@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/deep-code-agent",
     "crates/deep-code-tui",
-    "app/deep-code-desktop/src-tauri",
+    "apps/deep-code-desktop/src-tauri",
 ]
 
 [workspace.package]
