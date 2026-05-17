@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/deep-code-agent",
+    "crates/deep-code-tui",
+    "app/deep-code-desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/liwenka1/deep-code"
