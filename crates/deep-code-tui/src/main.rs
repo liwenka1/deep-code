@@ -1,3 +1,7 @@
-fn main() {
-    println!("hello from deep-code-tui");
+mod app;
+mod ui;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    ui::run()
 }
