@@ -1,9 +1,23 @@
+//! TUI application state.
+//!
+//! This module is intentionally thin: the agent runtime owns the model loop,
+//! tool registry, session, and approval gating. The UI only has to:
+//!
+//! 1. forward user prompts via [`AgentRuntimeHandle::submit_user`],
+//! 2. render [`RuntimeEvent`]s as they arrive,
+//! 3. forward approval decisions via [`AgentRuntimeHandle::submit_approval`].
+
+use std::sync::Arc;
+
 use deep_code_agent::{
-    AgentConfig, AgentEvent, AgentEventStream, ChatRequest, DeepSeekClient, LlmClient, Message,
-    Session,
+    AgentConfig, AgentEvent, AgentRuntime, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest,
+    DeepSeekClient, RuntimeEvent, ToolRegistry, workspace_tool_registry,
 };
-use futures_util::StreamExt;
 use tokio::sync::mpsc;
+
+use crate::echo_client::EchoClient;
+
+const SYSTEM_PROMPT: &str = "You are deep-code's minimal TUI assistant.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Author {
@@ -18,16 +32,15 @@ pub struct ChatMessage {
     pub text: String,
 }
 
+/// Updates pushed from the bridge task into the UI thread.
 #[derive(Debug, Clone, PartialEq)]
-pub enum StreamUpdate {
-    Event(AgentEvent),
-    Error(String),
-    Finished,
+enum UiUpdate {
+    Event(RuntimeEvent),
+    StreamFinished,
 }
 
-pub type StreamReceiver = mpsc::UnboundedReceiver<StreamUpdate>;
+type UiUpdateReceiver = mpsc::UnboundedReceiver<UiUpdate>;
 
-#[derive(Debug)]
 pub struct App {
     pub input: String,
     pub messages: Vec<ChatMessage>,
@@ -36,41 +49,38 @@ pub struct App {
     pub error: Option<String>,
     pub should_quit: bool,
     pub is_streaming: bool,
-    session: Session,
-    stream_rx: Option<StreamReceiver>,
-    use_real_agent: bool,
+    pub pending_approval: Option<ApprovalRequest>,
+    runtime: Arc<dyn AgentRuntimeHandle>,
+    backend_label: String,
+    ui_rx: Option<UiUpdateReceiver>,
 }
 
 impl App {
     #[must_use]
     pub fn new() -> Self {
         let config = AgentConfig::from_env();
-        let use_real_agent = config.api_key.is_some();
-        let status = if use_real_agent {
-            format!("Ready - DeepSeek {}", config.model)
-        } else {
-            "Ready - offline echo mode (set DEEPSEEK_API_KEY for DeepSeek)".to_string()
-        };
-
-        let mut session = Session::new();
-        session.push(Message::system(
-            "You are deep-code's minimal TUI assistant.",
-        ));
+        let (runtime, backend_label) = build_runtime(&config);
+        let status = format!("Ready - {backend_label}");
 
         Self {
             input: String::new(),
             messages: vec![ChatMessage {
                 author: Author::System,
-                text: "Type a prompt and press Enter. Press Esc or Ctrl+C to exit.".to_string(),
+                text: format!(
+                    "{}\n{}",
+                    "Type a prompt and press Enter. Press Esc or Ctrl+C to exit.",
+                    "Tip: in offline mode, type \"/mock-tool hello\" to exercise approval."
+                ),
             }],
             streaming_buffer: String::new(),
             status,
             error: None,
             should_quit: false,
             is_streaming: false,
-            session,
-            stream_rx: None,
-            use_real_agent,
+            pending_approval: None,
+            runtime,
+            backend_label,
+            ui_rx: None,
         }
     }
 
@@ -87,7 +97,7 @@ impl App {
     }
 
     pub fn submit(&mut self) {
-        if self.is_streaming {
+        if self.is_streaming || self.pending_approval.is_some() {
             return;
         }
 
@@ -101,88 +111,158 @@ impl App {
         self.error = None;
         self.streaming_buffer.clear();
         self.is_streaming = true;
-        self.status = if self.use_real_agent {
-            "Streaming from DeepSeek...".to_string()
-        } else {
-            "Streaming offline echo...".to_string()
-        };
+        self.status = format!("Streaming from {}...", self.backend_label);
 
-        self.session.push(Message::user(prompt.clone()));
         self.messages.push(ChatMessage {
             author: Author::User,
             text: prompt.clone(),
         });
 
-        let messages = self.session.messages().to_vec();
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.stream_rx = Some(rx);
+        self.start_stream(StreamRequest::User(prompt));
+    }
 
-        if self.use_real_agent {
-            tokio::spawn(stream_deepseek(messages, tx));
-        } else {
-            tokio::spawn(stream_echo(prompt, tx));
-        }
+    pub fn approve_pending_tool(&mut self) {
+        self.resolve_pending_tool(ApprovalDecision::Approved);
+    }
+
+    pub fn deny_pending_tool(&mut self) {
+        self.resolve_pending_tool(ApprovalDecision::Denied);
     }
 
     pub fn drain_stream_updates(&mut self) {
-        let Some(mut rx) = self.stream_rx.take() else {
+        let Some(mut rx) = self.ui_rx.take() else {
             return;
         };
 
         while let Ok(update) = rx.try_recv() {
-            self.apply_stream_update(update);
+            self.apply_ui_update(update);
         }
 
         if self.is_streaming {
-            self.stream_rx = Some(rx);
+            self.ui_rx = Some(rx);
         }
     }
 
-    fn apply_stream_update(&mut self, update: StreamUpdate) {
-        match update {
-            StreamUpdate::Event(AgentEvent::TextDelta { text })
-            | StreamUpdate::Event(AgentEvent::ReasoningDelta { text }) => {
-                self.streaming_buffer.push_str(&text);
-            }
-            StreamUpdate::Event(AgentEvent::ToolCallDelta { .. }) => {
-                self.status =
-                    "Received tool call delta; tools are not enabled in this MVP.".to_string();
-            }
-            StreamUpdate::Event(AgentEvent::Done { .. }) | StreamUpdate::Finished => {
-                self.finish_stream();
-            }
-            StreamUpdate::Event(AgentEvent::Error { message }) | StreamUpdate::Error(message) => {
-                self.error = Some(message.clone());
-                self.status = "Agent error.".to_string();
-                self.messages.push(ChatMessage {
-                    author: Author::System,
-                    text: format!("Error: {message}"),
-                });
-                self.is_streaming = false;
-                self.stream_rx = None;
-            }
-        }
-    }
-
-    fn finish_stream(&mut self) {
-        if !self.is_streaming {
+    fn resolve_pending_tool(&mut self, decision: ApprovalDecision) {
+        if self.pending_approval.take().is_none() {
             return;
         }
 
-        let text = if self.streaming_buffer.is_empty() {
-            "(empty response)".to_string()
-        } else {
-            std::mem::take(&mut self.streaming_buffer)
+        let label = match decision {
+            ApprovalDecision::Approved => "approved",
+            ApprovalDecision::Denied => "denied",
         };
+        self.status = format!("Tool {label}, resuming...");
+        self.is_streaming = true;
+        self.start_stream(StreamRequest::Approval(decision));
+    }
 
-        self.session.push(Message::assistant(text.clone()));
+    fn start_stream(&mut self, request: StreamRequest) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.ui_rx = Some(rx);
+
+        let runtime = Arc::clone(&self.runtime);
+        tokio::spawn(async move {
+            let mut events = match request {
+                StreamRequest::User(prompt) => runtime.submit_user(prompt).await,
+                StreamRequest::Approval(decision) => runtime.submit_approval(decision).await,
+            };
+
+            while let Some(event) = events.recv().await {
+                let is_terminal = matches!(
+                    event,
+                    RuntimeEvent::TurnFinished { .. }
+                        | RuntimeEvent::ApprovalRequired { .. }
+                        | RuntimeEvent::Error { .. }
+                );
+                if tx.send(UiUpdate::Event(event)).is_err() {
+                    return;
+                }
+                if is_terminal {
+                    break;
+                }
+            }
+
+            let _ = tx.send(UiUpdate::StreamFinished);
+        });
+    }
+
+    fn apply_ui_update(&mut self, update: UiUpdate) {
+        match update {
+            UiUpdate::Event(event) => self.apply_runtime_event(event),
+            UiUpdate::StreamFinished => {
+                self.is_streaming = false;
+                self.ui_rx = None;
+            }
+        }
+    }
+
+    fn apply_runtime_event(&mut self, event: RuntimeEvent) {
+        match event {
+            RuntimeEvent::Provider(AgentEvent::TextDelta { text })
+            | RuntimeEvent::Provider(AgentEvent::ReasoningDelta { text }) => {
+                self.streaming_buffer.push_str(&text);
+            }
+            RuntimeEvent::Provider(AgentEvent::ToolCallDelta { .. }) => {
+                self.status = "Receiving tool call...".to_string();
+            }
+            RuntimeEvent::Provider(AgentEvent::Done { .. }) => {
+                // Provider stream finished; runtime will send TurnFinished or
+                // ApprovalRequired next. Nothing to do here.
+            }
+            RuntimeEvent::Provider(AgentEvent::Error { message }) => {
+                self.record_error(message);
+            }
+            RuntimeEvent::ApprovalRequired { request } => {
+                self.flush_assistant_buffer();
+                self.status = format!(
+                    "Approve tool '{}' ? Press y to approve or n to deny.",
+                    request.tool_name
+                );
+                self.pending_approval = Some(request);
+                self.is_streaming = false;
+                self.ui_rx = None;
+            }
+            RuntimeEvent::ToolResult { result } => {
+                let summary = summarize_tool_result(&result.content);
+                self.messages.push(ChatMessage {
+                    author: Author::System,
+                    text: format!(
+                        "Tool result ({} / {:?}): {}",
+                        result.tool_name, result.status, summary
+                    ),
+                });
+            }
+            RuntimeEvent::TurnFinished { .. } => {
+                self.flush_assistant_buffer();
+                self.status = format!("Ready - {}", self.backend_label);
+                self.is_streaming = false;
+                self.ui_rx = None;
+            }
+            RuntimeEvent::Error { message } => self.record_error(message),
+        }
+    }
+
+    fn flush_assistant_buffer(&mut self) {
+        if self.streaming_buffer.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.streaming_buffer);
         self.messages.push(ChatMessage {
             author: Author::Assistant,
             text,
         });
-        self.status = "Ready".to_string();
+    }
+
+    fn record_error(&mut self, message: String) {
+        self.error = Some(message.clone());
+        self.status = "Agent error.".to_string();
+        self.messages.push(ChatMessage {
+            author: Author::System,
+            text: format!("Error: {message}"),
+        });
         self.is_streaming = false;
-        self.stream_rx = None;
+        self.ui_rx = None;
     }
 }
 
@@ -192,52 +272,129 @@ impl Default for App {
     }
 }
 
-async fn stream_echo(prompt: String, tx: mpsc::UnboundedSender<StreamUpdate>) {
-    let response = format!("Echo: {prompt}");
-    for token in response.split_inclusive(' ') {
-        if tx
-            .send(StreamUpdate::Event(AgentEvent::TextDelta {
-                text: token.to_string(),
-            }))
-            .is_err()
-        {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(35)).await;
-    }
-
-    let _ = tx.send(StreamUpdate::Event(AgentEvent::Done { usage: None }));
+enum StreamRequest {
+    User(String),
+    Approval(ApprovalDecision),
 }
 
-async fn stream_deepseek(messages: Vec<Message>, tx: mpsc::UnboundedSender<StreamUpdate>) {
-    match open_deepseek_stream(messages).await {
-        Ok(mut stream) => {
-            while let Some(event) = stream.next().await {
-                let update = match event {
-                    Ok(event) => StreamUpdate::Event(event),
-                    Err(error) => StreamUpdate::Error(error.to_string()),
-                };
-
-                let is_error = matches!(update, StreamUpdate::Error(_));
-                if tx.send(update).is_err() || is_error {
-                    return;
-                }
+fn build_runtime(config: &AgentConfig) -> (Arc<dyn AgentRuntimeHandle>, String) {
+    let tool_registry = default_tool_registry();
+    if config.api_key.is_some() {
+        match DeepSeekClient::new(config.clone()) {
+            Ok(client) => {
+                let runtime =
+                    AgentRuntime::with_system_prompt(client, tool_registry, SYSTEM_PROMPT);
+                let label = format!("DeepSeek {}", config.model);
+                return (Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>, label);
             }
-
-            let _ = tx.send(StreamUpdate::Finished);
-        }
-        Err(error) => {
-            let _ = tx.send(StreamUpdate::Error(error.to_string()));
+            Err(_) => {
+                // Fall through to offline echo. The runtime is still useful
+                // for trying out the UX without a key.
+            }
         }
     }
+
+    let runtime = AgentRuntime::with_system_prompt(EchoClient, tool_registry, SYSTEM_PROMPT);
+    let label = "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string();
+    (Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>, label)
 }
 
-async fn open_deepseek_stream(
-    messages: Vec<Message>,
-) -> deep_code_agent::AgentResult<AgentEventStream> {
-    let config = AgentConfig::from_env();
-    let client = DeepSeekClient::new(config.clone())?;
-    let request = ChatRequest::streaming(config.model.clone(), messages);
+fn summarize_tool_result(content: &str) -> String {
+    const MAX_CHARS: usize = 300;
 
-    client.stream_chat(request).await
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
+        && let Some(summary) = summarize_json_tool_result(&value)
+    {
+        return summary;
+    }
+
+    let flattened = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(&flattened, MAX_CHARS)
+}
+
+fn summarize_json_tool_result(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    let path = object
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+
+    if let Some(entries) = object.get("entries").and_then(serde_json::Value::as_array) {
+        return Some(format!("{path}: {} entries", entries.len()));
+    }
+
+    if let Some(lines) = object.get("lines").and_then(serde_json::Value::as_array) {
+        let total_lines = object
+            .get("total_lines")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(lines.len() as u64);
+        let truncated = object
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        return Some(format!(
+            "{path}: {} lines shown of {total_lines} (truncated={truncated})",
+            lines.len()
+        ));
+    }
+
+    if let Some(matches) = object.get("matches").and_then(serde_json::Value::as_array) {
+        let files_searched = object
+            .get("files_searched")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let truncated = object
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        return Some(format!(
+            "{path}: {} matches across {files_searched} files (truncated={truncated})",
+            matches.len()
+        ));
+    }
+
+    if let Some(bytes_written) = object
+        .get("bytes_written")
+        .and_then(serde_json::Value::as_u64)
+    {
+        return Some(format!("{path}: wrote {bytes_written} bytes"));
+    }
+
+    if let Some(replacements) = object
+        .get("replacements")
+        .and_then(serde_json::Value::as_u64)
+    {
+        return Some(format!("{path}: {replacements} replacements"));
+    }
+
+    None
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut truncated = String::new();
+    for _ in 0..max_chars {
+        let Some(ch) = chars.next() else {
+            return text.to_string();
+        };
+        truncated.push(ch);
+    }
+    if chars.next().is_some() {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
+fn default_tool_registry() -> ToolRegistry {
+    let mut registry = ToolRegistry::with_mock_tools();
+    match std::env::current_dir()
+        .map_err(|error| error.to_string())
+        .and_then(|cwd| workspace_tool_registry(cwd).map_err(|error| error.to_string()))
+    {
+        Ok(workspace_tools) => registry.extend(workspace_tools),
+        Err(error) => {
+            eprintln!("workspace tools disabled: {error}");
+        }
+    }
+    registry
 }

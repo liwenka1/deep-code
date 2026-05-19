@@ -12,6 +12,8 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ChatTool>,
 }
 
 impl ChatRequest {
@@ -23,7 +25,14 @@ impl ChatRequest {
             stream: true,
             temperature: None,
             max_tokens: None,
+            tools: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<ChatTool>) -> Self {
+        self.tools = tools;
+        self
     }
 }
 
@@ -65,6 +74,40 @@ pub struct FunctionCallDelta {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatTool {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: ChatToolFunction,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatToolFunction {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+/// Tool call payload as it appears on a finalized assistant message.
+///
+/// Distinct from [`ToolCallDelta`], which represents incremental streaming
+/// fragments of the same logical call. The `arguments` field is kept as a raw
+/// JSON string so that history sent back to the provider is byte-identical to
+/// what the model originally produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallPayload {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: ToolCallFunctionPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallFunctionPayload {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamChunk {
     pub id: Option<String>,
     pub model: Option<String>,
@@ -95,6 +138,25 @@ mod tests {
         assert_eq!(json["stream"], true);
         assert_eq!(json["messages"][0]["role"], "user");
         assert_eq!(json["messages"][0]["content"], "ping");
+        assert!(json.get("tools").is_none());
+    }
+
+    #[test]
+    fn chat_request_serializes_openai_compatible_tools() {
+        let request = ChatRequest::streaming("deepseek-v4-pro", vec![Message::user("ping")])
+            .with_tools(vec![ChatTool {
+                tool_type: "function".to_string(),
+                function: ChatToolFunction {
+                    name: "mock_echo".to_string(),
+                    description: "Echo safely".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            }]);
+        let json = serde_json::to_value(request).unwrap();
+
+        assert_eq!(json["tools"][0]["type"], "function");
+        assert_eq!(json["tools"][0]["function"]["name"], "mock_echo");
+        assert_eq!(json["tools"][0]["function"]["parameters"]["type"], "object");
     }
 
     #[test]

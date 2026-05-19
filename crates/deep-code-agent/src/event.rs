@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{StreamChunk, ToolCallDelta, Usage};
 
+/// Provider-stream events. These are produced by an [`crate::LlmClient`] and
+/// represent only what comes back from the model API. Approval requests and
+/// tool results are *not* provider events; they are synthesized by the agent
+/// runtime — see [`crate::runtime::RuntimeEvent`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {

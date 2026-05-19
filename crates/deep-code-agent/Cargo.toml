@@ -11,8 +11,15 @@ description = "deep-code agent core library (scaffold)"
 async-stream = "0.3"
 futures-core = "0.3"
 futures-util = "0.3"
+ignore = "0.4"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+walkdir = "2"
+
+[dev-dependencies]
+anyhow = "1"
+tempfile = "3"

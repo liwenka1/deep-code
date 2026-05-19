@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::model::ToolCallPayload;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -13,6 +15,10 @@ pub enum Role {
 pub struct Message {
     pub role: Role,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCallPayload>,
 }
 
 impl Message {
@@ -21,6 +27,8 @@ impl Message {
         Self {
             role,
             content: content.into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -38,6 +46,32 @@ impl Message {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::new(Role::Assistant, content)
     }
+
+    /// Build an assistant message that carries `tool_calls`. Required by the
+    /// OpenAI/DeepSeek protocol whenever the assistant turn requested tools;
+    /// the subsequent `role=tool` messages must reference these `id`s.
+    #[must_use]
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCallPayload>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls,
+        }
+    }
+
+    #[must_use]
+    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_call_id: Some(tool_call_id.into()),
+            tool_calls: Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -49,5 +83,43 @@ mod tests {
         let json = serde_json::to_string(&Message::user("hello")).unwrap();
 
         assert_eq!(json, r#"{"role":"user","content":"hello"}"#);
+    }
+
+    #[test]
+    fn tool_message_serializes_tool_call_id() {
+        let json = serde_json::to_string(&Message::tool("call_1", "ok")).unwrap();
+
+        assert_eq!(
+            json,
+            r#"{"role":"tool","content":"ok","tool_call_id":"call_1"}"#
+        );
+    }
+
+    #[test]
+    fn assistant_with_tool_calls_serializes_protocol_payload() {
+        use crate::model::{ToolCallFunctionPayload, ToolCallPayload};
+
+        let message = Message::assistant_with_tool_calls(
+            "",
+            vec![ToolCallPayload {
+                id: "call_1".to_string(),
+                call_type: "function".to_string(),
+                function: ToolCallFunctionPayload {
+                    name: "mock_echo".to_string(),
+                    arguments: r#"{"message":"hi"}"#.to_string(),
+                },
+            }],
+        );
+        let json = serde_json::to_value(&message).unwrap();
+
+        assert_eq!(json["role"], "assistant");
+        assert_eq!(json["content"], "");
+        assert_eq!(json["tool_calls"][0]["id"], "call_1");
+        assert_eq!(json["tool_calls"][0]["type"], "function");
+        assert_eq!(json["tool_calls"][0]["function"]["name"], "mock_echo");
+        assert_eq!(
+            json["tool_calls"][0]["function"]["arguments"],
+            r#"{"message":"hi"}"#
+        );
     }
 }

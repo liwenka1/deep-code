@@ -62,6 +62,18 @@ fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
+    if app.pending_approval.is_some() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => app.approve_pending_tool(),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.deny_pending_tool(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.should_quit = true;
+            }
+            _ => {}
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -106,6 +118,16 @@ fn render_messages(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect
         items.push(ListItem::new(vec![
             Line::from(label_for_author(&Author::Assistant)),
             Line::from(app.streaming_buffer.clone()),
+        ]));
+    }
+
+    if let Some(request) = &app.pending_approval {
+        items.push(ListItem::new(vec![
+            Line::from("Approval required".yellow().bold()),
+            Line::from(format!("Tool: {}", request.tool_name)),
+            Line::from(format!("Description: {}", request.description)),
+            Line::from(format!("Arguments: {}", request.arguments)),
+            Line::from("Press y to approve, n to deny."),
         ]));
     }
 

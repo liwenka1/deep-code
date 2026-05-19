@@ -1,0 +1,618 @@
+//! Agent runtime: orchestrates the model loop, tool calls, and approvals.
+//!
+//! The runtime owns the [`Session`], an [`LlmClient`], and a [`ToolRegistry`],
+//! and produces [`RuntimeEvent`]s for UIs. UIs are expected to render events
+//! and forward approval decisions back via [`AgentRuntime::submit_approval`].
+//!
+//! Design notes
+//! - [`AgentEvent`] is intentionally kept narrow (provider-stream only). The
+//!   runtime synthesizes higher-level events such as approval requests and
+//!   tool results into [`RuntimeEvent`].
+//! - Multi tool-call turns are not supported yet: the runtime emits a
+//!   `RuntimeEvent::Error` if the model produces more than one tool call in
+//!   one turn. The single-call path is enough for the 03 milestone.
+
+use std::sync::Arc;
+
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, mpsc};
+
+use crate::client::LlmClient;
+use crate::event::AgentEvent;
+use crate::message::Message;
+use crate::model::{ChatRequest, ToolCallFunctionPayload, ToolCallPayload, Usage};
+use crate::session::Session;
+use crate::tool::{
+    ApprovalDecision, ApprovalRequest, ToolCall, ToolCallAccumulator, ToolError, ToolRegistry,
+    ToolResult, ToolRunOutcome,
+};
+
+/// Events the agent runtime produces for UIs.
+///
+/// These are higher level than [`AgentEvent`]: approval requests and tool
+/// results are emitted by the runtime, never by an [`LlmClient`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RuntimeEvent {
+    /// Forwarded provider event (text/reasoning/tool-call-delta).
+    Provider(AgentEvent),
+    /// Runtime is requesting human approval for a tool call.
+    ApprovalRequired { request: ApprovalRequest },
+    /// A tool finished (executed, denied, or failed) and its result has been
+    /// recorded in the session.
+    ToolResult { result: ToolResult },
+    /// Current turn finished cleanly (no further provider activity).
+    TurnFinished { usage: Option<Usage> },
+    /// Runtime-level error. Terminal for the current turn.
+    Error { message: String },
+}
+
+pub type RuntimeEventReceiver = mpsc::UnboundedReceiver<RuntimeEvent>;
+
+/// Object-safe handle so that callers (UIs, tests) can hold heterogeneous
+/// runtimes (DeepSeek, offline echo, scripted, ...) behind a `Box<dyn ...>`.
+///
+/// Methods here return owned futures so the trait stays object-safe even
+/// though [`LlmClient`] is not.
+pub trait AgentRuntimeHandle: Send + Sync {
+    fn submit_user(
+        &self,
+        prompt: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeEventReceiver> + Send + '_>>;
+
+    fn submit_approval(
+        &self,
+        decision: ApprovalDecision,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeEventReceiver> + Send + '_>>;
+
+    fn session_messages(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Message>> + Send + '_>>;
+}
+
+impl<C: LlmClient + 'static> AgentRuntimeHandle for AgentRuntime<C> {
+    fn submit_user(
+        &self,
+        prompt: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeEventReceiver> + Send + '_>>
+    {
+        Box::pin(AgentRuntime::submit_user(self, prompt))
+    }
+
+    fn submit_approval(
+        &self,
+        decision: ApprovalDecision,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeEventReceiver> + Send + '_>>
+    {
+        Box::pin(AgentRuntime::submit_approval(self, decision))
+    }
+
+    fn session_messages(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Message>> + Send + '_>> {
+        Box::pin(AgentRuntime::session_messages(self))
+    }
+}
+
+/// Internal: the runtime can be in one of these states between [`RuntimeEvent`]
+/// emissions. Kept private so callers cannot poke at it.
+#[derive(Debug, Default)]
+struct RuntimeState {
+    session: Session,
+    pending: Option<PendingToolCall>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingToolCall {
+    call: ToolCall,
+}
+
+/// Agent runtime tying together [`LlmClient`], [`ToolRegistry`], and [`Session`].
+///
+/// Cheap to clone: state is behind an [`Arc`]/[`Mutex`].
+pub struct AgentRuntime<C: LlmClient + 'static> {
+    client: Arc<C>,
+    tools: Arc<ToolRegistry>,
+    state: Arc<Mutex<RuntimeState>>,
+}
+
+// Manual `Clone` to avoid the auto-derived `where C: Clone` bound that the
+// compiler would otherwise add. `client` is already an `Arc<C>`, so cloning
+// the runtime never requires cloning `C` itself.
+impl<C: LlmClient + 'static> Clone for AgentRuntime<C> {
+    fn clone(&self) -> Self {
+        Self {
+            client: Arc::clone(&self.client),
+            tools: Arc::clone(&self.tools),
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl<C: LlmClient + 'static> AgentRuntime<C> {
+    pub fn new(client: C, tools: ToolRegistry) -> Self {
+        Self {
+            client: Arc::new(client),
+            tools: Arc::new(tools),
+            state: Arc::new(Mutex::new(RuntimeState::default())),
+        }
+    }
+
+    pub fn with_system_prompt(client: C, tools: ToolRegistry, system: impl Into<String>) -> Self {
+        let mut session = Session::new();
+        session.push(Message::system(system));
+        Self {
+            client: Arc::new(client),
+            tools: Arc::new(tools),
+            state: Arc::new(Mutex::new(RuntimeState {
+                session,
+                pending: None,
+            })),
+        }
+    }
+
+    /// Start a new turn from a user prompt. Returns a receiver that yields
+    /// [`RuntimeEvent`]s until either the turn finishes or an approval is
+    /// required. After approval, call [`submit_approval`] to resume.
+    pub async fn submit_user(&self, prompt: impl Into<String>) -> RuntimeEventReceiver {
+        let prompt = prompt.into();
+        {
+            let mut state = self.state.lock().await;
+            state.session.push(Message::user(prompt));
+            state.pending = None;
+        }
+
+        self.spawn_loop()
+    }
+
+    /// Resolve a pending tool approval and resume the loop.
+    ///
+    /// If there is no pending approval, returns an error event on the stream.
+    pub async fn submit_approval(&self, decision: ApprovalDecision) -> RuntimeEventReceiver {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pending = {
+            let mut state = self.state.lock().await;
+            state.pending.take()
+        };
+
+        let Some(pending) = pending else {
+            let _ = tx.send(RuntimeEvent::Error {
+                message: "no pending tool approval".to_string(),
+            });
+            return rx;
+        };
+
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            runtime.handle_approval(pending, decision, &tx).await;
+        });
+        rx
+    }
+
+    fn spawn_loop(&self) -> RuntimeEventReceiver {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            runtime.run_loop(&tx).await;
+        });
+        rx
+    }
+
+    /// Drive the model/tool loop until either the turn finishes or an
+    /// approval is required. All paths emit a terminal [`RuntimeEvent`]
+    /// (`TurnFinished`, `ApprovalRequired`, or `Error`) before returning.
+    async fn run_loop(&self, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
+        loop {
+            let request = {
+                let state = self.state.lock().await;
+                ChatRequest::streaming(
+                    self.client.model().to_string(),
+                    state.session.messages().to_vec(),
+                )
+                .with_tools(self.tools.chat_tools())
+            };
+
+            let mut stream = match self.client.stream_chat(request).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    emit(
+                        tx,
+                        RuntimeEvent::Error {
+                            message: error.to_string(),
+                        },
+                    );
+                    return;
+                }
+            };
+
+            let mut accumulator = ToolCallAccumulator::default();
+            let mut text_buffer = String::new();
+            let mut last_usage: Option<Usage> = None;
+            let mut had_error = false;
+
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(AgentEvent::TextDelta { text }) => {
+                        text_buffer.push_str(&text);
+                        emit(tx, RuntimeEvent::Provider(AgentEvent::TextDelta { text }));
+                    }
+                    Ok(AgentEvent::ReasoningDelta { text }) => {
+                        emit(
+                            tx,
+                            RuntimeEvent::Provider(AgentEvent::ReasoningDelta { text }),
+                        );
+                    }
+                    Ok(AgentEvent::ToolCallDelta { delta }) => {
+                        let forwarded = delta.clone();
+                        accumulator.push_delta(delta);
+                        emit(
+                            tx,
+                            RuntimeEvent::Provider(AgentEvent::ToolCallDelta { delta: forwarded }),
+                        );
+                    }
+                    Ok(AgentEvent::Done { usage }) => {
+                        last_usage = usage;
+                    }
+                    Ok(AgentEvent::Error { message }) => {
+                        emit(tx, RuntimeEvent::Error { message });
+                        had_error = true;
+                    }
+                    Err(error) => {
+                        emit(
+                            tx,
+                            RuntimeEvent::Error {
+                                message: error.to_string(),
+                            },
+                        );
+                        had_error = true;
+                    }
+                }
+            }
+
+            if had_error {
+                return;
+            }
+
+            let calls = match accumulator.finish() {
+                Ok(calls) => calls,
+                Err(error) => {
+                    emit(tx, runtime_error_from_tool_error(error));
+                    return;
+                }
+            };
+
+            if calls.is_empty() {
+                let mut state = self.state.lock().await;
+                state.session.push(Message::assistant(text_buffer));
+                emit(tx, RuntimeEvent::TurnFinished { usage: last_usage });
+                return;
+            }
+
+            if calls.len() > 1 {
+                emit(
+                    tx,
+                    RuntimeEvent::Error {
+                        message: format!(
+                            "multi tool call turns are not supported yet (got {} calls)",
+                            calls.len()
+                        ),
+                    },
+                );
+                return;
+            }
+
+            let call = calls.into_iter().next().expect("exactly one tool call");
+            let payload = tool_call_payload(&call);
+
+            {
+                let mut state = self.state.lock().await;
+                state.session.push(Message::assistant_with_tool_calls(
+                    text_buffer,
+                    vec![payload],
+                ));
+            }
+
+            match self.tools.run_tool_call(call.clone(), None) {
+                Ok(ToolRunOutcome::ApprovalRequired { request }) => {
+                    {
+                        let mut state = self.state.lock().await;
+                        state.pending = Some(PendingToolCall { call });
+                    }
+                    emit(tx, RuntimeEvent::ApprovalRequired { request });
+                    return;
+                }
+                Ok(ToolRunOutcome::Result { result }) => {
+                    self.record_tool_result(result, tx).await;
+                    // Loop again: feed tool result back into the next chat turn.
+                    continue;
+                }
+                Err(error) => {
+                    emit(tx, runtime_error_from_tool_error(error));
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn handle_approval(
+        &self,
+        pending: PendingToolCall,
+        decision: ApprovalDecision,
+        tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let outcome = self
+            .tools
+            .run_tool_call(pending.call.clone(), Some(decision));
+        match outcome {
+            Ok(ToolRunOutcome::Result { result }) => {
+                self.record_tool_result(result, tx).await;
+            }
+            Ok(ToolRunOutcome::ApprovalRequired { request }) => {
+                {
+                    let mut state = self.state.lock().await;
+                    state.pending = Some(pending);
+                }
+                emit(tx, RuntimeEvent::ApprovalRequired { request });
+                return;
+            }
+            Err(error) => {
+                emit(tx, runtime_error_from_tool_error(error));
+                return;
+            }
+        }
+
+        // Approved (or denied) call recorded; resume the loop to feed the
+        // tool result into the next chat turn.
+        self.run_loop(tx).await;
+    }
+
+    async fn record_tool_result(
+        &self,
+        result: ToolResult,
+        tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        {
+            let mut state = self.state.lock().await;
+            state.session.push(result.to_message());
+        }
+        emit(tx, RuntimeEvent::ToolResult { result });
+    }
+
+    /// Snapshot the current message history. Mostly for tests/debugging.
+    pub async fn session_messages(&self) -> Vec<Message> {
+        self.state.lock().await.session.messages().to_vec()
+    }
+}
+
+fn emit(tx: &mpsc::UnboundedSender<RuntimeEvent>, event: RuntimeEvent) {
+    let _ = tx.send(event);
+}
+
+fn tool_call_payload(call: &ToolCall) -> ToolCallPayload {
+    // Compact form keeps history small and matches typical OpenAI-style
+    // assistant payloads. We don't try to preserve the exact bytes the model
+    // produced because we already parsed them through `ToolCallAccumulator`.
+    let arguments = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_string());
+    ToolCallPayload {
+        id: call.id.clone(),
+        call_type: "function".to_string(),
+        function: ToolCallFunctionPayload {
+            name: call.name.clone(),
+            arguments,
+        },
+    }
+}
+
+fn runtime_error_from_tool_error(error: ToolError) -> RuntimeEvent {
+    RuntimeEvent::Error {
+        message: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    use async_stream::try_stream;
+    use futures_core::Stream;
+
+    use super::*;
+    use crate::client::AgentEventStream;
+    use crate::error::AgentResult;
+    use crate::event::AgentEvent;
+    use crate::model::{FunctionCallDelta, ToolCallDelta};
+    use crate::tool::{MockEchoTool, ToolRegistry, ToolResultStatus};
+
+    /// Scripted client: replays a pre-recorded sequence of provider events for
+    /// each successive call to `stream_chat`.
+    struct ScriptedClient {
+        scripts: Mutex<Vec<Vec<AgentEvent>>>,
+    }
+
+    impl ScriptedClient {
+        fn new(scripts: Vec<Vec<AgentEvent>>) -> Self {
+            Self {
+                scripts: Mutex::new(scripts),
+            }
+        }
+    }
+
+    impl LlmClient for ScriptedClient {
+        fn provider_name(&self) -> &'static str {
+            "scripted"
+        }
+
+        fn model(&self) -> &str {
+            "scripted-model"
+        }
+
+        async fn stream_chat(&self, _request: ChatRequest) -> AgentResult<AgentEventStream> {
+            let events = {
+                let mut scripts = self.scripts.lock().unwrap();
+                if scripts.is_empty() {
+                    Vec::new()
+                } else {
+                    scripts.remove(0)
+                }
+            };
+
+            let stream = try_stream! {
+                for event in events {
+                    yield event;
+                }
+            };
+            let stream: Pin<Box<dyn Stream<Item = AgentResult<AgentEvent>> + Send>> =
+                Box::pin(stream);
+            Ok(stream)
+        }
+    }
+
+    fn tool_call_delta(id: &str, name: &str, arguments: &str) -> ToolCallDelta {
+        ToolCallDelta {
+            index: Some(0),
+            id: Some(id.to_string()),
+            call_type: Some("function".to_string()),
+            function: Some(FunctionCallDelta {
+                name: Some(name.to_string()),
+                arguments: Some(arguments.to_string()),
+            }),
+        }
+    }
+
+    async fn drain(rx: &mut RuntimeEventReceiver) -> Vec<RuntimeEvent> {
+        let mut out = Vec::new();
+        while let Some(event) = rx.recv().await {
+            out.push(event);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn approve_path_feeds_tool_result_into_next_turn() {
+        let client = ScriptedClient::new(vec![
+            vec![
+                AgentEvent::ToolCallDelta {
+                    delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+            vec![
+                AgentEvent::TextDelta {
+                    text: "thanks".to_string(),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+        ]);
+        let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools());
+
+        let mut rx = runtime.submit_user("please echo").await;
+        let first = drain(&mut rx).await;
+        assert!(matches!(
+            first.last(),
+            Some(RuntimeEvent::ApprovalRequired { .. })
+        ));
+
+        let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+        let second = drain(&mut rx).await;
+
+        let mut saw_tool_result = false;
+        let mut saw_finish = false;
+        for event in &second {
+            match event {
+                RuntimeEvent::ToolResult { result } => {
+                    assert_eq!(result.status, ToolResultStatus::Success);
+                    assert_eq!(result.content, "mock_echo: hi");
+                    saw_tool_result = true;
+                }
+                RuntimeEvent::TurnFinished { .. } => saw_finish = true,
+                _ => {}
+            }
+        }
+        assert!(saw_tool_result, "expected ToolResult event after approval");
+        assert!(saw_finish, "expected TurnFinished after second turn");
+
+        let messages = runtime.session_messages().await;
+        // Expect: user, assistant(tool_calls), tool, assistant("thanks").
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1].tool_calls.len(), 1);
+        assert_eq!(messages[1].tool_calls[0].id, "call_1");
+        assert_eq!(messages[2].role, crate::message::Role::Tool);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(messages[3].content, "thanks");
+    }
+
+    #[tokio::test]
+    async fn deny_path_records_denied_tool_message_and_continues() {
+        let client = ScriptedClient::new(vec![
+            vec![
+                AgentEvent::ToolCallDelta {
+                    delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+            vec![
+                AgentEvent::TextDelta {
+                    text: "ok".to_string(),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+        ]);
+        let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools());
+
+        let mut rx = runtime.submit_user("please echo").await;
+        drain(&mut rx).await;
+
+        let mut rx = runtime.submit_approval(ApprovalDecision::Denied).await;
+        let events = drain(&mut rx).await;
+
+        let denied = events.iter().find_map(|event| match event {
+            RuntimeEvent::ToolResult { result } => Some(result),
+            _ => None,
+        });
+        let denied = denied.expect("expected ToolResult on deny path");
+        assert_eq!(denied.status, ToolResultStatus::Denied);
+
+        let messages = runtime.session_messages().await;
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m.role, crate::message::Role::Tool)
+                    && m.content.contains("denied"))
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_response_yields_assistant_message_and_finish() {
+        let client = ScriptedClient::new(vec![vec![
+            AgentEvent::TextDelta {
+                text: "hello".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ]]);
+        let runtime = AgentRuntime::new(client, ToolRegistry::default());
+
+        let mut rx = runtime.submit_user("hi").await;
+        let events = drain(&mut rx).await;
+
+        assert!(matches!(
+            events.last(),
+            Some(RuntimeEvent::TurnFinished { .. })
+        ));
+        let messages = runtime.session_messages().await;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "hello");
+        assert!(messages[1].tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn submit_approval_without_pending_emits_error() {
+        let client = ScriptedClient::new(vec![]);
+        let runtime = AgentRuntime::new(client, ToolRegistry::default());
+
+        let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+        let events = drain(&mut rx).await;
+        assert!(matches!(events.first(), Some(RuntimeEvent::Error { .. })));
+    }
+}
