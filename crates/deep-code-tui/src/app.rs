@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use deep_code_agent::{
     AgentConfig, AgentEvent, AgentRuntime, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest,
-    DeepSeekClient, RuntimeEvent, ToolRegistry, workspace_tool_registry,
+    DeepSeekClient, RuntimeEvent, ToolRegistry, git_tool_registry, shell_tool_registry,
+    workspace_tool_registry,
 };
 use tokio::sync::mpsc;
 
@@ -367,6 +368,58 @@ fn summarize_json_tool_result(value: &serde_json::Value) -> Option<String> {
         return Some(format!("{path}: {replacements} replacements"));
     }
 
+    if let Some(command) = object.get("command").and_then(serde_json::Value::as_str) {
+        let status = object
+            .get("status")
+            .or_else(|| object.get("tool_status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let cwd = object
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(".");
+        if let Some(job_id) = object.get("job_id").and_then(serde_json::Value::as_str) {
+            return Some(format!("{job_id}: {status} in {cwd} ({command})"));
+        }
+        if object.contains_key("stdout") || object.contains_key("stderr") {
+            let exit = object
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64)
+                .map_or("none".to_string(), |code| code.to_string());
+            return Some(format!("{status} exit={exit} in {cwd} ({command})"));
+        }
+        if object.contains_key("diff") {
+            let truncated = object
+                .get("truncated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            return Some(format!("git diff in {cwd} (truncated={truncated})"));
+        }
+        if object.contains_key("status_output") {
+            let entries = object
+                .get("entries")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, |entries| entries.len());
+            return Some(format!("git status in {cwd}: {entries} entries"));
+        }
+        if object.contains_key("log") {
+            let lines = object
+                .get("log")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value.lines().count())
+                .unwrap_or(0);
+            return Some(format!("git log in {cwd}: {lines} lines"));
+        }
+    }
+
+    if let Some(job_id) = object.get("job_id").and_then(serde_json::Value::as_str) {
+        let status = object
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        return Some(format!("{job_id}: {status}"));
+    }
+
     None
 }
 
@@ -387,14 +440,22 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 
 fn default_tool_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::with_mock_tools();
-    match std::env::current_dir()
-        .map_err(|error| error.to_string())
-        .and_then(|cwd| workspace_tool_registry(cwd).map_err(|error| error.to_string()))
-    {
-        Ok(workspace_tools) => registry.extend(workspace_tools),
-        Err(error) => {
-            eprintln!("workspace tools disabled: {error}");
+    match std::env::current_dir() {
+        Ok(cwd) => {
+            match workspace_tool_registry(cwd.clone()) {
+                Ok(workspace_tools) => registry.extend(workspace_tools),
+                Err(error) => eprintln!("workspace tools disabled: {error}"),
+            }
+            match shell_tool_registry(cwd.clone()) {
+                Ok(shell_tools) => registry.extend(shell_tools),
+                Err(error) => eprintln!("shell tools disabled: {error}"),
+            }
+            match git_tool_registry(cwd) {
+                Ok(git_tools) => registry.extend(git_tools),
+                Err(error) => eprintln!("git tools disabled: {error}"),
+            }
         }
+        Err(error) => eprintln!("workspace tools disabled: {error}"),
     }
     registry
 }
