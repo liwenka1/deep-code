@@ -2,7 +2,7 @@ use std::process::{Command, Output, Stdio};
 
 use serde_json::{Value, json};
 
-use crate::execution_policy::{
+use crate::workspace_policy::{
     WorkspacePolicy, invalid, json_string, optional_bool, optional_str, optional_u64,
     truncate_string,
 };

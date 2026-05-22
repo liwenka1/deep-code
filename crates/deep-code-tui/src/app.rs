@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use deep_code_agent::{
     AgentConfig, AgentEvent, AgentRuntime, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest,
-    DeepSeekClient, RuntimeEvent, ToolRegistry, git_tool_registry, shell_tool_registry,
-    workspace_tool_registry,
+    CheckpointId, CheckpointStore, DeepSeekClient, RuntimeEvent, ToolRegistry, git_tool_registry,
+    shell_tool_registry, workspace_tool_registry,
 };
 use tokio::sync::mpsc;
 
@@ -51,6 +51,7 @@ pub struct App {
     pub should_quit: bool,
     pub is_streaming: bool,
     pub pending_approval: Option<ApprovalRequest>,
+    pub last_checkpoint: Option<String>,
     runtime: Arc<dyn AgentRuntimeHandle>,
     backend_label: String,
     ui_rx: Option<UiUpdateReceiver>,
@@ -68,9 +69,10 @@ impl App {
             messages: vec![ChatMessage {
                 author: Author::System,
                 text: format!(
-                    "{}\n{}",
+                    "{}\n{}\n{}",
                     "Type a prompt and press Enter. Press Esc or Ctrl+C to exit.",
-                    "Tip: in offline mode, type \"/mock-tool hello\" to exercise approval."
+                    "Tip: in offline mode, type \"/mock-tool hello\" to exercise approval.",
+                    "Slash: /checkpoints, /restore <id>"
                 ),
             }],
             streaming_buffer: String::new(),
@@ -79,6 +81,7 @@ impl App {
             should_quit: false,
             is_streaming: false,
             pending_approval: None,
+            last_checkpoint: None,
             runtime,
             backend_label,
             ui_rx: None,
@@ -105,6 +108,11 @@ impl App {
         let prompt = self.input.trim().to_string();
         if prompt.is_empty() {
             self.status = "Enter a prompt before sending.".to_string();
+            return;
+        }
+
+        if prompt.starts_with('/') && self.handle_slash_command(&prompt) {
+            self.input.clear();
             return;
         }
 
@@ -170,16 +178,15 @@ impl App {
             };
 
             while let Some(event) = events.recv().await {
-                let is_terminal = matches!(
+                if tx.send(UiUpdate::Event(event.clone())).is_err() {
+                    return;
+                }
+                if matches!(
                     event,
                     RuntimeEvent::TurnFinished { .. }
                         | RuntimeEvent::ApprovalRequired { .. }
                         | RuntimeEvent::Error { .. }
-                );
-                if tx.send(UiUpdate::Event(event)).is_err() {
-                    return;
-                }
-                if is_terminal {
+                ) {
                     break;
                 }
             }
@@ -216,13 +223,33 @@ impl App {
             }
             RuntimeEvent::ApprovalRequired { request } => {
                 self.flush_assistant_buffer();
+                let sandbox = if request.requires_sandbox {
+                    "yes"
+                } else {
+                    "no"
+                };
                 self.status = format!(
-                    "Approve tool '{}' ? Press y to approve or n to deny.",
-                    request.tool_name
+                    "Approve '{}' (risk={:?}, sandbox={sandbox})? y/n",
+                    request.tool_name, request.risk_level
                 );
                 self.pending_approval = Some(request);
                 self.is_streaming = false;
                 self.ui_rx = None;
+            }
+            RuntimeEvent::CheckpointCreated { id, label } => {
+                self.last_checkpoint = Some(id.0.clone());
+                self.messages.push(ChatMessage {
+                    author: Author::System,
+                    text: format!("Checkpoint [{label}]: {}", id.0),
+                });
+            }
+            RuntimeEvent::WorkspaceRestored { id } => {
+                self.last_checkpoint = Some(id.0.clone());
+                self.messages.push(ChatMessage {
+                    author: Author::System,
+                    text: format!("Workspace restored from checkpoint {}", id.0),
+                });
+                self.status = format!("Restored checkpoint {}", id.0);
             }
             RuntimeEvent::ToolResult { result } => {
                 let summary = summarize_tool_result(&result.content);
@@ -236,7 +263,12 @@ impl App {
             }
             RuntimeEvent::TurnFinished { .. } => {
                 self.flush_assistant_buffer();
-                self.status = format!("Ready - {}", self.backend_label);
+                let checkpoint = self
+                    .last_checkpoint
+                    .as_ref()
+                    .map(|id| format!(" | rollback: /restore {id}"))
+                    .unwrap_or_default();
+                self.status = format!("Ready - {}{checkpoint}", self.backend_label);
                 self.is_streaming = false;
                 self.ui_rx = None;
             }
@@ -253,6 +285,74 @@ impl App {
             author: Author::Assistant,
             text,
         });
+    }
+
+    fn handle_slash_command(&mut self, prompt: &str) -> bool {
+        match prompt {
+            "/checkpoints" => {
+                self.list_checkpoints();
+                true
+            }
+            _ if prompt.starts_with("/restore ") => {
+                let id = prompt.trim_start_matches("/restore ").trim();
+                if id.is_empty() {
+                    self.status = "Usage: /restore <checkpoint_id>".to_string();
+                } else {
+                    self.restore_checkpoint(id);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn list_checkpoints(&mut self) {
+        let Ok(cwd) = std::env::current_dir() else {
+            self.status = "Cannot resolve workspace for checkpoints.".to_string();
+            return;
+        };
+        match CheckpointStore::new(cwd) {
+            Ok(store) => match store.list() {
+                Ok(ids) if ids.is_empty() => {
+                    self.status = "No checkpoints yet.".to_string();
+                }
+                Ok(ids) => {
+                    self.messages.push(ChatMessage {
+                        author: Author::System,
+                        text: format!(
+                            "Checkpoints:\n{}",
+                            ids.iter()
+                                .map(|id| format!("- {}", id.0))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        ),
+                    });
+                    self.status = format!("{} checkpoint(s).", ids.len());
+                }
+                Err(error) => self.status = format!("List failed: {error}"),
+            },
+            Err(error) => self.status = format!("Checkpoints unavailable: {error}"),
+        }
+    }
+
+    fn restore_checkpoint(&mut self, id: &str) {
+        let Ok(cwd) = std::env::current_dir() else {
+            self.status = "Cannot resolve workspace for restore.".to_string();
+            return;
+        };
+        let checkpoint_id = CheckpointId(id.to_string());
+        match CheckpointStore::new(cwd) {
+            Ok(store) => match store.restore(&checkpoint_id) {
+                Ok(()) => {
+                    self.last_checkpoint = Some(id.to_string());
+                    self.apply_runtime_event(RuntimeEvent::WorkspaceRestored {
+                        id: checkpoint_id,
+                    });
+                }
+                Err(error) => self.status = format!("Restore failed: {error}"),
+            },
+            Err(error) => self.status = format!("Checkpoints unavailable: {error}"),
+        }
     }
 
     fn record_error(&mut self, message: String) {
@@ -283,8 +383,11 @@ fn build_runtime(config: &AgentConfig) -> (Arc<dyn AgentRuntimeHandle>, String) 
     if config.api_key.is_some() {
         match DeepSeekClient::new(config.clone()) {
             Ok(client) => {
-                let runtime =
-                    AgentRuntime::with_system_prompt(client, tool_registry, SYSTEM_PROMPT);
+                let runtime = attach_checkpoints(AgentRuntime::with_system_prompt(
+                    client,
+                    tool_registry,
+                    SYSTEM_PROMPT,
+                ));
                 let label = format!("DeepSeek {}", config.model);
                 return (Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>, label);
             }
@@ -295,9 +398,25 @@ fn build_runtime(config: &AgentConfig) -> (Arc<dyn AgentRuntimeHandle>, String) 
         }
     }
 
-    let runtime = AgentRuntime::with_system_prompt(EchoClient, tool_registry, SYSTEM_PROMPT);
+    let runtime = attach_checkpoints(AgentRuntime::with_system_prompt(
+        EchoClient,
+        tool_registry,
+        SYSTEM_PROMPT,
+    ));
     let label = "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string();
     (Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>, label)
+}
+
+fn attach_checkpoints<C: deep_code_agent::LlmClient + 'static>(
+    runtime: AgentRuntime<C>,
+) -> AgentRuntime<C> {
+    match std::env::current_dir() {
+        Ok(cwd) => runtime.with_checkpoints(cwd),
+        Err(error) => {
+            eprintln!("checkpoints disabled: {error}");
+            runtime
+        }
+    }
 }
 
 fn summarize_tool_result(content: &str) -> String {

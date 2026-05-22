@@ -1,6 +1,9 @@
 # Rust / Cargo (workspace root targets all crates)
 /target/
 
+# Agent side storage (checkpoints, local metadata)
+.deep-code/
+
 # --- Node (nested apps, e.g. Tauri frontend) ---
 node_modules/
 

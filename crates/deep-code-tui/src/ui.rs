@@ -122,9 +122,20 @@ fn render_messages(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect
     }
 
     if let Some(request) = &app.pending_approval {
+        let sandbox = if request.requires_sandbox {
+            "yes (OS sandbox when available)"
+        } else {
+            "no"
+        };
+        let rule = request
+            .matched_rule
+            .as_deref()
+            .unwrap_or("none");
         items.push(ListItem::new(vec![
             Line::from("Approval required".yellow().bold()),
             Line::from(format!("Tool: {}", request.tool_name)),
+            Line::from(format!("Risk: {:?} | Sandbox: {sandbox}", request.risk_level)),
+            Line::from(format!("Rule: {rule}")),
             Line::from(format!("Description: {}", request.description)),
             Line::from(format!("Arguments: {}", request.arguments)),
             Line::from("Press y to approve, n to deny."),

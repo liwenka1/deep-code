@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use crate::execution_policy::{ExecPolicy, PolicyVerdict, RiskLevel, ToolExecutionPlan};
 use crate::message::Message;
 use crate::model::{ChatTool, ChatToolFunction, FunctionCallDelta, ToolCallDelta};
 
@@ -121,12 +122,24 @@ impl ToolResult {
     }
 }
 
+fn default_risk_level() -> RiskLevel {
+    RiskLevel::Low
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub call_id: String,
     pub tool_name: String,
     pub description: String,
     pub arguments: Value,
+    #[serde(default = "default_risk_level")]
+    pub risk_level: RiskLevel,
+    #[serde(default)]
+    pub requires_sandbox: bool,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_rule: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +177,7 @@ pub trait Tool: Send + Sync {
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    policy: ExecPolicy,
 }
 
 impl std::fmt::Debug for ToolRegistry {
@@ -179,6 +193,23 @@ impl ToolRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_policy(policy: ExecPolicy) -> Self {
+        Self {
+            tools: HashMap::new(),
+            policy,
+        }
+    }
+
+    #[must_use]
+    pub fn policy(&self) -> &ExecPolicy {
+        &self.policy
+    }
+
+    pub fn set_policy(&mut self, policy: ExecPolicy) {
+        self.policy = policy;
     }
 
     pub fn register<T>(&mut self, tool: T)
@@ -223,6 +254,23 @@ impl ToolRegistry {
         call: ToolCall,
         decision: Option<ApprovalDecision>,
     ) -> Result<ToolRunOutcome, ToolError> {
+        self.run_tool_call_with_plan(
+            &call,
+            decision,
+            self.policy.evaluate_tool(&call.name, &call.arguments),
+        )
+    }
+
+    pub fn evaluate_tool(&self, call: &ToolCall) -> ToolExecutionPlan {
+        self.policy.evaluate_tool(&call.name, &call.arguments)
+    }
+
+    pub fn run_tool_call_with_plan(
+        &self,
+        call: &ToolCall,
+        decision: Option<ApprovalDecision>,
+        plan: ToolExecutionPlan,
+    ) -> Result<ToolRunOutcome, ToolError> {
         let tool = self
             .tools
             .get(&call.name)
@@ -232,21 +280,36 @@ impl ToolRegistry {
             })?;
         let spec = tool.spec();
 
-        if spec.requires_approval {
+        if let Some(reason) = plan.denied_reason() {
+            return Ok(ToolRunOutcome::Result {
+                result: ToolResult::error(call, format!("execution policy denied: {reason}")),
+            });
+        }
+
+        let needs_approval = plan.requires_approval || spec.requires_approval;
+        if needs_approval {
+            let description = match &plan.verdict {
+                PolicyVerdict::NeedsApproval { reason } => reason.clone(),
+                _ => spec.description.clone(),
+            };
             match decision {
                 None => {
                     return Ok(ToolRunOutcome::ApprovalRequired {
                         request: ApprovalRequest {
-                            call_id: call.id,
+                            call_id: call.id.clone(),
                             tool_name: spec.name,
-                            description: spec.description,
-                            arguments: call.arguments,
+                            description,
+                            arguments: call.arguments.clone(),
+                            risk_level: plan.risk_level,
+                            requires_sandbox: plan.requires_sandbox,
+                            read_only: plan.read_only,
+                            matched_rule: plan.matched_rule.clone(),
                         },
                     });
                 }
                 Some(ApprovalDecision::Denied) => {
                     return Ok(ToolRunOutcome::Result {
-                        result: ToolResult::denied(&call),
+                        result: ToolResult::denied(call),
                     });
                 }
                 Some(ApprovalDecision::Approved) => {}
@@ -254,7 +317,7 @@ impl ToolRegistry {
         }
 
         Ok(ToolRunOutcome::Result {
-            result: tool.execute(&call)?,
+            result: crate::tool_execution::with_plan(plan, || tool.execute(call))?,
         })
     }
 }
@@ -374,6 +437,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn policy_denies_dangerous_shell_before_execution() {
+        let workspace = tempfile::tempdir().unwrap();
+        let registry = crate::shell_tools::shell_tool_registry(workspace.path()).unwrap();
+        let call = ToolCall::new("call_deny", "shell_run", json!({"command": "rm -rf /"}));
+        let plan = registry.evaluate_tool(&call);
+        let outcome = registry.run_tool_call_with_plan(&call, None, plan).unwrap();
+        let ToolRunOutcome::Result { result } = outcome else {
+            panic!("expected denied result");
+        };
+        assert_eq!(result.status, ToolResultStatus::Error);
+        assert!(result.content.contains("execution policy denied"));
+    }
+
+    #[test]
     fn mock_tool_requires_approval_then_executes_after_approval() {
         let registry = ToolRegistry::with_mock_tools();
         let call = ToolCall::new(
@@ -383,17 +460,12 @@ mod tests {
         );
 
         let pending = registry.run_tool_call(call.clone(), None).unwrap();
-        assert_eq!(
-            pending,
-            ToolRunOutcome::ApprovalRequired {
-                request: ApprovalRequest {
-                    call_id: "call_1".to_string(),
-                    tool_name: MockEchoTool::NAME.to_string(),
-                    description: "Safely echoes a message to validate the tool loop.".to_string(),
-                    arguments: json!({"message": "hello tools"}),
-                }
-            }
-        );
+        let ToolRunOutcome::ApprovalRequired { request } = pending else {
+            panic!("expected approval request");
+        };
+        assert_eq!(request.call_id, "call_1");
+        assert_eq!(request.tool_name, MockEchoTool::NAME);
+        assert!(request.description.contains("approval"));
 
         let executed = registry
             .run_tool_call(call, Some(ApprovalDecision::Approved))

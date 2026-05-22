@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::{BufReader, Read};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::json;
 
-use crate::execution_policy::{
+use crate::sandbox::SandboxManager;
+use crate::tool_execution::current_sandbox_policy;
+use crate::workspace_policy::{
     WorkspacePolicy, invalid, json_string, optional_str, optional_u64, required_str,
 };
 use crate::tool::{Tool, ToolCall, ToolError, ToolRegistry, ToolResult, ToolSpec};
@@ -29,6 +31,7 @@ const SHELL_RUN_STARTUP_WAIT_MS: u64 = 100;
 pub struct ShellTools {
     root: WorkspacePolicy,
     jobs: JobStore,
+    sandbox: SandboxManager,
 }
 
 impl ShellTools {
@@ -36,13 +39,28 @@ impl ShellTools {
         Ok(Self {
             root: WorkspacePolicy::new(root)?,
             jobs: JobStore::default(),
+            sandbox: SandboxManager::new(),
         })
+    }
+
+    #[must_use]
+    pub fn with_sandbox(mut self, sandbox: SandboxManager) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     pub fn into_registry(self) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
-        registry.register(ShellRunTool::new(self.root.clone(), self.jobs.clone()));
-        registry.register(JobStartTool::new(self.root, self.jobs.clone()));
+        registry.register(ShellRunTool::new(
+            self.root.clone(),
+            self.jobs.clone(),
+            self.sandbox.clone(),
+        ));
+        registry.register(JobStartTool::new(
+            self.root.clone(),
+            self.jobs.clone(),
+            self.sandbox.clone(),
+        ));
         registry.register(JobStatusTool::new(self.jobs.clone()));
         registry.register(JobTailTool::new(self.jobs.clone()));
         registry.register(JobCancelTool::new(self.jobs));
@@ -186,13 +204,14 @@ impl RingBuffer {
 struct ShellRunTool {
     root: WorkspacePolicy,
     jobs: JobStore,
+    sandbox: SandboxManager,
 }
 
 impl ShellRunTool {
     const NAME: &'static str = "shell_run";
 
-    fn new(root: WorkspacePolicy, jobs: JobStore) -> Self {
-        Self { root, jobs }
+    fn new(root: WorkspacePolicy, jobs: JobStore, sandbox: SandboxManager) -> Self {
+        Self { root, jobs, sandbox }
     }
 }
 
@@ -232,8 +251,14 @@ impl Tool for ShellRunTool {
         .clamp(1, MAX_TIMEOUT_MS);
 
         let started = Instant::now();
-        let mut child = shell_command(command)
-            .current_dir(&cwd)
+        let mut child = self
+            .sandbox
+            .wrap_shell_command(
+                command,
+                &cwd,
+                self.root.root(),
+                &current_sandbox_policy(),
+            )
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -294,13 +319,14 @@ impl Tool for ShellRunTool {
 struct JobStartTool {
     root: WorkspacePolicy,
     jobs: JobStore,
+    sandbox: SandboxManager,
 }
 
 impl JobStartTool {
     const NAME: &'static str = "job_start";
 
-    fn new(root: WorkspacePolicy, jobs: JobStore) -> Self {
-        Self { root, jobs }
+    fn new(root: WorkspacePolicy, jobs: JobStore, sandbox: SandboxManager) -> Self {
+        Self { root, jobs, sandbox }
     }
 }
 
@@ -330,8 +356,14 @@ impl Tool for JobStartTool {
         let cwd = self
             .root
             .resolve_cwd(optional_str(&call.arguments, "cwd"), Self::NAME)?;
-        let mut child = shell_command(command)
-            .current_dir(&cwd)
+        let mut child = self
+            .sandbox
+            .wrap_shell_command(
+                command,
+                &cwd,
+                self.root.root(),
+                &current_sandbox_policy(),
+            )
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -512,20 +544,6 @@ impl Tool for JobCancelTool {
     }
 }
 
-fn shell_command(command: &str) -> Command {
-    let mut cmd = if cfg!(windows) {
-        let mut cmd = Command::new("cmd");
-        cmd.arg("/C").arg(command);
-        cmd
-    } else {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(command);
-        cmd
-    };
-    cmd.stdin(Stdio::null());
-    cmd
-}
-
 fn spawn_buffer_reader<R: Read + Send + 'static>(pipe: R, buffer: SharedBuffer) {
     thread::spawn(move || {
         let mut reader = BufReader::new(pipe);
@@ -660,7 +678,10 @@ mod tests {
     use crate::tool::{ApprovalDecision, ToolResultStatus, ToolRunOutcome};
 
     fn registry(root: &std::path::Path) -> ToolRegistry {
-        shell_tool_registry(root.to_path_buf()).unwrap()
+        ShellTools::new(root)
+            .unwrap()
+            .with_sandbox(SandboxManager::new().force_sandbox(Some(false)))
+            .into_registry()
     }
 
     fn approved(root: &std::path::Path, name: &str, arguments: Value) -> ToolResult {
@@ -678,7 +699,11 @@ mod tests {
     fn shell_run_requires_approval_and_returns_output() {
         let tmp = tempdir().unwrap();
         let registry = registry(tmp.path());
-        let call = ToolCall::new("call_1", "shell_run", json!({"command": "printf hello"}));
+        let call = ToolCall::new(
+            "call_1",
+            "shell_run",
+            json!({"command": "python3 -c 'print(\"hello\")'"}),
+        );
 
         assert!(matches!(
             registry.run_tool_call(call.clone(), None).unwrap(),
@@ -692,7 +717,7 @@ mod tests {
         };
         let output: Value = serde_json::from_str(&result.content).unwrap();
         assert_eq!(result.status, ToolResultStatus::Success);
-        assert_eq!(output["stdout"], "hello");
+        assert!(output["stdout"].as_str().unwrap().contains("hello"));
         assert_eq!(output["status"], "completed");
         assert_eq!(output["kind"], "foreground");
         let job_id = output["job_id"].as_str().unwrap();

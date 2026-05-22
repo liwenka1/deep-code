@@ -12,12 +12,14 @@
 //!   `RuntimeEvent::Error` if the model produces more than one tool call in
 //!   one turn. The single-call path is enough for the 03 milestone.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
 
+use crate::checkpoint::{CheckpointId, CheckpointStore};
 use crate::client::LlmClient;
 use crate::event::AgentEvent;
 use crate::message::Message;
@@ -44,6 +46,13 @@ pub enum RuntimeEvent {
     ToolResult { result: ToolResult },
     /// Current turn finished cleanly (no further provider activity).
     TurnFinished { usage: Option<Usage> },
+    /// Workspace snapshot stored under `.deep-code/checkpoints/`.
+    CheckpointCreated {
+        id: CheckpointId,
+        label: String,
+    },
+    /// Workspace restored from a checkpoint (via runtime or UI command).
+    WorkspaceRestored { id: CheckpointId },
     /// Runtime-level error. Terminal for the current turn.
     Error { message: String },
 }
@@ -69,6 +78,11 @@ pub trait AgentRuntimeHandle: Send + Sync {
     fn session_messages(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Message>> + Send + '_>>;
+
+    fn restore_checkpoint(
+        &self,
+        id: CheckpointId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + Send + '_>>;
 }
 
 impl<C: LlmClient + 'static> AgentRuntimeHandle for AgentRuntime<C> {
@@ -93,6 +107,14 @@ impl<C: LlmClient + 'static> AgentRuntimeHandle for AgentRuntime<C> {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Message>> + Send + '_>> {
         Box::pin(AgentRuntime::session_messages(self))
     }
+
+    fn restore_checkpoint(
+        &self,
+        id: CheckpointId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + Send + '_>>
+    {
+        Box::pin(AgentRuntime::restore_checkpoint(self, id))
+    }
 }
 
 /// Internal: the runtime can be in one of these states between [`RuntimeEvent`]
@@ -115,6 +137,7 @@ pub struct AgentRuntime<C: LlmClient + 'static> {
     client: Arc<C>,
     tools: Arc<ToolRegistry>,
     state: Arc<Mutex<RuntimeState>>,
+    checkpoints: Option<Arc<CheckpointStore>>,
 }
 
 // Manual `Clone` to avoid the auto-derived `where C: Clone` bound that the
@@ -126,6 +149,7 @@ impl<C: LlmClient + 'static> Clone for AgentRuntime<C> {
             client: Arc::clone(&self.client),
             tools: Arc::clone(&self.tools),
             state: Arc::clone(&self.state),
+            checkpoints: self.checkpoints.clone(),
         }
     }
 }
@@ -136,6 +160,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             client: Arc::new(client),
             tools: Arc::new(tools),
             state: Arc::new(Mutex::new(RuntimeState::default())),
+            checkpoints: None,
         }
     }
 
@@ -149,7 +174,38 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 session,
                 pending: None,
             })),
+            checkpoints: None,
         }
+    }
+
+    /// Enable automatic before/after turn snapshots for the given workspace root.
+    ///
+    /// If checkpoint storage cannot be created, checkpoints stay disabled and the
+    /// runtime is still returned.
+    #[must_use]
+    pub fn with_checkpoints(mut self, workspace: impl Into<PathBuf>) -> Self {
+        match CheckpointStore::new(workspace) {
+            Ok(store) => self.checkpoints = Some(Arc::new(store)),
+            Err(error) => eprintln!("checkpoints disabled: {error}"),
+        }
+        self
+    }
+
+    /// Restore workspace files from a checkpoint id.
+    pub async fn restore_checkpoint(&self, id: CheckpointId) -> Result<(), ToolError> {
+        let store = self
+            .checkpoints
+            .as_ref()
+            .ok_or_else(|| ToolError::ExecutionFailed {
+                name: "checkpoint".to_string(),
+                message: "checkpoints are not enabled on this runtime".to_string(),
+            })?;
+        store.restore(&id)
+    }
+
+    #[must_use]
+    pub fn checkpoints_enabled(&self) -> bool {
+        self.checkpoints.is_some()
     }
 
     /// Start a new turn from a user prompt. Returns a receiver that yields
@@ -163,7 +219,13 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             state.pending = None;
         }
 
-        self.spawn_loop()
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.snapshot_turn("before_turn", &tx);
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            runtime.run_loop(&tx).await;
+        });
+        rx
     }
 
     /// Resolve a pending tool approval and resume the loop.
@@ -186,15 +248,6 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         let runtime = self.clone();
         tokio::spawn(async move {
             runtime.handle_approval(pending, decision, &tx).await;
-        });
-        rx
-    }
-
-    fn spawn_loop(&self) -> RuntimeEventReceiver {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let runtime = self.clone();
-        tokio::spawn(async move {
-            runtime.run_loop(&tx).await;
         });
         rx
     }
@@ -285,6 +338,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             if calls.is_empty() {
                 let mut state = self.state.lock().await;
                 state.session.push(Message::assistant(text_buffer));
+                self.snapshot_turn("after_turn", tx);
                 emit(tx, RuntimeEvent::TurnFinished { usage: last_usage });
                 return;
             }
@@ -377,6 +431,24 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             state.session.push(result.to_message());
         }
         emit(tx, RuntimeEvent::ToolResult { result });
+    }
+
+    fn snapshot_turn(&self, label: &str, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
+        let Some(store) = self.checkpoints.as_ref() else {
+            return;
+        };
+        match store.snapshot(label) {
+            Ok(id) => emit(
+                tx,
+                RuntimeEvent::CheckpointCreated {
+                    id,
+                    label: label.to_string(),
+                },
+            ),
+            Err(error) => {
+                eprintln!("checkpoint snapshot '{label}' failed: {error}");
+            }
+        }
     }
 
     /// Snapshot the current message history. Mostly for tests/debugging.
@@ -604,6 +676,33 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].content, "hello");
         assert!(messages[1].tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn turn_snapshots_emit_checkpoint_events() {
+        let workspace = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ]]);
+        let runtime = AgentRuntime::new(client, ToolRegistry::default())
+            .with_checkpoints(workspace.path());
+
+        let mut rx = runtime.submit_user("hi").await;
+        let events = drain(&mut rx).await;
+
+        let before = events.iter().find_map(|event| match event {
+            RuntimeEvent::CheckpointCreated { id, label } if label == "before_turn" => Some(id.0.clone()),
+            _ => None,
+        });
+        let after = events.iter().find_map(|event| match event {
+            RuntimeEvent::CheckpointCreated { id, label } if label == "after_turn" => Some(id.0.clone()),
+            _ => None,
+        });
+        assert!(before.is_some(), "expected before_turn checkpoint");
+        assert!(after.is_some(), "expected after_turn checkpoint");
     }
 
     #[tokio::test]
