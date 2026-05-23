@@ -8,7 +8,9 @@ repository.workspace = true
 description = "deep-code agent core library (scaffold)"
 
 [dependencies]
+anyhow = "1"
 async-stream = "0.3"
+async-trait = "0.1"
 futures-core = "0.3"
 futures-util = "0.3"
 ignore = "0.4"
@@ -17,7 +19,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 walkdir = "2"
 
 [dev-dependencies]

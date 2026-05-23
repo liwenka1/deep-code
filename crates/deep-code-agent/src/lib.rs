@@ -7,6 +7,7 @@ mod event;
 mod checkpoint;
 mod execution_policy;
 mod git_tools;
+mod lsp;
 mod sandbox;
 mod workspace_policy;
 mod message;
@@ -27,6 +28,11 @@ pub use execution_policy::{
     ExecPolicy, PolicyVerdict, RiskLevel, ToolExecutionPlan, ToolKind, evaluate_shell_command,
 };
 pub use git_tools::{GitTools, git_tool_registry};
+pub use lsp::{
+    Diagnostic, DiagnosticBlock, DiagnosticRange, Language, LspConfig, LspManager, LspTransport,
+    Severity, StdioLspTransport, detect_language, is_edit_tool, normalize_path, paths_equal,
+    render_blocks, summarize_blocks,
+};
 pub use sandbox::{
     SandboxBackend, SandboxCapabilities, SandboxManager, SandboxPolicy, capabilities,
     detect_capabilities,

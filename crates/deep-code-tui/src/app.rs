@@ -261,6 +261,19 @@ impl App {
                     ),
                 });
             }
+            RuntimeEvent::DiagnosticsUpdated { summary, rendered } => {
+                self.messages.push(ChatMessage {
+                    author: Author::System,
+                    text: format!("Diagnostics: {summary}"),
+                });
+                if !rendered.is_empty() {
+                    self.messages.push(ChatMessage {
+                        author: Author::System,
+                        text: rendered,
+                    });
+                }
+                self.status = format!("Diagnostics: {summary}");
+            }
             RuntimeEvent::TurnFinished { .. } => {
                 self.flush_assistant_buffer();
                 let checkpoint = self
@@ -365,6 +378,10 @@ impl App {
         self.is_streaming = false;
         self.ui_rx = None;
     }
+
+    pub async fn shutdown_runtime(&self) {
+        self.runtime.shutdown().await;
+    }
 }
 
 impl Default for App {
@@ -383,7 +400,7 @@ fn build_runtime(config: &AgentConfig) -> (Arc<dyn AgentRuntimeHandle>, String) 
     if config.api_key.is_some() {
         match DeepSeekClient::new(config.clone()) {
             Ok(client) => {
-                let runtime = attach_checkpoints(AgentRuntime::with_system_prompt(
+                let runtime = attach_workspace_runtime(AgentRuntime::with_system_prompt(
                     client,
                     tool_registry,
                     SYSTEM_PROMPT,
@@ -398,7 +415,7 @@ fn build_runtime(config: &AgentConfig) -> (Arc<dyn AgentRuntimeHandle>, String) 
         }
     }
 
-    let runtime = attach_checkpoints(AgentRuntime::with_system_prompt(
+    let runtime = attach_workspace_runtime(AgentRuntime::with_system_prompt(
         EchoClient,
         tool_registry,
         SYSTEM_PROMPT,
@@ -407,13 +424,13 @@ fn build_runtime(config: &AgentConfig) -> (Arc<dyn AgentRuntimeHandle>, String) 
     (Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>, label)
 }
 
-fn attach_checkpoints<C: deep_code_agent::LlmClient + 'static>(
+fn attach_workspace_runtime<C: deep_code_agent::LlmClient + 'static>(
     runtime: AgentRuntime<C>,
 ) -> AgentRuntime<C> {
     match std::env::current_dir() {
-        Ok(cwd) => runtime.with_checkpoints(cwd),
+        Ok(cwd) => runtime.with_checkpoints(cwd.clone()).with_diagnostics(cwd),
         Err(error) => {
-            eprintln!("checkpoints disabled: {error}");
+            eprintln!("workspace helpers disabled: {error}");
             runtime
         }
     }
@@ -421,6 +438,22 @@ fn attach_checkpoints<C: deep_code_agent::LlmClient + 'static>(
 
 fn summarize_tool_result(content: &str) -> String {
     const MAX_CHARS: usize = 300;
+
+    if content.contains("<diagnostics file=") {
+        if let Some(block_start) = content.find("<diagnostics file=") {
+            let prefix = content[..block_start].trim();
+            let diagnostics = &content[block_start..];
+            let diag_summary = diagnostics
+                .lines()
+                .find(|line| line.starts_with("  ERROR") || line.starts_with("  WARNING"))
+                .map(|line| line.trim().to_string())
+                .unwrap_or_else(|| "diagnostics attached".to_string());
+            if prefix.is_empty() {
+                return truncate_chars(&diag_summary, MAX_CHARS);
+            }
+            return truncate_chars(&format!("{prefix} | {diag_summary}"), MAX_CHARS);
+        }
+    }
 
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
         && let Some(summary) = summarize_json_tool_result(&value)

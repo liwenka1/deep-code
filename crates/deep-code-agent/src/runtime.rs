@@ -22,12 +22,13 @@ use tokio::sync::{Mutex, mpsc};
 use crate::checkpoint::{CheckpointId, CheckpointStore};
 use crate::client::LlmClient;
 use crate::event::AgentEvent;
+use crate::lsp::{LspConfig, LspManager, is_edit_tool, render_blocks, summarize_blocks};
 use crate::message::Message;
 use crate::model::{ChatRequest, ToolCallFunctionPayload, ToolCallPayload, Usage};
 use crate::session::Session;
 use crate::tool::{
     ApprovalDecision, ApprovalRequest, ToolCall, ToolCallAccumulator, ToolError, ToolRegistry,
-    ToolResult, ToolRunOutcome,
+    ToolResult, ToolResultStatus, ToolRunOutcome,
 };
 
 /// Events the agent runtime produces for UIs.
@@ -53,6 +54,11 @@ pub enum RuntimeEvent {
     },
     /// Workspace restored from a checkpoint (via runtime or UI command).
     WorkspaceRestored { id: CheckpointId },
+    /// Post-edit LSP diagnostics were collected for one or more files.
+    DiagnosticsUpdated {
+        summary: String,
+        rendered: String,
+    },
     /// Runtime-level error. Terminal for the current turn.
     Error { message: String },
 }
@@ -83,6 +89,10 @@ pub trait AgentRuntimeHandle: Send + Sync {
         &self,
         id: CheckpointId,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + Send + '_>>;
+
+    fn shutdown(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
 }
 
 impl<C: LlmClient + 'static> AgentRuntimeHandle for AgentRuntime<C> {
@@ -115,6 +125,12 @@ impl<C: LlmClient + 'static> AgentRuntimeHandle for AgentRuntime<C> {
     {
         Box::pin(AgentRuntime::restore_checkpoint(self, id))
     }
+
+    fn shutdown(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(AgentRuntime::shutdown(self))
+    }
 }
 
 /// Internal: the runtime can be in one of these states between [`RuntimeEvent`]
@@ -138,6 +154,8 @@ pub struct AgentRuntime<C: LlmClient + 'static> {
     tools: Arc<ToolRegistry>,
     state: Arc<Mutex<RuntimeState>>,
     checkpoints: Option<Arc<CheckpointStore>>,
+    workspace: Option<PathBuf>,
+    lsp: Option<Arc<LspManager>>,
 }
 
 // Manual `Clone` to avoid the auto-derived `where C: Clone` bound that the
@@ -150,6 +168,8 @@ impl<C: LlmClient + 'static> Clone for AgentRuntime<C> {
             tools: Arc::clone(&self.tools),
             state: Arc::clone(&self.state),
             checkpoints: self.checkpoints.clone(),
+            workspace: self.workspace.clone(),
+            lsp: self.lsp.clone(),
         }
     }
 }
@@ -161,6 +181,8 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             tools: Arc::new(tools),
             state: Arc::new(Mutex::new(RuntimeState::default())),
             checkpoints: None,
+            workspace: None,
+            lsp: None,
         }
     }
 
@@ -175,6 +197,8 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 pending: None,
             })),
             checkpoints: None,
+            workspace: None,
+            lsp: None,
         }
     }
 
@@ -188,6 +212,50 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             Ok(store) => self.checkpoints = Some(Arc::new(store)),
             Err(error) => eprintln!("checkpoints disabled: {error}"),
         }
+        self
+    }
+
+    /// Enable post-edit LSP diagnostics for the given workspace root.
+    #[must_use]
+    pub fn with_diagnostics(mut self, workspace: impl Into<PathBuf>) -> Self {
+        let workspace = workspace.into();
+        self.workspace = Some(workspace.clone());
+        self.lsp = Some(Arc::new(LspManager::new(LspConfig::default(), workspace)));
+        self
+    }
+
+    /// Enable post-edit LSP diagnostics with explicit config.
+    #[must_use]
+    pub fn with_diagnostics_config(
+        mut self,
+        workspace: impl Into<PathBuf>,
+        config: LspConfig,
+    ) -> Self {
+        let workspace = workspace.into();
+        self.workspace = Some(workspace.clone());
+        self.lsp = Some(Arc::new(LspManager::new(config, workspace)));
+        self
+    }
+
+    #[must_use]
+    pub fn diagnostics_enabled(&self) -> bool {
+        self.lsp
+            .as_ref()
+            .is_some_and(|manager| manager.config().enabled)
+    }
+
+    /// Shut down background resources such as spawned LSP servers.
+    pub async fn shutdown(&self) {
+        if let Some(lsp) = self.lsp.as_ref() {
+            lsp.shutdown_all().await;
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_lsp_manager(mut self, workspace: PathBuf, manager: LspManager) -> Self {
+        self.workspace = Some(workspace);
+        self.lsp = Some(Arc::new(manager));
         self
     }
 
@@ -377,7 +445,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                     return;
                 }
                 Ok(ToolRunOutcome::Result { result }) => {
-                    self.record_tool_result(result, tx).await;
+                    self.record_tool_result(&call, result, tx).await;
                     // Loop again: feed tool result back into the next chat turn.
                     continue;
                 }
@@ -400,7 +468,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             .run_tool_call(pending.call.clone(), Some(decision));
         match outcome {
             Ok(ToolRunOutcome::Result { result }) => {
-                self.record_tool_result(result, tx).await;
+                self.record_tool_result(&pending.call, result, tx).await;
             }
             Ok(ToolRunOutcome::ApprovalRequired { request }) => {
                 {
@@ -423,9 +491,28 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
 
     async fn record_tool_result(
         &self,
-        result: ToolResult,
+        call: &ToolCall,
+        mut result: ToolResult,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
+        if result.status == ToolResultStatus::Success && is_edit_tool(&call.name) {
+            if let Some(lsp) = self.lsp.as_ref() {
+                let blocks = lsp.collect_for_edit(&call.name, &call.arguments).await;
+                if !blocks.is_empty() {
+                    let rendered = render_blocks(&blocks);
+                    let summary = summarize_blocks(&blocks);
+                    result.content = append_diagnostics(&result.content, &rendered);
+                    emit(
+                        tx,
+                        RuntimeEvent::DiagnosticsUpdated {
+                            summary: summary.clone(),
+                            rendered,
+                        },
+                    );
+                }
+            }
+        }
+
         {
             let mut state = self.state.lock().await;
             state.session.push(result.to_message());
@@ -482,6 +569,16 @@ fn runtime_error_from_tool_error(error: ToolError) -> RuntimeEvent {
     }
 }
 
+fn append_diagnostics(content: &str, rendered: &str) -> String {
+    if rendered.is_empty() {
+        content.to_string()
+    } else if content.is_empty() {
+        rendered.to_string()
+    } else {
+        format!("{content}\n\n{rendered}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
@@ -496,6 +593,14 @@ mod tests {
     use crate::event::AgentEvent;
     use crate::model::{FunctionCallDelta, ToolCallDelta};
     use crate::tool::{MockEchoTool, ToolRegistry, ToolResultStatus};
+
+    #[test]
+    fn append_diagnostics_joins_blocks() {
+        assert_eq!(
+            append_diagnostics("{\"path\":\"a.rs\"}", "<diagnostics file=\"a.rs\">\n</diagnostics>"),
+            "{\"path\":\"a.rs\"}\n\n<diagnostics file=\"a.rs\">\n</diagnostics>"
+        );
+    }
 
     /// Scripted client: replays a pre-recorded sequence of provider events for
     /// each successive call to `stream_chat`.
@@ -713,5 +818,100 @@ mod tests {
         let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
         let events = drain(&mut rx).await;
         assert!(matches!(events.first(), Some(RuntimeEvent::Error { .. })));
+    }
+
+    #[tokio::test]
+    async fn write_file_appends_lsp_diagnostics_to_session() {
+        use std::sync::Arc;
+
+        use async_trait::async_trait;
+
+        use crate::lsp::{Diagnostic, DiagnosticRange, Language, LspConfig, LspManager, LspTransport, Severity};
+        use crate::workspace_tools::workspace_tool_registry;
+
+        struct FakeTransport {
+            items: Vec<Diagnostic>,
+        }
+
+        #[async_trait]
+        impl LspTransport for FakeTransport {
+            async fn diagnostics_for(
+                &self,
+                _path: &std::path::Path,
+                _text: &str,
+                _wait: std::time::Duration,
+            ) -> anyhow::Result<Vec<Diagnostic>> {
+                Ok(self.items.clone())
+            }
+
+            async fn shutdown(&self) {}
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = LspManager::new(LspConfig::default(), dir.path().to_path_buf());
+        manager
+            .install_test_transport(
+                Language::Rust,
+                Arc::new(FakeTransport {
+                    items: vec![Diagnostic {
+                        file: dir.path().join("broken.rs"),
+                        range: DiagnosticRange {
+                            start_line: 1,
+                            start_column: 1,
+                            end_line: 1,
+                            end_column: 2,
+                        },
+                        severity: Severity::Error,
+                        message: "syntax error".to_string(),
+                        source: None,
+                        code: None,
+                    }],
+                }),
+            )
+            .await;
+
+        let args = r#"{"path":"broken.rs","content":"fn main() {"}"#;
+        let client = ScriptedClient::new(vec![
+            vec![
+                AgentEvent::ToolCallDelta {
+                    delta: tool_call_delta("call_1", "write_file", args),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+            vec![
+                AgentEvent::TextDelta {
+                    text: "fixed".to_string(),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+        ]);
+        let runtime = AgentRuntime::new(client, workspace_tool_registry(dir.path()).unwrap())
+            .with_lsp_manager(dir.path().to_path_buf(), manager);
+
+        let mut rx = runtime.submit_user("write broken rust").await;
+        drain(&mut rx).await;
+
+        let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+        let events = drain(&mut rx).await;
+
+        let tool_result = events.iter().find_map(|event| match event {
+            RuntimeEvent::ToolResult { result } => Some(result),
+            _ => None,
+        });
+        let tool_result = tool_result.expect("tool result after approval");
+        assert!(tool_result.content.contains("<diagnostics file="));
+        assert!(tool_result.content.contains("syntax error"));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::DiagnosticsUpdated { .. }))
+        );
+
+        let messages = runtime.session_messages().await;
+        let tool_message = messages
+            .iter()
+            .find(|message| matches!(message.role, crate::message::Role::Tool))
+            .expect("tool message");
+        assert!(tool_message.content.contains("<diagnostics file="));
     }
 }

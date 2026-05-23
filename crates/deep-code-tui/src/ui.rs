@@ -16,13 +16,14 @@ use crate::app::{App, Author};
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
-pub fn run() -> Result<()> {
+pub async fn run() -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut app = App::new();
     let result = run_loop(&mut terminal, &mut app);
     restore_terminal(&mut terminal)?;
-
-    result
+    result?;
+    app.shutdown_runtime().await;
+    Ok(())
 }
 
 fn setup_terminal() -> Result<AppTerminal> {

@@ -4,5 +4,5 @@ mod ui;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    ui::run()
+    ui::run().await
 }
