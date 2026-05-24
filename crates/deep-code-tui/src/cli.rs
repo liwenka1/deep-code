@@ -18,6 +18,10 @@ pub enum RunMode {
     SessionExport {
         id: String,
     },
+    Mcp {
+        subcommand: String,
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +43,11 @@ pub fn parse_args() -> CliArgs {
     if args[0] == "session" {
         args.remove(0);
         return parse_session_command(args);
+    }
+
+    if args[0] == "mcp" {
+        args.remove(0);
+        return parse_mcp_command(args);
     }
 
     let mut resume = None;
@@ -80,6 +89,20 @@ pub fn parse_args() -> CliArgs {
         mode: RunMode::Tui {
             resume,
             force_new,
+        },
+    }
+}
+
+fn parse_mcp_command(mut args: Vec<String>) -> CliArgs {
+    let Some(subcommand) = args.first().cloned() else {
+        eprintln!("Usage: deep-code mcp <list|enable|disable|validate|reload> [server]");
+        std::process::exit(2);
+    };
+    args.remove(0);
+    CliArgs {
+        mode: RunMode::Mcp {
+            subcommand,
+            args,
         },
     }
 }
@@ -184,6 +207,7 @@ pub fn run_session_command(mode: RunMode) -> anyhow::Result<()> {
             println!("{}", store.export(&SessionId::parse(&id)?)?);
         }
         RunMode::Tui { .. } => unreachable!("TUI mode handled by caller"),
+        RunMode::Mcp { .. } => unreachable!("MCP mode handled by caller"),
     }
     Ok(())
 }

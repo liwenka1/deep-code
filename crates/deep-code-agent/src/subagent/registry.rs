@@ -90,13 +90,17 @@ pub fn attach_subagent_tools<C: LlmClient + Clone + 'static>(
     workspace: PathBuf,
     parent_cancel: CancellationToken,
 ) -> Arc<SubAgentServices<C>> {
-    Arc::clone(&crate::extensions::attach_agent_extensions(
-        registry,
-        client,
-        workspace,
-        parent_cancel,
+    let bootstrap = crate::extensions::RuntimeBootstrap::load(&workspace, None);
+    Arc::clone(
+        &crate::extensions::attach_agent_extensions(
+            registry,
+            client,
+            workspace,
+            parent_cancel,
+            &bootstrap,
+        )
+        .subagent,
     )
-    .subagent)
 }
 
 pub fn subagent_tool_registry<C: LlmClient + Clone + 'static>(

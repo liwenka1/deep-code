@@ -9,9 +9,12 @@ mod execution_policy;
 mod extensions;
 mod git_tools;
 mod handle;
+mod hooks;
 mod lsp;
+mod mcp;
 mod rlm;
 mod sandbox;
+mod skills;
 mod subagent;
 mod workspace_policy;
 mod message;
@@ -54,7 +57,24 @@ pub use session_store::{
     SessionStoreError, TurnRecord, SESSION_SCHEMA_VERSION, new_session_id,
     sessions_dir_for_workspace, validate_session_id, format_sessions_storage_note,
 };
-pub use extensions::{AgentExtensions, attach_agent_extensions};
+pub use extensions::{
+    AgentExtensions, RuntimeBootstrap, attach_agent_extensions, attach_runtime_tools,
+    build_runtime_system_prompt,
+};
+pub use hooks::{
+    HookDispatcher, HookError, HookEvent, HookSink, HooksConfig, JsonlHookSink, StdoutHookSink,
+    default_hooks_config_path, load_hooks_config,
+};
+pub use mcp::{
+    InMemoryMcpClient, McpConfigFile, McpError, McpManager, McpServerConfig, McpServerEntry,
+    McpServerStatus, McpServerSummary, McpTransport, McpValidationReport, default_mcp_config_path,
+    is_mcp_tool_name, load_mcp_config, qualify_tool_name, register_mcp_tools,
+    set_server_enabled, workspace_mcp_config_path,
+};
+pub use skills::{
+    Skill, SkillRegistry, build_system_prompt, discover_in_workspace, global_skills_dir,
+    render_skills_block, skills_directories, workspace_skills_dir,
+};
 pub use handle::{
     HandleCount, HandleId, HandleKind, HandleReadOutput, HandleRecord, HandleStore, HandleSummary,
     VarHandle, HANDLE_READ_TOOL, HandleReadTool, register_handle_read,

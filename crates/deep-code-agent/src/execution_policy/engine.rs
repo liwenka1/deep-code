@@ -14,6 +14,7 @@ pub enum ToolKind {
     SubAgent,
     HandleRead,
     Rlm,
+    Mcp,
     Unknown,
 }
 
@@ -127,6 +128,7 @@ impl ExecPolicy {
             "agent_open" | "agent_eval" | "agent_close" => ToolKind::SubAgent,
             "handle_read" => ToolKind::HandleRead,
             "rlm_open" | "rlm_eval" | "rlm_configure" | "rlm_close" => ToolKind::Rlm,
+            name if name.starts_with("mcp__") => ToolKind::Mcp,
             _ => ToolKind::Unknown,
         }
     }
@@ -226,6 +228,16 @@ impl ExecPolicy {
                     matched_rule: Some(format!("builtin:{tool_name}")),
                 }
             }
+            ToolKind::Mcp => ToolExecutionPlan {
+                verdict: PolicyVerdict::NeedsApproval {
+                    reason: format!("MCP tool '{tool_name}' requires approval"),
+                },
+                requires_approval: true,
+                requires_sandbox: false,
+                read_only: false,
+                risk_level: RiskLevel::Medium,
+                matched_rule: Some("builtin:mcp_tool".to_string()),
+            },
             ToolKind::Unknown => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {
                     reason: format!("unknown tool '{tool_name}' requires approval"),

@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod echo_client;
+mod mcp_cli;
 mod startup;
 mod ui;
 
@@ -20,6 +21,7 @@ async fn main() -> anyhow::Result<()> {
                 startup::choose_startup(&store, force_new, resume.as_deref())?;
             ui::run(app::LaunchConfig { resume: record }).await
         }
+        RunMode::Mcp { subcommand, args } => mcp_cli::run_mcp_command(&subcommand, &args),
         other => run_session_command(other),
     }
 }

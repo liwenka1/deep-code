@@ -12,9 +12,10 @@ use std::sync::Arc;
 use deep_code_agent::{
     AgentConfig, AgentEvent, AgentRuntime, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest,
     CheckpointId, CheckpointStore, ConfigSnapshot, DeepSeekClient, JsonSessionStore, Message,
-    Role, RuntimeEvent, SessionId, SessionRecord, SessionStore, SharedSubAgentManager,
-    ToolRegistry, attach_agent_extensions, format_sessions_storage_note, git_tool_registry,
-    is_subagent_tool, shell_tool_registry, workspace_tool_registry,
+    Role, RuntimeBootstrap, RuntimeEvent, SessionId, SessionRecord, SessionStore,
+    SharedSubAgentManager, ToolRegistry, attach_agent_extensions, build_runtime_system_prompt,
+    format_sessions_storage_note, git_tool_registry, is_subagent_tool, shell_tool_registry,
+    workspace_tool_registry,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -645,7 +646,7 @@ fn build_runtime(
             let runtime = attach_workspace_runtime(AgentRuntime::with_system_prompt(
                 (*client).clone(),
                 tools,
-                SYSTEM_PROMPT,
+                runtime_system_prompt(),
             ));
             let label = format!("DeepSeek {}", config.model);
             return (
@@ -681,7 +682,7 @@ fn build_runtime(
     let runtime = attach_workspace_runtime(AgentRuntime::with_system_prompt(
         EchoClient,
         tools,
-        SYSTEM_PROMPT,
+        runtime_system_prompt(),
     ));
     (
         Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
@@ -701,8 +702,15 @@ fn build_parent_tool_registry<C: deep_code_agent::LlmClient + Clone + 'static>(
     Box<dyn Fn() + Send + Sync>,
 ) {
     let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let bootstrap = RuntimeBootstrap::load(&workspace, None);
     let mut registry = base_tool_registry();
-    let extensions = attach_agent_extensions(&mut registry, client, workspace, parent_cancel.clone());
+    let extensions = attach_agent_extensions(
+        &mut registry,
+        client,
+        workspace,
+        parent_cancel.clone(),
+        &bootstrap,
+    );
     let shutdown: Box<dyn Fn() + Send + Sync> = Box::new({
         let extensions = Arc::clone(&extensions);
         move || extensions.cancel_all_running()
@@ -717,7 +725,7 @@ fn create_persisted_runtime<C: deep_code_agent::LlmClient + 'static>(
     config: &AgentConfig,
 ) -> Result<(AgentRuntime<C>, SessionId), deep_code_agent::SessionStoreError> {
     let store = JsonSessionStore::for_workspace(&workspace)?;
-    let record = SessionRecord::new(workspace, config, SYSTEM_PROMPT);
+    let record = SessionRecord::new(workspace, config, runtime_system_prompt());
     let session_id = record.id.clone();
     store.save(&record)?;
     Ok((
@@ -936,6 +944,11 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
         truncated.push_str("...");
     }
     truncated
+}
+
+fn runtime_system_prompt() -> String {
+    let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    build_runtime_system_prompt(SYSTEM_PROMPT, &workspace)
 }
 
 fn base_tool_registry() -> ToolRegistry {

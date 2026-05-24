@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::execution_policy::{ExecPolicy, PolicyVerdict, RiskLevel, ToolExecutionPlan};
+use crate::hooks::HookDispatcher;
 use crate::message::Message;
 use crate::model::{ChatTool, ChatToolFunction, FunctionCallDelta, ToolCallDelta};
 
@@ -178,6 +179,7 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     policy: ExecPolicy,
+    hooks: Option<Arc<HookDispatcher>>,
 }
 
 impl std::fmt::Debug for ToolRegistry {
@@ -200,7 +202,17 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             policy,
+            hooks: None,
         }
+    }
+
+    pub fn set_hooks(&mut self, hooks: Arc<HookDispatcher>) {
+        self.hooks = Some(hooks);
+    }
+
+    #[must_use]
+    pub fn hooks(&self) -> Option<&HookDispatcher> {
+        self.hooks.as_deref()
     }
 
     #[must_use]
@@ -228,6 +240,9 @@ impl ToolRegistry {
 
     pub fn extend(&mut self, other: ToolRegistry) {
         self.tools.extend(other.tools);
+        if self.hooks.is_none() {
+            self.hooks = other.hooks;
+        }
     }
 
     /// Clone a subset of tools from another registry.
@@ -238,6 +253,7 @@ impl ToolRegistry {
     ) -> Self {
         let mut registry = Self::new();
         registry.policy = source.policy.clone();
+        registry.hooks = source.hooks.clone();
         for (name, tool) in &source.tools {
             if predicate(name) {
                 registry.tools.insert(name.clone(), Arc::clone(tool));
@@ -332,9 +348,24 @@ impl ToolRegistry {
             }
         }
 
-        Ok(ToolRunOutcome::Result {
-            result: crate::tool_execution::with_plan(plan, || tool.execute(call))?,
-        })
+        if let Some(hooks) = &self.hooks {
+            hooks.emit_tool_pre(call);
+        }
+
+        match crate::tool_execution::with_plan(plan, || tool.execute(call)) {
+            Ok(result) => {
+                if let Some(hooks) = &self.hooks {
+                    hooks.emit_tool_post(call, &result);
+                }
+                Ok(ToolRunOutcome::Result { result })
+            }
+            Err(error) => {
+                if let Some(hooks) = &self.hooks {
+                    hooks.emit_tool_post(call, &ToolResult::error(call, error.to_string()));
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -451,6 +482,65 @@ struct PartialToolCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hooks_emit_post_when_tool_execution_fails() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::hooks::{HookEvent, HookSink};
+
+        #[derive(Default)]
+        struct RecordingSink {
+            events: Mutex<Vec<serde_json::Value>>,
+        }
+
+        impl HookSink for RecordingSink {
+            fn emit(&self, event: &HookEvent) {
+                self.events.lock().unwrap().push(event.to_json());
+            }
+        }
+
+        struct FailingTool;
+
+        impl Tool for FailingTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::new(
+                    "failing_tool",
+                    "always fails",
+                    json!({"type": "object", "properties": {}}),
+                    false,
+                )
+            }
+
+            fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+                Err(ToolError::ExecutionFailed {
+                    name: call.name.clone(),
+                    message: "boom".to_string(),
+                })
+            }
+        }
+
+        let sink = Arc::new(RecordingSink::default());
+        let mut registry = ToolRegistry::new();
+        registry.register(FailingTool);
+        registry.set_hooks(Arc::new({
+            let mut dispatcher = crate::hooks::HookDispatcher::default();
+            dispatcher.add_sink(sink.clone());
+            dispatcher
+        }));
+
+        let call = ToolCall::new("call_fail", "failing_tool", json!({}));
+        let error = registry
+            .run_tool_call(call, Some(ApprovalDecision::Approved))
+            .unwrap_err();
+        assert!(matches!(error, ToolError::ExecutionFailed { .. }));
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "tool_pre");
+        assert_eq!(events[1]["type"], "tool_post");
+        assert_eq!(events[1]["result"]["status"], "error");
+    }
 
     #[test]
     fn policy_denies_dangerous_shell_before_execution() {
