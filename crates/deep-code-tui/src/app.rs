@@ -12,11 +12,12 @@ use std::sync::Arc;
 use deep_code_agent::{
     AgentConfig, AgentEvent, AgentRuntime, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest,
     CheckpointId, CheckpointStore, ConfigSnapshot, DeepSeekClient, JsonSessionStore, Message,
-    Role, RuntimeEvent, SessionId, SessionRecord, SessionStore, ToolRegistry,
-    format_sessions_storage_note, git_tool_registry, shell_tool_registry,
-    workspace_tool_registry,
+    Role, RuntimeEvent, SessionId, SessionRecord, SessionStore, SharedSubAgentManager,
+    ToolRegistry, attach_subagent_tools, format_sessions_storage_note, git_tool_registry,
+    is_subagent_tool, shell_tool_registry, workspace_tool_registry,
 };
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::echo_client::EchoClient;
 
@@ -62,6 +63,8 @@ pub struct App {
     pub session_id: Option<String>,
     runtime: Arc<dyn AgentRuntimeHandle>,
     backend_label: String,
+    subagent_manager: SharedSubAgentManager,
+    subagent_shutdown: Option<Box<dyn Fn() + Send + Sync>>,
     ui_rx: Option<UiUpdateReceiver>,
 }
 
@@ -69,7 +72,7 @@ impl App {
     #[must_use]
     pub fn launch(config: LaunchConfig) -> Self {
         let agent_config = AgentConfig::from_env();
-        let (runtime, backend_label, session_id) =
+        let (runtime, backend_label, session_id, subagent_manager, subagent_shutdown) =
             build_runtime(&agent_config, config.resume.as_ref());
         let resumed = config.resume.is_some();
         let persistent = session_id.is_some();
@@ -85,7 +88,7 @@ impl App {
                 "{}\n{}\n{}\n{}\n{}",
                 "Type a prompt and press Enter. Press Esc or Ctrl+C to exit.",
                 "Tip: in offline mode, type \"/mock-tool hello\" to exercise approval.",
-                "Slash: /checkpoints, /restore <id>, /sessions",
+                "Slash: /checkpoints, /restore <id>, /sessions, /agents",
                 workspace_note,
                 if resumed {
                     "Resumed previous session."
@@ -120,6 +123,8 @@ impl App {
             session_id,
             runtime,
             backend_label,
+            subagent_manager,
+            subagent_shutdown,
             ui_rx: None,
         }
     }
@@ -301,6 +306,9 @@ impl App {
                         result.tool_name, result.status, summary
                     ),
                 });
+                if is_subagent_tool(&result.tool_name) {
+                    self.refresh_subagent_status();
+                }
             }
             RuntimeEvent::DiagnosticsUpdated { summary, rendered } => {
                 self.messages.push(ChatMessage {
@@ -356,6 +364,10 @@ impl App {
                 self.list_sessions();
                 true
             }
+            "/agents" => {
+                self.list_subagents();
+                true
+            }
             _ if prompt.starts_with("/restore ") => {
                 let id = prompt.trim_start_matches("/restore ").trim();
                 if id.is_empty() {
@@ -366,6 +378,60 @@ impl App {
                 true
             }
             _ => false,
+        }
+    }
+
+    fn list_subagents(&mut self) {
+        let manager = match self.subagent_manager.read() {
+            Ok(manager) => manager,
+            Err(error) => {
+                self.status = format!("Sub-agents unavailable: {error}");
+                return;
+            }
+        };
+        let agents = manager.list_current_session();
+        if agents.is_empty() {
+            self.status = "No sub-agents in this session.".to_string();
+            return;
+        }
+        let body = agents
+            .iter()
+            .map(|agent| {
+                let handle = agent
+                    .transcript_handle
+                    .as_ref()
+                    .map(|id| id.as_str())
+                    .unwrap_or("-");
+                format!(
+                    "- {} [{}] {} | handle={handle} | {}",
+                    agent.name,
+                    agent.status.as_str(),
+                    agent.role,
+                    agent.short_summary()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.messages.push(ChatMessage {
+            author: Author::System,
+            text: format!("Sub-agents:\n{body}"),
+        });
+        self.status = format!(
+            "{} sub-agent(s), {} running",
+            agents.len(),
+            manager.running_count()
+        );
+    }
+
+    fn refresh_subagent_status(&mut self) {
+        if let Ok(manager) = self.subagent_manager.read() {
+            let running = manager.running_count();
+            if running > 0 {
+                self.status = format!(
+                    "Ready - {} | {} sub-agent(s) running",
+                    self.backend_label, running
+                );
+            }
         }
     }
 
@@ -470,6 +536,9 @@ impl App {
     }
 
     pub async fn shutdown_runtime(&self) {
+        if let Some(shutdown) = &self.subagent_shutdown {
+            shutdown();
+        }
         self.runtime.shutdown().await;
     }
 }
@@ -488,8 +557,14 @@ enum StreamRequest {
 fn build_runtime(
     config: &AgentConfig,
     resume: Option<&SessionRecord>,
-) -> (Arc<dyn AgentRuntimeHandle>, String, Option<String>) {
-    let tool_registry = default_tool_registry();
+) -> (
+    Arc<dyn AgentRuntimeHandle>,
+    String,
+    Option<String>,
+    SharedSubAgentManager,
+    Option<Box<dyn Fn() + Send + Sync>>,
+) {
+    let parent_cancel = CancellationToken::new();
 
     if let Some(record) = resume {
         let store = match JsonSessionStore::for_workspace(&record.workspace) {
@@ -507,9 +582,12 @@ fn build_runtime(
         }
         if config.api_key.is_some() {
             if let Ok(client) = DeepSeekClient::new(config.clone()) {
+                let client = Arc::new(client);
+                let (tools, subagents, shutdown) =
+                    build_parent_tool_registry(Arc::clone(&client), &parent_cancel);
                 let runtime = attach_workspace_runtime(AgentRuntime::from_session_record(
-                    client,
-                    tool_registry,
+                    (*client).clone(),
+                    tools,
                     record.clone(),
                     store,
                 ));
@@ -518,12 +596,17 @@ fn build_runtime(
                     Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
                     label,
                     Some(record.id.as_str().to_string()),
+                    subagents,
+                    Some(shutdown),
                 );
             }
         }
+        let client = Arc::new(EchoClient);
+        let (tools, subagents, shutdown) =
+            build_parent_tool_registry(Arc::clone(&client), &parent_cancel);
         let runtime = attach_workspace_runtime(AgentRuntime::from_session_record(
-            EchoClient,
-            tool_registry,
+            (*client).clone(),
+            tools,
             record.clone(),
             store,
         ));
@@ -531,64 +614,100 @@ fn build_runtime(
             Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
             "offline echo (resumed)".to_string(),
             Some(record.id.as_str().to_string()),
+            subagents,
+            Some(shutdown),
         );
     }
 
     if config.api_key.is_some() {
         if let Ok(client) = DeepSeekClient::new(config.clone()) {
+            let client = Arc::new(client);
             if let Ok(cwd) = std::env::current_dir() {
-                if let Ok((runtime, session_id)) = create_persisted_runtime(
-                    client,
-                    default_tool_registry(),
-                    cwd,
-                    config,
-                ) {
+                let (tools, subagents, shutdown) =
+                    build_parent_tool_registry(Arc::clone(&client), &parent_cancel);
+                if let Ok((runtime, session_id)) =
+                    create_persisted_runtime((*client).clone(), tools, cwd, config)
+                {
                     let runtime = attach_workspace_runtime(runtime);
                     let label = format!("DeepSeek {}", config.model);
                     return (
                         Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
                         label,
                         Some(session_id.as_str().to_string()),
+                        subagents,
+                        Some(shutdown),
                     );
                 }
                 eprintln!("warning: session persistence unavailable; this session will not be saved");
             }
-            if let Ok(client) = DeepSeekClient::new(config.clone()) {
-                let runtime = attach_workspace_runtime(AgentRuntime::with_system_prompt(
-                    client,
-                    default_tool_registry(),
-                    SYSTEM_PROMPT,
-                ));
-                let label = format!("DeepSeek {}", config.model);
-                return (Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>, label, None);
-            }
+            let (tools, subagents, shutdown) =
+                build_parent_tool_registry(Arc::clone(&client), &parent_cancel);
+            let runtime = attach_workspace_runtime(AgentRuntime::with_system_prompt(
+                (*client).clone(),
+                tools,
+                SYSTEM_PROMPT,
+            ));
+            let label = format!("DeepSeek {}", config.model);
+            return (
+                Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
+                label,
+                None,
+                subagents,
+                Some(shutdown),
+            );
         }
     }
 
+    let client = Arc::new(EchoClient);
     if let Ok(cwd) = std::env::current_dir() {
+        let (tools, subagents, shutdown) =
+            build_parent_tool_registry(Arc::clone(&client), &parent_cancel);
         if let Ok((runtime, session_id)) =
-            create_persisted_runtime(EchoClient, default_tool_registry(), cwd, config)
+            create_persisted_runtime((*client).clone(), tools, cwd, config)
         {
             let runtime = attach_workspace_runtime(runtime);
             return (
                 Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
                 "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string(),
                 Some(session_id.as_str().to_string()),
+                subagents,
+                Some(shutdown),
             );
         }
         eprintln!("warning: session persistence unavailable; this session will not be saved");
     }
 
+    let (tools, subagents, shutdown) = build_parent_tool_registry(client, &parent_cancel);
     let runtime = attach_workspace_runtime(AgentRuntime::with_system_prompt(
         EchoClient,
-        default_tool_registry(),
+        tools,
         SYSTEM_PROMPT,
     ));
     (
         Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
         "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string(),
         None,
+        subagents,
+        Some(shutdown),
     )
+}
+
+fn build_parent_tool_registry<C: deep_code_agent::LlmClient + Clone + 'static>(
+    client: Arc<C>,
+    parent_cancel: &CancellationToken,
+) -> (
+    ToolRegistry,
+    SharedSubAgentManager,
+    Box<dyn Fn() + Send + Sync>,
+) {
+    let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut registry = base_tool_registry();
+    let services = attach_subagent_tools(&mut registry, client, workspace, parent_cancel.clone());
+    let shutdown: Box<dyn Fn() + Send + Sync> = Box::new({
+        let services = Arc::clone(&services);
+        move || services.cancel_all_running()
+    });
+    (registry, Arc::clone(&services.manager), shutdown)
 }
 
 fn create_persisted_runtime<C: deep_code_agent::LlmClient + 'static>(
@@ -819,7 +938,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn default_tool_registry() -> ToolRegistry {
+fn base_tool_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::with_mock_tools();
     match std::env::current_dir() {
         Ok(cwd) => {

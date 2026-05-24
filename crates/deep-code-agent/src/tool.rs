@@ -230,6 +230,22 @@ impl ToolRegistry {
         self.tools.extend(other.tools);
     }
 
+    /// Clone a subset of tools from another registry.
+    #[must_use]
+    pub fn filtered_from(
+        source: &ToolRegistry,
+        predicate: impl Fn(&str) -> bool,
+    ) -> Self {
+        let mut registry = Self::new();
+        registry.policy = source.policy.clone();
+        for (name, tool) in &source.tools {
+            if predicate(name) {
+                registry.tools.insert(name.clone(), Arc::clone(tool));
+            }
+        }
+        registry
+    }
+
     #[must_use]
     pub fn specs(&self) -> Vec<ToolSpec> {
         let mut specs = self

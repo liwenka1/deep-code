@@ -7,8 +7,10 @@ mod event;
 mod checkpoint;
 mod execution_policy;
 mod git_tools;
+mod handle;
 mod lsp;
 mod sandbox;
+mod subagent;
 mod workspace_policy;
 mod message;
 mod model;
@@ -49,6 +51,13 @@ pub use session_store::{
     ConfigSnapshot, JsonSessionStore, SessionId, SessionRecord, SessionStore,
     SessionStoreError, TurnRecord, SESSION_SCHEMA_VERSION, new_session_id,
     sessions_dir_for_workspace, validate_session_id, format_sessions_storage_note,
+};
+pub use handle::{HandleId, HandleKind, HandleRecord, HandleStore, HandleSummary};
+pub use subagent::{
+    AgentCloseTool, AgentEvalTool, AgentOpenTool, DEFAULT_MAX_CONCURRENT, HARD_MAX_CONCURRENT,
+    SharedSubAgentManager, StructuredReport, SubAgentManager, SubAgentRole, SubAgentServices,
+    SubAgentSessionProjection, SubAgentStatus, attach_subagent_tools, is_subagent_tool,
+    register_subagent_tools, subagent_tool_registry,
 };
 pub use shell_tools::{ShellTools, shell_tool_registry};
 pub use tool::{

@@ -11,6 +11,7 @@ pub enum ToolKind {
     GitRead,
     JobControl,
     Mock,
+    SubAgent,
     Unknown,
 }
 
@@ -121,6 +122,7 @@ impl ExecPolicy {
             "job_cancel" => ToolKind::JobControl,
             name if name.starts_with("git_") => ToolKind::GitRead,
             "mock_echo" => ToolKind::Mock,
+            "agent_open" | "agent_eval" | "agent_close" => ToolKind::SubAgent,
             _ => ToolKind::Unknown,
         }
     }
@@ -181,6 +183,14 @@ impl ExecPolicy {
                 read_only: true,
                 risk_level: RiskLevel::Low,
                 matched_rule: Some("builtin:mock_tool".to_string()),
+            },
+            ToolKind::SubAgent => ToolExecutionPlan {
+                verdict: PolicyVerdict::Allow,
+                requires_approval: false,
+                requires_sandbox: false,
+                read_only: true,
+                risk_level: RiskLevel::Low,
+                matched_rule: Some("builtin:subagent_tool".to_string()),
             },
             ToolKind::Unknown => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {

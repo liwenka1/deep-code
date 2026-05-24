@@ -426,6 +426,12 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// [`RuntimeEvent`]s until either the turn finishes or an approval is
     /// required. After approval, call [`submit_approval`] to resume.
     pub async fn submit_user(&self, prompt: impl Into<String>) -> RuntimeEventReceiver {
+        self.begin_turn(prompt).await;
+        self.drive_turn().await
+    }
+
+    /// Record a user prompt and start turn bookkeeping without spawning the loop.
+    pub async fn begin_turn(&self, prompt: impl Into<String>) {
         self.finalize_orphan_turn().await;
         let prompt = prompt.into();
         {
@@ -435,7 +441,10 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             state.current_turn = Some(TurnRecord::new(prompt));
         }
         self.persist().await;
+    }
 
+    /// Spawn the model/tool loop for the current turn.
+    pub async fn drive_turn(&self) -> RuntimeEventReceiver {
         let (tx, rx) = mpsc::unbounded_channel();
         self.snapshot_turn("before_turn", &tx);
         let runtime = self.clone();
@@ -704,6 +713,25 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// Snapshot the current message history. Mostly for tests/debugging.
     pub async fn session_messages(&self) -> Vec<Message> {
         self.state.lock().await.session.messages().to_vec()
+    }
+
+    /// Resolve a pending tool call for a background sub-agent.
+    ///
+    /// Inherits the runtime [`ToolRegistry`] execution policy: only tools that
+    /// are allowed without human approval are auto-approved. Write tools and
+    /// shell commands that would normally require parent approval are denied.
+    pub fn subagent_approval_decision(&self, request: &ApprovalRequest) -> ApprovalDecision {
+        let call = ToolCall::new(
+            request.call_id.clone(),
+            request.tool_name.clone(),
+            request.arguments.clone(),
+        );
+        let plan = self.tools.evaluate_tool(&call);
+        if plan.denied_reason().is_some() || plan.requires_approval {
+            ApprovalDecision::Denied
+        } else {
+            ApprovalDecision::Approved
+        }
     }
 }
 
