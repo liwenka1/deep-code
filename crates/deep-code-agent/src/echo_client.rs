@@ -1,15 +1,16 @@
 //! Offline echo backend implementing [`LlmClient`].
 //!
-//! Used when `DEEPSEEK_API_KEY` is missing so the TUI is still demoable.
-//! The `/mock-tool <message>` prefix is recognized and turned into a
-//! `mock_echo` tool call so the approval flow can be exercised without a
-//! real model.
+//! Used when `DEEPSEEK_API_KEY` is missing so the TUI and runtime API remain
+//! demoable without network access.
 
 use async_stream::try_stream;
-use deep_code_agent::{
-    AgentEvent, AgentEventStream, AgentResult, ChatRequest, FunctionCallDelta, LlmClient, Message,
-    MockEchoTool, Role, ToolCallDelta,
-};
+
+use crate::client::{AgentEventStream, LlmClient};
+use crate::error::AgentResult;
+use crate::event::AgentEvent;
+use crate::message::{Message, Role};
+use crate::model::{ChatRequest, FunctionCallDelta, ToolCallDelta};
+use crate::tool::MockEchoTool;
 
 #[derive(Debug, Default, Clone)]
 pub struct EchoClient;

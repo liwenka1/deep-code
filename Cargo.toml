@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/deep-code-agent",
+    "crates/deep-code-runtime",
     "crates/deep-code-tui",
     "apps/deep-code-desktop/src-tauri",
 ]

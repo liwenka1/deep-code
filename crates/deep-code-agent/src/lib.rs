@@ -2,6 +2,8 @@
 
 mod client;
 mod config;
+mod doctor;
+mod echo_client;
 mod error;
 mod event;
 mod checkpoint;
@@ -20,6 +22,7 @@ mod workspace_policy;
 mod message;
 mod model;
 mod runtime;
+mod runtime_launch;
 mod session;
 mod session_store;
 mod shell_tools;
@@ -28,7 +31,9 @@ mod tool_execution;
 mod workspace_tools;
 
 pub use client::{AgentEventStream, DeepSeekClient, LlmClient};
+pub use echo_client::EchoClient;
 pub use config::{AgentConfig, DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL};
+pub use doctor::{DoctorReport, default_config_path};
 pub use error::{AgentError, AgentResult};
 pub use checkpoint::{CheckpointId, CheckpointStore};
 pub use event::{AgentEvent, chunk_to_events};
@@ -51,6 +56,10 @@ pub use model::{
     StreamChunk, ToolCallDelta, ToolCallFunctionPayload, ToolCallPayload, Usage,
 };
 pub use runtime::{AgentRuntime, AgentRuntimeHandle, RuntimeEvent, RuntimeEventReceiver};
+pub use runtime_launch::{
+    LaunchedRuntime, build_tool_registry, launch_runtime, runtime_system_prompt,
+    DEFAULT_SYSTEM_PROMPT,
+};
 pub use session::Session;
 pub use session_store::{
     ConfigSnapshot, JsonSessionStore, SessionId, SessionRecord, SessionStore,

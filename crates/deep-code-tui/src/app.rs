@@ -10,19 +10,14 @@
 use std::sync::Arc;
 
 use deep_code_agent::{
-    AgentConfig, AgentEvent, AgentRuntime, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest,
-    CheckpointId, CheckpointStore, ConfigSnapshot, DeepSeekClient, JsonSessionStore, Message,
-    Role, RuntimeBootstrap, RuntimeEvent, SessionId, SessionRecord, SessionStore,
-    SharedSubAgentManager, ToolRegistry, attach_agent_extensions, build_runtime_system_prompt,
-    format_sessions_storage_note, git_tool_registry, is_subagent_tool, shell_tool_registry,
-    workspace_tool_registry,
+    AgentConfig, AgentEvent, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest,
+    CheckpointId, CheckpointStore, JsonSessionStore, Message, Role, RuntimeEvent,
+    SessionRecord, SessionStore, SharedSubAgentManager, format_sessions_storage_note,
+    is_subagent_tool, launch_runtime,
 };
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
-use crate::echo_client::EchoClient;
-
-const SYSTEM_PROMPT: &str = "You are deep-code's minimal TUI assistant.";
+use crate::cli::workspace_root;
 
 #[derive(Debug, Clone, Default)]
 pub struct LaunchConfig {
@@ -73,8 +68,13 @@ impl App {
     #[must_use]
     pub fn launch(config: LaunchConfig) -> Self {
         let agent_config = AgentConfig::from_env();
-        let (runtime, backend_label, session_id, subagent_manager, subagent_shutdown) =
-            build_runtime(&agent_config, config.resume.as_ref());
+        let workspace = workspace_root();
+        let launched = launch_runtime(&agent_config, workspace, config.resume.clone());
+        let runtime = launched.handle;
+        let backend_label = launched.backend_label;
+        let session_id = launched.session_id;
+        let subagent_manager = launched.subagent_manager;
+        let subagent_shutdown = Some(launched.stop_hook);
         let resumed = config.resume.is_some();
         let persistent = session_id.is_some();
         let workspace_note = std::env::current_dir()
@@ -555,185 +555,6 @@ enum StreamRequest {
     Approval(ApprovalDecision),
 }
 
-fn build_runtime(
-    config: &AgentConfig,
-    resume: Option<&SessionRecord>,
-) -> (
-    Arc<dyn AgentRuntimeHandle>,
-    String,
-    Option<String>,
-    SharedSubAgentManager,
-    Option<Box<dyn Fn() + Send + Sync>>,
-) {
-    let parent_cancel = CancellationToken::new();
-
-    if let Some(record) = resume {
-        let store = match JsonSessionStore::for_workspace(&record.workspace) {
-            Ok(store) => store,
-            Err(error) => {
-                eprintln!("session store unavailable: {error}");
-                return build_runtime(config, None);
-            }
-        };
-        let mut record = record.clone();
-        record.config = ConfigSnapshot::from(config);
-        record.touch();
-        if let Err(error) = store.save(&record) {
-            eprintln!("failed to refresh session config snapshot: {error}");
-        }
-        if config.api_key.is_some() {
-            if let Ok(client) = DeepSeekClient::new(config.clone()) {
-                let client = Arc::new(client);
-                let (tools, subagents, shutdown) =
-                    build_parent_tool_registry(Arc::clone(&client), &parent_cancel);
-                let runtime = attach_workspace_runtime(AgentRuntime::from_session_record(
-                    (*client).clone(),
-                    tools,
-                    record.clone(),
-                    store,
-                ));
-                let label = format!("DeepSeek {} (resumed)", config.model);
-                return (
-                    Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
-                    label,
-                    Some(record.id.as_str().to_string()),
-                    subagents,
-                    Some(shutdown),
-                );
-            }
-        }
-        let client = Arc::new(EchoClient);
-        let (tools, subagents, shutdown) =
-            build_parent_tool_registry(Arc::clone(&client), &parent_cancel);
-        let runtime = attach_workspace_runtime(AgentRuntime::from_session_record(
-            (*client).clone(),
-            tools,
-            record.clone(),
-            store,
-        ));
-        return (
-            Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
-            "offline echo (resumed)".to_string(),
-            Some(record.id.as_str().to_string()),
-            subagents,
-            Some(shutdown),
-        );
-    }
-
-    if config.api_key.is_some() {
-        if let Ok(client) = DeepSeekClient::new(config.clone()) {
-            let client = Arc::new(client);
-            if let Ok(cwd) = std::env::current_dir() {
-                let (tools, subagents, shutdown) =
-                    build_parent_tool_registry(Arc::clone(&client), &parent_cancel);
-                if let Ok((runtime, session_id)) =
-                    create_persisted_runtime((*client).clone(), tools, cwd, config)
-                {
-                    let runtime = attach_workspace_runtime(runtime);
-                    let label = format!("DeepSeek {}", config.model);
-                    return (
-                        Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
-                        label,
-                        Some(session_id.as_str().to_string()),
-                        subagents,
-                        Some(shutdown),
-                    );
-                }
-                eprintln!("warning: session persistence unavailable; this session will not be saved");
-            }
-            let (tools, subagents, shutdown) =
-                build_parent_tool_registry(Arc::clone(&client), &parent_cancel);
-            let runtime = attach_workspace_runtime(AgentRuntime::with_system_prompt(
-                (*client).clone(),
-                tools,
-                runtime_system_prompt(),
-            ));
-            let label = format!("DeepSeek {}", config.model);
-            return (
-                Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
-                label,
-                None,
-                subagents,
-                Some(shutdown),
-            );
-        }
-    }
-
-    let client = Arc::new(EchoClient);
-    if let Ok(cwd) = std::env::current_dir() {
-        let (tools, subagents, shutdown) =
-            build_parent_tool_registry(Arc::clone(&client), &parent_cancel);
-        if let Ok((runtime, session_id)) =
-            create_persisted_runtime((*client).clone(), tools, cwd, config)
-        {
-            let runtime = attach_workspace_runtime(runtime);
-            return (
-                Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
-                "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string(),
-                Some(session_id.as_str().to_string()),
-                subagents,
-                Some(shutdown),
-            );
-        }
-        eprintln!("warning: session persistence unavailable; this session will not be saved");
-    }
-
-    let (tools, subagents, shutdown) = build_parent_tool_registry(client, &parent_cancel);
-    let runtime = attach_workspace_runtime(AgentRuntime::with_system_prompt(
-        EchoClient,
-        tools,
-        runtime_system_prompt(),
-    ));
-    (
-        Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
-        "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string(),
-        None,
-        subagents,
-        Some(shutdown),
-    )
-}
-
-fn build_parent_tool_registry<C: deep_code_agent::LlmClient + Clone + 'static>(
-    client: Arc<C>,
-    parent_cancel: &CancellationToken,
-) -> (
-    ToolRegistry,
-    SharedSubAgentManager,
-    Box<dyn Fn() + Send + Sync>,
-) {
-    let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let bootstrap = RuntimeBootstrap::load(&workspace, None);
-    let mut registry = base_tool_registry();
-    let extensions = attach_agent_extensions(
-        &mut registry,
-        client,
-        workspace,
-        parent_cancel.clone(),
-        &bootstrap,
-    );
-    let shutdown: Box<dyn Fn() + Send + Sync> = Box::new({
-        let extensions = Arc::clone(&extensions);
-        move || extensions.cancel_all_running()
-    });
-    (registry, extensions.subagent_manager(), shutdown)
-}
-
-fn create_persisted_runtime<C: deep_code_agent::LlmClient + 'static>(
-    client: C,
-    tools: ToolRegistry,
-    workspace: std::path::PathBuf,
-    config: &AgentConfig,
-) -> Result<(AgentRuntime<C>, SessionId), deep_code_agent::SessionStoreError> {
-    let store = JsonSessionStore::for_workspace(&workspace)?;
-    let record = SessionRecord::new(workspace, config, runtime_system_prompt());
-    let session_id = record.id.clone();
-    store.save(&record)?;
-    Ok((
-        AgentRuntime::from_session_record(client, tools, record, store),
-        session_id,
-    ))
-}
-
 fn hydrate_messages(record: &SessionRecord) -> Vec<ChatMessage> {
     record
         .messages
@@ -777,18 +598,6 @@ fn message_to_chat(message: &Message) -> Option<ChatMessage> {
                 summarize_tool_result(&message.content)
             ),
         }),
-    }
-}
-
-fn attach_workspace_runtime<C: deep_code_agent::LlmClient + 'static>(
-    runtime: AgentRuntime<C>,
-) -> AgentRuntime<C> {
-    match std::env::current_dir() {
-        Ok(cwd) => runtime.with_checkpoints(cwd.clone()).with_diagnostics(cwd),
-        Err(error) => {
-            eprintln!("workspace helpers disabled: {error}");
-            runtime
-        }
     }
 }
 
@@ -944,31 +753,4 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
         truncated.push_str("...");
     }
     truncated
-}
-
-fn runtime_system_prompt() -> String {
-    let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    build_runtime_system_prompt(SYSTEM_PROMPT, &workspace)
-}
-
-fn base_tool_registry() -> ToolRegistry {
-    let mut registry = ToolRegistry::with_mock_tools();
-    match std::env::current_dir() {
-        Ok(cwd) => {
-            match workspace_tool_registry(cwd.clone()) {
-                Ok(workspace_tools) => registry.extend(workspace_tools),
-                Err(error) => eprintln!("workspace tools disabled: {error}"),
-            }
-            match shell_tool_registry(cwd.clone()) {
-                Ok(shell_tools) => registry.extend(shell_tools),
-                Err(error) => eprintln!("shell tools disabled: {error}"),
-            }
-            match git_tool_registry(cwd) {
-                Ok(git_tools) => registry.extend(git_tools),
-                Err(error) => eprintln!("git tools disabled: {error}"),
-            }
-        }
-        Err(error) => eprintln!("workspace tools disabled: {error}"),
-    }
-    registry
 }

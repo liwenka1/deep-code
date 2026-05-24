@@ -11,6 +11,15 @@ pub enum RunMode {
         resume: Option<String>,
         force_new: bool,
     },
+    Doctor {
+        json: bool,
+    },
+    Serve {
+        host: String,
+        port: u16,
+        auth_token: Option<String>,
+        resume: Option<String>,
+    },
     SessionList,
     SessionDelete {
         id: String,
@@ -40,14 +49,24 @@ pub fn parse_args() -> CliArgs {
         };
     }
 
-    if args[0] == "session" {
-        args.remove(0);
-        return parse_session_command(args);
-    }
-
-    if args[0] == "mcp" {
-        args.remove(0);
-        return parse_mcp_command(args);
+    match args[0].as_str() {
+        "session" => {
+            args.remove(0);
+            return parse_session_command(args);
+        }
+        "mcp" => {
+            args.remove(0);
+            return parse_mcp_command(args);
+        }
+        "doctor" => {
+            args.remove(0);
+            return parse_doctor_command(args);
+        }
+        "serve" => {
+            args.remove(0);
+            return parse_serve_command(args);
+        }
+        _ => {}
     }
 
     let mut resume = None;
@@ -69,7 +88,11 @@ pub fn parse_args() -> CliArgs {
             }
             value if value.starts_with("--resume=") => {
                 let id = value.trim_start_matches("--resume=");
-                resume = Some(if id.is_empty() { "latest".to_string() } else { id.to_string() });
+                resume = Some(if id.is_empty() {
+                    "latest".to_string()
+                } else {
+                    id.to_string()
+                });
             }
             other => positional.push(other.to_string()),
         }
@@ -78,10 +101,10 @@ pub fn parse_args() -> CliArgs {
 
     if !positional.is_empty() {
         eprintln!(
-            "Unknown arguments: {}. Try `deep-code session list`.",
+            "Unknown arguments: {}. Try `deep-code doctor` or `deep-code serve --http`.",
             positional.join(" ")
         );
-        print_session_usage();
+        print_usage();
         std::process::exit(2);
     }
 
@@ -91,6 +114,91 @@ pub fn parse_args() -> CliArgs {
             force_new,
         },
     }
+}
+
+fn parse_doctor_command(mut args: Vec<String>) -> CliArgs {
+    let mut json = false;
+    while let Some(arg) = args.first().cloned() {
+        match arg.as_str() {
+            "--json" => {
+                json = true;
+                args.remove(0);
+            }
+            other => {
+                eprintln!("Unknown doctor argument '{other}'. Usage: deep-code doctor [--json]");
+                std::process::exit(2);
+            }
+        }
+    }
+    CliArgs {
+        mode: RunMode::Doctor { json },
+    }
+}
+
+fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
+    let mut http = false;
+    let mut host = "127.0.0.1".to_string();
+    let mut port = 7878u16;
+    let mut auth_token = None;
+    let mut resume = None;
+
+    while let Some(arg) = args.first().cloned() {
+        match arg.as_str() {
+            "--http" => {
+                http = true;
+                args.remove(0);
+            }
+            "--host" => {
+                args.remove(0);
+                host = require_value(&mut args, "--host");
+            }
+            "--port" => {
+                args.remove(0);
+                port = require_value(&mut args, "--port")
+                    .parse()
+                    .unwrap_or_else(|_| {
+                        eprintln!("Invalid --port value");
+                        std::process::exit(2);
+                    });
+            }
+            "--auth-token" => {
+                args.remove(0);
+                auth_token = Some(require_value(&mut args, "--auth-token"));
+            }
+            "--resume" => {
+                args.remove(0);
+                resume = Some(require_value(&mut args, "--resume"));
+            }
+            other => {
+                eprintln!(
+                    "Unknown serve argument '{other}'. Usage: deep-code serve --http [--host HOST] [--port PORT] [--auth-token TOKEN] [--resume ID]"
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+
+    if !http {
+        eprintln!("Usage: deep-code serve --http [--host 127.0.0.1] [--port 7878]");
+        std::process::exit(2);
+    }
+
+    CliArgs {
+        mode: RunMode::Serve {
+            host,
+            port,
+            auth_token,
+            resume,
+        },
+    }
+}
+
+fn require_value(args: &mut Vec<String>, flag: &str) -> String {
+    if args.is_empty() {
+        eprintln!("Missing value for {flag}");
+        std::process::exit(2);
+    }
+    args.remove(0)
 }
 
 fn parse_mcp_command(mut args: Vec<String>) -> CliArgs {
@@ -206,10 +314,21 @@ pub fn run_session_command(mode: RunMode) -> anyhow::Result<()> {
             let store = open_session_store();
             println!("{}", store.export(&SessionId::parse(&id)?)?);
         }
-        RunMode::Tui { .. } => unreachable!("TUI mode handled by caller"),
-        RunMode::Mcp { .. } => unreachable!("MCP mode handled by caller"),
+        RunMode::Tui { .. }
+        | RunMode::Doctor { .. }
+        | RunMode::Serve { .. }
+        | RunMode::Mcp { .. } => unreachable!("handled by caller"),
     }
     Ok(())
+}
+
+fn print_usage() {
+    eprintln!("Commands:");
+    eprintln!("  deep-code");
+    eprintln!("  deep-code doctor [--json]");
+    eprintln!("  deep-code serve --http [--host HOST] [--port PORT]");
+    eprintln!("  deep-code session list|delete|export");
+    eprintln!("  deep-code mcp list|validate|reload|enable|disable");
 }
 
 fn print_session_usage() {
@@ -267,5 +386,11 @@ mod tests {
     fn parse_session_list_subcommand() {
         let parsed = parse_session_command(vec!["list".to_string()]);
         assert_eq!(parsed.mode, RunMode::SessionList);
+    }
+
+    #[test]
+    fn parse_doctor_json_flag() {
+        let parsed = parse_doctor_command(vec!["--json".to_string()]);
+        assert_eq!(parsed.mode, RunMode::Doctor { json: true });
     }
 }
