@@ -26,6 +26,7 @@ use crate::lsp::{LspConfig, LspManager, is_edit_tool, render_blocks, summarize_b
 use crate::message::Message;
 use crate::model::{ChatRequest, ToolCallFunctionPayload, ToolCallPayload, Usage};
 use crate::session::Session;
+use crate::session_store::{JsonSessionStore, SessionId, SessionRecord, SessionStore, TurnRecord};
 use crate::tool::{
     ApprovalDecision, ApprovalRequest, ToolCall, ToolCallAccumulator, ToolError, ToolRegistry,
     ToolResult, ToolResultStatus, ToolRunOutcome,
@@ -90,6 +91,10 @@ pub trait AgentRuntimeHandle: Send + Sync {
         id: CheckpointId,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + Send + '_>>;
 
+    fn session_id(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<SessionId>> + Send + '_>>;
+
     fn shutdown(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
@@ -126,6 +131,12 @@ impl<C: LlmClient + 'static> AgentRuntimeHandle for AgentRuntime<C> {
         Box::pin(AgentRuntime::restore_checkpoint(self, id))
     }
 
+    fn session_id(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<SessionId>> + Send + '_>> {
+        Box::pin(AgentRuntime::session_id(self))
+    }
+
     fn shutdown(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
@@ -139,6 +150,12 @@ impl<C: LlmClient + 'static> AgentRuntimeHandle for AgentRuntime<C> {
 struct RuntimeState {
     session: Session,
     pending: Option<PendingToolCall>,
+    current_turn: Option<TurnRecord>,
+}
+
+struct Persistence {
+    store: Arc<JsonSessionStore>,
+    record: Arc<Mutex<SessionRecord>>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +173,7 @@ pub struct AgentRuntime<C: LlmClient + 'static> {
     checkpoints: Option<Arc<CheckpointStore>>,
     workspace: Option<PathBuf>,
     lsp: Option<Arc<LspManager>>,
+    persistence: Option<Arc<Persistence>>,
 }
 
 // Manual `Clone` to avoid the auto-derived `where C: Clone` bound that the
@@ -170,6 +188,7 @@ impl<C: LlmClient + 'static> Clone for AgentRuntime<C> {
             checkpoints: self.checkpoints.clone(),
             workspace: self.workspace.clone(),
             lsp: self.lsp.clone(),
+            persistence: self.persistence.clone(),
         }
     }
 }
@@ -183,6 +202,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             checkpoints: None,
             workspace: None,
             lsp: None,
+            persistence: None,
         }
     }
 
@@ -195,10 +215,135 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             state: Arc::new(Mutex::new(RuntimeState {
                 session,
                 pending: None,
+                current_turn: None,
             })),
             checkpoints: None,
             workspace: None,
             lsp: None,
+            persistence: None,
+        }
+    }
+
+    /// Create a runtime backed by a new on-disk session in the workspace.
+    pub fn with_new_session(
+        client: C,
+        tools: ToolRegistry,
+        system: impl Into<String>,
+        workspace: impl Into<PathBuf>,
+        config: &crate::config::AgentConfig,
+    ) -> Result<Self, crate::session_store::SessionStoreError> {
+        let workspace = workspace.into();
+        let store = JsonSessionStore::for_workspace(&workspace)?;
+        let record = SessionRecord::new(workspace.clone(), config, system);
+        store.save(&record)?;
+        Ok(Self::from_session_record(client, tools, record, store))
+    }
+
+    /// Resume a runtime from a previously saved session record.
+    #[must_use]
+    pub fn from_session_record(
+        client: C,
+        tools: ToolRegistry,
+        record: SessionRecord,
+        store: JsonSessionStore,
+    ) -> Self {
+        let workspace = record.workspace.clone();
+        let session = Session::from_messages(record.messages.clone());
+        Self {
+            client: Arc::new(client),
+            tools: Arc::new(tools),
+            state: Arc::new(Mutex::new(RuntimeState {
+                session,
+                pending: None,
+                current_turn: None,
+            })),
+            checkpoints: None,
+            workspace: Some(workspace.clone()),
+            lsp: None,
+            persistence: Some(Arc::new(Persistence {
+                store: Arc::new(store),
+                record: Arc::new(Mutex::new(record)),
+            })),
+        }
+    }
+
+    /// Attach session persistence to an existing runtime, creating a new record.
+    pub fn enable_persistence(
+        mut self,
+        workspace: impl Into<PathBuf>,
+        config: &crate::config::AgentConfig,
+        system_prompt: impl Into<String>,
+    ) -> Result<Self, crate::session_store::SessionStoreError> {
+        let workspace = workspace.into();
+        let store = JsonSessionStore::for_workspace(&workspace)?;
+        let mut record = SessionRecord::new(workspace.clone(), config, system_prompt);
+        {
+            let state = self.state.try_lock().map_err(|_| {
+                crate::session_store::SessionStoreError::Io {
+                    message: "runtime state is busy".to_string(),
+                }
+            })?;
+            record.messages = state.session.messages().to_vec();
+        }
+        store.save(&record)?;
+        self.workspace = Some(workspace);
+        self.persistence = Some(Arc::new(Persistence {
+            store: Arc::new(store),
+            record: Arc::new(Mutex::new(record)),
+        }));
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn persistence_enabled(&self) -> bool {
+        self.persistence.is_some()
+    }
+
+    pub async fn session_id(&self) -> Option<SessionId> {
+        let persistence = self.persistence.as_ref()?;
+        Some(persistence.record.lock().await.id.clone())
+    }
+
+    async fn persist(&self) {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return;
+        };
+        let messages = self.state.lock().await.session.messages().to_vec();
+        let mut record = persistence.record.lock().await;
+        record.messages = messages;
+        record.touch();
+        if let Err(error) = persistence.store.save(&record) {
+            eprintln!("session save failed: {error}");
+        }
+    }
+
+    async fn finish_turn(&self, usage: Option<Usage>) {
+        let mut state = self.state.lock().await;
+        if let Some(mut turn) = state.current_turn.take() {
+            turn.finish(usage);
+            drop(state);
+            if let Some(persistence) = self.persistence.as_ref() {
+                let mut record = persistence.record.lock().await;
+                record.turns.push(turn);
+                record.touch();
+                if let Err(error) = persistence.store.save(&record) {
+                    eprintln!("session save failed: {error}");
+                }
+            }
+        } else {
+            drop(state);
+        }
+        self.persist().await;
+    }
+
+    async fn abort_turn(&self) {
+        self.finish_turn(None).await;
+    }
+
+    async fn finalize_orphan_turn(&self) {
+        let has_open = self.state.lock().await.current_turn.is_some();
+        if has_open {
+            self.finish_turn(None).await;
         }
     }
 
@@ -246,6 +391,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
 
     /// Shut down background resources such as spawned LSP servers.
     pub async fn shutdown(&self) {
+        self.persist().await;
         if let Some(lsp) = self.lsp.as_ref() {
             lsp.shutdown_all().await;
         }
@@ -280,12 +426,15 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// [`RuntimeEvent`]s until either the turn finishes or an approval is
     /// required. After approval, call [`submit_approval`] to resume.
     pub async fn submit_user(&self, prompt: impl Into<String>) -> RuntimeEventReceiver {
+        self.finalize_orphan_turn().await;
         let prompt = prompt.into();
         {
             let mut state = self.state.lock().await;
-            state.session.push(Message::user(prompt));
+            state.session.push(Message::user(&prompt));
             state.pending = None;
+            state.current_turn = Some(TurnRecord::new(prompt));
         }
+        self.persist().await;
 
         let (tx, rx) = mpsc::unbounded_channel();
         self.snapshot_turn("before_turn", &tx);
@@ -343,6 +492,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                             message: error.to_string(),
                         },
                     );
+                    self.abort_turn().await;
                     return;
                 }
             };
@@ -392,6 +542,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             }
 
             if had_error {
+                self.abort_turn().await;
                 return;
             }
 
@@ -399,6 +550,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 Ok(calls) => calls,
                 Err(error) => {
                     emit(tx, runtime_error_from_tool_error(error));
+                    self.abort_turn().await;
                     return;
                 }
             };
@@ -406,7 +558,10 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             if calls.is_empty() {
                 let mut state = self.state.lock().await;
                 state.session.push(Message::assistant(text_buffer));
+                drop(state);
                 self.snapshot_turn("after_turn", tx);
+                let usage = last_usage.clone();
+                self.finish_turn(usage).await;
                 emit(tx, RuntimeEvent::TurnFinished { usage: last_usage });
                 return;
             }
@@ -421,6 +576,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                         ),
                     },
                 );
+                self.abort_turn().await;
                 return;
             }
 
@@ -434,6 +590,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                     vec![payload],
                 ));
             }
+            self.persist().await;
 
             match self.tools.run_tool_call(call.clone(), None) {
                 Ok(ToolRunOutcome::ApprovalRequired { request }) => {
@@ -451,6 +608,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 }
                 Err(error) => {
                     emit(tx, runtime_error_from_tool_error(error));
+                    self.abort_turn().await;
                     return;
                 }
             }
@@ -480,6 +638,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             }
             Err(error) => {
                 emit(tx, runtime_error_from_tool_error(error));
+                self.abort_turn().await;
                 return;
             }
         }
@@ -516,7 +675,11 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         {
             let mut state = self.state.lock().await;
             state.session.push(result.to_message());
+            if let Some(turn) = state.current_turn.as_mut() {
+                turn.tool_results.push(result.clone());
+            }
         }
+        self.persist().await;
         emit(tx, RuntimeEvent::ToolResult { result });
     }
 
@@ -913,5 +1076,158 @@ mod tests {
             .find(|message| matches!(message.role, crate::message::Role::Tool))
             .expect("tool message");
         assert!(tool_message.content.contains("<diagnostics file="));
+    }
+
+    #[tokio::test]
+    async fn persistence_saves_messages_and_turns() {
+        let workspace = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![vec![
+            AgentEvent::TextDelta {
+                text: "hello".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ]]);
+        let runtime = AgentRuntime::with_new_session(
+            client,
+            ToolRegistry::default(),
+            "system",
+            workspace.path(),
+            &crate::config::AgentConfig::default(),
+        )
+        .unwrap();
+
+        let session_id = runtime.session_id().await.expect("session id");
+        let mut rx = runtime.submit_user("hi").await;
+        drain(&mut rx).await;
+        runtime.shutdown().await;
+
+        let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+        let record = store.load(&session_id).unwrap();
+        assert_eq!(record.messages.len(), 3);
+        assert_eq!(record.turns.len(), 1);
+        assert_eq!(record.turns[0].user_prompt, "hi");
+    }
+
+    #[tokio::test]
+    async fn stream_error_finalizes_open_turn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![vec![AgentEvent::Error {
+            message: "boom".to_string(),
+        }]]);
+        let runtime = AgentRuntime::with_new_session(
+            client,
+            ToolRegistry::default(),
+            "system",
+            workspace.path(),
+            &crate::config::AgentConfig::default(),
+        )
+        .unwrap();
+
+        let session_id = runtime.session_id().await.expect("session id");
+        let mut rx = runtime.submit_user("hi").await;
+        drain(&mut rx).await;
+        runtime.shutdown().await;
+
+        let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+        let record = store.load(&session_id).unwrap();
+        assert_eq!(record.turns.len(), 1);
+        assert_eq!(record.turns[0].user_prompt, "hi");
+        assert!(record.turns[0].finished_at_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn persistence_saves_tool_results_in_turn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![
+            vec![
+                AgentEvent::ToolCallDelta {
+                    delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+            vec![
+                AgentEvent::TextDelta {
+                    text: "thanks".to_string(),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+        ]);
+        let runtime = AgentRuntime::with_new_session(
+            client,
+            ToolRegistry::with_mock_tools(),
+            "system",
+            workspace.path(),
+            &crate::config::AgentConfig::default(),
+        )
+        .unwrap();
+
+        let session_id = runtime.session_id().await.expect("session id");
+        let mut rx = runtime.submit_user("please echo").await;
+        drain(&mut rx).await;
+        let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+        drain(&mut rx).await;
+        runtime.shutdown().await;
+
+        let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+        let record = store.load(&session_id).unwrap();
+        assert_eq!(record.turns.len(), 1);
+        assert_eq!(record.turns[0].user_prompt, "please echo");
+        assert_eq!(record.turns[0].tool_results.len(), 1);
+        assert_eq!(record.turns[0].tool_results[0].tool_name, MockEchoTool::NAME);
+        assert_eq!(record.turns[0].tool_results[0].content, "mock_echo: hi");
+    }
+
+    #[tokio::test]
+    async fn resumed_runtime_continues_conversation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![
+            vec![
+                AgentEvent::TextDelta {
+                    text: "hello".to_string(),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+            vec![
+                AgentEvent::TextDelta {
+                    text: "world".to_string(),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+        ]);
+        let runtime = AgentRuntime::with_new_session(
+            client,
+            ToolRegistry::default(),
+            "system",
+            workspace.path(),
+            &crate::config::AgentConfig::default(),
+        )
+        .unwrap();
+
+        let session_id = runtime.session_id().await.expect("session id");
+        let mut rx = runtime.submit_user("first").await;
+        drain(&mut rx).await;
+        runtime.shutdown().await;
+
+        let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+        let record = store.load(&session_id).unwrap();
+        assert_eq!(record.messages.len(), 3);
+
+        let resumed = AgentRuntime::from_session_record(
+            ScriptedClient::new(vec![vec![
+                AgentEvent::TextDelta {
+                    text: "world".to_string(),
+                },
+                AgentEvent::Done { usage: None },
+            ]]),
+            ToolRegistry::default(),
+            record,
+            store,
+        );
+        let mut rx = resumed.submit_user("second").await;
+        drain(&mut rx).await;
+        let messages = resumed.session_messages().await;
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[3].content, "second");
+        assert_eq!(messages[4].content, "world");
     }
 }

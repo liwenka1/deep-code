@@ -21,6 +21,15 @@ impl Session {
     }
 
     #[must_use]
+    pub fn from_messages(messages: Vec<Message>) -> Self {
+        Self { messages }
+    }
+
+    pub fn replace_messages(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
+    }
+
+    #[must_use]
     pub fn into_messages(self) -> Vec<Message> {
         self.messages
     }

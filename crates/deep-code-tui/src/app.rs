@@ -11,14 +11,21 @@ use std::sync::Arc;
 
 use deep_code_agent::{
     AgentConfig, AgentEvent, AgentRuntime, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest,
-    CheckpointId, CheckpointStore, DeepSeekClient, RuntimeEvent, ToolRegistry, git_tool_registry,
-    shell_tool_registry, workspace_tool_registry,
+    CheckpointId, CheckpointStore, ConfigSnapshot, DeepSeekClient, JsonSessionStore, Message,
+    Role, RuntimeEvent, SessionId, SessionRecord, SessionStore, ToolRegistry,
+    format_sessions_storage_note, git_tool_registry, shell_tool_registry,
+    workspace_tool_registry,
 };
 use tokio::sync::mpsc;
 
 use crate::echo_client::EchoClient;
 
 const SYSTEM_PROMPT: &str = "You are deep-code's minimal TUI assistant.";
+
+#[derive(Debug, Clone, Default)]
+pub struct LaunchConfig {
+    pub resume: Option<SessionRecord>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Author {
@@ -52,6 +59,7 @@ pub struct App {
     pub is_streaming: bool,
     pub pending_approval: Option<ApprovalRequest>,
     pub last_checkpoint: Option<String>,
+    pub session_id: Option<String>,
     runtime: Arc<dyn AgentRuntimeHandle>,
     backend_label: String,
     ui_rx: Option<UiUpdateReceiver>,
@@ -59,22 +67,49 @@ pub struct App {
 
 impl App {
     #[must_use]
-    pub fn new() -> Self {
-        let config = AgentConfig::from_env();
-        let (runtime, backend_label) = build_runtime(&config);
-        let status = format!("Ready - {backend_label}");
+    pub fn launch(config: LaunchConfig) -> Self {
+        let agent_config = AgentConfig::from_env();
+        let (runtime, backend_label, session_id) =
+            build_runtime(&agent_config, config.resume.as_ref());
+        let resumed = config.resume.is_some();
+        let persistent = session_id.is_some();
+        let workspace_note = std::env::current_dir()
+            .map(|cwd| format_sessions_storage_note(&cwd))
+            .unwrap_or_else(|_| {
+                "Sessions are stored under .deep-code/sessions/ in the current workspace directory."
+                    .to_string()
+            });
+        let mut messages = vec![ChatMessage {
+            author: Author::System,
+            text: format!(
+                "{}\n{}\n{}\n{}\n{}",
+                "Type a prompt and press Enter. Press Esc or Ctrl+C to exit.",
+                "Tip: in offline mode, type \"/mock-tool hello\" to exercise approval.",
+                "Slash: /checkpoints, /restore <id>, /sessions",
+                workspace_note,
+                if resumed {
+                    "Resumed previous session."
+                } else if persistent {
+                    "Started a new persistent session."
+                } else {
+                    "Session persistence unavailable in this workspace."
+                }
+            ),
+        }];
+
+        if let Some(record) = config.resume.as_ref() {
+            messages.extend(hydrate_messages(record));
+        }
+
+        let status = if let Some(id) = &session_id {
+            format!("Ready - {backend_label} | session {id}")
+        } else {
+            format!("Ready - {backend_label}")
+        };
 
         Self {
             input: String::new(),
-            messages: vec![ChatMessage {
-                author: Author::System,
-                text: format!(
-                    "{}\n{}\n{}",
-                    "Type a prompt and press Enter. Press Esc or Ctrl+C to exit.",
-                    "Tip: in offline mode, type \"/mock-tool hello\" to exercise approval.",
-                    "Slash: /checkpoints, /restore <id>"
-                ),
-            }],
+            messages,
             streaming_buffer: String::new(),
             status,
             error: None,
@@ -82,10 +117,16 @@ impl App {
             is_streaming: false,
             pending_approval: None,
             last_checkpoint: None,
+            session_id,
             runtime,
             backend_label,
             ui_rx: None,
         }
+    }
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self::launch(LaunchConfig::default())
     }
 
     pub fn push_char(&mut self, value: char) {
@@ -281,7 +322,12 @@ impl App {
                     .as_ref()
                     .map(|id| format!(" | rollback: /restore {id}"))
                     .unwrap_or_default();
-                self.status = format!("Ready - {}{checkpoint}", self.backend_label);
+                let session = self
+                    .session_id
+                    .as_ref()
+                    .map(|id| format!(" | session {id}"))
+                    .unwrap_or_default();
+                self.status = format!("Ready - {}{checkpoint}{session}", self.backend_label);
                 self.is_streaming = false;
                 self.ui_rx = None;
             }
@@ -306,6 +352,10 @@ impl App {
                 self.list_checkpoints();
                 true
             }
+            "/sessions" => {
+                self.list_sessions();
+                true
+            }
             _ if prompt.starts_with("/restore ") => {
                 let id = prompt.trim_start_matches("/restore ").trim();
                 if id.is_empty() {
@@ -316,6 +366,46 @@ impl App {
                 true
             }
             _ => false,
+        }
+    }
+
+    fn list_sessions(&mut self) {
+        let Ok(cwd) = std::env::current_dir() else {
+            self.status = "Cannot resolve workspace for sessions.".to_string();
+            return;
+        };
+        match JsonSessionStore::for_workspace(cwd) {
+            Ok(store) => match store.list() {
+                Ok(records) if records.is_empty() => {
+                    self.status = "No saved sessions.".to_string();
+                }
+                Ok(records) => {
+                    let note = std::env::current_dir()
+                        .map(|cwd| format_sessions_storage_note(&cwd))
+                        .unwrap_or_default();
+                    self.messages.push(ChatMessage {
+                        author: Author::System,
+                        text: format!(
+                            "{note}\nSessions:\n{}",
+                            records
+                                .iter()
+                                .map(|record| {
+                                    format!(
+                                        "- {} ({} msgs) {}",
+                                        record.id.as_str(),
+                                        record.messages.len(),
+                                        record.preview().replace('\n', " ")
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        ),
+                    });
+                    self.status = format!("{} session(s). CLI: deep-code session list", records.len());
+                }
+                Err(error) => self.status = format!("List failed: {error}"),
+            },
+            Err(error) => self.status = format!("Sessions unavailable: {error}"),
         }
     }
 
@@ -395,33 +485,172 @@ enum StreamRequest {
     Approval(ApprovalDecision),
 }
 
-fn build_runtime(config: &AgentConfig) -> (Arc<dyn AgentRuntimeHandle>, String) {
+fn build_runtime(
+    config: &AgentConfig,
+    resume: Option<&SessionRecord>,
+) -> (Arc<dyn AgentRuntimeHandle>, String, Option<String>) {
     let tool_registry = default_tool_registry();
-    if config.api_key.is_some() {
-        match DeepSeekClient::new(config.clone()) {
-            Ok(client) => {
-                let runtime = attach_workspace_runtime(AgentRuntime::with_system_prompt(
+
+    if let Some(record) = resume {
+        let store = match JsonSessionStore::for_workspace(&record.workspace) {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("session store unavailable: {error}");
+                return build_runtime(config, None);
+            }
+        };
+        let mut record = record.clone();
+        record.config = ConfigSnapshot::from(config);
+        record.touch();
+        if let Err(error) = store.save(&record) {
+            eprintln!("failed to refresh session config snapshot: {error}");
+        }
+        if config.api_key.is_some() {
+            if let Ok(client) = DeepSeekClient::new(config.clone()) {
+                let runtime = attach_workspace_runtime(AgentRuntime::from_session_record(
                     client,
                     tool_registry,
+                    record.clone(),
+                    store,
+                ));
+                let label = format!("DeepSeek {} (resumed)", config.model);
+                return (
+                    Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
+                    label,
+                    Some(record.id.as_str().to_string()),
+                );
+            }
+        }
+        let runtime = attach_workspace_runtime(AgentRuntime::from_session_record(
+            EchoClient,
+            tool_registry,
+            record.clone(),
+            store,
+        ));
+        return (
+            Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
+            "offline echo (resumed)".to_string(),
+            Some(record.id.as_str().to_string()),
+        );
+    }
+
+    if config.api_key.is_some() {
+        if let Ok(client) = DeepSeekClient::new(config.clone()) {
+            if let Ok(cwd) = std::env::current_dir() {
+                if let Ok((runtime, session_id)) = create_persisted_runtime(
+                    client,
+                    default_tool_registry(),
+                    cwd,
+                    config,
+                ) {
+                    let runtime = attach_workspace_runtime(runtime);
+                    let label = format!("DeepSeek {}", config.model);
+                    return (
+                        Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
+                        label,
+                        Some(session_id.as_str().to_string()),
+                    );
+                }
+                eprintln!("warning: session persistence unavailable; this session will not be saved");
+            }
+            if let Ok(client) = DeepSeekClient::new(config.clone()) {
+                let runtime = attach_workspace_runtime(AgentRuntime::with_system_prompt(
+                    client,
+                    default_tool_registry(),
                     SYSTEM_PROMPT,
                 ));
                 let label = format!("DeepSeek {}", config.model);
-                return (Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>, label);
-            }
-            Err(_) => {
-                // Fall through to offline echo. The runtime is still useful
-                // for trying out the UX without a key.
+                return (Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>, label, None);
             }
         }
     }
 
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Ok((runtime, session_id)) =
+            create_persisted_runtime(EchoClient, default_tool_registry(), cwd, config)
+        {
+            let runtime = attach_workspace_runtime(runtime);
+            return (
+                Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
+                "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string(),
+                Some(session_id.as_str().to_string()),
+            );
+        }
+        eprintln!("warning: session persistence unavailable; this session will not be saved");
+    }
+
     let runtime = attach_workspace_runtime(AgentRuntime::with_system_prompt(
         EchoClient,
-        tool_registry,
+        default_tool_registry(),
         SYSTEM_PROMPT,
     ));
-    let label = "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string();
-    (Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>, label)
+    (
+        Arc::new(runtime) as Arc<dyn AgentRuntimeHandle>,
+        "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string(),
+        None,
+    )
+}
+
+fn create_persisted_runtime<C: deep_code_agent::LlmClient + 'static>(
+    client: C,
+    tools: ToolRegistry,
+    workspace: std::path::PathBuf,
+    config: &AgentConfig,
+) -> Result<(AgentRuntime<C>, SessionId), deep_code_agent::SessionStoreError> {
+    let store = JsonSessionStore::for_workspace(&workspace)?;
+    let record = SessionRecord::new(workspace, config, SYSTEM_PROMPT);
+    let session_id = record.id.clone();
+    store.save(&record)?;
+    Ok((
+        AgentRuntime::from_session_record(client, tools, record, store),
+        session_id,
+    ))
+}
+
+fn hydrate_messages(record: &SessionRecord) -> Vec<ChatMessage> {
+    record
+        .messages
+        .iter()
+        .filter_map(|message| message_to_chat(message))
+        .collect()
+}
+
+fn message_to_chat(message: &Message) -> Option<ChatMessage> {
+    match message.role {
+        Role::System => None,
+        Role::User => Some(ChatMessage {
+            author: Author::User,
+            text: message.content.clone(),
+        }),
+        Role::Assistant => {
+            let mut text = message.content.clone();
+            if !message.tool_calls.is_empty() {
+                let tools = message
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.function.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if text.is_empty() {
+                    text = format!("(requested tools: {tools})");
+                } else {
+                    text = format!("{text}\n(requested tools: {tools})");
+                }
+            }
+            Some(ChatMessage {
+                author: Author::Assistant,
+                text,
+            })
+        }
+        Role::Tool => Some(ChatMessage {
+            author: Author::System,
+            text: format!(
+                "Tool result ({}): {}",
+                message.tool_call_id.as_deref().unwrap_or("unknown"),
+                summarize_tool_result(&message.content)
+            ),
+        }),
+    }
 }
 
 fn attach_workspace_runtime<C: deep_code_agent::LlmClient + 'static>(

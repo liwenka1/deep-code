@@ -14,6 +14,7 @@ mod message;
 mod model;
 mod runtime;
 mod session;
+mod session_store;
 mod shell_tools;
 mod tool;
 mod tool_execution;
@@ -44,6 +45,11 @@ pub use model::{
 };
 pub use runtime::{AgentRuntime, AgentRuntimeHandle, RuntimeEvent, RuntimeEventReceiver};
 pub use session::Session;
+pub use session_store::{
+    ConfigSnapshot, JsonSessionStore, SessionId, SessionRecord, SessionStore,
+    SessionStoreError, TurnRecord, SESSION_SCHEMA_VERSION, new_session_id,
+    sessions_dir_for_workspace, validate_session_id, format_sessions_storage_note,
+};
 pub use shell_tools::{ShellTools, shell_tool_registry};
 pub use tool::{
     ApprovalDecision, ApprovalRequest, MockEchoTool, Tool, ToolCall, ToolCallAccumulator,

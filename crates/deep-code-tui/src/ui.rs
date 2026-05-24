@@ -12,13 +12,13 @@ use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style, Stylize};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
-use crate::app::{App, Author};
+use crate::app::{App, Author, LaunchConfig};
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
-pub async fn run() -> Result<()> {
+pub async fn run(config: LaunchConfig) -> Result<()> {
     let mut terminal = setup_terminal()?;
-    let mut app = App::new();
+    let mut app = App::launch(config);
     let result = run_loop(&mut terminal, &mut app);
     restore_terminal(&mut terminal)?;
     result?;
