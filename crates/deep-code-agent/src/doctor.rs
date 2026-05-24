@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::config::{AgentConfig, DEEPSEEK_API_KEY_ENV};
+use crate::error::api_key_setup_hint;
 use crate::hooks::default_hooks_config_path;
+use crate::model_registry::ModelRegistry;
 use crate::mcp::{McpManager, McpServerStatus, default_mcp_config_path, workspace_mcp_config_path};
 use crate::sandbox::detect_capabilities;
 use crate::skills::{discover_in_workspace, global_skills_dir, workspace_skills_dir};
@@ -69,6 +71,24 @@ pub struct HooksDoctorReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelDoctorEntry {
+    pub id: String,
+    pub context_window: u32,
+    pub supports_reasoning: bool,
+    pub supports_tools: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeepSeekDoctorReport {
+    pub auto_model: bool,
+    pub reasoning_effort: String,
+    pub cost_currency: String,
+    pub beta_endpoint: bool,
+    pub models: Vec<ModelDoctorEntry>,
+    pub api_key_hint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorReport {
     pub version: String,
     pub config_path: String,
@@ -77,6 +97,7 @@ pub struct DoctorReport {
     pub api_key: ApiKeyReport,
     pub base_url: String,
     pub default_model: String,
+    pub deepseek: DeepSeekDoctorReport,
     pub sandbox: SandboxReport,
     pub mcp: McpDoctorReport,
     pub skills: SkillsDoctorReport,
@@ -92,6 +113,7 @@ impl DoctorReport {
         let mcp = collect_mcp(workspace);
         let skills = collect_skills(workspace);
         let hooks_path = default_hooks_config_path();
+        let deepseek = collect_deepseek(config);
 
         Self {
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -101,6 +123,7 @@ impl DoctorReport {
             api_key: api_key_report(config),
             base_url: config.base_url.clone(),
             default_model: config.model.clone(),
+            deepseek,
             sandbox: SandboxReport {
                 available: sandbox.available,
                 kind: if sandbox.available {
@@ -121,6 +144,29 @@ impl DoctorReport {
 
     pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
+    }
+}
+
+fn collect_deepseek(config: &AgentConfig) -> DeepSeekDoctorReport {
+    let registry = ModelRegistry::default();
+    let models = registry
+        .list()
+        .iter()
+        .map(|model| ModelDoctorEntry {
+            id: model.id.clone(),
+            context_window: model.context_window,
+            supports_reasoning: model.supports_reasoning,
+            supports_tools: model.supports_tools,
+        })
+        .collect();
+
+    DeepSeekDoctorReport {
+        auto_model: config.auto_model_enabled(),
+        reasoning_effort: config.reasoning_effort.as_setting().to_string(),
+        cost_currency: format!("{:?}", config.cost_currency).to_ascii_lowercase(),
+        beta_endpoint: config.uses_beta_endpoint(),
+        models,
+        api_key_hint: api_key_setup_hint().to_string(),
     }
 }
 

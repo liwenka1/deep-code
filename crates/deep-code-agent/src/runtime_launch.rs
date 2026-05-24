@@ -19,6 +19,7 @@ use crate::session_store::{
 use crate::shell_tools::shell_tool_registry;
 use crate::subagent::SharedSubAgentManager;
 use crate::tool::ToolRegistry;
+use crate::workspace_summary::build_workspace_summary;
 use crate::workspace_tools::workspace_tool_registry;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are deep-code's coding assistant.";
@@ -59,7 +60,9 @@ pub fn build_tool_registry(workspace: &Path) -> ToolRegistry {
 
 #[must_use]
 pub fn runtime_system_prompt(workspace: &Path) -> String {
-    build_runtime_system_prompt(DEFAULT_SYSTEM_PROMPT, workspace)
+    let base = build_runtime_system_prompt(DEFAULT_SYSTEM_PROMPT, workspace);
+    let summary = build_workspace_summary(workspace);
+    format!("{base}\n\n{summary}")
 }
 
 pub fn launch_runtime(
@@ -78,7 +81,7 @@ pub fn launch_runtime(
         if let Ok(client) = DeepSeekClient::new(config.clone()) {
             let client = Arc::new(client);
             let (tools, subagent_manager, shutdown) =
-                build_parent_tools(Arc::clone(&client), &workspace, &parent_cancel);
+                build_parent_tools(Arc::clone(&client), config, &workspace, &parent_cancel);
             if let Some((runtime, session_id)) =
                 try_persisted_runtime((*client).clone(), tools, workspace.clone(), config, &prompt)
             {
@@ -93,9 +96,15 @@ pub fn launch_runtime(
             }
             eprintln!("warning: session persistence unavailable; this session will not be saved");
             let (tools, subagent_manager, shutdown) =
-                build_parent_tools(Arc::clone(&client), &workspace, &parent_cancel);
+                build_parent_tools(Arc::clone(&client), config, &workspace, &parent_cancel);
             let runtime = attach_workspace_helpers(
-                AgentRuntime::with_system_prompt((*client).clone(), tools, prompt),
+                AgentRuntime::with_system_prompt(
+                    (*client).clone(),
+                    tools,
+                    prompt,
+                    config.clone(),
+                    false,
+                ),
                 &workspace,
             );
             return LaunchedRuntime {
@@ -110,7 +119,7 @@ pub fn launch_runtime(
 
     let client = Arc::new(EchoClient);
     let (tools, subagent_manager, shutdown) =
-        build_parent_tools(Arc::clone(&client), &workspace, &parent_cancel);
+        build_parent_tools(Arc::clone(&client), config, &workspace, &parent_cancel);
     if let Some((runtime, session_id)) =
         try_persisted_runtime(EchoClient, tools, workspace.clone(), config, &prompt)
     {
@@ -125,9 +134,9 @@ pub fn launch_runtime(
     }
     eprintln!("warning: session persistence unavailable; this session will not be saved");
     let (tools, subagent_manager, shutdown) =
-        build_parent_tools(Arc::clone(&client), &workspace, &parent_cancel);
+        build_parent_tools(Arc::clone(&client), config, &workspace, &parent_cancel);
     let runtime = attach_workspace_helpers(
-        AgentRuntime::with_system_prompt(EchoClient, tools, prompt),
+        AgentRuntime::with_system_prompt(EchoClient, tools, prompt, config.clone(), false),
         &workspace,
     );
     LaunchedRuntime {
@@ -162,9 +171,15 @@ fn launch_resumed(
         if let Ok(client) = DeepSeekClient::new(config.clone()) {
             let client = Arc::new(client);
             let (tools, subagent_manager, shutdown) =
-                build_parent_tools(Arc::clone(&client), &workspace, parent_cancel);
+                build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
             let runtime = attach_workspace_helpers(
-                AgentRuntime::from_session_record((*client).clone(), tools, record.clone(), store),
+                AgentRuntime::from_session_record(
+                    (*client).clone(),
+                    tools,
+                    record.clone(),
+                    store,
+                    config.clone(),
+                ),
                 &workspace,
             );
             return LaunchedRuntime {
@@ -179,9 +194,9 @@ fn launch_resumed(
 
     let client = Arc::new(EchoClient);
     let (tools, subagent_manager, shutdown) =
-        build_parent_tools(Arc::clone(&client), &workspace, parent_cancel);
+        build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
     let runtime = attach_workspace_helpers(
-        AgentRuntime::from_session_record(EchoClient, tools, record.clone(), store),
+        AgentRuntime::from_session_record(EchoClient, tools, record.clone(), store, config.clone()),
         &workspace,
     );
     LaunchedRuntime {
@@ -195,6 +210,7 @@ fn launch_resumed(
 
 fn build_parent_tools<C: LlmClient + Clone + 'static>(
     client: Arc<C>,
+    config: &AgentConfig,
     workspace: &Path,
     parent_cancel: &CancellationToken,
 ) -> (
@@ -207,6 +223,7 @@ fn build_parent_tools<C: LlmClient + Clone + 'static>(
     let extensions = attach_agent_extensions(
         &mut registry,
         client,
+        config.clone(),
         workspace.to_path_buf(),
         parent_cancel.clone(),
         &bootstrap,
@@ -230,7 +247,7 @@ fn try_persisted_runtime<C: LlmClient + 'static>(
     let session_id = record.id.clone();
     store.save(&record).ok()?;
     Some((
-        AgentRuntime::from_session_record(client, tools, record, store),
+        AgentRuntime::from_session_record(client, tools, record, store, config.clone()),
         session_id,
     ))
 }

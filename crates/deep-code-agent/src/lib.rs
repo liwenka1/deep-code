@@ -1,6 +1,8 @@
 //! deep-code agent core library.
 
+mod auto_mode;
 mod client;
+mod compaction;
 mod config;
 mod doctor;
 mod echo_client;
@@ -14,6 +16,9 @@ mod handle;
 mod hooks;
 mod lsp;
 mod mcp;
+mod model_registry;
+mod pricing;
+mod reasoning;
 mod rlm;
 mod sandbox;
 mod skills;
@@ -28,13 +33,23 @@ mod session_store;
 mod shell_tools;
 mod tool;
 mod tool_execution;
+mod workspace_summary;
 mod workspace_tools;
 
+pub use auto_mode::{TurnRoute, api_fallback_model, resolve_turn_route, select_auto_model};
 pub use client::{AgentEventStream, DeepSeekClient, LlmClient};
+pub use compaction::{
+    CompactionResult, compact_messages, context_usage_percent, effective_compaction_threshold,
+    estimate_token_count, near_compaction_threshold, should_compact, stable_prefix_fingerprint,
+};
 pub use echo_client::EchoClient;
-pub use config::{AgentConfig, DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL};
+pub use config::{
+    AgentConfig, AUTO_COST_SAVING_ENV, COMPACTION_THRESHOLD_ENV, COST_CURRENCY_ENV,
+    DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, DEEPSEEK_API_KEY_ENV, MODEL_ENV,
+    REASONING_EFFORT_ENV,
+};
 pub use doctor::{DoctorReport, default_config_path};
-pub use error::{AgentError, AgentResult};
+pub use error::{AgentError, AgentResult, api_key_setup_hint};
 pub use checkpoint::{CheckpointId, CheckpointStore};
 pub use event::{AgentEvent, chunk_to_events};
 pub use execution_policy::{
@@ -50,6 +65,13 @@ pub use sandbox::{
     SandboxBackend, SandboxCapabilities, SandboxManager, SandboxPolicy, capabilities,
     detect_capabilities,
 };
+pub use model_registry::{
+    AUTO_MODEL, DEEPSEEK_V4_CONTEXT_WINDOW, DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO,
+    ModelInfo, ModelRegistry, ModelResolution, context_window_for_model,
+    compaction_threshold_for_model,
+};
+pub use pricing::{CostCurrency, CostEstimate, PrefixStatus, TurnTelemetry, calculate_turn_cost};
+pub use reasoning::{ReasoningEffort, ReasoningEffortSetting, select_auto_effort};
 pub use message::{Message, Role};
 pub use model::{
     ChatChoice, ChatRequest, ChatTool, ChatToolFunction, ChoiceDelta, FunctionCallDelta,
@@ -103,4 +125,5 @@ pub use tool::{
     ApprovalDecision, ApprovalRequest, MockEchoTool, Tool, ToolCall, ToolCallAccumulator,
     ToolError, ToolRegistry, ToolResult, ToolResultStatus, ToolRunOutcome, ToolSpec,
 };
+pub use workspace_summary::build_workspace_summary;
 pub use workspace_tools::{WorkspaceTools, workspace_tool_registry};

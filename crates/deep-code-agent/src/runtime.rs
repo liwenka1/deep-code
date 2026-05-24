@@ -19,12 +19,22 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
 
+use crate::auto_mode::{api_fallback_model, resolve_turn_route};
 use crate::checkpoint::{CheckpointId, CheckpointStore};
 use crate::client::LlmClient;
+use crate::compaction::{
+    compact_messages, context_usage_percent, effective_compaction_threshold, estimate_token_count,
+    should_compact, stable_prefix_fingerprint,
+};
+use crate::config::AgentConfig;
+use crate::error::AgentError;
 use crate::event::AgentEvent;
 use crate::lsp::{LspConfig, LspManager, is_edit_tool, render_blocks, summarize_blocks};
 use crate::message::Message;
 use crate::model::{ChatRequest, ToolCallFunctionPayload, ToolCallPayload, Usage};
+use crate::model_registry::ModelRegistry;
+use crate::model_registry::context_window_for_model;
+use crate::pricing::{CostEstimate, PrefixStatus, TurnTelemetry, calculate_turn_cost};
 use crate::session::Session;
 use crate::session_store::{JsonSessionStore, SessionId, SessionRecord, SessionStore, TurnRecord};
 use crate::tool::{
@@ -47,7 +57,16 @@ pub enum RuntimeEvent {
     /// recorded in the session.
     ToolResult { result: ToolResult },
     /// Current turn finished cleanly (no further provider activity).
-    TurnFinished { usage: Option<Usage> },
+    TurnFinished {
+        usage: Option<Usage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        telemetry: Option<TurnTelemetry>,
+    },
+    /// Transcript compaction was applied before the model request.
+    CompactionApplied {
+        archived_count: usize,
+        summary: String,
+    },
     /// Workspace snapshot stored under `.deep-code/checkpoints/`.
     CheckpointCreated {
         id: CheckpointId,
@@ -151,6 +170,9 @@ struct RuntimeState {
     session: Session,
     pending: Option<PendingToolCall>,
     current_turn: Option<TurnRecord>,
+    last_prefix_hash: Option<u64>,
+    session_cost: CostEstimate,
+    current_prompt: Option<String>,
 }
 
 struct Persistence {
@@ -168,6 +190,9 @@ struct PendingToolCall {
 /// Cheap to clone: state is behind an [`Arc`]/[`Mutex`].
 pub struct AgentRuntime<C: LlmClient + 'static> {
     client: Arc<C>,
+    config: AgentConfig,
+    registry: ModelRegistry,
+    is_subagent: bool,
     tools: Arc<ToolRegistry>,
     state: Arc<Mutex<RuntimeState>>,
     checkpoints: Option<Arc<CheckpointStore>>,
@@ -183,6 +208,9 @@ impl<C: LlmClient + 'static> Clone for AgentRuntime<C> {
     fn clone(&self) -> Self {
         Self {
             client: Arc::clone(&self.client),
+            config: self.config.clone(),
+            registry: self.registry.clone(),
+            is_subagent: self.is_subagent,
             tools: Arc::clone(&self.tools),
             state: Arc::clone(&self.state),
             checkpoints: self.checkpoints.clone(),
@@ -195,8 +223,15 @@ impl<C: LlmClient + 'static> Clone for AgentRuntime<C> {
 
 impl<C: LlmClient + 'static> AgentRuntime<C> {
     pub fn new(client: C, tools: ToolRegistry) -> Self {
+        Self::with_config(client, tools, AgentConfig::default())
+    }
+
+    pub fn with_config(client: C, tools: ToolRegistry, config: AgentConfig) -> Self {
         Self {
             client: Arc::new(client),
+            config: config.clone(),
+            registry: ModelRegistry::default(),
+            is_subagent: false,
             tools: Arc::new(tools),
             state: Arc::new(Mutex::new(RuntimeState::default())),
             checkpoints: None,
@@ -206,16 +241,41 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         }
     }
 
-    pub fn with_system_prompt(client: C, tools: ToolRegistry, system: impl Into<String>) -> Self {
+    pub fn with_system_prompt(
+        client: C,
+        tools: ToolRegistry,
+        system: impl Into<String>,
+        config: AgentConfig,
+        is_subagent: bool,
+    ) -> Self {
+        Self::with_system_prompt_flags(client, tools, system, config, is_subagent)
+    }
+
+    fn with_system_prompt_flags(
+        client: C,
+        tools: ToolRegistry,
+        system: impl Into<String>,
+        config: AgentConfig,
+        is_subagent: bool,
+    ) -> Self {
         let mut session = Session::new();
-        session.push(Message::system(system));
+        let system_text = system.into();
+        if !system_text.is_empty() {
+            session.push(Message::system(system_text));
+        }
         Self {
             client: Arc::new(client),
+            config: config.clone(),
+            registry: ModelRegistry::default(),
+            is_subagent,
             tools: Arc::new(tools),
             state: Arc::new(Mutex::new(RuntimeState {
                 session,
                 pending: None,
                 current_turn: None,
+                last_prefix_hash: None,
+                session_cost: CostEstimate::default(),
+                current_prompt: None,
             })),
             checkpoints: None,
             workspace: None,
@@ -236,7 +296,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         let store = JsonSessionStore::for_workspace(&workspace)?;
         let record = SessionRecord::new(workspace.clone(), config, system);
         store.save(&record)?;
-        Ok(Self::from_session_record(client, tools, record, store))
+        Ok(Self::from_session_record(client, tools, record, store, config.clone()))
     }
 
     /// Resume a runtime from a previously saved session record.
@@ -246,16 +306,23 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         tools: ToolRegistry,
         record: SessionRecord,
         store: JsonSessionStore,
+        config: AgentConfig,
     ) -> Self {
         let workspace = record.workspace.clone();
         let session = Session::from_messages(record.messages.clone());
         Self {
             client: Arc::new(client),
+            config,
+            registry: ModelRegistry::default(),
+            is_subagent: false,
             tools: Arc::new(tools),
             state: Arc::new(Mutex::new(RuntimeState {
                 session,
                 pending: None,
                 current_turn: None,
+                last_prefix_hash: None,
+                session_cost: CostEstimate::default(),
+                current_prompt: None,
             })),
             checkpoints: None,
             workspace: Some(workspace.clone()),
@@ -438,7 +505,8 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             let mut state = self.state.lock().await;
             state.session.push(Message::user(&prompt));
             state.pending = None;
-            state.current_turn = Some(TurnRecord::new(prompt));
+            state.current_turn = Some(TurnRecord::new(prompt.clone()));
+            state.current_prompt = Some(prompt);
         }
         self.persist().await;
     }
@@ -482,17 +550,41 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// approval is required. All paths emit a terminal [`RuntimeEvent`]
     /// (`TurnFinished`, `ApprovalRequired`, or `Error`) before returning.
     async fn run_loop(&self, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
+        let user_prompt = {
+            let state = self.state.lock().await;
+            state.current_prompt.clone().unwrap_or_default()
+        };
+        let mut route = resolve_turn_route(
+            &self.config,
+            &self.registry,
+            &user_prompt,
+            self.is_subagent,
+        );
+
+        if self
+            .maybe_compact(&route.effective_model, tx)
+            .await
+        {
+            // compaction event already emitted; continue with trimmed history
+        }
+
         loop {
-            let request = {
+            let (messages, prefix_hash) = {
                 let state = self.state.lock().await;
-                ChatRequest::streaming(
-                    self.client.model().to_string(),
-                    state.session.messages().to_vec(),
-                )
-                .with_tools(self.tools.chat_tools())
+                let messages = state.session.messages().to_vec();
+                let prefix_hash = stable_prefix_fingerprint(&messages);
+                (messages, prefix_hash)
             };
 
-            let mut stream = match self.client.stream_chat(request).await {
+            let estimated_context_tokens = estimate_token_count(&messages);
+
+            let mut request = ChatRequest::streaming(route.effective_model.clone(), messages)
+                .with_tools(self.tools.chat_tools());
+            if let Some(effort) = route.effective_effort.as_api_value() {
+                request = request.with_reasoning_effort(effort);
+            }
+
+            let mut stream = match self.stream_with_fallback(&mut route, request).await {
                 Ok(stream) => stream,
                 Err(error) => {
                     emit(
@@ -570,8 +662,20 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 drop(state);
                 self.snapshot_turn("after_turn", tx);
                 let usage = last_usage.clone();
-                self.finish_turn(usage).await;
-                emit(tx, RuntimeEvent::TurnFinished { usage: last_usage });
+                let telemetry = self.build_turn_telemetry(
+                    &route,
+                    usage.as_ref(),
+                    prefix_hash,
+                    estimated_context_tokens,
+                );
+                self.finish_turn(usage.clone()).await;
+                emit(
+                    tx,
+                    RuntimeEvent::TurnFinished {
+                        usage: last_usage,
+                        telemetry: Some(telemetry),
+                    },
+                );
                 return;
             }
 
@@ -733,6 +837,168 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             ApprovalDecision::Approved
         }
     }
+
+    async fn maybe_compact(
+        &self,
+        model: &str,
+        tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> bool {
+        let messages = self.state.lock().await.session.messages().to_vec();
+        if !should_compact(model, &messages, self.config.compaction_threshold) {
+            return false;
+        }
+        let result = compact_messages(&messages);
+        if result.archived_count == 0 {
+            return false;
+        }
+        {
+            let mut state = self.state.lock().await;
+            state.session.replace_messages(result.messages.clone());
+            state.last_prefix_hash = None;
+        }
+        if let Some(persistence) = self.persistence.as_ref() {
+            let mut record = persistence.record.lock().await;
+            record.messages = self.state.lock().await.session.messages().to_vec();
+            record.summary = Some(result.summary.clone());
+            record.compaction = Some(format!("archived={}", result.archived_count));
+            record.touch();
+            if let Err(error) = persistence.store.save(&record) {
+                eprintln!("session save failed after compaction: {error}");
+            }
+        }
+        emit(
+            tx,
+            RuntimeEvent::CompactionApplied {
+                archived_count: result.archived_count,
+                summary: result.summary.clone(),
+            },
+        );
+        true
+    }
+
+    async fn stream_with_fallback(
+        &self,
+        route: &mut crate::auto_mode::TurnRoute,
+        request: ChatRequest,
+    ) -> Result<crate::client::AgentEventStream, AgentError> {
+        match self.client.stream_chat(request.clone()).await {
+            Ok(stream) => Ok(stream),
+            Err(error) if api_error_retriable(&error) => {
+                if let Some(fallback) = api_fallback_model(route) {
+                    route.effective_model = fallback.to_string();
+                    route.used_model_fallback = true;
+                    let mut retry = request;
+                    retry.model = fallback.to_string();
+                    self.client.stream_chat(retry).await
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn build_turn_telemetry(
+        &self,
+        route: &crate::auto_mode::TurnRoute,
+        usage: Option<&Usage>,
+        prefix_hash: u64,
+        estimated_context_tokens: u32,
+    ) -> TurnTelemetry {
+        let usage = usage.cloned().unwrap_or_default();
+        let turn_cost = calculate_turn_cost(&route.effective_model, &usage);
+        let prior_hash = self.state.try_lock().ok().and_then(|state| state.last_prefix_hash);
+        let prefix_status = match prior_hash {
+            None => PrefixStatus::FirstTurn,
+            Some(previous) if previous == prefix_hash => PrefixStatus::Stable,
+            Some(_) => PrefixStatus::Changed,
+        };
+        if let Ok(mut state) = self.state.try_lock() {
+            state.last_prefix_hash = Some(prefix_hash);
+            state.session_cost.usd += turn_cost.usd;
+            state.session_cost.cny += turn_cost.cny;
+        }
+        let session_cost = self
+            .state
+            .try_lock()
+            .map(|state| state.session_cost)
+            .unwrap_or(turn_cost);
+        let estimated_context_tokens = usage
+            .input_tokens()
+            .max(estimated_context_tokens);
+        let context_window = context_window_for_model(&route.effective_model);
+        let message_estimate = estimated_context_tokens;
+
+        TurnTelemetry {
+            route_label: route.label(),
+            effective_model: route.effective_model.clone(),
+            reasoning_effort: route.effective_effort.short_label().to_string(),
+            prompt_tokens: usage.input_tokens(),
+            completion_tokens: usage.output_tokens(),
+            cache_hit_tokens: usage.prompt_cache_hit_tokens,
+            cache_miss_tokens: usage.prompt_cache_miss_tokens,
+            prefix_status,
+            context_window,
+            estimated_context_tokens,
+            context_usage_percent: context_usage_percent(estimated_context_tokens, &route.effective_model),
+            near_compaction_threshold: message_estimate
+                >= effective_compaction_threshold(
+                    &route.effective_model,
+                    self.config.compaction_threshold,
+                )
+                .saturating_mul(80)
+                / 100,
+            used_model_fallback: route.used_model_fallback,
+            turn_cost,
+            session_cost,
+        }
+    }
+}
+
+fn api_error_retriable(error: &AgentError) -> bool {
+    match error {
+        AgentError::Api { status, .. } => matches!(
+            status.as_u16(),
+            429 | 502 | 503 | 504
+        ),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod api_retriable_tests {
+    use super::*;
+    use reqwest::StatusCode;
+
+    fn api_error(status: StatusCode) -> AgentError {
+        AgentError::Api {
+            status,
+            message: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn retriable_statuses_include_rate_limit_and_gateway_errors() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(api_error_retriable(&api_error(status)), "{status}");
+        }
+    }
+
+    #[test]
+    fn auth_and_bad_request_errors_are_not_retriable() {
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
+        ] {
+            assert!(!api_error_retriable(&api_error(status)), "{status}");
+        }
+    }
 }
 
 fn emit(tx: &mpsc::UnboundedSender<RuntimeEvent>, event: RuntimeEvent) {
@@ -773,7 +1039,7 @@ fn append_diagnostics(content: &str, rendered: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use async_stream::try_stream;
     use futures_core::Stream;
@@ -1250,6 +1516,7 @@ mod tests {
             ToolRegistry::default(),
             record,
             store,
+            AgentConfig::default(),
         );
         let mut rx = resumed.submit_user("second").await;
         drain(&mut rx).await;
@@ -1257,5 +1524,156 @@ mod tests {
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[3].content, "second");
         assert_eq!(messages[4].content, "world");
+    }
+
+    /// Returns a retriable API error on the first `stream_chat`, then succeeds.
+    #[derive(Clone)]
+    struct FallbackTestClient {
+        inner: Arc<FallbackTestClientInner>,
+    }
+
+    struct FallbackTestClientInner {
+        models: Mutex<Vec<String>>,
+        attempts: Mutex<u32>,
+    }
+
+    impl FallbackTestClient {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(FallbackTestClientInner {
+                    models: Mutex::new(Vec::new()),
+                    attempts: Mutex::new(0),
+                }),
+            }
+        }
+
+        fn models_used(&self) -> Vec<String> {
+            self.inner.models.lock().unwrap().clone()
+        }
+    }
+
+    impl LlmClient for FallbackTestClient {
+        fn provider_name(&self) -> &'static str {
+            "fallback-test"
+        }
+
+        fn model(&self) -> &str {
+            "fallback-test"
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
+            self.inner
+                .models
+                .lock()
+                .unwrap()
+                .push(request.model.clone());
+            let attempt = {
+                let mut attempts = self.inner.attempts.lock().unwrap();
+                *attempts += 1;
+                *attempts
+            };
+            if attempt == 1 {
+                return Err(AgentError::Api {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    message: "model overloaded".to_string(),
+                });
+            }
+
+            let stream = try_stream! {
+                yield AgentEvent::TextDelta { text: "recovered".to_string() };
+                yield AgentEvent::Done { usage: None };
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_pro_retries_with_flash_after_retriable_api_error() {
+        use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO};
+
+        let client = FallbackTestClient::new();
+        let config = AgentConfig {
+            model: AUTO_MODEL.to_string(),
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::with_system_prompt(
+            client.clone(),
+            ToolRegistry::default(),
+            "system",
+            config,
+            false,
+        );
+
+        let mut rx = runtime.submit_user("debug this crash").await;
+        let events = drain(&mut rx).await;
+
+        assert_eq!(
+            client.models_used(),
+            vec![
+                DEEPSEEK_V4_PRO.to_string(),
+                DEEPSEEK_V4_FLASH.to_string()
+            ]
+        );
+        let telemetry = events.iter().find_map(|event| match event {
+            RuntimeEvent::TurnFinished { telemetry, .. } => telemetry.as_ref(),
+            _ => None,
+        });
+        let telemetry = telemetry.expect("turn finished with telemetry");
+        assert!(telemetry.used_model_fallback);
+        assert_eq!(telemetry.effective_model, DEEPSEEK_V4_FLASH);
+        assert!(telemetry.route_label.contains("fallback→flash"));
+        assert_eq!(
+            runtime.session_messages().await.last().unwrap().content,
+            "recovered"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthorized_api_error_does_not_fallback() {
+        use crate::model_registry::AUTO_MODEL;
+
+        #[derive(Clone)]
+        struct AuthFailClient {
+            calls: Arc<Mutex<u32>>,
+        }
+
+        impl LlmClient for AuthFailClient {
+            fn provider_name(&self) -> &'static str {
+                "auth-fail"
+            }
+
+            fn model(&self) -> &str {
+                "auth-fail"
+            }
+
+            async fn stream_chat(&self, _request: ChatRequest) -> AgentResult<AgentEventStream> {
+                *self.calls.lock().unwrap() += 1;
+                Err(AgentError::Api {
+                    status: reqwest::StatusCode::UNAUTHORIZED,
+                    message: "invalid key".to_string(),
+                })
+            }
+        }
+
+        let client = AuthFailClient {
+            calls: Arc::new(Mutex::new(0)),
+        };
+        let config = AgentConfig {
+            model: AUTO_MODEL.to_string(),
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::with_system_prompt(
+            client.clone(),
+            ToolRegistry::default(),
+            "system",
+            config,
+            false,
+        );
+
+        let mut rx = runtime.submit_user("debug this").await;
+        let events = drain(&mut rx).await;
+
+        assert_eq!(*client.calls.lock().unwrap(), 1);
+        assert!(matches!(events.last(), Some(RuntimeEvent::Error { .. })));
     }
 }

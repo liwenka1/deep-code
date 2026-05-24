@@ -47,6 +47,12 @@ impl SessionId {
 pub struct ConfigSnapshot {
     pub base_url: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub auto_model: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_currency: Option<String>,
     pub timeout_secs: Option<u64>,
     pub api_key_present: bool,
 }
@@ -56,6 +62,9 @@ impl From<&AgentConfig> for ConfigSnapshot {
         Self {
             base_url: config.base_url.clone(),
             model: config.model.clone(),
+            reasoning_effort: Some(config.reasoning_effort.as_setting().to_string()),
+            auto_model: config.auto_model_enabled(),
+            cost_currency: Some(format!("{:?}", config.cost_currency).to_ascii_lowercase()),
             timeout_secs: config.timeout.map(|duration| duration.as_secs()),
             api_key_present: config
                 .api_key
@@ -104,10 +113,10 @@ pub struct SessionRecord {
     pub config: ConfigSnapshot,
     pub messages: Vec<Message>,
     pub turns: Vec<TurnRecord>,
-    /// Reserved for future transcript compaction (not implemented yet).
+    /// Transcript summary produced by compaction (when applied).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    /// Reserved for future compaction metadata (not implemented yet).
+    /// Compaction metadata, e.g. `archived=N` (when applied).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<String>,
 }

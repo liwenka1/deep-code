@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::LlmClient;
+use crate::config::AgentConfig;
 use crate::handle::{HandleStore, register_handle_read};
 use crate::hooks::{HookDispatcher, HooksConfig, load_hooks_config};
 use crate::mcp::{McpManager, register_mcp_tools};
@@ -75,6 +76,7 @@ pub fn attach_runtime_tools(
 pub fn attach_agent_extensions<C: LlmClient + Clone + 'static>(
     registry: &mut ToolRegistry,
     client: Arc<C>,
+    agent_config: AgentConfig,
     workspace: PathBuf,
     parent_cancel: CancellationToken,
     bootstrap: &RuntimeBootstrap,
@@ -84,6 +86,7 @@ pub fn attach_agent_extensions<C: LlmClient + Clone + 'static>(
     let exec_policy = registry.policy().clone();
     let subagent = Arc::new(SubAgentServices::new(
         client,
+        agent_config,
         workspace.clone(),
         parent_cancel,
         DEFAULT_MAX_CONCURRENT,

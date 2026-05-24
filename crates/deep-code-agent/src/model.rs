@@ -12,6 +12,8 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ChatTool>,
 }
@@ -25,8 +27,15 @@ impl ChatRequest {
             stream: true,
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
             tools: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+        self.reasoning_effort = Some(effort.into());
+        self
     }
 
     #[must_use]
@@ -122,6 +131,22 @@ pub struct Usage {
     pub total_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_hit_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_miss_tokens: Option<u32>,
+}
+
+impl Usage {
+    #[must_use]
+    pub fn input_tokens(&self) -> u32 {
+        self.prompt_tokens.unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn output_tokens(&self) -> u32 {
+        self.completion_tokens.unwrap_or(0)
+    }
 }
 
 #[cfg(test)]

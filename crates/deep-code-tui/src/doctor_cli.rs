@@ -21,6 +21,22 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
     println!("  api key: {}", report.api_key.source);
     println!("  model: {} @ {}", report.default_model, report.base_url);
     println!(
+        "  deepseek: auto_model={} reasoning={} currency={} beta={}",
+        report.deepseek.auto_model,
+        report.deepseek.reasoning_effort,
+        report.deepseek.cost_currency,
+        report.deepseek.beta_endpoint
+    );
+    for model in &report.deepseek.models {
+        println!(
+            "    - {} ctx={} reasoning={} tools={}",
+            model.id, model.context_window, model.supports_reasoning, model.supports_tools
+        );
+    }
+    if report.api_key.source == "missing" {
+        println!("  api key 引导:\n{}", report.deepseek.api_key_hint);
+    }
+    println!(
         "  sandbox: {} ({})",
         if report.sandbox.available { "available" } else { "unavailable" },
         report.sandbox.detail

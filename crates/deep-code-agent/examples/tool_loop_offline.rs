@@ -12,8 +12,9 @@ use std::sync::Mutex;
 
 use async_stream::try_stream;
 use deep_code_agent::{
-    AgentEvent, AgentEventStream, AgentResult, AgentRuntime, ApprovalDecision, ChatRequest,
-    FunctionCallDelta, LlmClient, MockEchoTool, RuntimeEvent, ToolCallDelta, ToolRegistry,
+    AgentConfig, AgentEvent, AgentEventStream, AgentResult, AgentRuntime, ApprovalDecision,
+    ChatRequest, FunctionCallDelta, LlmClient, MockEchoTool, RuntimeEvent, ToolCallDelta,
+    ToolRegistry,
 };
 use futures_core::Stream;
 
@@ -86,6 +87,8 @@ async fn main() -> anyhow::Result<()> {
         client,
         ToolRegistry::with_mock_tools(),
         "You are a smoke-test assistant.",
+        AgentConfig::default(),
+        false,
     );
 
     let mut events = runtime.submit_user("please run the mock tool").await;
@@ -148,7 +151,7 @@ fn print_event(event: &RuntimeEvent) {
                 result.status, result.content
             );
         }
-        RuntimeEvent::TurnFinished { usage } => {
+        RuntimeEvent::TurnFinished { usage, .. } => {
             println!("turn finished: usage={usage:?}");
         }
         RuntimeEvent::Error { message } => {

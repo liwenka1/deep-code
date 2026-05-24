@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use deep_code_agent::{
     AgentConfig, AgentEvent, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest,
-    CheckpointId, CheckpointStore, JsonSessionStore, Message, Role, RuntimeEvent,
-    SessionRecord, SessionStore, SharedSubAgentManager, format_sessions_storage_note,
-    is_subagent_tool, launch_runtime,
+    CheckpointId, CheckpointStore, CostCurrency, JsonSessionStore, Message, Role, RuntimeEvent,
+    SessionRecord, SessionStore, SharedSubAgentManager, TurnTelemetry,
+    format_sessions_storage_note, is_subagent_tool, launch_runtime,
 };
 use tokio::sync::mpsc;
 
@@ -62,12 +62,14 @@ pub struct App {
     subagent_manager: SharedSubAgentManager,
     subagent_shutdown: Option<Box<dyn Fn() + Send + Sync>>,
     ui_rx: Option<UiUpdateReceiver>,
+    cost_currency: CostCurrency,
 }
 
 impl App {
     #[must_use]
     pub fn launch(config: LaunchConfig) -> Self {
         let agent_config = AgentConfig::from_env();
+        let cost_currency = agent_config.cost_currency;
         let workspace = workspace_root();
         let launched = launch_runtime(&agent_config, workspace, config.resume.clone());
         let runtime = launched.handle;
@@ -127,6 +129,7 @@ impl App {
             subagent_manager,
             subagent_shutdown,
             ui_rx: None,
+            cost_currency,
         }
     }
 
@@ -324,19 +327,36 @@ impl App {
                 }
                 self.status = format!("Diagnostics: {summary}");
             }
-            RuntimeEvent::TurnFinished { .. } => {
+            RuntimeEvent::CompactionApplied {
+                archived_count,
+                summary,
+            } => {
+                self.messages.push(ChatMessage {
+                    author: Author::System,
+                    text: format!("已压缩 {archived_count} 条历史消息\n{summary}"),
+                });
+                self.status = format!("已压缩 {archived_count} 条历史消息");
+            }
+            RuntimeEvent::TurnFinished { telemetry, .. } => {
                 self.flush_assistant_buffer();
                 let checkpoint = self
                     .last_checkpoint
                     .as_ref()
-                    .map(|id| format!(" | rollback: /restore {id}"))
+                    .map(|id| format!(" | 回滚: /restore {id}"))
                     .unwrap_or_default();
                 let session = self
                     .session_id
                     .as_ref()
                     .map(|id| format!(" | session {id}"))
                     .unwrap_or_default();
-                self.status = format!("Ready - {}{checkpoint}{session}", self.backend_label);
+                let telemetry_note = telemetry
+                    .as_ref()
+                    .map(|value| format_turn_telemetry(value, self.cost_currency))
+                    .unwrap_or_default();
+                self.status = format!(
+                    "就绪 - {}{}{}{telemetry_note}",
+                    self.backend_label, checkpoint, session
+                );
                 self.is_streaming = false;
                 self.ui_rx = None;
             }
@@ -753,4 +773,29 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
         truncated.push_str("...");
     }
     truncated
+}
+
+fn format_turn_telemetry(telemetry: &TurnTelemetry, currency: CostCurrency) -> String {
+    let turn = telemetry.turn_cost.format(currency);
+    let session = telemetry.session_cost.format(currency);
+    let cache = match (telemetry.cache_hit_tokens, telemetry.cache_miss_tokens) {
+        (Some(hit), Some(miss)) => format!(" | cache {hit}/{miss}"),
+        _ => String::new(),
+    };
+    let context = format!(
+        "ctx {}/{} ({}%)",
+        telemetry.estimated_context_tokens, telemetry.context_window, telemetry.context_usage_percent
+    );
+    let compaction = if telemetry.near_compaction_threshold {
+        " | 接近压缩阈值"
+    } else {
+        ""
+    };
+    format!(
+        " | {} | 本回合 {} | 累计 {}{cache} | {context}{compaction} | {}",
+        telemetry.route_label,
+        turn,
+        session,
+        telemetry.prefix_status.label_zh()
+    )
 }

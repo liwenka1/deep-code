@@ -393,6 +393,7 @@ fn runtime_event_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::CheckpointCreated { .. } => "checkpoint.created",
         RuntimeEvent::WorkspaceRestored { .. } => "workspace.restored",
         RuntimeEvent::DiagnosticsUpdated { .. } => "diagnostics.updated",
+        RuntimeEvent::CompactionApplied { .. } => "compaction.applied",
         RuntimeEvent::Error { .. } => "error",
     }
 }

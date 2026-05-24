@@ -52,7 +52,8 @@ pub async fn run_subagent<C: LlmClient + Clone + 'static>(
             RuntimeEvent::Provider(_) => {}
             RuntimeEvent::CheckpointCreated { .. }
             | RuntimeEvent::WorkspaceRestored { .. }
-            | RuntimeEvent::DiagnosticsUpdated { .. } => {}
+            | RuntimeEvent::DiagnosticsUpdated { .. }
+            | RuntimeEvent::CompactionApplied { .. } => {}
         }
     }
 }

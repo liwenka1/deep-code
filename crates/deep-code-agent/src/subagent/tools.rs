@@ -109,6 +109,8 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentOpenTool<C> {
             (*client).clone(),
             child_tools,
             system_prompt,
+            self.services.agent_config.clone(),
+            true,
         );
         let cancel = self.services.parent_cancel.child_token();
         {

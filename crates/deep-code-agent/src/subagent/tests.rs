@@ -8,6 +8,7 @@ mod integration {
     use tokio_util::sync::CancellationToken;
 
     use crate::client::{AgentEventStream, LlmClient};
+    use crate::config::AgentConfig;
     use crate::error::AgentResult;
     use crate::event::AgentEvent;
     use crate::model::ChatRequest;
@@ -85,6 +86,7 @@ None.
         let services = attach_subagent_tools(
             &mut registry,
             Arc::clone(&client),
+            AgentConfig::default(),
             dir.path().to_path_buf(),
             cancel,
         );
@@ -123,6 +125,7 @@ None.
         let services = attach_subagent_tools(
             &mut registry,
             Arc::clone(&client),
+            AgentConfig::default(),
             dir.path().to_path_buf(),
             cancel,
         );
@@ -170,6 +173,7 @@ None.
         let services = attach_subagent_tools(
             &mut registry,
             Arc::clone(&client),
+            AgentConfig::default(),
             dir.path().to_path_buf(),
             cancel,
         );
@@ -218,6 +222,7 @@ None.
         let services = attach_subagent_tools(
             &mut registry,
             Arc::clone(&client),
+            AgentConfig::default(),
             dir.path().to_path_buf(),
             cancel.clone(),
         );
@@ -261,6 +266,7 @@ None.
         attach_subagent_tools(
             &mut registry,
             client,
+            AgentConfig::default(),
             dir.path().to_path_buf(),
             cancel,
         );

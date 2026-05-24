@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::LlmClient;
+use crate::config::AgentConfig;
 use crate::execution_policy::ExecPolicy;
 use crate::git_tools::git_tool_registry;
 use crate::handle::HandleStore;
@@ -28,6 +29,7 @@ pub fn is_subagent_tool(name: &str) -> bool {
 pub struct SubAgentServices<C: LlmClient + Clone + 'static> {
     pub manager: Arc<RwLock<SubAgentManager>>,
     pub client: Arc<C>,
+    pub agent_config: AgentConfig,
     pub workspace: PathBuf,
     pub parent_cancel: CancellationToken,
     pub handle_store: Arc<RwLock<HandleStore>>,
@@ -38,6 +40,7 @@ pub struct SubAgentServices<C: LlmClient + Clone + 'static> {
 impl<C: LlmClient + Clone + 'static> SubAgentServices<C> {
     pub fn new(
         client: Arc<C>,
+        agent_config: AgentConfig,
         workspace: PathBuf,
         parent_cancel: CancellationToken,
         max_concurrent: usize,
@@ -52,6 +55,7 @@ impl<C: LlmClient + Clone + 'static> SubAgentServices<C> {
         Self {
             manager,
             client,
+            agent_config,
             workspace,
             parent_cancel,
             handle_store,
@@ -87,6 +91,7 @@ pub fn register_subagent_tools<C: LlmClient + Clone + 'static>(
 pub fn attach_subagent_tools<C: LlmClient + Clone + 'static>(
     registry: &mut ToolRegistry,
     client: Arc<C>,
+    agent_config: AgentConfig,
     workspace: PathBuf,
     parent_cancel: CancellationToken,
 ) -> Arc<SubAgentServices<C>> {
@@ -95,6 +100,7 @@ pub fn attach_subagent_tools<C: LlmClient + Clone + 'static>(
         &crate::extensions::attach_agent_extensions(
             registry,
             client,
+            agent_config,
             workspace,
             parent_cancel,
             &bootstrap,
@@ -105,12 +111,14 @@ pub fn attach_subagent_tools<C: LlmClient + Clone + 'static>(
 
 pub fn subagent_tool_registry<C: LlmClient + Clone + 'static>(
     client: Arc<C>,
+    agent_config: AgentConfig,
     workspace: PathBuf,
     parent_cancel: CancellationToken,
 ) -> (ToolRegistry, Arc<SubAgentServices<C>>) {
     let handle_store = Arc::new(RwLock::new(HandleStore::new()));
     let services = Arc::new(SubAgentServices::new(
         client,
+        agent_config,
         workspace,
         parent_cancel,
         super::types::DEFAULT_MAX_CONCURRENT,
