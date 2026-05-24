@@ -42,8 +42,8 @@ impl<C: LlmClient + Clone + 'static> SubAgentServices<C> {
         parent_cancel: CancellationToken,
         max_concurrent: usize,
         exec_policy: ExecPolicy,
+        handle_store: Arc<RwLock<HandleStore>>,
     ) -> Self {
-        let handle_store = Arc::new(RwLock::new(HandleStore::new()));
         let manager = Arc::new(RwLock::new(SubAgentManager::new(
             workspace.clone(),
             max_concurrent,
@@ -90,16 +90,13 @@ pub fn attach_subagent_tools<C: LlmClient + Clone + 'static>(
     workspace: PathBuf,
     parent_cancel: CancellationToken,
 ) -> Arc<SubAgentServices<C>> {
-    let exec_policy = registry.policy().clone();
-    let services = Arc::new(SubAgentServices::new(
+    Arc::clone(&crate::extensions::attach_agent_extensions(
+        registry,
         client,
         workspace,
         parent_cancel,
-        super::types::DEFAULT_MAX_CONCURRENT,
-        exec_policy,
-    ));
-    register_subagent_tools(registry, Arc::clone(&services));
-    services
+    )
+    .subagent)
 }
 
 pub fn subagent_tool_registry<C: LlmClient + Clone + 'static>(
@@ -107,12 +104,14 @@ pub fn subagent_tool_registry<C: LlmClient + Clone + 'static>(
     workspace: PathBuf,
     parent_cancel: CancellationToken,
 ) -> (ToolRegistry, Arc<SubAgentServices<C>>) {
+    let handle_store = Arc::new(RwLock::new(HandleStore::new()));
     let services = Arc::new(SubAgentServices::new(
         client,
         workspace,
         parent_cancel,
         super::types::DEFAULT_MAX_CONCURRENT,
         ExecPolicy::default(),
+        handle_store,
     ));
     let mut registry = ToolRegistry::new();
     register_subagent_tools(&mut registry, Arc::clone(&services));

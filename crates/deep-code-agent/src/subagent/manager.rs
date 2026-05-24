@@ -4,14 +4,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::handle::{HandleKind, HandleStore};
+use crate::handle::{HandleKind, HandleStore, VarHandle};
 use crate::subagent::output::parse_structured_report;
 use crate::subagent::types::{
     HARD_MAX_CONCURRENT, SUBAGENT_STATE_FILE,
     SUBAGENT_STATE_SCHEMA_VERSION, SubAgentError, SubAgentRecord, SubAgentSessionProjection,
     SubAgentStatus,
 };
-use crate::handle::HandleRecord;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedSubAgentState {
@@ -135,7 +134,7 @@ impl SubAgentManager {
                     .ok()
                     .and_then(|store| store.get_summary(id))
             })
-            .map(HandleRecord::from)
+            .map(|summary| VarHandle::from_summary(&summary, &record.name))
             .ok_or_else(|| SubAgentError::State {
                 message: format!("missing transcript handle for {}", record.agent_id),
             })?;
@@ -176,11 +175,27 @@ impl SubAgentManager {
         let mut store = self.handle_store.write().map_err(|error| SubAgentError::State {
             message: error.to_string(),
         })?;
-        Ok(store.insert_json(
+        Ok(store.insert_json_with_owner(
             format!("agent:{}", record.agent_id),
             HandleKind::Transcript,
             payload,
+            Some(record.name.clone()),
         ))
+    }
+
+    pub fn release_transcript_handles(
+        &mut self,
+        record: &SubAgentRecord,
+    ) -> Result<(), SubAgentError> {
+        if let Ok(mut store) = self.handle_store.write() {
+            store.purge_session(&record.name);
+        }
+        if record.transcript_handle.is_some() {
+            self.update(&record.agent_id, |record| {
+                record.transcript_handle = None;
+            })?;
+        }
+        Ok(())
     }
 
     pub fn finalize_success(
@@ -395,6 +410,45 @@ mod tests {
         assert_eq!(record.status, SubAgentStatus::Completed);
         assert!(record.transcript_handle.is_some());
         assert!(record.structured.is_some());
+        let projection = manager.project(&record, false).unwrap();
+        assert_eq!(projection.transcript_handle.kind, "var_handle");
+        assert_eq!(projection.transcript_handle.session_id, "worker");
+    }
+
+    #[test]
+    fn release_transcript_handles_purges_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RwLock::new(HandleStore::new()));
+        let mut manager = SubAgentManager::new(
+            dir.path().to_path_buf(),
+            crate::subagent::types::DEFAULT_MAX_CONCURRENT,
+            Arc::clone(&store),
+        );
+        let boot = manager.session_boot_id.clone();
+        manager
+            .insert(SubAgentRecord {
+                schema_version: SUBAGENT_STATE_SCHEMA_VERSION,
+                agent_id: "a1".to_string(),
+                name: "worker".to_string(),
+                role: "general".to_string(),
+                status: SubAgentStatus::Running,
+                assignment: "do".to_string(),
+                result: None,
+                structured: None,
+                transcript_handle: None,
+                error: None,
+                fork_context: false,
+                started_at_ms: now_ms(),
+                finished_at_ms: None,
+                steps_taken: 0,
+                session_boot_id: Some(boot),
+            })
+            .unwrap();
+        let record = manager.finalize_success("a1", "done".to_string(), 1).unwrap();
+        let handle_id = record.transcript_handle.clone().expect("handle");
+        assert!(store.read().unwrap().get_summary(&handle_id).is_some());
+        manager.release_transcript_handles(&record).unwrap();
+        assert!(store.read().unwrap().get_summary(&handle_id).is_none());
     }
 
     #[test]

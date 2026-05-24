@@ -12,6 +12,8 @@ pub enum ToolKind {
     JobControl,
     Mock,
     SubAgent,
+    HandleRead,
+    Rlm,
     Unknown,
 }
 
@@ -123,6 +125,8 @@ impl ExecPolicy {
             name if name.starts_with("git_") => ToolKind::GitRead,
             "mock_echo" => ToolKind::Mock,
             "agent_open" | "agent_eval" | "agent_close" => ToolKind::SubAgent,
+            "handle_read" => ToolKind::HandleRead,
+            "rlm_open" | "rlm_eval" | "rlm_configure" | "rlm_close" => ToolKind::Rlm,
             _ => ToolKind::Unknown,
         }
     }
@@ -192,6 +196,36 @@ impl ExecPolicy {
                 risk_level: RiskLevel::Low,
                 matched_rule: Some("builtin:subagent_tool".to_string()),
             },
+            ToolKind::HandleRead => ToolExecutionPlan {
+                verdict: PolicyVerdict::Allow,
+                requires_approval: false,
+                requires_sandbox: false,
+                read_only: true,
+                risk_level: RiskLevel::Low,
+                matched_rule: Some("builtin:handle_read".to_string()),
+            },
+            ToolKind::Rlm => {
+                let needs_approval = matches!(tool_name, "rlm_eval");
+                let read_only = matches!(tool_name, "rlm_open" | "rlm_configure" | "rlm_close");
+                ToolExecutionPlan {
+                    verdict: if needs_approval {
+                        PolicyVerdict::NeedsApproval {
+                            reason: "rlm_eval executes analysis code against loaded context".to_string(),
+                        }
+                    } else {
+                        PolicyVerdict::Allow
+                    },
+                    requires_approval: needs_approval,
+                    requires_sandbox: needs_approval && self.enable_sandbox,
+                    read_only,
+                    risk_level: if needs_approval {
+                        RiskLevel::Medium
+                    } else {
+                        RiskLevel::Low
+                    },
+                    matched_rule: Some(format!("builtin:{tool_name}")),
+                }
+            }
             ToolKind::Unknown => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {
                     reason: format!("unknown tool '{tool_name}' requires approval"),
@@ -299,5 +333,24 @@ mod tests {
         let plan = evaluate_shell_command(&policy, "cargo test -p deep-code-agent");
         assert_eq!(plan.verdict, PolicyVerdict::Allow);
         assert!(!plan.requires_approval);
+    }
+
+    #[test]
+    fn handle_read_is_read_only() {
+        let policy = ExecPolicy::default();
+        let plan = policy.evaluate_tool("handle_read", &json!({"handle": "h_x", "mode": "head"}));
+        assert_eq!(plan.verdict, PolicyVerdict::Allow);
+        assert!(plan.read_only);
+    }
+
+    #[test]
+    fn rlm_eval_requires_approval() {
+        let policy = ExecPolicy::default();
+        let plan = policy.evaluate_tool(
+            "rlm_eval",
+            &json!({"name": "ctx", "code": "stats"}),
+        );
+        assert!(matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }));
+        assert!(plan.requires_approval);
     }
 }

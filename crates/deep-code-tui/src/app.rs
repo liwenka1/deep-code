@@ -13,7 +13,7 @@ use deep_code_agent::{
     AgentConfig, AgentEvent, AgentRuntime, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest,
     CheckpointId, CheckpointStore, ConfigSnapshot, DeepSeekClient, JsonSessionStore, Message,
     Role, RuntimeEvent, SessionId, SessionRecord, SessionStore, SharedSubAgentManager,
-    ToolRegistry, attach_subagent_tools, format_sessions_storage_note, git_tool_registry,
+    ToolRegistry, attach_agent_extensions, format_sessions_storage_note, git_tool_registry,
     is_subagent_tool, shell_tool_registry, workspace_tool_registry,
 };
 use tokio::sync::mpsc;
@@ -702,12 +702,12 @@ fn build_parent_tool_registry<C: deep_code_agent::LlmClient + Clone + 'static>(
 ) {
     let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut registry = base_tool_registry();
-    let services = attach_subagent_tools(&mut registry, client, workspace, parent_cancel.clone());
+    let extensions = attach_agent_extensions(&mut registry, client, workspace, parent_cancel.clone());
     let shutdown: Box<dyn Fn() + Send + Sync> = Box::new({
-        let services = Arc::clone(&services);
-        move || services.cancel_all_running()
+        let extensions = Arc::clone(&extensions);
+        move || extensions.cancel_all_running()
     });
-    (registry, Arc::clone(&services.manager), shutdown)
+    (registry, extensions.subagent_manager(), shutdown)
 }
 
 fn create_persisted_runtime<C: deep_code_agent::LlmClient + 'static>(

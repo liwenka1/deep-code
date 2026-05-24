@@ -400,6 +400,9 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentCloseTool<C> {
             })?;
         let record = manager.mark_cancelled(&resolved_id).map_err(tool_error)?;
         let projection = manager.project(&record, false).map_err(tool_error)?;
+        manager
+            .release_transcript_handles(&record)
+            .map_err(tool_error)?;
         Ok(ToolResult::success(
             &call.id,
             CLOSE_TOOL,

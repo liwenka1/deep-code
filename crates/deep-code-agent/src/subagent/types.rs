@@ -103,7 +103,7 @@ pub struct SubAgentSessionProjection {
     pub terminal: bool,
     pub context_mode: String,
     pub fork_context: bool,
-    pub transcript_handle: crate::handle::HandleRecord,
+    pub transcript_handle: crate::handle::VarHandle,
     pub snapshot: SubAgentRecord,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub timed_out: bool,

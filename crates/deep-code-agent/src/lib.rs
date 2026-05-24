@@ -6,9 +6,11 @@ mod error;
 mod event;
 mod checkpoint;
 mod execution_policy;
+mod extensions;
 mod git_tools;
 mod handle;
 mod lsp;
+mod rlm;
 mod sandbox;
 mod subagent;
 mod workspace_policy;
@@ -52,7 +54,15 @@ pub use session_store::{
     SessionStoreError, TurnRecord, SESSION_SCHEMA_VERSION, new_session_id,
     sessions_dir_for_workspace, validate_session_id, format_sessions_storage_note,
 };
-pub use handle::{HandleId, HandleKind, HandleRecord, HandleStore, HandleSummary};
+pub use extensions::{AgentExtensions, attach_agent_extensions};
+pub use handle::{
+    HandleCount, HandleId, HandleKind, HandleReadOutput, HandleRecord, HandleStore, HandleSummary,
+    VarHandle, HANDLE_READ_TOOL, HandleReadTool, register_handle_read,
+};
+pub use rlm::{
+    RlmCloseTool, RlmConfigureTool, RlmEvalTool, RlmManager, RlmOpenTool, RlmConfig, RlmServices,
+    RlmSessionInfo, RLM_TOOL_NAMES, is_rlm_tool, register_rlm_tools,
+};
 pub use subagent::{
     AgentCloseTool, AgentEvalTool, AgentOpenTool, DEFAULT_MAX_CONCURRENT, HARD_MAX_CONCURRENT,
     SharedSubAgentManager, StructuredReport, SubAgentManager, SubAgentRole, SubAgentServices,
