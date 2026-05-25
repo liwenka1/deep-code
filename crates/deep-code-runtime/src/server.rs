@@ -66,12 +66,19 @@ impl Default for RuntimeServerOptions {
 }
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     version: String,
-    workspace: PathBuf,
+    pub(crate) workspace: PathBuf,
     auth_token: Option<String>,
-    runtime: Arc<Mutex<LaunchedRuntime>>,
+    pub(crate) runtime: Arc<Mutex<LaunchedRuntime>>,
     approval: Arc<Mutex<Option<PendingApproval>>>,
+}
+
+impl AppState {
+    pub(crate) async fn clear_pending_approval(&self) {
+        let mut slot = self.approval.lock().await;
+        *slot = None;
+    }
 }
 
 struct PendingApproval {
@@ -104,9 +111,22 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
 
     let protected = Router::new()
         .route("/v1/sessions", get(list_sessions))
+        .route("/v1/sessions/new", post(crate::sessions::new_session))
+        .route(
+            "/v1/sessions/{id}/resume",
+            post(crate::sessions::resume_session),
+        )
         .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
         .route("/v1/prompt", post(prompt_sse))
         .route("/v1/approvals", post(submit_approval))
+        .route("/v1/doctor", get(crate::meta::doctor))
+        .route("/v1/checkpoints", get(crate::meta::list_checkpoints))
+        .route(
+            "/v1/checkpoints/{id}/restore",
+            post(crate::meta::restore_checkpoint),
+        )
+        .route("/v1/subagents", get(crate::meta::list_subagents))
+        .route("/v1/jobs", get(crate::meta::list_jobs))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_auth,
@@ -147,12 +167,14 @@ fn load_resume_record(options: &RuntimeServerOptions) -> Result<Option<SessionRe
 struct HealthResponse {
     status: String,
     version: String,
+    auth_required: bool,
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
         version: state.version,
+        auth_required: state.auth_token.is_some(),
     })
 }
 
@@ -399,7 +421,7 @@ fn runtime_event_name(event: &RuntimeEvent) -> &'static str {
 }
 
 #[derive(Debug)]
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
     message: String,
 }
@@ -418,6 +440,20 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<deep_code_agent::SessionStoreError> for ApiError {
@@ -431,6 +467,19 @@ impl From<deep_code_agent::SessionStoreError> for ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 message: other.to_string(),
             },
+        }
+    }
+}
+
+impl From<deep_code_agent::ToolError> for ApiError {
+    fn from(error: deep_code_agent::ToolError) -> Self {
+        match &error {
+            deep_code_agent::ToolError::ExecutionFailed { message, .. }
+                if message.contains("does not exist") =>
+            {
+                Self::not_found(error.to_string())
+            }
+            _ => Self::internal(error.to_string()),
         }
     }
 }

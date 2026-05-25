@@ -142,7 +142,8 @@ pub fn child_tool_registry(
     });
     registry.set_policy(exec_policy);
     if role.allows_shell() {
-        registry.extend(shell_tool_registry(workspace)?);
+        let (shell_tools, _) = shell_tool_registry(workspace)?;
+        registry.extend(shell_tools);
     }
     registry.extend(git_tool_registry(workspace)?);
     Ok(registry)

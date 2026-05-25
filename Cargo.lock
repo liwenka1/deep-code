@@ -897,11 +897,15 @@ dependencies = [
 name = "deep-code-desktop"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "deep-code-runtime",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tokio",
 ]
 
 [[package]]

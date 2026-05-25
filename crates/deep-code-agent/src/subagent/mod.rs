@@ -19,7 +19,7 @@ pub use registry::{
 pub use roles::SubAgentRole;
 pub use tools::{AgentCloseTool, AgentEvalTool, AgentOpenTool};
 pub use types::{
-    DEFAULT_MAX_CONCURRENT, HARD_MAX_CONCURRENT, SubAgentSessionProjection,
+    DEFAULT_MAX_CONCURRENT, HARD_MAX_CONCURRENT, SubAgentRecord, SubAgentSessionProjection,
     SubAgentStatus, StructuredReport,
 };
 

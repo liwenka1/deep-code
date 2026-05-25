@@ -16,7 +16,7 @@ use crate::runtime::{AgentRuntime, AgentRuntimeHandle};
 use crate::session_store::{
     ConfigSnapshot, JsonSessionStore, SessionId, SessionRecord, SessionStore,
 };
-use crate::shell_tools::shell_tool_registry;
+use crate::shell_tools::{JobStore, shell_tool_registry};
 use crate::subagent::SharedSubAgentManager;
 use crate::tool::ToolRegistry;
 use crate::workspace_summary::build_workspace_summary;
@@ -30,6 +30,7 @@ pub struct LaunchedRuntime {
     pub backend_label: String,
     pub session_id: Option<String>,
     pub subagent_manager: SharedSubAgentManager,
+    pub job_store: JobStore,
     pub stop_hook: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -41,21 +42,25 @@ impl LaunchedRuntime {
 }
 
 #[must_use]
-pub fn build_tool_registry(workspace: &Path) -> ToolRegistry {
+pub fn build_tool_registry(workspace: &Path) -> (ToolRegistry, JobStore) {
     let mut registry = ToolRegistry::with_mock_tools();
+    let mut job_store = JobStore::default();
     match workspace_tool_registry(workspace.to_path_buf()) {
         Ok(workspace_tools) => registry.extend(workspace_tools),
         Err(error) => eprintln!("workspace tools disabled: {error}"),
     }
     match shell_tool_registry(workspace.to_path_buf()) {
-        Ok(shell_tools) => registry.extend(shell_tools),
+        Ok((shell_tools, shell_jobs)) => {
+            registry.extend(shell_tools);
+            job_store = shell_jobs;
+        }
         Err(error) => eprintln!("shell tools disabled: {error}"),
     }
     match git_tool_registry(workspace.to_path_buf()) {
         Ok(git_tools) => registry.extend(git_tools),
         Err(error) => eprintln!("git tools disabled: {error}"),
     }
-    registry
+    (registry, job_store)
 }
 
 #[must_use]
@@ -80,7 +85,7 @@ pub fn launch_runtime(
     if config.api_key.is_some() {
         if let Ok(client) = DeepSeekClient::new(config.clone()) {
             let client = Arc::new(client);
-            let (tools, subagent_manager, shutdown) =
+            let (tools, subagent_manager, job_store, shutdown) =
                 build_parent_tools(Arc::clone(&client), config, &workspace, &parent_cancel);
             if let Some((runtime, session_id)) =
                 try_persisted_runtime((*client).clone(), tools, workspace.clone(), config, &prompt)
@@ -91,11 +96,12 @@ pub fn launch_runtime(
                     backend_label: format!("DeepSeek {}", config.model),
                     session_id: Some(session_id.as_str().to_string()),
                     subagent_manager,
+                    job_store,
                     stop_hook: shutdown,
                 };
             }
             eprintln!("warning: session persistence unavailable; this session will not be saved");
-            let (tools, subagent_manager, shutdown) =
+            let (tools, subagent_manager, job_store, shutdown) =
                 build_parent_tools(Arc::clone(&client), config, &workspace, &parent_cancel);
             let runtime = attach_workspace_helpers(
                 AgentRuntime::with_system_prompt(
@@ -112,13 +118,14 @@ pub fn launch_runtime(
                 backend_label: format!("DeepSeek {}", config.model),
                 session_id: None,
                 subagent_manager,
+                job_store,
                 stop_hook: shutdown,
             };
         }
     }
 
     let client = Arc::new(EchoClient);
-    let (tools, subagent_manager, shutdown) =
+    let (tools, subagent_manager, job_store, shutdown) =
         build_parent_tools(Arc::clone(&client), config, &workspace, &parent_cancel);
     if let Some((runtime, session_id)) =
         try_persisted_runtime(EchoClient, tools, workspace.clone(), config, &prompt)
@@ -129,11 +136,12 @@ pub fn launch_runtime(
             backend_label: "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string(),
             session_id: Some(session_id.as_str().to_string()),
             subagent_manager,
+            job_store,
             stop_hook: shutdown,
         };
     }
     eprintln!("warning: session persistence unavailable; this session will not be saved");
-    let (tools, subagent_manager, shutdown) =
+    let (tools, subagent_manager, job_store, shutdown) =
         build_parent_tools(Arc::clone(&client), config, &workspace, &parent_cancel);
     let runtime = attach_workspace_helpers(
         AgentRuntime::with_system_prompt(EchoClient, tools, prompt, config.clone(), false),
@@ -144,6 +152,7 @@ pub fn launch_runtime(
         backend_label: "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string(),
         session_id: None,
         subagent_manager,
+        job_store,
         stop_hook: shutdown,
     }
 }
@@ -170,7 +179,7 @@ fn launch_resumed(
     if config.api_key.is_some() {
         if let Ok(client) = DeepSeekClient::new(config.clone()) {
             let client = Arc::new(client);
-            let (tools, subagent_manager, shutdown) =
+            let (tools, subagent_manager, job_store, shutdown) =
                 build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
             let runtime = attach_workspace_helpers(
                 AgentRuntime::from_session_record(
@@ -187,13 +196,14 @@ fn launch_resumed(
                 backend_label: format!("DeepSeek {} (resumed)", config.model),
                 session_id: Some(record.id.as_str().to_string()),
                 subagent_manager,
+                job_store,
                 stop_hook: shutdown,
             };
         }
     }
 
     let client = Arc::new(EchoClient);
-    let (tools, subagent_manager, shutdown) =
+    let (tools, subagent_manager, job_store, shutdown) =
         build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
     let runtime = attach_workspace_helpers(
         AgentRuntime::from_session_record(EchoClient, tools, record.clone(), store, config.clone()),
@@ -204,6 +214,7 @@ fn launch_resumed(
         backend_label: "offline echo (resumed)".to_string(),
         session_id: Some(record.id.as_str().to_string()),
         subagent_manager,
+        job_store,
         stop_hook: shutdown,
     }
 }
@@ -216,10 +227,11 @@ fn build_parent_tools<C: LlmClient + Clone + 'static>(
 ) -> (
     ToolRegistry,
     SharedSubAgentManager,
+    JobStore,
     Box<dyn Fn() + Send + Sync>,
 ) {
     let bootstrap = RuntimeBootstrap::load(workspace, None);
-    let mut registry = build_tool_registry(workspace);
+    let (mut registry, job_store) = build_tool_registry(workspace);
     let extensions = attach_agent_extensions(
         &mut registry,
         client,
@@ -232,7 +244,12 @@ fn build_parent_tools<C: LlmClient + Clone + 'static>(
         let extensions = Arc::clone(&extensions);
         move || extensions.cancel_all_running()
     });
-    (registry, extensions.subagent_manager(), shutdown)
+    (
+        registry,
+        extensions.subagent_manager(),
+        job_store,
+        shutdown,
+    )
 }
 
 fn try_persisted_runtime<C: LlmClient + 'static>(

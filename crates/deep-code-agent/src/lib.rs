@@ -116,11 +116,11 @@ pub use rlm::{
 };
 pub use subagent::{
     AgentCloseTool, AgentEvalTool, AgentOpenTool, DEFAULT_MAX_CONCURRENT, HARD_MAX_CONCURRENT,
-    SharedSubAgentManager, StructuredReport, SubAgentManager, SubAgentRole, SubAgentServices,
+    SharedSubAgentManager, StructuredReport, SubAgentManager, SubAgentRecord, SubAgentRole, SubAgentServices,
     SubAgentSessionProjection, SubAgentStatus, attach_subagent_tools, is_subagent_tool,
     register_subagent_tools, subagent_tool_registry,
 };
-pub use shell_tools::{ShellTools, shell_tool_registry};
+pub use shell_tools::{BackgroundJobSummary, JobStore, ShellTools, shell_tool_registry};
 pub use tool::{
     ApprovalDecision, ApprovalRequest, MockEchoTool, Tool, ToolCall, ToolCallAccumulator,
     ToolError, ToolRegistry, ToolResult, ToolResultStatus, ToolRunOutcome, ToolSpec,

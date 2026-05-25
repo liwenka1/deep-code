@@ -49,6 +49,11 @@ impl ShellTools {
         self
     }
 
+    #[must_use]
+    pub fn job_store(&self) -> JobStore {
+        self.jobs.clone()
+    }
+
     pub fn into_registry(self) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
         registry.register(ShellRunTool::new(
@@ -68,17 +73,52 @@ impl ShellTools {
     }
 }
 
-pub fn shell_tool_registry(root: impl Into<std::path::PathBuf>) -> Result<ToolRegistry, ToolError> {
-    Ok(ShellTools::new(root)?.into_registry())
+pub fn shell_tool_registry(
+    root: impl Into<std::path::PathBuf>,
+) -> Result<(ToolRegistry, JobStore), ToolError> {
+    let shell = ShellTools::new(root)?;
+    let jobs = shell.job_store();
+    Ok((shell.into_registry(), jobs))
 }
 
 #[derive(Debug, Clone, Default)]
-struct JobStore {
+pub struct JobStore {
     next_id: Arc<AtomicU64>,
     jobs: Arc<Mutex<HashMap<String, Arc<Mutex<JobState>>>>>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BackgroundJobSummary {
+    pub id: String,
+    pub command: String,
+    pub cwd: String,
+    pub status: JobStatus,
+    pub exit_code: Option<i32>,
+    pub background: bool,
+}
+
 impl JobStore {
+    /// Summaries of shell jobs tracked for the current runtime (foreground + background).
+    pub fn list_summaries(&self) -> Vec<BackgroundJobSummary> {
+        let guard = self.jobs.lock().expect("job store lock poisoned");
+        let mut summaries: Vec<_> = guard
+            .iter()
+            .filter_map(|(id, state_arc)| {
+                let state = state_arc.lock().ok()?;
+                Some(BackgroundJobSummary {
+                    id: id.clone(),
+                    command: state.command.clone(),
+                    cwd: state.cwd.clone(),
+                    status: state.status,
+                    exit_code: state.exit_code,
+                    background: state.kind == JobKind::Background,
+                })
+            })
+            .collect();
+        summaries.sort_by(|left, right| right.id.cmp(&left.id));
+        summaries
+    }
+
     fn insert(&self, state: JobState) -> String {
         let id = format!("job_{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
         self.jobs
@@ -114,14 +154,14 @@ struct JobState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum JobKind {
+pub enum JobKind {
     Foreground,
     Background,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum JobStatus {
+pub enum JobStatus {
     Running,
     Completed,
     Failed,

@@ -545,7 +545,7 @@ mod tests {
     #[test]
     fn policy_denies_dangerous_shell_before_execution() {
         let workspace = tempfile::tempdir().unwrap();
-        let registry = crate::shell_tools::shell_tool_registry(workspace.path()).unwrap();
+        let (registry, _) = crate::shell_tools::shell_tool_registry(workspace.path()).unwrap();
         let call = ToolCall::new("call_deny", "shell_run", json!({"command": "rm -rf /"}));
         let plan = registry.evaluate_tool(&call);
         let outcome = registry.run_tool_call_with_plan(&call, None, plan).unwrap();
