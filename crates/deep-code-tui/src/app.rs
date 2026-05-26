@@ -10,10 +10,10 @@
 use std::sync::Arc;
 
 use deep_code_agent::{
-    AgentConfig, AgentEvent, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest,
-    CheckpointId, CheckpointStore, CostCurrency, JsonSessionStore, Message, Role, RuntimeEvent,
-    SessionRecord, SessionStore, SharedSubAgentManager, TurnTelemetry,
-    format_sessions_storage_note, is_subagent_tool, launch_runtime,
+    AgentConfig, AgentEvent, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest, CheckpointId,
+    CheckpointStore, CostCurrency, JsonSessionStore, Message, Role, RuntimeEvent, SessionRecord,
+    SessionStore, SharedSubAgentManager, TurnTelemetry, format_sessions_storage_note,
+    is_subagent_tool, launch_runtime,
 };
 use tokio::sync::mpsc;
 
@@ -488,7 +488,8 @@ impl App {
                                 .join("\n")
                         ),
                     });
-                    self.status = format!("{} session(s). CLI: deep-code session list", records.len());
+                    self.status =
+                        format!("{} session(s). CLI: deep-code session list", records.len());
                 }
                 Err(error) => self.status = format!("List failed: {error}"),
             },
@@ -535,9 +536,7 @@ impl App {
             Ok(store) => match store.restore(&checkpoint_id) {
                 Ok(()) => {
                     self.last_checkpoint = Some(id.to_string());
-                    self.apply_runtime_event(RuntimeEvent::WorkspaceRestored {
-                        id: checkpoint_id,
-                    });
+                    self.apply_runtime_event(RuntimeEvent::WorkspaceRestored { id: checkpoint_id });
                 }
                 Err(error) => self.status = format!("Restore failed: {error}"),
             },
@@ -576,11 +575,7 @@ enum StreamRequest {
 }
 
 fn hydrate_messages(record: &SessionRecord) -> Vec<ChatMessage> {
-    record
-        .messages
-        .iter()
-        .filter_map(|message| message_to_chat(message))
-        .collect()
+    record.messages.iter().filter_map(message_to_chat).collect()
 }
 
 fn message_to_chat(message: &Message) -> Option<ChatMessage> {
@@ -624,20 +619,20 @@ fn message_to_chat(message: &Message) -> Option<ChatMessage> {
 fn summarize_tool_result(content: &str) -> String {
     const MAX_CHARS: usize = 300;
 
-    if content.contains("<diagnostics file=") {
-        if let Some(block_start) = content.find("<diagnostics file=") {
-            let prefix = content[..block_start].trim();
-            let diagnostics = &content[block_start..];
-            let diag_summary = diagnostics
-                .lines()
-                .find(|line| line.starts_with("  ERROR") || line.starts_with("  WARNING"))
-                .map(|line| line.trim().to_string())
-                .unwrap_or_else(|| "diagnostics attached".to_string());
-            if prefix.is_empty() {
-                return truncate_chars(&diag_summary, MAX_CHARS);
-            }
-            return truncate_chars(&format!("{prefix} | {diag_summary}"), MAX_CHARS);
+    if content.contains("<diagnostics file=")
+        && let Some(block_start) = content.find("<diagnostics file=")
+    {
+        let prefix = content[..block_start].trim();
+        let diagnostics = &content[block_start..];
+        let diag_summary = diagnostics
+            .lines()
+            .find(|line| line.starts_with("  ERROR") || line.starts_with("  WARNING"))
+            .map(|line| line.trim().to_string())
+            .unwrap_or_else(|| "diagnostics attached".to_string());
+        if prefix.is_empty() {
+            return truncate_chars(&diag_summary, MAX_CHARS);
         }
+        return truncate_chars(&format!("{prefix} | {diag_summary}"), MAX_CHARS);
     }
 
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
@@ -784,7 +779,9 @@ fn format_turn_telemetry(telemetry: &TurnTelemetry, currency: CostCurrency) -> S
     };
     let context = format!(
         "ctx {}/{} ({}%)",
-        telemetry.estimated_context_tokens, telemetry.context_window, telemetry.context_usage_percent
+        telemetry.estimated_context_tokens,
+        telemetry.context_window,
+        telemetry.context_usage_percent
     );
     let compaction = if telemetry.near_compaction_threshold {
         " | 接近压缩阈值"

@@ -7,9 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::handle::{HandleKind, HandleStore, VarHandle};
 use crate::subagent::output::parse_structured_report;
 use crate::subagent::types::{
-    HARD_MAX_CONCURRENT, SUBAGENT_STATE_FILE,
-    SUBAGENT_STATE_SCHEMA_VERSION, SubAgentError, SubAgentRecord, SubAgentSessionProjection,
-    SubAgentStatus,
+    HARD_MAX_CONCURRENT, SUBAGENT_STATE_FILE, SUBAGENT_STATE_SCHEMA_VERSION, SubAgentError,
+    SubAgentRecord, SubAgentSessionProjection, SubAgentStatus,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,7 +93,11 @@ impl SubAgentManager {
         self.persist_state()
     }
 
-    pub fn update(&mut self, agent_id: &str, update: impl FnOnce(&mut SubAgentRecord)) -> Result<(), SubAgentError> {
+    pub fn update(
+        &mut self,
+        agent_id: &str,
+        update: impl FnOnce(&mut SubAgentRecord),
+    ) -> Result<(), SubAgentError> {
         let record = self
             .agents
             .get_mut(agent_id)
@@ -172,9 +175,12 @@ impl SubAgentManager {
             "started_at_ms": record.started_at_ms,
             "finished_at_ms": record.finished_at_ms,
         });
-        let mut store = self.handle_store.write().map_err(|error| SubAgentError::State {
-            message: error.to_string(),
-        })?;
+        let mut store = self
+            .handle_store
+            .write()
+            .map_err(|error| SubAgentError::State {
+                message: error.to_string(),
+            })?;
         Ok(store.insert_json_with_owner(
             format!("agent:{}", record.agent_id),
             HandleKind::Transcript,
@@ -265,9 +271,10 @@ impl SubAgentManager {
         if !self.state_path.exists() {
             return Ok(());
         }
-        let payload = std::fs::read_to_string(&self.state_path).map_err(|error| SubAgentError::Io {
-            message: error.to_string(),
-        })?;
+        let payload =
+            std::fs::read_to_string(&self.state_path).map_err(|error| SubAgentError::Io {
+                message: error.to_string(),
+            })?;
         let state: PersistedSubAgentState =
             serde_json::from_str(&payload).map_err(|error| SubAgentError::State {
                 message: error.to_string(),
@@ -302,9 +309,10 @@ impl SubAgentManager {
             session_boot_id: self.session_boot_id.clone(),
             agents: self.agents.values().cloned().collect(),
         };
-        let payload = serde_json::to_string_pretty(&state).map_err(|error| SubAgentError::State {
-            message: error.to_string(),
-        })?;
+        let payload =
+            serde_json::to_string_pretty(&state).map_err(|error| SubAgentError::State {
+                message: error.to_string(),
+            })?;
         let tmp = self.state_path.with_extension("tmp");
         std::fs::write(&tmp, payload).map_err(|error| SubAgentError::Io {
             message: error.to_string(),
@@ -444,7 +452,9 @@ mod tests {
                 session_boot_id: Some(boot),
             })
             .unwrap();
-        let record = manager.finalize_success("a1", "done".to_string(), 1).unwrap();
+        let record = manager
+            .finalize_success("a1", "done".to_string(), 1)
+            .unwrap();
         let handle_id = record.transcript_handle.clone().expect("handle");
         assert!(store.read().unwrap().get_summary(&handle_id).is_some());
         manager.release_transcript_handles(&record).unwrap();
@@ -456,7 +466,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(RwLock::new(HandleStore::new()));
         {
-            let mut manager = SubAgentManager::new(dir.path().to_path_buf(), 10, Arc::clone(&store));
+            let mut manager =
+                SubAgentManager::new(dir.path().to_path_buf(), 10, Arc::clone(&store));
             let boot = manager.session_boot_id.clone();
             manager
                 .insert(SubAgentRecord {

@@ -7,8 +7,8 @@ use serde::Serialize;
 use crate::config::{AgentConfig, DEEPSEEK_API_KEY_ENV};
 use crate::error::api_key_setup_hint;
 use crate::hooks::default_hooks_config_path;
-use crate::model_registry::ModelRegistry;
 use crate::mcp::{McpManager, McpServerStatus, default_mcp_config_path, workspace_mcp_config_path};
+use crate::model_registry::ModelRegistry;
 use crate::sandbox::detect_capabilities;
 use crate::skills::{discover_in_workspace, global_skills_dir, workspace_skills_dir};
 
@@ -204,9 +204,7 @@ fn collect_mcp(workspace: &Path) -> McpDoctorReport {
             let (status, detail) = match &server.status {
                 McpServerStatus::Ready => ("ok".to_string(), "ready".to_string()),
                 McpServerStatus::Disabled => ("disabled".to_string(), "disabled".to_string()),
-                McpServerStatus::Failed { error } => {
-                    ("error".to_string(), error.clone())
-                }
+                McpServerStatus::Failed { error } => ("error".to_string(), error.clone()),
             };
             McpServerDoctorEntry {
                 name: server.name,

@@ -10,9 +10,7 @@ use crate::hooks::{HookDispatcher, HooksConfig, load_hooks_config};
 use crate::mcp::{McpManager, register_mcp_tools};
 use crate::rlm::{RlmServices, register_rlm_tools};
 use crate::skills::build_system_prompt;
-use crate::subagent::{
-    SubAgentServices, register_subagent_tools, DEFAULT_MAX_CONCURRENT,
-};
+use crate::subagent::{DEFAULT_MAX_CONCURRENT, SubAgentServices, register_subagent_tools};
 use crate::tool::ToolRegistry;
 
 /// Shared parent-runtime services for handles, sub-agents, RLM, and MCP.
@@ -65,10 +63,7 @@ pub fn build_runtime_system_prompt(base: &str, workspace: &Path) -> String {
     build_system_prompt(base, workspace)
 }
 
-pub fn attach_runtime_tools(
-    registry: &mut ToolRegistry,
-    bootstrap: &RuntimeBootstrap,
-) {
+pub fn attach_runtime_tools(registry: &mut ToolRegistry, bootstrap: &RuntimeBootstrap) {
     registry.set_hooks(Arc::clone(&bootstrap.hooks));
     register_mcp_tools(registry, Arc::clone(&bootstrap.mcp));
 }

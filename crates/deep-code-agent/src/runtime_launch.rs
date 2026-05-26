@@ -8,9 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::client::{DeepSeekClient, LlmClient};
 use crate::config::AgentConfig;
 use crate::echo_client::EchoClient;
-use crate::extensions::{
-    RuntimeBootstrap, attach_agent_extensions, build_runtime_system_prompt,
-};
+use crate::extensions::{RuntimeBootstrap, attach_agent_extensions, build_runtime_system_prompt};
 use crate::git_tools::git_tool_registry;
 use crate::runtime::{AgentRuntime, AgentRuntimeHandle};
 use crate::session_store::{
@@ -82,46 +80,46 @@ pub fn launch_runtime(
         return launch_resumed(config, record, &parent_cancel);
     }
 
-    if config.api_key.is_some() {
-        if let Ok(client) = DeepSeekClient::new(config.clone()) {
-            let client = Arc::new(client);
-            let (tools, subagent_manager, job_store, shutdown) =
-                build_parent_tools(Arc::clone(&client), config, &workspace, &parent_cancel);
-            if let Some((runtime, session_id)) =
-                try_persisted_runtime((*client).clone(), tools, workspace.clone(), config, &prompt)
-            {
-                let runtime = attach_workspace_helpers(runtime, &workspace);
-                return LaunchedRuntime {
-                    handle: Arc::new(runtime),
-                    backend_label: format!("DeepSeek {}", config.model),
-                    session_id: Some(session_id.as_str().to_string()),
-                    subagent_manager,
-                    job_store,
-                    stop_hook: shutdown,
-                };
-            }
-            eprintln!("warning: session persistence unavailable; this session will not be saved");
-            let (tools, subagent_manager, job_store, shutdown) =
-                build_parent_tools(Arc::clone(&client), config, &workspace, &parent_cancel);
-            let runtime = attach_workspace_helpers(
-                AgentRuntime::with_system_prompt(
-                    (*client).clone(),
-                    tools,
-                    prompt,
-                    config.clone(),
-                    false,
-                ),
-                &workspace,
-            );
+    if config.api_key.is_some()
+        && let Ok(client) = DeepSeekClient::new(config.clone())
+    {
+        let client = Arc::new(client);
+        let (tools, subagent_manager, job_store, shutdown) =
+            build_parent_tools(Arc::clone(&client), config, &workspace, &parent_cancel);
+        if let Some((runtime, session_id)) =
+            try_persisted_runtime((*client).clone(), tools, workspace.clone(), config, &prompt)
+        {
+            let runtime = attach_workspace_helpers(runtime, &workspace);
             return LaunchedRuntime {
                 handle: Arc::new(runtime),
                 backend_label: format!("DeepSeek {}", config.model),
-                session_id: None,
+                session_id: Some(session_id.as_str().to_string()),
                 subagent_manager,
                 job_store,
                 stop_hook: shutdown,
             };
         }
+        eprintln!("warning: session persistence unavailable; this session will not be saved");
+        let (tools, subagent_manager, job_store, shutdown) =
+            build_parent_tools(Arc::clone(&client), config, &workspace, &parent_cancel);
+        let runtime = attach_workspace_helpers(
+            AgentRuntime::with_system_prompt(
+                (*client).clone(),
+                tools,
+                prompt,
+                config.clone(),
+                false,
+            ),
+            &workspace,
+        );
+        return LaunchedRuntime {
+            handle: Arc::new(runtime),
+            backend_label: format!("DeepSeek {}", config.model),
+            session_id: None,
+            subagent_manager,
+            job_store,
+            stop_hook: shutdown,
+        };
     }
 
     let client = Arc::new(EchoClient);
@@ -176,30 +174,30 @@ fn launch_resumed(
         eprintln!("failed to refresh session config snapshot: {error}");
     }
 
-    if config.api_key.is_some() {
-        if let Ok(client) = DeepSeekClient::new(config.clone()) {
-            let client = Arc::new(client);
-            let (tools, subagent_manager, job_store, shutdown) =
-                build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
-            let runtime = attach_workspace_helpers(
-                AgentRuntime::from_session_record(
-                    (*client).clone(),
-                    tools,
-                    record.clone(),
-                    store,
-                    config.clone(),
-                ),
-                &workspace,
-            );
-            return LaunchedRuntime {
-                handle: Arc::new(runtime),
-                backend_label: format!("DeepSeek {} (resumed)", config.model),
-                session_id: Some(record.id.as_str().to_string()),
-                subagent_manager,
-                job_store,
-                stop_hook: shutdown,
-            };
-        }
+    if config.api_key.is_some()
+        && let Ok(client) = DeepSeekClient::new(config.clone())
+    {
+        let client = Arc::new(client);
+        let (tools, subagent_manager, job_store, shutdown) =
+            build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
+        let runtime = attach_workspace_helpers(
+            AgentRuntime::from_session_record(
+                (*client).clone(),
+                tools,
+                record.clone(),
+                store,
+                config.clone(),
+            ),
+            &workspace,
+        );
+        return LaunchedRuntime {
+            handle: Arc::new(runtime),
+            backend_label: format!("DeepSeek {} (resumed)", config.model),
+            session_id: Some(record.id.as_str().to_string()),
+            subagent_manager,
+            job_store,
+            stop_hook: shutdown,
+        };
     }
 
     let client = Arc::new(EchoClient);
@@ -244,12 +242,7 @@ fn build_parent_tools<C: LlmClient + Clone + 'static>(
         let extensions = Arc::clone(&extensions);
         move || extensions.cancel_all_running()
     });
-    (
-        registry,
-        extensions.subagent_manager(),
-        job_store,
-        shutdown,
-    )
+    (registry, extensions.subagent_manager(), job_store, shutdown)
 }
 
 fn try_persisted_runtime<C: LlmClient + 'static>(

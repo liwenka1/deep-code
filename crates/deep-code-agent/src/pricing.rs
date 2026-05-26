@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::Usage;
-use crate::model_registry::{ModelRegistry, ModelPricingMeta};
+use crate::model_registry::{ModelPricingMeta, ModelRegistry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -101,7 +101,9 @@ pub struct TurnTelemetry {
 
 #[must_use]
 pub fn calculate_turn_cost(model: &str, usage: &Usage) -> CostEstimate {
-    let Some(pricing) = ModelRegistry::default().info_for(model).map(|info| info.pricing.clone())
+    let Some(pricing) = ModelRegistry::default()
+        .info_for(model)
+        .map(|info| info.pricing.clone())
     else {
         return CostEstimate::default();
     };

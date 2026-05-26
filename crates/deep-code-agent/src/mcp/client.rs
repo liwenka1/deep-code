@@ -8,8 +8,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::config::{McpServerConfig, McpTransport};
 use super::McpError;
+use super::config::{McpServerConfig, McpTransport};
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -46,8 +46,10 @@ impl InMemoryMcpClient {
         description: Option<&str>,
         sample_result: Value,
     ) -> Self {
-        self.tools
-            .insert(name.into(), (description.map(str::to_string), sample_result));
+        self.tools.insert(
+            name.into(),
+            (description.map(str::to_string), sample_result),
+        );
         self
     }
 
@@ -160,17 +162,16 @@ impl StdioMcpClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         command_builder.envs(&config.env);
-        let mut child = command_builder.spawn().map_err(|error| McpError::ConnectFailed {
-            server: config.name.clone(),
-            message: error.to_string(),
-        })?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| McpError::ConnectFailed {
+        let mut child = command_builder
+            .spawn()
+            .map_err(|error| McpError::ConnectFailed {
                 server: config.name.clone(),
-                message: "missing stdout".to_string(),
+                message: error.to_string(),
             })?;
+        let stdout = child.stdout.take().ok_or_else(|| McpError::ConnectFailed {
+            server: config.name.clone(),
+            message: "missing stdout".to_string(),
+        })?;
         let mut session = StdioMcpSession {
             server_name: config.name.clone(),
             child,
@@ -285,10 +286,13 @@ impl StdioMcpSession {
                 });
             }
             let mut line = String::new();
-            let read = self.stdout.read_line(&mut line).map_err(|error| McpError::Protocol {
-                server: self.server_name.clone(),
-                message: error.to_string(),
-            })?;
+            let read = self
+                .stdout
+                .read_line(&mut line)
+                .map_err(|error| McpError::Protocol {
+                    server: self.server_name.clone(),
+                    message: error.to_string(),
+                })?;
             if read == 0 {
                 return Err(McpError::Protocol {
                     server: self.server_name.clone(),
@@ -298,12 +302,11 @@ impl StdioMcpSession {
             if line.trim().is_empty() {
                 continue;
             }
-            let message: JsonRpcMessage = serde_json::from_str(&line).map_err(|error| {
-                McpError::Protocol {
+            let message: JsonRpcMessage =
+                serde_json::from_str(&line).map_err(|error| McpError::Protocol {
                     server: self.server_name.clone(),
                     message: format!("invalid json-rpc line: {error}"),
-                }
-            })?;
+                })?;
             if message.id.is_none() {
                 continue;
             }

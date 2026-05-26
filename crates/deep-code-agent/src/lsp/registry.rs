@@ -69,7 +69,10 @@ mod tests {
             detect_language(&PathBuf::from("foo.ts")),
             Language::TypeScript
         );
-        assert_eq!(detect_language(&PathBuf::from("notes.txt")), Language::Other);
+        assert_eq!(
+            detect_language(&PathBuf::from("notes.txt")),
+            Language::Other
+        );
     }
 
     #[test]

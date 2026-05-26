@@ -111,7 +111,7 @@ impl AnalysisRuntime {
             }
             "peek" => {
                 let start = parse_usize(&tokens, 1, "peek")?;
-                let end = tokens.get(2).map(|value| value.parse::<usize>().ok()).flatten();
+                let end = tokens.get(2).and_then(|value| value.parse::<usize>().ok());
                 let end = end.unwrap_or(start);
                 Ok(slice_lines(&self.context, start, end))
             }
@@ -195,7 +195,11 @@ fn rest_as_pattern(tokens: &[String]) -> Result<String, String> {
 fn take_lines(text: &str, count: usize, from_head: bool) -> String {
     let lines: Vec<&str> = text.lines().collect();
     if from_head {
-        lines.into_iter().take(count.max(1)).collect::<Vec<_>>().join("\n")
+        lines
+            .into_iter()
+            .take(count.max(1))
+            .collect::<Vec<_>>()
+            .join("\n")
     } else {
         let start = lines.len().saturating_sub(count.max(1));
         lines[start..].join("\n")

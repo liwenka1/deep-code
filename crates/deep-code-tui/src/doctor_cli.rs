@@ -17,7 +17,10 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
     println!("deep-code doctor");
     println!("  version: {}", report.version);
     println!("  workspace: {}", report.workspace);
-    println!("  config: {} (present={})", report.config_path, report.config_present);
+    println!(
+        "  config: {} (present={})",
+        report.config_path, report.config_present
+    );
     println!("  api key: {}", report.api_key.source);
     println!("  model: {} @ {}", report.default_model, report.base_url);
     println!(
@@ -38,7 +41,11 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
     }
     println!(
         "  sandbox: {} ({})",
-        if report.sandbox.available { "available" } else { "unavailable" },
+        if report.sandbox.available {
+            "available"
+        } else {
+            "unavailable"
+        },
         report.sandbox.detail
     );
     println!(

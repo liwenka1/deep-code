@@ -80,10 +80,11 @@ impl Tool for RlmOpenTool {
         let (body, source_type, source_hint) = if let Some(path) = file_path {
             let policy = WorkspacePolicy::new(&self.services.workspace)?;
             let resolved = policy.resolve_existing(path, "rlm_open")?;
-            let body = std::fs::read_to_string(&resolved).map_err(|error| ToolError::ExecutionFailed {
-                name: "rlm_open".to_string(),
-                message: format!("failed to read {}: {error}", resolved.display()),
-            })?;
+            let body =
+                std::fs::read_to_string(&resolved).map_err(|error| ToolError::ExecutionFailed {
+                    name: "rlm_open".to_string(),
+                    message: format!("failed to read {}: {error}", resolved.display()),
+                })?;
             (
                 body,
                 "file".to_string(),
@@ -107,10 +108,14 @@ impl Tool for RlmOpenTool {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| derive_session_name(source_hint.as_deref()));
 
-        let mut manager = self.services.manager.write().map_err(|error| ToolError::ExecutionFailed {
-            name: "rlm_open".to_string(),
-            message: error.to_string(),
-        })?;
+        let mut manager =
+            self.services
+                .manager
+                .write()
+                .map_err(|error| ToolError::ExecutionFailed {
+                    name: "rlm_open".to_string(),
+                    message: error.to_string(),
+                })?;
         let info = manager
             .open(name.clone(), body, source_type)
             .map_err(rlm_error)?;
@@ -163,10 +168,14 @@ impl Tool for RlmEvalTool {
     fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
         let name = required_str(&call.arguments, "name", "rlm_eval")?;
         let code = required_str(&call.arguments, "code", "rlm_eval")?;
-        let mut manager = self.services.manager.write().map_err(|error| ToolError::ExecutionFailed {
-            name: "rlm_eval".to_string(),
-            message: error.to_string(),
-        })?;
+        let mut manager =
+            self.services
+                .manager
+                .write()
+                .map_err(|error| ToolError::ExecutionFailed {
+                    name: "rlm_eval".to_string(),
+                    message: error.to_string(),
+                })?;
         let output = manager.eval(name, code).map_err(rlm_error)?;
         let payload = if output.stored_handle {
             let handle_id = output.handle_id.clone().unwrap_or_default();
@@ -245,10 +254,14 @@ impl Tool for RlmConfigureTool {
             .get("grep_max_matches")
             .and_then(Value::as_u64)
             .map(|value| value as usize);
-        let mut manager = self.services.manager.write().map_err(|error| ToolError::ExecutionFailed {
-            name: "rlm_configure".to_string(),
-            message: error.to_string(),
-        })?;
+        let mut manager =
+            self.services
+                .manager
+                .write()
+                .map_err(|error| ToolError::ExecutionFailed {
+                    name: "rlm_configure".to_string(),
+                    message: error.to_string(),
+                })?;
         let config = manager
             .configure(name, max_inline, grep_max)
             .map_err(rlm_error)?;
@@ -289,10 +302,14 @@ impl Tool for RlmCloseTool {
 
     fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
         let name = required_str(&call.arguments, "name", "rlm_close")?;
-        let mut manager = self.services.manager.write().map_err(|error| ToolError::ExecutionFailed {
-            name: "rlm_close".to_string(),
-            message: error.to_string(),
-        })?;
+        let mut manager =
+            self.services
+                .manager
+                .write()
+                .map_err(|error| ToolError::ExecutionFailed {
+                    name: "rlm_close".to_string(),
+                    message: error.to_string(),
+                })?;
         let info = manager.close(name).map_err(rlm_error)?;
         Ok(ToolResult::success(
             &call.id,

@@ -3,7 +3,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use deep_code_agent::{format_sessions_storage_note, JsonSessionStore, SessionId, SessionStore};
+use deep_code_agent::{JsonSessionStore, SessionId, SessionStore, format_sessions_storage_note};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunMode {
@@ -109,10 +109,7 @@ pub fn parse_args() -> CliArgs {
     }
 
     CliArgs {
-        mode: RunMode::Tui {
-            resume,
-            force_new,
-        },
+        mode: RunMode::Tui { resume, force_new },
     }
 }
 
@@ -208,10 +205,7 @@ fn parse_mcp_command(mut args: Vec<String>) -> CliArgs {
     };
     args.remove(0);
     CliArgs {
-        mode: RunMode::Mcp {
-            subcommand,
-            args,
-        },
+        mode: RunMode::Mcp { subcommand, args },
     }
 }
 

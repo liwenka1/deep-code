@@ -63,11 +63,11 @@ pub fn detect_capabilities() -> SandboxCapabilities {
                 detail: "sandbox-exec (Seatbelt) is available".to_string(),
             };
         }
-        return SandboxCapabilities {
+        SandboxCapabilities {
             backend: SandboxBackend::None,
             available: false,
             detail: "sandbox-exec is missing or not permitted".to_string(),
-        };
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -132,7 +132,7 @@ impl SandboxManager {
 
         #[cfg(target_os = "macos")]
         {
-            return macos_seatbelt::wrap_shell_command(command, cwd, workspace, policy);
+            macos_seatbelt::wrap_shell_command(command, cwd, workspace, policy)
         }
 
         #[cfg(not(target_os = "macos"))]

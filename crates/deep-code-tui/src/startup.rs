@@ -9,7 +9,9 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use deep_code_agent::{format_sessions_storage_note, JsonSessionStore, SessionRecord, SessionStore};
+use deep_code_agent::{
+    JsonSessionStore, SessionRecord, SessionStore, format_sessions_storage_note,
+};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::{Color, Line, Style};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
@@ -40,7 +42,9 @@ pub fn choose_startup(
                 .ok_or_else(|| anyhow::anyhow!("no saved sessions to resume"))
                 .map(Some);
         }
-        return Ok(Some(store.load(&deep_code_agent::SessionId::parse(token)?)?));
+        return Ok(Some(
+            store.load(&deep_code_agent::SessionId::parse(token)?)?,
+        ));
     }
 
     if sessions.is_empty() {
@@ -60,9 +64,7 @@ fn storage_note(sessions: &[SessionRecord]) -> String {
         .unwrap_or_else(|| {
             std::env::current_dir()
                 .map(|cwd| format_sessions_storage_note(&cwd))
-                .unwrap_or_else(|_| {
-                    "Sessions are stored per workspace directory.".to_string()
-                })
+                .unwrap_or_else(|_| "Sessions are stored per workspace directory.".to_string())
         })
 }
 
@@ -112,26 +114,26 @@ fn run_picker(sessions: &[SessionRecord]) -> Result<StartupChoice> {
             frame.render_widget(help, chunks[1]);
         })?;
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match key.code {
-                    KeyCode::Up => selected = selected.saturating_sub(1),
-                    KeyCode::Down => {
-                        if selected + 1 < sessions.len() {
-                            selected += 1;
-                        }
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Up => selected = selected.saturating_sub(1),
+                KeyCode::Down => {
+                    if selected + 1 < sessions.len() {
+                        selected += 1;
                     }
-                    KeyCode::Enter => break StartupChoice::Resume(selected),
-                    KeyCode::Char('n') | KeyCode::Esc => break StartupChoice::NewSession,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        restore_terminal(&mut terminal)?;
-                        std::process::exit(0);
-                    }
-                    _ => {}
                 }
+                KeyCode::Enter => break StartupChoice::Resume(selected),
+                KeyCode::Char('n') | KeyCode::Esc => break StartupChoice::NewSession,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    restore_terminal(&mut terminal)?;
+                    std::process::exit(0);
+                }
+                _ => {}
             }
         }
     };

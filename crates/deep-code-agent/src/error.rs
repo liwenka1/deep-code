@@ -4,7 +4,9 @@ pub type AgentResult<T> = Result<T, AgentError>;
 
 #[derive(Debug, Error)]
 pub enum AgentError {
-    #[error("缺少 DeepSeek API Key；请设置环境变量 DEEPSEEK_API_KEY，或在 https://platform.deepseek.com 获取密钥")]
+    #[error(
+        "缺少 DeepSeek API Key；请设置环境变量 DEEPSEEK_API_KEY，或在 https://platform.deepseek.com 获取密钥"
+    )]
     MissingApiKey,
 
     #[error("配置无效：{0}")]

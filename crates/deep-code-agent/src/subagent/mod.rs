@@ -19,8 +19,8 @@ pub use registry::{
 pub use roles::SubAgentRole;
 pub use tools::{AgentCloseTool, AgentEvalTool, AgentOpenTool};
 pub use types::{
-    DEFAULT_MAX_CONCURRENT, HARD_MAX_CONCURRENT, SubAgentRecord, SubAgentSessionProjection,
-    SubAgentStatus, StructuredReport,
+    DEFAULT_MAX_CONCURRENT, HARD_MAX_CONCURRENT, StructuredReport, SubAgentRecord,
+    SubAgentSessionProjection, SubAgentStatus,
 };
 
 pub type SharedSubAgentManager = std::sync::Arc<std::sync::RwLock<SubAgentManager>>;

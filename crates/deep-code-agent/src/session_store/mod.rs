@@ -125,8 +125,7 @@ impl SessionRecord {
     #[must_use]
     pub fn new(workspace: PathBuf, config: &AgentConfig, system_prompt: impl Into<String>) -> Self {
         let now = now_ms();
-        let mut messages = Vec::new();
-        messages.push(crate::message::Message::system(system_prompt));
+        let messages = vec![crate::message::Message::system(system_prompt)];
         Self {
             schema_version: SESSION_SCHEMA_VERSION,
             id: new_session_id(),
@@ -193,17 +192,13 @@ pub fn new_session_id() -> SessionId {
 /// Reject path components and other unsafe filename characters in session ids.
 pub fn validate_session_id(id: &str) -> Result<(), SessionStoreError> {
     if id.is_empty() || id.len() > 128 {
-        return Err(SessionStoreError::InvalidId {
-            id: id.to_string(),
-        });
+        return Err(SessionStoreError::InvalidId { id: id.to_string() });
     }
     if !id
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
     {
-        return Err(SessionStoreError::InvalidId {
-            id: id.to_string(),
-        });
+        return Err(SessionStoreError::InvalidId { id: id.to_string() });
     }
     Ok(())
 }
@@ -261,11 +256,8 @@ mod tests {
 
     #[test]
     fn session_record_preview_uses_latest_user_message() {
-        let mut record = SessionRecord::new(
-            PathBuf::from("/tmp/ws"),
-            &AgentConfig::default(),
-            "system",
-        );
+        let mut record =
+            SessionRecord::new(PathBuf::from("/tmp/ws"), &AgentConfig::default(), "system");
         record.messages.push(Message::user("first"));
         record.messages.push(Message::assistant("ok"));
         record.messages.push(Message::user("second"));

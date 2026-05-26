@@ -103,7 +103,10 @@ mod tests {
 
     #[test]
     fn role_aliases_resolve() {
-        assert_eq!(SubAgentRole::parse("explorer").unwrap(), SubAgentRole::Explore);
+        assert_eq!(
+            SubAgentRole::parse("explorer").unwrap(),
+            SubAgentRole::Explore
+        );
         assert_eq!(
             SubAgentRole::parse("code-review").unwrap(),
             SubAgentRole::Review

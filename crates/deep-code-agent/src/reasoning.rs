@@ -155,6 +155,9 @@ mod tests {
             ReasoningEffort::Low
         );
         assert_eq!(select_auto_effort(true, "debug"), ReasoningEffort::Low);
-        assert_eq!(select_auto_effort(false, "refactor module"), ReasoningEffort::High);
+        assert_eq!(
+            select_auto_effort(false, "refactor module"),
+            ReasoningEffort::High
+        );
     }
 }

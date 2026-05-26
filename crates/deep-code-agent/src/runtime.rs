@@ -68,17 +68,11 @@ pub enum RuntimeEvent {
         summary: String,
     },
     /// Workspace snapshot stored under `.deep-code/checkpoints/`.
-    CheckpointCreated {
-        id: CheckpointId,
-        label: String,
-    },
+    CheckpointCreated { id: CheckpointId, label: String },
     /// Workspace restored from a checkpoint (via runtime or UI command).
     WorkspaceRestored { id: CheckpointId },
     /// Post-edit LSP diagnostics were collected for one or more files.
-    DiagnosticsUpdated {
-        summary: String,
-        rendered: String,
-    },
+    DiagnosticsUpdated { summary: String, rendered: String },
     /// Runtime-level error. Terminal for the current turn.
     Error { message: String },
 }
@@ -114,9 +108,7 @@ pub trait AgentRuntimeHandle: Send + Sync {
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<SessionId>> + Send + '_>>;
 
-    fn shutdown(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+    fn shutdown(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
 }
 
 impl<C: LlmClient + 'static> AgentRuntimeHandle for AgentRuntime<C> {
@@ -156,9 +148,7 @@ impl<C: LlmClient + 'static> AgentRuntimeHandle for AgentRuntime<C> {
         Box::pin(AgentRuntime::session_id(self))
     }
 
-    fn shutdown(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    fn shutdown(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(AgentRuntime::shutdown(self))
     }
 }
@@ -296,7 +286,13 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         let store = JsonSessionStore::for_workspace(&workspace)?;
         let record = SessionRecord::new(workspace.clone(), config, system);
         store.save(&record)?;
-        Ok(Self::from_session_record(client, tools, record, store, config.clone()))
+        Ok(Self::from_session_record(
+            client,
+            tools,
+            record,
+            store,
+            config.clone(),
+        ))
     }
 
     /// Resume a runtime from a previously saved session record.
@@ -345,11 +341,12 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         let store = JsonSessionStore::for_workspace(&workspace)?;
         let mut record = SessionRecord::new(workspace.clone(), config, system_prompt);
         {
-            let state = self.state.try_lock().map_err(|_| {
-                crate::session_store::SessionStoreError::Io {
-                    message: "runtime state is busy".to_string(),
-                }
-            })?;
+            let state =
+                self.state
+                    .try_lock()
+                    .map_err(|_| crate::session_store::SessionStoreError::Io {
+                        message: "runtime state is busy".to_string(),
+                    })?;
             record.messages = state.session.messages().to_vec();
         }
         store.save(&record)?;
@@ -554,17 +551,10 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             let state = self.state.lock().await;
             state.current_prompt.clone().unwrap_or_default()
         };
-        let mut route = resolve_turn_route(
-            &self.config,
-            &self.registry,
-            &user_prompt,
-            self.is_subagent,
-        );
+        let mut route =
+            resolve_turn_route(&self.config, &self.registry, &user_prompt, self.is_subagent);
 
-        if self
-            .maybe_compact(&route.effective_model, tx)
-            .await
-        {
+        if self.maybe_compact(&route.effective_model, tx).await {
             // compaction event already emitted; continue with trimmed history
         }
 
@@ -767,21 +757,22 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         mut result: ToolResult,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        if result.status == ToolResultStatus::Success && is_edit_tool(&call.name) {
-            if let Some(lsp) = self.lsp.as_ref() {
-                let blocks = lsp.collect_for_edit(&call.name, &call.arguments).await;
-                if !blocks.is_empty() {
-                    let rendered = render_blocks(&blocks);
-                    let summary = summarize_blocks(&blocks);
-                    result.content = append_diagnostics(&result.content, &rendered);
-                    emit(
-                        tx,
-                        RuntimeEvent::DiagnosticsUpdated {
-                            summary: summary.clone(),
-                            rendered,
-                        },
-                    );
-                }
+        if result.status == ToolResultStatus::Success
+            && is_edit_tool(&call.name)
+            && let Some(lsp) = self.lsp.as_ref()
+        {
+            let blocks = lsp.collect_for_edit(&call.name, &call.arguments).await;
+            if !blocks.is_empty() {
+                let rendered = render_blocks(&blocks);
+                let summary = summarize_blocks(&blocks);
+                result.content = append_diagnostics(&result.content, &rendered);
+                emit(
+                    tx,
+                    RuntimeEvent::DiagnosticsUpdated {
+                        summary: summary.clone(),
+                        rendered,
+                    },
+                );
             }
         }
 
@@ -838,11 +829,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         }
     }
 
-    async fn maybe_compact(
-        &self,
-        model: &str,
-        tx: &mpsc::UnboundedSender<RuntimeEvent>,
-    ) -> bool {
+    async fn maybe_compact(&self, model: &str, tx: &mpsc::UnboundedSender<RuntimeEvent>) -> bool {
         let messages = self.state.lock().await.session.messages().to_vec();
         if !should_compact(model, &messages, self.config.compaction_threshold) {
             return false;
@@ -907,7 +894,11 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     ) -> TurnTelemetry {
         let usage = usage.cloned().unwrap_or_default();
         let turn_cost = calculate_turn_cost(&route.effective_model, &usage);
-        let prior_hash = self.state.try_lock().ok().and_then(|state| state.last_prefix_hash);
+        let prior_hash = self
+            .state
+            .try_lock()
+            .ok()
+            .and_then(|state| state.last_prefix_hash);
         let prefix_status = match prior_hash {
             None => PrefixStatus::FirstTurn,
             Some(previous) if previous == prefix_hash => PrefixStatus::Stable,
@@ -923,9 +914,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             .try_lock()
             .map(|state| state.session_cost)
             .unwrap_or(turn_cost);
-        let estimated_context_tokens = usage
-            .input_tokens()
-            .max(estimated_context_tokens);
+        let estimated_context_tokens = usage.input_tokens().max(estimated_context_tokens);
         let context_window = context_window_for_model(&route.effective_model);
         let message_estimate = estimated_context_tokens;
 
@@ -940,14 +929,17 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             prefix_status,
             context_window,
             estimated_context_tokens,
-            context_usage_percent: context_usage_percent(estimated_context_tokens, &route.effective_model),
+            context_usage_percent: context_usage_percent(
+                estimated_context_tokens,
+                &route.effective_model,
+            ),
             near_compaction_threshold: message_estimate
                 >= effective_compaction_threshold(
                     &route.effective_model,
                     self.config.compaction_threshold,
                 )
                 .saturating_mul(80)
-                / 100,
+                    / 100,
             used_model_fallback: route.used_model_fallback,
             turn_cost,
             session_cost,
@@ -957,10 +949,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
 
 fn api_error_retriable(error: &AgentError) -> bool {
     match error {
-        AgentError::Api { status, .. } => matches!(
-            status.as_u16(),
-            429 | 502 | 503 | 504
-        ),
+        AgentError::Api { status, .. } => matches!(status.as_u16(), 429 | 502 | 503 | 504),
         _ => false,
     }
 }
@@ -1054,7 +1043,10 @@ mod tests {
     #[test]
     fn append_diagnostics_joins_blocks() {
         assert_eq!(
-            append_diagnostics("{\"path\":\"a.rs\"}", "<diagnostics file=\"a.rs\">\n</diagnostics>"),
+            append_diagnostics(
+                "{\"path\":\"a.rs\"}",
+                "<diagnostics file=\"a.rs\">\n</diagnostics>"
+            ),
             "{\"path\":\"a.rs\"}\n\n<diagnostics file=\"a.rs\">\n</diagnostics>"
         );
     }
@@ -1249,18 +1241,22 @@ mod tests {
             },
             AgentEvent::Done { usage: None },
         ]]);
-        let runtime = AgentRuntime::new(client, ToolRegistry::default())
-            .with_checkpoints(workspace.path());
+        let runtime =
+            AgentRuntime::new(client, ToolRegistry::default()).with_checkpoints(workspace.path());
 
         let mut rx = runtime.submit_user("hi").await;
         let events = drain(&mut rx).await;
 
         let before = events.iter().find_map(|event| match event {
-            RuntimeEvent::CheckpointCreated { id, label } if label == "before_turn" => Some(id.0.clone()),
+            RuntimeEvent::CheckpointCreated { id, label } if label == "before_turn" => {
+                Some(id.0.clone())
+            }
             _ => None,
         });
         let after = events.iter().find_map(|event| match event {
-            RuntimeEvent::CheckpointCreated { id, label } if label == "after_turn" => Some(id.0.clone()),
+            RuntimeEvent::CheckpointCreated { id, label } if label == "after_turn" => {
+                Some(id.0.clone())
+            }
             _ => None,
         });
         assert!(before.is_some(), "expected before_turn checkpoint");
@@ -1283,7 +1279,9 @@ mod tests {
 
         use async_trait::async_trait;
 
-        use crate::lsp::{Diagnostic, DiagnosticRange, Language, LspConfig, LspManager, LspTransport, Severity};
+        use crate::lsp::{
+            Diagnostic, DiagnosticRange, Language, LspConfig, LspManager, LspTransport, Severity,
+        };
         use crate::workspace_tools::workspace_tool_registry;
 
         struct FakeTransport {
@@ -1395,7 +1393,8 @@ mod tests {
         drain(&mut rx).await;
         runtime.shutdown().await;
 
-        let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+        let store =
+            crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
         let record = store.load(&session_id).unwrap();
         assert_eq!(record.messages.len(), 3);
         assert_eq!(record.turns.len(), 1);
@@ -1422,7 +1421,8 @@ mod tests {
         drain(&mut rx).await;
         runtime.shutdown().await;
 
-        let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+        let store =
+            crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
         let record = store.load(&session_id).unwrap();
         assert_eq!(record.turns.len(), 1);
         assert_eq!(record.turns[0].user_prompt, "hi");
@@ -1462,12 +1462,16 @@ mod tests {
         drain(&mut rx).await;
         runtime.shutdown().await;
 
-        let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+        let store =
+            crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
         let record = store.load(&session_id).unwrap();
         assert_eq!(record.turns.len(), 1);
         assert_eq!(record.turns[0].user_prompt, "please echo");
         assert_eq!(record.turns[0].tool_results.len(), 1);
-        assert_eq!(record.turns[0].tool_results[0].tool_name, MockEchoTool::NAME);
+        assert_eq!(
+            record.turns[0].tool_results[0].tool_name,
+            MockEchoTool::NAME
+        );
         assert_eq!(record.turns[0].tool_results[0].content, "mock_echo: hi");
     }
 
@@ -1502,7 +1506,8 @@ mod tests {
         drain(&mut rx).await;
         runtime.shutdown().await;
 
-        let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+        let store =
+            crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
         let record = store.load(&session_id).unwrap();
         assert_eq!(record.messages.len(), 3);
 
@@ -1609,10 +1614,7 @@ mod tests {
 
         assert_eq!(
             client.models_used(),
-            vec![
-                DEEPSEEK_V4_PRO.to_string(),
-                DEEPSEEK_V4_FLASH.to_string()
-            ]
+            vec![DEEPSEEK_V4_PRO.to_string(), DEEPSEEK_V4_FLASH.to_string()]
         );
         let telemetry = events.iter().find_map(|event| match event {
             RuntimeEvent::TurnFinished { telemetry, .. } => telemetry.as_ref(),

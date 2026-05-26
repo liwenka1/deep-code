@@ -247,10 +247,7 @@ impl ToolRegistry {
 
     /// Clone a subset of tools from another registry.
     #[must_use]
-    pub fn filtered_from(
-        source: &ToolRegistry,
-        predicate: impl Fn(&str) -> bool,
-    ) -> Self {
+    pub fn filtered_from(source: &ToolRegistry, predicate: impl Fn(&str) -> bool) -> Self {
         let mut registry = Self::new();
         registry.policy = source.policy.clone();
         registry.hooks = source.hooks.clone();

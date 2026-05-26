@@ -40,9 +40,10 @@ impl JsonSessionStore {
             let mut file = File::create(&tmp_path).map_err(|error| SessionStoreError::Io {
                 message: format!("failed to create {}: {error}", tmp_path.display()),
             })?;
-            file.write_all(contents).map_err(|error| SessionStoreError::Io {
-                message: format!("failed to write {}: {error}", tmp_path.display()),
-            })?;
+            file.write_all(contents)
+                .map_err(|error| SessionStoreError::Io {
+                    message: format!("failed to write {}: {error}", tmp_path.display()),
+                })?;
             file.sync_all().map_err(|error| SessionStoreError::Io {
                 message: format!("failed to fsync {}: {error}", tmp_path.display()),
             })?;
@@ -232,7 +233,10 @@ mod tests {
         let id = record.id.clone();
         store.save(&record).unwrap();
         store.delete(&id).unwrap();
-        assert!(matches!(store.load(&id), Err(SessionStoreError::NotFound { .. })));
+        assert!(matches!(
+            store.load(&id),
+            Err(SessionStoreError::NotFound { .. })
+        ));
     }
 
     #[test]

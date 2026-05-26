@@ -109,9 +109,15 @@ None.
         let first = registry.run_tool_call(open, None).unwrap();
         assert!(first.is_result_success(), "open failed: {first:?}");
         let second = registry.run_tool_call(second, None);
-        assert!(second.is_err(), "expected concurrency error, got {second:?}");
         assert!(
-            second.unwrap_err().to_string().contains("concurrency limit"),
+            second.is_err(),
+            "expected concurrency error, got {second:?}"
+        );
+        assert!(
+            second
+                .unwrap_err()
+                .to_string()
+                .contains("concurrency limit"),
             "unexpected error"
         );
     }
@@ -135,7 +141,11 @@ None.
             "agent_open",
             json!({"prompt": "summarize lib.rs", "type": "explore", "name": "worker"}),
         );
-        let open_result = registry.run_tool_call(open, None).unwrap().into_result().unwrap();
+        let open_result = registry
+            .run_tool_call(open, None)
+            .unwrap()
+            .into_result()
+            .unwrap();
         let opened: serde_json::Value = serde_json::from_str(&open_result.content).unwrap();
         let agent_id = opened["agent_id"].as_str().expect("agent_id").to_string();
 
@@ -155,13 +165,19 @@ None.
             "agent_eval",
             json!({"agent_id": agent_id, "wait": false}),
         );
-        let eval_result = registry.run_tool_call(eval, None).unwrap().into_result().unwrap();
+        let eval_result = registry
+            .run_tool_call(eval, None)
+            .unwrap()
+            .into_result()
+            .unwrap();
         let projection: serde_json::Value = serde_json::from_str(&eval_result.content).unwrap();
         assert_eq!(projection["status"], "completed");
-        assert!(projection["snapshot"]["structured"]["summary"]
-            .as_str()
-            .unwrap()
-            .contains("Mapped"));
+        assert!(
+            projection["snapshot"]["structured"]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("Mapped")
+        );
     }
 
     #[tokio::test]
@@ -183,16 +199,20 @@ None.
             "agent_open",
             json!({"prompt": "slow task", "type": "explore", "name": "slow-worker"}),
         );
-        let open_result = registry.run_tool_call(open, None).unwrap().into_result().unwrap();
+        let open_result = registry
+            .run_tool_call(open, None)
+            .unwrap()
+            .into_result()
+            .unwrap();
         let opened: serde_json::Value = serde_json::from_str(&open_result.content).unwrap();
         let agent_id = opened["agent_id"].as_str().expect("agent_id").to_string();
 
-        let close = ToolCall::new(
-            "call_2",
-            "agent_close",
-            json!({"agent_id": agent_id}),
-        );
-        let close_result = registry.run_tool_call(close, None).unwrap().into_result().unwrap();
+        let close = ToolCall::new("call_2", "agent_close", json!({"agent_id": agent_id}));
+        let close_result = registry
+            .run_tool_call(close, None)
+            .unwrap()
+            .into_result()
+            .unwrap();
         let projection: serde_json::Value = serde_json::from_str(&close_result.content).unwrap();
         assert_eq!(projection["status"], "cancelled");
 
@@ -232,11 +252,16 @@ None.
             "agent_open",
             json!({"prompt": "slow", "type": "explore", "name": "bg"}),
         );
-        let open_result = registry.run_tool_call(open, None).unwrap().into_result().unwrap();
-        let agent_id = serde_json::from_str::<serde_json::Value>(&open_result.content).unwrap()["agent_id"]
-            .as_str()
-            .expect("agent_id")
-            .to_string();
+        let open_result = registry
+            .run_tool_call(open, None)
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let agent_id =
+            serde_json::from_str::<serde_json::Value>(&open_result.content).unwrap()["agent_id"]
+                .as_str()
+                .expect("agent_id")
+                .to_string();
 
         services.cancel_all_running();
 
@@ -276,18 +301,27 @@ None.
             "agent_open",
             json!({"prompt": "slow", "type": "explore", "name": "slow"}),
         );
-        let open_result = registry.run_tool_call(open, None).unwrap().into_result().unwrap();
-        let agent_id = serde_json::from_str::<serde_json::Value>(&open_result.content).unwrap()["agent_id"]
-            .as_str()
-            .expect("agent_id")
-            .to_string();
+        let open_result = registry
+            .run_tool_call(open, None)
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let agent_id =
+            serde_json::from_str::<serde_json::Value>(&open_result.content).unwrap()["agent_id"]
+                .as_str()
+                .expect("agent_id")
+                .to_string();
 
         let eval = ToolCall::new(
             "call_2",
             "agent_eval",
             json!({"agent_id": agent_id, "wait": true, "timeout_ms": 100}),
         );
-        let eval_result = registry.run_tool_call(eval, None).unwrap().into_result().unwrap();
+        let eval_result = registry
+            .run_tool_call(eval, None)
+            .unwrap()
+            .into_result()
+            .unwrap();
         let projection: serde_json::Value = serde_json::from_str(&eval_result.content).unwrap();
         assert_eq!(projection["timed_out"], true);
         assert_eq!(projection["status"], "running");
@@ -295,7 +329,6 @@ None.
 
     #[tokio::test]
     async fn subagent_denies_write_tool_approval() {
-        let dir = tempfile::tempdir().unwrap();
         let runtime = AgentRuntime::new(SummaryClient, ToolRegistry::new());
         let request = ApprovalRequest {
             call_id: "call_1".to_string(),

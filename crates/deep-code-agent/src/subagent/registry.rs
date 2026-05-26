@@ -137,9 +137,8 @@ pub fn child_tool_registry(
     exec_policy: ExecPolicy,
 ) -> Result<ToolRegistry, crate::tool::ToolError> {
     let workspace_tools = workspace_tool_registry(workspace)?;
-    let mut registry = ToolRegistry::filtered_from(&workspace_tools, |name| {
-        include_workspace_tool(role, name)
-    });
+    let mut registry =
+        ToolRegistry::filtered_from(&workspace_tools, |name| include_workspace_tool(role, name));
     registry.set_policy(exec_policy);
     if role.allows_shell() {
         let (shell_tools, _) = shell_tool_registry(workspace)?;

@@ -79,11 +79,7 @@ impl StdioLspTransport {
 
         let pending: Arc<AsyncMutex<HashMap<i64, oneshot::Sender<Value>>>> =
             Arc::new(AsyncMutex::new(HashMap::new()));
-        tokio::spawn(dispatcher_task(
-            rx_inbound,
-            tx_diag,
-            pending.clone(),
-        ));
+        tokio::spawn(dispatcher_task(rx_inbound, tx_diag, pending.clone()));
 
         let init_payload = json!({
             "jsonrpc": "2.0",
@@ -329,13 +325,11 @@ fn decode_diagnostic_code(value: Option<&Value>) -> Option<String> {
     match value {
         Some(Value::String(text)) => Some(text.clone()),
         Some(Value::Number(number)) => Some(number.to_string()),
-        Some(Value::Object(object)) => object
-            .get("value")
-            .and_then(|inner| match inner {
-                Value::String(text) => Some(text.clone()),
-                Value::Number(number) => Some(number.to_string()),
-                _ => None,
-            }),
+        Some(Value::Object(object)) => object.get("value").and_then(|inner| match inner {
+            Value::String(text) => Some(text.clone()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        }),
         _ => None,
     }
 }

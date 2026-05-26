@@ -93,9 +93,7 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
     let launched = launch_runtime(&config, options.workspace.clone(), resume);
     eprintln!(
         "deep-code runtime API listening on http://{}:{} ({})",
-        options.host,
-        options.port,
-        launched.backend_label
+        options.host, options.port, launched.backend_label
     );
     if options.auth_token.is_some() {
         eprintln!("auth: bearer token required for /v1/* routes");
@@ -127,10 +125,7 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
         )
         .route("/v1/subagents", get(crate::meta::list_subagents))
         .route("/v1/jobs", get(crate::meta::list_jobs))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_auth,
-        ))
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state.clone());
 
     let app = Router::new()
@@ -178,25 +173,17 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-async fn require_auth(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    if let Some(expected) = &state.auth_token {
-        if !token_matches(
-            expected,
-            request.headers(),
-            request.uri().query(),
-        ) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": "missing or invalid runtime token"
-                })),
-            )
-                .into_response();
-        }
+async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    if let Some(expected) = &state.auth_token
+        && !token_matches(expected, request.headers(), request.uri().query())
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "missing or invalid runtime token"
+            })),
+        )
+            .into_response();
     }
     next.run(request).await
 }
@@ -501,6 +488,14 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
 
+    static RUNTIME_TOKEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_runtime_token_env() -> std::sync::MutexGuard<'static, ()> {
+        RUNTIME_TOKEN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn test_state(workspace: PathBuf, auth_token: Option<String>) -> AppState {
         AppState {
             version: "0.1.0".to_string(),
@@ -520,10 +515,7 @@ mod tests {
             .route("/v1/sessions", get(list_sessions))
             .route("/v1/prompt", post(prompt_sse))
             .route("/v1/approvals", post(submit_approval))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                require_auth,
-            ))
+            .layer(middleware::from_fn_with_state(state.clone(), require_auth))
             .with_state(state.clone());
 
         Router::new()
@@ -551,6 +543,7 @@ mod tests {
 
     #[test]
     fn resolve_auth_token_falls_back_to_env() {
+        let _guard = lock_runtime_token_env();
         unsafe {
             std::env::set_var(RUNTIME_TOKEN_ENV, "from-env");
         }
@@ -573,6 +566,7 @@ mod tests {
 
     #[test]
     fn cli_auth_token_overrides_env() {
+        let _guard = lock_runtime_token_env();
         unsafe {
             std::env::set_var(RUNTIME_TOKEN_ENV, "from-env");
         }

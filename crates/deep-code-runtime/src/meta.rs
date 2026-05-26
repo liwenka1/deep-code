@@ -3,8 +3,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use deep_code_agent::{
-    AgentConfig, BackgroundJobSummary, CheckpointId, CheckpointStore, DoctorReport,
-    SubAgentRecord,
+    AgentConfig, BackgroundJobSummary, CheckpointId, CheckpointStore, DoctorReport, SubAgentRecord,
 };
 use serde::Serialize;
 
@@ -51,10 +50,7 @@ pub async fn restore_checkpoint(
             .await
             .map_err(ApiError::from)?;
     }
-    Ok(Json(RestoreResponse {
-        restored: true,
-        id,
-    }))
+    Ok(Json(RestoreResponse { restored: true, id }))
 }
 
 pub async fn list_subagents(

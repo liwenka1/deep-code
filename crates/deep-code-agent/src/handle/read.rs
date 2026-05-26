@@ -87,10 +87,13 @@ impl Tool for HandleReadTool {
             .map(|value| (value as usize).min(HARD_MAX_CHARS))
             .unwrap_or(DEFAULT_MAX_CHARS);
 
-        let store = self.store.read().map_err(|error| ToolError::ExecutionFailed {
-            name: HANDLE_READ_TOOL.to_string(),
-            message: error.to_string(),
-        })?;
+        let store = self
+            .store
+            .read()
+            .map_err(|error| ToolError::ExecutionFailed {
+                name: HANDLE_READ_TOOL.to_string(),
+                message: error.to_string(),
+            })?;
         let handle_id = parse_handle_id(handle_value, &store)?;
 
         let output = match mode {
@@ -111,8 +114,12 @@ impl Tool for HandleReadTool {
                 summary: None,
             },
             "head" => {
-                let lines = optional_u64(&call.arguments, "lines", DEFAULT_HEAD_TAIL_LINES as u64, HANDLE_READ_TOOL)?
-                    as usize;
+                let lines = optional_u64(
+                    &call.arguments,
+                    "lines",
+                    DEFAULT_HEAD_TAIL_LINES as u64,
+                    HANDLE_READ_TOOL,
+                )? as usize;
                 let (content, truncated) = store
                     .read_head(&handle_id, lines.max(1), max_chars)
                     .ok_or_else(|| missing_handle(&handle_id))?;
@@ -126,8 +133,12 @@ impl Tool for HandleReadTool {
                 }
             }
             "tail" => {
-                let lines = optional_u64(&call.arguments, "lines", DEFAULT_HEAD_TAIL_LINES as u64, HANDLE_READ_TOOL)?
-                    as usize;
+                let lines = optional_u64(
+                    &call.arguments,
+                    "lines",
+                    DEFAULT_HEAD_TAIL_LINES as u64,
+                    HANDLE_READ_TOOL,
+                )? as usize;
                 let (content, truncated) = store
                     .read_tail(&handle_id, lines.max(1), max_chars)
                     .ok_or_else(|| missing_handle(&handle_id))?;
@@ -141,8 +152,10 @@ impl Tool for HandleReadTool {
                 }
             }
             "lines" => {
-                let start = optional_u64(&call.arguments, "start_line", 1, HANDLE_READ_TOOL)? as usize;
-                let end = optional_u64(&call.arguments, "end_line", start as u64, HANDLE_READ_TOOL)? as usize;
+                let start =
+                    optional_u64(&call.arguments, "start_line", 1, HANDLE_READ_TOOL)? as usize;
+                let end = optional_u64(&call.arguments, "end_line", start as u64, HANDLE_READ_TOOL)?
+                    as usize;
                 let (content, truncated) = store
                     .read_lines(&handle_id, start, end, max_chars)
                     .ok_or_else(|| missing_handle(&handle_id))?;
@@ -158,7 +171,7 @@ impl Tool for HandleReadTool {
             other => {
                 return Err(invalid(
                     HANDLE_READ_TOOL,
-                    &format!("unsupported mode '{other}'"),
+                    format!("unsupported mode '{other}'"),
                 ));
             }
         };
@@ -216,7 +229,10 @@ fn missing_handle(id: &HandleId) -> ToolError {
     }
 }
 
-pub fn register_handle_read(registry: &mut crate::tool::ToolRegistry, store: Arc<RwLock<HandleStore>>) {
+pub fn register_handle_read(
+    registry: &mut crate::tool::ToolRegistry,
+    store: Arc<RwLock<HandleStore>>,
+) {
     registry.register(HandleReadTool::new(store));
 }
 

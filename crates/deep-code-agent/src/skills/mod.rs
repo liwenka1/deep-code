@@ -35,9 +35,11 @@ impl SkillRegistry {
         }
         let mut visited = HashSet::new();
         Self::discover_recursive(dir, 0, &mut registry, &mut visited);
-        registry
-            .skills
-            .sort_by(|left, right| left.name.cmp(&right.name).then_with(|| left.path.cmp(&right.path)));
+        registry.skills.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.path.cmp(&right.path))
+        });
         registry
     }
 
@@ -145,7 +147,9 @@ impl SkillRegistry {
                 }
                 if let Some((key, value)) = line.split_once(':') {
                     let value = value.trim();
-                    let unquoted = if (value.starts_with('"') && value.ends_with('"') && value.len() >= 2)
+                    let unquoted = if (value.starts_with('"')
+                        && value.ends_with('"')
+                        && value.len() >= 2)
                         || (value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2)
                     {
                         &value[1..value.len() - 1]
@@ -235,7 +239,11 @@ pub fn discover_in_workspace(workspace: &Path) -> SkillRegistry {
     for dir in skills_directories(workspace) {
         let registry = SkillRegistry::discover(&dir);
         for skill in registry.skills {
-            if !merged.skills.iter().any(|existing| existing.name == skill.name) {
+            if !merged
+                .skills
+                .iter()
+                .any(|existing| existing.name == skill.name)
+            {
                 merged.skills.push(skill);
             }
         }

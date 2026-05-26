@@ -152,10 +152,12 @@ mod tests {
         let result = compact_messages(&messages);
         assert!(result.archived_count > 0);
         assert!(result.messages.len() < messages.len());
-        assert!(result
-            .messages
-            .iter()
-            .any(|message| message.content.contains("会话摘要")));
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|message| message.content.contains("会话摘要"))
+        );
         assert_eq!(result.messages.last().unwrap().content, "a11");
     }
 

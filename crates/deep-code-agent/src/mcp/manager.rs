@@ -1,5 +1,5 @@
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -7,11 +7,11 @@ use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::McpError;
 use super::client::{
     McpClient, McpPromptDescriptor, McpResourceDescriptor, McpToolDescriptor, connect_client,
 };
 use super::config::{McpConfigFile, McpServerConfig, load_mcp_config};
-use super::McpError;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -146,10 +146,10 @@ impl McpManager {
             if let Err(error) = entry.config.validate() {
                 errors.push(format!("{name}: {error}"));
             }
-            if entry.config.enabled {
-                if let Some(error) = &entry.last_error {
-                    errors.push(format!("{name}: {error}"));
-                }
+            if entry.config.enabled
+                && let Some(error) = &entry.last_error
+            {
+                errors.push(format!("{name}: {error}"));
             }
             let (tool_count, resource_count, prompt_count) = if let Some(client) = &entry.client {
                 (
@@ -261,9 +261,12 @@ impl McpManager {
             .ok_or_else(|| McpError::UnknownServer {
                 name: server_name.clone(),
             })?;
-        let client = entry.client.as_ref().ok_or_else(|| McpError::ServerUnavailable {
-            name: server_name.clone(),
-        })?;
+        let client = entry
+            .client
+            .as_ref()
+            .ok_or_else(|| McpError::ServerUnavailable {
+                name: server_name.clone(),
+            })?;
         client.call_tool(&tool_name, arguments)
     }
 
@@ -277,7 +280,11 @@ impl McpManager {
             .collect()
     }
 
-    pub fn save_config(&mut self, path: &Path, configs: &[McpServerConfig]) -> Result<(), McpError> {
+    pub fn save_config(
+        &mut self,
+        path: &Path,
+        configs: &[McpServerConfig],
+    ) -> Result<(), McpError> {
         let mut file = McpConfigFile::default();
         for config in configs {
             file.servers.insert(
@@ -397,10 +404,11 @@ mod tests {
 
     #[test]
     fn manager_discovers_and_calls_mock_tools() {
-        let client = Arc::new(
-            InMemoryMcpClient::new("mock")
-                .with_tool("echo", Some("echo tool"), json!({"ok": true})),
-        );
+        let client = Arc::new(InMemoryMcpClient::new("mock").with_tool(
+            "echo",
+            Some("echo tool"),
+            json!({"ok": true}),
+        ));
         let mut manager = McpManager::new();
         manager
             .register_mock_client(mock_config("mock"), client)

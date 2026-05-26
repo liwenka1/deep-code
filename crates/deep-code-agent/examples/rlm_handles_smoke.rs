@@ -24,7 +24,10 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     let store = Arc::new(RwLock::new(HandleStore::new()));
-    let services = Arc::new(RlmServices::new(Arc::clone(&store), dir.path().to_path_buf()));
+    let services = Arc::new(RlmServices::new(
+        Arc::clone(&store),
+        dir.path().to_path_buf(),
+    ));
     let mut registry = ToolRegistry::new();
     register_rlm_tools(&mut registry, Arc::clone(&services));
     register_handle_read(&mut registry, store);
@@ -83,5 +86,10 @@ fn extract_handle_id(payload: &str) -> Option<String> {
         .and_then(|handle| handle.get("id").or_else(|| handle.get("name")))
         .and_then(|id| id.as_str())
         .map(str::to_string)
-        .or_else(|| value.get("handle_id").and_then(|id| id.as_str()).map(str::to_string))
+        .or_else(|| {
+            value
+                .get("handle_id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+        })
 }

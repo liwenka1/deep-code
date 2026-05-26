@@ -3,8 +3,8 @@ use std::sync::{Arc, RwLock};
 use serde_json::json;
 use tempfile::TempDir;
 
-use crate::handle::{HandleStore, register_handle_read, HANDLE_READ_TOOL};
-use crate::rlm::{RlmManager, register_rlm_tools, RlmServices};
+use crate::handle::{HANDLE_READ_TOOL, HandleStore, register_handle_read};
+use crate::rlm::{RlmManager, RlmServices, register_rlm_tools};
 use crate::tool::{ApprovalDecision, ToolCall, ToolRegistry};
 
 #[test]
@@ -16,7 +16,6 @@ fn rlm_open_eval_and_handle_overflow() {
         .collect::<Vec<_>>()
         .join("\n");
     manager.open("paper".to_string(), body, "inline").unwrap();
-    let mut manager = manager;
     manager
         .configure("paper", Some(128), None)
         .expect("configure");
@@ -34,7 +33,10 @@ fn rlm_tools_roundtrip_with_handle_read() {
     std::fs::write(&file_path, "alpha\nbeta\ngamma\n").unwrap();
 
     let store = Arc::new(RwLock::new(HandleStore::new()));
-    let services = Arc::new(RlmServices::new(Arc::clone(&store), dir.path().to_path_buf()));
+    let services = Arc::new(RlmServices::new(
+        Arc::clone(&store),
+        dir.path().to_path_buf(),
+    ));
     let mut registry = ToolRegistry::new();
     register_rlm_tools(&mut registry, Arc::clone(&services));
     register_handle_read(&mut registry, store);
@@ -60,7 +62,11 @@ fn rlm_tools_roundtrip_with_handle_read() {
     assert!(eval_outcome.approval_required());
     let eval_result = registry
         .run_tool_call(
-            ToolCall::new("c2", "rlm_eval", json!({"name": "ctx", "code": "grep alpha"})),
+            ToolCall::new(
+                "c2",
+                "rlm_eval",
+                json!({"name": "ctx", "code": "grep alpha"}),
+            ),
             Some(ApprovalDecision::Approved),
         )
         .expect("eval")
@@ -86,7 +92,10 @@ fn rlm_overflow_then_handle_read() {
     std::fs::write(dir.path().join("log.txt"), &body).unwrap();
 
     let store = Arc::new(RwLock::new(HandleStore::new()));
-    let services = Arc::new(RlmServices::new(Arc::clone(&store), dir.path().to_path_buf()));
+    let services = Arc::new(RlmServices::new(
+        Arc::clone(&store),
+        dir.path().to_path_buf(),
+    ));
     let mut registry = ToolRegistry::new();
     register_rlm_tools(&mut registry, Arc::clone(&services));
     register_handle_read(&mut registry, store);
@@ -155,7 +164,12 @@ fn extract_handle_id(payload: &str) -> Option<String> {
         .and_then(|handle| handle.get("id").or_else(|| handle.get("name")))
         .and_then(|id| id.as_str())
         .map(str::to_string)
-        .or_else(|| value.get("handle_id").and_then(|id| id.as_str()).map(str::to_string))
+        .or_else(|| {
+            value
+                .get("handle_id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+        })
 }
 
 trait ToolOutcomeExt {

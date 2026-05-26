@@ -15,17 +15,27 @@ fn main() -> anyhow::Result<()> {
     println!(
         "sandbox: {} ({}) — {}",
         caps.backend.id(),
-        if caps.available { "available" } else { "unavailable" },
+        if caps.available {
+            "available"
+        } else {
+            "unavailable"
+        },
         caps.detail
     );
 
     let policy = ExecPolicy::default();
     for command in ["git status", "rm -rf /tmp", "python -V"] {
         let plan = evaluate_shell_command(&policy, command);
-        println!("shell '{command}' => {:?} (approval={})", plan.verdict, plan.requires_approval);
+        println!(
+            "shell '{command}' => {:?} (approval={})",
+            plan.verdict, plan.requires_approval
+        );
     }
 
-    let write_plan = policy.evaluate_tool("write_file", &serde_json::json!({"path": "x", "content": "y"}));
+    let write_plan = policy.evaluate_tool(
+        "write_file",
+        &serde_json::json!({"path": "x", "content": "y"}),
+    );
     println!("write_file => {:?}", write_plan.verdict);
 
     let store = CheckpointStore::new(&workspace)?;
@@ -38,7 +48,10 @@ fn main() -> anyhow::Result<()> {
     println!("checkpoint round-trip: {restored}");
     fs::remove_file(&probe)?;
 
-    if matches!(evaluate_shell_command(&policy, "rm -rf /").verdict, PolicyVerdict::Deny { .. }) {
+    if matches!(
+        evaluate_shell_command(&policy, "rm -rf /").verdict,
+        PolicyVerdict::Deny { .. }
+    ) {
         println!("policy deny path: ok");
     }
 

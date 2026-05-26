@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use deep_code_runtime::{RuntimeServerOptions, run_http_server, RUNTIME_TOKEN_ENV};
+use deep_code_runtime::{RUNTIME_TOKEN_ENV, RuntimeServerOptions, run_http_server};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";
@@ -106,7 +106,9 @@ struct HealthBody {
 
 #[tauri::command]
 pub async fn get_runtime_info() -> Result<RuntimeInfo, String> {
-    let embedded = ensure_runtime_server().await.map_err(|error| error.to_string())?;
+    let embedded = ensure_runtime_server()
+        .await
+        .map_err(|error| error.to_string())?;
     let workspace = resolve_workspace();
     let auth_token = resolve_auth_token();
     let health = reqwest::Client::new()

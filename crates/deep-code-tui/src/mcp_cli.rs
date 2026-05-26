@@ -13,7 +13,9 @@ pub fn run_mcp_command(subcommand: &str, args: &[String]) -> anyhow::Result<()> 
         "enable" => cmd_set_enabled(&workspace, args, true),
         "disable" => cmd_set_enabled(&workspace, args, false),
         other => {
-            anyhow::bail!("unknown mcp subcommand '{other}'. Use list, enable, disable, validate, or reload.");
+            anyhow::bail!(
+                "unknown mcp subcommand '{other}'. Use list, enable, disable, validate, or reload."
+            );
         }
     }
 }
@@ -56,7 +58,10 @@ fn cmd_validate(workspace: &std::path::Path) -> anyhow::Result<()> {
     if report.valid {
         println!("MCP validation passed.");
     } else {
-        anyhow::bail!("MCP validation failed with {} error(s)", report.errors.len());
+        anyhow::bail!(
+            "MCP validation failed with {} error(s)",
+            report.errors.len()
+        );
     }
     Ok(())
 }
@@ -78,14 +83,25 @@ fn cmd_reload(workspace: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_set_enabled(workspace: &std::path::Path, args: &[String], enabled: bool) -> anyhow::Result<()> {
+fn cmd_set_enabled(
+    workspace: &std::path::Path,
+    args: &[String],
+    enabled: bool,
+) -> anyhow::Result<()> {
     let Some(name) = args.first() else {
-        anyhow::bail!("Usage: deep-code mcp {} <server>", if enabled { "enable" } else { "disable" });
+        anyhow::bail!(
+            "Usage: deep-code mcp {} <server>",
+            if enabled { "enable" } else { "disable" }
+        );
     };
     if args.len() > 1 {
-        anyhow::bail!("Usage: deep-code mcp {} <server>", if enabled { "enable" } else { "disable" });
+        anyhow::bail!(
+            "Usage: deep-code mcp {} <server>",
+            if enabled { "enable" } else { "disable" }
+        );
     }
-    let path = set_server_enabled(workspace, name, enabled).map_err(|error| anyhow::anyhow!(error))?;
+    let path =
+        set_server_enabled(workspace, name, enabled).map_err(|error| anyhow::anyhow!(error))?;
     cmd_reload(workspace)?;
     println!(
         "MCP server '{name}' {} (saved to {}).",

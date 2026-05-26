@@ -13,11 +13,11 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::sandbox::SandboxManager;
+use crate::tool::{Tool, ToolCall, ToolError, ToolRegistry, ToolResult, ToolSpec};
 use crate::tool_execution::current_sandbox_policy;
 use crate::workspace_policy::{
     WorkspacePolicy, invalid, json_string, optional_str, optional_u64, required_str,
 };
-use crate::tool::{Tool, ToolCall, ToolError, ToolRegistry, ToolResult, ToolSpec};
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
@@ -251,7 +251,11 @@ impl ShellRunTool {
     const NAME: &'static str = "shell_run";
 
     fn new(root: WorkspacePolicy, jobs: JobStore, sandbox: SandboxManager) -> Self {
-        Self { root, jobs, sandbox }
+        Self {
+            root,
+            jobs,
+            sandbox,
+        }
     }
 }
 
@@ -293,12 +297,7 @@ impl Tool for ShellRunTool {
         let started = Instant::now();
         let mut child = self
             .sandbox
-            .wrap_shell_command(
-                command,
-                &cwd,
-                self.root.root(),
-                &current_sandbox_policy(),
-            )
+            .wrap_shell_command(command, &cwd, self.root.root(), &current_sandbox_policy())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -366,7 +365,11 @@ impl JobStartTool {
     const NAME: &'static str = "job_start";
 
     fn new(root: WorkspacePolicy, jobs: JobStore, sandbox: SandboxManager) -> Self {
-        Self { root, jobs, sandbox }
+        Self {
+            root,
+            jobs,
+            sandbox,
+        }
     }
 }
 
@@ -398,12 +401,7 @@ impl Tool for JobStartTool {
             .resolve_cwd(optional_str(&call.arguments, "cwd"), Self::NAME)?;
         let mut child = self
             .sandbox
-            .wrap_shell_command(
-                command,
-                &cwd,
-                self.root.root(),
-                &current_sandbox_policy(),
-            )
+            .wrap_shell_command(command, &cwd, self.root.root(), &current_sandbox_policy())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

@@ -63,9 +63,7 @@ impl ModelRegistry {
     pub fn new(models: Vec<ModelInfo>) -> Self {
         let mut alias_map = HashMap::new();
         for (idx, model) in models.iter().enumerate() {
-            alias_map
-                .entry(normalize_key(&model.id))
-                .or_insert(idx);
+            alias_map.entry(normalize_key(&model.id)).or_insert(idx);
             for alias in &model.aliases {
                 alias_map.entry(normalize_key(alias)).or_insert(idx);
             }
@@ -147,10 +145,7 @@ pub fn deepseek_default_models() -> Vec<ModelInfo> {
         },
         ModelInfo {
             id: DEEPSEEK_V4_FLASH.to_string(),
-            aliases: vec![
-                "deepseek-chat".to_string(),
-                "deepseek-reasoner".to_string(),
-            ],
+            aliases: vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
             context_window: DEEPSEEK_V4_CONTEXT_WINDOW,
             supports_tools: true,
             supports_reasoning: true,

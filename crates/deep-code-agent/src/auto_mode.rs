@@ -65,10 +65,7 @@ pub fn resolve_turn_route(
     };
 
     let auto_effort = config.reasoning_effort.is_auto();
-    let effective_effort =
-        config
-            .reasoning_effort
-            .resolve(is_subagent, user_prompt);
+    let effective_effort = config.reasoning_effort.resolve(is_subagent, user_prompt);
 
     TurnRoute {
         requested_model: config.model.clone(),
@@ -87,7 +84,12 @@ pub fn select_auto_model(input: &str, cost_saving: bool) -> String {
     let len = input.chars().count();
     let lower = input.to_lowercase();
 
-    let borderline = ["implement", "analyze", "\u{5b9e}\u{73b0}", "\u{5206}\u{6790}"];
+    let borderline = [
+        "implement",
+        "analyze",
+        "\u{5b9e}\u{73b0}",
+        "\u{5206}\u{6790}",
+    ];
     let strong_match = COMPLEX_KEYWORDS
         .iter()
         .any(|keyword| !borderline.contains(keyword) && lower.contains(keyword));
@@ -153,7 +155,10 @@ mod tests {
     #[test]
     fn chinese_refactor_routes_to_pro() {
         assert_eq!(
-            select_auto_model("\u{5e2e}\u{6211}\u{91cd}\u{6784}\u{8fd9}\u{4e2a}\u{6a21}\u{5757}", false),
+            select_auto_model(
+                "\u{5e2e}\u{6211}\u{91cd}\u{6784}\u{8fd9}\u{4e2a}\u{6a21}\u{5757}",
+                false
+            ),
             DEEPSEEK_V4_PRO
         );
     }
@@ -165,12 +170,7 @@ mod tests {
             reasoning_effort: ReasoningEffortSetting::Auto,
             ..AgentConfig::default()
         };
-        let route = resolve_turn_route(
-            &config,
-            &ModelRegistry::default(),
-            "debug crash",
-            false,
-        );
+        let route = resolve_turn_route(&config, &ModelRegistry::default(), "debug crash", false);
         assert!(route.auto_model);
         assert!(route.auto_effort);
         assert_eq!(route.effective_model, DEEPSEEK_V4_PRO);
@@ -183,12 +183,7 @@ mod tests {
             reasoning_effort: ReasoningEffortSetting::Auto,
             ..AgentConfig::default()
         };
-        let route = resolve_turn_route(
-            &config,
-            &ModelRegistry::default(),
-            "debug crash",
-            true,
-        );
+        let route = resolve_turn_route(&config, &ModelRegistry::default(), "debug crash", true);
         assert_eq!(route.effective_effort, ReasoningEffort::Low);
     }
 
@@ -214,12 +209,7 @@ mod tests {
             cost_currency: CostCurrency::Cny,
             ..AgentConfig::default()
         };
-        let route = resolve_turn_route(
-            &config,
-            &ModelRegistry::default(),
-            "hello",
-            false,
-        );
+        let route = resolve_turn_route(&config, &ModelRegistry::default(), "hello", false);
         assert!(!route.auto_model);
         assert_eq!(route.effective_model, DEEPSEEK_V4_PRO);
     }

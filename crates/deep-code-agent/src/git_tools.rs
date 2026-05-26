@@ -2,11 +2,11 @@ use std::process::{Command, Output, Stdio};
 
 use serde_json::{Value, json};
 
+use crate::tool::{Tool, ToolCall, ToolError, ToolRegistry, ToolResult, ToolSpec};
 use crate::workspace_policy::{
     WorkspacePolicy, invalid, json_string, optional_bool, optional_str, optional_u64,
     truncate_string,
 };
-use crate::tool::{Tool, ToolCall, ToolError, ToolRegistry, ToolResult, ToolSpec};
 
 const MAX_OUTPUT_CHARS: usize = 40_000;
 const DEFAULT_LOG_COUNT: u64 = 20;

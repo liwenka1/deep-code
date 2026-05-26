@@ -84,9 +84,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await;
     } else if !rust_analyzer_available() {
-        anyhow::bail!(
-            "rust-analyzer is not on PATH; install it or rerun with --offline"
-        );
+        anyhow::bail!("rust-analyzer is not on PATH; install it or rerun with --offline");
     }
 
     let block = manager.diagnostics_for(&file).await;

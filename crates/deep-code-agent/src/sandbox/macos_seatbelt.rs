@@ -71,13 +71,7 @@ pub fn wrap_shell_command(
         .collect();
 
     let mut wrapped = Command::new(SANDBOX_EXEC_PATH);
-    wrapped.args(seatbelt_args(
-        vec![program],
-        args,
-        workspace,
-        cwd,
-        policy,
-    ));
+    wrapped.args(seatbelt_args(vec![program], args, workspace, cwd, policy));
     wrapped.current_dir(cwd);
     wrapped
 }
@@ -172,10 +166,7 @@ mod tests {
         let workspace = tempdir().unwrap();
         let outside = tempdir().unwrap();
         let target = outside.path().join("blocked.txt");
-        let command = format!(
-            "echo leaked > {}",
-            target.display()
-        );
+        let command = format!("echo leaked > {}", target.display());
 
         let status = wrap_shell_command(
             &command,

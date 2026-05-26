@@ -80,10 +80,11 @@ impl McpConfigFile {
                 message: error.to_string(),
             })?;
         }
-        let encoded = serde_json::to_string_pretty(self).map_err(|error| McpError::ConfigParse {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        })?;
+        let encoded =
+            serde_json::to_string_pretty(self).map_err(|error| McpError::ConfigParse {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
         fs::write(path, encoded).map_err(|error| McpError::ConfigIo {
             path: path.to_path_buf(),
             message: error.to_string(),
@@ -100,9 +101,12 @@ impl McpConfigFile {
     }
 
     pub fn set_enabled(&mut self, name: &str, enabled: bool) -> Result<(), McpError> {
-        let entry = self.servers.get_mut(name).ok_or_else(|| McpError::UnknownServer {
-            name: name.to_string(),
-        })?;
+        let entry = self
+            .servers
+            .get_mut(name)
+            .ok_or_else(|| McpError::UnknownServer {
+                name: name.to_string(),
+            })?;
         entry.enabled = enabled;
         Ok(())
     }
@@ -131,7 +135,11 @@ impl McpServerConfig {
         }
         match self.transport {
             McpTransport::Stdio => {
-                if self.command.as_ref().is_none_or(|value| value.trim().is_empty()) {
+                if self
+                    .command
+                    .as_ref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
                     return Err(McpError::InvalidConfig {
                         message: format!(
                             "stdio server '{}' requires a non-empty command",
@@ -141,7 +149,11 @@ impl McpServerConfig {
                 }
             }
             McpTransport::Http => {
-                if self.url.as_ref().is_none_or(|value| value.trim().is_empty()) {
+                if self
+                    .url
+                    .as_ref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
                     return Err(McpError::InvalidConfig {
                         message: format!("http server '{}' requires a url", self.name),
                     });

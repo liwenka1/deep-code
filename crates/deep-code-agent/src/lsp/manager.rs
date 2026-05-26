@@ -90,11 +90,7 @@ impl LspManager {
         self.test_transports.lock().await.insert(lang, transport);
     }
 
-    pub async fn collect_for_edit(
-        &self,
-        tool_name: &str,
-        input: &Value,
-    ) -> Vec<DiagnosticBlock> {
+    pub async fn collect_for_edit(&self, tool_name: &str, input: &Value) -> Vec<DiagnosticBlock> {
         if !self.config.enabled {
             return Vec::new();
         }
@@ -140,12 +136,7 @@ impl LspManager {
             self.config.poll_after_edit_ms
         };
         let wait = Duration::from_millis(wait_ms);
-        let raw = match timeout(
-            wait,
-            transport.diagnostics_for(file, &text, wait),
-        )
-        .await
-        {
+        let raw = match timeout(wait, transport.diagnostics_for(file, &text, wait)).await {
             Ok(Ok(items)) => items,
             Ok(Err(error)) => {
                 eprintln!(
@@ -313,9 +304,7 @@ mod tests {
             source: Some("rust-analyzer".to_string()),
             code: None,
         }]));
-        manager
-            .install_test_transport(Language::Rust, fake)
-            .await;
+        manager.install_test_transport(Language::Rust, fake).await;
 
         let block = manager.diagnostics_for(&path).await.expect("block");
         assert!(block.render().contains("expected i32, found &str"));
@@ -329,9 +318,7 @@ mod tests {
         tokio::fs::create_dir_all(path.parent().unwrap())
             .await
             .unwrap();
-        tokio::fs::write(&path, b"fn main() {")
-            .await
-            .unwrap();
+        tokio::fs::write(&path, b"fn main() {").await.unwrap();
 
         let fake = Arc::new(FakeTransport::new(vec![Diagnostic {
             file: path.clone(),
@@ -346,9 +333,7 @@ mod tests {
             source: None,
             code: None,
         }]));
-        manager
-            .install_test_transport(Language::Rust, fake)
-            .await;
+        manager.install_test_transport(Language::Rust, fake).await;
 
         let blocks = manager
             .collect_for_edit(

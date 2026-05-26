@@ -27,9 +27,7 @@ fn tool_error(error: SubAgentError) -> ToolError {
 }
 
 fn first_str<'a>(input: &'a Value, fields: &[&str]) -> Option<&'a str> {
-    fields
-        .iter()
-        .find_map(|field| optional_str(input, field))
+    fields.iter().find_map(|field| optional_str(input, field))
 }
 
 fn required_alias<'a>(
@@ -76,7 +74,11 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentOpenTool<C> {
     }
 
     fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let prompt = required_alias(&call.arguments, &["prompt", "message", "objective"], OPEN_TOOL)?;
+        let prompt = required_alias(
+            &call.arguments,
+            &["prompt", "message", "objective"],
+            OPEN_TOOL,
+        )?;
         let role_raw = optional_str(&call.arguments, "type")
             .or_else(|| optional_str(&call.arguments, "agent_type"))
             .or_else(|| optional_str(&call.arguments, "role"))
@@ -95,13 +97,14 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentOpenTool<C> {
             name
         };
 
-        let child_tools =
-            child_tool_registry(&self.services.workspace, role, self.services.exec_policy.clone())
-                .map_err(|error| {
-            ToolError::ExecutionFailed {
-                name: OPEN_TOOL.to_string(),
-                message: error.to_string(),
-            }
+        let child_tools = child_tool_registry(
+            &self.services.workspace,
+            role,
+            self.services.exec_policy.clone(),
+        )
+        .map_err(|error| ToolError::ExecutionFailed {
+            name: OPEN_TOOL.to_string(),
+            message: error.to_string(),
         })?;
         let system_prompt = child_system_prompt(role);
         let client = std::sync::Arc::clone(&self.services.client);
@@ -114,26 +117,24 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentOpenTool<C> {
         );
         let cancel = self.services.parent_cancel.child_token();
         {
-            let mut cancels = self
-                .services
-                .agent_cancels
-                .write()
-                .map_err(|error| ToolError::ExecutionFailed {
+            let mut cancels = self.services.agent_cancels.write().map_err(|error| {
+                ToolError::ExecutionFailed {
                     name: OPEN_TOOL.to_string(),
                     message: error.to_string(),
-                })?;
+                }
+            })?;
             cancels.insert(agent_id.clone(), cancel.clone());
         }
 
         let boot_id = {
-            let manager = self
-                .services
-                .manager
-                .read()
-                .map_err(|error| ToolError::ExecutionFailed {
-                    name: OPEN_TOOL.to_string(),
-                    message: error.to_string(),
-                })?;
+            let manager =
+                self.services
+                    .manager
+                    .read()
+                    .map_err(|error| ToolError::ExecutionFailed {
+                        name: OPEN_TOOL.to_string(),
+                        message: error.to_string(),
+                    })?;
             manager.session_boot_id.clone()
         };
 
@@ -156,21 +157,21 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentOpenTool<C> {
         };
 
         {
-            let mut manager = self
-                .services
-                .manager
-                .write()
-                .map_err(|error| ToolError::ExecutionFailed {
-                    name: OPEN_TOOL.to_string(),
-                    message: error.to_string(),
-                })?;
+            let mut manager =
+                self.services
+                    .manager
+                    .write()
+                    .map_err(|error| ToolError::ExecutionFailed {
+                        name: OPEN_TOOL.to_string(),
+                        message: error.to_string(),
+                    })?;
             manager.insert(record.clone()).map_err(tool_error)?;
-            if let Some(stored) = manager.get(&agent_id).cloned() {
-                if let Ok(handle) = manager.store_transcript(&stored) {
-                    let _ = manager.update(&agent_id, |record| {
-                        record.transcript_handle = Some(handle.id);
-                    });
-                }
+            if let Some(stored) = manager.get(&agent_id).cloned()
+                && let Ok(handle) = manager.store_transcript(&stored)
+            {
+                let _ = manager.update(&agent_id, |record| {
+                    record.transcript_handle = Some(handle.id);
+                });
             }
         }
 
@@ -186,10 +187,9 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentOpenTool<C> {
                 super::runner::default_max_steps(),
             )
             .await;
-            services.agent_cancels.write().ok().and_then(|mut map| {
+            if let Ok(mut map) = services.agent_cancels.write() {
                 map.remove(&spawned_id);
-                Some(())
-            });
+            }
             let mut manager = match services.manager.write() {
                 Ok(manager) => manager,
                 Err(_) => return,
@@ -281,19 +281,23 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentEvalTool<C> {
             DEFAULT_EVAL_TIMEOUT_MS,
             EVAL_TOOL,
         )?
-        .min(if wait { MAX_SYNC_EVAL_WAIT_MS } else { DEFAULT_EVAL_TIMEOUT_MS });
+        .min(if wait {
+            MAX_SYNC_EVAL_WAIT_MS
+        } else {
+            DEFAULT_EVAL_TIMEOUT_MS
+        });
 
         let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
         let mut timed_out = false;
         loop {
-            let manager = self
-                .services
-                .manager
-                .read()
-                .map_err(|error| ToolError::ExecutionFailed {
-                    name: EVAL_TOOL.to_string(),
-                    message: error.to_string(),
-                })?;
+            let manager =
+                self.services
+                    .manager
+                    .read()
+                    .map_err(|error| ToolError::ExecutionFailed {
+                        name: EVAL_TOOL.to_string(),
+                        message: error.to_string(),
+                    })?;
             let record = find_record(&manager, agent_id.as_deref(), name.as_deref())
                 .ok_or_else(|| ToolError::ExecutionFailed {
                     name: EVAL_TOOL.to_string(),
@@ -314,14 +318,14 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentEvalTool<C> {
             drop(manager);
             if std::time::Instant::now() >= deadline {
                 timed_out = true;
-                let manager = self
-                    .services
-                    .manager
-                    .read()
-                    .map_err(|error| ToolError::ExecutionFailed {
-                        name: EVAL_TOOL.to_string(),
-                        message: error.to_string(),
-                    })?;
+                let manager =
+                    self.services
+                        .manager
+                        .read()
+                        .map_err(|error| ToolError::ExecutionFailed {
+                            name: EVAL_TOOL.to_string(),
+                            message: error.to_string(),
+                        })?;
                 let record = find_record(&manager, agent_id.as_deref(), name.as_deref())
                     .expect("record")
                     .clone();
@@ -371,14 +375,14 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentCloseTool<C> {
             .or_else(|| optional_str(&call.arguments, "session_name"))
             .map(str::to_string);
         let resolved_id = {
-            let manager = self
-                .services
-                .manager
-                .read()
-                .map_err(|error| ToolError::ExecutionFailed {
-                    name: CLOSE_TOOL.to_string(),
-                    message: error.to_string(),
-                })?;
+            let manager =
+                self.services
+                    .manager
+                    .read()
+                    .map_err(|error| ToolError::ExecutionFailed {
+                        name: CLOSE_TOOL.to_string(),
+                        message: error.to_string(),
+                    })?;
             find_record(&manager, agent_id.as_deref(), name.as_deref())
                 .ok_or_else(|| ToolError::ExecutionFailed {
                     name: CLOSE_TOOL.to_string(),
@@ -387,19 +391,19 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentCloseTool<C> {
                 .agent_id
                 .clone()
         };
-        if let Ok(cancels) = self.services.agent_cancels.read() {
-            if let Some(token) = cancels.get(&resolved_id) {
-                token.cancel();
-            }
+        if let Ok(cancels) = self.services.agent_cancels.read()
+            && let Some(token) = cancels.get(&resolved_id)
+        {
+            token.cancel();
         }
-        let mut manager = self
-            .services
-            .manager
-            .write()
-            .map_err(|error| ToolError::ExecutionFailed {
-                name: CLOSE_TOOL.to_string(),
-                message: error.to_string(),
-            })?;
+        let mut manager =
+            self.services
+                .manager
+                .write()
+                .map_err(|error| ToolError::ExecutionFailed {
+                    name: CLOSE_TOOL.to_string(),
+                    message: error.to_string(),
+                })?;
         let record = manager.mark_cancelled(&resolved_id).map_err(tool_error)?;
         let projection = manager.project(&record, false).map_err(tool_error)?;
         manager

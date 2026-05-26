@@ -123,7 +123,11 @@ impl RlmManager {
         Ok(session.info.config.clone())
     }
 
-    pub fn eval(&mut self, name: &str, code: &str) -> Result<crate::rlm::runtime::EvalOutput, RlmError> {
+    pub fn eval(
+        &mut self,
+        name: &str,
+        code: &str,
+    ) -> Result<crate::rlm::runtime::EvalOutput, RlmError> {
         let (session_name, config, raw) = {
             let session = self.session_mut(name)?;
             session.info.eval_count = session.info.eval_count.saturating_add(1);
@@ -166,7 +170,10 @@ impl RlmManager {
     }
 
     pub fn list(&self) -> Vec<RlmSessionInfo> {
-        self.sessions.values().map(|session| session.info.clone()).collect()
+        self.sessions
+            .values()
+            .map(|session| session.info.clone())
+            .collect()
     }
 
     pub fn close_all(&mut self) {
@@ -177,11 +184,9 @@ impl RlmManager {
     }
 
     fn session(&self, name: &str) -> Result<&RlmSession, RlmError> {
-        self.sessions
-            .get(name)
-            .ok_or_else(|| RlmError::NotFound {
-                name: name.to_string(),
-            })
+        self.sessions.get(name).ok_or_else(|| RlmError::NotFound {
+            name: name.to_string(),
+        })
     }
 
     fn session_mut(&mut self, name: &str) -> Result<&mut RlmSession, RlmError> {

@@ -25,7 +25,5 @@ pub fn with_plan<R>(plan: ToolExecutionPlan, action: impl FnOnce() -> R) -> R {
 /// Sandbox policy for the current tool invocation, if any.
 #[must_use]
 pub fn current_sandbox_policy() -> SandboxPolicy {
-    ACTIVE_PLAN.with(|cell| {
-        SandboxPolicy::from_execution_plan(cell.borrow().as_ref())
-    })
+    ACTIVE_PLAN.with(|cell| SandboxPolicy::from_execution_plan(cell.borrow().as_ref()))
 }

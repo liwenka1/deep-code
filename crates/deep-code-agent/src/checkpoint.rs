@@ -81,10 +81,11 @@ impl CheckpointStore {
 
     pub fn list(&self) -> Result<Vec<CheckpointId>, ToolError> {
         let mut ids = Vec::new();
-        let entries = fs::read_dir(&self.storage_root).map_err(|error| ToolError::ExecutionFailed {
-            name: "checkpoint".to_string(),
-            message: format!("failed to list checkpoints: {error}"),
-        })?;
+        let entries =
+            fs::read_dir(&self.storage_root).map_err(|error| ToolError::ExecutionFailed {
+                name: "checkpoint".to_string(),
+                message: format!("failed to list checkpoints: {error}"),
+            })?;
         for entry in entries {
             let entry = entry.map_err(|error| ToolError::ExecutionFailed {
                 name: "checkpoint".to_string(),
@@ -126,13 +127,14 @@ fn should_skip(rel: &Path) -> bool {
 fn copy_tree(source: &Path, dest: &Path, skip_meta: bool) -> Result<(), ToolError> {
     fs::create_dir_all(dest).map_err(|error| checkpoint_error("create snapshot dir", error))?;
     for entry in WalkDir::new(source).into_iter().filter_map(Result::ok) {
-        let rel = entry
-            .path()
-            .strip_prefix(source)
-            .map_err(|error| ToolError::ExecutionFailed {
-                name: "checkpoint".to_string(),
-                message: error.to_string(),
-            })?;
+        let rel =
+            entry
+                .path()
+                .strip_prefix(source)
+                .map_err(|error| ToolError::ExecutionFailed {
+                    name: "checkpoint".to_string(),
+                    message: error.to_string(),
+                })?;
         if rel.as_os_str().is_empty() {
             continue;
         }
@@ -156,7 +158,8 @@ fn copy_tree(source: &Path, dest: &Path, skip_meta: bool) -> Result<(), ToolErro
 }
 
 fn clear_workspace_contents(workspace: &Path) -> Result<(), ToolError> {
-    for entry in fs::read_dir(workspace).map_err(|error| checkpoint_error("read workspace", error))?
+    for entry in
+        fs::read_dir(workspace).map_err(|error| checkpoint_error("read workspace", error))?
     {
         let entry = entry.map_err(|error| checkpoint_error("read workspace entry", error))?;
         let name = entry.file_name();

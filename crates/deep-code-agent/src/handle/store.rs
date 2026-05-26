@@ -225,14 +225,28 @@ impl HandleStore {
         })
     }
 
-    pub fn read_head(&self, id: &HandleId, max_lines: usize, max_chars: usize) -> Option<(String, bool)> {
+    pub fn read_head(
+        &self,
+        id: &HandleId,
+        max_lines: usize,
+        max_chars: usize,
+    ) -> Option<(String, bool)> {
         let stored = self.handles.get(id.as_str())?;
         let lines: Vec<&str> = stored.text.lines().collect();
-        let selected = lines.into_iter().take(max_lines).collect::<Vec<_>>().join("\n");
+        let selected = lines
+            .into_iter()
+            .take(max_lines)
+            .collect::<Vec<_>>()
+            .join("\n");
         Some(truncate_chars(selected, max_chars))
     }
 
-    pub fn read_tail(&self, id: &HandleId, max_lines: usize, max_chars: usize) -> Option<(String, bool)> {
+    pub fn read_tail(
+        &self,
+        id: &HandleId,
+        max_lines: usize,
+        max_chars: usize,
+    ) -> Option<(String, bool)> {
         let stored = self.handles.get(id.as_str())?;
         let lines: Vec<&str> = stored.text.lines().collect();
         let start = lines.len().saturating_sub(max_lines);
@@ -263,7 +277,9 @@ impl HandleStore {
 
     #[must_use]
     pub fn get_payload(&self, id: &HandleId) -> Option<&Value> {
-        self.handles.get(id.as_str()).and_then(|stored| stored.payload.as_ref())
+        self.handles
+            .get(id.as_str())
+            .and_then(|stored| stored.payload.as_ref())
     }
 
     pub fn purge_session(&mut self, session_id: &str) -> usize {
@@ -318,10 +334,7 @@ fn truncate_chars(text: String, max_chars: usize) -> (String, bool) {
     if text.chars().count() <= max_chars {
         return (text, false);
     }
-    (
-        text.chars().take(max_chars).collect::<String>(),
-        true,
-    )
+    (text.chars().take(max_chars).collect::<String>(), true)
 }
 
 fn sanitize_hint(hint: &str) -> String {
@@ -343,10 +356,7 @@ fn summarize_text(text: &str) -> String {
     if flattened.chars().count() <= MAX {
         flattened
     } else {
-        format!(
-            "{}...",
-            flattened.chars().take(MAX).collect::<String>()
-        )
+        format!("{}...", flattened.chars().take(MAX).collect::<String>())
     }
 }
 

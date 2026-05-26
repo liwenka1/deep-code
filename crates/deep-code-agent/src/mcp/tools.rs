@@ -31,15 +31,12 @@ impl Tool for McpDynamicTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             self.qualified_name.clone(),
-            self.descriptor
-                .description
-                .clone()
-                .unwrap_or_else(|| {
-                    format!(
-                        "MCP tool {}::{}",
-                        self.descriptor.server_name, self.descriptor.tool_name
-                    )
-                }),
+            self.descriptor.description.clone().unwrap_or_else(|| {
+                format!(
+                    "MCP tool {}::{}",
+                    self.descriptor.server_name, self.descriptor.tool_name
+                )
+            }),
             self.descriptor.input_schema.clone(),
             true,
         )
@@ -67,10 +64,7 @@ impl Tool for McpDynamicTool {
 }
 
 pub fn register_mcp_tools(registry: &mut ToolRegistry, manager: Arc<RwLock<McpManager>>) {
-    let qualified_tools = manager
-        .read()
-        .expect("mcp lock")
-        .qualified_tools();
+    let qualified_tools = manager.read().expect("mcp lock").qualified_tools();
     for (qualified_name, descriptor) in qualified_tools {
         registry.register(McpDynamicTool::new(
             Arc::clone(&manager),
@@ -95,10 +89,11 @@ mod tests {
 
     #[test]
     fn mcp_tool_runs_through_registry_with_approval() {
-        let client = Arc::new(
-            InMemoryMcpClient::new("mock")
-                .with_tool("ping", Some("ping"), json!({"pong": true})),
-        );
+        let client = Arc::new(InMemoryMcpClient::new("mock").with_tool(
+            "ping",
+            Some("ping"),
+            json!({"pong": true}),
+        ));
         let mut manager = McpManager::new();
         manager
             .register_mock_client(

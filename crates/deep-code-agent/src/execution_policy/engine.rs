@@ -136,16 +136,14 @@ impl ExecPolicy {
     pub fn evaluate_tool(&self, tool_name: &str, arguments: &Value) -> ToolExecutionPlan {
         let kind = Self::classify_tool(tool_name);
         match kind {
-            ToolKind::ReadOnlyFile | ToolKind::Search | ToolKind::GitRead => {
-                ToolExecutionPlan {
-                    verdict: PolicyVerdict::Allow,
-                    requires_approval: false,
-                    requires_sandbox: false,
-                    read_only: true,
-                    risk_level: RiskLevel::Low,
-                    matched_rule: Some("builtin:read_only_tool".to_string()),
-                }
-            }
+            ToolKind::ReadOnlyFile | ToolKind::Search | ToolKind::GitRead => ToolExecutionPlan {
+                verdict: PolicyVerdict::Allow,
+                requires_approval: false,
+                requires_sandbox: false,
+                read_only: true,
+                risk_level: RiskLevel::Low,
+                matched_rule: Some("builtin:read_only_tool".to_string()),
+            },
             ToolKind::WriteFile => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {
                     reason: "write tools can modify workspace files".to_string(),
@@ -212,7 +210,8 @@ impl ExecPolicy {
                 ToolExecutionPlan {
                     verdict: if needs_approval {
                         PolicyVerdict::NeedsApproval {
-                            reason: "rlm_eval executes analysis code against loaded context".to_string(),
+                            reason: "rlm_eval executes analysis code against loaded context"
+                                .to_string(),
                         }
                     } else {
                         PolicyVerdict::Allow
@@ -316,10 +315,7 @@ mod tests {
     #[test]
     fn write_tools_need_approval() {
         let policy = ExecPolicy::default();
-        let plan = policy.evaluate_tool(
-            "write_file",
-            &json!({"path": "a.rs", "content": "x"}),
-        );
+        let plan = policy.evaluate_tool("write_file", &json!({"path": "a.rs", "content": "x"}));
         assert!(matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }));
         assert!(plan.requires_approval);
     }
@@ -358,10 +354,7 @@ mod tests {
     #[test]
     fn rlm_eval_requires_approval() {
         let policy = ExecPolicy::default();
-        let plan = policy.evaluate_tool(
-            "rlm_eval",
-            &json!({"name": "ctx", "code": "stats"}),
-        );
+        let plan = policy.evaluate_tool("rlm_eval", &json!({"name": "ctx", "code": "stats"}));
         assert!(matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }));
         assert!(plan.requires_approval);
     }
