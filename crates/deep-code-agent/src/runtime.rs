@@ -12,11 +12,14 @@
 //!   `RuntimeEvent::Error` if the model produces more than one tool call in
 //!   one turn. The single-call path is enough for the 03 milestone.
 
+mod event;
+mod handle;
+mod state;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::auto_mode::{api_fallback_model, resolve_turn_route};
@@ -41,139 +44,10 @@ use crate::tool::{
     ApprovalDecision, ApprovalRequest, ToolCall, ToolCallAccumulator, ToolError, ToolRegistry,
     ToolResult, ToolResultStatus, ToolRunOutcome,
 };
-
-/// Events the agent runtime produces for UIs.
-///
-/// These are higher level than [`AgentEvent`]: approval requests and tool
-/// results are emitted by the runtime, never by an [`LlmClient`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum RuntimeEvent {
-    /// Forwarded provider event (text/reasoning/tool-call-delta).
-    Provider(AgentEvent),
-    /// Runtime is requesting human approval for a tool call.
-    ApprovalRequired { request: ApprovalRequest },
-    /// A tool finished (executed, denied, or failed) and its result has been
-    /// recorded in the session.
-    ToolResult { result: ToolResult },
-    /// Current turn finished cleanly (no further provider activity).
-    TurnFinished {
-        usage: Option<Usage>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        telemetry: Option<TurnTelemetry>,
-    },
-    /// Transcript compaction was applied before the model request.
-    CompactionApplied {
-        archived_count: usize,
-        summary: String,
-    },
-    /// Workspace snapshot stored under `.deep-code/checkpoints/`.
-    CheckpointCreated { id: CheckpointId, label: String },
-    /// Workspace restored from a checkpoint (via runtime or UI command).
-    WorkspaceRestored { id: CheckpointId },
-    /// Post-edit LSP diagnostics were collected for one or more files.
-    DiagnosticsUpdated { summary: String, rendered: String },
-    /// Runtime-level error. Terminal for the current turn.
-    Error { message: String },
-}
-
-pub type RuntimeEventReceiver = mpsc::UnboundedReceiver<RuntimeEvent>;
-
-/// Object-safe handle so that callers (UIs, tests) can hold heterogeneous
-/// runtimes (DeepSeek, offline echo, scripted, ...) behind a `Box<dyn ...>`.
-///
-/// Methods here return owned futures so the trait stays object-safe even
-/// though [`LlmClient`] is not.
-pub trait AgentRuntimeHandle: Send + Sync {
-    fn submit_user(
-        &self,
-        prompt: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeEventReceiver> + Send + '_>>;
-
-    fn submit_approval(
-        &self,
-        decision: ApprovalDecision,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeEventReceiver> + Send + '_>>;
-
-    fn session_messages(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Message>> + Send + '_>>;
-
-    fn restore_checkpoint(
-        &self,
-        id: CheckpointId,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + Send + '_>>;
-
-    fn session_id(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<SessionId>> + Send + '_>>;
-
-    fn shutdown(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
-}
-
-impl<C: LlmClient + 'static> AgentRuntimeHandle for AgentRuntime<C> {
-    fn submit_user(
-        &self,
-        prompt: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeEventReceiver> + Send + '_>>
-    {
-        Box::pin(AgentRuntime::submit_user(self, prompt))
-    }
-
-    fn submit_approval(
-        &self,
-        decision: ApprovalDecision,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeEventReceiver> + Send + '_>>
-    {
-        Box::pin(AgentRuntime::submit_approval(self, decision))
-    }
-
-    fn session_messages(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Message>> + Send + '_>> {
-        Box::pin(AgentRuntime::session_messages(self))
-    }
-
-    fn restore_checkpoint(
-        &self,
-        id: CheckpointId,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + Send + '_>>
-    {
-        Box::pin(AgentRuntime::restore_checkpoint(self, id))
-    }
-
-    fn session_id(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<SessionId>> + Send + '_>> {
-        Box::pin(AgentRuntime::session_id(self))
-    }
-
-    fn shutdown(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-        Box::pin(AgentRuntime::shutdown(self))
-    }
-}
-
-/// Internal: the runtime can be in one of these states between [`RuntimeEvent`]
-/// emissions. Kept private so callers cannot poke at it.
-#[derive(Debug, Default)]
-struct RuntimeState {
-    session: Session,
-    pending: Option<PendingToolCall>,
-    current_turn: Option<TurnRecord>,
-    last_prefix_hash: Option<u64>,
-    session_cost: CostEstimate,
-    current_prompt: Option<String>,
-}
-
-struct Persistence {
-    store: Arc<JsonSessionStore>,
-    record: Arc<Mutex<SessionRecord>>,
-}
-
-#[derive(Debug, Clone)]
-struct PendingToolCall {
-    call: ToolCall,
-}
+use event::emit;
+pub use event::{RuntimeEvent, RuntimeEventReceiver};
+pub use handle::AgentRuntimeHandle;
+use state::{PendingToolCall, Persistence, RuntimeState};
 
 /// Agent runtime tying together [`LlmClient`], [`ToolRegistry`], and [`Session`].
 ///
@@ -954,10 +828,6 @@ fn api_error_retriable(error: &AgentError) -> bool {
     }
 }
 
-fn emit(tx: &mpsc::UnboundedSender<RuntimeEvent>, event: RuntimeEvent) {
-    let _ = tx.send(event);
-}
-
 fn tool_call_payload(call: &ToolCall) -> ToolCallPayload {
     // Compact form keeps history small and matches typical OpenAI-style
     // assistant payloads. We don't try to preserve the exact bytes the model
@@ -988,7 +858,6 @@ fn append_diagnostics(content: &str, rendered: &str) -> String {
         format!("{content}\n\n{rendered}")
     }
 }
-
 
 #[cfg(test)]
 #[path = "runtime/api_retriable_tests.rs"]

@@ -60,8 +60,7 @@ impl LlmClient for ScriptedClient {
                 yield event;
             }
         };
-        let stream: Pin<Box<dyn Stream<Item = AgentResult<AgentEvent>> + Send>> =
-            Box::pin(stream);
+        let stream: Pin<Box<dyn Stream<Item = AgentResult<AgentEvent>> + Send>> = Box::pin(stream);
         Ok(stream)
     }
 }
@@ -175,8 +174,7 @@ async fn deny_path_records_denied_tool_message_and_continues() {
     assert!(
         messages
             .iter()
-            .any(|m| matches!(m.role, crate::message::Role::Tool)
-                && m.content.contains("denied"))
+            .any(|m| matches!(m.role, crate::message::Role::Tool) && m.content.contains("denied"))
     );
 }
 
@@ -364,8 +362,7 @@ async fn persistence_saves_messages_and_turns() {
     drain(&mut rx).await;
     runtime.shutdown().await;
 
-    let store =
-        crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
     let record = store.load(&session_id).unwrap();
     assert_eq!(record.messages.len(), 3);
     assert_eq!(record.turns.len(), 1);
@@ -392,8 +389,7 @@ async fn stream_error_finalizes_open_turn() {
     drain(&mut rx).await;
     runtime.shutdown().await;
 
-    let store =
-        crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
     let record = store.load(&session_id).unwrap();
     assert_eq!(record.turns.len(), 1);
     assert_eq!(record.turns[0].user_prompt, "hi");
@@ -433,8 +429,7 @@ async fn persistence_saves_tool_results_in_turn() {
     drain(&mut rx).await;
     runtime.shutdown().await;
 
-    let store =
-        crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
     let record = store.load(&session_id).unwrap();
     assert_eq!(record.turns.len(), 1);
     assert_eq!(record.turns[0].user_prompt, "please echo");
@@ -477,8 +472,7 @@ async fn resumed_runtime_continues_conversation() {
     drain(&mut rx).await;
     runtime.shutdown().await;
 
-    let store =
-        crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
     let record = store.load(&session_id).unwrap();
     assert_eq!(record.messages.len(), 3);
 
