@@ -70,6 +70,72 @@ impl WorkspacePolicy {
         Ok(canonical)
     }
 
+    pub(crate) fn resolve_for_write(
+        &self,
+        raw: &str,
+        tool_name: &str,
+    ) -> Result<PathBuf, ToolError> {
+        let candidate = self.prepare_candidate(raw, tool_name)?;
+        if candidate.exists() {
+            if contains_symlink(&candidate, Some(&self.root)).map_err(|error| {
+                ToolError::ExecutionFailed {
+                    name: tool_name.to_string(),
+                    message: format!("failed to inspect {}: {error}", candidate.display()),
+                }
+            })? {
+                return Err(path_error(
+                    tool_name,
+                    raw,
+                    "symlinks in the destination path are not allowed",
+                ));
+            }
+            let canonical =
+                candidate
+                    .canonicalize()
+                    .map_err(|error| ToolError::ExecutionFailed {
+                        name: tool_name.to_string(),
+                        message: format!("failed to resolve {}: {error}", candidate.display()),
+                    })?;
+            if !canonical.starts_with(&self.root) {
+                return Err(path_error(tool_name, raw, "path escapes the workspace"));
+            }
+            return Ok(candidate);
+        }
+        let parent = candidate.parent().ok_or_else(|| {
+            path_error(
+                tool_name,
+                raw,
+                "path must have a parent directory inside workspace",
+            )
+        })?;
+        if contains_symlink(parent, Some(&self.root)).map_err(|error| {
+            ToolError::ExecutionFailed {
+                name: tool_name.to_string(),
+                message: format!("failed to inspect {}: {error}", parent.display()),
+            }
+        })? {
+            return Err(path_error(
+                tool_name,
+                raw,
+                "symlinks in the destination path are not allowed",
+            ));
+        }
+        let parent_canonical =
+            parent
+                .canonicalize()
+                .map_err(|error| ToolError::ExecutionFailed {
+                    name: tool_name.to_string(),
+                    message: format!(
+                        "destination parent {} does not exist or cannot be resolved: {error}",
+                        parent.display()
+                    ),
+                })?;
+        if !parent_canonical.starts_with(&self.root) {
+            return Err(path_error(tool_name, raw, "path escapes the workspace"));
+        }
+        Ok(candidate)
+    }
+
     pub(crate) fn relative_display(&self, path: &Path) -> String {
         path.strip_prefix(&self.root)
             .unwrap_or(path)
@@ -171,7 +237,7 @@ pub(crate) fn truncate_string(value: String, max_chars: usize) -> (String, bool,
     (truncated, true, total - max_chars)
 }
 
-fn contains_symlink(path: &Path, stop_at: Option<&Path>) -> std::io::Result<bool> {
+pub(crate) fn contains_symlink(path: &Path, stop_at: Option<&Path>) -> std::io::Result<bool> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());

@@ -6,9 +6,10 @@ use futures_core::Stream;
 
 use super::*;
 use crate::client::AgentEventStream;
-use crate::error::AgentResult;
+use crate::error::{AgentError, AgentResult};
 use crate::event::AgentEvent;
 use crate::model::{FunctionCallDelta, ToolCallDelta};
+use crate::session_store::SessionStore;
 use crate::tool::{MockEchoTool, ToolRegistry, ToolResultStatus};
 
 #[test]

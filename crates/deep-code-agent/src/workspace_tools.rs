@@ -1,12 +1,15 @@
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
 use ignore::WalkBuilder;
 use regex::RegexBuilder;
-use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::tool::{Tool, ToolCall, ToolError, ToolRegistry, ToolResult, ToolSpec};
+use crate::workspace_policy::{
+    WorkspacePolicy, contains_symlink, invalid, json_string, optional_bool, optional_str,
+    required_str,
+};
 
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 500;
@@ -17,13 +20,13 @@ const DEFAULT_CONTEXT_LINES: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceTools {
-    root: WorkspaceRoot,
+    root: WorkspacePolicy,
 }
 
 impl WorkspaceTools {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, ToolError> {
         Ok(Self {
-            root: WorkspaceRoot::new(root.into())?,
+            root: WorkspacePolicy::new(root)?,
         })
     }
 
@@ -43,156 +46,14 @@ pub fn workspace_tool_registry(root: impl Into<PathBuf>) -> Result<ToolRegistry,
 }
 
 #[derive(Debug, Clone)]
-struct WorkspaceRoot {
-    root: PathBuf,
-}
-
-impl WorkspaceRoot {
-    fn new(root: PathBuf) -> Result<Self, ToolError> {
-        let canonical = root
-            .canonicalize()
-            .map_err(|error| ToolError::ExecutionFailed {
-                name: "workspace".to_string(),
-                message: format!(
-                    "failed to resolve workspace root {}: {error}",
-                    root.display()
-                ),
-            })?;
-        Ok(Self { root: canonical })
-    }
-
-    fn root(&self) -> &Path {
-        &self.root
-    }
-
-    fn resolve_existing(&self, raw: &str, tool_name: &str) -> Result<PathBuf, ToolError> {
-        let candidate = self.prepare_candidate(raw, tool_name)?;
-        if path_contains_symlink(&candidate, Some(&self.root)).map_err(|error| {
-            ToolError::ExecutionFailed {
-                name: tool_name.to_string(),
-                message: format!("failed to inspect {}: {error}", candidate.display()),
-            }
-        })? {
-            return Err(path_error(tool_name, raw, "symlinks are not allowed"));
-        }
-        let canonical = candidate
-            .canonicalize()
-            .map_err(|error| ToolError::ExecutionFailed {
-                name: tool_name.to_string(),
-                message: format!("failed to resolve {}: {error}", candidate.display()),
-            })?;
-        if !canonical.starts_with(&self.root) {
-            return Err(path_error(tool_name, raw, "path escapes the workspace"));
-        }
-        Ok(canonical)
-    }
-
-    fn resolve_for_write(&self, raw: &str, tool_name: &str) -> Result<PathBuf, ToolError> {
-        let candidate = self.prepare_candidate(raw, tool_name)?;
-        if candidate.exists() {
-            if path_contains_symlink(&candidate, Some(&self.root)).map_err(|error| {
-                ToolError::ExecutionFailed {
-                    name: tool_name.to_string(),
-                    message: format!("failed to inspect {}: {error}", candidate.display()),
-                }
-            })? {
-                return Err(path_error(
-                    tool_name,
-                    raw,
-                    "symlinks in the destination path are not allowed",
-                ));
-            }
-            let canonical =
-                candidate
-                    .canonicalize()
-                    .map_err(|error| ToolError::ExecutionFailed {
-                        name: tool_name.to_string(),
-                        message: format!("failed to resolve {}: {error}", candidate.display()),
-                    })?;
-            if !canonical.starts_with(&self.root) {
-                return Err(path_error(tool_name, raw, "path escapes the workspace"));
-            }
-            return Ok(candidate);
-        }
-        let parent = candidate.parent().ok_or_else(|| {
-            path_error(
-                tool_name,
-                raw,
-                "path must have a parent directory inside workspace",
-            )
-        })?;
-        if path_contains_symlink(parent, Some(&self.root)).map_err(|error| {
-            ToolError::ExecutionFailed {
-                name: tool_name.to_string(),
-                message: format!("failed to inspect {}: {error}", parent.display()),
-            }
-        })? {
-            return Err(path_error(
-                tool_name,
-                raw,
-                "symlinks in the destination path are not allowed",
-            ));
-        }
-        let parent_canonical =
-            parent
-                .canonicalize()
-                .map_err(|error| ToolError::ExecutionFailed {
-                    name: tool_name.to_string(),
-                    message: format!(
-                        "destination parent {} does not exist or cannot be resolved: {error}",
-                        parent.display()
-                    ),
-                })?;
-        if !parent_canonical.starts_with(&self.root) {
-            return Err(path_error(tool_name, raw, "path escapes the workspace"));
-        }
-        Ok(candidate)
-    }
-
-    fn prepare_candidate(&self, raw: &str, tool_name: &str) -> Result<PathBuf, ToolError> {
-        let raw_path = Path::new(raw);
-        if raw.trim().is_empty() {
-            return Err(path_error(tool_name, raw, "path must not be empty"));
-        }
-        if raw_path.is_absolute() {
-            return Err(path_error(
-                tool_name,
-                raw,
-                "absolute paths are not allowed; use a workspace-relative path",
-            ));
-        }
-        if raw_path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::Prefix(_) | Component::RootDir
-            )
-        }) {
-            return Err(path_error(
-                tool_name,
-                raw,
-                "parent traversal and absolute prefixes are not allowed",
-            ));
-        }
-        Ok(self.root.join(raw_path))
-    }
-
-    fn relative_display(&self, path: &Path) -> String {
-        path.strip_prefix(&self.root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/")
-    }
-}
-
-#[derive(Debug, Clone)]
 struct ReadFileTool {
-    root: WorkspaceRoot,
+    root: WorkspacePolicy,
 }
 
 impl ReadFileTool {
     const NAME: &'static str = "read_file";
 
-    fn new(root: WorkspaceRoot) -> Self {
+    fn new(root: WorkspacePolicy) -> Self {
         Self { root }
     }
 }
@@ -279,13 +140,13 @@ impl Tool for ReadFileTool {
 
 #[derive(Debug, Clone)]
 struct ListDirTool {
-    root: WorkspaceRoot,
+    root: WorkspacePolicy,
 }
 
 impl ListDirTool {
     const NAME: &'static str = "list_dir";
 
-    fn new(root: WorkspaceRoot) -> Self {
+    fn new(root: WorkspacePolicy) -> Self {
         Self { root }
     }
 }
@@ -360,13 +221,13 @@ impl Tool for ListDirTool {
 
 #[derive(Debug, Clone)]
 struct GrepFilesTool {
-    root: WorkspaceRoot,
+    root: WorkspacePolicy,
 }
 
 impl GrepFilesTool {
     const NAME: &'static str = "grep_files";
 
-    fn new(root: WorkspaceRoot) -> Self {
+    fn new(root: WorkspacePolicy) -> Self {
         Self { root }
     }
 }
@@ -431,7 +292,7 @@ impl Tool for GrepFilesTool {
             if !path.is_file() {
                 continue;
             }
-            if path_contains_symlink(path, Some(self.root.root())).unwrap_or(true) {
+            if contains_symlink(path, Some(self.root.root())).unwrap_or(true) {
                 continue;
             }
             let Ok(metadata) = fs::metadata(path) else {
@@ -487,13 +348,13 @@ impl Tool for GrepFilesTool {
 
 #[derive(Debug, Clone)]
 struct WriteFileTool {
-    root: WorkspaceRoot,
+    root: WorkspacePolicy,
 }
 
 impl WriteFileTool {
     const NAME: &'static str = "write_file";
 
-    fn new(root: WorkspaceRoot) -> Self {
+    fn new(root: WorkspacePolicy) -> Self {
         Self { root }
     }
 }
@@ -537,13 +398,13 @@ impl Tool for WriteFileTool {
 
 #[derive(Debug, Clone)]
 struct ApplyPatchTool {
-    root: WorkspaceRoot,
+    root: WorkspacePolicy,
 }
 
 impl ApplyPatchTool {
     const NAME: &'static str = "apply_patch";
 
-    fn new(root: WorkspaceRoot) -> Self {
+    fn new(root: WorkspacePolicy) -> Self {
         Self { root }
     }
 }
@@ -602,45 +463,6 @@ impl Tool for ApplyPatchTool {
     }
 }
 
-fn path_contains_symlink(path: &Path, stop_at: Option<&Path>) -> std::io::Result<bool> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        if stop_at.is_some_and(|root| current == root) {
-            continue;
-        }
-        if fs::symlink_metadata(&current)?.file_type().is_symlink() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn required_str<'a>(input: &'a Value, field: &str, tool_name: &str) -> Result<&'a str, ToolError> {
-    input
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid(tool_name, format!("missing string field '{field}'")))
-}
-
-fn optional_str<'a>(input: &'a Value, field: &str) -> Option<&'a str> {
-    input.get(field).and_then(Value::as_str)
-}
-
-fn optional_bool(
-    input: &Value,
-    field: &str,
-    default: bool,
-    tool_name: &str,
-) -> Result<bool, ToolError> {
-    match input.get(field) {
-        Some(value) => value
-            .as_bool()
-            .ok_or_else(|| invalid(tool_name, format!("field '{field}' must be a boolean"))),
-        None => Ok(default),
-    }
-}
-
 fn optional_usize(
     input: &Value,
     field: &str,
@@ -659,21 +481,6 @@ fn optional_usize(
             }),
         None => Ok(default),
     }
-}
-
-fn invalid(name: impl Into<String>, message: impl Into<String>) -> ToolError {
-    ToolError::InvalidArguments {
-        name: name.into(),
-        message: message.into(),
-    }
-}
-
-fn path_error(tool_name: &str, raw: &str, message: &str) -> ToolError {
-    invalid(tool_name, format!("invalid path '{raw}': {message}"))
-}
-
-fn json_string(value: impl Serialize) -> String {
-    serde_json::to_string_pretty(&value).expect("serializing tool output should not fail")
 }
 
 #[cfg(test)]

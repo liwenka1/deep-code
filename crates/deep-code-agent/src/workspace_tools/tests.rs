@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde_json::json;
 use tempfile::tempdir;
 
