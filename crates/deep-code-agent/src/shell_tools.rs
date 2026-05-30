@@ -1,15 +1,9 @@
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::io::{BufReader, Read};
-use std::process::{Child, Stdio};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
-};
+mod jobs;
+
+use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
 use serde_json::json;
 
 use crate::sandbox::SandboxManager;
@@ -18,13 +12,17 @@ use crate::tool_execution::current_sandbox_policy;
 use crate::workspace_policy::{
     WorkspacePolicy, invalid, json_string, optional_str, optional_u64, required_str,
 };
+pub use jobs::{BackgroundJobSummary, JobStore};
+use jobs::{
+    JobKind, JobState, JobStatus, SharedBuffer, cancel_job, command_output_json, job_snapshot_json,
+    refresh_job, spawn_buffer_reader,
+};
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
 const MAX_OUTPUT_CHARS: usize = 20_000;
 const DEFAULT_TAIL_CHARS: usize = 4_000;
 const MAX_TAIL_CHARS: usize = 20_000;
-const JOB_BUFFER_BYTES: usize = 128 * 1024;
 const SHELL_RUN_STARTUP_WAIT_MS: u64 = 100;
 
 #[derive(Debug, Clone)]
@@ -79,165 +77,6 @@ pub fn shell_tool_registry(
     let shell = ShellTools::new(root)?;
     let jobs = shell.job_store();
     Ok((shell.into_registry(), jobs))
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct JobStore {
-    next_id: Arc<AtomicU64>,
-    jobs: Arc<Mutex<HashMap<String, Arc<Mutex<JobState>>>>>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct BackgroundJobSummary {
-    pub id: String,
-    pub command: String,
-    pub cwd: String,
-    pub status: JobStatus,
-    pub exit_code: Option<i32>,
-    pub background: bool,
-}
-
-impl JobStore {
-    /// Summaries of shell jobs tracked for the current runtime (foreground + background).
-    pub fn list_summaries(&self) -> Vec<BackgroundJobSummary> {
-        let guard = self.jobs.lock().expect("job store lock poisoned");
-        let mut summaries: Vec<_> = guard
-            .iter()
-            .filter_map(|(id, state_arc)| {
-                let state = state_arc.lock().ok()?;
-                Some(BackgroundJobSummary {
-                    id: id.clone(),
-                    command: state.command.clone(),
-                    cwd: state.cwd.clone(),
-                    status: state.status,
-                    exit_code: state.exit_code,
-                    background: state.kind == JobKind::Background,
-                })
-            })
-            .collect();
-        summaries.sort_by(|left, right| right.id.cmp(&left.id));
-        summaries
-    }
-
-    fn insert(&self, state: JobState) -> String {
-        let id = format!("job_{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
-        self.jobs
-            .lock()
-            .expect("job store lock poisoned")
-            .insert(id.clone(), Arc::new(Mutex::new(state)));
-        id
-    }
-
-    fn get(&self, id: &str, tool_name: &str) -> Result<Arc<Mutex<JobState>>, ToolError> {
-        self.jobs
-            .lock()
-            .expect("job store lock poisoned")
-            .get(id)
-            .cloned()
-            .ok_or_else(|| invalid(tool_name, format!("unknown job_id '{id}'")))
-    }
-}
-
-#[derive(Debug)]
-struct JobState {
-    kind: JobKind,
-    command: String,
-    cwd: String,
-    started_at: Instant,
-    timeout_deadline: Option<Instant>,
-    status: JobStatus,
-    exit_code: Option<i32>,
-    stdout: SharedBuffer,
-    stderr: SharedBuffer,
-    child: Option<Child>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobKind {
-    Foreground,
-    Background,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobStatus {
-    Running,
-    Completed,
-    Failed,
-    TimedOut,
-    Cancelled,
-}
-
-#[derive(Debug, Clone)]
-struct SharedBuffer(Arc<Mutex<RingBuffer>>);
-
-impl Default for SharedBuffer {
-    fn default() -> Self {
-        Self(Arc::new(Mutex::new(RingBuffer::new(JOB_BUFFER_BYTES))))
-    }
-}
-
-impl SharedBuffer {
-    fn push(&self, bytes: &[u8]) {
-        self.0
-            .lock()
-            .expect("output buffer lock poisoned")
-            .push(bytes);
-    }
-
-    fn text(&self) -> String {
-        self.0.lock().expect("output buffer lock poisoned").text()
-    }
-
-    fn total_len(&self) -> usize {
-        self.0
-            .lock()
-            .expect("output buffer lock poisoned")
-            .total_len
-    }
-
-    fn omitted_len(&self) -> usize {
-        self.0
-            .lock()
-            .expect("output buffer lock poisoned")
-            .omitted_len()
-    }
-}
-
-#[derive(Debug)]
-struct RingBuffer {
-    bytes: VecDeque<u8>,
-    capacity: usize,
-    total_len: usize,
-}
-
-impl RingBuffer {
-    fn new(capacity: usize) -> Self {
-        Self {
-            bytes: VecDeque::with_capacity(capacity),
-            capacity,
-            total_len: 0,
-        }
-    }
-
-    fn push(&mut self, bytes: &[u8]) {
-        self.total_len += bytes.len();
-        for byte in bytes {
-            if self.bytes.len() == self.capacity {
-                self.bytes.pop_front();
-            }
-            self.bytes.push_back(*byte);
-        }
-    }
-
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.bytes.iter().copied().collect::<Vec<_>>()).to_string()
-    }
-
-    fn omitted_len(&self) -> usize {
-        self.total_len.saturating_sub(self.bytes.len())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -349,7 +188,7 @@ impl Tool for ShellRunTool {
         Ok(ToolResult::success(
             call.id.clone(),
             call.name.clone(),
-            command_output_json(&job_id, &job),
+            command_output_json(&job_id, &job, MAX_OUTPUT_CHARS),
         ))
     }
 }
@@ -580,131 +419,6 @@ impl Tool for JobCancelTool {
             job_snapshot_json(job_id, &job, DEFAULT_TAIL_CHARS),
         ))
     }
-}
-
-fn spawn_buffer_reader<R: Read + Send + 'static>(pipe: R, buffer: SharedBuffer) {
-    thread::spawn(move || {
-        let mut reader = BufReader::new(pipe);
-        let mut chunk = [0_u8; 8192];
-        loop {
-            match reader.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(bytes) => buffer.push(&chunk[..bytes]),
-                Err(_) => break,
-            }
-        }
-    });
-}
-
-fn refresh_job(job: &mut JobState) {
-    if job.status != JobStatus::Running {
-        return;
-    }
-    let Some(child) = job.child.as_mut() else {
-        return;
-    };
-    if let Ok(Some(status)) = child.try_wait() {
-        job.exit_code = status.code();
-        job.status = if status.success() {
-            JobStatus::Completed
-        } else {
-            JobStatus::Failed
-        };
-        job.child = None;
-        return;
-    }
-    if job
-        .timeout_deadline
-        .is_some_and(|deadline| Instant::now() >= deadline)
-    {
-        timeout_job(job);
-    }
-}
-
-fn timeout_job(job: &mut JobState) {
-    if let Some(child) = job.child.as_mut() {
-        let _ = child.kill();
-        if let Ok(status) = child.wait() {
-            job.exit_code = status.code();
-        }
-    }
-    job.child = None;
-    job.status = JobStatus::TimedOut;
-}
-
-fn cancel_job(job: &mut JobState, tool_name: &str) -> Result<(), ToolError> {
-    if let Some(child) = job.child.as_mut() {
-        let _ = child.kill();
-        let status = child.wait().map_err(|error| ToolError::ExecutionFailed {
-            name: tool_name.to_string(),
-            message: format!("failed to wait after cancel: {error}"),
-        })?;
-        job.exit_code = status.code();
-    }
-    job.child = None;
-    job.status = JobStatus::Cancelled;
-    Ok(())
-}
-
-fn command_output_json(job_id: &str, job: &JobState) -> String {
-    let stdout = job.stdout.text();
-    let stderr = job.stderr.text();
-    let stdout_len = job.stdout.total_len();
-    let stderr_len = job.stderr.total_len();
-    let stdout_omitted_chars = job.stdout.omitted_len();
-    let stderr_omitted_chars = job.stderr.omitted_len();
-    let stdout = tail_chars(&stdout, MAX_OUTPUT_CHARS);
-    let stderr = tail_chars(&stderr, MAX_OUTPUT_CHARS);
-    json_string(json!({
-        "job_id": job_id,
-        "kind": job.kind,
-        "command": job.command,
-        "cwd": job.cwd,
-        "status": job.status,
-        "exit_code": job.exit_code,
-        "elapsed_ms": job.started_at.elapsed().as_millis() as u64,
-        "stdout": stdout,
-        "stderr": stderr,
-        "stdout_len": stdout_len,
-        "stderr_len": stderr_len,
-        "stdout_truncated": stdout_omitted_chars > 0,
-        "stderr_truncated": stderr_omitted_chars > 0,
-        "stdout_omitted_chars": stdout_omitted_chars,
-        "stderr_omitted_chars": stderr_omitted_chars,
-        "approval_reason": "shell commands can modify files, run code, or access the network"
-    }))
-}
-
-fn job_snapshot_json(job_id: &str, job: &JobState, max_chars: usize) -> String {
-    let stdout = job.stdout.text();
-    let stderr = job.stderr.text();
-    let stdout_len = job.stdout.total_len();
-    let stderr_len = job.stderr.total_len();
-    let stdout_tail = tail_chars(&stdout, max_chars);
-    let stderr_tail = tail_chars(&stderr, max_chars);
-    json_string(json!({
-        "job_id": job_id,
-        "kind": job.kind,
-        "command": job.command,
-        "cwd": job.cwd,
-        "status": job.status,
-        "exit_code": job.exit_code,
-        "elapsed_ms": job.started_at.elapsed().as_millis() as u64,
-        "stdout_tail": stdout_tail,
-        "stderr_tail": stderr_tail,
-        "stdout_len": stdout_len,
-        "stderr_len": stderr_len,
-        "stdout_omitted_chars": job.stdout.omitted_len(),
-        "stderr_omitted_chars": job.stderr.omitted_len()
-    }))
-}
-
-fn tail_chars(value: &str, max_chars: usize) -> String {
-    let count = value.chars().count();
-    if count <= max_chars {
-        return value.to_string();
-    }
-    value.chars().skip(count - max_chars).collect()
 }
 
 #[cfg(test)]
@@ -951,15 +665,5 @@ mod tests {
         };
         let output: Value = serde_json::from_str(&result.content).unwrap();
         assert_eq!(output["status"], "cancelled");
-    }
-
-    #[test]
-    fn job_output_buffer_is_bounded_with_omitted_count() {
-        let buffer = SharedBuffer::default();
-        buffer.push(&vec![b'a'; JOB_BUFFER_BYTES + 10]);
-
-        assert_eq!(buffer.total_len(), JOB_BUFFER_BYTES + 10);
-        assert_eq!(buffer.omitted_len(), 10);
-        assert_eq!(buffer.text().len(), JOB_BUFFER_BYTES);
     }
 }
