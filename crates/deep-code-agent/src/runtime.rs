@@ -12,9 +12,15 @@
 //!   `RuntimeEvent::Error` if the model produces more than one tool call in
 //!   one turn. The single-call path is enough for the 03 milestone.
 
+mod checkpoints;
+mod compaction_flow;
+mod diagnostics;
 mod event;
 mod handle;
+mod persistence;
 mod state;
+mod streaming;
+mod telemetry;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,28 +28,24 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::auto_mode::{api_fallback_model, resolve_turn_route};
-use crate::checkpoint::{CheckpointId, CheckpointStore};
+use crate::auto_mode::resolve_turn_route;
+use crate::checkpoint::CheckpointStore;
 use crate::client::LlmClient;
-use crate::compaction::{
-    compact_messages, context_usage_percent, effective_compaction_threshold, estimate_token_count,
-    should_compact, stable_prefix_fingerprint,
-};
+use crate::compaction::{estimate_token_count, stable_prefix_fingerprint};
 use crate::config::AgentConfig;
-use crate::error::AgentError;
 use crate::event::AgentEvent;
-use crate::lsp::{LspConfig, LspManager, is_edit_tool, render_blocks, summarize_blocks};
+use crate::lsp::{LspManager, is_edit_tool, render_blocks, summarize_blocks};
 use crate::message::Message;
 use crate::model::{ChatRequest, ToolCallFunctionPayload, ToolCallPayload, Usage};
 use crate::model_registry::ModelRegistry;
-use crate::model_registry::context_window_for_model;
-use crate::pricing::{CostEstimate, PrefixStatus, TurnTelemetry, calculate_turn_cost};
+use crate::pricing::CostEstimate;
 use crate::session::Session;
-use crate::session_store::{JsonSessionStore, SessionId, SessionRecord, SessionStore, TurnRecord};
+use crate::session_store::TurnRecord;
 use crate::tool::{
     ApprovalDecision, ApprovalRequest, ToolCall, ToolCallAccumulator, ToolError, ToolRegistry,
     ToolResult, ToolResultStatus, ToolRunOutcome,
 };
+use diagnostics::append_diagnostics;
 use event::emit;
 pub use event::{RuntimeEvent, RuntimeEventReceiver};
 pub use handle::AgentRuntimeHandle;
@@ -148,216 +150,12 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         }
     }
 
-    /// Create a runtime backed by a new on-disk session in the workspace.
-    pub fn with_new_session(
-        client: C,
-        tools: ToolRegistry,
-        system: impl Into<String>,
-        workspace: impl Into<PathBuf>,
-        config: &crate::config::AgentConfig,
-    ) -> Result<Self, crate::session_store::SessionStoreError> {
-        let workspace = workspace.into();
-        let store = JsonSessionStore::for_workspace(&workspace)?;
-        let record = SessionRecord::new(workspace.clone(), config, system);
-        store.save(&record)?;
-        Ok(Self::from_session_record(
-            client,
-            tools,
-            record,
-            store,
-            config.clone(),
-        ))
-    }
-
-    /// Resume a runtime from a previously saved session record.
-    #[must_use]
-    pub fn from_session_record(
-        client: C,
-        tools: ToolRegistry,
-        record: SessionRecord,
-        store: JsonSessionStore,
-        config: AgentConfig,
-    ) -> Self {
-        let workspace = record.workspace.clone();
-        let session = Session::from_messages(record.messages.clone());
-        Self {
-            client: Arc::new(client),
-            config,
-            registry: ModelRegistry::default(),
-            is_subagent: false,
-            tools: Arc::new(tools),
-            state: Arc::new(Mutex::new(RuntimeState {
-                session,
-                pending: None,
-                current_turn: None,
-                last_prefix_hash: None,
-                session_cost: CostEstimate::default(),
-                current_prompt: None,
-            })),
-            checkpoints: None,
-            workspace: Some(workspace.clone()),
-            lsp: None,
-            persistence: Some(Arc::new(Persistence {
-                store: Arc::new(store),
-                record: Arc::new(Mutex::new(record)),
-            })),
-        }
-    }
-
-    /// Attach session persistence to an existing runtime, creating a new record.
-    pub fn enable_persistence(
-        mut self,
-        workspace: impl Into<PathBuf>,
-        config: &crate::config::AgentConfig,
-        system_prompt: impl Into<String>,
-    ) -> Result<Self, crate::session_store::SessionStoreError> {
-        let workspace = workspace.into();
-        let store = JsonSessionStore::for_workspace(&workspace)?;
-        let mut record = SessionRecord::new(workspace.clone(), config, system_prompt);
-        {
-            let state =
-                self.state
-                    .try_lock()
-                    .map_err(|_| crate::session_store::SessionStoreError::Io {
-                        message: "runtime state is busy".to_string(),
-                    })?;
-            record.messages = state.session.messages().to_vec();
-        }
-        store.save(&record)?;
-        self.workspace = Some(workspace);
-        self.persistence = Some(Arc::new(Persistence {
-            store: Arc::new(store),
-            record: Arc::new(Mutex::new(record)),
-        }));
-        Ok(self)
-    }
-
-    #[must_use]
-    pub fn persistence_enabled(&self) -> bool {
-        self.persistence.is_some()
-    }
-
-    pub async fn session_id(&self) -> Option<SessionId> {
-        let persistence = self.persistence.as_ref()?;
-        Some(persistence.record.lock().await.id.clone())
-    }
-
-    async fn persist(&self) {
-        let Some(persistence) = self.persistence.as_ref() else {
-            return;
-        };
-        let messages = self.state.lock().await.session.messages().to_vec();
-        let mut record = persistence.record.lock().await;
-        record.messages = messages;
-        record.touch();
-        if let Err(error) = persistence.store.save(&record) {
-            eprintln!("session save failed: {error}");
-        }
-    }
-
-    async fn finish_turn(&self, usage: Option<Usage>) {
-        let mut state = self.state.lock().await;
-        if let Some(mut turn) = state.current_turn.take() {
-            turn.finish(usage);
-            drop(state);
-            if let Some(persistence) = self.persistence.as_ref() {
-                let mut record = persistence.record.lock().await;
-                record.turns.push(turn);
-                record.touch();
-                if let Err(error) = persistence.store.save(&record) {
-                    eprintln!("session save failed: {error}");
-                }
-            }
-        } else {
-            drop(state);
-        }
-        self.persist().await;
-    }
-
-    async fn abort_turn(&self) {
-        self.finish_turn(None).await;
-    }
-
-    async fn finalize_orphan_turn(&self) {
-        let has_open = self.state.lock().await.current_turn.is_some();
-        if has_open {
-            self.finish_turn(None).await;
-        }
-    }
-
-    /// Enable automatic before/after turn snapshots for the given workspace root.
-    ///
-    /// If checkpoint storage cannot be created, checkpoints stay disabled and the
-    /// runtime is still returned.
-    #[must_use]
-    pub fn with_checkpoints(mut self, workspace: impl Into<PathBuf>) -> Self {
-        match CheckpointStore::new(workspace) {
-            Ok(store) => self.checkpoints = Some(Arc::new(store)),
-            Err(error) => eprintln!("checkpoints disabled: {error}"),
-        }
-        self
-    }
-
-    /// Enable post-edit LSP diagnostics for the given workspace root.
-    #[must_use]
-    pub fn with_diagnostics(mut self, workspace: impl Into<PathBuf>) -> Self {
-        let workspace = workspace.into();
-        self.workspace = Some(workspace.clone());
-        self.lsp = Some(Arc::new(LspManager::new(LspConfig::default(), workspace)));
-        self
-    }
-
-    /// Enable post-edit LSP diagnostics with explicit config.
-    #[must_use]
-    pub fn with_diagnostics_config(
-        mut self,
-        workspace: impl Into<PathBuf>,
-        config: LspConfig,
-    ) -> Self {
-        let workspace = workspace.into();
-        self.workspace = Some(workspace.clone());
-        self.lsp = Some(Arc::new(LspManager::new(config, workspace)));
-        self
-    }
-
-    #[must_use]
-    pub fn diagnostics_enabled(&self) -> bool {
-        self.lsp
-            .as_ref()
-            .is_some_and(|manager| manager.config().enabled)
-    }
-
     /// Shut down background resources such as spawned LSP servers.
     pub async fn shutdown(&self) {
         self.persist().await;
         if let Some(lsp) = self.lsp.as_ref() {
             lsp.shutdown_all().await;
         }
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub fn with_lsp_manager(mut self, workspace: PathBuf, manager: LspManager) -> Self {
-        self.workspace = Some(workspace);
-        self.lsp = Some(Arc::new(manager));
-        self
-    }
-
-    /// Restore workspace files from a checkpoint id.
-    pub async fn restore_checkpoint(&self, id: CheckpointId) -> Result<(), ToolError> {
-        let store = self
-            .checkpoints
-            .as_ref()
-            .ok_or_else(|| ToolError::ExecutionFailed {
-                name: "checkpoint".to_string(),
-                message: "checkpoints are not enabled on this runtime".to_string(),
-            })?;
-        store.restore(&id)
-    }
-
-    #[must_use]
-    pub fn checkpoints_enabled(&self) -> bool {
-        self.checkpoints.is_some()
     }
 
     /// Start a new turn from a user prompt. Returns a receiver that yields
@@ -661,24 +459,6 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         emit(tx, RuntimeEvent::ToolResult { result });
     }
 
-    fn snapshot_turn(&self, label: &str, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
-        let Some(store) = self.checkpoints.as_ref() else {
-            return;
-        };
-        match store.snapshot(label) {
-            Ok(id) => emit(
-                tx,
-                RuntimeEvent::CheckpointCreated {
-                    id,
-                    label: label.to_string(),
-                },
-            ),
-            Err(error) => {
-                eprintln!("checkpoint snapshot '{label}' failed: {error}");
-            }
-        }
-    }
-
     /// Snapshot the current message history. Mostly for tests/debugging.
     pub async fn session_messages(&self) -> Vec<Message> {
         self.state.lock().await.session.messages().to_vec()
@@ -702,130 +482,6 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             ApprovalDecision::Approved
         }
     }
-
-    async fn maybe_compact(&self, model: &str, tx: &mpsc::UnboundedSender<RuntimeEvent>) -> bool {
-        let messages = self.state.lock().await.session.messages().to_vec();
-        if !should_compact(model, &messages, self.config.compaction_threshold) {
-            return false;
-        }
-        let result = compact_messages(&messages);
-        if result.archived_count == 0 {
-            return false;
-        }
-        {
-            let mut state = self.state.lock().await;
-            state.session.replace_messages(result.messages.clone());
-            state.last_prefix_hash = None;
-        }
-        if let Some(persistence) = self.persistence.as_ref() {
-            let mut record = persistence.record.lock().await;
-            record.messages = self.state.lock().await.session.messages().to_vec();
-            record.summary = Some(result.summary.clone());
-            record.compaction = Some(format!("archived={}", result.archived_count));
-            record.touch();
-            if let Err(error) = persistence.store.save(&record) {
-                eprintln!("session save failed after compaction: {error}");
-            }
-        }
-        emit(
-            tx,
-            RuntimeEvent::CompactionApplied {
-                archived_count: result.archived_count,
-                summary: result.summary.clone(),
-            },
-        );
-        true
-    }
-
-    async fn stream_with_fallback(
-        &self,
-        route: &mut crate::auto_mode::TurnRoute,
-        request: ChatRequest,
-    ) -> Result<crate::client::AgentEventStream, AgentError> {
-        match self.client.stream_chat(request.clone()).await {
-            Ok(stream) => Ok(stream),
-            Err(error) if api_error_retriable(&error) => {
-                if let Some(fallback) = api_fallback_model(route) {
-                    route.effective_model = fallback.to_string();
-                    route.used_model_fallback = true;
-                    let mut retry = request;
-                    retry.model = fallback.to_string();
-                    self.client.stream_chat(retry).await
-                } else {
-                    Err(error)
-                }
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn build_turn_telemetry(
-        &self,
-        route: &crate::auto_mode::TurnRoute,
-        usage: Option<&Usage>,
-        prefix_hash: u64,
-        estimated_context_tokens: u32,
-    ) -> TurnTelemetry {
-        let usage = usage.cloned().unwrap_or_default();
-        let turn_cost = calculate_turn_cost(&route.effective_model, &usage);
-        let prior_hash = self
-            .state
-            .try_lock()
-            .ok()
-            .and_then(|state| state.last_prefix_hash);
-        let prefix_status = match prior_hash {
-            None => PrefixStatus::FirstTurn,
-            Some(previous) if previous == prefix_hash => PrefixStatus::Stable,
-            Some(_) => PrefixStatus::Changed,
-        };
-        if let Ok(mut state) = self.state.try_lock() {
-            state.last_prefix_hash = Some(prefix_hash);
-            state.session_cost.usd += turn_cost.usd;
-            state.session_cost.cny += turn_cost.cny;
-        }
-        let session_cost = self
-            .state
-            .try_lock()
-            .map(|state| state.session_cost)
-            .unwrap_or(turn_cost);
-        let estimated_context_tokens = usage.input_tokens().max(estimated_context_tokens);
-        let context_window = context_window_for_model(&route.effective_model);
-        let message_estimate = estimated_context_tokens;
-
-        TurnTelemetry {
-            route_label: route.label(),
-            effective_model: route.effective_model.clone(),
-            reasoning_effort: route.effective_effort.short_label().to_string(),
-            prompt_tokens: usage.input_tokens(),
-            completion_tokens: usage.output_tokens(),
-            cache_hit_tokens: usage.prompt_cache_hit_tokens,
-            cache_miss_tokens: usage.prompt_cache_miss_tokens,
-            prefix_status,
-            context_window,
-            estimated_context_tokens,
-            context_usage_percent: context_usage_percent(
-                estimated_context_tokens,
-                &route.effective_model,
-            ),
-            near_compaction_threshold: message_estimate
-                >= effective_compaction_threshold(
-                    &route.effective_model,
-                    self.config.compaction_threshold,
-                )
-                .saturating_mul(80)
-                    / 100,
-            used_model_fallback: route.used_model_fallback,
-            turn_cost,
-            session_cost,
-        }
-    }
-}
-
-fn api_error_retriable(error: &AgentError) -> bool {
-    match error {
-        AgentError::Api { status, .. } => matches!(status.as_u16(), 429 | 502 | 503 | 504),
-        _ => false,
-    }
 }
 
 fn tool_call_payload(call: &ToolCall) -> ToolCallPayload {
@@ -848,20 +504,6 @@ fn runtime_error_from_tool_error(error: ToolError) -> RuntimeEvent {
         message: error.to_string(),
     }
 }
-
-fn append_diagnostics(content: &str, rendered: &str) -> String {
-    if rendered.is_empty() {
-        content.to_string()
-    } else if content.is_empty() {
-        rendered.to_string()
-    } else {
-        format!("{content}\n\n{rendered}")
-    }
-}
-
-#[cfg(test)]
-#[path = "runtime/api_retriable_tests.rs"]
-mod api_retriable_tests;
 
 #[cfg(test)]
 #[path = "runtime/integration_tests.rs"]
