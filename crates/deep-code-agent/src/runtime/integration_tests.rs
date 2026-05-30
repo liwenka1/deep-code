@@ -9,6 +9,7 @@ use crate::client::AgentEventStream;
 use crate::error::{AgentError, AgentResult};
 use crate::event::AgentEvent;
 use crate::model::{FunctionCallDelta, ToolCallDelta};
+use crate::runtime::diagnostics::append_diagnostics;
 use crate::session_store::SessionStore;
 use crate::tool::{MockEchoTool, ToolRegistry, ToolResultStatus};
 
