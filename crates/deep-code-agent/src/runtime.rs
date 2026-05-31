@@ -22,34 +22,27 @@ mod state;
 mod streaming;
 mod telemetry;
 mod tool_result;
+mod turn_loop;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use futures_util::StreamExt;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::auto_mode::resolve_turn_route;
 use crate::checkpoint::CheckpointStore;
 use crate::client::LlmClient;
-use crate::compaction::{estimate_token_count, stable_prefix_fingerprint};
 use crate::config::AgentConfig;
-use crate::event::AgentEvent;
 use crate::lsp::LspManager;
 use crate::message::Message;
-use crate::model::{ChatRequest, Usage};
 use crate::model_registry::ModelRegistry;
 use crate::pricing::CostEstimate;
 use crate::session::Session;
-use crate::session_store::TurnRecord;
-use crate::tool::{
-    ApprovalDecision, ApprovalRequest, ToolCall, ToolCallAccumulator, ToolRegistry, ToolRunOutcome,
-};
+use crate::session_store::{TurnRecord, now_ms};
+use crate::tool::{ApprovalDecision, ApprovalRequest, ToolCall, ToolRegistry};
 use event::emit;
-pub use event::{RuntimeEvent, RuntimeEventReceiver};
+pub use event::{RuntimeEvent, RuntimeEventReceiver, ToolCallId, TurnId};
 pub use handle::AgentRuntimeHandle;
-use state::{PendingToolCall, Persistence, RuntimeState};
-use tool_result::{runtime_error_from_tool_error, tool_call_payload};
+use state::{Persistence, RuntimeState};
 
 /// Agent runtime tying together [`LlmClient`], [`ToolRegistry`], and [`Session`].
 ///
@@ -142,6 +135,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 last_prefix_hash: None,
                 session_cost: CostEstimate::default(),
                 current_prompt: None,
+                current_turn_id: None,
             })),
             checkpoints: None,
             workspace: None,
@@ -170,12 +164,14 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     pub async fn begin_turn(&self, prompt: impl Into<String>) {
         self.finalize_orphan_turn().await;
         let prompt = prompt.into();
+        let turn_id = TurnId::new();
         {
             let mut state = self.state.lock().await;
             state.session.push(Message::user(&prompt));
             state.pending = None;
             state.current_turn = Some(TurnRecord::new(prompt.clone()));
             state.current_prompt = Some(prompt);
+            state.current_turn_id = Some(turn_id);
         }
         self.persist().await;
     }
@@ -183,6 +179,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// Spawn the model/tool loop for the current turn.
     pub async fn drive_turn(&self) -> RuntimeEventReceiver {
         let (tx, rx) = mpsc::unbounded_channel();
+        let (turn_id, prompt) = self.current_turn_context().await;
+        emit(&tx, RuntimeEvent::TurnStarted { turn_id, prompt });
+        self.emit_session_updated(&tx).await;
         self.snapshot_turn("before_turn", &tx);
         let runtime = self.clone();
         tokio::spawn(async move {
@@ -203,6 +202,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
 
         let Some(pending) = pending else {
             let _ = tx.send(RuntimeEvent::Error {
+                turn_id: None,
                 message: "no pending tool approval".to_string(),
             });
             return rx;
@@ -210,189 +210,72 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
 
         let runtime = self.clone();
         tokio::spawn(async move {
+            emit(
+                &tx,
+                RuntimeEvent::ApprovalResolved {
+                    turn_id: Some(pending.turn_id.clone()),
+                    tool_call_id: ToolCallId::from(pending.call.id.clone()),
+                    decision,
+                },
+            );
             runtime.handle_approval(pending, decision, &tx).await;
         });
         rx
     }
 
-    /// Drive the model/tool loop until either the turn finishes or an
-    /// approval is required. All paths emit a terminal [`RuntimeEvent`]
-    /// (`TurnFinished`, `ApprovalRequired`, or `Error`) before returning.
-    async fn run_loop(&self, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
-        let user_prompt = {
-            let state = self.state.lock().await;
-            state.current_prompt.clone().unwrap_or_default()
-        };
-        let mut route =
-            resolve_turn_route(&self.config, &self.registry, &user_prompt, self.is_subagent);
-
-        if self.maybe_compact(&route.effective_model, tx).await {
-            // compaction event already emitted; continue with trimmed history
-        }
-
-        loop {
-            let (messages, prefix_hash) = {
-                let state = self.state.lock().await;
-                let messages = state.session.messages().to_vec();
-                let prefix_hash = stable_prefix_fingerprint(&messages);
-                (messages, prefix_hash)
-            };
-
-            let estimated_context_tokens = estimate_token_count(&messages);
-
-            let mut request = ChatRequest::streaming(route.effective_model.clone(), messages)
-                .with_tools(self.tools.chat_tools());
-            if let Some(effort) = route.effective_effort.as_api_value() {
-                request = request.with_reasoning_effort(effort);
-            }
-
-            let mut stream = match self.stream_with_fallback(&mut route, request).await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    emit(
-                        tx,
-                        RuntimeEvent::Error {
-                            message: error.to_string(),
-                        },
-                    );
-                    self.abort_turn().await;
-                    return;
-                }
-            };
-
-            let mut accumulator = ToolCallAccumulator::default();
-            let mut text_buffer = String::new();
-            let mut last_usage: Option<Usage> = None;
-            let mut had_error = false;
-
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(AgentEvent::TextDelta { text }) => {
-                        text_buffer.push_str(&text);
-                        emit(tx, RuntimeEvent::Provider(AgentEvent::TextDelta { text }));
-                    }
-                    Ok(AgentEvent::ReasoningDelta { text }) => {
-                        emit(
-                            tx,
-                            RuntimeEvent::Provider(AgentEvent::ReasoningDelta { text }),
-                        );
-                    }
-                    Ok(AgentEvent::ToolCallDelta { delta }) => {
-                        let forwarded = delta.clone();
-                        accumulator.push_delta(delta);
-                        emit(
-                            tx,
-                            RuntimeEvent::Provider(AgentEvent::ToolCallDelta { delta: forwarded }),
-                        );
-                    }
-                    Ok(AgentEvent::Done { usage }) => {
-                        last_usage = usage;
-                    }
-                    Ok(AgentEvent::Error { message }) => {
-                        emit(tx, RuntimeEvent::Error { message });
-                        had_error = true;
-                    }
-                    Err(error) => {
-                        emit(
-                            tx,
-                            RuntimeEvent::Error {
-                                message: error.to_string(),
-                            },
-                        );
-                        had_error = true;
-                    }
-                }
-            }
-
-            if had_error {
-                self.abort_turn().await;
-                return;
-            }
-
-            let calls = match accumulator.finish() {
-                Ok(calls) => calls,
-                Err(error) => {
-                    emit(tx, runtime_error_from_tool_error(error));
-                    self.abort_turn().await;
-                    return;
-                }
-            };
-
-            if calls.is_empty() {
-                let mut state = self.state.lock().await;
-                state.session.push(Message::assistant(text_buffer));
-                drop(state);
-                self.snapshot_turn("after_turn", tx);
-                let usage = last_usage.clone();
-                let telemetry = self.build_turn_telemetry(
-                    &route,
-                    usage.as_ref(),
-                    prefix_hash,
-                    estimated_context_tokens,
-                );
-                self.finish_turn(usage.clone()).await;
-                emit(
-                    tx,
-                    RuntimeEvent::TurnFinished {
-                        usage: last_usage,
-                        telemetry: Some(telemetry),
-                    },
-                );
-                return;
-            }
-
-            if calls.len() > 1 {
-                emit(
-                    tx,
-                    RuntimeEvent::Error {
-                        message: format!(
-                            "multi tool call turns are not supported yet (got {} calls)",
-                            calls.len()
-                        ),
-                    },
-                );
-                self.abort_turn().await;
-                return;
-            }
-
-            let call = calls.into_iter().next().expect("exactly one tool call");
-            let payload = tool_call_payload(&call);
-
-            {
-                let mut state = self.state.lock().await;
-                state.session.push(Message::assistant_with_tool_calls(
-                    text_buffer,
-                    vec![payload],
-                ));
-            }
-            self.persist().await;
-
-            match self.tools.run_tool_call(call.clone(), None) {
-                Ok(ToolRunOutcome::ApprovalRequired { request }) => {
-                    {
-                        let mut state = self.state.lock().await;
-                        state.pending = Some(PendingToolCall { call });
-                    }
-                    emit(tx, RuntimeEvent::ApprovalRequired { request });
-                    return;
-                }
-                Ok(ToolRunOutcome::Result { result }) => {
-                    self.record_tool_result(&call, result, tx).await;
-                    // Loop again: feed tool result back into the next chat turn.
-                    continue;
-                }
-                Err(error) => {
-                    emit(tx, runtime_error_from_tool_error(error));
-                    self.abort_turn().await;
-                    return;
-                }
-            }
-        }
-    }
-
     /// Snapshot the current message history. Mostly for tests/debugging.
     pub async fn session_messages(&self) -> Vec<Message> {
         self.state.lock().await.session.messages().to_vec()
+    }
+
+    async fn current_turn_id(&self) -> TurnId {
+        self.state
+            .lock()
+            .await
+            .current_turn_id
+            .clone()
+            .unwrap_or_else(TurnId::new)
+    }
+
+    async fn current_turn_context(&self) -> (TurnId, String) {
+        let state = self.state.lock().await;
+        (
+            state.current_turn_id.clone().unwrap_or_else(TurnId::new),
+            state.current_prompt.clone().unwrap_or_default(),
+        )
+    }
+
+    async fn emit_session_updated(&self, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
+        let state = self.state.lock().await;
+        let message_count = state.session.messages().len();
+        let current_turn_id = state.current_turn_id.clone();
+        drop(state);
+
+        let (session_id, turn_count, summary, compaction, updated_at_ms) =
+            if let Some(persistence) = self.persistence.as_ref() {
+                let record = persistence.record.lock().await;
+                (
+                    Some(record.id.clone()),
+                    record.turns.len(),
+                    record.summary.clone(),
+                    record.compaction.clone(),
+                    record.updated_at_ms,
+                )
+            } else {
+                (None, 0, None, None, now_ms())
+            };
+        emit(
+            tx,
+            RuntimeEvent::SessionUpdated {
+                session_id,
+                current_turn_id,
+                message_count,
+                turn_count,
+                summary,
+                compaction,
+                updated_at_ms,
+            },
+        );
     }
 
     /// Resolve a pending tool call for a background sub-agent.

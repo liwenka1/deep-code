@@ -61,6 +61,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 last_prefix_hash: None,
                 session_cost: CostEstimate::default(),
                 current_prompt: None,
+                current_turn_id: None,
             })),
             checkpoints: None,
             workspace: Some(workspace.clone()),
@@ -123,6 +124,8 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     pub(super) async fn finish_turn(&self, usage: Option<Usage>) {
         let mut state = self.state.lock().await;
         if let Some(mut turn) = state.current_turn.take() {
+            state.current_prompt = None;
+            state.current_turn_id = None;
             turn.finish(usage);
             drop(state);
             if let Some(persistence) = self.persistence.as_ref() {

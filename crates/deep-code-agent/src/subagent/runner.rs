@@ -38,18 +38,26 @@ pub async fn run_subagent<C: LlmClient + Clone + 'static>(
                     .unwrap_or_default();
                 return Ok((text, steps));
             }
-            RuntimeEvent::ApprovalRequired { request } => {
+            RuntimeEvent::ApprovalRequired { request, .. } => {
                 let decision = runtime.subagent_approval_decision(&request);
                 if decision == ApprovalDecision::Approved {
                     steps += 1;
                 }
                 rx = runtime.submit_approval(decision).await;
             }
-            RuntimeEvent::Error { message } => return Err(message),
+            RuntimeEvent::Error { message, .. } => return Err(message),
             RuntimeEvent::ToolResult { .. } => {
                 steps += 1;
             }
-            RuntimeEvent::Provider(_) => {}
+            RuntimeEvent::Provider(_)
+            | RuntimeEvent::TurnStarted { .. }
+            | RuntimeEvent::AssistantDelta { .. }
+            | RuntimeEvent::ReasoningDelta { .. }
+            | RuntimeEvent::ToolCallStarted { .. }
+            | RuntimeEvent::ToolCallUpdated { .. }
+            | RuntimeEvent::ApprovalResolved { .. }
+            | RuntimeEvent::ToolCallFinished { .. }
+            | RuntimeEvent::SessionUpdated { .. } => {}
             RuntimeEvent::CheckpointCreated { .. }
             | RuntimeEvent::WorkspaceRestored { .. }
             | RuntimeEvent::DiagnosticsUpdated { .. }

@@ -139,7 +139,7 @@ fn print_event(event: &RuntimeEvent) {
         RuntimeEvent::Provider(AgentEvent::ToolCallDelta { delta }) => {
             println!("tool-call-delta: {delta:?}");
         }
-        RuntimeEvent::ApprovalRequired { request } => {
+        RuntimeEvent::ApprovalRequired { request, .. } => {
             println!(
                 "approval required: tool={} args={}",
                 request.tool_name, request.arguments
@@ -154,7 +154,7 @@ fn print_event(event: &RuntimeEvent) {
         RuntimeEvent::TurnFinished { usage, .. } => {
             println!("turn finished: usage={usage:?}");
         }
-        RuntimeEvent::Error { message } => {
+        RuntimeEvent::Error { message, .. } => {
             println!("error: {message}");
         }
         other => println!("event: {other:?}"),
