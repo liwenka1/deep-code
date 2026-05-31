@@ -90,6 +90,10 @@ pub struct TurnTelemetry {
     pub cache_hit_tokens: Option<u32>,
     pub cache_miss_tokens: Option<u32>,
     pub prefix_status: PrefixStatus,
+    #[serde(default)]
+    pub route_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
     pub context_window: u32,
     pub estimated_context_tokens: u32,
     pub context_usage_percent: u8,

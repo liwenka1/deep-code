@@ -13,6 +13,8 @@ pub struct TurnRoute {
     pub effective_effort: ReasoningEffort,
     pub auto_effort: bool,
     pub used_model_fallback: bool,
+    pub route_reason: String,
+    pub fallback_reason: Option<String>,
 }
 
 impl TurnRoute {
@@ -58,10 +60,13 @@ pub fn resolve_turn_route(
 ) -> TurnRoute {
     let resolution = registry.resolve(Some(config.model.as_str()));
     let auto_model = resolution.resolved_id == AUTO_MODEL;
-    let effective_model = if auto_model {
-        select_auto_model(user_prompt, config.auto_cost_saving)
+    let (effective_model, route_reason) = if auto_model {
+        select_auto_model_with_reason(user_prompt, config.auto_cost_saving)
     } else {
-        resolution.resolved_id.clone()
+        (
+            resolution.resolved_id.clone(),
+            format!("固定模型配置：{}", resolution.resolved_id),
+        )
     };
 
     let auto_effort = config.reasoning_effort.is_auto();
@@ -75,12 +80,21 @@ pub fn resolve_turn_route(
         effective_effort,
         auto_effort,
         used_model_fallback: resolution.used_fallback && !auto_model,
+        route_reason,
+        fallback_reason: None,
     }
 }
 
 /// Short prompts → Flash; complex keywords or long prompts → Pro.
 #[must_use]
 pub fn select_auto_model(input: &str, cost_saving: bool) -> String {
+    select_auto_model_with_reason(input, cost_saving).0
+}
+
+/// Short prompts → Flash; complex keywords or long prompts → Pro, with a reason
+/// suitable for status surfaces.
+#[must_use]
+pub fn select_auto_model_with_reason(input: &str, cost_saving: bool) -> (String, String) {
     let len = input.chars().count();
     let lower = input.to_lowercase();
 
@@ -92,19 +106,37 @@ pub fn select_auto_model(input: &str, cost_saving: bool) -> String {
     ];
     let strong_match = COMPLEX_KEYWORDS
         .iter()
-        .any(|keyword| !borderline.contains(keyword) && lower.contains(keyword));
-    let borderline_match = borderline.iter().any(|keyword| lower.contains(keyword));
-    if strong_match || (!cost_saving && borderline_match) {
-        return DEEPSEEK_V4_PRO.to_string();
+        .find(|keyword| !borderline.contains(keyword) && lower.contains(**keyword));
+    let borderline_match = borderline.iter().find(|keyword| lower.contains(**keyword));
+    if let Some(keyword) = strong_match {
+        return (
+            DEEPSEEK_V4_PRO.to_string(),
+            format!("命中复杂任务关键词“{keyword}”，使用 Pro 以获得更强推理和工具规划能力"),
+        );
+    }
+    if !cost_saving && let Some(keyword) = borderline_match {
+        return (
+            DEEPSEEK_V4_PRO.to_string(),
+            format!("任务包含“{keyword}”，且未开启成本优先，使用 Pro"),
+        );
     }
     if len < 100 {
-        return DEEPSEEK_V4_FLASH.to_string();
+        return (
+            DEEPSEEK_V4_FLASH.to_string(),
+            "短提示优先使用 Flash，降低延迟和成本".to_string(),
+        );
     }
     let long_threshold = if cost_saving { 1_000 } else { 500 };
     if len > long_threshold {
-        return DEEPSEEK_V4_PRO.to_string();
+        return (
+            DEEPSEEK_V4_PRO.to_string(),
+            format!("输入长度 {len} 超过阈值 {long_threshold}，使用 Pro 处理长上下文"),
+        );
     }
-    DEEPSEEK_V4_FLASH.to_string()
+    (
+        DEEPSEEK_V4_FLASH.to_string(),
+        "未命中复杂任务规则，默认使用 Flash 保持响应速度和成本效率".to_string(),
+    )
 }
 
 const COMPLEX_KEYWORDS: &[&str] = &[
@@ -175,6 +207,7 @@ mod tests {
         assert!(route.auto_effort);
         assert_eq!(route.effective_model, DEEPSEEK_V4_PRO);
         assert_eq!(route.effective_effort, ReasoningEffort::Max);
+        assert!(route.route_reason.contains("debug"));
     }
 
     #[test]
@@ -197,8 +230,21 @@ mod tests {
             effective_effort: ReasoningEffort::High,
             auto_effort: false,
             used_model_fallback: false,
+            route_reason: "test".to_string(),
+            fallback_reason: None,
         };
         assert_eq!(api_fallback_model(&route), Some(DEEPSEEK_V4_FLASH));
+    }
+
+    #[test]
+    fn auto_model_returns_human_readable_reason() {
+        let (model, reason) = select_auto_model_with_reason("please debug this error", false);
+        assert_eq!(model, DEEPSEEK_V4_PRO);
+        assert!(reason.contains("debug"));
+
+        let (model, reason) = select_auto_model_with_reason("hi", false);
+        assert_eq!(model, DEEPSEEK_V4_FLASH);
+        assert!(reason.contains("短提示"));
     }
 
     #[test]

@@ -49,6 +49,8 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             cache_hit_tokens: usage.prompt_cache_hit_tokens,
             cache_miss_tokens: usage.prompt_cache_miss_tokens,
             prefix_status,
+            route_reason: route.route_reason.clone(),
+            fallback_reason: route.fallback_reason.clone(),
             context_window,
             estimated_context_tokens,
             context_usage_percent: context_usage_percent(

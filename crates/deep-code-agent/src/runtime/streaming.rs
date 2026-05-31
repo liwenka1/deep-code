@@ -16,6 +16,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 if let Some(fallback) = api_fallback_model(route) {
                     route.effective_model = fallback.to_string();
                     route.used_model_fallback = true;
+                    route.fallback_reason = Some(
+                        "DeepSeek 临时不可用或限流，已从 Pro 自动降级到 Flash 重试".to_string(),
+                    );
                     let mut retry = request;
                     retry.model = fallback.to_string();
                     self.client.stream_chat(retry).await
