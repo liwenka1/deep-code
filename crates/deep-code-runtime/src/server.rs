@@ -3,7 +3,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result};
 use async_stream::stream;
@@ -15,10 +15,9 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, middleware};
-use chrono::Utc;
 use deep_code_agent::{
     AgentConfig, ApprovalDecision, ApprovalRequest, JsonSessionStore, LaunchedRuntime,
-    RuntimeEvent, SessionId, SessionRecord, SessionStore, launch_runtime,
+    RuntimeEvent, SessionId, SessionRecord, SessionStore, TurnId, launch_runtime,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -26,6 +25,7 @@ use tokio::sync::{Mutex, oneshot};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::{RUNTIME_TOKEN_ENV, token_matches};
+use crate::threads::{RuntimeEnvelope, RuntimeThread, RuntimeThreadDetail, RuntimeThreadStore};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 7878;
@@ -72,6 +72,8 @@ pub(crate) struct AppState {
     auth_token: Option<String>,
     pub(crate) runtime: Arc<Mutex<LaunchedRuntime>>,
     approval: Arc<Mutex<Option<PendingApproval>>>,
+    active_turn: Arc<StdMutex<Option<String>>>,
+    threads: RuntimeThreadStore,
 }
 
 impl AppState {
@@ -83,7 +85,21 @@ impl AppState {
 
 struct PendingApproval {
     request: ApprovalRequest,
+    thread_id: String,
+    turn_id: Option<TurnId>,
     respond: oneshot::Sender<ApprovalDecision>,
+}
+
+struct ActiveTurnLease {
+    active_turn: Arc<StdMutex<Option<String>>>,
+}
+
+impl Drop for ActiveTurnLease {
+    fn drop(&mut self) {
+        if let Ok(mut active_turn) = self.active_turn.lock() {
+            *active_turn = None;
+        }
+    }
 }
 
 pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
@@ -99,12 +115,21 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
         eprintln!("auth: bearer token required for /v1/* routes");
     }
 
+    let threads = RuntimeThreadStore::new();
+    if let Ok(store) = JsonSessionStore::for_workspace(&options.workspace)
+        && let Ok(records) = store.list()
+    {
+        threads.hydrate_sessions(records).await;
+    }
+
     let state = AppState {
         version: env!("CARGO_PKG_VERSION").to_string(),
         workspace: options.workspace,
         auth_token: options.auth_token,
         runtime: Arc::new(Mutex::new(launched)),
         approval: Arc::new(Mutex::new(None)),
+        active_turn: Arc::new(StdMutex::new(None)),
+        threads,
     };
 
     let protected = Router::new()
@@ -117,6 +142,14 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
         .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
         .route("/v1/prompt", post(prompt_sse))
         .route("/v1/approvals", post(submit_approval))
+        .route("/v1/threads", get(list_threads).post(create_thread))
+        .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
+        .route("/v1/threads/{id}/turns", post(post_thread_turn))
+        .route(
+            "/v1/threads/{id}/turns/{turn_id}/approvals",
+            post(submit_thread_turn_approval),
+        )
+        .route("/v1/threads/{id}/events", get(thread_events))
         .route("/v1/doctor", get(crate::meta::doctor))
         .route("/v1/checkpoints", get(crate::meta::list_checkpoints))
         .route(
@@ -248,21 +281,157 @@ struct PromptRequest {
     prompt: String,
 }
 
-#[derive(Serialize)]
-struct SseEnvelope {
-    seq: u64,
-    timestamp: String,
-    event: String,
-    payload: serde_json::Value,
+#[derive(Deserialize)]
+struct CreateThreadRequest {
+    #[serde(default)]
+    title: Option<String>,
 }
 
-fn sse_payload(event: &RuntimeEvent) -> serde_json::Value {
-    match event {
-        RuntimeEvent::Provider(agent) => {
-            serde_json::json!({ "category": "provider", "provider": agent })
+#[derive(Deserialize)]
+struct PatchThreadRequest {
+    #[serde(default)]
+    title: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ThreadEventsQuery {
+    #[serde(default)]
+    since_seq: u64,
+    #[serde(default)]
+    replay_only: bool,
+}
+
+async fn list_threads(State(state): State<AppState>) -> Result<Json<Vec<RuntimeThread>>, ApiError> {
+    Ok(Json(state.threads.list_threads().await))
+}
+
+async fn create_thread(
+    State(state): State<AppState>,
+    body: Option<Json<CreateThreadRequest>>,
+) -> Result<Json<RuntimeThread>, ApiError> {
+    let title = body.and_then(|Json(body)| body.title);
+    Ok(Json(state.threads.create_thread(title).await))
+}
+
+async fn get_thread(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<RuntimeThreadDetail>, ApiError> {
+    state
+        .threads
+        .get_thread(&id)
+        .await
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("thread '{id}' not found")))
+}
+
+async fn update_thread(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<PatchThreadRequest>,
+) -> Result<Json<RuntimeThreadDetail>, ApiError> {
+    let Some(mut detail) = state.threads.get_thread(&id).await else {
+        return Err(ApiError::not_found(format!("thread '{id}' not found")));
+    };
+    if let Some(title) = body.title {
+        if let Some(thread) = state
+            .threads
+            .update_thread_title(&id, Some(title.clone()))
+            .await
+        {
+            detail.thread = thread;
         }
-        other => serde_json::to_value(other).unwrap_or_else(|_| serde_json::json!({})),
+        let _ = state
+            .threads
+            .append_manual_item(&id, "thread.updated", serde_json::json!({ "title": title }))
+            .await;
     }
+    Ok(Json(detail))
+}
+
+async fn post_thread_turn(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<PromptRequest>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    if body.prompt.trim().is_empty() {
+        return Err(ApiError::bad_request("prompt must not be empty"));
+    }
+    if state.threads.get_thread(&id).await.is_none() {
+        let _ = state
+            .threads
+            .ensure_thread(id.clone(), Some(id.clone()))
+            .await;
+    }
+    prompt_sse_for_thread(state, id, body.prompt).await
+}
+
+async fn thread_events(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ThreadEventsQuery>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    if state.threads.get_thread(&id).await.is_none() {
+        return Err(ApiError::not_found(format!("thread '{id}' not found")));
+    }
+    let store = state.threads.clone();
+    let mut live = store.subscribe();
+    let replay = store.replay_since(&id, query.since_seq).await;
+    let replay_only = query.replay_only;
+    let stream = stream! {
+        for envelope in replay {
+            yield Ok(thread_sse_event(envelope));
+        }
+        if replay_only {
+            return;
+        }
+        loop {
+            match live.recv().await {
+                Ok(envelope) if envelope.thread_id == id => {
+                    yield Ok(thread_sse_event(envelope));
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keepalive"),
+    ))
+}
+
+async fn submit_thread_turn_approval(
+    State(state): State<AppState>,
+    Path((thread_id, turn_id)): Path<(String, String)>,
+    Json(body): Json<ApprovalRequestBody>,
+) -> Result<Json<ApprovalResponse>, ApiError> {
+    resolve_pending_approval(state, body, Some((&thread_id, &turn_id))).await
+}
+
+fn thread_sse_event(envelope: RuntimeEnvelope) -> Event {
+    Event::default()
+        .event(envelope.item.kind.clone())
+        .json_data(envelope)
+        .unwrap_or_else(|_| Event::default().data("serialization error"))
+}
+
+fn acquire_active_turn(state: &AppState, thread_id: &str) -> Result<ActiveTurnLease, ApiError> {
+    let mut active_turn = state
+        .active_turn
+        .lock()
+        .map_err(|_| ApiError::internal("active turn gate poisoned"))?;
+    if let Some(active_thread_id) = active_turn.as_ref() {
+        return Err(ApiError::conflict(format!(
+            "runtime already has an active turn on thread '{active_thread_id}'"
+        )));
+    }
+    *active_turn = Some(thread_id.to_string());
+    Ok(ActiveTurnLease {
+        active_turn: Arc::clone(&state.active_turn),
+    })
 }
 
 async fn prompt_sse(
@@ -273,12 +442,24 @@ async fn prompt_sse(
         return Err(ApiError::bad_request("prompt must not be empty"));
     }
 
+    let thread = state
+        .threads
+        .create_thread(Some("prompt".to_string()))
+        .await;
+    prompt_sse_for_thread(state, thread.thread_id, body.prompt).await
+}
+
+async fn prompt_sse_for_thread(
+    state: AppState,
+    thread_id: String,
+    prompt: String,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let active_turn_lease = acquire_active_turn(&state, &thread_id)?;
     let runtime = state.runtime.clone();
     let approval_gate = state.approval.clone();
-    let prompt = body.prompt;
-
+    let threads = state.threads.clone();
     let stream = stream! {
-        let mut seq = 0u64;
+        let _active_turn_lease = active_turn_lease;
         let mut event_stream = {
             let runtime = runtime.lock().await;
             runtime.handle.submit_user(prompt).await
@@ -287,25 +468,20 @@ async fn prompt_sse(
         loop {
             let mut resume_after_approval = false;
             while let Some(event) = event_stream.recv().await {
-                seq += 1;
-                let envelope = SseEnvelope {
-                    seq,
-                    timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                    event: runtime_event_name(&event).to_string(),
-                    payload: sse_payload(&event),
-                };
-                yield Ok(Event::default()
-                    .event(envelope.event.clone())
-                    .json_data(envelope)
-                    .unwrap_or_else(|_| Event::default().data("serialization error")));
+                let envelope = threads.append_event(&thread_id, &event).await;
+                yield Ok(thread_sse_event(envelope));
 
                 match event {
-                    RuntimeEvent::ApprovalRequired { request } => {
+                    RuntimeEvent::ApprovalRequired {
+                        turn_id, request, ..
+                    } => {
                         let (tx, rx) = oneshot::channel();
                         {
                             let mut slot = approval_gate.lock().await;
                             *slot = Some(PendingApproval {
                                 request,
+                                thread_id: thread_id.clone(),
+                                turn_id,
                                 respond: tx,
                             });
                         }
@@ -370,6 +546,14 @@ async fn submit_approval(
     State(state): State<AppState>,
     Json(body): Json<ApprovalRequestBody>,
 ) -> Result<Json<ApprovalResponse>, ApiError> {
+    resolve_pending_approval(state, body, None).await
+}
+
+async fn resolve_pending_approval(
+    state: AppState,
+    body: ApprovalRequestBody,
+    expected_scope: Option<(&str, &str)>,
+) -> Result<Json<ApprovalResponse>, ApiError> {
     let pending = {
         let mut slot = state.approval.lock().await;
         slot.take()
@@ -377,6 +561,22 @@ async fn submit_approval(
     let Some(pending) = pending else {
         return Err(ApiError::conflict("no pending approval"));
     };
+    if let Some((expected_thread_id, expected_turn_id)) = expected_scope {
+        let actual_thread_id = pending.thread_id.clone();
+        let actual_turn_id = pending
+            .turn_id
+            .as_ref()
+            .map(TurnId::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        if actual_thread_id != expected_thread_id || actual_turn_id != expected_turn_id {
+            let mut slot = state.approval.lock().await;
+            *slot = Some(pending);
+            return Err(ApiError::bad_request(format!(
+                "approval scope mismatch: expected thread='{expected_thread_id}' turn='{expected_turn_id}', active thread='{actual_thread_id}' turn='{actual_turn_id}'"
+            )));
+        }
+    }
     if pending.request.call_id != body.call_id {
         let expected = pending.request.call_id.clone();
         let mut slot = state.approval.lock().await;
@@ -391,20 +591,6 @@ async fn submit_approval(
         accepted: true,
         call_id: body.call_id,
     }))
-}
-
-fn runtime_event_name(event: &RuntimeEvent) -> &'static str {
-    match event {
-        RuntimeEvent::Provider(_) => "provider",
-        RuntimeEvent::ApprovalRequired { .. } => "approval.required",
-        RuntimeEvent::ToolResult { .. } => "tool.result",
-        RuntimeEvent::TurnFinished { .. } => "turn.completed",
-        RuntimeEvent::CheckpointCreated { .. } => "checkpoint.created",
-        RuntimeEvent::WorkspaceRestored { .. } => "workspace.restored",
-        RuntimeEvent::DiagnosticsUpdated { .. } => "diagnostics.updated",
-        RuntimeEvent::CompactionApplied { .. } => "compaction.applied",
-        RuntimeEvent::Error { .. } => "error",
-    }
 }
 
 #[derive(Debug)]
@@ -507,6 +693,8 @@ mod tests {
                 None,
             ))),
             approval: Arc::new(Mutex::new(None)),
+            active_turn: Arc::new(StdMutex::new(None)),
+            threads: RuntimeThreadStore::new(),
         }
     }
 
@@ -515,6 +703,14 @@ mod tests {
             .route("/v1/sessions", get(list_sessions))
             .route("/v1/prompt", post(prompt_sse))
             .route("/v1/approvals", post(submit_approval))
+            .route("/v1/threads", get(list_threads).post(create_thread))
+            .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
+            .route("/v1/threads/{id}/turns", post(post_thread_turn))
+            .route(
+                "/v1/threads/{id}/turns/{turn_id}/approvals",
+                post(submit_thread_turn_approval),
+            )
+            .route("/v1/threads/{id}/events", get(thread_events))
             .layer(middleware::from_fn_with_state(state.clone(), require_auth))
             .with_state(state.clone());
 
@@ -532,6 +728,13 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         addr
+    }
+
+    fn envelopes_from_sse(body: &str) -> Vec<RuntimeEnvelope> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<RuntimeEnvelope>(line).ok())
+            .collect()
     }
 
     #[test]
@@ -651,6 +854,219 @@ mod tests {
             body.contains("event: turn.completed"),
             "expected turn.completed SSE event, got: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn thread_turn_records_detail_and_replays_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), None);
+        let addr = spawn_test_server(state).await;
+        let client = reqwest::Client::new();
+
+        let thread: RuntimeThread = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({ "title": "runtime test" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let turn_body = client
+            .post(format!(
+                "http://{addr}/v1/threads/{}/turns",
+                thread.thread_id
+            ))
+            .json(&json!({ "prompt": "hello thread api" }))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            turn_body.contains("event: turn.completed"),
+            "expected completed turn, got: {turn_body}"
+        );
+        let turn_envelopes = envelopes_from_sse(&turn_body);
+        assert!(
+            turn_envelopes
+                .iter()
+                .enumerate()
+                .all(|(index, envelope)| envelope.seq == index as u64 + 1),
+            "expected durable thread seqs starting at 1, got: {turn_body}"
+        );
+
+        let detail: RuntimeThreadDetail = client
+            .get(format!("http://{addr}/v1/threads/{}", thread.thread_id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(detail.thread.thread_id, thread.thread_id);
+        assert_eq!(detail.turns.len(), 1);
+        assert!(
+            detail
+                .items
+                .iter()
+                .any(|item| item.kind == "turn.completed")
+        );
+
+        let replay = client
+            .get(format!(
+                "http://{addr}/v1/threads/{}/events?since_seq=0",
+                thread.thread_id
+            ))
+            .query(&[("replay_only", "true")])
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            replay.contains("event: turn.started"),
+            "expected replayed turn.started event, got: {replay}"
+        );
+        assert!(
+            replay.contains("event: turn.completed"),
+            "expected replayed turn.completed event, got: {replay}"
+        );
+        let replay_envelopes = envelopes_from_sse(&replay);
+        assert_eq!(
+            replay_envelopes
+                .iter()
+                .map(|envelope| envelope.seq)
+                .collect::<Vec<_>>(),
+            turn_envelopes
+                .iter()
+                .map(|envelope| envelope.seq)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_turn_rejects_second_active_turn_until_approval_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), None);
+        let addr = spawn_test_server(state).await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        let thread: RuntimeThread = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({ "title": "active gate test" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let turns_url = format!("http://{addr}/v1/threads/{}/turns", thread.thread_id);
+        let approvals_url = format!("http://{addr}/v1/approvals");
+
+        let prompt_client = client.clone();
+        let first_turn_url = turns_url.clone();
+        let prompt_handle = tokio::spawn(async move {
+            prompt_client
+                .post(first_turn_url)
+                .json(&json!({ "prompt": "/mock-tool hello" }))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let conflict = client
+            .post(&turns_url)
+            .json(&json!({ "prompt": "second turn" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+        let approval = client
+            .post(&approvals_url)
+            .json(&json!({ "call_id": "echo_call_1", "decision": "approved" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(approval.status(), StatusCode::OK);
+
+        let body = prompt_handle.await.unwrap();
+        assert!(body.contains("event: approval.required"));
+        assert!(body.contains("event: turn.completed"));
+    }
+
+    #[tokio::test]
+    async fn thread_turn_approval_rejects_wrong_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), None);
+        let addr = spawn_test_server(state).await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        let thread: RuntimeThread = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({ "title": "approval scope test" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let turns_url = format!("http://{addr}/v1/threads/{}/turns", thread.thread_id);
+        let approvals_url = format!("http://{addr}/v1/approvals");
+        let scoped_approvals_url = format!(
+            "http://{addr}/v1/threads/{}/turns/wrong_turn/approvals",
+            thread.thread_id
+        );
+
+        let prompt_client = client.clone();
+        let prompt_handle = tokio::spawn(async move {
+            prompt_client
+                .post(turns_url)
+                .json(&json!({ "prompt": "/mock-tool hello" }))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let wrong_scope = client
+            .post(&scoped_approvals_url)
+            .json(&json!({ "call_id": "echo_call_1", "decision": "approved" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_scope.status(), StatusCode::BAD_REQUEST);
+
+        let good = client
+            .post(&approvals_url)
+            .json(&json!({ "call_id": "echo_call_1", "decision": "approved" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(good.status(), StatusCode::OK);
+
+        let body = prompt_handle.await.unwrap();
+        assert!(body.contains("event: approval.required"));
+        assert!(body.contains("event: turn.completed"));
     }
 
     #[tokio::test]
