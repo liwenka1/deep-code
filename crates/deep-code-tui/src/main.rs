@@ -1,6 +1,10 @@
+mod active_turn;
 mod app;
 mod cli;
+mod commands;
 mod doctor_cli;
+mod event_routing;
+mod history;
 mod mcp_cli;
 mod startup;
 mod ui;

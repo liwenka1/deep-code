@@ -12,7 +12,8 @@ use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style, Stylize};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
-use crate::app::{App, Author, LaunchConfig};
+use crate::app::{App, LaunchConfig};
+use crate::history::HistoryCell;
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -82,6 +83,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => app.submit(),
         KeyCode::Backspace => app.backspace(),
+        KeyCode::PageUp | KeyCode::Up => app.scroll_up(),
+        KeyCode::PageDown | KeyCode::Down => app.scroll_down(),
+        KeyCode::End => app.scroll_to_bottom(),
         KeyCode::Char(value) => app.push_char(value),
         _ => {}
     }
@@ -104,43 +108,20 @@ fn render(frame: &mut Frame<'_>, app: &App) {
 
 fn render_messages(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
     let mut items = Vec::new();
+    let mut cells = app.history.clone();
+    if let Some(active) = &app.active_turn {
+        cells.extend(active.preview_cells());
+    }
     let visible_messages = usize::from(area.height.saturating_sub(2)).saturating_div(3);
-    let skip_count = app.messages.len().saturating_sub(visible_messages.max(1));
+    let visible_messages = visible_messages.max(1);
+    let bottom_skip = cells.len().saturating_sub(visible_messages);
+    let skip_count = bottom_skip.saturating_sub(app.scroll_offset);
 
-    for message in app.messages.iter().skip(skip_count) {
-        items.push(ListItem::new(vec![
-            Line::from(label_for_author(&message.author)),
-            Line::from(message.text.clone()),
-            Line::default(),
-        ]));
-    }
-
-    if !app.streaming_buffer.is_empty() {
-        items.push(ListItem::new(vec![
-            Line::from(label_for_author(&Author::Assistant)),
-            Line::from(app.streaming_buffer.clone()),
-        ]));
-    }
-
-    if let Some(request) = &app.pending_approval {
-        let sandbox = if request.requires_sandbox {
-            "yes (OS sandbox when available)"
-        } else {
-            "no"
-        };
-        let rule = request.matched_rule.as_deref().unwrap_or("none");
-        items.push(ListItem::new(vec![
-            Line::from("Approval required".yellow().bold()),
-            Line::from(format!("Tool: {}", request.tool_name)),
-            Line::from(format!(
-                "Risk: {:?} | Sandbox: {sandbox}",
-                request.risk_level
-            )),
-            Line::from(format!("Rule: {rule}")),
-            Line::from(format!("Description: {}", request.description)),
-            Line::from(format!("Arguments: {}", request.arguments)),
-            Line::from("Press y to approve, n to deny."),
-        ]));
+    for cell in cells.iter().skip(skip_count).take(visible_messages) {
+        let mut lines = vec![Line::from(label_for_cell(cell))];
+        lines.extend(cell.lines().into_iter().map(Line::from));
+        lines.push(Line::default());
+        items.push(ListItem::new(lines));
     }
 
     let list = List::new(items).block(
@@ -185,10 +166,16 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) 
     );
 }
 
-fn label_for_author(author: &Author) -> Span<'static> {
-    match author {
-        Author::User => "You".blue().bold(),
-        Author::Assistant => "Assistant".green().bold(),
-        Author::System => "System".dark_gray().bold(),
+fn label_for_cell(cell: &HistoryCell) -> Span<'static> {
+    match cell {
+        HistoryCell::User { .. } => cell.label().blue().bold(),
+        HistoryCell::Assistant { .. } => cell.label().green().bold(),
+        HistoryCell::Reasoning { .. } => cell.label().cyan().bold(),
+        HistoryCell::ToolCall { .. } => cell.label().yellow().bold(),
+        HistoryCell::ToolResult { .. } => cell.label().magenta().bold(),
+        HistoryCell::Approval { .. } => cell.label().yellow().bold(),
+        HistoryCell::Diagnostics { .. } => cell.label().red().bold(),
+        HistoryCell::Checkpoint { .. } => cell.label().dark_gray().bold(),
+        HistoryCell::System { .. } => cell.label().dark_gray().bold(),
     }
 }

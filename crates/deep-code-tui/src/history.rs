@@ -1,0 +1,430 @@
+use deep_code_agent::{Message, Role, SessionRecord, ToolResultStatus};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryCell {
+    System {
+        text: String,
+    },
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    Reasoning {
+        text: String,
+    },
+    ToolCall {
+        tool_name: String,
+        arguments: String,
+    },
+    ToolResult {
+        tool_name: String,
+        status: ToolResultStatus,
+        summary: String,
+    },
+    Approval {
+        tool_name: String,
+        description: String,
+        risk_level: String,
+        requires_sandbox: bool,
+        matched_rule: Option<String>,
+        arguments: String,
+    },
+    Diagnostics {
+        summary: String,
+        rendered: String,
+    },
+    Checkpoint {
+        id: String,
+        label: String,
+    },
+}
+
+impl HistoryCell {
+    #[must_use]
+    pub fn system(text: impl Into<String>) -> Self {
+        Self::System { text: text.into() }
+    }
+
+    #[must_use]
+    pub fn user(text: impl Into<String>) -> Self {
+        Self::User { text: text.into() }
+    }
+
+    #[must_use]
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self::Assistant { text: text.into() }
+    }
+
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::System { .. } => "System",
+            Self::User { .. } => "You",
+            Self::Assistant { .. } => "Assistant",
+            Self::Reasoning { .. } => "Reasoning",
+            Self::ToolCall { .. } => "Tool call",
+            Self::ToolResult { .. } => "Tool result",
+            Self::Approval { .. } => "Approval",
+            Self::Diagnostics { .. } => "Diagnostics",
+            Self::Checkpoint { .. } => "Checkpoint",
+        }
+    }
+
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        match self {
+            Self::System { text }
+            | Self::User { text }
+            | Self::Assistant { text }
+            | Self::Reasoning { text } => vec![text.clone()],
+            Self::ToolCall {
+                tool_name,
+                arguments,
+            } => vec![
+                format!("Tool: {tool_name}"),
+                format!("Arguments: {}", truncate_chars(arguments, 240)),
+            ],
+            Self::ToolResult {
+                tool_name,
+                status,
+                summary,
+            } => vec![
+                format!("Tool: {tool_name}"),
+                format!("Result: {status:?}"),
+                format!("Summary: {}", truncate_chars(summary, 300)),
+            ],
+            Self::Approval {
+                tool_name,
+                description,
+                risk_level,
+                requires_sandbox,
+                matched_rule,
+                arguments,
+            } => vec![
+                format!("Tool: {tool_name}"),
+                format!("Risk: {risk_level} | Sandbox: {requires_sandbox}"),
+                format!("Rule: {}", matched_rule.as_deref().unwrap_or("none")),
+                format!("Description: {}", truncate_chars(description, 200)),
+                format!("Arguments: {}", truncate_chars(arguments, 240)),
+                "Press y to approve, n to deny.".to_string(),
+            ],
+            Self::Diagnostics { summary, rendered } => {
+                if rendered.is_empty() {
+                    vec![summary.clone()]
+                } else {
+                    vec![summary.clone(), truncate_chars(rendered, 600)]
+                }
+            }
+            Self::Checkpoint { id, label } => vec![
+                format!("Label: {label}"),
+                format!("ID: {id}"),
+                format!("Restore: /restore {id}"),
+            ],
+        }
+    }
+}
+
+pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
+    let mut cells = record
+        .messages
+        .iter()
+        .flat_map(message_to_cells)
+        .collect::<Vec<_>>();
+    if let Some(summary) = &record.summary {
+        let prefix = record
+            .compaction
+            .as_deref()
+            .map_or("Compaction summary".to_string(), |value| {
+                format!("Compaction summary ({value})")
+            });
+        cells.push(HistoryCell::System {
+            text: format!("{prefix}\n{summary}"),
+        });
+    }
+    cells.extend(
+        record
+            .checkpoints
+            .iter()
+            .map(|checkpoint| HistoryCell::Checkpoint {
+                id: checkpoint.id.0.clone(),
+                label: checkpoint.label.clone(),
+            }),
+    );
+    cells
+}
+
+fn message_to_cells(message: &Message) -> Vec<HistoryCell> {
+    match message.role {
+        Role::System => Vec::new(),
+        Role::User => vec![HistoryCell::user(message.content.clone())],
+        Role::Assistant => {
+            let mut cells = Vec::new();
+            if !message.content.is_empty() {
+                cells.push(HistoryCell::assistant(message.content.clone()));
+            }
+            cells.extend(message.tool_calls.iter().map(|call| HistoryCell::ToolCall {
+                tool_name: call.function.name.clone(),
+                arguments: call.function.arguments.clone(),
+            }));
+            cells
+        }
+        Role::Tool => vec![HistoryCell::ToolResult {
+            tool_name: message
+                .tool_call_id
+                .as_deref()
+                .unwrap_or("unknown")
+                .to_string(),
+            status: ToolResultStatus::Success,
+            summary: summarize_tool_result(&message.content),
+        }],
+    }
+}
+
+pub(crate) fn summarize_tool_result(content: &str) -> String {
+    const MAX_CHARS: usize = 300;
+
+    if content.contains("<diagnostics file=")
+        && let Some(block_start) = content.find("<diagnostics file=")
+    {
+        let prefix = content[..block_start].trim();
+        let diagnostics = &content[block_start..];
+        let diag_summary = diagnostics
+            .lines()
+            .find(|line| line.starts_with("  ERROR") || line.starts_with("  WARNING"))
+            .map(|line| line.trim().to_string())
+            .unwrap_or_else(|| "diagnostics attached".to_string());
+        if prefix.is_empty() {
+            return truncate_chars(&diag_summary, MAX_CHARS);
+        }
+        return truncate_chars(&format!("{prefix} | {diag_summary}"), MAX_CHARS);
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
+        && let Some(summary) = summarize_json_tool_result(&value)
+    {
+        return summary;
+    }
+
+    let flattened = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(&flattened, MAX_CHARS)
+}
+
+fn summarize_json_tool_result(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    let path = object
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+
+    if let Some(entries) = object.get("entries").and_then(serde_json::Value::as_array) {
+        return Some(format!("{path}: {} entries", entries.len()));
+    }
+
+    if let Some(lines) = object.get("lines").and_then(serde_json::Value::as_array) {
+        let total_lines = object
+            .get("total_lines")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(lines.len() as u64);
+        let truncated = object
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        return Some(format!(
+            "{path}: {} lines shown of {total_lines} (truncated={truncated})",
+            lines.len()
+        ));
+    }
+
+    if let Some(matches) = object.get("matches").and_then(serde_json::Value::as_array) {
+        let files_searched = object
+            .get("files_searched")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let truncated = object
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        return Some(format!(
+            "{path}: {} matches across {files_searched} files (truncated={truncated})",
+            matches.len()
+        ));
+    }
+
+    if let Some(bytes_written) = object
+        .get("bytes_written")
+        .and_then(serde_json::Value::as_u64)
+    {
+        return Some(format!("{path}: wrote {bytes_written} bytes"));
+    }
+
+    if let Some(replacements) = object
+        .get("replacements")
+        .and_then(serde_json::Value::as_u64)
+    {
+        return Some(format!("{path}: {replacements} replacements"));
+    }
+
+    if let Some(command) = object.get("command").and_then(serde_json::Value::as_str) {
+        let status = object
+            .get("status")
+            .or_else(|| object.get("tool_status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let cwd = object
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(".");
+        if let Some(job_id) = object.get("job_id").and_then(serde_json::Value::as_str) {
+            return Some(format!("{job_id}: {status} in {cwd} ({command})"));
+        }
+        if object.contains_key("stdout") || object.contains_key("stderr") {
+            let exit = object
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64)
+                .map_or("none".to_string(), |code| code.to_string());
+            return Some(format!("{status} exit={exit} in {cwd} ({command})"));
+        }
+        if object.contains_key("diff") {
+            let truncated = object
+                .get("truncated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            return Some(format!("git diff in {cwd} (truncated={truncated})"));
+        }
+        if object.contains_key("status_output") {
+            let entries = object
+                .get("entries")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, |entries| entries.len());
+            return Some(format!("git status in {cwd}: {entries} entries"));
+        }
+        if object.contains_key("log") {
+            let lines = object
+                .get("log")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value.lines().count())
+                .unwrap_or(0);
+            return Some(format!("git log in {cwd}: {lines} lines"));
+        }
+    }
+
+    if let Some(job_id) = object.get("job_id").and_then(serde_json::Value::as_str) {
+        let status = object
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        return Some(format!("{job_id}: {status}"));
+    }
+
+    None
+}
+
+pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut truncated = String::new();
+    for _ in 0..max_chars {
+        let Some(ch) = chars.next() else {
+            return text.to_string();
+        };
+        truncated.push(ch);
+    }
+    if chars.next().is_some() {
+        truncated.push_str("... (truncated)");
+    }
+    truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use deep_code_agent::{AgentConfig, Message, SessionRecord, ToolCallPayload};
+
+    use super::*;
+
+    #[test]
+    fn hydrate_history_keeps_assistant_tool_calls_and_results() {
+        let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), &AgentConfig::default(), "");
+        record.messages.push(Message::user("hi"));
+        record.messages.push(Message::assistant_with_tool_calls(
+            "",
+            vec![ToolCallPayload {
+                id: "call_1".to_string(),
+                call_type: "function".to_string(),
+                function: deep_code_agent::ToolCallFunctionPayload {
+                    name: "mock_echo".to_string(),
+                    arguments: "{\"message\":\"hi\"}".to_string(),
+                },
+            }],
+        ));
+        record
+            .messages
+            .push(Message::tool("call_1", "mock_echo: hi"));
+        record.summary = Some("older conversation summary".to_string());
+        record.compaction = Some("archived=2".to_string());
+        record
+            .checkpoints
+            .push(deep_code_agent::CheckpointRecord::new(
+                deep_code_agent::CheckpointId("checkpoint_1".to_string()),
+                "before_turn",
+            ));
+
+        let cells = hydrate_history(&record);
+        assert!(matches!(cells[0], HistoryCell::User { .. }));
+        assert!(matches!(
+            &cells[1],
+            HistoryCell::ToolCall { tool_name, .. } if tool_name == "mock_echo"
+        ));
+        assert!(matches!(
+            &cells[2],
+            HistoryCell::ToolResult { tool_name, summary, .. }
+                if tool_name == "call_1" && summary.contains("mock_echo")
+        ));
+        assert!(cells.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::System { text } if text.contains("archived=2")
+        )));
+        assert!(cells.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::Checkpoint { id, .. } if id == "checkpoint_1"
+        )));
+    }
+
+    #[test]
+    fn tool_and_approval_lines_truncate_long_fields() {
+        let long = "x".repeat(500);
+        let tool = HistoryCell::ToolCall {
+            tool_name: "write_file".to_string(),
+            arguments: long.clone(),
+        };
+        assert!(tool.lines().iter().any(|line| line.contains("(truncated)")));
+
+        let approval = HistoryCell::Approval {
+            tool_name: "shell_run".to_string(),
+            description: long.clone(),
+            risk_level: "High".to_string(),
+            requires_sandbox: true,
+            matched_rule: Some("shell".to_string()),
+            arguments: long,
+        };
+        let lines = approval.lines();
+        assert!(lines.iter().any(|line| line.contains("Risk: High")));
+        assert!(lines.iter().any(|line| line.contains("Rule: shell")));
+        assert!(lines.iter().any(|line| line.contains("(truncated)")));
+    }
+
+    #[test]
+    fn checkpoint_lines_include_restore_command() {
+        let cell = HistoryCell::Checkpoint {
+            id: "checkpoint_1".to_string(),
+            label: "before_turn".to_string(),
+        };
+        assert!(
+            cell.lines()
+                .iter()
+                .any(|line| line == "Restore: /restore checkpoint_1")
+        );
+    }
+}
