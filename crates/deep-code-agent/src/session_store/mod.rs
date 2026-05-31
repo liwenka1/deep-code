@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 pub use json::JsonSessionStore;
 
+use crate::checkpoint::CheckpointId;
 use crate::config::AgentConfig;
 use crate::message::Message;
 use crate::model::Usage;
@@ -84,6 +85,25 @@ pub struct TurnRecord {
     pub finished_at_ms: Option<u64>,
 }
 
+/// Checkpoint metadata retained in the session for UI/API resume projections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointRecord {
+    pub id: CheckpointId,
+    pub label: String,
+    pub created_at_ms: u64,
+}
+
+impl CheckpointRecord {
+    #[must_use]
+    pub fn new(id: CheckpointId, label: impl Into<String>) -> Self {
+        Self {
+            id,
+            label: label.into(),
+            created_at_ms: now_ms(),
+        }
+    }
+}
+
 impl TurnRecord {
     #[must_use]
     pub fn new(user_prompt: impl Into<String>) -> Self {
@@ -113,6 +133,9 @@ pub struct SessionRecord {
     pub config: ConfigSnapshot,
     pub messages: Vec<Message>,
     pub turns: Vec<TurnRecord>,
+    /// Workspace snapshots created during this session.
+    #[serde(default)]
+    pub checkpoints: Vec<CheckpointRecord>,
     /// Transcript summary produced by compaction (when applied).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
@@ -135,6 +158,7 @@ impl SessionRecord {
             config: ConfigSnapshot::from(config),
             messages,
             turns: Vec::new(),
+            checkpoints: Vec::new(),
             summary: None,
             compaction: None,
         }

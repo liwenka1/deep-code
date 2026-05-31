@@ -36,7 +36,10 @@ mod workspace_policy;
 mod workspace_summary;
 mod workspace_tools;
 
-pub use auto_mode::{TurnRoute, api_fallback_model, resolve_turn_route, select_auto_model};
+pub use auto_mode::{
+    TurnRoute, api_fallback_model, resolve_turn_route, select_auto_model,
+    select_auto_model_with_reason,
+};
 pub use checkpoint::{CheckpointId, CheckpointStore};
 pub use client::{AgentEventStream, DeepSeekClient, LlmClient};
 pub use compaction::{
@@ -94,7 +97,9 @@ pub use rlm::{
     RLM_TOOL_NAMES, RlmCloseTool, RlmConfig, RlmConfigureTool, RlmEvalTool, RlmManager,
     RlmOpenTool, RlmServices, RlmSessionInfo, is_rlm_tool, register_rlm_tools,
 };
-pub use runtime::{AgentRuntime, AgentRuntimeHandle, RuntimeEvent, RuntimeEventReceiver};
+pub use runtime::{
+    AgentRuntime, AgentRuntimeHandle, RuntimeEvent, RuntimeEventReceiver, ToolCallId, TurnId,
+};
 pub use runtime_launch::{
     DEFAULT_SYSTEM_PROMPT, LaunchedRuntime, build_tool_registry, launch_runtime,
     runtime_system_prompt,
@@ -105,9 +110,9 @@ pub use sandbox::{
 };
 pub use session::Session;
 pub use session_store::{
-    ConfigSnapshot, JsonSessionStore, SESSION_SCHEMA_VERSION, SessionId, SessionRecord,
-    SessionStore, SessionStoreError, TurnRecord, format_sessions_storage_note, new_session_id,
-    sessions_dir_for_workspace, validate_session_id,
+    CheckpointRecord, ConfigSnapshot, JsonSessionStore, SESSION_SCHEMA_VERSION, SessionId,
+    SessionRecord, SessionStore, SessionStoreError, TurnRecord, format_sessions_storage_note,
+    new_session_id, sessions_dir_for_workspace, validate_session_id,
 };
 pub use shell_tools::{BackgroundJobSummary, JobStore, ShellTools, shell_tool_registry};
 pub use skills::{

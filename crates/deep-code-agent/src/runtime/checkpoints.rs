@@ -7,6 +7,7 @@ use crate::checkpoint::{CheckpointId, CheckpointStore};
 use crate::client::LlmClient;
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, emit};
+use crate::session_store::{CheckpointRecord, SessionStore};
 use crate::tool::ToolError;
 
 impl<C: LlmClient + 'static> AgentRuntime<C> {
@@ -45,15 +46,37 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             return;
         };
         match store.snapshot(label) {
-            Ok(id) => emit(
-                tx,
-                RuntimeEvent::CheckpointCreated {
-                    id,
-                    label: label.to_string(),
-                },
-            ),
+            Ok(id) => {
+                self.record_checkpoint(id.clone(), label);
+                emit(
+                    tx,
+                    RuntimeEvent::CheckpointCreated {
+                        id,
+                        label: label.to_string(),
+                    },
+                );
+            }
             Err(error) => {
                 eprintln!("checkpoint snapshot '{label}' failed: {error}");
+            }
+        }
+    }
+
+    fn record_checkpoint(&self, id: CheckpointId, label: &str) {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return;
+        };
+        let record = CheckpointRecord::new(id, label);
+        match persistence.record.try_lock() {
+            Ok(mut session) => {
+                session.checkpoints.push(record);
+                session.touch();
+                if let Err(error) = persistence.store.save(&session) {
+                    eprintln!("session save failed after checkpoint: {error}");
+                }
+            }
+            Err(_) => {
+                eprintln!("session checkpoint metadata skipped: session record is busy");
             }
         }
     }

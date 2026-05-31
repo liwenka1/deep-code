@@ -8,7 +8,7 @@ use super::*;
 use crate::client::AgentEventStream;
 use crate::error::{AgentError, AgentResult};
 use crate::event::AgentEvent;
-use crate::model::{FunctionCallDelta, ToolCallDelta};
+use crate::model::{ChatRequest, FunctionCallDelta, ToolCallDelta};
 use crate::runtime::diagnostics::append_diagnostics;
 use crate::session_store::SessionStore;
 use crate::tool::{MockEchoTool, ToolRegistry, ToolResultStatus};
@@ -204,6 +204,219 @@ async fn plain_response_yields_assistant_message_and_finish() {
 }
 
 #[tokio::test]
+async fn plain_response_emits_structured_lifecycle_events() {
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::ReasoningDelta {
+            text: "thinking".to_string(),
+        },
+        AgentEvent::TextDelta {
+            text: "hello".to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::default());
+
+    let mut rx = runtime.submit_user("hi").await;
+    let events = drain(&mut rx).await;
+
+    let turn_id = events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::TurnStarted { turn_id, prompt } => {
+                assert_eq!(prompt, "hi");
+                Some(turn_id.clone())
+            }
+            _ => None,
+        })
+        .expect("turn started event");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::SessionUpdated {
+            message_count: 1,
+            current_turn_id: Some(id),
+            ..
+        } if id == &turn_id
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ReasoningDelta { turn_id: id, text }
+            if id == &turn_id && text == "thinking"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::AssistantDelta { turn_id: id, text }
+            if id == &turn_id && text == "hello"
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::TurnFinished { turn_id: id, .. }) if id == &turn_id
+    ));
+}
+
+#[tokio::test]
+async fn tool_turn_emits_structured_tool_and_approval_events() {
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools());
+
+    let mut rx = runtime.submit_user("please echo").await;
+    let first = drain(&mut rx).await;
+    let turn_id = first
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::TurnStarted { turn_id, .. } => Some(turn_id.clone()),
+            _ => None,
+        })
+        .expect("turn started");
+
+    assert!(first.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ToolCallUpdated {
+            turn_id: id,
+            tool_call_id,
+            arguments_delta: Some(delta),
+        } if id == &turn_id && tool_call_id.as_str() == "call_1" && delta.contains("hi")
+    )));
+    assert!(first.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ToolCallStarted {
+            turn_id: id,
+            tool_call_id,
+            tool_name,
+            ..
+        } if id == &turn_id && tool_call_id.as_str() == "call_1" && tool_name == MockEchoTool::NAME
+    )));
+    assert!(first.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ApprovalRequired {
+            turn_id: Some(id),
+            tool_call_id: Some(tool_id),
+            ..
+        } if id == &turn_id && tool_id.as_str() == "call_1"
+    )));
+
+    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let second = drain(&mut rx).await;
+    assert!(matches!(
+        second.first(),
+        Some(RuntimeEvent::ApprovalResolved {
+            turn_id: Some(id),
+            tool_call_id,
+            decision: ApprovalDecision::Approved,
+        }) if id == &turn_id && tool_call_id.as_str() == "call_1"
+    ));
+    assert!(second.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ToolCallFinished {
+            turn_id: Some(id),
+            tool_call_id,
+            result,
+        } if id == &turn_id
+            && tool_call_id.as_str() == "call_1"
+            && result.status == ToolResultStatus::Success
+    )));
+}
+
+#[tokio::test]
+async fn tool_call_updates_reuse_stable_id_for_delta_fragments_without_id() {
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::ToolCallDelta {
+            delta: ToolCallDelta {
+                index: Some(0),
+                id: Some("call_1".to_string()),
+                call_type: Some("function".to_string()),
+                function: Some(FunctionCallDelta {
+                    name: Some(MockEchoTool::NAME.to_string()),
+                    arguments: Some(r#"{"message":"hel"#.to_string()),
+                }),
+            },
+        },
+        AgentEvent::ToolCallDelta {
+            delta: ToolCallDelta {
+                index: Some(0),
+                id: None,
+                call_type: None,
+                function: Some(FunctionCallDelta {
+                    name: None,
+                    arguments: Some(r#"lo"}"#.to_string()),
+                }),
+            },
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools());
+
+    let mut rx = runtime.submit_user("please echo").await;
+    let events = drain(&mut rx).await;
+    let updated_ids = events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::ToolCallUpdated { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(updated_ids, vec!["call_1", "call_1"]);
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::ApprovalRequired { .. })
+    ));
+}
+
+#[tokio::test]
+async fn invalid_tool_arguments_error_keeps_turn_id() {
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::ToolCallDelta {
+            delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"unterminated""#),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools());
+
+    let mut rx = runtime.submit_user("please echo").await;
+    let events = drain(&mut rx).await;
+    let turn_id = events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::TurnStarted { turn_id, .. } => Some(turn_id.clone()),
+            _ => None,
+        })
+        .expect("turn started");
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Error {
+            turn_id: Some(id),
+            ..
+        } if id == &turn_id
+    )));
+}
+
+#[test]
+fn runtime_event_serializes_structured_turn_started() {
+    let event = RuntimeEvent::TurnStarted {
+        turn_id: TurnId("turn_test".to_string()),
+        prompt: "hello".to_string(),
+    };
+    let json = serde_json::to_value(event).unwrap();
+    assert_eq!(json["type"], "turn_started");
+    assert_eq!(json["turn_id"], "turn_test");
+    assert_eq!(json["prompt"], "hello");
+}
+
+#[tokio::test]
 async fn turn_snapshots_emit_checkpoint_events() {
     let workspace = tempfile::tempdir().unwrap();
     let client = ScriptedClient::new(vec![vec![
@@ -232,6 +445,46 @@ async fn turn_snapshots_emit_checkpoint_events() {
     });
     assert!(before.is_some(), "expected before_turn checkpoint");
     assert!(after.is_some(), "expected after_turn checkpoint");
+}
+
+#[tokio::test]
+async fn persistent_runtime_records_checkpoint_metadata() {
+    let workspace = tempfile::tempdir().unwrap();
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::TextDelta {
+            text: "done".to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = AgentRuntime::with_new_session(
+        client,
+        ToolRegistry::default(),
+        "system",
+        workspace.path(),
+        &crate::config::AgentConfig::default(),
+    )
+    .unwrap()
+    .with_checkpoints(workspace.path());
+    let session_id = runtime.session_id().await.expect("session id");
+
+    let mut rx = runtime.submit_user("hi").await;
+    drain(&mut rx).await;
+    runtime.shutdown().await;
+
+    let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let record = store.load(&session_id).unwrap();
+    assert!(
+        record
+            .checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.label == "before_turn")
+    );
+    assert!(
+        record
+            .checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.label == "after_turn")
+    );
 }
 
 #[tokio::test]
@@ -369,6 +622,40 @@ async fn persistence_saves_messages_and_turns() {
     assert_eq!(record.messages.len(), 3);
     assert_eq!(record.turns.len(), 1);
     assert_eq!(record.turns[0].user_prompt, "hi");
+}
+
+#[tokio::test]
+async fn session_updated_reports_authoritative_metadata() {
+    let workspace = tempfile::tempdir().unwrap();
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::TextDelta {
+            text: "hello".to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = AgentRuntime::with_new_session(
+        client,
+        ToolRegistry::default(),
+        "system",
+        workspace.path(),
+        &crate::config::AgentConfig::default(),
+    )
+    .unwrap();
+    let session_id = runtime.session_id().await.expect("session id");
+
+    let mut rx = runtime.submit_user("hi").await;
+    let events = drain(&mut rx).await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::SessionUpdated {
+            session_id: Some(id),
+            current_turn_id: Some(_),
+            message_count,
+            turn_count,
+            ..
+        } if id == &session_id && *message_count >= 2 && *turn_count == 0
+    )));
 }
 
 #[tokio::test]
@@ -591,6 +878,13 @@ async fn auto_pro_retries_with_flash_after_retriable_api_error() {
     assert!(telemetry.used_model_fallback);
     assert_eq!(telemetry.effective_model, DEEPSEEK_V4_FLASH);
     assert!(telemetry.route_label.contains("fallback→flash"));
+    assert!(telemetry.route_reason.contains("debug"));
+    assert!(
+        telemetry
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("降级"))
+    );
     assert_eq!(
         runtime.session_messages().await.last().unwrap().content,
         "recovered"
@@ -643,5 +937,8 @@ async fn unauthorized_api_error_does_not_fallback() {
     let events = drain(&mut rx).await;
 
     assert_eq!(*client.calls.lock().unwrap(), 1);
-    assert!(matches!(events.last(), Some(RuntimeEvent::Error { .. })));
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::Error { message, .. }) if message.contains("鉴权失败")
+    ));
 }
