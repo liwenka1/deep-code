@@ -1,12 +1,15 @@
 use deep_code_agent::{ApprovalRequest, ToolCallId, TurnId};
 
-use crate::history::HistoryCell;
+use crate::history::{HistoryCell, ToolApprovalState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveToolCell {
     pub tool_call_id: ToolCallId,
     pub tool_name: String,
     pub arguments: String,
+    pub risk_level: Option<String>,
+    pub requires_sandbox: Option<bool>,
+    pub approval: ToolApprovalState,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -17,6 +20,7 @@ pub struct ActiveTurn {
     pub saw_structured_assistant_delta: bool,
     pub saw_structured_reasoning_delta: bool,
     pub tools: Vec<ActiveToolCell>,
+    pub diagnostics: Vec<HistoryCell>,
     pub pending_approval: Option<ApprovalRequest>,
 }
 
@@ -30,6 +34,7 @@ impl ActiveTurn {
             saw_structured_assistant_delta: false,
             saw_structured_reasoning_delta: false,
             tools: Vec::new(),
+            diagnostics: Vec::new(),
             pending_approval: None,
         }
     }
@@ -80,8 +85,56 @@ impl ActiveTurn {
                 tool_call_id: tool_call_id.clone(),
                 tool_name: tool_call_id.as_str().to_string(),
                 arguments: delta.to_string(),
+                risk_level: None,
+                requires_sandbox: None,
+                approval: ToolApprovalState::NotRequired,
             });
         }
+    }
+
+    pub fn mark_approval_required(&mut self, request: &ApprovalRequest) {
+        let tool_call_id = ToolCallId::from(request.call_id.clone());
+        if let Some(existing) = self
+            .tools
+            .iter_mut()
+            .find(|tool| tool.tool_call_id == tool_call_id)
+        {
+            existing.risk_level = Some(format!("{:?}", request.risk_level));
+            existing.requires_sandbox = Some(request.requires_sandbox);
+            existing.approval = ToolApprovalState::Required;
+        } else {
+            self.tools.push(ActiveToolCell {
+                tool_call_id,
+                tool_name: request.tool_name.clone(),
+                arguments: request.arguments.to_string(),
+                risk_level: Some(format!("{:?}", request.risk_level)),
+                requires_sandbox: Some(request.requires_sandbox),
+                approval: ToolApprovalState::Required,
+            });
+        }
+    }
+
+    pub fn resolve_approval(&mut self, decision: deep_code_agent::ApprovalDecision) {
+        let Some(request) = self.pending_approval.take() else {
+            return;
+        };
+        let tool_call_id = ToolCallId::from(request.call_id);
+        let approval = match decision {
+            deep_code_agent::ApprovalDecision::Approved => ToolApprovalState::Approved,
+            deep_code_agent::ApprovalDecision::Denied => ToolApprovalState::Denied,
+        };
+        if let Some(existing) = self
+            .tools
+            .iter_mut()
+            .find(|tool| tool.tool_call_id == tool_call_id)
+        {
+            existing.approval = approval;
+        }
+    }
+
+    pub fn push_diagnostics(&mut self, summary: String, rendered: String) {
+        self.diagnostics
+            .push(HistoryCell::Diagnostics { summary, rendered });
     }
 
     #[must_use]
@@ -100,7 +153,11 @@ impl ActiveTurn {
         cells.extend(self.tools.iter().map(|tool| HistoryCell::ToolCall {
             tool_name: tool.tool_name.clone(),
             arguments: tool.arguments.clone(),
+            risk_level: tool.risk_level.clone(),
+            requires_sandbox: tool.requires_sandbox,
+            approval: tool.approval,
         }));
+        cells.extend(self.diagnostics.iter().cloned());
         if let Some(request) = &self.pending_approval {
             cells.push(HistoryCell::Approval {
                 tool_name: request.tool_name.clone(),
@@ -128,6 +185,9 @@ mod tests {
             tool_call_id: ToolCallId("call_1".to_string()),
             tool_name: "mock_echo".to_string(),
             arguments: "{\"message\":\"hi\"}".to_string(),
+            risk_level: None,
+            requires_sandbox: None,
+            approval: ToolApprovalState::NotRequired,
         });
 
         let cells = turn.preview_cells();

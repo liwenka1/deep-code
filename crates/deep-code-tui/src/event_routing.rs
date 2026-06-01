@@ -2,7 +2,7 @@ use deep_code_agent::{AgentEvent, RuntimeEvent, ToolCallId};
 
 use crate::active_turn::{ActiveToolCell, ActiveTurn};
 use crate::app::App;
-use crate::history::{HistoryCell, summarize_tool_result};
+use crate::history::{HistoryCell, ToolApprovalState, summarize_tool_result};
 
 impl App {
     pub(crate) fn apply_runtime_event(&mut self, event: RuntimeEvent) {
@@ -40,6 +40,9 @@ impl App {
                     tool_call_id,
                     tool_name: tool_name.clone(),
                     arguments: arguments.to_string(),
+                    risk_level: None,
+                    requires_sandbox: None,
+                    approval: ToolApprovalState::NotRequired,
                 });
                 self.status = format!("Receiving tool call: {tool_name}");
             }
@@ -65,12 +68,13 @@ impl App {
                     request.tool_name, request.risk_level
                 );
                 self.pending_approval = Some(request);
+                self.approval_scroll_offset = 0;
                 self.is_streaming = false;
                 self.clear_stream_receiver();
             }
             RuntimeEvent::ApprovalResolved { decision, .. } => {
                 if let Some(active) = self.active_turn.as_mut() {
-                    active.pending_approval = None;
+                    active.resolve_approval(decision);
                 }
                 self.status = format!("Approval resolved: {decision:?}");
             }
@@ -107,10 +111,14 @@ impl App {
                 }
             }
             RuntimeEvent::DiagnosticsUpdated { summary, rendered } => {
-                self.history.push(HistoryCell::Diagnostics {
-                    summary: summary.clone(),
-                    rendered,
-                });
+                if let Some(active) = self.active_turn.as_mut() {
+                    active.push_diagnostics(summary.clone(), rendered);
+                } else {
+                    self.history.push(HistoryCell::Diagnostics {
+                        summary: summary.clone(),
+                        rendered,
+                    });
+                }
                 self.status = format!("Diagnostics: {summary}");
             }
             RuntimeEvent::CompactionApplied {
@@ -212,9 +220,11 @@ impl App {
 
     fn set_active_approval(&mut self, request: deep_code_agent::ApprovalRequest) {
         if let Some(active) = self.active_turn.as_mut() {
+            active.mark_approval_required(&request);
             active.pending_approval = Some(request);
         } else {
             let mut active = ActiveTurn::new(Default::default());
+            active.mark_approval_required(&request);
             active.pending_approval = Some(request);
             self.active_turn = Some(active);
         }

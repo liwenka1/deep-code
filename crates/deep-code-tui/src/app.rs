@@ -46,6 +46,7 @@ pub struct App {
     pub last_checkpoint: Option<String>,
     pub session_id: Option<String>,
     pub scroll_offset: usize,
+    pub approval_scroll_offset: usize,
     pub(crate) runtime: Arc<dyn AgentRuntimeHandle>,
     pub(crate) backend_label: String,
     pub(crate) subagent_manager: SharedSubAgentManager,
@@ -116,6 +117,7 @@ impl App {
             last_checkpoint: None,
             session_id,
             scroll_offset: 0,
+            approval_scroll_offset: 0,
             runtime,
             backend_label,
             subagent_manager,
@@ -165,6 +167,7 @@ impl App {
         self.error = None;
         self.active_turn = None;
         self.scroll_offset = 0;
+        self.approval_scroll_offset = 0;
         self.is_streaming = true;
         self.status = format!("Streaming from {}...", self.backend_label);
 
@@ -193,6 +196,45 @@ impl App {
         self.scroll_offset = 0;
     }
 
+    pub fn scroll_approval_up(&mut self) {
+        self.approval_scroll_offset = self.approval_scroll_offset.saturating_sub(3);
+    }
+
+    pub fn scroll_approval_down(&mut self) {
+        self.approval_scroll_offset = self
+            .approval_scroll_offset
+            .saturating_add(3)
+            .min(self.approval_scroll_max());
+    }
+
+    pub fn scroll_approval_to_top(&mut self) {
+        self.approval_scroll_offset = 0;
+    }
+
+    #[must_use]
+    pub fn clamped_approval_scroll_offset(&self) -> usize {
+        self.approval_scroll_offset.min(self.approval_scroll_max())
+    }
+
+    pub(crate) fn approval_cell(&self) -> Option<HistoryCell> {
+        self.pending_approval
+            .as_ref()
+            .map(|request| HistoryCell::Approval {
+                tool_name: request.tool_name.clone(),
+                description: request.description.clone(),
+                risk_level: format!("{:?}", request.risk_level),
+                requires_sandbox: request.requires_sandbox,
+                matched_rule: request.matched_rule.clone(),
+                arguments: request.arguments.to_string(),
+            })
+    }
+
+    fn approval_scroll_max(&self) -> usize {
+        self.approval_cell()
+            .map(|cell| cell.lines().len().saturating_sub(1))
+            .unwrap_or(0)
+    }
+
     pub fn drain_stream_updates(&mut self) {
         let Some(mut rx) = self.ui_rx.take() else {
             return;
@@ -216,6 +258,7 @@ impl App {
             ApprovalDecision::Approved => "approved",
             ApprovalDecision::Denied => "denied",
         };
+        self.approval_scroll_offset = 0;
         self.status = format!("Tool {label}, resuming...");
         self.is_streaming = true;
         self.start_stream(StreamRequest::Approval(decision));
@@ -273,6 +316,45 @@ impl App {
         self.ui_rx = None;
     }
 
+    #[must_use]
+    pub fn status_line(&self) -> String {
+        let mode = if self.error.is_some() {
+            "error"
+        } else if self.pending_approval.is_some() {
+            "approval"
+        } else if self.is_streaming {
+            "streaming"
+        } else {
+            "ready"
+        };
+        let session = self
+            .session_id
+            .as_deref()
+            .map(|id| format!(" | session {id}"))
+            .unwrap_or_else(|| " | session none".to_string());
+        let checkpoint = self
+            .last_checkpoint
+            .as_deref()
+            .map(|id| format!(" | checkpoint {id}"))
+            .unwrap_or_default();
+        let telemetry = self
+            .last_telemetry
+            .as_ref()
+            .map(|value| {
+                format!(
+                    " | {} | turn {} | total {}",
+                    value.route_label,
+                    value.turn_cost.format(self.cost_currency),
+                    value.session_cost.format(self.cost_currency)
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "{mode} - {}{session}{checkpoint} | {}{telemetry}",
+            self.backend_label, self.status
+        )
+    }
+
     pub async fn shutdown_runtime(&self) {
         if let Some(shutdown) = &self.subagent_shutdown {
             shutdown();
@@ -321,6 +403,34 @@ mod tests {
         app.scroll_up();
         app.scroll_to_bottom();
         assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn approval_scroll_helpers_adjust_panel_offset() {
+        let mut app = App::new();
+        app.pending_approval = Some(deep_code_agent::ApprovalRequest {
+            call_id: "call_1".to_string(),
+            tool_name: "write_file".to_string(),
+            description: "Write a file".to_string(),
+            arguments: serde_json::json!({ "path": "note.txt", "content": "hello" }),
+            risk_level: deep_code_agent::RiskLevel::High,
+            requires_sandbox: true,
+            read_only: false,
+            matched_rule: Some("write".to_string()),
+        });
+        for _ in 0..10 {
+            app.scroll_approval_down();
+        }
+        assert_eq!(
+            app.approval_scroll_offset,
+            app.clamped_approval_scroll_offset()
+        );
+        assert!(app.approval_scroll_offset > 0);
+        app.scroll_approval_up();
+        assert!(app.approval_scroll_offset < app.approval_scroll_max());
+        app.scroll_approval_down();
+        app.scroll_approval_to_top();
+        assert_eq!(app.approval_scroll_offset, 0);
     }
 
     #[test]
@@ -402,6 +512,173 @@ mod tests {
 
         assert_eq!(tool_result_indices.len(), 1);
         assert!(tool_call_index < tool_result_indices[0]);
+    }
+
+    #[test]
+    fn approval_events_render_pending_and_resolved_tool_metadata() {
+        let mut app = App::new();
+        app.scroll_up();
+        app.scroll_approval_down();
+        let turn_id = deep_code_agent::TurnId("turn_1".to_string());
+        let tool_call_id = deep_code_agent::ToolCallId("call_1".to_string());
+        app.apply_runtime_event(RuntimeEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            prompt: "write something".to_string(),
+        });
+        app.apply_runtime_event(RuntimeEvent::ToolCallStarted {
+            turn_id: turn_id.clone(),
+            tool_call_id: tool_call_id.clone(),
+            tool_name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": "note.txt", "content": "hello" }),
+        });
+        app.apply_runtime_event(RuntimeEvent::ApprovalRequired {
+            turn_id: Some(turn_id.clone()),
+            tool_call_id: Some(tool_call_id.clone()),
+            request: deep_code_agent::ApprovalRequest {
+                call_id: "call_1".to_string(),
+                tool_name: "write_file".to_string(),
+                description: "Write note.txt".to_string(),
+                arguments: serde_json::json!({ "path": "note.txt", "content": "hello" }),
+                risk_level: deep_code_agent::RiskLevel::High,
+                requires_sandbox: true,
+                read_only: false,
+                matched_rule: Some("write".to_string()),
+            },
+        });
+
+        let preview = app.active_turn.as_ref().unwrap().preview_cells();
+        assert!(preview.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::ToolCall {
+                risk_level: Some(risk),
+                requires_sandbox: Some(true),
+                approval,
+                ..
+            } if risk == "High" && *approval == crate::history::ToolApprovalState::Required
+        )));
+        assert!(preview.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::Approval {
+                matched_rule: Some(rule),
+                ..
+            } if rule == "write"
+        )));
+        assert_eq!(app.scroll_offset, 3);
+        assert_eq!(app.approval_scroll_offset, 0);
+
+        app.pending_approval = None;
+        app.apply_runtime_event(RuntimeEvent::ApprovalResolved {
+            turn_id: Some(turn_id.clone()),
+            tool_call_id: tool_call_id.clone(),
+            decision: deep_code_agent::ApprovalDecision::Approved,
+        });
+        let result =
+            deep_code_agent::ToolResult::success("call_1", "write_file", "{\"bytes_written\":5}");
+        app.apply_runtime_event(RuntimeEvent::ToolCallFinished {
+            turn_id: Some(turn_id),
+            tool_call_id,
+            result,
+        });
+        assert!(app.history.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::ToolCall { approval, .. }
+                if *approval == crate::history::ToolApprovalState::Approved
+        )));
+    }
+
+    #[test]
+    fn diagnostics_are_flushed_after_tool_call_before_result() {
+        let mut app = App::new();
+        let turn_id = deep_code_agent::TurnId("turn_1".to_string());
+        let tool_call_id = deep_code_agent::ToolCallId("call_1".to_string());
+        app.apply_runtime_event(RuntimeEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            prompt: "edit file".to_string(),
+        });
+        app.apply_runtime_event(RuntimeEvent::ToolCallStarted {
+            turn_id: turn_id.clone(),
+            tool_call_id: tool_call_id.clone(),
+            tool_name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": "src/main.rs" }),
+        });
+        app.apply_runtime_event(RuntimeEvent::DiagnosticsUpdated {
+            summary: "1 warning".to_string(),
+            rendered: "warning: unused variable".to_string(),
+        });
+        assert!(
+            app.history
+                .iter()
+                .all(|cell| !matches!(cell, HistoryCell::Diagnostics { .. }))
+        );
+
+        let result = deep_code_agent::ToolResult::success(
+            "call_1",
+            "write_file",
+            "{\"path\":\"src/main.rs\",\"bytes_written\":10}",
+        );
+        app.apply_runtime_event(RuntimeEvent::ToolCallFinished {
+            turn_id: Some(turn_id),
+            tool_call_id,
+            result,
+        });
+
+        let tool_call_index = app
+            .history
+            .iter()
+            .position(|cell| matches!(cell, HistoryCell::ToolCall { .. }))
+            .expect("tool call");
+        let diagnostics_index = app
+            .history
+            .iter()
+            .position(|cell| matches!(cell, HistoryCell::Diagnostics { .. }))
+            .expect("diagnostics");
+        let tool_result_index = app
+            .history
+            .iter()
+            .position(|cell| matches!(cell, HistoryCell::ToolResult { .. }))
+            .expect("tool result");
+
+        assert!(tool_call_index < diagnostics_index);
+        assert!(diagnostics_index < tool_result_index);
+    }
+
+    #[test]
+    fn status_line_includes_mode_backend_session_checkpoint_and_cost() {
+        let mut app = App::new();
+        app.session_id = Some("session_1".to_string());
+        app.last_checkpoint = Some("checkpoint_1".to_string());
+        app.last_telemetry = Some(TurnTelemetry {
+            route_label: "auto->deepseek-v4-flash (high)".to_string(),
+            effective_model: "deepseek-v4-flash".to_string(),
+            reasoning_effort: "high".to_string(),
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            cache_hit_tokens: Some(80),
+            cache_miss_tokens: Some(20),
+            prefix_status: deep_code_agent::PrefixStatus::Stable,
+            route_reason: "short prompt".to_string(),
+            fallback_reason: None,
+            context_window: 1_000_000,
+            estimated_context_tokens: 120,
+            context_usage_percent: 1,
+            near_compaction_threshold: false,
+            used_model_fallback: false,
+            turn_cost: deep_code_agent::CostEstimate {
+                cny: 0.001,
+                usd: 0.0001,
+            },
+            session_cost: deep_code_agent::CostEstimate {
+                cny: 0.002,
+                usd: 0.0002,
+            },
+        });
+
+        let status = app.status_line();
+        assert!(status.contains("ready"));
+        assert!(status.contains("session session_1"));
+        assert!(status.contains("checkpoint checkpoint_1"));
+        assert!(status.contains("auto->deepseek-v4-flash"));
+        assert!(status.contains("total ¥0.0020"));
     }
 
     #[test]

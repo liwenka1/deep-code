@@ -68,6 +68,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => app.approve_pending_tool(),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.deny_pending_tool(),
+            KeyCode::PageUp | KeyCode::Up => app.scroll_approval_up(),
+            KeyCode::PageDown | KeyCode::Down => app.scroll_approval_down(),
+            KeyCode::Home => app.scroll_approval_to_top(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.should_quit = true;
             }
@@ -92,18 +95,33 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 }
 
 fn render(frame: &mut Frame<'_>, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(5),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(frame.area());
-
-    render_messages(frame, app, chunks[0]);
-    render_input(frame, app, chunks[1]);
-    render_status(frame, app, chunks[2]);
+    if app.pending_approval.is_some() {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(5),
+                Constraint::Length(8),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(frame.area());
+        render_messages(frame, app, chunks[0]);
+        render_approval_panel(frame, app, chunks[1]);
+        render_input(frame, app, chunks[2]);
+        render_status(frame, app, chunks[3]);
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(5),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(frame.area());
+        render_messages(frame, app, chunks[0]);
+        render_input(frame, app, chunks[1]);
+        render_status(frame, app, chunks[2]);
+    }
 }
 
 fn render_messages(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
@@ -134,6 +152,32 @@ fn render_messages(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect
     frame.render_widget(list, area);
 }
 
+fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
+    let Some(cell) = app.approval_cell() else {
+        return;
+    };
+    let visible_lines = usize::from(area.height.saturating_sub(2)).max(1);
+    let mut lines = vec![Line::from(
+        "Keys: y approve | n/Esc deny | PageUp/PageDown scroll",
+    )];
+    lines.extend(
+        cell.lines()
+            .into_iter()
+            .skip(app.clamped_approval_scroll_offset())
+            .take(visible_lines.saturating_sub(1))
+            .map(Line::from),
+    );
+    let panel = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title("Approval required")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(panel, area);
+}
+
 fn render_input(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
     let title = if app.is_streaming {
         "Prompt (streaming...)"
@@ -157,7 +201,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) 
             Span::raw(error.clone()),
         ])
     } else {
-        Line::from(app.status.clone())
+        Line::from(app.status_line())
     };
 
     frame.render_widget(

@@ -1,4 +1,26 @@
+use std::collections::{HashMap, VecDeque};
+
 use deep_code_agent::{Message, Role, SessionRecord, ToolResultStatus};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolApprovalState {
+    NotRequired,
+    Required,
+    Approved,
+    Denied,
+}
+
+impl ToolApprovalState {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not required",
+            Self::Required => "required",
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryCell {
@@ -17,6 +39,9 @@ pub enum HistoryCell {
     ToolCall {
         tool_name: String,
         arguments: String,
+        risk_level: Option<String>,
+        requires_sandbox: Option<bool>,
+        approval: ToolApprovalState,
     },
     ToolResult {
         tool_name: String,
@@ -82,8 +107,19 @@ impl HistoryCell {
             Self::ToolCall {
                 tool_name,
                 arguments,
+                risk_level,
+                requires_sandbox,
+                approval,
             } => vec![
                 format!("Tool: {tool_name}"),
+                format!("Approval: {}", approval.label()),
+                format!(
+                    "Risk: {} | Sandbox: {}",
+                    risk_level.as_deref().unwrap_or("unknown"),
+                    requires_sandbox
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                ),
                 format!("Arguments: {}", truncate_chars(arguments, 240)),
             ],
             Self::ToolResult {
@@ -127,10 +163,18 @@ impl HistoryCell {
 }
 
 pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
+    let mut tool_names = HashMap::new();
+    let mut tool_results: HashMap<String, VecDeque<(String, ToolResultStatus)>> = HashMap::new();
+    for result in record.turns.iter().flat_map(|turn| &turn.tool_results) {
+        tool_results
+            .entry(result.call_id.clone())
+            .or_default()
+            .push_back((result.tool_name.clone(), result.status.clone()));
+    }
     let mut cells = record
         .messages
         .iter()
-        .flat_map(message_to_cells)
+        .flat_map(|message| message_to_cells(message, &mut tool_names, &mut tool_results))
         .collect::<Vec<_>>();
     if let Some(summary) = &record.summary {
         let prefix = record
@@ -155,7 +199,11 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
     cells
 }
 
-fn message_to_cells(message: &Message) -> Vec<HistoryCell> {
+fn message_to_cells(
+    message: &Message,
+    tool_names: &mut HashMap<String, String>,
+    tool_results: &mut HashMap<String, VecDeque<(String, ToolResultStatus)>>,
+) -> Vec<HistoryCell> {
     match message.role {
         Role::System => Vec::new(),
         Role::User => vec![HistoryCell::user(message.content.clone())],
@@ -164,24 +212,35 @@ fn message_to_cells(message: &Message) -> Vec<HistoryCell> {
             if !message.content.is_empty() {
                 cells.push(HistoryCell::assistant(message.content.clone()));
             }
-            cells.extend(message.tool_calls.iter().map(|call| HistoryCell::ToolCall {
-                tool_name: call.function.name.clone(),
-                arguments: call.function.arguments.clone(),
+            cells.extend(message.tool_calls.iter().map(|call| {
+                tool_names.insert(call.id.clone(), call.function.name.clone());
+                HistoryCell::ToolCall {
+                    tool_name: call.function.name.clone(),
+                    arguments: call.function.arguments.clone(),
+                    risk_level: None,
+                    requires_sandbox: None,
+                    approval: ToolApprovalState::NotRequired,
+                }
             }));
             cells
         }
-        Role::Tool => vec![HistoryCell::ToolResult {
-            tool_name: message
-                .tool_call_id
-                .as_deref()
-                .unwrap_or("unknown")
-                .to_string(),
-            status: ToolResultStatus::Success,
-            summary: summarize_tool_result(&message.content),
-        }],
+        Role::Tool => {
+            let call_id = message.tool_call_id.as_deref().unwrap_or("unknown");
+            let result = tool_results.get_mut(call_id).and_then(VecDeque::pop_front);
+            vec![HistoryCell::ToolResult {
+                tool_name: result
+                    .as_ref()
+                    .map(|(tool_name, _)| tool_name.clone())
+                    .or_else(|| tool_names.get(call_id).cloned())
+                    .unwrap_or_else(|| call_id.to_string()),
+                status: result
+                    .map(|(_, status)| status)
+                    .unwrap_or(ToolResultStatus::Success),
+                summary: summarize_tool_result(&message.content),
+            }]
+        }
     }
 }
-
 pub(crate) fn summarize_tool_result(content: &str) -> String {
     const MAX_CHARS: usize = 300;
 
@@ -362,6 +421,14 @@ mod tests {
         record
             .messages
             .push(Message::tool("call_1", "mock_echo: hi"));
+        let mut turn = deep_code_agent::TurnRecord::new("hi");
+        turn.tool_results.push(deep_code_agent::ToolResult {
+            call_id: "call_1".to_string(),
+            tool_name: "mock_echo".to_string(),
+            status: ToolResultStatus::Denied,
+            content: "mock_echo: hi".to_string(),
+        });
+        record.turns.push(turn);
         record.summary = Some("older conversation summary".to_string());
         record.compaction = Some("archived=2".to_string());
         record
@@ -379,8 +446,13 @@ mod tests {
         ));
         assert!(matches!(
             &cells[2],
-            HistoryCell::ToolResult { tool_name, summary, .. }
-                if tool_name == "call_1" && summary.contains("mock_echo")
+            HistoryCell::ToolResult {
+                tool_name,
+                status,
+                summary,
+            } if tool_name == "mock_echo"
+                && *status == ToolResultStatus::Denied
+                && summary.contains("mock_echo")
         ));
         assert!(cells.iter().any(|cell| matches!(
             cell,
@@ -393,11 +465,82 @@ mod tests {
     }
 
     #[test]
+    fn hydrate_history_matches_duplicate_tool_call_ids_in_order() {
+        let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), &AgentConfig::default(), "");
+        record.messages.push(Message::assistant_with_tool_calls(
+            "",
+            vec![ToolCallPayload {
+                id: "call_1".to_string(),
+                call_type: "function".to_string(),
+                function: deep_code_agent::ToolCallFunctionPayload {
+                    name: "first_tool".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }],
+        ));
+        record
+            .messages
+            .push(Message::tool("call_1", "first result"));
+        record.messages.push(Message::assistant_with_tool_calls(
+            "",
+            vec![ToolCallPayload {
+                id: "call_1".to_string(),
+                call_type: "function".to_string(),
+                function: deep_code_agent::ToolCallFunctionPayload {
+                    name: "second_tool".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }],
+        ));
+        record
+            .messages
+            .push(Message::tool("call_1", "second result"));
+
+        let mut first_turn = deep_code_agent::TurnRecord::new("first");
+        first_turn.tool_results.push(deep_code_agent::ToolResult {
+            call_id: "call_1".to_string(),
+            tool_name: "first_tool".to_string(),
+            status: ToolResultStatus::Denied,
+            content: "first result".to_string(),
+        });
+        let mut second_turn = deep_code_agent::TurnRecord::new("second");
+        second_turn.tool_results.push(deep_code_agent::ToolResult {
+            call_id: "call_1".to_string(),
+            tool_name: "second_tool".to_string(),
+            status: ToolResultStatus::Error,
+            content: "second result".to_string(),
+        });
+        record.turns.push(first_turn);
+        record.turns.push(second_turn);
+
+        let tool_results = hydrate_history(&record)
+            .into_iter()
+            .filter_map(|cell| match cell {
+                HistoryCell::ToolResult {
+                    tool_name, status, ..
+                } => Some((tool_name, status)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            tool_results,
+            vec![
+                ("first_tool".to_string(), ToolResultStatus::Denied),
+                ("second_tool".to_string(), ToolResultStatus::Error),
+            ]
+        );
+    }
+
+    #[test]
     fn tool_and_approval_lines_truncate_long_fields() {
         let long = "x".repeat(500);
         let tool = HistoryCell::ToolCall {
             tool_name: "write_file".to_string(),
             arguments: long.clone(),
+            risk_level: None,
+            requires_sandbox: None,
+            approval: ToolApprovalState::NotRequired,
         };
         assert!(tool.lines().iter().any(|line| line.contains("(truncated)")));
 
