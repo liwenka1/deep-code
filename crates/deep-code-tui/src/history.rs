@@ -64,6 +64,10 @@ pub enum HistoryCell {
         id: String,
         label: String,
     },
+    Compaction {
+        metadata: Option<String>,
+        summary: String,
+    },
 }
 
 impl HistoryCell {
@@ -94,6 +98,7 @@ impl HistoryCell {
             Self::Approval { .. } => "Approval",
             Self::Diagnostics { .. } => "Diagnostics",
             Self::Checkpoint { .. } => "Checkpoint",
+            Self::Compaction { .. } => "Compaction",
         }
     }
 
@@ -158,6 +163,13 @@ impl HistoryCell {
                 format!("ID: {id}"),
                 format!("Restore: /restore {id}"),
             ],
+            Self::Compaction { metadata, summary } => {
+                let title = metadata
+                    .as_deref()
+                    .map(|value| format!("Compaction summary ({value})"))
+                    .unwrap_or_else(|| "Compaction summary".to_string());
+                vec![title, summary.clone()]
+            }
         }
     }
 }
@@ -171,32 +183,68 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
             .or_default()
             .push_back((result.tool_name.clone(), result.status.clone()));
     }
-    let mut cells = record
-        .messages
-        .iter()
-        .flat_map(|message| message_to_cells(message, &mut tool_names, &mut tool_results))
-        .collect::<Vec<_>>();
+
+    let mut cells = Vec::new();
+    let mut turn_index = 0usize;
+    let mut current_turn = Vec::new();
+
+    for message in &record.messages {
+        match message.role {
+            Role::User => {
+                if !current_turn.is_empty() {
+                    cells.extend(current_turn.drain(..));
+                    append_turn_checkpoints(&mut cells, record, turn_index);
+                    turn_index += 1;
+                }
+                current_turn.push(HistoryCell::user(message.content.clone()));
+            }
+            Role::System => {}
+            _ => {
+                current_turn.extend(message_to_cells(
+                    message,
+                    &mut tool_names,
+                    &mut tool_results,
+                ));
+            }
+        }
+    }
+    if !current_turn.is_empty() {
+        cells.extend(current_turn);
+        append_turn_checkpoints(&mut cells, record, turn_index);
+    }
+
     if let Some(summary) = &record.summary {
-        let prefix = record
-            .compaction
-            .as_deref()
-            .map_or("Compaction summary".to_string(), |value| {
-                format!("Compaction summary ({value})")
-            });
-        cells.push(HistoryCell::System {
-            text: format!("{prefix}\n{summary}"),
+        cells.push(HistoryCell::Compaction {
+            metadata: record.compaction.clone(),
+            summary: summary.clone(),
         });
     }
-    cells.extend(
-        record
-            .checkpoints
-            .iter()
-            .map(|checkpoint| HistoryCell::Checkpoint {
+
+    cells
+}
+
+fn append_turn_checkpoints(
+    cells: &mut Vec<HistoryCell>,
+    record: &SessionRecord,
+    turn_index: usize,
+) {
+    let Some(turn) = record.turns.get(turn_index) else {
+        return;
+    };
+    let window_end = record
+        .turns
+        .get(turn_index + 1)
+        .map_or(u64::MAX, |next| next.started_at_ms);
+    for checkpoint in &record.checkpoints {
+        if checkpoint.created_at_ms >= turn.started_at_ms
+            && checkpoint.created_at_ms < window_end
+        {
+            cells.push(HistoryCell::Checkpoint {
                 id: checkpoint.id.0.clone(),
                 label: checkpoint.label.clone(),
-            }),
-    );
-    cells
+            });
+        }
+    }
 }
 
 fn message_to_cells(
@@ -209,6 +257,15 @@ fn message_to_cells(
         Role::User => vec![HistoryCell::user(message.content.clone())],
         Role::Assistant => {
             let mut cells = Vec::new();
+            if let Some(reasoning) = message
+                .reasoning_content
+                .as_ref()
+                .filter(|text| !text.is_empty())
+            {
+                cells.push(HistoryCell::Reasoning {
+                    text: reasoning.clone(),
+                });
+            }
             if !message.content.is_empty() {
                 cells.push(HistoryCell::assistant(message.content.clone()));
             }
@@ -428,15 +485,17 @@ mod tests {
             status: ToolResultStatus::Denied,
             content: "mock_echo: hi".to_string(),
         });
+        turn.started_at_ms = 10;
+        turn.finished_at_ms = Some(20);
         record.turns.push(turn);
         record.summary = Some("older conversation summary".to_string());
         record.compaction = Some("archived=2".to_string());
-        record
-            .checkpoints
-            .push(deep_code_agent::CheckpointRecord::new(
-                deep_code_agent::CheckpointId("checkpoint_1".to_string()),
-                "before_turn",
-            ));
+        let mut checkpoint = deep_code_agent::CheckpointRecord::new(
+            deep_code_agent::CheckpointId("checkpoint_1".to_string()),
+            "before_turn",
+        );
+        checkpoint.created_at_ms = 15;
+        record.checkpoints.push(checkpoint);
 
         let cells = hydrate_history(&record);
         assert!(matches!(cells[0], HistoryCell::User { .. }));
@@ -456,12 +515,35 @@ mod tests {
         ));
         assert!(cells.iter().any(|cell| matches!(
             cell,
-            HistoryCell::System { text } if text.contains("archived=2")
+            HistoryCell::Compaction { metadata, summary }
+                if metadata.as_deref() == Some("archived=2")
+                    && summary == "older conversation summary"
         )));
         assert!(cells.iter().any(|cell| matches!(
             cell,
             HistoryCell::Checkpoint { id, .. } if id == "checkpoint_1"
         )));
+    }
+
+    #[test]
+    fn hydrate_history_restores_reasoning_content() {
+        let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), &AgentConfig::default(), "");
+        record.messages.push(Message::user("hi"));
+        record.messages.push(Message::assistant_turn(
+            "answer",
+            "thinking",
+            Vec::new(),
+        ));
+
+        let cells = hydrate_history(&record);
+        assert!(matches!(
+            &cells[1],
+            HistoryCell::Reasoning { text } if text == "thinking"
+        ));
+        assert!(matches!(
+            &cells[2],
+            HistoryCell::Assistant { text } if text == "answer"
+        ));
     }
 
     #[test]

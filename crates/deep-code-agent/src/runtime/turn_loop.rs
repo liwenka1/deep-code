@@ -66,6 +66,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             let mut accumulator = ToolCallAccumulator::default();
             let mut tool_call_ids: HashMap<u32, ToolCallId> = HashMap::new();
             let mut text_buffer = String::new();
+            let mut reasoning_buffer = String::new();
             let mut last_usage: Option<Usage> = None;
             let mut had_error = false;
 
@@ -83,6 +84,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                         emit(tx, RuntimeEvent::Provider(AgentEvent::TextDelta { text }));
                     }
                     Ok(AgentEvent::ReasoningDelta { text }) => {
+                        reasoning_buffer.push_str(&text);
                         emit(
                             tx,
                             RuntimeEvent::ReasoningDelta {
@@ -170,7 +172,11 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
 
             if calls.is_empty() {
                 let mut state = self.state.lock().await;
-                state.session.push(Message::assistant(text_buffer));
+                state.session.push(Message::assistant_turn(
+                    text_buffer,
+                    reasoning_buffer,
+                    Vec::new(),
+                ));
                 drop(state);
                 self.persist().await;
                 self.emit_session_updated(tx).await;
@@ -223,8 +229,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
 
             {
                 let mut state = self.state.lock().await;
-                state.session.push(Message::assistant_with_tool_calls(
+                state.session.push(Message::assistant_turn(
                     text_buffer,
+                    reasoning_buffer,
                     vec![payload],
                 ));
             }

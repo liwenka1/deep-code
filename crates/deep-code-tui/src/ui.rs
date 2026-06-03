@@ -220,6 +220,7 @@ fn label_for_cell(cell: &HistoryCell) -> Span<'static> {
         HistoryCell::Approval { .. } => cell.label().yellow().bold(),
         HistoryCell::Diagnostics { .. } => cell.label().red().bold(),
         HistoryCell::Checkpoint { .. } => cell.label().dark_gray().bold(),
+        HistoryCell::Compaction { .. } => cell.label().dark_gray().bold(),
         HistoryCell::System { .. } => cell.label().dark_gray().bold(),
     }
 }

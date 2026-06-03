@@ -45,6 +45,7 @@ pub struct App {
     pub pending_approval: Option<ApprovalRequest>,
     pub last_checkpoint: Option<String>,
     pub session_id: Option<String>,
+    pub(crate) resumed: bool,
     pub scroll_offset: usize,
     pub approval_scroll_offset: usize,
     pub(crate) runtime: Arc<dyn AgentRuntimeHandle>,
@@ -100,7 +101,11 @@ impl App {
         }
 
         let status = if let Some(id) = &session_id {
-            format!("Ready - {backend_label} | session {id}")
+            if resumed {
+                format!("Ready (resumed) - {backend_label} | session {id}")
+            } else {
+                format!("Ready - {backend_label} | session {id}")
+            }
         } else {
             format!("Ready - {backend_label}")
         };
@@ -116,6 +121,7 @@ impl App {
             pending_approval: None,
             last_checkpoint: None,
             session_id,
+            resumed,
             scroll_offset: 0,
             approval_scroll_offset: 0,
             runtime,
@@ -324,6 +330,8 @@ impl App {
             "approval"
         } else if self.is_streaming {
             "streaming"
+        } else if self.resumed {
+            "ready (resumed)"
         } else {
             "ready"
         };

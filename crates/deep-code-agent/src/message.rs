@@ -15,6 +15,9 @@ pub enum Role {
 pub struct Message {
     pub role: Role,
     pub content: String,
+    /// DeepSeek thinking-mode replay payload for assistant turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -27,6 +30,7 @@ impl Message {
         Self {
             role,
             content: content.into(),
+            reasoning_content: None,
             tool_call_id: None,
             tool_calls: Vec::new(),
         }
@@ -55,9 +59,25 @@ impl Message {
         content: impl Into<String>,
         tool_calls: Vec<ToolCallPayload>,
     ) -> Self {
+        Self::assistant_turn(content, "", tool_calls)
+    }
+
+    /// Build an assistant turn message, preserving optional reasoning replay.
+    #[must_use]
+    pub fn assistant_turn(
+        content: impl Into<String>,
+        reasoning: impl Into<String>,
+        tool_calls: Vec<ToolCallPayload>,
+    ) -> Self {
+        let reasoning = reasoning.into();
         Self {
             role: Role::Assistant,
             content: content.into(),
+            reasoning_content: if reasoning.is_empty() {
+                None
+            } else {
+                Some(reasoning)
+            },
             tool_call_id: None,
             tool_calls,
         }
@@ -68,6 +88,7 @@ impl Message {
         Self {
             role: Role::Tool,
             content: content.into(),
+            reasoning_content: None,
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: Vec::new(),
         }
@@ -93,6 +114,16 @@ mod tests {
             json,
             r#"{"role":"tool","content":"ok","tool_call_id":"call_1"}"#
         );
+    }
+
+    #[test]
+    fn assistant_turn_serializes_reasoning_content() {
+        let message = Message::assistant_turn("answer", "thinking", Vec::new());
+        let json = serde_json::to_value(&message).unwrap();
+
+        assert_eq!(json["role"], "assistant");
+        assert_eq!(json["content"], "answer");
+        assert_eq!(json["reasoning_content"], "thinking");
     }
 
     #[test]

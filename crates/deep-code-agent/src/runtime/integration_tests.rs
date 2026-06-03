@@ -625,6 +625,46 @@ async fn persistence_saves_messages_and_turns() {
 }
 
 #[tokio::test]
+async fn persistence_saves_reasoning_content() {
+    let workspace = tempfile::tempdir().unwrap();
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::ReasoningDelta {
+            text: "thinking".to_string(),
+        },
+        AgentEvent::TextDelta {
+            text: "hello".to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = AgentRuntime::with_new_session(
+        client,
+        ToolRegistry::default(),
+        "system",
+        workspace.path(),
+        &crate::config::AgentConfig::default(),
+    )
+    .unwrap();
+
+    let session_id = runtime.session_id().await.expect("session id");
+    let mut rx = runtime.submit_user("hi").await;
+    drain(&mut rx).await;
+    runtime.shutdown().await;
+
+    let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let record = store.load(&session_id).unwrap();
+    let assistant = record
+        .messages
+        .iter()
+        .find(|message| matches!(message.role, crate::message::Role::Assistant))
+        .expect("assistant message");
+    assert_eq!(assistant.content, "hello");
+    assert_eq!(
+        assistant.reasoning_content.as_deref(),
+        Some("thinking")
+    );
+}
+
+#[tokio::test]
 async fn session_updated_reports_authoritative_metadata() {
     let workspace = tempfile::tempdir().unwrap();
     let client = ScriptedClient::new(vec![vec![

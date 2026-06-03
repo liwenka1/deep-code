@@ -211,7 +211,7 @@ fn parse_mcp_command(mut args: Vec<String>) -> CliArgs {
 
 fn parse_session_command(mut args: Vec<String>) -> CliArgs {
     let Some(subcommand) = args.first().cloned() else {
-        eprintln!("Usage: deep-code session <list|delete|export> [id]");
+        eprintln!("Usage: deep-code session <list|resume|delete|export> [id]");
         print_session_usage();
         std::process::exit(2);
     };
@@ -225,6 +225,22 @@ fn parse_session_command(mut args: Vec<String>) -> CliArgs {
             }
             CliArgs {
                 mode: RunMode::SessionList,
+            }
+        }
+        "resume" => {
+            let Some(id) = args.first().cloned() else {
+                eprintln!("Usage: deep-code session resume <id>");
+                std::process::exit(2);
+            };
+            if args.len() > 1 {
+                eprintln!("Usage: deep-code session resume <id>");
+                std::process::exit(2);
+            }
+            CliArgs {
+                mode: RunMode::Tui {
+                    resume: Some(id),
+                    force_new: false,
+                },
             }
         }
         "delete" => {
@@ -254,7 +270,7 @@ fn parse_session_command(mut args: Vec<String>) -> CliArgs {
             }
         }
         other => {
-            eprintln!("Unknown session subcommand '{other}'. Use list, delete, or export.");
+            eprintln!("Unknown session subcommand '{other}'. Use list, resume, delete, or export.");
             std::process::exit(2);
         }
     }
@@ -321,7 +337,7 @@ fn print_usage() {
     eprintln!("  deep-code");
     eprintln!("  deep-code doctor [--json]");
     eprintln!("  deep-code serve --http [--host HOST] [--port PORT]");
-    eprintln!("  deep-code session list|delete|export");
+    eprintln!("  deep-code session list|resume|delete|export");
     eprintln!("  deep-code mcp list|validate|reload|enable|disable");
 }
 
@@ -330,6 +346,7 @@ fn print_session_usage() {
     eprintln!("{}", format_sessions_storage_note(&workspace));
     eprintln!("Examples:");
     eprintln!("  deep-code session list");
+    eprintln!("  deep-code session resume <session_id>");
     eprintln!("  deep-code session export <session_id>");
     eprintln!("  deep-code --resume latest");
 }
@@ -371,6 +388,21 @@ mod tests {
             args.mode,
             RunMode::Tui {
                 resume: None,
+                force_new: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_session_resume_subcommand() {
+        let parsed = parse_session_command(vec![
+            "resume".to_string(),
+            "session_123_0".to_string(),
+        ]);
+        assert_eq!(
+            parsed.mode,
+            RunMode::Tui {
+                resume: Some("session_123_0".to_string()),
                 force_new: false,
             }
         );

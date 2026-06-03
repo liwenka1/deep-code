@@ -125,8 +125,9 @@ impl App {
                 archived_count,
                 summary,
             } => {
-                self.history.push(HistoryCell::System {
-                    text: format!("已压缩 {archived_count} 条历史消息\n{summary}"),
+                self.history.push(HistoryCell::Compaction {
+                    metadata: Some(format!("archived={archived_count}")),
+                    summary: summary.clone(),
                 });
                 self.status = format!("已压缩 {archived_count} 条历史消息");
             }
@@ -147,8 +148,13 @@ impl App {
                     .as_ref()
                     .map(|value| crate::commands::format_turn_telemetry(value, self.cost_currency))
                     .unwrap_or_default();
+                let ready = if self.resumed {
+                    "就绪 (resumed)"
+                } else {
+                    "就绪"
+                };
                 self.status = format!(
-                    "就绪 - {}{}{}{telemetry_note}",
+                    "{ready} - {}{}{}{telemetry_note}",
                     self.backend_label, checkpoint, session
                 );
                 self.is_streaming = false;
