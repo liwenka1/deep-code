@@ -81,6 +81,34 @@ impl AppState {
         let mut slot = self.approval.lock().await;
         *slot = None;
     }
+
+    async fn active_runtime_session_id(&self) -> Option<String> {
+        self.runtime.lock().await.session_id.clone()
+    }
+
+    fn thread_detail(
+        &self,
+        detail: RuntimeThreadDetail,
+    ) -> impl std::future::Future<Output = RuntimeThreadDetail> + Send {
+        let active = self.active_runtime_session_id();
+        async move {
+            RuntimeThreadStore::with_active_runtime_session(detail, active.await)
+        }
+    }
+
+    async fn ensure_runtime_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), ApiError> {
+        let current = self.active_runtime_session_id().await;
+        if current.as_deref() == Some(session_id.as_str()) {
+            return Ok(());
+        }
+        let store = JsonSessionStore::for_workspace(&self.workspace).map_err(ApiError::from)?;
+        let record = store.load(session_id)?;
+        crate::sessions::switch_runtime(self, Some(record)).await?;
+        Ok(())
+    }
 }
 
 struct PendingApproval {
@@ -285,6 +313,9 @@ struct PromptRequest {
 struct CreateThreadRequest {
     #[serde(default)]
     title: Option<String>,
+    /// Bind this thread to an on-disk session (`session_<id>` thread id).
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -309,7 +340,17 @@ async fn create_thread(
     State(state): State<AppState>,
     body: Option<Json<CreateThreadRequest>>,
 ) -> Result<Json<RuntimeThread>, ApiError> {
-    let title = body.and_then(|Json(body)| body.title);
+    let body = body.map(|Json(body)| body);
+    let title = body.as_ref().and_then(|body| body.title.clone());
+    if let Some(session_token) = body.as_ref().and_then(|body| body.session_id.as_deref()) {
+        let session_id = SessionId::parse(session_token)?;
+        let thread_id = format!("session_{session_token}");
+        let thread = state
+            .threads
+            .ensure_thread_with_session(thread_id, title, session_id)
+            .await;
+        return Ok(Json(thread));
+    }
     Ok(Json(state.threads.create_thread(title).await))
 }
 
@@ -317,12 +358,12 @@ async fn get_thread(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<RuntimeThreadDetail>, ApiError> {
-    state
+    let detail = state
         .threads
         .get_thread(&id)
         .await
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("thread '{id}' not found")))
+        .ok_or_else(|| ApiError::not_found(format!("thread '{id}' not found")))?;
+    Ok(Json(state.thread_detail(detail).await))
 }
 
 async fn update_thread(
@@ -330,23 +371,25 @@ async fn update_thread(
     Path(id): Path<String>,
     Json(body): Json<PatchThreadRequest>,
 ) -> Result<Json<RuntimeThreadDetail>, ApiError> {
-    let Some(mut detail) = state.threads.get_thread(&id).await else {
+    if state.threads.get_thread(&id).await.is_none() {
         return Err(ApiError::not_found(format!("thread '{id}' not found")));
-    };
+    }
     if let Some(title) = body.title {
-        if let Some(thread) = state
+        state
             .threads
             .update_thread_title(&id, Some(title.clone()))
-            .await
-        {
-            detail.thread = thread;
-        }
+            .await;
         let _ = state
             .threads
             .append_manual_item(&id, "thread.updated", serde_json::json!({ "title": title }))
             .await;
     }
-    Ok(Json(detail))
+    let detail = state
+        .threads
+        .get_thread(&id)
+        .await
+        .ok_or_else(|| ApiError::not_found(format!("thread '{id}' not found")))?;
+    Ok(Json(state.thread_detail(detail).await))
 }
 
 async fn post_thread_turn(
@@ -363,6 +406,14 @@ async fn post_thread_turn(
             .ensure_thread(id.clone(), Some(id.clone()))
             .await;
     }
+    if let Some(session_id) = state
+        .threads
+        .get_thread(&id)
+        .await
+        .and_then(|detail| detail.thread.session_id)
+    {
+        state.ensure_runtime_session(&session_id).await?;
+    }
     prompt_sse_for_thread(state, id, body.prompt).await
 }
 
@@ -375,11 +426,16 @@ async fn thread_events(
         return Err(ApiError::not_found(format!("thread '{id}' not found")));
     }
     let store = state.threads.clone();
-    let mut live = store.subscribe();
-    let replay = store.replay_since(&id, query.since_seq).await;
+    let thread_id = id.clone();
     let replay_only = query.replay_only;
+    let since_seq = query.since_seq;
     let stream = stream! {
+        // Subscribe before replay so events emitted during replay are not lost.
+        let mut live = store.subscribe();
+        let replay = store.replay_since(&thread_id, since_seq).await;
+        let mut high_water = replay.last().map(|envelope| envelope.seq).unwrap_or(since_seq);
         for envelope in replay {
+            high_water = envelope.seq;
             yield Ok(thread_sse_event(envelope));
         }
         if replay_only {
@@ -387,11 +443,19 @@ async fn thread_events(
         }
         loop {
             match live.recv().await {
-                Ok(envelope) if envelope.thread_id == id => {
+                Ok(envelope) if envelope.thread_id == thread_id && envelope.seq > high_water => {
+                    high_water = envelope.seq;
                     yield Ok(thread_sse_event(envelope));
                 }
                 Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    yield Ok(Event::default().event("stream.lagged").json_data(serde_json::json!({
+                        "thread_id": thread_id,
+                        "since_seq": high_water,
+                        "action": "reconnect_with_since_seq",
+                    })).unwrap_or_else(|_| Event::default().data("stream lagged")));
+                    break;
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -460,6 +524,15 @@ async fn prompt_sse_for_thread(
     let threads = state.threads.clone();
     let stream = stream! {
         let _active_turn_lease = active_turn_lease;
+        let user_envelope = threads
+            .append_manual_item(
+                &thread_id,
+                "user.message",
+                serde_json::json!({ "content": prompt }),
+            )
+            .await;
+        yield Ok(thread_sse_event(user_envelope));
+
         let mut event_stream = {
             let runtime = runtime.lock().await;
             runtime.handle.submit_user(prompt).await
@@ -1067,6 +1140,77 @@ mod tests {
         let body = prompt_handle.await.unwrap();
         assert!(body.contains("event: approval.required"));
         assert!(body.contains("event: turn.completed"));
+    }
+
+    #[tokio::test]
+    async fn patch_thread_returns_fresh_detail_with_updated_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), None);
+        let addr = spawn_test_server(state).await;
+        let client = reqwest::Client::new();
+
+        let thread: RuntimeThread = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({ "title": "before" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let detail: RuntimeThreadDetail = client
+            .patch(format!("http://{addr}/v1/threads/{}", thread.thread_id))
+            .json(&json!({ "title": "after" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(detail.thread.title.as_deref(), Some("after"));
+        assert!(
+            detail
+                .items
+                .iter()
+                .any(|item| item.kind == "thread.updated"),
+            "expected thread.updated item in fresh detail"
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_turn_includes_user_message_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), None);
+        let addr = spawn_test_server(state).await;
+        let client = reqwest::Client::new();
+
+        let thread: RuntimeThread = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({ "title": "user item test" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let turn_body = client
+            .post(format!(
+                "http://{addr}/v1/threads/{}/turns",
+                thread.thread_id
+            ))
+            .json(&json!({ "prompt": "hello thread api" }))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            turn_body.contains("event: user.message"),
+            "expected user.message SSE item, got: {turn_body}"
+        );
     }
 
     #[tokio::test]

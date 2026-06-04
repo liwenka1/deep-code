@@ -30,7 +30,7 @@ pub async fn resume_session(
     Ok(Json(switch_runtime(&state, Some(record)).await?))
 }
 
-async fn switch_runtime(
+pub(crate) async fn switch_runtime(
     state: &AppState,
     resume: Option<SessionRecord>,
 ) -> Result<ActiveSessionResponse, ApiError> {

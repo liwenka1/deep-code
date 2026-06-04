@@ -2,10 +2,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
-use deep_code_agent::{Role, RuntimeEvent, SessionId, SessionRecord, TurnId};
+use deep_code_agent::{Message, Role, RuntimeEvent, SessionId, SessionRecord, TurnId};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
+
+/// Broadcast capacity for live thread event fan-out. Slow clients should reconnect
+/// with `since_seq` when they receive a `stream.lagged` SSE event.
+const LIVE_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeThread {
@@ -50,6 +54,9 @@ pub struct RuntimeThreadDetail {
     pub thread: RuntimeThread,
     pub turns: Vec<RuntimeTurn>,
     pub items: Vec<RuntimeItem>,
+    /// Session currently loaded in the shared in-process agent runtime, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_runtime_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,7 +76,7 @@ struct ThreadState {
 impl RuntimeThreadStore {
     #[must_use]
     pub fn new() -> Self {
-        let (live_tx, _) = broadcast::channel(256);
+        let (live_tx, _) = broadcast::channel(LIVE_EVENT_CHANNEL_CAPACITY);
         Self {
             inner: Arc::new(Mutex::new(ThreadState::default())),
             next_thread: Arc::new(AtomicU64::new(0)),
@@ -120,6 +127,35 @@ impl RuntimeThreadStore {
         thread
     }
 
+    pub async fn ensure_thread_with_session(
+        &self,
+        thread_id: impl Into<String>,
+        title: Option<String>,
+        session_id: SessionId,
+    ) -> RuntimeThread {
+        let thread_id = thread_id.into();
+        let mut state = self.inner.lock().await;
+        if let Some(thread) = state
+            .threads
+            .iter()
+            .find(|thread| thread.thread_id == thread_id)
+            .cloned()
+        {
+            return thread;
+        }
+        let now = now_ms();
+        let thread = RuntimeThread {
+            thread_id,
+            session_id: Some(session_id),
+            title,
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_seq: 0,
+        };
+        state.threads.push(thread.clone());
+        thread
+    }
+
     pub async fn hydrate_sessions(&self, sessions: Vec<SessionRecord>) {
         let mut state = self.inner.lock().await;
         for session in sessions {
@@ -131,60 +167,8 @@ impl RuntimeThreadStore {
             {
                 continue;
             }
-            let mut seq = 0u64;
-            let mut turns = Vec::new();
-            let mut items = Vec::new();
-            for (index, turn) in session.turns.iter().enumerate() {
-                let turn_id = TurnId(format!("{thread_id}_turn_{}", index + 1));
-                turns.push(RuntimeTurn {
-                    thread_id: thread_id.clone(),
-                    turn_id: turn_id.clone(),
-                    prompt: turn.user_prompt.clone(),
-                    started_at_ms: turn.started_at_ms,
-                    finished_at_ms: turn.finished_at_ms,
-                });
-            }
-            for message in &session.messages {
-                let kind = match message.role {
-                    Role::System => "system.message",
-                    Role::User => "user.message",
-                    Role::Assistant => "assistant.message",
-                    Role::Tool => "tool.result",
-                };
-                seq += 1;
-                items.push(RuntimeItem {
-                    thread_id: thread_id.clone(),
-                    turn_id: None,
-                    item_id: format!("{thread_id}_item_{seq}"),
-                    seq,
-                    kind: kind.to_string(),
-                    created_at_ms: session.updated_at_ms,
-                    payload: serde_json::to_value(message)
-                        .unwrap_or_else(|_| serde_json::json!({})),
-                });
-            }
-            for checkpoint in &session.checkpoints {
-                seq += 1;
-                items.push(RuntimeItem {
-                    thread_id: thread_id.clone(),
-                    turn_id: None,
-                    item_id: format!("{thread_id}_item_{seq}"),
-                    seq,
-                    kind: "checkpoint.created".to_string(),
-                    created_at_ms: checkpoint.created_at_ms,
-                    payload: serde_json::to_value(checkpoint)
-                        .unwrap_or_else(|_| serde_json::json!({})),
-                });
-            }
-
-            state.threads.push(RuntimeThread {
-                thread_id: thread_id.clone(),
-                session_id: Some(session.id.clone()),
-                title: Some(session.preview()),
-                created_at_ms: session.created_at_ms,
-                updated_at_ms: session.updated_at_ms,
-                last_seq: seq,
-            });
+            let (thread, turns, items) = project_session_record(&session);
+            state.threads.push(thread);
             state.turns.extend(turns);
             state.items.extend(items);
         }
@@ -219,7 +203,18 @@ impl RuntimeThreadStore {
             thread,
             turns,
             items,
+            active_runtime_session_id: None,
         })
+    }
+
+    pub fn with_active_runtime_session(
+        detail: RuntimeThreadDetail,
+        active_runtime_session_id: Option<String>,
+    ) -> RuntimeThreadDetail {
+        RuntimeThreadDetail {
+            active_runtime_session_id,
+            ..detail
+        }
     }
 
     pub async fn update_thread_title(
@@ -460,6 +455,188 @@ fn now_ms() -> u64 {
         .map_or(0, |duration| duration.as_millis() as u64)
 }
 
+fn project_session_record(session: &SessionRecord) -> (RuntimeThread, Vec<RuntimeTurn>, Vec<RuntimeItem>) {
+    let thread_id = format!("session_{}", session.id.as_str());
+    let mut turns = Vec::new();
+    let turn_ids: Vec<TurnId> = session
+        .turns
+        .iter()
+        .enumerate()
+        .map(|(index, turn)| {
+            let turn_id = TurnId(format!("{thread_id}_turn_{}", index + 1));
+            turns.push(RuntimeTurn {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                prompt: turn.user_prompt.clone(),
+                started_at_ms: turn.started_at_ms,
+                finished_at_ms: turn.finished_at_ms,
+            });
+            turn_id
+        })
+        .collect();
+
+    let mut items = Vec::new();
+    let mut seq = 0u64;
+    let mut turn_index = 0usize;
+
+    let mut push_item = |kind: &str, turn_id: Option<TurnId>, created_at_ms: u64, payload: Value| {
+        seq += 1;
+        items.push(RuntimeItem {
+            thread_id: thread_id.clone(),
+            turn_id,
+            item_id: format!("{thread_id}_item_{seq}"),
+            seq,
+            kind: kind.to_string(),
+            created_at_ms,
+            payload,
+        });
+    };
+
+    for message in &session.messages {
+        match message.role {
+            Role::User => {
+                if turn_index > 0 {
+                    append_hydrated_turn_checkpoints(
+                        &mut push_item,
+                        session,
+                        turn_index - 1,
+                        &turn_ids,
+                    );
+                    turn_index += 1;
+                }
+                let turn_id = turn_ids.get(turn_index).cloned();
+                let created_at_ms = session
+                    .turns
+                    .get(turn_index)
+                    .map(|turn| turn.started_at_ms)
+                    .unwrap_or(session.updated_at_ms);
+                push_item(
+                    "user.message",
+                    turn_id,
+                    created_at_ms,
+                    message_payload(message),
+                );
+            }
+            Role::System => {}
+            Role::Assistant => {
+                let turn_id = turn_ids.get(turn_index).cloned();
+                push_assistant_message_items(&mut push_item, message, turn_id, session.updated_at_ms);
+            }
+            Role::Tool => {
+                let turn_id = turn_ids.get(turn_index).cloned();
+                push_item(
+                    "tool.result",
+                    turn_id,
+                    session.updated_at_ms,
+                    message_payload(message),
+                );
+            }
+        }
+    }
+
+    if !turn_ids.is_empty() {
+        append_hydrated_turn_checkpoints(&mut push_item, session, turn_index, &turn_ids);
+    }
+
+    if let Some(summary) = &session.summary {
+        push_item(
+            "compaction.applied",
+            None,
+            session.updated_at_ms,
+            json!({
+                "summary": summary,
+                "compaction": session.compaction,
+            }),
+        );
+    }
+
+    let thread = RuntimeThread {
+        thread_id: thread_id.clone(),
+        session_id: Some(session.id.clone()),
+        title: Some(session.preview()),
+        created_at_ms: session.created_at_ms,
+        updated_at_ms: session.updated_at_ms,
+        last_seq: seq,
+    };
+    (thread, turns, items)
+}
+
+fn message_payload(message: &Message) -> Value {
+    serde_json::to_value(message).unwrap_or_else(|_| json!({}))
+}
+
+fn push_assistant_message_items<F>(
+    push_item: &mut F,
+    message: &Message,
+    turn_id: Option<TurnId>,
+    created_at_ms: u64,
+) where
+    F: FnMut(&str, Option<TurnId>, u64, Value),
+{
+    if let Some(reasoning) = message
+        .reasoning_content
+        .as_ref()
+        .filter(|text| !text.is_empty())
+    {
+        push_item(
+            "reasoning.delta",
+            turn_id.clone(),
+            created_at_ms,
+            json!({ "text": reasoning }),
+        );
+    }
+    if !message.content.is_empty() || message.tool_calls.is_empty() {
+        push_item(
+            "assistant.message",
+            turn_id.clone(),
+            created_at_ms,
+            message_payload(message),
+        );
+    }
+    for call in &message.tool_calls {
+        push_item(
+            "tool.started",
+            turn_id.clone(),
+            created_at_ms,
+            json!({
+                "tool_call_id": call.id,
+                "tool_name": call.function.name,
+                "arguments": call.function.arguments,
+            }),
+        );
+    }
+}
+
+fn append_hydrated_turn_checkpoints<F>(
+    push_item: &mut F,
+    session: &SessionRecord,
+    turn_index: usize,
+    turn_ids: &[TurnId],
+) where
+    F: FnMut(&str, Option<TurnId>, u64, Value),
+{
+    let Some(turn) = session.turns.get(turn_index) else {
+        return;
+    };
+    let turn_id = turn_ids.get(turn_index).cloned();
+    let window_end = session
+        .turns
+        .get(turn_index + 1)
+        .map_or(u64::MAX, |next| next.started_at_ms);
+    for checkpoint in &session.checkpoints {
+        if checkpoint.created_at_ms >= turn.started_at_ms
+            && checkpoint.created_at_ms < window_end
+        {
+            push_item(
+                "checkpoint.created",
+                turn_id.clone(),
+                checkpoint.created_at_ms,
+                serde_json::to_value(checkpoint).unwrap_or_else(|_| json!({})),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use deep_code_agent::RuntimeEvent;
@@ -540,6 +717,89 @@ mod tests {
                 .items
                 .iter()
                 .any(|item| item.kind == "assistant.message")
+        );
+        assert!(
+            detail
+                .items
+                .iter()
+                .find(|item| item.kind == "user.message")
+                .and_then(|item| item.turn_id.as_ref())
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_sessions_projects_reasoning_tools_and_compaction() {
+        use deep_code_agent::{
+            CheckpointId, CheckpointRecord, Message, ToolCallFunctionPayload, ToolCallPayload,
+        };
+
+        let config = deep_code_agent::AgentConfig::default();
+        let mut session = SessionRecord::new(
+            std::path::PathBuf::from("/tmp/project"),
+            &config,
+            "system prompt",
+        );
+        let mut turn = deep_code_agent::TurnRecord::new("run tool");
+        turn.started_at_ms = 10;
+        turn.finished_at_ms = Some(20);
+        session.turns.push(turn);
+        session.messages.push(Message::user("run tool"));
+        session.messages.push(Message::assistant_turn(
+            "calling",
+            "thinking",
+            vec![ToolCallPayload {
+                id: "call_1".to_string(),
+                call_type: "function".to_string(),
+                function: ToolCallFunctionPayload {
+                    name: "mock_echo".to_string(),
+                    arguments: r#"{"message":"hi"}"#.to_string(),
+                },
+            }],
+        ));
+        session
+            .messages
+            .push(Message::tool("call_1", "mock_echo: hi"));
+        session.summary = Some("older summary".to_string());
+        session.compaction = Some("archived=2".to_string());
+        let mut checkpoint = CheckpointRecord::new(CheckpointId("cp_1".to_string()), "snap");
+        checkpoint.created_at_ms = 15;
+        session.checkpoints.push(checkpoint);
+
+        let thread_id = format!("session_{}", session.id.as_str());
+        let store = RuntimeThreadStore::new();
+        store.hydrate_sessions(vec![session]).await;
+
+        let detail = store.get_thread(&thread_id).await.unwrap();
+        assert!(
+            detail
+                .items
+                .iter()
+                .any(|item| item.kind == "reasoning.delta")
+        );
+        assert!(
+            detail
+                .items
+                .iter()
+                .any(|item| item.kind == "tool.started")
+        );
+        assert!(
+            detail
+                .items
+                .iter()
+                .any(|item| item.kind == "tool.result")
+        );
+        assert!(
+            detail
+                .items
+                .iter()
+                .any(|item| item.kind == "checkpoint.created")
+        );
+        assert!(
+            detail
+                .items
+                .iter()
+                .any(|item| item.kind == "compaction.applied")
         );
     }
 }
