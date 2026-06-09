@@ -7,7 +7,7 @@ use crate::checkpoint::{CheckpointId, CheckpointStore};
 use crate::client::LlmClient;
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, emit};
-use crate::session_store::{CheckpointRecord, SessionStore};
+use crate::session_store::CheckpointRecord;
 use crate::tool::ToolError;
 
 impl<C: LlmClient + 'static> AgentRuntime<C> {
@@ -71,13 +71,12 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             Ok(mut session) => {
                 session.checkpoints.push(record);
                 session.touch();
-                if let Err(error) = persistence.store.save(&session) {
-                    eprintln!("session save failed after checkpoint: {error}");
-                }
             }
             Err(_) => {
                 eprintln!("session checkpoint metadata skipped: session record is busy");
+                return;
             }
         }
+        persistence.actor.request_save();
     }
 }

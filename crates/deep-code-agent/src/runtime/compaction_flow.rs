@@ -4,7 +4,6 @@ use crate::client::LlmClient;
 use crate::compaction::{compact_messages, should_compact};
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, emit};
-use crate::session_store::SessionStore;
 
 impl<C: LlmClient + 'static> AgentRuntime<C> {
     pub(super) async fn maybe_compact(
@@ -20,20 +19,21 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         if result.archived_count == 0 {
             return false;
         }
-        {
+        let compacted = {
             let mut state = self.state.lock().await;
             state.session.replace_messages(result.messages.clone());
             state.last_prefix_hash = None;
-        }
+            state.session.messages().to_vec()
+        };
         if let Some(persistence) = self.persistence.as_ref() {
-            let mut record = persistence.record.lock().await;
-            record.messages = self.state.lock().await.session.messages().to_vec();
-            record.summary = Some(result.summary.clone());
-            record.compaction = Some(format!("archived={}", result.archived_count));
-            record.touch();
-            if let Err(error) = persistence.store.save(&record) {
-                eprintln!("session save failed after compaction: {error}");
+            {
+                let mut record = persistence.record.lock().await;
+                record.messages = compacted;
+                record.summary = Some(result.summary.clone());
+                record.compaction = Some(format!("archived={}", result.archived_count));
+                record.touch();
             }
+            persistence.actor.request_save();
         }
         emit(
             tx,

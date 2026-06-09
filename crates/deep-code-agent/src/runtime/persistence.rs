@@ -8,12 +8,20 @@ use crate::config::AgentConfig;
 use crate::model::Usage;
 use crate::pricing::CostEstimate;
 use crate::runtime::AgentRuntime;
+use crate::runtime::persistence_actor::PersistenceActorHandle;
 use crate::runtime::state::{Persistence, RuntimeState};
 use crate::session::Session;
 use crate::session_store::{
     JsonSessionStore, SessionId, SessionRecord, SessionStore, SessionStoreError,
 };
 use crate::tool::ToolRegistry;
+
+fn build_persistence(store: JsonSessionStore, record: SessionRecord) -> Arc<Persistence> {
+    let store: Arc<dyn SessionStore + Send + Sync> = Arc::new(store);
+    let record = Arc::new(Mutex::new(record));
+    let actor = PersistenceActorHandle::spawn(store, Arc::clone(&record));
+    Arc::new(Persistence { record, actor })
+}
 
 impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// Create a runtime backed by a new on-disk session in the workspace.
@@ -27,6 +35,8 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         let workspace = workspace.into();
         let store = JsonSessionStore::for_workspace(&workspace)?;
         let record = SessionRecord::new(workspace.clone(), config, system);
+        // First write is synchronous so callers see the session file before
+        // returning. Subsequent saves go through the actor.
         store.save(&record)?;
         Ok(Self::from_session_record(
             client,
@@ -66,10 +76,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             checkpoints: None,
             workspace: Some(workspace.clone()),
             lsp: None,
-            persistence: Some(Arc::new(Persistence {
-                store: Arc::new(store),
-                record: Arc::new(Mutex::new(record)),
-            })),
+            persistence: Some(build_persistence(store, record)),
         }
     }
 
@@ -91,10 +98,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         }
         store.save(&record)?;
         self.workspace = Some(workspace);
-        self.persistence = Some(Arc::new(Persistence {
-            store: Arc::new(store),
-            record: Arc::new(Mutex::new(record)),
-        }));
+        self.persistence = Some(build_persistence(store, record));
         Ok(self)
     }
 
@@ -113,12 +117,12 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             return;
         };
         let messages = self.state.lock().await.session.messages().to_vec();
-        let mut record = persistence.record.lock().await;
-        record.messages = messages;
-        record.touch();
-        if let Err(error) = persistence.store.save(&record) {
-            eprintln!("session save failed: {error}");
+        {
+            let mut record = persistence.record.lock().await;
+            record.messages = messages;
+            record.touch();
         }
+        persistence.actor.request_save();
     }
 
     pub(super) async fn finish_turn(&self, usage: Option<Usage>) {
@@ -132,9 +136,6 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 let mut record = persistence.record.lock().await;
                 record.turns.push(turn);
                 record.touch();
-                if let Err(error) = persistence.store.save(&record) {
-                    eprintln!("session save failed: {error}");
-                }
             }
         } else {
             drop(state);

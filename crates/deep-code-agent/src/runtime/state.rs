@@ -3,9 +3,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::event::TurnId;
+use super::persistence_actor::PersistenceActorHandle;
 use crate::pricing::CostEstimate;
 use crate::session::Session;
-use crate::session_store::{JsonSessionStore, SessionRecord, TurnRecord};
+use crate::session_store::{SessionRecord, TurnRecord};
 use crate::tool::ToolCall;
 
 /// Internal: the runtime can be in one of these states between
@@ -23,8 +24,10 @@ pub(super) struct RuntimeState {
 }
 
 pub(super) struct Persistence {
-    pub(super) store: Arc<JsonSessionStore>,
+    /// Authoritative in-memory transcript. Callers mutate this under the
+    /// mutex; durable writes are funnelled through [`PersistenceActorHandle`].
     pub(super) record: Arc<Mutex<SessionRecord>>,
+    pub(super) actor: PersistenceActorHandle,
 }
 
 #[derive(Debug, Clone)]

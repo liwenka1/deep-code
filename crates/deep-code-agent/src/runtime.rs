@@ -18,6 +18,7 @@ mod diagnostics;
 mod event;
 mod handle;
 mod persistence;
+mod persistence_actor;
 mod state;
 mod streaming;
 mod telemetry;
@@ -147,6 +148,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// Shut down background resources such as spawned LSP servers.
     pub async fn shutdown(&self) {
         self.persist().await;
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence.actor.flush().await;
+        }
         if let Some(lsp) = self.lsp.as_ref() {
             lsp.shutdown_all().await;
         }
