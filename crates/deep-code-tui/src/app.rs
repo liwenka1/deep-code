@@ -523,6 +523,72 @@ mod tests {
     }
 
     #[test]
+    fn multi_tool_cells_flush_independently_per_finished_call() {
+        let mut app = App::new();
+        let turn_id = deep_code_agent::TurnId("turn_1".to_string());
+        let call_1 = deep_code_agent::ToolCallId("call_1".to_string());
+        let call_2 = deep_code_agent::ToolCallId("call_2".to_string());
+        app.apply_runtime_event(RuntimeEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            prompt: "run both".to_string(),
+        });
+        app.apply_runtime_event(RuntimeEvent::ToolCallStarted {
+            turn_id: turn_id.clone(),
+            tool_call_id: call_1.clone(),
+            tool_name: "git_echo".to_string(),
+            arguments: serde_json::json!({ "message": "one" }),
+        });
+        app.apply_runtime_event(RuntimeEvent::ToolCallStarted {
+            turn_id: turn_id.clone(),
+            tool_call_id: call_2.clone(),
+            tool_name: "mock_echo".to_string(),
+            arguments: serde_json::json!({ "message": "two" }),
+        });
+
+        app.apply_runtime_event(RuntimeEvent::ToolCallFinished {
+            turn_id: Some(turn_id.clone()),
+            tool_call_id: call_1,
+            result: deep_code_agent::ToolResult::success("call_1", "git_echo", "git_echo: one"),
+        });
+
+        // call_1 cell flushed to history; call_2 still streaming in active turn.
+        assert!(app.history.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::ToolCall { tool_name, .. } if tool_name == "git_echo"
+        )));
+        assert!(app.history.iter().all(|cell| !matches!(
+            cell,
+            HistoryCell::ToolCall { tool_name, .. } if tool_name == "mock_echo"
+        )));
+        let active = app.active_turn.as_ref().expect("active turn kept");
+        assert_eq!(active.tools.len(), 1);
+        assert_eq!(active.tools[0].tool_name, "mock_echo");
+
+        app.apply_runtime_event(RuntimeEvent::ToolCallFinished {
+            turn_id: Some(turn_id),
+            tool_call_id: call_2,
+            result: deep_code_agent::ToolResult::success("call_2", "mock_echo", "mock_echo: two"),
+        });
+
+        let tool_cells = app
+            .history
+            .iter()
+            .filter_map(|cell| match cell {
+                HistoryCell::ToolCall { tool_name, .. } => Some(tool_name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_cells, vec!["git_echo", "mock_echo"]);
+        let result_cells = app
+            .history
+            .iter()
+            .filter(|cell| matches!(cell, HistoryCell::ToolResult { .. }))
+            .count();
+        assert_eq!(result_cells, 2);
+        assert!(app.active_turn.as_ref().is_some_and(|active| active.tools.is_empty()));
+    }
+
+    #[test]
     fn approval_events_render_pending_and_resolved_tool_metadata() {
         let mut app = App::new();
         app.scroll_up();

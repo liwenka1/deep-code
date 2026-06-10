@@ -8,9 +8,9 @@
 //! - [`AgentEvent`] is intentionally kept narrow (provider-stream only). The
 //!   runtime synthesizes higher-level events such as approval requests and
 //!   tool results into [`RuntimeEvent`].
-//! - Multi tool-call turns are not supported yet: the runtime emits a
-//!   `RuntimeEvent::Error` if the model produces more than one tool call in
-//!   one turn. The single-call path is enough for the 03 milestone.
+//! - Multi tool-call turns run as an ordered batch: auto-approved calls
+//!   execute immediately, approval-gated calls park the rest of the batch
+//!   until the decision arrives (one approval prompt at a time).
 
 mod checkpoints;
 mod compaction_flow;
@@ -218,7 +218,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 &tx,
                 RuntimeEvent::ApprovalResolved {
                     turn_id: Some(pending.turn_id.clone()),
-                    tool_call_id: ToolCallId::from(pending.call.id.clone()),
+                    tool_call_id: ToolCallId::from(pending.current.id.clone()),
                     decision,
                 },
             );

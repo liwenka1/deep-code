@@ -11,7 +11,9 @@ use crate::event::AgentEvent;
 use crate::model::{ChatRequest, FunctionCallDelta, ToolCallDelta};
 use crate::runtime::diagnostics::append_diagnostics;
 use crate::session_store::SessionStore;
-use crate::tool::{MockEchoTool, ToolRegistry, ToolResultStatus};
+use crate::tool::{
+    MockEchoTool, Tool, ToolError, ToolRegistry, ToolResult, ToolResultStatus, ToolSpec,
+};
 
 #[test]
 fn append_diagnostics_joins_blocks() {
@@ -68,8 +70,12 @@ impl LlmClient for ScriptedClient {
 }
 
 fn tool_call_delta(id: &str, name: &str, arguments: &str) -> ToolCallDelta {
+    indexed_tool_call_delta(0, id, name, arguments)
+}
+
+fn indexed_tool_call_delta(index: u32, id: &str, name: &str, arguments: &str) -> ToolCallDelta {
     ToolCallDelta {
-        index: Some(0),
+        index: Some(index),
         id: Some(id.to_string()),
         call_type: Some("function".to_string()),
         function: Some(FunctionCallDelta {
@@ -77,6 +83,76 @@ fn tool_call_delta(id: &str, name: &str, arguments: &str) -> ToolCallDelta {
             arguments: Some(arguments.to_string()),
         }),
     }
+}
+
+/// Auto-approved echo tool: the `git_` prefix classifies as read-only in the
+/// execution policy, and the spec itself does not require approval.
+#[derive(Debug, Clone, Copy)]
+struct AutoEchoTool;
+
+impl AutoEchoTool {
+    const NAME: &'static str = "git_echo";
+}
+
+impl Tool for AutoEchoTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            Self::NAME,
+            "Echoes a message without approval.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" }
+                },
+                "required": ["message"],
+                "additionalProperties": false
+            }),
+            false,
+        )
+    }
+
+    fn execute(&self, call: &crate::tool::ToolCall) -> Result<ToolResult, ToolError> {
+        let message = call
+            .arguments
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        Ok(ToolResult::success(
+            call.id.clone(),
+            call.name.clone(),
+            format!("git_echo: {message}"),
+        ))
+    }
+}
+
+fn registry_with_auto_and_mock() -> ToolRegistry {
+    let mut registry = ToolRegistry::with_mock_tools();
+    registry.register(AutoEchoTool);
+    registry
+}
+
+fn started_ids(events: &[RuntimeEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::ToolCallStarted { tool_call_id, .. } => {
+                Some(tool_call_id.as_str().to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn finished_ids(events: &[RuntimeEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::ToolCallFinished { tool_call_id, .. } => {
+                Some(tool_call_id.as_str().to_string())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 async fn drain(rx: &mut RuntimeEventReceiver) -> Vec<RuntimeEvent> {
@@ -981,4 +1057,224 @@ async fn unauthorized_api_error_does_not_fallback() {
         events.last(),
         Some(RuntimeEvent::Error { message, .. }) if message.contains("鉴权失败")
     ));
+}
+
+#[tokio::test]
+async fn multi_tool_turn_executes_all_auto_calls_in_order_and_persists() {
+    let workspace = tempfile::tempdir().unwrap();
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: indexed_tool_call_delta(0, "call_1", AutoEchoTool::NAME, r#"{"message":"one"}"#),
+            },
+            AgentEvent::ToolCallDelta {
+                delta: indexed_tool_call_delta(1, "call_2", AutoEchoTool::NAME, r#"{"message":"two"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::with_new_session(
+        client,
+        registry_with_auto_and_mock(),
+        "system",
+        workspace.path(),
+        &crate::config::AgentConfig::default(),
+    )
+    .unwrap();
+    let session_id = runtime.session_id().await.expect("session id");
+
+    let mut rx = runtime.submit_user("run both").await;
+    let events = drain(&mut rx).await;
+
+    assert_eq!(started_ids(&events), vec!["call_1", "call_2"]);
+    assert_eq!(finished_ids(&events), vec!["call_1", "call_2"]);
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+
+    let messages = runtime.session_messages().await;
+    // system, user, assistant(2 tool_calls), tool(call_1), tool(call_2), assistant("done")
+    assert_eq!(messages.len(), 6);
+    assert_eq!(messages[2].tool_calls.len(), 2);
+    assert_eq!(messages[2].tool_calls[0].id, "call_1");
+    assert_eq!(messages[2].tool_calls[1].id, "call_2");
+    assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(messages[3].content, "git_echo: one");
+    assert_eq!(messages[4].tool_call_id.as_deref(), Some("call_2"));
+    assert_eq!(messages[4].content, "git_echo: two");
+    assert_eq!(messages[5].content, "done");
+
+    runtime.shutdown().await;
+    let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let record = store.load(&session_id).unwrap();
+    assert_eq!(record.messages.len(), 6);
+    assert_eq!(record.turns.len(), 1);
+    assert_eq!(record.turns[0].tool_results.len(), 2);
+}
+
+#[tokio::test]
+async fn multi_tool_turn_mixes_auto_and_approval_calls() {
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: indexed_tool_call_delta(0, "call_1", AutoEchoTool::NAME, r#"{"message":"auto"}"#),
+            },
+            AgentEvent::ToolCallDelta {
+                delta: indexed_tool_call_delta(1, "call_2", MockEchoTool::NAME, r#"{"message":"gated"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::new(client, registry_with_auto_and_mock());
+
+    let mut rx = runtime.submit_user("run both").await;
+    let first = drain(&mut rx).await;
+
+    // The auto call completes before the gated call asks for approval.
+    assert_eq!(finished_ids(&first), vec!["call_1"]);
+    assert!(matches!(
+        first.last(),
+        Some(RuntimeEvent::ApprovalRequired { tool_call_id: Some(id), .. })
+            if id.as_str() == "call_2"
+    ));
+
+    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let second = drain(&mut rx).await;
+    assert_eq!(finished_ids(&second), vec!["call_2"]);
+    assert!(matches!(
+        second.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+
+    let messages = runtime.session_messages().await;
+    // user, assistant(2 tool_calls), tool(call_1), tool(call_2), assistant("done")
+    assert_eq!(messages.len(), 5);
+    assert_eq!(messages[1].tool_calls.len(), 2);
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_2"));
+    assert_eq!(messages[3].content, "mock_echo: gated");
+}
+
+#[tokio::test]
+async fn multi_tool_turn_serializes_two_approvals() {
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: indexed_tool_call_delta(0, "call_1", MockEchoTool::NAME, r#"{"message":"first"}"#),
+            },
+            AgentEvent::ToolCallDelta {
+                delta: indexed_tool_call_delta(1, "call_2", MockEchoTool::NAME, r#"{"message":"second"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::new(client, registry_with_auto_and_mock());
+
+    let mut rx = runtime.submit_user("run both").await;
+    let first = drain(&mut rx).await;
+    assert!(finished_ids(&first).is_empty());
+    assert!(matches!(
+        first.last(),
+        Some(RuntimeEvent::ApprovalRequired { tool_call_id: Some(id), .. })
+            if id.as_str() == "call_1"
+    ));
+
+    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let second = drain(&mut rx).await;
+    assert_eq!(finished_ids(&second), vec!["call_1"]);
+    assert!(matches!(
+        second.last(),
+        Some(RuntimeEvent::ApprovalRequired { tool_call_id: Some(id), .. })
+            if id.as_str() == "call_2"
+    ));
+
+    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let third = drain(&mut rx).await;
+    assert_eq!(finished_ids(&third), vec!["call_2"]);
+    assert!(matches!(
+        third.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+
+    let messages = runtime.session_messages().await;
+    assert_eq!(messages.len(), 5);
+    assert_eq!(messages[2].content, "mock_echo: first");
+    assert_eq!(messages[3].content, "mock_echo: second");
+}
+
+#[tokio::test]
+async fn multi_tool_turn_denying_one_call_keeps_batch_running() {
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: indexed_tool_call_delta(0, "call_1", MockEchoTool::NAME, r#"{"message":"first"}"#),
+            },
+            AgentEvent::ToolCallDelta {
+                delta: indexed_tool_call_delta(1, "call_2", MockEchoTool::NAME, r#"{"message":"second"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::new(client, registry_with_auto_and_mock());
+
+    let mut rx = runtime.submit_user("run both").await;
+    drain(&mut rx).await;
+
+    let mut rx = runtime.submit_approval(ApprovalDecision::Denied).await;
+    let second = drain(&mut rx).await;
+    let denied = second
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::ToolCallFinished { tool_call_id, result, .. }
+                if tool_call_id.as_str() == "call_1" =>
+            {
+                Some(result.status.clone())
+            }
+            _ => None,
+        })
+        .expect("denied call_1 still records a result");
+    assert_eq!(denied, ToolResultStatus::Denied);
+    assert!(matches!(
+        second.last(),
+        Some(RuntimeEvent::ApprovalRequired { tool_call_id: Some(id), .. })
+            if id.as_str() == "call_2"
+    ));
+
+    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let third = drain(&mut rx).await;
+    assert!(matches!(
+        third.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+
+    let messages = runtime.session_messages().await;
+    // user, assistant(2 tool_calls), tool(denied), tool(success), assistant("done")
+    assert_eq!(messages.len(), 5);
+    assert!(messages[2].content.contains("denied"));
+    assert_eq!(messages[3].content, "mock_echo: second");
 }

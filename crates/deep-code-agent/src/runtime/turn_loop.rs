@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
@@ -11,9 +11,8 @@ use crate::message::Message;
 use crate::model::{ChatRequest, Usage};
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, ToolCallId, emit};
-use crate::runtime::state::PendingToolCall;
-use crate::runtime::tool_result::{runtime_error_from_tool_error, tool_call_payload};
-use crate::tool::{ToolCallAccumulator, ToolRunOutcome};
+use crate::runtime::tool_result::{BatchOutcome, runtime_error_from_tool_error, tool_call_payload};
+use crate::tool::ToolCallAccumulator;
 
 impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// Drive the model/tool loop until either the turn finishes or an
@@ -200,77 +199,37 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 return;
             }
 
-            if calls.len() > 1 {
+            let payloads = calls.iter().map(tool_call_payload).collect::<Vec<_>>();
+            for call in &calls {
                 emit(
                     tx,
-                    RuntimeEvent::Error {
-                        turn_id: Some(turn_id.clone()),
-                        message: format!(
-                            "multi tool call turns are not supported yet (got {} calls)",
-                            calls.len()
-                        ),
+                    RuntimeEvent::ToolCallStarted {
+                        turn_id: turn_id.clone(),
+                        tool_call_id: ToolCallId::from(call.id.clone()),
+                        tool_name: call.name.clone(),
+                        arguments: call.arguments.clone(),
                     },
                 );
-                self.abort_turn().await;
-                return;
             }
-
-            let call = calls.into_iter().next().expect("exactly one tool call");
-            let payload = tool_call_payload(&call);
-            emit(
-                tx,
-                RuntimeEvent::ToolCallStarted {
-                    turn_id: turn_id.clone(),
-                    tool_call_id: ToolCallId::from(call.id.clone()),
-                    tool_name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                },
-            );
 
             {
                 let mut state = self.state.lock().await;
                 state.session.push(Message::assistant_turn(
                     text_buffer,
                     reasoning_buffer,
-                    vec![payload],
+                    payloads,
                 ));
             }
             self.persist().await;
             self.emit_session_updated(tx).await;
 
-            match self.tools.run_tool_call(call.clone(), None) {
-                Ok(ToolRunOutcome::ApprovalRequired { request }) => {
-                    {
-                        let mut state = self.state.lock().await;
-                        state.pending = Some(PendingToolCall {
-                            call,
-                            turn_id: turn_id.clone(),
-                        });
-                    }
-                    emit(
-                        tx,
-                        RuntimeEvent::ApprovalRequired {
-                            turn_id: Some(turn_id.clone()),
-                            tool_call_id: Some(ToolCallId::from(request.call_id.clone())),
-                            request,
-                        },
-                    );
-                    return;
-                }
-                Ok(ToolRunOutcome::Result { result }) => {
-                    self.record_tool_result(&call, result, tx, turn_id.clone())
-                        .await;
-                    // Loop again: feed tool result back into the next chat turn.
-                    continue;
-                }
-                Err(error) => {
-                    emit(
-                        tx,
-                        runtime_error_from_tool_error(error, Some(turn_id.clone())),
-                    );
-                    self.abort_turn().await;
-                    return;
-                }
+            match self
+                .process_tool_batch(VecDeque::from(calls), &turn_id, tx)
+                .await
+            {
+                // Loop again: feed tool results back into the next chat turn.
+                BatchOutcome::Completed => continue,
+                BatchOutcome::AwaitingApproval => return,
             }
         }
     }

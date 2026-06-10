@@ -93,8 +93,17 @@ impl App {
             RuntimeEvent::ToolResult { result } => {
                 self.push_tool_result_cell(&result);
             }
-            RuntimeEvent::ToolCallFinished { result, .. } => {
-                self.flush_active_turn();
+            RuntimeEvent::ToolCallFinished {
+                tool_call_id,
+                result,
+                ..
+            } => {
+                // Flush only the finished tool so cells of other calls in the
+                // same multi-tool batch keep streaming in the active turn.
+                if let Some(active) = self.active_turn.as_mut() {
+                    let cells = active.take_finished_tool_cells(&tool_call_id);
+                    self.history.extend(cells);
+                }
                 self.push_tool_result_cell(&result);
             }
             RuntimeEvent::SessionUpdated {

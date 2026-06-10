@@ -137,6 +137,39 @@ impl ActiveTurn {
             .push(HistoryCell::Diagnostics { summary, rendered });
     }
 
+    /// Flush only what belongs to one finished tool call: the streamed
+    /// text/reasoning so far (once), that tool's cell, and accumulated
+    /// diagnostics. Other still-running tool cells stay in the active turn.
+    pub fn take_finished_tool_cells(&mut self, tool_call_id: &ToolCallId) -> Vec<HistoryCell> {
+        let mut cells = Vec::new();
+        if !self.reasoning_buffer.is_empty() {
+            cells.push(HistoryCell::Reasoning {
+                text: std::mem::take(&mut self.reasoning_buffer),
+            });
+        }
+        if !self.assistant_buffer.is_empty() {
+            cells.push(HistoryCell::Assistant {
+                text: std::mem::take(&mut self.assistant_buffer),
+            });
+        }
+        if let Some(position) = self
+            .tools
+            .iter()
+            .position(|tool| &tool.tool_call_id == tool_call_id)
+        {
+            let tool = self.tools.remove(position);
+            cells.push(HistoryCell::ToolCall {
+                tool_name: tool.tool_name,
+                arguments: tool.arguments,
+                risk_level: tool.risk_level,
+                requires_sandbox: tool.requires_sandbox,
+                approval: tool.approval,
+            });
+        }
+        cells.append(&mut self.diagnostics);
+        cells
+    }
+
     #[must_use]
     pub fn preview_cells(&self) -> Vec<HistoryCell> {
         let mut cells = Vec::new();

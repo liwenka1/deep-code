@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -15,7 +16,7 @@ use crate::tool::ToolCall;
 #[derive(Debug, Default)]
 pub(super) struct RuntimeState {
     pub(super) session: Session,
-    pub(super) pending: Option<PendingToolCall>,
+    pub(super) pending: Option<PendingToolBatch>,
     pub(super) current_turn: Option<TurnRecord>,
     pub(super) last_prefix_hash: Option<u64>,
     pub(super) session_cost: CostEstimate,
@@ -30,8 +31,11 @@ pub(super) struct Persistence {
     pub(super) actor: PersistenceActorHandle,
 }
 
+/// A turn's tool calls awaiting approval: the call currently pending plus the
+/// rest of the batch, resumed in order once the decision arrives.
 #[derive(Debug, Clone)]
-pub(super) struct PendingToolCall {
-    pub(super) call: ToolCall,
+pub(super) struct PendingToolBatch {
+    pub(super) current: ToolCall,
+    pub(super) remaining: VecDeque<ToolCall>,
     pub(super) turn_id: TurnId,
 }
