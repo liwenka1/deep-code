@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 
-use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::auto_mode::resolve_turn_route;
@@ -34,6 +33,8 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             // compaction event already emitted; continue with trimmed history
         }
 
+        let mut stream_retries = 0u32;
+
         loop {
             if cancel.is_cancelled() {
                 self.finish_turn(None).await;
@@ -60,9 +61,24 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 request = request.with_reasoning_effort(effort);
             }
 
-            let mut stream = match self.stream_with_fallback(&mut route, request).await {
-                Ok(stream) => stream,
-                Err(error) => {
+            let opened = tokio::select! {
+                biased;
+                () = cancel.cancelled() => None,
+                opened = self.open_turn_stream(&mut route, request) => Some(opened),
+            };
+            let mut stream = match opened {
+                None => {
+                    self.finish_turn(None).await;
+                    emit(
+                        tx,
+                        RuntimeEvent::TurnCancelled {
+                            turn_id: turn_id.clone(),
+                        },
+                    );
+                    return;
+                }
+                Some(Ok(stream)) => stream,
+                Some(Err(error)) => {
                     emit(
                         tx,
                         RuntimeEvent::Error {
@@ -177,6 +193,8 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 }
             }
 
+            stream_retries += stream.retries_used();
+
             if cancelled {
                 // Partial assistant output stays in the transcript; partial
                 // tool-call deltas are discarded before they become real
@@ -234,6 +252,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                     usage.as_ref(),
                     prefix_hash,
                     estimated_context_tokens,
+                    stream_retries,
                 );
                 self.finish_turn(usage.clone()).await;
                 emit(

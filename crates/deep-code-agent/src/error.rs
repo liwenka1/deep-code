@@ -26,6 +26,15 @@ pub enum AgentError {
 
     #[error("序列化错误：{0}")]
     Serde(#[from] serde_json::Error),
+
+    #[error("流式响应卡顿：连续 {seconds}s 未收到新数据")]
+    StreamStalled { seconds: u64 },
+
+    #[error("流式响应总时长超过 {seconds}s 上限")]
+    StreamDeadlineExceeded { seconds: u64 },
+
+    #[error("流式响应过大：累计内容超过 {limit_bytes} 字节上限")]
+    StreamOverflow { limit_bytes: u64 },
 }
 
 impl AgentError {
@@ -51,6 +60,15 @@ impl AgentError {
                     "{self}\nDeepSeek 服务暂时不可用或网络链路异常：可稍后重试，auto mode 会在可重试场景下尝试从 Pro 降级到 Flash。原始信息：{message}"
                 )
             }
+            Self::StreamStalled { .. } => format!(
+                "{self}\n网络可能卡顿或代理中断：请检查网络后重试；如确属长任务，可调大 DEEP_CODE_STREAM_CHUNK_TIMEOUT_SECS。"
+            ),
+            Self::StreamDeadlineExceeded { .. } => format!(
+                "{self}\n本轮响应耗时过长已被终止：可拆分任务后重试，或调大 DEEP_CODE_STREAM_TOTAL_TIMEOUT_SECS。"
+            ),
+            Self::StreamOverflow { .. } => format!(
+                "{self}\n响应内容异常巨大已被截断保护：请缩小任务范围，或调大 DEEP_CODE_STREAM_MAX_BYTES。"
+            ),
             _ => self.to_string(),
         }
     }

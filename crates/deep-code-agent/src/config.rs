@@ -14,6 +14,15 @@ pub const REASONING_EFFORT_ENV: &str = "DEEP_CODE_REASONING_EFFORT";
 pub const COST_CURRENCY_ENV: &str = "DEEP_CODE_COST_CURRENCY";
 pub const AUTO_COST_SAVING_ENV: &str = "DEEP_CODE_AUTO_COST_SAVING";
 pub const COMPACTION_THRESHOLD_ENV: &str = "DEEP_CODE_COMPACTION_THRESHOLD";
+pub const STREAM_MAX_RETRIES_ENV: &str = "DEEP_CODE_STREAM_MAX_RETRIES";
+pub const STREAM_CHUNK_TIMEOUT_ENV: &str = "DEEP_CODE_STREAM_CHUNK_TIMEOUT_SECS";
+pub const STREAM_TOTAL_TIMEOUT_ENV: &str = "DEEP_CODE_STREAM_TOTAL_TIMEOUT_SECS";
+pub const STREAM_MAX_BYTES_ENV: &str = "DEEP_CODE_STREAM_MAX_BYTES";
+
+pub const DEFAULT_STREAM_MAX_RETRIES: u32 = 3;
+pub const DEFAULT_STREAM_CHUNK_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_STREAM_TOTAL_TIMEOUT_SECS: u64 = 900;
+pub const DEFAULT_STREAM_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
@@ -26,6 +35,14 @@ pub struct AgentConfig {
     /// Override compaction token threshold (for dev/testing).
     pub compaction_threshold: Option<u32>,
     pub timeout: Option<Duration>,
+    /// Transparent stream retries before any content arrived.
+    pub stream_max_retries: u32,
+    /// Abort when no stream chunk arrives within this window.
+    pub stream_chunk_timeout: Duration,
+    /// Hard ceiling for one model stream from open to close.
+    pub stream_total_timeout: Duration,
+    /// Abort when cumulative streamed content exceeds this size.
+    pub stream_max_bytes: u64,
 }
 
 impl Default for AgentConfig {
@@ -52,8 +69,21 @@ impl Default for AgentConfig {
                 .ok()
                 .and_then(|value| value.parse().ok()),
             timeout: Some(Duration::from_secs(60)),
+            stream_max_retries: env_parse(STREAM_MAX_RETRIES_ENV)
+                .unwrap_or(DEFAULT_STREAM_MAX_RETRIES),
+            stream_chunk_timeout: Duration::from_secs(
+                env_parse(STREAM_CHUNK_TIMEOUT_ENV).unwrap_or(DEFAULT_STREAM_CHUNK_TIMEOUT_SECS),
+            ),
+            stream_total_timeout: Duration::from_secs(
+                env_parse(STREAM_TOTAL_TIMEOUT_ENV).unwrap_or(DEFAULT_STREAM_TOTAL_TIMEOUT_SECS),
+            ),
+            stream_max_bytes: env_parse(STREAM_MAX_BYTES_ENV).unwrap_or(DEFAULT_STREAM_MAX_BYTES),
         }
     }
+}
+
+fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
+    env::var(name).ok().and_then(|value| value.parse().ok())
 }
 
 impl AgentConfig {

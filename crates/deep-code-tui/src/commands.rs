@@ -75,7 +75,7 @@ impl App {
                     .map(|reason| format!("\nfallback_reason={reason}"))
                     .unwrap_or_default();
                 format!(
-                    "\neffective_model={}\nroute={}\nreasoning={}\nauto_reason={}\nturn_cost={}\nsession_cost={}\ncontext={}/{} ({}%)\ncompaction_near={}{}",
+                    "\neffective_model={}\nroute={}\nreasoning={}\nauto_reason={}\nturn_cost={}\nsession_cost={}\ncontext={}/{} ({}%)\ncompaction_near={}\nstream_retries={}{}",
                     telemetry.effective_model,
                     telemetry.route_label,
                     telemetry.reasoning_effort,
@@ -86,6 +86,7 @@ impl App {
                     telemetry.context_window,
                     telemetry.context_usage_percent,
                     telemetry.near_compaction_threshold,
+                    telemetry.stream_retries,
                     fallback
                 )
             })
@@ -259,8 +260,13 @@ pub(crate) fn format_turn_telemetry(telemetry: &TurnTelemetry, currency: CostCur
         .as_deref()
         .map(|reason| format!(" | {reason}"))
         .unwrap_or_default();
+    let retries = if telemetry.stream_retries > 0 {
+        format!(" | 流重试 {} 次", telemetry.stream_retries)
+    } else {
+        String::new()
+    };
     format!(
-        " | {} | {} | 本回合 {} | 累计 {}{cache} | {context}{compaction} | {}{fallback}",
+        " | {} | {} | 本回合 {} | 累计 {}{cache} | {context}{compaction} | {}{fallback}{retries}",
         telemetry.route_label,
         telemetry.route_reason,
         turn,

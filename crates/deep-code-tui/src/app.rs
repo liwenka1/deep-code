@@ -487,6 +487,7 @@ mod tests {
             context_usage_percent: 1,
             near_compaction_threshold: false,
             used_model_fallback: false,
+            stream_retries: 2,
             turn_cost: deep_code_agent::CostEstimate {
                 cny: 0.001,
                 usd: 0.0001,
@@ -504,6 +505,7 @@ mod tests {
                 if text.contains("effective_model=deepseek-v4-flash")
                     && text.contains("auto_reason=短提示优先使用 Flash")
                     && text.contains("session_cost=¥0.0020")
+                    && text.contains("stream_retries=2")
         ));
     }
 
@@ -820,6 +822,7 @@ mod tests {
             context_usage_percent: 1,
             near_compaction_threshold: false,
             used_model_fallback: false,
+            stream_retries: 0,
             turn_cost: deep_code_agent::CostEstimate {
                 cny: 0.001,
                 usd: 0.0001,

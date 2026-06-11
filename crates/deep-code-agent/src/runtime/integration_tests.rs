@@ -1404,6 +1404,267 @@ async fn cancel_while_waiting_approval_synthesizes_results_for_batch() {
     assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_2"));
 }
 
+/// Per-attempt scripted behaviors for stream-robustness tests. Each
+/// `stream_chat` call consumes the next behavior and records the model used.
+#[derive(Debug, Clone)]
+enum AttemptBehavior {
+    /// `stream_chat` itself fails with this API status.
+    ConnectFail(u16),
+    /// Stream errors immediately, before any content.
+    StreamErr,
+    /// Stream yields text, then errors.
+    TextThenErr(String),
+    /// Stream yields nothing and pends forever.
+    Hang,
+    /// Stream yields this text and finishes cleanly.
+    Text(String),
+}
+
+#[derive(Clone)]
+struct AttemptScriptClient {
+    inner: Arc<AttemptScriptInner>,
+}
+
+struct AttemptScriptInner {
+    behaviors: Mutex<Vec<AttemptBehavior>>,
+    models: Mutex<Vec<String>>,
+}
+
+impl AttemptScriptClient {
+    fn new(behaviors: Vec<AttemptBehavior>) -> Self {
+        Self {
+            inner: Arc::new(AttemptScriptInner {
+                behaviors: Mutex::new(behaviors),
+                models: Mutex::new(Vec::new()),
+            }),
+        }
+    }
+
+    fn models_used(&self) -> Vec<String> {
+        self.inner.models.lock().unwrap().clone()
+    }
+
+    fn attempts(&self) -> usize {
+        self.inner.models.lock().unwrap().len()
+    }
+}
+
+impl LlmClient for AttemptScriptClient {
+    fn provider_name(&self) -> &'static str {
+        "attempt-script"
+    }
+
+    fn model(&self) -> &str {
+        "attempt-script"
+    }
+
+    async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
+        self.inner
+            .models
+            .lock()
+            .unwrap()
+            .push(request.model.clone());
+        let behavior = {
+            let mut behaviors = self.inner.behaviors.lock().unwrap();
+            if behaviors.is_empty() {
+                AttemptBehavior::Text("default".to_string())
+            } else {
+                behaviors.remove(0)
+            }
+        };
+        if let AttemptBehavior::ConnectFail(status) = behavior {
+            return Err(AgentError::Api {
+                status: reqwest::StatusCode::from_u16(status).unwrap(),
+                message: "scripted failure".to_string(),
+            });
+        }
+        let stream = try_stream! {
+            match behavior {
+                AttemptBehavior::ConnectFail(_) => unreachable!("handled above"),
+                AttemptBehavior::StreamErr => {
+                    Err(AgentError::Parse("connection reset".to_string()))?;
+                }
+                AttemptBehavior::TextThenErr(text) => {
+                    yield AgentEvent::TextDelta { text };
+                    Err(AgentError::Parse("broken mid-stream".to_string()))?;
+                }
+                AttemptBehavior::Hang => {
+                    futures_util::future::pending::<()>().await;
+                }
+                AttemptBehavior::Text(text) => {
+                    yield AgentEvent::TextDelta { text };
+                    yield AgentEvent::Done { usage: None };
+                }
+            }
+        };
+        let stream: Pin<Box<dyn Stream<Item = AgentResult<AgentEvent>> + Send>> = Box::pin(stream);
+        Ok(stream)
+    }
+}
+
+fn turn_finished_telemetry(events: &[RuntimeEvent]) -> Option<crate::pricing::TurnTelemetry> {
+    events.iter().find_map(|event| match event {
+        RuntimeEvent::TurnFinished { telemetry, .. } => telemetry.clone(),
+        _ => None,
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn stream_error_before_content_retries_transparently() {
+    let client = AttemptScriptClient::new(vec![
+        AttemptBehavior::StreamErr,
+        AttemptBehavior::Text("recovered".to_string()),
+    ]);
+    let runtime = AgentRuntime::new(client.clone(), ToolRegistry::default());
+
+    let mut rx = runtime.submit_user("hi").await;
+    let events = drain(&mut rx).await;
+
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, RuntimeEvent::Error { .. })),
+        "transparent retry must not surface an error"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+    assert_eq!(client.attempts(), 2);
+    let telemetry = turn_finished_telemetry(&events).expect("telemetry");
+    assert_eq!(telemetry.stream_retries, 1);
+    assert_eq!(
+        runtime.session_messages().await.last().unwrap().content,
+        "recovered"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn stream_error_after_content_is_not_retried() {
+    let client = AttemptScriptClient::new(vec![AttemptBehavior::TextThenErr("part".to_string())]);
+    let runtime = AgentRuntime::new(client.clone(), ToolRegistry::default());
+
+    let mut rx = runtime.submit_user("hi").await;
+    let events = drain(&mut rx).await;
+
+    assert_eq!(client.attempts(), 1, "billed content must never be retried");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Error { .. }))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_stream_times_out_with_chinese_error() {
+    let client = AttemptScriptClient::new(vec![AttemptBehavior::Hang]);
+    let config = AgentConfig {
+        stream_chunk_timeout: std::time::Duration::from_secs(5),
+        ..AgentConfig::default()
+    };
+    let runtime =
+        AgentRuntime::with_system_prompt(client, ToolRegistry::default(), "system", config, false);
+
+    let mut rx = runtime.submit_user("hi").await;
+    let events = drain(&mut rx).await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Error { message, .. } if message.contains("卡顿")
+    )));
+}
+
+#[tokio::test(start_paused = true)]
+async fn oversized_stream_is_cut_off() {
+    let client =
+        AttemptScriptClient::new(vec![AttemptBehavior::Text("x".repeat(64))]);
+    let config = AgentConfig {
+        stream_max_bytes: 10,
+        ..AgentConfig::default()
+    };
+    let runtime =
+        AgentRuntime::with_system_prompt(client, ToolRegistry::default(), "system", config, false);
+
+    let mut rx = runtime.submit_user("hi").await;
+    let events = drain(&mut rx).await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Error { message, .. } if message.contains("过大")
+    )));
+}
+
+#[tokio::test]
+async fn cancel_during_open_backoff_finalizes_as_cancelled() {
+    let client = AttemptScriptClient::new(vec![
+        AttemptBehavior::ConnectFail(503),
+        AttemptBehavior::ConnectFail(503),
+        AttemptBehavior::ConnectFail(503),
+        AttemptBehavior::ConnectFail(503),
+    ]);
+    let runtime = AgentRuntime::new(client.clone(), ToolRegistry::default());
+
+    let mut rx = runtime.submit_user("hi").await;
+    // Give the loop time to fail the first attempt and enter backoff sleep.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let _ = runtime.cancel_turn().await;
+    let events = drain(&mut rx).await;
+
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::TurnCancelled { .. })
+    ));
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, RuntimeEvent::Error { .. }))
+    );
+    assert!(client.attempts() <= 2, "cancel must abort the backoff");
+}
+
+#[tokio::test(start_paused = true)]
+async fn open_retry_runs_after_fallback_exhausted_and_is_counted() {
+    use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO};
+
+    let client = AttemptScriptClient::new(vec![
+        AttemptBehavior::ConnectFail(503),
+        AttemptBehavior::ConnectFail(503),
+        AttemptBehavior::Text("recovered".to_string()),
+    ]);
+    let config = AgentConfig {
+        model: AUTO_MODEL.to_string(),
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::with_system_prompt(
+        client.clone(),
+        ToolRegistry::default(),
+        "system",
+        config,
+        false,
+    );
+
+    let mut rx = runtime.submit_user("debug this crash").await;
+    let events = drain(&mut rx).await;
+
+    // Pinned order: Pro fails -> immediate Flash fallback fails -> backoff
+    // retry stays on the downgraded Flash model and succeeds.
+    assert_eq!(
+        client.models_used(),
+        vec![
+            DEEPSEEK_V4_PRO.to_string(),
+            DEEPSEEK_V4_FLASH.to_string(),
+            DEEPSEEK_V4_FLASH.to_string()
+        ]
+    );
+    let telemetry = turn_finished_telemetry(&events).expect("telemetry");
+    assert_eq!(telemetry.stream_retries, 1);
+    assert!(telemetry.used_model_fallback);
+    assert_eq!(
+        runtime.session_messages().await.last().unwrap().content,
+        "recovered"
+    );
+}
+
 #[tokio::test]
 async fn cancel_turn_when_idle_is_silent_noop() {
     let client = ScriptedClient::new(vec![vec![

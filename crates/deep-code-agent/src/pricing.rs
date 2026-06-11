@@ -99,6 +99,9 @@ pub struct TurnTelemetry {
     pub context_usage_percent: u8,
     pub near_compaction_threshold: bool,
     pub used_model_fallback: bool,
+    /// Transparent stream retries used this turn (0 when the network is fine).
+    #[serde(default)]
+    pub stream_retries: u32,
     pub turn_cost: CostEstimate,
     pub session_cost: CostEstimate,
 }

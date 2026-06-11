@@ -13,6 +13,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         usage: Option<&Usage>,
         prefix_hash: u64,
         estimated_context_tokens: u32,
+        stream_retries: u32,
     ) -> TurnTelemetry {
         let usage = usage.cloned().unwrap_or_default();
         let turn_cost = calculate_turn_cost(&route.effective_model, &usage);
@@ -65,6 +66,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 .saturating_mul(80)
                     / 100,
             used_model_fallback: route.used_model_fallback,
+            stream_retries,
             turn_cost,
             session_cost,
         }
