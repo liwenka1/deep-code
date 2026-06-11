@@ -62,11 +62,13 @@ pub struct App {
 impl App {
     #[must_use]
     pub fn launch(config: LaunchConfig) -> Self {
-        let agent_config = AgentConfig::from_env();
+        let workspace = workspace_root();
+        let loaded = AgentConfig::load(&workspace);
+        let config_warnings = loaded.report.warnings.clone();
+        let agent_config = loaded.config;
         let cost_currency = agent_config.cost_currency;
         let configured_model = agent_config.model.clone();
         let configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
-        let workspace = workspace_root();
         let launched = launch_runtime(&agent_config, workspace, config.resume.clone());
         let runtime = launched.handle;
         let backend_label = launched.backend_label;
@@ -95,6 +97,13 @@ impl App {
                 "Session persistence unavailable in this workspace."
             }
         ))];
+
+        if !config_warnings.is_empty() {
+            history.push(HistoryCell::system(format!(
+                "配置警告:\n{}",
+                config_warnings.join("\n")
+            )));
+        }
 
         if let Some(record) = config.resume.as_ref() {
             history.extend(hydrate_history(record));

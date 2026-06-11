@@ -21,8 +21,10 @@ pub(crate) struct RestoreResponse {
 }
 
 pub async fn doctor(State(state): State<AppState>) -> Json<DoctorReport> {
-    let config = AgentConfig::from_env();
-    Json(DoctorReport::collect(&state.workspace, &config))
+    let loaded = AgentConfig::load(&state.workspace);
+    Json(
+        DoctorReport::collect(&state.workspace, &loaded.config).with_config_layers(&loaded.report),
+    )
 }
 
 pub async fn list_checkpoints(

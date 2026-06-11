@@ -132,7 +132,11 @@ impl Drop for ActiveTurnLease {
 
 pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
     let options = options.resolve_auth_token();
-    let config = AgentConfig::from_env();
+    let loaded = AgentConfig::load(&options.workspace);
+    for warning in &loaded.report.warnings {
+        eprintln!("config warning: {warning}");
+    }
+    let config = loaded.config;
     let resume = load_resume_record(&options)?;
     let launched = launch_runtime(&config, options.workspace.clone(), resume);
     eprintln!(

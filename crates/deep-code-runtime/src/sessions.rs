@@ -36,7 +36,7 @@ pub(crate) async fn switch_runtime(
 ) -> Result<ActiveSessionResponse, ApiError> {
     state.clear_pending_approval().await;
 
-    let config = AgentConfig::from_env();
+    let config = AgentConfig::load(&state.workspace).config;
     let mut guard = state.runtime.lock().await;
     (guard.stop_hook)();
     guard.handle.shutdown().await;

@@ -47,11 +47,12 @@ pub use compaction::{
     estimate_token_count, near_compaction_threshold, should_compact, stable_prefix_fingerprint,
 };
 pub use config::{
-    AUTO_COST_SAVING_ENV, AgentConfig, COMPACTION_THRESHOLD_ENV, COST_CURRENCY_ENV,
-    DEEPSEEK_API_KEY_ENV, DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, MODEL_ENV,
+    AUTO_COST_SAVING_ENV, AgentConfig, COMPACTION_THRESHOLD_ENV, COST_CURRENCY_ENV, ConfigLayer,
+    ConfigLayerStatus, ConfigLoadReport, ConfigSources, DEEPSEEK_API_KEY_ENV,
+    DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, LoadedAgentConfig, MODEL_ENV,
     REASONING_EFFORT_ENV,
 };
-pub use doctor::{DoctorReport, default_config_path};
+pub use doctor::{ConfigLayersDoctorReport, DoctorReport, default_config_path};
 pub use echo_client::EchoClient;
 pub use error::{AgentError, AgentResult, api_key_setup_hint};
 pub use event::{AgentEvent, chunk_to_events};

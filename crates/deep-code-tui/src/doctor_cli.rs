@@ -6,8 +6,9 @@ use crate::cli::workspace_root;
 
 pub fn run_doctor(json: bool) -> anyhow::Result<()> {
     let workspace = workspace_root();
-    let config = AgentConfig::from_env();
-    let report = DoctorReport::collect(&workspace, &config);
+    let loaded = AgentConfig::load(&workspace);
+    let report =
+        DoctorReport::collect(&workspace, &loaded.config).with_config_layers(&loaded.report);
 
     if json {
         println!("{}", report.to_json_pretty()?);
@@ -21,6 +22,30 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
         "  config: {} (present={})",
         report.config_path, report.config_present
     );
+    if let Some(layers) = &report.config_layers {
+        for layer in &layers.layers {
+            match &layer.error {
+                Some(error) => println!(
+                    "    layer {}: {} (present={}, 错误: {error})",
+                    layer.name, layer.path, layer.present
+                ),
+                None => println!(
+                    "    layer {}: {} (present={})",
+                    layer.name, layer.path, layer.present
+                ),
+            }
+        }
+        println!(
+            "    sources: model={} base_url={} currency={} api_key={}",
+            layers.model_source,
+            layers.base_url_source,
+            layers.currency_source,
+            layers.api_key_source
+        );
+        for warning in &layers.warnings {
+            println!("    警告: {warning}");
+        }
+    }
     println!("  api key: {}", report.api_key.source);
     println!("  model: {} @ {}", report.default_model, report.base_url);
     println!(

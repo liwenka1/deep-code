@@ -1,0 +1,49 @@
+# deep-code 配置文件示例
+#
+# 加载顺序（后者覆盖前者）：
+#   内置默认 -> 全局 ~/.deep-code/config.toml -> 项目 .deep-code/config.toml -> 环境变量 -> CLI 参数
+#
+# 项目层只允许调优字段：provider.model / provider.reasoning_effort / cost.* / context.* / stream.*。
+# 项目层的 provider.api_key 一律忽略（防止随仓库泄露或被恶意仓库注入）；
+# 项目层覆盖 provider.base_url 会在启动时给出醒目警告。
+
+[provider]
+# DeepSeek API Key。建议只放在环境变量 DEEPSEEK_API_KEY 或本全局文件中；
+# 写入本文件后请执行 chmod 600 限制权限。
+# api_key = "sk-..."
+
+# API 端点。默认 https://api.deepseek.com/beta（beta 支持 reasoning 流）。
+# base_url = "https://api.deepseek.com/beta"
+
+# 模型：deepseek-v4-pro / deepseek-v4-flash / auto（按任务自动路由）。
+# model = "auto"
+
+# 推理力度：off / low / medium / high / max。
+# reasoning_effort = "high"
+
+# 单请求 HTTP 超时（秒）。
+# timeout_secs = 60
+
+[cost]
+# 成本展示货币：cny / usd。
+# currency = "cny"
+
+# auto 模式下成本优先（倾向 Flash）。
+# auto_cost_saving = false
+
+[context]
+# 触发压缩的 token 阈值（默认按模型上下文窗口计算，一般无需设置）。
+# compaction_threshold = 800000
+
+[stream]
+# 首内容到达前的透明重试次数。
+# max_retries = 3
+
+# 连续无数据的卡顿超时（秒）。
+# chunk_timeout_secs = 300
+
+# 单次流式响应总时长上限（秒）。
+# total_timeout_secs = 900
+
+# 累计内容体积上限（字节）。
+# max_bytes = 52428800

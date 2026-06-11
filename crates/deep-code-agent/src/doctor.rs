@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::config::{AgentConfig, DEEPSEEK_API_KEY_ENV};
+use crate::config::{AgentConfig, ConfigLoadReport, DEEPSEEK_API_KEY_ENV};
 use crate::error::api_key_setup_hint;
 use crate::hooks::default_hooks_config_path;
 use crate::mcp::{McpManager, McpServerStatus, default_mcp_config_path, workspace_mcp_config_path};
@@ -12,12 +12,54 @@ use crate::model_registry::ModelRegistry;
 use crate::sandbox::detect_capabilities;
 use crate::skills::{discover_in_workspace, global_skills_dir, workspace_skills_dir};
 
-/// Reserved path for a future user config file. Not loaded yet.
+/// Path of the global user config file loaded by [`AgentConfig::load`].
 #[must_use]
 pub fn default_config_path() -> PathBuf {
     home_dir()
         .map(|home| home.join(".deep-code").join("config.toml"))
         .unwrap_or_else(|| PathBuf::from(".deep-code/config.toml"))
+}
+
+/// How the layered configuration was assembled, for `deep-code doctor`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigLayersDoctorReport {
+    pub layers: Vec<ConfigLayerDoctorEntry>,
+    pub model_source: String,
+    pub base_url_source: String,
+    pub currency_source: String,
+    pub api_key_source: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigLayerDoctorEntry {
+    pub name: String,
+    pub path: String,
+    pub present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl From<&ConfigLoadReport> for ConfigLayersDoctorReport {
+    fn from(report: &ConfigLoadReport) -> Self {
+        Self {
+            layers: report
+                .layers
+                .iter()
+                .map(|layer| ConfigLayerDoctorEntry {
+                    name: layer.name.to_string(),
+                    path: layer.path.clone(),
+                    present: layer.present,
+                    error: layer.error.clone(),
+                })
+                .collect(),
+            model_source: report.sources.model.label().to_string(),
+            base_url_source: report.sources.base_url.label().to_string(),
+            currency_source: report.sources.cost_currency.label().to_string(),
+            api_key_source: report.sources.api_key.label().to_string(),
+            warnings: report.warnings.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -102,6 +144,8 @@ pub struct DoctorReport {
     pub mcp: McpDoctorReport,
     pub skills: SkillsDoctorReport,
     pub hooks: HooksDoctorReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_layers: Option<ConfigLayersDoctorReport>,
 }
 
 impl DoctorReport {
@@ -139,7 +183,15 @@ impl DoctorReport {
                 config_path: hooks_path.display().to_string(),
                 present: hooks_path.is_file(),
             },
+            config_layers: None,
         }
+    }
+
+    /// Attach the layered-config assembly report (from [`AgentConfig::load`]).
+    #[must_use]
+    pub fn with_config_layers(mut self, report: &ConfigLoadReport) -> Self {
+        self.config_layers = Some(ConfigLayersDoctorReport::from(report));
+        self
     }
 
     pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
