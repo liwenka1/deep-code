@@ -1278,3 +1278,150 @@ async fn multi_tool_turn_denying_one_call_keeps_batch_running() {
     assert!(messages[2].content.contains("denied"));
     assert_eq!(messages[3].content, "mock_echo: second");
 }
+
+/// First call: yields one text delta then hangs forever; later calls stream
+/// normally. Used to exercise mid-stream cancellation and token rotation.
+struct HangThenRecoverClient {
+    attempts: Arc<Mutex<u32>>,
+}
+
+impl HangThenRecoverClient {
+    fn new() -> Self {
+        Self {
+            attempts: Arc::new(Mutex::new(0)),
+        }
+    }
+}
+
+impl LlmClient for HangThenRecoverClient {
+    fn provider_name(&self) -> &'static str {
+        "hang-then-recover"
+    }
+
+    fn model(&self) -> &str {
+        "hang-then-recover"
+    }
+
+    async fn stream_chat(&self, _request: ChatRequest) -> AgentResult<AgentEventStream> {
+        let attempt = {
+            let mut attempts = self.attempts.lock().unwrap();
+            *attempts += 1;
+            *attempts
+        };
+        let stream = try_stream! {
+            if attempt == 1 {
+                yield AgentEvent::TextDelta { text: "partial".to_string() };
+                futures_util::future::pending::<()>().await;
+            } else {
+                yield AgentEvent::TextDelta { text: "recovered".to_string() };
+                yield AgentEvent::Done { usage: None };
+            }
+        };
+        let stream: Pin<Box<dyn Stream<Item = AgentResult<AgentEvent>> + Send>> = Box::pin(stream);
+        Ok(stream)
+    }
+}
+
+#[tokio::test]
+async fn cancel_during_stream_keeps_partial_text_and_allows_next_turn() {
+    let runtime = AgentRuntime::new(HangThenRecoverClient::new(), ToolRegistry::default());
+
+    let mut rx = runtime.submit_user("hang please").await;
+    while let Some(event) = rx.recv().await {
+        if matches!(event, RuntimeEvent::AssistantDelta { .. }) {
+            break;
+        }
+    }
+
+    let _ = runtime.cancel_turn().await;
+
+    let mut saw_cancelled = false;
+    while let Some(event) = rx.recv().await {
+        if matches!(event, RuntimeEvent::TurnCancelled { .. }) {
+            saw_cancelled = true;
+        }
+    }
+    assert!(saw_cancelled, "expected TurnCancelled on the live channel");
+
+    let messages = runtime.session_messages().await;
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[1].content, "partial");
+    assert!(messages[1].tool_calls.is_empty());
+
+    // Token was rotated: a fresh turn streams to completion.
+    let mut rx = runtime.submit_user("again").await;
+    let events = drain(&mut rx).await;
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+    assert_eq!(
+        runtime.session_messages().await.last().unwrap().content,
+        "recovered"
+    );
+}
+
+#[tokio::test]
+async fn cancel_while_waiting_approval_synthesizes_results_for_batch() {
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::ToolCallDelta {
+            delta: indexed_tool_call_delta(0, "call_1", MockEchoTool::NAME, r#"{"message":"a"}"#),
+        },
+        AgentEvent::ToolCallDelta {
+            delta: indexed_tool_call_delta(1, "call_2", MockEchoTool::NAME, r#"{"message":"b"}"#),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools());
+
+    let mut rx = runtime.submit_user("run both").await;
+    let first = drain(&mut rx).await;
+    assert!(matches!(
+        first.last(),
+        Some(RuntimeEvent::ApprovalRequired { .. })
+    ));
+
+    let mut rx = runtime.cancel_turn().await;
+    let events = drain(&mut rx).await;
+
+    assert_eq!(finished_ids(&events), vec!["call_1", "call_2"]);
+    assert!(events.iter().all(|event| match event {
+        RuntimeEvent::ToolCallFinished { result, .. } => {
+            result.status == ToolResultStatus::Error && result.content.contains("取消")
+        }
+        _ => true,
+    }));
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::TurnCancelled { .. })
+    ));
+
+    // Every tool_call keeps a paired tool message: no dangling calls.
+    let messages = runtime.session_messages().await;
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[1].tool_calls.len(), 2);
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_2"));
+}
+
+#[tokio::test]
+async fn cancel_turn_when_idle_is_silent_noop() {
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::TextDelta {
+            text: "hello".to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::default());
+
+    let mut rx = runtime.cancel_turn().await;
+    let events = drain(&mut rx).await;
+    assert!(events.is_empty(), "idle cancel must not emit events");
+
+    let mut rx = runtime.submit_user("hi").await;
+    let events = drain(&mut rx).await;
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+}

@@ -45,6 +45,7 @@ pub async fn run_subagent<C: LlmClient + Clone + 'static>(
                 }
                 rx = runtime.submit_approval(decision).await;
             }
+            RuntimeEvent::TurnCancelled { .. } => return Err("cancelled".to_string()),
             RuntimeEvent::Error { message, .. } => return Err(message),
             RuntimeEvent::ToolResult { .. } => {
                 steps += 1;

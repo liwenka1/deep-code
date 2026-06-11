@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crate::checkpoint::CheckpointStore;
 use crate::client::LlmClient;
@@ -137,6 +138,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 session_cost: CostEstimate::default(),
                 current_prompt: None,
                 current_turn_id: None,
+                cancel: CancellationToken::new(),
             })),
             checkpoints: None,
             workspace: None,
@@ -176,6 +178,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             state.current_turn = Some(TurnRecord::new(prompt.clone()));
             state.current_prompt = Some(prompt);
             state.current_turn_id = Some(turn_id);
+            state.cancel = CancellationToken::new();
         }
         self.persist().await;
     }
@@ -224,6 +227,39 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             );
             runtime.handle_approval(pending, decision, &tx).await;
         });
+        rx
+    }
+
+    /// Cancel the in-flight turn, if any. Idle runtimes treat this as a
+    /// silent no-op.
+    ///
+    /// When the loop is streaming, it observes the token and finalizes on the
+    /// turn's existing event channel; the returned receiver stays empty. When
+    /// the turn is parked on an approval, no task is polling the token, so the
+    /// cancellation is finalized here and its events (synthesized tool
+    /// results, `TurnCancelled`) arrive on the returned receiver.
+    pub async fn cancel_turn(&self) -> RuntimeEventReceiver {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (token, pending, streaming) = {
+            let mut state = self.state.lock().await;
+            let token = state.cancel.clone();
+            let pending = state.pending.take();
+            let streaming = state.current_turn_id.is_some();
+            (token, pending, streaming)
+        };
+
+        if let Some(pending) = pending {
+            token.cancel();
+            let runtime = self.clone();
+            tokio::spawn(async move {
+                runtime.finalize_cancelled_batch(pending, &tx).await;
+            });
+            return rx;
+        }
+
+        if streaming {
+            token.cancel();
+        }
         rx
     }
 

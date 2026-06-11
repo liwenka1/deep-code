@@ -169,6 +169,19 @@ impl App {
                 self.is_streaming = false;
                 self.clear_stream_receiver();
             }
+            RuntimeEvent::TurnCancelled { .. } => {
+                self.flush_active_turn();
+                self.history.push(HistoryCell::system("本轮已取消 (cancelled)"));
+                let session = self
+                    .session_id
+                    .as_ref()
+                    .map(|id| format!(" | session {id}"))
+                    .unwrap_or_default();
+                self.status = format!("已取消 - {}{session}", self.backend_label);
+                self.pending_approval = None;
+                self.is_streaming = false;
+                self.clear_stream_receiver();
+            }
             RuntimeEvent::Error { message, .. } => self.record_error(message),
         }
     }

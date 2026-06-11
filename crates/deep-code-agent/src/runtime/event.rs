@@ -134,6 +134,9 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         telemetry: Option<TurnTelemetry>,
     },
+    /// Current turn was cancelled by the user. Terminal for the turn; any
+    /// unfinished tool calls already have synthesized error results recorded.
+    TurnCancelled { turn_id: TurnId },
     /// Transcript compaction was applied before the model request.
     CompactionApplied {
         archived_count: usize,

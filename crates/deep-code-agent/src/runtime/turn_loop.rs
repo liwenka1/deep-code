@@ -19,9 +19,12 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// approval is required. All paths emit a terminal [`RuntimeEvent`]
     /// (`TurnFinished`, `ApprovalRequired`, or `Error`) before returning.
     pub(super) async fn run_loop(&self, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
-        let user_prompt = {
+        let (user_prompt, cancel) = {
             let state = self.state.lock().await;
-            state.current_prompt.clone().unwrap_or_default()
+            (
+                state.current_prompt.clone().unwrap_or_default(),
+                state.cancel.clone(),
+            )
         };
         let turn_id = self.current_turn_id().await;
         let mut route =
@@ -32,6 +35,16 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         }
 
         loop {
+            if cancel.is_cancelled() {
+                self.finish_turn(None).await;
+                emit(
+                    tx,
+                    RuntimeEvent::TurnCancelled {
+                        turn_id: turn_id.clone(),
+                    },
+                );
+                return;
+            }
             let (messages, prefix_hash) = {
                 let state = self.state.lock().await;
                 let messages = state.session.messages().to_vec();
@@ -68,8 +81,20 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             let mut reasoning_buffer = String::new();
             let mut last_usage: Option<Usage> = None;
             let mut had_error = false;
+            let mut cancelled = false;
 
-            while let Some(event) = stream.next().await {
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        cancelled = true;
+                        break;
+                    }
+                    event = stream.next() => match event {
+                        Some(event) => event,
+                        None => break,
+                    },
+                };
                 match event {
                     Ok(AgentEvent::TextDelta { text }) => {
                         text_buffer.push_str(&text);
@@ -152,6 +177,29 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 }
             }
 
+            if cancelled {
+                // Partial assistant output stays in the transcript; partial
+                // tool-call deltas are discarded before they become real
+                // calls, so no tool_call/tool pairing is broken.
+                if !text_buffer.is_empty() || !reasoning_buffer.is_empty() {
+                    let mut state = self.state.lock().await;
+                    state.session.push(Message::assistant_turn(
+                        text_buffer,
+                        reasoning_buffer,
+                        Vec::new(),
+                    ));
+                }
+                self.persist().await;
+                self.finish_turn(None).await;
+                emit(
+                    tx,
+                    RuntimeEvent::TurnCancelled {
+                        turn_id: turn_id.clone(),
+                    },
+                );
+                return;
+            }
+
             if had_error {
                 self.abort_turn().await;
                 return;
@@ -224,12 +272,12 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             self.emit_session_updated(tx).await;
 
             match self
-                .process_tool_batch(VecDeque::from(calls), &turn_id, tx)
+                .process_tool_batch(VecDeque::from(calls), &turn_id, &cancel, tx)
                 .await
             {
                 // Loop again: feed tool results back into the next chat turn.
                 BatchOutcome::Completed => continue,
-                BatchOutcome::AwaitingApproval => return,
+                BatchOutcome::AwaitingApproval | BatchOutcome::Cancelled => return,
             }
         }
     }

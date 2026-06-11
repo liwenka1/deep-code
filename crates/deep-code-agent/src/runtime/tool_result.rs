@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::client::LlmClient;
 use crate::lsp::{is_edit_tool, render_blocks, summarize_blocks};
@@ -13,12 +14,16 @@ use crate::tool::{
     ApprovalDecision, ToolCall, ToolError, ToolResult, ToolResultStatus, ToolRunOutcome,
 };
 
-/// How a tool-call batch ended: either every call has a recorded result, or
-/// the batch is parked in `RuntimeState::pending` waiting for an approval.
+pub(super) const CANCELLED_TOOL_RESULT: &str = "用户取消了本轮，该工具调用未执行 (cancelled by user)";
+
+/// How a tool-call batch ended: every call has a recorded result, the batch
+/// is parked in `RuntimeState::pending` waiting for an approval, or the user
+/// cancelled and the remaining calls received synthesized results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BatchOutcome {
     Completed,
     AwaitingApproval,
+    Cancelled,
 }
 
 impl<C: LlmClient + 'static> AgentRuntime<C> {
@@ -32,9 +37,17 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         &self,
         mut remaining: VecDeque<ToolCall>,
         turn_id: &TurnId,
+        cancel: &CancellationToken,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) -> BatchOutcome {
         while let Some(call) = remaining.pop_front() {
+            // Sync tool execution cannot be interrupted; cancellation takes
+            // effect at call boundaries.
+            if cancel.is_cancelled() {
+                remaining.push_front(call);
+                self.finish_cancelled_calls(remaining, turn_id, tx).await;
+                return BatchOutcome::Cancelled;
+            }
             match self.tools.run_tool_call(call.clone(), None) {
                 Ok(ToolRunOutcome::Result { result }) => {
                     self.record_tool_result(&call, result, tx, turn_id.clone())
@@ -69,17 +82,63 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         BatchOutcome::Completed
     }
 
+    /// Finalize a batch that was parked on an approval when the user
+    /// cancelled: every unresolved call gets a synthesized result so the
+    /// assistant message keeps its tool_call/tool message pairing.
+    pub(super) async fn finalize_cancelled_batch(
+        &self,
+        pending: PendingToolBatch,
+        tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let PendingToolBatch {
+            current,
+            mut remaining,
+            turn_id,
+        } = pending;
+        remaining.push_front(current);
+        self.finish_cancelled_calls(remaining, &turn_id, tx).await;
+    }
+
+    /// Record synthesized cancelled results for every queued call, then close
+    /// the turn and emit the terminal `TurnCancelled` event.
+    async fn finish_cancelled_calls(
+        &self,
+        calls: VecDeque<ToolCall>,
+        turn_id: &TurnId,
+        tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        for call in calls {
+            let result = ToolResult::error(&call, CANCELLED_TOOL_RESULT);
+            self.record_tool_result(&call, result, tx, turn_id.clone())
+                .await;
+        }
+        self.finish_turn(None).await;
+        emit(
+            tx,
+            RuntimeEvent::TurnCancelled {
+                turn_id: turn_id.clone(),
+            },
+        );
+    }
+
     pub(super) async fn handle_approval(
         &self,
         pending: PendingToolBatch,
         decision: ApprovalDecision,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
+        let cancel = self.state.lock().await.cancel.clone();
         let PendingToolBatch {
             current,
             remaining,
             turn_id,
         } = pending;
+        if cancel.is_cancelled() {
+            let mut calls = remaining;
+            calls.push_front(current);
+            self.finish_cancelled_calls(calls, &turn_id, tx).await;
+            return;
+        }
         match self.tools.run_tool_call(current.clone(), Some(decision)) {
             Ok(ToolRunOutcome::Result { result }) => {
                 self.record_tool_result(&current, result, tx, turn_id.clone())
@@ -113,7 +172,8 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
 
         // Resolved call recorded; drain the rest of the batch, then resume the
         // loop to feed all tool results into the next chat turn.
-        if self.process_tool_batch(remaining, &turn_id, tx).await == BatchOutcome::Completed {
+        if self.process_tool_batch(remaining, &turn_id, &cancel, tx).await == BatchOutcome::Completed
+        {
             self.run_loop(tx).await;
         }
     }

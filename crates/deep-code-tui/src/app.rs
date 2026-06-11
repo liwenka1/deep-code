@@ -83,7 +83,7 @@ impl App {
             });
         let mut history = vec![HistoryCell::system(format!(
             "{}\n{}\n{}\n{}\n{}",
-            "Type a prompt and press Enter. Press Esc or Ctrl+C to exit.",
+            "Type a prompt and press Enter. Esc: 取消本轮/清空输入/退出 (按状态依次生效), Ctrl+C: 退出.",
             "Tip: in offline mode, type \"/mock-tool hello\" to exercise approval.",
             "Slash: /checkpoints, /restore <id>, /sessions, /agents",
             workspace_note,
@@ -180,6 +180,32 @@ impl App {
         self.history.push(HistoryCell::user(prompt.clone()));
 
         self.start_stream(StreamRequest::User(prompt));
+    }
+
+    /// Esc cancel stack: deny approval (handled by the approval branch in
+    /// `ui::handle_key`) > cancel the streaming turn > clear input > quit.
+    pub fn handle_escape(&mut self) {
+        if self.is_streaming {
+            self.cancel_streaming_turn();
+        } else if !self.input.is_empty() {
+            self.input.clear();
+            self.status = "已清空输入 (再按 Esc 退出)".to_string();
+        } else {
+            self.should_quit = true;
+        }
+    }
+
+    fn cancel_streaming_turn(&mut self) {
+        self.status = "正在取消本轮... (取消在工具边界生效)".to_string();
+        let runtime = Arc::clone(&self.runtime);
+        // The streaming loop emits TurnCancelled on the live channel that the
+        // bridge task is already pumping; the receiver returned here stays
+        // empty, so it can be dropped.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = runtime.cancel_turn().await;
+            });
+        }
     }
 
     pub fn approve_pending_tool(&mut self) {
@@ -288,6 +314,7 @@ impl App {
                 if matches!(
                     event,
                     RuntimeEvent::TurnFinished { .. }
+                        | RuntimeEvent::TurnCancelled { .. }
                         | RuntimeEvent::ApprovalRequired { .. }
                         | RuntimeEvent::Error { .. }
                 ) {
@@ -586,6 +613,62 @@ mod tests {
             .count();
         assert_eq!(result_cells, 2);
         assert!(app.active_turn.as_ref().is_some_and(|active| active.tools.is_empty()));
+    }
+
+    #[test]
+    fn escape_ladder_clears_input_then_quits() {
+        let mut app = App::new();
+        app.input = "draft".to_string();
+
+        app.handle_escape();
+        assert!(app.input.is_empty());
+        assert!(!app.should_quit);
+        assert!(app.status.contains("已清空输入"));
+
+        app.handle_escape();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn escape_during_streaming_requests_cancel_without_quitting() {
+        let mut app = App::new();
+        app.is_streaming = true;
+        app.input = "keep me".to_string();
+
+        app.handle_escape();
+
+        assert!(!app.should_quit);
+        assert_eq!(app.input, "keep me");
+        assert!(app.status.contains("取消"));
+    }
+
+    #[test]
+    fn turn_cancelled_event_flushes_active_turn_and_resets_state() {
+        let mut app = App::new();
+        let turn_id = deep_code_agent::TurnId("turn_1".to_string());
+        app.apply_runtime_event(RuntimeEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            prompt: "hang".to_string(),
+        });
+        app.apply_runtime_event(RuntimeEvent::AssistantDelta {
+            turn_id: turn_id.clone(),
+            text: "partial".to_string(),
+        });
+        app.is_streaming = true;
+
+        app.apply_runtime_event(RuntimeEvent::TurnCancelled { turn_id });
+
+        assert!(!app.is_streaming);
+        assert!(app.status.contains("已取消"));
+        assert!(app.active_turn.is_none());
+        assert!(app.history.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::Assistant { text } if text == "partial"
+        )));
+        assert!(app.history.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::System { text } if text.contains("已取消")
+        )));
     }
 
     #[test]

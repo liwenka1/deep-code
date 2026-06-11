@@ -22,6 +22,11 @@ pub trait AgentRuntimeHandle: Send + Sync {
         decision: ApprovalDecision,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeEventReceiver> + Send + '_>>;
 
+    /// Cancel the in-flight turn, if any. See [`AgentRuntime::cancel_turn`].
+    fn cancel_turn(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeEventReceiver> + Send + '_>>;
+
     fn session_messages(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Message>> + Send + '_>>;
@@ -53,6 +58,13 @@ impl<C: LlmClient + 'static> AgentRuntimeHandle for AgentRuntime<C> {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeEventReceiver> + Send + '_>>
     {
         Box::pin(AgentRuntime::submit_approval(self, decision))
+    }
+
+    fn cancel_turn(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeEventReceiver> + Send + '_>>
+    {
+        Box::pin(AgentRuntime::cancel_turn(self))
     }
 
     fn session_messages(

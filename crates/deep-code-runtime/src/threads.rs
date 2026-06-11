@@ -268,7 +268,8 @@ impl RuntimeThreadStore {
                 finished_at_ms: None,
             });
         }
-        if let RuntimeEvent::TurnFinished { turn_id, .. } = event
+        if let RuntimeEvent::TurnFinished { turn_id, .. }
+        | RuntimeEvent::TurnCancelled { turn_id } = event
             && let Some(turn) = state.turns.iter_mut().find(|turn| turn.turn_id == *turn_id)
         {
             turn.finished_at_ms = Some(now);
@@ -409,6 +410,7 @@ pub fn runtime_event_kind(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::ToolCallFinished { .. } => "tool.finished",
         RuntimeEvent::SessionUpdated { .. } => "session.updated",
         RuntimeEvent::TurnFinished { .. } => "turn.completed",
+        RuntimeEvent::TurnCancelled { .. } => "turn.cancelled",
         RuntimeEvent::CheckpointCreated { .. } => "checkpoint.created",
         RuntimeEvent::WorkspaceRestored { .. } => "workspace.restored",
         RuntimeEvent::DiagnosticsUpdated { .. } => "diagnostics.updated",
@@ -434,7 +436,8 @@ fn event_turn_id(event: &RuntimeEvent) -> Option<TurnId> {
         | RuntimeEvent::ReasoningDelta { turn_id, .. }
         | RuntimeEvent::ToolCallStarted { turn_id, .. }
         | RuntimeEvent::ToolCallUpdated { turn_id, .. }
-        | RuntimeEvent::TurnFinished { turn_id, .. } => Some(turn_id.clone()),
+        | RuntimeEvent::TurnFinished { turn_id, .. }
+        | RuntimeEvent::TurnCancelled { turn_id } => Some(turn_id.clone()),
         RuntimeEvent::ApprovalRequired { turn_id, .. }
         | RuntimeEvent::ApprovalResolved { turn_id, .. }
         | RuntimeEvent::ToolCallFinished { turn_id, .. }

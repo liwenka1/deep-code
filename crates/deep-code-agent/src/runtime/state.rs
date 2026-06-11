@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use super::event::TurnId;
 use super::persistence_actor::PersistenceActorHandle;
@@ -22,6 +23,8 @@ pub(super) struct RuntimeState {
     pub(super) session_cost: CostEstimate,
     pub(super) current_prompt: Option<String>,
     pub(super) current_turn_id: Option<TurnId>,
+    /// Cancellation token for the in-flight turn; rotated by `begin_turn`.
+    pub(super) cancel: CancellationToken,
 }
 
 pub(super) struct Persistence {

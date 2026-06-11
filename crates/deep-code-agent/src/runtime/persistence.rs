@@ -72,6 +72,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 session_cost: CostEstimate::default(),
                 current_prompt: None,
                 current_turn_id: None,
+                cancel: tokio_util::sync::CancellationToken::new(),
             })),
             checkpoints: None,
             workspace: Some(workspace.clone()),

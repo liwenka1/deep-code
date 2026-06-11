@@ -568,7 +568,9 @@ async fn prompt_sse_for_thread(
                         resume_after_approval = true;
                         break;
                     }
-                    RuntimeEvent::TurnFinished { .. } | RuntimeEvent::Error { .. } => {
+                    RuntimeEvent::TurnFinished { .. }
+                    | RuntimeEvent::TurnCancelled { .. }
+                    | RuntimeEvent::Error { .. } => {
                         return;
                     }
                     _ => {}
