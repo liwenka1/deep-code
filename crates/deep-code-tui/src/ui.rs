@@ -1,5 +1,5 @@
 use std::io::{self, Stdout};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -14,6 +14,13 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::app::{App, LaunchConfig};
 use crate::history::HistoryCell;
+use crate::markdown::render_markdown;
+
+/// Redraws are coalesced to at most ~30fps; streaming deltas mark the UI
+/// dirty instead of forcing a frame each.
+const MIN_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
+/// Periodic full clear to flush any stale cells left by partial redraws.
+const FULL_REDRAW_EVERY: u32 = 50;
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -48,13 +55,34 @@ fn restore_terminal(terminal: &mut AppTerminal) -> Result<()> {
 }
 
 fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
+    let mut needs_redraw = true;
+    let mut last_draw: Option<Instant> = None;
+    let mut frames_since_clear = 0u32;
+
     while !app.should_quit {
-        app.drain_stream_updates();
-        terminal.draw(|frame| render(frame, app))?;
+        if app.drain_stream_updates() {
+            needs_redraw = true;
+        }
+
+        let draw_due = last_draw.is_none_or(|at| at.elapsed() >= MIN_REDRAW_INTERVAL);
+        if needs_redraw && draw_due {
+            frames_since_clear += 1;
+            if frames_since_clear >= FULL_REDRAW_EVERY {
+                terminal.clear()?;
+                frames_since_clear = 0;
+            }
+            terminal.draw(|frame| render(frame, app))?;
+            last_draw = Some(Instant::now());
+            needs_redraw = false;
+        }
 
         if event::poll(Duration::from_millis(40))? {
             match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, key),
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    handle_key(app, key);
+                    needs_redraw = true;
+                }
+                Event::Resize(..) => needs_redraw = true,
                 _ => {}
             }
         }
@@ -84,7 +112,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => app.push_newline(),
         KeyCode::Enter => app.submit(),
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => app.push_newline(),
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => app.history_prev(),
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => app.history_next(),
         KeyCode::Backspace => app.backspace(),
         KeyCode::PageUp | KeyCode::Up => app.scroll_up(),
         KeyCode::PageDown | KeyCode::Down => app.scroll_down(),
@@ -95,13 +127,14 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 }
 
 fn render(frame: &mut Frame<'_>, app: &App) {
+    let input_height = Constraint::Length(app.input_height());
     if app.pending_approval.is_some() {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),
                 Constraint::Length(8),
-                Constraint::Length(3),
+                input_height,
                 Constraint::Length(1),
             ])
             .split(frame.area());
@@ -112,11 +145,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     } else {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(5),
-                Constraint::Length(3),
-                Constraint::Length(1),
-            ])
+            .constraints([Constraint::Min(5), input_height, Constraint::Length(1)])
             .split(frame.area());
         render_messages(frame, app, chunks[0]);
         render_input(frame, app, chunks[1]);
@@ -126,18 +155,32 @@ fn render(frame: &mut Frame<'_>, app: &App) {
 
 fn render_messages(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
     let mut items = Vec::new();
+    let history_len = app.history.len();
     let mut cells = app.history.clone();
     if let Some(active) = &app.active_turn {
         cells.extend(active.preview_cells());
     }
+    let content_width = area.width.saturating_sub(2).max(8);
     let visible_messages = usize::from(area.height.saturating_sub(2)).saturating_div(3);
     let visible_messages = visible_messages.max(1);
     let bottom_skip = cells.len().saturating_sub(visible_messages);
     let skip_count = bottom_skip.saturating_sub(app.scroll_offset);
 
-    for cell in cells.iter().skip(skip_count).take(visible_messages) {
+    for (index, cell) in cells
+        .iter()
+        .enumerate()
+        .skip(skip_count)
+        .take(visible_messages)
+    {
         let mut lines = vec![Line::from(label_for_cell(cell))];
-        lines.extend(cell.lines().into_iter().map(Line::from));
+        // Flushed assistant cells render as markdown; the still-streaming
+        // preview stays plain so half-open code fences don't flicker.
+        match cell {
+            HistoryCell::Assistant { text } if index < history_len => {
+                lines.extend(render_markdown(text, content_width));
+            }
+            _ => lines.extend(cell.lines().into_iter().map(Line::from)),
+        }
         lines.push(Line::default());
         items.push(ListItem::new(lines));
     }

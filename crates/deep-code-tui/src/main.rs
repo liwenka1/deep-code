@@ -5,6 +5,7 @@ mod commands;
 mod doctor_cli;
 mod event_routing;
 mod history;
+mod markdown;
 mod mcp_cli;
 mod startup;
 mod ui;

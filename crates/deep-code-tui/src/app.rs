@@ -57,7 +57,12 @@ pub struct App {
     pub(crate) configured_model: String,
     pub(crate) configured_reasoning: String,
     pub(crate) last_telemetry: Option<TurnTelemetry>,
+    pub(crate) prompt_history: Vec<String>,
+    history_cursor: Option<usize>,
+    history_draft: String,
 }
+
+const PROMPT_HISTORY_CAP: usize = 100;
 
 impl App {
     #[must_use]
@@ -142,6 +147,9 @@ impl App {
             configured_model,
             configured_reasoning,
             last_telemetry: None,
+            prompt_history: Vec::new(),
+            history_cursor: None,
+            history_draft: String::new(),
         }
     }
 
@@ -153,13 +161,77 @@ impl App {
     pub fn push_char(&mut self, value: char) {
         if !self.is_streaming {
             self.input.push(value);
+            self.history_cursor = None;
         }
     }
 
     pub fn backspace(&mut self) {
         if !self.is_streaming {
             self.input.pop();
+            self.history_cursor = None;
         }
+    }
+
+    /// Insert a newline into the composer (Alt+Enter / Ctrl+J).
+    pub fn push_newline(&mut self) {
+        if !self.is_streaming {
+            self.input.push('\n');
+            self.history_cursor = None;
+        }
+    }
+
+    /// Composer area height including borders; content grows 1..=6 rows.
+    #[must_use]
+    pub fn input_height(&self) -> u16 {
+        let rows = self.input.split('\n').count().clamp(1, 6) as u16;
+        rows + 2
+    }
+
+    /// Recall the previous sent prompt (Ctrl+P). The live input is stashed as
+    /// a draft and restored when navigating past the newest entry.
+    pub fn history_prev(&mut self) {
+        if self.is_streaming || self.prompt_history.is_empty() {
+            return;
+        }
+        let cursor = match self.history_cursor {
+            None => {
+                self.history_draft = std::mem::take(&mut self.input);
+                self.prompt_history.len() - 1
+            }
+            Some(0) => 0,
+            Some(index) => index - 1,
+        };
+        self.history_cursor = Some(cursor);
+        self.input = self.prompt_history[cursor].clone();
+    }
+
+    /// Walk back toward the draft (Ctrl+N).
+    pub fn history_next(&mut self) {
+        if self.is_streaming {
+            return;
+        }
+        match self.history_cursor {
+            None => {}
+            Some(index) if index + 1 < self.prompt_history.len() => {
+                self.history_cursor = Some(index + 1);
+                self.input = self.prompt_history[index + 1].clone();
+            }
+            Some(_) => {
+                self.history_cursor = None;
+                self.input = std::mem::take(&mut self.history_draft);
+            }
+        }
+    }
+
+    fn remember_prompt(&mut self, prompt: &str) {
+        if self.prompt_history.last().map(String::as_str) != Some(prompt) {
+            self.prompt_history.push(prompt.to_string());
+            if self.prompt_history.len() > PROMPT_HISTORY_CAP {
+                self.prompt_history.remove(0);
+            }
+        }
+        self.history_cursor = None;
+        self.history_draft.clear();
     }
 
     pub fn submit(&mut self) {
@@ -172,6 +244,7 @@ impl App {
             self.status = "Enter a prompt before sending.".to_string();
             return;
         }
+        self.remember_prompt(&prompt);
 
         if prompt.starts_with('/') && self.handle_slash_command(&prompt) {
             self.input.clear();
@@ -198,6 +271,7 @@ impl App {
             self.cancel_streaming_turn();
         } else if !self.input.is_empty() {
             self.input.clear();
+            self.history_cursor = None;
             self.status = "已清空输入 (再按 Esc 退出)".to_string();
         } else {
             self.should_quit = true;
@@ -276,18 +350,23 @@ impl App {
             .unwrap_or(0)
     }
 
-    pub fn drain_stream_updates(&mut self) {
+    /// Apply queued runtime updates; returns whether anything changed (the
+    /// render loop uses this to skip redundant redraws).
+    pub fn drain_stream_updates(&mut self) -> bool {
         let Some(mut rx) = self.ui_rx.take() else {
-            return;
+            return false;
         };
 
+        let mut applied = false;
         while let Ok(update) = rx.try_recv() {
             self.apply_ui_update(update);
+            applied = true;
         }
 
         if self.is_streaming {
             self.ui_rx = Some(rx);
         }
+        applied
     }
 
     fn resolve_pending_tool(&mut self, decision: ApprovalDecision) {
@@ -624,6 +703,77 @@ mod tests {
             .count();
         assert_eq!(result_cells, 2);
         assert!(app.active_turn.as_ref().is_some_and(|active| active.tools.is_empty()));
+    }
+
+    #[test]
+    fn composer_newline_and_height_clamp() {
+        let mut app = App::new();
+        assert_eq!(app.input_height(), 3, "empty input is one row plus borders");
+
+        app.push_char('a');
+        app.push_newline();
+        app.push_char('b');
+        assert_eq!(app.input, "a\nb");
+        assert_eq!(app.input_height(), 4);
+
+        for _ in 0..10 {
+            app.push_newline();
+        }
+        assert_eq!(app.input_height(), 8, "content rows clamp at 6 (+2 borders)");
+
+        app.is_streaming = true;
+        let before = app.input.clone();
+        app.push_newline();
+        assert_eq!(app.input, before, "no edits while streaming");
+    }
+
+    #[test]
+    fn prompt_history_navigates_and_preserves_draft() {
+        let mut app = App::new();
+        app.remember_prompt("first");
+        app.remember_prompt("second");
+        app.remember_prompt("second");
+        assert_eq!(
+            app.prompt_history,
+            vec!["first".to_string(), "second".to_string()],
+            "consecutive duplicates collapse"
+        );
+
+        app.input = "draft".to_string();
+        app.history_prev();
+        assert_eq!(app.input, "second");
+        app.history_prev();
+        assert_eq!(app.input, "first");
+        app.history_prev();
+        assert_eq!(app.input, "first", "clamped at oldest");
+
+        app.history_next();
+        assert_eq!(app.input, "second");
+        app.history_next();
+        assert_eq!(app.input, "draft", "draft restored past newest");
+
+        // Editing a recalled entry detaches from history without mutating it.
+        app.history_prev();
+        assert_eq!(app.input, "second");
+        app.push_char('!');
+        assert_eq!(app.input, "second!");
+        assert_eq!(app.prompt_history[1], "second");
+        app.history_prev();
+        assert_eq!(
+            app.input, "second",
+            "after edits, Ctrl+P starts a fresh walk"
+        );
+    }
+
+    #[test]
+    fn prompt_history_caps_at_limit() {
+        let mut app = App::new();
+        for index in 0..150 {
+            app.remember_prompt(&format!("prompt-{index}"));
+        }
+        assert_eq!(app.prompt_history.len(), 100);
+        assert_eq!(app.prompt_history[0], "prompt-50");
+        assert_eq!(app.prompt_history[99], "prompt-149");
     }
 
     #[test]

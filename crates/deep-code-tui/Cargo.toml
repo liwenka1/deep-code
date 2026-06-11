@@ -20,5 +20,6 @@ deep-code-runtime = { path = "../deep-code-runtime" }
 futures-util = "0.3"
 ratatui = "0.29"
 serde_json = "1.0.149"
+unicode-width = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
