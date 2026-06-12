@@ -581,6 +581,10 @@ fn session_allow_excludes_shell_class_tools() {
     assert!(session_allowable("mock_echo"));
     assert!(session_allowable("write_file"));
     assert!(session_allowable("mcp__server__tool"));
+    assert!(
+        session_allowable("web_search") && session_allowable("fetch_url"),
+        "network tools are the prime session-allow use case"
+    );
     assert!(!session_allowable("shell_run"), "shell risk is per-argument");
     assert!(!session_allowable("job_start"));
 }

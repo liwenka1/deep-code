@@ -15,6 +15,7 @@ pub enum ToolKind {
     HandleRead,
     Rlm,
     Mcp,
+    Network,
     Unknown,
 }
 
@@ -126,6 +127,7 @@ impl ExecPolicy {
             // Exact names only: a prefix match would hand the read-only fast
             // path to any future tool that merely starts with "git_".
             "git_status" | "git_diff" | "git_log" => ToolKind::GitRead,
+            "web_search" | "fetch_url" => ToolKind::Network,
             "mock_echo" => ToolKind::Mock,
             "agent_open" | "agent_eval" | "agent_close" => ToolKind::SubAgent,
             "handle_read" => ToolKind::HandleRead,
@@ -155,6 +157,16 @@ impl ExecPolicy {
                 read_only: false,
                 risk_level: RiskLevel::Medium,
                 matched_rule: Some("builtin:write_tool".to_string()),
+            },
+            ToolKind::Network => ToolExecutionPlan {
+                verdict: PolicyVerdict::NeedsApproval {
+                    reason: "network tools can send data to external hosts".to_string(),
+                },
+                requires_approval: true,
+                requires_sandbox: false,
+                read_only: true,
+                risk_level: RiskLevel::Medium,
+                matched_rule: Some("builtin:network_tool".to_string()),
             },
             ToolKind::JobControl => {
                 let needs_approval = tool_name == "job_cancel";

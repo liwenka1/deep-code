@@ -34,6 +34,7 @@ mod tool;
 mod tool_execution;
 mod workspace_policy;
 mod workspace_summary;
+mod web_tools;
 mod workspace_tools;
 
 pub use auto_mode::{
@@ -131,4 +132,5 @@ pub use tool::{
     ToolError, ToolRegistry, ToolResult, ToolResultStatus, ToolRunOutcome, ToolSpec,
 };
 pub use workspace_summary::build_workspace_summary;
+pub use web_tools::{FetchUrlTool, WebSearchTool, web_tool_registry};
 pub use workspace_tools::{WorkspaceTools, workspace_tool_registry};

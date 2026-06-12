@@ -58,6 +58,7 @@ pub fn build_tool_registry(workspace: &Path) -> (ToolRegistry, JobStore) {
         Ok(git_tools) => registry.extend(git_tools),
         Err(error) => eprintln!("git tools disabled: {error}"),
     }
+    registry.extend(crate::web_tools::web_tool_registry());
     (registry, job_store)
 }
 
