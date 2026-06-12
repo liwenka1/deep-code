@@ -6,6 +6,18 @@ use deep_code_agent::{
 use crate::app::App;
 use crate::history::HistoryCell;
 
+/// (command, hint, takes an argument). Single source for the completion
+/// menu and `/help`.
+pub(crate) const SLASH_COMMANDS: &[(&str, &str, bool)] = &[
+    ("/help", "显示帮助", false),
+    ("/clear", "清空可见历史", false),
+    ("/status", "显示运行状态", false),
+    ("/checkpoints", "列出 checkpoints", false),
+    ("/restore", "恢复 checkpoint <id>", true),
+    ("/sessions", "列出会话", false),
+    ("/agents", "列出子代理", false),
+];
+
 impl App {
     pub(crate) fn handle_slash_command(&mut self, prompt: &str) -> bool {
         match prompt {

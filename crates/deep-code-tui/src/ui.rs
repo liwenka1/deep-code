@@ -109,6 +109,32 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Completion menu takes over navigation/accept keys while open; plain
+    // characters and backspace fall through so typing keeps filtering.
+    if app.completion_open() {
+        match key.code {
+            KeyCode::Up => {
+                app.completion_up();
+                return;
+            }
+            KeyCode::Down => {
+                app.completion_down();
+                return;
+            }
+            KeyCode::Tab => {
+                let _ = app.accept_completion();
+                return;
+            }
+            KeyCode::Enter => {
+                if app.accept_completion() {
+                    app.submit();
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
     match key.code {
         KeyCode::Esc => app.handle_escape(),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -144,6 +170,21 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         render_approval_panel(frame, app, chunks[1]);
         render_input(frame, app, chunks[2]);
         render_status(frame, app, chunks[3]);
+    } else if let Some(menu) = &app.completion {
+        let menu_height = (menu.items.len() as u16).min(8) + 2;
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(5),
+                Constraint::Length(menu_height),
+                input_height,
+                Constraint::Length(1),
+            ])
+            .split(frame.area());
+        render_messages(frame, app, chunks[0]);
+        render_completion_menu(frame, menu, chunks[1]);
+        render_input(frame, app, chunks[2]);
+        render_status(frame, app, chunks[3]);
     } else {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -153,6 +194,43 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         render_input(frame, app, chunks[1]);
         render_status(frame, app, chunks[2]);
     }
+}
+
+fn render_completion_menu(
+    frame: &mut Frame<'_>,
+    menu: &crate::app::CompletionMenu,
+    area: ratatui::layout::Rect,
+) {
+    let lines: Vec<Line<'static>> = menu
+        .items
+        .iter()
+        .enumerate()
+        .take(8)
+        .map(|(index, (value, hint))| {
+            let marker = if index == menu.selected { "▶ " } else { "  " };
+            let mut spans = vec![Span::raw(marker.to_string())];
+            let value_span = Span::raw(value.clone());
+            if index == menu.selected {
+                spans.push(value_span.bold());
+            } else {
+                spans.push(value_span);
+            }
+            if !hint.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {hint}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    let panel = Paragraph::new(lines).block(
+        Block::default()
+            .title("补全: ↑/↓ 选择 | Tab/Enter 确认 | Esc 关闭")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Blue)),
+    );
+    frame.render_widget(panel, area);
 }
 
 fn render_messages(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {

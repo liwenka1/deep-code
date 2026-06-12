@@ -131,6 +131,6 @@ pub use tool::{
     ApprovalDecision, ApprovalRequest, MockEchoTool, Tool, ToolCall, ToolCallAccumulator,
     ToolError, ToolRegistry, ToolResult, ToolResultStatus, ToolRunOutcome, ToolSpec,
 };
-pub use workspace_summary::build_workspace_summary;
+pub use workspace_summary::{build_workspace_summary, list_workspace_files};
 pub use web_tools::{FetchUrlTool, WebSearchTool, web_tool_registry};
 pub use workspace_tools::{WorkspaceTools, workspace_tool_registry};

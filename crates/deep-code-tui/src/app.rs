@@ -37,6 +37,23 @@ enum StreamRequest {
     Approval(ApprovalDecision),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionKind {
+    Slash,
+    File,
+}
+
+/// Inline completion menu state: `/` commands or `@` workspace files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompletionMenu {
+    pub(crate) kind: CompletionKind,
+    /// (completion value, hint)
+    pub(crate) items: Vec<(String, String)>,
+    pub(crate) selected: usize,
+}
+
+const COMPLETION_MENU_ITEMS: usize = 8;
+
 type UiUpdateReceiver = mpsc::UnboundedReceiver<UiUpdate>;
 
 pub struct App {
@@ -65,6 +82,8 @@ pub struct App {
     pub(crate) prompt_history: Vec<String>,
     history_cursor: Option<usize>,
     history_draft: String,
+    pub(crate) completion: Option<CompletionMenu>,
+    pub(crate) workspace_files: Vec<String>,
 }
 
 const PROMPT_HISTORY_CAP: usize = 100;
@@ -73,6 +92,7 @@ impl App {
     #[must_use]
     pub fn launch(config: LaunchConfig) -> Self {
         let workspace = workspace_root();
+        let workspace_files = deep_code_agent::list_workspace_files(&workspace, 2000);
         let loaded = AgentConfig::load(&workspace);
         let config_warnings = loaded.report.warnings.clone();
         let agent_config = loaded.config;
@@ -155,6 +175,8 @@ impl App {
             prompt_history: Vec::new(),
             history_cursor: None,
             history_draft: String::new(),
+            completion: None,
+            workspace_files,
         }
     }
 
@@ -167,6 +189,7 @@ impl App {
         if !self.is_streaming {
             self.input.push(value);
             self.history_cursor = None;
+            self.refresh_completion();
         }
     }
 
@@ -174,6 +197,7 @@ impl App {
         if !self.is_streaming {
             self.input.pop();
             self.history_cursor = None;
+            self.refresh_completion();
         }
     }
 
@@ -182,6 +206,122 @@ impl App {
         if !self.is_streaming {
             self.input.push('\n');
             self.history_cursor = None;
+            self.refresh_completion();
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn completion_open(&self) -> bool {
+        self.completion.is_some()
+    }
+
+    pub(crate) fn close_completion(&mut self) {
+        self.completion = None;
+    }
+
+    /// Recompute the menu from the current input: `/command` prefix while no
+    /// whitespace was typed, or a trailing `@file` token.
+    fn refresh_completion(&mut self) {
+        self.completion = self.compute_completion();
+    }
+
+    fn compute_completion(&self) -> Option<CompletionMenu> {
+        if let Some(rest) = self.input.strip_prefix('/') {
+            if self.input.contains(char::is_whitespace) {
+                return None;
+            }
+            let filter = rest.to_lowercase();
+            let items: Vec<(String, String)> = crate::commands::SLASH_COMMANDS
+                .iter()
+                .filter(|(name, _, _)| name[1..].starts_with(&filter))
+                .map(|(name, hint, takes_arg)| {
+                    let value = if *takes_arg {
+                        format!("{name} ")
+                    } else {
+                        (*name).to_string()
+                    };
+                    (value, (*hint).to_string())
+                })
+                .collect();
+            return (!items.is_empty()).then_some(CompletionMenu {
+                kind: CompletionKind::Slash,
+                items,
+                selected: 0,
+            });
+        }
+
+        let token_start = self.trailing_token_start();
+        let token = &self.input[token_start..];
+        let filter = token.strip_prefix('@')?;
+        let filter_lower = filter.to_lowercase();
+        let mut matched: Vec<&String> = self
+            .workspace_files
+            .iter()
+            .filter(|file| file.to_lowercase().contains(&filter_lower))
+            .collect();
+        matched.sort_by_key(|file| {
+            (
+                !file.to_lowercase().starts_with(&filter_lower),
+                file.len(),
+                (*file).clone(),
+            )
+        });
+        let items: Vec<(String, String)> = matched
+            .into_iter()
+            .take(COMPLETION_MENU_ITEMS)
+            .map(|file| (file.clone(), String::new()))
+            .collect();
+        (!items.is_empty()).then_some(CompletionMenu {
+            kind: CompletionKind::File,
+            items,
+            selected: 0,
+        })
+    }
+
+    /// Byte index where the trailing whitespace-delimited token begins.
+    fn trailing_token_start(&self) -> usize {
+        self.input
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map_or(0, |(index, ch)| index + ch.len_utf8())
+    }
+
+    pub(crate) fn completion_up(&mut self) {
+        if let Some(menu) = self.completion.as_mut() {
+            let len = menu.items.len();
+            menu.selected = (menu.selected + len - 1) % len;
+        }
+    }
+
+    pub(crate) fn completion_down(&mut self) {
+        if let Some(menu) = self.completion.as_mut() {
+            menu.selected = (menu.selected + 1) % menu.items.len();
+        }
+    }
+
+    /// Apply the selected completion to the input. Returns true when the
+    /// completed value is a ready-to-run slash command (no argument), so the
+    /// caller can submit immediately on Enter.
+    pub(crate) fn accept_completion(&mut self) -> bool {
+        let Some(menu) = self.completion.take() else {
+            return false;
+        };
+        let Some((value, _)) = menu.items.get(menu.selected) else {
+            return false;
+        };
+        match menu.kind {
+            CompletionKind::Slash => {
+                self.input = value.clone();
+                !value.ends_with(' ')
+            }
+            CompletionKind::File => {
+                let token_start = self.trailing_token_start();
+                self.input.truncate(token_start);
+                self.input.push_str(value);
+                self.input.push(' ');
+                false
+            }
         }
     }
 
@@ -243,6 +383,7 @@ impl App {
         if self.is_streaming || self.pending_approval.is_some() {
             return;
         }
+        self.close_completion();
 
         let prompt = self.input.trim().to_string();
         if prompt.is_empty() {
@@ -269,10 +410,13 @@ impl App {
         self.start_stream(StreamRequest::User(prompt));
     }
 
-    /// Esc cancel stack: deny approval (handled by the approval branch in
-    /// `ui::handle_key`) > cancel the streaming turn > clear input > quit.
+    /// Esc cancel stack: close completion menu > deny approval (handled by
+    /// the approval branch in `ui::handle_key`) > cancel the streaming turn
+    /// > clear input > quit.
     pub fn handle_escape(&mut self) {
-        if self.is_streaming {
+        if self.completion_open() {
+            self.close_completion();
+        } else if self.is_streaming {
             self.cancel_streaming_turn();
         } else if !self.input.is_empty() {
             self.input.clear();
@@ -790,6 +934,84 @@ mod tests {
         assert_eq!(app.prompt_history.len(), 100);
         assert_eq!(app.prompt_history[0], "prompt-50");
         assert_eq!(app.prompt_history[99], "prompt-149");
+    }
+
+    #[test]
+    fn slash_menu_filters_navigates_and_completes() {
+        let mut app = App::new();
+        app.push_char('/');
+        assert!(app.completion_open(), "typing '/' opens the command menu");
+        app.push_char('h');
+        app.push_char('e');
+        let menu = app.completion.as_ref().expect("menu open");
+        assert_eq!(menu.kind, CompletionKind::Slash);
+        assert_eq!(menu.items.len(), 1);
+        assert_eq!(menu.items[0].0, "/help");
+
+        let ready = app.accept_completion();
+        assert!(ready, "argless command is ready to run");
+        assert_eq!(app.input, "/help");
+        assert!(!app.completion_open());
+
+        // Argument-taking command completes with a trailing space, not ready.
+        app.input.clear();
+        app.push_char('/');
+        app.push_char('r');
+        app.push_char('e');
+        let ready = app.accept_completion();
+        assert!(!ready);
+        assert_eq!(app.input, "/restore ");
+
+        // After a space the slash menu stays closed.
+        app.push_char('x');
+        assert!(!app.completion_open());
+    }
+
+    #[test]
+    fn file_menu_completes_trailing_at_token() {
+        let mut app = App::new();
+        app.workspace_files = vec![
+            "Cargo.toml".to_string(),
+            "src/main.rs".to_string(),
+            "src/markdown.rs".to_string(),
+        ];
+        for ch in "see @ma".chars() {
+            app.push_char(ch);
+        }
+        let menu = app.completion.as_ref().expect("file menu open");
+        assert_eq!(menu.kind, CompletionKind::File);
+        assert!(menu.items.iter().any(|(value, _)| value == "src/main.rs"));
+
+        app.completion_down();
+        app.completion_up();
+        let ready = app.accept_completion();
+        assert!(!ready);
+        assert!(app.input.starts_with("see src/ma"), "input: {}", app.input);
+        assert!(app.input.ends_with(' '));
+        assert!(!app.input.contains('@'), "@ marker is stripped");
+
+        // An email-like token does not start with '@' → no menu.
+        app.input.clear();
+        for ch in "mail a@b".chars() {
+            app.push_char(ch);
+        }
+        assert!(!app.completion_open());
+    }
+
+    #[test]
+    fn escape_closes_completion_before_clearing_input() {
+        let mut app = App::new();
+        app.push_char('/');
+        app.push_char('h');
+        assert!(app.completion_open());
+
+        app.handle_escape();
+        assert!(!app.completion_open(), "first Esc closes the menu");
+        assert_eq!(app.input, "/h", "input preserved");
+
+        app.handle_escape();
+        assert!(app.input.is_empty(), "second Esc clears input");
+        assert!(!app.should_quit);
     }
 
     #[tokio::test]
