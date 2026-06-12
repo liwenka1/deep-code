@@ -156,18 +156,24 @@ fn render(frame: &mut Frame<'_>, app: &App) {
 fn render_messages(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
     let mut items = Vec::new();
     let history_len = app.history.len();
-    let mut cells = app.history.clone();
-    if let Some(active) = &app.active_turn {
-        cells.extend(active.preview_cells());
-    }
+    // Borrow history and chain the (small) active preview instead of deep
+    // cloning the whole transcript every frame.
+    let preview = app
+        .active_turn
+        .as_ref()
+        .map(|active| active.preview_cells())
+        .unwrap_or_default();
+    let total = history_len + preview.len();
     let content_width = area.width.saturating_sub(2).max(8);
     let visible_messages = usize::from(area.height.saturating_sub(2)).saturating_div(3);
     let visible_messages = visible_messages.max(1);
-    let bottom_skip = cells.len().saturating_sub(visible_messages);
+    let bottom_skip = total.saturating_sub(visible_messages);
     let skip_count = bottom_skip.saturating_sub(app.scroll_offset);
 
-    for (index, cell) in cells
+    for (index, cell) in app
+        .history
         .iter()
+        .chain(preview.iter())
         .enumerate()
         .skip(skip_count)
         .take(visible_messages)

@@ -192,7 +192,7 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
         match message.role {
             Role::User => {
                 if !current_turn.is_empty() {
-                    cells.extend(current_turn.drain(..));
+                    cells.append(&mut current_turn);
                     append_turn_checkpoints(&mut cells, record, turn_index);
                     turn_index += 1;
                 }

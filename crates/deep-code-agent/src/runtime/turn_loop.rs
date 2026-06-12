@@ -37,13 +37,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
 
         loop {
             if cancel.is_cancelled() {
-                self.finish_turn(None).await;
-                emit(
-                    tx,
-                    RuntimeEvent::TurnCancelled {
-                        turn_id: turn_id.clone(),
-                    },
-                );
+                self.finish_turn_cancelled(&turn_id, tx).await;
                 return;
             }
             let (messages, prefix_hash) = {
@@ -68,13 +62,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             };
             let mut stream = match opened {
                 None => {
-                    self.finish_turn(None).await;
-                    emit(
-                        tx,
-                        RuntimeEvent::TurnCancelled {
-                            turn_id: turn_id.clone(),
-                        },
-                    );
+                    self.finish_turn_cancelled(&turn_id, tx).await;
                     return;
                 }
                 Some(Ok(stream)) => stream,
@@ -207,18 +195,21 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                         Vec::new(),
                     ));
                 }
-                self.persist().await;
-                self.finish_turn(None).await;
-                emit(
-                    tx,
-                    RuntimeEvent::TurnCancelled {
-                        turn_id: turn_id.clone(),
-                    },
-                );
+                self.finish_turn_cancelled(&turn_id, tx).await;
                 return;
             }
 
             if had_error {
+                // Same semantics as cancellation: streamed partial output is
+                // kept (no tool_calls were pushed, so pairing is intact).
+                if !text_buffer.is_empty() || !reasoning_buffer.is_empty() {
+                    let mut state = self.state.lock().await;
+                    state.session.push(Message::assistant_turn(
+                        text_buffer,
+                        reasoning_buffer,
+                        Vec::new(),
+                    ));
+                }
                 self.abort_turn().await;
                 return;
             }

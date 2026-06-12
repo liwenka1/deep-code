@@ -28,8 +28,13 @@ pub struct LaunchConfig {
 /// Updates pushed from the bridge task into the UI thread.
 #[derive(Debug, Clone, PartialEq)]
 enum UiUpdate {
-    Event(RuntimeEvent),
+    Event(Box<RuntimeEvent>),
     StreamFinished,
+}
+
+enum StreamRequest {
+    User(String),
+    Approval(ApprovalDecision),
 }
 
 type UiUpdateReceiver = mpsc::UnboundedReceiver<UiUpdate>;
@@ -396,7 +401,7 @@ impl App {
             };
 
             while let Some(event) = events.recv().await {
-                if tx.send(UiUpdate::Event(event.clone())).is_err() {
+                if tx.send(UiUpdate::Event(Box::new(event.clone()))).is_err() {
                     return;
                 }
                 if matches!(
@@ -416,7 +421,7 @@ impl App {
 
     fn apply_ui_update(&mut self, update: UiUpdate) {
         match update {
-            UiUpdate::Event(event) => self.apply_runtime_event(event),
+            UiUpdate::Event(event) => self.apply_runtime_event(*event),
             UiUpdate::StreamFinished => {
                 self.is_streaming = false;
                 self.ui_rx = None;
@@ -425,6 +430,10 @@ impl App {
     }
 
     pub(crate) fn record_error(&mut self, message: String) {
+        // Keep any streamed partial content visible: flush the active turn
+        // into history before appending the error cell, otherwise the next
+        // TurnStarted would silently discard it.
+        self.flush_active_turn();
         self.error = Some(message.clone());
         self.status = "Agent error.".to_string();
         self.history
@@ -804,6 +813,40 @@ mod tests {
     }
 
     #[test]
+    fn error_event_flushes_partial_assistant_before_error_cell() {
+        let mut app = App::new();
+        let turn_id = deep_code_agent::TurnId("turn_1".to_string());
+        app.apply_runtime_event(RuntimeEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            prompt: "hi".to_string(),
+        });
+        app.apply_runtime_event(RuntimeEvent::AssistantDelta {
+            turn_id: turn_id.clone(),
+            text: "partial".to_string(),
+        });
+
+        app.apply_runtime_event(RuntimeEvent::Error {
+            turn_id: Some(turn_id),
+            message: "boom".to_string(),
+        });
+
+        assert!(app.active_turn.is_none(), "active turn flushed on error");
+        let assistant_index = app
+            .history
+            .iter()
+            .position(|cell| matches!(cell, HistoryCell::Assistant { text } if text == "partial"))
+            .expect("partial assistant kept in history");
+        let error_index = app
+            .history
+            .iter()
+            .position(
+                |cell| matches!(cell, HistoryCell::System { text } if text.contains("boom")),
+            )
+            .expect("error cell");
+        assert!(assistant_index < error_index);
+    }
+
+    #[test]
     fn turn_cancelled_event_flushes_active_turn_and_resets_state() {
         let mut app = App::new();
         let turn_id = deep_code_agent::TurnId("turn_1".to_string());
@@ -1043,9 +1086,4 @@ mod tests {
             Some(HistoryCell::Assistant { text }) if text == "hello"
         ));
     }
-}
-
-enum StreamRequest {
-    User(String),
-    Approval(ApprovalDecision),
 }

@@ -258,7 +258,7 @@ impl App {
         }
     }
 
-    fn flush_active_turn(&mut self) {
+    pub(crate) fn flush_active_turn(&mut self) {
         let Some(active) = self.active_turn.take() else {
             return;
         };

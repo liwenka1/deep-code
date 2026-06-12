@@ -486,11 +486,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_uses_deepseek_defaults() {
-        let config = AgentConfig {
-            api_key: None,
-            ..AgentConfig::default()
-        };
+    fn builtin_config_uses_deepseek_defaults() {
+        // builtin() (not default()) so developer env vars cannot flake this.
+        let config = AgentConfig::builtin();
 
         assert_eq!(config.base_url, DEFAULT_DEEPSEEK_BASE_URL);
         assert_eq!(config.model, DEEPSEEK_V4_PRO);
@@ -503,10 +501,7 @@ mod tests {
 
     #[test]
     fn require_api_key_rejects_missing_key() {
-        let config = AgentConfig {
-            api_key: None,
-            ..AgentConfig::default()
-        };
+        let config = AgentConfig::builtin();
 
         assert!(matches!(
             config.require_api_key(),
@@ -518,12 +513,12 @@ mod tests {
     fn auto_model_flag() {
         let config = AgentConfig {
             model: AUTO_MODEL.to_string(),
-            ..AgentConfig::default()
+            ..AgentConfig::builtin()
         };
         assert!(config.auto_model_enabled());
         let fixed = AgentConfig {
             model: DEEPSEEK_V4_PRO.to_string(),
-            ..AgentConfig::default()
+            ..AgentConfig::builtin()
         };
         assert!(!fixed.auto_model_enabled());
     }

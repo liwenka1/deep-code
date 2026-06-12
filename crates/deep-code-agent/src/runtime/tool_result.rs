@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -27,12 +28,40 @@ pub(super) enum BatchOutcome {
 }
 
 impl<C: LlmClient + 'static> AgentRuntime<C> {
+    /// Execute one tool call on the blocking pool so a long-running tool does
+    /// not stall the async runtime (cancellation still lands at call
+    /// boundaries: the tool itself runs to completion to keep its recorded
+    /// result paired with the assistant tool_call).
+    async fn run_tool_blocking(
+        &self,
+        call: ToolCall,
+        decision: Option<ApprovalDecision>,
+    ) -> Result<ToolRunOutcome, ToolError> {
+        let tools = Arc::clone(&self.tools);
+        let name = call.name.clone();
+        match tokio::task::spawn_blocking(move || tools.run_tool_call(call, decision)).await {
+            Ok(outcome) => outcome,
+            Err(join_error) => Err(ToolError::ExecutionFailed {
+                name,
+                message: format!("tool execution task failed: {join_error}"),
+            }),
+        }
+    }
+
+    /// Persist the session and announce the authoritative transcript change.
+    /// Called once per batch boundary instead of once per tool call.
+    async fn flush_session_update(&self, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
+        self.persist().await;
+        self.emit_session_updated(tx).await;
+    }
+
     /// Run the queued tool calls of one assistant turn in order.
     ///
     /// Every call ends with a recorded tool result message — including policy
     /// denials and execution errors — so each `tool_call` in the assistant
     /// message keeps its paired tool message (provider requirement). The only
     /// early exit is an approval request, which parks the rest of the batch.
+    /// Persistence and `SessionUpdated` are flushed once per batch outcome.
     pub(super) async fn process_tool_batch(
         &self,
         mut remaining: VecDeque<ToolCall>,
@@ -41,14 +70,14 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) -> BatchOutcome {
         while let Some(call) = remaining.pop_front() {
-            // Sync tool execution cannot be interrupted; cancellation takes
-            // effect at call boundaries.
+            // Cancellation takes effect at call boundaries; the in-flight
+            // tool (if any) completed on the blocking pool.
             if cancel.is_cancelled() {
                 remaining.push_front(call);
                 self.finish_cancelled_calls(remaining, turn_id, tx).await;
                 return BatchOutcome::Cancelled;
             }
-            match self.tools.run_tool_call(call.clone(), None) {
+            match self.run_tool_blocking(call.clone(), None).await {
                 Ok(ToolRunOutcome::Result { result }) => {
                     self.record_tool_result(&call, result, tx, turn_id.clone())
                         .await;
@@ -62,6 +91,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                             turn_id: turn_id.clone(),
                         });
                     }
+                    self.flush_session_update(tx).await;
                     emit(
                         tx,
                         RuntimeEvent::ApprovalRequired {
@@ -79,6 +109,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 }
             }
         }
+        self.flush_session_update(tx).await;
         BatchOutcome::Completed
     }
 
@@ -112,6 +143,18 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             self.record_tool_result(&call, result, tx, turn_id.clone())
                 .await;
         }
+        self.flush_session_update(tx).await;
+        self.finish_turn_cancelled(turn_id, tx).await;
+    }
+
+    /// The single cancellation epilogue: close the turn (persisting it) and
+    /// emit the terminal `TurnCancelled` event. Every cancel path funnels
+    /// through here so the ordering can never drift between call sites.
+    pub(super) async fn finish_turn_cancelled(
+        &self,
+        turn_id: &TurnId,
+        tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
         self.finish_turn(None).await;
         emit(
             tx,
@@ -139,7 +182,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             self.finish_cancelled_calls(calls, &turn_id, tx).await;
             return;
         }
-        match self.tools.run_tool_call(current.clone(), Some(decision)) {
+        match self.run_tool_blocking(current.clone(), Some(decision)).await {
             Ok(ToolRunOutcome::Result { result }) => {
                 self.record_tool_result(&current, result, tx, turn_id.clone())
                     .await;
@@ -211,8 +254,8 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 turn.tool_results.push(result.clone());
             }
         }
-        self.persist().await;
-        self.emit_session_updated(tx).await;
+        // Persistence and SessionUpdated are flushed once per batch boundary
+        // (see process_tool_batch / finish_cancelled_calls), not per call.
         emit(
             tx,
             RuntimeEvent::ToolCallFinished {

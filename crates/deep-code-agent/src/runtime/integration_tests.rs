@@ -537,7 +537,7 @@ async fn persistent_runtime_records_checkpoint_metadata() {
         ToolRegistry::default(),
         "system",
         workspace.path(),
-        &crate::config::AgentConfig::default(),
+        &crate::config::AgentConfig::builtin(),
     )
     .unwrap()
     .with_checkpoints(workspace.path());
@@ -684,7 +684,7 @@ async fn persistence_saves_messages_and_turns() {
         ToolRegistry::default(),
         "system",
         workspace.path(),
-        &crate::config::AgentConfig::default(),
+        &crate::config::AgentConfig::builtin(),
     )
     .unwrap();
 
@@ -717,7 +717,7 @@ async fn persistence_saves_reasoning_content() {
         ToolRegistry::default(),
         "system",
         workspace.path(),
-        &crate::config::AgentConfig::default(),
+        &crate::config::AgentConfig::builtin(),
     )
     .unwrap();
 
@@ -754,7 +754,7 @@ async fn session_updated_reports_authoritative_metadata() {
         ToolRegistry::default(),
         "system",
         workspace.path(),
-        &crate::config::AgentConfig::default(),
+        &crate::config::AgentConfig::builtin(),
     )
     .unwrap();
     let session_id = runtime.session_id().await.expect("session id");
@@ -785,7 +785,7 @@ async fn stream_error_finalizes_open_turn() {
         ToolRegistry::default(),
         "system",
         workspace.path(),
-        &crate::config::AgentConfig::default(),
+        &crate::config::AgentConfig::builtin(),
     )
     .unwrap();
 
@@ -823,7 +823,7 @@ async fn persistence_saves_tool_results_in_turn() {
         ToolRegistry::with_mock_tools(),
         "system",
         workspace.path(),
-        &crate::config::AgentConfig::default(),
+        &crate::config::AgentConfig::builtin(),
     )
     .unwrap();
 
@@ -868,7 +868,7 @@ async fn resumed_runtime_continues_conversation() {
         ToolRegistry::default(),
         "system",
         workspace.path(),
-        &crate::config::AgentConfig::default(),
+        &crate::config::AgentConfig::builtin(),
     )
     .unwrap();
 
@@ -891,7 +891,7 @@ async fn resumed_runtime_continues_conversation() {
         ToolRegistry::default(),
         record,
         store,
-        AgentConfig::default(),
+        AgentConfig::builtin(),
     );
     let mut rx = resumed.submit_user("second").await;
     drain(&mut rx).await;
@@ -969,7 +969,7 @@ async fn auto_pro_retries_with_flash_after_retriable_api_error() {
     let client = FallbackTestClient::new();
     let config = AgentConfig {
         model: AUTO_MODEL.to_string(),
-        ..AgentConfig::default()
+        ..AgentConfig::builtin()
     };
     let runtime = AgentRuntime::with_system_prompt(
         client.clone(),
@@ -1039,7 +1039,7 @@ async fn unauthorized_api_error_does_not_fallback() {
     };
     let config = AgentConfig {
         model: AUTO_MODEL.to_string(),
-        ..AgentConfig::default()
+        ..AgentConfig::builtin()
     };
     let runtime = AgentRuntime::with_system_prompt(
         client.clone(),
@@ -1084,7 +1084,7 @@ async fn multi_tool_turn_executes_all_auto_calls_in_order_and_persists() {
         registry_with_auto_and_mock(),
         "system",
         workspace.path(),
-        &crate::config::AgentConfig::default(),
+        &crate::config::AgentConfig::builtin(),
     )
     .unwrap();
     let session_id = runtime.session_id().await.expect("session id");
@@ -1098,6 +1098,22 @@ async fn multi_tool_turn_executes_all_auto_calls_in_order_and_persists() {
         events.last(),
         Some(RuntimeEvent::TurnFinished { .. })
     ));
+
+    // Persistence announcements are batched: no SessionUpdated may appear
+    // between the two ToolCallFinished events of one batch.
+    let finished_positions = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            matches!(event, RuntimeEvent::ToolCallFinished { .. }).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        events[finished_positions[0]..finished_positions[1]]
+            .iter()
+            .all(|event| !matches!(event, RuntimeEvent::SessionUpdated { .. })),
+        "per-call SessionUpdated noise inside a batch"
+    );
 
     let messages = runtime.session_messages().await;
     // system, user, assistant(2 tool_calls), tool(call_1), tool(call_2), assistant("done")
@@ -1560,7 +1576,7 @@ async fn stalled_stream_times_out_with_chinese_error() {
     let client = AttemptScriptClient::new(vec![AttemptBehavior::Hang]);
     let config = AgentConfig {
         stream_chunk_timeout: std::time::Duration::from_secs(5),
-        ..AgentConfig::default()
+        ..AgentConfig::builtin()
     };
     let runtime =
         AgentRuntime::with_system_prompt(client, ToolRegistry::default(), "system", config, false);
@@ -1580,7 +1596,7 @@ async fn oversized_stream_is_cut_off() {
         AttemptScriptClient::new(vec![AttemptBehavior::Text("x".repeat(64))]);
     let config = AgentConfig {
         stream_max_bytes: 10,
-        ..AgentConfig::default()
+        ..AgentConfig::builtin()
     };
     let runtime =
         AgentRuntime::with_system_prompt(client, ToolRegistry::default(), "system", config, false);
@@ -1633,7 +1649,7 @@ async fn open_retry_runs_after_fallback_exhausted_and_is_counted() {
     ]);
     let config = AgentConfig {
         model: AUTO_MODEL.to_string(),
-        ..AgentConfig::default()
+        ..AgentConfig::builtin()
     };
     let runtime = AgentRuntime::with_system_prompt(
         client.clone(),
@@ -1663,6 +1679,33 @@ async fn open_retry_runs_after_fallback_exhausted_and_is_counted() {
         runtime.session_messages().await.last().unwrap().content,
         "recovered"
     );
+}
+
+#[tokio::test]
+async fn stream_error_keeps_partial_assistant_text() {
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::TextDelta {
+            text: "partial answer".to_string(),
+        },
+        AgentEvent::Error {
+            message: "boom".to_string(),
+        },
+    ]]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::default());
+
+    let mut rx = runtime.submit_user("hi").await;
+    let events = drain(&mut rx).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Error { .. }))
+    );
+    let messages = runtime.session_messages().await;
+    // Same semantics as cancellation: the streamed partial text survives.
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[1].content, "partial answer");
+    assert!(messages[1].tool_calls.is_empty());
 }
 
 #[tokio::test]
