@@ -12,6 +12,9 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str, bool)] = &[
     ("/help", "显示帮助", false),
     ("/clear", "清空可见历史", false),
     ("/status", "显示运行状态", false),
+    ("/model", "查看/切换模型 (auto|pro|flash)", true),
+    ("/apikey", "设置 DeepSeek API key 并接入", true),
+    ("/logout", "清除 API key 回离线模式", false),
     ("/checkpoints", "列出 checkpoints", false),
     ("/restore", "恢复 checkpoint <id>", true),
     ("/sessions", "列出会话", false),
@@ -47,6 +50,20 @@ impl App {
                 self.list_subagents();
                 true
             }
+            "/logout" => {
+                self.logout();
+                true
+            }
+            _ if prompt == "/model" || prompt.starts_with("/model ") => {
+                let arg = prompt.strip_prefix("/model").unwrap_or_default().trim();
+                self.set_model(arg);
+                true
+            }
+            _ if prompt == "/apikey" || prompt.starts_with("/apikey ") => {
+                let arg = prompt.strip_prefix("/apikey").unwrap_or_default().trim();
+                self.set_api_key(arg);
+                true
+            }
             _ if prompt.starts_with("/restore ") => {
                 let id = prompt.trim_start_matches("/restore ").trim();
                 if id.is_empty() {
@@ -60,9 +77,93 @@ impl App {
         }
     }
 
+    fn set_api_key(&mut self, arg: &str) {
+        if let Err(message) = deep_code_agent::validate_api_key(arg) {
+            self.status = message;
+            return;
+        }
+        let update =
+            deep_code_agent::GlobalConfigUpdate::ApiKey(Some(arg.trim().to_string()));
+        match deep_code_agent::write_global_config_update(&self.global_config_path, &update) {
+            Ok(path) => match self.relaunch_runtime() {
+                Ok(()) => {
+                    self.history.push(HistoryCell::system(format!(
+                        "API key 已保存至 {}（权限 600）。当前后端: {}",
+                        path.display(),
+                        self.backend_label
+                    )));
+                    self.status = format!("已接入 - {}", self.backend_label);
+                }
+                Err(message) => self.status = message,
+            },
+            Err(message) => self.status = message,
+        }
+    }
+
+    fn set_model(&mut self, arg: &str) {
+        let registry = deep_code_agent::ModelRegistry::default();
+        let available = || {
+            let mut ids: Vec<String> =
+                registry.list().iter().map(|model| model.id.clone()).collect();
+            ids.push("auto".to_string());
+            ids.join(", ")
+        };
+        if arg.is_empty() {
+            self.history.push(HistoryCell::system(format!(
+                "当前模型: {}\n用法: /model <auto|pro|flash|完整 id>\n可用: {}",
+                self.configured_model,
+                available()
+            )));
+            self.status = "Model info displayed.".to_string();
+            return;
+        }
+        let resolved = match arg.to_ascii_lowercase().as_str() {
+            "auto" => "auto".to_string(),
+            "pro" => deep_code_agent::DEEPSEEK_V4_PRO.to_string(),
+            "flash" => deep_code_agent::DEEPSEEK_V4_FLASH.to_string(),
+            _ => match registry.info_for(arg) {
+                Some(info) => info.id.clone(),
+                None => {
+                    self.status = format!("未知模型 '{arg}'。可用: {}", available());
+                    return;
+                }
+            },
+        };
+        let update = deep_code_agent::GlobalConfigUpdate::Model(resolved.clone());
+        match deep_code_agent::write_global_config_update(&self.global_config_path, &update) {
+            Ok(_) => match self.relaunch_runtime() {
+                Ok(()) => {
+                    self.history.push(HistoryCell::system(format!(
+                        "模型已切换为 {resolved}（已写入全局配置）。当前后端: {}",
+                        self.backend_label
+                    )));
+                    self.status = format!("model = {resolved} - {}", self.backend_label);
+                }
+                Err(message) => self.status = message,
+            },
+            Err(message) => self.status = message,
+        }
+    }
+
+    fn logout(&mut self) {
+        let update = deep_code_agent::GlobalConfigUpdate::ApiKey(None);
+        match deep_code_agent::write_global_config_update(&self.global_config_path, &update) {
+            Ok(_) => match self.relaunch_runtime() {
+                Ok(()) => {
+                    self.history.push(HistoryCell::system(
+                        "已清除 API key，回到离线模式。/apikey sk-xxx 可重新接入。".to_string(),
+                    ));
+                    self.status = format!("已登出 - {}", self.backend_label);
+                }
+                Err(message) => self.status = message,
+            },
+            Err(message) => self.status = message,
+        }
+    }
+
     fn show_help(&mut self) {
         self.history.push(HistoryCell::system(
-            "Commands:\n/help - show this help\n/clear - clear visible history\n/status - show runtime status\n/checkpoints - list checkpoints\n/restore <id> - restore checkpoint\n/sessions - list sessions\n/agents - list sub-agents\nKeys: Enter send, Alt+Enter/Ctrl+J 换行, Ctrl+P/Ctrl+N 提示词历史, Esc 取消本轮/清空输入/退出 (审批面板中为 deny), Ctrl+C quit, PageUp/PageDown scroll, y/a/n approve/会话允许/deny.\n注意: 取消在工具边界生效，正在执行中的同步工具会先跑完；a 对 shell 类工具只做一次性批准。\n配置 [approval] auto_allow 可预先放行工具前缀（仅 env 或全局配置，项目配置无效）。",
+            "Commands:\n/help - show this help\n/clear - clear visible history\n/status - show runtime status\n/model <auto|pro|flash> - 切换模型并写入全局配置\n/apikey <sk-...> - 设置 API key 并就地接入\n/logout - 清除 API key 回离线\n/checkpoints - list checkpoints\n/restore <id> - restore checkpoint\n/sessions - list sessions\n/agents - list sub-agents\nKeys: Enter send, Alt+Enter/Ctrl+J 换行, Ctrl+P/Ctrl+N 提示词历史, Esc 取消本轮/清空输入/退出 (审批面板中为 deny), Ctrl+C quit, PageUp/PageDown scroll, y/a/n approve/会话允许/deny.\n注意: 取消在工具边界生效，正在执行中的同步工具会先跑完；a 对 shell 类工具只做一次性批准。\n配置 [approval] auto_allow 可预先放行工具前缀（仅 env 或全局配置，项目配置无效）。",
         ));
         self.status = "Help displayed.".to_string();
     }

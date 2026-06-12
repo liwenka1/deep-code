@@ -50,8 +50,8 @@ pub use compaction::{
 pub use config::{
     AUTO_COST_SAVING_ENV, AgentConfig, COMPACTION_THRESHOLD_ENV, COST_CURRENCY_ENV, ConfigLayer,
     ConfigLayerStatus, ConfigLoadReport, ConfigSources, DEEPSEEK_API_KEY_ENV,
-    DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, LoadedAgentConfig, MODEL_ENV,
-    REASONING_EFFORT_ENV,
+    DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, GlobalConfigUpdate, LoadedAgentConfig,
+    MODEL_ENV, REASONING_EFFORT_ENV, validate_api_key, write_global_config_update,
 };
 pub use doctor::{ConfigLayersDoctorReport, DoctorReport, default_config_path};
 pub use echo_client::EchoClient;

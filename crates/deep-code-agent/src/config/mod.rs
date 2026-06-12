@@ -2,6 +2,7 @@
 //! defaults live here; the layered file loading lives in [`layers`].
 
 mod layers;
+mod write;
 
 use std::env;
 use std::time::Duration;
@@ -9,6 +10,7 @@ use std::time::Duration;
 pub use layers::{
     ConfigLayer, ConfigLayerStatus, ConfigLoadReport, ConfigSources, LoadedAgentConfig,
 };
+pub use write::{GlobalConfigUpdate, validate_api_key, write_global_config_update};
 
 use crate::error::{AgentError, AgentResult};
 use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_PRO};

@@ -9,9 +9,12 @@
 
 use std::sync::Arc;
 
+use std::path::PathBuf;
+
 use deep_code_agent::{
-    AgentConfig, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest, CostCurrency, RuntimeEvent,
-    SessionRecord, SharedSubAgentManager, TurnTelemetry, format_sessions_storage_note,
+    AgentConfig, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest, CostCurrency,
+    JsonSessionStore, LaunchedRuntime, RuntimeEvent, SessionRecord, SessionStore,
+    SharedSubAgentManager, TurnTelemetry, default_config_path, format_sessions_storage_note,
     launch_runtime,
 };
 use tokio::sync::mpsc;
@@ -84,6 +87,8 @@ pub struct App {
     history_draft: String,
     pub(crate) completion: Option<CompletionMenu>,
     pub(crate) workspace_files: Vec<String>,
+    /// Target of `/apikey` `/model` `/logout` writes; overridable in tests.
+    pub(crate) global_config_path: PathBuf,
 }
 
 const PROMPT_HISTORY_CAP: usize = 100;
@@ -117,7 +122,7 @@ impl App {
             "{}\n{}\n{}\n{}\n{}",
             "Type a prompt and press Enter. Esc: 取消本轮/清空输入/退出 (按状态依次生效), Ctrl+C: 退出.",
             "Tip: in offline mode, type \"/mock-tool hello\" to exercise approval.",
-            "Slash: /checkpoints, /restore <id>, /sessions, /agents",
+            "Slash: /help, /model, /apikey, /checkpoints, /sessions, /agents",
             workspace_note,
             if resumed {
                 "Resumed previous session."
@@ -127,6 +132,12 @@ impl App {
                 "Session persistence unavailable in this workspace."
             }
         ))];
+        if backend_label.contains("offline echo") {
+            history.push(HistoryCell::system(
+                "当前为离线模式：输入 /apikey sk-xxx 即可接入 DeepSeek（获取密钥: https://platform.deepseek.com）"
+                    .to_string(),
+            ));
+        }
 
         if !config_warnings.is_empty() {
             history.push(HistoryCell::system(format!(
@@ -177,6 +188,7 @@ impl App {
             history_draft: String::new(),
             completion: None,
             workspace_files,
+            global_config_path: default_config_path(),
         }
     }
 
@@ -390,7 +402,10 @@ impl App {
             self.status = "Enter a prompt before sending.".to_string();
             return;
         }
-        self.remember_prompt(&prompt);
+        // Never let the API key into the recallable prompt history.
+        if !prompt.starts_with("/apikey") {
+            self.remember_prompt(&prompt);
+        }
 
         if prompt.starts_with('/') && self.handle_slash_command(&prompt) {
             self.input.clear();
@@ -538,6 +553,59 @@ impl App {
         self.status = format!("Tool {label}, resuming...");
         self.is_streaming = true;
         self.start_stream(StreamRequest::Approval(decision));
+    }
+
+    fn adopt_runtime(&mut self, launched: LaunchedRuntime) {
+        self.runtime = launched.handle;
+        self.backend_label = launched.backend_label;
+        self.session_id = launched.session_id;
+        self.subagent_manager = launched.subagent_manager;
+        self.subagent_shutdown = Some(launched.stop_hook);
+    }
+
+    /// Rebuild the runtime with the (re-loaded) layered config, resuming the
+    /// current persisted session so the conversation continues seamlessly.
+    /// The old runtime is shut down first so its persistence flush lands
+    /// before the session record is re-read.
+    pub(crate) fn relaunch_runtime(&mut self) -> Result<(), String> {
+        if self.is_streaming || self.pending_approval.is_some() {
+            return Err("正在流式输出或等待审批，请稍后再切换配置".to_string());
+        }
+
+        if let Some(stop) = self.subagent_shutdown.take() {
+            stop();
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let runtime = Arc::clone(&self.runtime);
+            tokio::task::block_in_place(|| handle.block_on(runtime.shutdown()));
+        }
+
+        let workspace = workspace_root();
+        let project = workspace.join(".deep-code").join("config.toml");
+        let loaded = AgentConfig::load_with(
+            Some(self.global_config_path.clone()),
+            Some(project),
+            &|name| std::env::var(name).ok(),
+        );
+        let agent_config = loaded.config;
+
+        let resume = self.session_id.as_ref().and_then(|id| {
+            let store = JsonSessionStore::for_workspace(&workspace).ok()?;
+            let session_id = deep_code_agent::SessionId::parse(id).ok()?;
+            store.load(&session_id).ok()
+        });
+        if resume.is_none() && self.session_id.is_some() {
+            return Err("无法读取当前会话记录，已取消配置切换".to_string());
+        }
+        let resumed = resume.is_some();
+
+        let launched = launch_runtime(&agent_config, workspace, resume);
+        self.cost_currency = agent_config.cost_currency;
+        self.configured_model = agent_config.model.clone();
+        self.configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
+        self.resumed = resumed;
+        self.adopt_runtime(launched);
+        Ok(())
     }
 
     fn start_stream(&mut self, request: StreamRequest) {
@@ -934,6 +1002,93 @@ mod tests {
         assert_eq!(app.prompt_history.len(), 100);
         assert_eq!(app.prompt_history[0], "prompt-50");
         assert_eq!(app.prompt_history[99], "prompt-149");
+    }
+
+    #[test]
+    fn apikey_command_validates_writes_and_stays_out_of_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        app.global_config_path = dir.path().join("config.toml");
+
+        // Invalid key: rejected, nothing written, nothing remembered.
+        app.input = "/apikey short".to_string();
+        app.submit();
+        assert!(!app.global_config_path.exists());
+        assert!(app.prompt_history.is_empty());
+        assert!(app.status.contains("API key") || app.status.contains("长度"));
+
+        // Valid key: persisted, runtime relaunched onto DeepSeek, and the
+        // key is recallable nowhere (history, prompts, status).
+        app.input = "/apikey sk-0123456789abcdef".to_string();
+        app.submit();
+        let contents = std::fs::read_to_string(&app.global_config_path).unwrap();
+        assert!(contents.contains("sk-0123456789abcdef"));
+        assert!(
+            app.prompt_history.is_empty(),
+            "key must not enter Ctrl+P history"
+        );
+        assert!(app.backend_label.contains("DeepSeek"));
+        assert!(!app.status.contains("sk-0123456789abcdef"));
+        assert!(
+            app.history
+                .iter()
+                .all(|cell| !format!("{cell:?}").contains("sk-0123456789abcdef")),
+            "key must not appear in any transcript cell"
+        );
+
+        // Ordinary slash commands ARE remembered (contrast).
+        app.input = "/help".to_string();
+        app.submit();
+        assert_eq!(app.prompt_history, vec!["/help".to_string()]);
+    }
+
+    #[test]
+    fn model_command_resolves_aliases_persists_and_keeps_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        app.global_config_path = dir.path().join("config.toml");
+        let original_session = app.session_id.clone();
+        assert!(original_session.is_some(), "test relies on persisted session");
+
+        assert!(app.handle_slash_command("/model flash"));
+        assert_eq!(app.configured_model, deep_code_agent::DEEPSEEK_V4_FLASH);
+        let contents = std::fs::read_to_string(&app.global_config_path).unwrap();
+        assert!(contents.contains("deepseek-v4-flash"));
+        assert_eq!(
+            app.session_id, original_session,
+            "config switch must resume the same session"
+        );
+
+        assert!(app.handle_slash_command("/model nope"));
+        assert!(app.status.contains("未知模型"));
+        assert!(app.status.contains("auto"));
+
+        assert!(app.handle_slash_command("/model"));
+        assert!(matches!(
+            app.history.last(),
+            Some(HistoryCell::System { text }) if text.contains("用法")
+        ));
+    }
+
+    #[test]
+    fn logout_removes_key_from_global_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        app.global_config_path = dir.path().join("config.toml");
+
+        assert!(app.handle_slash_command("/apikey sk-0123456789abcdef"));
+        assert!(
+            std::fs::read_to_string(&app.global_config_path)
+                .unwrap()
+                .contains("api_key")
+        );
+
+        assert!(app.handle_slash_command("/logout"));
+        assert!(
+            !std::fs::read_to_string(&app.global_config_path)
+                .unwrap()
+                .contains("api_key")
+        );
     }
 
     #[test]
