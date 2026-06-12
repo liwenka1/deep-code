@@ -50,7 +50,7 @@ impl App {
 
     fn show_help(&mut self) {
         self.history.push(HistoryCell::system(
-            "Commands:\n/help - show this help\n/clear - clear visible history\n/status - show runtime status\n/checkpoints - list checkpoints\n/restore <id> - restore checkpoint\n/sessions - list sessions\n/agents - list sub-agents\nKeys: Enter send, Alt+Enter/Ctrl+J 换行, Ctrl+P/Ctrl+N 提示词历史, Esc 取消本轮/清空输入/退出 (审批面板中为 deny), Ctrl+C quit, PageUp/PageDown scroll, y/n approve/deny.\n注意: 取消在工具边界生效，正在执行中的同步工具会先跑完。",
+            "Commands:\n/help - show this help\n/clear - clear visible history\n/status - show runtime status\n/checkpoints - list checkpoints\n/restore <id> - restore checkpoint\n/sessions - list sessions\n/agents - list sub-agents\nKeys: Enter send, Alt+Enter/Ctrl+J 换行, Ctrl+P/Ctrl+N 提示词历史, Esc 取消本轮/清空输入/退出 (审批面板中为 deny), Ctrl+C quit, PageUp/PageDown scroll, y/a/n approve/会话允许/deny.\n注意: 取消在工具边界生效，正在执行中的同步工具会先跑完；a 对 shell 类工具只做一次性批准。\n配置 [approval] auto_allow 可预先放行工具前缀（仅 env 或全局配置，项目配置无效）。",
         ));
         self.status = "Help displayed.".to_string();
     }

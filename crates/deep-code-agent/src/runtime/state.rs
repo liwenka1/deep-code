@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -25,6 +25,9 @@ pub(super) struct RuntimeState {
     pub(super) current_turn_id: Option<TurnId>,
     /// Cancellation token for the in-flight turn; rotated by `begin_turn`.
     pub(super) cancel: CancellationToken,
+    /// Tools the user approved for the whole session ("a" in the approval
+    /// panel). In-memory only: forgotten when the runtime shuts down.
+    pub(super) session_approved: HashSet<String>,
 }
 
 pub(super) struct Persistence {

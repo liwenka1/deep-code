@@ -17,6 +17,16 @@ use crate::tool::{
 
 pub(super) const CANCELLED_TOOL_RESULT: &str = "用户取消了本轮，该工具调用未执行 (cancelled by user)";
 
+/// Whether "approve for the whole session" may be recorded for a tool.
+/// Shell-class tools are excluded: their risk lives in the per-call
+/// arguments, so a blanket session consent would be misleading.
+pub(super) fn session_allowable(tool_name: &str) -> bool {
+    !matches!(
+        crate::execution_policy::ExecPolicy::classify_tool(tool_name),
+        crate::execution_policy::ToolKind::Shell
+    )
+}
+
 /// How a tool-call batch ended: every call has a recorded result, the batch
 /// is parked in `RuntimeState::pending` waiting for an approval, or the user
 /// cancelled and the remaining calls received synthesized results.
@@ -55,6 +65,26 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         self.emit_session_updated(tx).await;
     }
 
+    /// Whether a gated call may run without asking: the user session-allowed
+    /// the tool earlier, or a configured `auto_allow` prefix matches. Policy
+    /// hard-denials are unaffected (they short-circuit inside the registry
+    /// before any decision is consulted).
+    async fn auto_approval_granted(&self, tool_name: &str) -> bool {
+        if self
+            .config
+            .approval_auto_allow
+            .iter()
+            .any(|prefix| !prefix.is_empty() && tool_name.starts_with(prefix))
+        {
+            return true;
+        }
+        self.state
+            .lock()
+            .await
+            .session_approved
+            .contains(tool_name)
+    }
+
     /// Run the queued tool calls of one assistant turn in order.
     ///
     /// Every call ends with a recorded tool result message — including policy
@@ -83,6 +113,32 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                         .await;
                 }
                 Ok(ToolRunOutcome::ApprovalRequired { request }) => {
+                    if self.auto_approval_granted(&call.name).await {
+                        // Audit trail: the gate fired but a standing consent
+                        // (session "a" or config auto_allow) resolved it.
+                        emit(
+                            tx,
+                            RuntimeEvent::ApprovalResolved {
+                                turn_id: Some(turn_id.clone()),
+                                tool_call_id: ToolCallId::from(call.id.clone()),
+                                decision: ApprovalDecision::Approved,
+                            },
+                        );
+                        let result = match self
+                            .run_tool_blocking(call.clone(), Some(ApprovalDecision::Approved))
+                            .await
+                        {
+                            Ok(ToolRunOutcome::Result { result }) => result,
+                            Ok(ToolRunOutcome::ApprovalRequired { .. }) => ToolResult::error(
+                                &call,
+                                "tool re-requested approval after auto-approve",
+                            ),
+                            Err(error) => ToolResult::error(&call, error.to_string()),
+                        };
+                        self.record_tool_result(&call, result, tx, turn_id.clone())
+                            .await;
+                        continue;
+                    }
                     {
                         let mut state = self.state.lock().await;
                         state.pending = Some(PendingToolBatch {
@@ -182,6 +238,20 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             self.finish_cancelled_calls(calls, &turn_id, tx).await;
             return;
         }
+        // "Approve for session" is recorded here and executes as a plain
+        // approve; shell-class tools only get the one-time approval.
+        let decision = if decision == ApprovalDecision::ApprovedForSession {
+            if session_allowable(&current.name) {
+                self.state
+                    .lock()
+                    .await
+                    .session_approved
+                    .insert(current.name.clone());
+            }
+            ApprovalDecision::Approved
+        } else {
+            decision
+        };
         match self.run_tool_blocking(current.clone(), Some(decision)).await {
             Ok(ToolRunOutcome::Result { result }) => {
                 self.record_tool_result(&current, result, tx, turn_id.clone())

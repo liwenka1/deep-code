@@ -300,6 +300,12 @@ impl App {
         self.resolve_pending_tool(ApprovalDecision::Approved);
     }
 
+    /// "a": approve and remember the tool for this session. The runtime
+    /// downgrades shell-class tools to a one-time approve.
+    pub fn approve_pending_tool_for_session(&mut self) {
+        self.resolve_pending_tool(ApprovalDecision::ApprovedForSession);
+    }
+
     pub fn deny_pending_tool(&mut self) {
         self.resolve_pending_tool(ApprovalDecision::Denied);
     }
@@ -381,6 +387,7 @@ impl App {
 
         let label = match decision {
             ApprovalDecision::Approved => "approved",
+            ApprovalDecision::ApprovedForSession => "approved (session)",
             ApprovalDecision::Denied => "denied",
         };
         self.approval_scroll_offset = 0;
@@ -783,6 +790,27 @@ mod tests {
         assert_eq!(app.prompt_history.len(), 100);
         assert_eq!(app.prompt_history[0], "prompt-50");
         assert_eq!(app.prompt_history[99], "prompt-149");
+    }
+
+    #[tokio::test]
+    async fn approval_a_key_resolves_for_session() {
+        let mut app = App::new();
+        app.pending_approval = Some(deep_code_agent::ApprovalRequest {
+            call_id: "call_1".to_string(),
+            tool_name: "mock_echo".to_string(),
+            description: "echo".to_string(),
+            arguments: serde_json::json!({}),
+            risk_level: deep_code_agent::RiskLevel::Low,
+            requires_sandbox: false,
+            read_only: true,
+            matched_rule: None,
+        });
+
+        app.approve_pending_tool_for_session();
+
+        assert!(app.pending_approval.is_none());
+        assert!(app.is_streaming);
+        assert!(app.status.contains("approved (session)"));
     }
 
     #[test]

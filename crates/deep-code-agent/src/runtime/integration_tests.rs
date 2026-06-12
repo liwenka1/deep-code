@@ -575,6 +575,130 @@ async fn submit_approval_without_pending_emits_error() {
     assert!(matches!(events.first(), Some(RuntimeEvent::Error { .. })));
 }
 
+#[test]
+fn session_allow_excludes_shell_class_tools() {
+    use crate::runtime::tool_result::session_allowable;
+    assert!(session_allowable("mock_echo"));
+    assert!(session_allowable("write_file"));
+    assert!(session_allowable("mcp__server__tool"));
+    assert!(!session_allowable("shell_run"), "shell risk is per-argument");
+    assert!(!session_allowable("job_start"));
+}
+
+#[tokio::test]
+async fn session_approval_skips_future_prompts_for_same_tool() {
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"one"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_2", MockEchoTool::NAME, r#"{"message":"two"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools());
+
+    let mut rx = runtime.submit_user("echo twice").await;
+    let first = drain(&mut rx).await;
+    assert!(matches!(
+        first.last(),
+        Some(RuntimeEvent::ApprovalRequired { .. })
+    ));
+
+    let mut rx = runtime
+        .submit_approval(ApprovalDecision::ApprovedForSession)
+        .await;
+    let second = drain(&mut rx).await;
+
+    // The second gated call of the same tool runs without prompting again,
+    // leaving an ApprovalResolved audit event instead.
+    assert!(
+        second
+            .iter()
+            .all(|event| !matches!(event, RuntimeEvent::ApprovalRequired { .. })),
+        "session approval must suppress further prompts for the tool"
+    );
+    assert_eq!(finished_ids(&second), vec!["call_1", "call_2"]);
+    assert!(second.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ApprovalResolved {
+            tool_call_id,
+            decision: ApprovalDecision::Approved,
+            ..
+        } if tool_call_id.as_str() == "call_2"
+    )));
+    assert!(matches!(
+        second.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+    assert_eq!(
+        runtime.session_messages().await.last().unwrap().content,
+        "done"
+    );
+}
+
+#[tokio::test]
+async fn config_auto_allow_prefix_runs_gated_tool_without_prompt() {
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let config = AgentConfig {
+        approval_auto_allow: vec!["mock_".to_string()],
+        ..AgentConfig::builtin()
+    };
+    let runtime = AgentRuntime::with_system_prompt(
+        client,
+        ToolRegistry::with_mock_tools(),
+        "system",
+        config,
+        false,
+    );
+
+    let mut rx = runtime.submit_user("echo").await;
+    let events = drain(&mut rx).await;
+
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, RuntimeEvent::ApprovalRequired { .. })),
+        "auto_allow prefix must pre-approve the gated call"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ApprovalResolved {
+            decision: ApprovalDecision::Approved,
+            ..
+        }
+    )));
+    assert_eq!(finished_ids(&events), vec!["call_1"]);
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+}
+
 #[tokio::test]
 async fn late_approval_after_cancel_is_silent() {
     let client = ScriptedClient::new(vec![vec![

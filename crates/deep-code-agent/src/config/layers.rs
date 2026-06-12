@@ -10,9 +10,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AUTO_COST_SAVING_ENV, AgentConfig, COMPACTION_THRESHOLD_ENV, COST_CURRENCY_ENV,
-    DEEPSEEK_API_KEY_ENV, MODEL_ENV, REASONING_EFFORT_ENV, STREAM_CHUNK_TIMEOUT_ENV,
-    STREAM_MAX_BYTES_ENV, STREAM_MAX_RETRIES_ENV, STREAM_TOTAL_TIMEOUT_ENV,
+    APPROVAL_AUTO_ALLOW_ENV, AUTO_COST_SAVING_ENV, AgentConfig, COMPACTION_THRESHOLD_ENV,
+    COST_CURRENCY_ENV, DEEPSEEK_API_KEY_ENV, MODEL_ENV, REASONING_EFFORT_ENV,
+    STREAM_CHUNK_TIMEOUT_ENV, STREAM_MAX_BYTES_ENV, STREAM_MAX_RETRIES_ENV,
+    STREAM_TOTAL_TIMEOUT_ENV,
 };
 use crate::pricing::CostCurrency;
 use crate::reasoning::ReasoningEffortSetting;
@@ -169,6 +170,7 @@ struct ConfigFile {
     cost: CostSection,
     context: ContextSection,
     stream: StreamSection,
+    approval: ApprovalSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -203,10 +205,16 @@ struct StreamSection {
     max_bytes: Option<u64>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ApprovalSection {
+    auto_allow: Option<Vec<String>>,
+}
+
 enum FileRead {
     Missing,
     Error(String),
-    Parsed(ConfigFile),
+    Parsed(Box<ConfigFile>),
 }
 
 fn read_config_file(path: &Path) -> FileRead {
@@ -216,7 +224,7 @@ fn read_config_file(path: &Path) -> FileRead {
         Err(error) => return FileRead::Error(format!("读取失败：{error}")),
     };
     match toml::from_str::<ConfigFile>(&raw) {
-        Ok(file) => FileRead::Parsed(file),
+        Ok(file) => FileRead::Parsed(Box::new(file)),
         Err(error) => FileRead::Error(format!("TOML 解析失败：{error}")),
     }
 }
@@ -323,6 +331,20 @@ fn apply_file_overlay(
     if let Some(value) = file.stream.max_bytes {
         config.stream_max_bytes = value;
     }
+
+    if let Some(rules) = &file.approval.auto_allow {
+        if project {
+            report.warnings.push(
+                "项目配置中的 approval.auto_allow 已忽略：仓库不得解除审批门（防止恶意仓库静默放行写入/外联工具）".to_string(),
+            );
+        } else {
+            config.approval_auto_allow = rules
+                .iter()
+                .map(|rule| rule.trim().to_string())
+                .filter(|rule| !rule.is_empty())
+                .collect();
+        }
+    }
 }
 
 pub(super) fn apply_env_overlay(
@@ -366,6 +388,13 @@ pub(super) fn apply_env_overlay(
     }
     if let Some(value) = lookup(STREAM_MAX_BYTES_ENV).and_then(|value| value.parse().ok()) {
         config.stream_max_bytes = value;
+    }
+    if let Some(value) = lookup(APPROVAL_AUTO_ALLOW_ENV) {
+        config.approval_auto_allow = value
+            .split(',')
+            .map(|rule| rule.trim().to_string())
+            .filter(|rule| !rule.is_empty())
+            .collect();
     }
 }
 
@@ -542,6 +571,47 @@ mod tests {
         assert_eq!(loaded.report.layers.len(), 2);
         assert!(loaded.report.layers.iter().all(|layer| !layer.present));
         assert!(loaded.report.warnings.is_empty());
+    }
+
+    #[test]
+    fn approval_auto_allow_only_from_global_or_env() {
+        // Project layer must not be able to disarm approval gates.
+        let project_dir = tempfile::tempdir().unwrap();
+        let project = write_config(
+            project_dir.path(),
+            "[approval]\nauto_allow = [\"write_\"]\n",
+        );
+        let loaded = AgentConfig::load_with(None, Some(project), &no_env);
+        assert!(loaded.config.approval_auto_allow.is_empty());
+        assert!(
+            loaded
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("auto_allow"))
+        );
+
+        // Global layer applies.
+        let global_dir = tempfile::tempdir().unwrap();
+        let global = write_config(
+            global_dir.path(),
+            "[approval]\nauto_allow = [\"read_\", \" grep_ \", \"\"]\n",
+        );
+        let loaded = AgentConfig::load_with(Some(global), None, &no_env);
+        assert_eq!(
+            loaded.config.approval_auto_allow,
+            vec!["read_".to_string(), "grep_".to_string()]
+        );
+
+        // Env wins and parses comma-separated prefixes.
+        let env = |name: &str| {
+            (name == APPROVAL_AUTO_ALLOW_ENV).then(|| "mock_, git_ ,,".to_string())
+        };
+        let loaded = AgentConfig::load_with(None, None, &env);
+        assert_eq!(
+            loaded.config.approval_auto_allow,
+            vec!["mock_".to_string(), "git_".to_string()]
+        );
     }
 
     #[cfg(unix)]

@@ -35,6 +35,14 @@
 # 触发压缩的 token 阈值（默认按模型上下文窗口计算，一般无需设置）。
 # compaction_threshold = 800000
 
+[approval]
+# 预先放行的工具名前缀：命中的受审批工具直接执行（事件流中仍留
+# approval_resolved 审计记录）。策略硬拒绝不受影响。
+# 安全说明：本节只在环境变量(DEEP_CODE_APPROVAL_AUTO_ALLOW，逗号分隔)
+# 或全局配置中生效；项目 .deep-code/config.toml 中的本节会被忽略并警告，
+# 防止恶意仓库静默解除审批门。
+# auto_allow = ["read_", "grep_"]
+
 [stream]
 # 首内容到达前的透明重试次数。
 # max_retries = 3

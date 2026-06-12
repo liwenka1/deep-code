@@ -96,6 +96,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     if app.pending_approval.is_some() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => app.approve_pending_tool(),
+            KeyCode::Char('a') | KeyCode::Char('A') => app.approve_pending_tool_for_session(),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.deny_pending_tool(),
             KeyCode::PageUp | KeyCode::Up => app.scroll_approval_up(),
             KeyCode::PageDown | KeyCode::Down => app.scroll_approval_down(),
@@ -229,7 +230,7 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout
     };
     let visible_lines = usize::from(area.height.saturating_sub(2)).max(1);
     let mut lines = vec![Line::from(
-        "Keys: y approve | n/Esc deny | PageUp/PageDown scroll",
+        "Keys: y approve | a 本会话总是允许 | n/Esc deny | PageUp/PageDown scroll",
     )];
     lines.extend(
         cell.lines()

@@ -603,6 +603,7 @@ struct ApprovalRequestBody {
 #[serde(rename_all = "snake_case")]
 enum ApprovalDecisionWire {
     Approved,
+    ApprovedForSession,
     Denied,
 }
 
@@ -610,6 +611,7 @@ impl From<ApprovalDecisionWire> for ApprovalDecision {
     fn from(value: ApprovalDecisionWire) -> Self {
         match value {
             ApprovalDecisionWire::Approved => Self::Approved,
+            ApprovalDecisionWire::ApprovedForSession => Self::ApprovedForSession,
             ApprovalDecisionWire::Denied => Self::Denied,
         }
     }

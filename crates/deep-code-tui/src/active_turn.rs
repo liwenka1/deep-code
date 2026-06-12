@@ -120,7 +120,8 @@ impl ActiveTurn {
         };
         let tool_call_id = ToolCallId::from(request.call_id);
         let approval = match decision {
-            deep_code_agent::ApprovalDecision::Approved => ToolApprovalState::Approved,
+            deep_code_agent::ApprovalDecision::Approved
+            | deep_code_agent::ApprovalDecision::ApprovedForSession => ToolApprovalState::Approved,
             deep_code_agent::ApprovalDecision::Denied => ToolApprovalState::Denied,
         };
         if let Some(existing) = self

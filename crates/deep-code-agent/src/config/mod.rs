@@ -27,6 +27,7 @@ pub const STREAM_MAX_RETRIES_ENV: &str = "DEEP_CODE_STREAM_MAX_RETRIES";
 pub const STREAM_CHUNK_TIMEOUT_ENV: &str = "DEEP_CODE_STREAM_CHUNK_TIMEOUT_SECS";
 pub const STREAM_TOTAL_TIMEOUT_ENV: &str = "DEEP_CODE_STREAM_TOTAL_TIMEOUT_SECS";
 pub const STREAM_MAX_BYTES_ENV: &str = "DEEP_CODE_STREAM_MAX_BYTES";
+pub const APPROVAL_AUTO_ALLOW_ENV: &str = "DEEP_CODE_APPROVAL_AUTO_ALLOW";
 
 pub const DEFAULT_STREAM_MAX_RETRIES: u32 = 3;
 pub const DEFAULT_STREAM_CHUNK_TIMEOUT_SECS: u64 = 300;
@@ -52,6 +53,10 @@ pub struct AgentConfig {
     pub stream_total_timeout: Duration,
     /// Abort when cumulative streamed content exceeds this size.
     pub stream_max_bytes: u64,
+    /// Tool-name prefixes the user pre-approved: gated calls matching one of
+    /// these run without prompting. Only env and the global config file may
+    /// set this — project files are ignored (a repo must not disarm gates).
+    pub approval_auto_allow: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -82,6 +87,7 @@ impl AgentConfig {
             stream_chunk_timeout: Duration::from_secs(DEFAULT_STREAM_CHUNK_TIMEOUT_SECS),
             stream_total_timeout: Duration::from_secs(DEFAULT_STREAM_TOTAL_TIMEOUT_SECS),
             stream_max_bytes: DEFAULT_STREAM_MAX_BYTES,
+            approval_auto_allow: Vec::new(),
         }
     }
 

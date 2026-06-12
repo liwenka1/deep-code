@@ -139,6 +139,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 current_prompt: None,
                 current_turn_id: None,
                 cancel: CancellationToken::new(),
+                session_approved: Default::default(),
             })),
             checkpoints: None,
             workspace: None,

@@ -147,6 +147,10 @@ pub struct ApprovalRequest {
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
     Approved,
+    /// Approve now and remember the tool for the rest of the session
+    /// (recorded by the runtime; the registry treats it as a plain approve).
+    /// Shell-class tools are downgraded to a one-time approve.
+    ApprovedForSession,
     Denied,
 }
 
@@ -341,7 +345,7 @@ impl ToolRegistry {
                         result: ToolResult::denied(call),
                     });
                 }
-                Some(ApprovalDecision::Approved) => {}
+                Some(ApprovalDecision::Approved | ApprovalDecision::ApprovedForSession) => {}
             }
         }
 
