@@ -83,71 +83,70 @@ pub fn launch_runtime(
     if config.api_key.is_some()
         && let Ok(client) = DeepSeekClient::new(config.clone())
     {
-        let client = Arc::new(client);
-        let (tools, subagent_manager, job_store, shutdown) =
-            build_parent_tools(Arc::clone(&client), config, &workspace, &parent_cancel);
-        if let Some((runtime, session_id)) =
-            try_persisted_runtime((*client).clone(), tools, workspace.clone(), config, &prompt)
-        {
-            let runtime = attach_workspace_helpers(runtime, &workspace);
-            return LaunchedRuntime {
-                handle: Arc::new(runtime),
-                backend_label: format!("DeepSeek {}", config.model),
-                session_id: Some(session_id.as_str().to_string()),
-                subagent_manager,
-                job_store,
-                stop_hook: shutdown,
-            };
-        }
-        eprintln!("warning: session persistence unavailable; this session will not be saved");
-        let (tools, subagent_manager, job_store, shutdown) =
-            build_parent_tools(Arc::clone(&client), config, &workspace, &parent_cancel);
-        let runtime = attach_workspace_helpers(
-            AgentRuntime::with_system_prompt(
-                (*client).clone(),
-                tools,
-                prompt,
-                config.clone(),
-                false,
-            ),
-            &workspace,
+        return launch_fresh(
+            client,
+            format!("DeepSeek {}", config.model),
+            config,
+            workspace,
+            &prompt,
+            &parent_cancel,
         );
-        return LaunchedRuntime {
-            handle: Arc::new(runtime),
-            backend_label: format!("DeepSeek {}", config.model),
-            session_id: None,
-            subagent_manager,
-            job_store,
-            stop_hook: shutdown,
-        };
     }
 
-    let client = Arc::new(EchoClient);
+    launch_fresh(
+        EchoClient,
+        "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string(),
+        config,
+        workspace,
+        &prompt,
+        &parent_cancel,
+    )
+}
+
+/// Launch a new (non-resumed) runtime for any client: try a persisted
+/// session first, fall back to an in-memory one with a warning.
+fn launch_fresh<C: LlmClient + Clone + 'static>(
+    client: C,
+    backend_label: String,
+    config: &AgentConfig,
+    workspace: PathBuf,
+    prompt: &str,
+    parent_cancel: &CancellationToken,
+) -> LaunchedRuntime {
+    let client = Arc::new(client);
     let (tools, subagent_manager, job_store, shutdown) =
-        build_parent_tools(Arc::clone(&client), config, &workspace, &parent_cancel);
+        build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
+
     if let Some((runtime, session_id)) =
-        try_persisted_runtime(EchoClient, tools, workspace.clone(), config, &prompt)
+        try_persisted_runtime((*client).clone(), tools, workspace.clone(), config, prompt)
     {
         let runtime = attach_workspace_helpers(runtime, &workspace);
         return LaunchedRuntime {
             handle: Arc::new(runtime),
-            backend_label: "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string(),
+            backend_label,
             session_id: Some(session_id.as_str().to_string()),
             subagent_manager,
             job_store,
             stop_hook: shutdown,
         };
     }
+
     eprintln!("warning: session persistence unavailable; this session will not be saved");
     let (tools, subagent_manager, job_store, shutdown) =
-        build_parent_tools(Arc::clone(&client), config, &workspace, &parent_cancel);
+        build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
     let runtime = attach_workspace_helpers(
-        AgentRuntime::with_system_prompt(EchoClient, tools, prompt, config.clone(), false),
+        AgentRuntime::with_system_prompt(
+            (*client).clone(),
+            tools,
+            prompt,
+            config.clone(),
+            false,
+        ),
         &workspace,
     );
     LaunchedRuntime {
         handle: Arc::new(runtime),
-        backend_label: "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string(),
+        backend_label,
         session_id: None,
         subagent_manager,
         job_store,

@@ -1,3 +1,7 @@
+//! Layered configuration assembly: builtin → global TOML → project TOML
+//! (whitelisted) → environment. The parent module owns [`AgentConfig`]
+//! itself; this module owns how it is produced from files and env.
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -5,86 +9,84 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{AgentError, AgentResult};
-use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_PRO};
+use super::{
+    AUTO_COST_SAVING_ENV, AgentConfig, COMPACTION_THRESHOLD_ENV, COST_CURRENCY_ENV,
+    DEEPSEEK_API_KEY_ENV, MODEL_ENV, REASONING_EFFORT_ENV, STREAM_CHUNK_TIMEOUT_ENV,
+    STREAM_MAX_BYTES_ENV, STREAM_MAX_RETRIES_ENV, STREAM_TOTAL_TIMEOUT_ENV,
+};
 use crate::pricing::CostCurrency;
 use crate::reasoning::ReasoningEffortSetting;
 
-pub const DEFAULT_DEEPSEEK_MODEL: &str = DEEPSEEK_V4_PRO;
-pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/beta";
-pub const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
-pub const MODEL_ENV: &str = "DEEP_CODE_MODEL";
-pub const REASONING_EFFORT_ENV: &str = "DEEP_CODE_REASONING_EFFORT";
-pub const COST_CURRENCY_ENV: &str = "DEEP_CODE_COST_CURRENCY";
-pub const AUTO_COST_SAVING_ENV: &str = "DEEP_CODE_AUTO_COST_SAVING";
-pub const COMPACTION_THRESHOLD_ENV: &str = "DEEP_CODE_COMPACTION_THRESHOLD";
-pub const STREAM_MAX_RETRIES_ENV: &str = "DEEP_CODE_STREAM_MAX_RETRIES";
-pub const STREAM_CHUNK_TIMEOUT_ENV: &str = "DEEP_CODE_STREAM_CHUNK_TIMEOUT_SECS";
-pub const STREAM_TOTAL_TIMEOUT_ENV: &str = "DEEP_CODE_STREAM_TOTAL_TIMEOUT_SECS";
-pub const STREAM_MAX_BYTES_ENV: &str = "DEEP_CODE_STREAM_MAX_BYTES";
-
-pub const DEFAULT_STREAM_MAX_RETRIES: u32 = 3;
-pub const DEFAULT_STREAM_CHUNK_TIMEOUT_SECS: u64 = 300;
-pub const DEFAULT_STREAM_TOTAL_TIMEOUT_SECS: u64 = 900;
-pub const DEFAULT_STREAM_MAX_BYTES: u64 = 50 * 1024 * 1024;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentConfig {
-    pub api_key: Option<String>,
-    pub base_url: String,
-    pub model: String,
-    pub reasoning_effort: ReasoningEffortSetting,
-    pub auto_cost_saving: bool,
-    pub cost_currency: CostCurrency,
-    /// Override compaction token threshold (for dev/testing).
-    pub compaction_threshold: Option<u32>,
-    pub timeout: Option<Duration>,
-    /// Transparent stream retries before any content arrived.
-    pub stream_max_retries: u32,
-    /// Abort when no stream chunk arrives within this window.
-    pub stream_chunk_timeout: Duration,
-    /// Hard ceiling for one model stream from open to close.
-    pub stream_total_timeout: Duration,
-    /// Abort when cumulative streamed content exceeds this size.
-    pub stream_max_bytes: u64,
+/// Configuration layer, ordered from weakest to strongest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigLayer {
+    Builtin,
+    Global,
+    Project,
+    Env,
 }
 
-impl Default for AgentConfig {
-    /// Built-in defaults plus the environment overlay. Files are NOT read
-    /// here; use [`AgentConfig::load`] for the full layered configuration.
-    fn default() -> Self {
-        let mut config = Self::builtin();
-        let mut sources = ConfigSources::default();
-        apply_env_overlay(&mut config, &mut sources, &|name| env::var(name).ok());
-        config
+impl ConfigLayer {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Builtin => "default",
+            Self::Global => "global",
+            Self::Project => "project",
+            Self::Env => "env",
+        }
     }
+}
+
+/// Which layer last set each key field — lets doctor explain "当前 model
+/// 是哪一层给的".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ConfigSources {
+    pub api_key: ConfigLayer,
+    pub base_url: ConfigLayer,
+    pub model: ConfigLayer,
+    pub reasoning_effort: ConfigLayer,
+    pub cost_currency: ConfigLayer,
+}
+
+impl Default for ConfigSources {
+    fn default() -> Self {
+        Self {
+            api_key: ConfigLayer::Builtin,
+            base_url: ConfigLayer::Builtin,
+            model: ConfigLayer::Builtin,
+            reasoning_effort: ConfigLayer::Builtin,
+            cost_currency: ConfigLayer::Builtin,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigLayerStatus {
+    pub name: &'static str,
+    pub path: String,
+    pub present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ConfigLoadReport {
+    pub layers: Vec<ConfigLayerStatus>,
+    pub warnings: Vec<String>,
+    pub sources: ConfigSources,
+}
+
+/// Result of [`AgentConfig::load`]: the effective config plus how it was
+/// assembled.
+#[derive(Debug, Clone)]
+pub struct LoadedAgentConfig {
+    pub config: AgentConfig,
+    pub report: ConfigLoadReport,
 }
 
 impl AgentConfig {
-    /// Pure built-in defaults: no environment, no files.
-    #[must_use]
-    pub fn builtin() -> Self {
-        Self {
-            api_key: None,
-            base_url: DEFAULT_DEEPSEEK_BASE_URL.to_string(),
-            model: DEEPSEEK_V4_PRO.to_string(),
-            reasoning_effort: ReasoningEffortSetting::High,
-            auto_cost_saving: false,
-            cost_currency: CostCurrency::Cny,
-            compaction_threshold: None,
-            timeout: Some(Duration::from_secs(60)),
-            stream_max_retries: DEFAULT_STREAM_MAX_RETRIES,
-            stream_chunk_timeout: Duration::from_secs(DEFAULT_STREAM_CHUNK_TIMEOUT_SECS),
-            stream_total_timeout: Duration::from_secs(DEFAULT_STREAM_TOTAL_TIMEOUT_SECS),
-            stream_max_bytes: DEFAULT_STREAM_MAX_BYTES,
-        }
-    }
-
-    #[must_use]
-    pub fn from_env() -> Self {
-        Self::default()
-    }
-
     /// Load the layered configuration for a workspace:
     /// builtin → global `~/.deep-code/config.toml` → project
     /// `<workspace>/.deep-code/config.toml` (whitelisted) → environment.
@@ -158,97 +160,6 @@ impl AgentConfig {
         apply_env_overlay(&mut config, &mut report.sources, env_lookup);
         LoadedAgentConfig { config, report }
     }
-
-    #[must_use]
-    pub fn auto_model_enabled(&self) -> bool {
-        self.model.trim().eq_ignore_ascii_case(AUTO_MODEL)
-    }
-
-    pub fn require_api_key(&self) -> AgentResult<&str> {
-        self.api_key
-            .as_deref()
-            .filter(|key| !key.trim().is_empty())
-            .ok_or(AgentError::MissingApiKey)
-    }
-
-    #[must_use]
-    pub fn chat_completions_url(&self) -> String {
-        format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
-    }
-
-    #[must_use]
-    pub fn uses_beta_endpoint(&self) -> bool {
-        self.base_url.contains("/beta")
-    }
-}
-
-/// Configuration layer, ordered from weakest to strongest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConfigLayer {
-    Builtin,
-    Global,
-    Project,
-    Env,
-}
-
-impl ConfigLayer {
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Builtin => "default",
-            Self::Global => "global",
-            Self::Project => "project",
-            Self::Env => "env",
-        }
-    }
-}
-
-/// Which layer last set each key field — lets doctor explain "当前 model
-/// 是哪一层给的".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct ConfigSources {
-    pub api_key: ConfigLayer,
-    pub base_url: ConfigLayer,
-    pub model: ConfigLayer,
-    pub reasoning_effort: ConfigLayer,
-    pub cost_currency: ConfigLayer,
-}
-
-impl Default for ConfigSources {
-    fn default() -> Self {
-        Self {
-            api_key: ConfigLayer::Builtin,
-            base_url: ConfigLayer::Builtin,
-            model: ConfigLayer::Builtin,
-            reasoning_effort: ConfigLayer::Builtin,
-            cost_currency: ConfigLayer::Builtin,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ConfigLayerStatus {
-    pub name: &'static str,
-    pub path: String,
-    pub present: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct ConfigLoadReport {
-    pub layers: Vec<ConfigLayerStatus>,
-    pub warnings: Vec<String>,
-    pub sources: ConfigSources,
-}
-
-/// Result of [`AgentConfig::load`]: the effective config plus how it was
-/// assembled.
-#[derive(Debug, Clone)]
-pub struct LoadedAgentConfig {
-    pub config: AgentConfig,
-    pub report: ConfigLoadReport,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -373,9 +284,9 @@ fn apply_file_overlay(
 
     if let Some(secs) = file.provider.timeout_secs {
         if project {
-            report.warnings.push(
-                "项目配置中的 provider.timeout_secs 不在白名单内，已忽略".to_string(),
-            );
+            report
+                .warnings
+                .push("项目配置中的 provider.timeout_secs 不在白名单内，已忽略".to_string());
         } else {
             config.timeout = Some(Duration::from_secs(secs));
         }
@@ -414,7 +325,7 @@ fn apply_file_overlay(
     }
 }
 
-fn apply_env_overlay(
+pub(super) fn apply_env_overlay(
     config: &mut AgentConfig,
     sources: &mut ConfigSources,
     lookup: &dyn Fn(&str) -> Option<String>,
@@ -485,44 +396,6 @@ fn home_dir() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn builtin_config_uses_deepseek_defaults() {
-        // builtin() (not default()) so developer env vars cannot flake this.
-        let config = AgentConfig::builtin();
-
-        assert_eq!(config.base_url, DEFAULT_DEEPSEEK_BASE_URL);
-        assert_eq!(config.model, DEEPSEEK_V4_PRO);
-        assert_eq!(config.cost_currency, CostCurrency::Cny);
-        assert_eq!(
-            config.chat_completions_url(),
-            "https://api.deepseek.com/beta/chat/completions"
-        );
-    }
-
-    #[test]
-    fn require_api_key_rejects_missing_key() {
-        let config = AgentConfig::builtin();
-
-        assert!(matches!(
-            config.require_api_key(),
-            Err(AgentError::MissingApiKey)
-        ));
-    }
-
-    #[test]
-    fn auto_model_flag() {
-        let config = AgentConfig {
-            model: AUTO_MODEL.to_string(),
-            ..AgentConfig::builtin()
-        };
-        assert!(config.auto_model_enabled());
-        let fixed = AgentConfig {
-            model: DEEPSEEK_V4_PRO.to_string(),
-            ..AgentConfig::builtin()
-        };
-        assert!(!fixed.auto_model_enabled());
-    }
-
     fn no_env(_name: &str) -> Option<String> {
         None
     }
@@ -552,9 +425,7 @@ mod tests {
         let project = write_config(project_dir.path(), "[provider]\nmodel = \"project-model\"\n");
 
         // global < project for model; env wins over both.
-        let env = |name: &str| {
-            (name == MODEL_ENV).then(|| "env-model".to_string())
-        };
+        let env = |name: &str| (name == MODEL_ENV).then(|| "env-model".to_string());
         let loaded = AgentConfig::load_with(Some(global.clone()), Some(project.clone()), &env);
         assert_eq!(loaded.config.model, "env-model");
         assert_eq!(loaded.report.sources.model, ConfigLayer::Env);
@@ -582,7 +453,10 @@ mod tests {
         );
 
         let loaded = AgentConfig::load_with(None, Some(project), &no_env);
-        assert_eq!(loaded.config.api_key, None, "project api_key must be ignored");
+        assert_eq!(
+            loaded.config.api_key, None,
+            "project api_key must be ignored"
+        );
         assert_eq!(loaded.config.base_url, "https://evil.example");
         assert_eq!(
             loaded.config.timeout,
@@ -625,10 +499,7 @@ mod tests {
         assert_eq!(loaded.report.sources.api_key, ConfigLayer::Global);
         assert_eq!(loaded.config.timeout, Some(Duration::from_secs(120)));
         assert_eq!(loaded.config.stream_max_retries, 7);
-        assert_eq!(
-            loaded.config.stream_chunk_timeout,
-            Duration::from_secs(30)
-        );
+        assert_eq!(loaded.config.stream_chunk_timeout, Duration::from_secs(30));
     }
 
     #[test]
@@ -645,7 +516,12 @@ mod tests {
             .find(|layer| layer.name == "global")
             .expect("global layer status");
         assert!(layer.present);
-        assert!(layer.error.as_deref().is_some_and(|error| error.contains("解析失败")));
+        assert!(
+            layer
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("解析失败"))
+        );
         assert!(
             loaded
                 .report

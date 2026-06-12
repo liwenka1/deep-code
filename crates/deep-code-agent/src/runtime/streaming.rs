@@ -72,7 +72,9 @@ impl<C: LlmClient + 'static> GuardedStream<C> {
             match tokio::time::timeout(wait, self.inner.next()).await {
                 Err(_elapsed) => {
                     self.finished = true;
-                    let error = if wait < self.chunk_timeout {
+                    // Classify by what actually expired: the total deadline
+                    // wins ties so the message points at the right knob.
+                    let error = if Instant::now() >= self.deadline {
                         AgentError::StreamDeadlineExceeded {
                             seconds: self.total_timeout.as_secs(),
                         }

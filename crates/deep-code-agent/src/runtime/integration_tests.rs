@@ -85,13 +85,15 @@ fn indexed_tool_call_delta(index: u32, id: &str, name: &str, arguments: &str) ->
     }
 }
 
-/// Auto-approved echo tool: the `git_` prefix classifies as read-only in the
-/// execution policy, and the spec itself does not require approval.
+/// Auto-approved echo tool: borrows the exact whitelisted read-only name
+/// `git_status` (the policy classifies by exact tool name), and the spec
+/// itself does not require approval. The fake registry in these tests never
+/// registers the real git tools, so the name cannot collide.
 #[derive(Debug, Clone, Copy)]
 struct AutoEchoTool;
 
 impl AutoEchoTool {
-    const NAME: &'static str = "git_echo";
+    const NAME: &'static str = "git_status";
 }
 
 impl Tool for AutoEchoTool {
@@ -120,7 +122,7 @@ impl Tool for AutoEchoTool {
         Ok(ToolResult::success(
             call.id.clone(),
             call.name.clone(),
-            format!("git_echo: {message}"),
+            format!("git_status: {message}"),
         ))
     }
 }
@@ -571,6 +573,28 @@ async fn submit_approval_without_pending_emits_error() {
     let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
     let events = drain(&mut rx).await;
     assert!(matches!(events.first(), Some(RuntimeEvent::Error { .. })));
+}
+
+#[tokio::test]
+async fn late_approval_after_cancel_is_silent() {
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::ToolCallDelta {
+            delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"a"}"#),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools());
+
+    let mut rx = runtime.submit_user("run").await;
+    drain(&mut rx).await;
+
+    // Cancel wins the race for the parked batch; the user's keypress lands
+    // afterwards and must not surface a red error.
+    let mut rx = runtime.cancel_turn().await;
+    drain(&mut rx).await;
+    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let events = drain(&mut rx).await;
+    assert!(events.is_empty(), "late approval after cancel is benign");
 }
 
 #[tokio::test]
@@ -1122,9 +1146,9 @@ async fn multi_tool_turn_executes_all_auto_calls_in_order_and_persists() {
     assert_eq!(messages[2].tool_calls[0].id, "call_1");
     assert_eq!(messages[2].tool_calls[1].id, "call_2");
     assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_1"));
-    assert_eq!(messages[3].content, "git_echo: one");
+    assert_eq!(messages[3].content, "git_status: one");
     assert_eq!(messages[4].tool_call_id.as_deref(), Some("call_2"));
-    assert_eq!(messages[4].content, "git_echo: two");
+    assert_eq!(messages[4].content, "git_status: two");
     assert_eq!(messages[5].content, "done");
 
     runtime.shutdown().await;

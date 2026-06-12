@@ -123,7 +123,9 @@ impl ExecPolicy {
             "shell_run" | "job_start" => ToolKind::Shell,
             "job_status" | "job_tail" => ToolKind::JobControl,
             "job_cancel" => ToolKind::JobControl,
-            name if name.starts_with("git_") => ToolKind::GitRead,
+            // Exact names only: a prefix match would hand the read-only fast
+            // path to any future tool that merely starts with "git_".
+            "git_status" | "git_diff" | "git_log" => ToolKind::GitRead,
             "mock_echo" => ToolKind::Mock,
             "agent_open" | "agent_eval" | "agent_close" => ToolKind::SubAgent,
             "handle_read" => ToolKind::HandleRead,

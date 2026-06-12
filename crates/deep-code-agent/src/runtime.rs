@@ -202,16 +202,21 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// If there is no pending approval, returns an error event on the stream.
     pub async fn submit_approval(&self, decision: ApprovalDecision) -> RuntimeEventReceiver {
         let (tx, rx) = mpsc::unbounded_channel();
-        let pending = {
+        let (pending, cancelled) = {
             let mut state = self.state.lock().await;
-            state.pending.take()
+            let cancelled = state.cancel.is_cancelled();
+            (state.pending.take(), cancelled)
         };
 
         let Some(pending) = pending else {
-            let _ = tx.send(RuntimeEvent::Error {
-                turn_id: None,
-                message: "no pending tool approval".to_string(),
-            });
+            // A cancellation that raced ahead already resolved the batch —
+            // the late approval keypress is benign, not an error.
+            if !cancelled {
+                let _ = tx.send(RuntimeEvent::Error {
+                    turn_id: None,
+                    message: "no pending tool approval".to_string(),
+                });
+            }
             return rx;
         };
 

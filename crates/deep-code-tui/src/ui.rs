@@ -9,8 +9,9 @@ use crossterm::terminal::{
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style, Stylize};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Terminal, backend::CrosstermBackend};
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, LaunchConfig};
 use crate::history::HistoryCell;
@@ -154,7 +155,8 @@ fn render(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn render_messages(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
-    let mut items = Vec::new();
+    let viewport = usize::from(area.height.saturating_sub(2)).max(1);
+    let content_width = area.width.saturating_sub(2).max(8);
     let history_len = app.history.len();
     // Borrow history and chain the (small) active preview instead of deep
     // cloning the whole transcript every frame.
@@ -163,42 +165,62 @@ fn render_messages(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect
         .as_ref()
         .map(|active| active.preview_cells())
         .unwrap_or_default();
-    let total = history_len + preview.len();
-    let content_width = area.width.saturating_sub(2).max(8);
-    let visible_messages = usize::from(area.height.saturating_sub(2)).saturating_div(3);
-    let visible_messages = visible_messages.max(1);
-    let bottom_skip = total.saturating_sub(visible_messages);
-    let skip_count = bottom_skip.saturating_sub(app.scroll_offset);
 
-    for (index, cell) in app
-        .history
-        .iter()
-        .chain(preview.iter())
-        .enumerate()
-        .skip(skip_count)
-        .take(visible_messages)
-    {
-        let mut lines = vec![Line::from(label_for_cell(cell))];
-        // Flushed assistant cells render as markdown; the still-streaming
-        // preview stays plain so half-open code fences don't flicker.
-        match cell {
-            HistoryCell::Assistant { text } if index < history_len => {
-                lines.extend(render_markdown(text, content_width));
-            }
-            _ => lines.extend(cell.lines().into_iter().map(Line::from)),
-        }
-        lines.push(Line::default());
-        items.push(ListItem::new(lines));
+    // Visual-line scroll model: walk cells from the bottom, rendering only
+    // until the viewport plus the scroll-back distance is covered. This
+    // replaces the old "3 lines per cell" estimate that markdown broke.
+    let target = viewport + app.scroll_offset;
+    let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
+    let mut total_lines = 0usize;
+    let total_cells = history_len + preview.len();
+    let mut index = total_cells;
+    while index > 0 && total_lines < target {
+        index -= 1;
+        let cell = if index < history_len {
+            &app.history[index]
+        } else {
+            &preview[index - history_len]
+        };
+        let lines = cell_lines(cell, index < history_len, content_width);
+        total_lines += lines.len();
+        chunks.push(lines);
     }
 
-    let list = List::new(items).block(
-        Block::default()
-            .title("deep-code")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
-    );
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(total_lines);
+    for chunk in chunks.into_iter().rev() {
+        lines.extend(chunk);
+    }
 
-    frame.render_widget(list, area);
+    // Bottom-anchored: scroll_offset visual lines up from the end, clamped
+    // to the rendered range.
+    let max_scroll = lines.len().saturating_sub(viewport);
+    let scroll = app.scroll_offset.min(max_scroll);
+    let scroll_top = max_scroll - scroll;
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title("deep-code")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .scroll((scroll_top as u16, 0));
+    frame.render_widget(paragraph, area);
+}
+
+/// Render one transcript cell: label line, body, trailing blank. Flushed
+/// assistant cells render as markdown; the still-streaming preview stays
+/// plain so half-open code fences don't flicker.
+fn cell_lines(cell: &HistoryCell, flushed: bool, width: u16) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(label_for_cell(cell))];
+    match cell {
+        HistoryCell::Assistant { text } if flushed => {
+            lines.extend(render_markdown(text, width));
+        }
+        _ => lines.extend(cell.lines().into_iter().map(Line::from)),
+    }
+    lines.push(Line::default());
+    lines
 }
 
 fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
@@ -233,11 +255,52 @@ fn render_input(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
     } else {
         "Prompt"
     };
+    let inner_width = usize::from(area.width.saturating_sub(2)).max(1);
+    let inner_height = usize::from(area.height.saturating_sub(2)).max(1);
+
+    // Follow the tail: when the (wrapped) content is taller than the box,
+    // scroll so the line being typed stays visible.
+    let mut rows = 0usize;
+    let mut last_row_width = 0usize;
+    for line in app.input.split('\n') {
+        rows += wrapped_rows(line, inner_width);
+        last_row_width = last_visual_row_width(line, inner_width);
+    }
+    let scroll_top = rows.saturating_sub(inner_height);
+
     let paragraph = Paragraph::new(app.input.as_str())
         .block(Block::default().title(title).borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
-
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_top as u16, 0));
     frame.render_widget(paragraph, area);
+
+    if !app.is_streaming && app.pending_approval.is_none() {
+        let cursor_row = rows.saturating_sub(1) - scroll_top;
+        let cursor_x = area.x + 1 + last_row_width.min(inner_width.saturating_sub(1)) as u16;
+        let cursor_y = area.y + 1 + cursor_row.min(inner_height.saturating_sub(1)) as u16;
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
+}
+
+/// Visual rows a single logical line occupies when wrapped at `width`.
+fn wrapped_rows(line: &str, width: usize) -> usize {
+    let line_width = line.width();
+    if line_width == 0 {
+        1
+    } else {
+        line_width.div_ceil(width)
+    }
+}
+
+/// Display width of the last wrapped row of a logical line (cursor column).
+fn last_visual_row_width(line: &str, width: usize) -> usize {
+    let line_width = line.width();
+    if line_width == 0 {
+        0
+    } else {
+        let remainder = line_width % width;
+        if remainder == 0 { width } else { remainder }
+    }
 }
 
 fn render_status(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {

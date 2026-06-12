@@ -188,8 +188,15 @@ impl DoctorReport {
     }
 
     /// Attach the layered-config assembly report (from [`AgentConfig::load`]).
+    ///
+    /// Also replaces the env-sniffing api-key source heuristic with the
+    /// authoritative layer recorded by the loader (env/global), keeping
+    /// "missing" when no key was set anywhere.
     #[must_use]
     pub fn with_config_layers(mut self, report: &ConfigLoadReport) -> Self {
+        if report.sources.api_key != crate::config::ConfigLayer::Builtin {
+            self.api_key.source = report.sources.api_key.label().to_string();
+        }
         self.config_layers = Some(ConfigLayersDoctorReport::from(report));
         self
     }
