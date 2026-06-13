@@ -18,6 +18,7 @@ use deep_code_agent::{
     launch_runtime,
 };
 use tokio::sync::mpsc;
+use unicode_width::UnicodeWidthStr;
 
 use crate::active_turn::ActiveTurn;
 use crate::cli::workspace_root;
@@ -60,6 +61,7 @@ const COMPLETION_MENU_ITEMS: usize = 8;
 type UiUpdateReceiver = mpsc::UnboundedReceiver<UiUpdate>;
 
 pub struct App {
+    pub(crate) input_cursor: usize,
     pub input: String,
     pub history: Vec<HistoryCell>,
     pub active_turn: Option<ActiveTurn>,
@@ -92,6 +94,23 @@ pub struct App {
 }
 
 const PROMPT_HISTORY_CAP: usize = 100;
+
+/// Byte index of the character before `cursor` (respects UTF-8 boundaries).
+fn cursor_prev_byte(s: &str, cursor: usize) -> usize {
+    let prefix = &s[..cursor];
+    prefix
+        .char_indices()
+        .next_back()
+        .map_or(0, |(index, _)| index)
+}
+
+/// Byte index of the character after `cursor` (respects UTF-8 boundaries).
+fn cursor_next_byte(s: &str, cursor: usize) -> usize {
+    let tail = &s[cursor..];
+    tail.char_indices()
+        .nth(1)
+        .map_or(s.len(), |(index, _)| cursor + index)
+}
 
 impl App {
     #[must_use]
@@ -161,6 +180,7 @@ impl App {
         };
 
         Self {
+            input_cursor: 0,
             input: String::new(),
             history,
             active_turn: None,
@@ -198,28 +218,92 @@ impl App {
     }
 
     pub fn push_char(&mut self, value: char) {
-        if !self.is_streaming {
-            self.input.push(value);
-            self.history_cursor = None;
-            self.refresh_completion();
+        if self.is_streaming {
+            return;
         }
+        let pos = self.input_cursor.min(self.input.len());
+        self.input.insert(pos, value);
+        self.input_cursor = pos + value.len_utf8();
+        self.history_cursor = None;
+        self.refresh_completion();
     }
 
     pub fn backspace(&mut self) {
-        if !self.is_streaming {
-            self.input.pop();
-            self.history_cursor = None;
-            self.refresh_completion();
+        if self.is_streaming {
+            return;
         }
+        if self.input_cursor == 0 {
+            return;
+        }
+        let prev = cursor_prev_byte(&self.input, self.input_cursor);
+        self.input.remove(prev);
+        self.input_cursor = prev;
+        self.history_cursor = None;
+        self.refresh_completion();
     }
 
     /// Insert a newline into the composer (Alt+Enter / Ctrl+J).
     pub fn push_newline(&mut self) {
-        if !self.is_streaming {
-            self.input.push('\n');
-            self.history_cursor = None;
-            self.refresh_completion();
+        if self.is_streaming {
+            return;
         }
+        let pos = self.input_cursor.min(self.input.len());
+        self.input.insert(pos, '\n');
+        self.input_cursor = pos + 1;
+        self.history_cursor = None;
+        self.refresh_completion();
+    }
+
+    /// Delete the character after the cursor (Delete key).
+    pub fn delete_forward(&mut self) {
+        if self.is_streaming || self.input_cursor >= self.input.len() {
+            return;
+        }
+        self.input.remove(self.input_cursor);
+        // cursor stays — next char slides left into its place.
+        self.history_cursor = None;
+        self.refresh_completion();
+    }
+
+    /// Move cursor one character left (respects UTF-8 boundaries).
+    pub fn cursor_left(&mut self) {
+        if self.is_streaming || self.input_cursor == 0 {
+            return;
+        }
+        self.input_cursor = cursor_prev_byte(&self.input, self.input_cursor);
+    }
+
+    /// Move cursor one character right (respects UTF-8 boundaries).
+    pub fn cursor_right(&mut self) {
+        if self.is_streaming {
+            return;
+        }
+        self.input_cursor = cursor_next_byte(&self.input, self.input_cursor);
+    }
+
+    /// Move cursor to start of the current logical line.
+    pub fn cursor_home(&mut self) {
+        if self.is_streaming {
+            return;
+        }
+        let prefix = &self.input[..self.input_cursor.min(self.input.len())];
+        self.input_cursor = prefix.rfind('\n').map_or(0, |pos| pos + 1);
+    }
+
+    /// Move cursor to end of the current logical line.
+    pub fn cursor_end(&mut self) {
+        if self.is_streaming {
+            return;
+        }
+        let tail = &self.input[self.input_cursor.min(self.input.len())..];
+        let eol = tail.find('\n').unwrap_or(tail.len());
+        self.input_cursor = self.input_cursor.min(self.input.len()) + eol;
+        self.input_cursor = self.input_cursor.min(self.input.len());
+    }
+
+    /// Move cursor to the very end of input.
+    pub fn cursor_to_end(&mut self) {
+        self.input_cursor = self.input.len();
     }
 
     #[must_use]
@@ -325,6 +409,7 @@ impl App {
         match menu.kind {
             CompletionKind::Slash => {
                 self.input = value.clone();
+                self.cursor_to_end();
                 !value.ends_with(' ')
             }
             CompletionKind::File => {
@@ -332,16 +417,25 @@ impl App {
                 self.input.truncate(token_start);
                 self.input.push_str(value);
                 self.input.push(' ');
+                self.cursor_to_end();
                 false
             }
         }
     }
 
-    /// Composer area height including borders; content grows 1..=6 rows.
+    /// Composer area height including borders; content grows 1..=6 visual rows.
     #[must_use]
-    pub fn input_height(&self) -> u16 {
-        let rows = self.input.split('\n').count().clamp(1, 6) as u16;
-        rows + 2
+    pub fn input_height(&self, inner_width: u16) -> u16 {
+        let cols = usize::from(inner_width.max(1));
+        let rows: usize = self
+            .input
+            .split('\n')
+            .map(|line| {
+                let lw = line.width();
+                if lw == 0 { 1 } else { lw.div_ceil(cols) }
+            })
+            .sum();
+        (rows.clamp(1, 6) as u16) + 2
     }
 
     /// Recall the previous sent prompt (Ctrl+P). The live input is stashed as
@@ -360,6 +454,7 @@ impl App {
         };
         self.history_cursor = Some(cursor);
         self.input = self.prompt_history[cursor].clone();
+        self.cursor_to_end();
     }
 
     /// Walk back toward the draft (Ctrl+N).
@@ -372,10 +467,12 @@ impl App {
             Some(index) if index + 1 < self.prompt_history.len() => {
                 self.history_cursor = Some(index + 1);
                 self.input = self.prompt_history[index + 1].clone();
+                self.cursor_to_end();
             }
             Some(_) => {
                 self.history_cursor = None;
                 self.input = std::mem::take(&mut self.history_draft);
+                self.cursor_to_end();
             }
         }
     }
@@ -409,10 +506,12 @@ impl App {
 
         if prompt.starts_with('/') && self.handle_slash_command(&prompt) {
             self.input.clear();
+            self.input_cursor = 0;
             return;
         }
 
         self.input.clear();
+        self.input_cursor = 0;
         self.error = None;
         self.active_turn = None;
         self.scroll_offset = 0;
@@ -435,6 +534,7 @@ impl App {
             self.cancel_streaming_turn();
         } else if !self.input.is_empty() {
             self.input.clear();
+            self.input_cursor = 0;
             self.history_cursor = None;
             self.status = "已清空输入 (再按 Esc 退出)".to_string();
         } else {
@@ -475,10 +575,6 @@ impl App {
 
     pub fn scroll_down(&mut self) {
         self.scroll_offset = self.scroll_offset.saturating_sub(3);
-    }
-
-    pub fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = 0;
     }
 
     pub fn scroll_approval_up(&mut self) {

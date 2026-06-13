@@ -11,6 +11,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style, Stylize};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Terminal, backend::CrosstermBackend};
+use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, LaunchConfig};
@@ -146,16 +147,21 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => app.history_prev(),
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => app.history_next(),
         KeyCode::Backspace => app.backspace(),
+        KeyCode::Delete => app.delete_forward(),
+        KeyCode::Left => app.cursor_left(),
+        KeyCode::Right => app.cursor_right(),
+        KeyCode::Home => app.cursor_home(),
+        KeyCode::End => app.cursor_end(),
         KeyCode::PageUp | KeyCode::Up => app.scroll_up(),
         KeyCode::PageDown | KeyCode::Down => app.scroll_down(),
-        KeyCode::End => app.scroll_to_bottom(),
         KeyCode::Char(value) => app.push_char(value),
         _ => {}
     }
 }
 
 fn render(frame: &mut Frame<'_>, app: &App) {
-    let input_height = Constraint::Length(app.input_height());
+    let inner_width = frame.area().width.saturating_sub(2).max(1);
+    let input_height = Constraint::Length(app.input_height(inner_width));
     if app.pending_approval.is_some() {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -337,15 +343,33 @@ fn render_input(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
     let inner_width = usize::from(area.width.saturating_sub(2)).max(1);
     let inner_height = usize::from(area.height.saturating_sub(2)).max(1);
 
-    // Follow the tail: when the (wrapped) content is taller than the box,
-    // scroll so the line being typed stays visible.
-    let mut rows = 0usize;
-    let mut last_row_width = 0usize;
-    for line in app.input.split('\n') {
-        rows += wrapped_rows(line, inner_width);
-        last_row_width = last_visual_row_width(line, inner_width);
+    // Walk the text up to the cursor byte position, tracking visual row
+    // and column as each character and newline advances the cursor.
+    let (mut visual_rows, mut cursor_col) = (0usize, 0usize);
+    let cursor = app.input_cursor.min(app.input.len());
+    for (byte, ch) in app.input.char_indices() {
+        if byte >= cursor {
+            break;
+        }
+        if ch == '\n' {
+            visual_rows += 1;
+            cursor_col = 0;
+        } else {
+            let w = ch.width().unwrap_or(0).max(1);
+            cursor_col += w;
+            if cursor_col > inner_width {
+                visual_rows += 1;
+                cursor_col = w;
+            }
+        }
     }
-    let scroll_top = rows.saturating_sub(inner_height);
+
+    // Total rows and scroll offset for the whole content.
+    let mut total_rows = 0usize;
+    for line in app.input.split('\n') {
+        total_rows += wrapped_rows(line, inner_width);
+    }
+    let scroll_top = total_rows.saturating_sub(inner_height);
 
     let paragraph = Paragraph::new(app.input.as_str())
         .block(Block::default().title(title).borders(Borders::ALL))
@@ -354,9 +378,9 @@ fn render_input(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
     frame.render_widget(paragraph, area);
 
     if !app.is_streaming && app.pending_approval.is_none() {
-        let cursor_row = rows.saturating_sub(1) - scroll_top;
-        let cursor_x = area.x + 1 + last_row_width.min(inner_width.saturating_sub(1)) as u16;
-        let cursor_y = area.y + 1 + cursor_row.min(inner_height.saturating_sub(1)) as u16;
+        let cursor_y = area.y + 1 + (visual_rows.saturating_sub(scroll_top))
+            .min(inner_height.saturating_sub(1)) as u16;
+        let cursor_x = area.x + 1 + cursor_col.min(inner_width.saturating_sub(1)) as u16;
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
@@ -368,17 +392,6 @@ fn wrapped_rows(line: &str, width: usize) -> usize {
         1
     } else {
         line_width.div_ceil(width)
-    }
-}
-
-/// Display width of the last wrapped row of a logical line (cursor column).
-fn last_visual_row_width(line: &str, width: usize) -> usize {
-    let line_width = line.width();
-    if line_width == 0 {
-        0
-    } else {
-        let remainder = line_width % width;
-        if remainder == 0 { width } else { remainder }
     }
 }
 
