@@ -18,7 +18,7 @@ use deep_code_agent::{
     launch_runtime,
 };
 use tokio::sync::mpsc;
-use unicode_width::UnicodeWidthStr;
+use crate::ui::{COMPOSER_MAX_VISIBLE_ROWS, layout_input};
 
 use crate::active_turn::ActiveTurn;
 use crate::cli::workspace_root;
@@ -95,21 +95,30 @@ pub struct App {
 
 const PROMPT_HISTORY_CAP: usize = 100;
 
-/// Byte index of the character before `cursor` (respects UTF-8 boundaries).
-fn cursor_prev_byte(s: &str, cursor: usize) -> usize {
-    let prefix = &s[..cursor];
-    prefix
-        .char_indices()
-        .next_back()
-        .map_or(0, |(index, _)| index)
+/// Number of characters (not bytes) in `s`.
+fn char_count(s: &str) -> usize {
+    s.chars().count()
 }
 
-/// Byte index of the character after `cursor` (respects UTF-8 boundaries).
-fn cursor_next_byte(s: &str, cursor: usize) -> usize {
-    let tail = &s[cursor..];
-    tail.char_indices()
-        .nth(1)
-        .map_or(s.len(), |(index, _)| cursor + index)
+/// Convert a 0-based character index to a byte index. Clamps to `s.len()`.
+fn byte_idx(s: &str, char_index: usize) -> usize {
+    if char_index == 0 {
+        return 0;
+    }
+    s.char_indices()
+        .nth(char_index)
+        .map_or(s.len(), |(b, _)| b)
+}
+
+/// Remove the character at `char_index` (0-based). Returns true when removed.
+fn remove_char_at(s: &mut String, char_index: usize) -> bool {
+    let start = byte_idx(s, char_index);
+    if start >= s.len() {
+        return false;
+    }
+    let end = byte_idx(s, char_index + 1);
+    s.drain(start..end);
+    true
 }
 
 impl App {
@@ -221,23 +230,22 @@ impl App {
         if self.is_streaming {
             return;
         }
-        let pos = self.input_cursor.min(self.input.len());
-        self.input.insert(pos, value);
-        self.input_cursor = pos + value.len_utf8();
+        let cursor = self.input_cursor.min(char_count(&self.input));
+        let byte = byte_idx(&self.input, cursor);
+        self.input.insert(byte, value);
+        self.input_cursor = cursor + 1;
         self.history_cursor = None;
         self.refresh_completion();
     }
 
     pub fn backspace(&mut self) {
-        if self.is_streaming {
+        if self.is_streaming || self.input_cursor == 0 {
             return;
         }
-        if self.input_cursor == 0 {
-            return;
+        let target = self.input_cursor.saturating_sub(1);
+        if remove_char_at(&mut self.input, target) {
+            self.input_cursor = target;
         }
-        let prev = cursor_prev_byte(&self.input, self.input_cursor);
-        self.input.remove(prev);
-        self.input_cursor = prev;
         self.history_cursor = None;
         self.refresh_completion();
     }
@@ -247,38 +255,44 @@ impl App {
         if self.is_streaming {
             return;
         }
-        let pos = self.input_cursor.min(self.input.len());
-        self.input.insert(pos, '\n');
-        self.input_cursor = pos + 1;
+        let cursor = self.input_cursor.min(char_count(&self.input));
+        let byte = byte_idx(&self.input, cursor);
+        self.input.insert(byte, '\n');
+        self.input_cursor = cursor + 1;
         self.history_cursor = None;
         self.refresh_completion();
     }
 
     /// Delete the character after the cursor (Delete key).
     pub fn delete_forward(&mut self) {
-        if self.is_streaming || self.input_cursor >= self.input.len() {
+        if self.is_streaming {
             return;
         }
-        self.input.remove(self.input_cursor);
+        if self.input_cursor >= char_count(&self.input) {
+            return;
+        }
+        remove_char_at(&mut self.input, self.input_cursor);
         // cursor stays — next char slides left into its place.
         self.history_cursor = None;
         self.refresh_completion();
     }
 
-    /// Move cursor one character left (respects UTF-8 boundaries).
+    /// Move cursor one character left.
     pub fn cursor_left(&mut self) {
         if self.is_streaming || self.input_cursor == 0 {
             return;
         }
-        self.input_cursor = cursor_prev_byte(&self.input, self.input_cursor);
+        self.input_cursor -= 1;
     }
 
-    /// Move cursor one character right (respects UTF-8 boundaries).
+    /// Move cursor one character right.
     pub fn cursor_right(&mut self) {
         if self.is_streaming {
             return;
         }
-        self.input_cursor = cursor_next_byte(&self.input, self.input_cursor);
+        if self.input_cursor < char_count(&self.input) {
+            self.input_cursor += 1;
+        }
     }
 
     /// Move cursor to start of the current logical line.
@@ -286,8 +300,10 @@ impl App {
         if self.is_streaming {
             return;
         }
-        let prefix = &self.input[..self.input_cursor.min(self.input.len())];
-        self.input_cursor = prefix.rfind('\n').map_or(0, |pos| pos + 1);
+        let byte = byte_idx(&self.input, self.input_cursor.min(char_count(&self.input)));
+        let prefix = &self.input[..byte];
+        let line_start_byte = prefix.rfind('\n').map_or(0, |pos| pos + 1);
+        self.input_cursor = self.input[..line_start_byte].chars().count();
     }
 
     /// Move cursor to end of the current logical line.
@@ -295,15 +311,16 @@ impl App {
         if self.is_streaming {
             return;
         }
-        let tail = &self.input[self.input_cursor.min(self.input.len())..];
+        let byte = byte_idx(&self.input, self.input_cursor.min(char_count(&self.input)));
+        let tail = &self.input[byte..];
         let eol = tail.find('\n').unwrap_or(tail.len());
-        self.input_cursor = self.input_cursor.min(self.input.len()) + eol;
-        self.input_cursor = self.input_cursor.min(self.input.len());
+        let line_end_byte = byte + eol;
+        self.input_cursor = self.input[..line_end_byte].chars().count();
     }
 
     /// Move cursor to the very end of input.
     pub fn cursor_to_end(&mut self) {
-        self.input_cursor = self.input.len();
+        self.input_cursor = char_count(&self.input);
     }
 
     #[must_use]
@@ -423,19 +440,17 @@ impl App {
         }
     }
 
-    /// Composer area height including borders; content grows 1..=6 visual rows.
+    /// Composer area height including borders; content grows 1..=MAX visual rows.
     #[must_use]
+    #[allow(dead_code)]
     pub fn input_height(&self, inner_width: u16) -> u16 {
-        let cols = usize::from(inner_width.max(1));
-        let rows: usize = self
-            .input
-            .split('\n')
-            .map(|line| {
-                let lw = line.width();
-                if lw == 0 { 1 } else { lw.div_ceil(cols) }
-            })
-            .sum();
-        (rows.clamp(1, 6) as u16) + 2
+        let layout = layout_input(
+            &self.input,
+            self.input_cursor,
+            usize::from(inner_width.max(1)),
+            COMPOSER_MAX_VISIBLE_ROWS,
+        );
+        (layout.total_rows.clamp(1, COMPOSER_MAX_VISIBLE_ROWS) as u16) + 2
     }
 
     /// Recall the previous sent prompt (Ctrl+P). The live input is stashed as
@@ -575,6 +590,11 @@ impl App {
 
     pub fn scroll_down(&mut self) {
         self.scroll_offset = self.scroll_offset.saturating_sub(3);
+    }
+
+    #[allow(dead_code)]
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
     }
 
     pub fn scroll_approval_up(&mut self) {
@@ -1032,18 +1052,18 @@ mod tests {
     #[test]
     fn composer_newline_and_height_clamp() {
         let mut app = App::new();
-        assert_eq!(app.input_height(), 3, "empty input is one row plus borders");
+        assert_eq!(app.input_height(80), 3, "empty input is one row plus borders");
 
         app.push_char('a');
         app.push_newline();
         app.push_char('b');
         assert_eq!(app.input, "a\nb");
-        assert_eq!(app.input_height(), 4);
+        assert_eq!(app.input_height(80), 4);
 
         for _ in 0..10 {
             app.push_newline();
         }
-        assert_eq!(app.input_height(), 8, "content rows clamp at 6 (+2 borders)");
+        assert_eq!(app.input_height(80), 8, "content rows clamp at 6 (+2 borders)");
 
         app.is_streaming = true;
         let before = app.input.clone();

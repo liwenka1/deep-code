@@ -9,9 +9,9 @@ use crossterm::terminal::{
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style, Stylize};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use ratatui::{Terminal, backend::CrosstermBackend};
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, LaunchConfig};
@@ -21,9 +21,6 @@ use crate::markdown::render_markdown;
 /// Redraws are coalesced to at most ~30fps; streaming deltas mark the UI
 /// dirty instead of forcing a frame each.
 const MIN_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
-/// Periodic full clear to flush any stale cells left by partial redraws.
-const FULL_REDRAW_EVERY: u32 = 50;
-
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 pub async fn run(config: LaunchConfig) -> Result<()> {
@@ -59,7 +56,6 @@ fn restore_terminal(terminal: &mut AppTerminal) -> Result<()> {
 fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
     let mut needs_redraw = true;
     let mut last_draw: Option<Instant> = None;
-    let mut frames_since_clear = 0u32;
 
     while !app.should_quit {
         if app.drain_stream_updates() {
@@ -68,11 +64,6 @@ fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
 
         let draw_due = last_draw.is_none_or(|at| at.elapsed() >= MIN_REDRAW_INTERVAL);
         if needs_redraw && draw_due {
-            frames_since_clear += 1;
-            if frames_since_clear >= FULL_REDRAW_EVERY {
-                terminal.clear()?;
-                frames_since_clear = 0;
-            }
             terminal.draw(|frame| render(frame, app))?;
             last_draw = Some(Instant::now());
             needs_redraw = false;
@@ -159,9 +150,21 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Soft upper bound for composer visible rows before scrolling.
+pub(crate) const COMPOSER_MAX_VISIBLE_ROWS: usize = 6;
+
 fn render(frame: &mut Frame<'_>, app: &App) {
     let inner_width = frame.area().width.saturating_sub(2).max(1);
-    let input_height = Constraint::Length(app.input_height(inner_width));
+    // Compute layout once — height and rendering share the same result.
+    let layout = layout_input(
+        &app.input,
+        app.input_cursor,
+        inner_width as usize,
+        COMPOSER_MAX_VISIBLE_ROWS,
+    );
+    let visual_rows = layout.total_rows.clamp(1, COMPOSER_MAX_VISIBLE_ROWS);
+    let input_height = Constraint::Length(visual_rows as u16 + 2);
+
     if app.pending_approval.is_some() {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -174,7 +177,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             .split(frame.area());
         render_messages(frame, app, chunks[0]);
         render_approval_panel(frame, app, chunks[1]);
-        render_input(frame, app, chunks[2]);
+        render_input_from_layout(frame, app, &layout, chunks[2]);
         render_status(frame, app, chunks[3]);
     } else if let Some(menu) = &app.completion {
         let menu_height = (menu.items.len() as u16).min(8) + 2;
@@ -189,7 +192,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             .split(frame.area());
         render_messages(frame, app, chunks[0]);
         render_completion_menu(frame, menu, chunks[1]);
-        render_input(frame, app, chunks[2]);
+        render_input_from_layout(frame, app, &layout, chunks[2]);
         render_status(frame, app, chunks[3]);
     } else {
         let chunks = Layout::default()
@@ -197,7 +200,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             .constraints([Constraint::Min(5), input_height, Constraint::Length(1)])
             .split(frame.area());
         render_messages(frame, app, chunks[0]);
-        render_input(frame, app, chunks[1]);
+        render_input_from_layout(frame, app, &layout, chunks[1]);
         render_status(frame, app, chunks[2]);
     }
 }
@@ -334,64 +337,198 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout
     frame.render_widget(panel, area);
 }
 
-fn render_input(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
+// ---------------------------------------------------------------------------
+// layout_input — shared text layout engine for the composer
+// ---------------------------------------------------------------------------
+
+/// Pre-computed layout result: the visible subset of wrapped lines, the
+/// cursor row/column within that subset, and the total visual row count.
+#[derive(Debug, Clone)]
+pub(crate) struct LayoutResult {
+    /// Lines visible in the viewport (already wrapped).
+    pub visible_lines: Vec<String>,
+    /// Cursor row relative to the visible subset (0-based).
+    pub cursor_visible_row: usize,
+    /// Cursor column within its row (0-based, display width).
+    pub cursor_col: usize,
+    /// Total visual rows across the whole input (for scroll calculations).
+    pub total_rows: usize,
+}
+
+/// Layout the text, wrapping at `width`, scrolling to keep the cursor
+/// visible, and returning only the `max_visible_rows` subset.
+pub(crate) fn layout_input(
+    input: &str,
+    cursor_chars: usize,
+    width: usize,
+    max_visible_rows: usize,
+) -> LayoutResult {
+    let lines = wrap_input_lines(input, width);
+    let total_rows = lines.len().max(1);
+    let max_visible = max_visible_rows.max(1);
+    let (cursor_row, cursor_col) = cursor_row_col(input, cursor_chars, width.max(1));
+
+    // Scroll to keep the cursor visible.
+    let mut start = 0usize;
+    if cursor_row >= max_visible {
+        start = cursor_row + 1 - max_visible;
+    }
+    if start + max_visible > lines.len() {
+        start = lines.len().saturating_sub(max_visible);
+    }
+    let visible = lines[start..start + lines[start..].len().min(max_visible)].to_vec();
+    let cursor_visible_row = cursor_row.saturating_sub(start);
+
+    LayoutResult {
+        visible_lines: visible,
+        cursor_visible_row,
+        cursor_col: cursor_col.min(width.saturating_sub(1)),
+        total_rows,
+    }
+}
+
+/// Compute the visual row and column of a character position in a
+/// grapheme-cluster-aware way.
+fn cursor_row_col(input: &str, cursor_chars: usize, width: usize) -> (usize, usize) {
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let mut char_idx = 0usize;
+
+    for grapheme in input.graphemes(true) {
+        if char_idx >= cursor_chars {
+            break;
+        }
+        let num_chars = grapheme.chars().count();
+        let next_char_idx = char_idx.saturating_add(num_chars);
+        let cursor_inside = cursor_chars < next_char_idx;
+
+        if grapheme == "\n" {
+            row += 1;
+            col = 0;
+            char_idx = next_char_idx;
+            if cursor_inside {
+                break;
+            }
+            continue;
+        }
+
+        let gw = grapheme.width();
+        if col + gw > width && col != 0 {
+            row += 1;
+            col = 0;
+        }
+        col += gw;
+        if col >= width {
+            row += 1;
+            col = 0;
+        }
+        if cursor_inside {
+            break;
+        }
+        char_idx = next_char_idx;
+    }
+
+    (row, col)
+}
+
+/// Split text into logical lines, then wrap each line at `width`.
+fn wrap_input_lines(input: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![input.to_string()];
+    }
+    let mut lines = Vec::new();
+    for raw in input.split('\n') {
+        let wrapped = wrap_text(raw, width);
+        if wrapped.is_empty() {
+            lines.push(String::new());
+        } else {
+            lines.extend(wrapped);
+        }
+    }
+    lines
+}
+
+/// Wrap a single (newline-free) text at `width` grapheme-by-grapheme.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for grapheme in text.graphemes(true) {
+        let gw = grapheme.width();
+        // Start a new line when adding this grapheme would exceed width.
+        if current_width + gw > width && !current.is_empty() {
+            lines.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+        current.push_str(grapheme);
+        current_width += gw;
+        // If the grapheme alone fills or exceeds the line, finish it.
+        if current_width >= width {
+            lines.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn render_input_from_layout(
+    frame: &mut Frame<'_>,
+    app: &App,
+    layout: &LayoutResult,
+    area: ratatui::layout::Rect,
+) {
     let title = if app.is_streaming {
         "Prompt (streaming...)"
     } else {
         "Prompt"
     };
+    let style = Style::default();
     let inner_width = usize::from(area.width.saturating_sub(2)).max(1);
     let inner_height = usize::from(area.height.saturating_sub(2)).max(1);
 
-    // Walk the text up to the cursor byte position, tracking visual row
-    // and column as each character and newline advances the cursor.
-    let (mut visual_rows, mut cursor_col) = (0usize, 0usize);
-    let cursor = app.input_cursor.min(app.input.len());
-    for (byte, ch) in app.input.char_indices() {
-        if byte >= cursor {
+    // Render block borders first.
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner_area = block.inner(area);
+    block.render(area, frame.buffer_mut());
+
+    // Write each visible line directly — no Paragraph wrapping.
+    let visible = if layout.visible_lines.len() > inner_height {
+        &layout.visible_lines[..inner_height]
+    } else {
+        &layout.visible_lines
+    };
+    for (row, line_text) in visible.iter().enumerate() {
+        let y = inner_area.y.saturating_add(row as u16);
+        if y >= inner_area.y.saturating_add(inner_area.height) {
             break;
         }
-        if ch == '\n' {
-            visual_rows += 1;
-            cursor_col = 0;
-        } else {
-            let w = ch.width().unwrap_or(0).max(1);
-            cursor_col += w;
-            if cursor_col > inner_width {
-                visual_rows += 1;
-                cursor_col = w;
-            }
-        }
+        frame.buffer_mut().set_string(
+            inner_area.x,
+            y,
+            &line_text,
+            style,
+        );
     }
-
-    // Total rows and scroll offset for the whole content.
-    let mut total_rows = 0usize;
-    for line in app.input.split('\n') {
-        total_rows += wrapped_rows(line, inner_width);
-    }
-    let scroll_top = total_rows.saturating_sub(inner_height);
-
-    let paragraph = Paragraph::new(app.input.as_str())
-        .block(Block::default().title(title).borders(Borders::ALL))
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_top as u16, 0));
-    frame.render_widget(paragraph, area);
 
     if !app.is_streaming && app.pending_approval.is_none() {
-        let cursor_y = area.y + 1 + (visual_rows.saturating_sub(scroll_top))
-            .min(inner_height.saturating_sub(1)) as u16;
-        let cursor_x = area.x + 1 + cursor_col.min(inner_width.saturating_sub(1)) as u16;
+        let cursor_y = inner_area.y.saturating_add(
+            u16::try_from(layout.cursor_visible_row.min(inner_height.saturating_sub(1)))
+                .unwrap_or(u16::MAX),
+        );
+        let cursor_x = inner_area.x.saturating_add(
+            u16::try_from(layout.cursor_col.min(inner_width.saturating_sub(1)))
+                .unwrap_or(u16::MAX),
+        );
         frame.set_cursor_position((cursor_x, cursor_y));
-    }
-}
-
-/// Visual rows a single logical line occupies when wrapped at `width`.
-fn wrapped_rows(line: &str, width: usize) -> usize {
-    let line_width = line.width();
-    if line_width == 0 {
-        1
-    } else {
-        line_width.div_ceil(width)
     }
 }
 
