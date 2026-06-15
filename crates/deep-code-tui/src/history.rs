@@ -109,33 +109,29 @@ impl HistoryCell {
             | Self::User { text }
             | Self::Assistant { text }
             | Self::Reasoning { text } => vec![text.clone()],
+            // Compact single line: detailed risk/sandbox/rule live in the
+            // approval panel; here we only show name + args, plus an approval
+            // badge when the call was actually gated.
             Self::ToolCall {
                 tool_name,
                 arguments,
-                risk_level,
-                requires_sandbox,
                 approval,
-            } => vec![
-                format!("Tool: {tool_name}"),
-                format!("Approval: {}", approval.label()),
-                format!(
-                    "Risk: {} | Sandbox: {}",
-                    risk_level.as_deref().unwrap_or("unknown"),
-                    requires_sandbox
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "unknown".to_string())
-                ),
-                format!("Arguments: {}", truncate_chars(arguments, 240)),
-            ],
-            Self::ToolResult {
-                tool_name,
-                status,
-                summary,
-            } => vec![
-                format!("Tool: {tool_name}"),
-                format!("Result: {status:?}"),
-                format!("Summary: {}", truncate_chars(summary, 300)),
-            ],
+                ..
+            } => {
+                let args = truncate_chars(&collapse_whitespace(arguments), 72);
+                let badge = match approval {
+                    ToolApprovalState::NotRequired => String::new(),
+                    other => format!(" [{}]", other.label()),
+                };
+                vec![format!("{tool_name}  {args}{badge}")]
+            }
+            Self::ToolResult { status, summary, .. } => {
+                vec![format!(
+                    "{} {}",
+                    tool_result_word(status),
+                    truncate_chars(&collapse_whitespace(summary), 88)
+                )]
+            }
             Self::Approval {
                 tool_name,
                 description,
@@ -437,6 +433,21 @@ fn summarize_json_tool_result(value: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// Collapse all runs of whitespace (incl. newlines) to single spaces so a
+/// multi-line JSON argument or tool output renders on one line.
+pub(crate) fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[must_use]
+pub(crate) fn tool_result_word(status: &ToolResultStatus) -> &'static str {
+    match status {
+        ToolResultStatus::Success => "✓",
+        ToolResultStatus::Error => "✗",
+        ToolResultStatus::Denied => "⊘",
+    }
+}
+
 pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
     let mut truncated = String::new();
@@ -612,6 +623,45 @@ mod tests {
                 ("second_tool".to_string(), ToolResultStatus::Error),
             ]
         );
+    }
+
+    #[test]
+    fn tool_call_renders_compact_single_line() {
+        let tool = HistoryCell::ToolCall {
+            tool_name: "shell_run".to_string(),
+            arguments: "{\"command\":\n  \"grep foo\"}".to_string(),
+            risk_level: None,
+            requires_sandbox: None,
+            approval: ToolApprovalState::NotRequired,
+        };
+        let lines = tool.lines();
+        assert_eq!(lines.len(), 1, "tool call must be one line");
+        assert!(lines[0].starts_with("shell_run  "));
+        // Whitespace/newlines collapsed; no Risk/Approval/Sandbox noise.
+        assert!(!lines[0].contains('\n'));
+        assert!(!lines[0].contains("Risk"));
+        assert!(!lines[0].contains("not required"));
+
+        let gated = HistoryCell::ToolCall {
+            tool_name: "write_file".to_string(),
+            arguments: "{}".to_string(),
+            risk_level: Some("Medium".to_string()),
+            requires_sandbox: Some(false),
+            approval: ToolApprovalState::Approved,
+        };
+        assert!(gated.lines()[0].ends_with("[approved]"));
+    }
+
+    #[test]
+    fn tool_result_renders_compact_single_line() {
+        let result = HistoryCell::ToolResult {
+            tool_name: "shell_run".to_string(),
+            status: ToolResultStatus::Success,
+            summary: "ok\nmulti\nline".to_string(),
+        };
+        let lines = result.lines();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("ok multi line"));
     }
 
     #[test]

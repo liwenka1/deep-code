@@ -21,6 +21,9 @@ use crate::markdown::render_markdown;
 /// Redraws are coalesced to at most ~30fps; streaming deltas mark the UI
 /// dirty instead of forcing a frame each.
 const MIN_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
+/// While streaming, repaint at least this often so the activity indicator
+/// animates through a long time-to-first-token wait.
+const STREAM_TICK_INTERVAL: Duration = Duration::from_millis(120);
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 pub async fn run(config: LaunchConfig) -> Result<()> {
@@ -62,8 +65,13 @@ fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
             needs_redraw = true;
         }
 
+        // While streaming, redraw on a slow tick even when no tokens arrived,
+        // so the "generating Ns" activity indicator keeps animating during a
+        // long time-to-first-token wait instead of looking frozen.
         let draw_due = last_draw.is_none_or(|at| at.elapsed() >= MIN_REDRAW_INTERVAL);
-        if needs_redraw && draw_due {
+        let tick_due =
+            app.is_streaming && last_draw.is_none_or(|at| at.elapsed() >= STREAM_TICK_INTERVAL);
+        if (needs_redraw && draw_due) || tick_due {
             terminal.draw(|frame| render(frame, app))?;
             last_draw = Some(Instant::now());
             needs_redraw = false;
@@ -269,7 +277,7 @@ fn render_messages(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect
         } else {
             &preview[index - history_len]
         };
-        let lines = cell_lines(cell, index < history_len, content_width);
+        let lines = cell_lines(cell, content_width);
         total_lines += lines.len();
         chunks.push(lines);
     }
@@ -296,16 +304,49 @@ fn render_messages(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect
     frame.render_widget(paragraph, area);
 }
 
-/// Render one transcript cell: label line, body, trailing blank. Flushed
-/// assistant cells render as markdown; the still-streaming preview stays
-/// plain so half-open code fences don't flicker.
-fn cell_lines(cell: &HistoryCell, flushed: bool, width: u16) -> Vec<Line<'static>> {
+/// Render one transcript cell: label line, body, trailing blank.
+///
+/// Assistant text always renders as markdown — including while still
+/// streaming — so the formatting is consistent throughout instead of
+/// showing raw `#`/`*`/backticks mid-stream and snapping to formatted on
+/// completion. `parse_blocks` treats an unclosed code fence as a code block,
+/// so a half-streamed fence renders cleanly without flicker.
+fn cell_lines(cell: &HistoryCell, width: u16) -> Vec<Line<'static>> {
+    // Tool call/result are rendered as one tight colored line (no label box,
+    // no trailing blank) so a multi-step tool sequence stacks compactly.
+    match cell {
+        HistoryCell::ToolCall { .. } => {
+            let text = cell.lines().join(" ");
+            return vec![Line::from(Span::raw(format!("⏺ {text}")).yellow())];
+        }
+        HistoryCell::ToolResult { status, .. } => {
+            let text = cell.lines().join(" ");
+            let styled = Span::raw(format!("  {text}"));
+            let styled = match status {
+                deep_code_agent::ToolResultStatus::Success => styled.green(),
+                deep_code_agent::ToolResultStatus::Denied => styled.yellow(),
+                deep_code_agent::ToolResultStatus::Error => styled.red(),
+            };
+            return vec![Line::from(styled)];
+        }
+        _ => {}
+    }
     let mut lines = vec![Line::from(label_for_cell(cell))];
     match cell {
-        HistoryCell::Assistant { text } if flushed => {
+        HistoryCell::Assistant { text } => {
             lines.extend(render_markdown(text, width));
         }
-        _ => lines.extend(cell.lines().into_iter().map(Line::from)),
+        // Other plain cells (reasoning, system, user, etc.) must be wrapped
+        // to the viewport width here: the messages Paragraph is
+        // scroll-positioned, not `.wrap()`-ed, so an unwrapped long line
+        // would fill one row and get clipped.
+        _ => {
+            for logical in cell.lines() {
+                for wrapped in wrap_text(&logical, width as usize) {
+                    lines.push(Line::from(wrapped));
+                }
+            }
+        }
     }
     lines.push(Line::default());
     lines
@@ -511,12 +552,7 @@ fn render_input_from_layout(
         if y >= inner_area.y.saturating_add(inner_area.height) {
             break;
         }
-        frame.buffer_mut().set_string(
-            inner_area.x,
-            y,
-            &line_text,
-            style,
-        );
+        frame.buffer_mut().set_string(inner_area.x, y, line_text, style);
     }
 
     if !app.is_streaming && app.pending_approval.is_none() {
@@ -541,6 +577,16 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) 
             ),
             Span::raw(error.clone()),
         ])
+    } else if let Some(activity) = app.streaming_activity() {
+        // While streaming (incl. a long time-to-first-token wait) show an
+        // animated indicator so the screen never looks frozen.
+        Line::from(vec![
+            Span::styled(activity, Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "   Esc 取消".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
     } else {
         Line::from(app.status_line())
     };
@@ -563,5 +609,47 @@ fn label_for_cell(cell: &HistoryCell) -> Span<'static> {
         HistoryCell::Checkpoint { .. } => cell.label().dark_gray().bold(),
         HistoryCell::Compaction { .. } => cell.label().dark_gray().bold(),
         HistoryCell::System { .. } => cell.label().dark_gray().bold(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::HistoryCell;
+
+    fn line_width(line: &Line<'_>) -> usize {
+        line.spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum()
+    }
+
+    #[test]
+    fn streaming_plain_assistant_wraps_to_width() {
+        // Assistant text (streaming or flushed) wraps to width, never one row.
+        let cell = HistoryCell::Assistant {
+            text: "x".repeat(120),
+        };
+        let lines = cell_lines(&cell, 40);
+        assert!(
+            lines.len() >= 4,
+            "120 cols at width 40 must wrap to multiple rows, got {}",
+            lines.len()
+        );
+        for line in &lines {
+            assert!(line_width(line) <= 40, "row exceeds width: {}", line_width(line));
+        }
+    }
+
+    #[test]
+    fn streaming_cjk_text_wraps_by_display_width() {
+        let cell = HistoryCell::Assistant {
+            text: "中".repeat(30), // 60 display columns
+        };
+        let lines = cell_lines(&cell, 20);
+        assert!(lines.len() >= 4);
+        for line in &lines {
+            assert!(line_width(line) <= 20);
+        }
     }
 }

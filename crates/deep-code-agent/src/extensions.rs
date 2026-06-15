@@ -59,8 +59,19 @@ impl RuntimeBootstrap {
     }
 }
 
+/// Tool-use discipline appended to every runtime system prompt. Without it,
+/// DeepSeek tends to micro-step (edit → grep → edit), flooding the
+/// transcript with tiny tool calls.
+pub const TOOL_DISCIPLINE: &str = "\
+工具使用纪律 / Tool discipline:\n\
+- 先规划再行动：想清楚需要哪些信息，再决定调用哪些工具。\n\
+- 一次性读取所需文件，不要反复读取同一文件；能从已有上下文推断的内容不要再调工具确认。\n\
+- 调查类调用尽量批量进行；拿到足够信息后直接给出结论或一次性完成修改，避免一步一调的碎步操作。\n\
+- 工具结果已在上下文中，无需重复获取。";
+
 pub fn build_runtime_system_prompt(base: &str, workspace: &Path) -> String {
-    build_system_prompt(base, workspace)
+    let prompt = build_system_prompt(base, workspace);
+    format!("{prompt}\n\n{TOOL_DISCIPLINE}")
 }
 
 pub fn attach_runtime_tools(registry: &mut ToolRegistry, bootstrap: &RuntimeBootstrap) {
@@ -99,4 +110,19 @@ pub fn attach_agent_extensions<C: LlmClient + Clone + 'static>(
         mcp: Arc::clone(&bootstrap.mcp),
         hooks: Arc::clone(&bootstrap.hooks),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn runtime_prompt_includes_tool_discipline() {
+        let dir = TempDir::new().unwrap();
+        let prompt = build_runtime_system_prompt("base prompt", dir.path());
+        assert!(prompt.starts_with("base prompt"));
+        assert!(prompt.contains("工具使用纪律"));
+        assert!(prompt.contains("不要反复读取同一文件"));
+    }
 }

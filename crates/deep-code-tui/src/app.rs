@@ -91,6 +91,9 @@ pub struct App {
     pub(crate) workspace_files: Vec<String>,
     /// Target of `/apikey` `/model` `/logout` writes; overridable in tests.
     pub(crate) global_config_path: PathBuf,
+    /// When the current stream segment began, for the live activity
+    /// indicator. Only read while `is_streaming`.
+    pub(crate) streaming_since: Option<std::time::Instant>,
 }
 
 const PROMPT_HISTORY_CAP: usize = 100;
@@ -218,7 +221,22 @@ impl App {
             completion: None,
             workspace_files,
             global_config_path: default_config_path(),
+            streaming_since: None,
         }
+    }
+
+    /// Live activity label shown while streaming: an animated spinner plus
+    /// elapsed seconds, so a long time-to-first-token wait reads as
+    /// "生成中" rather than a frozen screen.
+    #[must_use]
+    pub(crate) fn streaming_activity(&self) -> Option<String> {
+        if !self.is_streaming {
+            return None;
+        }
+        let elapsed = self.streaming_since?.elapsed();
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let frame = FRAMES[(elapsed.as_millis() / 120 % FRAMES.len() as u128) as usize];
+        Some(format!("{frame} 生成中 {}s", elapsed.as_secs()))
     }
 
     #[must_use]
@@ -727,6 +745,7 @@ impl App {
     fn start_stream(&mut self, request: StreamRequest) {
         let (tx, rx) = mpsc::unbounded_channel();
         self.ui_rx = Some(rx);
+        self.streaming_since = Some(std::time::Instant::now());
 
         let runtime = Arc::clone(&self.runtime);
         tokio::spawn(async move {
@@ -1304,6 +1323,20 @@ mod tests {
         assert!(app.pending_approval.is_none());
         assert!(app.is_streaming);
         assert!(app.status.contains("approved (session)"));
+    }
+
+    #[test]
+    fn streaming_activity_shows_only_while_streaming() {
+        let mut app = App::new();
+        assert!(app.streaming_activity().is_none(), "idle shows no indicator");
+
+        app.is_streaming = true;
+        app.streaming_since = Some(std::time::Instant::now());
+        let activity = app.streaming_activity().expect("indicator while streaming");
+        assert!(activity.contains("生成中"));
+
+        app.is_streaming = false;
+        assert!(app.streaming_activity().is_none());
     }
 
     #[test]

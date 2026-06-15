@@ -319,7 +319,12 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
 
         {
             let mut state = self.state.lock().await;
-            state.session.push(result.to_message());
+            // Model history gets a size-bounded copy; the event stream and the
+            // persisted TurnRecord keep the full output.
+            let trimmed = truncate_tool_output(&result.content);
+            state
+                .session
+                .push(crate::message::Message::tool(result.call_id.clone(), trimmed));
             if let Some(turn) = state.current_turn.as_mut() {
                 turn.tool_results.push(result.clone());
             }
@@ -336,6 +341,28 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         );
         emit(tx, RuntimeEvent::ToolResult { result });
     }
+}
+
+const TOOL_OUTPUT_BUDGET: usize = 12_000;
+const TOOL_OUTPUT_HEAD: usize = 4_000;
+const TOOL_OUTPUT_TAIL: usize = 4_000;
+
+/// Bound a tool result before it re-enters the model context: oversized
+/// outputs keep their head and tail with a marker for the elided middle, so
+/// the next request stays small without losing the most relevant ends.
+/// Counts by `char` to stay UTF-8 safe.
+pub(super) fn truncate_tool_output(content: &str) -> String {
+    let total = content.chars().count();
+    if total <= TOOL_OUTPUT_BUDGET {
+        return content.to_string();
+    }
+    let head: String = content.chars().take(TOOL_OUTPUT_HEAD).collect();
+    let tail: String = content
+        .chars()
+        .skip(total - TOOL_OUTPUT_TAIL)
+        .collect();
+    let elided = total - TOOL_OUTPUT_HEAD - TOOL_OUTPUT_TAIL;
+    format!("{head}\n\n...[省略 {elided} 字符 / {elided} chars truncated]...\n\n{tail}")
 }
 
 pub(super) fn tool_call_payload(call: &ToolCall) -> ToolCallPayload {

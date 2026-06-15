@@ -576,6 +576,23 @@ async fn submit_approval_without_pending_emits_error() {
 }
 
 #[test]
+fn truncate_tool_output_keeps_head_and_tail() {
+    use crate::runtime::tool_result::truncate_tool_output;
+
+    let small = "short output";
+    assert_eq!(truncate_tool_output(small), small, "small output unchanged");
+
+    let big = "A".repeat(5_000) + &"B".repeat(20_000) + &"C".repeat(5_000);
+    let out = truncate_tool_output(&big);
+    assert!(out.chars().count() < big.chars().count());
+    assert!(out.starts_with("AAAA"));
+    assert!(out.ends_with("CCCC"));
+    assert!(out.contains("truncated"));
+    // Head + tail + marker, far below the original 30k.
+    assert!(out.chars().count() < 9_000);
+}
+
+#[test]
 fn session_allow_excludes_shell_class_tools() {
     use crate::runtime::tool_result::session_allowable;
     assert!(session_allowable("mock_echo"));
