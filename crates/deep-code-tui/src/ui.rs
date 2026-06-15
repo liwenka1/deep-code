@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -42,10 +42,16 @@ pub async fn run(config: LaunchConfig) -> Result<()> {
 fn setup_terminal() -> Result<AppTerminal> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Bracketed paste: the terminal delivers a paste as one `Event::Paste`
-    // string instead of a burst of key events — so multi-line pastes don't
-    // trigger Enter (submit) on every newline.
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    // Bracketed paste: paste arrives as one `Event::Paste` string instead of a
+    // burst of key events. Mouse capture: wheel events scroll the transcript
+    // (laptops often lack PageUp/PageDown). Native click-drag selection then
+    // needs Option/Shift held in macOS terminals.
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -58,6 +64,7 @@ fn restore_terminal(terminal: &mut AppTerminal) -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
     )?;
@@ -97,6 +104,17 @@ fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
                     app.paste_str(text);
                     needs_redraw = true;
                 }
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        app.scroll_up();
+                        needs_redraw = true;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        app.scroll_down();
+                        needs_redraw = true;
+                    }
+                    _ => {}
+                },
                 Event::Resize(..) => needs_redraw = true,
                 _ => {}
             }

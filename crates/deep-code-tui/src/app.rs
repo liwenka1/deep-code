@@ -493,24 +493,29 @@ impl App {
         self.input[..byte + eol].chars().count()
     }
 
-    /// Up arrow: move the cursor to the previous logical line; on the first
-    /// line, recall the previous prompt from history instead.
+    /// Up arrow drives the composer only — never the transcript (that's
+    /// PageUp/PageDown). In a multi-line draft it moves the cursor up a line
+    /// (no-op at the top, so the draft is never clobbered); on a single-line
+    /// or empty composer it recalls the previous prompt.
     pub fn on_up(&mut self) {
         if self.is_streaming {
             return;
         }
-        if !self.cursor_up_logical() {
+        if self.input.contains('\n') {
+            self.cursor_up_logical();
+        } else {
             self.history_prev();
         }
     }
 
-    /// Down arrow: move the cursor to the next logical line; on the last
-    /// line, walk back toward the draft / next history entry.
+    /// Down arrow: mirror of [`on_up`].
     pub fn on_down(&mut self) {
         if self.is_streaming {
             return;
         }
-        if !self.cursor_down_logical() {
+        if self.input.contains('\n') {
+            self.cursor_down_logical();
+        } else {
             self.history_next();
         }
     }
@@ -1675,6 +1680,38 @@ mod tests {
         assert_eq!(app.input_cursor, 4); // start of "bar"
         app.word_right();
         assert_eq!(app.input_cursor, 7); // end of "bar"
+    }
+
+    #[test]
+    fn arrows_drive_draft_and_history_never_scroll() {
+        let mut app = App::new();
+        app.remember_prompt("earlier");
+
+        // Single-line draft: ↑ recalls history (stashing the draft), ↓ restores
+        // it; the transcript scroll offset never changes.
+        for ch in "typing".chars() {
+            app.push_char(ch);
+        }
+        app.on_up();
+        assert_eq!(app.scroll_offset, 0, "↑ never scrolls");
+        assert_eq!(app.input, "earlier", "single-line ↑ recalls history");
+        app.on_down();
+        assert_eq!(app.input, "typing", "↓ restores the stashed draft");
+        assert_eq!(app.scroll_offset, 0);
+
+        // Multi-line draft: ↑ moves the cursor; at the top line it does nothing
+        // (must not clobber the draft with history).
+        app.input.clear();
+        app.input_cursor = 0;
+        for ch in "l1\nl2".chars() {
+            app.push_char(ch);
+        }
+        app.on_up();
+        assert_eq!(app.cursor_line_col().0, 0, "↑ moved cursor to first line");
+        let at_top = app.input.clone();
+        app.on_up();
+        assert_eq!(app.input, at_top, "top-line ↑ must not recall history");
+        assert_eq!(app.scroll_offset, 0);
     }
 
     #[test]
