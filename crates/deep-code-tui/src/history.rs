@@ -87,22 +87,6 @@ impl HistoryCell {
     }
 
     #[must_use]
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::System { .. } => "System",
-            Self::User { .. } => "You",
-            Self::Assistant { .. } => "Assistant",
-            Self::Reasoning { .. } => "Reasoning",
-            Self::ToolCall { .. } => "Tool call",
-            Self::ToolResult { .. } => "Tool result",
-            Self::Approval { .. } => "Approval",
-            Self::Diagnostics { .. } => "Diagnostics",
-            Self::Checkpoint { .. } => "Checkpoint",
-            Self::Compaction { .. } => "Compaction",
-        }
-    }
-
-    #[must_use]
     pub fn lines(&self) -> Vec<String> {
         match self {
             Self::System { text }

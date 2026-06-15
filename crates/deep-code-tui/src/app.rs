@@ -68,6 +68,9 @@ pub struct App {
     pub status: String,
     pub error: Option<String>,
     pub should_quit: bool,
+    /// Armed by a first Ctrl+C on an idle, empty composer; a second
+    /// consecutive Ctrl+C then quits. Reset by any other key.
+    pub(crate) ctrl_c_pending: bool,
     pub is_streaming: bool,
     pub pending_approval: Option<ApprovalRequest>,
     pub last_checkpoint: Option<String>,
@@ -94,6 +97,10 @@ pub struct App {
     /// When the current stream segment began, for the live activity
     /// indicator. Only read while `is_streaming`.
     pub(crate) streaming_since: Option<std::time::Instant>,
+    /// Collapsed pastes: `(placeholder token, real content)`. Large pastes
+    /// show a compact `[粘贴 #N …]` chip in the composer; the real content is
+    /// expanded back in on submit. Reset once a turn is sent or input cleared.
+    pub(crate) pasted_blocks: Vec<(String, String)>,
 }
 
 const PROMPT_HISTORY_CAP: usize = 100;
@@ -151,7 +158,7 @@ impl App {
             });
         let mut history = vec![HistoryCell::system(format!(
             "{}\n{}\n{}\n{}\n{}",
-            "Type a prompt and press Enter. Esc: 取消本轮/清空输入/退出 (按状态依次生效), Ctrl+C: 退出.",
+            "Type a prompt and press Enter. Esc: 取消本轮/清空输入/退出 (按状态依次生效), Ctrl+C: 取消/清空/连按两次退出.",
             "Tip: in offline mode, type \"/mock-tool hello\" to exercise approval.",
             "Slash: /help, /model, /apikey, /checkpoints, /sessions, /agents",
             workspace_note,
@@ -199,6 +206,7 @@ impl App {
             status,
             error: None,
             should_quit: false,
+            ctrl_c_pending: false,
             is_streaming: false,
             pending_approval: None,
             last_checkpoint: None,
@@ -222,6 +230,7 @@ impl App {
             workspace_files,
             global_config_path: default_config_path(),
             streaming_since: None,
+            pasted_blocks: Vec::new(),
         }
     }
 
@@ -339,6 +348,238 @@ impl App {
     /// Move cursor to the very end of input.
     pub fn cursor_to_end(&mut self) {
         self.input_cursor = char_count(&self.input);
+    }
+
+    fn insert_str_at_cursor(&mut self, text: &str) {
+        let cursor = self.input_cursor.min(char_count(&self.input));
+        let byte = byte_idx(&self.input, cursor);
+        self.input.insert_str(byte, text);
+        self.input_cursor = cursor + char_count(text);
+        self.history_cursor = None;
+        self.refresh_completion();
+    }
+
+    /// Handle a bracketed-paste payload. Large pastes (multi-line or long)
+    /// collapse to a compact `[粘贴 #N …]` chip whose real content is kept in
+    /// `pasted_blocks` and expanded back in on submit; short single-line
+    /// pastes insert inline.
+    pub fn paste_str(&mut self, text: String) {
+        if self.is_streaming {
+            return;
+        }
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        if normalized.is_empty() {
+            return;
+        }
+        let multiline = normalized.contains('\n');
+        let chars = char_count(&normalized);
+        if multiline || chars > 120 {
+            let id = self.pasted_blocks.len() + 1;
+            let placeholder = if multiline {
+                format!("[粘贴 #{id} +{} 行]", normalized.lines().count().max(1))
+            } else {
+                format!("[粘贴 #{id} · {chars} 字]")
+            };
+            self.insert_str_at_cursor(&placeholder);
+            self.pasted_blocks.push((placeholder, normalized));
+        } else {
+            self.insert_str_at_cursor(&normalized);
+        }
+    }
+
+    /// Replace any collapsed-paste placeholders with their real content.
+    fn expand_pasted(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for (placeholder, content) in &self.pasted_blocks {
+            out = out.replace(placeholder.as_str(), content);
+        }
+        out
+    }
+
+    /// Delete the word (and any whitespace) before the cursor (Ctrl+W).
+    pub fn delete_word_back(&mut self) {
+        if self.is_streaming || self.input_cursor == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut start = self.input_cursor.min(chars.len());
+        while start > 0 && chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        self.drain_chars(start, self.input_cursor);
+        self.input_cursor = start;
+        self.history_cursor = None;
+        self.refresh_completion();
+    }
+
+    /// Delete from the current logical line's start up to the cursor (Ctrl+U).
+    pub fn kill_to_line_start(&mut self) {
+        if self.is_streaming || self.input_cursor == 0 {
+            return;
+        }
+        let start = self.current_line_start_char();
+        self.drain_chars(start, self.input_cursor);
+        self.input_cursor = start;
+        self.history_cursor = None;
+        self.refresh_completion();
+    }
+
+    /// Delete from the cursor to the end of the current logical line (Ctrl+K).
+    pub fn kill_to_line_end(&mut self) {
+        if self.is_streaming {
+            return;
+        }
+        let end = self.current_line_end_char();
+        self.drain_chars(self.input_cursor, end);
+        self.history_cursor = None;
+        self.refresh_completion();
+    }
+
+    /// Move cursor to the previous word start (Ctrl/Alt + Left).
+    pub fn word_left(&mut self) {
+        if self.is_streaming || self.input_cursor == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut i = self.input_cursor.min(chars.len());
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        self.input_cursor = i;
+    }
+
+    /// Move cursor to the next word end (Ctrl/Alt + Right).
+    pub fn word_right(&mut self) {
+        if self.is_streaming {
+            return;
+        }
+        let chars: Vec<char> = self.input.chars().collect();
+        let len = chars.len();
+        let mut i = self.input_cursor.min(len);
+        while i < len && chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < len && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        self.input_cursor = i;
+    }
+
+    fn drain_chars(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        let mut chars: Vec<char> = self.input.chars().collect();
+        let end = end.min(chars.len());
+        chars.drain(start..end);
+        self.input = chars.into_iter().collect();
+    }
+
+    fn current_line_start_char(&self) -> usize {
+        let byte = byte_idx(&self.input, self.input_cursor.min(char_count(&self.input)));
+        let start_byte = self.input[..byte].rfind('\n').map_or(0, |pos| pos + 1);
+        self.input[..start_byte].chars().count()
+    }
+
+    fn current_line_end_char(&self) -> usize {
+        let byte = byte_idx(&self.input, self.input_cursor.min(char_count(&self.input)));
+        let eol = self.input[byte..].find('\n').unwrap_or(self.input.len() - byte);
+        self.input[..byte + eol].chars().count()
+    }
+
+    /// Up arrow: move the cursor to the previous logical line; on the first
+    /// line, recall the previous prompt from history instead.
+    pub fn on_up(&mut self) {
+        if self.is_streaming {
+            return;
+        }
+        if !self.cursor_up_logical() {
+            self.history_prev();
+        }
+    }
+
+    /// Down arrow: move the cursor to the next logical line; on the last
+    /// line, walk back toward the draft / next history entry.
+    pub fn on_down(&mut self) {
+        if self.is_streaming {
+            return;
+        }
+        if !self.cursor_down_logical() {
+            self.history_next();
+        }
+    }
+
+    /// Move one logical line up, preserving column. Returns false when already
+    /// on the first line (so the caller can fall back to history).
+    fn cursor_up_logical(&mut self) -> bool {
+        let (line, col) = self.cursor_line_col();
+        if line == 0 {
+            return false;
+        }
+        let target = line - 1;
+        let len = self.logical_line_len(target);
+        self.input_cursor = self.line_start_char(target) + col.min(len);
+        true
+    }
+
+    fn cursor_down_logical(&mut self) -> bool {
+        let (line, col) = self.cursor_line_col();
+        let total = self.input.split('\n').count();
+        if line + 1 >= total {
+            return false;
+        }
+        let target = line + 1;
+        let len = self.logical_line_len(target);
+        self.input_cursor = self.line_start_char(target) + col.min(len);
+        true
+    }
+
+    /// (logical line index, column in chars) of the cursor.
+    fn cursor_line_col(&self) -> (usize, usize) {
+        let mut line = 0usize;
+        let mut col = 0usize;
+        for (i, ch) in self.input.chars().enumerate() {
+            if i >= self.input_cursor {
+                break;
+            }
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+
+    /// Char index where logical line `line` starts.
+    fn line_start_char(&self, line: usize) -> usize {
+        if line == 0 {
+            return 0;
+        }
+        let mut seen = 0usize;
+        for (i, ch) in self.input.chars().enumerate() {
+            if ch == '\n' {
+                seen += 1;
+                if seen == line {
+                    return i + 1;
+                }
+            }
+        }
+        char_count(&self.input)
+    }
+
+    fn logical_line_len(&self, line: usize) -> usize {
+        self.input
+            .split('\n')
+            .nth(line)
+            .map_or(0, |l| l.chars().count())
     }
 
     #[must_use]
@@ -527,24 +768,26 @@ impl App {
         }
         self.close_completion();
 
-        let prompt = self.input.trim().to_string();
-        if prompt.is_empty() {
+        // `display` keeps the compact `[粘贴 #N …]` chips (shown in the
+        // transcript and recalled by Ctrl+P); `sent` expands them to the real
+        // pasted content for the model.
+        let display = self.input.trim().to_string();
+        if display.is_empty() {
             self.status = "Enter a prompt before sending.".to_string();
             return;
         }
+        let sent = self.expand_pasted(&display);
         // Never let the API key into the recallable prompt history.
-        if !prompt.starts_with("/apikey") {
-            self.remember_prompt(&prompt);
+        if !display.starts_with("/apikey") {
+            self.remember_prompt(&display);
         }
 
-        if prompt.starts_with('/') && self.handle_slash_command(&prompt) {
-            self.input.clear();
-            self.input_cursor = 0;
+        if display.starts_with('/') && self.handle_slash_command(&display) {
+            self.clear_input();
             return;
         }
 
-        self.input.clear();
-        self.input_cursor = 0;
+        self.clear_input();
         self.error = None;
         self.active_turn = None;
         self.scroll_offset = 0;
@@ -552,9 +795,16 @@ impl App {
         self.is_streaming = true;
         self.status = format!("Streaming from {}...", self.backend_label);
 
-        self.history.push(HistoryCell::user(prompt.clone()));
+        self.history.push(HistoryCell::user(display));
 
-        self.start_stream(StreamRequest::User(prompt));
+        self.start_stream(StreamRequest::User(sent));
+    }
+
+    /// Clear the composer and any pending collapsed-paste blocks.
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.input_cursor = 0;
+        self.pasted_blocks.clear();
     }
 
     /// Esc cancel stack: close completion menu > deny approval (handled by
@@ -566,13 +816,36 @@ impl App {
         } else if self.is_streaming {
             self.cancel_streaming_turn();
         } else if !self.input.is_empty() {
-            self.input.clear();
-            self.input_cursor = 0;
+            self.clear_input();
             self.history_cursor = None;
             self.status = "已清空输入 (再按 Esc 退出)".to_string();
         } else {
             self.should_quit = true;
         }
+    }
+
+    /// Graceful Ctrl+C: interrupt a stream, else clear input, else require a
+    /// second consecutive press to actually quit.
+    pub fn handle_ctrl_c(&mut self) {
+        if self.is_streaming {
+            self.ctrl_c_pending = false;
+            self.cancel_streaming_turn();
+        } else if !self.input.is_empty() {
+            self.clear_input();
+            self.history_cursor = None;
+            self.ctrl_c_pending = false;
+            self.status = "已清空输入 (再按 Ctrl+C 退出)".to_string();
+        } else if self.ctrl_c_pending {
+            self.should_quit = true;
+        } else {
+            self.ctrl_c_pending = true;
+            self.status = "再按一次 Ctrl+C 退出".to_string();
+        }
+    }
+
+    /// Any non-Ctrl+C key disarms the quit guard.
+    pub fn clear_ctrl_c_guard(&mut self) {
+        self.ctrl_c_pending = false;
     }
 
     fn cancel_streaming_turn(&mut self) {
@@ -828,10 +1101,11 @@ impl App {
             .as_ref()
             .map(|value| {
                 format!(
-                    " | {} | turn {} | total {}",
+                    " | {} | turn {} | total {} | ctx {}%",
                     value.route_label,
                     value.turn_cost.format(self.cost_currency),
-                    value.session_cost.format(self.cost_currency)
+                    value.session_cost.format(self.cost_currency),
+                    value.context_usage_percent
                 )
             })
             .unwrap_or_default();
@@ -1326,6 +1600,126 @@ mod tests {
     }
 
     #[test]
+    fn multiline_paste_collapses_to_placeholder_and_expands_on_send() {
+        let mut app = App::new();
+        for ch in "看这个 ".chars() {
+            app.push_char(ch);
+        }
+        app.paste_str("line1\nline2\nline3".to_string());
+
+        // Composer shows a compact chip, not the raw content.
+        assert!(app.input.contains("[粘贴 #1 +3 行]"));
+        assert!(!app.input.contains("line2"));
+        assert_eq!(app.pasted_blocks.len(), 1);
+
+        // Sent form expands the chip back to the real content.
+        let sent = app.expand_pasted(&app.input);
+        assert!(sent.contains("line1\nline2\nline3"));
+        assert!(!sent.contains("[粘贴"));
+    }
+
+    #[test]
+    fn short_single_line_paste_stays_inline() {
+        let mut app = App::new();
+        app.paste_str("quick".to_string());
+        assert_eq!(app.input, "quick");
+        assert!(app.pasted_blocks.is_empty());
+    }
+
+    #[test]
+    fn long_single_line_paste_collapses_with_char_count() {
+        let mut app = App::new();
+        app.paste_str("x".repeat(200));
+        assert!(app.input.contains("[粘贴 #1 · 200 字]"));
+        assert_eq!(app.pasted_blocks.len(), 1);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_previous_word() {
+        let mut app = App::new();
+        for ch in "hello world".chars() {
+            app.push_char(ch);
+        }
+        app.delete_word_back();
+        assert_eq!(app.input, "hello ");
+        assert_eq!(app.input_cursor, 6);
+        app.delete_word_back();
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn ctrl_u_and_ctrl_k_kill_line_segments() {
+        let mut app = App::new();
+        for ch in "abcdef".chars() {
+            app.push_char(ch);
+        }
+        app.cursor_left();
+        app.cursor_left();
+        app.cursor_left(); // cursor at index 3 (between c and d)
+        app.kill_to_line_end();
+        assert_eq!(app.input, "abc");
+        app.kill_to_line_start();
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn word_movement_jumps_between_words() {
+        let mut app = App::new();
+        for ch in "foo bar baz".chars() {
+            app.push_char(ch);
+        }
+        assert_eq!(app.input_cursor, 11);
+        app.word_left();
+        assert_eq!(app.input_cursor, 8); // start of "baz"
+        app.word_left();
+        assert_eq!(app.input_cursor, 4); // start of "bar"
+        app.word_right();
+        assert_eq!(app.input_cursor, 7); // end of "bar"
+    }
+
+    #[test]
+    fn ctrl_c_requires_double_press_when_idle() {
+        let mut app = App::new();
+        app.handle_ctrl_c();
+        assert!(!app.should_quit, "first Ctrl+C must not quit");
+        assert!(app.ctrl_c_pending);
+        assert!(app.status.contains("再按一次"));
+        app.handle_ctrl_c();
+        assert!(app.should_quit, "second consecutive Ctrl+C quits");
+    }
+
+    #[test]
+    fn ctrl_c_clears_input_before_quitting() {
+        let mut app = App::new();
+        for ch in "draft".chars() {
+            app.push_char(ch);
+        }
+        app.handle_ctrl_c();
+        assert!(app.input.is_empty());
+        assert!(!app.should_quit);
+        assert!(!app.ctrl_c_pending, "clearing input does not arm the guard");
+    }
+
+    #[test]
+    fn ctrl_c_guard_disarmed_by_other_key() {
+        let mut app = App::new();
+        app.handle_ctrl_c(); // arm
+        assert!(app.ctrl_c_pending);
+        app.clear_ctrl_c_guard(); // any other key disarms
+        app.handle_ctrl_c(); // counts as a fresh first press
+        assert!(!app.should_quit);
+        assert!(app.ctrl_c_pending);
+    }
+
+    #[test]
+    fn ctrl_c_while_streaming_does_not_quit() {
+        let mut app = App::new();
+        app.is_streaming = true;
+        app.handle_ctrl_c();
+        assert!(!app.should_quit, "Ctrl+C interrupts the turn, not the app");
+    }
+
+    #[test]
     fn streaming_activity_shows_only_while_streaming() {
         let mut app = App::new();
         assert!(app.streaming_activity().is_none(), "idle shows no indicator");
@@ -1595,6 +1989,7 @@ mod tests {
         assert!(status.contains("checkpoint checkpoint_1"));
         assert!(status.contains("auto->deepseek-v4-flash"));
         assert!(status.contains("total ¥0.0020"));
+        assert!(status.contains("ctx 1%"));
     }
 
     #[test]

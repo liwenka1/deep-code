@@ -2,14 +2,17 @@ use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style, Stylize};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph, Widget, Wrap};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -39,7 +42,10 @@ pub async fn run(config: LaunchConfig) -> Result<()> {
 fn setup_terminal() -> Result<AppTerminal> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Bracketed paste: the terminal delivers a paste as one `Event::Paste`
+    // string instead of a burst of key events — so multi-line pastes don't
+    // trigger Enter (submit) on every newline.
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -50,7 +56,11 @@ fn setup_terminal() -> Result<AppTerminal> {
 
 fn restore_terminal(terminal: &mut AppTerminal) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     Ok(())
@@ -83,6 +93,10 @@ fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
                     handle_key(app, key);
                     needs_redraw = true;
                 }
+                Event::Paste(text) => {
+                    app.paste_str(text);
+                    needs_redraw = true;
+                }
                 Event::Resize(..) => needs_redraw = true,
                 _ => {}
             }
@@ -93,17 +107,24 @@ fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
+    // Any key other than Ctrl+C disarms the "press again to quit" guard.
+    let is_ctrl_c = matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        && key.modifiers.contains(KeyModifiers::CONTROL);
+    if !is_ctrl_c {
+        app.clear_ctrl_c_guard();
+    }
+
     if app.pending_approval.is_some() {
         match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.handle_ctrl_c();
+            }
             KeyCode::Char('y') | KeyCode::Char('Y') => app.approve_pending_tool(),
             KeyCode::Char('a') | KeyCode::Char('A') => app.approve_pending_tool_for_session(),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.deny_pending_tool(),
             KeyCode::PageUp | KeyCode::Up => app.scroll_approval_up(),
             KeyCode::PageDown | KeyCode::Down => app.scroll_approval_down(),
             KeyCode::Home => app.scroll_approval_to_top(),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.should_quit = true;
-            }
             _ => {}
         }
         return;
@@ -137,22 +158,44 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
     match key.code {
         KeyCode::Esc => app.handle_escape(),
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.handle_ctrl_c(),
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => app.push_newline(),
         KeyCode::Enter => app.submit(),
         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => app.push_newline(),
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => app.history_prev(),
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => app.history_next(),
+        // Readline-style editing.
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.delete_word_back();
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.kill_to_line_start();
+        }
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.kill_to_line_end();
+        }
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cursor_home(),
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cursor_end(),
+        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => app.delete_word_back(),
         KeyCode::Backspace => app.backspace(),
         KeyCode::Delete => app.delete_forward(),
+        // Word-wise cursor movement (Ctrl/Alt + ←→).
+        KeyCode::Left if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            app.word_left();
+        }
+        KeyCode::Right if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            app.word_right();
+        }
         KeyCode::Left => app.cursor_left(),
         KeyCode::Right => app.cursor_right(),
         KeyCode::Home => app.cursor_home(),
         KeyCode::End => app.cursor_end(),
-        KeyCode::PageUp | KeyCode::Up => app.scroll_up(),
-        KeyCode::PageDown | KeyCode::Down => app.scroll_down(),
+        // ↑↓ serve the composer (cursor between lines, else history); the
+        // transcript scrolls with PageUp/PageDown.
+        KeyCode::Up => app.on_up(),
+        KeyCode::Down => app.on_down(),
+        KeyCode::PageUp => app.scroll_up(),
+        KeyCode::PageDown => app.scroll_down(),
         KeyCode::Char(value) => app.push_char(value),
         _ => {}
     }
@@ -251,7 +294,9 @@ fn render_completion_menu(
 }
 
 fn render_messages(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
-    let viewport = usize::from(area.height.saturating_sub(2)).max(1);
+    // Claude-style: no transcript border/title — a 1-col left gutter and the
+    // input box below provide all the structure. Maximizes content width.
+    let viewport = usize::from(area.height).max(1);
     let content_width = area.width.saturating_sub(2).max(8);
     let history_len = app.history.len();
     // Borrow history and chain the (small) active preview instead of deep
@@ -294,62 +339,134 @@ fn render_messages(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect
     let scroll_top = max_scroll - scroll;
 
     let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title("deep-code")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        )
+        .block(Block::default().padding(Padding::new(1, 0, 0, 0)))
         .scroll((scroll_top as u16, 0));
     frame.render_widget(paragraph, area);
 }
 
-/// Render one transcript cell: label line, body, trailing blank.
+/// Render one transcript cell, Claude-style: speakers are distinguished by a
+/// marker glyph + colour rather than a text label, and there is no per-cell
+/// box. Secondary content (reasoning, tool noise, system) is dimmed; the
+/// user line and assistant prose carry the conversation.
 ///
 /// Assistant text always renders as markdown — including while still
-/// streaming — so the formatting is consistent throughout instead of
-/// showing raw `#`/`*`/backticks mid-stream and snapping to formatted on
-/// completion. `parse_blocks` treats an unclosed code fence as a code block,
-/// so a half-streamed fence renders cleanly without flicker.
+/// streaming — so formatting is consistent throughout. `parse_blocks` treats
+/// an unclosed code fence as a code block, so a half-streamed fence renders
+/// without flicker.
 fn cell_lines(cell: &HistoryCell, width: u16) -> Vec<Line<'static>> {
-    // Tool call/result are rendered as one tight colored line (no label box,
-    // no trailing blank) so a multi-step tool sequence stacks compactly.
+    let width = width as usize;
+    let dim = Style::default().fg(Color::DarkGray);
     match cell {
+        HistoryCell::User { text } => {
+            let mut lines = wrap_prefixed(
+                "› ",
+                text,
+                width,
+                Style::default(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            );
+            lines.push(Line::default());
+            lines
+        }
+        HistoryCell::Assistant { text } => {
+            let mut lines = render_markdown(text, width as u16);
+            lines.push(Line::default());
+            lines
+        }
+        HistoryCell::Reasoning { text } => {
+            let mut lines = wrap_styled(text, width, dim);
+            lines.push(Line::default());
+            lines
+        }
+        // Tool call + result form a tight group: a green dot for the call,
+        // a dim ⎿ connector for the result. No blank between them.
         HistoryCell::ToolCall { .. } => {
             let text = cell.lines().join(" ");
-            return vec![Line::from(Span::raw(format!("⏺ {text}")).yellow())];
+            vec![Line::from(vec![
+                Span::styled("⏺ ", Style::default().fg(Color::Green)),
+                Span::raw(text),
+            ])]
         }
-        HistoryCell::ToolResult { status, .. } => {
-            let text = cell.lines().join(" ");
-            let styled = Span::raw(format!("  {text}"));
-            let styled = match status {
-                deep_code_agent::ToolResultStatus::Success => styled.green(),
-                deep_code_agent::ToolResultStatus::Denied => styled.yellow(),
-                deep_code_agent::ToolResultStatus::Error => styled.red(),
+        HistoryCell::ToolResult {
+            status, summary, ..
+        } => {
+            let body = match status {
+                deep_code_agent::ToolResultStatus::Success => dim,
+                deep_code_agent::ToolResultStatus::Denied => Style::default().fg(Color::Yellow),
+                deep_code_agent::ToolResultStatus::Error => Style::default().fg(Color::Red),
             };
-            return vec![Line::from(styled)];
+            let mut lines = wrap_prefixed("  ⎿ ", summary, width, body, dim);
+            lines.push(Line::default());
+            lines
         }
-        _ => {}
-    }
-    let mut lines = vec![Line::from(label_for_cell(cell))];
-    match cell {
-        HistoryCell::Assistant { text } => {
-            lines.extend(render_markdown(text, width));
-        }
-        // Other plain cells (reasoning, system, user, etc.) must be wrapped
-        // to the viewport width here: the messages Paragraph is
-        // scroll-positioned, not `.wrap()`-ed, so an unwrapped long line
-        // would fill one row and get clipped.
-        _ => {
+        HistoryCell::Approval { .. } => {
+            // An action prompt — keep it visible (yellow), not dimmed.
+            let style = Style::default().fg(Color::Yellow);
+            let mut lines = Vec::new();
             for logical in cell.lines() {
-                for wrapped in wrap_text(&logical, width as usize) {
-                    lines.push(Line::from(wrapped));
-                }
+                lines.extend(wrap_styled(&logical, width, style));
+            }
+            lines.push(Line::default());
+            lines
+        }
+        // Diagnostics / Checkpoint / Compaction / System: dim secondary lines.
+        _ => {
+            let mut lines = Vec::new();
+            for logical in cell.lines() {
+                lines.extend(wrap_styled(&logical, width, dim));
+            }
+            lines.push(Line::default());
+            lines
+        }
+    }
+}
+
+/// Wrap `text` (honouring embedded newlines) to `width`, styling every row.
+fn wrap_styled(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for logical in text.split('\n') {
+        for row in wrap_text(logical, width.max(1)) {
+            out.push(Line::from(Span::styled(row, style)));
+        }
+    }
+    if out.is_empty() {
+        out.push(Line::default());
+    }
+    out
+}
+
+/// Wrap `text` with a marker `prefix` on the first row and a matching indent
+/// on continuation rows, so a wrapped block stays visually aligned.
+fn wrap_prefixed(
+    prefix: &str,
+    text: &str,
+    width: usize,
+    text_style: Style,
+    prefix_style: Style,
+) -> Vec<Line<'static>> {
+    let pad = UnicodeWidthStr::width(prefix);
+    let body_width = width.saturating_sub(pad).max(4);
+    let indent = " ".repeat(pad);
+    let mut out = Vec::new();
+    for logical in text.split('\n') {
+        for row in wrap_text(logical, body_width) {
+            if out.is_empty() {
+                out.push(Line::from(vec![
+                    Span::styled(prefix.to_string(), prefix_style),
+                    Span::styled(row, text_style),
+                ]));
+            } else {
+                out.push(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled(row, text_style),
+                ]));
             }
         }
     }
-    lines.push(Line::default());
-    lines
+    if out.is_empty() {
+        out.push(Line::from(Span::styled(prefix.to_string(), prefix_style)));
+    }
+    out
 }
 
 fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
@@ -527,21 +644,23 @@ fn render_input_from_layout(
     layout: &LayoutResult,
     area: ratatui::layout::Rect,
 ) {
-    let title = if app.is_streaming {
-        "Prompt (streaming...)"
-    } else {
-        "Prompt"
-    };
+    // Claude-style composer: no box — just a dim rule above and below, with a
+    // "› " prompt marker. The streaming state shows in the status line, so the
+    // composer needs no title.
+    const PROMPT: &str = "› ";
+    const GUTTER: u16 = 2;
     let style = Style::default();
-    let inner_width = usize::from(area.width.saturating_sub(2)).max(1);
-    let inner_height = usize::from(area.height.saturating_sub(2)).max(1);
+    let prompt_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 
-    // Render block borders first.
-    let block = Block::default().title(title).borders(Borders::ALL);
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(Color::DarkGray));
     let inner_area = block.inner(area);
     block.render(area, frame.buffer_mut());
 
-    // Write each visible line directly — no Paragraph wrapping.
+    let inner_height = usize::from(inner_area.height).max(1);
+    let text_x = inner_area.x.saturating_add(GUTTER);
+
     let visible = if layout.visible_lines.len() > inner_height {
         &layout.visible_lines[..inner_height]
     } else {
@@ -552,7 +671,21 @@ fn render_input_from_layout(
         if y >= inner_area.y.saturating_add(inner_area.height) {
             break;
         }
-        frame.buffer_mut().set_string(inner_area.x, y, line_text, style);
+        // "› " on the first row, a matching indent on wrapped continuations.
+        if row == 0 {
+            frame.buffer_mut().set_string(inner_area.x, y, PROMPT, prompt_style);
+        }
+        frame.buffer_mut().set_string(text_x, y, line_text, style);
+    }
+
+    // Faint placeholder when empty and idle.
+    if app.input.is_empty() && !app.is_streaming && app.pending_approval.is_none() {
+        frame.buffer_mut().set_string(
+            text_x,
+            inner_area.y,
+            "输入消息，输入 / 唤起命令",
+            Style::default().fg(Color::DarkGray),
+        );
     }
 
     if !app.is_streaming && app.pending_approval.is_none() {
@@ -560,10 +693,7 @@ fn render_input_from_layout(
             u16::try_from(layout.cursor_visible_row.min(inner_height.saturating_sub(1)))
                 .unwrap_or(u16::MAX),
         );
-        let cursor_x = inner_area.x.saturating_add(
-            u16::try_from(layout.cursor_col.min(inner_width.saturating_sub(1)))
-                .unwrap_or(u16::MAX),
-        );
+        let cursor_x = text_x.saturating_add(u16::try_from(layout.cursor_col).unwrap_or(u16::MAX));
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
@@ -595,21 +725,6 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) 
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
         area,
     );
-}
-
-fn label_for_cell(cell: &HistoryCell) -> Span<'static> {
-    match cell {
-        HistoryCell::User { .. } => cell.label().blue().bold(),
-        HistoryCell::Assistant { .. } => cell.label().green().bold(),
-        HistoryCell::Reasoning { .. } => cell.label().cyan().bold(),
-        HistoryCell::ToolCall { .. } => cell.label().yellow().bold(),
-        HistoryCell::ToolResult { .. } => cell.label().magenta().bold(),
-        HistoryCell::Approval { .. } => cell.label().yellow().bold(),
-        HistoryCell::Diagnostics { .. } => cell.label().red().bold(),
-        HistoryCell::Checkpoint { .. } => cell.label().dark_gray().bold(),
-        HistoryCell::Compaction { .. } => cell.label().dark_gray().bold(),
-        HistoryCell::System { .. } => cell.label().dark_gray().bold(),
-    }
 }
 
 #[cfg(test)]
