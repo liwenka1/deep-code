@@ -24,6 +24,18 @@ impl ToolApprovalState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryCell {
+    /// The startup header: a compact, styled welcome card (rendered specially
+    /// in `cell_lines`). It scrolls away naturally after the first message.
+    Welcome {
+        version: String,
+        /// Online model summary, e.g. "DeepSeek deepseek-chat · 推理 medium".
+        model: String,
+        offline: bool,
+        /// Home-relative workspace path, left-truncated at render time.
+        workspace: String,
+        /// e.g. "新会话 · 已持久化" or "已恢复 · 3 轮对话".
+        session: String,
+    },
     System {
         text: String,
     },
@@ -89,6 +101,25 @@ impl HistoryCell {
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         match self {
+            Self::Welcome {
+                version,
+                model,
+                offline,
+                workspace,
+                session,
+            } => {
+                let status = if *offline {
+                    "离线模式 · 输入 /apikey sk-… 接入 DeepSeek".to_string()
+                } else {
+                    format!("模型 {model}")
+                };
+                vec![
+                    format!("deep-code v{version}"),
+                    status,
+                    format!("目录 {workspace}"),
+                    format!("会话 {session}"),
+                ]
+            }
             Self::System { text }
             | Self::User { text }
             | Self::Assistant { text }

@@ -529,6 +529,46 @@ fn cell_lines(cell: &HistoryCell, width: u16) -> Vec<Line<'static>> {
     let width = width as usize;
     let dim = Style::default().fg(Color::DarkGray);
     match cell {
+        HistoryCell::Welcome {
+            version,
+            model,
+            offline,
+            workspace,
+            session,
+        } => {
+            let cyan = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+            let label = |key: &str| Span::styled(format!("{key}   "), dim);
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled("deep-code", cyan),
+                    Span::styled(format!("  v{version}"), dim),
+                ]),
+                Line::from(Span::styled("─".repeat(width.clamp(8, 46)), dim)),
+            ];
+            if *offline {
+                lines.push(Line::from(vec![
+                    label("状态"),
+                    Span::styled(
+                        "离线模式 · 输入 /apikey sk-… 接入 DeepSeek",
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]));
+            } else {
+                lines.push(Line::from(vec![label("模型"), Span::raw(model.clone())]));
+            }
+            lines.push(Line::from(vec![
+                label("目录"),
+                Span::raw(left_truncate(workspace, width.saturating_sub(8).max(8))),
+            ]));
+            lines.push(Line::from(vec![label("会话"), Span::raw(session.clone())]));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "输入消息开始对话 · 输入 / 查看命令 · Ctrl+C 退出",
+                dim,
+            )));
+            lines.push(Line::default());
+            lines
+        }
         HistoryCell::User { text } => {
             let mut lines = wrap_prefixed(
                 "› ",
@@ -591,6 +631,17 @@ fn cell_lines(cell: &HistoryCell, width: u16) -> Vec<Line<'static>> {
             lines
         }
     }
+}
+
+/// Keep the rightmost `max` characters of `s`, prefixing `…` when truncated —
+/// so a long path shows its meaningful tail (the project directory).
+fn left_truncate(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(count - max.saturating_sub(1)).collect();
+    format!("…{tail}")
 }
 
 /// Wrap `text` (honouring embedded newlines) to `width`, styling every row.
@@ -926,6 +977,42 @@ mod tests {
         for line in &lines {
             assert!(line_width(line) <= 40, "row exceeds width: {}", line_width(line));
         }
+    }
+
+    fn welcome_text(offline: bool) -> String {
+        let cell = HistoryCell::Welcome {
+            version: "0.1.0".to_string(),
+            model: "DeepSeek deepseek-chat · 推理 medium".to_string(),
+            offline,
+            workspace: "~/code/deep-code".to_string(),
+            session: "新会话 · 已持久化".to_string(),
+        };
+        cell_lines(&cell, 60)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn welcome_cell_shows_model_dir_session_when_online() {
+        let text = welcome_text(false);
+        assert!(text.contains("deep-code") && text.contains("v0.1.0"));
+        assert!(text.contains("模型") && text.contains("deepseek-chat"));
+        assert!(text.contains("目录") && text.contains("会话"));
+        assert!(!text.contains("/apikey"), "online must not nag about apikey");
+    }
+
+    #[test]
+    fn welcome_cell_prompts_apikey_when_offline() {
+        let text = welcome_text(true);
+        assert!(text.contains("离线模式") && text.contains("/apikey"));
+        assert!(!text.contains("deepseek-chat"), "offline hides the model line");
+    }
+
+    #[test]
+    fn left_truncate_keeps_tail_with_ellipsis() {
+        assert_eq!(left_truncate("short", 10), "short");
+        assert_eq!(left_truncate("abcdefghij", 5), "…ghij");
     }
 
     #[test]

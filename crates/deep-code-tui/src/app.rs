@@ -14,8 +14,7 @@ use std::path::PathBuf;
 use deep_code_agent::{
     AgentConfig, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest, CostCurrency,
     JsonSessionStore, LaunchedRuntime, RuntimeEvent, SessionRecord, SessionStore,
-    SharedSubAgentManager, TurnTelemetry, default_config_path, format_sessions_storage_note,
-    launch_runtime,
+    SharedSubAgentManager, TurnTelemetry, default_config_path, launch_runtime,
 };
 use tokio::sync::mpsc;
 use crate::ui::{COMPOSER_MAX_VISIBLE_ROWS, layout_input};
@@ -183,6 +182,20 @@ fn byte_idx(s: &str, char_index: usize) -> usize {
         .map_or(s.len(), |(b, _)| b)
 }
 
+/// Render a path home-relative (`/Users/x/p` → `~/p`) for the welcome header.
+fn home_relative(path: &std::path::Path) -> String {
+    let shown = path.display().to_string();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if !home.is_empty()
+            && let Some(rest) = shown.strip_prefix(home.as_ref())
+        {
+            return format!("~{rest}");
+        }
+    }
+    shown
+}
+
 /// Remove the character at `char_index` (0-based). Returns true when removed.
 fn remove_char_at(s: &mut String, char_index: usize) -> bool {
     let start = byte_idx(s, char_index);
@@ -205,6 +218,7 @@ impl App {
         let cost_currency = agent_config.cost_currency;
         let configured_model = agent_config.model.clone();
         let configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
+        let workspace_display = home_relative(&workspace);
         let launched = launch_runtime(&agent_config, workspace, config.resume.clone());
         let runtime = launched.handle;
         let backend_label = launched.backend_label;
@@ -213,32 +227,31 @@ impl App {
         let subagent_shutdown = Some(launched.stop_hook);
         let resumed = config.resume.is_some();
         let persistent = session_id.is_some();
-        let workspace_note = std::env::current_dir()
-            .map(|cwd| format_sessions_storage_note(&cwd))
-            .unwrap_or_else(|_| {
-                "Sessions are stored under .deep-code/sessions/ in the current workspace directory."
-                    .to_string()
-            });
-        let mut history = vec![HistoryCell::system(format!(
-            "{}\n{}\n{}\n{}\n{}",
-            "Type a prompt and press Enter. Esc: 取消本轮/清空输入/退出 (按状态依次生效), Ctrl+C: 取消/清空/连按两次退出.",
-            "Tip: in offline mode, type \"/mock-tool hello\" to exercise approval.",
-            "Slash: /help, /model, /apikey, /resume, /checkpoints, /sessions, /agents",
-            workspace_note,
-            if resumed {
-                "Resumed previous session."
-            } else if persistent {
-                "Started a new persistent session."
-            } else {
-                "Session persistence unavailable in this workspace."
-            }
-        ))];
-        if backend_label.contains("offline echo") {
-            history.push(HistoryCell::system(
-                "当前为离线模式：输入 /apikey sk-xxx 即可接入 DeepSeek（获取密钥: https://platform.deepseek.com）"
-                    .to_string(),
-            ));
-        }
+        let session_summary = if resumed {
+            let turns = config
+                .resume
+                .as_ref()
+                .map(|record| {
+                    record
+                        .messages
+                        .iter()
+                        .filter(|message| message.role == deep_code_agent::Role::User)
+                        .count()
+                })
+                .unwrap_or(0);
+            format!("已恢复 · {turns} 轮对话")
+        } else if persistent {
+            "新会话 · 已持久化".to_string()
+        } else {
+            "新会话 · 未持久化".to_string()
+        };
+        let mut history = vec![HistoryCell::Welcome {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            model: format!("DeepSeek {configured_model} · 推理 {configured_reasoning}"),
+            offline: backend_label.contains("offline echo"),
+            workspace: workspace_display,
+            session: session_summary,
+        }];
 
         if !config_warnings.is_empty() {
             history.push(HistoryCell::system(format!(
