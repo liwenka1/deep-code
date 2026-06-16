@@ -107,6 +107,16 @@ pub struct App {
     /// Active mouse selection over the transcript: `(anchor, head)` as
     /// `(line, display_col)` into [`TranscriptSnapshot::lines`].
     pub(crate) selection: Option<(TextPos, TextPos)>,
+    /// Open `/resume` modal: rendered as an in-app overlay (no alt-screen
+    /// churn, so switching sessions doesn't flicker) over the live TUI.
+    pub(crate) resume_picker: Option<ResumePicker>,
+}
+
+/// In-session `/resume` modal state: the resumable sessions (newest-first) and
+/// the highlighted row.
+pub(crate) struct ResumePicker {
+    pub(crate) sessions: Vec<SessionRecord>,
+    pub(crate) selected: usize,
 }
 
 /// A position in the transcript line buffer: absolute line index + display
@@ -213,7 +223,7 @@ impl App {
             "{}\n{}\n{}\n{}\n{}",
             "Type a prompt and press Enter. Esc: 取消本轮/清空输入/退出 (按状态依次生效), Ctrl+C: 取消/清空/连按两次退出.",
             "Tip: in offline mode, type \"/mock-tool hello\" to exercise approval.",
-            "Slash: /help, /model, /apikey, /checkpoints, /sessions, /agents",
+            "Slash: /help, /model, /apikey, /resume, /checkpoints, /sessions, /agents",
             workspace_note,
             if resumed {
                 "Resumed previous session."
@@ -286,6 +296,7 @@ impl App {
             pasted_blocks: Vec::new(),
             transcript: None,
             selection: None,
+            resume_picker: None,
         }
     }
 
@@ -1157,6 +1168,131 @@ impl App {
         Ok(())
     }
 
+    pub(crate) fn resume_picker_open(&self) -> bool {
+        self.resume_picker.is_some()
+    }
+
+    /// Open the in-app `/resume` modal, listing the workspace's non-empty
+    /// sessions (newest-first). No-ops with a status note when none qualify.
+    pub(crate) fn open_resume_picker(&mut self) {
+        if self.is_streaming || self.pending_approval.is_some() {
+            self.status = "正在流式输出或等待审批，无法切换会话".to_string();
+            return;
+        }
+        let sessions = match JsonSessionStore::for_workspace(workspace_root())
+            .and_then(|store| store.list())
+        {
+            Ok(list) => list
+                .into_iter()
+                .filter(crate::startup::has_user_message)
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                self.status = format!("无法读取历史会话: {error}");
+                return;
+            }
+        };
+        if sessions.is_empty() {
+            self.status = "没有可恢复的历史会话".to_string();
+            return;
+        }
+        self.close_completion();
+        self.clear_selection();
+        self.resume_picker = Some(ResumePicker {
+            sessions,
+            selected: 0,
+        });
+        self.status = "选择要恢复的历史会话 (↑/↓ · Enter · Esc 取消)".to_string();
+    }
+
+    pub(crate) fn resume_picker_up(&mut self) {
+        if let Some(picker) = self.resume_picker.as_mut() {
+            picker.selected = picker.selected.saturating_sub(1);
+        }
+    }
+
+    pub(crate) fn resume_picker_down(&mut self) {
+        if let Some(picker) = self.resume_picker.as_mut()
+            && picker.selected + 1 < picker.sessions.len()
+        {
+            picker.selected += 1;
+        }
+    }
+
+    pub(crate) fn resume_picker_cancel(&mut self) {
+        if self.resume_picker.take().is_some() {
+            self.status = "已取消，留在当前会话".to_string();
+        }
+    }
+
+    /// Switch to the highlighted session and close the modal.
+    pub(crate) fn resume_picker_accept(&mut self) {
+        let Some(mut picker) = self.resume_picker.take() else {
+            return;
+        };
+        if picker.selected >= picker.sessions.len() {
+            return;
+        }
+        let record = picker.sessions.swap_remove(picker.selected);
+        if let Err(message) = self.switch_session(record) {
+            self.status = message;
+        }
+    }
+
+    /// Load session `id` and switch to it in place. Surfaces a readable status
+    /// on a bad id / missing record rather than failing the command.
+    pub(crate) fn switch_session_by_id(&mut self, id: &str) -> Result<(), String> {
+        let workspace = workspace_root();
+        let store = JsonSessionStore::for_workspace(&workspace)
+            .map_err(|error| format!("无法打开会话存储: {error}"))?;
+        let session_id = deep_code_agent::SessionId::parse(id)
+            .map_err(|error| format!("无效的会话 id '{id}': {error}"))?;
+        let record = store
+            .load(&session_id)
+            .map_err(|error| format!("找不到会话 '{id}': {error}"))?;
+        self.switch_session(record)
+    }
+
+    /// Switch the live session to `record` in place: shut the current runtime
+    /// down (flushing its persistence), relaunch resuming `record`, and rebuild
+    /// the visible transcript. Mirrors Claude Code's `/resume`.
+    pub(crate) fn switch_session(&mut self, record: SessionRecord) -> Result<(), String> {
+        if self.is_streaming || self.pending_approval.is_some() {
+            return Err("正在流式输出或等待审批，请稍后再切换会话".to_string());
+        }
+        if self.session_id.as_deref() == Some(record.id.as_str()) {
+            self.status = "已是当前会话".to_string();
+            return Ok(());
+        }
+
+        if let Some(stop) = self.subagent_shutdown.take() {
+            stop();
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let runtime = Arc::clone(&self.runtime);
+            tokio::task::block_in_place(|| handle.block_on(runtime.shutdown()));
+        }
+
+        let workspace = workspace_root();
+        let loaded = AgentConfig::load(&workspace);
+        let agent_config = loaded.config;
+        let launched = launch_runtime(&agent_config, workspace, Some(record.clone()));
+        self.cost_currency = agent_config.cost_currency;
+        self.configured_model = agent_config.model.clone();
+        self.configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
+        self.resumed = true;
+        self.adopt_runtime(launched);
+
+        self.history.clear();
+        self.active_turn = None;
+        self.clear_selection();
+        self.scroll_offset = 0;
+        self.last_telemetry = None;
+        self.error = None;
+        self.history.extend(hydrate_history(&record));
+        self.status = format!("已切换到会话 {} - {}", record.id.as_str(), self.backend_label);
+        Ok(())
+    }
+
     fn start_stream(&mut self, request: StreamRequest) {
         let (tx, rx) = mpsc::unbounded_channel();
         self.ui_rx = Some(rx);
@@ -1293,6 +1429,56 @@ mod tests {
 
         assert!(app.handle_slash_command("/clear"));
         assert!(app.history.is_empty());
+    }
+
+    #[test]
+    fn resume_picker_navigates_and_cancels() {
+        use deep_code_agent::{AgentConfig, Message};
+        let make = |prompt: &str| {
+            let mut record = SessionRecord::new(
+                std::path::PathBuf::from("/tmp/ws"),
+                &AgentConfig::builtin(),
+                "system",
+            );
+            record.messages = vec![Message::system("system"), Message::user(prompt)];
+            record
+        };
+        let mut app = App::new();
+        app.resume_picker = Some(ResumePicker {
+            sessions: vec![make("a"), make("b"), make("c")],
+            selected: 0,
+        });
+        assert!(app.resume_picker_open());
+
+        app.resume_picker_down();
+        app.resume_picker_down();
+        assert_eq!(app.resume_picker.as_ref().unwrap().selected, 2);
+        app.resume_picker_down(); // clamp at last row
+        assert_eq!(app.resume_picker.as_ref().unwrap().selected, 2);
+        app.resume_picker_up();
+        assert_eq!(app.resume_picker.as_ref().unwrap().selected, 1);
+
+        app.resume_picker_cancel();
+        assert!(app.resume_picker.is_none());
+        assert!(app.status.contains("已取消"));
+    }
+
+    #[test]
+    fn slash_resume_blocked_while_streaming() {
+        let mut app = App::new();
+        app.is_streaming = true;
+        assert!(app.handle_slash_command("/resume"));
+        assert!(app.resume_picker.is_none());
+        assert!(app.status.contains("无法切换会话"), "status: {}", app.status);
+    }
+
+    #[test]
+    fn resume_command_is_registered() {
+        assert!(
+            crate::commands::SLASH_COMMANDS
+                .iter()
+                .any(|(name, _, _)| *name == "/resume")
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ use crossterm::terminal::{
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style, Stylize};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Widget, Wrap};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -140,6 +140,21 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         app.clear_ctrl_c_guard();
     }
 
+    // The `/resume` modal is a full-screen overlay: it owns all keys while open.
+    if app.resume_picker_open() {
+        match key.code {
+            KeyCode::Up => app.resume_picker_up(),
+            KeyCode::Down => app.resume_picker_down(),
+            KeyCode::Enter => app.resume_picker_accept(),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.resume_picker_cancel(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.resume_picker_cancel();
+            }
+            _ => {}
+        }
+        return;
+    }
+
     if app.pending_approval.is_some() {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -234,6 +249,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 pub(crate) const COMPOSER_MAX_VISIBLE_ROWS: usize = 6;
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
+    if let Some(picker) = &app.resume_picker {
+        render_resume_picker(frame, picker);
+        return;
+    }
+
     let inner_width = frame.area().width.saturating_sub(2).max(1);
     // Compute layout once — height and rendering share the same result.
     let layout = layout_input(
@@ -287,6 +307,83 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         snap
     };
     app.set_transcript_snapshot(snapshot);
+}
+
+/// In-app `/resume` overlay. Mirrors the standalone startup picker's minimal
+/// look, but draws inside the live alt-screen (a full-area `Clear` wipes the
+/// transcript beneath) so opening/closing it never flickers.
+fn render_resume_picker(frame: &mut Frame<'_>, picker: &crate::app::ResumePicker) {
+    use crate::startup::{now_ms, relative_time, session_title};
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+    let header = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "历史会话",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+    ])
+    .block(Block::default().padding(Padding::new(1, 0, 0, 0)));
+    frame.render_widget(header, chunks[0]);
+
+    let viewport = usize::from(chunks[1].height).max(1);
+    let selected = picker.selected;
+    let start = selected.saturating_sub(viewport.saturating_sub(1));
+    let now = now_ms();
+    let rows: Vec<Line> = picker
+        .sessions
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(viewport)
+        .map(|(index, record)| {
+            let time = relative_time(now, record.updated_at_ms);
+            let title = session_title(record);
+            if index == selected {
+                Line::from(vec![
+                    Span::styled(
+                        "› ",
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("{title}  "), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(time, Style::default().fg(Color::DarkGray)),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::raw(title),
+                    Span::styled(format!("  {time}"), Style::default().fg(Color::DarkGray)),
+                ])
+            }
+        })
+        .collect();
+    let list = Paragraph::new(rows).block(Block::default().padding(Padding::new(1, 0, 0, 0)));
+    frame.render_widget(list, chunks[1]);
+
+    let note = picker
+        .sessions
+        .first()
+        .map(|record| deep_code_agent::format_sessions_storage_note(&record.workspace))
+        .unwrap_or_default();
+    let help = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "↑/↓ 选择 · Enter 恢复 · n/Esc 取消",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(note, Style::default().fg(Color::DarkGray))),
+    ])
+    .block(Block::default().padding(Padding::new(1, 0, 0, 0)));
+    frame.render_widget(help, chunks[2]);
 }
 
 fn render_completion_menu(

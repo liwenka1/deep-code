@@ -18,9 +18,9 @@ use deep_code_agent::JsonSessionStore;
 async fn main() -> anyhow::Result<()> {
     let CliArgs { mode } = parse_args();
     match mode {
-        RunMode::Tui { resume, force_new } => {
+        RunMode::Tui { intent } => {
             let store = JsonSessionStore::for_workspace(workspace_root())?;
-            let record = startup::choose_startup(&store, force_new, resume.as_deref())?;
+            let record = startup::choose_startup(&store, intent)?;
             ui::run(app::LaunchConfig { resume: record }).await
         }
         RunMode::Doctor { json } => doctor_cli::run_doctor(json),

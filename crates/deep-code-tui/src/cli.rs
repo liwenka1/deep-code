@@ -5,11 +5,24 @@ use std::path::PathBuf;
 
 use deep_code_agent::{JsonSessionStore, SessionId, SessionStore, format_sessions_storage_note};
 
+/// What the interactive TUI should open with. Mirrors Claude Code: a bare
+/// `deep-code` starts fresh; resuming is opt-in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupIntent {
+    /// Start a new session (default, and `--new`).
+    New,
+    /// Resume the most recent non-empty session (`-c` / `--continue`).
+    ContinueLatest,
+    /// Show the session picker (`-r` / `--resume` with no id).
+    ResumePicker,
+    /// Resume a specific session id (`--resume <id>`, `session resume <id>`).
+    ResumeId(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunMode {
     Tui {
-        resume: Option<String>,
-        force_new: bool,
+        intent: StartupIntent,
     },
     Doctor {
         json: bool,
@@ -43,8 +56,7 @@ pub fn parse_args() -> CliArgs {
     if args.is_empty() {
         return CliArgs {
             mode: RunMode::Tui {
-                resume: None,
-                force_new: false,
+                intent: StartupIntent::New,
             },
         };
     }
@@ -69,30 +81,35 @@ pub fn parse_args() -> CliArgs {
         _ => {}
     }
 
-    let mut resume = None;
-    let mut force_new = false;
+    parse_tui_args(args)
+}
+
+/// Parse the TUI flags (`--new`, `-c`/`--continue`, `-r`/`--resume [id]`) into
+/// a [`StartupIntent`]. Last intent wins; unknown args abort with usage.
+fn parse_tui_args(args: Vec<String>) -> CliArgs {
+    let mut intent = StartupIntent::New;
     let mut positional = Vec::new();
 
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--new" => force_new = true,
-            "--resume" => {
-                index += 1;
-                if index < args.len() && !args[index].starts_with('-') {
-                    resume = Some(args[index].clone());
+            "--new" => intent = StartupIntent::New,
+            "--continue" | "-c" => intent = StartupIntent::ContinueLatest,
+            "--resume" | "-r" => {
+                if index + 1 < args.len() && !args[index + 1].starts_with('-') {
+                    index += 1;
+                    intent = StartupIntent::ResumeId(args[index].clone());
                 } else {
-                    resume = Some("latest".to_string());
-                    index -= 1;
+                    intent = StartupIntent::ResumePicker;
                 }
             }
             value if value.starts_with("--resume=") => {
                 let id = value.trim_start_matches("--resume=");
-                resume = Some(if id.is_empty() {
-                    "latest".to_string()
+                intent = if id.is_empty() {
+                    StartupIntent::ResumePicker
                 } else {
-                    id.to_string()
-                });
+                    StartupIntent::ResumeId(id.to_string())
+                };
             }
             other => positional.push(other.to_string()),
         }
@@ -109,7 +126,7 @@ pub fn parse_args() -> CliArgs {
     }
 
     CliArgs {
-        mode: RunMode::Tui { resume, force_new },
+        mode: RunMode::Tui { intent },
     }
 }
 
@@ -238,8 +255,7 @@ fn parse_session_command(mut args: Vec<String>) -> CliArgs {
             }
             CliArgs {
                 mode: RunMode::Tui {
-                    resume: Some(id),
-                    force_new: false,
+                    intent: StartupIntent::ResumeId(id),
                 },
             }
         }
@@ -334,7 +350,9 @@ pub fn run_session_command(mode: RunMode) -> anyhow::Result<()> {
 
 fn print_usage() {
     eprintln!("Commands:");
-    eprintln!("  deep-code");
+    eprintln!("  deep-code                # 新会话");
+    eprintln!("  deep-code -c             # 续最近会话");
+    eprintln!("  deep-code -r             # 选择历史会话");
     eprintln!("  deep-code doctor [--json]");
     eprintln!("  deep-code serve --http [--host HOST] [--port PORT]");
     eprintln!("  deep-code session list|resume|delete|export");
@@ -348,7 +366,8 @@ fn print_session_usage() {
     eprintln!("  deep-code session list");
     eprintln!("  deep-code session resume <session_id>");
     eprintln!("  deep-code session export <session_id>");
-    eprintln!("  deep-code --resume latest");
+    eprintln!("  deep-code -c            # 续最近会话");
+    eprintln!("  deep-code -r            # 选择历史会话");
 }
 
 fn truncate_preview(text: &str, max_chars: usize) -> String {
@@ -377,23 +396,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_default_is_tui() {
-        let args = CliArgs {
-            mode: RunMode::Tui {
-                resume: None,
-                force_new: false,
-            },
-        };
-        assert_eq!(
-            args.mode,
-            RunMode::Tui {
-                resume: None,
-                force_new: false,
-            }
-        );
-    }
-
-    #[test]
     fn parse_session_resume_subcommand() {
         let parsed = parse_session_command(vec![
             "resume".to_string(),
@@ -402,8 +404,7 @@ mod tests {
         assert_eq!(
             parsed.mode,
             RunMode::Tui {
-                resume: Some("session_123_0".to_string()),
-                force_new: false,
+                intent: StartupIntent::ResumeId("session_123_0".to_string()),
             }
         );
     }
@@ -412,6 +413,33 @@ mod tests {
     fn parse_session_list_subcommand() {
         let parsed = parse_session_command(vec!["list".to_string()]);
         assert_eq!(parsed.mode, RunMode::SessionList);
+    }
+
+    fn tui_intent(args: &[&str]) -> StartupIntent {
+        let parsed = parse_tui_args(args.iter().map(|s| (*s).to_string()).collect());
+        match parsed.mode {
+            RunMode::Tui { intent } => intent,
+            other => panic!("expected Tui, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tui_flags_map_to_startup_intent() {
+        assert_eq!(tui_intent(&[]), StartupIntent::New);
+        assert_eq!(tui_intent(&["--new"]), StartupIntent::New);
+        assert_eq!(tui_intent(&["-c"]), StartupIntent::ContinueLatest);
+        assert_eq!(tui_intent(&["--continue"]), StartupIntent::ContinueLatest);
+        assert_eq!(tui_intent(&["-r"]), StartupIntent::ResumePicker);
+        assert_eq!(tui_intent(&["--resume"]), StartupIntent::ResumePicker);
+        assert_eq!(
+            tui_intent(&["--resume", "session_9_0"]),
+            StartupIntent::ResumeId("session_9_0".to_string())
+        );
+        assert_eq!(
+            tui_intent(&["--resume=session_9_0"]),
+            StartupIntent::ResumeId("session_9_0".to_string())
+        );
+        assert_eq!(tui_intent(&["--resume="]), StartupIntent::ResumePicker);
     }
 
     #[test]
