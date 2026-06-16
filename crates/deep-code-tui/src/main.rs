@@ -1,6 +1,7 @@
 mod active_turn;
 mod app;
 mod cli;
+mod clipboard;
 mod commands;
 mod doctor_cli;
 mod event_routing;

@@ -101,6 +101,28 @@ pub struct App {
     /// show a compact `[粘贴 #N …]` chip in the composer; the real content is
     /// expanded back in on submit. Reset once a turn is sent or input cleared.
     pub(crate) pasted_blocks: Vec<(String, String)>,
+    /// Geometry + plain text of the last transcript render, so mouse events
+    /// can be mapped to a text position for drag-selection.
+    pub(crate) transcript: Option<TranscriptSnapshot>,
+    /// Active mouse selection over the transcript: `(anchor, head)` as
+    /// `(line, display_col)` into [`TranscriptSnapshot::lines`].
+    pub(crate) selection: Option<(TextPos, TextPos)>,
+}
+
+/// A position in the transcript line buffer: absolute line index + display
+/// column (CJK counts as 2).
+pub(crate) type TextPos = (usize, usize);
+
+/// What the transcript looked like at the last render — used to translate a
+/// mouse `(col, row)` into a `(line, display_col)` position.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TranscriptSnapshot {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    pub scroll_top: usize,
+    pub lines: Vec<String>,
 }
 
 const PROMPT_HISTORY_CAP: usize = 100;
@@ -108,6 +130,37 @@ const PROMPT_HISTORY_CAP: usize = 100;
 /// Number of characters (not bytes) in `s`.
 fn char_count(s: &str) -> usize {
     s.chars().count()
+}
+
+/// Display width of a string (CJK counts as 2), for selection columns.
+fn display_width(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    UnicodeWidthStr::width(s)
+}
+
+/// Substring of `s` covering display columns `[from, to)`. A grapheme is
+/// included when its cell range overlaps the requested span (so a CJK char
+/// straddling the boundary is kept whole rather than split).
+fn slice_by_display_cols(s: &str, from: usize, to: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    if from >= to {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut col = 0usize;
+    for g in s.graphemes(true) {
+        let w = UnicodeWidthStr::width(g).max(1);
+        let g_end = col + w;
+        if col < to && g_end > from {
+            out.push_str(g);
+        }
+        col = g_end;
+        if col >= to {
+            break;
+        }
+    }
+    out
 }
 
 /// Convert a 0-based character index to a byte index. Clamps to `s.len()`.
@@ -231,6 +284,8 @@ impl App {
             global_config_path: default_config_path(),
             streaming_since: None,
             pasted_blocks: Vec::new(),
+            transcript: None,
+            selection: None,
         }
     }
 
@@ -348,6 +403,86 @@ impl App {
     /// Move cursor to the very end of input.
     pub fn cursor_to_end(&mut self) {
         self.input_cursor = char_count(&self.input);
+    }
+
+    /// Record what the transcript render produced, for mouse → text mapping.
+    pub(crate) fn set_transcript_snapshot(&mut self, snap: TranscriptSnapshot) {
+        self.transcript = Some(snap);
+    }
+
+    /// Map an absolute mouse `(col, row)` to a `(line, display_col)` position
+    /// in the transcript buffer, or `None` if outside the transcript area.
+    fn mouse_to_text(&self, col: u16, row: u16) -> Option<TextPos> {
+        let snap = self.transcript.as_ref()?;
+        if row < snap.y
+            || row >= snap.y.saturating_add(snap.height)
+            || col < snap.x
+            || col >= snap.x.saturating_add(snap.width)
+        {
+            return None;
+        }
+        // Text starts one column in (the left padding gutter).
+        let text_x = snap.x.saturating_add(1);
+        let line = snap.scroll_top + usize::from(row - snap.y);
+        if line >= snap.lines.len() {
+            // Below the last line → clamp to end of the last line.
+            let last = snap.lines.len().saturating_sub(1);
+            let width = snap.lines.get(last).map_or(0, |l| display_width(l));
+            return Some((last, width));
+        }
+        let display_col = usize::from(col.saturating_sub(text_x));
+        let max = display_width(&snap.lines[line]);
+        Some((line, display_col.min(max)))
+    }
+
+    /// Begin a selection at a mouse position (left button down).
+    pub(crate) fn selection_begin(&mut self, col: u16, row: u16) {
+        match self.mouse_to_text(col, row) {
+            Some(pos) => self.selection = Some((pos, pos)),
+            None => self.selection = None,
+        }
+    }
+
+    /// Extend the in-progress selection (left button drag).
+    pub(crate) fn selection_update(&mut self, col: u16, row: u16) {
+        if let (Some((anchor, _)), Some(pos)) =
+            (self.selection, self.mouse_to_text(col, row))
+        {
+            self.selection = Some((anchor, pos));
+        }
+    }
+
+    /// Finish a selection (left button up): returns the selected text to copy,
+    /// or `None` for an empty selection (a plain click), which clears it.
+    pub(crate) fn selection_finish(&mut self) -> Option<String> {
+        let (anchor, head) = self.selection?;
+        if anchor == head {
+            self.selection = None;
+            return None;
+        }
+        self.selected_text()
+    }
+
+    pub(crate) fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Extract the currently selected transcript text.
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        let (a, b) = self.selection?;
+        let snap = self.transcript.as_ref()?;
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        let mut out = String::new();
+        for line in start.0..=end.0 {
+            let text = snap.lines.get(line)?;
+            let from = if line == start.0 { start.1 } else { 0 };
+            let to = if line == end.0 { end.1 } else { display_width(text) };
+            out.push_str(&slice_by_display_cols(text, from, to));
+            if line != end.0 {
+                out.push('\n');
+            }
+        }
+        Some(out)
     }
 
     fn insert_str_at_cursor(&mut self, text: &str) {
@@ -772,6 +907,8 @@ impl App {
             return;
         }
         self.close_completion();
+        // The transcript is about to grow; drop any stale selection.
+        self.clear_selection();
 
         // `display` keeps the compact `[粘贴 #N …]` chips (shown in the
         // transcript and recalled by Ctrl+P); `sent` expands them to the real
@@ -1680,6 +1817,57 @@ mod tests {
         assert_eq!(app.input_cursor, 4); // start of "bar"
         app.word_right();
         assert_eq!(app.input_cursor, 7); // end of "bar"
+    }
+
+    fn snapshot(lines: &[&str]) -> TranscriptSnapshot {
+        TranscriptSnapshot {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+            scroll_top: 0,
+            lines: lines.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn slice_by_display_cols_handles_cjk_boundaries() {
+        assert_eq!(slice_by_display_cols("hello", 1, 4), "ell");
+        // "你好世界" = 8 display cols; cols [2,6) spans 好世.
+        assert_eq!(slice_by_display_cols("你好世界", 2, 6), "好世");
+        // A CJK char straddling the boundary is kept whole.
+        assert_eq!(slice_by_display_cols("你好", 1, 2), "你");
+    }
+
+    #[test]
+    fn drag_selection_extracts_multiline_text() {
+        let mut app = App::new();
+        // text origin x = snapshot.x + 1 = 1; row 0 = line 0.
+        app.set_transcript_snapshot(snapshot(&["first line", "second line", "third"]));
+
+        // Drag from line 0 col 6 ("line") to line 1 col 7 ("second ").
+        app.selection_begin(1 + 6, 0);
+        app.selection_update(1 + 7, 1);
+        let text = app.selection_finish().expect("non-empty selection");
+        assert_eq!(text, "line\nsecond ");
+    }
+
+    #[test]
+    fn plain_click_makes_no_selection() {
+        let mut app = App::new();
+        app.set_transcript_snapshot(snapshot(&["abc"]));
+        app.selection_begin(2, 0);
+        app.selection_update(2, 0); // no movement
+        assert!(app.selection_finish().is_none());
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn mouse_outside_transcript_clears_selection() {
+        let mut app = App::new();
+        app.set_transcript_snapshot(snapshot(&["abc"]));
+        app.selection_begin(200, 200); // outside
+        assert!(app.selection.is_none());
     }
 
     #[test]

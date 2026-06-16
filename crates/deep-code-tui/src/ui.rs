@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -17,7 +17,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, LaunchConfig};
+use crate::app::{App, LaunchConfig, TranscriptSnapshot};
 use crate::history::HistoryCell;
 use crate::markdown::render_markdown;
 
@@ -42,10 +42,9 @@ pub async fn run(config: LaunchConfig) -> Result<()> {
 fn setup_terminal() -> Result<AppTerminal> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Bracketed paste: paste arrives as one `Event::Paste` string instead of a
-    // burst of key events. Mouse capture: wheel events scroll the transcript
-    // (laptops often lack PageUp/PageDown). Native click-drag selection then
-    // needs Option/Shift held in macOS terminals.
+    // Bracketed paste: paste arrives as one `Event::Paste` string. Mouse
+    // capture: wheel scrolls the transcript and drag selects text (we render
+    // an in-app selection + copy, since capture disables native selection).
     execute!(
         stdout,
         EnterAlternateScreen,
@@ -104,17 +103,26 @@ fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
                     app.paste_str(text);
                     needs_redraw = true;
                 }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        app.scroll_up();
-                        needs_redraw = true;
+                Event::Mouse(mouse) => {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => app.scroll_up(),
+                        MouseEventKind::ScrollDown => app.scroll_down(),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            app.selection_begin(mouse.column, mouse.row);
+                        }
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            app.selection_update(mouse.column, mouse.row);
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            if let Some(text) = app.selection_finish() {
+                                crate::clipboard::copy(&text);
+                                app.status = format!("已复制选中文本 ({} 字)", text.chars().count());
+                            }
+                        }
+                        _ => {}
                     }
-                    MouseEventKind::ScrollDown => {
-                        app.scroll_down();
-                        needs_redraw = true;
-                    }
-                    _ => {}
-                },
+                    needs_redraw = true;
+                }
                 Event::Resize(..) => needs_redraw = true,
                 _ => {}
             }
@@ -208,12 +216,15 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Right => app.cursor_right(),
         KeyCode::Home => app.cursor_home(),
         KeyCode::End => app.cursor_end(),
-        // ↑↓ serve the composer (cursor between lines, else history); the
-        // transcript scrolls with PageUp/PageDown.
-        KeyCode::Up => app.on_up(),
-        KeyCode::Down => app.on_down(),
+        // Shift+↑/↓ (and PageUp/PageDown) scroll the transcript — laptop
+        // friendly since the mouse is left for native selection/copy.
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => app.scroll_up(),
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => app.scroll_down(),
         KeyCode::PageUp => app.scroll_up(),
         KeyCode::PageDown => app.scroll_down(),
+        // Plain ↑↓ serve the composer (cursor between lines, else history).
+        KeyCode::Up => app.on_up(),
+        KeyCode::Down => app.on_down(),
         KeyCode::Char(value) => app.push_char(value),
         _ => {}
     }
@@ -222,7 +233,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 /// Soft upper bound for composer visible rows before scrolling.
 pub(crate) const COMPOSER_MAX_VISIBLE_ROWS: usize = 6;
 
-fn render(frame: &mut Frame<'_>, app: &App) {
+fn render(frame: &mut Frame<'_>, app: &mut App) {
     let inner_width = frame.area().width.saturating_sub(2).max(1);
     // Compute layout once — height and rendering share the same result.
     let layout = layout_input(
@@ -234,7 +245,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     let visual_rows = layout.total_rows.clamp(1, COMPOSER_MAX_VISIBLE_ROWS);
     let input_height = Constraint::Length(visual_rows as u16 + 2);
 
-    if app.pending_approval.is_some() {
+    let snapshot: TranscriptSnapshot = if app.pending_approval.is_some() {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -244,10 +255,11 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                 Constraint::Length(1),
             ])
             .split(frame.area());
-        render_messages(frame, app, chunks[0]);
+        let snap = render_messages(frame, app, chunks[0]);
         render_approval_panel(frame, app, chunks[1]);
         render_input_from_layout(frame, app, &layout, chunks[2]);
         render_status(frame, app, chunks[3]);
+        snap
     } else if let Some(menu) = &app.completion {
         let menu_height = (menu.items.len() as u16).min(8) + 2;
         let chunks = Layout::default()
@@ -259,19 +271,22 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                 Constraint::Length(1),
             ])
             .split(frame.area());
-        render_messages(frame, app, chunks[0]);
+        let snap = render_messages(frame, app, chunks[0]);
         render_completion_menu(frame, menu, chunks[1]);
         render_input_from_layout(frame, app, &layout, chunks[2]);
         render_status(frame, app, chunks[3]);
+        snap
     } else {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(5), input_height, Constraint::Length(1)])
             .split(frame.area());
-        render_messages(frame, app, chunks[0]);
+        let snap = render_messages(frame, app, chunks[0]);
         render_input_from_layout(frame, app, &layout, chunks[1]);
         render_status(frame, app, chunks[2]);
-    }
+        snap
+    };
+    app.set_transcript_snapshot(snapshot);
 }
 
 fn render_completion_menu(
@@ -311,55 +326,97 @@ fn render_completion_menu(
     frame.render_widget(panel, area);
 }
 
-fn render_messages(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
+fn render_messages(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: ratatui::layout::Rect,
+) -> TranscriptSnapshot {
     // Claude-style: no transcript border/title — a 1-col left gutter and the
-    // input box below provide all the structure. Maximizes content width.
+    // input box below provide all the structure.
     let viewport = usize::from(area.height).max(1);
     let content_width = area.width.saturating_sub(2).max(8);
-    let history_len = app.history.len();
-    // Borrow history and chain the (small) active preview instead of deep
-    // cloning the whole transcript every frame.
+
+    // Render the WHOLE transcript into a stable line buffer: a fixed
+    // coordinate space is what lets mouse drag-selection map cleanly, and
+    // bottom-anchored scroll then just windows it.
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for cell in &app.history {
+        lines.extend(cell_lines(cell, content_width));
+    }
     let preview = app
         .active_turn
         .as_ref()
         .map(|active| active.preview_cells())
         .unwrap_or_default();
-
-    // Visual-line scroll model: walk cells from the bottom, rendering only
-    // until the viewport plus the scroll-back distance is covered. This
-    // replaces the old "3 lines per cell" estimate that markdown broke.
-    let target = viewport + app.scroll_offset;
-    let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
-    let mut total_lines = 0usize;
-    let total_cells = history_len + preview.len();
-    let mut index = total_cells;
-    while index > 0 && total_lines < target {
-        index -= 1;
-        let cell = if index < history_len {
-            &app.history[index]
-        } else {
-            &preview[index - history_len]
-        };
-        let lines = cell_lines(cell, content_width);
-        total_lines += lines.len();
-        chunks.push(lines);
+    for cell in &preview {
+        lines.extend(cell_lines(cell, content_width));
     }
 
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(total_lines);
-    for chunk in chunks.into_iter().rev() {
-        lines.extend(chunk);
-    }
-
-    // Bottom-anchored: scroll_offset visual lines up from the end, clamped
-    // to the rendered range.
     let max_scroll = lines.len().saturating_sub(viewport);
     let scroll = app.scroll_offset.min(max_scroll);
     let scroll_top = max_scroll - scroll;
+
+    let plain: Vec<String> = lines.iter().map(line_plain_text).collect();
 
     let paragraph = Paragraph::new(lines)
         .block(Block::default().padding(Padding::new(1, 0, 0, 0)))
         .scroll((scroll_top as u16, 0));
     frame.render_widget(paragraph, area);
+
+    if let Some(sel) = app.selection {
+        highlight_selection(frame, area, scroll_top, viewport, &plain, sel);
+    }
+
+    TranscriptSnapshot {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height,
+        scroll_top,
+        lines: plain,
+    }
+}
+
+fn line_plain_text(line: &Line<'_>) -> String {
+    line.spans.iter().map(|span| span.content.as_ref()).collect()
+}
+
+/// Overlay reverse-video on the selected span (post-render buffer styling, so
+/// it composes over whatever colours the cells already used).
+fn highlight_selection(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    scroll_top: usize,
+    viewport: usize,
+    lines: &[String],
+    selection: (crate::app::TextPos, crate::app::TextPos),
+) {
+    let (a, b) = selection;
+    let (start, end) = if a <= b { (a, b) } else { (b, a) };
+    let text_x = area.x.saturating_add(1);
+    let style = Style::default().add_modifier(Modifier::REVERSED);
+    for line in start.0..=end.0 {
+        if line < scroll_top || line >= scroll_top + viewport {
+            continue;
+        }
+        let Some(text) = lines.get(line) else { continue };
+        let width = UnicodeWidthStr::width(text.as_str());
+        let from = if line == start.0 { start.1 } else { 0 }.min(width);
+        let to = if line == end.0 { end.1 } else { width }.min(width);
+        if to <= from {
+            continue;
+        }
+        let y = area.y + (line - scroll_top) as u16;
+        let x = text_x.saturating_add(from as u16);
+        let avail = area.x.saturating_add(area.width).saturating_sub(x);
+        let w = ((to - from) as u16).min(avail);
+        if w == 0 {
+            continue;
+        }
+        frame
+            .buffer_mut()
+            .set_style(ratatui::layout::Rect::new(x, y, w, 1), style);
+    }
 }
 
 /// Render one transcript cell, Claude-style: speakers are distinguished by a

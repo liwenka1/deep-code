@@ -32,6 +32,7 @@ impl App {
             "/clear" => {
                 self.history.clear();
                 self.active_turn = None;
+                self.clear_selection();
                 self.status = "Cleared visible history.".to_string();
                 true
             }
@@ -173,7 +174,7 @@ impl App {
         });
         match last {
             Some(text) => {
-                copy_to_clipboard(&text);
+                crate::clipboard::copy(&text);
                 self.status = format!("已复制最近回复到剪贴板 ({} 字)", text.chars().count());
             }
             None => self.status = "没有可复制的助手回复".to_string(),
@@ -182,7 +183,7 @@ impl App {
 
     fn show_help(&mut self) {
         self.history.push(HistoryCell::system(
-            "Commands:\n/help - show this help\n/clear - clear visible history\n/status - show runtime status\n/model <auto|pro|flash> - 切换模型并写入全局配置\n/apikey <sk-...> - 设置 API key 并就地接入\n/logout - 清除 API key 回离线\n/copy - 复制最近一条助手回复\n/checkpoints - list checkpoints\n/restore <id> - restore checkpoint\n/sessions - list sessions\n/agents - list sub-agents\nKeys: Enter send, Alt+Enter/Ctrl+J 换行, ↑↓ 滚动聊天 (多行草稿内移光标), Ctrl+P/Ctrl+N 历史, Ctrl+W 删词, Ctrl+U/K 删行, Ctrl+A/E 行首尾, Esc 取消本轮/清空输入/退出 (审批面板中为 deny), Ctrl+C 取消/清空/连按两次退出, 鼠标滚轮/PageUp/PageDown 滚动正文, y/a/n approve/会话允许/deny.\n注意: 取消在工具边界生效，正在执行中的同步工具会先跑完；a 对 shell 类工具只做一次性批准。\n配置 [approval] auto_allow 可预先放行工具前缀（仅 env 或全局配置，项目配置无效）。",
+            "Commands:\n/help - show this help\n/clear - clear visible history\n/status - show runtime status\n/model <auto|pro|flash> - 切换模型并写入全局配置\n/apikey <sk-...> - 设置 API key 并就地接入\n/logout - 清除 API key 回离线\n/copy - 复制最近一条助手回复\n/checkpoints - list checkpoints\n/restore <id> - restore checkpoint\n/sessions - list sessions\n/agents - list sub-agents\nKeys: Enter send, Alt+Enter/Ctrl+J 换行, ↑↓ 滚动聊天 (多行草稿内移光标), Ctrl+P/Ctrl+N 历史, Ctrl+W 删词, Ctrl+U/K 删行, Ctrl+A/E 行首尾, Esc 取消本轮/清空输入/退出 (审批面板中为 deny), Ctrl+C 取消/清空/连按两次退出, Shift+↑/↓ 或 PageUp/PageDown 滚动正文 (鼠标可原生划选复制), y/a/n approve/会话允许/deny.\n注意: 取消在工具边界生效，正在执行中的同步工具会先跑完；a 对 shell 类工具只做一次性批准。\n配置 [approval] auto_allow 可预先放行工具前缀（仅 env 或全局配置，项目配置无效）。",
         ));
         self.status = "Help displayed.".to_string();
     }
@@ -407,57 +408,9 @@ pub(crate) fn format_turn_telemetry(telemetry: &TurnTelemetry, currency: CostCur
     )
 }
 
-/// Copy `text` to the system clipboard via the OSC 52 escape sequence.
-///
-/// No external dependency and works over SSH/tmux on terminals that support
-/// it. The sequence is invisible to the rendered TUI.
-fn copy_to_clipboard(text: &str) {
-    use std::io::Write;
-    let seq = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
-    let mut out = std::io::stdout();
-    let _ = out.write_all(seq.as_bytes());
-    let _ = out.flush();
-}
-
-/// Minimal standard-alphabet base64 (avoids pulling in a crate just for OSC 52).
-fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((n >> 18) & 63) as usize] as char);
-        out.push(TABLE[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[((n >> 6) & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn base64_matches_known_vectors() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode("你好".as_bytes()), "5L2g5aW9");
-    }
 
     #[test]
     fn copy_last_response_picks_latest_assistant() {
