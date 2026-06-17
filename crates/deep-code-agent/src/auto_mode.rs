@@ -37,6 +37,19 @@ impl TurnRoute {
     }
 }
 
+/// Cap reasoning effort to what the chosen model accepts: Flash tops out at
+/// High (only Pro supports `max`). Applied to whichever model a turn actually
+/// runs on, including after an API fallback from Pro to Flash, so we never send
+/// `max` to Flash.
+#[must_use]
+pub fn clamp_effort_to_model(model: &str, effort: ReasoningEffort) -> ReasoningEffort {
+    if model == DEEPSEEK_V4_FLASH && effort == ReasoningEffort::Max {
+        ReasoningEffort::High
+    } else {
+        effort
+    }
+}
+
 /// When auto mode picked Pro and the API call fails, retry once with Flash.
 #[must_use]
 pub fn api_fallback_model(route: &TurnRoute) -> Option<&'static str> {
@@ -70,7 +83,10 @@ pub fn resolve_turn_route(
     };
 
     let auto_effort = config.reasoning_effort.is_auto();
-    let effective_effort = config.reasoning_effort.resolve(is_subagent, user_prompt);
+    let effective_effort = clamp_effort_to_model(
+        &effective_model,
+        config.reasoning_effort.resolve(is_subagent, user_prompt),
+    );
 
     TurnRoute {
         requested_model: config.model.clone(),
@@ -218,6 +234,37 @@ mod tests {
         };
         let route = resolve_turn_route(&config, &ModelRegistry::default(), "debug crash", true);
         assert_eq!(route.effective_effort, ReasoningEffort::Low);
+    }
+
+    #[test]
+    fn flash_never_requests_max_effort() {
+        assert_eq!(
+            clamp_effort_to_model(DEEPSEEK_V4_FLASH, ReasoningEffort::Max),
+            ReasoningEffort::High
+        );
+        // High and below pass through; Pro keeps Max.
+        assert_eq!(
+            clamp_effort_to_model(DEEPSEEK_V4_FLASH, ReasoningEffort::High),
+            ReasoningEffort::High
+        );
+        assert_eq!(
+            clamp_effort_to_model(DEEPSEEK_V4_PRO, ReasoningEffort::Max),
+            ReasoningEffort::Max
+        );
+    }
+
+    #[test]
+    fn auto_route_clamps_flash_to_high_for_max_effort_prompt() {
+        // "fix this error" is short → Flash, but `error` → Max effort; Flash must
+        // not be asked for Max.
+        let config = AgentConfig {
+            model: AUTO_MODEL.to_string(),
+            reasoning_effort: ReasoningEffortSetting::Auto,
+            ..AgentConfig::default()
+        };
+        let route = resolve_turn_route(&config, &ModelRegistry::default(), "fix this error", false);
+        assert_eq!(route.effective_model, DEEPSEEK_V4_FLASH);
+        assert_eq!(route.effective_effort, ReasoningEffort::High);
     }
 
     #[test]

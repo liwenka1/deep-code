@@ -22,7 +22,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use tokio::time::Instant;
 
-use crate::auto_mode::{TurnRoute, api_fallback_model};
+use crate::auto_mode::{TurnRoute, api_fallback_model, clamp_effort_to_model};
 use crate::client::{AgentEventStream, LlmClient};
 use crate::error::{AgentError, AgentResult};
 use crate::event::AgentEvent;
@@ -208,11 +208,15 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 if let Some(fallback) = api_fallback_model(route) {
                     route.effective_model = fallback.to_string();
                     route.used_model_fallback = true;
+                    // Flash rejects `max`; cap the retry's effort to what it accepts.
+                    route.effective_effort = clamp_effort_to_model(fallback, route.effective_effort);
                     route.fallback_reason = Some(
                         "DeepSeek 临时不可用或限流，已从 Pro 自动降级到 Flash 重试".to_string(),
                     );
                     let mut retry = request;
                     retry.model = fallback.to_string();
+                    retry.reasoning_effort =
+                        route.effective_effort.as_api_value().map(str::to_string);
                     self.client.stream_chat(retry).await
                 } else {
                     Err(error)
