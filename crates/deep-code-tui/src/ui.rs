@@ -27,6 +27,9 @@ const MIN_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 /// While streaming, repaint at least this often so the activity indicator
 /// animates through a long time-to-first-token wait.
 const STREAM_TICK_INTERVAL: Duration = Duration::from_millis(120);
+/// Max completion rows shown at once; the list windows around the selection so
+/// wrapping past the top/bottom keeps the highlighted item on screen.
+const COMPLETION_VISIBLE_ROWS: usize = 8;
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 pub async fn run(config: LaunchConfig) -> Result<()> {
@@ -281,7 +284,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_status(frame, app, chunks[3]);
         snap
     } else if let Some(menu) = &app.completion {
-        let menu_height = (menu.items.len() as u16).min(8) + 2;
+        let menu_height = (menu.items.len() as u16).min(COMPLETION_VISIBLE_ROWS as u16) + 2;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -391,11 +394,17 @@ fn render_completion_menu(
     menu: &crate::app::CompletionMenu,
     area: ratatui::layout::Rect,
 ) {
+    // Window around the selection so wrapping to the last/first item keeps the
+    // highlight visible instead of scrolling it off the top of the list.
+    let start = menu
+        .selected
+        .saturating_sub(COMPLETION_VISIBLE_ROWS.saturating_sub(1));
     let lines: Vec<Line<'static>> = menu
         .items
         .iter()
         .enumerate()
-        .take(8)
+        .skip(start)
+        .take(COMPLETION_VISIBLE_ROWS)
         .map(|(index, (value, hint))| {
             let marker = if index == menu.selected { "▶ " } else { "  " };
             let mut spans = vec![Span::raw(marker.to_string())];
@@ -1013,6 +1022,45 @@ mod tests {
     fn left_truncate_keeps_tail_with_ellipsis() {
         assert_eq!(left_truncate("short", 10), "short");
         assert_eq!(left_truncate("abcdefghij", 5), "…ghij");
+    }
+
+    #[test]
+    fn completion_menu_windows_to_keep_selection_visible() {
+        use crate::app::{CompletionKind, CompletionMenu};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let items: Vec<(String, String)> = (0..12)
+            .map(|i| (format!("/cmd{i:02}"), String::new()))
+            .collect();
+        let render_at = |selected: usize| -> String {
+            let menu = CompletionMenu {
+                kind: CompletionKind::Slash,
+                items: items.clone(),
+                selected,
+            };
+            let mut terminal = Terminal::new(TestBackend::new(50, 12)).unwrap();
+            terminal
+                .draw(|frame| render_completion_menu(frame, &menu, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let mut text = String::new();
+            for row in 0..buffer.area.height {
+                for col in 0..buffer.area.width {
+                    text.push_str(buffer[(col, row)].symbol());
+                }
+            }
+            text
+        };
+
+        // Wrapping Up from the top lands on the last item — it must stay on screen.
+        let bottom = render_at(11);
+        assert!(bottom.contains("▶ /cmd11"), "last item highlighted + visible");
+        assert!(!bottom.contains("/cmd00"), "top items scroll out of the window");
+
+        // Selecting the top item shows it highlighted at the top.
+        let top = render_at(0);
+        assert!(top.contains("▶ /cmd00"));
     }
 
     #[test]
