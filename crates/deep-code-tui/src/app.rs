@@ -182,6 +182,24 @@ fn byte_idx(s: &str, char_index: usize) -> usize {
         .map_or(s.len(), |(b, _)| b)
 }
 
+/// Build the startup welcome header from the resolved session/runtime state.
+/// Shared by initial launch and `/clear` (which starts a fresh conversation).
+fn welcome_cell(
+    model: &str,
+    reasoning: &str,
+    offline: bool,
+    workspace: String,
+    session: String,
+) -> HistoryCell {
+    HistoryCell::Welcome {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        model: format!("DeepSeek {model} · 推理 {reasoning}"),
+        offline,
+        workspace,
+        session,
+    }
+}
+
 /// Render a path home-relative (`/Users/x/p` → `~/p`) for the welcome header.
 fn home_relative(path: &std::path::Path) -> String {
     let shown = path.display().to_string();
@@ -245,13 +263,13 @@ impl App {
         } else {
             "新会话 · 未持久化".to_string()
         };
-        let mut history = vec![HistoryCell::Welcome {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            model: format!("DeepSeek {configured_model} · 推理 {configured_reasoning}"),
-            offline: backend_label.contains("offline echo"),
-            workspace: workspace_display,
-            session: session_summary,
-        }];
+        let mut history = vec![welcome_cell(
+            &configured_model,
+            &configured_reasoning,
+            backend_label.contains("offline echo"),
+            workspace_display,
+            session_summary,
+        )];
 
         if !config_warnings.is_empty() {
             history.push(HistoryCell::system(format!(
@@ -1306,6 +1324,58 @@ impl App {
         Ok(())
     }
 
+    /// Start a fresh conversation in place — Claude Code's `/clear`. The current
+    /// session is flushed to disk (recoverable via `/resume`), a brand-new
+    /// session is launched, and the view resets to the welcome header.
+    pub(crate) fn start_new_conversation(&mut self) {
+        if self.is_streaming || self.pending_approval.is_some() {
+            self.status = "正在流式输出或等待审批，无法开启新对话".to_string();
+            return;
+        }
+
+        if let Some(stop) = self.subagent_shutdown.take() {
+            stop();
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let runtime = Arc::clone(&self.runtime);
+            tokio::task::block_in_place(|| handle.block_on(runtime.shutdown()));
+        }
+
+        let workspace = workspace_root();
+        let workspace_display = home_relative(&workspace);
+        let loaded = AgentConfig::load(&workspace);
+        let agent_config = loaded.config;
+        let launched = launch_runtime(&agent_config, workspace, None);
+        self.cost_currency = agent_config.cost_currency;
+        self.configured_model = agent_config.model.clone();
+        self.configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
+        self.resumed = false;
+        self.adopt_runtime(launched);
+
+        let persistent = self.session_id.is_some();
+        self.history.clear();
+        self.active_turn = None;
+        self.clear_selection();
+        self.close_completion();
+        self.scroll_offset = 0;
+        self.last_telemetry = None;
+        self.last_checkpoint = None;
+        self.error = None;
+        let cell = welcome_cell(
+            &self.configured_model,
+            &self.configured_reasoning,
+            self.backend_label.contains("offline echo"),
+            workspace_display,
+            if persistent {
+                "新会话 · 已持久化".to_string()
+            } else {
+                "新会话 · 未持久化".to_string()
+            },
+        );
+        self.history.push(cell);
+        self.status = "已开启新对话（旧对话可用 /resume 找回）".to_string();
+    }
+
     fn start_stream(&mut self, request: StreamRequest) {
         let (tx, rx) = mpsc::unbounded_channel();
         self.ui_rx = Some(rx);
@@ -1440,8 +1510,15 @@ mod tests {
             Some(HistoryCell::System { text }) if text.contains("backend=")
         ));
 
+        // `/clear` starts a fresh conversation: the transcript resets to just
+        // the welcome header rather than going empty.
         assert!(app.handle_slash_command("/clear"));
-        assert!(app.history.is_empty());
+        assert!(
+            matches!(app.history.as_slice(), [HistoryCell::Welcome { .. }]),
+            "clear leaves only the welcome header, got {} cells",
+            app.history.len()
+        );
+        assert!(app.status.contains("新对话"));
     }
 
     #[test]
