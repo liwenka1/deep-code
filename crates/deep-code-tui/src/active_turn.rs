@@ -192,16 +192,8 @@ impl ActiveTurn {
             approval: tool.approval,
         }));
         cells.extend(self.diagnostics.iter().cloned());
-        if let Some(request) = &self.pending_approval {
-            cells.push(HistoryCell::Approval {
-                tool_name: request.tool_name.clone(),
-                description: request.description.clone(),
-                risk_level: format!("{:?}", request.risk_level),
-                requires_sandbox: request.requires_sandbox,
-                matched_rule: request.matched_rule.clone(),
-                arguments: request.arguments.to_string(),
-            });
-        }
+        // The pending approval is shown by the dedicated panel (with the y/a/n
+        // choices); don't also duplicate it inline in the transcript preview.
         cells
     }
 }

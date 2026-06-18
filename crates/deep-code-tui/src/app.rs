@@ -2366,13 +2366,18 @@ mod tests {
                 ..
             } if risk == "High" && *approval == crate::history::ToolApprovalState::Required
         )));
-        assert!(preview.iter().any(|cell| matches!(
-            cell,
-            HistoryCell::Approval {
-                matched_rule: Some(rule),
-                ..
-            } if rule == "write"
-        )));
+        // The approval is surfaced by the dedicated panel (app.pending_approval),
+        // not duplicated inline in the transcript preview.
+        assert!(
+            !preview
+                .iter()
+                .any(|cell| matches!(cell, HistoryCell::Approval { .. })),
+            "approval must not be duplicated in the transcript preview"
+        );
+        let pending = app.pending_approval.as_ref().expect("pending approval set");
+        assert_eq!(pending.matched_rule.as_deref(), Some("write"));
+        assert_eq!(format!("{:?}", pending.risk_level), "High");
+        assert!(pending.requires_sandbox);
         assert_eq!(app.scroll_offset, 3);
         assert_eq!(app.approval_scroll_offset, 0);
 

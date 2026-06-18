@@ -174,6 +174,10 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         let turn_id = TurnId::new();
         {
             let mut state = self.state.lock().await;
+            // A prior turn may have been interrupted between the assistant's
+            // tool_calls and the tool running (exit while awaiting approval),
+            // leaving dangling tool_calls that the API rejects on resume.
+            state.session.repair_dangling_tool_calls();
             state.session.push(Message::user(&prompt));
             state.pending = None;
             state.current_turn = Some(TurnRecord::new(prompt.clone()));

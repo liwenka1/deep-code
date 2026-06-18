@@ -12,7 +12,7 @@ use crossterm::terminal::{
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style, Stylize};
-use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Widget};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -273,7 +273,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),
-                Constraint::Length(8),
+                Constraint::Length(6),
                 input_height,
                 Constraint::Length(1),
             ])
@@ -620,13 +620,23 @@ fn cell_lines(cell: &HistoryCell, width: u16) -> Vec<Line<'static>> {
             lines.push(Line::default());
             lines
         }
-        HistoryCell::Approval { .. } => {
-            // An action prompt — keep it visible (yellow), not dimmed.
-            let style = Style::default().fg(Color::Yellow);
-            let mut lines = Vec::new();
-            for logical in cell.lines() {
-                lines.extend(wrap_styled(&logical, width, style));
-            }
+        HistoryCell::Approval {
+            tool_name,
+            description,
+            risk_level,
+            requires_sandbox,
+            matched_rule,
+            arguments,
+        } => {
+            let mut lines = approval_lines(
+                tool_name,
+                risk_level,
+                *requires_sandbox,
+                matched_rule.as_deref(),
+                description,
+                arguments,
+                width,
+            );
             lines.push(Line::default());
             lines
         }
@@ -701,30 +711,126 @@ fn wrap_prefixed(
     out
 }
 
+/// Risk tier (Debug of `RiskLevel`) → (Chinese tag, accent colour). Risk is
+/// shown as colour, not a `Risk: …` field. Unknown tiers fall back to amber.
+fn risk_display(risk: &str) -> (&'static str, Color) {
+    match risk {
+        "High" => ("高风险", Color::Red),
+        "Medium" => ("中风险", Color::Yellow),
+        "Low" => ("低风险", Color::DarkGray),
+        _ => ("", Color::Yellow),
+    }
+}
+
+/// The human-meaningful action behind a tool call — the shell command, the file
+/// path, etc. — instead of the raw JSON blob. Falls back to compact arguments.
+fn extract_action(arguments_json: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments_json)
+        && let Some(object) = value.as_object()
+    {
+        for key in ["command", "path", "file_path", "url", "pattern", "query"] {
+            if let Some(text) = object.get(key).and_then(serde_json::Value::as_str) {
+                return crate::history::collapse_whitespace(text);
+            }
+        }
+    }
+    crate::history::collapse_whitespace(arguments_json)
+}
+
+/// Minimal, borderless approval block matching the welcome/picker style: a
+/// risk-coloured `●` + tool, the action it will take (prominent), an optional
+/// dim description, and only meaningful metadata (sandbox / matched rule).
+fn approval_lines(
+    tool_name: &str,
+    risk: &str,
+    requires_sandbox: bool,
+    matched_rule: Option<&str>,
+    description: &str,
+    arguments_json: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let (risk_tag, risk_color) = risk_display(risk);
+    let risk_style = Style::default().fg(risk_color);
+
+    let mut header = vec![
+        Span::styled("● ", risk_style),
+        Span::styled("需要批准", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(" · ", dim),
+        Span::styled(
+            tool_name.to_string(),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !risk_tag.is_empty() {
+        header.push(Span::styled(" · ", dim));
+        header.push(Span::styled(risk_tag, risk_style));
+    }
+    let mut lines = vec![Line::from(header)];
+
+    let action = crate::history::truncate_chars(&extract_action(arguments_json), 240);
+    lines.extend(wrap_prefixed("  ", &action, width, Style::default(), Style::default()));
+
+    let description = description.trim();
+    if !description.is_empty() && description != action {
+        lines.extend(wrap_prefixed("  ", description, width, dim, dim));
+    }
+
+    let mut meta = Vec::new();
+    if requires_sandbox {
+        meta.push("需沙箱执行".to_string());
+    }
+    if let Some(rule) = matched_rule {
+        meta.push(format!("规则 {rule}"));
+    }
+    if !meta.is_empty() {
+        lines.push(Line::from(Span::styled(format!("  {}", meta.join(" · ")), dim)));
+    }
+    lines
+}
+
 fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
-    let Some(cell) = app.approval_cell() else {
+    let Some(request) = app.pending_approval.as_ref() else {
         return;
     };
-    let visible_lines = usize::from(area.height.saturating_sub(2)).max(1);
-    let mut lines = vec![Line::from(
-        "Keys: y approve | a 本会话总是允许 | n/Esc deny | PageUp/PageDown scroll",
-    )];
-    lines.extend(
-        cell.lines()
-            .into_iter()
-            .skip(app.clamped_approval_scroll_offset())
-            .take(visible_lines.saturating_sub(1))
-            .map(Line::from),
+    // Body (scrollable) on top; the y/a/n choices pinned to the bottom rows so
+    // they stay visible even when a long command wraps.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .split(area);
+
+    let width = usize::from(chunks[0].width.saturating_sub(2)).max(8);
+    let body = approval_lines(
+        &request.tool_name,
+        &format!("{:?}", request.risk_level),
+        request.requires_sandbox,
+        request.matched_rule.as_deref(),
+        &request.description,
+        &request.arguments.to_string(),
+        width,
     );
-    let panel = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title("Approval required")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(panel, area);
+    let body_paragraph = Paragraph::new(body)
+        .block(Block::default().padding(Padding::new(1, 0, 0, 0)))
+        .scroll((app.clamped_approval_scroll_offset() as u16, 0));
+    frame.render_widget(body_paragraph, chunks[0]);
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let key = Style::default().add_modifier(Modifier::BOLD);
+    let options = Paragraph::new(vec![
+        Line::default(),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("y", key),
+            Span::styled(" 批准    ", dim),
+            Span::styled("a", key),
+            Span::styled(" 本会话始终允许    ", dim),
+            Span::styled("n", key),
+            Span::styled(" 拒绝（Esc）", dim),
+        ]),
+    ])
+    .block(Block::default().padding(Padding::new(1, 0, 0, 0)));
+    frame.render_widget(options, chunks[1]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,6 +1129,51 @@ mod tests {
         assert_eq!(left_truncate("short", 10), "short");
         assert_eq!(left_truncate("abcdefghij", 5), "…ghij");
     }
+
+    #[test]
+    fn extract_action_pulls_command_or_path() {
+        assert_eq!(
+            extract_action(r#"{"command":"npm run build"}"#),
+            "npm run build"
+        );
+        assert_eq!(
+            extract_action(r#"{"path":"src/foo.rs","content":"x"}"#),
+            "src/foo.rs"
+        );
+    }
+
+    #[test]
+    fn risk_display_maps_tier_to_colour() {
+        assert_eq!(risk_display("High"), ("高风险", Color::Red));
+        assert_eq!(risk_display("Medium"), ("中风险", Color::Yellow));
+        assert_eq!(risk_display("Low"), ("低风险", Color::DarkGray));
+        assert_eq!(risk_display("weird").0, "");
+    }
+
+    #[test]
+    fn approval_lines_are_minimal_no_dump_fields() {
+        let lines = approval_lines(
+            "shell_run",
+            "Medium",
+            false,
+            None,
+            "运行构建脚本",
+            r#"{"command":"npm run build"}"#,
+            60,
+        );
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(text.contains("需要批准") && text.contains("shell_run"));
+        assert!(text.contains("npm run build") && text.contains("中风险"));
+        for noise in ["Risk:", "Sandbox:", "Rule:", "Tool:", "Approval required"] {
+            assert!(!text.contains(noise), "must not contain `{noise}`");
+        }
+        // false/none metadata is hidden.
+        assert!(!text.contains("沙箱") && !text.contains("规则"));
+    }
+
 
     #[test]
     fn completion_menu_windows_to_keep_selection_visible() {
