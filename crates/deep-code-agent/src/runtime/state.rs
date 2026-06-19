@@ -28,6 +28,11 @@ pub(super) struct RuntimeState {
     /// Tools the user approved for the whole session ("a" in the approval
     /// panel). In-memory only: forgotten when the runtime shuts down.
     pub(super) session_approved: HashSet<String>,
+    /// Leading programs of shell commands the user approved for the session
+    /// ("a" on a shell call) — e.g. `cargo`, `git`. Shell isn't blanket
+    /// session-approvable by tool name, so this trusts at command granularity.
+    /// In-memory only; compound commands are never matched (they keep prompting).
+    pub(super) session_trusted_shell_prefixes: HashSet<String>,
 }
 
 pub(super) struct Persistence {

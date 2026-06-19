@@ -27,6 +27,33 @@ pub(super) fn session_allowable(tool_name: &str) -> bool {
     )
 }
 
+/// Leading program of a *simple* shell command, lowercased — e.g. `cargo` from
+/// `cargo test --all`. Returns `None` for non-shell calls and for
+/// compound/substitution/redirection commands, which are never matched by the
+/// session shell allowlist (they keep prompting). This is what `a` records and
+/// later matches against, so a trusted `cargo` can never smuggle a chained
+/// `cargo x && rm -rf /` past the gate.
+pub(super) fn session_shell_prefix(call: &ToolCall) -> Option<String> {
+    if !matches!(
+        crate::execution_policy::ExecPolicy::classify_tool(&call.name),
+        crate::execution_policy::ToolKind::Shell
+    ) {
+        return None;
+    }
+    let command = call.arguments.get("command").and_then(|value| value.as_str())?;
+    let command = command.trim();
+    if command.is_empty()
+        || command.contains(['&', '|', ';', '\n', '`', '<', '>', '(', ')', '$'])
+    {
+        return None;
+    }
+    let token = command.split_whitespace().next()?;
+    if token.contains('=') {
+        return None; // leading `FOO=bar` env assignment, not a plain program
+    }
+    Some(token.to_ascii_lowercase())
+}
+
 /// How a tool-call batch ended: every call has a recorded result, the batch
 /// is parked in `RuntimeState::pending` waiting for an approval, or the user
 /// cancelled and the remaining calls received synthesized results.
@@ -69,20 +96,25 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// the tool earlier, or a configured `auto_allow` prefix matches. Policy
     /// hard-denials are unaffected (they short-circuit inside the registry
     /// before any decision is consulted).
-    async fn auto_approval_granted(&self, tool_name: &str) -> bool {
+    async fn auto_approval_granted(&self, call: &ToolCall) -> bool {
         if self
             .config
             .approval_auto_allow
             .iter()
-            .any(|prefix| !prefix.is_empty() && tool_name.starts_with(prefix))
+            .any(|prefix| !prefix.is_empty() && call.name.starts_with(prefix))
         {
             return true;
         }
-        self.state
-            .lock()
-            .await
-            .session_approved
-            .contains(tool_name)
+        let state = self.state.lock().await;
+        if state.session_approved.contains(&call.name) {
+            return true;
+        }
+        // Shell isn't blanket session-approvable by name; trust at command
+        // granularity instead ("a" remembered `cargo`, `git`, …).
+        match session_shell_prefix(call) {
+            Some(prefix) => state.session_trusted_shell_prefixes.contains(&prefix),
+            None => false,
+        }
     }
 
     /// Run the queued tool calls of one assistant turn in order.
@@ -113,7 +145,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                         .await;
                 }
                 Ok(ToolRunOutcome::ApprovalRequired { request }) => {
-                    if self.auto_approval_granted(&call.name).await {
+                    if self.auto_approval_granted(&call).await {
                         // Audit trail: the gate fired but a standing consent
                         // (session "a" or config auto_allow) resolved it.
                         emit(
@@ -247,6 +279,15 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                     .await
                     .session_approved
                     .insert(current.name.clone());
+            } else if let Some(prefix) = session_shell_prefix(&current) {
+                // Shell: remember this command's program for the session so
+                // repeated `cargo`/`git`/… stop prompting (compound commands
+                // still prompt — `session_shell_prefix` returns None for them).
+                self.state
+                    .lock()
+                    .await
+                    .session_trusted_shell_prefixes
+                    .insert(prefix);
             }
             ApprovalDecision::Approved
         } else {
@@ -387,5 +428,63 @@ pub(super) fn runtime_error_from_tool_error(
     RuntimeEvent::Error {
         turn_id,
         message: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn shell(command: &str) -> ToolCall {
+        ToolCall {
+            id: "c1".to_string(),
+            name: "shell_run".to_string(),
+            arguments: json!({ "command": command }),
+        }
+    }
+
+    #[test]
+    fn shell_prefix_extracts_leading_program() {
+        assert_eq!(
+            session_shell_prefix(&shell("cargo test --all")),
+            Some("cargo".to_string())
+        );
+        assert_eq!(
+            session_shell_prefix(&shell("  Git Status  ")),
+            Some("git".to_string())
+        );
+    }
+
+    #[test]
+    fn shell_prefix_rejects_compound_and_substitution() {
+        // The guard against `cargo … && rm -rf /` riding a trusted `cargo`.
+        for command in [
+            "cargo test && rm -rf /",
+            "ls | grep foo",
+            "a; b",
+            "echo `whoami`",
+            "echo $(id)",
+            "cat < file",
+            "echo x > y",
+            "FOO=bar cargo test",
+            "",
+        ] {
+            assert_eq!(
+                session_shell_prefix(&shell(command)),
+                None,
+                "must not trust: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_prefix_is_none_for_non_shell_tools() {
+        let call = ToolCall {
+            id: "c1".to_string(),
+            name: "write_file".to_string(),
+            arguments: json!({ "path": "x", "content": "y" }),
+        };
+        assert_eq!(session_shell_prefix(&call), None);
     }
 }
