@@ -77,6 +77,9 @@ pub struct App {
     pub(crate) resumed: bool,
     pub scroll_offset: usize,
     pub approval_scroll_offset: usize,
+    /// Currently highlighted approval option: 0 = y (approve), 1 = a (session),
+    /// 2 = n (deny). Navigated with ↑/↓, acted on with Enter.
+    pub approval_focus: usize,
     pub(crate) runtime: Arc<dyn AgentRuntimeHandle>,
     pub(crate) backend_label: String,
     pub(crate) subagent_manager: SharedSubAgentManager,
@@ -308,6 +311,7 @@ impl App {
             resumed,
             scroll_offset: 0,
             approval_scroll_offset: 0,
+            approval_focus: 0,
             runtime,
             backend_label,
             subagent_manager,
@@ -1057,6 +1061,25 @@ impl App {
 
     pub fn deny_pending_tool(&mut self) {
         self.resolve_pending_tool(ApprovalDecision::Denied);
+    }
+
+    /// Move the approval highlight to the previous option (wrap around).
+    pub fn approval_focus_up(&mut self) {
+        self.approval_focus = if self.approval_focus == 0 { 2 } else { self.approval_focus - 1 };
+    }
+
+    /// Move the approval highlight to the next option (wrap around).
+    pub fn approval_focus_down(&mut self) {
+        self.approval_focus = if self.approval_focus == 2 { 0 } else { self.approval_focus + 1 };
+    }
+
+    /// Execute the currently highlighted approval action.
+    pub fn execute_focused_approval(&mut self) {
+        match self.approval_focus {
+            0 => self.approve_pending_tool(),
+            1 => self.approve_pending_tool_for_session(),
+            _ => self.deny_pending_tool(),
+        }
     }
 
     pub fn scroll_up(&mut self) {

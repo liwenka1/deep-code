@@ -69,6 +69,7 @@ impl App {
                 );
                 self.pending_approval = Some(request);
                 self.approval_scroll_offset = 0;
+                self.approval_focus = 0;
                 self.is_streaming = false;
                 self.clear_stream_receiver();
             }

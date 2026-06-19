@@ -166,8 +166,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('y') | KeyCode::Char('Y') => app.approve_pending_tool(),
             KeyCode::Char('a') | KeyCode::Char('A') => app.approve_pending_tool_for_session(),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.deny_pending_tool(),
-            KeyCode::PageUp | KeyCode::Up => app.scroll_approval_up(),
-            KeyCode::PageDown | KeyCode::Down => app.scroll_approval_down(),
+            KeyCode::Up => app.approval_focus_up(),
+            KeyCode::Down => app.approval_focus_down(),
+            KeyCode::Enter => app.execute_focused_approval(),
+            KeyCode::PageUp => app.scroll_approval_up(),
+            KeyCode::PageDown => app.scroll_approval_down(),
             KeyCode::Home => app.scroll_approval_to_top(),
             _ => {}
         }
@@ -797,7 +800,7 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout
     // they stay visible even when a long command wraps.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(area);
 
     let width = usize::from(chunks[0].width.saturating_sub(2)).max(8);
@@ -815,21 +818,36 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout
         .scroll((app.clamped_approval_scroll_offset() as u16, 0));
     frame.render_widget(body_paragraph, chunks[0]);
 
+    let key_y = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+    let key_a = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let key_n = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Color::DarkGray);
-    let key = Style::default().add_modifier(Modifier::BOLD);
-    let options = Paragraph::new(vec![
-        Line::default(),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled("y", key),
-            Span::styled(" 批准    ", dim),
-            Span::styled("a", key),
-            Span::styled(" 本会话始终允许    ", dim),
-            Span::styled("n", key),
-            Span::styled(" 拒绝（Esc）", dim),
-        ]),
-    ])
-    .block(Block::default().padding(Padding::new(1, 0, 0, 0)));
+
+    let focus = app.approval_focus;
+    let options_body: Vec<Line> = [
+        ("  y", "批准", key_y),
+        ("  a", "本会话始终允许", key_a),
+        ("  n", "拒绝（Esc）", key_n),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, &(key_label, desc, style))| {
+        if i == focus {
+            let arrow = Span::styled(" ▶", style);
+            let key = Span::styled(key_label, style);
+            let desc = Span::styled(format!("  {desc}"), Style::default().add_modifier(Modifier::BOLD));
+            Line::from(vec![arrow, key, desc])
+        } else {
+            let arrow = Span::styled("  ", dim);
+            let key = Span::styled(key_label, dim);
+            let desc = Span::styled(format!("  {desc}"), dim);
+            Line::from(vec![arrow, key, desc])
+        }
+    })
+    .collect();
+
+    let options = Paragraph::new(options_body)
+        .block(Block::default().padding(Padding::new(1, 0, 0, 0)));
     frame.render_widget(options, chunks[1]);
 }
 
