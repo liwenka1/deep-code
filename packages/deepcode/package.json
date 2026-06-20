@@ -1,0 +1,34 @@
+{
+  "name": "deepcode",
+  "version": "0.1.0",
+  "description": "AI coding assistant in your terminal — powered by DeepSeek",
+  "bin": {
+    "deepcode": "bin/deepcode"
+  },
+  "scripts": {
+    "postinstall": "node install.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/liwenka1/deep-code"
+  },
+  "homepage": "https://github.com/liwenka1/deep-code#readme",
+  "keywords": [
+    "ai",
+    "coding",
+    "assistant",
+    "cli",
+    "terminal",
+    "deepseek"
+  ],
+  "license": "MIT",
+  "files": [
+    "install.mjs",
+    "package.json"
+  ],
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"],
+  "engines": {
+    "node": ">=18"
+  }
+}

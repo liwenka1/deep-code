@@ -1,0 +1,18 @@
+# deep-code npm 包装包
+#
+# 这个包本身只是一个安装器：npm install 时自动从 GitHub Releases
+# 下载对应平台的预编译 Rust 二进制。包体积 < 10 KB。
+
+# 排除非必要文件
+src/
+target/
+Cargo.*
+rustfmt.toml
+config.example.toml
+.editorconfig
+.gitignore
+.github/
+apps/
+crates/
+docs/
+node_modules/

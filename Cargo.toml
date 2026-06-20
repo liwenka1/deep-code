@@ -13,3 +13,11 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/liwenka1/deep-code"
+
+# 最小体积 release profile —— 用于 npm 分发
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

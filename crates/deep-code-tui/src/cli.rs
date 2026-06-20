@@ -62,6 +62,10 @@ pub fn parse_args() -> CliArgs {
     }
 
     match args[0].as_str() {
+        "--version" | "-V" => {
+            eprintln!("deep-code {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
         "session" => {
             args.remove(0);
             return parse_session_command(args);
