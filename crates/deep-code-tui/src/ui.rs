@@ -33,6 +33,11 @@ const COMPLETION_VISIBLE_ROWS: usize = 8;
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 pub async fn run(config: LaunchConfig) -> Result<()> {
+    // The alternate-screen TUI owns the terminal; any stray write to stderr
+    // (LSP "server unavailable" notices, persistence warnings, panics) would
+    // paint raw text over the rendered buffer. Send stderr to a log file so it
+    // can never corrupt the screen.
+    redirect_stderr_to_log();
     let mut terminal = setup_terminal()?;
     let mut app = App::launch(config);
     let result = run_loop(&mut terminal, &mut app);
@@ -74,6 +79,37 @@ fn restore_terminal(terminal: &mut AppTerminal) -> Result<()> {
 
     Ok(())
 }
+
+/// Point the process's stderr at `.deep-code/deep-code.log` so background tasks
+/// (LSP, persistence) and panics can't paint over the alternate-screen TUI.
+/// Best-effort: if the log can't be opened, stderr is left as-is.
+#[cfg(unix)]
+fn redirect_stderr_to_log() {
+    use std::os::unix::io::AsRawFd;
+
+    let path = crate::cli::workspace_root()
+        .join(".deep-code")
+        .join("deep-code.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    // SAFETY: `file` holds a valid fd for the duration of this call, and
+    // `STDERR_FILENO` (2) is always a valid target. After dup2, fd 2 is an
+    // independent reference to the log file, so dropping `file` is fine.
+    unsafe {
+        libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
+    }
+}
+
+#[cfg(not(unix))]
+fn redirect_stderr_to_log() {}
 
 fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
     let mut needs_redraw = true;

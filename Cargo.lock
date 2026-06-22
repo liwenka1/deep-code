@@ -938,6 +938,7 @@ dependencies = [
  "deep-code-agent",
  "deep-code-runtime",
  "futures-util",
+ "libc",
  "ratatui",
  "serde_json",
  "tempfile",
