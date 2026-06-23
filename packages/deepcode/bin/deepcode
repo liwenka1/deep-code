@@ -1,0 +1,36 @@
+#!/usr/bin/env node
+// Cross-platform launcher for the deepcode CLI.
+//
+// `install.mjs` downloads the platform's prebuilt Rust binary next to this file
+// (`deepcode-bin` on Unix, `deepcode.exe` on Windows). This launcher is what
+// `package.json` `bin` points at and is shipped in the tarball, so npm's bin
+// link always targets a real file — Windows no longer depends on PATHEXT
+// resolving an extension-less name, and `--ignore-scripts` installs fail loudly
+// instead of leaving a command pointing at nothing.
+'use strict';
+
+const { spawnSync } = require('node:child_process');
+const { existsSync } = require('node:fs');
+const { join } = require('node:path');
+
+const binary = join(
+  __dirname,
+  process.platform === 'win32' ? 'deepcode.exe' : 'deepcode-bin',
+);
+
+if (!existsSync(binary)) {
+  console.error('deepcode: native binary not found.');
+  console.error('Reinstall without --ignore-scripts, or grab a prebuilt binary from');
+  console.error('https://github.com/liwenka1/deep-code/releases');
+  process.exit(1);
+}
+
+const result = spawnSync(binary, process.argv.slice(2), { stdio: 'inherit' });
+
+if (result.error) {
+  console.error(`deepcode: failed to launch binary: ${result.error.message}`);
+  process.exit(1);
+}
+
+// Mirror the child's exit; a signal-terminated child reports null status.
+process.exit(result.status === null ? 1 : result.status);

@@ -7,6 +7,11 @@
 # --- Node (nested apps, e.g. Tauri frontend) ---
 node_modules/
 
+# npm installer fetches the platform binary next to the launcher at install
+# time; never commit it (the launcher bin/deepcode itself IS tracked).
+/packages/deepcode/bin/deepcode-bin
+/packages/deepcode/bin/deepcode.exe
+
 # --- Build outputs ---
 dist/
 dist-ssr/

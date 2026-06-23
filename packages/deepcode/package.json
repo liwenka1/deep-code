@@ -24,7 +24,8 @@
   "license": "MIT",
   "files": [
     "install.mjs",
-    "package.json"
+    "package.json",
+    "bin/deepcode"
   ],
   "os": ["darwin", "linux", "win32"],
   "cpu": ["x64", "arm64"],

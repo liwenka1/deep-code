@@ -6,13 +6,18 @@
 import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { platform, arch } from 'node:os';
 
 // ── 配置 ──
 const REPO = 'liwenka1/deep-code';
 const VERSION = process.env.npm_package_version || '0.1.0';
-const BIN_DIR = path.join(import.meta.dirname, 'bin');
-const BIN_NAME = platform() === 'win32' ? 'deepcode.exe' : 'deepcode';
+// `import.meta.dirname` only exists on Node 20.11+; derive it from the module
+// URL so the `engines: node >=18` floor actually works.
+const BIN_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'bin');
+// The real binary sits next to the `deepcode` JS launcher (bin/deepcode), which
+// spawns it. Distinct names so the download never clobbers the launcher.
+const BIN_NAME = platform() === 'win32' ? 'deepcode.exe' : 'deepcode-bin';
 
 // ── 平台 → GitHub Release asset 名称映射 ──
 const ASSET_MAP = {
