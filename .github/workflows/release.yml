@@ -32,7 +32,9 @@ jobs:
             os: macos-latest
             target: aarch64-apple-darwin
           - name: darwin-x64
-            os: macos-13
+            # Intel macOS runners (macos-13) are scarce/retiring and can queue
+            # forever; cross-compile x86_64 on the arm64 runner instead.
+            os: macos-latest
             target: x86_64-apple-darwin
           - name: linux-x64
             os: ubuntu-latest
