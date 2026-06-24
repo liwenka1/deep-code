@@ -1,5 +1,5 @@
 {
-  "name": "@liwenka1/deepcode",
+  "name": "@liwenkai/deepcode",
   "version": "0.1.0",
   "description": "AI coding assistant in your terminal — powered by DeepSeek",
   "bin": {
