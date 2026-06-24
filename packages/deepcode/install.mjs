@@ -6,6 +6,7 @@
 import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { platform, arch } from 'node:os';
 
@@ -26,6 +27,9 @@ const ASSET_MAP = {
   'linux-arm64':  'deep-code-aarch64-unknown-linux-gnu',
   'linux-x64':    'deep-code-x86_64-unknown-linux-gnu',
   'win32-x64':    'deep-code-x86_64-pc-windows-msvc.exe',
+  // Windows on ARM runs x64 binaries via built-in emulation, so reuse the x64
+  // asset (matches the win32+arm64 combo allowed by package.json os/cpu).
+  'win32-arm64':  'deep-code-x86_64-pc-windows-msvc.exe',
 };
 
 // ── 主逻辑 ──
@@ -35,7 +39,9 @@ async function main() {
 
   if (!assetName) {
     console.error(`❌ deepcode: unsupported platform "${platformKey}"`);
-    console.error('   Supported: darwin-arm64, darwin-x64, linux-arm64, linux-x64, win32-x64');
+    console.error(
+      '   Supported: darwin-arm64, darwin-x64, linux-arm64, linux-x64, win32-x64, win32-arm64',
+    );
     process.exit(1);
   }
 
@@ -57,6 +63,9 @@ async function main() {
   // 下载
   await downloadFile(downloadUrl, binPath);
 
+  // 校验完整性（SHA256SUMS 来自同一 release）
+  await verifyChecksum(assetName, binPath);
+
   // 设置可执行权限（非 Windows）
   if (platform() !== 'win32') {
     fs.chmodSync(binPath, 0o755);
@@ -66,14 +75,72 @@ async function main() {
   console.log('   Run "deepcode" in your terminal to get started.');
 }
 
+// ── 完整性校验 ──
+// 从同一 release 拉取 SHA256SUMS，比对下载二进制的哈希。SHA256SUMS 缺失时
+// （旧 release / 手动构建）跳过校验；哈希不匹配则删除文件并报错。
+async function verifyChecksum(assetName, binPath) {
+  const sumsUrl = `https://github.com/${REPO}/releases/download/v${VERSION}/SHA256SUMS`;
+  const sumsPath = `${binPath}.SHA256SUMS`;
+
+  try {
+    await downloadFile(sumsUrl, sumsPath);
+  } catch {
+    console.warn('⚠️  deepcode: SHA256SUMS not published for this release; skipping checksum verification.');
+    return;
+  }
+
+  let expected;
+  try {
+    expected = parseChecksum(fs.readFileSync(sumsPath, 'utf8'), assetName);
+  } finally {
+    fs.rmSync(sumsPath, { force: true });
+  }
+
+  if (!expected) {
+    console.warn(`⚠️  deepcode: no checksum entry for ${assetName}; skipping verification.`);
+    return;
+  }
+
+  const actual = await sha256OfFile(binPath);
+  if (actual !== expected) {
+    fs.rmSync(binPath, { force: true });
+    throw new Error(
+      `checksum mismatch for ${assetName}\n  expected: ${expected}\n  actual:   ${actual}\n` +
+      '  The download may be corrupted or tampered with — aborting.'
+    );
+  }
+  console.log('🔒 deepcode: checksum verified.');
+}
+
+// 解析 `sha256sum` 风格的清单（`<hex>  name` 或 `<hex> *name`）。
+function parseChecksum(text, assetName) {
+  for (const line of text.split('\n')) {
+    const match = line.trim().match(/^([0-9a-f]{64})\s+\*?(.+)$/i);
+    if (match && path.basename(match[2].trim()) === assetName) {
+      return match[1].toLowerCase();
+    }
+  }
+  return undefined;
+}
+
+function sha256OfFile(file) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(file);
+    stream.on('error', reject);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
+}
+
 // ── 辅助函数 ──
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest, { mode: 0o755 });
 
     const request = https.get(url, { headers: { 'User-Agent': 'deepcode-npm-installer' } }, (response) => {
-      // 处理重定向
-      if (response.statusCode === 301 || response.statusCode === 302) {
+      // 处理重定向（GitHub release 资产会 302 到签名 URL）
+      if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
         const redirectUrl = response.headers.location;
         if (!redirectUrl) {
           reject(new Error(`Redirect with no location from ${url}`));
@@ -137,7 +204,7 @@ main().catch((err) => {
   console.error('❌ deepcode installation failed:', err.message);
   console.error('');
   console.error('Manual install options:');
-  console.error(`  1. Check https://github.com/${REPO}/releases for prebuilt binaries`);
-  console.error('  2. Or build from source: cargo install deep-code-tui');
+  console.error(`  1. Prebuilt binaries: https://github.com/${REPO}/releases`);
+  console.error(`  2. Build from source: clone ${REPO}, then \`cargo build --release -p deep-code-tui\``);
   process.exit(1);
 });
