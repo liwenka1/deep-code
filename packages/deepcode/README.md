@@ -1,12 +1,14 @@
-# deepcode
+# deep-code
 
 AI coding assistant in your terminal — powered by DeepSeek.
 
 ## Install
 
 ```sh
-npm install -g deepcode
+npm install -g deep-code
 ```
+
+(The installed command is `deepcode`.)
 
 The `postinstall` step downloads the prebuilt binary for your platform from
 [GitHub Releases](https://github.com/liwenka1/deep-code/releases) and verifies
