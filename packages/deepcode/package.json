@@ -1,5 +1,5 @@
 {
-  "name": "deep-code",
+  "name": "@liwenka1/deepcode",
   "version": "0.1.0",
   "description": "AI coding assistant in your terminal — powered by DeepSeek",
   "bin": {
@@ -10,7 +10,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/liwenka1/deep-code"
+    "url": "git+https://github.com/liwenka1/deep-code.git"
   },
   "homepage": "https://github.com/liwenka1/deep-code#readme",
   "keywords": [
