@@ -241,6 +241,14 @@ pub(crate) fn contains_symlink(path: &Path, stop_at: Option<&Path>) -> std::io::
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        // Only named segments can be symlinks. Prefix/RootDir must be
+        // accumulated into `current` but not stat'd on their own: on Windows
+        // `canonicalize` yields verbatim paths (`\\?\D:\...`) whose first
+        // component is the bare disk prefix `\\?\D:`, and `symlink_metadata`
+        // on it fails with ERROR_INVALID_FUNCTION (os error 1).
+        if !matches!(component, Component::Normal(_)) {
+            continue;
+        }
         if stop_at.is_some_and(|root| current == root) {
             continue;
         }
@@ -253,4 +261,33 @@ pub(crate) fn contains_symlink(path: &Path, stop_at: Option<&Path>) -> std::io::
 
 fn path_error(tool_name: &str, raw: &str, message: &str) -> ToolError {
     invalid(tool_name, format!("invalid path '{raw}': {message}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contains_symlink_walks_canonical_path_without_error() {
+        // `canonicalize` yields a verbatim `\\?\D:\...` path on Windows, whose
+        // first component is the bare disk prefix. Statting it directly fails
+        // with ERROR_INVALID_FUNCTION; the walk must skip Prefix/RootDir.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = root.join("note.txt");
+        fs::write(&file, "x").unwrap();
+        assert!(!contains_symlink(&file, Some(&root)).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contains_symlink_still_detects_a_symlink_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target = root.join("real");
+        fs::create_dir(&target).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(contains_symlink(&link.join("inner"), Some(&root)).unwrap());
+    }
 }
