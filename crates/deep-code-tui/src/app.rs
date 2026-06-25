@@ -1366,7 +1366,15 @@ impl App {
 
         let workspace = workspace_root();
         let workspace_display = home_relative(&workspace);
-        let loaded = AgentConfig::load(&workspace);
+        // Match `relaunch_runtime`: load through `self.global_config_path` so a
+        // key saved via `/apikey` (and test overrides of the path) survives the
+        // reload instead of falling back to the offline echo backend.
+        let project = workspace.join(".deep-code").join("config.toml");
+        let loaded = AgentConfig::load_with(
+            Some(self.global_config_path.clone()),
+            Some(project),
+            &|name| std::env::var(name).ok(),
+        );
         let agent_config = loaded.config;
         let launched = launch_runtime(&agent_config, workspace, None);
         self.cost_currency = agent_config.cost_currency;

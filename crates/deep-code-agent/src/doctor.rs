@@ -317,7 +317,13 @@ fn collect_skills(workspace: &Path) -> SkillsDoctorReport {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    // Must match `config::layers::home_dir`: on Windows `HOME` is usually unset
+    // and `USERPROFILE` holds the home. If these diverge, `default_config_path`
+    // (the `/apikey` write + relaunch read target) points at a different file
+    // than the config loader's global layer, silently dropping the saved key.
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 #[cfg(test)]
