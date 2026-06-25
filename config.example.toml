@@ -31,6 +31,18 @@
 # auto 模式下成本优先（倾向 Flash）。
 # auto_cost_saving = false
 
+[auto]
+# auto 模式遇到“中等难度、无明确关键词”的模糊任务时，调用一次 Flash
+# (thinking-off) 分类器结合最近上下文判定模型与思考力度。关掉则退回纯启发式
+# （不产生额外模型调用）。对应环境变量 DEEP_CODE_AUTO_ROUTER_ENABLED。
+# router_enabled = true
+
+# Flash 路由的硬超时（毫秒）；超时静默回退启发式。
+# router_timeout_ms = 2500
+
+# 交给 Flash 路由参考的最近对话轮数。
+# router_context_turns = 6
+
 [context]
 # 触发压缩的 token 阈值（默认按模型上下文窗口计算，一般无需设置）。
 # compaction_threshold = 800000

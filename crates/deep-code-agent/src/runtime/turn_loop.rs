@@ -2,9 +2,10 @@ use std::collections::{HashMap, VecDeque};
 
 use tokio::sync::mpsc;
 
-use crate::auto_mode::resolve_turn_route;
+use crate::auto_mode::RouteContext;
 use crate::client::LlmClient;
 use crate::compaction::{estimate_token_count, stable_prefix_fingerprint};
+use crate::model_registry::{DEEPSEEK_V4_PRO, context_window_for_model};
 use crate::event::AgentEvent;
 use crate::message::Message;
 use crate::model::{ChatRequest, Usage};
@@ -18,16 +19,29 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// approval is required. All paths emit a terminal [`RuntimeEvent`]
     /// (`TurnFinished`, `ApprovalRequired`, or `Error`) before returning.
     pub(super) async fn run_loop(&self, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
-        let (user_prompt, cancel) = {
+        let (user_prompt, cancel, route_ctx) = {
             let state = self.state.lock().await;
+            let context_tokens = estimate_token_count(state.session.messages());
             (
                 state.current_prompt.clone().unwrap_or_default(),
                 state.cancel.clone(),
+                RouteContext {
+                    context_tokens,
+                    context_window: context_window_for_model(DEEPSEEK_V4_PRO),
+                },
             )
         };
         let turn_id = self.current_turn_id().await;
-        let mut route =
-            resolve_turn_route(&self.config, &self.registry, &user_prompt, self.is_subagent);
+        // Routing may consult the Flash classifier (a short network call); let a
+        // cancel during that wait abort the turn instead of stalling.
+        let mut route = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                self.finish_turn_cancelled(&turn_id, tx).await;
+                return;
+            }
+            route = self.route_turn(&user_prompt, route_ctx) => route,
+        };
 
         if self.maybe_compact(&route.effective_model, tx).await {
             // compaction event already emitted; continue with trimmed history

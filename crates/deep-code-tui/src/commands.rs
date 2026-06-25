@@ -219,9 +219,10 @@ impl App {
                     .map(|reason| format!("\nfallback_reason={reason}"))
                     .unwrap_or_default();
                 format!(
-                    "\neffective_model={}\nroute={}\nreasoning={}\nauto_reason={}\nturn_cost={}\nsession_cost={}\ncontext={}/{} ({}%)\ncompaction_near={}\nstream_retries={}{}",
+                    "\neffective_model={}\nroute={}\nroute_source={}\nreasoning={}\nauto_reason={}\nturn_cost={}\nsession_cost={}\ncontext={}/{} ({}%)\ncompaction_near={}\nstream_retries={}{}",
                     telemetry.effective_model,
                     telemetry.route_label,
+                    telemetry.route_source,
                     telemetry.reasoning_effort,
                     telemetry.route_reason,
                     telemetry.turn_cost.format(self.cost_currency),

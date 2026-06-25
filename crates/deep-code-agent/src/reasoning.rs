@@ -97,48 +97,24 @@ impl ReasoningEffort {
 }
 
 /// Adaptive tier selection for Auto reasoning effort.
+///
+/// Derives from the same keyword table as model selection
+/// ([`crate::task_class`]) so the two axes stay consistent: debugging-class
+/// keywords get `Max`, lookups get `Low`, everything else `High`.
 #[must_use]
 pub fn select_auto_effort(is_subagent: bool, last_msg: &str) -> ReasoningEffort {
+    use crate::task_class::{TaskWeight, classify_keyword};
+
     if is_subagent {
         return ReasoningEffort::Low;
     }
 
-    let lower = last_msg.to_lowercase();
-
-    if HIGH_EFFORT_KEYWORDS
-        .iter()
-        .any(|keyword| lower.contains(keyword))
-    {
-        return ReasoningEffort::Max;
+    match classify_keyword(last_msg).map(|hit| hit.0) {
+        Some(TaskWeight::Deep) => ReasoningEffort::Max,
+        Some(TaskWeight::Light) => ReasoningEffort::Low,
+        _ => ReasoningEffort::High,
     }
-
-    if LOW_EFFORT_KEYWORDS
-        .iter()
-        .any(|keyword| lower.contains(keyword))
-    {
-        return ReasoningEffort::Low;
-    }
-
-    ReasoningEffort::High
 }
-
-const HIGH_EFFORT_KEYWORDS: &[&str] = &[
-    "debug",
-    "error",
-    "\u{8c03}\u{8bd5}",
-    "\u{9519}\u{8bef}",
-    "\u{62a5}\u{9519}",
-    "\u{51fa}\u{9519}",
-    "\u{5d29}\u{6e83}",
-];
-
-const LOW_EFFORT_KEYWORDS: &[&str] = &[
-    "search",
-    "lookup",
-    "\u{641c}\u{7d22}",
-    "\u{67e5}\u{627e}",
-    "\u{67e5}\u{8be2}",
-];
 
 #[cfg(test)]
 mod tests {

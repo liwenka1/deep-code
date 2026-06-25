@@ -29,6 +29,7 @@ mod session;
 mod session_store;
 mod shell_tools;
 mod skills;
+mod task_class;
 mod subagent;
 mod tool;
 mod tool_execution;

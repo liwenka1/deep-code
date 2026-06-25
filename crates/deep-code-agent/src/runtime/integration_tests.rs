@@ -1898,3 +1898,100 @@ async fn cancel_turn_when_idle_is_silent_noop() {
         Some(RuntimeEvent::TurnFinished { .. })
     ));
 }
+
+const AMBIGUOUS_PROMPT: &str = "Walk me through the overall layout of this project and what the different \
+parts are generally for, so I can get my bearings before we begin making changes together.";
+
+fn auto_runtime(client: ScriptedClient) -> AgentRuntime<ScriptedClient> {
+    let config = AgentConfig {
+        model: crate::model_registry::AUTO_MODEL.to_string(),
+        reasoning_effort: crate::reasoning::ReasoningEffortSetting::Auto,
+        ..AgentConfig::builtin()
+    };
+    AgentRuntime::with_config(client, ToolRegistry::default(), config)
+}
+
+#[tokio::test]
+async fn flash_router_resolves_ambiguous_turn() {
+    // The ambiguous gray zone escalates to the Flash classifier, which here
+    // returns Pro/max; the route is sourced from the router.
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::TextDelta {
+            text: r#"{"model":"pro","thinking":"max"}"#.to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = auto_runtime(client);
+
+    let route = runtime
+        .route_turn(AMBIGUOUS_PROMPT, crate::auto_mode::RouteContext::default())
+        .await;
+
+    assert_eq!(route.source, crate::auto_mode::RouteSource::FlashRouter);
+    assert_eq!(route.effective_model, crate::model_registry::DEEPSEEK_V4_PRO);
+    assert_eq!(route.effective_effort, crate::reasoning::ReasoningEffort::Max);
+}
+
+#[tokio::test]
+async fn decisive_turn_skips_flash_router() {
+    // A keyword-decisive prompt must not consult the router at all.
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::TextDelta {
+            text: r#"{"model":"flash","thinking":"off"}"#.to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = auto_runtime(client);
+
+    let route = runtime
+        .route_turn("refactor the authentication module", crate::auto_mode::RouteContext::default())
+        .await;
+
+    assert_eq!(route.source, crate::auto_mode::RouteSource::Heuristic);
+    assert_eq!(route.effective_model, crate::model_registry::DEEPSEEK_V4_PRO);
+}
+
+#[tokio::test]
+async fn router_disabled_uses_heuristic_only() {
+    // With the router off, the ambiguous gray zone stays on the heuristic
+    // (Flash fallback) and never consults the classifier.
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::TextDelta {
+            text: r#"{"model":"pro","thinking":"max"}"#.to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let config = AgentConfig {
+        model: crate::model_registry::AUTO_MODEL.to_string(),
+        reasoning_effort: crate::reasoning::ReasoningEffortSetting::Auto,
+        router_enabled: false,
+        ..AgentConfig::builtin()
+    };
+    let runtime = AgentRuntime::with_config(client, ToolRegistry::default(), config);
+
+    let route = runtime
+        .route_turn(AMBIGUOUS_PROMPT, crate::auto_mode::RouteContext::default())
+        .await;
+
+    assert_eq!(route.source, crate::auto_mode::RouteSource::Heuristic);
+    assert_eq!(route.effective_model, crate::model_registry::DEEPSEEK_V4_FLASH);
+}
+
+#[tokio::test]
+async fn flash_router_garbage_falls_back_to_heuristic() {
+    // Unparseable classifier output must not break routing — fall back.
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::TextDelta {
+            text: "I cannot decide".to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = auto_runtime(client);
+
+    let route = runtime
+        .route_turn(AMBIGUOUS_PROMPT, crate::auto_mode::RouteContext::default())
+        .await;
+
+    assert_eq!(route.source, crate::auto_mode::RouteSource::Heuristic);
+    assert_eq!(route.effective_model, crate::model_registry::DEEPSEEK_V4_FLASH);
+}

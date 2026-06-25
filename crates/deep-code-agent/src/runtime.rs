@@ -19,6 +19,7 @@ mod event;
 mod handle;
 mod persistence;
 mod persistence_actor;
+mod routing;
 mod state;
 mod streaming;
 mod telemetry;

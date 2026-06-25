@@ -92,6 +92,9 @@ pub struct TurnTelemetry {
     pub prefix_status: PrefixStatus,
     #[serde(default)]
     pub route_reason: String,
+    /// What decided the route this turn: `hard-rule` / `heuristic` / `flash-router`.
+    #[serde(default)]
+    pub route_source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
     pub context_window: u32,
