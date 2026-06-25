@@ -134,9 +134,13 @@ impl Tool for ShellRunTool {
         .clamp(1, MAX_TIMEOUT_MS);
 
         let started = Instant::now();
+        // Detach stdin from the console: an inherited child (e.g. `cmd /C` on
+        // Windows) restores default console mode on exit, dropping our mouse
+        // capture so the wheel turns into ↑/↓ keys in the TUI.
         let mut child = self
             .sandbox
             .wrap_shell_command(command, &cwd, self.root.root(), &current_sandbox_policy())
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -241,6 +245,7 @@ impl Tool for JobStartTool {
         let mut child = self
             .sandbox
             .wrap_shell_command(command, &cwd, self.root.root(), &current_sandbox_policy())
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

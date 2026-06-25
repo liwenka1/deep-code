@@ -114,11 +114,21 @@ fn redirect_stderr_to_log() {}
 fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
     let mut needs_redraw = true;
     let mut last_draw: Option<Instant> = None;
+    let mut was_streaming = app.is_streaming;
 
     while !app.should_quit {
         if app.drain_stream_updates() {
             needs_redraw = true;
         }
+
+        // A turn that just ended may have spawned child processes (shell, git,
+        // LSP) that, on Windows, reset the console input mode and silently drop
+        // our mouse capture — after which the terminal translates wheel motion
+        // into ↑/↓ keys. Re-assert mouse capture on every turn boundary.
+        if was_streaming && !app.is_streaming {
+            let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
+        }
+        was_streaming = app.is_streaming;
 
         // While streaming, redraw on a slow tick even when no tokens arrived,
         // so the "generating Ns" activity indicator keeps animating during a
@@ -155,6 +165,10 @@ fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
                         MouseEventKind::Up(MouseButton::Left) => {
                             if let Some(text) = app.selection_finish() {
                                 crate::clipboard::copy(&text);
+                                // The clipboard helper (clip.exe / pbcopy / xclip)
+                                // is a child process that can reset the console
+                                // mode on Windows; re-assert mouse capture.
+                                let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
                                 app.status = format!("已复制选中文本 ({} 字)", text.chars().count());
                             }
                         }
