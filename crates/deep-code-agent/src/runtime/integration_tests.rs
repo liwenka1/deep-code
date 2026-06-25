@@ -1933,6 +1933,27 @@ async fn flash_router_resolves_ambiguous_turn() {
 }
 
 #[tokio::test]
+async fn flash_router_assembles_prefix_completion() {
+    // /beta prefix completion: the model returns only the JSON continuation
+    // (the assistant reply was seeded with `{"model":"`).
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::TextDelta {
+            text: "pro\",\"thinking\":\"high\"".to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = auto_runtime(client);
+
+    let route = runtime
+        .route_turn(AMBIGUOUS_PROMPT, crate::auto_mode::RouteContext::default())
+        .await;
+
+    assert_eq!(route.source, crate::auto_mode::RouteSource::FlashRouter);
+    assert_eq!(route.effective_model, crate::model_registry::DEEPSEEK_V4_PRO);
+    assert_eq!(route.effective_effort, crate::reasoning::ReasoningEffort::High);
+}
+
+#[tokio::test]
 async fn decisive_turn_skips_flash_router() {
     // A keyword-decisive prompt must not consult the router at all.
     let client = ScriptedClient::new(vec![vec![

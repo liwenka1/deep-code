@@ -16,6 +16,9 @@ pub struct ChatRequest {
     pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ChatTool>,
+    /// Stop sequences; pairs with assistant prefix completion to bound output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
 }
 
 impl ChatRequest {
@@ -29,12 +32,19 @@ impl ChatRequest {
             max_tokens: None,
             reasoning_effort: None,
             tools: Vec::new(),
+            stop: Vec::new(),
         }
     }
 
     #[must_use]
     pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
         self.reasoning_effort = Some(effort.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_stop(mut self, stop: Vec<String>) -> Self {
+        self.stop = stop;
         self
     }
 

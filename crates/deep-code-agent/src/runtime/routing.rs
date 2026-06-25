@@ -27,6 +27,9 @@ use crate::runtime::AgentRuntime;
 const ROUTER_CONTEXT_CHARS: usize = 900;
 /// Truncation for the latest prompt handed to the classifier.
 const ROUTER_PROMPT_CHARS: usize = 4000;
+/// Assistant prefix seed for DeepSeek `/beta` prefix completion: forces the
+/// classifier's reply to begin a JSON object whose first key is `model`.
+const ROUTER_JSON_PREFIX: &str = "{\"model\":\"";
 
 impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// Resolve a turn's route, escalating ambiguous turns to the Flash router.
@@ -56,16 +59,31 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     }
 
     async fn flash_route(&self, user_prompt: &str) -> Option<TurnRoute> {
-        let messages = self.router_messages(user_prompt).await;
+        let mut messages = self.router_messages(user_prompt).await;
+        // On `/beta`, seed the assistant reply so the classifier can only emit a
+        // parseable JSON object, and stop at the closing brace. Other endpoints
+        // free-form and are parsed leniently as before.
+        let beta = self.config.uses_beta_endpoint();
+        if beta {
+            messages.push(Message::assistant_prefix(ROUTER_JSON_PREFIX));
+        }
         let mut request =
             ChatRequest::streaming(DEEPSEEK_V4_FLASH, messages).with_reasoning_effort("off");
+        if beta {
+            request = request.with_stop(vec!["}".to_string()]);
+        }
         request.max_tokens = Some(32);
 
         let router_timeout = Duration::from_millis(self.config.router_timeout_ms);
-        let text = timeout(router_timeout, collect_text(self.client.as_ref(), request))
+        let completion = timeout(router_timeout, collect_text(self.client.as_ref(), request))
             .await
             .ok()??;
-        let decision = parse_router_decision(&text)?;
+        let json = if beta {
+            assemble_prefix_json(&completion)
+        } else {
+            completion
+        };
+        let decision = parse_router_decision(&json)?;
         Some(self.route_from_router(decision))
     }
 
@@ -184,6 +202,23 @@ impl RouterDecision {
     }
 }
 
+/// Reassemble a JSON object from a prefix-completion response. The model
+/// returns only the continuation of [`ROUTER_JSON_PREFIX`], so prepend the seed
+/// (unless the reply echoed it) and close the brace if `stop` consumed it.
+fn assemble_prefix_json(completion: &str) -> String {
+    let body = completion.trim();
+    let combined = if body.starts_with('{') {
+        body.to_string()
+    } else {
+        format!("{ROUTER_JSON_PREFIX}{body}")
+    };
+    if combined.contains('}') {
+        combined
+    } else {
+        format!("{combined}}}")
+    }
+}
+
 /// Extract and parse the first JSON object from the classifier's reply, which
 /// may carry stray prose or code fences around it.
 fn parse_router_decision(raw: &str) -> Option<RouterDecision> {
@@ -256,6 +291,25 @@ mod tests {
     #[test]
     fn rejects_hallucinated_model() {
         assert!(parse_router_decision(r#"{"model":"gpt-9","thinking":"high"}"#).is_none());
+    }
+
+    #[test]
+    fn assembles_completion_only_prefix_response() {
+        // Beta prefix completion returns only the continuation of `{"model":"`.
+        let decision =
+            parse_router_decision(&assemble_prefix_json("pro\",\"thinking\":\"max\"")).unwrap();
+        assert!(decision.is_pro());
+        assert_eq!(decision.thinking_effort(), ReasoningEffort::Max);
+    }
+
+    #[test]
+    fn assemble_passes_through_echoed_full_json() {
+        let decision = parse_router_decision(&assemble_prefix_json(
+            "{\"model\":\"flash\",\"thinking\":\"low\"}",
+        ))
+        .unwrap();
+        assert!(!decision.is_pro());
+        assert_eq!(decision.thinking_effort(), ReasoningEffort::Low);
     }
 
     #[test]
