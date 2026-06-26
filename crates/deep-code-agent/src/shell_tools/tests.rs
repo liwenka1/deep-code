@@ -29,11 +29,8 @@ fn approved(root: &std::path::Path, name: &str, arguments: Value) -> ToolResult 
 fn shell_run_requires_approval_and_returns_output() {
     let tmp = tempdir().unwrap();
     let registry = registry(tmp.path());
-    let call = ToolCall::new(
-        "call_1",
-        "shell_run",
-        json!({"command": "python3 -c 'print(\"hello\")'"}),
-    );
+    // `echo hello` works on both sh and cmd, so the test is cross-platform.
+    let call = ToolCall::new("call_1", "shell_run", json!({"command": "echo hello"}));
 
     assert!(matches!(
         registry.run_tool_call(call.clone(), None).unwrap(),
