@@ -135,7 +135,12 @@ impl SandboxManager {
             macos_seatbelt::wrap_shell_command(command, cwd, workspace, policy)
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            linux::wrap_shell_command(command, cwd, workspace, policy)
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = workspace;
             bare_shell_command(command, cwd)

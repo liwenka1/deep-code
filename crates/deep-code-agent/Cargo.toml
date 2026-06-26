@@ -26,6 +26,13 @@ toml_edit = "0.20"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 
+# Linux sandbox backend (Landlock filesystem confinement + seccomp syscall
+# filtering). Linux-only so macOS/Windows builds never pull these.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"
+libc = "0.2"
+
 [dev-dependencies]
 anyhow = "1"
 tempfile = "3"
