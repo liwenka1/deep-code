@@ -1,7 +1,7 @@
 //! Minimal persistent analysis sessions (RLM v1).
 //!
 //! v1 uses a bounded command runtime over loaded context instead of a full
-//! Python REPL. The tool surface matches DeepSeek-TUI so richer backends can
+//! Python REPL. The tool surface is backend-agnostic so richer backends can
 //! be swapped in later.
 
 mod runtime;

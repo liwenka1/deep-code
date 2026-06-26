@@ -2,7 +2,7 @@
 //! filtering, applied in the forked child via `pre_exec` (no external binary,
 //! unlike the macOS `sandbox-exec` wrapper).
 //!
-//! Model (parity with macOS seatbelt, ≥ CodeWhale):
+//! Model (parity with the macOS seatbelt backend):
 //! - **Reads stay broad** — only write-class Landlock access rights are
 //!   *handled*, so reads are unrestricted (keeps tools working).
 //! - **Writes are confined** to the policy's writable roots, plus the temp dir
