@@ -15,7 +15,7 @@ impl HandleId {
     }
 }
 
-/// DeepSeek-TUI compatible symbolic handle reference.
+/// Symbolic handle reference for richer analysis backends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VarHandle {
     pub kind: String,
