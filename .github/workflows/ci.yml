@@ -39,3 +39,25 @@ jobs:
 
       - name: Test
         run: cargo test -p deep-code-agent -p deep-code-tui -p deep-code-runtime
+
+  # Compiles & tests the Windows-only sandbox (Job Object) code, which the
+  # Linux job's `cfg(windows)` gating skips.
+  windows:
+    name: windows · clippy · test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # Pinned to match rust-toolchain.toml; bump both together.
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy -p deep-code-agent -p deep-code-tui -p deep-code-runtime --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test -p deep-code-agent -p deep-code-tui -p deep-code-runtime

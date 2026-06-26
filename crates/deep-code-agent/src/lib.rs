@@ -108,7 +108,7 @@ pub use runtime_launch::{
     runtime_system_prompt,
 };
 pub use sandbox::{
-    SandboxBackend, SandboxCapabilities, SandboxManager, SandboxPolicy, capabilities,
+    SandboxBackend, SandboxCapabilities, SandboxGuard, SandboxManager, SandboxPolicy, capabilities,
     detect_capabilities,
 };
 pub use session::Session;

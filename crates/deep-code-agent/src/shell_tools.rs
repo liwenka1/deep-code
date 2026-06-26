@@ -149,6 +149,9 @@ impl Tool for ShellRunTool {
                 message: format!("failed to start command: {error}"),
             })?;
 
+        let job_guard = self
+            .sandbox
+            .confine_spawned(&child, &current_sandbox_policy());
         let stdout = SharedBuffer::default();
         let stderr = SharedBuffer::default();
         if let Some(pipe) = child.stdout.take() {
@@ -168,6 +171,7 @@ impl Tool for ShellRunTool {
             stdout: stdout.clone(),
             stderr: stderr.clone(),
             child: Some(child),
+            job_guard,
         });
         let foreground_wait_deadline =
             Instant::now() + Duration::from_millis(SHELL_RUN_STARTUP_WAIT_MS.min(timeout_ms));
@@ -253,6 +257,9 @@ impl Tool for JobStartTool {
                 name: Self::NAME.to_string(),
                 message: format!("failed to start background command: {error}"),
             })?;
+        let job_guard = self
+            .sandbox
+            .confine_spawned(&child, &current_sandbox_policy());
         let stdout = SharedBuffer::default();
         let stderr = SharedBuffer::default();
         if let Some(pipe) = child.stdout.take() {
@@ -273,6 +280,7 @@ impl Tool for JobStartTool {
             stdout,
             stderr,
             child: Some(child),
+            job_guard,
         });
 
         Ok(ToolResult::success(

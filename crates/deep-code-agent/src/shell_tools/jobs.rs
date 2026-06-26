@@ -85,6 +85,11 @@ pub(super) struct JobState {
     pub(super) stdout: SharedBuffer,
     pub(super) stderr: SharedBuffer,
     pub(super) child: Option<Child>,
+    /// OS sandbox guard tied to the child (Windows Job Object); dropping it with
+    /// the job kills the process tree. `None` on macOS/Linux (confined pre-spawn).
+    /// Held purely for its `Drop` — never read.
+    #[allow(dead_code)]
+    pub(super) job_guard: Option<crate::sandbox::SandboxGuard>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
