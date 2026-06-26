@@ -1,0 +1,7 @@
+# Pin the toolchain so local and CI never drift (a floating `stable` once
+# silently bumped clippy/rustfmt and broke CI on untouched code). Bump this
+# version deliberately, and keep the CI workflows' `dtolnay/rust-toolchain@<ver>`
+# in sync with it.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
