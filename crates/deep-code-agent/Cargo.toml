@@ -33,6 +33,13 @@ landlock = "0.4"
 seccompiler = "0.5"
 libc = "0.2"
 
+# Windows sandbox backend (Job Object: process-tree kill + resource limits).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+] }
+
 [dev-dependencies]
 anyhow = "1"
 tempfile = "3"

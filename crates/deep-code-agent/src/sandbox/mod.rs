@@ -12,7 +12,7 @@ mod windows;
 pub use policy::SandboxPolicy;
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::OnceLock;
 
 /// Detected sandbox backend for the current platform.
@@ -90,6 +90,15 @@ pub fn detect_capabilities() -> SandboxCapabilities {
     }
 }
 
+/// Keeps an OS sandbox alive for a spawned child's lifetime. On Windows it owns
+/// the Job Object handle (dropping it kills the process tree); on macOS/Linux
+/// it is empty, since those confine before spawn via [`SandboxManager::wrap_shell_command`].
+#[derive(Debug)]
+pub struct SandboxGuard {
+    #[cfg(target_os = "windows")]
+    _job: windows::JobGuard,
+}
+
 /// Prepares subprocess commands, optionally wrapping them in an OS sandbox.
 #[derive(Debug, Clone, Default)]
 pub struct SandboxManager {
@@ -144,6 +153,28 @@ impl SandboxManager {
         {
             let _ = workspace;
             bare_shell_command(command, cwd)
+        }
+    }
+
+    /// Confine an already-spawned child where the OS sandbox must be applied
+    /// post-spawn (Windows Job Object). Returns a guard to retain for the
+    /// child's lifetime, or `None` when no post-spawn step is needed (macOS and
+    /// Linux confine via [`Self::wrap_shell_command`]) or sandboxing is off.
+    #[must_use]
+    pub fn confine_spawned(&self, child: &Child, policy: &SandboxPolicy) -> Option<SandboxGuard> {
+        if !self.should_sandbox(policy) {
+            return None;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Some(SandboxGuard {
+                _job: windows::confine(child)?,
+            })
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = child;
+            None
         }
     }
 }
