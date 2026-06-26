@@ -422,8 +422,7 @@ pub(super) fn apply_env_overlay(
     if let Some(value) = lookup(AUTO_ROUTER_TIMEOUT_MS_ENV).and_then(|value| value.parse().ok()) {
         config.router_timeout_ms = value;
     }
-    if let Some(value) =
-        lookup(AUTO_ROUTER_CONTEXT_TURNS_ENV).and_then(|value| value.parse().ok())
+    if let Some(value) = lookup(AUTO_ROUTER_CONTEXT_TURNS_ENV).and_then(|value| value.parse().ok())
     {
         config.router_context_turns = value;
     }
@@ -482,7 +481,10 @@ mod tests {
             global_dir.path(),
             "[provider]\nmodel = \"global-model\"\nbase_url = \"https://global.example\"\n[cost]\ncurrency = \"usd\"\n",
         );
-        let project = write_config(project_dir.path(), "[provider]\nmodel = \"project-model\"\n");
+        let project = write_config(
+            project_dir.path(),
+            "[provider]\nmodel = \"project-model\"\n",
+        );
 
         // global < project for model; env wins over both.
         let env = |name: &str| (name == MODEL_ENV).then(|| "env-model".to_string());
@@ -659,9 +661,8 @@ mod tests {
         );
 
         // Env wins and parses comma-separated prefixes.
-        let env = |name: &str| {
-            (name == APPROVAL_AUTO_ALLOW_ENV).then(|| "mock_, git_ ,,".to_string())
-        };
+        let env =
+            |name: &str| (name == APPROVAL_AUTO_ALLOW_ENV).then(|| "mock_, git_ ,,".to_string());
         let loaded = AgentConfig::load_with(None, None, &env);
         assert_eq!(
             loaded.config.approval_auto_allow,

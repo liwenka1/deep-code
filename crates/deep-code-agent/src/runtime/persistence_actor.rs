@@ -223,7 +223,11 @@ mod tests {
         let handle = PersistenceActorHandle::spawn(store_dyn, Arc::clone(&record));
 
         handle.request_save();
-        assert_eq!(store.saves(), 0, "actor cannot have run yet on current_thread");
+        assert_eq!(
+            store.saves(),
+            0,
+            "actor cannot have run yet on current_thread"
+        );
         handle.flush().await;
         assert_eq!(store.saves(), 1);
     }

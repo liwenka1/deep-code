@@ -91,15 +91,10 @@ impl AppState {
         detail: RuntimeThreadDetail,
     ) -> impl std::future::Future<Output = RuntimeThreadDetail> + Send {
         let active = self.active_runtime_session_id();
-        async move {
-            RuntimeThreadStore::with_active_runtime_session(detail, active.await)
-        }
+        async move { RuntimeThreadStore::with_active_runtime_session(detail, active.await) }
     }
 
-    async fn ensure_runtime_session(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<(), ApiError> {
+    async fn ensure_runtime_session(&self, session_id: &SessionId) -> Result<(), ApiError> {
         let current = self.active_runtime_session_id().await;
         if current.as_deref() == Some(session_id.as_str()) {
             return Ok(());

@@ -10,7 +10,11 @@ use crate::history::HistoryCell;
 /// menu and `/help`.
 pub(crate) const SLASH_COMMANDS: &[(&str, &str, bool)] = &[
     ("/help", "显示帮助", false),
-    ("/clear", "开启新对话：重置上下文并清屏（旧对话可 /resume 找回）", false),
+    (
+        "/clear",
+        "开启新对话：重置上下文并清屏（旧对话可 /resume 找回）",
+        false,
+    ),
     ("/status", "显示运行状态", false),
     ("/model", "查看/切换模型 (auto|pro|flash)", true),
     ("/apikey", "设置 DeepSeek API key 并接入", true),
@@ -99,8 +103,7 @@ impl App {
             self.status = message;
             return;
         }
-        let update =
-            deep_code_agent::GlobalConfigUpdate::ApiKey(Some(arg.trim().to_string()));
+        let update = deep_code_agent::GlobalConfigUpdate::ApiKey(Some(arg.trim().to_string()));
         match deep_code_agent::write_global_config_update(&self.global_config_path, &update) {
             Ok(path) => match self.relaunch_runtime() {
                 Ok(()) => {
@@ -120,8 +123,11 @@ impl App {
     fn set_model(&mut self, arg: &str) {
         let registry = deep_code_agent::ModelRegistry::default();
         let available = || {
-            let mut ids: Vec<String> =
-                registry.list().iter().map(|model| model.id.clone()).collect();
+            let mut ids: Vec<String> = registry
+                .list()
+                .iter()
+                .map(|model| model.id.clone())
+                .collect();
             ids.push("auto".to_string());
             ids.join(", ")
         };

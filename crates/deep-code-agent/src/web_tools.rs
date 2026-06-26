@@ -136,7 +136,11 @@ impl Tool for FetchUrlTool {
         if truncated {
             text.push_str("\n\n[内容已按大小上限截断]");
         }
-        Ok(ToolResult::success(call.id.clone(), call.name.clone(), text))
+        Ok(ToolResult::success(
+            call.id.clone(),
+            call.name.clone(),
+            text,
+        ))
     }
 }
 
@@ -213,7 +217,10 @@ impl Tool for WebSearchTool {
         let html = match response.text() {
             Ok(html) => html,
             Err(error) => {
-                return Ok(ToolResult::error(call, format!("读取搜索结果失败：{error}")));
+                return Ok(ToolResult::error(
+                    call,
+                    format!("读取搜索结果失败：{error}"),
+                ));
             }
         };
 
@@ -270,9 +277,7 @@ fn check_url(url: &Url, allow_private: bool) -> Result<(), String> {
         "http" | "https" => {}
         other => return Err(format!("不支持的协议 '{other}'：仅允许 http/https")),
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| "URL 缺少主机名".to_string())?;
+    let host = url.host_str().ok_or_else(|| "URL 缺少主机名".to_string())?;
     if allow_private {
         return Ok(());
     }
@@ -495,10 +500,7 @@ mod tests {
             "http://[fd00::1]/",
         ] {
             let parsed = Url::parse(url).unwrap();
-            assert!(
-                check_url(&parsed, false).is_err(),
-                "{url} must be rejected"
-            );
+            assert!(check_url(&parsed, false).is_err(), "{url} must be rejected");
         }
     }
 

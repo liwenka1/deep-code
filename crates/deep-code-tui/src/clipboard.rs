@@ -69,8 +69,7 @@ fn copy_osc52(text: &str) {
 
 /// Minimal standard-alphabet base64 (avoids a crate just for OSC 52).
 pub(crate) fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -111,7 +110,11 @@ mod tests {
     fn native_clipboard_commands_present_on_desktop() {
         // macOS/Linux/Windows ship a clipboard tool; the list must be non-empty
         // there so `copy` doesn't silently depend on OSC 52 for the common case.
-        if cfg!(any(target_os = "macos", target_os = "linux", target_os = "windows")) {
+        if cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        )) {
             assert!(!NATIVE_CLIPBOARD_COMMANDS.is_empty());
         }
     }

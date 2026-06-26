@@ -140,7 +140,9 @@ fn run_picker(sessions: &[SessionRecord]) -> Result<StartupChoice> {
             let header = Paragraph::new(vec![
                 Line::from(Span::styled(
                     "历史会话",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::default(),
             ])
@@ -162,7 +164,9 @@ fn run_picker(sessions: &[SessionRecord]) -> Result<StartupChoice> {
                         Line::from(vec![
                             Span::styled(
                                 "› ",
-                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
                                 format!("{title}  "),
@@ -174,16 +178,13 @@ fn run_picker(sessions: &[SessionRecord]) -> Result<StartupChoice> {
                         Line::from(vec![
                             Span::raw("  "),
                             Span::raw(title),
-                            Span::styled(
-                                format!("  {time}"),
-                                Style::default().fg(Color::DarkGray),
-                            ),
+                            Span::styled(format!("  {time}"), Style::default().fg(Color::DarkGray)),
                         ])
                     }
                 })
                 .collect();
-            let list = Paragraph::new(rows)
-                .block(Block::default().padding(Padding::new(1, 0, 0, 0)));
+            let list =
+                Paragraph::new(rows).block(Block::default().padding(Padding::new(1, 0, 0, 0)));
             frame.render_widget(list, chunks[1]);
 
             let help = Paragraph::new(vec![
@@ -191,7 +192,10 @@ fn run_picker(sessions: &[SessionRecord]) -> Result<StartupChoice> {
                     "↑/↓ 选择 · Enter 恢复 · n/Esc 新会话 · Ctrl+C 退出",
                     Style::default().fg(Color::DarkGray),
                 )),
-                Line::from(Span::styled(note.clone(), Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(
+                    note.clone(),
+                    Style::default().fg(Color::DarkGray),
+                )),
             ])
             .block(Block::default().padding(Padding::new(1, 0, 0, 0)));
             frame.render_widget(help, chunks[2]);
@@ -266,10 +270,7 @@ mod tests {
     }
 
     fn with_prompt(prompt: &str, ts: u64) -> SessionRecord {
-        session_with(
-            vec![Message::system("system"), Message::user(prompt)],
-            ts,
-        )
+        session_with(vec![Message::system("system"), Message::user(prompt)], ts)
     }
 
     #[test]
@@ -283,7 +284,11 @@ mod tests {
     #[test]
     fn continue_resumes_latest_non_empty() {
         // Newest-first input; the empty one is skipped.
-        let sessions = vec![empty(), with_prompt("recent", 200), with_prompt("older", 100)];
+        let sessions = vec![
+            empty(),
+            with_prompt("recent", 200),
+            with_prompt("older", 100),
+        ];
         match resolve(&StartupIntent::ContinueLatest, sessions) {
             Resolution::Resume(r) => assert_eq!(session_title(&r), "recent"),
             other => panic!("expected Resume, got {other:?}"),

@@ -11,13 +11,13 @@ use std::sync::Arc;
 
 use std::path::PathBuf;
 
+use crate::ui::{COMPOSER_MAX_VISIBLE_ROWS, layout_input};
 use deep_code_agent::{
     AgentConfig, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest, CostCurrency,
     JsonSessionStore, LaunchedRuntime, RuntimeEvent, SessionRecord, SessionStore,
     SharedSubAgentManager, TurnTelemetry, default_config_path, launch_runtime,
 };
 use tokio::sync::mpsc;
-use crate::ui::{COMPOSER_MAX_VISIBLE_ROWS, layout_input};
 
 use crate::active_turn::ActiveTurn;
 use crate::cli::workspace_root;
@@ -180,9 +180,7 @@ fn byte_idx(s: &str, char_index: usize) -> usize {
     if char_index == 0 {
         return 0;
     }
-    s.char_indices()
-        .nth(char_index)
-        .map_or(s.len(), |(b, _)| b)
+    s.char_indices().nth(char_index).map_or(s.len(), |(b, _)| b)
 }
 
 /// Build the startup welcome header from the resolved session/runtime state.
@@ -491,9 +489,7 @@ impl App {
 
     /// Extend the in-progress selection (left button drag).
     pub(crate) fn selection_update(&mut self, col: u16, row: u16) {
-        if let (Some((anchor, _)), Some(pos)) =
-            (self.selection, self.mouse_to_text(col, row))
-        {
+        if let (Some((anchor, _)), Some(pos)) = (self.selection, self.mouse_to_text(col, row)) {
             self.selection = Some((anchor, pos));
         }
     }
@@ -522,7 +518,11 @@ impl App {
         for line in start.0..=end.0 {
             let text = snap.lines.get(line)?;
             let from = if line == start.0 { start.1 } else { 0 };
-            let to = if line == end.0 { end.1 } else { display_width(text) };
+            let to = if line == end.0 {
+                end.1
+            } else {
+                display_width(text)
+            };
             out.push_str(&slice_by_display_cols(text, from, to));
             if line != end.0 {
                 out.push('\n');
@@ -670,7 +670,9 @@ impl App {
 
     fn current_line_end_char(&self) -> usize {
         let byte = byte_idx(&self.input, self.input_cursor.min(char_count(&self.input)));
-        let eol = self.input[byte..].find('\n').unwrap_or(self.input.len() - byte);
+        let eol = self.input[byte..]
+            .find('\n')
+            .unwrap_or(self.input.len() - byte);
         self.input[..byte + eol].chars().count()
     }
 
@@ -1065,12 +1067,20 @@ impl App {
 
     /// Move the approval highlight to the previous option (wrap around).
     pub fn approval_focus_up(&mut self) {
-        self.approval_focus = if self.approval_focus == 0 { 2 } else { self.approval_focus - 1 };
+        self.approval_focus = if self.approval_focus == 0 {
+            2
+        } else {
+            self.approval_focus - 1
+        };
     }
 
     /// Move the approval highlight to the next option (wrap around).
     pub fn approval_focus_down(&mut self) {
-        self.approval_focus = if self.approval_focus == 2 { 0 } else { self.approval_focus + 1 };
+        self.approval_focus = if self.approval_focus == 2 {
+            0
+        } else {
+            self.approval_focus + 1
+        };
     }
 
     /// Execute the currently highlighted approval action.
@@ -1343,7 +1353,11 @@ impl App {
         self.last_telemetry = None;
         self.error = None;
         self.history.extend(hydrate_history(&record));
-        self.status = format!("已切换到会话 {} - {}", record.id.as_str(), self.backend_label);
+        self.status = format!(
+            "已切换到会话 {} - {}",
+            record.id.as_str(),
+            self.backend_label
+        );
         Ok(())
     }
 
@@ -1590,7 +1604,11 @@ mod tests {
         app.is_streaming = true;
         assert!(app.handle_slash_command("/resume"));
         assert!(app.resume_picker.is_none());
-        assert!(app.status.contains("无法切换会话"), "status: {}", app.status);
+        assert!(
+            app.status.contains("无法切换会话"),
+            "status: {}",
+            app.status
+        );
     }
 
     #[test]
@@ -1792,13 +1810,21 @@ mod tests {
             .filter(|cell| matches!(cell, HistoryCell::ToolResult { .. }))
             .count();
         assert_eq!(result_cells, 2);
-        assert!(app.active_turn.as_ref().is_some_and(|active| active.tools.is_empty()));
+        assert!(
+            app.active_turn
+                .as_ref()
+                .is_some_and(|active| active.tools.is_empty())
+        );
     }
 
     #[test]
     fn composer_newline_and_height_clamp() {
         let mut app = App::new();
-        assert_eq!(app.input_height(80), 3, "empty input is one row plus borders");
+        assert_eq!(
+            app.input_height(80),
+            3,
+            "empty input is one row plus borders"
+        );
 
         app.push_char('a');
         app.push_newline();
@@ -1809,7 +1835,11 @@ mod tests {
         for _ in 0..10 {
             app.push_newline();
         }
-        assert_eq!(app.input_height(80), 8, "content rows clamp at 6 (+2 borders)");
+        assert_eq!(
+            app.input_height(80),
+            8,
+            "content rows clamp at 6 (+2 borders)"
+        );
 
         app.is_streaming = true;
         let before = app.input.clone();
@@ -1910,7 +1940,10 @@ mod tests {
         let mut app = App::new();
         app.global_config_path = dir.path().join("config.toml");
         let original_session = app.session_id.clone();
-        assert!(original_session.is_some(), "test relies on persisted session");
+        assert!(
+            original_session.is_some(),
+            "test relies on persisted session"
+        );
 
         assert!(app.handle_slash_command("/model flash"));
         assert_eq!(app.configured_model, deep_code_agent::DEEPSEEK_V4_FLASH);
@@ -2258,7 +2291,10 @@ mod tests {
     #[test]
     fn streaming_activity_shows_only_while_streaming() {
         let mut app = App::new();
-        assert!(app.streaming_activity().is_none(), "idle shows no indicator");
+        assert!(
+            app.streaming_activity().is_none(),
+            "idle shows no indicator"
+        );
 
         app.is_streaming = true;
         app.streaming_since = Some(std::time::Instant::now());
@@ -2323,9 +2359,7 @@ mod tests {
         let error_index = app
             .history
             .iter()
-            .position(
-                |cell| matches!(cell, HistoryCell::System { text } if text.contains("boom")),
-            )
+            .position(|cell| matches!(cell, HistoryCell::System { text } if text.contains("boom")))
             .expect("error cell");
         assert!(assistant_index < error_index);
     }

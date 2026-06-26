@@ -268,8 +268,8 @@ impl RuntimeThreadStore {
                 finished_at_ms: None,
             });
         }
-        if let RuntimeEvent::TurnFinished { turn_id, .. }
-        | RuntimeEvent::TurnCancelled { turn_id } = event
+        if let RuntimeEvent::TurnFinished { turn_id, .. } | RuntimeEvent::TurnCancelled { turn_id } =
+            event
             && let Some(turn) = state.turns.iter_mut().find(|turn| turn.turn_id == *turn_id)
         {
             turn.finished_at_ms = Some(now);
@@ -458,7 +458,9 @@ fn now_ms() -> u64 {
         .map_or(0, |duration| duration.as_millis() as u64)
 }
 
-fn project_session_record(session: &SessionRecord) -> (RuntimeThread, Vec<RuntimeTurn>, Vec<RuntimeItem>) {
+fn project_session_record(
+    session: &SessionRecord,
+) -> (RuntimeThread, Vec<RuntimeTurn>, Vec<RuntimeItem>) {
     let thread_id = format!("session_{}", session.id.as_str());
     let mut turns = Vec::new();
     let turn_ids: Vec<TurnId> = session
@@ -482,18 +484,19 @@ fn project_session_record(session: &SessionRecord) -> (RuntimeThread, Vec<Runtim
     let mut seq = 0u64;
     let mut turn_index = 0usize;
 
-    let mut push_item = |kind: &str, turn_id: Option<TurnId>, created_at_ms: u64, payload: Value| {
-        seq += 1;
-        items.push(RuntimeItem {
-            thread_id: thread_id.clone(),
-            turn_id,
-            item_id: format!("{thread_id}_item_{seq}"),
-            seq,
-            kind: kind.to_string(),
-            created_at_ms,
-            payload,
-        });
-    };
+    let mut push_item =
+        |kind: &str, turn_id: Option<TurnId>, created_at_ms: u64, payload: Value| {
+            seq += 1;
+            items.push(RuntimeItem {
+                thread_id: thread_id.clone(),
+                turn_id,
+                item_id: format!("{thread_id}_item_{seq}"),
+                seq,
+                kind: kind.to_string(),
+                created_at_ms,
+                payload,
+            });
+        };
 
     for message in &session.messages {
         match message.role {
@@ -523,7 +526,12 @@ fn project_session_record(session: &SessionRecord) -> (RuntimeThread, Vec<Runtim
             Role::System => {}
             Role::Assistant => {
                 let turn_id = turn_ids.get(turn_index).cloned();
-                push_assistant_message_items(&mut push_item, message, turn_id, session.updated_at_ms);
+                push_assistant_message_items(
+                    &mut push_item,
+                    message,
+                    turn_id,
+                    session.updated_at_ms,
+                );
             }
             Role::Tool => {
                 let turn_id = turn_ids.get(turn_index).cloned();
@@ -627,9 +635,7 @@ fn append_hydrated_turn_checkpoints<F>(
         .get(turn_index + 1)
         .map_or(u64::MAX, |next| next.started_at_ms);
     for checkpoint in &session.checkpoints {
-        if checkpoint.created_at_ms >= turn.started_at_ms
-            && checkpoint.created_at_ms < window_end
-        {
+        if checkpoint.created_at_ms >= turn.started_at_ms && checkpoint.created_at_ms < window_end {
             push_item(
                 "checkpoint.created",
                 turn_id.clone(),
@@ -780,18 +786,8 @@ mod tests {
                 .iter()
                 .any(|item| item.kind == "reasoning.delta")
         );
-        assert!(
-            detail
-                .items
-                .iter()
-                .any(|item| item.kind == "tool.started")
-        );
-        assert!(
-            detail
-                .items
-                .iter()
-                .any(|item| item.kind == "tool.result")
-        );
+        assert!(detail.items.iter().any(|item| item.kind == "tool.started"));
+        assert!(detail.items.iter().any(|item| item.kind == "tool.result"));
         assert!(
             detail
                 .items

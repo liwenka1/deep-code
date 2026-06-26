@@ -136,13 +136,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
     let (tools, subagent_manager, job_store, shutdown) =
         build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
     let runtime = attach_workspace_helpers(
-        AgentRuntime::with_system_prompt(
-            (*client).clone(),
-            tools,
-            prompt,
-            config.clone(),
-            false,
-        ),
+        AgentRuntime::with_system_prompt((*client).clone(), tools, prompt, config.clone(), false),
         &workspace,
     );
     LaunchedRuntime {

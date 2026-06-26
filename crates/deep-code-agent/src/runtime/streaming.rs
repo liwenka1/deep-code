@@ -209,7 +209,8 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                     route.effective_model = fallback.to_string();
                     route.used_model_fallback = true;
                     // Flash rejects `max`; cap the retry's effort to what it accepts.
-                    route.effective_effort = clamp_effort_to_model(fallback, route.effective_effort);
+                    route.effective_effort =
+                        clamp_effort_to_model(fallback, route.effective_effort);
                     route.fallback_reason = Some(
                         "DeepSeek 临时不可用或限流，已从 Pro 自动降级到 Flash 重试".to_string(),
                     );

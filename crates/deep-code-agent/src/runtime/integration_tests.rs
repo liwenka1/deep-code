@@ -602,7 +602,10 @@ fn session_allow_excludes_shell_class_tools() {
         session_allowable("web_search") && session_allowable("fetch_url"),
         "network tools are the prime session-allow use case"
     );
-    assert!(!session_allowable("shell_run"), "shell risk is per-argument");
+    assert!(
+        !session_allowable("shell_run"),
+        "shell risk is per-argument"
+    );
     assert!(!session_allowable("job_start"));
 }
 
@@ -903,10 +906,7 @@ async fn persistence_saves_reasoning_content() {
         .find(|message| matches!(message.role, crate::message::Role::Assistant))
         .expect("assistant message");
     assert_eq!(assistant.content, "hello");
-    assert_eq!(
-        assistant.reasoning_content.as_deref(),
-        Some("thinking")
-    );
+    assert_eq!(assistant.reasoning_content.as_deref(), Some("thinking"));
 }
 
 #[tokio::test]
@@ -1234,10 +1234,20 @@ async fn multi_tool_turn_executes_all_auto_calls_in_order_and_persists() {
     let client = ScriptedClient::new(vec![
         vec![
             AgentEvent::ToolCallDelta {
-                delta: indexed_tool_call_delta(0, "call_1", AutoEchoTool::NAME, r#"{"message":"one"}"#),
+                delta: indexed_tool_call_delta(
+                    0,
+                    "call_1",
+                    AutoEchoTool::NAME,
+                    r#"{"message":"one"}"#,
+                ),
             },
             AgentEvent::ToolCallDelta {
-                delta: indexed_tool_call_delta(1, "call_2", AutoEchoTool::NAME, r#"{"message":"two"}"#),
+                delta: indexed_tool_call_delta(
+                    1,
+                    "call_2",
+                    AutoEchoTool::NAME,
+                    r#"{"message":"two"}"#,
+                ),
             },
             AgentEvent::Done { usage: None },
         ],
@@ -1309,10 +1319,20 @@ async fn multi_tool_turn_mixes_auto_and_approval_calls() {
     let client = ScriptedClient::new(vec![
         vec![
             AgentEvent::ToolCallDelta {
-                delta: indexed_tool_call_delta(0, "call_1", AutoEchoTool::NAME, r#"{"message":"auto"}"#),
+                delta: indexed_tool_call_delta(
+                    0,
+                    "call_1",
+                    AutoEchoTool::NAME,
+                    r#"{"message":"auto"}"#,
+                ),
             },
             AgentEvent::ToolCallDelta {
-                delta: indexed_tool_call_delta(1, "call_2", MockEchoTool::NAME, r#"{"message":"gated"}"#),
+                delta: indexed_tool_call_delta(
+                    1,
+                    "call_2",
+                    MockEchoTool::NAME,
+                    r#"{"message":"gated"}"#,
+                ),
             },
             AgentEvent::Done { usage: None },
         ],
@@ -1358,10 +1378,20 @@ async fn multi_tool_turn_serializes_two_approvals() {
     let client = ScriptedClient::new(vec![
         vec![
             AgentEvent::ToolCallDelta {
-                delta: indexed_tool_call_delta(0, "call_1", MockEchoTool::NAME, r#"{"message":"first"}"#),
+                delta: indexed_tool_call_delta(
+                    0,
+                    "call_1",
+                    MockEchoTool::NAME,
+                    r#"{"message":"first"}"#,
+                ),
             },
             AgentEvent::ToolCallDelta {
-                delta: indexed_tool_call_delta(1, "call_2", MockEchoTool::NAME, r#"{"message":"second"}"#),
+                delta: indexed_tool_call_delta(
+                    1,
+                    "call_2",
+                    MockEchoTool::NAME,
+                    r#"{"message":"second"}"#,
+                ),
             },
             AgentEvent::Done { usage: None },
         ],
@@ -1411,10 +1441,20 @@ async fn multi_tool_turn_denying_one_call_keeps_batch_running() {
     let client = ScriptedClient::new(vec![
         vec![
             AgentEvent::ToolCallDelta {
-                delta: indexed_tool_call_delta(0, "call_1", MockEchoTool::NAME, r#"{"message":"first"}"#),
+                delta: indexed_tool_call_delta(
+                    0,
+                    "call_1",
+                    MockEchoTool::NAME,
+                    r#"{"message":"first"}"#,
+                ),
             },
             AgentEvent::ToolCallDelta {
-                delta: indexed_tool_call_delta(1, "call_2", MockEchoTool::NAME, r#"{"message":"second"}"#),
+                delta: indexed_tool_call_delta(
+                    1,
+                    "call_2",
+                    MockEchoTool::NAME,
+                    r#"{"message":"second"}"#,
+                ),
             },
             AgentEvent::Done { usage: None },
         ],
@@ -1435,11 +1475,11 @@ async fn multi_tool_turn_denying_one_call_keeps_batch_running() {
     let denied = second
         .iter()
         .find_map(|event| match event {
-            RuntimeEvent::ToolCallFinished { tool_call_id, result, .. }
-                if tool_call_id.as_str() == "call_1" =>
-            {
-                Some(result.status.clone())
-            }
+            RuntimeEvent::ToolCallFinished {
+                tool_call_id,
+                result,
+                ..
+            } if tool_call_id.as_str() == "call_1" => Some(result.status.clone()),
             _ => None,
         })
         .expect("denied call_1 still records a result");
@@ -1761,8 +1801,7 @@ async fn stalled_stream_times_out_with_chinese_error() {
 
 #[tokio::test(start_paused = true)]
 async fn oversized_stream_is_cut_off() {
-    let client =
-        AttemptScriptClient::new(vec![AttemptBehavior::Text("x".repeat(64))]);
+    let client = AttemptScriptClient::new(vec![AttemptBehavior::Text("x".repeat(64))]);
     let config = AgentConfig {
         stream_max_bytes: 10,
         ..AgentConfig::builtin()
@@ -1928,8 +1967,14 @@ async fn flash_router_resolves_ambiguous_turn() {
         .await;
 
     assert_eq!(route.source, crate::auto_mode::RouteSource::FlashRouter);
-    assert_eq!(route.effective_model, crate::model_registry::DEEPSEEK_V4_PRO);
-    assert_eq!(route.effective_effort, crate::reasoning::ReasoningEffort::Max);
+    assert_eq!(
+        route.effective_model,
+        crate::model_registry::DEEPSEEK_V4_PRO
+    );
+    assert_eq!(
+        route.effective_effort,
+        crate::reasoning::ReasoningEffort::Max
+    );
 }
 
 #[tokio::test]
@@ -1949,8 +1994,14 @@ async fn flash_router_assembles_prefix_completion() {
         .await;
 
     assert_eq!(route.source, crate::auto_mode::RouteSource::FlashRouter);
-    assert_eq!(route.effective_model, crate::model_registry::DEEPSEEK_V4_PRO);
-    assert_eq!(route.effective_effort, crate::reasoning::ReasoningEffort::High);
+    assert_eq!(
+        route.effective_model,
+        crate::model_registry::DEEPSEEK_V4_PRO
+    );
+    assert_eq!(
+        route.effective_effort,
+        crate::reasoning::ReasoningEffort::High
+    );
 }
 
 #[tokio::test]
@@ -1965,11 +2016,17 @@ async fn decisive_turn_skips_flash_router() {
     let runtime = auto_runtime(client);
 
     let route = runtime
-        .route_turn("refactor the authentication module", crate::auto_mode::RouteContext::default())
+        .route_turn(
+            "refactor the authentication module",
+            crate::auto_mode::RouteContext::default(),
+        )
         .await;
 
     assert_eq!(route.source, crate::auto_mode::RouteSource::Heuristic);
-    assert_eq!(route.effective_model, crate::model_registry::DEEPSEEK_V4_PRO);
+    assert_eq!(
+        route.effective_model,
+        crate::model_registry::DEEPSEEK_V4_PRO
+    );
 }
 
 #[tokio::test]
@@ -1995,7 +2052,10 @@ async fn router_disabled_uses_heuristic_only() {
         .await;
 
     assert_eq!(route.source, crate::auto_mode::RouteSource::Heuristic);
-    assert_eq!(route.effective_model, crate::model_registry::DEEPSEEK_V4_FLASH);
+    assert_eq!(
+        route.effective_model,
+        crate::model_registry::DEEPSEEK_V4_FLASH
+    );
 }
 
 #[tokio::test]
@@ -2014,5 +2074,8 @@ async fn flash_router_garbage_falls_back_to_heuristic() {
         .await;
 
     assert_eq!(route.source, crate::auto_mode::RouteSource::Heuristic);
-    assert_eq!(route.effective_model, crate::model_registry::DEEPSEEK_V4_FLASH);
+    assert_eq!(
+        route.effective_model,
+        crate::model_registry::DEEPSEEK_V4_FLASH
+    );
 }

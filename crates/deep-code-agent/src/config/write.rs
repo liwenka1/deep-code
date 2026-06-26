@@ -73,8 +73,7 @@ pub fn write_global_config_update(
     let tmp = path.with_extension("toml.tmp");
     fs::write(&tmp, document.to_string())
         .map_err(|error| format!("写入 {} 失败：{error}", tmp.display()))?;
-    fs::rename(&tmp, path)
-        .map_err(|error| format!("替换 {} 失败：{error}", path.display()))?;
+    fs::rename(&tmp, path).map_err(|error| format!("替换 {} 失败：{error}", path.display()))?;
     restrict_permissions(path);
     Ok(path.to_path_buf())
 }
@@ -137,7 +136,10 @@ mod tests {
 
         // The layered loader can read it back.
         let loaded = crate::config::AgentConfig::load_with(Some(path), None, &|_| None);
-        assert_eq!(loaded.config.api_key.as_deref(), Some("sk-0123456789abcdef"));
+        assert_eq!(
+            loaded.config.api_key.as_deref(),
+            Some("sk-0123456789abcdef")
+        );
     }
 
     #[test]

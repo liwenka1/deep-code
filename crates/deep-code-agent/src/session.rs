@@ -56,8 +56,11 @@ impl Session {
                 out.push(message);
                 continue;
             }
-            let call_ids: Vec<String> =
-                message.tool_calls.iter().map(|call| call.id.clone()).collect();
+            let call_ids: Vec<String> = message
+                .tool_calls
+                .iter()
+                .map(|call| call.id.clone())
+                .collect();
             out.push(message);
             // Consume the tool responses that immediately follow.
             let mut answered = HashSet::new();

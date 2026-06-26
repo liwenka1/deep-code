@@ -29,13 +29,13 @@ mod session;
 mod session_store;
 mod shell_tools;
 mod skills;
-mod task_class;
 mod subagent;
+mod task_class;
 mod tool;
 mod tool_execution;
+mod web_tools;
 mod workspace_policy;
 mod workspace_summary;
-mod web_tools;
 mod workspace_tools;
 
 pub use auto_mode::{
@@ -132,6 +132,6 @@ pub use tool::{
     ApprovalDecision, ApprovalRequest, MockEchoTool, Tool, ToolCall, ToolCallAccumulator,
     ToolError, ToolRegistry, ToolResult, ToolResultStatus, ToolRunOutcome, ToolSpec,
 };
-pub use workspace_summary::{build_workspace_summary, list_workspace_files};
 pub use web_tools::{FetchUrlTool, WebSearchTool, web_tool_registry};
+pub use workspace_summary::{build_workspace_summary, list_workspace_files};
 pub use workspace_tools::{WorkspaceTools, workspace_tool_registry};

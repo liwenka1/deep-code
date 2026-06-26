@@ -11,10 +11,21 @@ use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkdownBlock {
-    Heading { level: u8, text: String },
-    CodeBlock { language: Option<String>, lines: Vec<String> },
-    ListItem { indent: usize, text: String },
-    Paragraph { text: String },
+    Heading {
+        level: u8,
+        text: String,
+    },
+    CodeBlock {
+        language: Option<String>,
+        lines: Vec<String>,
+    },
+    ListItem {
+        indent: usize,
+        text: String,
+    },
+    Paragraph {
+        text: String,
+    },
     Blank,
 }
 

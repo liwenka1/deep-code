@@ -127,8 +127,14 @@ pub fn cache_savings(model: &str, cache_hit_tokens: u32) -> CostEstimate {
         return CostEstimate::default();
     };
     CostEstimate {
-        usd: tier_cost(cache_hit_tokens, pricing.input_miss_usd - pricing.input_hit_usd),
-        cny: tier_cost(cache_hit_tokens, pricing.input_miss_cny - pricing.input_hit_cny),
+        usd: tier_cost(
+            cache_hit_tokens,
+            pricing.input_miss_usd - pricing.input_hit_usd,
+        ),
+        cny: tier_cost(
+            cache_hit_tokens,
+            pricing.input_miss_cny - pricing.input_hit_cny,
+        ),
     }
 }
 

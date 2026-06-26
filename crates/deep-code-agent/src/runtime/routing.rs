@@ -12,7 +12,7 @@ use serde::Deserialize;
 use tokio::time::timeout;
 
 use crate::auto_mode::{
-    ModelClass, RouteContext, RouteSource, TurnRoute, classify_model, clamp_effort_to_model,
+    ModelClass, RouteContext, RouteSource, TurnRoute, clamp_effort_to_model, classify_model,
     resolve_turn_route,
 };
 use crate::client::LlmClient;
@@ -34,8 +34,15 @@ const ROUTER_JSON_PREFIX: &str = "{\"model\":\"";
 impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// Resolve a turn's route, escalating ambiguous turns to the Flash router.
     pub(super) async fn route_turn(&self, user_prompt: &str, ctx: RouteContext) -> TurnRoute {
-        let heuristic =
-            || resolve_turn_route(&self.config, &self.registry, user_prompt, self.is_subagent, ctx);
+        let heuristic = || {
+            resolve_turn_route(
+                &self.config,
+                &self.registry,
+                user_prompt,
+                self.is_subagent,
+                ctx,
+            )
+        };
 
         // Only the auto + online + parent path consults the router.
         if !self.config.router_enabled
@@ -126,7 +133,11 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         };
         let effective_effort = clamp_effort_to_model(&model, effort);
 
-        let short_model = if model == DEEPSEEK_V4_PRO { "Pro" } else { "Flash" };
+        let short_model = if model == DEEPSEEK_V4_PRO {
+            "Pro"
+        } else {
+            "Flash"
+        };
         TurnRoute {
             requested_model: self.config.model.clone(),
             effective_model: model,
@@ -192,7 +203,13 @@ impl RouterDecision {
     }
 
     fn thinking_effort(&self) -> ReasoningEffort {
-        match self.thinking.as_deref().map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        match self
+            .thinking
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
             Some("off") => ReasoningEffort::Off,
             Some("low") => ReasoningEffort::Low,
             Some("medium" | "med") => ReasoningEffort::Medium,
@@ -281,9 +298,10 @@ mod tests {
 
     #[test]
     fn parses_json_with_surrounding_prose() {
-        let decision =
-            parse_router_decision("Here you go:\n```json\n{\"model\": \"flash\", \"thinking\": \"low\"}\n```")
-                .unwrap();
+        let decision = parse_router_decision(
+            "Here you go:\n```json\n{\"model\": \"flash\", \"thinking\": \"low\"}\n```",
+        )
+        .unwrap();
         assert!(!decision.is_pro());
         assert_eq!(decision.thinking_effort(), ReasoningEffort::Low);
     }

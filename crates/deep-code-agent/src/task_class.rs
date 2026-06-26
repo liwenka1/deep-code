@@ -124,8 +124,14 @@ mod tests {
 
     #[test]
     fn ascii_prefix_catches_inflections() {
-        assert_eq!(classify_keyword("debugging the loop").map(|hit| hit.0), Some(TaskWeight::Deep));
-        assert_eq!(classify_keyword("searching files").map(|hit| hit.0), Some(TaskWeight::Light));
+        assert_eq!(
+            classify_keyword("debugging the loop").map(|hit| hit.0),
+            Some(TaskWeight::Deep)
+        );
+        assert_eq!(
+            classify_keyword("searching files").map(|hit| hit.0),
+            Some(TaskWeight::Light)
+        );
     }
 
     #[test]

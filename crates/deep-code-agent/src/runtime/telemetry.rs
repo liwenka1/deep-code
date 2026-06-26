@@ -39,18 +39,23 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             state.session_cache_savings.usd += turn_cache_savings.usd;
             state.session_cache_savings.cny += turn_cache_savings.cny;
         }
-        let (session_cost, session_cache_hit_tokens, session_cache_miss_tokens, session_cache_savings) =
-            self.state
-                .try_lock()
-                .map(|state| {
-                    (
-                        state.session_cost,
-                        u32::try_from(state.session_cache_hit_tokens).unwrap_or(u32::MAX),
-                        u32::try_from(state.session_cache_miss_tokens).unwrap_or(u32::MAX),
-                        state.session_cache_savings,
-                    )
-                })
-                .unwrap_or((turn_cost, cache_hit, cache_miss, turn_cache_savings));
+        let (
+            session_cost,
+            session_cache_hit_tokens,
+            session_cache_miss_tokens,
+            session_cache_savings,
+        ) = self
+            .state
+            .try_lock()
+            .map(|state| {
+                (
+                    state.session_cost,
+                    u32::try_from(state.session_cache_hit_tokens).unwrap_or(u32::MAX),
+                    u32::try_from(state.session_cache_miss_tokens).unwrap_or(u32::MAX),
+                    state.session_cache_savings,
+                )
+            })
+            .unwrap_or((turn_cost, cache_hit, cache_miss, turn_cache_savings));
         let estimated_context_tokens = usage.input_tokens().max(estimated_context_tokens);
         let context_window = context_window_for_model(&route.effective_model);
         let message_estimate = estimated_context_tokens;

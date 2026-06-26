@@ -172,7 +172,8 @@ impl App {
             }
             RuntimeEvent::TurnCancelled { .. } => {
                 self.flush_active_turn();
-                self.history.push(HistoryCell::system("本轮已取消 (cancelled)"));
+                self.history
+                    .push(HistoryCell::system("本轮已取消 (cancelled)"));
                 let session = self
                     .session_id
                     .as_ref()

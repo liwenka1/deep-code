@@ -176,7 +176,11 @@ pub fn resolve_turn_route(
             } => (model, reason, source),
             ModelClass::Ambiguous { reason } => {
                 // No router yet: the gray zone defaults to Flash.
-                (DEEPSEEK_V4_FLASH.to_string(), reason, RouteSource::Heuristic)
+                (
+                    DEEPSEEK_V4_FLASH.to_string(),
+                    reason,
+                    RouteSource::Heuristic,
+                )
             }
         };
 

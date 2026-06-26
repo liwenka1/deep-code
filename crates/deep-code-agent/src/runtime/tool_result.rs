@@ -15,7 +15,8 @@ use crate::tool::{
     ApprovalDecision, ToolCall, ToolError, ToolResult, ToolResultStatus, ToolRunOutcome,
 };
 
-pub(super) const CANCELLED_TOOL_RESULT: &str = "用户取消了本轮，该工具调用未执行 (cancelled by user)";
+pub(super) const CANCELLED_TOOL_RESULT: &str =
+    "用户取消了本轮，该工具调用未执行 (cancelled by user)";
 
 /// Whether "approve for the whole session" may be recorded for a tool.
 /// Shell-class tools are excluded: their risk lives in the per-call
@@ -40,11 +41,12 @@ pub(super) fn session_shell_prefix(call: &ToolCall) -> Option<String> {
     ) {
         return None;
     }
-    let command = call.arguments.get("command").and_then(|value| value.as_str())?;
+    let command = call
+        .arguments
+        .get("command")
+        .and_then(|value| value.as_str())?;
     let command = command.trim();
-    if command.is_empty()
-        || command.contains(['&', '|', ';', '\n', '`', '<', '>', '(', ')', '$'])
-    {
+    if command.is_empty() || command.contains(['&', '|', ';', '\n', '`', '<', '>', '(', ')', '$']) {
         return None;
     }
     let token = command.split_whitespace().next()?;
@@ -293,7 +295,10 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         } else {
             decision
         };
-        match self.run_tool_blocking(current.clone(), Some(decision)).await {
+        match self
+            .run_tool_blocking(current.clone(), Some(decision))
+            .await
+        {
             Ok(ToolRunOutcome::Result { result }) => {
                 self.record_tool_result(&current, result, tx, turn_id.clone())
                     .await;
@@ -326,7 +331,10 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
 
         // Resolved call recorded; drain the rest of the batch, then resume the
         // loop to feed all tool results into the next chat turn.
-        if self.process_tool_batch(remaining, &turn_id, &cancel, tx).await == BatchOutcome::Completed
+        if self
+            .process_tool_batch(remaining, &turn_id, &cancel, tx)
+            .await
+            == BatchOutcome::Completed
         {
             self.run_loop(tx).await;
         }
@@ -363,9 +371,10 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             // Model history gets a size-bounded copy; the event stream and the
             // persisted TurnRecord keep the full output.
             let trimmed = truncate_tool_output(&result.content);
-            state
-                .session
-                .push(crate::message::Message::tool(result.call_id.clone(), trimmed));
+            state.session.push(crate::message::Message::tool(
+                result.call_id.clone(),
+                trimmed,
+            ));
             if let Some(turn) = state.current_turn.as_mut() {
                 turn.tool_results.push(result.clone());
             }
@@ -398,10 +407,7 @@ pub(super) fn truncate_tool_output(content: &str) -> String {
         return content.to_string();
     }
     let head: String = content.chars().take(TOOL_OUTPUT_HEAD).collect();
-    let tail: String = content
-        .chars()
-        .skip(total - TOOL_OUTPUT_TAIL)
-        .collect();
+    let tail: String = content.chars().skip(total - TOOL_OUTPUT_TAIL).collect();
     let elided = total - TOOL_OUTPUT_HEAD - TOOL_OUTPUT_TAIL;
     format!("{head}\n\n...[省略 {elided} 字符 / {elided} chars truncated]...\n\n{tail}")
 }

@@ -140,7 +140,9 @@ impl HistoryCell {
                 };
                 vec![format!("{tool_name}  {args}{badge}")]
             }
-            Self::ToolResult { status, summary, .. } => {
+            Self::ToolResult {
+                status, summary, ..
+            } => {
                 vec![format!(
                     "{} {}",
                     tool_result_word(status),
@@ -247,9 +249,7 @@ fn append_turn_checkpoints(
         .get(turn_index + 1)
         .map_or(u64::MAX, |next| next.started_at_ms);
     for checkpoint in &record.checkpoints {
-        if checkpoint.created_at_ms >= turn.started_at_ms
-            && checkpoint.created_at_ms < window_end
-        {
+        if checkpoint.created_at_ms >= turn.started_at_ms && checkpoint.created_at_ms < window_end {
             cells.push(HistoryCell::Checkpoint {
                 id: checkpoint.id.0.clone(),
                 label: checkpoint.label.clone(),
@@ -555,11 +555,9 @@ mod tests {
     fn hydrate_history_restores_reasoning_content() {
         let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), &AgentConfig::default(), "");
         record.messages.push(Message::user("hi"));
-        record.messages.push(Message::assistant_turn(
-            "answer",
-            "thinking",
-            Vec::new(),
-        ));
+        record
+            .messages
+            .push(Message::assistant_turn("answer", "thinking", Vec::new()));
 
         let cells = hydrate_history(&record);
         assert!(matches!(

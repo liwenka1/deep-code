@@ -169,7 +169,8 @@ fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
                                 // is a child process that can reset the console
                                 // mode on Windows; re-assert mouse capture.
                                 let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
-                                app.status = format!("已复制选中文本 ({} 字)", text.chars().count());
+                                app.status =
+                                    format!("已复制选中文本 ({} 字)", text.chars().count());
                             }
                         }
                         _ => {}
@@ -277,10 +278,18 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Backspace => app.backspace(),
         KeyCode::Delete => app.delete_forward(),
         // Word-wise cursor movement (Ctrl/Alt + ←→).
-        KeyCode::Left if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+        KeyCode::Left
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             app.word_left();
         }
-        KeyCode::Right if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+        KeyCode::Right
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             app.word_right();
         }
         KeyCode::Left => app.cursor_left(),
@@ -385,7 +394,9 @@ fn render_resume_picker(frame: &mut Frame<'_>, picker: &crate::app::ResumePicker
     let header = Paragraph::new(vec![
         Line::from(Span::styled(
             "历史会话",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::default(),
     ])
@@ -409,9 +420,14 @@ fn render_resume_picker(frame: &mut Frame<'_>, picker: &crate::app::ResumePicker
                 Line::from(vec![
                     Span::styled(
                         "› ",
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(format!("{title}  "), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{title}  "),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(time, Style::default().fg(Color::DarkGray)),
                 ])
             } else {
@@ -537,7 +553,10 @@ fn render_messages(
 }
 
 fn line_plain_text(line: &Line<'_>) -> String {
-    line.spans.iter().map(|span| span.content.as_ref()).collect()
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
 }
 
 /// Overlay reverse-video on the selected span (post-render buffer styling, so
@@ -558,7 +577,9 @@ fn highlight_selection(
         if line < scroll_top || line >= scroll_top + viewport {
             continue;
         }
-        let Some(text) = lines.get(line) else { continue };
+        let Some(text) = lines.get(line) else {
+            continue;
+        };
         let width = UnicodeWidthStr::width(text.as_str());
         let from = if line == start.0 { start.1 } else { 0 }.min(width);
         let to = if line == end.0 { end.1 } else { width }.min(width);
@@ -598,7 +619,9 @@ fn cell_lines(cell: &HistoryCell, width: u16) -> Vec<Line<'static>> {
             workspace,
             session,
         } => {
-            let cyan = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+            let cyan = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
             let label = |key: &str| Span::styled(format!("{key}   "), dim);
             let mut lines = vec![
                 Line::from(vec![
@@ -637,7 +660,9 @@ fn cell_lines(cell: &HistoryCell, width: u16) -> Vec<Line<'static>> {
                 text,
                 width,
                 Style::default(),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             );
             lines.push(Line::default());
             lines
@@ -812,7 +837,9 @@ fn approval_lines(
         Span::styled(" · ", dim),
         Span::styled(
             tool_name.to_string(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     if !risk_tag.is_empty() {
@@ -822,7 +849,13 @@ fn approval_lines(
     let mut lines = vec![Line::from(header)];
 
     let action = crate::history::truncate_chars(&extract_action(arguments_json), 240);
-    lines.extend(wrap_prefixed("  ", &action, width, Style::default(), Style::default()));
+    lines.extend(wrap_prefixed(
+        "  ",
+        &action,
+        width,
+        Style::default(),
+        Style::default(),
+    ));
 
     let description = description.trim();
     if !description.is_empty() && description != action {
@@ -837,7 +870,10 @@ fn approval_lines(
         meta.push(format!("规则 {rule}"));
     }
     if !meta.is_empty() {
-        lines.push(Line::from(Span::styled(format!("  {}", meta.join(" · ")), dim)));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", meta.join(" · ")),
+            dim,
+        )));
     }
     lines
 }
@@ -868,8 +904,12 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout
         .scroll((app.clamped_approval_scroll_offset() as u16, 0));
     frame.render_widget(body_paragraph, chunks[0]);
 
-    let key_y = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
-    let key_a = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let key_y = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+    let key_a = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
     let key_n = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Color::DarkGray);
 
@@ -885,7 +925,10 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout
         if i == focus {
             let arrow = Span::styled(" ▶", style);
             let key = Span::styled(key_label, style);
-            let desc = Span::styled(format!("  {desc}"), Style::default().add_modifier(Modifier::BOLD));
+            let desc = Span::styled(
+                format!("  {desc}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            );
             Line::from(vec![arrow, key, desc])
         } else {
             let arrow = Span::styled("  ", dim);
@@ -896,8 +939,8 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout
     })
     .collect();
 
-    let options = Paragraph::new(options_body)
-        .block(Block::default().padding(Padding::new(1, 0, 0, 0)));
+    let options =
+        Paragraph::new(options_body).block(Block::default().padding(Padding::new(1, 0, 0, 0)));
     frame.render_widget(options, chunks[1]);
 }
 
@@ -1056,7 +1099,9 @@ fn render_input_from_layout(
     const PROMPT: &str = "› ";
     const GUTTER: u16 = 2;
     let style = Style::default();
-    let prompt_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let prompt_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
 
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
@@ -1079,7 +1124,9 @@ fn render_input_from_layout(
         }
         // "› " on the first row, a matching indent on wrapped continuations.
         if row == 0 {
-            frame.buffer_mut().set_string(inner_area.x, y, PROMPT, prompt_style);
+            frame
+                .buffer_mut()
+                .set_string(inner_area.x, y, PROMPT, prompt_style);
         }
         frame.buffer_mut().set_string(text_x, y, line_text, style);
     }
@@ -1096,8 +1143,12 @@ fn render_input_from_layout(
 
     if !app.is_streaming && app.pending_approval.is_none() {
         let cursor_y = inner_area.y.saturating_add(
-            u16::try_from(layout.cursor_visible_row.min(inner_height.saturating_sub(1)))
-                .unwrap_or(u16::MAX),
+            u16::try_from(
+                layout
+                    .cursor_visible_row
+                    .min(inner_height.saturating_sub(1)),
+            )
+            .unwrap_or(u16::MAX),
         );
         let cursor_x = text_x.saturating_add(u16::try_from(layout.cursor_col).unwrap_or(u16::MAX));
         frame.set_cursor_position((cursor_x, cursor_y));
@@ -1158,7 +1209,11 @@ mod tests {
             lines.len()
         );
         for line in &lines {
-            assert!(line_width(line) <= 40, "row exceeds width: {}", line_width(line));
+            assert!(
+                line_width(line) <= 40,
+                "row exceeds width: {}",
+                line_width(line)
+            );
         }
     }
 
@@ -1182,14 +1237,20 @@ mod tests {
         assert!(text.contains("deep-code") && text.contains("v0.1.0"));
         assert!(text.contains("模型") && text.contains("deepseek-chat"));
         assert!(text.contains("目录") && text.contains("会话"));
-        assert!(!text.contains("/apikey"), "online must not nag about apikey");
+        assert!(
+            !text.contains("/apikey"),
+            "online must not nag about apikey"
+        );
     }
 
     #[test]
     fn welcome_cell_prompts_apikey_when_offline() {
         let text = welcome_text(true);
         assert!(text.contains("离线模式") && text.contains("/apikey"));
-        assert!(!text.contains("deepseek-chat"), "offline hides the model line");
+        assert!(
+            !text.contains("deepseek-chat"),
+            "offline hides the model line"
+        );
     }
 
     #[test]
@@ -1242,7 +1303,6 @@ mod tests {
         assert!(!text.contains("沙箱") && !text.contains("规则"));
     }
 
-
     #[test]
     fn completion_menu_windows_to_keep_selection_visible() {
         use crate::app::{CompletionKind, CompletionMenu};
@@ -1274,8 +1334,14 @@ mod tests {
 
         // Wrapping Up from the top lands on the last item — it must stay on screen.
         let bottom = render_at(11);
-        assert!(bottom.contains("▶ /cmd11"), "last item highlighted + visible");
-        assert!(!bottom.contains("/cmd00"), "top items scroll out of the window");
+        assert!(
+            bottom.contains("▶ /cmd11"),
+            "last item highlighted + visible"
+        );
+        assert!(
+            !bottom.contains("/cmd00"),
+            "top items scroll out of the window"
+        );
 
         // Selecting the top item shows it highlighted at the top.
         let top = render_at(0);

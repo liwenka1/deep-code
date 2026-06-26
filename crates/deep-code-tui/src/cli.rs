@@ -401,10 +401,7 @@ mod tests {
 
     #[test]
     fn parse_session_resume_subcommand() {
-        let parsed = parse_session_command(vec![
-            "resume".to_string(),
-            "session_123_0".to_string(),
-        ]);
+        let parsed = parse_session_command(vec!["resume".to_string(), "session_123_0".to_string()]);
         assert_eq!(
             parsed.mode,
             RunMode::Tui {
