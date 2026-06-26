@@ -17,6 +17,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     ) -> TurnTelemetry {
         let usage = usage.cloned().unwrap_or_default();
         let turn_cost = calculate_turn_cost(&route.effective_model, &usage);
+        let cache_hit = usage.prompt_cache_hit_tokens.unwrap_or(0);
+        let cache_miss = usage.prompt_cache_miss_tokens.unwrap_or(0);
+        let turn_cache_savings = crate::pricing::cache_savings(&route.effective_model, cache_hit);
         let prior_hash = self
             .state
             .try_lock()
@@ -31,12 +34,23 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             state.last_prefix_hash = Some(prefix_hash);
             state.session_cost.usd += turn_cost.usd;
             state.session_cost.cny += turn_cost.cny;
+            state.session_cache_hit_tokens += u64::from(cache_hit);
+            state.session_cache_miss_tokens += u64::from(cache_miss);
+            state.session_cache_savings.usd += turn_cache_savings.usd;
+            state.session_cache_savings.cny += turn_cache_savings.cny;
         }
-        let session_cost = self
-            .state
-            .try_lock()
-            .map(|state| state.session_cost)
-            .unwrap_or(turn_cost);
+        let (session_cost, session_cache_hit_tokens, session_cache_miss_tokens, session_cache_savings) =
+            self.state
+                .try_lock()
+                .map(|state| {
+                    (
+                        state.session_cost,
+                        u32::try_from(state.session_cache_hit_tokens).unwrap_or(u32::MAX),
+                        u32::try_from(state.session_cache_miss_tokens).unwrap_or(u32::MAX),
+                        state.session_cache_savings,
+                    )
+                })
+                .unwrap_or((turn_cost, cache_hit, cache_miss, turn_cache_savings));
         let estimated_context_tokens = usage.input_tokens().max(estimated_context_tokens);
         let context_window = context_window_for_model(&route.effective_model);
         let message_estimate = estimated_context_tokens;
@@ -49,6 +63,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             completion_tokens: usage.output_tokens(),
             cache_hit_tokens: usage.prompt_cache_hit_tokens,
             cache_miss_tokens: usage.prompt_cache_miss_tokens,
+            session_cache_hit_tokens,
+            session_cache_miss_tokens,
+            session_cache_savings,
             prefix_status,
             route_reason: route.route_reason.clone(),
             route_source: route.source.label().to_string(),

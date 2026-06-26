@@ -218,8 +218,18 @@ impl App {
                     .as_deref()
                     .map(|reason| format!("\nfallback_reason={reason}"))
                     .unwrap_or_default();
+                let turn_cache = cache_hit_percent(
+                    telemetry.cache_hit_tokens.unwrap_or(0),
+                    telemetry.cache_miss_tokens.unwrap_or(0),
+                )
+                .map_or_else(|| "—".to_string(), |pct| format!("{pct}%"));
+                let session_cache = cache_hit_percent(
+                    telemetry.session_cache_hit_tokens,
+                    telemetry.session_cache_miss_tokens,
+                )
+                .map_or_else(|| "—".to_string(), |pct| format!("{pct}%"));
                 format!(
-                    "\neffective_model={}\nroute={}\nroute_source={}\nreasoning={}\nauto_reason={}\nturn_cost={}\nsession_cost={}\ncontext={}/{} ({}%)\ncompaction_near={}\nstream_retries={}{}",
+                    "\neffective_model={}\nroute={}\nroute_source={}\nreasoning={}\nauto_reason={}\nturn_cost={}\nsession_cost={}\ncache_hit=本轮 {} · 会话 {}（已省 {}）\ncontext={}/{} ({}%)\ncompaction_near={}\nstream_retries={}{}",
                     telemetry.effective_model,
                     telemetry.route_label,
                     telemetry.route_source,
@@ -227,6 +237,9 @@ impl App {
                     telemetry.route_reason,
                     telemetry.turn_cost.format(self.cost_currency),
                     telemetry.session_cost.format(self.cost_currency),
+                    turn_cache,
+                    session_cache,
+                    telemetry.session_cache_savings.format(self.cost_currency),
                     telemetry.estimated_context_tokens,
                     telemetry.context_window,
                     telemetry.context_usage_percent,
@@ -382,11 +395,24 @@ impl App {
     }
 }
 
+/// Cache hit rate as a percentage, or `None` when no prompt tokens were billed.
+pub(crate) fn cache_hit_percent(hit: u32, miss: u32) -> Option<u8> {
+    let total = u64::from(hit) + u64::from(miss);
+    if total == 0 {
+        None
+    } else {
+        Some((u64::from(hit) * 100 / total) as u8)
+    }
+}
+
 pub(crate) fn format_turn_telemetry(telemetry: &TurnTelemetry, currency: CostCurrency) -> String {
     let turn = telemetry.turn_cost.format(currency);
     let session = telemetry.session_cost.format(currency);
     let cache = match (telemetry.cache_hit_tokens, telemetry.cache_miss_tokens) {
-        (Some(hit), Some(miss)) => format!(" | cache {hit}/{miss}"),
+        (Some(hit), Some(miss)) => match cache_hit_percent(hit, miss) {
+            Some(pct) => format!(" | 缓存命中 {pct}%"),
+            None => String::new(),
+        },
         _ => String::new(),
     };
     let context = format!(
@@ -423,6 +449,14 @@ pub(crate) fn format_turn_telemetry(telemetry: &TurnTelemetry, currency: CostCur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_hit_percent_handles_zero_and_rounds_down() {
+        assert_eq!(cache_hit_percent(0, 0), None);
+        assert_eq!(cache_hit_percent(80, 20), Some(80));
+        assert_eq!(cache_hit_percent(1, 2), Some(33));
+        assert_eq!(cache_hit_percent(100, 0), Some(100));
+    }
 
     #[test]
     fn copy_last_response_picks_latest_assistant() {

@@ -21,6 +21,12 @@ pub(super) struct RuntimeState {
     pub(super) current_turn: Option<TurnRecord>,
     pub(super) last_prefix_hash: Option<u64>,
     pub(super) session_cost: CostEstimate,
+    /// Cumulative DeepSeek prompt-cache tokens this session (hit is ~50–120×
+    /// cheaper than miss), for surfacing cache efficiency. In-memory only.
+    pub(super) session_cache_hit_tokens: u64,
+    pub(super) session_cache_miss_tokens: u64,
+    /// Cumulative spend avoided by cache hits this session (vs all-miss).
+    pub(super) session_cache_savings: CostEstimate,
     pub(super) current_prompt: Option<String>,
     pub(super) current_turn_id: Option<TurnId>,
     /// Cancellation token for the in-flight turn; rotated by `begin_turn`.

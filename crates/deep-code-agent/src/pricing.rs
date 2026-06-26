@@ -89,6 +89,14 @@ pub struct TurnTelemetry {
     pub completion_tokens: u32,
     pub cache_hit_tokens: Option<u32>,
     pub cache_miss_tokens: Option<u32>,
+    /// Cumulative session cache tokens, for a session-wide hit-rate readout.
+    #[serde(default)]
+    pub session_cache_hit_tokens: u32,
+    #[serde(default)]
+    pub session_cache_miss_tokens: u32,
+    /// Cumulative spend avoided by cache hits this session (vs all-miss).
+    #[serde(default)]
+    pub session_cache_savings: CostEstimate,
     pub prefix_status: PrefixStatus,
     #[serde(default)]
     pub route_reason: String,
@@ -107,6 +115,21 @@ pub struct TurnTelemetry {
     pub stream_retries: u32,
     pub turn_cost: CostEstimate,
     pub session_cost: CostEstimate,
+}
+
+/// Spend avoided by cache hits this turn: `cache_hit_tokens × (miss − hit)` price.
+#[must_use]
+pub fn cache_savings(model: &str, cache_hit_tokens: u32) -> CostEstimate {
+    let Some(pricing) = ModelRegistry::default()
+        .info_for(model)
+        .map(|info| info.pricing.clone())
+    else {
+        return CostEstimate::default();
+    };
+    CostEstimate {
+        usd: tier_cost(cache_hit_tokens, pricing.input_miss_usd - pricing.input_hit_usd),
+        cny: tier_cost(cache_hit_tokens, pricing.input_miss_cny - pricing.input_hit_cny),
+    }
 }
 
 #[must_use]
