@@ -41,13 +41,40 @@ pub struct CompactionResult {
     pub archived_count: usize,
 }
 
+/// Rough token estimate. ASCII/Latin text is ~4 chars per token, but CJK text
+/// is closer to ~1 token per character — counting it as `chars/4` (the old
+/// behavior) underestimated Chinese context by 3–4×, tripping compaction far
+/// too late and skewing the cost/usage display for DeepSeek's main audience.
 #[must_use]
 pub fn estimate_token_count(messages: &[Message]) -> u32 {
-    let chars = messages
-        .iter()
-        .map(|message| message.content.chars().count())
-        .sum::<usize>();
-    (chars / 4).max(1) as u32
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for message in messages {
+        for ch in message.content.chars() {
+            if is_cjk(ch) {
+                cjk += 1;
+            } else {
+                other += 1;
+            }
+        }
+    }
+    // CJK ≈ 1 token/char; other text ≈ 4 chars/token.
+    (cjk + other / 4).max(1) as u32
+}
+
+/// Whether a character is CJK-ish (Chinese/Japanese/Korean script or wide
+/// punctuation), for the per-character token estimate.
+fn is_cjk(ch: char) -> bool {
+    matches!(ch as u32,
+        0x3000..=0x303F      // CJK symbols & punctuation
+        | 0x3040..=0x30FF    // Hiragana + Katakana
+        | 0x3400..=0x4DBF    // CJK Unified Ideographs Ext A
+        | 0x4E00..=0x9FFF    // CJK Unified Ideographs
+        | 0xAC00..=0xD7AF    // Hangul syllables
+        | 0xF900..=0xFAFF    // CJK compatibility ideographs
+        | 0xFF00..=0xFFEF    // Halfwidth/Fullwidth forms
+        | 0x20000..=0x2FFFF  // CJK Unified Ideographs Ext B–F
+    )
 }
 
 #[must_use]
@@ -159,6 +186,24 @@ mod tests {
                 .any(|message| message.content.contains("会话摘要"))
         );
         assert_eq!(result.messages.last().unwrap().content, "a11");
+    }
+
+    #[test]
+    fn cjk_text_is_not_underestimated() {
+        // 100 Han chars ≈ ~100 tokens (not 25 like the old chars/4); ASCII stays ~/4.
+        let han = "\u{5b57}".repeat(100);
+        let ascii = "a".repeat(100);
+        let cjk_tokens = estimate_token_count(&[Message::user(han)]);
+        let ascii_tokens = estimate_token_count(&[Message::user(ascii)]);
+        assert!(
+            cjk_tokens >= 90,
+            "CJK should count ~1 token/char, got {cjk_tokens}"
+        );
+        assert!(
+            ascii_tokens <= 30,
+            "ASCII should stay ~chars/4, got {ascii_tokens}"
+        );
+        assert!(cjk_tokens > ascii_tokens);
     }
 
     #[test]
