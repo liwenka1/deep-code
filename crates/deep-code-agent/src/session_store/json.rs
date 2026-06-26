@@ -149,7 +149,7 @@ impl SessionStore for JsonSessionStore {
             }
         }
 
-        records.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+        records.sort_by_key(|record| std::cmp::Reverse(record.updated_at_ms));
         Ok(records)
     }
 

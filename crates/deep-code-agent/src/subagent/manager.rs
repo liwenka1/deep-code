@@ -72,7 +72,7 @@ impl SubAgentManager {
             .filter(|agent| agent.session_boot_id.as_deref() == Some(self.session_boot_id.as_str()))
             .cloned()
             .collect();
-        agents.sort_by(|left, right| right.started_at_ms.cmp(&left.started_at_ms));
+        agents.sort_by_key(|agent| std::cmp::Reverse(agent.started_at_ms));
         agents
     }
 

@@ -40,22 +40,22 @@ const LANDLOCK_ABI: ABI = ABI::V1;
 /// Always-blocked syscalls (escape / privilege / host-tampering). Limited to
 /// numbers present on both x86_64 and aarch64.
 const DANGEROUS_SYSCALLS: &[i64] = &[
-    libc::SYS_ptrace as i64,
-    libc::SYS_mount as i64,
-    libc::SYS_umount2 as i64,
-    libc::SYS_pivot_root as i64,
-    libc::SYS_chroot as i64,
-    libc::SYS_reboot as i64,
-    libc::SYS_kexec_load as i64,
-    libc::SYS_init_module as i64,
-    libc::SYS_finit_module as i64,
-    libc::SYS_delete_module as i64,
-    libc::SYS_bpf as i64,
+    libc::SYS_ptrace,
+    libc::SYS_mount,
+    libc::SYS_umount2,
+    libc::SYS_pivot_root,
+    libc::SYS_chroot,
+    libc::SYS_reboot,
+    libc::SYS_kexec_load,
+    libc::SYS_init_module,
+    libc::SYS_finit_module,
+    libc::SYS_delete_module,
+    libc::SYS_bpf,
 ];
 
 /// Blocked when the policy forbids network. Denying `socket` stops any new
 /// socket (no network of any family); `connect` is belt-and-suspenders.
-const NETWORK_SYSCALLS: &[i64] = &[libc::SYS_socket as i64, libc::SYS_connect as i64];
+const NETWORK_SYSCALLS: &[i64] = &[libc::SYS_socket, libc::SYS_connect];
 
 /// Write-class access rights: everything Landlock can govern minus the
 /// read/execute rights, so reads stay unrestricted.
