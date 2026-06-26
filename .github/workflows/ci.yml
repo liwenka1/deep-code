@@ -1,0 +1,40 @@
+# CI gate for deep-code
+#
+# 触发：push 到 main、以及所有 pull request
+# 检查：rustfmt 格式、clippy(-D warnings)、核心 crate 测试
+#
+# 仅检查三个核心 crate(agent / tui / runtime)；桌面 Tauri 应用需要系统库,
+# 与 release.yml 一样不在此构建。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy -p deep-code-agent -p deep-code-tui -p deep-code-runtime --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test -p deep-code-agent -p deep-code-tui -p deep-code-runtime
