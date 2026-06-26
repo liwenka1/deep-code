@@ -404,11 +404,9 @@ impl App {
 /// Cache hit rate as a percentage, or `None` when no prompt tokens were billed.
 pub(crate) fn cache_hit_percent(hit: u32, miss: u32) -> Option<u8> {
     let total = u64::from(hit) + u64::from(miss);
-    if total == 0 {
-        None
-    } else {
-        Some((u64::from(hit) * 100 / total) as u8)
-    }
+    (u64::from(hit) * 100)
+        .checked_div(total)
+        .map(|percent| percent as u8)
 }
 
 pub(crate) fn format_turn_telemetry(telemetry: &TurnTelemetry, currency: CostCurrency) -> String {

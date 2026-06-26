@@ -176,7 +176,7 @@ impl RuntimeThreadStore {
 
     pub async fn list_threads(&self) -> Vec<RuntimeThread> {
         let mut threads = self.inner.lock().await.threads.clone();
-        threads.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+        threads.sort_by_key(|thread| std::cmp::Reverse(thread.updated_at_ms));
         threads
     }
 
