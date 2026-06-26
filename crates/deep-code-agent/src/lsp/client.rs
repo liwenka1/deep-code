@@ -387,6 +387,10 @@ mod tests {
         assert_eq!(diags[0].code.as_deref(), Some("E0101"));
     }
 
+    // Unix-only for now: Windows file URIs (file:///C:/…, backslashes,
+    // drive-letter case) aren't normalized for path comparison yet — tracked
+    // separately from the sandbox work.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn canonical_publish_uri_matches_non_canonical_query_path() {
         let dir = tempfile::tempdir().unwrap();

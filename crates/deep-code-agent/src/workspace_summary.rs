@@ -59,7 +59,9 @@ pub fn list_workspace_files(workspace: &Path, max: usize) -> Vec<String> {
             continue;
         }
         if let Ok(relative) = entry.path().strip_prefix(workspace) {
-            files.push(relative.display().to_string());
+            // Normalize to forward slashes so the listing is identical across
+            // platforms (the model and `@` completion expect `/`).
+            files.push(relative.to_string_lossy().replace('\\', "/"));
             if files.len() >= max {
                 break;
             }
