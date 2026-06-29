@@ -26,5 +26,13 @@ unicode-width = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
+# Redirect stderr to the log file on Windows (SetStdHandle), mirroring the
+# unix `dup2` path so stray writes can't paint over the alternate-screen TUI.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
 [dev-dependencies]
 tempfile = "3"
