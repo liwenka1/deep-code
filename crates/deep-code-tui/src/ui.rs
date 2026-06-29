@@ -108,7 +108,41 @@ fn redirect_stderr_to_log() {
     }
 }
 
-#[cfg(not(unix))]
+/// Windows equivalent of the unix path: point the process's `STD_ERROR_HANDLE`
+/// at the log file via `SetStdHandle`, so LSP/persistence `eprintln!`s land in
+/// the log instead of corrupting the alternate-screen TUI.
+#[cfg(windows)]
+fn redirect_stderr_to_log() {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
+
+    let path = crate::cli::workspace_root()
+        .join(".deep-code")
+        .join("deep-code.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let handle: HANDLE = file.as_raw_handle();
+    // SAFETY: `handle` is a valid, writable file handle. SetStdHandle just
+    // records it as the process's stderr; `forget` keeps it open for the
+    // process lifetime (the alternate-screen TUI runs until exit), mirroring how
+    // the unix `dup2` fd outlives the dropped `File`.
+    unsafe {
+        SetStdHandle(STD_ERROR_HANDLE, handle);
+    }
+    std::mem::forget(file);
+}
+
+#[cfg(not(any(unix, windows)))]
 fn redirect_stderr_to_log() {}
 
 fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
