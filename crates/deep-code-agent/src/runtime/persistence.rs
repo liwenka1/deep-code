@@ -78,6 +78,8 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 cancel: tokio_util::sync::CancellationToken::new(),
                 session_approved: Default::default(),
                 session_trusted_shell_prefixes: Default::default(),
+                cascade_escalated: false,
+                turn_tool_errors: 0,
             })),
             checkpoints: None,
             workspace: Some(workspace.clone()),

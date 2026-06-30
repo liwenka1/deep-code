@@ -19,7 +19,6 @@ mod event;
 mod handle;
 mod persistence;
 mod persistence_actor;
-mod routing;
 mod state;
 mod streaming;
 mod telemetry;
@@ -145,6 +144,8 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 cancel: CancellationToken::new(),
                 session_approved: Default::default(),
                 session_trusted_shell_prefixes: Default::default(),
+                cascade_escalated: false,
+                turn_tool_errors: 0,
             })),
             checkpoints: None,
             workspace: None,
@@ -189,6 +190,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             state.current_prompt = Some(prompt);
             state.current_turn_id = Some(turn_id);
             state.cancel = CancellationToken::new();
+            // Per-turn struggle counter resets; the `cascade_escalated` latch
+            // intentionally persists for the rest of the session.
+            state.turn_tool_errors = 0;
         }
         self.persist().await;
     }

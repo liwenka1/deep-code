@@ -8,18 +8,17 @@ use crate::task_class::{TaskWeight, classify_keyword};
 /// Force the strong model once the session fills this fraction of the context
 /// window — long contexts need Pro regardless of how the prompt reads.
 const CONTEXT_PRESSURE_PERCENT: u64 = 70;
-/// Prompts shorter than this (and free of difficulty keywords) default to Flash.
-const SHORT_PROMPT_CHARS: usize = 100;
 
 /// What decided a turn's route, for explainable telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteSource {
     /// A non-negotiable rule (sub-agent, fixed model, context pressure).
     HardRule,
-    /// The keyword/length heuristic.
+    /// The keyword heuristic (difficulty keyword → Pro), else Flash-first.
     Heuristic,
-    /// The Flash classifier resolved an otherwise-ambiguous turn.
-    FlashRouter,
+    /// Cascade escalation: Flash visibly struggled earlier this session, so
+    /// later turns run on Pro until the session ends.
+    Cascade,
 }
 
 impl RouteSource {
@@ -28,7 +27,7 @@ impl RouteSource {
         match self {
             Self::HardRule => "hard-rule",
             Self::Heuristic => "heuristic",
-            Self::FlashRouter => "flash-router",
+            Self::Cascade => "cascade",
         }
     }
 }
@@ -40,6 +39,9 @@ pub struct RouteContext {
     pub context_tokens: u32,
     /// Context window of the model family (0 disables the pressure rule).
     pub context_window: u32,
+    /// Cascade escalation latch: Flash already struggled (repeated tool-call
+    /// failures) earlier this session, so force Pro for the rest of it.
+    pub escalated: bool,
 }
 
 impl RouteContext {
@@ -120,21 +122,6 @@ pub fn api_fallback_model(route: &TurnRoute) -> Option<&'static str> {
     }
 }
 
-/// A model-selection outcome from the deterministic heuristic.
-///
-/// `Ambiguous` is the gray zone the Phase-2 Flash router resolves; callers
-/// without a router fall back to Flash.
-pub(crate) enum ModelClass {
-    Decisive {
-        model: String,
-        reason: String,
-        source: RouteSource,
-    },
-    Ambiguous {
-        reason: String,
-    },
-}
-
 /// Resolve the concrete model + reasoning effort for one user turn.
 #[must_use]
 pub fn resolve_turn_route(
@@ -168,21 +155,7 @@ pub fn resolve_turn_route(
     }
 
     let (effective_model, route_reason, source) =
-        match classify_model(user_prompt, &ctx, config.auto_cost_saving) {
-            ModelClass::Decisive {
-                model,
-                reason,
-                source,
-            } => (model, reason, source),
-            ModelClass::Ambiguous { reason } => {
-                // No router yet: the gray zone defaults to Flash.
-                (
-                    DEEPSEEK_V4_FLASH.to_string(),
-                    reason,
-                    RouteSource::Heuristic,
-                )
-            }
-        };
+        classify_model(user_prompt, &ctx, config.auto_cost_saving);
 
     // Effort and model both derive from `task_class`, so they stay coherent.
     let effort = config.reasoning_effort.resolve(is_subagent, user_prompt);
@@ -211,68 +184,64 @@ pub fn select_auto_model(input: &str, cost_saving: bool) -> String {
 /// Model + human-readable reason for status surfaces (no session context).
 #[must_use]
 pub fn select_auto_model_with_reason(input: &str, cost_saving: bool) -> (String, String) {
-    match classify_model(input, &RouteContext::default(), cost_saving) {
-        ModelClass::Decisive { model, reason, .. } => (model, reason),
-        ModelClass::Ambiguous { reason } => (DEEPSEEK_V4_FLASH.to_string(), reason),
-    }
+    let (model, reason, _) = classify_model(input, &RouteContext::default(), cost_saving);
+    (model, reason)
 }
 
-/// Deterministic model selection over the shared [`crate::task_class`] table.
-/// Priority: context pressure → difficulty keyword → length, with the
-/// 100‑to‑threshold gray zone left `Ambiguous` for the Flash router.
-pub(crate) fn classify_model(input: &str, ctx: &RouteContext, cost_saving: bool) -> ModelClass {
+/// Flash-first model selection over the shared [`crate::task_class`] table.
+///
+/// Returns `(model, human-readable reason, source)`. Pro is forced only by hard
+/// facts (cascade escalation, context pressure) or an explicit difficulty
+/// keyword. Everything else starts on Flash — cascade escalation (driven by
+/// observed tool-call failures) upgrades later turns when Flash actually
+/// struggles, so we no longer guess difficulty from prompt length.
+pub(crate) fn classify_model(
+    input: &str,
+    ctx: &RouteContext,
+    cost_saving: bool,
+) -> (String, String, RouteSource) {
+    if ctx.escalated {
+        return (
+            DEEPSEEK_V4_PRO.to_string(),
+            "级联升级：本会话内 Flash 工具调用反复失败，改用 Pro 接管".to_string(),
+            RouteSource::Cascade,
+        );
+    }
+
     if ctx.under_pressure() {
-        return ModelClass::Decisive {
-            model: DEEPSEEK_V4_PRO.to_string(),
-            reason: format!(
+        return (
+            DEEPSEEK_V4_PRO.to_string(),
+            format!(
                 "上下文占用约 {}%（≥{CONTEXT_PRESSURE_PERCENT}% 阈值），使用 Pro 处理长上下文",
                 ctx.usage_percent()
             ),
-            source: RouteSource::HardRule,
-        };
+            RouteSource::HardRule,
+        );
     }
 
     match classify_keyword(input) {
-        Some((TaskWeight::Deep, keyword)) => ModelClass::Decisive {
-            model: DEEPSEEK_V4_PRO.to_string(),
-            reason: format!("命中调试/报错类关键词“{keyword}”，使用 Pro 配深推理"),
-            source: RouteSource::Heuristic,
-        },
-        Some((TaskWeight::Heavy, keyword)) => ModelClass::Decisive {
-            model: DEEPSEEK_V4_PRO.to_string(),
-            reason: format!("命中复杂任务关键词“{keyword}”，使用 Pro 以获得更强推理和工具规划能力"),
-            source: RouteSource::Heuristic,
-        },
-        Some((TaskWeight::Borderline, keyword)) if !cost_saving => ModelClass::Decisive {
-            model: DEEPSEEK_V4_PRO.to_string(),
-            reason: format!("任务包含“{keyword}”，且未开启成本优先，使用 Pro"),
-            source: RouteSource::Heuristic,
-        },
-        // Borderline under cost-saving and Light keywords fall through to the
-        // length check below (Light shouldn't force Flash on a long prompt).
-        _ => classify_by_length(input, cost_saving),
-    }
-}
-
-fn classify_by_length(input: &str, cost_saving: bool) -> ModelClass {
-    let len = input.chars().count();
-    if len < SHORT_PROMPT_CHARS {
-        return ModelClass::Decisive {
-            model: DEEPSEEK_V4_FLASH.to_string(),
-            reason: "短提示优先使用 Flash，降低延迟和成本".to_string(),
-            source: RouteSource::Heuristic,
-        };
-    }
-    let long_threshold = if cost_saving { 1_000 } else { 500 };
-    if len > long_threshold {
-        return ModelClass::Decisive {
-            model: DEEPSEEK_V4_PRO.to_string(),
-            reason: format!("输入长度 {len} 超过阈值 {long_threshold}，使用 Pro 处理长上下文"),
-            source: RouteSource::Heuristic,
-        };
-    }
-    ModelClass::Ambiguous {
-        reason: format!("中等长度（{len} 字）且无明确难度信号，待进一步判定"),
+        Some((TaskWeight::Deep, keyword)) => (
+            DEEPSEEK_V4_PRO.to_string(),
+            format!("命中调试/报错类关键词“{keyword}”，使用 Pro 配深推理"),
+            RouteSource::Heuristic,
+        ),
+        Some((TaskWeight::Heavy, keyword)) => (
+            DEEPSEEK_V4_PRO.to_string(),
+            format!("命中复杂任务关键词“{keyword}”，使用 Pro 以获得更强推理和工具规划能力"),
+            RouteSource::Heuristic,
+        ),
+        Some((TaskWeight::Borderline, keyword)) if !cost_saving => (
+            DEEPSEEK_V4_PRO.to_string(),
+            format!("任务包含“{keyword}”，且未开启成本优先，使用 Pro"),
+            RouteSource::Heuristic,
+        ),
+        // Everything else (Light keywords, Borderline under cost-saving, no
+        // keyword) starts on Flash; cascade upgrades it if Flash struggles.
+        _ => (
+            DEEPSEEK_V4_FLASH.to_string(),
+            "默认先用 Flash（更快更省）；若工具调用反复失败，级联会升级到 Pro".to_string(),
+            RouteSource::Heuristic,
+        ),
     }
 }
 
@@ -409,10 +378,30 @@ mod tests {
         let ctx = RouteContext {
             context_tokens: 800_000,
             context_window: 1_000_000,
+            escalated: false,
         };
         let route = resolve_turn_route(&config, &ModelRegistry::default(), "hi", false, ctx);
         assert_eq!(route.effective_model, DEEPSEEK_V4_PRO);
         assert_eq!(route.source, RouteSource::HardRule);
+    }
+
+    #[test]
+    fn cascade_escalation_forces_pro_on_trivial_prompt() {
+        // Once Flash has struggled this session, even a short trivial prompt
+        // that would normally be Flash routes to Pro, tagged as Cascade.
+        let config = AgentConfig {
+            model: AUTO_MODEL.to_string(),
+            reasoning_effort: ReasoningEffortSetting::Auto,
+            ..AgentConfig::default()
+        };
+        let ctx = RouteContext {
+            escalated: true,
+            ..RouteContext::default()
+        };
+        let route = resolve_turn_route(&config, &ModelRegistry::default(), "hi", false, ctx);
+        assert_eq!(route.effective_model, DEEPSEEK_V4_PRO);
+        assert_eq!(route.source, RouteSource::Cascade);
+        assert!(route.route_reason.contains("级联升级"));
     }
 
     #[test]
@@ -440,7 +429,7 @@ mod tests {
 
         let (model, reason) = select_auto_model_with_reason("hi", false);
         assert_eq!(model, DEEPSEEK_V4_FLASH);
-        assert!(reason.contains("短提示"));
+        assert!(reason.contains("Flash"));
     }
 
     #[test]
