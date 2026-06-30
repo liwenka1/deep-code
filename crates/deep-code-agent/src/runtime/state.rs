@@ -39,6 +39,13 @@ pub(super) struct RuntimeState {
     /// session-approvable by tool name, so this trusts at command granularity.
     /// In-memory only; compound commands are never matched (they keep prompting).
     pub(super) session_trusted_shell_prefixes: HashSet<String>,
+    /// Cascade routing latch: set once Flash visibly struggles (repeated
+    /// tool-call execution failures within a turn). Sticky for the rest of the
+    /// session, forcing auto mode onto Pro. In-memory only.
+    pub(super) cascade_escalated: bool,
+    /// Tool-call execution failures observed in the current turn; reset at the
+    /// start of each turn. Crossing the cascade threshold latches `cascade_escalated`.
+    pub(super) turn_tool_errors: u32,
 }
 
 pub(super) struct Persistence {

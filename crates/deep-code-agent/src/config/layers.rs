@@ -10,8 +10,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    APPROVAL_AUTO_ALLOW_ENV, AUTO_COST_SAVING_ENV, AUTO_ROUTER_CONTEXT_TURNS_ENV,
-    AUTO_ROUTER_ENABLED_ENV, AUTO_ROUTER_TIMEOUT_MS_ENV, AgentConfig, COMPACTION_THRESHOLD_ENV,
+    APPROVAL_AUTO_ALLOW_ENV, AUTO_COST_SAVING_ENV, AgentConfig, COMPACTION_THRESHOLD_ENV,
     COST_CURRENCY_ENV, DEEPSEEK_API_KEY_ENV, MODEL_ENV, REASONING_EFFORT_ENV,
     STREAM_CHUNK_TIMEOUT_ENV, STREAM_MAX_BYTES_ENV, STREAM_MAX_RETRIES_ENV,
     STREAM_TOTAL_TIMEOUT_ENV,
@@ -172,15 +171,6 @@ struct ConfigFile {
     context: ContextSection,
     stream: StreamSection,
     approval: ApprovalSection,
-    auto: AutoSection,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct AutoSection {
-    router_enabled: Option<bool>,
-    router_timeout_ms: Option<u64>,
-    router_context_turns: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -355,16 +345,6 @@ fn apply_file_overlay(
                 .collect();
         }
     }
-
-    if let Some(value) = file.auto.router_enabled {
-        config.router_enabled = value;
-    }
-    if let Some(value) = file.auto.router_timeout_ms {
-        config.router_timeout_ms = value;
-    }
-    if let Some(value) = file.auto.router_context_turns {
-        config.router_context_turns = value;
-    }
 }
 
 pub(super) fn apply_env_overlay(
@@ -415,16 +395,6 @@ pub(super) fn apply_env_overlay(
             .map(|rule| rule.trim().to_string())
             .filter(|rule| !rule.is_empty())
             .collect();
-    }
-    if let Some(value) = lookup(AUTO_ROUTER_ENABLED_ENV) {
-        config.router_enabled = matches!(value.trim(), "1" | "true" | "yes" | "on");
-    }
-    if let Some(value) = lookup(AUTO_ROUTER_TIMEOUT_MS_ENV).and_then(|value| value.parse().ok()) {
-        config.router_timeout_ms = value;
-    }
-    if let Some(value) = lookup(AUTO_ROUTER_CONTEXT_TURNS_ENV).and_then(|value| value.parse().ok())
-    {
-        config.router_context_turns = value;
     }
 }
 
@@ -562,30 +532,6 @@ mod tests {
         assert_eq!(loaded.config.timeout, Some(Duration::from_secs(120)));
         assert_eq!(loaded.config.stream_max_retries, 7);
         assert_eq!(loaded.config.stream_chunk_timeout, Duration::from_secs(30));
-    }
-
-    #[test]
-    fn auto_router_settings_from_file_and_env() {
-        let global_dir = tempfile::tempdir().unwrap();
-        let global = write_config(
-            global_dir.path(),
-            "[auto]\nrouter_enabled = false\nrouter_timeout_ms = 1500\nrouter_context_turns = 3\n",
-        );
-        let loaded = AgentConfig::load_with(Some(global), None, &no_env);
-        assert!(!loaded.config.router_enabled);
-        assert_eq!(loaded.config.router_timeout_ms, 1500);
-        assert_eq!(loaded.config.router_context_turns, 3);
-
-        // Env overrides the file.
-        let env = |name: &str| match name {
-            super::AUTO_ROUTER_ENABLED_ENV => Some("true".to_string()),
-            super::AUTO_ROUTER_TIMEOUT_MS_ENV => Some("2000".to_string()),
-            _ => None,
-        };
-        let global = write_config(global_dir.path(), "[auto]\nrouter_enabled = false\n");
-        let loaded = AgentConfig::load_with(Some(global), None, &env);
-        assert!(loaded.config.router_enabled);
-        assert_eq!(loaded.config.router_timeout_ms, 2000);
     }
 
     #[test]

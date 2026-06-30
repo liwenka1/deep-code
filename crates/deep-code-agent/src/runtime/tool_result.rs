@@ -18,6 +18,12 @@ use crate::tool::{
 pub(super) const CANCELLED_TOOL_RESULT: &str =
     "用户取消了本轮，该工具调用未执行 (cancelled by user)";
 
+/// Tool-call execution failures within a single turn that latch cascade
+/// escalation (Flash → Pro for the rest of the session). Two mirrors the
+/// "2–3 failed self-corrections, then escalate" rule of thumb without waiting
+/// so long that a whole turn is wasted flailing on the weak model.
+const CASCADE_ESCALATE_TOOL_ERRORS: u32 = 2;
+
 /// Whether "approve for the whole session" may be recorded for a tool.
 /// Shell-class tools are excluded: their risk lives in the per-call
 /// arguments, so a blanket session consent would be misleading.
@@ -377,6 +383,17 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             ));
             if let Some(turn) = state.current_turn.as_mut() {
                 turn.tool_results.push(result.clone());
+            }
+            // Cascade signal: a genuine execution failure means the model
+            // fumbled this tool call. Denials carry their own status and user
+            // cancellations carry a known marker, so neither counts. Enough
+            // fumbles in one turn latch escalation onto Pro (sticky for the
+            // session); the latch is read by the next turn's router.
+            if result.status == ToolResultStatus::Error && result.content != CANCELLED_TOOL_RESULT {
+                state.turn_tool_errors += 1;
+                if state.turn_tool_errors >= CASCADE_ESCALATE_TOOL_ERRORS {
+                    state.cascade_escalated = true;
+                }
             }
         }
         // Persistence and SessionUpdated are flushed once per batch boundary
