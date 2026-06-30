@@ -30,17 +30,11 @@ pub const STREAM_CHUNK_TIMEOUT_ENV: &str = "DEEP_CODE_STREAM_CHUNK_TIMEOUT_SECS"
 pub const STREAM_TOTAL_TIMEOUT_ENV: &str = "DEEP_CODE_STREAM_TOTAL_TIMEOUT_SECS";
 pub const STREAM_MAX_BYTES_ENV: &str = "DEEP_CODE_STREAM_MAX_BYTES";
 pub const APPROVAL_AUTO_ALLOW_ENV: &str = "DEEP_CODE_APPROVAL_AUTO_ALLOW";
-pub const AUTO_ROUTER_ENABLED_ENV: &str = "DEEP_CODE_AUTO_ROUTER_ENABLED";
-pub const AUTO_ROUTER_TIMEOUT_MS_ENV: &str = "DEEP_CODE_AUTO_ROUTER_TIMEOUT_MS";
-pub const AUTO_ROUTER_CONTEXT_TURNS_ENV: &str = "DEEP_CODE_AUTO_ROUTER_CONTEXT_TURNS";
 
 pub const DEFAULT_STREAM_MAX_RETRIES: u32 = 3;
 pub const DEFAULT_STREAM_CHUNK_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_STREAM_TOTAL_TIMEOUT_SECS: u64 = 900;
 pub const DEFAULT_STREAM_MAX_BYTES: u64 = 50 * 1024 * 1024;
-pub const DEFAULT_AUTO_ROUTER_ENABLED: bool = true;
-pub const DEFAULT_AUTO_ROUTER_TIMEOUT_MS: u64 = 2500;
-pub const DEFAULT_AUTO_ROUTER_CONTEXT_TURNS: usize = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
@@ -65,13 +59,6 @@ pub struct AgentConfig {
     /// these run without prompting. Only env and the global config file may
     /// set this — project files are ignored (a repo must not disarm gates).
     pub approval_auto_allow: Vec<String>,
-    /// Consult the Flash classifier for ambiguous auto-mode turns. When false,
-    /// auto mode is the pure heuristic (no extra model call).
-    pub router_enabled: bool,
-    /// Hard timeout for the Flash router round-trip, in milliseconds.
-    pub router_timeout_ms: u64,
-    /// Recent turns of context handed to the Flash router.
-    pub router_context_turns: usize,
 }
 
 impl Default for AgentConfig {
@@ -103,9 +90,6 @@ impl AgentConfig {
             stream_total_timeout: Duration::from_secs(DEFAULT_STREAM_TOTAL_TIMEOUT_SECS),
             stream_max_bytes: DEFAULT_STREAM_MAX_BYTES,
             approval_auto_allow: Vec::new(),
-            router_enabled: DEFAULT_AUTO_ROUTER_ENABLED,
-            router_timeout_ms: DEFAULT_AUTO_ROUTER_TIMEOUT_MS,
-            router_context_turns: DEFAULT_AUTO_ROUTER_CONTEXT_TURNS,
         }
     }
 
