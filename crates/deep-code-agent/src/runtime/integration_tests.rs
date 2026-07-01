@@ -133,6 +133,34 @@ fn registry_with_auto_and_mock() -> ToolRegistry {
     registry
 }
 
+/// A tool that always returns an error result, for exercising the cascade
+/// struggle signal (repeated tool-call execution failures).
+#[derive(Debug, Clone, Copy)]
+struct FailingTool;
+
+impl FailingTool {
+    const NAME: &'static str = "fail_probe";
+}
+
+impl Tool for FailingTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            Self::NAME,
+            "Always fails.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            false,
+        )
+    }
+
+    fn execute(&self, call: &crate::tool::ToolCall) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult::error(call, "boom"))
+    }
+}
+
 fn started_ids(events: &[RuntimeEvent]) -> Vec<String> {
     events
         .iter()
@@ -1936,4 +1964,51 @@ async fn cancel_turn_when_idle_is_silent_noop() {
         events.last(),
         Some(RuntimeEvent::TurnFinished { .. })
     ));
+}
+
+#[tokio::test]
+async fn repeated_tool_errors_trigger_cascade_and_surface_in_telemetry() {
+    // The model calls a failing tool twice in one turn; both error, crossing
+    // the cascade threshold. The triggering turn still finishes on Flash, but
+    // its telemetry must flag `cascade_triggered` so the escalation is visible.
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: indexed_tool_call_delta(0, "c1", FailingTool::NAME, "{}"),
+            },
+            AgentEvent::ToolCallDelta {
+                delta: indexed_tool_call_delta(1, "c2", FailingTool::NAME, "{}"),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let config = AgentConfig {
+        model: crate::model_registry::AUTO_MODEL.to_string(),
+        approval_auto_allow: vec![FailingTool::NAME.to_string()],
+        ..AgentConfig::builtin()
+    };
+    let mut registry = ToolRegistry::with_mock_tools();
+    registry.register(FailingTool);
+    let runtime = AgentRuntime::with_config(client, registry, config);
+
+    let mut rx = runtime.submit_user("do the thing").await;
+    let events = drain(&mut rx).await;
+    let telemetry = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            RuntimeEvent::TurnFinished { telemetry, .. } => telemetry.clone(),
+            _ => None,
+        })
+        .expect("turn should finish with telemetry");
+    assert!(
+        telemetry.cascade_triggered,
+        "two tool-call failures in one turn must trigger cascade escalation"
+    );
 }

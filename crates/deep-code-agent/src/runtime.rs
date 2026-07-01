@@ -146,6 +146,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 session_trusted_shell_prefixes: Default::default(),
                 cascade_escalated: false,
                 turn_tool_errors: 0,
+                cascade_triggered_this_turn: false,
             })),
             checkpoints: None,
             workspace: None,
@@ -190,9 +191,11 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             state.current_prompt = Some(prompt);
             state.current_turn_id = Some(turn_id);
             state.cancel = CancellationToken::new();
-            // Per-turn struggle counter resets; the `cascade_escalated` latch
-            // intentionally persists for the rest of the session.
+            // Per-turn struggle counter and the "triggered this turn" flag
+            // reset; the `cascade_escalated` latch intentionally persists for
+            // the rest of the session.
             state.turn_tool_errors = 0;
+            state.cascade_triggered_this_turn = false;
         }
         self.persist().await;
     }

@@ -80,6 +80,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 session_trusted_shell_prefixes: Default::default(),
                 cascade_escalated: false,
                 turn_tool_errors: 0,
+                cascade_triggered_this_turn: false,
             })),
             checkpoints: None,
             workspace: Some(workspace.clone()),

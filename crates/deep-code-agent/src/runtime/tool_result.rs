@@ -391,8 +391,13 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             // session); the latch is read by the next turn's router.
             if result.status == ToolResultStatus::Error && result.content != CANCELLED_TOOL_RESULT {
                 state.turn_tool_errors += 1;
-                if state.turn_tool_errors >= CASCADE_ESCALATE_TOOL_ERRORS {
+                if state.turn_tool_errors >= CASCADE_ESCALATE_TOOL_ERRORS
+                    && !state.cascade_escalated
+                {
                     state.cascade_escalated = true;
+                    // Mark the triggering turn so telemetry can surface the
+                    // escalation now, not just on the next (Pro) turn.
+                    state.cascade_triggered_this_turn = true;
                 }
             }
         }
