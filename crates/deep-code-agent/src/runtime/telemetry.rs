@@ -44,6 +44,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             session_cache_hit_tokens,
             session_cache_miss_tokens,
             session_cache_savings,
+            cascade_triggered,
         ) = self
             .state
             .try_lock()
@@ -53,9 +54,10 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                     u32::try_from(state.session_cache_hit_tokens).unwrap_or(u32::MAX),
                     u32::try_from(state.session_cache_miss_tokens).unwrap_or(u32::MAX),
                     state.session_cache_savings,
+                    state.cascade_triggered_this_turn,
                 )
             })
-            .unwrap_or((turn_cost, cache_hit, cache_miss, turn_cache_savings));
+            .unwrap_or((turn_cost, cache_hit, cache_miss, turn_cache_savings, false));
         let estimated_context_tokens = usage.input_tokens().max(estimated_context_tokens);
         let context_window = context_window_for_model(&route.effective_model);
         let message_estimate = estimated_context_tokens;
@@ -74,6 +76,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             prefix_status,
             route_reason: route.route_reason.clone(),
             route_source: route.source.label().to_string(),
+            cascade_triggered,
             fallback_reason: route.fallback_reason.clone(),
             context_window,
             estimated_context_tokens,

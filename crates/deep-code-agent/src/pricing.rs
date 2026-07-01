@@ -100,9 +100,14 @@ pub struct TurnTelemetry {
     pub prefix_status: PrefixStatus,
     #[serde(default)]
     pub route_reason: String,
-    /// What decided the route this turn: `hard-rule` / `heuristic` / `flash-router`.
+    /// What decided the route this turn: `hard-rule` / `heuristic` / `cascade`.
     #[serde(default)]
     pub route_source: String,
+    /// True on the turn where cascade escalation latched on (Flash's repeated
+    /// tool-call failures crossed the threshold). That turn still ran on Flash;
+    /// escalation takes effect from the next turn.
+    #[serde(default)]
+    pub cascade_triggered: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
     pub context_window: u32,

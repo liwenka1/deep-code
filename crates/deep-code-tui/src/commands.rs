@@ -235,10 +235,11 @@ impl App {
                 )
                 .map_or_else(|| "—".to_string(), |pct| format!("{pct}%"));
                 format!(
-                    "\neffective_model={}\nroute={}\nroute_source={}\nreasoning={}\nauto_reason={}\nturn_cost={}\nsession_cost={}\ncache_hit=本轮 {} · 会话 {}（已省 {}）\ncontext={}/{} ({}%)\ncompaction_near={}\nstream_retries={}{}",
+                    "\neffective_model={}\nroute={}\nroute_source={}\ncascade_triggered={}\nreasoning={}\nauto_reason={}\nturn_cost={}\nsession_cost={}\ncache_hit=本轮 {} · 会话 {}（已省 {}）\ncontext={}/{} ({}%)\ncompaction_near={}\nstream_retries={}{}",
                     telemetry.effective_model,
                     telemetry.route_label,
                     telemetry.route_source,
+                    telemetry.cascade_triggered,
                     telemetry.reasoning_effort,
                     telemetry.route_reason,
                     telemetry.turn_cost.format(self.cost_currency),
@@ -440,8 +441,13 @@ pub(crate) fn format_turn_telemetry(telemetry: &TurnTelemetry, currency: CostCur
     } else {
         String::new()
     };
+    let cascade = if telemetry.cascade_triggered {
+        " | ⚡ 级联升级：Flash 工具调用连续失败，本会话改用 Pro"
+    } else {
+        ""
+    };
     format!(
-        " | {} | {} | 本回合 {} | 累计 {}{cache} | {context}{compaction} | {}{fallback}{retries}",
+        " | {} | {} | 本回合 {} | 累计 {}{cache} | {context}{compaction} | {}{fallback}{retries}{cascade}",
         telemetry.route_label,
         telemetry.route_reason,
         turn,

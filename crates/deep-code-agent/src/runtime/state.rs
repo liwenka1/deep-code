@@ -46,6 +46,10 @@ pub(super) struct RuntimeState {
     /// Tool-call execution failures observed in the current turn; reset at the
     /// start of each turn. Crossing the cascade threshold latches `cascade_escalated`.
     pub(super) turn_tool_errors: u32,
+    /// True only for the turn in which `cascade_escalated` flipped on, so
+    /// telemetry can surface the escalation at the moment it triggers (the
+    /// triggering turn still finishes on Flash). Reset at the start of each turn.
+    pub(super) cascade_triggered_this_turn: bool,
 }
 
 pub(super) struct Persistence {
