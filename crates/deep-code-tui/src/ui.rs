@@ -732,6 +732,12 @@ fn cell_lines(cell: &HistoryCell, width: u16) -> Vec<Line<'static>> {
             lines.push(Line::default());
             lines
         }
+        // Live output of a running tool: dim, indented under the call line,
+        // no trailing blank (the block keeps growing while streaming).
+        HistoryCell::ToolStream { text } => text
+            .lines()
+            .flat_map(|logical| wrap_prefixed("    ", logical, width, dim, dim))
+            .collect(),
         HistoryCell::Approval {
             tool_name,
             description,

@@ -60,6 +60,12 @@ pub enum HistoryCell {
         status: ToolResultStatus,
         summary: String,
     },
+    /// Live output tail of a still-running tool (streaming shell). Preview
+    /// only: it is never flushed into the persistent transcript — the final
+    /// ToolResult summary replaces it.
+    ToolStream {
+        text: String,
+    },
     Approval {
         tool_name: String,
         description: String,
@@ -149,6 +155,7 @@ impl HistoryCell {
                     truncate_chars(&collapse_whitespace(summary), 88)
                 )]
             }
+            Self::ToolStream { text } => text.lines().map(str::to_string).collect(),
             Self::Approval {
                 tool_name,
                 description,

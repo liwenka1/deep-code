@@ -43,6 +43,7 @@ impl App {
                     risk_level: None,
                     requires_sandbox: None,
                     approval: ToolApprovalState::NotRequired,
+                    live_output: Default::default(),
                 });
                 self.status = format!("Receiving tool call: {tool_name}");
             }
@@ -56,9 +57,14 @@ impl App {
                 }
                 self.status = "Receiving tool call...".to_string();
             }
-            RuntimeEvent::ToolCallProgress { .. } => {
-                // No tool emits live progress yet; rendering lands with the
-                // streaming shell tool.
+            RuntimeEvent::ToolCallProgress {
+                tool_call_id,
+                tool_name,
+                update,
+                ..
+            } => {
+                self.append_active_tool_output(&tool_call_id, &update.text);
+                self.status = format!("Running {tool_name}…");
             }
             RuntimeEvent::ApprovalRequired { request, .. } => {
                 self.set_active_approval(request.clone());
@@ -239,6 +245,14 @@ impl App {
             let mut active = ActiveTurn::new(Default::default());
             active.upsert_tool(cell);
             self.active_turn = Some(active);
+        }
+    }
+
+    fn append_active_tool_output(&mut self, tool_call_id: &ToolCallId, text: &str) {
+        // No fallback cell: progress without a started tool call cannot be
+        // attributed meaningfully, and the final result still lands.
+        if let Some(active) = self.active_turn.as_mut() {
+            active.append_tool_output(tool_call_id, text);
         }
     }
 

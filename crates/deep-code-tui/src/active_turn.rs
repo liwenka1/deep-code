@@ -2,6 +2,42 @@ use deep_code_agent::{ApprovalRequest, ToolCallId, TurnId};
 
 use crate::history::{HistoryCell, ToolApprovalState};
 
+/// Bound on the buffered live-output tail per running tool (display only —
+/// the agent-side ring buffer keeps the full 128 KiB).
+const LIVE_OUTPUT_MAX_CHARS: usize = 4_096;
+/// How many trailing output lines the transcript preview shows per tool.
+const LIVE_OUTPUT_PREVIEW_LINES: usize = 6;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LiveOutput(String);
+
+impl LiveOutput {
+    pub fn push(&mut self, text: &str) {
+        self.0.push_str(text);
+        let count = self.0.chars().count();
+        if count > LIVE_OUTPUT_MAX_CHARS {
+            self.0 = self
+                .0
+                .chars()
+                .skip(count - LIVE_OUTPUT_MAX_CHARS)
+                .collect();
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Last few complete lines for the transcript preview.
+    #[must_use]
+    pub fn preview_tail(&self) -> String {
+        let lines: Vec<&str> = self.0.lines().collect();
+        let start = lines.len().saturating_sub(LIVE_OUTPUT_PREVIEW_LINES);
+        lines[start..].join("\n")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveToolCell {
     pub tool_call_id: ToolCallId,
@@ -10,6 +46,7 @@ pub struct ActiveToolCell {
     pub risk_level: Option<String>,
     pub requires_sandbox: Option<bool>,
     pub approval: ToolApprovalState,
+    pub live_output: LiveOutput,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -67,9 +104,23 @@ impl ActiveTurn {
             .iter_mut()
             .find(|tool| tool.tool_call_id == cell.tool_call_id)
         {
+            // A re-upsert (duplicate ToolCallStarted) must not wipe output
+            // that already streamed in.
+            let live_output = std::mem::take(&mut existing.live_output);
             *existing = cell;
+            existing.live_output = live_output;
         } else {
             self.tools.push(cell);
+        }
+    }
+
+    pub fn append_tool_output(&mut self, tool_call_id: &ToolCallId, text: &str) {
+        if let Some(existing) = self
+            .tools
+            .iter_mut()
+            .find(|tool| &tool.tool_call_id == tool_call_id)
+        {
+            existing.live_output.push(text);
         }
     }
 
@@ -88,6 +139,7 @@ impl ActiveTurn {
                 risk_level: None,
                 requires_sandbox: None,
                 approval: ToolApprovalState::NotRequired,
+                live_output: LiveOutput::default(),
             });
         }
     }
@@ -110,6 +162,7 @@ impl ActiveTurn {
                 risk_level: Some(format!("{:?}", request.risk_level)),
                 requires_sandbox: Some(request.requires_sandbox),
                 approval: ToolApprovalState::Required,
+                live_output: LiveOutput::default(),
             });
         }
     }
@@ -184,13 +237,20 @@ impl ActiveTurn {
                 text: self.assistant_buffer.clone(),
             });
         }
-        cells.extend(self.tools.iter().map(|tool| HistoryCell::ToolCall {
-            tool_name: tool.tool_name.clone(),
-            arguments: tool.arguments.clone(),
-            risk_level: tool.risk_level.clone(),
-            requires_sandbox: tool.requires_sandbox,
-            approval: tool.approval,
-        }));
+        for tool in &self.tools {
+            cells.push(HistoryCell::ToolCall {
+                tool_name: tool.tool_name.clone(),
+                arguments: tool.arguments.clone(),
+                risk_level: tool.risk_level.clone(),
+                requires_sandbox: tool.requires_sandbox,
+                approval: tool.approval,
+            });
+            if !tool.live_output.is_empty() {
+                cells.push(HistoryCell::ToolStream {
+                    text: tool.live_output.preview_tail(),
+                });
+            }
+        }
         cells.extend(self.diagnostics.iter().cloned());
         // The pending approval is shown by the dedicated panel (with the y/a/n
         // choices); don't also duplicate it inline in the transcript preview.
@@ -214,6 +274,7 @@ mod tests {
             risk_level: None,
             requires_sandbox: None,
             approval: ToolApprovalState::NotRequired,
+            live_output: LiveOutput::default(),
         });
 
         let cells = turn.preview_cells();
@@ -223,6 +284,67 @@ mod tests {
             &cells[2],
             HistoryCell::ToolCall { tool_name, .. } if tool_name == "mock_echo"
         ));
+    }
+
+    #[test]
+    fn streamed_tool_output_previews_tail_and_never_reaches_history() {
+        let mut turn = ActiveTurn::new(TurnId("turn_1".to_string()));
+        let id = ToolCallId("call_1".to_string());
+        turn.upsert_tool(ActiveToolCell {
+            tool_call_id: id.clone(),
+            tool_name: "shell".to_string(),
+            arguments: "{\"command\":\"cargo build\"}".to_string(),
+            risk_level: None,
+            requires_sandbox: None,
+            approval: ToolApprovalState::NotRequired,
+            live_output: LiveOutput::default(),
+        });
+
+        for line in 0..10 {
+            turn.append_tool_output(&id, &format!("line-{line}\n"));
+        }
+
+        let cells = turn.preview_cells();
+        let Some(HistoryCell::ToolStream { text }) = cells
+            .iter()
+            .find(|cell| matches!(cell, HistoryCell::ToolStream { .. }))
+        else {
+            panic!("expected a live-output preview cell");
+        };
+        // Only the trailing lines survive the preview cap.
+        assert!(text.contains("line-9"));
+        assert!(!text.contains("line-0"));
+
+        // A duplicate upsert must not wipe streamed output.
+        turn.upsert_tool(ActiveToolCell {
+            tool_call_id: id.clone(),
+            tool_name: "shell".to_string(),
+            arguments: "{\"command\":\"cargo build\"}".to_string(),
+            risk_level: None,
+            requires_sandbox: None,
+            approval: ToolApprovalState::NotRequired,
+            live_output: LiveOutput::default(),
+        });
+        assert!(!turn.tools[0].live_output.is_empty());
+
+        // The finished-tool flush drops live output: the final ToolResult
+        // summary replaces it in history.
+        let flushed = turn.take_finished_tool_cells(&id);
+        assert!(
+            flushed
+                .iter()
+                .all(|cell| !matches!(cell, HistoryCell::ToolStream { .. }))
+        );
+    }
+
+    #[test]
+    fn live_output_buffer_keeps_bounded_tail() {
+        let mut output = LiveOutput::default();
+        output.push(&"a".repeat(5_000));
+        output.push("tail-marker");
+        let preview = output.preview_tail();
+        assert!(preview.contains("tail-marker"));
+        assert!(preview.chars().count() <= 4_096);
     }
 
     #[test]
