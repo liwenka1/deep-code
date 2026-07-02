@@ -13,8 +13,7 @@
 //! [`super::SandboxManager::confine_spawned`], not the pre-spawn
 //! `wrap_shell_command` path used elsewhere.
 
-use std::os::windows::io::AsRawHandle;
-use std::process::Child;
+use std::os::windows::io::RawHandle;
 use std::{mem, ptr};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
@@ -62,11 +61,12 @@ impl Drop for JobGuard {
     }
 }
 
-/// Assign an already-spawned child to a fresh kill-on-close job with a process
-/// cap. Returns the guard to retain, or `None` on any failure (best-effort: the
-/// child then runs unconfined, matching the fail-open semantics on other OSes).
+/// Assign an already-spawned child (by raw process handle) to a fresh
+/// kill-on-close job with a process cap. Returns the guard to retain, or
+/// `None` on any failure (best-effort: the child then runs unconfined,
+/// matching the fail-open semantics on other OSes).
 #[must_use]
-pub fn confine(child: &Child) -> Option<JobGuard> {
+pub fn confine(process: RawHandle) -> Option<JobGuard> {
     // SAFETY: standard Win32 Job Object sequence; every handle is checked and
     // closed on the failure paths.
     unsafe {
@@ -91,8 +91,7 @@ pub fn confine(child: &Child) -> Option<JobGuard> {
             return None;
         }
 
-        let process: HANDLE = child.as_raw_handle();
-        if AssignProcessToJobObject(job, process) == 0 {
+        if AssignProcessToJobObject(job, process as HANDLE) == 0 {
             CloseHandle(job);
             return None;
         }
@@ -104,6 +103,7 @@ pub fn confine(child: &Child) -> Option<JobGuard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::io::AsRawHandle;
     use std::process::{Command, Stdio};
 
     #[test]
@@ -118,7 +118,7 @@ mod tests {
             .spawn()
             .expect("spawn test child");
 
-        let guard = confine(&child);
+        let guard = confine(child.as_raw_handle());
         assert!(guard.is_some(), "Job Object confinement should succeed");
 
         drop(guard); // KILL_ON_JOB_CLOSE terminates the process tree.

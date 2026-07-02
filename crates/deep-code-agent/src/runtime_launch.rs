@@ -9,7 +9,6 @@ use crate::client::{DeepSeekClient, LlmClient};
 use crate::config::AgentConfig;
 use crate::echo_client::EchoClient;
 use crate::extensions::{RuntimeBootstrap, attach_agent_extensions, build_runtime_system_prompt};
-use crate::git_tools::git_tool_registry;
 use crate::runtime::{AgentRuntime, AgentRuntimeHandle};
 use crate::session_store::{
     ConfigSnapshot, JsonSessionStore, SessionId, SessionRecord, SessionStore,
@@ -53,10 +52,6 @@ pub fn build_tool_registry(workspace: &Path) -> (ToolRegistry, JobStore) {
             job_store = shell_jobs;
         }
         Err(error) => eprintln!("shell tools disabled: {error}"),
-    }
-    match git_tool_registry(workspace.to_path_buf()) {
-        Ok(git_tools) => registry.extend(git_tools),
-        Err(error) => eprintln!("git tools disabled: {error}"),
     }
     registry.extend(crate::web_tools::web_tool_registry());
     (registry, job_store)

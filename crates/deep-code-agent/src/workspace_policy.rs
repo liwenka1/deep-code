@@ -182,15 +182,6 @@ pub(crate) fn json_string(value: impl serde::Serialize) -> String {
     serde_json::to_string_pretty(&value).expect("serializing tool output should not fail")
 }
 
-pub(crate) fn truncate_string(value: String, max_chars: usize) -> (String, bool, usize) {
-    let total = value.chars().count();
-    if total <= max_chars {
-        return (value, false, 0);
-    }
-    let truncated = value.chars().take(max_chars).collect::<String>();
-    (truncated, true, total - max_chars)
-}
-
 pub(crate) fn contains_symlink(path: &Path, stop_at: Option<&Path>) -> std::io::Result<bool> {
     let mut current = PathBuf::new();
     for component in path.components() {

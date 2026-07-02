@@ -7,7 +7,6 @@ use tokio_util::sync::CancellationToken;
 use crate::client::LlmClient;
 use crate::config::AgentConfig;
 use crate::execution_policy::ExecPolicy;
-use crate::git_tools::git_tool_registry;
 use crate::handle::HandleStore;
 use crate::shell_tools::shell_tool_registry;
 use crate::subagent::roles::{SubAgentRole, build_system_prompt};
@@ -144,7 +143,6 @@ pub fn child_tool_registry(
         let (shell_tools, _) = shell_tool_registry(workspace)?;
         registry.extend(shell_tools);
     }
-    registry.extend(git_tool_registry(workspace)?);
     Ok(registry)
 }
 

@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn tool_call_renders_compact_single_line() {
         let tool = HistoryCell::ToolCall {
-            tool_name: "shell_run".to_string(),
+            tool_name: "shell".to_string(),
             arguments: "{\"command\":\n  \"grep foo\"}".to_string(),
             risk_level: None,
             requires_sandbox: None,
@@ -652,7 +652,7 @@ mod tests {
         };
         let lines = tool.lines();
         assert_eq!(lines.len(), 1, "tool call must be one line");
-        assert!(lines[0].starts_with("shell_run  "));
+        assert!(lines[0].starts_with("shell  "));
         // Whitespace/newlines collapsed; no Risk/Approval/Sandbox noise.
         assert!(!lines[0].contains('\n'));
         assert!(!lines[0].contains("Risk"));
@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn tool_result_renders_compact_single_line() {
         let result = HistoryCell::ToolResult {
-            tool_name: "shell_run".to_string(),
+            tool_name: "shell".to_string(),
             status: ToolResultStatus::Success,
             summary: "ok\nmulti\nline".to_string(),
         };
@@ -693,7 +693,7 @@ mod tests {
         assert!(tool.lines().iter().any(|line| line.contains("(truncated)")));
 
         let approval = HistoryCell::Approval {
-            tool_name: "shell_run".to_string(),
+            tool_name: "shell".to_string(),
             description: long.clone(),
             risk_level: "High".to_string(),
             requires_sandbox: true,

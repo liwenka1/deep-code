@@ -8,8 +8,8 @@ pub enum ToolKind {
     WriteFile,
     Search,
     Shell,
-    GitRead,
-    JobControl,
+    /// The background-job tool; risk depends on the `action` argument.
+    Job,
     Mock,
     SubAgent,
     HandleRead,
@@ -121,12 +121,8 @@ impl ExecPolicy {
             "read_file" | "list_dir" => ToolKind::ReadOnlyFile,
             "grep_files" => ToolKind::Search,
             "write_file" | "apply_patch" => ToolKind::WriteFile,
-            "shell_run" | "job_start" => ToolKind::Shell,
-            "job_status" | "job_tail" => ToolKind::JobControl,
-            "job_cancel" => ToolKind::JobControl,
-            // Exact names only: a prefix match would hand the read-only fast
-            // path to any future tool that merely starts with "git_".
-            "git_status" | "git_diff" | "git_log" => ToolKind::GitRead,
+            "shell" => ToolKind::Shell,
+            "job" => ToolKind::Job,
             "web_search" | "fetch_url" => ToolKind::Network,
             "mock_echo" => ToolKind::Mock,
             "agent_open" | "agent_eval" | "agent_close" => ToolKind::SubAgent,
@@ -140,7 +136,7 @@ impl ExecPolicy {
     pub fn evaluate_tool(&self, tool_name: &str, arguments: &Value) -> ToolExecutionPlan {
         let kind = Self::classify_tool(tool_name);
         match kind {
-            ToolKind::ReadOnlyFile | ToolKind::Search | ToolKind::GitRead => ToolExecutionPlan {
+            ToolKind::ReadOnlyFile | ToolKind::Search => ToolExecutionPlan {
                 verdict: PolicyVerdict::Allow,
                 requires_approval: false,
                 requires_sandbox: false,
@@ -168,23 +164,47 @@ impl ExecPolicy {
                 risk_level: RiskLevel::Medium,
                 matched_rule: Some("builtin:network_tool".to_string()),
             },
-            ToolKind::JobControl => {
-                let needs_approval = tool_name == "job_cancel";
-                ToolExecutionPlan {
-                    verdict: if needs_approval {
-                        PolicyVerdict::NeedsApproval {
-                            reason: "job_cancel changes process state".to_string(),
-                        }
-                    } else {
-                        PolicyVerdict::Allow
-                    },
-                    requires_approval: needs_approval,
+            ToolKind::Job => match arguments.get("action").and_then(Value::as_str) {
+                // Launching a background command is exactly as risky as the
+                // command itself: same deny/trust/approve gate as `shell`.
+                Some("start") => {
+                    let command = arguments
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    evaluate_shell_command(self, command)
+                }
+                Some("status" | "tail") => ToolExecutionPlan {
+                    verdict: PolicyVerdict::Allow,
+                    requires_approval: false,
                     requires_sandbox: false,
-                    read_only: tool_name != "job_cancel",
+                    read_only: true,
                     risk_level: RiskLevel::Low,
                     matched_rule: Some("builtin:job_control".to_string()),
-                }
-            }
+                },
+                Some("cancel") => ToolExecutionPlan {
+                    verdict: PolicyVerdict::NeedsApproval {
+                        reason: "cancelling a job kills its process".to_string(),
+                    },
+                    requires_approval: true,
+                    requires_sandbox: false,
+                    read_only: false,
+                    risk_level: RiskLevel::Low,
+                    matched_rule: Some("builtin:job_control".to_string()),
+                },
+                // Missing/unknown action: gate defensively; the tool then
+                // rejects it as InvalidArguments.
+                _ => ToolExecutionPlan {
+                    verdict: PolicyVerdict::NeedsApproval {
+                        reason: "unknown job action".to_string(),
+                    },
+                    requires_approval: true,
+                    requires_sandbox: false,
+                    read_only: false,
+                    risk_level: RiskLevel::High,
+                    matched_rule: None,
+                },
+            },
             ToolKind::Shell => {
                 let command = arguments
                     .get("command")
@@ -355,6 +375,48 @@ mod tests {
         let plan = evaluate_shell_command(&policy, "cargo test -p deep-code-agent");
         assert_eq!(plan.verdict, PolicyVerdict::Allow);
         assert!(!plan.requires_approval);
+    }
+
+    #[test]
+    fn job_status_and_tail_are_allowed_read_only() {
+        let policy = ExecPolicy::default();
+        for action in ["status", "tail"] {
+            let plan = policy.evaluate_tool("job", &json!({"action": action, "job_id": "job_1"}));
+            assert_eq!(plan.verdict, PolicyVerdict::Allow, "action={action}");
+            assert!(plan.read_only, "action={action}");
+        }
+    }
+
+    #[test]
+    fn job_cancel_needs_approval() {
+        let policy = ExecPolicy::default();
+        let plan = policy.evaluate_tool("job", &json!({"action": "cancel", "job_id": "job_1"}));
+        assert!(matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }));
+        assert!(!plan.read_only);
+    }
+
+    #[test]
+    fn job_start_inherits_shell_gating() {
+        let policy = ExecPolicy::default();
+        let denied =
+            policy.evaluate_tool("job", &json!({"action": "start", "command": "rm -rf /"}));
+        assert!(matches!(denied.verdict, PolicyVerdict::Deny { .. }));
+
+        let trusted =
+            policy.evaluate_tool("job", &json!({"action": "start", "command": "cargo test"}));
+        assert_eq!(trusted.verdict, PolicyVerdict::Allow);
+
+        let unknown =
+            policy.evaluate_tool("job", &json!({"action": "start", "command": "python x.py"}));
+        assert!(matches!(unknown.verdict, PolicyVerdict::NeedsApproval { .. }));
+    }
+
+    #[test]
+    fn unknown_job_action_needs_approval() {
+        let policy = ExecPolicy::default();
+        let plan = policy.evaluate_tool("job", &json!({"job_id": "job_1"}));
+        assert!(matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }));
+        assert_eq!(plan.risk_level, RiskLevel::High);
     }
 
     #[test]

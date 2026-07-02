@@ -12,7 +12,7 @@ mod windows;
 pub use policy::SandboxPolicy;
 
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::OnceLock;
 
 /// Detected sandbox backend for the current platform.
@@ -161,14 +161,20 @@ impl SandboxManager {
     /// child's lifetime, or `None` when no post-spawn step is needed (macOS and
     /// Linux confine via [`Self::wrap_shell_command`]) or sandboxing is off.
     #[must_use]
-    pub fn confine_spawned(&self, child: &Child, policy: &SandboxPolicy) -> Option<SandboxGuard> {
+    pub fn confine_spawned(
+        &self,
+        child: &tokio::process::Child,
+        policy: &SandboxPolicy,
+    ) -> Option<SandboxGuard> {
         if !self.should_sandbox(policy) {
             return None;
         }
         #[cfg(target_os = "windows")]
         {
+            // `raw_handle()` is `None` once the child has already exited — the
+            // same tiny fail-open window as the old pre-tokio path.
             Some(SandboxGuard {
-                _job: windows::confine(child)?,
+                _job: windows::confine(child.raw_handle()?)?,
             })
         }
         #[cfg(not(target_os = "windows"))]

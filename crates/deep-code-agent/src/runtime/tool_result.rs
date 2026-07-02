@@ -26,11 +26,13 @@ const CASCADE_ESCALATE_TOOL_ERRORS: u32 = 2;
 
 /// Whether "approve for the whole session" may be recorded for a tool.
 /// Shell-class tools are excluded: their risk lives in the per-call
-/// arguments, so a blanket session consent would be misleading.
+/// arguments, so a blanket session consent would be misleading. The `job`
+/// tool is excluded for the same reason — a session-allow granted on a
+/// `cancel` prompt must not blanket-approve future `action=start` commands.
 pub(super) fn session_allowable(tool_name: &str) -> bool {
     !matches!(
         crate::execution_policy::ExecPolicy::classify_tool(tool_name),
-        crate::execution_policy::ToolKind::Shell
+        crate::execution_policy::ToolKind::Shell | crate::execution_policy::ToolKind::Job
     )
 }
 
@@ -41,10 +43,16 @@ pub(super) fn session_allowable(tool_name: &str) -> bool {
 /// later matches against, so a trusted `cargo` can never smuggle a chained
 /// `cargo x && rm -rf /` past the gate.
 pub(super) fn session_shell_prefix(call: &ToolCall) -> Option<String> {
-    if !matches!(
-        crate::execution_policy::ExecPolicy::classify_tool(&call.name),
-        crate::execution_policy::ToolKind::Shell
-    ) {
+    let command_bearing = match crate::execution_policy::ExecPolicy::classify_tool(&call.name) {
+        crate::execution_policy::ToolKind::Shell => true,
+        // Only `job action=start` carries a command; status/tail/cancel
+        // approvals must not record a shell prefix.
+        crate::execution_policy::ToolKind::Job => {
+            call.arguments.get("action").and_then(|value| value.as_str()) == Some("start")
+        }
+        _ => false,
+    };
+    if !command_bearing {
         return None;
     }
     let command = call
@@ -489,9 +497,31 @@ mod tests {
     fn shell(command: &str) -> ToolCall {
         ToolCall {
             id: "c1".to_string(),
-            name: "shell_run".to_string(),
+            name: "shell".to_string(),
             arguments: json!({ "command": command }),
         }
+    }
+
+    fn job_start(command: &str) -> ToolCall {
+        ToolCall {
+            id: "c1".to_string(),
+            name: "job".to_string(),
+            arguments: json!({ "action": "start", "command": command }),
+        }
+    }
+
+    #[test]
+    fn shell_prefix_covers_job_start_but_not_other_actions() {
+        assert_eq!(
+            session_shell_prefix(&job_start("cargo test --all")),
+            Some("cargo".to_string())
+        );
+        let cancel = ToolCall {
+            id: "c1".to_string(),
+            name: "job".to_string(),
+            arguments: json!({ "action": "cancel", "job_id": "job_1" }),
+        };
+        assert_eq!(session_shell_prefix(&cancel), None);
     }
 
     #[test]

@@ -1316,7 +1316,7 @@ mod tests {
     #[test]
     fn approval_lines_are_minimal_no_dump_fields() {
         let lines = approval_lines(
-            "shell_run",
+            "shell",
             "Medium",
             false,
             None,
@@ -1328,7 +1328,7 @@ mod tests {
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
             .collect();
-        assert!(text.contains("需要批准") && text.contains("shell_run"));
+        assert!(text.contains("需要批准") && text.contains("shell"));
         assert!(text.contains("npm run build") && text.contains("中风险"));
         for noise in ["Risk:", "Sandbox:", "Rule:", "Tool:", "Approval required"] {
             assert!(!text.contains(noise), "must not contain `{noise}`");

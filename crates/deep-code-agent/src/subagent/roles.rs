@@ -61,7 +61,10 @@ impl SubAgentRole {
 
     #[must_use]
     pub fn allows_shell(self) -> bool {
-        !matches!(self, Self::Review)
+        // Review included since the git_* tools were removed: policy auto-denies
+        // anything unapproved in children, so a reviewer can effectively only
+        // run trusted read-only prefixes (git status/diff/log, …).
+        true
     }
 }
 

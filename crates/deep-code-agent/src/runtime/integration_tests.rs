@@ -84,14 +84,14 @@ fn indexed_tool_call_delta(index: u32, id: &str, name: &str, arguments: &str) ->
 }
 
 /// Auto-approved echo tool: borrows the exact whitelisted read-only name
-/// `git_status` (the policy classifies by exact tool name), and the spec
+/// `read_file` (the policy classifies by exact tool name), and the spec
 /// itself does not require approval. The fake registry in these tests never
-/// registers the real git tools, so the name cannot collide.
+/// registers the real workspace tools, so the name cannot collide.
 #[derive(Debug, Clone, Copy)]
 struct AutoEchoTool;
 
 impl AutoEchoTool {
-    const NAME: &'static str = "git_status";
+    const NAME: &'static str = "read_file";
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -118,7 +118,7 @@ impl Tool for AutoEchoTool {
     ) -> Result<crate::tool::ToolOutput, ToolError> {
         let message = params.message.unwrap_or_default();
         Ok(crate::tool::ToolOutput::text(format!(
-            "git_status: {message}"
+            "read_file: {message}"
         )))
     }
 }
@@ -631,11 +631,11 @@ fn session_allow_excludes_shell_class_tools() {
         session_allowable("web_search") && session_allowable("fetch_url"),
         "network tools are the prime session-allow use case"
     );
+    assert!(!session_allowable("shell"), "shell risk is per-argument");
     assert!(
-        !session_allowable("shell_run"),
-        "shell risk is per-argument"
+        !session_allowable("job"),
+        "a cancel-time consent must not blanket-approve action=start"
     );
-    assert!(!session_allowable("job_start"));
 }
 
 #[tokio::test]
@@ -1330,9 +1330,9 @@ async fn multi_tool_turn_executes_all_auto_calls_in_order_and_persists() {
     assert_eq!(messages[2].tool_calls[0].id, "call_1");
     assert_eq!(messages[2].tool_calls[1].id, "call_2");
     assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_1"));
-    assert_eq!(messages[3].content, "git_status: one");
+    assert_eq!(messages[3].content, "read_file: one");
     assert_eq!(messages[4].tool_call_id.as_deref(), Some("call_2"));
-    assert_eq!(messages[4].content, "git_status: two");
+    assert_eq!(messages[4].content, "read_file: two");
     assert_eq!(messages[5].content, "done");
 
     runtime.shutdown().await;

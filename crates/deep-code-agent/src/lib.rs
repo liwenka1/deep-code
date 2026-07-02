@@ -11,7 +11,6 @@ mod error;
 mod event;
 mod execution_policy;
 mod extensions;
-mod git_tools;
 mod handle;
 mod hooks;
 mod lsp;
@@ -64,7 +63,6 @@ pub use extensions::{
     AgentExtensions, RuntimeBootstrap, attach_agent_extensions, attach_runtime_tools,
     build_runtime_system_prompt,
 };
-pub use git_tools::{GitTools, git_tool_registry};
 pub use handle::{
     HANDLE_READ_TOOL, HandleCount, HandleId, HandleKind, HandleReadOutput, HandleReadTool,
     HandleRecord, HandleStore, HandleSummary, VarHandle, register_handle_read,

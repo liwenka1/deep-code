@@ -1,18 +1,17 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufReader, Read};
-use std::process::Child;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
-use std::thread;
 use std::time::Instant;
 
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
+use tokio::process::Child;
 
 use crate::tool::ToolError;
-use crate::workspace_policy::{invalid, json_string};
+use crate::workspace_policy::invalid;
 
 const JOB_BUFFER_BYTES: usize = 128 * 1024;
 
@@ -79,11 +78,12 @@ pub(super) struct JobState {
     pub(super) command: String,
     pub(super) cwd: String,
     pub(super) started_at: Instant,
-    pub(super) timeout_deadline: Option<Instant>,
     pub(super) status: JobStatus,
     pub(super) exit_code: Option<i32>,
     pub(super) stdout: SharedBuffer,
     pub(super) stderr: SharedBuffer,
+    /// Present for background jobs; foreground children are owned by the
+    /// running tool future and only their terminal state lands here.
     pub(super) child: Option<Child>,
     /// OS sandbox guard tied to the child (Windows Job Object); dropping it with
     /// the job kills the process tree. `None` on macOS/Linux (confined pre-spawn).
@@ -109,6 +109,18 @@ pub enum JobStatus {
     Cancelled,
 }
 
+impl JobStatus {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct SharedBuffer(Arc<Mutex<RingBuffer>>);
 
@@ -126,7 +138,7 @@ impl SharedBuffer {
             .push(bytes);
     }
 
-    fn text(&self) -> String {
+    pub(super) fn text(&self) -> String {
         self.0.lock().expect("output buffer lock poisoned").text()
     }
 
@@ -180,20 +192,34 @@ impl RingBuffer {
     }
 }
 
-pub(super) fn spawn_buffer_reader<R: Read + Send + 'static>(pipe: R, buffer: SharedBuffer) {
-    thread::spawn(move || {
-        let mut reader = BufReader::new(pipe);
+pub(super) type ChunkFn = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+/// Drain one child pipe into the ring buffer, optionally forwarding each
+/// chunk (live streaming for foreground shells; background jobs pass `None`
+/// because their parent turn has already ended).
+pub(super) fn spawn_buffer_reader<R>(mut pipe: R, buffer: SharedBuffer, on_chunk: Option<ChunkFn>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
         let mut chunk = [0_u8; 8192];
         loop {
-            match reader.read(&mut chunk) {
+            match pipe.read(&mut chunk).await {
                 Ok(0) => break,
-                Ok(bytes) => buffer.push(&chunk[..bytes]),
+                Ok(bytes) => {
+                    buffer.push(&chunk[..bytes]);
+                    if let Some(on_chunk) = &on_chunk {
+                        on_chunk(&chunk[..bytes]);
+                    }
+                }
                 Err(_) => break,
             }
         }
     });
 }
 
+/// Fold a finished child's exit status into the job record (background jobs;
+/// foreground terminal states are written by the shell tool itself).
 pub(super) fn refresh_job(job: &mut JobState) {
     if job.status != JobStatus::Running {
         return;
@@ -209,95 +235,150 @@ pub(super) fn refresh_job(job: &mut JobState) {
             JobStatus::Failed
         };
         job.child = None;
-        return;
-    }
-    if job
-        .timeout_deadline
-        .is_some_and(|deadline| Instant::now() >= deadline)
-    {
-        timeout_job(job);
     }
 }
 
-fn timeout_job(job: &mut JobState) {
-    if let Some(child) = job.child.as_mut() {
-        let _ = child.kill();
-        if let Ok(status) = child.wait() {
-            job.exit_code = status.code();
+/// Kill a running job's child and mark it cancelled. The kill signal is sent
+/// under the lock; waiting for the exit happens outside it.
+pub(super) async fn cancel_job(
+    state: &Arc<Mutex<JobState>>,
+    tool_name: &str,
+) -> Result<(), ToolError> {
+    let child = {
+        let mut job = state.lock().expect("job lock poisoned");
+        if job.status != JobStatus::Running {
+            return Ok(());
         }
-    }
-    job.child = None;
-    job.status = JobStatus::TimedOut;
-}
-
-pub(super) fn cancel_job(job: &mut JobState, tool_name: &str) -> Result<(), ToolError> {
-    if let Some(child) = job.child.as_mut() {
-        let _ = child.kill();
-        let status = child.wait().map_err(|error| ToolError::ExecutionFailed {
-            name: tool_name.to_string(),
-            message: format!("failed to wait after cancel: {error}"),
-        })?;
-        job.exit_code = status.code();
-    }
-    job.child = None;
+        let mut child = job.child.take();
+        if let Some(child) = child.as_mut() {
+            let _ = child.start_kill();
+        }
+        child
+    };
+    let exit_code = match child {
+        Some(mut child) => child
+            .wait()
+            .await
+            .map_err(|error| ToolError::ExecutionFailed {
+                name: tool_name.to_string(),
+                message: format!("failed to wait after cancel: {error}"),
+            })?
+            .code(),
+        None => None,
+    };
+    let mut job = state.lock().expect("job lock poisoned");
+    job.exit_code = exit_code;
     job.status = JobStatus::Cancelled;
     Ok(())
 }
 
-pub(super) fn command_output_json(job_id: &str, job: &JobState, max_output_chars: usize) -> String {
-    let stdout = job.stdout.text();
-    let stderr = job.stderr.text();
-    let stdout_len = job.stdout.total_len();
-    let stderr_len = job.stderr.total_len();
-    let stdout_omitted_chars = job.stdout.omitted_len();
-    let stderr_omitted_chars = job.stderr.omitted_len();
-    let stdout = tail_chars(&stdout, max_output_chars);
-    let stderr = tail_chars(&stderr, max_output_chars);
-    json_string(json!({
+/// Model-facing plain-text output for a finished foreground shell command.
+pub(super) fn shell_text_output(job_id: &str, job: &JobState, max_chars: usize) -> String {
+    let stdout = tail_chars(&job.stdout.text(), max_chars);
+    let stderr = tail_chars(&job.stderr.text(), max_chars);
+    let elapsed = format_elapsed(job.started_at.elapsed().as_millis() as u64);
+
+    let mut out = String::new();
+    if stdout.is_empty() && stderr.is_empty() {
+        out.push_str("(no output)\n");
+    } else {
+        if !stdout.is_empty() {
+            out.push_str(&stdout);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        if !stderr.is_empty() {
+            out.push_str("[stderr]\n");
+            out.push_str(&stderr);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+
+    match job.status {
+        JobStatus::TimedOut => out.push_str(&format!(
+            "[timed out after {elapsed} — killed; use `job action=start` for long-running processes]"
+        )),
+        JobStatus::Cancelled => out.push_str(&format!("[cancelled after {elapsed}]")),
+        _ => out.push_str(&format!(
+            "[exit {} · {elapsed}]",
+            job.exit_code.map_or_else(|| "?".to_string(), |code| code.to_string())
+        )),
+    }
+
+    if job.stdout.omitted_len() > 0 || job.stderr.omitted_len() > 0 {
+        out.push_str(&format!(
+            "\n[output truncated — full tail: job action=tail job_id={job_id}]"
+        ));
+    }
+    out
+}
+
+/// Model-facing plain-text snapshot for job status/tail.
+pub(super) fn job_text_snapshot(job_id: &str, job: &JobState, max_chars: usize) -> String {
+    let kind = match job.kind {
+        JobKind::Foreground => "foreground",
+        JobKind::Background => "background",
+    };
+    let exit = job
+        .exit_code
+        .map_or_else(String::new, |code| format!(" · exit {code}"));
+    let mut out = format!(
+        "{job_id} ({kind}) — {}{exit} · {} · cmd: {}\n",
+        job.status.as_str(),
+        format_elapsed(job.started_at.elapsed().as_millis() as u64),
+        job.command
+    );
+    let stdout = tail_chars(&job.stdout.text(), max_chars);
+    let stderr = tail_chars(&job.stderr.text(), max_chars);
+    if !stdout.is_empty() {
+        out.push_str("[stdout]\n");
+        out.push_str(&stdout);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if !stderr.is_empty() {
+        out.push_str("[stderr]\n");
+        out.push_str(&stderr);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if stdout.is_empty() && stderr.is_empty() {
+        out.push_str("(no output)\n");
+    }
+    out
+}
+
+/// UI-facing structured details for any job-backed result.
+pub(super) fn job_details(job_id: &str, job: &JobState) -> Value {
+    json!({
         "job_id": job_id,
         "kind": job.kind,
         "command": job.command,
         "cwd": job.cwd,
         "status": job.status,
         "exit_code": job.exit_code,
-        "elapsed_ms": job.started_at.elapsed().as_millis() as u64,
-        "stdout": stdout,
-        "stderr": stderr,
-        "stdout_len": stdout_len,
-        "stderr_len": stderr_len,
-        "stdout_truncated": stdout_omitted_chars > 0,
-        "stderr_truncated": stderr_omitted_chars > 0,
-        "stdout_omitted_chars": stdout_omitted_chars,
-        "stderr_omitted_chars": stderr_omitted_chars,
-        "approval_reason": "shell commands can modify files, run code, or access the network"
-    }))
+        "duration_ms": job.started_at.elapsed().as_millis() as u64,
+        "stdout_len": job.stdout.total_len(),
+        "stderr_len": job.stderr.total_len(),
+        "stdout_truncated": job.stdout.omitted_len() > 0,
+        "stderr_truncated": job.stderr.omitted_len() > 0,
+    })
 }
 
-pub(super) fn job_snapshot_json(job_id: &str, job: &JobState, max_chars: usize) -> String {
-    let stdout = job.stdout.text();
-    let stderr = job.stderr.text();
-    let stdout_len = job.stdout.total_len();
-    let stderr_len = job.stderr.total_len();
-    let stdout_tail = tail_chars(&stdout, max_chars);
-    let stderr_tail = tail_chars(&stderr, max_chars);
-    json_string(json!({
-        "job_id": job_id,
-        "kind": job.kind,
-        "command": job.command,
-        "cwd": job.cwd,
-        "status": job.status,
-        "exit_code": job.exit_code,
-        "elapsed_ms": job.started_at.elapsed().as_millis() as u64,
-        "stdout_tail": stdout_tail,
-        "stderr_tail": stderr_tail,
-        "stdout_len": stdout_len,
-        "stderr_len": stderr_len,
-        "stdout_omitted_chars": job.stdout.omitted_len(),
-        "stderr_omitted_chars": job.stderr.omitted_len()
-    }))
+fn format_elapsed(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    }
 }
 
-fn tail_chars(value: &str, max_chars: usize) -> String {
+pub(super) fn tail_chars(value: &str, max_chars: usize) -> String {
     let count = value.chars().count();
     if count <= max_chars {
         return value.to_string();
