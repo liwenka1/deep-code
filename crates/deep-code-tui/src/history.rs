@@ -194,7 +194,7 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
         tool_results
             .entry(result.call_id.clone())
             .or_default()
-            .push_back((result.tool_name.clone(), result.status.clone()));
+            .push_back((result.tool_name.clone(), result.status));
     }
 
     let mut cells = Vec::new();
@@ -510,6 +510,7 @@ mod tests {
             tool_name: "mock_echo".to_string(),
             status: ToolResultStatus::Denied,
             content: "mock_echo: hi".to_string(),
+            details: None,
         });
         turn.started_at_ms = 10;
         turn.finished_at_ms = Some(20);
@@ -608,6 +609,7 @@ mod tests {
             tool_name: "first_tool".to_string(),
             status: ToolResultStatus::Denied,
             content: "first result".to_string(),
+            details: None,
         });
         let mut second_turn = deep_code_agent::TurnRecord::new("second");
         second_turn.tool_results.push(deep_code_agent::ToolResult {
@@ -615,6 +617,7 @@ mod tests {
             tool_name: "second_tool".to_string(),
             status: ToolResultStatus::Error,
             content: "second result".to_string(),
+            details: None,
         });
         record.turns.push(first_turn);
         record.turns.push(second_turn);

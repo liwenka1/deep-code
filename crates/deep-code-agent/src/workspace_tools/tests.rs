@@ -1,20 +1,22 @@
+use std::fs;
 use std::path::Path;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::tempdir;
 
 use super::*;
-use crate::tool::{ApprovalDecision, ToolResultStatus, ToolRunOutcome};
+use crate::tool::{ApprovalDecision, ToolCall, ToolResult, ToolResultStatus, ToolRunOutcome};
 
 fn registry(root: &Path) -> ToolRegistry {
     workspace_tool_registry(root.to_path_buf()).unwrap()
 }
 
-fn run(root: &Path, name: &str, arguments: Value) -> ToolResult {
+async fn run(root: &Path, name: &str, arguments: Value) -> ToolResult {
     let registry = registry(root);
     let call = ToolCall::new("call_1", name, arguments);
     let ToolRunOutcome::Result { result } = registry
         .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await
         .unwrap()
     else {
         panic!("expected result");
@@ -22,8 +24,8 @@ fn run(root: &Path, name: &str, arguments: Value) -> ToolResult {
     result
 }
 
-#[test]
-fn read_file_returns_structured_lines() {
+#[tokio::test]
+async fn read_file_returns_structured_lines() {
     let tmp = tempdir().unwrap();
     fs::write(tmp.path().join("notes.txt"), "one\ntwo\nthree\n").unwrap();
 
@@ -31,7 +33,8 @@ fn read_file_returns_structured_lines() {
         tmp.path(),
         "read_file",
         json!({"path": "notes.txt", "start_line": 2, "max_lines": 1}),
-    );
+    )
+    .await;
     let output: Value = serde_json::from_str(&result.content).unwrap();
 
     assert_eq!(output["path"], "notes.txt");
@@ -40,13 +43,13 @@ fn read_file_returns_structured_lines() {
     assert_eq!(output["truncated"], true);
 }
 
-#[test]
-fn list_dir_returns_structured_entries() {
+#[tokio::test]
+async fn list_dir_returns_structured_entries() {
     let tmp = tempdir().unwrap();
     fs::create_dir(tmp.path().join("src")).unwrap();
     fs::write(tmp.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
-    let result = run(tmp.path(), "list_dir", json!({"path": "src"}));
+    let result = run(tmp.path(), "list_dir", json!({"path": "src"})).await;
     let output: Value = serde_json::from_str(&result.content).unwrap();
 
     assert_eq!(output["path"], "src");
@@ -54,8 +57,8 @@ fn list_dir_returns_structured_entries() {
     assert_eq!(output["entries"][0]["kind"], "file");
 }
 
-#[test]
-fn grep_files_returns_matches_with_context() {
+#[tokio::test]
+async fn grep_files_returns_matches_with_context() {
     let tmp = tempdir().unwrap();
     fs::write(tmp.path().join("main.rs"), "alpha\nneedle\nomega\n").unwrap();
 
@@ -63,7 +66,8 @@ fn grep_files_returns_matches_with_context() {
         tmp.path(),
         "grep_files",
         json!({"pattern": "needle", "context_lines": 1}),
-    );
+    )
+    .await;
     let output: Value = serde_json::from_str(&result.content).unwrap();
 
     assert_eq!(output["matches"][0]["path"], "main.rs");
@@ -72,8 +76,8 @@ fn grep_files_returns_matches_with_context() {
     assert_eq!(output["matches"][0]["context_after"][0]["text"], "omega");
 }
 
-#[test]
-fn write_file_requires_approval_and_writes_after_approval() {
+#[tokio::test]
+async fn write_file_requires_approval_and_writes_after_approval() {
     let tmp = tempdir().unwrap();
     let registry = registry(tmp.path());
     let call = ToolCall::new(
@@ -83,11 +87,12 @@ fn write_file_requires_approval_and_writes_after_approval() {
     );
 
     assert!(matches!(
-        registry.run_tool_call(call.clone(), None).unwrap(),
+        registry.run_tool_call(call.clone(), None).await.unwrap(),
         ToolRunOutcome::ApprovalRequired { .. }
     ));
     let ToolRunOutcome::Result { result } = registry
         .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await
         .unwrap()
     else {
         panic!("expected result");
@@ -100,8 +105,8 @@ fn write_file_requires_approval_and_writes_after_approval() {
     );
 }
 
-#[test]
-fn apply_patch_replaces_exactly_once_after_approval() {
+#[tokio::test]
+async fn apply_patch_replaces_exactly_once_after_approval() {
     let tmp = tempdir().unwrap();
     fs::write(tmp.path().join("lib.rs"), "fn old() {}\n").unwrap();
 
@@ -109,7 +114,8 @@ fn apply_patch_replaces_exactly_once_after_approval() {
         tmp.path(),
         "apply_patch",
         json!({"path": "lib.rs", "old": "old", "new": "new"}),
-    );
+    )
+    .await;
 
     assert_eq!(result.status, ToolResultStatus::Success);
     assert_eq!(
@@ -118,21 +124,21 @@ fn apply_patch_replaces_exactly_once_after_approval() {
     );
 }
 
-#[test]
-fn rejects_parent_traversal() {
+#[tokio::test]
+async fn rejects_parent_traversal() {
     let tmp = tempdir().unwrap();
     let registry = registry(tmp.path());
     let call = ToolCall::new("call_1", "read_file", json!({"path": "../secret.txt"}));
 
     assert!(matches!(
-        registry.run_tool_call(call, None),
+        registry.run_tool_call(call, None).await,
         Err(ToolError::InvalidArguments { .. })
     ));
 }
 
 #[cfg(unix)]
-#[test]
-fn rejects_symlink_paths() {
+#[tokio::test]
+async fn rejects_symlink_paths() {
     use std::os::unix::fs::symlink;
 
     let tmp = tempdir().unwrap();
@@ -147,14 +153,14 @@ fn rejects_symlink_paths() {
     let call = ToolCall::new("call_1", "read_file", json!({"path": "link.txt"}));
 
     assert!(matches!(
-        registry.run_tool_call(call, None),
+        registry.run_tool_call(call, None).await,
         Err(ToolError::InvalidArguments { .. })
     ));
 }
 
 #[cfg(unix)]
-#[test]
-fn write_file_rejects_existing_target_symlink() {
+#[tokio::test]
+async fn write_file_rejects_existing_target_symlink() {
     use std::os::unix::fs::symlink;
 
     let tmp = tempdir().unwrap();
@@ -171,7 +177,9 @@ fn write_file_rejects_existing_target_symlink() {
     );
 
     assert!(matches!(
-        registry.run_tool_call(call, Some(ApprovalDecision::Approved)),
+        registry
+            .run_tool_call(call, Some(ApprovalDecision::Approved))
+            .await,
         Err(ToolError::InvalidArguments { .. })
     ));
     assert_eq!(fs::read_to_string(outside_file).unwrap(), "secret");

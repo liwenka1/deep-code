@@ -56,6 +56,7 @@ pub async fn run_subagent<C: LlmClient + Clone + 'static>(
             | RuntimeEvent::ReasoningDelta { .. }
             | RuntimeEvent::ToolCallStarted { .. }
             | RuntimeEvent::ToolCallUpdated { .. }
+            | RuntimeEvent::ToolCallProgress { .. }
             | RuntimeEvent::ApprovalResolved { .. }
             | RuntimeEvent::ToolCallFinished { .. }
             | RuntimeEvent::SessionUpdated { .. } => {}

@@ -32,7 +32,6 @@ mod skills;
 mod subagent;
 mod task_class;
 mod tool;
-mod tool_execution;
 mod web_tools;
 mod workspace_policy;
 mod workspace_summary;
@@ -129,8 +128,9 @@ pub use subagent::{
     is_subagent_tool, register_subagent_tools, subagent_tool_registry,
 };
 pub use tool::{
-    ApprovalDecision, ApprovalRequest, MockEchoTool, Tool, ToolCall, ToolCallAccumulator,
-    ToolError, ToolRegistry, ToolResult, ToolResultStatus, ToolRunOutcome, ToolSpec,
+    ApprovalDecision, ApprovalRequest, ErasedTool, ExecutionMode, MockEchoTool, Tool, ToolCall,
+    ToolCallAccumulator, ToolCx, ToolError, ToolOutput, ToolRegistry, ToolResult,
+    ToolResultStatus, ToolRunOutcome, ToolSpec, ToolUpdate, ToolUpdateFn, run_blocking,
 };
 pub use web_tools::{FetchUrlTool, WebSearchTool, web_tool_registry};
 pub use workspace_summary::{build_workspace_summary, list_workspace_files};

@@ -22,7 +22,8 @@ impl HookSink for RecordingSink {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let workspace = TempDir::new()?;
     let skills_dir = workspace.path().join("skills").join("demo-skill");
     std::fs::create_dir_all(&skills_dir)?;
@@ -78,7 +79,9 @@ fn main() -> anyhow::Result<()> {
 
     let qualified = qualify_tool_name("mock", "echo");
     let call = ToolCall::new("call_1", qualified, json!({}));
-    let outcome = registry.run_tool_call(call, Some(ApprovalDecision::Approved))?;
+    let outcome = registry
+        .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await?;
     let ToolRunOutcome::Result { result } = outcome else {
         anyhow::bail!("expected tool result");
     };

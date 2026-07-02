@@ -56,6 +56,10 @@ impl App {
                 }
                 self.status = "Receiving tool call...".to_string();
             }
+            RuntimeEvent::ToolCallProgress { .. } => {
+                // No tool emits live progress yet; rendering lands with the
+                // streaming shell tool.
+            }
             RuntimeEvent::ApprovalRequired { request, .. } => {
                 self.set_active_approval(request.clone());
                 let sandbox = if request.requires_sandbox {
@@ -282,7 +286,7 @@ impl App {
         if !duplicate {
             self.history.push(HistoryCell::ToolResult {
                 tool_name: result.tool_name.clone(),
-                status: result.status.clone(),
+                status: result.status,
                 summary,
             });
         }

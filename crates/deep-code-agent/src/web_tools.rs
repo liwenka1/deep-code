@@ -1,6 +1,7 @@
 //! Network tools: `web_search` (DuckDuckGo, keyless) and `fetch_url`.
 //!
-//! Both run as blocking tools on the spawn_blocking pool and are gated by
+//! Both wrap their blocking `reqwest` bodies in [`crate::tool::run_blocking`],
+//! so requests land on the spawn_blocking pool, and are gated by
 //! the execution policy (`ToolKind::Network` → approval required); session
 //! approval / `auto_allow` are the intended low-friction paths.
 //!
@@ -13,13 +14,15 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use regex::Regex;
 use reqwest::Url;
 use reqwest::blocking::Client;
 use reqwest::redirect::Policy;
-use serde_json::{Value, json};
+use schemars::JsonSchema;
+use serde::Deserialize;
 
-use crate::tool::{Tool, ToolCall, ToolError, ToolRegistry, ToolResult, ToolSpec};
+use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, run_blocking};
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_REDIRECTS: usize = 5;
@@ -56,61 +59,31 @@ impl Default for FetchUrlTool {
 
 impl FetchUrlTool {
     pub const NAME: &'static str = "fetch_url";
-}
 
-impl Tool for FetchUrlTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Fetch a public http(s) URL and return its text content (HTML is reduced to readable text). Private/internal addresses are rejected.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "Absolute http or https URL to fetch."
-                    }
-                },
-                "required": ["url"],
-                "additionalProperties": false
-            }),
-            false,
-        )
-    }
-
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let url = call
-            .arguments
-            .get("url")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArguments {
-                name: call.name.clone(),
-                message: "missing string field 'url'".to_string(),
-            })?;
-
-        let parsed = match Url::parse(url) {
+    fn fetch_sync(&self, params: FetchUrlParams) -> Result<ToolOutput, ToolError> {
+        let parsed = match Url::parse(&params.url) {
             Ok(parsed) => parsed,
             Err(error) => {
-                return Ok(ToolResult::error(call, format!("无法解析 URL：{error}")));
+                return Ok(ToolOutput::soft_error(format!("无法解析 URL：{error}")));
             }
         };
         if let Err(reason) = check_url(&parsed, self.allow_private) {
-            return Ok(ToolResult::error(call, reason));
+            return Ok(ToolOutput::soft_error(reason));
         }
 
         let client = match guarded_client(self.allow_private) {
             Ok(client) => client,
-            Err(error) => return Ok(ToolResult::error(call, error)),
+            Err(error) => return Ok(ToolOutput::soft_error(error)),
         };
         let response = match client.get(parsed).send() {
             Ok(response) => response,
             Err(error) => {
-                return Ok(ToolResult::error(call, format!("请求失败：{error}")));
+                return Ok(ToolOutput::soft_error(format!("请求失败：{error}")));
             }
         };
         let status = response.status();
         if !status.is_success() {
-            return Ok(ToolResult::error(call, format!("HTTP 状态 {status}")));
+            return Ok(ToolOutput::soft_error(format!("HTTP 状态 {status}")));
         }
         let content_type = response
             .headers()
@@ -122,7 +95,7 @@ impl Tool for FetchUrlTool {
         let mut body = Vec::new();
         let mut limited = response.take(self.max_bytes as u64 + 1);
         if let Err(error) = limited.read_to_end(&mut body) {
-            return Ok(ToolResult::error(call, format!("读取响应失败：{error}")));
+            return Ok(ToolOutput::soft_error(format!("读取响应失败：{error}")));
         }
         let truncated = body.len() > self.max_bytes;
         body.truncate(self.max_bytes);
@@ -136,11 +109,32 @@ impl Tool for FetchUrlTool {
         if truncated {
             text.push_str("\n\n[内容已按大小上限截断]");
         }
-        Ok(ToolResult::success(
-            call.id.clone(),
-            call.name.clone(),
-            text,
-        ))
+        Ok(ToolOutput::text(text))
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FetchUrlParams {
+    /// Absolute http or https URL to fetch.
+    url: String,
+}
+
+#[async_trait]
+impl Tool for FetchUrlTool {
+    type Params = FetchUrlParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Fetch a public http(s) URL and return its text content (HTML is reduced to readable text). Private/internal addresses are rejected."
+    }
+
+    async fn run(&self, params: FetchUrlParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        let this = self.clone();
+        run_blocking(Self::NAME, move || this.fetch_sync(params)).await
     }
 }
 
@@ -149,53 +143,24 @@ pub struct WebSearchTool;
 
 impl WebSearchTool {
     pub const NAME: &'static str = "web_search";
-}
 
-impl Tool for WebSearchTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Search the web (DuckDuckGo) and return the top results with title, URL and snippet.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query."
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Number of results to return (1-10, default 5)."
-                    }
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            }),
-            false,
-        )
-    }
-
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let query = call
-            .arguments
-            .get("query")
-            .and_then(Value::as_str)
-            .filter(|query| !query.trim().is_empty())
-            .ok_or_else(|| ToolError::InvalidArguments {
-                name: call.name.clone(),
+    fn search_sync(&self, params: WebSearchParams) -> Result<ToolOutput, ToolError> {
+        let query = params.query.as_str();
+        if query.trim().is_empty() {
+            return Err(ToolError::InvalidArguments {
+                name: Self::NAME.to_string(),
                 message: "missing string field 'query'".to_string(),
-            })?;
-        let max_results = call
-            .arguments
-            .get("max_results")
-            .and_then(Value::as_u64)
+            });
+        }
+        let max_results = params
+            .max_results
             .map_or(DEFAULT_SEARCH_RESULTS, |value| {
-                (value as usize).clamp(1, MAX_SEARCH_RESULTS)
+                value.clamp(1, MAX_SEARCH_RESULTS)
             });
 
         let client = match guarded_client(false) {
             Ok(client) => client,
-            Err(error) => return Ok(ToolResult::error(call, error)),
+            Err(error) => return Ok(ToolOutput::soft_error(error)),
         };
         let url = format!(
             "https://html.duckduckgo.com/html/?q={}",
@@ -204,30 +169,25 @@ impl Tool for WebSearchTool {
         let response = match client.get(&url).send() {
             Ok(response) => response,
             Err(error) => {
-                return Ok(ToolResult::error(
-                    call,
-                    format!("搜索请求失败（国内网络可能需要代理）：{error}"),
-                ));
+                return Ok(ToolOutput::soft_error(format!(
+                    "搜索请求失败（国内网络可能需要代理）：{error}"
+                )));
             }
         };
         let status = response.status();
         if !status.is_success() {
-            return Ok(ToolResult::error(call, format!("搜索返回 HTTP {status}")));
+            return Ok(ToolOutput::soft_error(format!("搜索返回 HTTP {status}")));
         }
         let html = match response.text() {
             Ok(html) => html,
             Err(error) => {
-                return Ok(ToolResult::error(
-                    call,
-                    format!("读取搜索结果失败：{error}"),
-                ));
+                return Ok(ToolOutput::soft_error(format!("读取搜索结果失败：{error}")));
             }
         };
 
         let results = parse_search_results(&html, max_results);
         if results.is_empty() {
-            return Ok(ToolResult::error(
-                call,
+            return Ok(ToolOutput::soft_error(
                 "未解析到搜索结果：可能无匹配，或 DuckDuckGo 页面结构已变化".to_string(),
             ));
         }
@@ -241,7 +201,34 @@ impl Tool for WebSearchTool {
                 result.snippet
             ));
         }
-        Ok(ToolResult::success(call.id.clone(), call.name.clone(), out))
+        Ok(ToolOutput::text(out))
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchParams {
+    /// Search query.
+    query: String,
+    /// Number of results to return (1-10, default 5).
+    max_results: Option<usize>,
+}
+
+#[async_trait]
+impl Tool for WebSearchTool {
+    type Params = WebSearchParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Search the web (DuckDuckGo) and return the top results with title, URL and snippet."
+    }
+
+    async fn run(&self, params: WebSearchParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        let this = *self;
+        run_blocking(Self::NAME, move || this.search_sync(params)).await
     }
 }
 
@@ -463,6 +450,10 @@ mod tests {
     use std::io::Write;
     use std::net::TcpListener;
 
+    use serde_json::{Value, json};
+
+    use crate::tool::{ErasedTool, ToolCall, ToolCx};
+
     fn call(name: &str, arguments: Value) -> ToolCall {
         ToolCall::new("call_1", name, arguments)
     }
@@ -544,16 +535,20 @@ mod tests {
         assert_eq!(capped.len(), 1);
     }
 
-    #[test]
-    fn fetch_url_reads_local_server_and_truncates() {
+    #[tokio::test]
+    async fn fetch_url_reads_local_server_and_truncates() {
         let url = serve_once("x".repeat(64), "text/plain");
         let tool = FetchUrlTool {
             allow_private: true,
             max_bytes: 16,
         };
-        let result = tool
-            .execute(&call(FetchUrlTool::NAME, json!({ "url": url })))
-            .unwrap();
+        let result = ErasedTool::execute(
+            &tool,
+            &call(FetchUrlTool::NAME, json!({ "url": url })),
+            &ToolCx::default(),
+        )
+        .await
+        .unwrap();
         assert!(result.content.starts_with("xxxx"));
         assert!(result.content.contains("截断"));
 
@@ -562,21 +557,26 @@ mod tests {
             allow_private: true,
             max_bytes: DEFAULT_MAX_FETCH_BYTES,
         };
-        let result = tool
-            .execute(&call(FetchUrlTool::NAME, json!({ "url": url })))
-            .unwrap();
+        let result = ErasedTool::execute(
+            &tool,
+            &call(FetchUrlTool::NAME, json!({ "url": url })),
+            &ToolCx::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.content, "纯文本 & tags");
     }
 
-    #[test]
-    fn fetch_url_blocks_private_by_default() {
+    #[tokio::test]
+    async fn fetch_url_blocks_private_by_default() {
         let tool = FetchUrlTool::default();
-        let result = tool
-            .execute(&call(
-                FetchUrlTool::NAME,
-                json!({ "url": "http://127.0.0.1:9/" }),
-            ))
-            .unwrap();
+        let result = ErasedTool::execute(
+            &tool,
+            &call(FetchUrlTool::NAME, json!({ "url": "http://127.0.0.1:9/" })),
+            &ToolCx::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.status, crate::tool::ToolResultStatus::Error);
         assert!(result.content.contains("非公网"));
     }
@@ -593,43 +593,58 @@ mod tests {
         }
     }
 
-    #[test]
-    fn missing_arguments_are_invalid() {
-        assert!(
-            FetchUrlTool::default()
-                .execute(&call(FetchUrlTool::NAME, json!({})))
-                .is_err()
-        );
-        assert!(
-            WebSearchTool
-                .execute(&call(WebSearchTool::NAME, json!({ "query": " " })))
-                .is_err()
-        );
+    #[tokio::test]
+    async fn missing_arguments_are_invalid() {
+        // Missing `url` now fails serde parsing in the ErasedTool blanket impl
+        // (message wording is serde's, e.g. "missing field `url`").
+        let error = ErasedTool::execute(
+            &FetchUrlTool::default(),
+            &call(FetchUrlTool::NAME, json!({})),
+            &ToolCx::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments { .. }));
+
+        // Blank query is value-level validation inside the tool body.
+        let error = ErasedTool::execute(
+            &WebSearchTool,
+            &call(WebSearchTool::NAME, json!({ "query": " " })),
+            &ToolCx::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments { .. }));
     }
 
     /// Real-network checks; run manually with
     /// `cargo test -p deep-code-agent web_tools -- --ignored`.
-    #[test]
+    #[tokio::test]
     #[ignore]
-    fn fetch_url_real_network() {
-        let result = FetchUrlTool::default()
-            .execute(&call(
-                FetchUrlTool::NAME,
-                json!({ "url": "https://example.com/" }),
-            ))
-            .unwrap();
+    async fn fetch_url_real_network() {
+        let result = ErasedTool::execute(
+            &FetchUrlTool::default(),
+            &call(FetchUrlTool::NAME, json!({ "url": "https://example.com/" })),
+            &ToolCx::default(),
+        )
+        .await
+        .unwrap();
         assert!(result.content.contains("Example Domain"));
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore]
-    fn web_search_real_network() {
-        let result = WebSearchTool
-            .execute(&call(
+    async fn web_search_real_network() {
+        let result = ErasedTool::execute(
+            &WebSearchTool,
+            &call(
                 WebSearchTool::NAME,
                 json!({ "query": "rust programming language", "max_results": 3 }),
-            ))
-            .unwrap();
+            ),
+            &ToolCx::default(),
+        )
+        .await
+        .unwrap();
         assert!(result.content.contains("1. "));
     }
 }

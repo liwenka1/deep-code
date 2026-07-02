@@ -106,9 +106,9 @@ None.
             json!({"prompt": "explore mod.rs", "type": "explore", "name": "second"}),
         );
 
-        let first = registry.run_tool_call(open, None).unwrap();
+        let first = registry.run_tool_call(open, None).await.unwrap();
         assert!(first.is_result_success(), "open failed: {first:?}");
-        let second = registry.run_tool_call(second, None);
+        let second = registry.run_tool_call(second, None).await;
         assert!(
             second.is_err(),
             "expected concurrency error, got {second:?}"
@@ -143,6 +143,7 @@ None.
         );
         let open_result = registry
             .run_tool_call(open, None)
+            .await
             .unwrap()
             .into_result()
             .unwrap();
@@ -167,6 +168,7 @@ None.
         );
         let eval_result = registry
             .run_tool_call(eval, None)
+            .await
             .unwrap()
             .into_result()
             .unwrap();
@@ -201,6 +203,7 @@ None.
         );
         let open_result = registry
             .run_tool_call(open, None)
+            .await
             .unwrap()
             .into_result()
             .unwrap();
@@ -210,6 +213,7 @@ None.
         let close = ToolCall::new("call_2", "agent_close", json!({"agent_id": agent_id}));
         let close_result = registry
             .run_tool_call(close, None)
+            .await
             .unwrap()
             .into_result()
             .unwrap();
@@ -254,6 +258,7 @@ None.
         );
         let open_result = registry
             .run_tool_call(open, None)
+            .await
             .unwrap()
             .into_result()
             .unwrap();
@@ -303,6 +308,7 @@ None.
         );
         let open_result = registry
             .run_tool_call(open, None)
+            .await
             .unwrap()
             .into_result()
             .unwrap();
@@ -319,6 +325,7 @@ None.
         );
         let eval_result = registry
             .run_tool_call(eval, None)
+            .await
             .unwrap()
             .into_result()
             .unwrap();

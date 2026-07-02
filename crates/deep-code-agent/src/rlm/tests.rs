@@ -26,8 +26,8 @@ fn rlm_open_eval_and_handle_overflow() {
     assert!(output.handle_id.is_some());
 }
 
-#[test]
-fn rlm_tools_roundtrip_with_handle_read() {
+#[tokio::test]
+async fn rlm_tools_roundtrip_with_handle_read() {
     let dir = TempDir::new().unwrap();
     let file_path = dir.path().join("sample.txt");
     std::fs::write(&file_path, "alpha\nbeta\ngamma\n").unwrap();
@@ -48,6 +48,7 @@ fn rlm_tools_roundtrip_with_handle_read() {
     );
     let open_result = registry
         .run_tool_call(open, None)
+        .await
         .expect("open")
         .result()
         .expect("open result");
@@ -58,7 +59,7 @@ fn rlm_tools_roundtrip_with_handle_read() {
         "rlm_eval",
         json!({"name": "ctx", "code": "grep alpha"}),
     );
-    let eval_outcome = registry.run_tool_call(eval, None).expect("eval plan");
+    let eval_outcome = registry.run_tool_call(eval, None).await.expect("eval plan");
     assert!(eval_outcome.approval_required());
     let eval_result = registry
         .run_tool_call(
@@ -69,6 +70,7 @@ fn rlm_tools_roundtrip_with_handle_read() {
             ),
             Some(ApprovalDecision::Approved),
         )
+        .await
         .expect("eval")
         .result()
         .expect("eval result");
@@ -77,13 +79,14 @@ fn rlm_tools_roundtrip_with_handle_read() {
     let close = ToolCall::new("c3", "rlm_close", json!({"name": "ctx"}));
     registry
         .run_tool_call(close, None)
+        .await
         .expect("close")
         .result()
         .expect("close result");
 }
 
-#[test]
-fn rlm_overflow_then_handle_read() {
+#[tokio::test]
+async fn rlm_overflow_then_handle_read() {
     let dir = TempDir::new().unwrap();
     let body = (0..500)
         .map(|index| format!("event-{index}"))
@@ -109,6 +112,7 @@ fn rlm_overflow_then_handle_read() {
             ),
             None,
         )
+        .await
         .expect("open")
         .result()
         .expect("open result");
@@ -122,6 +126,7 @@ fn rlm_overflow_then_handle_read() {
             ),
             None,
         )
+        .await
         .expect("configure")
         .result()
         .expect("configure result");
@@ -135,6 +140,7 @@ fn rlm_overflow_then_handle_read() {
             ),
             Some(ApprovalDecision::Approved),
         )
+        .await
         .expect("eval")
         .result()
         .expect("eval result");
@@ -150,6 +156,7 @@ fn rlm_overflow_then_handle_read() {
             ),
             None,
         )
+        .await
         .expect("handle_read")
         .result()
         .expect("handle_read result");

@@ -403,6 +403,7 @@ pub fn runtime_event_kind(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::ReasoningDelta { .. } => "reasoning.delta",
         RuntimeEvent::ToolCallStarted { .. } => "tool.started",
         RuntimeEvent::ToolCallUpdated { .. } => "tool.updated",
+        RuntimeEvent::ToolCallProgress { .. } => "tool.progress",
         RuntimeEvent::Provider(_) => "provider",
         RuntimeEvent::ApprovalRequired { .. } => "approval.required",
         RuntimeEvent::ApprovalResolved { .. } => "approval.resolved",
@@ -440,6 +441,7 @@ fn event_turn_id(event: &RuntimeEvent) -> Option<TurnId> {
         | RuntimeEvent::TurnCancelled { turn_id } => Some(turn_id.clone()),
         RuntimeEvent::ApprovalRequired { turn_id, .. }
         | RuntimeEvent::ApprovalResolved { turn_id, .. }
+        | RuntimeEvent::ToolCallProgress { turn_id, .. }
         | RuntimeEvent::ToolCallFinished { turn_id, .. }
         | RuntimeEvent::Error { turn_id, .. } => turn_id.clone(),
         RuntimeEvent::Provider(_)

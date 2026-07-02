@@ -12,7 +12,8 @@ use deep_code_agent::{
 use serde_json::json;
 use tempfile::TempDir;
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let sample = dir.path().join("log.txt");
     std::fs::write(
@@ -37,7 +38,7 @@ fn main() -> anyhow::Result<()> {
         "rlm_open",
         json!({"name": "logs", "file_path": "log.txt"}),
     );
-    let open_result = run(&registry, open, None)?;
+    let open_result = run(&registry, open, None).await?;
     println!("rlm_open: {open_result}");
 
     let eval = ToolCall::new(
@@ -45,7 +46,7 @@ fn main() -> anyhow::Result<()> {
         "rlm_eval",
         json!({"name": "logs", "code": "stats\nhead 5"}),
     );
-    let eval_result = run(&registry, eval, Some(ApprovalDecision::Approved))?;
+    let eval_result = run(&registry, eval, Some(ApprovalDecision::Approved)).await?;
     println!("rlm_eval: {eval_result}");
 
     let handle_id = extract_handle_id(&eval_result);
@@ -55,23 +56,23 @@ fn main() -> anyhow::Result<()> {
             "handle_read",
             json!({"handle": handle_id, "mode": "head", "lines": 3}),
         );
-        let read_result = run(&registry, read, None)?;
+        let read_result = run(&registry, read, None).await?;
         println!("handle_read: {read_result}");
     }
 
     let close = ToolCall::new("close", "rlm_close", json!({"name": "logs"}));
-    let close_result = run(&registry, close, None)?;
+    let close_result = run(&registry, close, None).await?;
     println!("rlm_close: {close_result}");
 
     Ok(())
 }
 
-fn run(
+async fn run(
     registry: &ToolRegistry,
     call: ToolCall,
     decision: Option<ApprovalDecision>,
 ) -> anyhow::Result<String> {
-    match registry.run_tool_call(call, decision)? {
+    match registry.run_tool_call(call, decision).await? {
         deep_code_agent::ToolRunOutcome::ApprovalRequired { request } => {
             anyhow::bail!("unexpected approval for {}", request.tool_name)
         }

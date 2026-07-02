@@ -4,14 +4,14 @@ use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::json;
 
-use crate::sandbox::SandboxManager;
-use crate::tool::{Tool, ToolCall, ToolError, ToolRegistry, ToolResult, ToolSpec};
-use crate::tool_execution::current_sandbox_policy;
-use crate::workspace_policy::{
-    WorkspacePolicy, invalid, json_string, optional_str, optional_u64, required_str,
-};
+use crate::sandbox::{SandboxManager, SandboxPolicy};
+use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, run_blocking};
+use crate::workspace_policy::{WorkspacePolicy, invalid, json_string};
 pub use jobs::{BackgroundJobSummary, JobStore};
 use jobs::{
     JobKind, JobState, JobStatus, SharedBuffer, cancel_job, command_output_json, job_snapshot_json,
@@ -96,42 +96,21 @@ impl ShellRunTool {
             sandbox,
         }
     }
-}
 
-impl Tool for ShellRunTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Run a foreground shell command inside the workspace with timeout, bounded output, and a cancellable job record. Requires approval because shell commands can modify the workspace.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "Shell command to execute"},
-                    "cwd": {"type": "string", "description": "Optional workspace-relative working directory"},
-                    "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds, default 30000, max 300000"}
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-            true,
-        )
-    }
-
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let command = required_str(&call.arguments, "command", Self::NAME)?;
+    fn run_sync(
+        &self,
+        params: ShellRunParams,
+        policy: &SandboxPolicy,
+    ) -> Result<ToolOutput, ToolError> {
+        let command = params.command.as_str();
         if command.trim().is_empty() {
             return Err(invalid(Self::NAME, "command must not be empty"));
         }
-        let cwd = self
-            .root
-            .resolve_cwd(optional_str(&call.arguments, "cwd"), Self::NAME)?;
-        let timeout_ms = optional_u64(
-            &call.arguments,
-            "timeout_ms",
-            DEFAULT_TIMEOUT_MS,
-            Self::NAME,
-        )?
-        .clamp(1, MAX_TIMEOUT_MS);
+        let cwd = self.root.resolve_cwd(params.cwd.as_deref(), Self::NAME)?;
+        let timeout_ms = params
+            .timeout_ms
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .clamp(1, MAX_TIMEOUT_MS);
 
         let started = Instant::now();
         // Detach stdin from the console: an inherited child (e.g. `cmd /C` on
@@ -139,7 +118,7 @@ impl Tool for ShellRunTool {
         // capture so the wheel turns into ↑/↓ keys in the TUI.
         let mut child = self
             .sandbox
-            .wrap_shell_command(command, &cwd, self.root.root(), &current_sandbox_policy())
+            .wrap_shell_command(command, &cwd, self.root.root(), policy)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -149,9 +128,7 @@ impl Tool for ShellRunTool {
                 message: format!("failed to start command: {error}"),
             })?;
 
-        let job_guard = self
-            .sandbox
-            .confine_spawned(&child, &current_sandbox_policy());
+        let job_guard = self.sandbox.confine_spawned(&child, policy);
         let stdout = SharedBuffer::default();
         let stderr = SharedBuffer::default();
         if let Some(pipe) = child.stdout.take() {
@@ -193,11 +170,45 @@ impl Tool for ShellRunTool {
 
         let job = self.jobs.get(&job_id, Self::NAME)?;
         let job = job.lock().expect("job lock poisoned");
-        Ok(ToolResult::success(
-            call.id.clone(),
-            call.name.clone(),
-            command_output_json(&job_id, &job, MAX_OUTPUT_CHARS),
-        ))
+        Ok(ToolOutput::text(command_output_json(
+            &job_id,
+            &job,
+            MAX_OUTPUT_CHARS,
+        )))
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ShellRunParams {
+    /// Shell command to execute
+    command: String,
+    /// Optional workspace-relative working directory
+    cwd: Option<String>,
+    /// Timeout in milliseconds, default 30000, max 300000
+    timeout_ms: Option<u64>,
+}
+
+#[async_trait]
+impl Tool for ShellRunTool {
+    type Params = ShellRunParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Run a foreground shell command inside the workspace with timeout, bounded output, and a cancellable job record. Requires approval because shell commands can modify the workspace."
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn run(&self, params: ShellRunParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        let this = self.clone();
+        let policy = cx.sandbox_policy();
+        run_blocking(Self::NAME, move || this.run_sync(params, &policy)).await
     }
 }
 
@@ -218,37 +229,20 @@ impl JobStartTool {
             sandbox,
         }
     }
-}
 
-impl Tool for JobStartTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Start a background shell command inside the workspace. Requires approval because shell commands can modify the workspace.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "cwd": {"type": "string", "description": "Optional workspace-relative working directory"}
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-            true,
-        )
-    }
-
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let command = required_str(&call.arguments, "command", Self::NAME)?;
+    fn start_sync(
+        &self,
+        params: JobStartParams,
+        policy: &SandboxPolicy,
+    ) -> Result<ToolOutput, ToolError> {
+        let command = params.command.as_str();
         if command.trim().is_empty() {
             return Err(invalid(Self::NAME, "command must not be empty"));
         }
-        let cwd = self
-            .root
-            .resolve_cwd(optional_str(&call.arguments, "cwd"), Self::NAME)?;
+        let cwd = self.root.resolve_cwd(params.cwd.as_deref(), Self::NAME)?;
         let mut child = self
             .sandbox
-            .wrap_shell_command(command, &cwd, self.root.root(), &current_sandbox_policy())
+            .wrap_shell_command(command, &cwd, self.root.root(), policy)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -257,9 +251,7 @@ impl Tool for JobStartTool {
                 name: Self::NAME.to_string(),
                 message: format!("failed to start background command: {error}"),
             })?;
-        let job_guard = self
-            .sandbox
-            .confine_spawned(&child, &current_sandbox_policy());
+        let job_guard = self.sandbox.confine_spawned(&child, policy);
         let stdout = SharedBuffer::default();
         let stderr = SharedBuffer::default();
         if let Some(pipe) = child.stdout.take() {
@@ -283,18 +275,45 @@ impl Tool for JobStartTool {
             job_guard,
         });
 
-        Ok(ToolResult::success(
-            call.id.clone(),
-            call.name.clone(),
-            json_string(json!({
-                "job_id": job_id,
-                "command": command,
-                "cwd": self.root.relative_display(&cwd),
-                "status": "running",
-                "kind": "background",
-                "approval_reason": "shell commands can modify files, run code, or access the network"
-            })),
-        ))
+        Ok(ToolOutput::text(json_string(json!({
+            "job_id": job_id,
+            "command": command,
+            "cwd": self.root.relative_display(&cwd),
+            "status": "running",
+            "kind": "background",
+            "approval_reason": "shell commands can modify files, run code, or access the network"
+        }))))
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct JobStartParams {
+    command: String,
+    /// Optional workspace-relative working directory
+    cwd: Option<String>,
+}
+
+#[async_trait]
+impl Tool for JobStartTool {
+    type Params = JobStartParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Start a background shell command inside the workspace. Requires approval because shell commands can modify the workspace."
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn run(&self, params: JobStartParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        let this = self.clone();
+        let policy = cx.sandbox_policy();
+        run_blocking(Self::NAME, move || this.start_sync(params, &policy)).await
     }
 }
 
@@ -309,33 +328,40 @@ impl JobStatusTool {
     fn new(jobs: JobStore) -> Self {
         Self { jobs }
     }
-}
 
-impl Tool for JobStatusTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Read the current status of a background job.",
-            json!({
-                "type": "object",
-                "properties": {"job_id": {"type": "string"}},
-                "required": ["job_id"],
-                "additionalProperties": false
-            }),
-            false,
-        )
-    }
-
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let job_id = required_str(&call.arguments, "job_id", Self::NAME)?;
-        let job = self.jobs.get(job_id, Self::NAME)?;
+    fn status_sync(&self, params: JobStatusParams) -> Result<ToolOutput, ToolError> {
+        let job = self.jobs.get(&params.job_id, Self::NAME)?;
         let mut job = job.lock().expect("job lock poisoned");
         refresh_job(&mut job);
-        Ok(ToolResult::success(
-            call.id.clone(),
-            call.name.clone(),
-            job_snapshot_json(job_id, &job, DEFAULT_TAIL_CHARS),
-        ))
+        Ok(ToolOutput::text(job_snapshot_json(
+            &params.job_id,
+            &job,
+            DEFAULT_TAIL_CHARS,
+        )))
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct JobStatusParams {
+    job_id: String,
+}
+
+#[async_trait]
+impl Tool for JobStatusTool {
+    type Params = JobStatusParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Read the current status of a background job."
+    }
+
+    async fn run(&self, params: JobStatusParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        let this = self.clone();
+        run_blocking(Self::NAME, move || this.status_sync(params)).await
     }
 }
 
@@ -350,43 +376,46 @@ impl JobTailTool {
     fn new(jobs: JobStore) -> Self {
         Self { jobs }
     }
-}
 
-impl Tool for JobTailTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Read bounded stdout/stderr tails for a background job.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "job_id": {"type": "string"},
-                    "max_chars": {"type": "integer", "description": "Tail size per stream, default 4000, max 20000"}
-                },
-                "required": ["job_id"],
-                "additionalProperties": false
-            }),
-            false,
-        )
-    }
-
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let job_id = required_str(&call.arguments, "job_id", Self::NAME)?;
-        let max_chars = optional_u64(
-            &call.arguments,
-            "max_chars",
-            DEFAULT_TAIL_CHARS as u64,
-            Self::NAME,
-        )?
-        .clamp(1, MAX_TAIL_CHARS as u64) as usize;
-        let job = self.jobs.get(job_id, Self::NAME)?;
+    fn tail_sync(&self, params: JobTailParams) -> Result<ToolOutput, ToolError> {
+        let max_chars = params
+            .max_chars
+            .unwrap_or(DEFAULT_TAIL_CHARS as u64)
+            .clamp(1, MAX_TAIL_CHARS as u64) as usize;
+        let job = self.jobs.get(&params.job_id, Self::NAME)?;
         let mut job = job.lock().expect("job lock poisoned");
         refresh_job(&mut job);
-        Ok(ToolResult::success(
-            call.id.clone(),
-            call.name.clone(),
-            job_snapshot_json(job_id, &job, max_chars),
-        ))
+        Ok(ToolOutput::text(job_snapshot_json(
+            &params.job_id,
+            &job,
+            max_chars,
+        )))
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct JobTailParams {
+    job_id: String,
+    /// Tail size per stream, default 4000, max 20000
+    max_chars: Option<u64>,
+}
+
+#[async_trait]
+impl Tool for JobTailTool {
+    type Params = JobTailParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Read bounded stdout/stderr tails for a background job."
+    }
+
+    async fn run(&self, params: JobTailParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        let this = self.clone();
+        run_blocking(Self::NAME, move || this.tail_sync(params)).await
     }
 }
 
@@ -401,36 +430,47 @@ impl JobCancelTool {
     fn new(jobs: JobStore) -> Self {
         Self { jobs }
     }
-}
 
-impl Tool for JobCancelTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Cancel a running shell job. Requires approval because it changes process state.",
-            json!({
-                "type": "object",
-                "properties": {"job_id": {"type": "string"}},
-                "required": ["job_id"],
-                "additionalProperties": false
-            }),
-            true,
-        )
-    }
-
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let job_id = required_str(&call.arguments, "job_id", Self::NAME)?;
-        let job = self.jobs.get(job_id, Self::NAME)?;
+    fn cancel_sync(&self, params: JobCancelParams) -> Result<ToolOutput, ToolError> {
+        let job = self.jobs.get(&params.job_id, Self::NAME)?;
         let mut job = job.lock().expect("job lock poisoned");
         refresh_job(&mut job);
         if job.status == JobStatus::Running {
             cancel_job(&mut job, Self::NAME)?;
         }
-        Ok(ToolResult::success(
-            call.id.clone(),
-            call.name.clone(),
-            job_snapshot_json(job_id, &job, DEFAULT_TAIL_CHARS),
-        ))
+        Ok(ToolOutput::text(job_snapshot_json(
+            &params.job_id,
+            &job,
+            DEFAULT_TAIL_CHARS,
+        )))
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct JobCancelParams {
+    job_id: String,
+}
+
+#[async_trait]
+impl Tool for JobCancelTool {
+    type Params = JobCancelParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Cancel a running shell job. Requires approval because it changes process state."
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn run(&self, params: JobCancelParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        let this = self.clone();
+        run_blocking(Self::NAME, move || this.cancel_sync(params)).await
     }
 }
 

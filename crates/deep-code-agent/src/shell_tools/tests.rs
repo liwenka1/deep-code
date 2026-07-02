@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 
 use super::*;
-use crate::tool::{ApprovalDecision, ToolResultStatus, ToolRunOutcome};
+use crate::tool::{ApprovalDecision, ToolCall, ToolResult, ToolResultStatus, ToolRunOutcome};
 
 fn registry(root: &std::path::Path) -> ToolRegistry {
     ShellTools::new(root)
@@ -14,10 +14,11 @@ fn registry(root: &std::path::Path) -> ToolRegistry {
         .into_registry()
 }
 
-fn approved(root: &std::path::Path, name: &str, arguments: Value) -> ToolResult {
+async fn approved(root: &std::path::Path, name: &str, arguments: Value) -> ToolResult {
     let call = ToolCall::new("call_1", name, arguments);
     let ToolRunOutcome::Result { result } = registry(root)
         .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await
         .unwrap()
     else {
         panic!("expected result");
@@ -25,19 +26,20 @@ fn approved(root: &std::path::Path, name: &str, arguments: Value) -> ToolResult 
     result
 }
 
-#[test]
-fn shell_run_requires_approval_and_returns_output() {
+#[tokio::test]
+async fn shell_run_requires_approval_and_returns_output() {
     let tmp = tempdir().unwrap();
     let registry = registry(tmp.path());
     // `echo hello` works on both sh and cmd, so the test is cross-platform.
     let call = ToolCall::new("call_1", "shell_run", json!({"command": "echo hello"}));
 
     assert!(matches!(
-        registry.run_tool_call(call.clone(), None).unwrap(),
+        registry.run_tool_call(call.clone(), None).await.unwrap(),
         ToolRunOutcome::ApprovalRequired { .. }
     ));
     let ToolRunOutcome::Result { result } = registry
         .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await
         .unwrap()
     else {
         panic!("expected result");
@@ -49,41 +51,44 @@ fn shell_run_requires_approval_and_returns_output() {
     assert_eq!(output["kind"], "foreground");
     let job_id = output["job_id"].as_str().unwrap();
     let status = ToolCall::new("call_2", "job_status", json!({"job_id": job_id}));
-    let ToolRunOutcome::Result { result } = registry.run_tool_call(status, None).unwrap() else {
+    let ToolRunOutcome::Result { result } = registry.run_tool_call(status, None).await.unwrap()
+    else {
         panic!("expected result");
     };
     let output: Value = serde_json::from_str(&result.content).unwrap();
     assert_eq!(output["kind"], "foreground");
 }
 
-#[test]
-fn shell_run_reports_failure() {
+#[tokio::test]
+async fn shell_run_reports_failure() {
     let tmp = tempdir().unwrap();
-    let result = approved(tmp.path(), "shell_run", json!({"command": "exit 7"}));
+    let result = approved(tmp.path(), "shell_run", json!({"command": "exit 7"})).await;
     let output: Value = serde_json::from_str(&result.content).unwrap();
     assert_eq!(output["status"], "failed");
     assert_eq!(output["exit_code"], 7);
 }
 
-#[test]
-fn shell_run_times_out() {
+#[tokio::test]
+async fn shell_run_times_out() {
     let tmp = tempdir().unwrap();
     let result = approved(
         tmp.path(),
         "shell_run",
         json!({"command": "sleep 1", "timeout_ms": 1}),
-    );
+    )
+    .await;
     let output: Value = serde_json::from_str(&result.content).unwrap();
     assert_eq!(output["status"], "timed_out");
 }
 
-#[test]
-fn long_shell_run_returns_cancellable_job_id() {
+#[tokio::test]
+async fn long_shell_run_returns_cancellable_job_id() {
     let tmp = tempdir().unwrap();
     let registry = registry(tmp.path());
     let call = ToolCall::new("call_1", "shell_run", json!({"command": "sleep 2"}));
     let ToolRunOutcome::Result { result } = registry
         .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await
         .unwrap()
     else {
         panic!("expected result");
@@ -95,6 +100,7 @@ fn long_shell_run_returns_cancellable_job_id() {
     let cancel = ToolCall::new("call_2", "job_cancel", json!({"job_id": job_id}));
     let ToolRunOutcome::Result { result } = registry
         .run_tool_call(cancel, Some(ApprovalDecision::Approved))
+        .await
         .unwrap()
     else {
         panic!("expected result");
@@ -103,8 +109,8 @@ fn long_shell_run_returns_cancellable_job_id() {
     assert_eq!(output["status"], "cancelled");
 }
 
-#[test]
-fn running_shell_run_preserves_timeout_on_job_status() {
+#[tokio::test]
+async fn running_shell_run_preserves_timeout_on_job_status() {
     let tmp = tempdir().unwrap();
     let registry = registry(tmp.path());
     let call = ToolCall::new(
@@ -114,6 +120,7 @@ fn running_shell_run_preserves_timeout_on_job_status() {
     );
     let ToolRunOutcome::Result { result } = registry
         .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await
         .unwrap()
     else {
         panic!("expected result");
@@ -124,15 +131,16 @@ fn running_shell_run_preserves_timeout_on_job_status() {
 
     thread::sleep(Duration::from_millis(220));
     let status = ToolCall::new("call_2", "job_status", json!({"job_id": job_id}));
-    let ToolRunOutcome::Result { result } = registry.run_tool_call(status, None).unwrap() else {
+    let ToolRunOutcome::Result { result } = registry.run_tool_call(status, None).await.unwrap()
+    else {
         panic!("expected result");
     };
     let output: Value = serde_json::from_str(&result.content).unwrap();
     assert_eq!(output["status"], "timed_out");
 }
 
-#[test]
-fn completed_shell_run_is_not_marked_timed_out_by_late_status_check() {
+#[tokio::test]
+async fn completed_shell_run_is_not_marked_timed_out_by_late_status_check() {
     let tmp = tempdir().unwrap();
     let registry = registry(tmp.path());
     let call = ToolCall::new(
@@ -142,6 +150,7 @@ fn completed_shell_run_is_not_marked_timed_out_by_late_status_check() {
     );
     let ToolRunOutcome::Result { result } = registry
         .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await
         .unwrap()
     else {
         panic!("expected result");
@@ -152,15 +161,16 @@ fn completed_shell_run_is_not_marked_timed_out_by_late_status_check() {
 
     thread::sleep(Duration::from_millis(1_100));
     let status = ToolCall::new("call_2", "job_status", json!({"job_id": job_id}));
-    let ToolRunOutcome::Result { result } = registry.run_tool_call(status, None).unwrap() else {
+    let ToolRunOutcome::Result { result } = registry.run_tool_call(status, None).await.unwrap()
+    else {
         panic!("expected result");
     };
     let output: Value = serde_json::from_str(&result.content).unwrap();
     assert_eq!(output["status"], "completed");
 }
 
-#[test]
-fn shell_run_times_out_without_polling_before_deadline() {
+#[tokio::test]
+async fn shell_run_times_out_without_polling_before_deadline() {
     let tmp = tempdir().unwrap();
     let registry = registry(tmp.path());
     let call = ToolCall::new(
@@ -170,6 +180,7 @@ fn shell_run_times_out_without_polling_before_deadline() {
     );
     let ToolRunOutcome::Result { result } = registry
         .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await
         .unwrap()
     else {
         panic!("expected result");
@@ -180,15 +191,16 @@ fn shell_run_times_out_without_polling_before_deadline() {
 
     thread::sleep(Duration::from_millis(300));
     let status = ToolCall::new("call_2", "job_status", json!({"job_id": job_id}));
-    let ToolRunOutcome::Result { result } = registry.run_tool_call(status, None).unwrap() else {
+    let ToolRunOutcome::Result { result } = registry.run_tool_call(status, None).await.unwrap()
+    else {
         panic!("expected result");
     };
     let output: Value = serde_json::from_str(&result.content).unwrap();
     assert_eq!(output["status"], "timed_out");
 }
 
-#[test]
-fn shell_rejects_cwd_escape() {
+#[tokio::test]
+async fn shell_rejects_cwd_escape() {
     let tmp = tempdir().unwrap();
     let call = ToolCall::new(
         "call_1",
@@ -196,13 +208,15 @@ fn shell_rejects_cwd_escape() {
         json!({"command": "pwd", "cwd": "../outside"}),
     );
     assert!(matches!(
-        registry(tmp.path()).run_tool_call(call, Some(ApprovalDecision::Approved)),
+        registry(tmp.path())
+            .run_tool_call(call, Some(ApprovalDecision::Approved))
+            .await,
         Err(ToolError::InvalidArguments { .. })
     ));
 }
 
-#[test]
-fn job_start_status_tail_and_cancel_work() {
+#[tokio::test]
+async fn job_start_status_tail_and_cancel_work() {
     let tmp = tempdir().unwrap();
     let registry = registry(tmp.path());
     let call = ToolCall::new(
@@ -212,6 +226,7 @@ fn job_start_status_tail_and_cancel_work() {
     );
     let ToolRunOutcome::Result { result } = registry
         .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await
         .unwrap()
     else {
         panic!("expected result");
@@ -221,7 +236,8 @@ fn job_start_status_tail_and_cancel_work() {
 
     thread::sleep(Duration::from_millis(50));
     let tail = ToolCall::new("call_2", "job_tail", json!({"job_id": job_id}));
-    let ToolRunOutcome::Result { result } = registry.run_tool_call(tail, None).unwrap() else {
+    let ToolRunOutcome::Result { result } = registry.run_tool_call(tail, None).await.unwrap()
+    else {
         panic!("expected result");
     };
     let output: Value = serde_json::from_str(&result.content).unwrap();
@@ -230,6 +246,7 @@ fn job_start_status_tail_and_cancel_work() {
     let cancel = ToolCall::new("call_3", "job_cancel", json!({"job_id": job_id}));
     let ToolRunOutcome::Result { result } = registry
         .run_tool_call(cancel, Some(ApprovalDecision::Approved))
+        .await
         .unwrap()
     else {
         panic!("expected result");

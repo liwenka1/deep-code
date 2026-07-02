@@ -1,12 +1,12 @@
 use std::process::{Command, Output, Stdio};
 
+use async_trait::async_trait;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::tool::{Tool, ToolCall, ToolError, ToolRegistry, ToolResult, ToolSpec};
-use crate::workspace_policy::{
-    WorkspacePolicy, invalid, json_string, optional_bool, optional_str, optional_u64,
-    truncate_string,
-};
+use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, run_blocking};
+use crate::workspace_policy::{WorkspacePolicy, invalid, json_string, truncate_string};
 
 const MAX_OUTPUT_CHARS: usize = 40_000;
 const DEFAULT_LOG_COUNT: u64 = 20;
@@ -50,37 +50,16 @@ impl GitStatusTool {
     fn new(root: WorkspacePolicy) -> Self {
         Self { root }
     }
-}
 
-impl Tool for GitStatusTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Read git status with `git status --porcelain=v1 -b`, optionally scoped to a workspace path.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Optional workspace-relative path"}
-                },
-                "additionalProperties": false
-            }),
-            false,
-        )
-    }
-
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let ctx = GitContext::resolve(
-            &self.root,
-            optional_str(&call.arguments, "path"),
-            Self::NAME,
-        )?;
+    fn status_sync(&self, params: GitStatusParams) -> Result<ToolOutput, ToolError> {
+        let ctx = GitContext::resolve(&self.root, params.path.as_deref(), Self::NAME)?;
         let mut args = vec![
             "status".to_string(),
             "--porcelain=v1".to_string(),
             "-b".to_string(),
         ];
         push_pathspec(&mut args, &ctx);
-        git_result(call, Self::NAME, &ctx, args, |stdout| {
+        git_result(Self::NAME, &ctx, args, |stdout| {
             let (branch, entries) = parse_status_output(&stdout);
             json!({
                 "branch": branch,
@@ -88,6 +67,31 @@ impl Tool for GitStatusTool {
                 "status_output": stdout
             })
         })
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitStatusParams {
+    /// Optional workspace-relative path
+    path: Option<String>,
+}
+
+#[async_trait]
+impl Tool for GitStatusTool {
+    type Params = GitStatusParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Read git status with `git status --porcelain=v1 -b`, optionally scoped to a workspace path."
+    }
+
+    async fn run(&self, params: GitStatusParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        let this = self.clone();
+        run_blocking(Self::NAME, move || this.status_sync(params)).await
     }
 }
 
@@ -102,35 +106,11 @@ impl GitDiffTool {
     fn new(root: WorkspacePolicy) -> Self {
         Self { root }
     }
-}
 
-impl Tool for GitDiffTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Read git diff output with safe defaults, optionally staged or scoped to a workspace path.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Optional workspace-relative path"},
-                    "cached": {"type": "boolean", "description": "When true, read staged diff"},
-                    "unified": {"type": "integer", "description": "Context lines, default 3, max 50"}
-                },
-                "additionalProperties": false
-            }),
-            false,
-        )
-    }
-
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let ctx = GitContext::resolve(
-            &self.root,
-            optional_str(&call.arguments, "path"),
-            Self::NAME,
-        )?;
-        let cached = optional_bool(&call.arguments, "cached", false, Self::NAME)?;
-        let unified =
-            optional_u64(&call.arguments, "unified", DEFAULT_UNIFIED, Self::NAME)?.min(MAX_UNIFIED);
+    fn diff_sync(&self, params: GitDiffParams) -> Result<ToolOutput, ToolError> {
+        let ctx = GitContext::resolve(&self.root, params.path.as_deref(), Self::NAME)?;
+        let cached = params.cached.unwrap_or(false);
+        let unified = params.unified.unwrap_or(DEFAULT_UNIFIED).min(MAX_UNIFIED);
         let mut args = vec![
             "diff".to_string(),
             "--no-color".to_string(),
@@ -142,12 +122,40 @@ impl Tool for GitDiffTool {
         }
         push_pathspec(&mut args, &ctx);
         git_result(
-            call,
             Self::NAME,
             &ctx,
             args,
             |stdout| json!({ "diff": stdout, "cached": cached, "unified": unified }),
         )
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitDiffParams {
+    /// Optional workspace-relative path
+    path: Option<String>,
+    /// When true, read staged diff
+    cached: Option<bool>,
+    /// Context lines, default 3, max 50
+    unified: Option<u64>,
+}
+
+#[async_trait]
+impl Tool for GitDiffTool {
+    type Params = GitDiffParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Read git diff output with safe defaults, optionally staged or scoped to a workspace path."
+    }
+
+    async fn run(&self, params: GitDiffParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        let this = self.clone();
+        run_blocking(Self::NAME, move || this.diff_sync(params)).await
     }
 }
 
@@ -162,32 +170,12 @@ impl GitLogTool {
     fn new(root: WorkspacePolicy) -> Self {
         Self { root }
     }
-}
 
-impl Tool for GitLogTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Read recent git history with `git log`, optionally scoped to a workspace path.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Optional workspace-relative path"},
-                    "max_count": {"type": "integer", "description": "Maximum commits, default 20, max 200"}
-                },
-                "additionalProperties": false
-            }),
-            false,
-        )
-    }
-
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let ctx = GitContext::resolve(
-            &self.root,
-            optional_str(&call.arguments, "path"),
-            Self::NAME,
-        )?;
-        let max_count = optional_u64(&call.arguments, "max_count", DEFAULT_LOG_COUNT, Self::NAME)?
+    fn log_sync(&self, params: GitLogParams) -> Result<ToolOutput, ToolError> {
+        let ctx = GitContext::resolve(&self.root, params.path.as_deref(), Self::NAME)?;
+        let max_count = params
+            .max_count
+            .unwrap_or(DEFAULT_LOG_COUNT)
             .clamp(1, MAX_LOG_COUNT);
         let mut args = vec![
             "log".to_string(),
@@ -198,12 +186,38 @@ impl Tool for GitLogTool {
         ];
         push_pathspec(&mut args, &ctx);
         git_result(
-            call,
             Self::NAME,
             &ctx,
             args,
             |stdout| json!({ "log": stdout, "max_count": max_count }),
         )
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitLogParams {
+    /// Optional workspace-relative path
+    path: Option<String>,
+    /// Maximum commits, default 20, max 200
+    max_count: Option<u64>,
+}
+
+#[async_trait]
+impl Tool for GitLogTool {
+    type Params = GitLogParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Read recent git history with `git log`, optionally scoped to a workspace path."
+    }
+
+    async fn run(&self, params: GitLogParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        let this = self.clone();
+        run_blocking(Self::NAME, move || this.log_sync(params)).await
     }
 }
 
@@ -267,29 +281,24 @@ fn push_pathspec(args: &mut Vec<String>, ctx: &GitContext) {
 }
 
 fn git_result(
-    call: &ToolCall,
     tool_name: &str,
     ctx: &GitContext,
     args: Vec<String>,
     payload: impl FnOnce(String) -> Value,
-) -> Result<ToolResult, ToolError> {
+) -> Result<ToolOutput, ToolError> {
     let command = format!("git {}", args.join(" "));
     let output = run_git(&ctx.cwd, &args, tool_name)?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !output.status.success() {
-        return Ok(ToolResult::success(
-            call.id.clone(),
-            call.name.clone(),
-            json_string(json!({
-                "command": command,
-                "cwd": ctx.cwd_display,
-                "pathspec": ctx.pathspec,
-                "tool_status": "error",
-                "exit_code": output.status.code(),
-                "stderr": stderr
-            })),
-        ));
+        return Ok(ToolOutput::text(json_string(json!({
+            "command": command,
+            "cwd": ctx.cwd_display,
+            "pathspec": ctx.pathspec,
+            "tool_status": "error",
+            "exit_code": output.status.code(),
+            "stderr": stderr
+        }))));
     }
     let (stdout, truncated, omitted_chars) = truncate_string(stdout, MAX_OUTPUT_CHARS);
     let mut payload = payload(stdout);
@@ -301,11 +310,7 @@ fn git_result(
         object.insert("truncated".to_string(), json!(truncated));
         object.insert("omitted_chars".to_string(), json!(omitted_chars));
     }
-    Ok(ToolResult::success(
-        call.id.clone(),
-        call.name.clone(),
-        json_string(payload),
-    ))
+    Ok(ToolOutput::text(json_string(payload)))
 }
 
 fn run_git(cwd: &std::path::Path, args: &[String], tool_name: &str) -> Result<Output, ToolError> {
@@ -350,7 +355,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::tool::ToolRunOutcome;
+    use crate::tool::{ToolCall, ToolRunOutcome};
 
     fn workspace_tempdir() -> TempDir {
         tempfile::Builder::new()
@@ -363,17 +368,18 @@ mod tests {
         std::env::current_dir().unwrap()
     }
 
-    fn call(root: &std::path::Path, name: &str, arguments: Value) -> Value {
+    async fn call(root: &std::path::Path, name: &str, arguments: Value) -> Value {
         let registry = git_tool_registry(root.to_path_buf()).unwrap();
         let call = ToolCall::new("call_1", name, arguments);
-        let ToolRunOutcome::Result { result } = registry.run_tool_call(call, None).unwrap() else {
+        let ToolRunOutcome::Result { result } = registry.run_tool_call(call, None).await.unwrap()
+        else {
             panic!("expected result");
         };
         serde_json::from_str(&result.content).unwrap()
     }
 
-    #[test]
-    fn git_status_reports_changes() {
+    #[tokio::test]
+    async fn git_status_reports_changes() {
         let tmp = workspace_tempdir();
         fs::write(tmp.path().join("new.txt"), "new\n").unwrap();
         let rel = tmp
@@ -381,30 +387,30 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap();
-        let output = call(&workspace_root(), "git_status", json!({"path": rel}));
+        let output = call(&workspace_root(), "git_status", json!({"path": rel})).await;
         assert!(output["status_output"].as_str().unwrap().contains("??"));
         assert_eq!(output["entries"][0]["xy"], "??");
     }
 
-    #[test]
-    fn git_diff_returns_structured_output() {
-        let output = call(&workspace_root(), "git_diff", json!({"path": "."}));
+    #[tokio::test]
+    async fn git_diff_returns_structured_output() {
+        let output = call(&workspace_root(), "git_diff", json!({"path": "."})).await;
         assert_eq!(output["tool_status"], "success");
         assert!(output["diff"].is_string());
     }
 
-    #[test]
-    fn git_log_reports_commit_subject() {
-        let output = call(&workspace_root(), "git_log", json!({"max_count": 1}));
+    #[tokio::test]
+    async fn git_log_reports_commit_subject() {
+        let output = call(&workspace_root(), "git_log", json!({"max_count": 1})).await;
         assert!(output["log"].as_str().unwrap().contains("Subject:"));
     }
 
-    #[test]
-    fn git_rejects_path_escape() {
+    #[tokio::test]
+    async fn git_rejects_path_escape() {
         let registry = git_tool_registry(workspace_root()).unwrap();
         let call = ToolCall::new("call_1", "git_status", json!({"path": "../outside"}));
         assert!(matches!(
-            registry.run_tool_call(call, None),
+            registry.run_tool_call(call, None).await,
             Err(ToolError::InvalidArguments { .. })
         ));
     }

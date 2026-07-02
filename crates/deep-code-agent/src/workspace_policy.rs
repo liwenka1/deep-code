@@ -178,52 +178,6 @@ pub(crate) fn invalid(name: impl Into<String>, message: impl Into<String>) -> To
     }
 }
 
-pub(crate) fn required_str<'a>(
-    input: &'a serde_json::Value,
-    field: &str,
-    tool_name: &str,
-) -> Result<&'a str, ToolError> {
-    input
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| invalid(tool_name, format!("missing string field '{field}'")))
-}
-
-pub(crate) fn optional_str<'a>(input: &'a serde_json::Value, field: &str) -> Option<&'a str> {
-    input.get(field).and_then(serde_json::Value::as_str)
-}
-
-pub(crate) fn optional_bool(
-    input: &serde_json::Value,
-    field: &str,
-    default: bool,
-    tool_name: &str,
-) -> Result<bool, ToolError> {
-    match input.get(field) {
-        Some(value) => value
-            .as_bool()
-            .ok_or_else(|| invalid(tool_name, format!("field '{field}' must be a boolean"))),
-        None => Ok(default),
-    }
-}
-
-pub(crate) fn optional_u64(
-    input: &serde_json::Value,
-    field: &str,
-    default: u64,
-    tool_name: &str,
-) -> Result<u64, ToolError> {
-    match input.get(field) {
-        Some(value) => value.as_u64().ok_or_else(|| {
-            invalid(
-                tool_name,
-                format!("field '{field}' must be a positive integer"),
-            )
-        }),
-        None => Ok(default),
-    }
-}
-
 pub(crate) fn json_string(value: impl serde::Serialize) -> String {
     serde_json::to_string_pretty(&value).expect("serializing tool output should not fail")
 }

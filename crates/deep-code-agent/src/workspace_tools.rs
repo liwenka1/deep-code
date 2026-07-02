@@ -1,15 +1,15 @@
 use std::fs;
 use std::path::PathBuf;
 
+use async_trait::async_trait;
 use ignore::WalkBuilder;
 use regex::RegexBuilder;
-use serde_json::{Value, json};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::json;
 
-use crate::tool::{Tool, ToolCall, ToolError, ToolRegistry, ToolResult, ToolSpec};
-use crate::workspace_policy::{
-    WorkspacePolicy, contains_symlink, invalid, json_string, optional_bool, optional_str,
-    required_str,
-};
+use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, run_blocking};
+use crate::workspace_policy::{WorkspacePolicy, contains_symlink, invalid, json_string};
 
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 500;
@@ -56,37 +56,17 @@ impl ReadFileTool {
     fn new(root: WorkspacePolicy) -> Self {
         Self { root }
     }
-}
 
-impl Tool for ReadFileTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Read a UTF-8 file from the workspace. Supports start_line and max_lines for bounded reads.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative file path"},
-                    "start_line": {"type": "integer", "description": "1-based line number, default 1"},
-                    "max_lines": {"type": "integer", "description": "Maximum lines to return, default 200, max 500"}
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
-            false,
-        )
-    }
-
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let path_arg = required_str(&call.arguments, "path", Self::NAME)?;
-        let start_line = optional_usize(&call.arguments, "start_line", 1, Self::NAME)?;
+    fn read_sync(&self, params: ReadFileParams) -> Result<ToolOutput, ToolError> {
+        let start_line = params.start_line.unwrap_or(1);
         if start_line == 0 {
             return Err(invalid(Self::NAME, "start_line must be greater than 0"));
         }
-        let max_lines =
-            optional_usize(&call.arguments, "max_lines", DEFAULT_READ_LINES, Self::NAME)?
-                .clamp(1, MAX_READ_LINES);
-        let path = self.root.resolve_existing(path_arg, Self::NAME)?;
+        let max_lines = params
+            .max_lines
+            .unwrap_or(DEFAULT_READ_LINES)
+            .clamp(1, MAX_READ_LINES);
+        let path = self.root.resolve_existing(&params.path, Self::NAME)?;
         let metadata = fs::metadata(&path).map_err(|error| ToolError::ExecutionFailed {
             name: Self::NAME.to_string(),
             message: format!("failed to read metadata for {}: {error}", path.display()),
@@ -122,19 +102,44 @@ impl Tool for ReadFileTool {
         } else {
             None
         };
-        Ok(ToolResult::success(
-            call.id.clone(),
-            call.name.clone(),
-            json_string(json!({
-                "path": self.root.relative_display(&path),
-                "total_lines": total_lines,
-                "start_line": start_line,
-                "max_lines": max_lines,
-                "truncated": next_start_line.is_some(),
-                "next_start_line": next_start_line,
-                "lines": selected
-            })),
-        ))
+        Ok(ToolOutput::text(json_string(json!({
+            "path": self.root.relative_display(&path),
+            "total_lines": total_lines,
+            "start_line": start_line,
+            "max_lines": max_lines,
+            "truncated": next_start_line.is_some(),
+            "next_start_line": next_start_line,
+            "lines": selected
+        }))))
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadFileParams {
+    /// Workspace-relative file path
+    path: String,
+    /// 1-based line number, default 1
+    start_line: Option<usize>,
+    /// Maximum lines to return, default 200, max 500
+    max_lines: Option<usize>,
+}
+
+#[async_trait]
+impl Tool for ReadFileTool {
+    type Params = ReadFileParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Read a UTF-8 file from the workspace. Supports start_line and max_lines for bounded reads."
+    }
+
+    async fn run(&self, params: ReadFileParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        let this = self.clone();
+        run_blocking(Self::NAME, move || this.read_sync(params)).await
     }
 }
 
@@ -149,26 +154,9 @@ impl ListDirTool {
     fn new(root: WorkspacePolicy) -> Self {
         Self { root }
     }
-}
 
-impl Tool for ListDirTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "List a workspace directory with structured entries.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative directory path, default ."}
-                },
-                "additionalProperties": false
-            }),
-            false,
-        )
-    }
-
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let path_arg = optional_str(&call.arguments, "path").unwrap_or(".");
+    fn list_sync(&self, params: ListDirParams) -> Result<ToolOutput, ToolError> {
+        let path_arg = params.path.as_deref().unwrap_or(".");
         let path = self.root.resolve_existing(path_arg, Self::NAME)?;
         if !path.is_dir() {
             return Err(invalid(Self::NAME, "path is not a directory"));
@@ -208,14 +196,35 @@ impl Tool for ListDirTool {
             })
             .collect::<Result<Vec<_>, ToolError>>()?;
         entries.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
-        Ok(ToolResult::success(
-            call.id.clone(),
-            call.name.clone(),
-            json_string(json!({
-                "path": self.root.relative_display(&path),
-                "entries": entries
-            })),
-        ))
+        Ok(ToolOutput::text(json_string(json!({
+            "path": self.root.relative_display(&path),
+            "entries": entries
+        }))))
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ListDirParams {
+    /// Workspace-relative directory path, default .
+    path: Option<String>,
+}
+
+#[async_trait]
+impl Tool for ListDirTool {
+    type Params = ListDirParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "List a workspace directory with structured entries."
+    }
+
+    async fn run(&self, params: ListDirParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        let this = self.clone();
+        run_blocking(Self::NAME, move || this.list_sync(params)).await
     }
 }
 
@@ -230,47 +239,16 @@ impl GrepFilesTool {
     fn new(root: WorkspacePolicy) -> Self {
         Self { root }
     }
-}
 
-impl Tool for GrepFilesTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Search UTF-8 workspace files with a regex. Returns structured matches with file, line number, and context.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Regex pattern"},
-                    "path": {"type": "string", "description": "Workspace-relative file or directory, default ."},
-                    "context_lines": {"type": "integer", "description": "Context lines before and after each match, default 2"},
-                    "case_insensitive": {"type": "boolean", "description": "Case-insensitive search, default false"},
-                    "max_results": {"type": "integer", "description": "Maximum matches, default 100, max 500"}
-                },
-                "required": ["pattern"],
-                "additionalProperties": false
-            }),
-            false,
-        )
-    }
-
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let pattern = required_str(&call.arguments, "pattern", Self::NAME)?;
-        let path_arg = optional_str(&call.arguments, "path").unwrap_or(".");
-        let context_lines = optional_usize(
-            &call.arguments,
-            "context_lines",
-            DEFAULT_CONTEXT_LINES,
-            Self::NAME,
-        )?;
-        let case_insensitive =
-            optional_bool(&call.arguments, "case_insensitive", false, Self::NAME)?;
-        let max_results = optional_usize(
-            &call.arguments,
-            "max_results",
-            DEFAULT_GREP_RESULTS,
-            Self::NAME,
-        )?
-        .clamp(1, MAX_GREP_RESULTS);
+    fn grep_sync(&self, params: GrepFilesParams) -> Result<ToolOutput, ToolError> {
+        let pattern = params.pattern.as_str();
+        let path_arg = params.path.as_deref().unwrap_or(".");
+        let context_lines = params.context_lines.unwrap_or(DEFAULT_CONTEXT_LINES);
+        let case_insensitive = params.case_insensitive.unwrap_or(false);
+        let max_results = params
+            .max_results
+            .unwrap_or(DEFAULT_GREP_RESULTS)
+            .clamp(1, MAX_GREP_RESULTS);
         let regex = RegexBuilder::new(pattern)
             .case_insensitive(case_insensitive)
             .build()
@@ -332,17 +310,46 @@ impl Tool for GrepFilesTool {
             }
         }
 
-        Ok(ToolResult::success(
-            call.id.clone(),
-            call.name.clone(),
-            json_string(json!({
-                "pattern": pattern,
-                "path": self.root.relative_display(&search_path),
-                "files_searched": files_searched,
-                "truncated": matches.len() >= max_results,
-                "matches": matches
-            })),
-        ))
+        Ok(ToolOutput::text(json_string(json!({
+            "pattern": pattern,
+            "path": self.root.relative_display(&search_path),
+            "files_searched": files_searched,
+            "truncated": matches.len() >= max_results,
+            "matches": matches
+        }))))
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GrepFilesParams {
+    /// Regex pattern
+    pattern: String,
+    /// Workspace-relative file or directory, default .
+    path: Option<String>,
+    /// Context lines before and after each match, default 2
+    context_lines: Option<usize>,
+    /// Case-insensitive search, default false
+    case_insensitive: Option<bool>,
+    /// Maximum matches, default 100, max 500
+    max_results: Option<usize>,
+}
+
+#[async_trait]
+impl Tool for GrepFilesTool {
+    type Params = GrepFilesParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Search UTF-8 workspace files with a regex. Returns structured matches with file, line number, and context."
+    }
+
+    async fn run(&self, params: GrepFilesParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        let this = self.clone();
+        run_blocking(Self::NAME, move || this.grep_sync(params)).await
     }
 }
 
@@ -357,42 +364,48 @@ impl WriteFileTool {
     fn new(root: WorkspacePolicy) -> Self {
         Self { root }
     }
-}
 
-impl Tool for WriteFileTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Create or overwrite a UTF-8 file inside the workspace. Requires approval.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative file path"},
-                    "content": {"type": "string", "description": "Full file contents"}
-                },
-                "required": ["path", "content"],
-                "additionalProperties": false
-            }),
-            true,
-        )
-    }
-
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let path_arg = required_str(&call.arguments, "path", Self::NAME)?;
-        let content = required_str(&call.arguments, "content", Self::NAME)?;
-        let path = self.root.resolve_for_write(path_arg, Self::NAME)?;
-        fs::write(&path, content).map_err(|error| ToolError::ExecutionFailed {
+    fn write_sync(&self, params: WriteFileParams) -> Result<ToolOutput, ToolError> {
+        let path = self.root.resolve_for_write(&params.path, Self::NAME)?;
+        fs::write(&path, &params.content).map_err(|error| ToolError::ExecutionFailed {
             name: Self::NAME.to_string(),
             message: format!("failed to write {}: {error}", path.display()),
         })?;
-        Ok(ToolResult::success(
-            call.id.clone(),
-            call.name.clone(),
-            json_string(json!({
-                "path": self.root.relative_display(&path),
-                "bytes_written": content.len()
-            })),
-        ))
+        Ok(ToolOutput::text(json_string(json!({
+            "path": self.root.relative_display(&path),
+            "bytes_written": params.content.len()
+        }))))
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WriteFileParams {
+    /// Workspace-relative file path
+    path: String,
+    /// Full file contents
+    content: String,
+}
+
+#[async_trait]
+impl Tool for WriteFileTool {
+    type Params = WriteFileParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Create or overwrite a UTF-8 file inside the workspace. Requires approval."
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn run(&self, params: WriteFileParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        let this = self.clone();
+        run_blocking(Self::NAME, move || this.write_sync(params)).await
     }
 }
 
@@ -407,79 +420,65 @@ impl ApplyPatchTool {
     fn new(root: WorkspacePolicy) -> Self {
         Self { root }
     }
-}
 
-impl Tool for ApplyPatchTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Apply a simple text replacement patch to one workspace file. Requires approval.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative file path"},
-                    "old": {"type": "string", "description": "Text to replace; must occur exactly once"},
-                    "new": {"type": "string", "description": "Replacement text"}
-                },
-                "required": ["path", "old", "new"],
-                "additionalProperties": false
-            }),
-            true,
-        )
-    }
-
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let path_arg = required_str(&call.arguments, "path", Self::NAME)?;
-        let old = required_str(&call.arguments, "old", Self::NAME)?;
-        let new = required_str(&call.arguments, "new", Self::NAME)?;
-        if old.is_empty() {
+    fn patch_sync(&self, params: ApplyPatchParams) -> Result<ToolOutput, ToolError> {
+        if params.old.is_empty() {
             return Err(invalid(Self::NAME, "old must not be empty"));
         }
-        let path = self.root.resolve_existing(path_arg, Self::NAME)?;
+        let path = self.root.resolve_existing(&params.path, Self::NAME)?;
         let contents = fs::read_to_string(&path).map_err(|error| ToolError::ExecutionFailed {
             name: Self::NAME.to_string(),
             message: format!("failed to read {} as UTF-8: {error}", path.display()),
         })?;
-        let count = contents.matches(old).count();
+        let count = contents.matches(&params.old).count();
         if count != 1 {
             return Err(invalid(
                 Self::NAME,
                 format!("old text must occur exactly once, found {count} occurrences"),
             ));
         }
-        let updated = contents.replacen(old, new, 1);
+        let updated = contents.replacen(&params.old, &params.new, 1);
         fs::write(&path, updated).map_err(|error| ToolError::ExecutionFailed {
             name: Self::NAME.to_string(),
             message: format!("failed to write {}: {error}", path.display()),
         })?;
-        Ok(ToolResult::success(
-            call.id.clone(),
-            call.name.clone(),
-            json_string(json!({
-                "path": self.root.relative_display(&path),
-                "replacements": 1
-            })),
-        ))
+        Ok(ToolOutput::text(json_string(json!({
+            "path": self.root.relative_display(&path),
+            "replacements": 1
+        }))))
     }
 }
 
-fn optional_usize(
-    input: &Value,
-    field: &str,
-    default: usize,
-    tool_name: &str,
-) -> Result<usize, ToolError> {
-    match input.get(field) {
-        Some(value) => value
-            .as_u64()
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| {
-                invalid(
-                    tool_name,
-                    format!("field '{field}' must be a positive integer"),
-                )
-            }),
-        None => Ok(default),
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ApplyPatchParams {
+    /// Workspace-relative file path
+    path: String,
+    /// Text to replace; must occur exactly once
+    old: String,
+    /// Replacement text
+    new: String,
+}
+
+#[async_trait]
+impl Tool for ApplyPatchTool {
+    type Params = ApplyPatchParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Apply a simple text replacement patch to one workspace file. Requires approval."
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn run(&self, params: ApplyPatchParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        let this = self.clone();
+        run_blocking(Self::NAME, move || this.patch_sync(params)).await
     }
 }
 

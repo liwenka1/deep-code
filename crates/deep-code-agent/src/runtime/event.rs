@@ -10,7 +10,7 @@ use crate::event::AgentEvent;
 use crate::model::Usage;
 use crate::pricing::TurnTelemetry;
 use crate::session_store::SessionId;
-use crate::tool::{ApprovalRequest, ToolResult};
+use crate::tool::{ApprovalRequest, ToolResult, ToolUpdate};
 
 /// Stable identifier for one user-visible agent turn.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -102,6 +102,16 @@ pub enum RuntimeEvent {
         turn_id: Option<TurnId>,
         tool_call_id: ToolCallId,
         decision: crate::tool::ApprovalDecision,
+    },
+    /// Incremental progress from an executing tool (e.g. streamed shell
+    /// output). Distinct from [`RuntimeEvent::ToolCallUpdated`], which is
+    /// provider-side argument streaming.
+    ToolCallProgress {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<TurnId>,
+        tool_call_id: ToolCallId,
+        tool_name: String,
+        update: ToolUpdate,
     },
     /// A tool finished (executed, denied, or failed) and its result has been
     /// recorded in the session.

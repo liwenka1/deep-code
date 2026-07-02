@@ -12,7 +12,7 @@ use crate::runtime::diagnostics::append_diagnostics;
 use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
 use crate::runtime::state::PendingToolBatch;
 use crate::tool::{
-    ApprovalDecision, ToolCall, ToolError, ToolResult, ToolResultStatus, ToolRunOutcome,
+    ApprovalDecision, ToolCall, ToolCx, ToolError, ToolResult, ToolResultStatus, ToolRunOutcome,
 };
 
 pub(super) const CANCELLED_TOOL_RESULT: &str =
@@ -72,25 +72,47 @@ pub(super) enum BatchOutcome {
     Cancelled,
 }
 
+/// Progress bridge: tool `cx.update(..)` calls become `ToolCallProgress`
+/// runtime events attributed to the emitting call.
+fn tool_progress_fn(
+    tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    turn_id: &TurnId,
+    call: &ToolCall,
+) -> crate::tool::ToolUpdateFn {
+    let tx = tx.clone();
+    let turn_id = turn_id.clone();
+    let tool_call_id = ToolCallId::from(call.id.clone());
+    let tool_name = call.name.clone();
+    Arc::new(move |update| {
+        let _ = tx.send(RuntimeEvent::ToolCallProgress {
+            turn_id: Some(turn_id.clone()),
+            tool_call_id: tool_call_id.clone(),
+            tool_name: tool_name.clone(),
+            update,
+        });
+    })
+}
+
 impl<C: LlmClient + 'static> AgentRuntime<C> {
-    /// Execute one tool call on the blocking pool so a long-running tool does
-    /// not stall the async runtime (cancellation still lands at call
-    /// boundaries: the tool itself runs to completion to keep its recorded
-    /// result paired with the assistant tool_call).
-    async fn run_tool_blocking(
+    /// Execute one tool call with the turn's cancellation token and a progress
+    /// bridge attached. Cancellation still lands at call boundaries: the tool
+    /// runs to completion so its recorded result stays paired with the
+    /// assistant tool_call (tools observe the token cooperatively for now).
+    async fn run_tool(
         &self,
-        call: ToolCall,
+        call: &ToolCall,
         decision: Option<ApprovalDecision>,
+        cancel: &CancellationToken,
+        turn_id: &TurnId,
+        tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) -> Result<ToolRunOutcome, ToolError> {
-        let tools = Arc::clone(&self.tools);
-        let name = call.name.clone();
-        match tokio::task::spawn_blocking(move || tools.run_tool_call(call, decision)).await {
-            Ok(outcome) => outcome,
-            Err(join_error) => Err(ToolError::ExecutionFailed {
-                name,
-                message: format!("tool execution task failed: {join_error}"),
-            }),
-        }
+        let cx = ToolCx::new()
+            .with_cancel(cancel.clone())
+            .with_update_fn(tool_progress_fn(tx, turn_id, call));
+        let plan = self.tools.evaluate_tool(call);
+        self.tools
+            .run_tool_call_with_plan(call, decision, plan, cx)
+            .await
     }
 
     /// Persist the session and announce the authoritative transcript change.
@@ -147,7 +169,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 self.finish_cancelled_calls(remaining, turn_id, tx).await;
                 return BatchOutcome::Cancelled;
             }
-            match self.run_tool_blocking(call.clone(), None).await {
+            match self.run_tool(&call, None, cancel, turn_id, tx).await {
                 Ok(ToolRunOutcome::Result { result }) => {
                     self.record_tool_result(&call, result, tx, turn_id.clone())
                         .await;
@@ -165,7 +187,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                             },
                         );
                         let result = match self
-                            .run_tool_blocking(call.clone(), Some(ApprovalDecision::Approved))
+                            .run_tool(&call, Some(ApprovalDecision::Approved), cancel, turn_id, tx)
                             .await
                         {
                             Ok(ToolRunOutcome::Result { result }) => result,
@@ -302,7 +324,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             decision
         };
         match self
-            .run_tool_blocking(current.clone(), Some(decision))
+            .run_tool(&current, Some(decision), &cancel, &turn_id, tx)
             .await
         {
             Ok(ToolRunOutcome::Result { result }) => {

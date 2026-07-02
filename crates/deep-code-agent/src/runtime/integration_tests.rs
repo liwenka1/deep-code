@@ -11,9 +11,7 @@ use crate::event::AgentEvent;
 use crate::model::{ChatRequest, FunctionCallDelta, ToolCallDelta};
 use crate::runtime::diagnostics::append_diagnostics;
 use crate::session_store::SessionStore;
-use crate::tool::{
-    MockEchoTool, Tool, ToolError, ToolRegistry, ToolResult, ToolResultStatus, ToolSpec,
-};
+use crate::tool::{MockEchoTool, Tool, ToolError, ToolRegistry, ToolResultStatus};
 
 #[test]
 fn append_diagnostics_joins_blocks() {
@@ -96,34 +94,32 @@ impl AutoEchoTool {
     const NAME: &'static str = "git_status";
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AutoEchoParams {
+    message: Option<String>,
+}
+
+#[async_trait::async_trait]
 impl Tool for AutoEchoTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Echoes a message without approval.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "message": { "type": "string" }
-                },
-                "required": ["message"],
-                "additionalProperties": false
-            }),
-            false,
-        )
+    type Params = AutoEchoParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
     }
 
-    fn execute(&self, call: &crate::tool::ToolCall) -> Result<ToolResult, ToolError> {
-        let message = call
-            .arguments
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        Ok(ToolResult::success(
-            call.id.clone(),
-            call.name.clone(),
-            format!("git_status: {message}"),
-        ))
+    fn description(&self) -> &str {
+        "Echoes a message without approval."
+    }
+
+    async fn run(
+        &self,
+        params: AutoEchoParams,
+        _cx: &crate::tool::ToolCx,
+    ) -> Result<crate::tool::ToolOutput, ToolError> {
+        let message = params.message.unwrap_or_default();
+        Ok(crate::tool::ToolOutput::text(format!(
+            "git_status: {message}"
+        )))
     }
 }
 
@@ -142,22 +138,27 @@ impl FailingTool {
     const NAME: &'static str = "fail_probe";
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct FailingParams {}
+
+#[async_trait::async_trait]
 impl Tool for FailingTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Always fails.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-            false,
-        )
+    type Params = FailingParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
     }
 
-    fn execute(&self, call: &crate::tool::ToolCall) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult::error(call, "boom"))
+    fn description(&self) -> &str {
+        "Always fails."
+    }
+
+    async fn run(
+        &self,
+        _params: FailingParams,
+        _cx: &crate::tool::ToolCx,
+    ) -> Result<crate::tool::ToolOutput, ToolError> {
+        Ok(crate::tool::ToolOutput::soft_error("boom"))
     }
 }
 
@@ -1507,7 +1508,7 @@ async fn multi_tool_turn_denying_one_call_keeps_batch_running() {
                 tool_call_id,
                 result,
                 ..
-            } if tool_call_id.as_str() == "call_1" => Some(result.status.clone()),
+            } if tool_call_id.as_str() == "call_1" => Some(result.status),
             _ => None,
         })
         .expect("denied call_1 still records a result");

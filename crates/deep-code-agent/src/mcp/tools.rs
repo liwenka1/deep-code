@@ -1,12 +1,15 @@
 use std::sync::{Arc, RwLock};
 
+use async_trait::async_trait;
 use serde_json::json;
 
-use crate::tool::{Tool, ToolCall, ToolError, ToolRegistry, ToolResult, ToolSpec};
+use crate::tool::{ErasedTool, ToolCall, ToolCx, ToolError, ToolRegistry, ToolResult, ToolSpec};
 
 use super::client::McpToolDescriptor;
 use super::manager::McpManager;
 
+/// MCP tools implement [`ErasedTool`] directly: their schema arrives at
+/// runtime from the MCP server, so there is no compile-time `Params` type.
 struct McpDynamicTool {
     manager: Arc<RwLock<McpManager>>,
     descriptor: McpToolDescriptor,
@@ -25,24 +28,8 @@ impl McpDynamicTool {
             qualified_name,
         }
     }
-}
 
-impl Tool for McpDynamicTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            self.qualified_name.clone(),
-            self.descriptor.description.clone().unwrap_or_else(|| {
-                format!(
-                    "MCP tool {}::{}",
-                    self.descriptor.server_name, self.descriptor.tool_name
-                )
-            }),
-            self.descriptor.input_schema.clone(),
-            true,
-        )
-    }
-
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+    fn call_sync(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
         let arguments = if call.arguments.is_null() {
             json!({})
         } else {
@@ -63,14 +50,49 @@ impl Tool for McpDynamicTool {
     }
 }
 
+#[async_trait]
+impl ErasedTool for McpDynamicTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            self.qualified_name.clone(),
+            self.descriptor.description.clone().unwrap_or_else(|| {
+                format!(
+                    "MCP tool {}::{}",
+                    self.descriptor.server_name, self.descriptor.tool_name
+                )
+            }),
+            self.descriptor.input_schema.clone(),
+            true,
+        )
+    }
+
+    async fn execute(&self, call: &ToolCall, _cx: &ToolCx) -> Result<ToolResult, ToolError> {
+        // MCP calls go through a blocking client; keep them off the runtime
+        // workers. The call data is cloned in because the erased trait borrows.
+        let this = Self {
+            manager: Arc::clone(&self.manager),
+            descriptor: self.descriptor.clone(),
+            qualified_name: self.qualified_name.clone(),
+        };
+        let call = call.clone();
+        match tokio::task::spawn_blocking(move || this.call_sync(&call)).await {
+            Ok(result) => result,
+            Err(join_error) => Err(ToolError::ExecutionFailed {
+                name: self.qualified_name.clone(),
+                message: format!("tool execution task failed: {join_error}"),
+            }),
+        }
+    }
+}
+
 pub fn register_mcp_tools(registry: &mut ToolRegistry, manager: Arc<RwLock<McpManager>>) {
     let qualified_tools = manager.read().expect("mcp lock").qualified_tools();
     for (qualified_name, descriptor) in qualified_tools {
-        registry.register(McpDynamicTool::new(
+        registry.register_erased(Arc::new(McpDynamicTool::new(
             Arc::clone(&manager),
             qualified_name,
             descriptor,
-        ));
+        )));
     }
 }
 
@@ -87,8 +109,8 @@ mod tests {
     use crate::mcp::manager::qualify_tool_name;
     use crate::tool::{ApprovalDecision, ToolCall, ToolRegistry, ToolRunOutcome};
 
-    #[test]
-    fn mcp_tool_runs_through_registry_with_approval() {
+    #[tokio::test]
+    async fn mcp_tool_runs_through_registry_with_approval() {
         let client = Arc::new(InMemoryMcpClient::new("mock").with_tool(
             "ping",
             Some("ping"),
@@ -114,12 +136,13 @@ mod tests {
         register_mcp_tools(&mut registry, Arc::clone(&manager));
         let qualified = qualify_tool_name("mock", "ping");
         let call = ToolCall::new("call_1", qualified, json!({}));
-        let pending = registry.run_tool_call(call.clone(), None).unwrap();
+        let pending = registry.run_tool_call(call.clone(), None).await.unwrap();
         let ToolRunOutcome::ApprovalRequired { .. } = pending else {
             panic!("expected approval");
         };
         let outcome = registry
             .run_tool_call(call, Some(ApprovalDecision::Approved))
+            .await
             .unwrap();
         let ToolRunOutcome::Result { result } = outcome else {
             panic!("expected result");

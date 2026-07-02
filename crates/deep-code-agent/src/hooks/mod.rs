@@ -232,6 +232,7 @@ mod tests {
                 tool_name: call.name.clone(),
                 status: ToolResultStatus::Success,
                 content: "ok".to_string(),
+                details: None,
             },
         );
         let events = sink.events.lock().unwrap();

@@ -1,14 +1,30 @@
+mod schema;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 use crate::execution_policy::{ExecPolicy, PolicyVerdict, RiskLevel, ToolExecutionPlan};
 use crate::hooks::HookDispatcher;
 use crate::message::Message;
 use crate::model::{ChatTool, ChatToolFunction, FunctionCallDelta, ToolCallDelta};
+use crate::sandbox::SandboxPolicy;
+
+/// Per-tool scheduling hint. Reserved: the batch loop stays serial for now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    #[default]
+    Sequential,
+    Parallel,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -17,6 +33,8 @@ pub struct ToolSpec {
     pub parameters: Value,
     #[serde(default)]
     pub requires_approval: bool,
+    #[serde(default)]
+    pub execution_mode: ExecutionMode,
 }
 
 impl ToolSpec {
@@ -32,7 +50,14 @@ impl ToolSpec {
             description: description.into(),
             parameters,
             requires_approval,
+            execution_mode: ExecutionMode::Sequential,
         }
+    }
+
+    #[must_use]
+    pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
+        self.execution_mode = mode;
+        self
     }
 
     #[must_use]
@@ -66,7 +91,7 @@ impl ToolCall {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolResultStatus {
     Success,
@@ -80,6 +105,9 @@ pub struct ToolResult {
     pub tool_name: String,
     pub status: ToolResultStatus,
     pub content: String,
+    /// Structured data for UI rendering; never sent to the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
 }
 
 impl ToolResult {
@@ -94,6 +122,7 @@ impl ToolResult {
             tool_name: tool_name.into(),
             status: ToolResultStatus::Success,
             content: content.into(),
+            details: None,
         }
     }
 
@@ -104,6 +133,7 @@ impl ToolResult {
             tool_name: call.name.clone(),
             status: ToolResultStatus::Denied,
             content: "Tool call denied by user.".to_string(),
+            details: None,
         }
     }
 
@@ -114,12 +144,150 @@ impl ToolResult {
             tool_name: call.name.clone(),
             status: ToolResultStatus::Error,
             content: message.into(),
+            details: None,
         }
     }
 
     #[must_use]
     pub fn to_message(&self) -> Message {
         Message::tool(self.call_id.clone(), self.content.clone())
+    }
+}
+
+/// Incremental progress payload a tool can emit while running.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolUpdate {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+pub type ToolUpdateFn = Arc<dyn Fn(ToolUpdate) + Send + Sync>;
+
+/// Execution context for one tool invocation.
+///
+/// Replaces the old `tool_execution` thread-local: the sandbox plan travels
+/// explicitly with the invocation, so it survives `.await` points and can be
+/// cloned into `spawn_blocking` closures.
+#[derive(Clone, Default)]
+pub struct ToolCx {
+    cancel: CancellationToken,
+    plan: Option<ToolExecutionPlan>,
+    on_update: Option<ToolUpdateFn>,
+}
+
+impl ToolCx {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = token;
+        self
+    }
+
+    #[must_use]
+    pub fn with_update_fn(mut self, on_update: ToolUpdateFn) -> Self {
+        self.on_update = Some(on_update);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_plan(mut self, plan: ToolExecutionPlan) -> Self {
+        self.plan = Some(plan);
+        self
+    }
+
+    #[must_use]
+    pub fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    #[must_use]
+    pub fn plan(&self) -> Option<&ToolExecutionPlan> {
+        self.plan.as_ref()
+    }
+
+    /// Sandbox policy for this invocation (Unsandboxed when no plan is set),
+    /// mirroring the old `tool_execution::current_sandbox_policy()` semantics.
+    #[must_use]
+    pub fn sandbox_policy(&self) -> SandboxPolicy {
+        SandboxPolicy::from_execution_plan(self.plan.as_ref())
+    }
+
+    pub fn update(&self, update: ToolUpdate) {
+        if let Some(on_update) = &self.on_update {
+            on_update(update);
+        }
+    }
+
+    pub fn update_text(&self, text: impl Into<String>) {
+        self.update(ToolUpdate {
+            text: text.into(),
+            details: None,
+        });
+    }
+}
+
+/// What a tool produces: model-facing `content`, UI-facing `details`.
+///
+/// `status` exists because some tools report soft failures as a normal result
+/// (status=Error) rather than a `ToolError` — e.g. web tools returning an
+/// unreachable-URL message the model should read and react to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolOutput {
+    pub status: ToolResultStatus,
+    pub content: String,
+    pub details: Option<Value>,
+    /// Hint that the agent should stop after this batch. Reserved: the
+    /// runtime ignores it for now.
+    pub terminate: bool,
+}
+
+impl ToolOutput {
+    #[must_use]
+    pub fn text(content: impl Into<String>) -> Self {
+        Self {
+            status: ToolResultStatus::Success,
+            content: content.into(),
+            details: None,
+            terminate: false,
+        }
+    }
+
+    /// A failure the model should read and recover from, recorded as a
+    /// status=Error result without aborting the tool pipeline.
+    #[must_use]
+    pub fn soft_error(content: impl Into<String>) -> Self {
+        Self {
+            status: ToolResultStatus::Error,
+            content: content.into(),
+            details: None,
+            terminate: false,
+        }
+    }
+
+    #[must_use]
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+
+    fn into_result(self, call_id: &str, tool_name: &str) -> ToolResult {
+        ToolResult {
+            call_id: call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            status: self.status,
+            content: self.content,
+            details: self.details,
+        }
     }
 }
 
@@ -173,15 +341,103 @@ pub enum ToolError {
     ExecutionFailed { name: String, message: String },
 }
 
-pub trait Tool: Send + Sync {
+/// A tool with typed, schema-derived parameters.
+///
+/// `Params` is the single source of truth: schemars derives the wire schema,
+/// serde parses and validates the arguments before [`Tool::run`] is invoked.
+///
+/// `run` executes on the async runtime — wrap blocking work (fs, subprocess
+/// wait, blocking HTTP) in [`run_blocking`] so it lands on the blocking pool.
+#[async_trait]
+pub trait Tool: Send + Sync + 'static {
+    type Params: DeserializeOwned + JsonSchema + Send + 'static;
+
+    fn name(&self) -> &str;
+
+    fn description(&self) -> &str;
+
+    fn requires_approval(&self) -> bool {
+        false
+    }
+
+    fn execution_mode(&self) -> ExecutionMode {
+        ExecutionMode::Sequential
+    }
+
+    /// Wire schema for the params. Override only when the generated schema
+    /// must diverge from the derive (hand-tuned `oneOf`, alias-aware
+    /// `required` lists); parsing still goes through `Params`.
+    fn parameters(&self) -> Value {
+        schema::parameters_schema::<Self::Params>()
+    }
+
+    async fn run(&self, params: Self::Params, cx: &ToolCx) -> Result<ToolOutput, ToolError>;
+}
+
+/// Object-safe tool interface the registry stores.
+///
+/// Every [`Tool`] gets this via the blanket impl. Implement it directly only
+/// for tools whose schema is not known at compile time (MCP dynamic tools).
+#[async_trait]
+pub trait ErasedTool: Send + Sync {
     fn spec(&self) -> ToolSpec;
 
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError>;
+    async fn execute(&self, call: &ToolCall, cx: &ToolCx) -> Result<ToolResult, ToolError>;
+}
+
+#[async_trait]
+impl<T: Tool> ErasedTool for T {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name().to_string(),
+            description: self.description().to_string(),
+            parameters: self.parameters(),
+            requires_approval: self.requires_approval(),
+            execution_mode: self.execution_mode(),
+        }
+    }
+
+    async fn execute(&self, call: &ToolCall, cx: &ToolCx) -> Result<ToolResult, ToolError> {
+        let params: T::Params = serde_json::from_value(call.arguments.clone()).map_err(|error| {
+            ToolError::InvalidArguments {
+                name: call.name.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        let output = self.run(params, cx).await?;
+        Ok(output.into_result(&call.id, &call.name))
+    }
+}
+
+/// Run a blocking tool body on the blocking pool.
+///
+/// Cancellation note: the closure runs to completion even if the caller is
+/// dropped — check `ToolCx::is_cancelled` inside long loops where feasible.
+pub async fn run_blocking<T>(
+    tool_name: &str,
+    body: impl FnOnce() -> Result<T, ToolError> + Send + 'static,
+) -> Result<T, ToolError>
+where
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(body).await {
+        Ok(result) => result,
+        Err(join_error) => Err(ToolError::ExecutionFailed {
+            name: tool_name.to_string(),
+            message: format!("tool execution task failed: {join_error}"),
+        }),
+    }
+}
+
+#[derive(Clone)]
+struct RegisteredTool {
+    spec: ToolSpec,
+    tool: Arc<dyn ErasedTool>,
 }
 
 #[derive(Default)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: HashMap<String, RegisteredTool>,
     policy: ExecPolicy,
     hooks: Option<Arc<HookDispatcher>>,
 }
@@ -228,11 +484,16 @@ impl ToolRegistry {
         self.policy = policy;
     }
 
-    pub fn register<T>(&mut self, tool: T)
-    where
-        T: Tool + 'static,
-    {
-        self.tools.insert(tool.spec().name, Arc::new(tool));
+    pub fn register<T: Tool>(&mut self, tool: T) {
+        self.register_erased(Arc::new(tool));
+    }
+
+    /// Register a dynamically-shaped tool. The spec (including the schemars
+    /// run for typed tools) is computed once here, not per request.
+    pub fn register_erased(&mut self, tool: Arc<dyn ErasedTool>) {
+        let spec = tool.spec();
+        self.tools
+            .insert(spec.name.clone(), RegisteredTool { spec, tool });
     }
 
     #[must_use]
@@ -255,9 +516,9 @@ impl ToolRegistry {
         let mut registry = Self::new();
         registry.policy = source.policy.clone();
         registry.hooks = source.hooks.clone();
-        for (name, tool) in &source.tools {
+        for (name, entry) in &source.tools {
             if predicate(name) {
-                registry.tools.insert(name.clone(), Arc::clone(tool));
+                registry.tools.insert(name.clone(), entry.clone());
             }
         }
         registry
@@ -268,7 +529,7 @@ impl ToolRegistry {
         let mut specs = self
             .tools
             .values()
-            .map(|tool| tool.spec())
+            .map(|entry| entry.spec.clone())
             .collect::<Vec<_>>();
         specs.sort_by(|left, right| left.name.cmp(&right.name));
         specs
@@ -282,36 +543,34 @@ impl ToolRegistry {
             .collect()
     }
 
-    pub fn run_tool_call(
+    pub async fn run_tool_call(
         &self,
         call: ToolCall,
         decision: Option<ApprovalDecision>,
     ) -> Result<ToolRunOutcome, ToolError> {
-        self.run_tool_call_with_plan(
-            &call,
-            decision,
-            self.policy.evaluate_tool(&call.name, &call.arguments),
-        )
+        let plan = self.policy.evaluate_tool(&call.name, &call.arguments);
+        self.run_tool_call_with_plan(&call, decision, plan, ToolCx::new())
+            .await
     }
 
     pub fn evaluate_tool(&self, call: &ToolCall) -> ToolExecutionPlan {
         self.policy.evaluate_tool(&call.name, &call.arguments)
     }
 
-    pub fn run_tool_call_with_plan(
+    pub async fn run_tool_call_with_plan(
         &self,
         call: &ToolCall,
         decision: Option<ApprovalDecision>,
         plan: ToolExecutionPlan,
+        cx: ToolCx,
     ) -> Result<ToolRunOutcome, ToolError> {
-        let tool = self
+        let entry = self
             .tools
             .get(&call.name)
-            .cloned()
             .ok_or_else(|| ToolError::UnknownTool {
                 name: call.name.clone(),
             })?;
-        let spec = tool.spec();
+        let spec = &entry.spec;
 
         if let Some(reason) = plan.denied_reason() {
             return Ok(ToolRunOutcome::Result {
@@ -330,7 +589,7 @@ impl ToolRegistry {
                     return Ok(ToolRunOutcome::ApprovalRequired {
                         request: ApprovalRequest {
                             call_id: call.id.clone(),
-                            tool_name: spec.name,
+                            tool_name: spec.name.clone(),
                             description,
                             arguments: call.arguments.clone(),
                             risk_level: plan.risk_level,
@@ -353,7 +612,8 @@ impl ToolRegistry {
             hooks.emit_tool_pre(call);
         }
 
-        match crate::tool_execution::with_plan(plan, || tool.execute(call)) {
+        let cx = cx.with_plan(plan);
+        match entry.tool.execute(call, &cx).await {
             Ok(result) => {
                 if let Some(hooks) = &self.hooks {
                     hooks.emit_tool_post(call, &result);
@@ -377,41 +637,31 @@ impl MockEchoTool {
     pub const NAME: &'static str = "mock_echo";
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MockEchoParams {
+    /// Message to echo back.
+    message: String,
+}
+
+#[async_trait]
 impl Tool for MockEchoTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            Self::NAME,
-            "Safely echoes a message to validate the tool loop.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "Message to echo back."
-                    }
-                },
-                "required": ["message"],
-                "additionalProperties": false
-            }),
-            true,
-        )
+    type Params = MockEchoParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
     }
 
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let message = call
-            .arguments
-            .get("message")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArguments {
-                name: call.name.clone(),
-                message: "missing string field 'message'".to_string(),
-            })?;
+    fn description(&self) -> &str {
+        "Safely echoes a message to validate the tool loop."
+    }
 
-        Ok(ToolResult::success(
-            call.id.clone(),
-            call.name.clone(),
-            format!("mock_echo: {message}"),
-        ))
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn run(&self, params: MockEchoParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text(format!("mock_echo: {}", params.message)))
     }
 }
 
@@ -483,9 +733,10 @@ struct PartialToolCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    #[test]
-    fn hooks_emit_post_when_tool_execution_fails() {
+    #[tokio::test]
+    async fn hooks_emit_post_when_tool_execution_fails() {
         use std::sync::{Arc, Mutex};
 
         use crate::hooks::{HookEvent, HookSink};
@@ -503,19 +754,28 @@ mod tests {
 
         struct FailingTool;
 
+        #[derive(Debug, Deserialize, JsonSchema)]
+        struct FailingParams {}
+
+        #[async_trait]
         impl Tool for FailingTool {
-            fn spec(&self) -> ToolSpec {
-                ToolSpec::new(
-                    "failing_tool",
-                    "always fails",
-                    json!({"type": "object", "properties": {}}),
-                    false,
-                )
+            type Params = FailingParams;
+
+            fn name(&self) -> &str {
+                "failing_tool"
             }
 
-            fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+            fn description(&self) -> &str {
+                "always fails"
+            }
+
+            async fn run(
+                &self,
+                _params: FailingParams,
+                _cx: &ToolCx,
+            ) -> Result<ToolOutput, ToolError> {
                 Err(ToolError::ExecutionFailed {
-                    name: call.name.clone(),
+                    name: "failing_tool".to_string(),
                     message: "boom".to_string(),
                 })
             }
@@ -533,6 +793,7 @@ mod tests {
         let call = ToolCall::new("call_fail", "failing_tool", json!({}));
         let error = registry
             .run_tool_call(call, Some(ApprovalDecision::Approved))
+            .await
             .unwrap_err();
         assert!(matches!(error, ToolError::ExecutionFailed { .. }));
 
@@ -543,13 +804,16 @@ mod tests {
         assert_eq!(events[1]["result"]["status"], "error");
     }
 
-    #[test]
-    fn policy_denies_dangerous_shell_before_execution() {
+    #[tokio::test]
+    async fn policy_denies_dangerous_shell_before_execution() {
         let workspace = tempfile::tempdir().unwrap();
         let (registry, _) = crate::shell_tools::shell_tool_registry(workspace.path()).unwrap();
         let call = ToolCall::new("call_deny", "shell_run", json!({"command": "rm -rf /"}));
         let plan = registry.evaluate_tool(&call);
-        let outcome = registry.run_tool_call_with_plan(&call, None, plan).unwrap();
+        let outcome = registry
+            .run_tool_call_with_plan(&call, None, plan, ToolCx::new())
+            .await
+            .unwrap();
         let ToolRunOutcome::Result { result } = outcome else {
             panic!("expected denied result");
         };
@@ -557,8 +821,8 @@ mod tests {
         assert!(result.content.contains("execution policy denied"));
     }
 
-    #[test]
-    fn mock_tool_requires_approval_then_executes_after_approval() {
+    #[tokio::test]
+    async fn mock_tool_requires_approval_then_executes_after_approval() {
         let registry = ToolRegistry::with_mock_tools();
         let call = ToolCall::new(
             "call_1",
@@ -566,7 +830,7 @@ mod tests {
             json!({"message": "hello tools"}),
         );
 
-        let pending = registry.run_tool_call(call.clone(), None).unwrap();
+        let pending = registry.run_tool_call(call.clone(), None).await.unwrap();
         let ToolRunOutcome::ApprovalRequired { request } = pending else {
             panic!("expected approval request");
         };
@@ -576,6 +840,7 @@ mod tests {
 
         let executed = registry
             .run_tool_call(call, Some(ApprovalDecision::Approved))
+            .await
             .unwrap();
         assert_eq!(
             executed,
@@ -585,13 +850,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn denied_tool_call_becomes_tool_result_message() {
+    #[tokio::test]
+    async fn denied_tool_call_becomes_tool_result_message() {
         let registry = ToolRegistry::with_mock_tools();
         let call = ToolCall::new("call_2", MockEchoTool::NAME, json!({"message": "nope"}));
 
         let ToolRunOutcome::Result { result } = registry
             .run_tool_call(call, Some(ApprovalDecision::Denied))
+            .await
             .unwrap()
         else {
             panic!("expected denied result");
@@ -599,6 +865,75 @@ mod tests {
 
         assert_eq!(result.status, ToolResultStatus::Denied);
         assert_eq!(result.to_message(), Message::tool("call_2", result.content));
+    }
+
+    #[tokio::test]
+    async fn blanket_impl_rejects_invalid_arguments_before_run() {
+        let registry = ToolRegistry::with_mock_tools();
+        // message must be a string; 42 fails serde validation in the blanket
+        // impl before MockEchoTool::run is ever invoked.
+        let call = ToolCall::new("call_bad", MockEchoTool::NAME, json!({"message": 42}));
+        let error = registry
+            .run_tool_call(call, Some(ApprovalDecision::Approved))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments { .. }));
+    }
+
+    #[test]
+    fn tool_cx_sandbox_policy_mirrors_execution_plan() {
+        // No plan → Unsandboxed (old thread-local default).
+        assert_eq!(ToolCx::new().sandbox_policy(), SandboxPolicy::Unsandboxed);
+
+        let plan = |requires_sandbox: bool, read_only: bool| ToolExecutionPlan {
+            verdict: PolicyVerdict::Allow,
+            requires_approval: false,
+            requires_sandbox,
+            read_only,
+            risk_level: RiskLevel::Low,
+            matched_rule: None,
+        };
+
+        assert_eq!(
+            ToolCx::new().with_plan(plan(true, true)).sandbox_policy(),
+            SandboxPolicy::ReadOnly
+        );
+        assert_eq!(
+            ToolCx::new().with_plan(plan(true, false)).sandbox_policy(),
+            SandboxPolicy::workspace_write()
+        );
+        assert_eq!(
+            ToolCx::new().with_plan(plan(false, false)).sandbox_policy(),
+            SandboxPolicy::Unsandboxed
+        );
+    }
+
+    #[test]
+    fn generated_schemas_keep_function_calling_invariants() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut registry = crate::workspace_tools::workspace_tool_registry(workspace.path())
+            .unwrap();
+        let (shell, _) = crate::shell_tools::shell_tool_registry(workspace.path()).unwrap();
+        registry.extend(shell);
+
+        for spec in registry.specs() {
+            let schema = &spec.parameters;
+            assert_eq!(schema["type"], "object", "{}: type", spec.name);
+            assert_eq!(
+                schema["additionalProperties"],
+                Value::Bool(false),
+                "{}: additionalProperties",
+                spec.name
+            );
+            let text = schema.to_string();
+            assert!(!text.contains("$schema"), "{}: $schema leaked", spec.name);
+            assert!(!text.contains("$ref"), "{}: $ref leaked", spec.name);
+            assert!(
+                schema["properties"].is_object(),
+                "{}: properties missing",
+                spec.name
+            );
+        }
     }
 
     #[test]

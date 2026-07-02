@@ -1,10 +1,13 @@
 use std::sync::{Arc, RwLock};
 
+use async_trait::async_trait;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::handle::{HandleId, HandleReadOutput, HandleStore};
-use crate::tool::{Tool, ToolCall, ToolError, ToolResult};
-use crate::workspace_policy::{invalid, optional_str, optional_u64};
+use crate::tool::{Tool, ToolCx, ToolError, ToolOutput};
+use crate::workspace_policy::invalid;
 
 pub const HANDLE_READ_TOOL: &str = "handle_read";
 
@@ -12,6 +15,7 @@ const DEFAULT_MAX_CHARS: usize = 12_000;
 const HARD_MAX_CHARS: usize = 50_000;
 const DEFAULT_HEAD_TAIL_LINES: usize = 50;
 
+#[derive(Clone)]
 pub struct HandleReadTool {
     store: Arc<RwLock<HandleStore>>,
 }
@@ -23,67 +27,80 @@ impl HandleReadTool {
     }
 }
 
+/// `handle` stays a raw [`Value`]: the model-facing schema is a hand-written
+/// `oneOf` (string | selector object) that schemars cannot express faithfully,
+/// and `parse_handle_id` implements the matching alias resolution.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HandleReadParams {
+    handle: Value,
+    mode: String,
+    lines: Option<u64>,
+    start_line: Option<u64>,
+    end_line: Option<u64>,
+    max_chars: Option<u64>,
+}
+
+#[async_trait]
 impl Tool for HandleReadTool {
-    fn spec(&self) -> crate::tool::ToolSpec {
-        crate::tool::ToolSpec::new(
-            HANDLE_READ_TOOL,
-            "Read a bounded projection from a handle returned by sub-agents, RLM sessions, or other large-output tools. Use mode=summary|head|tail|lines|count.",
-            json!({
-                "type": "object",
-                "required": ["handle", "mode"],
-                "properties": {
-                    "handle": {
-                        "description": "Handle id string, session_id/name alias, or var_handle object.",
-                        "oneOf": [
-                            {"type": "string"},
-                            {
-                                "type": "object",
-                                "properties": {
-                                    "id": {"type": "string"},
-                                    "name": {"type": "string"},
-                                    "session_id": {"type": "string"}
-                                }
-                            }
-                        ]
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["summary", "head", "tail", "lines", "count"]
-                    },
-                    "lines": {
-                        "type": "integer",
-                        "description": "Line count for head/tail modes (default 50)."
-                    },
-                    "start_line": {
-                        "type": "integer",
-                        "description": "1-based start line for lines mode."
-                    },
-                    "end_line": {
-                        "type": "integer",
-                        "description": "1-based inclusive end line for lines mode."
-                    },
-                    "max_chars": {
-                        "type": "integer",
-                        "description": "Hard cap on returned characters (default 12000, max 50000)."
-                    }
-                },
-                "additionalProperties": false
-            }),
-            false,
-        )
+    type Params = HandleReadParams;
+
+    fn name(&self) -> &str {
+        HANDLE_READ_TOOL
     }
 
-    fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let handle_value = call
-            .arguments
-            .get("handle")
-            .ok_or_else(|| invalid(HANDLE_READ_TOOL, "missing handle"))?;
-        let mode = optional_str(&call.arguments, "mode")
-            .ok_or_else(|| invalid(HANDLE_READ_TOOL, "missing mode"))?;
-        let max_chars = call
-            .arguments
-            .get("max_chars")
-            .and_then(Value::as_u64)
+    fn description(&self) -> &str {
+        "Read a bounded projection from a handle returned by sub-agents, RLM sessions, or other large-output tools. Use mode=summary|head|tail|lines|count."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": ["handle", "mode"],
+            "properties": {
+                "handle": {
+                    "description": "Handle id string, session_id/name alias, or var_handle object.",
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "name": {"type": "string"},
+                                "session_id": {"type": "string"}
+                            }
+                        }
+                    ]
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["summary", "head", "tail", "lines", "count"]
+                },
+                "lines": {
+                    "type": "integer",
+                    "description": "Line count for head/tail modes (default 50)."
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "1-based start line for lines mode."
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "1-based inclusive end line for lines mode."
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Hard cap on returned characters (default 12000, max 50000)."
+                }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    async fn run(&self, params: HandleReadParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        let mode = params.mode.as_str();
+        let max_chars = params
+            .max_chars
             .map(|value| (value as usize).min(HARD_MAX_CHARS))
             .unwrap_or(DEFAULT_MAX_CHARS);
 
@@ -94,7 +111,7 @@ impl Tool for HandleReadTool {
                 name: HANDLE_READ_TOOL.to_string(),
                 message: error.to_string(),
             })?;
-        let handle_id = parse_handle_id(handle_value, &store)?;
+        let handle_id = parse_handle_id(&params.handle, &store)?;
 
         let output = match mode {
             "summary" => HandleReadOutput {
@@ -114,12 +131,7 @@ impl Tool for HandleReadTool {
                 summary: None,
             },
             "head" => {
-                let lines = optional_u64(
-                    &call.arguments,
-                    "lines",
-                    DEFAULT_HEAD_TAIL_LINES as u64,
-                    HANDLE_READ_TOOL,
-                )? as usize;
+                let lines = params.lines.unwrap_or(DEFAULT_HEAD_TAIL_LINES as u64) as usize;
                 let (content, truncated) = store
                     .read_head(&handle_id, lines.max(1), max_chars)
                     .ok_or_else(|| missing_handle(&handle_id))?;
@@ -133,12 +145,7 @@ impl Tool for HandleReadTool {
                 }
             }
             "tail" => {
-                let lines = optional_u64(
-                    &call.arguments,
-                    "lines",
-                    DEFAULT_HEAD_TAIL_LINES as u64,
-                    HANDLE_READ_TOOL,
-                )? as usize;
+                let lines = params.lines.unwrap_or(DEFAULT_HEAD_TAIL_LINES as u64) as usize;
                 let (content, truncated) = store
                     .read_tail(&handle_id, lines.max(1), max_chars)
                     .ok_or_else(|| missing_handle(&handle_id))?;
@@ -152,10 +159,8 @@ impl Tool for HandleReadTool {
                 }
             }
             "lines" => {
-                let start =
-                    optional_u64(&call.arguments, "start_line", 1, HANDLE_READ_TOOL)? as usize;
-                let end = optional_u64(&call.arguments, "end_line", start as u64, HANDLE_READ_TOOL)?
-                    as usize;
+                let start = params.start_line.unwrap_or(1) as usize;
+                let end = params.end_line.unwrap_or(start as u64) as usize;
                 let (content, truncated) = store
                     .read_lines(&handle_id, start, end, max_chars)
                     .ok_or_else(|| missing_handle(&handle_id))?;
@@ -176,9 +181,7 @@ impl Tool for HandleReadTool {
             }
         };
 
-        Ok(ToolResult::success(
-            &call.id,
-            HANDLE_READ_TOOL,
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.handle_id.clone()),
         ))
     }
@@ -240,9 +243,10 @@ pub fn register_handle_read(
 mod tests {
     use super::*;
     use crate::handle::{HandleKind, HandleStore};
+    use crate::tool::{ErasedTool, ToolCall};
 
-    #[test]
-    fn handle_read_summary_and_head() {
+    #[tokio::test]
+    async fn handle_read_summary_and_head() {
         let store = Arc::new(RwLock::new(HandleStore::new()));
         let handle_id = {
             let mut guard = store.write().unwrap();
@@ -262,7 +266,9 @@ mod tests {
             HANDLE_READ_TOOL,
             json!({"handle": handle_id.as_str(), "mode": "summary"}),
         );
-        let summary = tool.execute(&summary_call).unwrap();
+        let summary = ErasedTool::execute(&tool, &summary_call, &ToolCx::default())
+            .await
+            .unwrap();
         assert!(summary.content.contains("byte_len"));
 
         let head_call = ToolCall::new(
@@ -270,7 +276,9 @@ mod tests {
             HANDLE_READ_TOOL,
             json!({"handle": handle_id.as_str(), "mode": "head", "lines": 1}),
         );
-        let head = tool.execute(&head_call).unwrap();
+        let head = ErasedTool::execute(&tool, &head_call, &ToolCx::default())
+            .await
+            .unwrap();
         assert!(head.content.contains("alpha"));
     }
 }
