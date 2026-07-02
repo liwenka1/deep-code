@@ -248,7 +248,11 @@ fn api_error_retriable(error: &AgentError) -> bool {
 }
 
 fn open_error_retriable(error: &AgentError) -> bool {
-    api_error_retriable(error) || matches!(error, AgentError::Http(_))
+    api_error_retriable(error)
+        || matches!(
+            error,
+            AgentError::Http(_) | AgentError::RequestTimeout { .. }
+        )
 }
 
 #[cfg(test)]

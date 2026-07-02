@@ -27,6 +27,9 @@ pub enum AgentError {
     #[error("序列化错误：{0}")]
     Serde(#[from] serde_json::Error),
 
+    #[error("请求超时：{seconds}s 内未收到 DeepSeek 响应头")]
+    RequestTimeout { seconds: u64 },
+
     #[error("流式响应卡顿：连续 {seconds}s 未收到新数据")]
     StreamStalled { seconds: u64 },
 
@@ -60,6 +63,9 @@ impl AgentError {
                     "{self}\nDeepSeek 服务暂时不可用或网络链路异常：可稍后重试，auto mode 会在可重试场景下尝试从 Pro 降级到 Flash。原始信息：{message}"
                 )
             }
+            Self::RequestTimeout { .. } => format!(
+                "{self}\n网络或 DeepSeek 服务响应缓慢：请检查网络后重试，或调大 provider.timeout_secs。"
+            ),
             Self::StreamStalled { .. } => format!(
                 "{self}\n网络可能卡顿或代理中断：请检查网络后重试；如确属长任务，可调大 DEEP_CODE_STREAM_CHUNK_TIMEOUT_SECS。"
             ),

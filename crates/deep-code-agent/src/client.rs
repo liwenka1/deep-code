@@ -34,13 +34,13 @@ impl DeepSeekClient {
     pub fn new(config: AgentConfig) -> AgentResult<Self> {
         config.require_api_key()?;
 
-        let mut builder = reqwest::Client::builder();
-        if let Some(timeout) = config.timeout {
-            builder = builder.timeout(timeout);
-        }
-
+        // Deliberately no `ClientBuilder::timeout`: that clock runs until the
+        // response body is fully read, so it would kill any SSE stream longer
+        // than the timeout. `config.timeout` guards only the open phase in
+        // `stream_chat`; stream liveness is enforced by the chunk/total
+        // guards in runtime/streaming.rs.
         Ok(Self {
-            http: builder.build()?,
+            http: reqwest::Client::builder().build()?,
             config,
         })
     }
@@ -66,7 +66,7 @@ impl LlmClient for DeepSeekClient {
         }
         request.stream = true;
 
-        let response = self
+        let send = self
             .http
             .post(self.config.chat_completions_url())
             .header(
@@ -75,8 +75,19 @@ impl LlmClient for DeepSeekClient {
             )
             .header(CONTENT_TYPE, "application/json")
             .json(&request)
-            .send()
-            .await?;
+            .send();
+
+        // `send()` resolves once response headers arrive, before the body, so
+        // this bounds connect + request + headers without constraining how
+        // long the SSE body may stream.
+        let response = match self.config.timeout {
+            Some(timeout) => tokio::time::timeout(timeout, send)
+                .await
+                .map_err(|_| AgentError::RequestTimeout {
+                    seconds: timeout.as_secs(),
+                })??,
+            None => send.await?,
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -86,26 +97,17 @@ impl LlmClient for DeepSeekClient {
 
         let byte_stream = response.bytes_stream();
         let stream = try_stream! {
-            let mut pending = String::new();
+            let mut decoder = SseDecoder::new();
             futures_util::pin_mut!(byte_stream);
 
             while let Some(bytes) = byte_stream.next().await {
                 let bytes = bytes?;
-                let text = std::str::from_utf8(&bytes)
-                    .map_err(|err| AgentError::Parse(err.to_string()))?;
-                pending.push_str(text);
-
-                while let Some(newline) = pending.find('\n') {
-                    let line = pending[..newline].trim_end_matches('\r').to_string();
-                    pending = pending[newline + 1..].to_string();
-
-                    for event in parse_sse_line(&line)? {
-                        yield event;
-                    }
+                for event in decoder.push(&bytes)? {
+                    yield event;
                 }
             }
 
-            for event in parse_sse_line(pending.trim_end_matches('\r'))? {
+            for event in decoder.finish()? {
                 yield event;
             }
         };
@@ -114,17 +116,88 @@ impl LlmClient for DeepSeekClient {
     }
 }
 
-pub(crate) fn parse_sse_line(line: &str) -> AgentResult<Vec<AgentEvent>> {
-    let Some(data) = line.trim().strip_prefix("data:") else {
-        return Ok(Vec::new());
-    };
+/// Incremental SSE decoder.
+///
+/// Buffers raw bytes and only decodes complete lines: chunk boundaries are set
+/// by TCP/TLS framing and can split a multi-byte UTF-8 character (any CJK char
+/// is 3 bytes), so per-chunk `from_utf8` would abort the stream. `\n` is a
+/// single byte that never occurs inside a UTF-8 sequence, which makes
+/// line-level decoding safe.
+///
+/// Follows the SSE spec: `data:` field lines accumulate (joined with `\n`)
+/// until a blank line dispatches the event; comment lines (`:`) and other
+/// fields (`event:`, `id:`, `retry:`) are ignored.
+pub(crate) struct SseDecoder {
+    buffer: Vec<u8>,
+    data: String,
+}
 
-    let data = data.trim();
-    if data.is_empty() {
-        return Ok(Vec::new());
+impl SseDecoder {
+    pub(crate) fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            data: String::new(),
+        }
     }
 
-    if data == "[DONE]" {
+    /// Feed one network chunk; returns the events it completed.
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> AgentResult<Vec<AgentEvent>> {
+        self.buffer.extend_from_slice(bytes);
+        let mut events = Vec::new();
+        while let Some(newline) = self.buffer.iter().position(|&byte| byte == b'\n') {
+            let line_bytes: Vec<u8> = self.buffer.drain(..=newline).collect();
+            let line = std::str::from_utf8(&line_bytes[..line_bytes.len() - 1])
+                .map_err(|error| AgentError::Parse(error.to_string()))?
+                .trim_end_matches('\r');
+            self.handle_line(line, &mut events)?;
+        }
+        Ok(events)
+    }
+
+    /// Flush a trailing event that was never terminated by a blank line.
+    pub(crate) fn finish(&mut self) -> AgentResult<Vec<AgentEvent>> {
+        let mut events = Vec::new();
+        if !self.buffer.is_empty() {
+            let tail = std::mem::take(&mut self.buffer);
+            let line = std::str::from_utf8(&tail)
+                .map_err(|error| AgentError::Parse(error.to_string()))?
+                .trim_end_matches('\r');
+            self.handle_line(line, &mut events)?;
+        }
+        self.dispatch(&mut events)?;
+        Ok(events)
+    }
+
+    fn handle_line(&mut self, line: &str, events: &mut Vec<AgentEvent>) -> AgentResult<()> {
+        if line.is_empty() {
+            return self.dispatch(events);
+        }
+        if line.starts_with(':') {
+            return Ok(());
+        }
+        if let Some(value) = line.strip_prefix("data:") {
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            if !self.data.is_empty() {
+                self.data.push('\n');
+            }
+            self.data.push_str(value);
+        }
+        Ok(())
+    }
+
+    fn dispatch(&mut self, events: &mut Vec<AgentEvent>) -> AgentResult<()> {
+        if self.data.is_empty() {
+            return Ok(());
+        }
+        let data = std::mem::take(&mut self.data);
+        events.extend(parse_sse_data(&data)?);
+        Ok(())
+    }
+}
+
+pub(crate) fn parse_sse_data(data: &str) -> AgentResult<Vec<AgentEvent>> {
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
         return Ok(Vec::new());
     }
 
@@ -136,23 +209,89 @@ pub(crate) fn parse_sse_line(line: &str) -> AgentResult<Vec<AgentEvent>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_sse_line_treats_done_marker_as_transport_terminator() {
-        assert_eq!(parse_sse_line("data: [DONE]").unwrap(), Vec::new());
+    const CHUNK: &str = r#"{"id":"1","model":"deepseek-v4-pro","choices":[{"index":0,"message":null,"delta":{"role":null,"content":"hi"},"finish_reason":null}],"usage":null}"#;
+
+    fn text_delta(text: &str) -> AgentEvent {
+        AgentEvent::TextDelta {
+            text: text.to_string(),
+        }
     }
 
     #[test]
-    fn parse_sse_line_maps_json_chunk() {
-        let events = parse_sse_line(
-            r#"data: {"id":"1","model":"deepseek-v4-pro","choices":[{"index":0,"message":null,"delta":{"role":null,"content":"hi"},"finish_reason":null}],"usage":null}"#,
-        )
-        .unwrap();
+    fn parse_sse_data_treats_done_marker_as_transport_terminator() {
+        assert_eq!(parse_sse_data("[DONE]").unwrap(), Vec::new());
+    }
 
+    #[test]
+    fn parse_sse_data_maps_json_chunk() {
+        assert_eq!(parse_sse_data(CHUNK).unwrap(), vec![text_delta("hi")]);
+    }
+
+    #[test]
+    fn decoder_dispatches_event_on_blank_line() {
+        let mut decoder = SseDecoder::new();
+        let frame = format!("data: {CHUNK}\n\n");
         assert_eq!(
-            events,
-            vec![AgentEvent::TextDelta {
-                text: "hi".to_string()
-            }]
+            decoder.push(frame.as_bytes()).unwrap(),
+            vec![text_delta("hi")]
         );
+    }
+
+    #[test]
+    fn decoder_survives_utf8_char_split_across_chunks() {
+        let payload = CHUNK.replace(r#""content":"hi""#, r#""content":"你好""#);
+        let frame = format!("data: {payload}\n\n");
+        let bytes = frame.as_bytes();
+        // Cut one byte into 你's three-byte UTF-8 sequence.
+        let split = frame.find('你').unwrap() + 1;
+
+        let mut decoder = SseDecoder::new();
+        assert_eq!(decoder.push(&bytes[..split]).unwrap(), Vec::new());
+        assert_eq!(
+            decoder.push(&bytes[split..]).unwrap(),
+            vec![text_delta("你好")]
+        );
+    }
+
+    #[test]
+    fn decoder_handles_crlf_lines() {
+        let mut decoder = SseDecoder::new();
+        let frame = format!("data: {CHUNK}\r\n\r\n");
+        assert_eq!(
+            decoder.push(frame.as_bytes()).unwrap(),
+            vec![text_delta("hi")]
+        );
+    }
+
+    #[test]
+    fn decoder_joins_multi_line_data_fields() {
+        // SSE spec: consecutive `data:` lines are joined with `\n` before
+        // dispatch; `\n` between JSON tokens is legal whitespace.
+        let (head, tail) = CHUNK.split_at(CHUNK.find(r#""choices""#).unwrap());
+        let frame = format!("data: {head}\ndata: {tail}\n\n");
+        let mut decoder = SseDecoder::new();
+        assert_eq!(
+            decoder.push(frame.as_bytes()).unwrap(),
+            vec![text_delta("hi")]
+        );
+    }
+
+    #[test]
+    fn decoder_ignores_comment_and_done_frames() {
+        let mut decoder = SseDecoder::new();
+        assert_eq!(
+            decoder
+                .push(b": keep-alive\n\ndata: [DONE]\n\n")
+                .unwrap(),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn decoder_finish_flushes_unterminated_trailing_event() {
+        let mut decoder = SseDecoder::new();
+        let frame = format!("data: {CHUNK}");
+        assert_eq!(decoder.push(frame.as_bytes()).unwrap(), Vec::new());
+        assert_eq!(decoder.finish().unwrap(), vec![text_delta("hi")]);
     }
 }

@@ -46,6 +46,9 @@ pub struct AgentConfig {
     pub cost_currency: CostCurrency,
     /// Override compaction token threshold (for dev/testing).
     pub compaction_threshold: Option<u32>,
+    /// Open-phase timeout: connect + request + response headers. Never bounds
+    /// the streaming body — long generations legitimately exceed any fixed
+    /// request timeout; stream liveness is enforced by the guards below.
     pub timeout: Option<Duration>,
     /// Transparent stream retries before any content arrived.
     pub stream_max_retries: u32,

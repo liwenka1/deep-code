@@ -21,7 +21,7 @@
 # 推理力度：off / low / medium / high / max。
 # reasoning_effort = "high"
 
-# 单请求 HTTP 超时（秒）。
+# 打开请求超时（秒）：连接 + 等待响应头；不限制流式响应本身（流的存活由 [stream] 超时管理）。
 # timeout_secs = 60
 
 [cost]
