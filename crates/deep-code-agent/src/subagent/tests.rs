@@ -55,6 +55,25 @@ None.
         }
     }
 
+    /// Panics while streaming — the child's run_loop task dies and the
+    /// runner must map the broken event channel to a Failed record.
+    #[derive(Clone)]
+    struct PanicClient;
+
+    impl LlmClient for PanicClient {
+        fn provider_name(&self) -> &'static str {
+            "panic"
+        }
+
+        fn model(&self) -> &str {
+            "panic-model"
+        }
+
+        async fn stream_chat(&self, _request: ChatRequest) -> AgentResult<AgentEventStream> {
+            panic!("synthetic client panic");
+        }
+    }
+
     #[derive(Clone)]
     struct SlowClient;
 
@@ -75,6 +94,54 @@ None.
             };
             Ok(Box::pin(stream))
         }
+    }
+
+    #[tokio::test]
+    async fn panicking_child_finalizes_as_failed_not_running_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Arc::new(PanicClient);
+        let cancel = CancellationToken::new();
+        let mut registry = ToolRegistry::new();
+        let services = attach_subagent_tools(
+            &mut registry,
+            Arc::clone(&client),
+            AgentConfig::default(),
+            dir.path().to_path_buf(),
+            cancel,
+        );
+
+        let open = ToolCall::new(
+            "call_1",
+            "agent_open",
+            json!({"prompt": "explode", "type": "explore", "name": "boom"}),
+        );
+        let open_result = registry
+            .run_tool_call(open, None)
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let opened: serde_json::Value = serde_json::from_str(&open_result.content).unwrap();
+        let agent_id = opened["agent_id"].as_str().expect("agent_id").to_string();
+
+        let mut terminal_status = None;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let manager = services.manager.read().unwrap();
+            if let Some(record) = manager.get(&agent_id)
+                && record.status.is_terminal()
+            {
+                terminal_status = Some((record.status, record.error.clone()));
+                break;
+            }
+        }
+
+        let (status, error) = terminal_status.expect("record must reach a terminal state");
+        assert_eq!(status, SubAgentStatus::Failed);
+        assert!(
+            error.is_some_and(|message| message.contains("event stream ended")),
+            "failure must carry the broken-channel reason"
+        );
     }
 
     #[tokio::test]

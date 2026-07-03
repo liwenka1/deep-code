@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -195,14 +196,24 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentOpenTool<C> {
         let assignment = prompt.clone();
         let spawned_id = agent_id.clone();
         tokio::spawn(async move {
-            runtime.begin_turn(assignment).await;
-            let outcome = run_subagent(
-                client,
-                runtime,
-                cancel.clone(),
-                super::runner::default_max_steps(),
-            )
-            .await;
+            // Panic insurance: a panic in this task would be swallowed by the
+            // JoinHandle and leave the record Running forever. (Client/tool
+            // panics inside the child's own run_loop task surface as a
+            // channel-close Err from run_subagent and take the normal
+            // failure path below.)
+            let outcome = std::panic::AssertUnwindSafe(async {
+                runtime.begin_turn(assignment).await;
+                run_subagent(
+                    client,
+                    runtime,
+                    cancel.clone(),
+                    super::runner::default_max_steps(),
+                )
+                .await
+            })
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err("sub-agent panicked".to_string()));
             if let Ok(mut map) = services.agent_cancels.write() {
                 map.remove(&spawned_id);
             }

@@ -48,12 +48,17 @@ impl LspConfig {
     }
 }
 
+/// Initial spawn plus at most one respawn per language per session — enough
+/// to recover from a crashed server without looping on a broken install.
+const MAX_SPAWNS_PER_LANGUAGE: u32 = 2;
+
 pub struct LspManager {
     config: LspConfig,
     workspace: PathBuf,
     transports: AsyncMutex<HashMap<Language, Arc<dyn LspTransport>>>,
     missing_warned: AsyncMutex<HashSet<Language>>,
     cold_start_pending: AsyncMutex<HashSet<Language>>,
+    spawn_counts: AsyncMutex<HashMap<Language, u32>>,
     test_transports: AsyncMutex<HashMap<Language, Arc<dyn LspTransport>>>,
 }
 
@@ -66,6 +71,7 @@ impl LspManager {
             transports: AsyncMutex::new(HashMap::new()),
             missing_warned: AsyncMutex::new(HashSet::new()),
             cold_start_pending: AsyncMutex::new(HashSet::new()),
+            spawn_counts: AsyncMutex::new(HashMap::new()),
             test_transports: AsyncMutex::new(HashMap::new()),
         }
     }
@@ -88,6 +94,18 @@ impl LspManager {
 
     pub async fn install_test_transport(&self, lang: Language, transport: Arc<dyn LspTransport>) {
         self.test_transports.lock().await.insert(lang, transport);
+    }
+
+    /// Install into the real transport cache (exercises the drop-on-failure
+    /// path, which test transports bypass).
+    #[cfg(test)]
+    pub(crate) async fn install_transport(&self, lang: Language, transport: Arc<dyn LspTransport>) {
+        self.transports.lock().await.insert(lang, transport);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn has_transport(&self, lang: Language) -> bool {
+        self.transports.lock().await.contains_key(&lang)
     }
 
     pub async fn collect_for_edit(&self, tool_name: &str, input: &Value) -> Vec<DiagnosticBlock> {
@@ -143,6 +161,11 @@ impl LspManager {
                     "lsp: diagnostics call failed for {}: {error}",
                     file.display()
                 );
+                // A request error usually means the server died. Drop the
+                // cached transport so the next edit respawns it lazily
+                // (budgeted by MAX_SPAWNS_PER_LANGUAGE). Timeouts above do
+                // NOT trigger this — a slow server is not a dead one.
+                self.drop_transport(lang).await;
                 return None;
             }
             Err(_) => {
@@ -188,17 +211,37 @@ impl LspManager {
         }
 
         let (cmd, args) = self.config.resolve_command(lang)?;
+        {
+            let counts = self.spawn_counts.lock().await;
+            if counts.get(&lang).copied().unwrap_or(0) >= MAX_SPAWNS_PER_LANGUAGE {
+                return None;
+            }
+        }
         match StdioLspTransport::spawn(&cmd, &args, lang, self.workspace.clone()).await {
             Ok(transport) => {
                 let arc: Arc<dyn LspTransport> = Arc::new(transport);
                 self.transports.lock().await.insert(lang, arc.clone());
                 self.cold_start_pending.lock().await.insert(lang);
+                *self.spawn_counts.lock().await.entry(lang).or_insert(0) += 1;
                 Some(arc)
             }
             Err(error) => {
                 self.warn_missing_once(lang, &cmd, &error).await;
                 None
             }
+        }
+    }
+
+    /// Remove and shut down a language's cached transport so the next edit
+    /// respawns it (within the per-language spawn budget).
+    async fn drop_transport(&self, lang: Language) {
+        let removed = self.transports.lock().await.remove(&lang);
+        if let Some(transport) = removed {
+            eprintln!(
+                "lsp: dropping the {} server; it will respawn on the next edit",
+                lang.as_key()
+            );
+            transport.shutdown().await;
         }
     }
 
@@ -308,6 +351,39 @@ mod tests {
 
         let block = manager.diagnostics_for(&path).await.expect("block");
         assert!(block.render().contains("expected i32, found &str"));
+    }
+
+    #[tokio::test]
+    async fn failed_transport_is_dropped_for_lazy_respawn() {
+        struct FailingTransport;
+
+        #[async_trait]
+        impl LspTransport for FailingTransport {
+            async fn diagnostics_for(
+                &self,
+                _path: &Path,
+                _text: &str,
+                _wait: Duration,
+            ) -> anyhow::Result<Vec<Diagnostic>> {
+                Err(anyhow::anyhow!("server pipe closed"))
+            }
+
+            async fn shutdown(&self) {}
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = LspManager::new(LspConfig::default(), dir.path().to_path_buf());
+        let path = dir.path().join("foo.rs");
+        tokio::fs::write(&path, b"fn main() {}").await.unwrap();
+
+        manager
+            .install_transport(Language::Rust, Arc::new(FailingTransport))
+            .await;
+        assert!(manager.diagnostics_for(&path).await.is_none());
+        assert!(
+            !manager.has_transport(Language::Rust).await,
+            "dead server must be evicted so the next edit can respawn it"
+        );
     }
 
     #[tokio::test]
