@@ -872,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "deep-code-agent"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "deep-code-desktop"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "deep-code-runtime",
@@ -917,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "deep-code-runtime"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "deep-code-tui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-stream",
