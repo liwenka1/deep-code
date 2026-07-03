@@ -171,6 +171,7 @@ fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
         let tick_due =
             app.is_streaming && last_draw.is_none_or(|at| at.elapsed() >= STREAM_TICK_INTERVAL);
         if (needs_redraw && draw_due) || tick_due {
+            app.enforce_history_cap();
             terminal.draw(|frame| render(frame, app))?;
             last_draw = Some(Instant::now());
             needs_redraw = false;

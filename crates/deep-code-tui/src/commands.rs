@@ -25,6 +25,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str, bool)] = &[
     ("/resume", "选择历史会话 (或手动输入 <id>)", false),
     ("/sessions", "列出会话", false),
     ("/agents", "列出子代理", false),
+    ("/find", "搜索转录 <关键词>（重复执行向更早处翻）", true),
 ];
 
 impl App {
@@ -83,6 +84,15 @@ impl App {
                     self.status = "Usage: /restore <checkpoint_id>".to_string();
                 } else {
                     self.restore_checkpoint(id);
+                }
+                true
+            }
+            _ if prompt == "/find" || prompt.starts_with("/find ") => {
+                let query = prompt.strip_prefix("/find").unwrap_or_default().trim();
+                if query.is_empty() {
+                    self.status = "Usage: /find <关键词>".to_string();
+                } else {
+                    self.find_in_transcript(query);
                 }
                 true
             }
@@ -256,8 +266,13 @@ impl App {
                 )
             })
             .unwrap_or_else(|| "\nlast_turn=none".to_string());
+        let trimmed = if self.trimmed_cells > 0 {
+            format!("（已折叠最早 {} 条）", self.trimmed_cells)
+        } else {
+            String::new()
+        };
         self.history.push(HistoryCell::system(format!(
-            "Status:\nbackend={}\nsession={session}\ncheckpoint={checkpoint}\nmode={mode}\nconfigured_model={}\nconfigured_reasoning={}\nhistory_cells={}{}",
+            "Status:\nbackend={}\nsession={session}\ncheckpoint={checkpoint}\nmode={mode}\nconfigured_model={}\nconfigured_reasoning={}\nhistory_cells={}{trimmed}{}",
             self.backend_label,
             self.configured_model,
             self.configured_reasoning,

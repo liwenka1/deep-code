@@ -78,6 +78,11 @@ pub struct App {
     /// One-shot latch for the "session save failed" transcript warning; the
     /// status line keeps warning until a save succeeds again.
     pub(crate) save_error_notified: bool,
+    /// Cells dropped from the front of `history` by the scrollback cap.
+    pub(crate) trimmed_cells: usize,
+    /// `/find` continuation state: (query, line index of the last match in
+    /// the transcript snapshot). Repeating the same query searches upward.
+    pub(crate) find_state: Option<(String, usize)>,
     pub scroll_offset: usize,
     pub approval_scroll_offset: usize,
     /// Currently highlighted approval option: 0 = y (approve), 1 = a (session),
@@ -141,6 +146,9 @@ pub(crate) struct TranscriptSnapshot {
 }
 
 const PROMPT_HISTORY_CAP: usize = 100;
+/// Scrollback cap: transcript cells beyond this are dropped from the front
+/// (multi-hour sessions would otherwise grow memory without bound).
+pub(crate) const MAX_HISTORY_CELLS: usize = 2000;
 
 /// Number of characters (not bytes) in `s`.
 fn char_count(s: &str) -> usize {
@@ -313,6 +321,8 @@ impl App {
             session_id,
             resumed,
             save_error_notified: false,
+            trimmed_cells: 0,
+            find_state: None,
             scroll_offset: 0,
             approval_scroll_offset: 0,
             approval_focus: 0,
@@ -458,6 +468,64 @@ impl App {
     /// Record what the transcript render produced, for mouse → text mapping.
     pub(crate) fn set_transcript_snapshot(&mut self, snap: TranscriptSnapshot) {
         self.transcript = Some(snap);
+    }
+
+    /// Drop the oldest transcript cells beyond [`MAX_HISTORY_CELLS`]. Called
+    /// once per frame before rendering; keeps multi-hour sessions bounded.
+    pub(crate) fn enforce_history_cap(&mut self) {
+        if self.history.len() <= MAX_HISTORY_CELLS {
+            return;
+        }
+        let excess = self.history.len() - MAX_HISTORY_CELLS;
+        self.history.drain(..excess);
+        self.trimmed_cells += excess;
+        // Snapshot line indices shifted; restart any /find continuation.
+        self.find_state = None;
+    }
+
+    /// `/find`: jump to the nearest earlier transcript line containing
+    /// `query` (case-insensitive). Repeating the same query continues upward;
+    /// exhausting matches resets so the next `/find` starts from the bottom.
+    /// Searches the last render's plain-text lines, so what it finds is
+    /// exactly what is on screen.
+    pub(crate) fn find_in_transcript(&mut self, query: &str) {
+        let Some(snapshot) = self.transcript.as_ref() else {
+            self.status = "暂无可搜索的转录内容".to_string();
+            return;
+        };
+        let needle = query.to_lowercase();
+        let total = snapshot.lines.len();
+        let search_end = match &self.find_state {
+            Some((previous, index)) if previous == query => (*index).min(total),
+            _ => total,
+        };
+        let matched = snapshot.lines[..search_end]
+            .iter()
+            .rposition(|line| line.to_lowercase().contains(&needle));
+        match matched {
+            Some(line_index) => {
+                let viewport = usize::from(snapshot.height).max(1);
+                let max_scroll = total.saturating_sub(viewport);
+                // scroll_offset counts lines up from the bottom; putting the
+                // match at the top of the viewport means scroll_top ==
+                // line_index (clamped to the scrollable range).
+                self.scroll_offset = max_scroll.saturating_sub(line_index);
+                self.find_state = Some((query.to_string(), line_index));
+                self.status =
+                    format!("找到 “{query}”（第 {} 行）· 再次 /find 向上继续", line_index + 1);
+            }
+            None => {
+                let was_continuing = self
+                    .find_state
+                    .take()
+                    .is_some_and(|(previous, _)| previous == query);
+                if was_continuing {
+                    self.status = format!("已到 “{query}” 的最早匹配 · 再次 /find 从底部重新开始");
+                } else {
+                    self.status = format!("未找到 “{query}”");
+                }
+            }
+        }
     }
 
     /// Map an absolute mouse `(col, row)` to a `(line, display_col)` position
@@ -1636,6 +1704,65 @@ mod tests {
         app.scroll_up();
         app.scroll_to_bottom();
         assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn history_cap_drops_oldest_cells_and_counts_them() {
+        let mut app = App::new();
+        for index in 0..(MAX_HISTORY_CELLS + 100) {
+            app.history.push(HistoryCell::system(format!("cell-{index}")));
+        }
+        app.enforce_history_cap();
+
+        assert_eq!(app.history.len(), MAX_HISTORY_CELLS);
+        assert!(app.trimmed_cells >= 100);
+        assert!(matches!(
+            app.history.last(),
+            Some(HistoryCell::System { text }) if text.ends_with(&format!("cell-{}", MAX_HISTORY_CELLS + 99))
+        ));
+        // Oldest survivor is a late cell, not cell-0.
+        assert!(matches!(
+            app.history.first(),
+            Some(HistoryCell::System { text }) if !text.ends_with("cell-0")
+        ));
+    }
+
+    #[test]
+    fn find_in_transcript_jumps_and_continues_upward() {
+        let mut app = App::new();
+        let mut lines: Vec<String> = (0..50).map(|index| format!("line {index}")).collect();
+        lines[10] = "needle alpha".to_string();
+        lines[30] = "NEEDLE beta".to_string();
+        app.transcript = Some(TranscriptSnapshot {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+            scroll_top: 0,
+            lines,
+        });
+
+        // First /find: nearest-to-bottom match (line 30, case-insensitive).
+        app.find_in_transcript("needle");
+        assert_eq!(app.find_state.as_ref().unwrap().1, 30);
+        // max_scroll = 50 - 10 = 40; match at top of viewport → offset 10.
+        assert_eq!(app.scroll_offset, 10);
+
+        // Same query again: continues upward to line 10.
+        app.find_in_transcript("needle");
+        assert_eq!(app.find_state.as_ref().unwrap().1, 10);
+        assert_eq!(app.scroll_offset, 30);
+
+        // Exhausted: resets so the next /find starts from the bottom again.
+        app.find_in_transcript("needle");
+        assert!(app.find_state.is_none());
+        assert!(app.status.contains("最早匹配"));
+        app.find_in_transcript("needle");
+        assert_eq!(app.find_state.as_ref().unwrap().1, 30);
+
+        // Unknown query reports not-found.
+        app.find_in_transcript("missing-term");
+        assert!(app.status.contains("未找到"));
     }
 
     #[test]
