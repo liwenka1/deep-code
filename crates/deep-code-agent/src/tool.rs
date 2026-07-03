@@ -309,6 +309,11 @@ pub struct ApprovalRequest {
     pub read_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched_rule: Option<String>,
+    /// Human-reviewable change preview (unified diff for file mutations),
+    /// filled by the runtime before the request is surfaced. Raw arguments
+    /// alone are not enough to approve a large rewrite safely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -596,6 +601,8 @@ impl ToolRegistry {
                             requires_sandbox: plan.requires_sandbox,
                             read_only: plan.read_only,
                             matched_rule: plan.matched_rule.clone(),
+                            // Filled by the runtime (needs workspace access).
+                            preview: None,
                         },
                     });
                 }

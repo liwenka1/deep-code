@@ -346,6 +346,7 @@ None.
             requires_sandbox: false,
             read_only: false,
             matched_rule: None,
+            preview: None,
         };
         assert_eq!(
             runtime.subagent_approval_decision(&request),

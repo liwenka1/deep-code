@@ -182,7 +182,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                     self.record_tool_result(&call, result, tx, turn_id.clone())
                         .await;
                 }
-                Ok(ToolRunOutcome::ApprovalRequired { request }) => {
+                Ok(ToolRunOutcome::ApprovalRequired { mut request }) => {
                     if self.auto_approval_granted(&call).await {
                         // Audit trail: the gate fired but a standing consent
                         // (session "a" or config auto_allow) resolved it.
@@ -209,6 +209,12 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                             .await;
                         continue;
                     }
+                    // File I/O for a bounded diff at a human-in-the-loop
+                    // pause: cheap relative to the wait, so no spawn_blocking.
+                    request.preview = self
+                        .workspace
+                        .as_deref()
+                        .and_then(|ws| crate::approval_preview::build_approval_preview(&call, ws));
                     {
                         let mut state = self.state.lock().await;
                         state.pending = Some(PendingToolBatch {
@@ -339,7 +345,11 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 self.record_tool_result(&current, result, tx, turn_id.clone())
                     .await;
             }
-            Ok(ToolRunOutcome::ApprovalRequired { request }) => {
+            Ok(ToolRunOutcome::ApprovalRequired { mut request }) => {
+                request.preview = self
+                    .workspace
+                    .as_deref()
+                    .and_then(|ws| crate::approval_preview::build_approval_preview(&current, ws));
                 {
                     let mut state = self.state.lock().await;
                     state.pending = Some(PendingToolBatch {

@@ -1650,6 +1650,7 @@ mod tests {
             requires_sandbox: true,
             read_only: false,
             matched_rule: Some("write".to_string()),
+            preview: None,
         });
         for _ in 0..10 {
             app.scroll_approval_down();
@@ -2083,6 +2084,7 @@ mod tests {
             requires_sandbox: false,
             read_only: true,
             matched_rule: None,
+            preview: None,
         });
 
         app.approve_pending_tool_for_session();
@@ -2429,6 +2431,7 @@ mod tests {
                 requires_sandbox: true,
                 read_only: false,
                 matched_rule: Some("write".to_string()),
+                preview: None,
             },
         });
 

@@ -753,6 +753,7 @@ fn cell_lines(cell: &HistoryCell, width: u16) -> Vec<Line<'static>> {
                 matched_rule.as_deref(),
                 description,
                 arguments,
+                None,
                 width,
             );
             lines.push(Line::default());
@@ -858,6 +859,7 @@ fn extract_action(arguments_json: &str) -> String {
 /// Minimal, borderless approval block matching the welcome/picker style: a
 /// risk-coloured `●` + tool, the action it will take (prominent), an optional
 /// dim description, and only meaningful metadata (sandbox / matched rule).
+#[allow(clippy::too_many_arguments)]
 fn approval_lines(
     tool_name: &str,
     risk: &str,
@@ -865,6 +867,7 @@ fn approval_lines(
     matched_rule: Option<&str>,
     description: &str,
     arguments_json: &str,
+    preview: Option<&str>,
     width: usize,
 ) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
@@ -915,6 +918,21 @@ fn approval_lines(
             dim,
         )));
     }
+
+    if let Some(preview) = preview.filter(|preview| !preview.trim().is_empty()) {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled("  ── 变更预览 ──", dim)));
+        let added = Style::default().fg(Color::Green);
+        let removed = Style::default().fg(Color::Red);
+        for raw in preview.lines() {
+            let style = match raw.as_bytes().first() {
+                Some(b'+') => added,
+                Some(b'-') => removed,
+                _ => dim,
+            };
+            lines.extend(wrap_prefixed("  ", raw, width, style, style));
+        }
+    }
     lines
 }
 
@@ -937,6 +955,7 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout
         request.matched_rule.as_deref(),
         &request.description,
         &request.arguments.to_string(),
+        request.preview.as_deref(),
         width,
     );
     let body_paragraph = Paragraph::new(body)
@@ -1328,6 +1347,7 @@ mod tests {
             None,
             "运行构建脚本",
             r#"{"command":"npm run build"}"#,
+            None,
             60,
         );
         let text: String = lines
@@ -1341,6 +1361,38 @@ mod tests {
         }
         // false/none metadata is hidden.
         assert!(!text.contains("沙箱") && !text.contains("规则"));
+    }
+
+    #[test]
+    fn approval_lines_render_colored_diff_preview() {
+        let preview = "@@ -1,2 +1,2 @@\n one\n-two\n+three";
+        let lines = approval_lines(
+            "write_file",
+            "Medium",
+            false,
+            None,
+            "写入 note.txt",
+            r#"{"path":"note.txt"}"#,
+            Some(preview),
+            60,
+        );
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(text.contains("变更预览"));
+        assert!(text.contains("-two") && text.contains("+three"));
+
+        let style_of = |needle: &str| {
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|span| span.content.contains(needle))
+                .map(|span| span.style)
+                .unwrap_or_else(|| panic!("missing span {needle}"))
+        };
+        assert_eq!(style_of("+three").fg, Some(Color::Green));
+        assert_eq!(style_of("-two").fg, Some(Color::Red));
     }
 
     #[test]
