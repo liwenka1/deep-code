@@ -25,6 +25,10 @@ enum Command {
 #[derive(Debug, Clone)]
 pub(super) struct PersistenceActorHandle {
     tx: mpsc::UnboundedSender<Command>,
+    /// Last save failure, cleared by the next successful save. Surfaced to
+    /// UIs via `SessionUpdated.save_error` — a silent persistence failure
+    /// would otherwise let the user believe their session is durable.
+    last_error: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl PersistenceActorHandle {
@@ -40,13 +44,23 @@ impl PersistenceActorHandle {
         record: Arc<Mutex<SessionRecord>>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let last_error = Arc::new(std::sync::Mutex::new(None));
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(actor_loop(store, record, rx));
+                handle.spawn(actor_loop(store, record, rx, Arc::clone(&last_error)));
             }
             Err(_) => drop(rx),
         }
-        Self { tx }
+        Self { tx, last_error }
+    }
+
+    /// The most recent save failure, if the latest save attempt failed.
+    #[must_use]
+    pub(super) fn last_save_error(&self) -> Option<String> {
+        self.last_error
+            .lock()
+            .expect("save error lock poisoned")
+            .clone()
     }
 
     /// Signal that a save is desired. Non-blocking. Concurrent and queued
@@ -79,6 +93,7 @@ async fn actor_loop(
     store: Arc<dyn SessionStore + Send + Sync>,
     record: Arc<Mutex<SessionRecord>>,
     mut rx: mpsc::UnboundedReceiver<Command>,
+    last_error: Arc<std::sync::Mutex<Option<String>>>,
 ) {
     while let Some(first) = rx.recv().await {
         let mut pending_save = false;
@@ -92,8 +107,14 @@ async fn actor_loop(
 
         if pending_save {
             let snapshot = record.lock().await.clone();
-            if let Err(error) = store.save(&snapshot) {
-                eprintln!("session save failed: {error}");
+            let outcome = store.save(&snapshot);
+            let mut slot = last_error.lock().expect("save error lock poisoned");
+            match outcome {
+                Ok(()) => *slot = None,
+                Err(error) => {
+                    eprintln!("session save failed: {error}");
+                    *slot = Some(error.to_string());
+                }
             }
         }
         for ack in acks {
@@ -261,5 +282,53 @@ mod tests {
         handle.flush().await;
         // Actor must still be alive — a second flush should still resolve.
         handle.flush().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn save_failure_is_recorded_and_cleared_on_recovery() {
+        // A store that fails once, then succeeds.
+        struct FlakyStore {
+            failed: AtomicUsize,
+        }
+        impl SessionStore for FlakyStore {
+            fn save(&self, _record: &SessionRecord) -> Result<(), SessionStoreError> {
+                if self.failed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(SessionStoreError::Io {
+                        message: "disk full".to_string(),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            fn load(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError> {
+                Err(SessionStoreError::NotFound {
+                    id: id.as_str().to_string(),
+                })
+            }
+            fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError> {
+                Ok(Vec::new())
+            }
+            fn delete(&self, _id: &SessionId) -> Result<(), SessionStoreError> {
+                Ok(())
+            }
+        }
+
+        let store: Arc<dyn SessionStore + Send + Sync> = Arc::new(FlakyStore {
+            failed: AtomicUsize::new(0),
+        });
+        let record = Arc::new(Mutex::new(make_record()));
+        let handle = PersistenceActorHandle::spawn(store, Arc::clone(&record));
+
+        handle.request_save();
+        handle.flush().await;
+        assert!(
+            handle
+                .last_save_error()
+                .is_some_and(|error| error.contains("disk full"))
+        );
+
+        handle.request_save();
+        handle.flush().await;
+        assert_eq!(handle.last_save_error(), None, "recovery clears the error");
     }
 }

@@ -24,6 +24,10 @@
 # 打开请求超时（秒）：连接 + 等待响应头；不限制流式响应本身（流的存活由 [stream] 超时管理）。
 # timeout_secs = 60
 
+[checkpoints]
+# 检查点保留上限：每轮前后各存一份工作区快照，超出上限按最旧删除（0 = 不清理）。
+# max_snapshots = 20
+
 [cost]
 # 成本展示货币：cny / usd。
 # currency = "cny"

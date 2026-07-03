@@ -255,19 +255,34 @@ impl McpManager {
         arguments: Value,
     ) -> Result<Value, McpError> {
         let (server_name, tool_name) = parse_qualified_tool_name(qualified_name)?;
-        let servers = self.servers.read().expect("mcp lock");
-        let entry = servers
-            .get(&server_name)
-            .ok_or_else(|| McpError::UnknownServer {
-                name: server_name.clone(),
-            })?;
-        let client = entry
-            .client
-            .as_ref()
-            .ok_or_else(|| McpError::ServerUnavailable {
-                name: server_name.clone(),
-            })?;
-        client.call_tool(&tool_name, arguments)
+        let client = {
+            let servers = self.servers.read().expect("mcp lock");
+            let entry = servers
+                .get(&server_name)
+                .ok_or_else(|| McpError::UnknownServer {
+                    name: server_name.clone(),
+                })?;
+            entry
+                .client
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| McpError::ServerUnavailable {
+                    name: server_name.clone(),
+                })?
+        };
+        let result = client.call_tool(&tool_name, arguments);
+        if matches!(result, Err(McpError::Timeout { .. })) {
+            // Poison the slot: a hung server would otherwise cost the full
+            // timeout on every subsequent call. Later calls fail fast with
+            // ServerUnavailable; doctor/validate report the reason.
+            let mut servers = self.servers.write().expect("mcp lock");
+            if let Some(entry) = servers.get_mut(&server_name) {
+                entry.client = None;
+                entry.last_error =
+                    Some("call timed out; server marked unavailable".to_string());
+            }
+        }
+        result
     }
 
     pub fn qualified_tools(&self) -> Vec<(String, McpToolDescriptor)> {
@@ -428,5 +443,43 @@ mod tests {
         let (server, tool) = parse_qualified_tool_name(&qualified).unwrap();
         assert_eq!(server, "my_server");
         assert_eq!(tool, "do_thing");
+    }
+
+    #[test]
+    fn timeout_poisons_server_slot_for_fast_failure() {
+        use crate::mcp::client::{
+            McpClient, McpPromptDescriptor, McpResourceDescriptor, McpToolDescriptor,
+        };
+
+        struct HangingClient;
+        impl McpClient for HangingClient {
+            fn list_tools(&self) -> Result<Vec<McpToolDescriptor>, McpError> {
+                Ok(Vec::new())
+            }
+            fn call_tool(&self, _tool: &str, _arguments: Value) -> Result<Value, McpError> {
+                Err(McpError::Timeout {
+                    server: "mock".to_string(),
+                })
+            }
+            fn list_resources(&self) -> Result<Vec<McpResourceDescriptor>, McpError> {
+                Ok(Vec::new())
+            }
+            fn list_prompts(&self) -> Result<Vec<McpPromptDescriptor>, McpError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let mut manager = McpManager::new();
+        manager
+            .register_mock_client(mock_config("mock"), Arc::new(HangingClient))
+            .unwrap();
+        let qualified = qualify_tool_name("mock", "slow");
+
+        let first = manager.call_qualified_tool(&qualified, json!({}));
+        assert!(matches!(first, Err(McpError::Timeout { .. })));
+
+        // The slot is poisoned: no more 30s waits, immediate unavailable.
+        let second = manager.call_qualified_tool(&qualified, json!({}));
+        assert!(matches!(second, Err(McpError::ServerUnavailable { .. })));
     }
 }

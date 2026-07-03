@@ -312,7 +312,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         let current_turn_id = state.current_turn_id.clone();
         drop(state);
 
-        let (session_id, turn_count, summary, compaction, updated_at_ms) =
+        let (session_id, turn_count, summary, compaction, save_error, updated_at_ms) =
             if let Some(persistence) = self.persistence.as_ref() {
                 let record = persistence.record.lock().await;
                 (
@@ -320,10 +320,11 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                     record.turns.len(),
                     record.summary.clone(),
                     record.compaction.clone(),
+                    persistence.actor.last_save_error(),
                     record.updated_at_ms,
                 )
             } else {
-                (None, 0, None, None, now_ms())
+                (None, 0, None, None, None, now_ms())
             };
         emit(
             tx,
@@ -334,6 +335,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 turn_count,
                 summary,
                 compaction,
+                save_error,
                 updated_at_ms,
             },
         );

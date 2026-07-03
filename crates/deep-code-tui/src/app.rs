@@ -75,6 +75,9 @@ pub struct App {
     pub last_checkpoint: Option<String>,
     pub session_id: Option<String>,
     pub(crate) resumed: bool,
+    /// One-shot latch for the "session save failed" transcript warning; the
+    /// status line keeps warning until a save succeeds again.
+    pub(crate) save_error_notified: bool,
     pub scroll_offset: usize,
     pub approval_scroll_offset: usize,
     /// Currently highlighted approval option: 0 = y (approve), 1 = a (session),
@@ -309,6 +312,7 @@ impl App {
             last_checkpoint: None,
             session_id,
             resumed,
+            save_error_notified: false,
             scroll_offset: 0,
             approval_scroll_offset: 0,
             approval_focus: 0,

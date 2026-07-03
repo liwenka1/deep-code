@@ -10,9 +10,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    APPROVAL_AUTO_ALLOW_ENV, AUTO_COST_SAVING_ENV, AgentConfig, COMPACTION_THRESHOLD_ENV,
-    COST_CURRENCY_ENV, DEEPSEEK_API_KEY_ENV, MODEL_ENV, REASONING_EFFORT_ENV,
-    STREAM_CHUNK_TIMEOUT_ENV, STREAM_MAX_BYTES_ENV, STREAM_MAX_RETRIES_ENV,
+    APPROVAL_AUTO_ALLOW_ENV, AUTO_COST_SAVING_ENV, AgentConfig, CHECKPOINT_MAX_SNAPSHOTS_ENV,
+    COMPACTION_THRESHOLD_ENV, COST_CURRENCY_ENV, DEEPSEEK_API_KEY_ENV, MODEL_ENV,
+    REASONING_EFFORT_ENV, STREAM_CHUNK_TIMEOUT_ENV, STREAM_MAX_BYTES_ENV, STREAM_MAX_RETRIES_ENV,
     STREAM_TOTAL_TIMEOUT_ENV,
 };
 use crate::pricing::CostCurrency;
@@ -171,6 +171,7 @@ struct ConfigFile {
     context: ContextSection,
     stream: StreamSection,
     approval: ApprovalSection,
+    checkpoints: CheckpointsSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -209,6 +210,12 @@ struct StreamSection {
 #[serde(default)]
 struct ApprovalSection {
     auto_allow: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct CheckpointsSection {
+    max_snapshots: Option<usize>,
 }
 
 enum FileRead {
@@ -331,6 +338,9 @@ fn apply_file_overlay(
     if let Some(value) = file.stream.max_bytes {
         config.stream_max_bytes = value;
     }
+    if let Some(value) = file.checkpoints.max_snapshots {
+        config.checkpoint_max_snapshots = value;
+    }
 
     if let Some(rules) = &file.approval.auto_allow {
         if project {
@@ -388,6 +398,10 @@ pub(super) fn apply_env_overlay(
     }
     if let Some(value) = lookup(STREAM_MAX_BYTES_ENV).and_then(|value| value.parse().ok()) {
         config.stream_max_bytes = value;
+    }
+    if let Some(value) = lookup(CHECKPOINT_MAX_SNAPSHOTS_ENV).and_then(|value| value.parse().ok())
+    {
+        config.checkpoint_max_snapshots = value;
     }
     if let Some(value) = lookup(APPROVAL_AUTO_ALLOW_ENV) {
         config.approval_auto_allow = value

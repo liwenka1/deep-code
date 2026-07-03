@@ -40,6 +40,8 @@ pub enum McpError {
     ConnectFailed { server: String, message: String },
     #[error("MCP protocol error for server '{server}': {message}")]
     Protocol { server: String, message: String },
+    #[error("MCP server '{server}' timed out waiting for a response")]
+    Timeout { server: String },
     #[error("MCP tool '{tool}' not found on server '{server}'")]
     ToolNotFound { server: String, tool: String },
     #[error("invalid qualified MCP tool name '{name}'")]

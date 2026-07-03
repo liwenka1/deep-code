@@ -46,20 +46,6 @@ impl Message {
         }
     }
 
-    /// Assistant message that seeds DeepSeek `/beta` prefix completion: the
-    /// model continues from `content`. Must be the final message in the request.
-    #[must_use]
-    pub fn assistant_prefix(content: impl Into<String>) -> Self {
-        Self {
-            role: Role::Assistant,
-            content: content.into(),
-            reasoning_content: None,
-            tool_call_id: None,
-            tool_calls: Vec::new(),
-            prefix: true,
-        }
-    }
-
     #[must_use]
     pub fn system(content: impl Into<String>) -> Self {
         Self::new(Role::System, content)

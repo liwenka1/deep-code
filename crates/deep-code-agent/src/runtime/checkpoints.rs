@@ -18,7 +18,11 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     #[must_use]
     pub fn with_checkpoints(mut self, workspace: impl Into<PathBuf>) -> Self {
         match CheckpointStore::new(workspace) {
-            Ok(store) => self.checkpoints = Some(Arc::new(store)),
+            Ok(store) => {
+                self.checkpoints = Some(Arc::new(
+                    store.with_max_snapshots(self.config.checkpoint_max_snapshots),
+                ));
+            }
             Err(error) => eprintln!("checkpoints disabled: {error}"),
         }
         self
@@ -58,6 +62,13 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             }
             Err(error) => {
                 eprintln!("checkpoint snapshot '{label}' failed: {error}");
+                emit(
+                    tx,
+                    RuntimeEvent::Error {
+                        turn_id: None,
+                        message: format!("检查点快照失败（{label}）：{error}"),
+                    },
+                );
             }
         }
     }

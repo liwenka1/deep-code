@@ -135,6 +135,10 @@ pub enum RuntimeEvent {
         summary: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         compaction: Option<String>,
+        /// Set while the most recent disk save failed; cleared on recovery.
+        /// UIs must surface this — the transcript on screen is NOT durable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        save_error: Option<String>,
         updated_at_ms: u64,
     },
     /// Current turn finished cleanly (no further provider activity).

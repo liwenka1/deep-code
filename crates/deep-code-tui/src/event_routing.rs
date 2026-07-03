@@ -121,13 +121,35 @@ impl App {
                 session_id,
                 turn_count,
                 compaction,
+                save_error,
                 ..
             } => {
                 if let Some(session_id) = session_id {
                     self.session_id = Some(session_id.0);
                 }
-                if let Some(compaction) = compaction {
-                    self.status = format!("Session updated: {turn_count} turn(s), {compaction}");
+                match save_error {
+                    Some(error) => {
+                        // Surface once per failure episode; the status line
+                        // keeps warning until a save succeeds again.
+                        if !self.save_error_notified {
+                            self.history.push(HistoryCell::system(format!(
+                                "⚠ 会话保存失败，当前对话未持久化：{error}"
+                            )));
+                            self.save_error_notified = true;
+                        }
+                        self.status = format!("⚠ 会话保存失败：{error}");
+                    }
+                    None => {
+                        if self.save_error_notified {
+                            self.history
+                                .push(HistoryCell::system("会话保存已恢复正常。"));
+                            self.save_error_notified = false;
+                        }
+                        if let Some(compaction) = compaction {
+                            self.status =
+                                format!("Session updated: {turn_count} turn(s), {compaction}");
+                        }
+                    }
                 }
             }
             RuntimeEvent::DiagnosticsUpdated { summary, rendered } => {

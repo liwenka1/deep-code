@@ -30,6 +30,7 @@ pub const STREAM_CHUNK_TIMEOUT_ENV: &str = "DEEP_CODE_STREAM_CHUNK_TIMEOUT_SECS"
 pub const STREAM_TOTAL_TIMEOUT_ENV: &str = "DEEP_CODE_STREAM_TOTAL_TIMEOUT_SECS";
 pub const STREAM_MAX_BYTES_ENV: &str = "DEEP_CODE_STREAM_MAX_BYTES";
 pub const APPROVAL_AUTO_ALLOW_ENV: &str = "DEEP_CODE_APPROVAL_AUTO_ALLOW";
+pub const CHECKPOINT_MAX_SNAPSHOTS_ENV: &str = "DEEP_CODE_CHECKPOINT_MAX_SNAPSHOTS";
 
 pub const DEFAULT_STREAM_MAX_RETRIES: u32 = 3;
 pub const DEFAULT_STREAM_CHUNK_TIMEOUT_SECS: u64 = 300;
@@ -62,6 +63,9 @@ pub struct AgentConfig {
     /// these run without prompting. Only env and the global config file may
     /// set this — project files are ignored (a repo must not disarm gates).
     pub approval_auto_allow: Vec<String>,
+    /// Checkpoint retention cap: oldest snapshots beyond this count are
+    /// pruned after each new snapshot (0 disables pruning).
+    pub checkpoint_max_snapshots: usize,
 }
 
 impl Default for AgentConfig {
@@ -93,6 +97,7 @@ impl AgentConfig {
             stream_total_timeout: Duration::from_secs(DEFAULT_STREAM_TOTAL_TIMEOUT_SECS),
             stream_max_bytes: DEFAULT_STREAM_MAX_BYTES,
             approval_auto_allow: Vec::new(),
+            checkpoint_max_snapshots: crate::checkpoint::DEFAULT_MAX_SNAPSHOTS,
         }
     }
 

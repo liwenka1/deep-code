@@ -129,15 +129,29 @@ impl McpClient for InMemoryMcpClient {
     }
 }
 
+/// Hard ceiling for one MCP request/response round trip (initialize
+/// included). A hung server costs at most this much once — the manager then
+/// poisons the server slot so later calls fail fast.
+const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Blocking stdio MCP client (initialize + tools/list + tools/call).
 pub struct StdioMcpClient {
     inner: Arc<Mutex<StdioMcpSession>>,
 }
 
+/// Lines from the child's stdout, pumped by a dedicated reader thread so
+/// response waits can time out even when the server emits nothing at all
+/// (a plain blocking `read_line` would hang forever).
+enum ReaderEvent {
+    Line(String),
+    Eof,
+    Error(String),
+}
+
 struct StdioMcpSession {
     server_name: String,
     child: std::process::Child,
-    stdout: BufReader<std::process::ChildStdout>,
+    lines: std::sync::mpsc::Receiver<ReaderEvent>,
     next_id: u64,
 }
 
@@ -172,10 +186,32 @@ impl StdioMcpClient {
             server: config.name.clone(),
             message: "missing stdout".to_string(),
         })?;
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        let _ = line_tx.send(ReaderEvent::Eof);
+                        break;
+                    }
+                    Ok(_) => {
+                        if line_tx.send(ReaderEvent::Line(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = line_tx.send(ReaderEvent::Error(error.to_string()));
+                        break;
+                    }
+                }
+            }
+        });
         let mut session = StdioMcpSession {
             server_name: config.name.clone(),
             child,
-            stdout: BufReader::new(stdout),
+            lines: line_rx,
             next_id: REQUEST_ID.fetch_add(1, Ordering::Relaxed),
         };
         session.initialize()?;
@@ -277,28 +313,40 @@ impl StdioMcpSession {
     }
 
     fn read_response(&mut self, expected_id: u64) -> Result<Value, McpError> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + MCP_CALL_TIMEOUT;
         loop {
-            if std::time::Instant::now() > deadline {
-                return Err(McpError::Protocol {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(McpError::Timeout {
                     server: self.server_name.clone(),
-                    message: "timed out waiting for MCP response".to_string(),
                 });
             }
-            let mut line = String::new();
-            let read = self
-                .stdout
-                .read_line(&mut line)
-                .map_err(|error| McpError::Protocol {
-                    server: self.server_name.clone(),
-                    message: error.to_string(),
-                })?;
-            if read == 0 {
-                return Err(McpError::Protocol {
-                    server: self.server_name.clone(),
-                    message: "unexpected EOF from MCP server".to_string(),
-                });
-            }
+            let line = match self.lines.recv_timeout(remaining) {
+                Ok(ReaderEvent::Line(line)) => line,
+                Ok(ReaderEvent::Eof) => {
+                    return Err(McpError::Protocol {
+                        server: self.server_name.clone(),
+                        message: "unexpected EOF from MCP server".to_string(),
+                    });
+                }
+                Ok(ReaderEvent::Error(message)) => {
+                    return Err(McpError::Protocol {
+                        server: self.server_name.clone(),
+                        message,
+                    });
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(McpError::Timeout {
+                        server: self.server_name.clone(),
+                    });
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(McpError::Protocol {
+                        server: self.server_name.clone(),
+                        message: "MCP reader thread exited".to_string(),
+                    });
+                }
+            };
             if line.trim().is_empty() {
                 continue;
             }
