@@ -407,10 +407,17 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             // Model history gets a size-bounded copy; the event stream and the
             // persisted TurnRecord keep the full output.
             let trimmed = truncate_tool_output(&result.content);
-            state.session.push(crate::message::Message::tool(
-                result.call_id.clone(),
-                trimmed,
-            ));
+            if !state
+                .session
+                .record_tool_result(&result.call_id, trimmed, result.status)
+            {
+                // Should be unreachable: the assistant entry carrying this
+                // call was pushed before the batch ran.
+                eprintln!(
+                    "warn: tool result {} had no pending exchange to attach to",
+                    result.call_id
+                );
+            }
             if let Some(turn) = state.current_turn.as_mut() {
                 turn.tool_results.push(result.clone());
             }

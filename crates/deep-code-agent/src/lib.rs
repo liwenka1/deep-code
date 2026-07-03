@@ -25,6 +25,7 @@ mod runtime;
 mod runtime_launch;
 mod sandbox;
 mod session;
+mod session_entry;
 mod session_store;
 mod shell_tools;
 mod skills;
@@ -43,7 +44,7 @@ pub use auto_mode::{
 pub use checkpoint::{CheckpointId, CheckpointStore};
 pub use client::{AgentEventStream, DeepSeekClient, LlmClient};
 pub use compaction::{
-    CompactionResult, compact_messages, context_usage_percent, effective_compaction_threshold,
+    CompactionResult, compact_entries, context_usage_percent, effective_compaction_threshold,
     estimate_token_count, near_compaction_threshold, should_compact, stable_prefix_fingerprint,
 };
 pub use config::{
@@ -109,6 +110,7 @@ pub use sandbox::{
     detect_capabilities,
 };
 pub use session::Session;
+pub use session_entry::{EntryId, EntryKind, ExchangeResult, SessionEntry, ToolExchange};
 pub use session_store::{
     CheckpointRecord, ConfigSnapshot, JsonSessionStore, SESSION_SCHEMA_VERSION, SessionId,
     SessionRecord, SessionStore, SessionStoreError, TurnRecord, format_sessions_storage_note,

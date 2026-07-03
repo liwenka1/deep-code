@@ -5,8 +5,13 @@ use std::hash::{Hash, Hasher};
 
 use crate::message::{Message, Role};
 use crate::model_registry::{compaction_threshold_for_model, context_window_for_model};
+use crate::session::entry_wire_messages;
+use crate::session_entry::{EntryKind, SessionEntry};
 
-const RECENT_TAIL: usize = 8;
+/// How many trailing entries survive compaction. Entries are atomic (an
+/// assistant entry carries its whole tool batch), so unlike the old
+/// message-based tail this can never sever a `tool_calls`/`tool` pair.
+const RECENT_TAIL_ENTRIES: usize = 5;
 
 /// Effective compaction threshold: env override or 80% of model context window.
 #[must_use]
@@ -36,7 +41,7 @@ pub fn near_compaction_threshold(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionResult {
-    pub messages: Vec<Message>,
+    pub entries: Vec<SessionEntry>,
     pub summary: String,
     pub archived_count: usize,
 }
@@ -93,47 +98,50 @@ pub fn stable_prefix_fingerprint(messages: &[Message]) -> u64 {
     hasher.finish()
 }
 
-/// Keep the first system prompt, summarize archived middle turns, retain recent tail.
+/// Keep the leading system entry, summarize archived middle entries into one
+/// Compaction entry, retain the recent tail. `archived_count` counts entries.
 #[must_use]
-pub fn compact_messages(messages: &[Message]) -> CompactionResult {
-    if messages.len() <= RECENT_TAIL + 1 {
-        return CompactionResult {
-            messages: messages.to_vec(),
-            summary: String::new(),
-            archived_count: 0,
-        };
+pub fn compact_entries(entries: &[SessionEntry]) -> CompactionResult {
+    let unchanged = || CompactionResult {
+        entries: entries.to_vec(),
+        summary: String::new(),
+        archived_count: 0,
+    };
+    if entries.len() <= RECENT_TAIL_ENTRIES + 1 {
+        return unchanged();
     }
 
-    let system = messages
+    let system = entries
         .first()
-        .filter(|message| matches!(message.role, Role::System))
+        .filter(|entry| matches!(entry.kind, EntryKind::System { .. }))
         .cloned();
-    let tail_start = messages.len().saturating_sub(RECENT_TAIL);
-    let head_offset = if system.is_some() { 1 } else { 0 };
+    let tail_start = entries.len().saturating_sub(RECENT_TAIL_ENTRIES);
+    let head_offset = usize::from(system.is_some());
     if tail_start <= head_offset {
-        return CompactionResult {
-            messages: messages.to_vec(),
-            summary: String::new(),
-            archived_count: 0,
-        };
+        return unchanged();
     }
 
-    let archived = &messages[head_offset..tail_start];
-    let summary = summarize_archived(archived);
-    let mut out = Vec::with_capacity(2 + RECENT_TAIL);
-    if let Some(system_message) = system {
-        out.push(system_message);
+    let archived = &entries[head_offset..tail_start];
+    let summary = summarize_archived_entries(archived);
+    let mut out = Vec::with_capacity(2 + RECENT_TAIL_ENTRIES);
+    if let Some(system_entry) = system {
+        out.push(system_entry);
     }
-    out.push(Message::system(format!(
-        "[会话摘要 / session summary]\n{summary}"
-    )));
-    out.extend_from_slice(&messages[tail_start..]);
+    out.push(SessionEntry::compaction(summary.clone(), archived.len()));
+    out.extend_from_slice(&entries[tail_start..]);
 
     CompactionResult {
         archived_count: archived.len(),
-        messages: out,
+        entries: out,
         summary,
     }
+}
+
+/// Summarize archived entries via their derived wire messages, so the summary
+/// text stays byte-equivalent with the old message-based path.
+fn summarize_archived_entries(entries: &[SessionEntry]) -> String {
+    let wire: Vec<Message> = entries.iter().flat_map(entry_wire_messages).collect();
+    summarize_archived(&wire)
 }
 
 fn summarize_archived(messages: &[Message]) -> String {
@@ -171,21 +179,31 @@ mod tests {
 
     #[test]
     fn compact_keeps_recent_tail() {
-        let mut messages = vec![Message::system("sys")];
+        let mut entries = vec![SessionEntry::system("sys")];
         for index in 0..12 {
-            messages.push(Message::user(format!("u{index}")));
-            messages.push(Message::assistant(format!("a{index}")));
+            entries.push(SessionEntry::user(format!("u{index}")));
+            entries.push(SessionEntry::assistant(
+                format!("a{index}"),
+                None,
+                Vec::new(),
+            ));
         }
-        let result = compact_messages(&messages);
+        let result = compact_entries(&entries);
         assert!(result.archived_count > 0);
-        assert!(result.messages.len() < messages.len());
+        assert!(result.entries.len() < entries.len());
         assert!(
             result
-                .messages
+                .entries
                 .iter()
-                .any(|message| message.content.contains("会话摘要"))
+                .any(|entry| matches!(entry.kind, EntryKind::Compaction { .. }))
         );
-        assert_eq!(result.messages.last().unwrap().content, "a11");
+        assert!(matches!(
+            &result.entries.last().unwrap().kind,
+            EntryKind::Assistant { content, .. } if content == "a11"
+        ));
+        // The tail keeps whole entries: the derived wire still pairs cleanly.
+        let wire: Vec<Message> = result.entries.iter().flat_map(entry_wire_messages).collect();
+        assert!(wire.iter().any(|message| message.content.contains("会话摘要")));
     }
 
     #[test]

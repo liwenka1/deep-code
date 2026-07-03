@@ -1,7 +1,7 @@
 use tokio::sync::mpsc;
 
 use crate::client::LlmClient;
-use crate::compaction::{compact_messages, should_compact};
+use crate::compaction::{compact_entries, should_compact};
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, emit};
 
@@ -11,19 +11,25 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         model: &str,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) -> bool {
-        let messages = self.state.lock().await.session.messages().to_vec();
-        if !should_compact(model, &messages, self.config.compaction_threshold) {
+        let (wire, entries) = {
+            let state = self.state.lock().await;
+            (
+                state.session.wire_messages(),
+                state.session.entries().to_vec(),
+            )
+        };
+        if !should_compact(model, &wire, self.config.compaction_threshold) {
             return false;
         }
-        let result = compact_messages(&messages);
+        let result = compact_entries(&entries);
         if result.archived_count == 0 {
             return false;
         }
         let compacted = {
             let mut state = self.state.lock().await;
-            state.session.replace_messages(result.messages.clone());
+            state.session.replace_entries(result.entries.clone());
             state.last_prefix_hash = None;
-            state.session.messages().to_vec()
+            state.session.wire_messages()
         };
         if let Some(persistence) = self.persistence.as_ref() {
             {

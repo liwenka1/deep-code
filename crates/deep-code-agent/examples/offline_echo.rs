@@ -1,9 +1,9 @@
-use deep_code_agent::{AgentEvent, Message, Session};
+use deep_code_agent::{AgentEvent, Session};
 
 fn main() {
     let mut session = Session::new();
-    session.push(Message::system("You are deep-code's offline smoke test."));
-    session.push(Message::user("ping"));
+    session.push_system("You are deep-code's offline smoke test.");
+    session.push_user("ping");
 
     let events = [
         AgentEvent::TextDelta {

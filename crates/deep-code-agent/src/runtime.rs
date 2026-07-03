@@ -122,7 +122,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         let mut session = Session::new();
         let system_text = system.into();
         if !system_text.is_empty() {
-            session.push(Message::system(system_text));
+            session.push_system(system_text);
         }
         Self {
             client: Arc::new(client),
@@ -181,11 +181,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         let turn_id = TurnId::new();
         {
             let mut state = self.state.lock().await;
-            // A prior turn may have been interrupted between the assistant's
-            // tool_calls and the tool running (exit while awaiting approval),
-            // leaving dangling tool_calls that the API rejects on resume.
-            state.session.repair_dangling_tool_calls();
-            state.session.push(Message::user(&prompt));
+            // Interrupted tool calls need no repair here: pending exchanges
+            // synthesize their placeholder at wire derivation.
+            state.session.push_user(&prompt);
             state.pending = None;
             state.current_turn = Some(TurnRecord::new(prompt.clone()));
             state.current_prompt = Some(prompt);
@@ -285,9 +283,10 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         rx
     }
 
-    /// Snapshot the current message history. Mostly for tests/debugging.
+    /// Snapshot the current wire-derived message history. Mostly for
+    /// tests/debugging.
     pub async fn session_messages(&self) -> Vec<Message> {
-        self.state.lock().await.session.messages().to_vec()
+        self.state.lock().await.session.wire_messages()
     }
 
     async fn current_turn_id(&self) -> TurnId {
@@ -309,7 +308,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
 
     async fn emit_session_updated(&self, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
         let state = self.state.lock().await;
-        let message_count = state.session.messages().len();
+        let message_count = state.session.wire_messages().len();
         let current_turn_id = state.current_turn_id.clone();
         drop(state);
 

@@ -6,7 +6,6 @@ use crate::auto_mode::{RouteContext, resolve_turn_route};
 use crate::client::LlmClient;
 use crate::compaction::{estimate_token_count, stable_prefix_fingerprint};
 use crate::event::AgentEvent;
-use crate::message::Message;
 use crate::model::{ChatRequest, Usage};
 use crate::model_registry::{DEEPSEEK_V4_PRO, context_window_for_model};
 use crate::runtime::AgentRuntime;
@@ -21,7 +20,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     pub(super) async fn run_loop(&self, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
         let (user_prompt, cancel, route_ctx) = {
             let state = self.state.lock().await;
-            let context_tokens = estimate_token_count(state.session.messages());
+            let context_tokens = estimate_token_count(&state.session.wire_messages());
             (
                 state.current_prompt.clone().unwrap_or_default(),
                 state.cancel.clone(),
@@ -60,7 +59,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             }
             let (messages, prefix_hash) = {
                 let state = self.state.lock().await;
-                let messages = state.session.messages().to_vec();
+                let messages = state.session.wire_messages();
                 let prefix_hash = stable_prefix_fingerprint(&messages);
                 (messages, prefix_hash)
             };
@@ -207,11 +206,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 // calls, so no tool_call/tool pairing is broken.
                 if !text_buffer.is_empty() || !reasoning_buffer.is_empty() {
                     let mut state = self.state.lock().await;
-                    state.session.push(Message::assistant_turn(
-                        text_buffer,
-                        reasoning_buffer,
-                        Vec::new(),
-                    ));
+                    state
+                        .session
+                        .push_assistant(text_buffer, reasoning_buffer, Vec::new());
                 }
                 self.finish_turn_cancelled(&turn_id, tx).await;
                 return;
@@ -222,11 +219,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 // kept (no tool_calls were pushed, so pairing is intact).
                 if !text_buffer.is_empty() || !reasoning_buffer.is_empty() {
                     let mut state = self.state.lock().await;
-                    state.session.push(Message::assistant_turn(
-                        text_buffer,
-                        reasoning_buffer,
-                        Vec::new(),
-                    ));
+                    state
+                        .session
+                        .push_assistant(text_buffer, reasoning_buffer, Vec::new());
                 }
                 self.abort_turn().await;
                 return;
@@ -246,11 +241,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
 
             if calls.is_empty() {
                 let mut state = self.state.lock().await;
-                state.session.push(Message::assistant_turn(
-                    text_buffer,
-                    reasoning_buffer,
-                    Vec::new(),
-                ));
+                state
+                    .session
+                    .push_assistant(text_buffer, reasoning_buffer, Vec::new());
                 drop(state);
                 self.persist().await;
                 self.emit_session_updated(tx).await;
@@ -290,11 +283,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
 
             {
                 let mut state = self.state.lock().await;
-                state.session.push(Message::assistant_turn(
-                    text_buffer,
-                    reasoning_buffer,
-                    payloads,
-                ));
+                state
+                    .session
+                    .push_assistant(text_buffer, reasoning_buffer, payloads);
             }
             self.persist().await;
             self.emit_session_updated(tx).await;
