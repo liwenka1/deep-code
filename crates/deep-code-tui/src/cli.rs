@@ -330,7 +330,7 @@ pub fn run_session_command(mode: RunMode) -> anyhow::Result<()> {
                     "{}\t{}\t{} msgs\t{}",
                     record.id.as_str(),
                     format_timestamp(record.updated_at_ms),
-                    record.messages.len(),
+                    record.message_count(),
                     preview
                 );
             }

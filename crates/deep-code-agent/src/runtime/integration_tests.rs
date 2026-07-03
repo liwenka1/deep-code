@@ -896,7 +896,7 @@ async fn persistence_saves_messages_and_turns() {
 
     let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
     let record = store.load(&session_id).unwrap();
-    assert_eq!(record.messages.len(), 3);
+    assert_eq!(record.message_count(), 3);
     assert_eq!(record.turns.len(), 1);
     assert_eq!(record.turns[0].user_prompt, "hi");
 }
@@ -929,13 +929,18 @@ async fn persistence_saves_reasoning_content() {
 
     let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
     let record = store.load(&session_id).unwrap();
-    let assistant = record
-        .messages
+    let (content, reasoning) = record
+        .entries
         .iter()
-        .find(|message| matches!(message.role, crate::message::Role::Assistant))
-        .expect("assistant message");
-    assert_eq!(assistant.content, "hello");
-    assert_eq!(assistant.reasoning_content.as_deref(), Some("thinking"));
+        .find_map(|entry| match &entry.kind {
+            crate::session_entry::EntryKind::Assistant {
+                content, reasoning, ..
+            } => Some((content.clone(), reasoning.clone())),
+            _ => None,
+        })
+        .expect("assistant entry");
+    assert_eq!(content, "hello");
+    assert_eq!(reasoning.as_deref(), Some("thinking"));
 }
 
 #[tokio::test]
@@ -1077,7 +1082,7 @@ async fn resumed_runtime_continues_conversation() {
 
     let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
     let record = store.load(&session_id).unwrap();
-    assert_eq!(record.messages.len(), 3);
+    assert_eq!(record.message_count(), 3);
 
     let resumed = AgentRuntime::from_session_record(
         ScriptedClient::new(vec![vec![
@@ -1338,7 +1343,7 @@ async fn multi_tool_turn_executes_all_auto_calls_in_order_and_persists() {
     runtime.shutdown().await;
     let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
     let record = store.load(&session_id).unwrap();
-    assert_eq!(record.messages.len(), 6);
+    assert_eq!(record.message_count(), 6);
     assert_eq!(record.turns.len(), 1);
     assert_eq!(record.turns[0].tool_results.len(), 2);
 }

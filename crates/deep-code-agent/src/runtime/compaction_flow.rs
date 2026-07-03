@@ -29,12 +29,12 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             let mut state = self.state.lock().await;
             state.session.replace_entries(result.entries.clone());
             state.last_prefix_hash = None;
-            state.session.wire_messages()
+            state.session.entries().to_vec()
         };
         if let Some(persistence) = self.persistence.as_ref() {
             {
                 let mut record = persistence.record.lock().await;
-                record.messages = compacted;
+                record.entries = compacted;
                 record.summary = Some(result.summary.clone());
                 record.compaction = Some(format!("archived={}", result.archived_count));
                 record.touch();

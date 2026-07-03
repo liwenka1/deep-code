@@ -252,9 +252,11 @@ impl App {
                 .as_ref()
                 .map(|record| {
                     record
-                        .messages
+                        .entries
                         .iter()
-                        .filter(|message| message.role == deep_code_agent::Role::User)
+                        .filter(|entry| {
+                            matches!(entry.kind, deep_code_agent::EntryKind::User { .. })
+                        })
                         .count()
                 })
                 .unwrap_or(0);
@@ -1568,14 +1570,14 @@ mod tests {
 
     #[test]
     fn resume_picker_navigates_and_cancels() {
-        use deep_code_agent::{AgentConfig, Message};
+        use deep_code_agent::{AgentConfig, SessionEntry};
         let make = |prompt: &str| {
             let mut record = SessionRecord::new(
                 std::path::PathBuf::from("/tmp/ws"),
                 &AgentConfig::builtin(),
                 "system",
             );
-            record.messages = vec![Message::system("system"), Message::user(prompt)];
+            record.entries = vec![SessionEntry::system("system"), SessionEntry::user(prompt)];
             record
         };
         let mut app = App::new();

@@ -57,7 +57,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         config: AgentConfig,
     ) -> Self {
         let workspace = record.workspace.clone();
-        let session = Session::from_wire_messages(&record.messages);
+        let session = Session::from_entries(record.entries.clone());
         Self {
             client: Arc::new(client),
             config,
@@ -103,7 +103,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             let state = self.state.try_lock().map_err(|_| SessionStoreError::Io {
                 message: "runtime state is busy".to_string(),
             })?;
-            record.messages = state.session.wire_messages();
+            record.entries = state.session.entries().to_vec();
         }
         store.save(&record)?;
         self.workspace = Some(workspace);
@@ -125,10 +125,10 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         let Some(persistence) = self.persistence.as_ref() else {
             return;
         };
-        let messages = self.state.lock().await.session.wire_messages();
+        let entries = self.state.lock().await.session.entries().to_vec();
         {
             let mut record = persistence.record.lock().await;
-            record.messages = messages;
+            record.entries = entries;
             record.touch();
         }
         persistence.actor.request_save();

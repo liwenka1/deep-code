@@ -5,6 +5,7 @@
 //! replace JSON later without touching the runtime.
 
 mod json;
+mod migrate;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,12 +17,14 @@ pub use json::JsonSessionStore;
 
 use crate::checkpoint::CheckpointId;
 use crate::config::AgentConfig;
-use crate::message::Message;
 use crate::model::Usage;
+use crate::session_entry::{EntryKind, SessionEntry};
 use crate::tool::ToolResult;
 
 /// Current on-disk schema version. Bump when making breaking layout changes.
-pub const SESSION_SCHEMA_VERSION: u32 = 1;
+/// v1 stored wire messages; v2 stores [`SessionEntry`] values (v1 files are
+/// migrated transparently on load).
+pub const SESSION_SCHEMA_VERSION: u32 = 2;
 
 const SESSIONS_DIR: &str = ".deep-code/sessions";
 
@@ -131,15 +134,18 @@ pub struct SessionRecord {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub config: ConfigSnapshot,
-    pub messages: Vec<Message>,
+    /// Domain-level conversation entries (schema v2). Wire messages are
+    /// derived via [`crate::session::Session::wire_messages`].
+    pub entries: Vec<SessionEntry>,
     pub turns: Vec<TurnRecord>,
     /// Workspace snapshots created during this session.
     #[serde(default)]
     pub checkpoints: Vec<CheckpointRecord>,
-    /// Transcript summary produced by compaction (when applied).
+    /// Transcript summary produced by compaction. Derived field mirroring the
+    /// latest Compaction entry, kept for status lines and events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    /// Compaction metadata, e.g. `archived=N` (when applied).
+    /// Compaction metadata, e.g. `archived=N` (when applied). Derived field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<String>,
 }
@@ -148,7 +154,7 @@ impl SessionRecord {
     #[must_use]
     pub fn new(workspace: PathBuf, config: &AgentConfig, system_prompt: impl Into<String>) -> Self {
         let now = now_ms();
-        let messages = vec![crate::message::Message::system(system_prompt)];
+        let entries = vec![SessionEntry::system(system_prompt)];
         Self {
             schema_version: SESSION_SCHEMA_VERSION,
             id: new_session_id(),
@@ -156,7 +162,7 @@ impl SessionRecord {
             created_at_ms: now,
             updated_at_ms: now,
             config: ConfigSnapshot::from(config),
-            messages,
+            entries,
             turns: Vec::new(),
             checkpoints: Vec::new(),
             summary: None,
@@ -169,12 +175,31 @@ impl SessionRecord {
     }
 
     pub fn preview(&self) -> String {
-        self.messages
+        self.entries
             .iter()
             .rev()
-            .find(|message| matches!(message.role, crate::message::Role::User))
-            .map(|message| message.content.clone())
+            .find_map(|entry| match &entry.kind {
+                EntryKind::User { content } => Some(content.clone()),
+                _ => None,
+            })
             .unwrap_or_else(|| "(empty session)".to_string())
+    }
+
+    #[must_use]
+    pub fn has_user_entry(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| matches!(entry.kind, EntryKind::User { .. }))
+    }
+
+    /// Derived wire-message count. Consumers report this (not the entry
+    /// count) so displayed numbers stay stable across the v1→v2 migration.
+    #[must_use]
+    pub fn message_count(&self) -> usize {
+        self.entries
+            .iter()
+            .map(SessionEntry::wire_message_count)
+            .sum()
     }
 }
 
@@ -248,20 +273,9 @@ pub fn format_sessions_storage_note(workspace: &Path) -> String {
     )
 }
 
-pub(crate) fn validate_schema(record: &SessionRecord) -> Result<(), SessionStoreError> {
-    if record.schema_version != SESSION_SCHEMA_VERSION {
-        return Err(SessionStoreError::UnsupportedSchema {
-            found: record.schema_version,
-            expected: SESSION_SCHEMA_VERSION,
-        });
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::Message;
 
     #[test]
     fn validate_session_id_rejects_traversal() {
@@ -279,14 +293,18 @@ mod tests {
     }
 
     #[test]
-    fn session_record_preview_uses_latest_user_message() {
+    fn session_record_preview_uses_latest_user_entry() {
         let mut record =
             SessionRecord::new(PathBuf::from("/tmp/ws"), &AgentConfig::default(), "system");
-        record.messages.push(Message::user("first"));
-        record.messages.push(Message::assistant("ok"));
-        record.messages.push(Message::user("second"));
+        record.entries.push(SessionEntry::user("first"));
+        record
+            .entries
+            .push(SessionEntry::assistant("ok", None, Vec::new()));
+        record.entries.push(SessionEntry::user("second"));
 
         assert_eq!(record.preview(), "second");
+        assert!(record.has_user_entry());
+        assert_eq!(record.message_count(), 4);
     }
 
     #[test]

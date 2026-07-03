@@ -1,6 +1,4 @@
-use std::collections::{HashMap, VecDeque};
-
-use deep_code_agent::{Message, Role, SessionRecord, ToolResultStatus};
+use deep_code_agent::{EntryKind, SessionRecord, ToolResultStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolApprovalState {
@@ -195,49 +193,64 @@ impl HistoryCell {
 }
 
 pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
-    let mut tool_names = HashMap::new();
-    let mut tool_results: HashMap<String, VecDeque<(String, ToolResultStatus)>> = HashMap::new();
-    for result in record.turns.iter().flat_map(|turn| &turn.tool_results) {
-        tool_results
-            .entry(result.call_id.clone())
-            .or_default()
-            .push_back((result.tool_name.clone(), result.status));
-    }
-
     let mut cells = Vec::new();
     let mut turn_index = 0usize;
     let mut current_turn = Vec::new();
 
-    for message in &record.messages {
-        match message.role {
-            Role::User => {
+    for entry in &record.entries {
+        match &entry.kind {
+            EntryKind::User { content } => {
                 if !current_turn.is_empty() {
                     cells.append(&mut current_turn);
                     append_turn_checkpoints(&mut cells, record, turn_index);
                     turn_index += 1;
                 }
-                current_turn.push(HistoryCell::user(message.content.clone()));
+                current_turn.push(HistoryCell::user(content.clone()));
             }
-            Role::System => {}
-            _ => {
-                current_turn.extend(message_to_cells(
-                    message,
-                    &mut tool_names,
-                    &mut tool_results,
-                ));
+            EntryKind::System { .. } => {}
+            EntryKind::Assistant {
+                content,
+                reasoning,
+                exchanges,
+            } => {
+                if let Some(reasoning) = reasoning.as_ref().filter(|text| !text.is_empty()) {
+                    current_turn.push(HistoryCell::Reasoning {
+                        text: reasoning.clone(),
+                    });
+                }
+                if !content.is_empty() {
+                    current_turn.push(HistoryCell::assistant(content.clone()));
+                }
+                for exchange in exchanges {
+                    current_turn.push(HistoryCell::ToolCall {
+                        tool_name: exchange.call.function.name.clone(),
+                        arguments: exchange.call.function.arguments.clone(),
+                        risk_level: None,
+                        requires_sandbox: None,
+                        approval: ToolApprovalState::NotRequired,
+                    });
+                    // Pending exchanges (interrupted before a result) render
+                    // the call only — no fabricated result line.
+                    if let Some(result) = &exchange.result {
+                        current_turn.push(HistoryCell::ToolResult {
+                            tool_name: exchange.call.function.name.clone(),
+                            status: result.status,
+                            summary: summarize_tool_result(&result.content),
+                        });
+                    }
+                }
+            }
+            EntryKind::Compaction { summary, archived_count } => {
+                current_turn.push(HistoryCell::Compaction {
+                    metadata: Some(format!("archived={archived_count}")),
+                    summary: summary.clone(),
+                });
             }
         }
     }
     if !current_turn.is_empty() {
         cells.extend(current_turn);
         append_turn_checkpoints(&mut cells, record, turn_index);
-    }
-
-    if let Some(summary) = &record.summary {
-        cells.push(HistoryCell::Compaction {
-            metadata: record.compaction.clone(),
-            summary: summary.clone(),
-        });
     }
 
     cells
@@ -265,57 +278,6 @@ fn append_turn_checkpoints(
     }
 }
 
-fn message_to_cells(
-    message: &Message,
-    tool_names: &mut HashMap<String, String>,
-    tool_results: &mut HashMap<String, VecDeque<(String, ToolResultStatus)>>,
-) -> Vec<HistoryCell> {
-    match message.role {
-        Role::System => Vec::new(),
-        Role::User => vec![HistoryCell::user(message.content.clone())],
-        Role::Assistant => {
-            let mut cells = Vec::new();
-            if let Some(reasoning) = message
-                .reasoning_content
-                .as_ref()
-                .filter(|text| !text.is_empty())
-            {
-                cells.push(HistoryCell::Reasoning {
-                    text: reasoning.clone(),
-                });
-            }
-            if !message.content.is_empty() {
-                cells.push(HistoryCell::assistant(message.content.clone()));
-            }
-            cells.extend(message.tool_calls.iter().map(|call| {
-                tool_names.insert(call.id.clone(), call.function.name.clone());
-                HistoryCell::ToolCall {
-                    tool_name: call.function.name.clone(),
-                    arguments: call.function.arguments.clone(),
-                    risk_level: None,
-                    requires_sandbox: None,
-                    approval: ToolApprovalState::NotRequired,
-                }
-            }));
-            cells
-        }
-        Role::Tool => {
-            let call_id = message.tool_call_id.as_deref().unwrap_or("unknown");
-            let result = tool_results.get_mut(call_id).and_then(VecDeque::pop_front);
-            vec![HistoryCell::ToolResult {
-                tool_name: result
-                    .as_ref()
-                    .map(|(tool_name, _)| tool_name.clone())
-                    .or_else(|| tool_names.get(call_id).cloned())
-                    .unwrap_or_else(|| call_id.to_string()),
-                status: result
-                    .map(|(_, status)| status)
-                    .unwrap_or(ToolResultStatus::Success),
-                summary: summarize_tool_result(&message.content),
-            }]
-        }
-    }
-}
 pub(crate) fn summarize_tool_result(content: &str) -> String {
     const MAX_CHARS: usize = 300;
 
@@ -489,41 +451,45 @@ pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use deep_code_agent::{AgentConfig, Message, SessionRecord, ToolCallPayload};
+    use deep_code_agent::{
+        AgentConfig, ExchangeResult, SessionEntry, SessionRecord, ToolCallPayload, ToolExchange,
+    };
 
     use super::*;
+
+    fn call(id: &str, name: &str) -> ToolCallPayload {
+        ToolCallPayload {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: deep_code_agent::ToolCallFunctionPayload {
+                name: name.to_string(),
+                arguments: "{\"message\":\"hi\"}".to_string(),
+            },
+        }
+    }
 
     #[test]
     fn hydrate_history_keeps_assistant_tool_calls_and_results() {
         let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), &AgentConfig::default(), "");
-        record.messages.push(Message::user("hi"));
-        record.messages.push(Message::assistant_with_tool_calls(
+        record.entries.push(SessionEntry::user("hi"));
+        record.entries.push(SessionEntry::assistant(
             "",
-            vec![ToolCallPayload {
-                id: "call_1".to_string(),
-                call_type: "function".to_string(),
-                function: deep_code_agent::ToolCallFunctionPayload {
-                    name: "mock_echo".to_string(),
-                    arguments: "{\"message\":\"hi\"}".to_string(),
-                },
+            None,
+            vec![ToolExchange {
+                call: call("call_1", "mock_echo"),
+                result: Some(ExchangeResult {
+                    content: "mock_echo: hi".to_string(),
+                    status: ToolResultStatus::Denied,
+                }),
             }],
         ));
         record
-            .messages
-            .push(Message::tool("call_1", "mock_echo: hi"));
+            .entries
+            .push(SessionEntry::compaction("older conversation summary", 2));
         let mut turn = deep_code_agent::TurnRecord::new("hi");
-        turn.tool_results.push(deep_code_agent::ToolResult {
-            call_id: "call_1".to_string(),
-            tool_name: "mock_echo".to_string(),
-            status: ToolResultStatus::Denied,
-            content: "mock_echo: hi".to_string(),
-            details: None,
-        });
         turn.started_at_ms = 10;
         turn.finished_at_ms = Some(20);
         record.turns.push(turn);
-        record.summary = Some("older conversation summary".to_string());
-        record.compaction = Some("archived=2".to_string());
         let mut checkpoint = deep_code_agent::CheckpointRecord::new(
             deep_code_agent::CheckpointId("checkpoint_1".to_string()),
             "before_turn",
@@ -537,6 +503,8 @@ mod tests {
             &cells[1],
             HistoryCell::ToolCall { tool_name, .. } if tool_name == "mock_echo"
         ));
+        // Status now comes structurally from the exchange — no silent
+        // Success fallback.
         assert!(matches!(
             &cells[2],
             HistoryCell::ToolResult {
@@ -562,10 +530,12 @@ mod tests {
     #[test]
     fn hydrate_history_restores_reasoning_content() {
         let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), &AgentConfig::default(), "");
-        record.messages.push(Message::user("hi"));
-        record
-            .messages
-            .push(Message::assistant_turn("answer", "thinking", Vec::new()));
+        record.entries.push(SessionEntry::user("hi"));
+        record.entries.push(SessionEntry::assistant(
+            "answer",
+            Some("thinking".to_string()),
+            Vec::new(),
+        ));
 
         let cells = hydrate_history(&record);
         assert!(matches!(
@@ -579,72 +549,26 @@ mod tests {
     }
 
     #[test]
-    fn hydrate_history_matches_duplicate_tool_call_ids_in_order() {
+    fn hydrate_history_renders_pending_exchange_as_call_only() {
+        // An interrupted exchange (result never recorded) shows the call but
+        // fabricates no result line.
         let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), &AgentConfig::default(), "");
-        record.messages.push(Message::assistant_with_tool_calls(
+        record.entries.push(SessionEntry::user("go"));
+        record.entries.push(SessionEntry::assistant(
             "",
-            vec![ToolCallPayload {
-                id: "call_1".to_string(),
-                call_type: "function".to_string(),
-                function: deep_code_agent::ToolCallFunctionPayload {
-                    name: "first_tool".to_string(),
-                    arguments: "{}".to_string(),
-                },
-            }],
+            None,
+            vec![ToolExchange::pending(call("call_1", "shell"))],
         ));
-        record
-            .messages
-            .push(Message::tool("call_1", "first result"));
-        record.messages.push(Message::assistant_with_tool_calls(
-            "",
-            vec![ToolCallPayload {
-                id: "call_1".to_string(),
-                call_type: "function".to_string(),
-                function: deep_code_agent::ToolCallFunctionPayload {
-                    name: "second_tool".to_string(),
-                    arguments: "{}".to_string(),
-                },
-            }],
+
+        let cells = hydrate_history(&record);
+        assert!(matches!(
+            &cells[1],
+            HistoryCell::ToolCall { tool_name, .. } if tool_name == "shell"
         ));
-        record
-            .messages
-            .push(Message::tool("call_1", "second result"));
-
-        let mut first_turn = deep_code_agent::TurnRecord::new("first");
-        first_turn.tool_results.push(deep_code_agent::ToolResult {
-            call_id: "call_1".to_string(),
-            tool_name: "first_tool".to_string(),
-            status: ToolResultStatus::Denied,
-            content: "first result".to_string(),
-            details: None,
-        });
-        let mut second_turn = deep_code_agent::TurnRecord::new("second");
-        second_turn.tool_results.push(deep_code_agent::ToolResult {
-            call_id: "call_1".to_string(),
-            tool_name: "second_tool".to_string(),
-            status: ToolResultStatus::Error,
-            content: "second result".to_string(),
-            details: None,
-        });
-        record.turns.push(first_turn);
-        record.turns.push(second_turn);
-
-        let tool_results = hydrate_history(&record)
-            .into_iter()
-            .filter_map(|cell| match cell {
-                HistoryCell::ToolResult {
-                    tool_name, status, ..
-                } => Some((tool_name, status)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            tool_results,
-            vec![
-                ("first_tool".to_string(), ToolResultStatus::Denied),
-                ("second_tool".to_string(), ToolResultStatus::Error),
-            ]
+        assert!(
+            !cells
+                .iter()
+                .any(|cell| matches!(cell, HistoryCell::ToolResult { .. }))
         );
     }
 

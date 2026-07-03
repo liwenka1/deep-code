@@ -2,9 +2,10 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use super::migrate::{SessionRecordV1, migrate_v1};
 use super::{
-    SessionId, SessionRecord, SessionStore, SessionStoreError, now_ms, sessions_dir_for_workspace,
-    validate_schema, validate_session_id,
+    SESSION_SCHEMA_VERSION, SessionId, SessionRecord, SessionStore, SessionStoreError, now_ms,
+    sessions_dir_for_workspace, validate_session_id,
 };
 
 /// JSON file backend: one pretty-printed file per session.
@@ -94,12 +95,32 @@ impl JsonSessionStore {
                 }
             }
         })?;
-        let record: SessionRecord =
+        let value: serde_json::Value =
             serde_json::from_str(&raw).map_err(|error| SessionStoreError::Serialization {
                 message: format!("failed to parse {}: {error}", path.display()),
             })?;
-        validate_schema(&record)?;
-        Ok(record)
+        let parse_error = |error: serde_json::Error| SessionStoreError::Serialization {
+            message: format!("failed to parse {}: {error}", path.display()),
+        };
+        let version = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32;
+        match version {
+            // Legacy wire-message layout: migrate in memory; the next persist
+            // writes the file back as v2.
+            1 => {
+                let v1: SessionRecordV1 = serde_json::from_value(value).map_err(parse_error)?;
+                Ok(migrate_v1(v1))
+            }
+            SESSION_SCHEMA_VERSION => {
+                serde_json::from_value::<SessionRecord>(value).map_err(parse_error)
+            }
+            other => Err(SessionStoreError::UnsupportedSchema {
+                found: other,
+                expected: SESSION_SCHEMA_VERSION,
+            }),
+        }
     }
 }
 
@@ -170,7 +191,6 @@ impl SessionStore for JsonSessionStore {
 mod tests {
     use super::*;
     use crate::config::AgentConfig;
-    use crate::message::Message;
 
     #[test]
     fn json_store_rejects_invalid_session_id() {
@@ -193,15 +213,84 @@ mod tests {
         let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
         let mut record =
             SessionRecord::new(dir.path().to_path_buf(), &AgentConfig::default(), "system");
-        record.messages.push(Message::user("hello"));
+        record
+            .entries
+            .push(crate::session_entry::SessionEntry::user("hello"));
         record.touch();
 
         store.save(&record).unwrap();
         let loaded = store.load(&record.id).unwrap();
 
         assert_eq!(loaded.id, record.id);
-        assert_eq!(loaded.messages.len(), 2);
-        assert_eq!(loaded.messages[1].content, "hello");
+        assert_eq!(loaded.entries.len(), 2);
+        assert!(matches!(
+            &loaded.entries[1].kind,
+            crate::session_entry::EntryKind::User { content } if content == "hello"
+        ));
+    }
+
+    #[test]
+    fn json_store_migrates_v1_files_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+        let v1_json = serde_json::json!({
+            "schema_version": 1,
+            "id": "session_1_0",
+            "workspace": dir.path(),
+            "created_at_ms": 1,
+            "updated_at_ms": 2,
+            "config": {
+                "base_url": "https://api.deepseek.com/beta",
+                "model": "deepseek-v4-pro",
+                "timeout_secs": 60,
+                "api_key_present": false
+            },
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "shell", "arguments": "{}"}
+                }]}
+                // interrupted: no tool message — the migration leaves a
+                // pending exchange instead of requiring a repair pass
+            ],
+            "turns": []
+        });
+        let path = dir
+            .path()
+            .join(".deep-code/sessions")
+            .join("session_1_0.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&v1_json).unwrap()).unwrap();
+
+        let loaded = store
+            .load(&SessionId("session_1_0".to_string()))
+            .unwrap();
+        assert_eq!(loaded.schema_version, super::SESSION_SCHEMA_VERSION);
+        assert_eq!(loaded.entries.len(), 3);
+        assert_eq!(loaded.preview(), "hi");
+
+        // Saving writes the file back as v2; reloading stays stable.
+        store.save(&loaded).unwrap();
+        let reloaded = store.load(&loaded.id).unwrap();
+        assert_eq!(reloaded.entries, loaded.entries);
+    }
+
+    #[test]
+    fn json_store_rejects_future_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+        let future = serde_json::json!({"schema_version": 3, "id": "session_9_0"});
+        let path = dir
+            .path()
+            .join(".deep-code/sessions")
+            .join("session_9_0.json");
+        std::fs::write(&path, future.to_string()).unwrap();
+
+        assert!(matches!(
+            store.load(&SessionId("session_9_0".to_string())),
+            Err(SessionStoreError::UnsupportedSchema { found: 3, .. })
+        ));
     }
 
     #[test]

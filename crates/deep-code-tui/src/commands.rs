@@ -341,7 +341,7 @@ impl App {
                                 format!(
                                     "- {} ({} msgs) {}",
                                     record.id.as_str(),
-                                    record.messages.len(),
+                                    record.message_count(),
                                     record.preview().replace('\n', " ")
                                 )
                             })

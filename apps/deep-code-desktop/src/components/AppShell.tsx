@@ -18,6 +18,7 @@ import type {
   ChatMessage,
   PendingApproval,
   RuntimeInfo,
+  SessionEntry,
   SessionSummary,
 } from "../api/types";
 import { sessionIdString } from "../api/types";
@@ -38,17 +39,37 @@ function nextId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function recordToMessages(
-  messages: Array<{ role: string; content: string; tool_call_id?: string }>,
-): ChatMessage[] {
-  return messages
-    .filter((message) => message.role !== "system")
-    .map((message) => ({
-      id: message.tool_call_id ?? nextId(message.role),
-      role: message.role as ChatMessage["role"],
-      content: message.content,
-      toolName: message.role === "tool" ? "tool" : undefined,
-    }));
+function recordToMessages(entries: SessionEntry[]): ChatMessage[] {
+  const messages: ChatMessage[] = [];
+  for (const entry of entries) {
+    switch (entry.type) {
+      case "user":
+        messages.push({ id: entry.id, role: "user", content: entry.content });
+        break;
+      case "assistant":
+        for (const exchange of entry.exchanges ?? []) {
+          messages.push({
+            id: exchange.call.id,
+            role: "tool",
+            content: exchange.result?.content ?? "",
+            toolName: exchange.call.function.name,
+            toolStatus: exchange.result?.status,
+          });
+        }
+        if (entry.content) {
+          messages.push({
+            id: entry.id,
+            role: "assistant",
+            content: entry.content,
+          });
+        }
+        break;
+      default:
+        // System and compaction entries are not rendered in the chat log.
+        break;
+    }
+  }
+  return messages;
 }
 
 function upsertToolMessage(
@@ -98,7 +119,7 @@ export function AppShell({
         const record = await getSession(auth, sessionId);
         setActiveSessionId(active.session_id ?? sessionId);
         setBackendLabel(active.backend_label);
-        setMessages(recordToMessages(record.messages));
+        setMessages(recordToMessages(record.entries));
         setStatus(`Resumed session ${sessionIdString(record.id)}`);
         void tasks.refresh();
       } catch (cause) {

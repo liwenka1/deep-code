@@ -279,7 +279,7 @@ async fn list_sessions(
         .map(|record| SessionSummary {
             id: record.id.as_str().to_string(),
             updated_at_ms: record.updated_at_ms,
-            message_count: record.messages.len(),
+            message_count: record.message_count(),
             preview: record.preview(),
         })
         .collect();

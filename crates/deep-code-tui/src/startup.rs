@@ -11,7 +11,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use deep_code_agent::{
-    JsonSessionStore, Role, SessionId, SessionRecord, SessionStore, format_sessions_storage_note,
+    JsonSessionStore, SessionId, SessionRecord, SessionStore, format_sessions_storage_note,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style};
@@ -75,18 +75,20 @@ fn resolve(intent: &StartupIntent, sessions: Vec<SessionRecord>) -> Resolution {
     }
 }
 
-/// A session worth listing: it has at least one user message.
+/// A session worth listing: it has at least one user entry.
 pub(crate) fn has_user_message(record: &SessionRecord) -> bool {
-    record.messages.iter().any(|m| m.role == Role::User)
+    record.has_user_entry()
 }
 
 /// First user prompt, single-lined and truncated — the list title.
 pub(crate) fn session_title(record: &SessionRecord) -> String {
     let first = record
-        .messages
+        .entries
         .iter()
-        .find(|m| m.role == Role::User)
-        .map(|m| m.content.as_str())
+        .find_map(|entry| match &entry.kind {
+            deep_code_agent::EntryKind::User { content } => Some(content.as_str()),
+            _ => None,
+        })
         .unwrap_or("(空会话)");
     truncate(&first.split_whitespace().collect::<Vec<_>>().join(" "), 56)
 }
@@ -254,23 +256,26 @@ fn truncate(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deep_code_agent::{AgentConfig, Message};
+    use deep_code_agent::{AgentConfig, SessionEntry};
     use std::path::PathBuf;
 
-    fn session_with(messages: Vec<Message>, updated_at_ms: u64) -> SessionRecord {
+    fn session_with(entries: Vec<SessionEntry>, updated_at_ms: u64) -> SessionRecord {
         let mut record =
             SessionRecord::new(PathBuf::from("/tmp/ws"), &AgentConfig::builtin(), "system");
-        record.messages = messages;
+        record.entries = entries;
         record.updated_at_ms = updated_at_ms;
         record
     }
 
     fn empty() -> SessionRecord {
-        session_with(vec![Message::system("system")], 100)
+        session_with(vec![SessionEntry::system("system")], 100)
     }
 
     fn with_prompt(prompt: &str, ts: u64) -> SessionRecord {
-        session_with(vec![Message::system("system"), Message::user(prompt)], ts)
+        session_with(
+            vec![SessionEntry::system("system"), SessionEntry::user(prompt)],
+            ts,
+        )
     }
 
     #[test]

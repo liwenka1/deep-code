@@ -58,6 +58,17 @@ impl SessionEntry {
         }
     }
 
+    /// Number of wire messages this entry derives to (an assistant entry
+    /// emits one tool message per exchange). Consumers report this count so
+    /// it stays stable across the v1→v2 schema migration.
+    #[must_use]
+    pub fn wire_message_count(&self) -> usize {
+        match &self.kind {
+            EntryKind::Assistant { exchanges, .. } => 1 + exchanges.len(),
+            _ => 1,
+        }
+    }
+
     #[must_use]
     pub fn system(content: impl Into<String>) -> Self {
         Self::new(EntryKind::System {

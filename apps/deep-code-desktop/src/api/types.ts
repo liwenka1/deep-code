@@ -19,16 +19,41 @@ export interface SessionSummary {
   preview: string;
 }
 
-export interface MessageRecord {
-  role: "system" | "user" | "assistant" | "tool";
-  content: string;
-  tool_call_id?: string;
+export interface ToolCallRecord {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
 }
+
+export interface ExchangeResult {
+  content: string;
+  status: "success" | "denied" | "error";
+}
+
+export interface ToolExchange {
+  call: ToolCallRecord;
+  result?: ExchangeResult;
+}
+
+export type SessionEntry =
+  | { id: string; type: "system"; content: string }
+  | { id: string; type: "user"; content: string }
+  | {
+      id: string;
+      type: "assistant";
+      content: string;
+      reasoning?: string;
+      exchanges?: ToolExchange[];
+    }
+  | { id: string; type: "compaction"; summary: string; archived_count: number };
 
 export interface SessionRecord {
   id: { "0": string } | string;
   workspace: string;
-  messages: MessageRecord[];
+  entries: SessionEntry[];
   preview?: string;
 }
 

@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
-use deep_code_agent::{Message, Role, RuntimeEvent, SessionId, SessionRecord, TurnId};
+use deep_code_agent::{
+    EntryKind, Message, RuntimeEvent, SessionId, SessionRecord, ToolExchange, TurnId,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
@@ -484,6 +486,7 @@ fn project_session_record(
 
     let mut items = Vec::new();
     let mut seq = 0u64;
+    // Number of user turns opened so far; the current turn is `turn_index - 1`.
     let mut turn_index = 0usize;
 
     let mut push_item =
@@ -500,66 +503,67 @@ fn project_session_record(
             });
         };
 
-    for message in &session.messages {
-        match message.role {
-            Role::User => {
-                if turn_index > 0 {
-                    append_hydrated_turn_checkpoints(
-                        &mut push_item,
-                        session,
-                        turn_index - 1,
-                        &turn_ids,
-                    );
-                    turn_index += 1;
+    for entry in &session.entries {
+        let current_turn = turn_index.checked_sub(1);
+        match &entry.kind {
+            EntryKind::System { .. } => {}
+            EntryKind::User { content } => {
+                // Close the previous turn before opening the next one.
+                if let Some(previous) = current_turn {
+                    append_hydrated_turn_checkpoints(&mut push_item, session, previous, &turn_ids);
                 }
-                let turn_id = turn_ids.get(turn_index).cloned();
+                turn_index += 1;
+                let turn_id = turn_ids.get(turn_index - 1).cloned();
                 let created_at_ms = session
                     .turns
-                    .get(turn_index)
+                    .get(turn_index - 1)
                     .map(|turn| turn.started_at_ms)
                     .unwrap_or(session.updated_at_ms);
                 push_item(
                     "user.message",
                     turn_id,
                     created_at_ms,
-                    message_payload(message),
+                    message_payload(&Message::user(content)),
                 );
             }
-            Role::System => {}
-            Role::Assistant => {
-                let turn_id = turn_ids.get(turn_index).cloned();
-                push_assistant_message_items(
+            EntryKind::Assistant {
+                content,
+                reasoning,
+                exchanges,
+            } => {
+                let turn_id = current_turn.and_then(|index| turn_ids.get(index).cloned());
+                push_assistant_entry_items(
                     &mut push_item,
-                    message,
+                    content,
+                    reasoning.as_deref(),
+                    exchanges,
                     turn_id,
                     session.updated_at_ms,
                 );
             }
-            Role::Tool => {
-                let turn_id = turn_ids.get(turn_index).cloned();
+            EntryKind::Compaction {
+                summary,
+                archived_count,
+            } => {
                 push_item(
-                    "tool.result",
-                    turn_id,
+                    "compaction.applied",
+                    None,
                     session.updated_at_ms,
-                    message_payload(message),
+                    json!({
+                        "summary": summary,
+                        "compaction": format!("archived={archived_count}"),
+                    }),
                 );
             }
         }
     }
 
     if !turn_ids.is_empty() {
-        append_hydrated_turn_checkpoints(&mut push_item, session, turn_index, &turn_ids);
-    }
-
-    if let Some(summary) = &session.summary {
-        push_item(
-            "compaction.applied",
-            None,
-            session.updated_at_ms,
-            json!({
-                "summary": summary,
-                "compaction": session.compaction,
-            }),
+        append_hydrated_turn_checkpoints(
+            &mut push_item,
+            session,
+            turn_index.saturating_sub(1),
+            &turn_ids,
         );
     }
 
@@ -578,19 +582,18 @@ fn message_payload(message: &Message) -> Value {
     serde_json::to_value(message).unwrap_or_else(|_| json!({}))
 }
 
-fn push_assistant_message_items<F>(
+fn push_assistant_entry_items<F>(
     push_item: &mut F,
-    message: &Message,
+    content: &str,
+    reasoning: Option<&str>,
+    exchanges: &[ToolExchange],
     turn_id: Option<TurnId>,
     created_at_ms: u64,
 ) where
     F: FnMut(&str, Option<TurnId>, u64, Value),
 {
-    if let Some(reasoning) = message
-        .reasoning_content
-        .as_ref()
-        .filter(|text| !text.is_empty())
-    {
+    let reasoning = reasoning.filter(|text| !text.is_empty());
+    if let Some(reasoning) = reasoning {
         push_item(
             "reasoning.delta",
             turn_id.clone(),
@@ -598,25 +601,41 @@ fn push_assistant_message_items<F>(
             json!({ "text": reasoning }),
         );
     }
-    if !message.content.is_empty() || message.tool_calls.is_empty() {
+    if !content.is_empty() || exchanges.is_empty() {
+        let calls = exchanges
+            .iter()
+            .map(|exchange| exchange.call.clone())
+            .collect();
         push_item(
             "assistant.message",
             turn_id.clone(),
             created_at_ms,
-            message_payload(message),
+            message_payload(&Message::assistant_turn(
+                content,
+                reasoning.unwrap_or_default(),
+                calls,
+            )),
         );
     }
-    for call in &message.tool_calls {
+    for exchange in exchanges {
         push_item(
             "tool.started",
             turn_id.clone(),
             created_at_ms,
             json!({
-                "tool_call_id": call.id,
-                "tool_name": call.function.name,
-                "arguments": call.function.arguments,
+                "tool_call_id": exchange.call.id,
+                "tool_name": exchange.call.function.name,
+                "arguments": exchange.call.function.arguments,
             }),
         );
+        if let Some(result) = &exchange.result {
+            push_item(
+                "tool.result",
+                turn_id.clone(),
+                created_at_ms,
+                message_payload(&Message::tool(&exchange.call.id, &result.content)),
+            );
+        }
     }
 }
 
@@ -702,11 +721,15 @@ mod tests {
             .turns
             .push(deep_code_agent::TurnRecord::new("hello"));
         session
-            .messages
-            .push(deep_code_agent::Message::user("hello"));
+            .entries
+            .push(deep_code_agent::SessionEntry::user("hello"));
         session
-            .messages
-            .push(deep_code_agent::Message::assistant("world"));
+            .entries
+            .push(deep_code_agent::SessionEntry::assistant(
+                "world",
+                None,
+                Vec::new(),
+            ));
 
         let thread_id = format!("session_{}", session.id.as_str());
         let store = RuntimeThreadStore::new();
@@ -742,7 +765,8 @@ mod tests {
     #[tokio::test]
     async fn hydrate_sessions_projects_reasoning_tools_and_compaction() {
         use deep_code_agent::{
-            CheckpointId, CheckpointRecord, Message, ToolCallFunctionPayload, ToolCallPayload,
+            CheckpointId, CheckpointRecord, ExchangeResult, SessionEntry, ToolCallFunctionPayload,
+            ToolCallPayload, ToolResultStatus,
         };
 
         let config = deep_code_agent::AgentConfig::default();
@@ -755,22 +779,28 @@ mod tests {
         turn.started_at_ms = 10;
         turn.finished_at_ms = Some(20);
         session.turns.push(turn);
-        session.messages.push(Message::user("run tool"));
-        session.messages.push(Message::assistant_turn(
+        session.entries.push(SessionEntry::user("run tool"));
+        session.entries.push(SessionEntry::assistant(
             "calling",
-            "thinking",
-            vec![ToolCallPayload {
-                id: "call_1".to_string(),
-                call_type: "function".to_string(),
-                function: ToolCallFunctionPayload {
-                    name: "mock_echo".to_string(),
-                    arguments: r#"{"message":"hi"}"#.to_string(),
+            Some("thinking".to_string()),
+            vec![ToolExchange {
+                call: ToolCallPayload {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: ToolCallFunctionPayload {
+                        name: "mock_echo".to_string(),
+                        arguments: r#"{"message":"hi"}"#.to_string(),
+                    },
                 },
+                result: Some(ExchangeResult {
+                    content: "mock_echo: hi".to_string(),
+                    status: ToolResultStatus::Success,
+                }),
             }],
         ));
         session
-            .messages
-            .push(Message::tool("call_1", "mock_echo: hi"));
+            .entries
+            .push(SessionEntry::compaction("older summary", 2));
         session.summary = Some("older summary".to_string());
         session.compaction = Some("archived=2".to_string());
         let mut checkpoint = CheckpointRecord::new(CheckpointId("cp_1".to_string()), "snap");
@@ -796,11 +826,86 @@ mod tests {
                 .iter()
                 .any(|item| item.kind == "checkpoint.created")
         );
-        assert!(
+        assert_eq!(
             detail
                 .items
                 .iter()
-                .any(|item| item.kind == "compaction.applied")
+                .filter(|item| item.kind == "compaction.applied")
+                .count(),
+            1,
+            "compaction entry should project exactly one compaction.applied item"
         );
+    }
+
+    #[tokio::test]
+    async fn hydrate_sessions_attributes_items_and_checkpoints_to_later_turns() {
+        use deep_code_agent::{CheckpointId, CheckpointRecord, SessionEntry};
+
+        let config = deep_code_agent::AgentConfig::default();
+        let mut session = SessionRecord::new(
+            std::path::PathBuf::from("/tmp/project"),
+            &config,
+            "system prompt",
+        );
+        let mut first_turn = deep_code_agent::TurnRecord::new("first prompt");
+        first_turn.started_at_ms = 10;
+        first_turn.finished_at_ms = Some(20);
+        session.turns.push(first_turn);
+        let mut second_turn = deep_code_agent::TurnRecord::new("second prompt");
+        second_turn.started_at_ms = 30;
+        second_turn.finished_at_ms = Some(40);
+        session.turns.push(second_turn);
+
+        session.entries.push(SessionEntry::user("first prompt"));
+        session.entries.push(SessionEntry::assistant(
+            "first answer",
+            None,
+            Vec::new(),
+        ));
+        session.entries.push(SessionEntry::user("second prompt"));
+        session.entries.push(SessionEntry::assistant(
+            "second answer",
+            None,
+            Vec::new(),
+        ));
+
+        // Falls inside the second turn's window [30, u64::MAX).
+        let mut checkpoint = CheckpointRecord::new(CheckpointId("cp_2".to_string()), "snap");
+        checkpoint.created_at_ms = 35;
+        session.checkpoints.push(checkpoint);
+
+        let thread_id = format!("session_{}", session.id.as_str());
+        let store = RuntimeThreadStore::new();
+        store.hydrate_sessions(vec![session]).await;
+
+        let detail = store.get_thread(&thread_id).await.unwrap();
+        assert_eq!(detail.turns.len(), 2);
+        let second_turn_id = TurnId(format!("{thread_id}_turn_2"));
+
+        let second_user = detail
+            .items
+            .iter()
+            .filter(|item| item.kind == "user.message")
+            .nth(1)
+            .expect("second user.message item");
+        assert_eq!(second_user.turn_id.as_ref(), Some(&second_turn_id));
+
+        for item in detail.items.iter().filter(|item| item.seq > second_user.seq) {
+            assert_eq!(
+                item.turn_id.as_ref(),
+                Some(&second_turn_id),
+                "item '{}' (seq {}) should belong to turn 2",
+                item.kind,
+                item.seq
+            );
+        }
+
+        let checkpoint_item = detail
+            .items
+            .iter()
+            .find(|item| item.kind == "checkpoint.created")
+            .expect("checkpoint.created item");
+        assert_eq!(checkpoint_item.turn_id.as_ref(), Some(&second_turn_id));
+        assert!(checkpoint_item.seq > second_user.seq);
     }
 }
