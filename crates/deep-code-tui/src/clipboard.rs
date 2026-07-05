@@ -1,7 +1,10 @@
 //! Clipboard copy. Locally we shell out to the OS clipboard tool (pbcopy /
-//! wl-copy / xclip / clip), which is UTF-8 safe and reliable. Over SSH — where
-//! no local clipboard tool is reachable — we fall back to the OSC 52 escape
-//! sequence so the *local* terminal still receives the copy.
+//! wl-copy / xclip / clip), which is UTF-8 safe and reliable on macOS/Linux.
+//! On Windows, clip.exe uses the system ANSI code page (e.g. GBK on Chinese
+//! Windows), which corrupts any non-ASCII text, so we use the Win32 clipboard
+//! API (CF_UNICODETEXT) instead.
+//! Over SSH — where no local clipboard tool is reachable — we fall back to
+//! the OSC 52 escape sequence so the *local* terminal still receives the copy.
 
 use std::io::Write;
 
@@ -35,9 +38,73 @@ const NATIVE_CLIPBOARD_COMMANDS: &[(&str, &[&str])] = &[("clip", &[])];
 const NATIVE_CLIPBOARD_COMMANDS: &[(&str, &[&str])] = &[];
 
 fn copy_with_native_tool(text: &str) -> bool {
+    // On Windows, use the Win32 clipboard API directly because clip.exe
+    // interprets bytes using the system ANSI code page (e.g. GBK on Chinese
+    // Windows), corrupting any non-ASCII text.
+    #[cfg(target_os = "windows")]
+    if copy_with_win32_api(text) {
+        return true;
+    }
+
     NATIVE_CLIPBOARD_COMMANDS
         .iter()
         .any(|(command, args)| write_to_command(command, args, text))
+}
+
+/// Windows-specific: use the Win32 clipboard API with CF_UNICODETEXT so that
+/// all Unicode characters are copied correctly regardless of system code page.
+#[cfg(target_os = "windows")]
+fn copy_with_win32_api(text: &str) -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::*;
+    use windows_sys::Win32::System::DataExchange::*;
+    use windows_sys::Win32::System::Memory::*;
+
+    // CF_UNICODETEXT = 13 — well-known Windows clipboard format for UTF-16 text.
+    // Not exported by windows-sys 0.59, so we define it locally.
+    const CF_UNICODETEXT: u32 = 13;
+
+    unsafe {
+        // Convert to null-terminated UTF-16
+        let wide: Vec<u16> = OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let byte_size = wide.len() * 2;
+
+        // Allocate movable global memory
+        let handle = GlobalAlloc(GMEM_MOVEABLE, byte_size);
+        if handle.is_null() {
+            return false;
+        }
+
+        // Lock, copy UTF-16 data, unlock
+        let ptr = GlobalLock(handle) as *mut u16;
+        if ptr.is_null() {
+            GlobalFree(handle);
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+        GlobalUnlock(handle);
+
+        // Open clipboard and set Unicode text
+        if OpenClipboard(std::ptr::null_mut()) == FALSE {
+            GlobalFree(handle);
+            return false;
+        }
+        EmptyClipboard();
+        let result = SetClipboardData(CF_UNICODETEXT, handle);
+        CloseClipboard();
+
+        if result.is_null() {
+            // SetClipboardData failed; the handle is still ours, free it
+            GlobalFree(handle);
+            return false;
+        }
+        true
+    }
 }
 
 /// Pipe `text` to `command` via stdin. Returns true only when the tool exists
