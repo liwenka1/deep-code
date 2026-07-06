@@ -201,7 +201,15 @@ fn dispatch_terminal_event(
             // at zero delay behind this one, gather the burst and decide
             // whether it is a paste. On unix, real pastes arrive as
             // `Event::Paste`, so this path stays cold.
-            if key_text_payload(&key).is_some() && event::poll(Duration::ZERO)? {
+            //
+            // On Windows, crossterm's background reader thread reads from
+            // the console in batches; `poll(Duration::ZERO)` can return
+            // false while the thread is fetching the next batch, splitting
+            // a single paste into fragments.  Retry once with 1 ms to let
+            // the thread catch up before declaring the key as solo.
+            if key_text_payload(&key).is_some()
+                && (event::poll(Duration::ZERO)? || event::poll(Duration::from_millis(1))?)
+            {
                 let (keys, leftover) = drain_key_burst(key)?;
                 let text: String = keys.iter().filter_map(key_text_payload).collect();
                 if burst_looks_like_paste(&text) {
@@ -274,24 +282,43 @@ fn key_text_payload(key: &KeyEvent) -> Option<char> {
 /// that, while a console paste floods the queue instantly.
 const PASTE_BURST_MIN_CHARS: usize = 12;
 
-/// Decide whether a gathered key burst is a paste:
-/// - a newline in the *interior* of the burst cannot be "typed text + Enter"
-///   (Enter would have ended the input), so it must be pasted content;
-/// - an implausibly long instant burst is a paste even without newlines.
+/// Decide whether a gathered key burst is a paste.
 ///
-/// Anything smaller replays as real keys so a fast "hi⏎" still submits.
+/// A multi-line burst (interior newline) is always a paste — a human typing
+/// Enter would have ended the input instead of continuing.  A very long
+/// instant burst without newlines is also a paste.  Crucially, **a trailing
+/// newline with non-empty content** ("hello\n") is treated as paste too:
+/// on Windows, crossterm's console event source does not deliver
+/// `Event::Paste`, so every paste hits this burst path, and many clipboard
+/// texts carry a trailing newline.  Without this rule a short trailing-`\n`
+/// paste would replay keys → Enter triggers `submit()`, starting a
+/// conversation or truncating the pasted content.
 fn burst_looks_like_paste(text: &str) -> bool {
     let interior = text.trim_end_matches('\n');
-    interior.contains('\n') || text.chars().count() >= PASTE_BURST_MIN_CHARS
+    // Multi-line content (interior newline) → paste
+    if interior.contains('\n') {
+        return true;
+    }
+    // Implausibly long instant burst → paste
+    if text.chars().count() >= PASTE_BURST_MIN_CHARS {
+        return true;
+    }
+    // Trailing newline with non-empty content → paste
+    // ("x\n" cannot be a fast typist's "x⏎" because a zero-delay burst
+    //  of >1 textual keys is always a paste on modern hardware.)
+    text.ends_with('\n') && !interior.is_empty()
 }
 
-/// Drain the immediately-available (zero-delay) textual key events following
-/// `first`. Release/repeat key events are skipped; the first non-textual
-/// event ends the burst and is returned for normal dispatch.
+/// Drain the immediately-available (or near-immediately-available) textual
+/// key events following `first`.  Uses a 1 ms poll inside so that on
+/// Windows, where crossterm's background reader thread may enqueue events
+/// in batches, we don't return prematurely and split a single paste burst
+/// into fragments (which would cause one fragment to be replayed as keys
+/// and another to create a folded paste block).
 fn drain_key_burst(first: KeyEvent) -> Result<(Vec<KeyEvent>, Option<Event>)> {
     let mut keys = vec![first];
     let mut leftover = None;
-    while event::poll(Duration::ZERO)? {
+    while event::poll(Duration::from_millis(1))? {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if key_text_payload(&key).is_some() {
@@ -383,6 +410,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.handle_escape(),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.handle_ctrl_c(),
+        // Ctrl+V on Windows in raw mode is NOT intercepted by the terminal,
+        // so it would fall through to push_char('v') and corrupt the input.
+        // Ignore it — the terminal handles paste via its own mechanism
+        // (right-click / menu) and injects characters directly.
+        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => app.push_newline(),
         KeyCode::Enter => app.submit(),
         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => app.push_newline(),
@@ -1462,11 +1494,14 @@ mod tests {
         assert!(burst_looks_like_paste("a\nb\n"));
         // Implausibly long instant burst = paste even without newlines.
         assert!(burst_looks_like_paste("cargo test --workspace"));
-        // Fast human typing must replay as keys: short text, short text with
-        // a single trailing Enter (that Enter means submit!).
+        // Fast human typing: short text without trailing newline is not a
+        // paste (it will replay as normal typed chars).
         assert!(!burst_looks_like_paste("hi"));
-        assert!(!burst_looks_like_paste("hi\n"));
-        assert!(!burst_looks_like_paste("好的\n"));
+        // ★ Trailing newline with content = paste on Windows
+        //   ("hi\n" / "好的\n" arriving as a zero-delay burst can only be a
+        //    paste; a human would never type >1 textual key in zero delay.)
+        assert!(burst_looks_like_paste("hi\n"));
+        assert!(burst_looks_like_paste("好的\n"));
     }
 
     #[test]

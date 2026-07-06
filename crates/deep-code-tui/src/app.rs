@@ -1032,9 +1032,10 @@ impl App {
         // The transcript is about to grow; drop any stale selection.
         self.clear_selection();
 
-        // `display` keeps the compact `[粘贴 #N …]` chips (shown in the
-        // transcript and recalled by Ctrl+P); `sent` expands them to the real
-        // pasted content for the model.
+        // During editing, the composer shows compact `[粘贴 #N …]` chips so
+        // long pasted blocks don't take over the input area.  At submit time
+        // both the transcript and the model receive the **expanded** content
+        // so the user can see what they actually sent.
         let display = self.input.trim().to_string();
         if display.is_empty() {
             self.status = "Enter a prompt before sending.".to_string();
@@ -1043,7 +1044,7 @@ impl App {
         let sent = self.expand_pasted(&display);
         // Never let the API key into the recallable prompt history.
         if !display.starts_with("/apikey") {
-            self.remember_prompt(&display);
+            self.remember_prompt(&sent);
         }
 
         if display.starts_with('/') && self.handle_slash_command(&display) {
@@ -1059,7 +1060,7 @@ impl App {
         self.is_streaming = true;
         self.status = format!("Streaming from {}...", self.backend_label);
 
-        self.history.push(HistoryCell::user(display));
+        self.history.push(HistoryCell::user(sent.clone()));
 
         self.start_stream(StreamRequest::User(sent));
     }
