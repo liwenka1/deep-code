@@ -44,6 +44,14 @@ pub enum RunMode {
         subcommand: String,
         args: Vec<String>,
     },
+    Eval {
+        subset: String,
+        sample: Option<usize>,
+        parallel: usize,
+        json: bool,
+        markdown: bool,
+        timeout_secs: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +89,10 @@ pub fn parse_args() -> CliArgs {
         "serve" => {
             args.remove(0);
             return parse_serve_command(args);
+        }
+        "eval" => {
+            args.remove(0);
+            return parse_eval_command(args);
         }
         _ => {}
     }
@@ -207,6 +219,76 @@ fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
             port,
             auth_token,
             resume,
+        },
+    }
+}
+
+fn parse_eval_command(mut args: Vec<String>) -> CliArgs {
+    let mut subset = "lite".to_string();
+    let mut sample = None;
+    let mut parallel = 1;
+    let mut json = false;
+    let mut markdown = false;
+    let mut timeout_secs = 300;
+
+    while let Some(arg) = args.first().cloned() {
+        match arg.as_str() {
+            "--subset" => {
+                args.remove(0);
+                subset = require_value(&mut args, "--subset");
+            }
+            "--sample" => {
+                args.remove(0);
+                sample = Some(
+                    require_value(&mut args, "--sample")
+                        .parse()
+                        .unwrap_or_else(|_| {
+                            eprintln!("Invalid --sample value");
+                            std::process::exit(2);
+                        }),
+                );
+            }
+            "--parallel" => {
+                args.remove(0);
+                parallel = require_value(&mut args, "--parallel")
+                    .parse()
+                    .unwrap_or_else(|_| {
+                        eprintln!("Invalid --parallel value");
+                        std::process::exit(2);
+                    });
+            }
+            "--json" => {
+                json = true;
+                args.remove(0);
+            }
+            "--markdown" | "--to-markdown" => {
+                markdown = true;
+                args.remove(0);
+            }
+            "--timeout" => {
+                args.remove(0);
+                timeout_secs = require_value(&mut args, "--timeout")
+                    .parse()
+                    .unwrap_or_else(|_| {
+                        eprintln!("Invalid --timeout value");
+                        std::process::exit(2);
+                    });
+            }
+            other => {
+                eprintln!("Unknown eval argument '{other}'. Usage: deep-code eval [--subset lite|verified] [--sample N] [--parallel N] [--json] [--markdown] [--timeout SECS]");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    CliArgs {
+        mode: RunMode::Eval {
+            subset,
+            sample,
+            parallel,
+            json,
+            markdown,
+            timeout_secs,
         },
     }
 }
@@ -347,7 +429,8 @@ pub fn run_session_command(mode: RunMode) -> anyhow::Result<()> {
         RunMode::Tui { .. }
         | RunMode::Doctor { .. }
         | RunMode::Serve { .. }
-        | RunMode::Mcp { .. } => unreachable!("handled by caller"),
+        | RunMode::Mcp { .. }
+        | RunMode::Eval { .. } => unreachable!("handled by caller"),
     }
     Ok(())
 }
@@ -361,6 +444,7 @@ fn print_usage() {
     eprintln!("  deep-code serve --http [--host HOST] [--port PORT]");
     eprintln!("  deep-code session list|resume|delete|export");
     eprintln!("  deep-code mcp list|validate|reload|enable|disable");
+    eprintln!("  deep-code eval [--subset lite] [--sample N] [--parallel N] [--json] [--markdown]");
 }
 
 fn print_session_usage() {

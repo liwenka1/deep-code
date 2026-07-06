@@ -4,6 +4,7 @@ members = [
     "crates/deep-code-agent",
     "crates/deep-code-runtime",
     "crates/deep-code-tui",
+    "crates/deep-code-eval",
     "apps/deep-code-desktop/src-tauri",
 ]
 

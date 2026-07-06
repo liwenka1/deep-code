@@ -4,6 +4,7 @@ mod cli;
 mod clipboard;
 mod commands;
 mod doctor_cli;
+mod eval_cli;
 mod event_routing;
 mod history;
 mod markdown;
@@ -40,6 +41,14 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         RunMode::Mcp { subcommand, args } => mcp_cli::run_mcp_command(&subcommand, &args),
+        RunMode::Eval {
+            subset,
+            sample,
+            parallel,
+            json,
+            markdown,
+            timeout_secs,
+        } => eval_cli::run_eval(subset, sample, parallel, json, markdown, timeout_secs).await,
         other => run_session_command(other),
     }
 }

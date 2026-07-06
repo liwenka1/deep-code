@@ -916,6 +916,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "deep-code-eval"
+version = "0.1.3"
+dependencies = [
+ "anyhow",
+ "deep-code-agent",
+ "futures-util",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "deep-code-runtime"
 version = "0.1.3"
 dependencies = [
@@ -942,6 +957,7 @@ dependencies = [
  "async-stream",
  "crossterm 0.29.0",
  "deep-code-agent",
+ "deep-code-eval",
  "deep-code-runtime",
  "futures-util",
  "libc",
