@@ -178,47 +178,138 @@ fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
         }
 
         if event::poll(Duration::from_millis(40))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    handle_key(app, key);
-                    needs_redraw = true;
-                }
-                Event::Paste(text) => {
-                    app.paste_str(text);
-                    needs_redraw = true;
-                }
-                Event::Mouse(mouse) => {
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => app.scroll_up(),
-                        MouseEventKind::ScrollDown => app.scroll_down(),
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            app.selection_begin(mouse.column, mouse.row);
-                        }
-                        MouseEventKind::Drag(MouseButton::Left) => {
-                            app.selection_update(mouse.column, mouse.row);
-                        }
-                        MouseEventKind::Up(MouseButton::Left) => {
-                            if let Some(text) = app.selection_finish() {
-                                crate::clipboard::copy(&text);
-                                // The clipboard helper (clip.exe / pbcopy / xclip)
-                                // is a child process that can reset the console
-                                // mode on Windows; re-assert mouse capture.
-                                let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
-                                app.status =
-                                    format!("已复制选中文本 ({} 字)", text.chars().count());
-                            }
-                        }
-                        _ => {}
-                    }
-                    needs_redraw = true;
-                }
-                Event::Resize(..) => needs_redraw = true,
-                _ => {}
-            }
+            let event = event::read()?;
+            needs_redraw |= dispatch_terminal_event(app, terminal, event)?;
         }
     }
 
     Ok(())
+}
+
+/// Route one terminal event; returns whether a redraw is needed.
+fn dispatch_terminal_event(
+    app: &mut App,
+    terminal: &mut AppTerminal,
+    event: Event,
+) -> Result<bool> {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            // Windows fallback: crossterm's console event source does not
+            // deliver bracketed paste there, so a paste replays as a flood of
+            // already-queued key events — and every newline in the pasted
+            // text would hit the Enter/submit path. If more keys are queued
+            // at zero delay behind this one, gather the burst and decide
+            // whether it is a paste. On unix, real pastes arrive as
+            // `Event::Paste`, so this path stays cold.
+            if key_text_payload(&key).is_some() && event::poll(Duration::ZERO)? {
+                let (keys, leftover) = drain_key_burst(key)?;
+                let text: String = keys.iter().filter_map(key_text_payload).collect();
+                if burst_looks_like_paste(&text) {
+                    app.paste_str(text);
+                } else {
+                    // Human-plausible burst (fast typing): keep exact key
+                    // semantics, including a trailing Enter meaning submit.
+                    for key in keys {
+                        handle_key(app, key);
+                    }
+                }
+                if let Some(event) = leftover {
+                    dispatch_terminal_event(app, terminal, event)?;
+                }
+            } else {
+                handle_key(app, key);
+            }
+            Ok(true)
+        }
+        Event::Key(_) => Ok(false),
+        Event::Paste(text) => {
+            app.paste_str(text);
+            Ok(true)
+        }
+        Event::Mouse(mouse) => {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => app.scroll_up(),
+                MouseEventKind::ScrollDown => app.scroll_down(),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    app.selection_begin(mouse.column, mouse.row);
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    app.selection_update(mouse.column, mouse.row);
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(text) = app.selection_finish() {
+                        crate::clipboard::copy(&text);
+                        // The clipboard helper (clip.exe / pbcopy / xclip)
+                        // is a child process that can reset the console
+                        // mode on Windows; re-assert mouse capture.
+                        let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
+                        app.status = format!("已复制选中文本 ({} 字)", text.chars().count());
+                    }
+                }
+                _ => {}
+            }
+            Ok(true)
+        }
+        Event::Resize(..) => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+/// The character a key event would type, for paste-burst reconstruction.
+/// `None` for shortcuts and navigation keys (they end a burst).
+fn key_text_payload(key: &KeyEvent) -> Option<char> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(ch) => Some(ch),
+        KeyCode::Enter => Some('\n'),
+        KeyCode::Tab => Some('\t'),
+        _ => None,
+    }
+}
+
+/// A zero-delay key burst no human could produce. 12 keys inside one poll
+/// window ≈ 300 keys/sec sustained; the fastest typists burst under half of
+/// that, while a console paste floods the queue instantly.
+const PASTE_BURST_MIN_CHARS: usize = 12;
+
+/// Decide whether a gathered key burst is a paste:
+/// - a newline in the *interior* of the burst cannot be "typed text + Enter"
+///   (Enter would have ended the input), so it must be pasted content;
+/// - an implausibly long instant burst is a paste even without newlines.
+///
+/// Anything smaller replays as real keys so a fast "hi⏎" still submits.
+fn burst_looks_like_paste(text: &str) -> bool {
+    let interior = text.trim_end_matches('\n');
+    interior.contains('\n') || text.chars().count() >= PASTE_BURST_MIN_CHARS
+}
+
+/// Drain the immediately-available (zero-delay) textual key events following
+/// `first`. Release/repeat key events are skipped; the first non-textual
+/// event ends the burst and is returned for normal dispatch.
+fn drain_key_burst(first: KeyEvent) -> Result<(Vec<KeyEvent>, Option<Event>)> {
+    let mut keys = vec![first];
+    let mut leftover = None;
+    while event::poll(Duration::ZERO)? {
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if key_text_payload(&key).is_some() {
+                    keys.push(key);
+                } else {
+                    leftover = Some(Event::Key(key));
+                    break;
+                }
+            }
+            // Interleaved key releases (Windows console reports them).
+            Event::Key(_) => {}
+            other => {
+                leftover = Some(other);
+                break;
+            }
+        }
+    }
+    Ok((keys, leftover))
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
@@ -1362,6 +1453,42 @@ mod tests {
         }
         // false/none metadata is hidden.
         assert!(!text.contains("沙箱") && !text.contains("规则"));
+    }
+
+    #[test]
+    fn key_burst_paste_detection_rules() {
+        // Interior newline = pasted multi-line content, however short.
+        assert!(burst_looks_like_paste("ab\ncd"));
+        assert!(burst_looks_like_paste("a\nb\n"));
+        // Implausibly long instant burst = paste even without newlines.
+        assert!(burst_looks_like_paste("cargo test --workspace"));
+        // Fast human typing must replay as keys: short text, short text with
+        // a single trailing Enter (that Enter means submit!).
+        assert!(!burst_looks_like_paste("hi"));
+        assert!(!burst_looks_like_paste("hi\n"));
+        assert!(!burst_looks_like_paste("好的\n"));
+    }
+
+    #[test]
+    fn key_text_payload_maps_typed_keys_only() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        assert_eq!(key_text_payload(&plain(KeyCode::Char('中'))), Some('中'));
+        assert_eq!(key_text_payload(&plain(KeyCode::Enter)), Some('\n'));
+        assert_eq!(key_text_payload(&plain(KeyCode::Tab)), Some('\t'));
+        // Shift-typed uppercase is still text.
+        assert_eq!(
+            key_text_payload(&KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            Some('A')
+        );
+        // Shortcuts and navigation end a burst.
+        assert_eq!(
+            key_text_payload(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(key_text_payload(&plain(KeyCode::Up)), None);
+        assert_eq!(key_text_payload(&plain(KeyCode::Backspace)), None);
     }
 
     #[test]
