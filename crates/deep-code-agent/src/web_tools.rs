@@ -152,11 +152,9 @@ impl WebSearchTool {
                 message: "missing string field 'query'".to_string(),
             });
         }
-        let max_results = params
-            .max_results
-            .map_or(DEFAULT_SEARCH_RESULTS, |value| {
-                value.clamp(1, MAX_SEARCH_RESULTS)
-            });
+        let max_results = params.max_results.map_or(DEFAULT_SEARCH_RESULTS, |value| {
+            value.clamp(1, MAX_SEARCH_RESULTS)
+        });
 
         let client = match guarded_client(false) {
             Ok(client) => client,

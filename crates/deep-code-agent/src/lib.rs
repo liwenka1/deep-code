@@ -130,8 +130,8 @@ pub use subagent::{
 };
 pub use tool::{
     ApprovalDecision, ApprovalRequest, ErasedTool, ExecutionMode, MockEchoTool, Tool, ToolCall,
-    ToolCallAccumulator, ToolCx, ToolError, ToolOutput, ToolRegistry, ToolResult,
-    ToolResultStatus, ToolRunOutcome, ToolSpec, ToolUpdate, ToolUpdateFn, run_blocking,
+    ToolCallAccumulator, ToolCx, ToolError, ToolOutput, ToolRegistry, ToolResult, ToolResultStatus,
+    ToolRunOutcome, ToolSpec, ToolUpdate, ToolUpdateFn, run_blocking,
 };
 pub use web_tools::{FetchUrlTool, WebSearchTool, web_tool_registry};
 pub use workspace_summary::{build_workspace_summary, list_workspace_files};

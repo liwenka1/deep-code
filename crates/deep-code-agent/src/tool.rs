@@ -403,12 +403,13 @@ impl<T: Tool> ErasedTool for T {
     }
 
     async fn execute(&self, call: &ToolCall, cx: &ToolCx) -> Result<ToolResult, ToolError> {
-        let params: T::Params = serde_json::from_value(call.arguments.clone()).map_err(|error| {
-            ToolError::InvalidArguments {
-                name: call.name.clone(),
-                message: error.to_string(),
-            }
-        })?;
+        let params: T::Params =
+            serde_json::from_value(call.arguments.clone()).map_err(|error| {
+                ToolError::InvalidArguments {
+                    name: call.name.clone(),
+                    message: error.to_string(),
+                }
+            })?;
         let output = self.run(params, cx).await?;
         Ok(output.into_result(&call.id, &call.name))
     }
@@ -918,8 +919,8 @@ mod tests {
     #[test]
     fn generated_schemas_keep_function_calling_invariants() {
         let workspace = tempfile::tempdir().unwrap();
-        let mut registry = crate::workspace_tools::workspace_tool_registry(workspace.path())
-            .unwrap();
+        let mut registry =
+            crate::workspace_tools::workspace_tool_registry(workspace.path()).unwrap();
         let (shell, _) = crate::shell_tools::shell_tool_registry(workspace.path()).unwrap();
         registry.extend(shell);
 

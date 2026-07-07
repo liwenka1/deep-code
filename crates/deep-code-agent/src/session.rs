@@ -79,10 +79,14 @@ impl Session {
         content: String,
         status: ToolResultStatus,
     ) -> bool {
-        let latest_assistant = self.entries.iter_mut().rev().find_map(|entry| match &mut entry.kind {
-            EntryKind::Assistant { exchanges, .. } => Some(exchanges),
-            _ => None,
-        });
+        let latest_assistant =
+            self.entries
+                .iter_mut()
+                .rev()
+                .find_map(|entry| match &mut entry.kind {
+                    EntryKind::Assistant { exchanges, .. } => Some(exchanges),
+                    _ => None,
+                });
         let Some(exchanges) = latest_assistant else {
             return false;
         };
@@ -145,9 +149,9 @@ impl Session {
                         let EntryKind::Assistant { exchanges, .. } = &mut entry.kind else {
                             return None;
                         };
-                        exchanges
-                            .iter_mut()
-                            .find(|exchange| exchange.call.id == call_id && exchange.result.is_none())
+                        exchanges.iter_mut().find(|exchange| {
+                            exchange.call.id == call_id && exchange.result.is_none()
+                        })
                     });
                     if let Some(exchange) = slot {
                         // Wire messages carry no status; the schema-v2
@@ -284,24 +288,28 @@ mod tests {
         let mut session = Session::new();
         session.push_system("you are deep-code");
         session.push_user("修个 bug");
-        session.push_assistant("看看文件", "先读再改", vec![tool_call("c1"), tool_call("c2")]);
+        session.push_assistant(
+            "看看文件",
+            "先读再改",
+            vec![tool_call("c1"), tool_call("c2")],
+        );
         assert!(session.record_tool_result(
             "c1",
             "content-1".to_string(),
             ToolResultStatus::Success
         ));
-        assert!(session.record_tool_result(
-            "c2",
-            "content-2".to_string(),
-            ToolResultStatus::Error
-        ));
+        assert!(session.record_tool_result("c2", "content-2".to_string(), ToolResultStatus::Error));
         session.push_assistant("改好了", "", Vec::new());
         session.push_user("thanks");
 
         let v1 = vec![
             Message::system("you are deep-code"),
             Message::user("修个 bug"),
-            Message::assistant_turn("看看文件", "先读再改", vec![tool_call("c1"), tool_call("c2")]),
+            Message::assistant_turn(
+                "看看文件",
+                "先读再改",
+                vec![tool_call("c1"), tool_call("c2")],
+            ),
             Message::tool("c1", "content-1"),
             Message::tool("c2", "content-2"),
             Message::assistant_turn("改好了", "", Vec::new()),
@@ -323,11 +331,7 @@ mod tests {
         // always belong to the newest batch).
         assert!(!session.record_tool_result("nope", String::new(), ToolResultStatus::Success));
         assert!(!session.record_tool_result("c1", String::new(), ToolResultStatus::Success));
-        assert!(session.record_tool_result(
-            "c9",
-            "ok".to_string(),
-            ToolResultStatus::Success
-        ));
+        assert!(session.record_tool_result("c9", "ok".to_string(), ToolResultStatus::Success));
         // Double-record of the same call is rejected.
         assert!(!session.record_tool_result("c9", "again".to_string(), ToolResultStatus::Success));
     }

@@ -16,11 +16,7 @@ impl LiveOutput {
         self.0.push_str(text);
         let count = self.0.chars().count();
         if count > LIVE_OUTPUT_MAX_CHARS {
-            self.0 = self
-                .0
-                .chars()
-                .skip(count - LIVE_OUTPUT_MAX_CHARS)
-                .collect();
+            self.0 = self.0.chars().skip(count - LIVE_OUTPUT_MAX_CHARS).collect();
         }
     }
 

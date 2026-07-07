@@ -511,8 +511,10 @@ impl App {
                 // line_index (clamped to the scrollable range).
                 self.scroll_offset = max_scroll.saturating_sub(line_index);
                 self.find_state = Some((query.to_string(), line_index));
-                self.status =
-                    format!("找到 “{query}”（第 {} 行）· 再次 /find 向上继续", line_index + 1);
+                self.status = format!(
+                    "找到 “{query}”（第 {} 行）· 再次 /find 向上继续",
+                    line_index + 1
+                );
             }
             None => {
                 let was_continuing = self
@@ -1711,7 +1713,8 @@ mod tests {
     fn history_cap_drops_oldest_cells_and_counts_them() {
         let mut app = App::new();
         for index in 0..(MAX_HISTORY_CELLS + 100) {
-            app.history.push(HistoryCell::system(format!("cell-{index}")));
+            app.history
+                .push(HistoryCell::system(format!("cell-{index}")));
         }
         app.enforce_history_cap();
 

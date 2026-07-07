@@ -200,11 +200,8 @@ mod tests {
     fn unknown_tools_produce_no_preview() {
         let workspace = tempfile::tempdir().unwrap();
         assert!(
-            build_approval_preview(
-                &call("shell", json!({"command": "ls"})),
-                workspace.path()
-            )
-            .is_none()
+            build_approval_preview(&call("shell", json!({"command": "ls"})), workspace.path())
+                .is_none()
         );
     }
 }

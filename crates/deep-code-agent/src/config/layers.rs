@@ -399,8 +399,7 @@ pub(super) fn apply_env_overlay(
     if let Some(value) = lookup(STREAM_MAX_BYTES_ENV).and_then(|value| value.parse().ok()) {
         config.stream_max_bytes = value;
     }
-    if let Some(value) = lookup(CHECKPOINT_MAX_SNAPSHOTS_ENV).and_then(|value| value.parse().ok())
-    {
+    if let Some(value) = lookup(CHECKPOINT_MAX_SNAPSHOTS_ENV).and_then(|value| value.parse().ok()) {
         config.checkpoint_max_snapshots = value;
     }
     if let Some(value) = lookup(APPROVAL_AUTO_ALLOW_ENV) {

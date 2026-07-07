@@ -240,7 +240,10 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
                     }
                 }
             }
-            EntryKind::Compaction { summary, archived_count } => {
+            EntryKind::Compaction {
+                summary,
+                archived_count,
+            } => {
                 current_turn.push(HistoryCell::Compaction {
                     metadata: Some(format!("archived={archived_count}")),
                     summary: summary.clone(),

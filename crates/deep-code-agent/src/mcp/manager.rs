@@ -278,8 +278,7 @@ impl McpManager {
             let mut servers = self.servers.write().expect("mcp lock");
             if let Some(entry) = servers.get_mut(&server_name) {
                 entry.client = None;
-                entry.last_error =
-                    Some("call timed out; server marked unavailable".to_string());
+                entry.last_error = Some("call timed out; server marked unavailable".to_string());
             }
         }
         result

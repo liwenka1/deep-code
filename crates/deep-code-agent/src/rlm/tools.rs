@@ -291,11 +291,7 @@ impl Tool for RlmConfigureTool {
         "Adjust RLM session feedback limits such as inline char cap and grep match cap."
     }
 
-    async fn run(
-        &self,
-        params: RlmConfigureParams,
-        _cx: &ToolCx,
-    ) -> Result<ToolOutput, ToolError> {
+    async fn run(&self, params: RlmConfigureParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
         let this = self.clone();
         run_blocking(Self::NAME, move || this.configure_sync(params)).await
     }

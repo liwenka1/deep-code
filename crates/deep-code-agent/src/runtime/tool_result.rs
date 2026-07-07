@@ -48,7 +48,10 @@ pub(super) fn session_shell_prefix(call: &ToolCall) -> Option<String> {
         // Only `job action=start` carries a command; status/tail/cancel
         // approvals must not record a shell prefix.
         crate::execution_policy::ToolKind::Job => {
-            call.arguments.get("action").and_then(|value| value.as_str()) == Some("start")
+            call.arguments
+                .get("action")
+                .and_then(|value| value.as_str())
+                == Some("start")
         }
         _ => false,
     };

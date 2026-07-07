@@ -319,10 +319,8 @@ impl JobTool {
         let job = self.jobs.get(job_id, Self::NAME)?;
         let mut job = job.lock().expect("job lock poisoned");
         refresh_job(&mut job);
-        Ok(
-            ToolOutput::text(job_text_snapshot(job_id, &job, max_chars))
-                .with_details(job_details(job_id, &job)),
-        )
+        Ok(ToolOutput::text(job_text_snapshot(job_id, &job, max_chars))
+            .with_details(job_details(job_id, &job)))
     }
 
     async fn cancel(&self, params: &JobParams) -> Result<ToolOutput, ToolError> {
@@ -334,12 +332,10 @@ impl JobTool {
         }
         cancel_job(&job, Self::NAME).await?;
         let job = job.lock().expect("job lock poisoned");
-        Ok(ToolOutput::text(job_text_snapshot(
-            job_id,
-            &job,
-            DEFAULT_TAIL_CHARS as usize,
-        ))
-        .with_details(job_details(job_id, &job)))
+        Ok(
+            ToolOutput::text(job_text_snapshot(job_id, &job, DEFAULT_TAIL_CHARS as usize))
+                .with_details(job_details(job_id, &job)),
+        )
     }
 }
 

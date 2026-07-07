@@ -118,7 +118,11 @@ mod tests {
         }
     }
 
-    fn v1(messages: Vec<Message>, turns: Vec<TurnRecord>, compaction: Option<&str>) -> SessionRecordV1 {
+    fn v1(
+        messages: Vec<Message>,
+        turns: Vec<TurnRecord>,
+        compaction: Option<&str>,
+    ) -> SessionRecordV1 {
         SessionRecordV1 {
             id: SessionId("session_1_0".to_string()),
             workspace: PathBuf::from("/tmp/ws"),
@@ -136,8 +140,10 @@ mod tests {
     #[test]
     fn migrates_plain_history_and_recovers_status() {
         let mut turn = TurnRecord::new("do it");
-        turn.tool_results
-            .push(ToolResult::error(&crate::tool::ToolCall::new("c1", "shell", serde_json::json!({})), "boom"));
+        turn.tool_results.push(ToolResult::error(
+            &crate::tool::ToolCall::new("c1", "shell", serde_json::json!({})),
+            "boom",
+        ));
         let record = migrate_v1(v1(
             vec![
                 Message::system("sys"),

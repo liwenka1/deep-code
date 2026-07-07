@@ -263,9 +263,7 @@ mod tests {
             .join("session_1_0.json");
         std::fs::write(&path, serde_json::to_string_pretty(&v1_json).unwrap()).unwrap();
 
-        let loaded = store
-            .load(&SessionId("session_1_0".to_string()))
-            .unwrap();
+        let loaded = store.load(&SessionId("session_1_0".to_string())).unwrap();
         assert_eq!(loaded.schema_version, super::SESSION_SCHEMA_VERSION);
         assert_eq!(loaded.entries.len(), 3);
         assert_eq!(loaded.preview(), "hi");

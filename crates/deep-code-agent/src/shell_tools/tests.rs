@@ -28,7 +28,10 @@ async fn approved(root: &std::path::Path, name: &str, arguments: Value) -> ToolR
 }
 
 fn details(result: &ToolResult) -> &Value {
-    result.details.as_ref().expect("shell results carry details")
+    result
+        .details
+        .as_ref()
+        .expect("shell results carry details")
 }
 
 #[tokio::test]
@@ -202,11 +205,7 @@ async fn job_start_status_tail_and_cancel_work() {
     let job_id = details(&result)["job_id"].as_str().unwrap().to_string();
 
     tokio::time::sleep(Duration::from_millis(80)).await;
-    let tail = ToolCall::new(
-        "call_2",
-        "job",
-        json!({"action": "tail", "job_id": job_id}),
-    );
+    let tail = ToolCall::new("call_2", "job", json!({"action": "tail", "job_id": job_id}));
     let ToolRunOutcome::Result { result } = registry.run_tool_call(tail, None).await.unwrap()
     else {
         panic!("expected result");

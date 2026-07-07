@@ -857,17 +857,13 @@ mod tests {
         session.turns.push(second_turn);
 
         session.entries.push(SessionEntry::user("first prompt"));
-        session.entries.push(SessionEntry::assistant(
-            "first answer",
-            None,
-            Vec::new(),
-        ));
+        session
+            .entries
+            .push(SessionEntry::assistant("first answer", None, Vec::new()));
         session.entries.push(SessionEntry::user("second prompt"));
-        session.entries.push(SessionEntry::assistant(
-            "second answer",
-            None,
-            Vec::new(),
-        ));
+        session
+            .entries
+            .push(SessionEntry::assistant("second answer", None, Vec::new()));
 
         // Falls inside the second turn's window [30, u64::MAX).
         let mut checkpoint = CheckpointRecord::new(CheckpointId("cp_2".to_string()), "snap");
@@ -890,7 +886,11 @@ mod tests {
             .expect("second user.message item");
         assert_eq!(second_user.turn_id.as_ref(), Some(&second_turn_id));
 
-        for item in detail.items.iter().filter(|item| item.seq > second_user.seq) {
+        for item in detail
+            .items
+            .iter()
+            .filter(|item| item.seq > second_user.seq)
+        {
             assert_eq!(
                 item.turn_id.as_ref(),
                 Some(&second_turn_id),

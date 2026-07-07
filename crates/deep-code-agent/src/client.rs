@@ -81,11 +81,11 @@ impl LlmClient for DeepSeekClient {
         // this bounds connect + request + headers without constraining how
         // long the SSE body may stream.
         let response = match self.config.timeout {
-            Some(timeout) => tokio::time::timeout(timeout, send)
-                .await
-                .map_err(|_| AgentError::RequestTimeout {
+            Some(timeout) => tokio::time::timeout(timeout, send).await.map_err(|_| {
+                AgentError::RequestTimeout {
                     seconds: timeout.as_secs(),
-                })??,
+                }
+            })??,
             None => send.await?,
         };
 
@@ -280,9 +280,7 @@ mod tests {
     fn decoder_ignores_comment_and_done_frames() {
         let mut decoder = SseDecoder::new();
         assert_eq!(
-            decoder
-                .push(b": keep-alive\n\ndata: [DONE]\n\n")
-                .unwrap(),
+            decoder.push(b": keep-alive\n\ndata: [DONE]\n\n").unwrap(),
             Vec::new()
         );
     }

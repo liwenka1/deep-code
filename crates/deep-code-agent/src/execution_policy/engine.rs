@@ -408,7 +408,10 @@ mod tests {
 
         let unknown =
             policy.evaluate_tool("job", &json!({"action": "start", "command": "python x.py"}));
-        assert!(matches!(unknown.verdict, PolicyVerdict::NeedsApproval { .. }));
+        assert!(matches!(
+            unknown.verdict,
+            PolicyVerdict::NeedsApproval { .. }
+        ));
     }
 
     #[test]

@@ -202,8 +202,15 @@ mod tests {
             EntryKind::Assistant { content, .. } if content == "a11"
         ));
         // The tail keeps whole entries: the derived wire still pairs cleanly.
-        let wire: Vec<Message> = result.entries.iter().flat_map(entry_wire_messages).collect();
-        assert!(wire.iter().any(|message| message.content.contains("会话摘要")));
+        let wire: Vec<Message> = result
+            .entries
+            .iter()
+            .flat_map(entry_wire_messages)
+            .collect();
+        assert!(
+            wire.iter()
+                .any(|message| message.content.contains("会话摘要"))
+        );
     }
 
     #[test]

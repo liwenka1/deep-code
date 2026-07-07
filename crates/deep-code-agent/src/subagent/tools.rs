@@ -102,10 +102,7 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentOpenTool<C> {
             .unwrap_or_else(|| "general".to_string());
         let role = SubAgentRole::parse(&role_raw).map_err(tool_error)?;
         let fork_context = params.fork_context.unwrap_or(false);
-        let name = params
-            .name
-            .or(params.session_name)
-            .unwrap_or_default();
+        let name = params.name.or(params.session_name).unwrap_or_default();
 
         let agent_id = new_agent_id();
         let session_name = if name.is_empty() {
