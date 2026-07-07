@@ -10,10 +10,8 @@ description = "deep-code benchmark evaluation driver (SWE-bench etc.)"
 [dependencies]
 anyhow = "1"
 deep-code-agent = { path = "../deep-code-agent" }
-futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
-uuid = { version = "1", features = ["v4"] }

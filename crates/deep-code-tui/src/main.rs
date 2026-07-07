@@ -40,15 +40,29 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
-        RunMode::Mcp { subcommand, args } => mcp_cli::run_mcp_command(&subcommand, &args),
         RunMode::Eval {
             subset,
+            split,
             sample,
             parallel,
             json,
             markdown,
             timeout_secs,
-        } => eval_cli::run_eval(subset, sample, parallel, json, markdown, timeout_secs).await,
+            out_dir,
+        } => {
+            eval_cli::run_eval(
+                subset,
+                split,
+                sample,
+                parallel,
+                json,
+                markdown,
+                timeout_secs,
+                out_dir,
+            )
+            .await
+        }
+        RunMode::Mcp { subcommand, args } => mcp_cli::run_mcp_command(&subcommand, &args),
         other => run_session_command(other),
     }
 }

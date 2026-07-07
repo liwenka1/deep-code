@@ -46,11 +46,13 @@ pub enum RunMode {
     },
     Eval {
         subset: String,
+        split: String,
         sample: Option<usize>,
         parallel: usize,
         json: bool,
         markdown: bool,
         timeout_secs: u64,
+        out_dir: PathBuf,
     },
 }
 
@@ -225,17 +227,28 @@ fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
 
 fn parse_eval_command(mut args: Vec<String>) -> CliArgs {
     let mut subset = "lite".to_string();
+    // dev(23 题)是默认:便宜、适合联调,避免误触 300 题的 test 全量。
+    let mut split = "dev".to_string();
     let mut sample = None;
     let mut parallel = 1;
     let mut json = false;
     let mut markdown = false;
     let mut timeout_secs = 300;
+    let mut out_dir = PathBuf::from("eval-out");
 
     while let Some(arg) = args.first().cloned() {
         match arg.as_str() {
             "--subset" => {
                 args.remove(0);
                 subset = require_value(&mut args, "--subset");
+            }
+            "--split" => {
+                args.remove(0);
+                split = require_value(&mut args, "--split");
+            }
+            "--out" => {
+                args.remove(0);
+                out_dir = PathBuf::from(require_value(&mut args, "--out"));
             }
             "--sample" => {
                 args.remove(0);
@@ -275,7 +288,11 @@ fn parse_eval_command(mut args: Vec<String>) -> CliArgs {
                     });
             }
             other => {
-                eprintln!("Unknown eval argument '{other}'. Usage: deep-code eval [--subset lite|verified] [--sample N] [--parallel N] [--json] [--markdown] [--timeout SECS]");
+                eprintln!(
+                    "Unknown eval argument '{other}'. Usage: deep-code eval \
+[--subset lite|verified] [--split dev|test] [--sample N] [--parallel N] \
+[--json] [--markdown] [--timeout SECS] [--out DIR]"
+                );
                 std::process::exit(2);
             }
         }
@@ -284,11 +301,13 @@ fn parse_eval_command(mut args: Vec<String>) -> CliArgs {
     CliArgs {
         mode: RunMode::Eval {
             subset,
+            split,
             sample,
             parallel,
             json,
             markdown,
             timeout_secs,
+            out_dir,
         },
     }
 }

@@ -27,9 +27,14 @@ pub struct BenchmarkSet<T: BenchmarkInstance + Clone> {
 }
 
 /// Load a benchmark by name.
-pub async fn load_bench(bench: &str, subset: &str, sample: Option<usize>) -> anyhow::Result<BenchmarkSet<SweBenchInstance>> {
+pub async fn load_bench(
+    bench: &str,
+    subset: &str,
+    split: &str,
+    sample: Option<usize>,
+) -> anyhow::Result<BenchmarkSet<SweBenchInstance>> {
     match bench {
-        "swe-bench" => swe_bench::load(subset, sample).await,
+        "swe-bench" => swe_bench::load(subset, split, sample).await,
         other => anyhow::bail!("unknown benchmark '{other}' (supported: swe-bench)"),
     }
 }
