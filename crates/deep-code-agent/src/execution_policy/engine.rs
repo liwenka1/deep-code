@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::bash_arity::BashArityDict;
+use super::shell_deny;
+
 /// Tool category used by the policy engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolKind {
@@ -63,26 +66,30 @@ impl ToolExecutionPlan {
 }
 
 /// Central execution policy (agent-side, not TUI-specific).
+///
+/// Shell-command gating is layered and tighten-only: the built-in structured
+/// deny rules ([`shell_deny::builtin_deny`]) always run and cannot be removed
+/// by configuration. Project/user layers may contribute `extra_denied_prefixes`
+/// (which add denials) and `trusted_shell_prefixes` (which grant auto-approval),
+/// but a trusted prefix can never override a deny — deny is evaluated first.
 #[derive(Debug, Clone)]
 pub struct ExecPolicy {
-    denied_shell_prefixes: Vec<String>,
+    /// Extra deny prefixes contributed by project/user layers, matched at
+    /// word boundary against each command segment. The built-in structured
+    /// deny always runs regardless of this list.
+    extra_denied_prefixes: Vec<String>,
+    /// Auto-approve rules, matched arity-aware (`git status` matches
+    /// `git status -s` but not `git push`).
     trusted_shell_prefixes: Vec<String>,
     enable_sandbox: bool,
+    /// Arity dictionary backing arity-aware trusted matching.
+    arity: BashArityDict,
 }
 
 impl Default for ExecPolicy {
     fn default() -> Self {
         Self {
-            denied_shell_prefixes: vec![
-                "rm -rf".to_string(),
-                "sudo ".to_string(),
-                "su ".to_string(),
-                "curl |".to_string(),
-                "wget |".to_string(),
-                "chmod 777".to_string(),
-                "dd if=".to_string(),
-                ":(){ :|:& };:".to_string(),
-            ],
+            extra_denied_prefixes: Vec::new(),
             trusted_shell_prefixes: vec![
                 "git status".to_string(),
                 "git diff".to_string(),
@@ -90,10 +97,11 @@ impl Default for ExecPolicy {
                 "cargo test".to_string(),
                 "cargo build".to_string(),
                 "cargo check".to_string(),
-                "printf ".to_string(),
-                "echo ".to_string(),
+                "printf".to_string(),
+                "echo".to_string(),
             ],
             enable_sandbox: true,
+            arity: BashArityDict::new(),
         }
     }
 }
@@ -110,9 +118,11 @@ impl ExecPolicy {
         self
     }
 
+    /// Add extra deny prefixes (project/user layer). These tighten the policy;
+    /// the built-in structured deny rules remain in force either way.
     #[must_use]
     pub fn with_denied_shell_prefixes(mut self, prefixes: Vec<String>) -> Self {
-        self.denied_shell_prefixes = prefixes;
+        self.extra_denied_prefixes = prefixes;
         self
     }
 
@@ -286,10 +296,34 @@ impl ExecPolicy {
 }
 
 pub fn evaluate_shell_command(policy: &ExecPolicy, command: &str) -> ToolExecutionPlan {
-    let normalized = normalize_command(command);
+    // 1. Built-in structured deny (basename + flag aware, segment-split).
+    //    Always runs; cannot be disabled by configuration.
+    if let Some(reason) = shell_deny::builtin_deny(command) {
+        return ToolExecutionPlan {
+            verdict: PolicyVerdict::Deny {
+                reason: format!("shell command denied: {}", reason.0),
+            },
+            requires_approval: false,
+            requires_sandbox: false,
+            read_only: false,
+            risk_level: RiskLevel::High,
+            matched_rule: Some(format!("deny:{}", reason.0)),
+        };
+    }
 
-    for prefix in &policy.denied_shell_prefixes {
-        if normalized.starts_with(prefix) {
+    // 2. Extra deny prefixes from project/user layers, matched at word
+    //    boundary against every segment (so `foo` denies `foo --bar` but not
+    //    `foobar`, and chaining cannot smuggle a denied segment past it).
+    let segments = shell_deny::segments(command);
+    for prefix in &policy.extra_denied_prefixes {
+        let needle = prefix.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            continue;
+        }
+        if segments
+            .iter()
+            .any(|segment| segment_matches_prefix(segment, &needle))
+        {
             return ToolExecutionPlan {
                 verdict: PolicyVerdict::Deny {
                     reason: format!("shell command denied by policy rule: {prefix}"),
@@ -303,19 +337,29 @@ pub fn evaluate_shell_command(policy: &ExecPolicy, command: &str) -> ToolExecuti
         }
     }
 
-    for prefix in &policy.trusted_shell_prefixes {
-        if normalized.starts_with(prefix) {
-            return ToolExecutionPlan {
-                verdict: PolicyVerdict::Allow,
-                requires_approval: false,
-                requires_sandbox: policy.enable_sandbox,
-                read_only: false,
-                risk_level: RiskLevel::Low,
-                matched_rule: Some(format!("trust:{prefix}")),
-            };
-        }
+    // 3. Auto-trust only if EVERY segment matches a trusted rule (arity-aware)
+    //    and the command has no redirection or command substitution — those
+    //    can write files or run sub-commands a trusted prefix doesn't cover.
+    if !segments.is_empty()
+        && !has_redirection_or_substitution(command)
+        && segments.iter().all(|segment| {
+            policy
+                .trusted_shell_prefixes
+                .iter()
+                .any(|prefix| policy.arity.allow_rule_matches(prefix, segment))
+        })
+    {
+        return ToolExecutionPlan {
+            verdict: PolicyVerdict::Allow,
+            requires_approval: false,
+            requires_sandbox: policy.enable_sandbox,
+            read_only: false,
+            risk_level: RiskLevel::Low,
+            matched_rule: Some("trust:all_segments".to_string()),
+        };
     }
 
+    // 4. Anything else needs explicit user approval.
     ToolExecutionPlan {
         verdict: PolicyVerdict::NeedsApproval {
             reason: "shell commands can modify files, run code, or access the network".to_string(),
@@ -328,8 +372,27 @@ pub fn evaluate_shell_command(policy: &ExecPolicy, command: &str) -> ToolExecuti
     }
 }
 
-fn normalize_command(command: &str) -> String {
-    command.trim().to_ascii_lowercase()
+/// Word-boundary prefix match of a deny needle against one command segment.
+fn segment_matches_prefix(segment: &str, needle: &str) -> bool {
+    let normalized: String = segment
+        .trim()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalized == needle
+        || (normalized.starts_with(needle)
+            && normalized.as_bytes().get(needle.len()) == Some(&b' '))
+}
+
+/// True if the command contains shell redirection or command substitution,
+/// which disqualifies it from auto-trust (a trusted `echo` must not become an
+/// auto-approved file write via `echo x > /etc/passwd`).
+fn has_redirection_or_substitution(command: &str) -> bool {
+    command.contains('>')
+        || command.contains('<')
+        || command.contains('`')
+        || command.contains("$(")
 }
 
 #[cfg(test)]
@@ -375,6 +438,81 @@ mod tests {
         let plan = evaluate_shell_command(&policy, "cargo test -p deep-code-agent");
         assert_eq!(plan.verdict, PolicyVerdict::Allow);
         assert!(!plan.requires_approval);
+    }
+
+    #[test]
+    fn absolute_path_destructive_command_cannot_bypass_deny() {
+        let policy = ExecPolicy::default();
+        // Regression: the old prefix matcher allowed `/bin/rm -rf /` through.
+        assert!(matches!(
+            evaluate_shell_command(&policy, "/bin/rm -rf /").verdict,
+            PolicyVerdict::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn chained_destructive_tail_is_denied_not_trusted() {
+        let policy = ExecPolicy::default();
+        // A trusted-looking head must not smuggle a destructive tail past the gate.
+        assert!(matches!(
+            evaluate_shell_command(&policy, "cargo test && rm -rf /").verdict,
+            PolicyVerdict::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn trusted_prefix_does_not_extend_to_sibling_subcommand() {
+        let policy = ExecPolicy::default();
+        // `git status` is trusted; `git push` (not trusted) must ask.
+        assert!(matches!(
+            evaluate_shell_command(&policy, "git push origin main").verdict,
+            PolicyVerdict::NeedsApproval { .. }
+        ));
+        // But flags on the trusted prefix stay trusted (arity-aware).
+        assert_eq!(
+            evaluate_shell_command(&policy, "git status --porcelain").verdict,
+            PolicyVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn trusted_echo_with_redirection_is_not_auto_allowed() {
+        let policy = ExecPolicy::default();
+        // `echo` is trusted, but a redirection turns it into a file write.
+        assert!(matches!(
+            evaluate_shell_command(&policy, "echo pwned > /etc/passwd").verdict,
+            PolicyVerdict::NeedsApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn every_segment_must_be_trusted_for_auto_allow() {
+        let policy = ExecPolicy::default();
+        // `git status` trusted, `python x.py` not → whole command asks.
+        assert!(matches!(
+            evaluate_shell_command(&policy, "git status && python deploy.py").verdict,
+            PolicyVerdict::NeedsApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn extra_denied_prefix_from_layer_tightens_policy() {
+        let policy =
+            ExecPolicy::default().with_denied_shell_prefixes(vec!["kubectl delete".to_string()]);
+        // Added deny matches at word boundary, even when chained.
+        assert!(matches!(
+            evaluate_shell_command(&policy, "kubectl delete pod x").verdict,
+            PolicyVerdict::Deny { .. }
+        ));
+        assert!(matches!(
+            evaluate_shell_command(&policy, "echo hi; kubectl delete ns prod").verdict,
+            PolicyVerdict::Deny { .. }
+        ));
+        // Non-matching kubectl subcommand is unaffected by the deny.
+        assert!(!matches!(
+            evaluate_shell_command(&policy, "kubectl get pods").verdict,
+            PolicyVerdict::Deny { .. }
+        ));
     }
 
     #[test]

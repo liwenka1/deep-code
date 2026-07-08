@@ -191,13 +191,18 @@ async fn shell_rejects_cwd_escape() {
 async fn job_start_status_tail_and_cancel_work() {
     let tmp = tempdir().unwrap();
     let registry = registry(tmp.path());
-    // `printf ` is a trusted prefix, so action=start runs without approval.
+    // A chained command (`printf ... && sleep`) is not auto-trusted — the
+    // trusted `printf` prefix no longer blesses the `sleep` tail — so start is
+    // run with an explicit approval.
     let call = ToolCall::new(
         "call_1",
         "job",
         json!({"action": "start", "command": "printf hello && sleep 2"}),
     );
-    let ToolRunOutcome::Result { result } = registry.run_tool_call(call, None).await.unwrap()
+    let ToolRunOutcome::Result { result } = registry
+        .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await
+        .unwrap()
     else {
         panic!("expected result");
     };
