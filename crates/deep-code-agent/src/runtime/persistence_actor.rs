@@ -7,10 +7,22 @@
 //! rapid mutations collapses to one atomic write.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::session_store::{SessionRecord, SessionStore};
+
+/// Backoff delays between save retries. A save is attempted once, then retried
+/// after each of these delays before the failure is finally recorded. This
+/// rides out transient faults (a momentary `ENOSPC`, a file lock, a network-FS
+/// blip) without waiting for the next mutation — which might never come if the
+/// user goes idle or the session ends right after the failed write.
+const SAVE_RETRY_BACKOFF: &[Duration] = &[
+    Duration::from_millis(200),
+    Duration::from_millis(800),
+    Duration::from_millis(2000),
+];
 
 #[derive(Debug)]
 enum Command {
@@ -106,13 +118,12 @@ async fn actor_loop(
         }
 
         if pending_save {
-            let snapshot = record.lock().await.clone();
-            let outcome = store.save(&snapshot);
+            let outcome = save_with_retry(store.as_ref(), &record).await;
             let mut slot = last_error.lock().expect("save error lock poisoned");
             match outcome {
                 Ok(()) => *slot = None,
                 Err(error) => {
-                    eprintln!("session save failed: {error}");
+                    eprintln!("session save failed after retries: {error}");
                     *slot = Some(error.to_string());
                 }
             }
@@ -122,6 +133,35 @@ async fn actor_loop(
         }
         if shutdown {
             return;
+        }
+    }
+}
+
+/// Save the record, retrying transient failures on the [`SAVE_RETRY_BACKOFF`]
+/// schedule. The record is re-snapshotted before every attempt, so a mutation
+/// that lands mid-backoff is captured by the next try (latest-wins holds).
+/// Returns the last error only once every attempt is exhausted.
+async fn save_with_retry(
+    store: &(dyn SessionStore + Send + Sync),
+    record: &Mutex<SessionRecord>,
+) -> Result<(), crate::session_store::SessionStoreError> {
+    let mut attempt = 0usize;
+    loop {
+        let snapshot = record.lock().await.clone();
+        match store.save(&snapshot) {
+            Ok(()) => return Ok(()),
+            Err(error) => match SAVE_RETRY_BACKOFF.get(attempt) {
+                Some(&delay) => {
+                    eprintln!(
+                        "session save failed (attempt {}), retrying in {}ms: {error}",
+                        attempt + 1,
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                None => return Err(error),
+            },
         }
     }
 }
@@ -272,7 +312,37 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    /// A store that fails its first `fail_first` save attempts, then succeeds.
+    /// Time is virtual in these tests (`start_paused`), so retry backoff is
+    /// instant.
+    struct FlakyStore {
+        attempts: AtomicUsize,
+        fail_first: usize,
+    }
+    impl SessionStore for FlakyStore {
+        fn save(&self, _record: &SessionRecord) -> Result<(), SessionStoreError> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) < self.fail_first {
+                Err(SessionStoreError::Io {
+                    message: "disk full".to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+        fn load(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError> {
+            Err(SessionStoreError::NotFound {
+                id: id.as_str().to_string(),
+            })
+        }
+        fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError> {
+            Ok(Vec::new())
+        }
+        fn delete(&self, _id: &SessionId) -> Result<(), SessionStoreError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn save_failure_does_not_kill_actor() {
         let store: Arc<dyn SessionStore + Send + Sync> = Arc::new(FailingStore);
         let record = Arc::new(Mutex::new(make_record()));
@@ -284,37 +354,34 @@ mod tests {
         handle.flush().await;
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn save_failure_is_recorded_and_cleared_on_recovery() {
-        // A store that fails once, then succeeds.
-        struct FlakyStore {
-            failed: AtomicUsize,
-        }
-        impl SessionStore for FlakyStore {
-            fn save(&self, _record: &SessionRecord) -> Result<(), SessionStoreError> {
-                if self.failed.fetch_add(1, Ordering::SeqCst) == 0 {
-                    Err(SessionStoreError::Io {
-                        message: "disk full".to_string(),
-                    })
-                } else {
-                    Ok(())
-                }
-            }
-            fn load(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError> {
-                Err(SessionStoreError::NotFound {
-                    id: id.as_str().to_string(),
-                })
-            }
-            fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError> {
-                Ok(Vec::new())
-            }
-            fn delete(&self, _id: &SessionId) -> Result<(), SessionStoreError> {
-                Ok(())
-            }
-        }
-
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn transient_failure_is_transparently_retried() {
+        // One failure inside the retry budget is recovered within the same
+        // save cycle: no error is ever surfaced.
         let store: Arc<dyn SessionStore + Send + Sync> = Arc::new(FlakyStore {
-            failed: AtomicUsize::new(0),
+            attempts: AtomicUsize::new(0),
+            fail_first: 1,
+        });
+        let record = Arc::new(Mutex::new(make_record()));
+        let handle = PersistenceActorHandle::spawn(store, Arc::clone(&record));
+
+        handle.request_save();
+        handle.flush().await;
+        assert_eq!(
+            handle.last_save_error(),
+            None,
+            "a transient failure within budget must not surface"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn save_failure_is_recorded_after_retries_and_cleared_on_recovery() {
+        // Fail the whole first cycle (initial attempt + all backoff retries),
+        // then succeed — the error is recorded, then cleared on the next cycle.
+        let budget = SAVE_RETRY_BACKOFF.len() + 1;
+        let store: Arc<dyn SessionStore + Send + Sync> = Arc::new(FlakyStore {
+            attempts: AtomicUsize::new(0),
+            fail_first: budget,
         });
         let record = Arc::new(Mutex::new(make_record()));
         let handle = PersistenceActorHandle::spawn(store, Arc::clone(&record));
@@ -324,7 +391,8 @@ mod tests {
         assert!(
             handle
                 .last_save_error()
-                .is_some_and(|error| error.contains("disk full"))
+                .is_some_and(|error| error.contains("disk full")),
+            "error must be recorded once every retry is exhausted"
         );
 
         handle.request_save();
