@@ -45,6 +45,13 @@ impl Default for EntryId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEntry {
     pub id: EntryId,
+    /// The entry that preceded this one when it was first appended to a live
+    /// session (branching foundation). `None` for the root entry, for entries
+    /// loaded from a schema-v1 record that predates this field, or for entries
+    /// rebuilt from wire messages. Assigned once at append time by
+    /// [`crate::session::Session`]; loading preserves the persisted value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<EntryId>,
     #[serde(flatten)]
     pub kind: EntryKind,
 }
@@ -54,8 +61,17 @@ impl SessionEntry {
     pub fn new(kind: EntryKind) -> Self {
         Self {
             id: EntryId::new(),
+            parent: None,
             kind,
         }
+    }
+
+    /// Set the linear predecessor. Used by the session append path; standalone
+    /// constructors leave `parent` unset so tests and loaders stay explicit.
+    #[must_use]
+    pub fn with_parent(mut self, parent: Option<EntryId>) -> Self {
+        self.parent = parent;
+        self
     }
 
     /// Number of wire messages this entry derives to (an assistant entry
