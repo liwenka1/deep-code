@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use crate::execution_policy::bash_arity::BashArityDict;
 
 use crate::client::LlmClient;
 use crate::lsp::{is_edit_tool, render_blocks, summarize_blocks};
@@ -36,12 +38,21 @@ pub(super) fn session_allowable(tool_name: &str) -> bool {
     )
 }
 
-/// Leading program of a *simple* shell command, lowercased — e.g. `cargo` from
-/// `cargo test --all`. Returns `None` for non-shell calls and for
-/// compound/substitution/redirection commands, which are never matched by the
-/// session shell allowlist (they keep prompting). This is what `a` records and
-/// later matches against, so a trusted `cargo` can never smuggle a chained
-/// `cargo x && rm -rf /` past the gate.
+/// Arity dictionary backing the session shell allowlist. Shared with the
+/// execution policy's trusted-prefix matching so a session-allow is recorded at
+/// the same granularity the policy trusts (`git status`, not `git`).
+static ARITY: LazyLock<BashArityDict> = LazyLock::new(BashArityDict::new);
+
+/// Arity-classified key of a *simple* shell command — e.g. `git status` from
+/// `git status -s`, or `cargo test` from `cargo test --all`. Returns `None` for
+/// non-shell calls and for compound/substitution/redirection commands, which
+/// are never matched by the session shell allowlist (they keep prompting).
+///
+/// This is what "approve for session" records and later matches against. Using
+/// the arity-classified prefix rather than the bare program means approving
+/// `git status` does NOT blanket-approve `git push`: the two classify to
+/// different keys, so a chained or sibling subcommand can't ride a prior
+/// consent past the gate.
 pub(super) fn session_shell_prefix(call: &ToolCall) -> Option<String> {
     let command_bearing = match crate::execution_policy::ExecPolicy::classify_tool(&call.name) {
         crate::execution_policy::ToolKind::Shell => true,
@@ -66,11 +77,12 @@ pub(super) fn session_shell_prefix(call: &ToolCall) -> Option<String> {
     if command.is_empty() || command.contains(['&', '|', ';', '\n', '`', '<', '>', '(', ')', '$']) {
         return None;
     }
-    let token = command.split_whitespace().next()?;
-    if token.contains('=') {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    if tokens.first().is_some_and(|token| token.contains('=')) {
         return None; // leading `FOO=bar` env assignment, not a plain program
     }
-    Some(token.to_ascii_lowercase())
+    let canonical = ARITY.classify(&tokens);
+    (!canonical.is_empty()).then_some(canonical)
 }
 
 /// How a tool-call batch ended: every call has a recorded result, the batch
@@ -534,7 +546,7 @@ mod tests {
     fn shell_prefix_covers_job_start_but_not_other_actions() {
         assert_eq!(
             session_shell_prefix(&job_start("cargo test --all")),
-            Some("cargo".to_string())
+            Some("cargo test".to_string())
         );
         let cancel = ToolCall {
             id: "c1".to_string(),
@@ -545,15 +557,33 @@ mod tests {
     }
 
     #[test]
-    fn shell_prefix_extracts_leading_program() {
+    fn shell_prefix_is_arity_classified_not_just_leading_program() {
+        // Flags on the same subcommand collapse to the same key.
         assert_eq!(
             session_shell_prefix(&shell("cargo test --all")),
-            Some("cargo".to_string())
+            Some("cargo test".to_string())
         );
         assert_eq!(
-            session_shell_prefix(&shell("  Git Status  ")),
-            Some("git".to_string())
+            session_shell_prefix(&shell("  Git Status --porcelain  ")),
+            Some("git status".to_string())
         );
+        // A bare program with no known subcommand falls back to the program.
+        assert_eq!(
+            session_shell_prefix(&shell("ls -la")),
+            Some("ls".to_string())
+        );
+    }
+
+    #[test]
+    fn session_allow_of_one_subcommand_does_not_cover_a_sibling() {
+        // Regression (exfil vector): approving `git status` for the session must
+        // not silently auto-approve `git push`. Distinct arity keys ⇒ the push
+        // still prompts.
+        let allowed = session_shell_prefix(&shell("git status")).unwrap();
+        let pushed = session_shell_prefix(&shell("git push origin main")).unwrap();
+        assert_eq!(allowed, "git status");
+        assert_eq!(pushed, "git push");
+        assert_ne!(allowed, pushed);
     }
 
     #[test]
