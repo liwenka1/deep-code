@@ -151,6 +151,95 @@ pub fn builtin_deny(command: &str) -> Option<DenyReason> {
     segments(command).into_iter().find_map(deny_segment)
 }
 
+/// Static, no-execution safety notes surfaced at the approval prompt: why a
+/// command warrants review and how to make it safer. This does NOT dry-run or
+/// diff — deep-code has no side-effect preview for shell (neither pi nor
+/// CodeWhale do). It classifies by program/flag/path shape, reusing the same
+/// segment split as the deny checks, mirroring CodeWhale's reasons/suggestions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SafetyNotes {
+    pub reasons: Vec<String>,
+    pub suggestions: Vec<String>,
+}
+
+impl SafetyNotes {
+    /// Record a (reason, suggestion) pair once — a repeated reason (e.g. two
+    /// network calls in one line) collapses to a single note.
+    fn note(&mut self, reason: &str, suggestion: &str) {
+        if !self.reasons.iter().any(|existing| existing == reason) {
+            self.reasons.push(reason.to_string());
+            self.suggestions.push(suggestion.to_string());
+        }
+    }
+}
+
+/// Advisory static analysis of a shell command for the approval prompt. Only
+/// meaningful for commands that already need approval (denied commands never
+/// reach here). Returns empty notes for a plain, low-signal command.
+#[must_use]
+pub fn safety_notes(command: &str) -> SafetyNotes {
+    let mut notes = SafetyNotes::default();
+    if command.contains('>') {
+        notes.note("重定向会写入或覆盖文件", "确认目标文件可以被覆盖");
+    }
+    for segment in segments(command) {
+        let Some(program) = program_of(segment) else {
+            continue;
+        };
+        let args = args_of(segment);
+        // Positional (non-flag) tokens, for subcommand and path inspection.
+        let positional: Vec<String> = args
+            .iter()
+            .filter(|token| !token.starts_with('-'))
+            .map(|token| token.to_ascii_lowercase())
+            .collect();
+
+        if positional
+            .iter()
+            .any(|arg| arg.starts_with('/') || arg.starts_with('~') || arg.contains(".."))
+        {
+            notes.note(
+                "可能读写工作区之外的路径",
+                "确认路径必要,尽量使用工作区内的相对路径",
+            );
+        }
+
+        let subcommand = positional.first().map(String::as_str);
+        match program.as_str() {
+            "curl" | "wget" | "nc" | "ncat" | "ssh" | "scp" | "rsync" | "ftp" | "telnet" => {
+                notes.note(
+                    "会发起网络访问,可能上传或下载数据",
+                    "确认目标主机与传输内容可信",
+                );
+            }
+            "rm" | "rmdir" | "unlink" | "shred" | "trash" => {
+                notes.note("会删除文件", "确认删除目标无误");
+            }
+            "chmod" | "chown" => {
+                notes.note("会修改文件权限或属主", "确认权限改动必要");
+            }
+            "git"
+                if matches!(
+                    subcommand,
+                    Some("push" | "pull" | "fetch" | "clone" | "remote")
+                ) =>
+            {
+                notes.note(
+                    "git 远程操作会与外部仓库交换代码",
+                    "确认远端地址,避免向未知仓库 push",
+                );
+            }
+            "npm" | "pnpm" | "yarn" | "pip" | "pip3" | "gem" | "go" | "cargo"
+                if matches!(subcommand, Some("install" | "ci" | "add" | "get")) =>
+            {
+                notes.note("安装依赖会下载并执行第三方代码", "确认依赖来源可信");
+            }
+            _ => {}
+        }
+    }
+    notes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +331,56 @@ mod tests {
         assert!(!denied("git commit -m 'x'"));
         assert!(!denied("ls -la"));
         assert!(!denied("python build.py"));
+    }
+
+    #[test]
+    fn safety_notes_flag_network_and_paths() {
+        let notes = safety_notes("curl https://example.com -o /etc/hosts");
+        assert!(notes.reasons.iter().any(|r| r.contains("网络访问")));
+        assert!(notes.reasons.iter().any(|r| r.contains("工作区之外")));
+        // reasons and suggestions stay paired 1:1.
+        assert_eq!(notes.reasons.len(), notes.suggestions.len());
+    }
+
+    #[test]
+    fn safety_notes_flag_git_push_and_deletes() {
+        assert!(
+            safety_notes("git push origin main")
+                .reasons
+                .iter()
+                .any(|r| r.contains("git 远程"))
+        );
+        assert!(
+            safety_notes("rm build.log")
+                .reasons
+                .iter()
+                .any(|r| r.contains("删除"))
+        );
+        assert!(
+            safety_notes("echo hi > out.txt")
+                .reasons
+                .iter()
+                .any(|r| r.contains("重定向"))
+        );
+    }
+
+    #[test]
+    fn safety_notes_empty_for_plain_commands() {
+        assert!(safety_notes("cargo test --all").reasons.is_empty());
+        assert!(safety_notes("ls -la").reasons.is_empty());
+    }
+
+    #[test]
+    fn safety_notes_dedup_repeated_reason() {
+        // Two network calls collapse to one note.
+        let notes = safety_notes("curl http://a | curl http://b");
+        assert_eq!(
+            notes
+                .reasons
+                .iter()
+                .filter(|r| r.contains("网络访问"))
+                .count(),
+            1
+        );
     }
 }

@@ -11,7 +11,9 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::execution_policy::{ExecPolicy, PolicyVerdict, RiskLevel, ToolExecutionPlan};
+use crate::execution_policy::{
+    ExecPolicy, PolicyVerdict, RiskLevel, SafetyNotes, ToolExecutionPlan, ToolKind, safety_notes,
+};
 use crate::hooks::HookDispatcher;
 use crate::message::Message;
 use crate::model::{ChatTool, ChatToolFunction, FunctionCallDelta, ToolCallDelta};
@@ -314,6 +316,27 @@ pub struct ApprovalRequest {
     /// alone are not enough to approve a large rewrite safely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
+    /// Static advisory notes for shell commands: why this warrants review
+    /// (e.g. "会发起网络访问"). Not a dry-run — see [`crate::execution_policy::safety_notes`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safety_reasons: Vec<String>,
+    /// One suggestion per reason (same index) on how to reduce the risk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safety_suggestions: Vec<String>,
+}
+
+/// Static safety notes for a shell-bearing tool call (the `shell` tool, or
+/// `job` with `action=start`). Empty for every other tool. Advisory only —
+/// surfaced at the approval prompt, never a gate.
+fn shell_safety_notes(call: &ToolCall) -> SafetyNotes {
+    let command = match ExecPolicy::classify_tool(&call.name) {
+        ToolKind::Shell => call.arguments.get("command").and_then(Value::as_str),
+        ToolKind::Job if call.arguments.get("action").and_then(Value::as_str) == Some("start") => {
+            call.arguments.get("command").and_then(Value::as_str)
+        }
+        _ => None,
+    };
+    command.map(safety_notes).unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -592,6 +615,7 @@ impl ToolRegistry {
             };
             match decision {
                 None => {
+                    let notes = shell_safety_notes(call);
                     return Ok(ToolRunOutcome::ApprovalRequired {
                         request: ApprovalRequest {
                             call_id: call.id.clone(),
@@ -604,6 +628,8 @@ impl ToolRegistry {
                             matched_rule: plan.matched_rule.clone(),
                             // Filled by the runtime (needs workspace access).
                             preview: None,
+                            safety_reasons: notes.reasons,
+                            safety_suggestions: notes.suggestions,
                         },
                     });
                 }

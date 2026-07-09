@@ -414,6 +414,8 @@ None.
             read_only: false,
             matched_rule: None,
             preview: None,
+            safety_reasons: Vec::new(),
+            safety_suggestions: Vec::new(),
         };
         assert_eq!(
             runtime.subagent_approval_decision(&request),

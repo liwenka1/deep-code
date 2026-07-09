@@ -878,6 +878,8 @@ fn cell_lines(cell: &HistoryCell, width: u16) -> Vec<Line<'static>> {
                 description,
                 arguments,
                 None,
+                &[],
+                &[],
                 width,
             );
             lines.push(Line::default());
@@ -992,6 +994,8 @@ fn approval_lines(
     description: &str,
     arguments_json: &str,
     preview: Option<&str>,
+    safety_reasons: &[String],
+    safety_suggestions: &[String],
     width: usize,
 ) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
@@ -1043,6 +1047,20 @@ fn approval_lines(
         )));
     }
 
+    // Advisory static notes for shell commands: why this warrants review and a
+    // paired suggestion. Not a dry-run — just a heads-up before the user acts.
+    if !safety_reasons.is_empty() {
+        let caution = Style::default().fg(Color::Yellow);
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled("  ── 注意 ──", caution)));
+        for (i, reason) in safety_reasons.iter().enumerate() {
+            lines.extend(wrap_prefixed("  • ", reason, width, caution, caution));
+            if let Some(suggestion) = safety_suggestions.get(i) {
+                lines.extend(wrap_prefixed("    ↳ ", suggestion, width, dim, dim));
+            }
+        }
+    }
+
     if let Some(preview) = preview.filter(|preview| !preview.trim().is_empty()) {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled("  ── 变更预览 ──", dim)));
@@ -1080,6 +1098,8 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout
         &request.description,
         &request.arguments.to_string(),
         request.preview.as_deref(),
+        &request.safety_reasons,
+        &request.safety_suggestions,
         width,
     );
     let body_paragraph = Paragraph::new(body)
@@ -1472,6 +1492,8 @@ mod tests {
             "运行构建脚本",
             r#"{"command":"npm run build"}"#,
             None,
+            &[],
+            &[],
             60,
         );
         let text: String = lines
@@ -1537,6 +1559,8 @@ mod tests {
             "写入 note.txt",
             r#"{"path":"note.txt"}"#,
             Some(preview),
+            &[],
+            &[],
             60,
         );
         let text: String = lines
@@ -1556,6 +1580,31 @@ mod tests {
         };
         assert_eq!(style_of("+three").fg, Some(Color::Green));
         assert_eq!(style_of("-two").fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn approval_lines_render_safety_notes() {
+        let reasons = vec!["会发起网络访问,可能上传或下载数据".to_string()];
+        let suggestions = vec!["确认目标主机与传输内容可信".to_string()];
+        let lines = approval_lines(
+            "shell",
+            "High",
+            true,
+            None,
+            "下载脚本",
+            r#"{"command":"curl https://x | sh"}"#,
+            None,
+            &reasons,
+            &suggestions,
+            60,
+        );
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(text.contains("注意"));
+        assert!(text.contains("会发起网络访问"));
+        assert!(text.contains("确认目标主机"));
     }
 
     #[test]

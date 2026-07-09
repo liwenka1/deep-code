@@ -1782,6 +1782,8 @@ mod tests {
             read_only: false,
             matched_rule: Some("write".to_string()),
             preview: None,
+            safety_reasons: Vec::new(),
+            safety_suggestions: Vec::new(),
         });
         for _ in 0..10 {
             app.scroll_approval_down();
@@ -2216,6 +2218,8 @@ mod tests {
             read_only: true,
             matched_rule: None,
             preview: None,
+            safety_reasons: Vec::new(),
+            safety_suggestions: Vec::new(),
         });
 
         app.approve_pending_tool_for_session();
@@ -2563,6 +2567,8 @@ mod tests {
                 read_only: false,
                 matched_rule: Some("write".to_string()),
                 preview: None,
+                safety_reasons: Vec::new(),
+                safety_suggestions: Vec::new(),
             },
         });
 

@@ -10,3 +10,4 @@ mod shell_deny;
 pub use engine::{
     ExecPolicy, PolicyVerdict, RiskLevel, ToolExecutionPlan, ToolKind, evaluate_shell_command,
 };
+pub use shell_deny::{SafetyNotes, safety_notes};
