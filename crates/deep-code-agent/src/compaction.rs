@@ -122,7 +122,25 @@ pub fn compact_entries(entries: &[SessionEntry]) -> CompactionResult {
     }
 
     let archived = &entries[head_offset..tail_start];
-    let summary = summarize_archived_entries(archived);
+    // Cache-aware summary fold. DeepSeek prompt caching is automatic longest-
+    // prefix matching, so a byte-stable `[system, summary…]` prefix lets the
+    // cache warmed right after one compaction survive the NEXT compaction
+    // instead of a full miss every time. When the archived range already opens
+    // with a prior compaction summary, carry that text forward verbatim as the
+    // PREFIX of the new summary (appending only the freshly-archived tail),
+    // rather than re-summarizing it into a lossy `- 系统: …` line that would
+    // rewrite the prefix bytes. Still destructive — only the summary text is
+    // additive; the archived entries are dropped as before.
+    let summary = match archived.split_first() {
+        Some((first, rest)) => match &first.kind {
+            EntryKind::Compaction { summary: base, .. } if rest.is_empty() => base.clone(),
+            EntryKind::Compaction { summary: base, .. } => {
+                format!("{base}\n{}", summarize_archived_entries(rest))
+            }
+            _ => summarize_archived_entries(archived),
+        },
+        None => summarize_archived_entries(archived),
+    };
     let mut out = Vec::with_capacity(2 + RECENT_TAIL_ENTRIES);
     if let Some(system_entry) = system {
         out.push(system_entry);
@@ -210,6 +228,57 @@ mod tests {
         assert!(
             wire.iter()
                 .any(|message| message.content.contains("会话摘要"))
+        );
+    }
+
+    #[test]
+    fn appending_entries_preserves_wire_prefix() {
+        // The invariant DeepSeek's automatic prefix cache depends on: appending
+        // a turn must never rewrite earlier wire bytes, or every turn misses.
+        // This guards any future refactor of the wire derivation.
+        let mut entries = vec![SessionEntry::system("sys"), SessionEntry::user("hi")];
+        let before: Vec<Message> = entries.iter().flat_map(entry_wire_messages).collect();
+        entries.push(SessionEntry::assistant("there", None, Vec::new()));
+        let after: Vec<Message> = entries.iter().flat_map(entry_wire_messages).collect();
+        assert!(after.len() > before.len());
+        assert_eq!(
+            &after[..before.len()],
+            &before[..],
+            "append must not rewrite earlier wire messages"
+        );
+    }
+
+    #[test]
+    fn recompaction_carries_prior_summary_as_stable_prefix() {
+        // Compact once, grow past threshold, compact again: the second summary
+        // must keep the first summary's text as a byte prefix so the automatic
+        // prefix cache survives the second compaction instead of a full miss.
+        let mut entries = vec![SessionEntry::system("sys")];
+        for index in 0..12 {
+            entries.push(SessionEntry::user(format!("u{index}")));
+            entries.push(SessionEntry::assistant(
+                format!("a{index}"),
+                None,
+                Vec::new(),
+            ));
+        }
+        let first = compact_entries(&entries);
+        assert!(first.archived_count > 0 && !first.summary.is_empty());
+
+        let mut grown = first.entries.clone();
+        for index in 12..24 {
+            grown.push(SessionEntry::user(format!("u{index}")));
+            grown.push(SessionEntry::assistant(
+                format!("a{index}"),
+                None,
+                Vec::new(),
+            ));
+        }
+        let second = compact_entries(&grown);
+        assert!(second.archived_count > 0);
+        assert!(
+            second.summary.starts_with(&first.summary),
+            "the re-compaction summary must extend the prior one as a stable prefix"
         );
     }
 
