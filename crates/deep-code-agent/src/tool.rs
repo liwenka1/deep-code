@@ -643,7 +643,15 @@ impl ToolRegistry {
         }
 
         if let Some(hooks) = &self.hooks {
-            hooks.emit_tool_pre(call);
+            // Pre-execution seam: emits the tool_pre event and runs interceptors.
+            // A block becomes a failed tool result the model reads, and the tool
+            // never runs. Approval already resolved above — this is a separate,
+            // additional gate.
+            if let crate::hooks::ToolGate::Block { reason } = hooks.before_tool(call) {
+                let result = ToolResult::error(call, format!("工具调用被拦截: {reason}"));
+                hooks.emit_tool_post(call, &result);
+                return Ok(ToolRunOutcome::Result { result });
+            }
         }
 
         let cx = cx.with_plan(plan);
@@ -836,6 +844,66 @@ mod tests {
         assert_eq!(events[0]["type"], "tool_pre");
         assert_eq!(events[1]["type"], "tool_post");
         assert_eq!(events[1]["result"]["status"], "error");
+    }
+
+    #[tokio::test]
+    async fn blocking_interceptor_prevents_tool_execution() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::hooks::{ToolGate, ToolInterceptor};
+
+        // A tool that records whether it actually ran.
+        struct SpyTool(Arc<AtomicBool>);
+        #[derive(Debug, Deserialize, JsonSchema)]
+        struct SpyParams {}
+        #[async_trait]
+        impl Tool for SpyTool {
+            type Params = SpyParams;
+            fn name(&self) -> &str {
+                "spy_tool"
+            }
+            fn description(&self) -> &str {
+                "records execution"
+            }
+            async fn run(&self, _params: SpyParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(ToolOutput::text("ran"))
+            }
+        }
+
+        struct BlockAll;
+        impl ToolInterceptor for BlockAll {
+            fn before_tool(&self, _call: &ToolCall) -> ToolGate {
+                ToolGate::Block {
+                    reason: "plan mode: writes disabled".to_string(),
+                }
+            }
+        }
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(SpyTool(ran.clone()));
+        registry.set_hooks(Arc::new({
+            let mut dispatcher = crate::hooks::HookDispatcher::default();
+            dispatcher.add_interceptor(Arc::new(BlockAll));
+            dispatcher
+        }));
+
+        let call = ToolCall::new("call_spy", "spy_tool", json!({}));
+        let outcome = registry
+            .run_tool_call(call, Some(ApprovalDecision::Approved))
+            .await
+            .unwrap();
+        // The tool never ran; the block surfaced as a failed tool result.
+        assert!(!ran.load(Ordering::SeqCst), "blocked tool must not execute");
+        match outcome {
+            ToolRunOutcome::Result { result } => {
+                assert_eq!(result.status, ToolResultStatus::Error);
+                assert!(result.content.contains("拦截") && result.content.contains("plan mode"));
+            }
+            other => panic!("expected a blocked result, got {other:?}"),
+        }
     }
 
     #[tokio::test]

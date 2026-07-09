@@ -51,6 +51,27 @@ pub trait HookSink: Send + Sync {
     fn emit(&self, event: &HookEvent);
 }
 
+/// An interceptor's verdict on a tool call about to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolGate {
+    /// Let the tool execute.
+    Allow,
+    /// Stop the tool; `reason` is surfaced to the model as a failed tool result.
+    Block { reason: String },
+}
+
+/// A programmatic veto evaluated right before a tool executes (after any user
+/// approval). Unlike [`HookSink`] observers, an interceptor can BLOCK a call —
+/// this is the seam in-process features like a plan/read-only mode plug into.
+///
+/// Approval stays a SEPARATE mechanism (the execution policy), not part of this
+/// chain: both pi and CodeWhale keep permission out of the observer/interceptor
+/// path, and folding it in here would tangle two concerns. An interceptor is an
+/// additional gate, never a replacement for approval.
+pub trait ToolInterceptor: Send + Sync {
+    fn before_tool(&self, call: &ToolCall) -> ToolGate;
+}
+
 #[derive(Default)]
 pub struct StdoutHookSink;
 
@@ -124,6 +145,7 @@ impl HooksConfig {
 #[derive(Default, Clone)]
 pub struct HookDispatcher {
     sinks: Arc<Vec<Arc<dyn HookSink>>>,
+    interceptors: Arc<Vec<Arc<dyn ToolInterceptor>>>,
 }
 
 impl HookDispatcher {
@@ -137,6 +159,7 @@ impl HookDispatcher {
         }
         Self {
             sinks: Arc::new(sinks),
+            interceptors: Arc::new(Vec::new()),
         }
     }
 
@@ -146,8 +169,31 @@ impl HookDispatcher {
         self.sinks = Arc::new(sinks);
     }
 
+    /// Register a programmatic gate run before every tool executes. Interceptors
+    /// run in registration order; the first [`ToolGate::Block`] wins.
+    pub fn add_interceptor(&mut self, interceptor: Arc<dyn ToolInterceptor>) {
+        let mut interceptors = (*self.interceptors).clone();
+        interceptors.push(interceptor);
+        self.interceptors = Arc::new(interceptors);
+    }
+
     pub fn enabled(&self) -> bool {
-        !self.sinks.is_empty()
+        !self.sinks.is_empty() || !self.interceptors.is_empty()
+    }
+
+    /// The pre-execution seam: emit the `tool_pre` observability event, then run
+    /// the interceptor chain. Returns the gate — the first interceptor to block
+    /// short-circuits the rest, and the caller turns a block into a failed tool
+    /// result the model reads (approval is handled separately, upstream).
+    pub fn before_tool(&self, call: &ToolCall) -> ToolGate {
+        self.emit_tool_pre(call);
+        for interceptor in self.interceptors.iter() {
+            let gate = interceptor.before_tool(call);
+            if let ToolGate::Block { .. } = gate {
+                return gate;
+            }
+        }
+        ToolGate::Allow
     }
 
     pub fn emit_tool_pre(&self, call: &ToolCall) {
@@ -239,6 +285,66 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["type"], "tool_pre");
         assert_eq!(events[1]["type"], "tool_post");
+    }
+
+    struct BlockingInterceptor {
+        reason: &'static str,
+    }
+    impl ToolInterceptor for BlockingInterceptor {
+        fn before_tool(&self, _call: &ToolCall) -> ToolGate {
+            ToolGate::Block {
+                reason: self.reason.to_string(),
+            }
+        }
+    }
+
+    struct AllowInterceptor;
+    impl ToolInterceptor for AllowInterceptor {
+        fn before_tool(&self, _call: &ToolCall) -> ToolGate {
+            ToolGate::Allow
+        }
+    }
+
+    fn a_call() -> ToolCall {
+        ToolCall {
+            id: "c1".to_string(),
+            name: "shell".to_string(),
+            arguments: json!({"command": "ls"}),
+        }
+    }
+
+    #[test]
+    fn before_tool_allows_when_no_interceptors() {
+        assert_eq!(
+            HookDispatcher::default().before_tool(&a_call()),
+            ToolGate::Allow
+        );
+    }
+
+    #[test]
+    fn before_tool_first_block_wins_and_short_circuits() {
+        let mut dispatcher = HookDispatcher::default();
+        dispatcher.add_interceptor(Arc::new(AllowInterceptor));
+        dispatcher.add_interceptor(Arc::new(BlockingInterceptor {
+            reason: "plan mode",
+        }));
+        assert_eq!(
+            dispatcher.before_tool(&a_call()),
+            ToolGate::Block {
+                reason: "plan mode".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn before_tool_still_emits_tool_pre_observability() {
+        let sink = Arc::new(RecordingSink::default());
+        let mut dispatcher = HookDispatcher::default();
+        dispatcher.add_sink(sink.clone());
+        dispatcher.add_interceptor(Arc::new(BlockingInterceptor { reason: "no" }));
+        let _ = dispatcher.before_tool(&a_call());
+        // The tool_pre event fires even though the call is blocked.
+        assert_eq!(sink.events.lock().unwrap()[0]["type"], "tool_pre");
     }
 
     #[test]
