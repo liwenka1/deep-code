@@ -69,23 +69,21 @@ jobs:
             -d "{\"prompt\": \"$PROMPT\"}" \
             > /tmp/deepcode-events.txt 2>&1
 
-          # 从 SSE 中提取 AI 的文本回答
-          # 不同事件的 payload 结构不同：
-          #   provider 事件:    payload = {"category":"provider", "provider":{"type":"text_delta","text":"..."}}
-          #   reasoning.delta:  payload = {"type":"reasoning_delta", "text":"..."}
-          #   assistant.delta:  payload = {"type":"assistant_delta", "text":"..."}
+          # 从 SSE 中提取 AI 的文本回答，拼接成连续文本
+          # 只取 provider（正式回答），不要 reasoning.delta（思考过程）
           grep '^data: ' /tmp/deepcode-events.txt | while read -r line; do
             json=$(echo "$line" | sed 's/^data: //')
             kind=$(echo "$json" | jq -r '.item.kind // empty' 2>/dev/null)
-            case "$kind" in
-              provider)
-                echo "$json" | jq -r '.item.payload.provider.text // empty' 2>/dev/null
-                ;;
-              reasoning.delta|assistant.delta)
-                echo "$json" | jq -r '.item.payload.text // empty' 2>/dev/null
-                ;;
-            esac
+            if [ "$kind" = "provider" ]; then
+              text=$(echo "$json" | jq -r '.item.payload.provider.text // empty' 2>/dev/null)
+              if [ -n "$text" ] && [ "$text" != "null" ]; then
+                # 用 printf 不加换行，把所有 delta 拼成一段
+                printf '%s' "$text"
+              fi
+            fi
           done > /tmp/deepcode-answer.txt
+          # 尾部加一个换行
+          echo "" >> /tmp/deepcode-answer.txt
 
           # 如果还是空的，dump 原始 JSON 方便排查
           if [ ! -s /tmp/deepcode-answer.txt ]; then
