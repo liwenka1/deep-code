@@ -133,7 +133,7 @@ jobs:
             const hasChanges = '${{ steps.diff.outputs.has_changes }}' === 'true';
 
             let body = '## 🤖 Deep Code\n\n';
-            body += '```\n' + answer + '\n```\n\n';
+            body += answer + '\n\n';
 
             if (hasChanges) {
               body += '✅ **已提交 PR，请查看仓库中的新 PR。**';
