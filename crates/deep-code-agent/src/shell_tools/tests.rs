@@ -8,6 +8,26 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::tool::{ApprovalDecision, ToolCall, ToolResult, ToolResultStatus, ToolRunOutcome};
 
+/// Platform-agnostic 5-second sleep command. `sleep 5` only exists in
+/// Unix `sh`; Windows `cmd` needs `ping -n 6 127.0.0.1 > nul`.
+fn sleep_5() -> &'static str {
+    if cfg!(windows) {
+        "ping -n 6 127.0.0.1 > nul"
+    } else {
+        "sleep 5"
+    }
+}
+
+/// Platform-agnostic 2-second background-able command that echoes "hello".
+/// Unix: `printf hello && sleep 2`; Windows: `echo hello & ping -n 3 127.0.0.1 > nul`.
+fn echo_and_sleep_2() -> &'static str {
+    if cfg!(windows) {
+        "echo hello & ping -n 3 127.0.0.1 > nul"
+    } else {
+        "printf hello && sleep 2"
+    }
+}
+
 fn registry(root: &std::path::Path) -> ToolRegistry {
     ShellTools::new(root)
         .unwrap()
@@ -97,7 +117,7 @@ async fn shell_times_out_and_kills_the_child() {
     let result = approved(
         tmp.path(),
         "shell",
-        json!({"command": "sleep 5", "timeout_secs": 1}),
+        json!({"command": sleep_5(), "timeout_secs": 1}),
     )
     .await;
     assert!(result.content.contains("timed out"));
@@ -145,7 +165,7 @@ async fn shell_streams_chunks_via_on_update() {
 async fn shell_kill_on_cancellation() {
     let tmp = tempdir().unwrap();
     let registry = registry(tmp.path());
-    let call = ToolCall::new("call_1", "shell", json!({"command": "sleep 5"}));
+    let call = ToolCall::new("call_1", "shell", json!({"command": sleep_5()}));
 
     let cancel = CancellationToken::new();
     let cx = crate::tool::ToolCx::new().with_cancel(cancel.clone());
@@ -197,7 +217,7 @@ async fn job_start_status_tail_and_cancel_work() {
     let call = ToolCall::new(
         "call_1",
         "job",
-        json!({"action": "start", "command": "printf hello && sleep 2"}),
+        json!({"action": "start", "command": echo_and_sleep_2()}),
     );
     let ToolRunOutcome::Result { result } = registry
         .run_tool_call(call, Some(ApprovalDecision::Approved))
