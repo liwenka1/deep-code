@@ -29,15 +29,47 @@ jobs:
       - name: Install deep-code
         run: npm i -g @liwenkai/deepcode
 
-      # 提取 /deepcode 后面的内容作为指令
-      - name: Extract prompt
+      # 拉取 Issue 全部评论，拼接成对话上下文
+      - name: Build conversation context
         id: prompt
         uses: actions/github-script@v7
         with:
           result-encoding: string
           script: |
-            const body = context.payload.comment.body;
-            return body.replace(/^\/deepcode\s*/, '').trim() || '请分析一下这个项目';
+            // 拉取 Issue body 和所有评论
+            const issue = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+
+            // 拼对话历史
+            let history = `## 对话历史\n\n`;
+            history += `### Issue 标题\n${issue.data.title}\n\n`;
+
+            if (issue.data.body) {
+              history += `### 第一条（Issue 正文）\n${issue.data.body}\n\n`;
+            }
+
+            for (const comment of comments.data) {
+              if (comment.user.type === 'Bot') continue;
+              history += `### ${comment.user.login}\n${comment.body}\n\n`;
+            }
+
+            const currentPrompt = context.payload.comment.body
+              .replace(/^\/deepcode\s*/, '')
+              .trim() || '请分析一下这个项目';
+
+            // 设定两个 output：full_context 给 deep-code，user_prompt 给 PR 标题
+            core.setOutput('result', `以下是本 Issue 的对话历史，根据上下文回答问题。\n\n${history}\n---\n当前指令：${currentPrompt}`);
+            core.setOutput('user_prompt', currentPrompt);
 
       # 启动 deep-code HTTP 服务（不需要 TTY）
       - name: Start deep-code server
@@ -113,12 +145,12 @@ jobs:
           git config user.email "bot@deep-code.dev"
           git checkout -b "$BRANCH"
           git add -A
-          git commit -m "🤖 deep-code: ${{ steps.prompt.outputs.result }}"
+          git commit -m "🤖 deep-code: ${{ steps.prompt.outputs.user_prompt }}"
           git push origin "$BRANCH"
           # 先创建标签（不存在则忽略报错）
           gh label create "🤖 deep-code" --color "1a9945" 2>/dev/null || true
           gh pr create \
-            --title "🤖 deep-code: ${{ steps.prompt.outputs.result }}" \
+            --title "🤖 deep-code: ${{ steps.prompt.outputs.user_prompt }}" \
             --body "由 @${{ github.event.comment.user.login }} 在 Issue #${{ github.event.issue.number }} 中触发" \
             --head "$BRANCH" \
             --label "🤖 deep-code"
