@@ -51,25 +51,25 @@ jobs:
             });
 
             // 拼对话历史
-            let history = `## 对话历史\n\n`;
-            history += `### Issue 标题\n${issue.data.title}\n\n`;
+            let history = '## 对话历史\n\n';
+            history += '### Issue 标题\n' + issue.data.title + '\n\n';
 
             if (issue.data.body) {
-              history += `### 第一条（Issue 正文）\n${issue.data.body}\n\n`;
+              history += '### 第一条（Issue 正文）\n' + issue.data.body + '\n\n';
             }
 
             for (const comment of comments.data) {
               if (comment.user.type === 'Bot') continue;
-              history += `### ${comment.user.login}\n${comment.body}\n\n`;
+              history += '### ' + comment.user.login + '\n' + comment.body + '\n\n';
             }
 
             const currentPrompt = context.payload.comment.body
               .replace(/^\/deepcode\s*/, '')
               .trim() || '请分析一下这个项目';
 
-            // 设定两个 output：full_context 给 deep-code，user_prompt 给 PR 标题
-            core.setOutput('result', `以下是本 Issue 的对话历史，根据上下文回答问题。\n\n${history}\n---\n当前指令：${currentPrompt}`);
+            // result 用 return（给 deep-code），user_prompt 用 setOutput（给 PR 标题）
             core.setOutput('user_prompt', currentPrompt);
+            return '以下是本 Issue 的对话历史，根据上下文回答问题。\n\n' + history + '\n---\n当前指令：' + currentPrompt;
 
       # 启动 deep-code HTTP 服务（不需要 TTY）
       - name: Start deep-code server
@@ -109,12 +109,10 @@ jobs:
             if [ "$kind" = "provider" ]; then
               text=$(echo "$json" | jq -r '.item.payload.provider.text // empty' 2>/dev/null)
               if [ -n "$text" ] && [ "$text" != "null" ]; then
-                # 用 printf 不加换行，把所有 delta 拼成一段
                 printf '%s' "$text"
               fi
             fi
           done > /tmp/deepcode-answer.txt
-          # 尾部加一个换行
           echo "" >> /tmp/deepcode-answer.txt
 
           # 如果还是空的，dump 原始 JSON 方便排查
@@ -162,7 +160,7 @@ jobs:
           script: |
             const fs = require('fs');
             const raw = fs.readFileSync('/tmp/deepcode-answer.txt', 'utf8').slice(0, 60000);
-            // 模型流式输出可能缺失段落间隔，在 ## / ### 标题前补双换行，确保 markdown 正常渲染
+            // 模型流式输出可能缺失段落间隔，在 ## / ### 标题前补双换行
             let answer = raw.replace(/([^\n])(#{1,3}\s)/g, '$1\n\n$2').trim();
             const hasChanges = '${{ steps.diff.outputs.has_changes }}' === 'true';
 
