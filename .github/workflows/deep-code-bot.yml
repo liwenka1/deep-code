@@ -69,21 +69,28 @@ jobs:
             -d "{\"prompt\": \"$PROMPT\"}" \
             > /tmp/deepcode-events.txt 2>&1
 
-          # 从 SSE 中提取 provider 事件的文本内容（AI 的回答）
+          # 从 SSE 中提取 AI 的文本回答
+          # 不同事件的 payload 结构不同：
+          #   provider 事件:    payload = {"category":"provider", "provider":{"type":"text_delta","text":"..."}}
+          #   reasoning.delta:  payload = {"type":"reasoning_delta", "text":"..."}
+          #   assistant.delta:  payload = {"type":"assistant_delta", "text":"..."}
           grep '^data: ' /tmp/deepcode-events.txt | while read -r line; do
-            kind=$(echo "$line" | sed 's/^data: //' | jq -r '.item.kind // empty' 2>/dev/null)
-            if [ "$kind" = "provider" ]; then
-              echo "$line" | sed 's/^data: //' | jq -r '.item.payload.delta // empty' 2>/dev/null
-            fi
+            json=$(echo "$line" | sed 's/^data: //')
+            kind=$(echo "$json" | jq -r '.item.kind // empty' 2>/dev/null)
+            case "$kind" in
+              provider)
+                echo "$json" | jq -r '.item.payload.provider.text // empty' 2>/dev/null
+                ;;
+              reasoning.delta|assistant.delta)
+                echo "$json" | jq -r '.item.payload.text // empty' 2>/dev/null
+                ;;
+            esac
           done > /tmp/deepcode-answer.txt
 
-          # 如果 AI 回答为空，把原始事件存下来方便排查
+          # 如果还是空的，dump 原始 JSON 方便排查
           if [ ! -s /tmp/deepcode-answer.txt ]; then
-            echo "（deep-code 未输出文本回答，以下为原始事件摘要）" > /tmp/deepcode-answer.txt
-            grep '^data: ' /tmp/deepcode-events.txt | head -20 | sed 's/^data: //' | while read -r line; do
-              kind=$(echo "$line" | jq -r '.item.kind // empty' 2>/dev/null)
-              echo "- 事件: $kind"
-            done >> /tmp/deepcode-answer.txt
+            echo "（debug：以下为原始 SSE 事件 JSON）" > /tmp/deepcode-answer.txt
+            grep '^data: ' /tmp/deepcode-events.txt | head -5 >> /tmp/deepcode-answer.txt
           fi
 
       # 检查是否有文件被修改
