@@ -91,14 +91,15 @@ jobs:
       # 发送指令给 deep-code，等待完成，保存返回的 SSE 事件
       - name: Run deep-code
         run: |
-          PROMPT='${{ steps.prompt.outputs.result }}'
-          echo "指令: $PROMPT"
+          # 用 jq 安全构造 JSON，避免换行符破坏请求
+          echo '${{ steps.prompt.outputs.result }}' > /tmp/deepcode-prompt.txt
+          jq -n --rawfile prompt /tmp/deepcode-prompt.txt '{prompt: $prompt}' > /tmp/deepcode-request.json
 
           # 调用 /v1/prompt API，返回 SSE 流
           curl -s -N -X POST http://127.0.0.1:7878/v1/prompt \
             -H "Authorization: Bearer bot-token" \
             -H "Content-Type: application/json" \
-            -d "{\"prompt\": \"$PROMPT\"}" \
+            -d @/tmp/deepcode-request.json \
             > /tmp/deepcode-events.txt 2>&1
 
           # 从 SSE 中提取 AI 的文本回答，拼接成连续文本
