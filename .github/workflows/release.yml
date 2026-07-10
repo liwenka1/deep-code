@@ -133,14 +133,12 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
 
+      # Node 24 ships with npm >= 11.5.1, meeting the OIDC trusted publishing
+      # requirement without a separate upgrade step that can break module paths.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           registry-url: 'https://registry.npmjs.org'
-
-      # OIDC trusted publishing needs npm >= 11.5.1.
-      - name: Upgrade npm
-        run: npm install -g npm@latest
 
       - name: Publish to npm (OIDC trusted publishing)
         working-directory: packages/deepcode
