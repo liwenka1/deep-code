@@ -69,7 +69,8 @@ jobs:
 
             // result 用 return（给 deep-code），user_prompt 用 setOutput（给 PR 标题）
             core.setOutput('user_prompt', currentPrompt);
-            return '以下是本 Issue 的对话历史，根据上下文回答问题。\n\n' + history + '\n---\n当前指令：' + currentPrompt;
+            return '【重要】你只需修改文件内容，不要执行任何 git 命令（git add/commit/push/branch 等）。git 操作由外部自动化处理。\n\n'
+              + '以下是本 Issue 的对话历史，根据上下文回答问题。\n\n' + history + '\n---\n当前指令：' + currentPrompt;
 
       # 启动 deep-code HTTP 服务（不需要 TTY）
       - name: Start deep-code server
