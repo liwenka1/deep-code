@@ -107,28 +107,22 @@ jobs:
             -d @/tmp/deepcode-request.json \
             > /tmp/deepcode-events.txt 2>&1
 
-          # provider 流里 text_delta=正式回答、reasoning_delta=思考，二者共用 "provider" kind，
-          # 按内层 type 分桶写入两个文件（reasoner 先流完思考再流回答，分桶后天然成段）。
-          : > /tmp/deepcode-answer.txt
-          : > /tmp/deepcode-reasoning.txt
-          grep '^data: ' /tmp/deepcode-events.txt | while read -r line; do
-            json=${line#data: }
-            kind=$(printf '%s' "$json" | jq -r '.item.kind // empty' 2>/dev/null)
-            [ "$kind" = "provider" ] || continue
-            ptype=$(printf '%s' "$json" | jq -r '.item.payload.provider.type // empty' 2>/dev/null)
-            text=$(printf '%s' "$json" | jq -r '.item.payload.provider.text // empty' 2>/dev/null)
-            [ -n "$text" ] && [ "$text" != "null" ] || continue
-            case "$ptype" in
-              text_delta) printf '%s' "$text" >> /tmp/deepcode-answer.txt ;;
-              reasoning_delta) printf '%s' "$text" >> /tmp/deepcode-reasoning.txt ;;
-            esac
-          done
-          echo "" >> /tmp/deepcode-answer.txt
+          # provider 流里 text_delta=正式回答、reasoning_delta=思考，二者共用 "provider" kind。
+          # 用单遍 jq 按内层 type 分桶：-R 逐行读、fromjson? 容错解析、-j 拼接不加分隔、
+          # -r 原始输出。关键是 jq 会原样保留 delta 里的换行——旧的 $(...) 捕获会吃掉每个
+          # delta 结尾的换行，导致段落/代码块/标题全部粘连。
+          grep '^data: ' /tmp/deepcode-events.txt | sed 's/^data: //' > /tmp/deepcode-data.txt
+          jq -Rrj 'fromjson? | select(.item.kind=="provider" and .item.payload.provider.type=="text_delta") | .item.payload.provider.text' \
+            /tmp/deepcode-data.txt > /tmp/deepcode-answer.txt
+          jq -Rrj 'fromjson? | select(.item.kind=="provider" and .item.payload.provider.type=="reasoning_delta") | .item.payload.provider.text' \
+            /tmp/deepcode-data.txt > /tmp/deepcode-reasoning.txt
 
-          # 如果回答为空，dump 原始 JSON 方便排查
+          # 回答为空则 dump 原始 JSON 方便排查；否则补一个结尾换行。
           if [ ! -s /tmp/deepcode-answer.txt ]; then
             echo "（debug：以下为原始 SSE 事件 JSON）" > /tmp/deepcode-answer.txt
-            grep '^data: ' /tmp/deepcode-events.txt | head -5 >> /tmp/deepcode-answer.txt
+            head -5 /tmp/deepcode-data.txt >> /tmp/deepcode-answer.txt
+          else
+            printf '\n' >> /tmp/deepcode-answer.txt
           fi
 
       # 检查是否有文件被修改
