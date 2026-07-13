@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
@@ -198,11 +198,38 @@ fn copy_tree(source: &Path, dest: &Path, skip_meta: bool) -> Result<(), ToolErro
                 fs::create_dir_all(parent)
                     .map_err(|error| checkpoint_error("create snapshot parent", error))?;
             }
-            fs::copy(entry.path(), &target)
+            copy_file_retrying(entry.path(), &target)
                 .map_err(|error| checkpoint_error("copy snapshot file", error))?;
         }
     }
     Ok(())
+}
+
+/// Copy a file, retrying briefly on a transient Windows lock. A freshly-written
+/// workspace file is often held for a few milliseconds by antivirus real-time
+/// scanning or a concurrent writer; on Windows that blocks even a read-copy and
+/// surfaces as `ERROR_SHARING_VIOLATION` (32) / `ERROR_LOCK_VIOLATION` (33).
+/// Unix has no such lock so those codes never occur there — the retry is a
+/// no-op cost on Linux/macOS. The lock clears fast, so a short backoff turns a
+/// flaky snapshot failure into a reliable one.
+fn copy_file_retrying(source: &Path, dest: &Path) -> std::io::Result<u64> {
+    const BACKOFF_MS: &[u64] = &[10, 30, 100, 300];
+    let mut attempt = 0;
+    loop {
+        match fs::copy(source, dest) {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => {
+                let transient = matches!(error.raw_os_error(), Some(32) | Some(33));
+                match BACKOFF_MS.get(attempt) {
+                    Some(&ms) if transient => {
+                        std::thread::sleep(Duration::from_millis(ms));
+                        attempt += 1;
+                    }
+                    _ => return Err(error),
+                }
+            }
+        }
+    }
 }
 
 fn clear_workspace_contents(workspace: &Path) -> Result<(), ToolError> {
@@ -238,6 +265,20 @@ fn checkpoint_error(action: &str, error: std::io::Error) -> ToolError {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn copy_file_retrying_copies_contents() {
+        // Happy path (the only path reachable cross-platform — the transient
+        // lock codes 32/33 never occur on Unix). Guards that the retry wrapper
+        // is a faithful drop-in for fs::copy.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        let dst = dir.path().join("b.txt");
+        fs::write(&src, "payload").unwrap();
+        let bytes = copy_file_retrying(&src, &dst).unwrap();
+        assert_eq!(bytes, "payload".len() as u64);
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "payload");
+    }
 
     #[test]
     fn snapshot_and_restore_round_trip() {
