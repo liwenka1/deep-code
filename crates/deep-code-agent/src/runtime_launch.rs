@@ -9,6 +9,7 @@ use crate::client::{DeepSeekClient, LlmClient};
 use crate::config::AgentConfig;
 use crate::echo_client::EchoClient;
 use crate::extensions::{RuntimeBootstrap, attach_agent_extensions, build_runtime_system_prompt};
+use crate::plan_mode::PlanMode;
 use crate::runtime::{AgentRuntime, AgentRuntimeHandle};
 use crate::session_store::{
     ConfigSnapshot, JsonSessionStore, SessionId, SessionRecord, SessionStore,
@@ -28,6 +29,7 @@ pub struct LaunchedRuntime {
     pub session_id: Option<String>,
     pub subagent_manager: SharedSubAgentManager,
     pub job_store: JobStore,
+    pub plan_mode: PlanMode,
     pub stop_hook: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -110,7 +112,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
     parent_cancel: &CancellationToken,
 ) -> LaunchedRuntime {
     let client = Arc::new(client);
-    let (tools, subagent_manager, job_store, shutdown) =
+    let (tools, subagent_manager, job_store, plan_mode, shutdown) =
         build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
 
     if let Some((runtime, session_id)) =
@@ -123,12 +125,13 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
             session_id: Some(session_id.as_str().to_string()),
             subagent_manager,
             job_store,
+            plan_mode,
             stop_hook: shutdown,
         };
     }
 
     eprintln!("warning: session persistence unavailable; this session will not be saved");
-    let (tools, subagent_manager, job_store, shutdown) =
+    let (tools, subagent_manager, job_store, plan_mode, shutdown) =
         build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
     let runtime = attach_workspace_helpers(
         AgentRuntime::with_system_prompt((*client).clone(), tools, prompt, config.clone(), false),
@@ -140,6 +143,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
         session_id: None,
         subagent_manager,
         job_store,
+        plan_mode,
         stop_hook: shutdown,
     }
 }
@@ -167,7 +171,7 @@ fn launch_resumed(
         && let Ok(client) = DeepSeekClient::new(config.clone())
     {
         let client = Arc::new(client);
-        let (tools, subagent_manager, job_store, shutdown) =
+        let (tools, subagent_manager, job_store, plan_mode, shutdown) =
             build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
         let runtime = attach_workspace_helpers(
             AgentRuntime::from_session_record(
@@ -185,12 +189,13 @@ fn launch_resumed(
             session_id: Some(record.id.as_str().to_string()),
             subagent_manager,
             job_store,
+            plan_mode,
             stop_hook: shutdown,
         };
     }
 
     let client = Arc::new(EchoClient);
-    let (tools, subagent_manager, job_store, shutdown) =
+    let (tools, subagent_manager, job_store, plan_mode, shutdown) =
         build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
     let runtime = attach_workspace_helpers(
         AgentRuntime::from_session_record(EchoClient, tools, record.clone(), store, config.clone()),
@@ -202,6 +207,7 @@ fn launch_resumed(
         session_id: Some(record.id.as_str().to_string()),
         subagent_manager,
         job_store,
+        plan_mode,
         stop_hook: shutdown,
     }
 }
@@ -215,6 +221,7 @@ fn build_parent_tools<C: LlmClient + Clone + 'static>(
     ToolRegistry,
     SharedSubAgentManager,
     JobStore,
+    PlanMode,
     Box<dyn Fn() + Send + Sync>,
 ) {
     let bootstrap = RuntimeBootstrap::load(workspace, None);
@@ -231,7 +238,13 @@ fn build_parent_tools<C: LlmClient + Clone + 'static>(
         let extensions = Arc::clone(&extensions);
         move || extensions.cancel_all_running()
     });
-    (registry, extensions.subagent_manager(), job_store, shutdown)
+    (
+        registry,
+        extensions.subagent_manager(),
+        job_store,
+        extensions.plan_mode(),
+        shutdown,
+    )
 }
 
 fn try_persisted_runtime<C: LlmClient + 'static>(

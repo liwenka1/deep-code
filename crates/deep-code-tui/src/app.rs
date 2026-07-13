@@ -91,6 +91,7 @@ pub struct App {
     pub(crate) runtime: Arc<dyn AgentRuntimeHandle>,
     pub(crate) backend_label: String,
     pub(crate) subagent_manager: SharedSubAgentManager,
+    pub(crate) plan_mode: deep_code_agent::PlanMode,
     subagent_shutdown: Option<Box<dyn Fn() + Send + Sync>>,
     ui_rx: Option<UiUpdateReceiver>,
     pub(crate) cost_currency: CostCurrency,
@@ -254,6 +255,7 @@ impl App {
         let backend_label = launched.backend_label;
         let session_id = launched.session_id;
         let subagent_manager = launched.subagent_manager;
+        let plan_mode = launched.plan_mode;
         let subagent_shutdown = Some(launched.stop_hook);
         let resumed = config.resume.is_some();
         let persistent = session_id.is_some();
@@ -329,6 +331,7 @@ impl App {
             runtime,
             backend_label,
             subagent_manager,
+            plan_mode,
             subagent_shutdown,
             ui_rx: None,
             cost_currency,
@@ -1261,6 +1264,7 @@ impl App {
         self.backend_label = launched.backend_label;
         self.session_id = launched.session_id;
         self.subagent_manager = launched.subagent_manager;
+        self.plan_mode = launched.plan_mode;
         self.subagent_shutdown = Some(launched.stop_hook);
     }
 
@@ -1569,6 +1573,12 @@ impl App {
         } else {
             "ready"
         };
+        // A persistent marker so the read-only ceiling is never a surprise.
+        let plan = if self.plan_mode.active() {
+            " [计划/只读]"
+        } else {
+            ""
+        };
         let session = self
             .session_id
             .as_deref()
@@ -1593,7 +1603,7 @@ impl App {
             })
             .unwrap_or_default();
         format!(
-            "{mode} - {}{session}{checkpoint} | {}{telemetry}",
+            "{mode}{plan} - {}{session}{checkpoint} | {}{telemetry}",
             self.backend_label, self.status
         )
     }
@@ -2717,6 +2727,14 @@ mod tests {
         assert!(status.contains("auto->deepseek-v4-flash"));
         assert!(status.contains("total ¥0.0020"));
         assert!(status.contains("ctx 1%"));
+    }
+
+    #[test]
+    fn status_line_shows_plan_marker_when_active() {
+        let app = App::new();
+        assert!(!app.status_line().contains("计划"));
+        app.plan_mode.set(true);
+        assert!(app.status_line().contains("计划/只读"));
     }
 
     #[test]

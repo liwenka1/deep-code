@@ -72,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
     let bootstrap = RuntimeBootstrap {
         hooks: Arc::new(hooks),
         mcp: Arc::new(RwLock::new(manager)),
+        plan_mode: deep_code_agent::PlanMode::new(),
     };
 
     let mut registry = ToolRegistry::new();

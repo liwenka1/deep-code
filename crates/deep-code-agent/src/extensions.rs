@@ -8,6 +8,7 @@ use crate::config::AgentConfig;
 use crate::handle::{HandleStore, register_handle_read};
 use crate::hooks::{HookDispatcher, HooksConfig, load_hooks_config};
 use crate::mcp::{McpManager, register_mcp_tools};
+use crate::plan_mode::{PlanMode, PlanModeInterceptor};
 use crate::rlm::{RlmServices, register_rlm_tools};
 use crate::skills::build_system_prompt;
 use crate::subagent::{DEFAULT_MAX_CONCURRENT, SubAgentServices, register_subagent_tools};
@@ -20,6 +21,7 @@ pub struct AgentExtensions<C: LlmClient + Clone + 'static> {
     pub rlm: Arc<RlmServices>,
     pub mcp: Arc<RwLock<McpManager>>,
     pub hooks: Arc<HookDispatcher>,
+    pub plan_mode: PlanMode,
 }
 
 impl<C: LlmClient + Clone + 'static> AgentExtensions<C> {
@@ -35,6 +37,11 @@ impl<C: LlmClient + Clone + 'static> AgentExtensions<C> {
         Arc::clone(&self.subagent.manager)
     }
 
+    #[must_use]
+    pub fn plan_mode(&self) -> PlanMode {
+        self.plan_mode.clone()
+    }
+
     pub fn reload_mcp(&self, workspace: &Path) -> Result<(), crate::mcp::McpError> {
         let manager = McpManager::load_from_workspace(workspace)?;
         *self.mcp.write().expect("mcp lock") = manager;
@@ -45,17 +52,27 @@ impl<C: LlmClient + Clone + 'static> AgentExtensions<C> {
 pub struct RuntimeBootstrap {
     pub hooks: Arc<HookDispatcher>,
     pub mcp: Arc<RwLock<McpManager>>,
+    pub plan_mode: PlanMode,
 }
 
 impl RuntimeBootstrap {
     pub fn load(workspace: &Path, hooks_config: Option<HooksConfig>) -> Self {
-        let hooks = Arc::new(HookDispatcher::from_config(
-            &hooks_config.unwrap_or_else(load_hooks_config),
-        ));
+        let mut dispatcher =
+            HookDispatcher::from_config(&hooks_config.unwrap_or_else(load_hooks_config));
+        // Plan mode rides the interceptor seam: register its gate now, while the
+        // dispatcher is still mutable (Arc-wrapping freezes it). The shared
+        // switch is surfaced so the TUI can toggle it.
+        let plan_mode = PlanMode::new();
+        dispatcher.add_interceptor(Arc::new(PlanModeInterceptor::new(plan_mode.clone())));
+        let hooks = Arc::new(dispatcher);
         let mcp = Arc::new(RwLock::new(
             McpManager::load_from_workspace(workspace).unwrap_or_default(),
         ));
-        Self { hooks, mcp }
+        Self {
+            hooks,
+            mcp,
+            plan_mode,
+        }
     }
 }
 
@@ -109,6 +126,7 @@ pub fn attach_agent_extensions<C: LlmClient + Clone + 'static>(
         rlm,
         mcp: Arc::clone(&bootstrap.mcp),
         hooks: Arc::clone(&bootstrap.hooks),
+        plan_mode: bootstrap.plan_mode.clone(),
     })
 }
 

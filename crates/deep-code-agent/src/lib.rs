@@ -19,6 +19,7 @@ mod mcp;
 mod message;
 mod model;
 mod model_registry;
+mod plan_mode;
 mod pricing;
 mod reasoning;
 mod rlm;
@@ -71,7 +72,7 @@ pub use handle::{
 };
 pub use hooks::{
     HookDispatcher, HookError, HookEvent, HookSink, HooksConfig, JsonlHookSink, StdoutHookSink,
-    default_hooks_config_path, load_hooks_config,
+    ToolGate, ToolInterceptor, default_hooks_config_path, load_hooks_config,
 };
 pub use lsp::{
     Diagnostic, DiagnosticBlock, DiagnosticRange, Language, LspConfig, LspManager, LspTransport,
@@ -93,6 +94,7 @@ pub use model_registry::{
     AUTO_MODEL, DEEPSEEK_V4_CONTEXT_WINDOW, DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO, ModelInfo,
     ModelRegistry, ModelResolution, compaction_threshold_for_model, context_window_for_model,
 };
+pub use plan_mode::{PlanMode, PlanModeInterceptor};
 pub use pricing::{CostCurrency, CostEstimate, PrefixStatus, TurnTelemetry, calculate_turn_cost};
 pub use reasoning::{ReasoningEffort, ReasoningEffortSetting, select_auto_effort};
 pub use rlm::{
