@@ -11,6 +11,12 @@ use crate::subagent::types::{
     SubAgentRecord, SubAgentSessionProjection, SubAgentStatus,
 };
 
+/// Cap on retained records from *prior* sessions. The current session's agents
+/// are never pruned (they are the live working set shown by `/agents`); only
+/// older cross-session history is bounded so the ledger file cannot grow
+/// without limit over a workspace's lifetime.
+const MAX_HISTORY_RECORDS: usize = 100;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedSubAgentState {
     schema_version: u32,
@@ -90,7 +96,28 @@ impl SubAgentManager {
             });
         }
         self.agents.insert(record.agent_id.clone(), record);
+        self.prune_history();
         self.persist_state()
+    }
+
+    /// Drop the oldest prior-session records beyond [`MAX_HISTORY_RECORDS`],
+    /// keeping every current-session record. No-op while history is within cap.
+    fn prune_history(&mut self) {
+        let current = self.session_boot_id.clone();
+        let mut prior: Vec<(String, u64)> = self
+            .agents
+            .values()
+            .filter(|agent| agent.session_boot_id.as_deref() != Some(current.as_str()))
+            .map(|agent| (agent.agent_id.clone(), agent.started_at_ms))
+            .collect();
+        if prior.len() <= MAX_HISTORY_RECORDS {
+            return;
+        }
+        // Newest first, then drop everything past the cap.
+        prior.sort_by_key(|(_, started_at)| std::cmp::Reverse(*started_at));
+        for (agent_id, _) in prior.into_iter().skip(MAX_HISTORY_RECORDS) {
+            self.agents.remove(&agent_id);
+        }
     }
 
     pub fn update(
@@ -295,6 +322,10 @@ impl SubAgentManager {
             }
             self.agents.insert(record.agent_id.clone(), record);
         }
+        // Bound the accumulated cross-session history on every load. All loaded
+        // records belong to prior sessions (the current boot id is fresh), so
+        // this trims the file back under cap before the new session appends.
+        self.prune_history();
         Ok(())
     }
 
@@ -459,6 +490,47 @@ mod tests {
         assert!(store.read().unwrap().get_summary(&handle_id).is_some());
         manager.release_transcript_handles(&record).unwrap();
         assert!(store.read().unwrap().get_summary(&handle_id).is_none());
+    }
+
+    #[test]
+    fn prune_bounds_prior_session_history_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = default_state_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // 150 terminal records from a prior session, started_at 1..=150.
+        let agents: Vec<SubAgentRecord> = (1..=150u64)
+            .map(|n| SubAgentRecord {
+                schema_version: SUBAGENT_STATE_SCHEMA_VERSION,
+                agent_id: format!("a{n}"),
+                name: format!("w{n}"),
+                role: "general".to_string(),
+                status: SubAgentStatus::Completed,
+                assignment: "t".to_string(),
+                result: None,
+                structured: None,
+                transcript_handle: None,
+                error: None,
+                fork_context: false,
+                started_at_ms: n,
+                finished_at_ms: Some(n),
+                steps_taken: 0,
+                session_boot_id: Some("old_boot".to_string()),
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "schema_version": SUBAGENT_STATE_SCHEMA_VERSION,
+            "session_boot_id": "old_boot",
+            "agents": agents,
+        });
+        std::fs::write(&path, serde_json::to_string(&payload).unwrap()).unwrap();
+
+        let store = Arc::new(RwLock::new(HandleStore::new()));
+        let manager = SubAgentManager::new(dir.path().to_path_buf(), 10, store);
+        // Newest MAX_HISTORY_RECORDS (started 51..=150) kept; oldest 50 dropped.
+        assert!(manager.get("a1").is_none(), "oldest must be pruned");
+        assert!(manager.get("a50").is_none(), "just past cap must be pruned");
+        assert!(manager.get("a51").is_some(), "cap boundary must be kept");
+        assert!(manager.get("a150").is_some(), "newest must be kept");
     }
 
     #[test]
