@@ -1264,7 +1264,12 @@ impl App {
         self.backend_label = launched.backend_label;
         self.session_id = launched.session_id;
         self.subagent_manager = launched.subagent_manager;
+        // Carry plan mode across a relaunch (/apikey, /model): the new handle is
+        // wired to the new runtime's interceptor, so re-apply the prior state
+        // onto it instead of silently resetting to off.
+        let plan_was_on = self.plan_mode.active();
         self.plan_mode = launched.plan_mode;
+        self.plan_mode.set(plan_was_on);
         self.subagent_shutdown = Some(launched.stop_hook);
     }
 
@@ -2735,6 +2740,22 @@ mod tests {
         assert!(!app.status_line().contains("计划"));
         app.plan_mode.set(true);
         assert!(app.status_line().contains("计划/只读"));
+    }
+
+    #[test]
+    fn plan_mode_survives_runtime_relaunch() {
+        let mut app = App::new();
+        app.plan_mode.set(true);
+        // A relaunch (/apikey, /model) adopts a freshly-built runtime; plan mode
+        // must carry over onto the new handle instead of silently resetting.
+        let workspace = tempfile::tempdir().unwrap();
+        let launched = deep_code_agent::launch_runtime(
+            &deep_code_agent::AgentConfig::default(),
+            workspace.path().to_path_buf(),
+            None,
+        );
+        app.adopt_runtime(launched);
+        assert!(app.plan_mode.active(), "plan mode must survive relaunch");
     }
 
     #[test]
