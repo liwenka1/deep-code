@@ -48,7 +48,7 @@ deepcode session list|resume|delete|export
 deepcode mcp list|validate|reload|enable|disable
 ```
 
-常用 slash 命令：`/help` `/model` `/apikey` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy`（`/help` 查看全部与快捷键）。
+常用 slash 命令：`/help` `/model` `/plan` `/apikey` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy`（`/help` 查看全部与快捷键）。
 
 ## 配置
 
@@ -57,6 +57,45 @@ deepcode mcp list|validate|reload|enable|disable
 
 常用项：`provider.model`（`pro`/`flash`/`auto`）、`provider.reasoning_effort`（`off`/`low`/`medium`/`high`/`max`）、`cost.currency`、`approval.auto_allow`（预放行的工具前缀）。
 > API Key 建议放在环境变量或全局配置；项目级配置中的 `api_key` 会被忽略，以防随仓库泄露。
+
+## MCP 扩展
+
+通过 [Model Context Protocol](https://modelcontextprotocol.io) 接入外部工具服务器，
+无需改动 deep-code 源码即可扩展工具集。
+
+配置文件（JSON，兼容 Cursor/Claude 的 `mcpServers` 结构）：
+- 全局：`~/.deep-code/mcp.json`
+- 项目：`<workspace>/.deep-code/mcp.json`（同名 server 覆盖全局）
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "enabled": true
+    },
+    "my-http-tool": {
+      "transport": "http",
+      "url": "http://127.0.0.1:8080/mcp",
+      "enabled": true
+    }
+  }
+}
+```
+
+- `transport`：`stdio`（默认，需 `command`）或 `http`（需 `url`）；`env` 为传给 stdio 子进程的环境变量。
+- MCP 工具在模型侧以 `mcp__<server>__<tool>` 命名，与内置工具一样受审批门与执行策略约束（不会因是外部工具而绕过）。
+
+管理命令：
+
+```sh
+deepcode mcp list       # 列出已配置的 server 及其工具
+deepcode mcp validate   # 校验配置（stdio 需 command、http 需 url）
+deepcode mcp enable <server>
+deepcode mcp disable <server>
+deepcode mcp reload     # 重新加载配置
+```
 
 ## 评测(SWE-bench)
 
