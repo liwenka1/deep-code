@@ -37,6 +37,10 @@ pub struct RuntimeServerOptions {
     pub auth_token: Option<String>,
     pub workspace: PathBuf,
     pub resume_session_id: Option<String>,
+    /// Headless/unattended: auto-deny (never park) any approval that reaches the
+    /// server, so a gated tool that slipped past auto-allow can't hang the turn
+    /// on a `/v1/approvals` callback that never arrives.
+    pub autonomous_approvals: bool,
 }
 
 impl RuntimeServerOptions {
@@ -60,6 +64,7 @@ impl Default for RuntimeServerOptions {
             auth_token: None,
             workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             resume_session_id: None,
+            autonomous_approvals: false,
         }
         .resolve_auth_token()
     }
@@ -74,6 +79,8 @@ pub(crate) struct AppState {
     approval: Arc<Mutex<Option<PendingApproval>>>,
     active_turn: Arc<StdMutex<Option<String>>>,
     threads: RuntimeThreadStore,
+    /// See [`RuntimeServerOptions::autonomous_approvals`].
+    autonomous_approvals: bool,
 }
 
 impl AppState {
@@ -157,6 +164,7 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
         approval: Arc::new(Mutex::new(None)),
         active_turn: Arc::new(StdMutex::new(None)),
         threads,
+        autonomous_approvals: options.autonomous_approvals,
     };
 
     let protected = Router::new()
@@ -521,6 +529,7 @@ async fn prompt_sse_for_thread(
     let runtime = state.runtime.clone();
     let approval_gate = state.approval.clone();
     let threads = state.threads.clone();
+    let autonomous_approvals = state.autonomous_approvals;
     let stream = stream! {
         let _active_turn_lease = active_turn_lease;
         let user_envelope = threads
@@ -547,21 +556,31 @@ async fn prompt_sse_for_thread(
                     RuntimeEvent::ApprovalRequired {
                         turn_id, request, ..
                     } => {
-                        let (tx, rx) = oneshot::channel();
-                        {
-                            let mut slot = approval_gate.lock().await;
-                            *slot = Some(PendingApproval {
-                                request,
-                                thread_id: thread_id.clone(),
-                                turn_id,
-                                respond: tx,
-                            });
-                        }
-                        let decision = rx.await.unwrap_or(ApprovalDecision::Denied);
-                        {
-                            let mut slot = approval_gate.lock().await;
-                            *slot = None;
-                        }
+                        let decision = if autonomous_approvals {
+                            // Headless/unattended: no HTTP client will POST to
+                            // /v1/approvals, so parking here would hang the turn
+                            // until the connection dies. Deny deterministically
+                            // instead — the agent records a denied result and
+                            // continues (it never blocks on the callback).
+                            ApprovalDecision::Denied
+                        } else {
+                            let (tx, rx) = oneshot::channel();
+                            {
+                                let mut slot = approval_gate.lock().await;
+                                *slot = Some(PendingApproval {
+                                    request,
+                                    thread_id: thread_id.clone(),
+                                    turn_id,
+                                    respond: tx,
+                                });
+                            }
+                            let decision = rx.await.unwrap_or(ApprovalDecision::Denied);
+                            {
+                                let mut slot = approval_gate.lock().await;
+                                *slot = None;
+                            }
+                            decision
+                        };
                         let runtime = runtime.lock().await;
                         event_stream = runtime.handle.submit_approval(decision).await;
                         resume_after_approval = true;
@@ -771,6 +790,7 @@ mod tests {
             approval: Arc::new(Mutex::new(None)),
             active_turn: Arc::new(StdMutex::new(None)),
             threads: RuntimeThreadStore::new(),
+            autonomous_approvals: false,
         }
     }
 
@@ -834,6 +854,7 @@ mod tests {
                 auth_token: None,
                 workspace: PathBuf::from("."),
                 resume_session_id: None,
+                autonomous_approvals: false,
             }
         }
         .resolve_auth_token();
@@ -857,6 +878,7 @@ mod tests {
                 auth_token: None,
                 workspace: PathBuf::from("."),
                 resume_session_id: None,
+                autonomous_approvals: false,
             }
         }
         .resolve_auth_token();
@@ -1262,5 +1284,40 @@ mod tests {
         let body = prompt_handle.await.unwrap();
         assert!(body.contains("event: approval.required"));
         assert!(body.contains("event: turn.completed"));
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_auto_denies_instead_of_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), None);
+        state.autonomous_approvals = true;
+        let addr = spawn_test_server(state).await;
+        // A short client timeout is the point: in interactive mode the turn
+        // would park forever (no one POSTs /v1/approvals) and trip this timeout.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        let body = client
+            .post(format!("http://{addr}/v1/prompt"))
+            .json(&json!({ "prompt": "/mock-tool hello" }))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        // Approval was surfaced, then auto-denied, and the turn still finished —
+        // no /v1/approvals call was ever made.
+        assert!(
+            body.contains("event: approval.required"),
+            "expected approval.required, got: {body}"
+        );
+        assert!(
+            body.contains("event: turn.completed"),
+            "expected auto-denied turn to complete, got: {body}"
+        );
     }
 }

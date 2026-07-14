@@ -32,6 +32,10 @@ pub enum RunMode {
         port: u16,
         auth_token: Option<String>,
         resume: Option<String>,
+        /// Headless/unattended: deny (never park) any approval that slips past
+        /// auto-allow, so a gated tool can't hang the turn waiting for a
+        /// callback no one will send. `--approval-mode autonomous` or env.
+        autonomous_approvals: bool,
     },
     SessionList,
     SessionDelete {
@@ -173,12 +177,28 @@ fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
     let mut port = 7878u16;
     let mut auth_token = None;
     let mut resume = None;
+    // None = not given on CLI → fall back to env below.
+    let mut approval_mode: Option<bool> = None;
 
     while let Some(arg) = args.first().cloned() {
         match arg.as_str() {
             "--http" => {
                 http = true;
                 args.remove(0);
+            }
+            "--approval-mode" => {
+                args.remove(0);
+                let value = require_value(&mut args, "--approval-mode");
+                approval_mode = Some(match value.as_str() {
+                    "autonomous" => true,
+                    "interactive" => false,
+                    other => {
+                        eprintln!(
+                            "Invalid --approval-mode '{other}'. Use 'interactive' or 'autonomous'."
+                        );
+                        std::process::exit(2);
+                    }
+                });
             }
             "--host" => {
                 args.remove(0);
@@ -203,7 +223,7 @@ fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
             }
             other => {
                 eprintln!(
-                    "Unknown serve argument '{other}'. Usage: deep-code serve --http [--host HOST] [--port PORT] [--auth-token TOKEN] [--resume ID]"
+                    "Unknown serve argument '{other}'. Usage: deep-code serve --http [--host HOST] [--port PORT] [--auth-token TOKEN] [--resume ID] [--approval-mode interactive|autonomous]"
                 );
                 std::process::exit(2);
             }
@@ -215,12 +235,20 @@ fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
         std::process::exit(2);
     }
 
+    // CLI flag wins; otherwise DEEP_CODE_APPROVAL_MODE=autonomous; else interactive.
+    let autonomous_approvals = approval_mode.unwrap_or_else(|| {
+        std::env::var("DEEP_CODE_APPROVAL_MODE")
+            .map(|value| value.eq_ignore_ascii_case("autonomous"))
+            .unwrap_or(false)
+    });
+
     CliArgs {
         mode: RunMode::Serve {
             host,
             port,
             auth_token,
             resume,
+            autonomous_approvals,
         },
     }
 }

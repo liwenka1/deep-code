@@ -30,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
             port,
             auth_token,
             resume,
+            autonomous_approvals,
         } => {
             deep_code_runtime::run_http_server(deep_code_runtime::RuntimeServerOptions {
                 host,
@@ -37,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
                 auth_token,
                 workspace: workspace_root(),
                 resume_session_id: resume,
+                autonomous_approvals,
             })
             .await
         }
