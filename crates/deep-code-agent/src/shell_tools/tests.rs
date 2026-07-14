@@ -272,3 +272,23 @@ async fn job_actions_validate_required_params() {
         Err(ToolError::InvalidArguments { .. })
     ));
 }
+
+/// `scrub_secret_env` must strip provider/runtime secrets so a spawned shell
+/// cannot read them from its own environment. The var is set explicitly on the
+/// command (no global env mutation → no cross-test races); the child must see
+/// nothing after scrubbing.
+#[cfg(unix)]
+#[tokio::test]
+async fn scrub_secret_env_hides_key_from_child() {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg(r#"printf %s "$DEEPSEEK_API_KEY""#)
+        .env(crate::config::DEEPSEEK_API_KEY_ENV, "super-secret-sentinel");
+    scrub_secret_env(&mut cmd);
+    let output = cmd.output().await.expect("spawn sh");
+    assert!(
+        output.stdout.is_empty(),
+        "child leaked the key: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

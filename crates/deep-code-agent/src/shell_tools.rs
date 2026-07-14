@@ -19,6 +19,24 @@ use jobs::{
     job_text_snapshot, refresh_job, shell_text_output, spawn_buffer_reader,
 };
 
+/// Strip provider/runtime secrets from a tool subprocess before it is spawned.
+///
+/// These live in the parent process environment because the LLM client reads
+/// the API key at startup and the HTTP server reads the auth token on bind —
+/// but no shell/job tool ever needs them. Removing them keeps an injected
+/// command from lifting the key straight out of its own environment
+/// (`echo $DEEPSEEK_API_KEY`, `curl -d "$DEEPSEEK_API_KEY"`).
+///
+/// This narrows exposure; it does not fully close it. A same-uid child can
+/// still read the parent's `/proc/<ppid>/environ` (reads are not sandboxed),
+/// which is out of scope for this hardening.
+fn scrub_secret_env(cmd: &mut tokio::process::Command) {
+    cmd.env_remove(crate::config::DEEPSEEK_API_KEY_ENV);
+    // Mirrors `deep_code_runtime::auth::RUNTIME_TOKEN_ENV`; that crate depends
+    // on this one, so the constant can't be imported here — keep in sync.
+    cmd.env_remove("DEEP_CODE_RUNTIME_TOKEN");
+}
+
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 300;
 const MAX_OUTPUT_CHARS: usize = 20_000;
@@ -157,6 +175,7 @@ impl Tool for ShellTool {
             .sandbox
             .wrap_shell_command(&command, &cwd, self.root.root(), &policy);
         let mut cmd = tokio::process::Command::from(std_cmd);
+        scrub_secret_env(&mut cmd);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -273,6 +292,7 @@ impl JobTool {
             .sandbox
             .wrap_shell_command(&command, &cwd, self.root.root(), &policy);
         let mut cmd = tokio::process::Command::from(std_cmd);
+        scrub_secret_env(&mut cmd);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
