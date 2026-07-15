@@ -150,7 +150,14 @@ async fn save_with_retry(
         let snapshot = record.lock().await.clone();
         match store.save(&snapshot) {
             Ok(()) => return Ok(()),
-            Err(error) => match SAVE_RETRY_BACKOFF.get(attempt) {
+            // Only transient I/O faults (ENOSPC, file lock, network-FS blip)
+            // are worth retrying; serialization / invalid-id / schema errors are
+            // permanent, so fail fast instead of burning the backoff budget on
+            // every save.
+            Err(error) => match SAVE_RETRY_BACKOFF
+                .get(attempt)
+                .filter(|_| matches!(error, crate::session_store::SessionStoreError::Io { .. }))
+            {
                 Some(&delay) => {
                     eprintln!(
                         "session save failed (attempt {}), retrying in {}ms: {error}",
@@ -398,5 +405,54 @@ mod tests {
         handle.request_save();
         handle.flush().await;
         assert_eq!(handle.last_save_error(), None, "recovery clears the error");
+    }
+
+    /// A store whose every save fails with a permanent (non-I/O) error, counting
+    /// attempts so the test can assert the retry budget was NOT spent.
+    struct PermanentFailStore {
+        attempts: Arc<AtomicUsize>,
+    }
+    impl SessionStore for PermanentFailStore {
+        fn save(&self, _record: &SessionRecord) -> Result<(), SessionStoreError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(SessionStoreError::Serialization {
+                message: "permanent".to_string(),
+            })
+        }
+        fn load(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError> {
+            Err(SessionStoreError::NotFound {
+                id: id.as_str().to_string(),
+            })
+        }
+        fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError> {
+            Ok(Vec::new())
+        }
+        fn delete(&self, _id: &SessionId) -> Result<(), SessionStoreError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn permanent_failure_is_not_retried() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let store: Arc<dyn SessionStore + Send + Sync> = Arc::new(PermanentFailStore {
+            attempts: Arc::clone(&attempts),
+        });
+        let record = Arc::new(Mutex::new(make_record()));
+        let handle = PersistenceActorHandle::spawn(store, Arc::clone(&record));
+
+        handle.request_save();
+        handle.flush().await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a permanent error must fail fast, not consume the retry budget"
+        );
+        assert!(
+            handle
+                .last_save_error()
+                .is_some_and(|error| error.contains("permanent")),
+            "the permanent error is still recorded"
+        );
     }
 }
