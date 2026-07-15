@@ -19,15 +19,6 @@ use crate::message::Message;
 use crate::model::{ChatTool, ChatToolFunction, FunctionCallDelta, ToolCallDelta};
 use crate::sandbox::SandboxPolicy;
 
-/// Per-tool scheduling hint. Reserved: the batch loop stays serial for now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionMode {
-    #[default]
-    Sequential,
-    Parallel,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
@@ -35,8 +26,6 @@ pub struct ToolSpec {
     pub parameters: Value,
     #[serde(default)]
     pub requires_approval: bool,
-    #[serde(default)]
-    pub execution_mode: ExecutionMode,
 }
 
 impl ToolSpec {
@@ -52,14 +41,7 @@ impl ToolSpec {
             description: description.into(),
             parameters,
             requires_approval,
-            execution_mode: ExecutionMode::Sequential,
         }
-    }
-
-    #[must_use]
-    pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
-        self.execution_mode = mode;
-        self
     }
 
     #[must_use]
@@ -248,9 +230,6 @@ pub struct ToolOutput {
     pub status: ToolResultStatus,
     pub content: String,
     pub details: Option<Value>,
-    /// Hint that the agent should stop after this batch. Reserved: the
-    /// runtime ignores it for now.
-    pub terminate: bool,
 }
 
 impl ToolOutput {
@@ -260,7 +239,6 @@ impl ToolOutput {
             status: ToolResultStatus::Success,
             content: content.into(),
             details: None,
-            terminate: false,
         }
     }
 
@@ -272,7 +250,6 @@ impl ToolOutput {
             status: ToolResultStatus::Error,
             content: content.into(),
             details: None,
-            terminate: false,
         }
     }
 
@@ -388,10 +365,6 @@ pub trait Tool: Send + Sync + 'static {
         false
     }
 
-    fn execution_mode(&self) -> ExecutionMode {
-        ExecutionMode::Sequential
-    }
-
     /// Wire schema for the params. Override only when the generated schema
     /// must diverge from the derive (hand-tuned `oneOf`, alias-aware
     /// `required` lists); parsing still goes through `Params`.
@@ -421,7 +394,6 @@ impl<T: Tool> ErasedTool for T {
             description: self.description().to_string(),
             parameters: self.parameters(),
             requires_approval: self.requires_approval(),
-            execution_mode: self.execution_mode(),
         }
     }
 

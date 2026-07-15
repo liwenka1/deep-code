@@ -131,7 +131,7 @@ pub use subagent::{
     is_subagent_tool, register_subagent_tools, subagent_tool_registry,
 };
 pub use tool::{
-    ApprovalDecision, ApprovalRequest, ErasedTool, ExecutionMode, MockEchoTool, Tool, ToolCall,
+    ApprovalDecision, ApprovalRequest, ErasedTool, MockEchoTool, Tool, ToolCall,
     ToolCallAccumulator, ToolCx, ToolError, ToolOutput, ToolRegistry, ToolResult, ToolResultStatus,
     ToolRunOutcome, ToolSpec, ToolUpdate, ToolUpdateFn, run_blocking,
 };
