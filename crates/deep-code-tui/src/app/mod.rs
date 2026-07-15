@@ -1,0 +1,743 @@
+//! TUI application state.
+//!
+//! This module is intentionally thin: the agent runtime owns the model loop,
+//! tool registry, session, and approval gating. The UI only has to:
+//!
+//! 1. forward user prompts via [`AgentRuntimeHandle::submit_user`],
+//! 2. render [`RuntimeEvent`]s as they arrive,
+//! 3. forward approval decisions via [`AgentRuntimeHandle::submit_approval`].
+
+use std::sync::Arc;
+
+use std::path::PathBuf;
+
+use crate::ui::{COMPOSER_MAX_VISIBLE_ROWS, layout_input};
+use deep_code_agent::{
+    AgentConfig, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest, CostCurrency,
+    JsonSessionStore, LaunchedRuntime, RuntimeEvent, SessionRecord, SessionStore,
+    SharedSubAgentManager, TurnTelemetry, default_config_path, launch_runtime,
+};
+use tokio::sync::mpsc;
+
+use crate::active_turn::ActiveTurn;
+use crate::cli::workspace_root;
+use crate::history::{HistoryCell, hydrate_history};
+
+mod completion;
+mod editor;
+mod selection;
+mod session;
+
+#[cfg(test)]
+mod tests;
+
+#[derive(Debug, Clone, Default)]
+pub struct LaunchConfig {
+    pub resume: Option<SessionRecord>,
+}
+
+/// Updates pushed from the bridge task into the UI thread.
+#[derive(Debug, Clone, PartialEq)]
+enum UiUpdate {
+    Event(Box<RuntimeEvent>),
+    StreamFinished,
+}
+
+enum StreamRequest {
+    User(String),
+    Approval(ApprovalDecision),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionKind {
+    Slash,
+    File,
+}
+
+/// Inline completion menu state: `/` commands or `@` workspace files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompletionMenu {
+    pub(crate) kind: CompletionKind,
+    /// (completion value, hint)
+    pub(crate) items: Vec<(String, String)>,
+    pub(crate) selected: usize,
+}
+
+const COMPLETION_MENU_ITEMS: usize = 8;
+
+type UiUpdateReceiver = mpsc::UnboundedReceiver<UiUpdate>;
+
+pub struct App {
+    pub(crate) input_cursor: usize,
+    pub input: String,
+    pub history: Vec<HistoryCell>,
+    pub active_turn: Option<ActiveTurn>,
+    pub status: String,
+    pub error: Option<String>,
+    pub should_quit: bool,
+    /// Armed by a first Ctrl+C on an idle, empty composer; a second
+    /// consecutive Ctrl+C then quits. Reset by any other key.
+    pub(crate) ctrl_c_pending: bool,
+    pub is_streaming: bool,
+    pub pending_approval: Option<ApprovalRequest>,
+    pub last_checkpoint: Option<String>,
+    pub session_id: Option<String>,
+    pub(crate) resumed: bool,
+    /// One-shot latch for the "session save failed" transcript warning; the
+    /// status line keeps warning until a save succeeds again.
+    pub(crate) save_error_notified: bool,
+    /// Cells dropped from the front of `history` by the scrollback cap.
+    pub(crate) trimmed_cells: usize,
+    /// `/find` continuation state: (query, line index of the last match in
+    /// the transcript snapshot). Repeating the same query searches upward.
+    pub(crate) find_state: Option<(String, usize)>,
+    pub scroll_offset: usize,
+    pub approval_scroll_offset: usize,
+    /// Currently highlighted approval option: 0 = y (approve), 1 = a (session),
+    /// 2 = n (deny). Navigated with ↑/↓, acted on with Enter.
+    pub approval_focus: usize,
+    pub(crate) runtime: Arc<dyn AgentRuntimeHandle>,
+    pub(crate) backend_label: String,
+    pub(crate) subagent_manager: SharedSubAgentManager,
+    pub(crate) plan_mode: deep_code_agent::PlanMode,
+    subagent_shutdown: Option<Box<dyn Fn() + Send + Sync>>,
+    ui_rx: Option<UiUpdateReceiver>,
+    pub(crate) cost_currency: CostCurrency,
+    pub(crate) configured_model: String,
+    pub(crate) configured_reasoning: String,
+    pub(crate) last_telemetry: Option<TurnTelemetry>,
+    pub(crate) prompt_history: Vec<String>,
+    history_cursor: Option<usize>,
+    history_draft: String,
+    pub(crate) completion: Option<CompletionMenu>,
+    pub(crate) workspace_files: Vec<String>,
+    /// Target of `/apikey` `/model` `/logout` writes; overridable in tests.
+    pub(crate) global_config_path: PathBuf,
+    /// When the current stream segment began, for the live activity
+    /// indicator. Only read while `is_streaming`.
+    pub(crate) streaming_since: Option<std::time::Instant>,
+    /// Collapsed pastes: `(placeholder token, real content)`. Large pastes
+    /// show a compact `[粘贴 #N …]` chip in the composer; the real content is
+    /// expanded back in on submit. Reset once a turn is sent or input cleared.
+    pub(crate) pasted_blocks: Vec<(String, String)>,
+    /// Geometry + plain text of the last transcript render, so mouse events
+    /// can be mapped to a text position for drag-selection.
+    pub(crate) transcript: Option<TranscriptSnapshot>,
+    /// Active mouse selection over the transcript: `(anchor, head)` as
+    /// `(line, display_col)` into [`TranscriptSnapshot::lines`].
+    pub(crate) selection: Option<(TextPos, TextPos)>,
+    /// Open `/resume` modal: rendered as an in-app overlay (no alt-screen
+    /// churn, so switching sessions doesn't flicker) over the live TUI.
+    pub(crate) resume_picker: Option<ResumePicker>,
+}
+
+/// In-session `/resume` modal state: the resumable sessions (newest-first) and
+/// the highlighted row.
+pub(crate) struct ResumePicker {
+    pub(crate) sessions: Vec<SessionRecord>,
+    pub(crate) selected: usize,
+}
+
+/// A position in the transcript line buffer: absolute line index + display
+/// column (CJK counts as 2).
+pub(crate) type TextPos = (usize, usize);
+
+/// What the transcript looked like at the last render — used to translate a
+/// mouse `(col, row)` into a `(line, display_col)` position.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TranscriptSnapshot {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    pub scroll_top: usize,
+    pub lines: Vec<String>,
+}
+
+const PROMPT_HISTORY_CAP: usize = 100;
+/// Scrollback cap: transcript cells beyond this are dropped from the front
+/// (multi-hour sessions would otherwise grow memory without bound).
+pub(crate) const MAX_HISTORY_CELLS: usize = 2000;
+
+/// Number of characters (not bytes) in `s`.
+fn char_count(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// Display width of a string (CJK counts as 2), for selection columns.
+fn display_width(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    UnicodeWidthStr::width(s)
+}
+
+/// Substring of `s` covering display columns `[from, to)`. A grapheme is
+/// included when its cell range overlaps the requested span (so a CJK char
+/// straddling the boundary is kept whole rather than split).
+fn slice_by_display_cols(s: &str, from: usize, to: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    if from >= to {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut col = 0usize;
+    for g in s.graphemes(true) {
+        let w = UnicodeWidthStr::width(g).max(1);
+        let g_end = col + w;
+        if col < to && g_end > from {
+            out.push_str(g);
+        }
+        col = g_end;
+        if col >= to {
+            break;
+        }
+    }
+    out
+}
+
+/// Convert a 0-based character index to a byte index. Clamps to `s.len()`.
+fn byte_idx(s: &str, char_index: usize) -> usize {
+    if char_index == 0 {
+        return 0;
+    }
+    s.char_indices().nth(char_index).map_or(s.len(), |(b, _)| b)
+}
+
+/// Build the startup welcome header from the resolved session/runtime state.
+/// Shared by initial launch and `/clear` (which starts a fresh conversation).
+fn welcome_cell(
+    model: &str,
+    reasoning: &str,
+    offline: bool,
+    workspace: String,
+    session: String,
+) -> HistoryCell {
+    HistoryCell::Welcome {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        model: format!("DeepSeek {model} · 推理 {reasoning}"),
+        offline,
+        workspace,
+        session,
+    }
+}
+
+/// Render a path home-relative (`/Users/x/p` → `~/p`) for the welcome header.
+fn home_relative(path: &std::path::Path) -> String {
+    let shown = path.display().to_string();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if !home.is_empty()
+            && let Some(rest) = shown.strip_prefix(home.as_ref())
+        {
+            return format!("~{rest}");
+        }
+    }
+    shown
+}
+
+/// Remove the character at `char_index` (0-based). Returns true when removed.
+fn remove_char_at(s: &mut String, char_index: usize) -> bool {
+    let start = byte_idx(s, char_index);
+    if start >= s.len() {
+        return false;
+    }
+    let end = byte_idx(s, char_index + 1);
+    s.drain(start..end);
+    true
+}
+
+impl App {
+    #[must_use]
+    pub fn launch(config: LaunchConfig) -> Self {
+        let workspace = workspace_root();
+        let workspace_files = deep_code_agent::list_workspace_files(&workspace, 2000);
+        let loaded = AgentConfig::load(&workspace);
+        let config_warnings = loaded.report.warnings.clone();
+        let agent_config = loaded.config;
+        let cost_currency = agent_config.cost_currency;
+        let configured_model = agent_config.model.clone();
+        let configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
+        let workspace_display = home_relative(&workspace);
+        let launched = launch_runtime(&agent_config, workspace, config.resume.clone());
+        let runtime = launched.handle;
+        let backend_label = launched.backend_label;
+        let session_id = launched.session_id;
+        let subagent_manager = launched.subagent_manager;
+        let plan_mode = launched.plan_mode;
+        let subagent_shutdown = Some(launched.stop_hook);
+        let resumed = config.resume.is_some();
+        let persistent = session_id.is_some();
+        let session_summary = if resumed {
+            let turns = config
+                .resume
+                .as_ref()
+                .map(|record| {
+                    record
+                        .entries
+                        .iter()
+                        .filter(|entry| {
+                            matches!(entry.kind, deep_code_agent::EntryKind::User { .. })
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            format!("已恢复 · {turns} 轮对话")
+        } else if persistent {
+            "新会话 · 已持久化".to_string()
+        } else {
+            "新会话 · 未持久化".to_string()
+        };
+        let mut history = vec![welcome_cell(
+            &configured_model,
+            &configured_reasoning,
+            backend_label.contains("offline echo"),
+            workspace_display,
+            session_summary,
+        )];
+
+        if !config_warnings.is_empty() {
+            history.push(HistoryCell::system(format!(
+                "配置警告:\n{}",
+                config_warnings.join("\n")
+            )));
+        }
+
+        if let Some(record) = config.resume.as_ref() {
+            history.extend(hydrate_history(record));
+        }
+
+        let status = if let Some(id) = &session_id {
+            if resumed {
+                format!("Ready (resumed) - {backend_label} | session {id}")
+            } else {
+                format!("Ready - {backend_label} | session {id}")
+            }
+        } else {
+            format!("Ready - {backend_label}")
+        };
+
+        Self {
+            input_cursor: 0,
+            input: String::new(),
+            history,
+            active_turn: None,
+            status,
+            error: None,
+            should_quit: false,
+            ctrl_c_pending: false,
+            is_streaming: false,
+            pending_approval: None,
+            last_checkpoint: None,
+            session_id,
+            resumed,
+            save_error_notified: false,
+            trimmed_cells: 0,
+            find_state: None,
+            scroll_offset: 0,
+            approval_scroll_offset: 0,
+            approval_focus: 0,
+            runtime,
+            backend_label,
+            subagent_manager,
+            plan_mode,
+            subagent_shutdown,
+            ui_rx: None,
+            cost_currency,
+            configured_model,
+            configured_reasoning,
+            last_telemetry: None,
+            prompt_history: Vec::new(),
+            history_cursor: None,
+            history_draft: String::new(),
+            completion: None,
+            workspace_files,
+            global_config_path: default_config_path(),
+            streaming_since: None,
+            pasted_blocks: Vec::new(),
+            transcript: None,
+            selection: None,
+            resume_picker: None,
+        }
+    }
+
+    /// Live activity label shown while streaming: an animated spinner plus
+    /// elapsed seconds, so a long time-to-first-token wait reads as
+    /// "生成中" rather than a frozen screen.
+    #[must_use]
+    pub(crate) fn streaming_activity(&self) -> Option<String> {
+        if !self.is_streaming {
+            return None;
+        }
+        let elapsed = self.streaming_since?.elapsed();
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let frame = FRAMES[(elapsed.as_millis() / 120 % FRAMES.len() as u128) as usize];
+        Some(format!("{frame} 生成中 {}s", elapsed.as_secs()))
+    }
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self::launch(LaunchConfig::default())
+    }
+
+    /// Drop the oldest transcript cells beyond [`MAX_HISTORY_CELLS`]. Called
+    /// once per frame before rendering; keeps multi-hour sessions bounded.
+    pub(crate) fn enforce_history_cap(&mut self) {
+        if self.history.len() <= MAX_HISTORY_CELLS {
+            return;
+        }
+        let excess = self.history.len() - MAX_HISTORY_CELLS;
+        self.history.drain(..excess);
+        self.trimmed_cells += excess;
+        // Snapshot line indices shifted; restart any /find continuation.
+        self.find_state = None;
+    }
+
+    pub fn submit(&mut self) {
+        if self.is_streaming || self.pending_approval.is_some() {
+            return;
+        }
+        self.close_completion();
+        // The transcript is about to grow; drop any stale selection.
+        self.clear_selection();
+
+        // During editing, the composer shows compact `[粘贴 #N …]` chips so
+        // long pasted blocks don't take over the input area.  At submit time
+        // both the transcript and the model receive the **expanded** content
+        // so the user can see what they actually sent.
+        let display = self.input.trim().to_string();
+        if display.is_empty() {
+            self.status = "Enter a prompt before sending.".to_string();
+            return;
+        }
+        let sent = self.expand_pasted(&display);
+        // Never let the API key into the recallable prompt history.
+        if !display.starts_with("/apikey") {
+            self.remember_prompt(&sent);
+        }
+
+        if display.starts_with('/') && self.handle_slash_command(&display) {
+            self.clear_input();
+            return;
+        }
+
+        self.clear_input();
+        self.error = None;
+        self.active_turn = None;
+        self.scroll_offset = 0;
+        self.approval_scroll_offset = 0;
+        self.is_streaming = true;
+        self.status = format!("Streaming from {}...", self.backend_label);
+
+        self.history.push(HistoryCell::user(sent.clone()));
+
+        self.start_stream(StreamRequest::User(sent));
+    }
+
+    /// Clear the composer and any pending collapsed-paste blocks.
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.input_cursor = 0;
+        self.pasted_blocks.clear();
+    }
+
+    /// Esc cancel stack: close completion menu > deny approval (handled by
+    /// the approval branch in `ui::handle_key`) > cancel the streaming turn
+    /// > clear input > quit.
+    pub fn handle_escape(&mut self) {
+        if self.completion_open() {
+            self.close_completion();
+        } else if self.is_streaming {
+            self.cancel_streaming_turn();
+        } else if !self.input.is_empty() {
+            self.clear_input();
+            self.history_cursor = None;
+            self.status = "已清空输入 (再按 Esc 退出)".to_string();
+        } else {
+            self.should_quit = true;
+        }
+    }
+
+    /// Graceful Ctrl+C: interrupt a stream, else clear input, else require a
+    /// second consecutive press to actually quit.
+    pub fn handle_ctrl_c(&mut self) {
+        if self.is_streaming {
+            self.ctrl_c_pending = false;
+            self.cancel_streaming_turn();
+        } else if !self.input.is_empty() {
+            self.clear_input();
+            self.history_cursor = None;
+            self.ctrl_c_pending = false;
+            self.status = "已清空输入 (再按 Ctrl+C 退出)".to_string();
+        } else if self.ctrl_c_pending {
+            self.should_quit = true;
+        } else {
+            self.ctrl_c_pending = true;
+            self.status = "再按一次 Ctrl+C 退出".to_string();
+        }
+    }
+
+    /// Any non-Ctrl+C key disarms the quit guard.
+    pub fn clear_ctrl_c_guard(&mut self) {
+        self.ctrl_c_pending = false;
+    }
+
+    fn cancel_streaming_turn(&mut self) {
+        self.status = "正在取消本轮... (取消在工具边界生效)".to_string();
+        let runtime = Arc::clone(&self.runtime);
+        // The streaming loop emits TurnCancelled on the live channel that the
+        // bridge task is already pumping; the receiver returned here stays
+        // empty, so it can be dropped.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = runtime.cancel_turn().await;
+            });
+        }
+    }
+
+    pub fn approve_pending_tool(&mut self) {
+        self.resolve_pending_tool(ApprovalDecision::Approved);
+    }
+
+    /// "a": approve and remember the tool for this session. The runtime
+    /// downgrades shell-class tools to a one-time approve.
+    pub fn approve_pending_tool_for_session(&mut self) {
+        self.resolve_pending_tool(ApprovalDecision::ApprovedForSession);
+    }
+
+    pub fn deny_pending_tool(&mut self) {
+        self.resolve_pending_tool(ApprovalDecision::Denied);
+    }
+
+    /// Move the approval highlight to the previous option (wrap around).
+    pub fn approval_focus_up(&mut self) {
+        self.approval_focus = if self.approval_focus == 0 {
+            2
+        } else {
+            self.approval_focus - 1
+        };
+    }
+
+    /// Move the approval highlight to the next option (wrap around).
+    pub fn approval_focus_down(&mut self) {
+        self.approval_focus = if self.approval_focus == 2 {
+            0
+        } else {
+            self.approval_focus + 1
+        };
+    }
+
+    /// Execute the currently highlighted approval action.
+    pub fn execute_focused_approval(&mut self) {
+        match self.approval_focus {
+            0 => self.approve_pending_tool(),
+            1 => self.approve_pending_tool_for_session(),
+            _ => self.deny_pending_tool(),
+        }
+    }
+
+    pub fn scroll_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_add(3);
+    }
+
+    pub fn scroll_down(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(3);
+    }
+
+    #[allow(dead_code)]
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    pub fn scroll_approval_up(&mut self) {
+        self.approval_scroll_offset = self.approval_scroll_offset.saturating_sub(3);
+    }
+
+    pub fn scroll_approval_down(&mut self) {
+        self.approval_scroll_offset = self
+            .approval_scroll_offset
+            .saturating_add(3)
+            .min(self.approval_scroll_max());
+    }
+
+    pub fn scroll_approval_to_top(&mut self) {
+        self.approval_scroll_offset = 0;
+    }
+
+    #[must_use]
+    pub fn clamped_approval_scroll_offset(&self) -> usize {
+        self.approval_scroll_offset.min(self.approval_scroll_max())
+    }
+
+    pub(crate) fn approval_cell(&self) -> Option<HistoryCell> {
+        self.pending_approval
+            .as_ref()
+            .map(|request| HistoryCell::Approval {
+                tool_name: request.tool_name.clone(),
+                description: request.description.clone(),
+                risk_level: format!("{:?}", request.risk_level),
+                requires_sandbox: request.requires_sandbox,
+                matched_rule: request.matched_rule.clone(),
+                arguments: request.arguments.to_string(),
+            })
+    }
+
+    fn approval_scroll_max(&self) -> usize {
+        self.approval_cell()
+            .map(|cell| cell.lines().len().saturating_sub(1))
+            .unwrap_or(0)
+    }
+
+    /// Apply queued runtime updates; returns whether anything changed (the
+    /// render loop uses this to skip redundant redraws).
+    pub fn drain_stream_updates(&mut self) -> bool {
+        let Some(mut rx) = self.ui_rx.take() else {
+            return false;
+        };
+
+        let mut applied = false;
+        while let Ok(update) = rx.try_recv() {
+            self.apply_ui_update(update);
+            applied = true;
+        }
+
+        if self.is_streaming {
+            self.ui_rx = Some(rx);
+        }
+        applied
+    }
+
+    fn resolve_pending_tool(&mut self, decision: ApprovalDecision) {
+        if self.pending_approval.take().is_none() {
+            return;
+        }
+
+        let label = match decision {
+            ApprovalDecision::Approved => "approved",
+            ApprovalDecision::ApprovedForSession => "approved (session)",
+            ApprovalDecision::Denied => "denied",
+        };
+        self.approval_scroll_offset = 0;
+        self.status = format!("Tool {label}, resuming...");
+        self.is_streaming = true;
+        self.start_stream(StreamRequest::Approval(decision));
+    }
+
+    fn start_stream(&mut self, request: StreamRequest) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.ui_rx = Some(rx);
+        self.streaming_since = Some(std::time::Instant::now());
+
+        let runtime = Arc::clone(&self.runtime);
+        tokio::spawn(async move {
+            let mut events = match request {
+                StreamRequest::User(prompt) => runtime.submit_user(prompt).await,
+                StreamRequest::Approval(decision) => runtime.submit_approval(decision).await,
+            };
+
+            while let Some(event) = events.recv().await {
+                if tx.send(UiUpdate::Event(Box::new(event.clone()))).is_err() {
+                    return;
+                }
+                if matches!(
+                    event,
+                    RuntimeEvent::TurnFinished { .. }
+                        | RuntimeEvent::TurnCancelled { .. }
+                        | RuntimeEvent::ApprovalRequired { .. }
+                        | RuntimeEvent::Error { .. }
+                ) {
+                    break;
+                }
+            }
+
+            let _ = tx.send(UiUpdate::StreamFinished);
+        });
+    }
+
+    fn apply_ui_update(&mut self, update: UiUpdate) {
+        match update {
+            UiUpdate::Event(event) => self.apply_runtime_event(*event),
+            UiUpdate::StreamFinished => {
+                self.is_streaming = false;
+                self.ui_rx = None;
+            }
+        }
+    }
+
+    pub(crate) fn record_error(&mut self, message: String) {
+        // Keep any streamed partial content visible: flush the active turn
+        // into history before appending the error cell, otherwise the next
+        // TurnStarted would silently discard it.
+        self.flush_active_turn();
+        self.error = Some(message.clone());
+        self.status = "Agent error.".to_string();
+        self.history
+            .push(HistoryCell::system(format!("Error: {message}")));
+        self.is_streaming = false;
+        self.clear_stream_receiver();
+    }
+
+    pub(crate) fn clear_stream_receiver(&mut self) {
+        self.ui_rx = None;
+    }
+
+    #[must_use]
+    pub fn status_line(&self) -> String {
+        let mode = if self.error.is_some() {
+            "error"
+        } else if self.pending_approval.is_some() {
+            "approval"
+        } else if self.is_streaming {
+            "streaming"
+        } else if self.resumed {
+            "ready (resumed)"
+        } else {
+            "ready"
+        };
+        // A persistent marker so the read-only ceiling is never a surprise.
+        let plan = if self.plan_mode.active() {
+            " [计划/只读]"
+        } else {
+            ""
+        };
+        let session = self
+            .session_id
+            .as_deref()
+            .map(|id| format!(" | session {id}"))
+            .unwrap_or_else(|| " | session none".to_string());
+        let checkpoint = self
+            .last_checkpoint
+            .as_deref()
+            .map(|id| format!(" | checkpoint {id}"))
+            .unwrap_or_default();
+        let telemetry = self
+            .last_telemetry
+            .as_ref()
+            .map(|value| {
+                format!(
+                    " | {} | turn {} | total {} | ctx {}%",
+                    value.route_label,
+                    value.turn_cost.format(self.cost_currency),
+                    value.session_cost.format(self.cost_currency),
+                    value.context_usage_percent
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "{mode}{plan} - {}{session}{checkpoint} | {}{telemetry}",
+            self.backend_label, self.status
+        )
+    }
+
+    pub async fn shutdown_runtime(&self) {
+        if let Some(shutdown) = &self.subagent_shutdown {
+            shutdown();
+        }
+        self.runtime.shutdown().await;
+    }
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
