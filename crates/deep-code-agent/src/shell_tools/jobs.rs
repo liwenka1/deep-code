@@ -53,6 +53,26 @@ impl JobStore {
         summaries
     }
 
+    /// Kill every still-running background child. Called on runtime shutdown so
+    /// a cancelled or quit session doesn't orphan long-running processes (dev
+    /// servers, watchers) that keep holding ports. `kill_on_drop` is the
+    /// backstop; this makes the kill immediate instead of waiting for the store
+    /// to drop.
+    pub fn shutdown(&self) {
+        let guard = self.jobs.lock().expect("job store lock poisoned");
+        for state_arc in guard.values() {
+            let Ok(mut state) = state_arc.lock() else {
+                continue;
+            };
+            if state.status == JobStatus::Running
+                && let Some(child) = state.child.as_mut()
+            {
+                let _ = child.start_kill();
+                state.status = JobStatus::Cancelled;
+            }
+        }
+    }
+
     pub(super) fn insert(&self, state: JobState) -> String {
         let id = format!("job_{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
         self.jobs

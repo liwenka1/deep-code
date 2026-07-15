@@ -292,6 +292,10 @@ impl JobTool {
             .wrap_shell_command(&command, &cwd, self.root.root(), &policy);
         let mut cmd = tokio::process::Command::from(std_cmd);
         scrub_secret_env(&mut cmd);
+        // Tie the process lifetime to its stored `Child`: if the JobStore is
+        // dropped (app exit) the OS process is killed rather than orphaned.
+        // `JobStore::shutdown` makes this deterministic on cancel/quit.
+        cmd.kill_on_drop(true);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

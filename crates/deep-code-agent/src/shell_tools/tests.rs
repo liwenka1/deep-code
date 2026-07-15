@@ -254,6 +254,40 @@ async fn job_start_status_tail_and_cancel_work() {
 }
 
 #[tokio::test]
+async fn job_store_shutdown_kills_running_background_jobs() {
+    let tmp = tempdir().unwrap();
+    let shell = ShellTools::new(tmp.path())
+        .unwrap()
+        .with_sandbox(SandboxManager::new().force_sandbox(Some(false)));
+    let jobs = shell.job_store();
+    let registry = shell.into_registry();
+
+    let call = ToolCall::new(
+        "call_1",
+        "job",
+        json!({"action": "start", "command": echo_and_sleep_2()}),
+    );
+    let ToolRunOutcome::Result { result } = registry
+        .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await
+        .unwrap()
+    else {
+        panic!("expected result");
+    };
+    assert_eq!(details(&result)["status"], "running");
+
+    // Runtime teardown must terminate the still-running child, not orphan it.
+    jobs.shutdown();
+
+    let summary = jobs
+        .list_summaries()
+        .into_iter()
+        .find(|summary| summary.background)
+        .expect("background job tracked");
+    assert_eq!(summary.status, JobStatus::Cancelled);
+}
+
+#[tokio::test]
 async fn job_actions_validate_required_params() {
     let tmp = tempdir().unwrap();
     let registry = registry(tmp.path());

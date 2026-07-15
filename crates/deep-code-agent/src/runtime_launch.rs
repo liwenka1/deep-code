@@ -36,6 +36,10 @@ pub struct LaunchedRuntime {
 impl LaunchedRuntime {
     pub async fn shutdown(self) {
         (self.stop_hook)();
+        // Kill still-running background jobs before tearing the runtime down so
+        // dev servers/watchers don't outlive the session. `kill_on_drop` is the
+        // backstop for paths that drop the store without calling this.
+        self.job_store.shutdown();
         self.handle.shutdown().await;
     }
 }
