@@ -1273,6 +1273,48 @@ impl App {
         self.subagent_shutdown = Some(launched.stop_hook);
     }
 
+    /// Load the layered agent config the same way for every runtime swap:
+    /// global (so an `/apikey`-saved key survives) + project
+    /// `.deep-code/config.toml` + env. Routing all three swap paths through one
+    /// loader keeps `/resume`, `/clear`, and `/model` from drifting — a plain
+    /// `AgentConfig::load` here once dropped the saved key on `/resume`.
+    fn load_layered_config(&self) -> AgentConfig {
+        let workspace = workspace_root();
+        let project = workspace.join(".deep-code").join("config.toml");
+        AgentConfig::load_with(
+            Some(self.global_config_path.clone()),
+            Some(project),
+            &|name| std::env::var(name).ok(),
+        )
+        .config
+    }
+
+    /// Stop the subagent supervisor and flush + tear down the live runtime.
+    /// Every runtime swap calls this first so the old session's persistence
+    /// lands on disk before anything re-reads it.
+    fn shutdown_current_runtime(&mut self) {
+        if let Some(stop) = self.subagent_shutdown.take() {
+            stop();
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let runtime = Arc::clone(&self.runtime);
+            tokio::task::block_in_place(|| handle.block_on(runtime.shutdown()));
+        }
+    }
+
+    /// Launch a fresh runtime from the current layered config (optionally
+    /// resuming `resume`) and adopt it, carrying the config-derived display
+    /// state. The caller must have shut the previous runtime down first.
+    fn launch_and_adopt(&mut self, resume: Option<SessionRecord>, resumed: bool) {
+        let agent_config = self.load_layered_config();
+        let launched = launch_runtime(&agent_config, workspace_root(), resume);
+        self.cost_currency = agent_config.cost_currency;
+        self.configured_model = agent_config.model.clone();
+        self.configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
+        self.resumed = resumed;
+        self.adopt_runtime(launched);
+    }
+
     /// Rebuild the runtime with the (re-loaded) layered config, resuming the
     /// current persisted session so the conversation continues seamlessly.
     /// The old runtime is shut down first so its persistence flush lands
@@ -1282,39 +1324,24 @@ impl App {
             return Err("正在流式输出或等待审批，请稍后再切换配置".to_string());
         }
 
-        if let Some(stop) = self.subagent_shutdown.take() {
-            stop();
-        }
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let runtime = Arc::clone(&self.runtime);
-            tokio::task::block_in_place(|| handle.block_on(runtime.shutdown()));
-        }
-
-        let workspace = workspace_root();
-        let project = workspace.join(".deep-code").join("config.toml");
-        let loaded = AgentConfig::load_with(
-            Some(self.global_config_path.clone()),
-            Some(project),
-            &|name| std::env::var(name).ok(),
-        );
-        let agent_config = loaded.config;
+        // Flush the old runtime first so re-reading the current session below
+        // sees its latest writes.
+        self.shutdown_current_runtime();
 
         let resume = self.session_id.as_ref().and_then(|id| {
-            let store = JsonSessionStore::for_workspace(&workspace).ok()?;
+            let store = JsonSessionStore::for_workspace(workspace_root()).ok()?;
             let session_id = deep_code_agent::SessionId::parse(id).ok()?;
             store.load(&session_id).ok()
         });
         if resume.is_none() && self.session_id.is_some() {
-            return Err("无法读取当前会话记录，已取消配置切换".to_string());
+            // The old runtime is already down; relaunch a fresh session so the
+            // app stays usable instead of pointing at a dead runtime.
+            self.launch_and_adopt(None, false);
+            return Err("无法读取当前会话记录，已重启为新会话".to_string());
         }
-        let resumed = resume.is_some();
 
-        let launched = launch_runtime(&agent_config, workspace, resume);
-        self.cost_currency = agent_config.cost_currency;
-        self.configured_model = agent_config.model.clone();
-        self.configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
-        self.resumed = resumed;
-        self.adopt_runtime(launched);
+        let resumed = resume.is_some();
+        self.launch_and_adopt(resume, resumed);
         Ok(())
     }
 
@@ -1414,23 +1441,8 @@ impl App {
             return Ok(());
         }
 
-        if let Some(stop) = self.subagent_shutdown.take() {
-            stop();
-        }
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let runtime = Arc::clone(&self.runtime);
-            tokio::task::block_in_place(|| handle.block_on(runtime.shutdown()));
-        }
-
-        let workspace = workspace_root();
-        let loaded = AgentConfig::load(&workspace);
-        let agent_config = loaded.config;
-        let launched = launch_runtime(&agent_config, workspace, Some(record.clone()));
-        self.cost_currency = agent_config.cost_currency;
-        self.configured_model = agent_config.model.clone();
-        self.configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
-        self.resumed = true;
-        self.adopt_runtime(launched);
+        self.shutdown_current_runtime();
+        self.launch_and_adopt(Some(record.clone()), true);
 
         self.history.clear();
         self.active_turn = None;
@@ -1456,32 +1468,9 @@ impl App {
             return;
         }
 
-        if let Some(stop) = self.subagent_shutdown.take() {
-            stop();
-        }
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let runtime = Arc::clone(&self.runtime);
-            tokio::task::block_in_place(|| handle.block_on(runtime.shutdown()));
-        }
-
-        let workspace = workspace_root();
-        let workspace_display = home_relative(&workspace);
-        // Match `relaunch_runtime`: load through `self.global_config_path` so a
-        // key saved via `/apikey` (and test overrides of the path) survives the
-        // reload instead of falling back to the offline echo backend.
-        let project = workspace.join(".deep-code").join("config.toml");
-        let loaded = AgentConfig::load_with(
-            Some(self.global_config_path.clone()),
-            Some(project),
-            &|name| std::env::var(name).ok(),
-        );
-        let agent_config = loaded.config;
-        let launched = launch_runtime(&agent_config, workspace, None);
-        self.cost_currency = agent_config.cost_currency;
-        self.configured_model = agent_config.model.clone();
-        self.configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
-        self.resumed = false;
-        self.adopt_runtime(launched);
+        let workspace_display = home_relative(&workspace_root());
+        self.shutdown_current_runtime();
+        self.launch_and_adopt(None, false);
 
         let persistent = self.session_id.is_some();
         self.history.clear();
