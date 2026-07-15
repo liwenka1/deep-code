@@ -106,6 +106,7 @@ impl CheckpointStore {
     }
 
     pub fn restore(&self, id: &CheckpointId) -> Result<(), ToolError> {
+        validate_checkpoint_id(id)?;
         let source = self.storage_root.join(&id.0);
         if !source.is_dir() {
             return Err(ToolError::ExecutionFailed {
@@ -148,6 +149,28 @@ fn snapshot_timestamp(id: &str) -> u128 {
         .next()
         .and_then(|tail| tail.parse::<u128>().ok())
         .unwrap_or(0)
+}
+
+/// Reject checkpoint ids that could escape the storage root. A valid id is a
+/// `{label}_{millis}` name `snapshot()` produced — a single path component of
+/// `[A-Za-z0-9_-]`. Anything with a path separator, `..`, or other characters
+/// is a traversal attempt; ids can arrive from an HTTP request or a session
+/// file, and `restore` clears the workspace before copying, so an unchecked id
+/// pointing outside storage would be destructive.
+fn validate_checkpoint_id(id: &CheckpointId) -> Result<(), ToolError> {
+    let raw = id.0.as_str();
+    let valid = !raw.is_empty()
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if valid {
+        Ok(())
+    } else {
+        Err(ToolError::ExecutionFailed {
+            name: "checkpoint".to_string(),
+            message: format!("invalid checkpoint id '{raw}'"),
+        })
+    }
 }
 
 fn sanitize_label(label: &str) -> String {
@@ -294,6 +317,24 @@ mod tests {
 
         store.restore(&id).unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "v1");
+    }
+
+    #[test]
+    fn restore_rejects_traversal_ids_without_touching_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("keep.txt");
+        fs::write(&file, "live").unwrap();
+        let store = CheckpointStore::new(workspace.path()).unwrap();
+
+        for bad in ["../escape", "..", "a/b", "a\\b", "", "with space"] {
+            let err = store.restore(&CheckpointId(bad.to_string())).unwrap_err();
+            assert!(
+                format!("{err:?}").contains("invalid checkpoint id"),
+                "id {bad:?} must be rejected before any workspace mutation"
+            );
+        }
+        // The workspace was never cleared by a rejected restore.
+        assert_eq!(fs::read_to_string(&file).unwrap(), "live");
     }
 
     #[test]
