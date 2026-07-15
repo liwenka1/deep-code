@@ -56,6 +56,11 @@ impl StdioLspTransport {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
+        // No LSP server needs the provider/runtime secrets; strip them so a
+        // third-party language server can't read them from its environment.
+        for var in crate::config::SUBPROCESS_SECRET_ENV {
+            cmd.env_remove(var);
+        }
 
         let mut child = cmd
             .spawn()

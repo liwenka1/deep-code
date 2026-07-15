@@ -175,6 +175,12 @@ impl StdioMcpClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        // Strip inherited provider/runtime secrets before applying the server's
+        // own env, so a third-party MCP server can't read the key out of its
+        // environment. An explicit key in `config.env` (user intent) still wins.
+        for var in crate::config::SUBPROCESS_SECRET_ENV {
+            command_builder.env_remove(var);
+        }
         command_builder.envs(&config.env);
         let mut child = command_builder
             .spawn()

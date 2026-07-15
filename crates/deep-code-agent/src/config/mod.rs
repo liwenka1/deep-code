@@ -20,6 +20,18 @@ use crate::reasoning::ReasoningEffortSetting;
 pub const DEFAULT_DEEPSEEK_MODEL: &str = DEEPSEEK_V4_PRO;
 pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/beta";
 pub const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
+
+/// Provider/runtime secrets that live in the parent process environment (the
+/// LLM client reads the API key at startup; the HTTP server reads the auth
+/// token on bind) but that NO spawned subprocess — shell, job, MCP, or LSP —
+/// needs. Stripping them before spawn keeps an injected or third-party
+/// subprocess from lifting a key straight out of its own environment.
+///
+/// `DEEP_CODE_RUNTIME_TOKEN` is duplicated from
+/// `deep_code_runtime::auth::RUNTIME_TOKEN_ENV`; that crate depends on this
+/// one, so the constant can't be imported here — keep the two in sync.
+pub const SUBPROCESS_SECRET_ENV: &[&str] = &[DEEPSEEK_API_KEY_ENV, "DEEP_CODE_RUNTIME_TOKEN"];
+
 pub const MODEL_ENV: &str = "DEEP_CODE_MODEL";
 pub const REASONING_EFFORT_ENV: &str = "DEEP_CODE_REASONING_EFFORT";
 pub const COST_CURRENCY_ENV: &str = "DEEP_CODE_COST_CURRENCY";

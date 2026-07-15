@@ -31,10 +31,9 @@ use jobs::{
 /// still read the parent's `/proc/<ppid>/environ` (reads are not sandboxed),
 /// which is out of scope for this hardening.
 fn scrub_secret_env(cmd: &mut tokio::process::Command) {
-    cmd.env_remove(crate::config::DEEPSEEK_API_KEY_ENV);
-    // Mirrors `deep_code_runtime::auth::RUNTIME_TOKEN_ENV`; that crate depends
-    // on this one, so the constant can't be imported here — keep in sync.
-    cmd.env_remove("DEEP_CODE_RUNTIME_TOKEN");
+    for var in crate::config::SUBPROCESS_SECRET_ENV {
+        cmd.env_remove(var);
+    }
 }
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
