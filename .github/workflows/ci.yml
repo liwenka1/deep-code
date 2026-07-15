@@ -1,10 +1,7 @@
 # CI gate for deep-code
 #
 # 触发：push 到 main、以及所有 pull request
-# 检查：rustfmt 格式、clippy(-D warnings)、核心 crate 测试
-#
-# 仅检查核心 crate(agent / tui / runtime / eval)；桌面 Tauri 应用需要系统库,
-# 与 release.yml 一样不在此构建。
+# 检查：rustfmt 格式、clippy(-D warnings)、全 workspace 测试
 
 name: CI
 
@@ -35,10 +32,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy -p deep-code-agent -p deep-code-tui -p deep-code-runtime -p deep-code-eval --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test -p deep-code-agent -p deep-code-tui -p deep-code-runtime -p deep-code-eval
+        run: cargo test --workspace
 
   # Compiles & tests the Windows-only sandbox (Job Object) code, which the
   # Linux job's `cfg(windows)` gating skips.
@@ -57,7 +54,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Clippy (deny warnings)
-        run: cargo clippy -p deep-code-agent -p deep-code-tui -p deep-code-runtime -p deep-code-eval --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test -p deep-code-agent -p deep-code-tui -p deep-code-runtime -p deep-code-eval
+        run: cargo test --workspace
