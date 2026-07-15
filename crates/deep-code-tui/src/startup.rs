@@ -1,5 +1,6 @@
-//! Startup session resolution. Mirrors Claude Code: a bare `deep-code` opens
-//! a fresh session; resuming is opt-in via `-c` (latest) or `-r` (picker).
+//! Startup session resolution: a bare `deep-code` opens a fresh session;
+//! resuming is opt-in via `-c` (latest) or `-r` (picker). Starting fresh by
+//! default keeps stale context from silently leaking into a new task.
 
 use std::io::{self, Stdout};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

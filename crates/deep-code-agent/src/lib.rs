@@ -19,6 +19,7 @@ mod mcp;
 mod message;
 mod model;
 mod model_registry;
+mod paths;
 mod plan_mode;
 mod pricing;
 mod reasoning;

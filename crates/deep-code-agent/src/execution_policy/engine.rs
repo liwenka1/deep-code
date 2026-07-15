@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::bash_arity::BashArityDict;
+use super::command_shape;
 use super::shell_deny;
 
 /// Tool category used by the policy engine.
@@ -78,12 +78,10 @@ pub struct ExecPolicy {
     /// word boundary against each command segment. The built-in structured
     /// deny always runs regardless of this list.
     extra_denied_prefixes: Vec<String>,
-    /// Auto-approve rules, matched arity-aware (`git status` matches
+    /// Auto-approve rules, matched by command identity (`git status` covers
     /// `git status -s` but not `git push`).
     trusted_shell_prefixes: Vec<String>,
     enable_sandbox: bool,
-    /// Arity dictionary backing arity-aware trusted matching.
-    arity: BashArityDict,
 }
 
 impl Default for ExecPolicy {
@@ -101,7 +99,6 @@ impl Default for ExecPolicy {
                 "echo".to_string(),
             ],
             enable_sandbox: true,
-            arity: BashArityDict::new(),
         }
     }
 }
@@ -337,16 +334,17 @@ pub fn evaluate_shell_command(policy: &ExecPolicy, command: &str) -> ToolExecuti
         }
     }
 
-    // 3. Auto-trust only if EVERY segment matches a trusted rule (arity-aware)
-    //    and the command has no redirection or command substitution — those
-    //    can write files or run sub-commands a trusted prefix doesn't cover.
+    // 3. Auto-trust only if EVERY segment is covered by a trusted rule
+    //    (identity-matched, so flags vary but subcommands don't) and the
+    //    command has no redirection or command substitution — those can write
+    //    files or run sub-commands a trusted prefix doesn't cover.
     if !segments.is_empty()
         && !has_redirection_or_substitution(command)
         && segments.iter().all(|segment| {
             policy
                 .trusted_shell_prefixes
                 .iter()
-                .any(|prefix| policy.arity.allow_rule_matches(prefix, segment))
+                .any(|prefix| command_shape::rule_covers(prefix, segment))
         })
     {
         return ToolExecutionPlan {
@@ -468,7 +466,7 @@ mod tests {
             evaluate_shell_command(&policy, "git push origin main").verdict,
             PolicyVerdict::NeedsApproval { .. }
         ));
-        // But flags on the trusted prefix stay trusted (arity-aware).
+        // But flags on the trusted prefix stay trusted (identity-matched).
         assert_eq!(
             evaluate_shell_command(&policy, "git status --porcelain").verdict,
             PolicyVerdict::Allow

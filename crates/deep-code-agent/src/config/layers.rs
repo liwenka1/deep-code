@@ -15,6 +15,7 @@ use super::{
     REASONING_EFFORT_ENV, STREAM_CHUNK_TIMEOUT_ENV, STREAM_MAX_BYTES_ENV, STREAM_MAX_RETRIES_ENV,
     STREAM_TOTAL_TIMEOUT_ENV,
 };
+use crate::paths::home_dir;
 use crate::pricing::CostCurrency;
 use crate::reasoning::ReasoningEffortSetting;
 
@@ -428,11 +429,6 @@ fn check_global_key_permissions(path: &Path, warnings: &mut Vec<String>) {
 #[cfg(not(unix))]
 fn check_global_key_permissions(_path: &Path, _warnings: &mut Vec<String>) {}
 
-fn home_dir() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-}
 
 #[cfg(test)]
 mod tests {

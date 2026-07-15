@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::paths::home_dir;
+
 use serde::{Deserialize, Serialize};
 
 use super::McpError;
@@ -44,7 +46,8 @@ pub struct McpConfigFile {
     pub servers: HashMap<String, McpServerEntry>,
 }
 
-/// Cursor/Claude-compatible nested server definition.
+/// One server definition, in the ecosystem-standard `mcpServers` layout so
+/// existing MCP config files drop in unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct McpServerEntry {
     #[serde(default)]
@@ -284,9 +287,6 @@ fn merge_configs(base: McpConfigFile, overlay: McpConfigFile) -> McpConfigFile {
     McpConfigFile { servers }
 }
 
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
 
 #[cfg(test)]
 mod tests {

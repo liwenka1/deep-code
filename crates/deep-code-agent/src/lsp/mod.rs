@@ -1,4 +1,12 @@
-//! Post-edit LSP diagnostics for deep-code-agent.
+//! Post-edit LSP diagnostics.
+//!
+//! After a successful file edit the runtime asks [`LspManager`] for fresh
+//! diagnostics on the touched file(s); the rendered result is appended to the
+//! tool output so the model sees breakage immediately. Submodules: `registry`
+//! (extension → language/server table), `client` (stdio JSON-RPC transport),
+//! `manager` (per-language server lifecycle + filtering), `diagnostics`
+//! (normalized types + rendering), `hooks` (edit-tool path extraction), and
+//! `path_util` (canonical path comparison).
 
 mod client;
 mod diagnostics;

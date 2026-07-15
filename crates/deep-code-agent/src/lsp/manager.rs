@@ -1,6 +1,12 @@
-//! Lazy LSP manager: one transport per language, bounded post-edit polling.
+//! Session-scoped coordinator for post-edit diagnostics.
+//!
+//! The manager owns at most one language server per [`Language`], spawned
+//! lazily on the first edit that needs it. Every failure mode degrades to
+//! "no diagnostics this time": missing binaries, crashed servers, and slow
+//! responses must never block the agent's edit loop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,14 +21,31 @@ use super::hooks::{edited_paths_for_tool, resolve_edit_paths};
 use super::path_util::normalize_path;
 use super::registry::{Language, detect_language, server_for};
 
+/// Tunables for the post-edit diagnostics pass.
+///
+/// The defaults trade signal against latency added to every edit:
+///
+/// * `poll_after_edit_ms = 5_000` — a warm server usually re-checks a small
+///   file in well under a second; five seconds leaves headroom for slower
+///   checkers while bounding how long one unresponsive server can stall a
+///   turn.
+/// * `cold_start_poll_ms = 30_000` — the first analysis after a spawn can
+///   take tens of seconds on a large workspace (index build), so the first
+///   query per server gets a far bigger budget.
+/// * `max_diagnostics_per_file = 20` — enough to show real breakage without
+///   flooding the model context when a single syntax error cascades into
+///   dozens of follow-on complaints.
 #[derive(Debug, Clone)]
 pub struct LspConfig {
+    /// Master switch; `false` turns every entry point into a no-op.
     pub enabled: bool,
-    /// Wait budget after a routine edit on a warm server.
+    /// Wait budget (ms) for diagnostics from an already-warm server.
     pub poll_after_edit_ms: u64,
-    /// Longer wait for the first diagnostics after spawning a server.
+    /// Wait budget (ms) for the first query after spawning a server.
     pub cold_start_poll_ms: u64,
+    /// Hard cap on diagnostics kept per file after severity ranking.
     pub max_diagnostics_per_file: usize,
+    /// Also surface warnings; off by default so only errors interrupt.
     pub include_warnings: bool,
 }
 
@@ -38,44 +61,53 @@ impl Default for LspConfig {
     }
 }
 
-impl LspConfig {
-    fn resolve_command(&self, lang: Language) -> Option<(String, Vec<String>)> {
-        let (cmd, args) = server_for(lang)?;
-        Some((
-            cmd.to_string(),
-            args.iter().map(|arg| (*arg).to_string()).collect(),
-        ))
-    }
-}
+/// Spawn ceiling per language per session: the initial launch plus one
+/// relaunch after a crash. A server that keeps dying costs at most two
+/// spawns instead of one per edit, while a single transient crash still
+/// self-heals.
+const SPAWN_BUDGET: u32 = 2;
 
-/// Initial spawn plus at most one respawn per language per session — enough
-/// to recover from a crashed server without looping on a broken install.
-const MAX_SPAWNS_PER_LANGUAGE: u32 = 2;
+/// Everything tracked per language, guarded together by one lock. The cell
+/// lock is held across probe + spawn + install, so concurrent queries for
+/// one language wait for a single spawn instead of double-spawning and
+/// burning the whole budget at once.
+#[derive(Default)]
+struct LangCell {
+    /// Live connection, if a server was spawned and has not been evicted.
+    transport: Option<Arc<dyn LspTransport>>,
+    /// Successful spawns so far, compared against [`SPAWN_BUDGET`].
+    spawns: u32,
+    /// Whether the "server unavailable" notice was already printed.
+    notified_unavailable: bool,
+}
 
 pub struct LspManager {
     config: LspConfig,
     workspace: PathBuf,
-    transports: AsyncMutex<HashMap<Language, Arc<dyn LspTransport>>>,
-    missing_warned: AsyncMutex<HashSet<Language>>,
-    cold_start_pending: AsyncMutex<HashSet<Language>>,
-    spawn_counts: AsyncMutex<HashMap<Language, u32>>,
-    test_transports: AsyncMutex<HashMap<Language, Arc<dyn LspTransport>>>,
+    /// Per-language server state (transport, spawn budget, warning latch).
+    /// The outer lock only guards the map itself and is never held across an
+    /// await; each cell has its own lock so languages stay independent.
+    languages: AsyncMutex<HashMap<Language, Arc<AsyncMutex<LangCell>>>>,
+    /// Test seam: a transport registered here bypasses spawning entirely and
+    /// always answers with the warm-server wait budget.
+    stubs: AsyncMutex<HashMap<Language, Arc<dyn LspTransport>>>,
 }
 
 impl LspManager {
+    /// Build a manager rooted at `workspace`. No servers are spawned here;
+    /// everything is lazy.
     #[must_use]
     pub fn new(config: LspConfig, workspace: PathBuf) -> Self {
         Self {
             config,
             workspace,
-            transports: AsyncMutex::new(HashMap::new()),
-            missing_warned: AsyncMutex::new(HashSet::new()),
-            cold_start_pending: AsyncMutex::new(HashSet::new()),
-            spawn_counts: AsyncMutex::new(HashMap::new()),
-            test_transports: AsyncMutex::new(HashMap::new()),
+            languages: AsyncMutex::new(HashMap::new()),
+            stubs: AsyncMutex::new(HashMap::new()),
         }
     }
 
+    /// A manager that answers `None`/empty everywhere. Lets callers hold an
+    /// `LspManager` unconditionally even when diagnostics are switched off.
     #[must_use]
     pub fn disabled() -> Self {
         Self::new(
@@ -92,40 +124,50 @@ impl LspManager {
         &self.config
     }
 
+    /// Register a stub transport for `lang`, bypassing real server spawns.
+    /// Public (not `cfg(test)`) so examples and integration tests can drive
+    /// the full pipeline without a language server installed.
     pub async fn install_test_transport(&self, lang: Language, transport: Arc<dyn LspTransport>) {
-        self.test_transports.lock().await.insert(lang, transport);
+        self.stubs.lock().await.insert(lang, transport);
     }
 
-    /// Install into the real transport cache (exercises the drop-on-failure
-    /// path, which test transports bypass).
+    /// Place a transport directly into the real per-language cache, as if it
+    /// had been spawned. Exercises eviction paths that stubs bypass.
     #[cfg(test)]
-    pub(crate) async fn install_transport(&self, lang: Language, transport: Arc<dyn LspTransport>) {
-        self.transports.lock().await.insert(lang, transport);
+    pub(crate) async fn seed_transport(&self, lang: Language, transport: Arc<dyn LspTransport>) {
+        self.cell(lang).await.lock().await.transport = Some(transport);
     }
 
     #[cfg(test)]
-    pub(crate) async fn has_transport(&self, lang: Language) -> bool {
-        self.transports.lock().await.contains_key(&lang)
+    pub(crate) async fn holds_transport(&self, lang: Language) -> bool {
+        let cell = self.languages.lock().await.get(&lang).cloned();
+        match cell {
+            Some(cell) => cell.lock().await.transport.is_some(),
+            None => false,
+        }
     }
 
+    /// Entry point for the post-edit hook: extract the file(s) an edit tool
+    /// touched from its arguments and gather one block per file that has
+    /// something to report.
     pub async fn collect_for_edit(&self, tool_name: &str, input: &Value) -> Vec<DiagnosticBlock> {
         if !self.config.enabled {
             return Vec::new();
         }
-        let relative = edited_paths_for_tool(tool_name, input);
-        if relative.is_empty() {
+        let touched = edited_paths_for_tool(tool_name, input);
+        if touched.is_empty() {
             return Vec::new();
         }
-        let paths = resolve_edit_paths(&self.workspace, &relative);
         let mut blocks = Vec::new();
-        for path in paths {
-            if let Some(block) = self.diagnostics_for(&path).await {
-                blocks.push(block);
-            }
+        for path in resolve_edit_paths(&self.workspace, &touched) {
+            blocks.extend(self.diagnostics_for(&path).await);
         }
         blocks
     }
 
+    /// Ask the responsible server about `file`. Returns `None` whenever there
+    /// is nothing useful to say — manager disabled, unsupported language,
+    /// unreadable file, no server, timeout, or zero surviving diagnostics.
     pub async fn diagnostics_for(&self, file: &Path) -> Option<DiagnosticBlock> {
         if !self.config.enabled {
             return None;
@@ -134,150 +176,179 @@ impl LspManager {
         if lang == Language::Other {
             return None;
         }
-
-        let text = match tokio::fs::read_to_string(file).await {
-            Ok(text) => text,
+        let contents = match tokio::fs::read_to_string(file).await {
+            Ok(contents) => contents,
             Err(error) => {
                 eprintln!(
-                    "lsp: failed to read {} for diagnostics: {error}",
+                    "lsp: cannot read {} ({error}); skipping diagnostics",
                     file.display()
                 );
                 return None;
             }
         };
 
-        let transport = self.transport_for(lang).await?;
-        let cold_start = self.cold_start_pending.lock().await.remove(&lang);
-        let wait_ms = if cold_start {
+        let (transport, first_query) = self.acquire(lang).await?;
+        let budget = Duration::from_millis(if first_query {
             self.config.cold_start_poll_ms
         } else {
             self.config.poll_after_edit_ms
-        };
-        let wait = Duration::from_millis(wait_ms);
-        let raw = match timeout(wait, transport.diagnostics_for(file, &text, wait)).await {
+        });
+
+        let published = match timeout(budget, transport.diagnostics_for(file, &contents, budget))
+            .await
+        {
             Ok(Ok(items)) => items,
             Ok(Err(error)) => {
                 eprintln!(
-                    "lsp: diagnostics call failed for {}: {error}",
-                    file.display()
+                    "lsp: query for {} failed ({error}); the {} server will respawn on demand",
+                    file.display(),
+                    lang.as_key()
                 );
-                // A request error usually means the server died. Drop the
-                // cached transport so the next edit respawns it lazily
-                // (budgeted by MAX_SPAWNS_PER_LANGUAGE). Timeouts above do
-                // NOT trigger this — a slow server is not a dead one.
-                self.drop_transport(lang).await;
+                // A failed call means the connection itself is gone (dead
+                // process, closed pipes), so evict and let the spawn budget
+                // decide whether a respawn is allowed. A timeout deliberately
+                // does NOT evict: slow is not dead.
+                self.evict(lang).await;
                 return None;
             }
             Err(_) => {
-                eprintln!("lsp: diagnostics timed out for {}", file.display());
+                eprintln!(
+                    "lsp: {} produced no diagnostics within {}ms",
+                    file.display(),
+                    budget.as_millis()
+                );
                 return None;
             }
         };
 
-        let include_warnings = self.config.include_warnings;
-        let mut items: Vec<Diagnostic> = raw
-            .into_iter()
-            .filter(|item| match item.severity {
-                Severity::Error => true,
-                Severity::Warning => include_warnings,
-                _ => false,
-            })
-            .collect();
-        items.sort_by_key(|item| match item.severity {
-            Severity::Error => 0u8,
-            Severity::Warning => 1u8,
-            Severity::Information => 2u8,
-            Severity::Hint => 3u8,
-        });
-
+        let kept = self.filter_and_rank(published);
+        if kept.is_empty() {
+            return None;
+        }
         let mut block = DiagnosticBlock {
-            file: relative_to_workspace(&self.workspace, file),
-            items,
+            file: self.display_path(file),
+            items: kept,
         };
         block.truncate(self.config.max_diagnostics_per_file);
-        if block.items.is_empty() {
-            None
-        } else {
-            Some(block)
-        }
+        Some(block)
     }
 
-    async fn transport_for(&self, lang: Language) -> Option<Arc<dyn LspTransport>> {
-        if let Some(transport) = self.test_transports.lock().await.get(&lang) {
-            return Some(transport.clone());
-        }
-        if let Some(transport) = self.transports.lock().await.get(&lang) {
-            return Some(transport.clone());
+    /// Keep only the severities the config asks for, most severe first. The
+    /// per-file cap is applied afterwards, on the assembled block.
+    fn filter_and_rank(&self, mut items: Vec<Diagnostic>) -> Vec<Diagnostic> {
+        let keep_warnings = self.config.include_warnings;
+        items.retain(|item| {
+            item.severity == Severity::Error
+                || (keep_warnings && item.severity == Severity::Warning)
+        });
+        items.sort_by_key(|item| item.severity.rank());
+        items
+    }
+
+    /// Fetch (creating on first use) the shared cell for `lang`. The global
+    /// lock is only held for the map access, never across an await.
+    async fn cell(&self, lang: Language) -> Arc<AsyncMutex<LangCell>> {
+        self.languages.lock().await.entry(lang).or_default().clone()
+    }
+
+    /// Hand back a usable transport plus whether this is the first query
+    /// against a freshly spawned server (which earns the cold-start budget).
+    /// Stubs win over real servers; real servers spawn lazily within budget.
+    async fn acquire(&self, lang: Language) -> Option<(Arc<dyn LspTransport>, bool)> {
+        let workspace = self.workspace.clone();
+        self.acquire_with(lang, move |program, args| async move {
+            let fresh = StdioLspTransport::spawn(&program, &args, lang, workspace).await?;
+            Ok(Arc::new(fresh) as Arc<dyn LspTransport>)
+        })
+        .await
+    }
+
+    /// [`acquire`](Self::acquire) with the server launch injectable, so tests
+    /// can observe spawn behavior without a real language server. The cell
+    /// lock is held across probe + launch + install: two concurrent queries
+    /// for one language get one spawn and one shared transport, while other
+    /// languages (own cells) proceed in parallel. A failed launch does not
+    /// touch the spawn count — the budget only pays for real spawns.
+    async fn acquire_with<F, Fut>(
+        &self,
+        lang: Language,
+        launch: F,
+    ) -> Option<(Arc<dyn LspTransport>, bool)>
+    where
+        F: FnOnce(String, Vec<String>) -> Fut,
+        Fut: Future<Output = anyhow::Result<Arc<dyn LspTransport>>>,
+    {
+        if let Some(stub) = self.stubs.lock().await.get(&lang) {
+            return Some((stub.clone(), false));
         }
 
-        let (cmd, args) = self.config.resolve_command(lang)?;
-        {
-            let counts = self.spawn_counts.lock().await;
-            if counts.get(&lang).copied().unwrap_or(0) >= MAX_SPAWNS_PER_LANGUAGE {
-                return None;
-            }
+        let cell = self.cell(lang).await;
+        let mut cell = cell.lock().await;
+        if let Some(live) = &cell.transport {
+            return Some((live.clone(), false));
         }
-        match StdioLspTransport::spawn(&cmd, &args, lang, self.workspace.clone()).await {
-            Ok(transport) => {
-                let arc: Arc<dyn LspTransport> = Arc::new(transport);
-                self.transports.lock().await.insert(lang, arc.clone());
-                self.cold_start_pending.lock().await.insert(lang);
-                *self.spawn_counts.lock().await.entry(lang).or_insert(0) += 1;
-                Some(arc)
+        if cell.spawns >= SPAWN_BUDGET {
+            return None;
+        }
+        let (program, args) = server_for(lang)?;
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+
+        match launch(program.to_owned(), args).await {
+            Ok(shared) => {
+                cell.spawns += 1;
+                cell.transport = Some(shared.clone());
+                Some((shared, true))
             }
             Err(error) => {
-                self.warn_missing_once(lang, &cmd, &error).await;
+                if !cell.notified_unavailable {
+                    cell.notified_unavailable = true;
+                    eprintln!(
+                        "lsp: `{program}` is not runnable ({error}); {} diagnostics are off",
+                        lang.as_key()
+                    );
+                }
                 None
             }
         }
     }
 
-    /// Remove and shut down a language's cached transport so the next edit
-    /// respawns it (within the per-language spawn budget).
-    async fn drop_transport(&self, lang: Language) {
-        let removed = self.transports.lock().await.remove(&lang);
-        if let Some(transport) = removed {
-            eprintln!(
-                "lsp: dropping the {} server; it will respawn on the next edit",
-                lang.as_key()
-            );
-            transport.shutdown().await;
+    /// Drop a language's live transport (shutting it down) so the next edit
+    /// can respawn it, still bounded by [`SPAWN_BUDGET`].
+    async fn evict(&self, lang: Language) {
+        let cell = self.languages.lock().await.get(&lang).cloned();
+        let Some(cell) = cell else { return };
+        let removed = cell.lock().await.transport.take();
+        if let Some(dead) = removed {
+            dead.shutdown().await;
         }
     }
 
-    async fn warn_missing_once(&self, lang: Language, cmd: &str, error: &anyhow::Error) {
-        let mut warned = self.missing_warned.lock().await;
-        if warned.insert(lang) {
-            eprintln!(
-                "lsp: server unavailable for {} (`{cmd}`): {error}; diagnostics disabled for this language",
-                lang.as_key()
-            );
-        }
-    }
-
+    /// Shut down every live server. Called once when the session ends.
     pub async fn shutdown_all(&self) {
-        let transports: Vec<Arc<dyn LspTransport>> = {
-            let mut map = self.transports.lock().await;
-            map.drain().map(|(_, transport)| transport).collect()
-        };
-        for transport in transports {
-            transport.shutdown().await;
+        let cells: Vec<Arc<AsyncMutex<LangCell>>> =
+            self.languages.lock().await.values().cloned().collect();
+        for cell in cells {
+            let live = cell.lock().await.transport.take();
+            if let Some(transport) = live {
+                transport.shutdown().await;
+            }
         }
-        self.cold_start_pending.lock().await.clear();
     }
-}
 
-fn relative_to_workspace(workspace: &Path, path: &Path) -> PathBuf {
-    let workspace = normalize_path(workspace);
-    let path = normalize_path(path);
-    if let Ok(relative) = path.strip_prefix(&workspace) {
-        return relative.to_path_buf();
+    /// Path shown in rendered blocks: workspace-relative when the file lives
+    /// under the workspace, bare file name otherwise (never the raw absolute
+    /// path, which would leak machine-specific prefixes into context).
+    fn display_path(&self, file: &Path) -> PathBuf {
+        let root = normalize_path(&self.workspace);
+        let full = normalize_path(file);
+        match full.strip_prefix(&root) {
+            Ok(relative) => relative.to_path_buf(),
+            Err(_) => full
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("unknown")),
+        }
     }
-    PathBuf::from(
-        path.file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| String::from("unknown")),
-    )
 }
 
 #[cfg(test)]
@@ -285,139 +356,272 @@ mod tests {
     use super::*;
     use crate::lsp::diagnostics::DiagnosticRange;
     use async_trait::async_trait;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU32, Ordering};
 
-    struct FakeTransport {
-        items: Vec<Diagnostic>,
-        calls: AtomicUsize,
-    }
-
-    impl FakeTransport {
-        fn new(items: Vec<Diagnostic>) -> Self {
-            Self {
-                items,
-                calls: AtomicUsize::new(0),
-            }
+    fn diag(line: u32, severity: Severity, message: &str) -> Diagnostic {
+        Diagnostic {
+            file: PathBuf::from("unused-by-manager.rs"),
+            range: DiagnosticRange {
+                start_line: line,
+                start_column: 1,
+                end_line: line,
+                end_column: 2,
+            },
+            severity,
+            message: message.to_owned(),
+            source: None,
+            code: None,
         }
     }
 
+    /// Stub that always answers with a fixed set of diagnostics.
+    struct CannedTransport(Vec<Diagnostic>);
+
     #[async_trait]
-    impl LspTransport for FakeTransport {
+    impl LspTransport for CannedTransport {
         async fn diagnostics_for(
             &self,
             _path: &Path,
             _text: &str,
             _wait: Duration,
         ) -> anyhow::Result<Vec<Diagnostic>> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Ok(self.items.clone())
+            Ok(self.0.clone())
         }
 
         async fn shutdown(&self) {}
     }
 
-    #[tokio::test]
-    async fn returns_none_when_disabled() {
-        let manager = LspManager::disabled();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("foo.rs");
-        tokio::fs::write(&path, b"fn main() {}").await.unwrap();
-        assert!(manager.diagnostics_for(&path).await.is_none());
-    }
+    /// Stub whose every query fails, simulating a dead server connection.
+    struct BrokenTransport;
 
-    #[tokio::test]
-    async fn forwards_fake_transport_diagnostics() {
-        let dir = tempfile::tempdir().unwrap();
-        let manager = LspManager::new(LspConfig::default(), dir.path().to_path_buf());
-        let path = dir.path().join("foo.rs");
-        tokio::fs::write(&path, b"let x: i32 = \"oops\";")
-            .await
-            .unwrap();
-
-        let fake = Arc::new(FakeTransport::new(vec![Diagnostic {
-            file: path.clone(),
-            range: DiagnosticRange {
-                start_line: 1,
-                start_column: 14,
-                end_line: 1,
-                end_column: 15,
-            },
-            severity: Severity::Error,
-            message: "expected i32, found &str".to_string(),
-            source: Some("rust-analyzer".to_string()),
-            code: None,
-        }]));
-        manager.install_test_transport(Language::Rust, fake).await;
-
-        let block = manager.diagnostics_for(&path).await.expect("block");
-        assert!(block.render().contains("expected i32, found &str"));
-    }
-
-    #[tokio::test]
-    async fn failed_transport_is_dropped_for_lazy_respawn() {
-        struct FailingTransport;
-
-        #[async_trait]
-        impl LspTransport for FailingTransport {
-            async fn diagnostics_for(
-                &self,
-                _path: &Path,
-                _text: &str,
-                _wait: Duration,
-            ) -> anyhow::Result<Vec<Diagnostic>> {
-                Err(anyhow::anyhow!("server pipe closed"))
-            }
-
-            async fn shutdown(&self) {}
+    #[async_trait]
+    impl LspTransport for BrokenTransport {
+        async fn diagnostics_for(
+            &self,
+            _path: &Path,
+            _text: &str,
+            _wait: Duration,
+        ) -> anyhow::Result<Vec<Diagnostic>> {
+            anyhow::bail!("stdout pipe closed")
         }
 
-        let dir = tempfile::tempdir().unwrap();
-        let manager = LspManager::new(LspConfig::default(), dir.path().to_path_buf());
-        let path = dir.path().join("foo.rs");
-        tokio::fs::write(&path, b"fn main() {}").await.unwrap();
+        async fn shutdown(&self) {}
+    }
 
+    async fn manager_with_stub(
+        config: LspConfig,
+        items: Vec<Diagnostic>,
+    ) -> (tempfile::TempDir, LspManager) {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = LspManager::new(config, dir.path().to_path_buf());
         manager
-            .install_transport(Language::Rust, Arc::new(FailingTransport))
+            .install_test_transport(Language::Rust, Arc::new(CannedTransport(items)))
             .await;
-        assert!(manager.diagnostics_for(&path).await.is_none());
-        assert!(
-            !manager.has_transport(Language::Rust).await,
-            "dead server must be evicted so the next edit can respawn it"
+        (dir, manager)
+    }
+
+    #[tokio::test]
+    async fn disabled_manager_reports_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("lib.rs");
+        tokio::fs::write(&target, b"fn broken( {").await.unwrap();
+
+        let manager = LspManager::disabled();
+        assert!(manager.diagnostics_for(&target).await.is_none());
+        assert!(!manager.config().enabled);
+    }
+
+    #[tokio::test]
+    async fn unsupported_extensions_are_skipped() {
+        let (dir, manager) =
+            manager_with_stub(LspConfig::default(), vec![diag(1, Severity::Error, "x")]).await;
+        let notes = dir.path().join("notes.md");
+        tokio::fs::write(&notes, b"# notes").await.unwrap();
+        assert!(manager.diagnostics_for(&notes).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stub_diagnostics_come_back_with_workspace_relative_paths() {
+        let (dir, manager) = manager_with_stub(
+            LspConfig::default(),
+            vec![diag(7, Severity::Error, "cannot find type `Foo`")],
+        )
+        .await;
+        let target = dir.path().join("src").join("types.rs");
+        tokio::fs::create_dir_all(target.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&target, b"type Bar = Foo;").await.unwrap();
+
+        let block = manager.diagnostics_for(&target).await.expect("a block");
+        assert_eq!(block.file, PathBuf::from("src/types.rs"));
+        assert!(block.render().contains("cannot find type `Foo`"));
+    }
+
+    #[tokio::test]
+    async fn warnings_are_dropped_unless_opted_in() {
+        let items = vec![
+            diag(1, Severity::Warning, "unused import"),
+            diag(2, Severity::Error, "syntax error"),
+            diag(3, Severity::Hint, "consider renaming"),
+        ];
+        let (dir, silent) = manager_with_stub(LspConfig::default(), items.clone()).await;
+        let target = dir.path().join("m.rs");
+        tokio::fs::write(&target, b"use x;").await.unwrap();
+
+        let block = silent.diagnostics_for(&target).await.expect("a block");
+        assert_eq!(block.items.len(), 1, "only the error survives");
+        assert_eq!(block.items[0].severity, Severity::Error);
+
+        let (dir, verbose) = manager_with_stub(
+            LspConfig {
+                include_warnings: true,
+                ..LspConfig::default()
+            },
+            items,
+        )
+        .await;
+        let target = dir.path().join("m.rs");
+        tokio::fs::write(&target, b"use x;").await.unwrap();
+
+        let block = verbose.diagnostics_for(&target).await.expect("a block");
+        assert_eq!(block.items.len(), 2, "hints stay excluded either way");
+        assert_eq!(
+            block.items[0].severity,
+            Severity::Error,
+            "errors rank ahead of warnings"
+        );
+        assert_eq!(block.items[1].severity, Severity::Warning, "warning follows");
+    }
+
+    #[tokio::test]
+    async fn the_per_file_cap_applies_after_ranking() {
+        let mut items: Vec<Diagnostic> = (1..=4)
+            .map(|n| diag(n, Severity::Warning, "w"))
+            .collect();
+        items.push(diag(9, Severity::Error, "the real problem"));
+        let (dir, manager) = manager_with_stub(
+            LspConfig {
+                include_warnings: true,
+                max_diagnostics_per_file: 2,
+                ..LspConfig::default()
+            },
+            items,
+        )
+        .await;
+        let target = dir.path().join("big.rs");
+        tokio::fs::write(&target, b"//").await.unwrap();
+
+        let block = manager.diagnostics_for(&target).await.expect("a block");
+        assert_eq!(block.items.len(), 2, "cap of two holds");
+        assert_eq!(
+            block.items[0].message, "the real problem",
+            "ranking must run before the cap so the error is kept"
         );
     }
 
     #[tokio::test]
-    async fn collect_for_edit_resolves_workspace_relative_paths() {
+    async fn a_failing_transport_is_evicted_for_respawn() {
         let dir = tempfile::tempdir().unwrap();
         let manager = LspManager::new(LspConfig::default(), dir.path().to_path_buf());
-        let path = dir.path().join("src/main.rs");
-        tokio::fs::create_dir_all(path.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(&path, b"fn main() {").await.unwrap();
+        let target = dir.path().join("crash.rs");
+        tokio::fs::write(&target, b"fn f() {}").await.unwrap();
 
-        let fake = Arc::new(FakeTransport::new(vec![Diagnostic {
-            file: path.clone(),
-            range: DiagnosticRange {
-                start_line: 1,
-                start_column: 1,
-                end_line: 1,
-                end_column: 2,
-            },
-            severity: Severity::Error,
-            message: "unclosed delimiter".to_string(),
-            source: None,
-            code: None,
-        }]));
-        manager.install_test_transport(Language::Rust, fake).await;
+        manager
+            .seed_transport(Language::Rust, Arc::new(BrokenTransport))
+            .await;
+        assert!(manager.holds_transport(Language::Rust).await);
+
+        assert!(manager.diagnostics_for(&target).await.is_none());
+        assert!(
+            !manager.holds_transport(Language::Rust).await,
+            "a dead connection must leave the cache so the budget can respawn it"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_queries_for_one_language_spawn_a_single_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = LspManager::new(LspConfig::default(), dir.path().to_path_buf());
+        let spawns = AtomicU32::new(0);
+
+        // Slow enough that both acquisitions overlap the launch window.
+        let slow_launch = |_program: String, _args: Vec<String>| async {
+            spawns.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(Arc::new(CannedTransport(Vec::new())) as Arc<dyn LspTransport>)
+        };
+        let (first, second) = tokio::join!(
+            manager.acquire_with(Language::Rust, slow_launch),
+            manager.acquire_with(Language::Rust, slow_launch),
+        );
+
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            1,
+            "the cell lock must serialize same-language spawns"
+        );
+        let (first_transport, first_cold) = first.expect("first caller gets a transport");
+        let (second_transport, second_cold) = second.expect("second caller gets a transport");
+        assert!(
+            Arc::ptr_eq(&first_transport, &second_transport),
+            "both callers share the one spawned transport"
+        );
+        assert!(
+            first_cold != second_cold,
+            "exactly one caller sees the fresh spawn (cold-start budget)"
+        );
+        assert!(manager.holds_transport(Language::Rust).await);
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_does_not_consume_the_spawn_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = LspManager::new(LspConfig::default(), dir.path().to_path_buf());
+        let attempts = AtomicU32::new(0);
+
+        let failing = |_program: String, _args: Vec<String>| async {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("binary missing")
+        };
+        // More failed attempts than the budget allows for real spawns…
+        for _ in 0..4 {
+            assert!(manager.acquire_with(Language::Rust, failing).await.is_none());
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+
+        // …and a later successful launch still fits inside the budget.
+        let working = |_program: String, _args: Vec<String>| async {
+            Ok(Arc::new(CannedTransport(Vec::new())) as Arc<dyn LspTransport>)
+        };
+        assert!(
+            manager.acquire_with(Language::Rust, working).await.is_some(),
+            "only real spawns may count against the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_for_edit_resolves_tool_arguments_to_blocks() {
+        let (dir, manager) = manager_with_stub(
+            LspConfig::default(),
+            vec![diag(1, Severity::Error, "mismatched types")],
+        )
+        .await;
+        let target = dir.path().join("edited.rs");
+        tokio::fs::write(&target, b"let x: u8 = -1;").await.unwrap();
 
         let blocks = manager
             .collect_for_edit(
                 "write_file",
-                &serde_json::json!({"path": "src/main.rs", "content": "fn main() {"}),
+                &serde_json::json!({ "path": "edited.rs", "content": "let x: u8 = -1;" }),
             )
             .await;
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].file, PathBuf::from("src/main.rs"));
+        assert_eq!(blocks[0].file, PathBuf::from("edited.rs"));
+
+        let none = manager
+            .collect_for_edit("read_file", &serde_json::json!({ "path": "edited.rs" }))
+            .await;
+        assert!(none.is_empty(), "non-edit tools trigger no diagnostics");
     }
 }

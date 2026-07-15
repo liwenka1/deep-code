@@ -173,7 +173,7 @@ impl App {
 
     /// Switch the live session to `record` in place: shut the current runtime
     /// down (flushing its persistence), relaunch resuming `record`, and rebuild
-    /// the visible transcript. Mirrors Claude Code's `/resume`.
+    /// the visible transcript. This is what `/resume` executes.
     pub(crate) fn switch_session(&mut self, record: SessionRecord) -> Result<(), String> {
         if self.is_streaming || self.pending_approval.is_some() {
             return Err("正在流式输出或等待审批，请稍后再切换会话".to_string());
@@ -201,7 +201,7 @@ impl App {
         Ok(())
     }
 
-    /// Start a fresh conversation in place — Claude Code's `/clear`. The current
+    /// Start a fresh conversation in place — what `/clear` executes. The current
     /// session is flushed to disk (recoverable via `/resume`), a brand-new
     /// session is launched, and the view resets to the welcome header.
     pub(crate) fn start_new_conversation(&mut self) {

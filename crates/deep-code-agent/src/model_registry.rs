@@ -1,16 +1,22 @@
-//! DeepSeek-first model registry: ids, aliases, context windows, pricing metadata.
-
-use std::collections::HashMap;
+//! The catalog of DeepSeek models deep-code can drive, and resolution of
+//! user-supplied names (config values, `/model` arguments) to canonical ids.
+//!
+//! The catalog is tiny by design — a handful of first-party entries — so
+//! lookups are plain scans over the entry list rather than a prebuilt index.
+//! That keeps one source of truth per entry (its id and alias list) and makes
+//! "earlier entry wins" conflict handling fall out of iteration order.
 
 use serde::{Deserialize, Serialize};
 
 pub const DEEPSEEK_V4_PRO: &str = "deepseek-v4-pro";
 pub const DEEPSEEK_V4_FLASH: &str = "deepseek-v4-flash";
+/// Pseudo-model: lets the turn router pick pro/flash per prompt.
 pub const AUTO_MODEL: &str = "auto";
 
-/// Approximate context window for DeepSeek V4 family models.
+/// Context window shared by the DeepSeek V4 family.
 pub const DEEPSEEK_V4_CONTEXT_WINDOW: u32 = 1_000_000;
 
+/// Per-model token pricing in both billing currencies.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelPricingMeta {
     /// USD per million input tokens (cache miss).
@@ -27,9 +33,13 @@ pub struct ModelPricingMeta {
     pub output_cny: f64,
 }
 
+/// One catalog entry: a canonical model id plus the names that map to it and
+/// the capabilities the runtime needs to know about.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
+    /// Alternative names accepted anywhere a model can be chosen. Includes
+    /// legacy ids kept working across releases.
     pub aliases: Vec<String>,
     pub context_window: u32,
     pub supports_tools: bool,
@@ -39,17 +49,23 @@ pub struct ModelInfo {
     pub pricing: ModelPricingMeta,
 }
 
+/// Outcome of turning a requested model name into a concrete id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelResolution {
+    /// What the caller asked for, verbatim (`None` when nothing usable was given).
     pub requested: Option<String>,
+    /// The id the runtime should actually use.
     pub resolved_id: String,
+    /// True when the catalog had no say: either nothing was requested (default
+    /// applied) or the name was unrecognized and passed through on trust.
     pub used_fallback: bool,
 }
 
+/// The model catalog. Construct via [`Default`] for the built-in DeepSeek
+/// entries, or [`ModelRegistry::new`] to supply a custom catalog.
 #[derive(Debug, Clone)]
 pub struct ModelRegistry {
-    models: Vec<ModelInfo>,
-    alias_map: HashMap<String, usize>,
+    catalog: Vec<ModelInfo>,
 }
 
 impl Default for ModelRegistry {
@@ -60,81 +76,89 @@ impl Default for ModelRegistry {
 
 impl ModelRegistry {
     #[must_use]
-    pub fn new(models: Vec<ModelInfo>) -> Self {
-        let mut alias_map = HashMap::new();
-        for (idx, model) in models.iter().enumerate() {
-            alias_map.entry(normalize_key(&model.id)).or_insert(idx);
-            for alias in &model.aliases {
-                alias_map.entry(normalize_key(alias)).or_insert(idx);
-            }
-        }
-        Self { models, alias_map }
+    pub fn new(catalog: Vec<ModelInfo>) -> Self {
+        Self { catalog }
     }
 
+    /// All catalog entries, in priority order.
     #[must_use]
     pub fn list(&self) -> &[ModelInfo] {
-        &self.models
+        &self.catalog
     }
 
+    /// Turn a requested model name into a concrete id.
+    ///
+    /// * Nothing (or only whitespace) requested → the flagship default,
+    ///   flagged as a fallback.
+    /// * [`AUTO_MODEL`] → passed through untouched so per-turn routing stays
+    ///   in charge.
+    /// * A catalog id or alias (case/whitespace-insensitive) → its canonical id.
+    /// * Anything else → trusted as-is (it may be a model newer than this
+    ///   binary), but flagged so callers can warn.
     #[must_use]
     pub fn resolve(&self, requested: Option<&str>) -> ModelResolution {
-        let fallback = DEEPSEEK_V4_PRO.to_string();
-        let Some(name) = requested.filter(|value| !value.trim().is_empty()) else {
+        let Some(asked) = requested.filter(|value| !value.trim().is_empty()) else {
             return ModelResolution {
                 requested: None,
-                resolved_id: fallback,
+                resolved_id: DEEPSEEK_V4_PRO.to_string(),
                 used_fallback: true,
             };
         };
 
-        if normalize_key(name) == normalize_key(AUTO_MODEL) {
-            return ModelResolution {
-                requested: Some(name.to_string()),
-                resolved_id: AUTO_MODEL.to_string(),
-                used_fallback: false,
-            };
-        }
+        let answer = |resolved_id: String, used_fallback: bool| ModelResolution {
+            requested: Some(asked.to_string()),
+            resolved_id,
+            used_fallback,
+        };
 
-        if let Some(idx) = self.alias_map.get(&normalize_key(name)) {
-            return ModelResolution {
-                requested: Some(name.to_string()),
-                resolved_id: self.models[*idx].id.clone(),
-                used_fallback: false,
-            };
+        if names_equal(asked, AUTO_MODEL) {
+            return answer(AUTO_MODEL.to_string(), false);
         }
-
-        ModelResolution {
-            requested: Some(name.to_string()),
-            resolved_id: name.trim().to_string(),
-            used_fallback: true,
+        if let Some(entry) = self.entry_matching(asked) {
+            return answer(entry.id.clone(), false);
         }
+        answer(asked.trim().to_string(), true)
     }
 
+    /// Catalog metadata for a model id or alias, if it is a known entry.
     #[must_use]
     pub fn info_for(&self, model_id: &str) -> Option<&ModelInfo> {
-        let key = normalize_key(model_id);
-        self.alias_map
-            .get(&key)
-            .map(|idx| &self.models[*idx])
-            .or_else(|| {
-                self.models
-                    .iter()
-                    .find(|model| normalize_key(&model.id) == key)
-            })
+        self.entry_matching(model_id)
+    }
+
+    /// Scan for the entry whose id or alias list covers `name`. Earlier
+    /// entries win if two entries ever claim the same name.
+    fn entry_matching(&self, name: &str) -> Option<&ModelInfo> {
+        self.catalog.iter().find(|entry| {
+            names_equal(&entry.id, name)
+                || entry.aliases.iter().any(|alias| names_equal(alias, name))
+        })
     }
 }
 
+/// Model names compare ignoring surrounding whitespace and ASCII case.
+fn names_equal(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// The built-in catalog: DeepSeek V4 Pro (flagship) and V4 Flash (fast/cheap).
+/// Flash keeps the legacy `deepseek-chat` / `deepseek-reasoner` ids working.
 #[must_use]
 pub fn deepseek_default_models() -> Vec<ModelInfo> {
+    let v4_entry = |id: &str, aliases: &[&str], pricing: ModelPricingMeta| ModelInfo {
+        id: id.to_string(),
+        aliases: aliases.iter().map(ToString::to_string).collect(),
+        context_window: DEEPSEEK_V4_CONTEXT_WINDOW,
+        supports_tools: true,
+        supports_reasoning: true,
+        beta_endpoint: true,
+        pricing,
+    };
     vec![
-        ModelInfo {
-            id: DEEPSEEK_V4_PRO.to_string(),
-            aliases: vec![],
-            context_window: DEEPSEEK_V4_CONTEXT_WINDOW,
-            supports_tools: true,
-            supports_reasoning: true,
-            beta_endpoint: true,
-            pricing: ModelPricingMeta {
+        v4_entry(
+            DEEPSEEK_V4_PRO,
+            &[],
+            ModelPricingMeta {
                 input_miss_usd: 0.435,
                 input_hit_usd: 0.003625,
                 output_usd: 0.87,
@@ -142,15 +166,11 @@ pub fn deepseek_default_models() -> Vec<ModelInfo> {
                 input_hit_cny: 0.025,
                 output_cny: 6.0,
             },
-        },
-        ModelInfo {
-            id: DEEPSEEK_V4_FLASH.to_string(),
-            aliases: vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
-            context_window: DEEPSEEK_V4_CONTEXT_WINDOW,
-            supports_tools: true,
-            supports_reasoning: true,
-            beta_endpoint: true,
-            pricing: ModelPricingMeta {
+        ),
+        v4_entry(
+            DEEPSEEK_V4_FLASH,
+            &["deepseek-chat", "deepseek-reasoner"],
+            ModelPricingMeta {
                 input_miss_usd: 0.14,
                 input_hit_usd: 0.0028,
                 output_usd: 0.28,
@@ -158,25 +178,24 @@ pub fn deepseek_default_models() -> Vec<ModelInfo> {
                 input_hit_cny: 0.02,
                 output_cny: 2.0,
             },
-        },
+        ),
     ]
 }
 
+/// Context window for `model`, falling back to the V4 family window for
+/// unknown ids (all currently supported models share it).
 #[must_use]
 pub fn context_window_for_model(model: &str) -> u32 {
     ModelRegistry::default()
         .info_for(model)
-        .map(|info| info.context_window)
-        .unwrap_or(DEEPSEEK_V4_CONTEXT_WINDOW)
+        .map_or(DEEPSEEK_V4_CONTEXT_WINDOW, |entry| entry.context_window)
 }
 
+/// Token count at which history compaction should kick in: 80% of the model's
+/// window, leaving headroom for the reply and compaction overhead.
 #[must_use]
 pub fn compaction_threshold_for_model(model: &str) -> u32 {
     context_window_for_model(model).saturating_mul(80) / 100
-}
-
-fn normalize_key(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -184,31 +203,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolves_pro_and_flash_aliases() {
+    fn canonical_ids_resolve_to_themselves() {
         let registry = ModelRegistry::default();
-        assert_eq!(
-            registry.resolve(Some(DEEPSEEK_V4_PRO)).resolved_id,
-            DEEPSEEK_V4_PRO
-        );
-        assert_eq!(
-            registry.resolve(Some("deepseek-chat")).resolved_id,
-            DEEPSEEK_V4_FLASH
-        );
+        for id in [DEEPSEEK_V4_PRO, DEEPSEEK_V4_FLASH] {
+            let resolution = registry.resolve(Some(id));
+            assert_eq!(resolution.resolved_id, id);
+            assert!(!resolution.used_fallback);
+            assert_eq!(resolution.requested.as_deref(), Some(id));
+        }
     }
 
     #[test]
-    fn auto_model_is_preserved() {
+    fn legacy_names_map_to_flash_ignoring_case() {
         let registry = ModelRegistry::default();
-        let resolution = registry.resolve(Some("auto"));
+        for legacy in ["deepseek-chat", "DeepSeek-Reasoner", "  deepseek-chat "] {
+            let resolution = registry.resolve(Some(legacy));
+            assert_eq!(resolution.resolved_id, DEEPSEEK_V4_FLASH, "for {legacy:?}");
+            assert!(!resolution.used_fallback);
+        }
+    }
+
+    #[test]
+    fn auto_passes_through_for_the_router() {
+        let resolution = ModelRegistry::default().resolve(Some("Auto"));
         assert_eq!(resolution.resolved_id, AUTO_MODEL);
         assert!(!resolution.used_fallback);
     }
 
     #[test]
-    fn unknown_model_keeps_requested_id() {
+    fn missing_or_blank_request_defaults_to_pro() {
         let registry = ModelRegistry::default();
-        let resolution = registry.resolve(Some("custom-model"));
-        assert_eq!(resolution.resolved_id, "custom-model");
+        for request in [None, Some(""), Some("   ")] {
+            let resolution = registry.resolve(request);
+            assert_eq!(resolution.resolved_id, DEEPSEEK_V4_PRO);
+            assert!(resolution.used_fallback);
+        }
+    }
+
+    #[test]
+    fn unlisted_id_is_trusted_but_flagged() {
+        let resolution = ModelRegistry::default().resolve(Some(" experimental-v5 "));
+        assert_eq!(resolution.resolved_id, "experimental-v5");
         assert!(resolution.used_fallback);
+        assert_eq!(resolution.requested.as_deref(), Some(" experimental-v5 "));
+    }
+
+    #[test]
+    fn info_lookup_works_through_aliases() {
+        let registry = ModelRegistry::default();
+        let entry = registry.info_for("deepseek-reasoner").expect("known alias");
+        assert_eq!(entry.id, DEEPSEEK_V4_FLASH);
+        assert!(registry.info_for("no-such-model").is_none());
+    }
+
+    #[test]
+    fn compaction_threshold_is_80_percent_of_window() {
+        assert_eq!(
+            compaction_threshold_for_model(DEEPSEEK_V4_PRO),
+            DEEPSEEK_V4_CONTEXT_WINDOW / 100 * 80
+        );
+        // Unknown models inherit the family window.
+        assert_eq!(
+            context_window_for_model("mystery"),
+            DEEPSEEK_V4_CONTEXT_WINDOW
+        );
     }
 }

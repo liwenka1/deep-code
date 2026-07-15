@@ -8,9 +8,9 @@
 //! (2) inspecting each segment's program *basename* and flag semantics rather
 //! than a raw string prefix.
 //!
-//! Deny rules are deliberately NOT arity-based: for a deny rule the flags are
-//! the danger (`rm -rf`), whereas arity matching strips flags. Trusted (allow)
-//! matching lives separately in [`super::bash_arity`].
+//! Deny rules deliberately ignore identity matching: for a deny rule the
+//! flags are the danger (`rm -rf`), whereas identity extraction skips flags.
+//! Trusted (allow) matching lives separately in [`super::command_shape`].
 
 /// Why a command segment was denied. The string is surfaced to the user and
 /// logged as the matched rule.
@@ -153,9 +153,9 @@ pub fn builtin_deny(command: &str) -> Option<DenyReason> {
 
 /// Static, no-execution safety notes surfaced at the approval prompt: why a
 /// command warrants review and how to make it safer. This does NOT dry-run or
-/// diff — deep-code has no side-effect preview for shell (neither pi nor
-/// CodeWhale do). It classifies by program/flag/path shape, reusing the same
-/// segment split as the deny checks, mirroring CodeWhale's reasons/suggestions.
+/// diff the command — shell side effects are impractical to preview — it
+/// classifies by program/flag/path shape, reusing the same segment split as
+/// the deny checks so notes and denials always agree on what a segment is.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SafetyNotes {
     pub reasons: Vec<String>,

@@ -1,212 +1,361 @@
+//! Shell-command confinement on macOS via the Seatbelt kernel sandbox.
+//!
+//! macOS ships `/usr/bin/sandbox-exec`, which launches a program under a
+//! profile written in SBPL — a small s-expression policy language evaluated
+//! by the kernel. deep-code composes a deny-by-default profile from the
+//! requested [`SandboxPolicy`], passes it with `-p`, and lets the kernel
+//! enforce it for the whole process tree the shell spawns. Filesystem paths
+//! enter the profile through `-D NAME=value` bindings referenced as
+//! `(param "NAME")`, which sidesteps quoting problems with arbitrary paths.
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
 use super::policy::SandboxPolicy;
 
-pub const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
+/// Launcher that applies an SBPL profile to a child process.
+pub const SEATBELT_BINARY: &str = "/usr/bin/sandbox-exec";
 
-const BASE_POLICY: &str = r#"
-(version 1)
-(deny default)
-(allow process-exec)
-(allow process-fork)
-(allow signal (target same-sandbox))
-(allow process-info* (target same-sandbox))
-(allow user-preference-read)
-(allow sysctl-read)
-(allow ipc-posix-sem)
-(allow pseudo-tty)
-(allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))
-(allow file-read* (literal "/dev/urandom"))
-(allow file-write-data
-  (require-all
-    (path "/dev/null")
-    (vnode-type CHARACTER-DEVICE)))
-(allow file-read*)
-"#;
-
-const NETWORK_POLICY: &str = r#"
-(allow network-outbound)
-(allow network-inbound)
-(allow system-socket)
-"#;
-
-const SENSITIVE_WRITE_DENY: &str = r#"
-(deny file-write*
-  (subpath (param "HOME_SSH")))
-(deny file-write*
-  (subpath (param "HOME_AWS")))
-(deny file-write*
-  (subpath (param "HOME_GNUPG")))
-(deny file-write*
-  (subpath (param "HOME_NETRC")))
-"#;
-
+/// Whether Seatbelt confinement can actually be used on this host.
+///
+/// Existence of the binary is not enough: some managed environments and
+/// nested sandboxes forbid `sandbox-exec` itself. The probe therefore runs a
+/// no-op command under a permissive profile once and caches the verdict for
+/// the process lifetime.
 pub fn is_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        if !Path::new(SANDBOX_EXEC_PATH).exists() {
-            return false;
-        }
-        Command::new(SANDBOX_EXEC_PATH)
-            .args(["-p", "(version 1)(allow default)", "--", "/usr/bin/true"])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    })
+    static VERDICT: OnceLock<bool> = OnceLock::new();
+    *VERDICT.get_or_init(probe_seatbelt)
 }
 
+fn probe_seatbelt() -> bool {
+    if !Path::new(SEATBELT_BINARY).is_file() {
+        return false;
+    }
+    Command::new(SEATBELT_BINARY)
+        .arg("-p")
+        .arg("(version 1)(allow default)")
+        .arg("--")
+        .arg("/usr/bin/true")
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Build a `Command` that runs `command` through `sh -c` under a Seatbelt
+/// profile derived from `policy`, with `workspace` (and `cwd`, when distinct)
+/// as the writable roots.
 pub fn wrap_shell_command(
     command: &str,
     cwd: &Path,
     workspace: &Path,
     policy: &SandboxPolicy,
 ) -> Command {
-    let inner = bare_shell_command(command, cwd);
-    let program = inner.get_program().to_string_lossy().into_owned();
-    let args: Vec<String> = inner
-        .get_args()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
+    let profile = compose_profile(policy, workspace, cwd);
 
-    let mut wrapped = Command::new(SANDBOX_EXEC_PATH);
-    wrapped.args(seatbelt_args(vec![program], args, workspace, cwd, policy));
-    wrapped.current_dir(cwd);
-    wrapped
-}
-
-fn bare_shell_command(command: &str, cwd: &Path) -> Command {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command);
-    cmd.current_dir(cwd);
-    cmd
-}
-
-fn seatbelt_args(
-    mut program: Vec<String>,
-    args: Vec<String>,
-    workspace: &Path,
-    cwd: &Path,
-    policy: &SandboxPolicy,
-) -> Vec<String> {
-    program.extend(args);
-    let mut seatbelt_args = vec![
-        "-p".to_string(),
-        build_policy_string(policy, workspace, cwd),
-    ];
-    for (key, value) in build_params(workspace, cwd) {
-        seatbelt_args.push(format!("-D{key}={}", value.display()));
+    let mut launcher = Command::new(SEATBELT_BINARY);
+    launcher.arg("-p").arg(profile.render());
+    for (name, path) in &profile.bindings {
+        launcher.arg(format!("-D{name}={}", path.display()));
     }
-    seatbelt_args.push("--".to_string());
-    seatbelt_args.extend(program);
-    seatbelt_args
+    launcher.arg("--").arg("sh").arg("-c").arg(command);
+    launcher.current_dir(cwd);
+    launcher
 }
 
-fn build_policy_string(policy: &SandboxPolicy, workspace: &Path, cwd: &Path) -> String {
-    let mut policy_text = BASE_POLICY.to_string();
-    policy_text.push_str(SENSITIVE_WRITE_DENY);
+/// An SBPL profile under construction: rule lines plus the path parameters
+/// the rules refer to. Keeping rules and bindings in one place guarantees a
+/// rule never mentions a parameter that was not passed on the command line
+/// (sandbox-exec refuses to load such a profile).
+struct SeatbeltProfile {
+    directives: Vec<String>,
+    bindings: Vec<(String, PathBuf)>,
+}
 
-    if policy.has_network_access() {
-        policy_text.push_str(NETWORK_POLICY);
-    }
-
-    if !matches!(policy, SandboxPolicy::ReadOnly) {
-        for index in 0..policy.writable_roots(workspace, cwd).len() {
-            policy_text.push_str(&format!(
-                "\n(allow file-write* (subpath (param \"WRITABLE_ROOT_{index}\")))"
-            ));
+impl SeatbeltProfile {
+    /// Start from the SBPL preamble: profile version and deny-by-default, so
+    /// everything below is an explicit grant.
+    fn deny_by_default() -> Self {
+        Self {
+            directives: vec!["(version 1)".to_string(), "(deny default)".to_string()],
+            bindings: Vec::new(),
         }
     }
 
-    policy_text
+    fn rule(&mut self, sbpl: impl Into<String>) {
+        self.directives.push(sbpl.into());
+    }
+
+    /// Register a path parameter and return the SBPL fragment referencing it.
+    fn bind_path(&mut self, name: &str, path: PathBuf) -> String {
+        self.bindings.push((name.to_string(), path));
+        format!("(param \"{name}\")")
+    }
+
+    fn render(&self) -> String {
+        self.directives.join("\n")
+    }
 }
 
-fn build_params(workspace: &Path, cwd: &Path) -> Vec<(String, PathBuf)> {
-    let workspace = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
-    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let mut params = vec![("WORKSPACE".to_string(), workspace.clone())];
-    params.push(("WRITABLE_ROOT_0".to_string(), workspace));
-    if cwd != params[0].1 {
-        params.push(("WRITABLE_ROOT_1".to_string(), cwd));
+/// Translate a [`SandboxPolicy`] into a concrete profile.
+///
+/// Ordering matters in SBPL (a later matching rule wins), so grants and
+/// denials are appended in a fixed sequence: process baseline, blanket read,
+/// optional network, the writable roots the policy grants, and LAST the
+/// credential-directory write denials so no writable root can override them.
+fn compose_profile(policy: &SandboxPolicy, workspace: &Path, cwd: &Path) -> SeatbeltProfile {
+    let mut profile = SeatbeltProfile::deny_by_default();
+
+    // Shell commands are process trees: the shell itself plus whatever it
+    // spawns. Fork/exec must work, and members of the same sandbox need to
+    // signal and inspect each other (build tools wait on and kill children).
+    profile.rule("(allow process-exec)");
+    profile.rule("(allow process-fork)");
+    profile.rule("(allow signal (target same-sandbox))");
+    profile.rule("(allow process-info* (target same-sandbox))");
+
+    // Plenty of stock CLI tools consult defaults(1) domains and sysctl values
+    // during startup; blocking these produces confusing mid-command crashes
+    // rather than useful denials.
+    profile.rule("(allow user-preference-read)");
+    profile.rule("(allow sysctl-read)");
+
+    // POSIX semaphores back common runtime primitives (e.g. interpreter
+    // worker pools) even for commands that never look parallel.
+    profile.rule("(allow ipc-posix-sem)");
+
+    // Terminal plumbing: tools probe for a TTY and may allocate pseudo
+    // terminals even when running inside a pipeline.
+    profile.rule("(allow pseudo-tty)");
+    profile.rule("(allow file-read* file-write* file-ioctl (literal \"/dev/ptmx\"))");
+
+    // Entropy for TLS handshakes, UUIDs, temp-name generation.
+    profile.rule("(allow file-read* (literal \"/dev/urandom\"))");
+
+    // Discarding output must always work — but only to the real character
+    // device, so a file smuggled in at that path cannot become writable.
+    profile.rule(
+        "(allow file-write-data (require-all (path \"/dev/null\") \
+         (vnode-type CHARACTER-DEVICE)))",
+    );
+
+    // Reads are unrestricted: deep-code's own read tools already expose the
+    // filesystem to the model, so hiding it from subprocesses would add
+    // breakage (dyld, locale data, toolchains) without adding secrecy.
+    profile.rule("(allow file-read*)");
+
+    // Network is opt-in per policy. `system-socket` covers the raw/system
+    // sockets some resolvers use.
+    if policy.has_network_access() {
+        profile.rule("(allow network-outbound)");
+        profile.rule("(allow network-inbound)");
+        profile.rule("(allow system-socket)");
     }
 
-    if let Ok(home) = std::env::var("HOME") {
-        let home = PathBuf::from(home);
-        params.push(("HOME_SSH".to_string(), home.join(".ssh")));
-        params.push(("HOME_AWS".to_string(), home.join(".aws")));
-        params.push(("HOME_GNUPG".to_string(), home.join(".gnupg")));
-        params.push(("HOME_NETRC".to_string(), home.join(".netrc")));
+    // Grant writes only under the roots the policy hands out (workspace and,
+    // when different, the command's cwd). Paths are canonicalized because
+    // Seatbelt matches the real path — on macOS /tmp is a symlink into
+    // /private, and an uncanonicalized grant there would never match.
+    let mut granted: Vec<PathBuf> = Vec::new();
+    for root in policy.writable_roots(workspace, cwd) {
+        let resolved = root.canonicalize().unwrap_or(root);
+        if !granted.contains(&resolved) {
+            granted.push(resolved);
+        }
+    }
+    for (index, root) in granted.into_iter().enumerate() {
+        let param = profile.bind_path(&format!("WRITE_ROOT_{index}"), root);
+        profile.rule(format!("(allow file-write* (subpath {param}))"));
     }
 
-    params
+    // Credential stores must never be *modified* by a sandboxed command, even
+    // inside an otherwise writable tree. Because a later matching rule wins,
+    // these denials MUST come after the write grants above — a writable root
+    // that is an ancestor of `~/.ssh` (e.g. running with HOME as the
+    // workspace) would otherwise override the denial.
+    for (name, dir) in credential_dirs() {
+        let param = profile.bind_path(&name, dir);
+        profile.rule(format!("(deny file-write* (subpath {param}))"));
+    }
+
+    profile
+}
+
+/// Home directories holding long-lived secrets — SSH keys, cloud credentials,
+/// GnuPG keyrings, `.netrc` passwords — that stay write-denied under every
+/// policy. Empty when `HOME` is unset (nothing to protect, nothing to bind).
+fn credential_dirs() -> Vec<(String, PathBuf)> {
+    let Some(home) = crate::paths::home_dir() else {
+        return Vec::new();
+    };
+    [".ssh", ".aws", ".gnupg", ".netrc"]
+        .into_iter()
+        .map(|entry| {
+            let name = format!(
+                "KEEP_{}",
+                entry.trim_start_matches('.').to_ascii_uppercase()
+            );
+            (name, home.join(entry))
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::tempdir;
 
     #[test]
-    fn seatbelt_availability_is_queryable() {
-        let _ = is_available();
+    fn availability_probe_is_stable_and_panic_free() {
+        // Two calls must agree (the verdict is cached process-wide).
+        assert_eq!(is_available(), is_available());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn seatbelt_blocks_write_outside_workspace() {
-        if !is_available() {
-            eprintln!("skipping seatbelt smoke test: sandbox-exec unavailable");
-            return;
-        }
+    fn profile_opens_with_deny_by_default() {
+        let ws = Path::new("/tmp/dc-ws");
+        let text = compose_profile(&SandboxPolicy::workspace_write(), ws, ws).render();
+        assert!(text.starts_with("(version 1)\n(deny default)"));
+        assert!(text.contains("(allow file-read*)"));
+    }
 
-        let workspace = tempdir().unwrap();
-        let outside = tempdir().unwrap();
-        let target = outside.path().join("blocked.txt");
-        let command = format!("echo leaked > {}", target.display());
+    #[test]
+    fn network_rules_appear_only_when_policy_grants_network() {
+        let ws = Path::new("/tmp/dc-ws");
+        let offline = compose_profile(&SandboxPolicy::workspace_write(), ws, ws).render();
+        assert!(!offline.contains("network-outbound"));
 
-        let status = wrap_shell_command(
-            &command,
-            workspace.path(),
-            workspace.path(),
-            &SandboxPolicy::workspace_write(),
+        let online = compose_profile(
+            &SandboxPolicy::WorkspaceWrite {
+                network_access: true,
+            },
+            ws,
+            ws,
         )
-        .status()
-        .expect("sandboxed command should spawn");
-
-        assert!(!status.success() || !target.exists());
+        .render();
+        assert!(online.contains("(allow network-outbound)"));
+        assert!(online.contains("(allow network-inbound)"));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn seatbelt_allows_write_inside_workspace() {
-        if !is_available() {
-            eprintln!("skipping seatbelt smoke test: sandbox-exec unavailable");
-            return;
-        }
-
-        let workspace = tempdir().unwrap();
-        let target = workspace.path().join("allowed.txt");
-        let command = format!(
-            "echo ok > {}",
-            target.file_name().unwrap().to_string_lossy()
+    fn read_only_policy_grants_no_write_roots() {
+        let ws = Path::new("/tmp/dc-ws");
+        let profile = compose_profile(&SandboxPolicy::ReadOnly, ws, ws);
+        assert!(!profile.render().contains("WRITE_ROOT_"));
+        assert!(
+            !profile
+                .bindings
+                .iter()
+                .any(|(name, _)| name.starts_with("WRITE_ROOT_"))
         );
+    }
+
+    #[test]
+    fn distinct_cwd_receives_its_own_write_grant() {
+        let workspace = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let profile = compose_profile(
+            &SandboxPolicy::workspace_write(),
+            workspace.path(),
+            elsewhere.path(),
+        );
+        let write_roots: Vec<&str> = profile
+            .bindings
+            .iter()
+            .filter(|(name, _)| name.starts_with("WRITE_ROOT_"))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(write_roots, ["WRITE_ROOT_0", "WRITE_ROOT_1"]);
+        assert!(profile.render().contains("WRITE_ROOT_1"));
+    }
+
+    #[test]
+    fn credential_denials_outrank_write_grants() {
+        // SBPL resolves conflicts by last-match-wins, so the credential-dir
+        // denials must render AFTER every write grant. If a writable root is
+        // an ancestor of `~/.ssh` (HOME as workspace), an earlier deny would
+        // be silently overridden and sandboxed commands could edit
+        // authorized_keys.
+        let home = std::env::var("HOME").expect("test environment has HOME");
+        let profile =
+            compose_profile(&SandboxPolicy::workspace_write(), home.as_ref(), home.as_ref());
+        let text = profile.render();
+        let last_grant = text
+            .rfind("(allow file-write* (subpath")
+            .expect("profile grants a write root");
+        let first_denial = text
+            .find("(deny file-write* (subpath")
+            .expect("profile denies credential dirs");
+        assert!(
+            first_denial > last_grant,
+            "credential denials must come after write grants:\n{text}"
+        );
+    }
+
+    #[test]
+    fn every_referenced_param_is_bound() {
+        // sandbox-exec rejects profiles referencing unbound params; make sure
+        // rules and bindings cannot drift apart.
+        let workspace = tempfile::tempdir().unwrap();
+        let profile = compose_profile(
+            &SandboxPolicy::workspace_write(),
+            workspace.path(),
+            workspace.path(),
+        );
+        let text = profile.render();
+        for fragment in text.split("(param \"").skip(1) {
+            let name = fragment.split('"').next().unwrap();
+            assert!(
+                profile.bindings.iter().any(|(bound, _)| bound == name),
+                "profile references unbound param {name}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confined_command_cannot_write_outside_granted_roots() {
+        if !is_available() {
+            eprintln!("seatbelt unavailable on this host; skipping");
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let escape = elsewhere.path().join("escape-attempt.txt");
 
         let status = wrap_shell_command(
-            &command,
+            &format!("printf leaked > {}", escape.display()),
             workspace.path(),
             workspace.path(),
             &SandboxPolicy::workspace_write(),
         )
         .status()
-        .expect("sandboxed command should spawn");
+        .expect("sandbox-exec should launch");
+
+        assert!(
+            !status.success() || !escape.exists(),
+            "write outside the workspace must be denied"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confined_command_writes_within_granted_root() {
+        if !is_available() {
+            eprintln!("seatbelt unavailable on this host; skipping");
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+
+        let status = wrap_shell_command(
+            "printf written-inside > inside.txt",
+            workspace.path(),
+            workspace.path(),
+            &SandboxPolicy::workspace_write(),
+        )
+        .status()
+        .expect("sandbox-exec should launch");
 
         assert!(status.success());
-        assert!(target.exists());
-        let content = fs::read_to_string(&target).unwrap();
-        assert!(content.contains("ok"));
+        let written = std::fs::read_to_string(workspace.path().join("inside.txt")).unwrap();
+        assert_eq!(written, "written-inside");
     }
 }

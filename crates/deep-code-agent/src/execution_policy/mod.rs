@@ -3,7 +3,7 @@
 //! Policy is independent of TUI: callers evaluate a [`ToolExecutionPlan`] before
 //! running tools or spawning subprocesses.
 
-pub mod bash_arity;
+pub mod command_shape;
 mod engine;
 mod shell_deny;
 

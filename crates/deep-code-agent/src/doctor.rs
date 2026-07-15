@@ -9,6 +9,7 @@ use crate::error::api_key_setup_hint;
 use crate::hooks::default_hooks_config_path;
 use crate::mcp::{McpManager, McpServerStatus, default_mcp_config_path, workspace_mcp_config_path};
 use crate::model_registry::ModelRegistry;
+use crate::paths::home_dir;
 use crate::sandbox::detect_capabilities;
 use crate::skills::{discover_in_workspace, global_skills_dir, workspace_skills_dir};
 
@@ -316,15 +317,6 @@ fn collect_skills(workspace: &Path) -> SkillsDoctorReport {
     }
 }
 
-fn home_dir() -> Option<PathBuf> {
-    // Must match `config::layers::home_dir`: on Windows `HOME` is usually unset
-    // and `USERPROFILE` holds the home. If these diverge, `default_config_path`
-    // (the `/apikey` write + relaunch read target) points at a different file
-    // than the config loader's global layer, silently dropping the saved key.
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-}
 
 #[cfg(test)]
 mod tests {

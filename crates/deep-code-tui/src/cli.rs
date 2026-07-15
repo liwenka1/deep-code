@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use deep_code_agent::{JsonSessionStore, SessionId, SessionStore, format_sessions_storage_note};
 
-/// What the interactive TUI should open with. Mirrors Claude Code: a bare
-/// `deep-code` starts fresh; resuming is opt-in.
+/// What the interactive TUI should open with. A bare `deep-code` starts
+/// fresh; resuming is opt-in, so stale context never leaks in by default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartupIntent {
     /// Start a new session (default, and `--new`).

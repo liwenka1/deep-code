@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::execution_policy::bash_arity::BashArityDict;
+use crate::execution_policy::command_shape;
 
 use crate::client::LlmClient;
 use crate::lsp::{is_edit_tool, render_blocks, summarize_blocks};
@@ -38,19 +38,14 @@ pub(super) fn session_allowable(tool_name: &str) -> bool {
     )
 }
 
-/// Arity dictionary backing the session shell allowlist. Shared with the
-/// execution policy's trusted-prefix matching so a session-allow is recorded at
-/// the same granularity the policy trusts (`git status`, not `git`).
-static ARITY: LazyLock<BashArityDict> = LazyLock::new(BashArityDict::new);
-
-/// Arity-classified key of a *simple* shell command — e.g. `git status` from
+/// Identity key of a *simple* shell command — e.g. `git status` from
 /// `git status -s`, or `cargo test` from `cargo test --all`. Returns `None` for
 /// non-shell calls and for compound/substitution/redirection commands, which
 /// are never matched by the session shell allowlist (they keep prompting).
 ///
 /// This is what "approve for session" records and later matches against. Using
-/// the arity-classified prefix rather than the bare program means approving
-/// `git status` does NOT blanket-approve `git push`: the two classify to
+/// the command identity rather than the bare program means approving
+/// `git status` does NOT blanket-approve `git push`: the two resolve to
 /// different keys, so a chained or sibling subcommand can't ride a prior
 /// consent past the gate.
 pub(super) fn session_shell_prefix(call: &ToolCall) -> Option<String> {
@@ -81,7 +76,7 @@ pub(super) fn session_shell_prefix(call: &ToolCall) -> Option<String> {
     if tokens.first().is_some_and(|token| token.contains('=')) {
         return None; // leading `FOO=bar` env assignment, not a plain program
     }
-    let canonical = ARITY.classify(&tokens);
+    let canonical = command_shape::identity(&tokens);
     (!canonical.is_empty()).then_some(canonical)
 }
 

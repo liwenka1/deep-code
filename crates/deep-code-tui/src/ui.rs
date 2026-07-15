@@ -664,8 +664,8 @@ fn render_messages(
     app: &App,
     area: ratatui::layout::Rect,
 ) -> TranscriptSnapshot {
-    // Claude-style: no transcript border/title — a 1-col left gutter and the
-    // input box below provide all the structure.
+    // No transcript border/title — a 1-col left gutter and the input box
+    // below provide all the structure, keeping every column for content.
     let viewport = usize::from(area.height).max(1);
     let content_width = area.width.saturating_sub(2).max(8);
 
@@ -757,9 +757,9 @@ fn highlight_selection(
     }
 }
 
-/// Render one transcript cell, Claude-style: speakers are distinguished by a
-/// marker glyph + colour rather than a text label, and there is no per-cell
-/// box. Secondary content (reasoning, tool noise, system) is dimmed; the
+/// Render one transcript cell: speakers are distinguished by a coloured
+/// marker glyph rather than a text label, and there is no per-cell box.
+/// Secondary content (reasoning, tool noise, system) is dimmed; the
 /// user line and assistant prose carry the conversation.
 ///
 /// Assistant text always renders as markdown — including while still
@@ -1296,8 +1296,8 @@ fn render_input_from_layout(
     layout: &LayoutResult,
     area: ratatui::layout::Rect,
 ) {
-    // Claude-style composer: no box — just a dim rule above and below, with a
-    // "› " prompt marker. The streaming state shows in the status line, so the
+    // Borderless composer: just a dim rule above and below, with a "› "
+    // prompt marker. The streaming state shows in the status line, so the
     // composer needs no title.
     const PROMPT: &str = "› ";
     const GUTTER: u16 = 2;
