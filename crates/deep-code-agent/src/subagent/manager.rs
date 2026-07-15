@@ -344,15 +344,41 @@ impl SubAgentManager {
             serde_json::to_string_pretty(&state).map_err(|error| SubAgentError::State {
                 message: error.to_string(),
             })?;
-        let tmp = self.state_path.with_extension("tmp");
-        std::fs::write(&tmp, payload).map_err(|error| SubAgentError::Io {
-            message: error.to_string(),
-        })?;
-        std::fs::rename(&tmp, &self.state_path).map_err(|error| SubAgentError::Io {
-            message: error.to_string(),
-        })?;
-        Ok(())
+        write_atomic(&self.state_path, payload.as_bytes())
     }
+}
+
+/// Durably write `contents` to `path`: stage to a per-process-unique tmp file,
+/// fsync it, rename over the target, then fsync the directory. The unique tmp
+/// name (pid + nanos) keeps two deep-code processes sharing one workspace from
+/// clobbering each other's staging file; the fsyncs stop a crash from leaving a
+/// truncated ledger behind. Mirrors `session_store::write_atomic`.
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), SubAgentError> {
+    use std::io::Write;
+
+    let io_err = |error: std::io::Error| SubAgentError::Io {
+        message: error.to_string(),
+    };
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("subagents");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let tmp = parent.join(format!(".{stem}.{}.{nanos}.tmp", std::process::id()));
+    {
+        let mut file = std::fs::File::create(&tmp).map_err(io_err)?;
+        file.write_all(contents).map_err(io_err)?;
+        file.sync_all().map_err(io_err)?;
+    }
+    std::fs::rename(&tmp, path).map_err(io_err)?;
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 pub fn default_state_path(workspace: &Path) -> PathBuf {
