@@ -425,27 +425,249 @@ impl ApplyPatchTool {
         if params.old.is_empty() {
             return Err(invalid(Self::NAME, "old must not be empty"));
         }
+        if params.old == params.new {
+            return Err(invalid(
+                Self::NAME,
+                "old and new are identical; no change intended",
+            ));
+        }
         let path = self.root.resolve_existing(&params.path, Self::NAME)?;
         let contents = fs::read_to_string(&path).map_err(|error| ToolError::ExecutionFailed {
             name: Self::NAME.to_string(),
             message: format!("failed to read {} as UTF-8: {error}", path.display()),
         })?;
-        let count = contents.matches(&params.old).count();
-        if count != 1 {
-            return Err(invalid(
-                Self::NAME,
-                format!("old text must occur exactly once, found {count} occurrences"),
-            ));
-        }
-        let updated = contents.replacen(&params.old, &params.new, 1);
+        let display = self.root.relative_display(&path);
+
+        let located = locate_match(&contents, &params.old)
+            .map_err(|error| invalid(Self::NAME, error.message(&display)))?;
+
+        // Splice the matched *original* byte range out and drop `new` in: every
+        // byte outside `[start, end)` is preserved verbatim, so CRLF, BOM, and
+        // any untouched typographic characters elsewhere in the file survive a
+        // fuzzy match unchanged (only the matched region is rewritten).
+        let updated = format!(
+            "{}{}{}",
+            &contents[..located.start],
+            params.new,
+            &contents[located.end..]
+        );
         fs::write(&path, updated).map_err(|error| ToolError::ExecutionFailed {
             name: Self::NAME.to_string(),
             message: format!("failed to write {}: {error}", path.display()),
         })?;
         Ok(ToolOutput::text(json_string(json!({
-            "path": self.root.relative_display(&path),
-            "replacements": 1
+            "path": display,
+            "replacements": 1,
+            "match": located.kind.label(),
         }))))
+    }
+}
+
+/// Which matching layer located the `old` text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchKind {
+    /// Byte-for-byte match.
+    Exact,
+    /// Matched after ignoring each line's leading whitespace (indentation).
+    Indent,
+    /// Matched after normalizing typographic punctuation (smart quotes,
+    /// dashes, non-breaking/wide spaces) to ASCII.
+    Punct,
+}
+
+impl MatchKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Indent => "fuzzy-indent",
+            Self::Punct => "fuzzy-punct",
+        }
+    }
+
+    /// Clause appended to the "matched N places" error so the model knows which
+    /// relaxation produced the ambiguity.
+    fn ambiguity_qualifier(self) -> &'static str {
+        match self {
+            Self::Exact => "",
+            Self::Indent => " after ignoring indentation",
+            Self::Punct => " after normalizing punctuation",
+        }
+    }
+}
+
+/// The located byte range in the ORIGINAL contents plus the layer that found it.
+struct Located {
+    start: usize,
+    end: usize,
+    kind: MatchKind,
+}
+
+enum MatchError {
+    NotFound,
+    NonUnique { count: usize, kind: MatchKind },
+}
+
+impl MatchError {
+    fn message(&self, path: &str) -> String {
+        match self {
+            Self::NotFound => format!(
+                "old text not found in {path} (tried exact, indentation-insensitive, and \
+                 punctuation-normalized matching). Recovery: call read_file on \"{path}\" and \
+                 copy `old` verbatim from the current contents."
+            ),
+            Self::NonUnique { count, kind } => format!(
+                "old text matched {count} places in {path}{}. Recovery: call read_file on \
+                 \"{path}\" and extend `old` with surrounding lines so it is unique.",
+                kind.ambiguity_qualifier()
+            ),
+        }
+    }
+}
+
+/// Locate `old` in `contents` through a cascade of increasingly tolerant
+/// layers — exact, then indentation-insensitive, then punctuation-normalized —
+/// each requiring a UNIQUE match. Returns the range in the original bytes.
+fn locate_match(contents: &str, old: &str) -> Result<Located, MatchError> {
+    // 1. Exact.
+    match contents.matches(old).count() {
+        1 => {
+            let start = contents.find(old).expect("counted one match");
+            return Ok(Located {
+                start,
+                end: start + old.len(),
+                kind: MatchKind::Exact,
+            });
+        }
+        count if count > 1 => {
+            return Err(MatchError::NonUnique {
+                count,
+                kind: MatchKind::Exact,
+            });
+        }
+        _ => {}
+    }
+
+    // 2. Indentation-insensitive: strip each line's leading whitespace on both
+    //    sides, then require a unique match; the line-start expansion lets `new`
+    //    supply the replacement's indentation.
+    let (hay_indent, indent_map) = strip_leading_ws_with_map(contents);
+    let needle_indent = strip_leading_ws_with_map(old).0;
+    match unique_range(&hay_indent, &indent_map, &needle_indent) {
+        Ok((start, end)) => {
+            return Ok(Located {
+                start: expand_to_line_start(contents, start),
+                end,
+                kind: MatchKind::Indent,
+            });
+        }
+        Err(Some(count)) => {
+            return Err(MatchError::NonUnique {
+                count,
+                kind: MatchKind::Indent,
+            });
+        }
+        Err(None) => {}
+    }
+
+    // 3. Punctuation-normalized: fold smart quotes / dashes / exotic spaces to
+    //    ASCII on both sides, then require a unique match.
+    let (hay_punct, punct_map) = normalize_punct_with_map(contents);
+    let needle_punct = normalize_punct_with_map(old).0;
+    match unique_range(&hay_punct, &punct_map, &needle_punct) {
+        Ok((start, end)) => Ok(Located {
+            start,
+            end,
+            kind: MatchKind::Punct,
+        }),
+        Err(Some(count)) => Err(MatchError::NonUnique {
+            count,
+            kind: MatchKind::Punct,
+        }),
+        Err(None) => Err(MatchError::NotFound),
+    }
+}
+
+/// Find the unique occurrence of `needle` in the normalized `hay` and map its
+/// bounds back to original byte offsets via `map` (`map[i]` = original offset of
+/// normalized byte `i`, with a terminal entry for the end). `Err(None)` means no
+/// match, `Err(Some(n))` means `n > 1` ambiguous matches.
+fn unique_range(hay: &str, map: &[usize], needle: &str) -> Result<(usize, usize), Option<usize>> {
+    if needle.is_empty() {
+        return Err(None);
+    }
+    match hay.matches(needle).count() {
+        1 => {
+            let ns = hay.find(needle).expect("counted one match");
+            let ne = ns + needle.len();
+            Ok((map[ns], map[ne]))
+        }
+        0 => Err(None),
+        count => Err(Some(count)),
+    }
+}
+
+/// If the matched region begins partway into a line preceded only by
+/// whitespace, extend the start back to the line start so the replacement text
+/// (which carries its own indentation) supersedes the original indentation.
+fn expand_to_line_start(contents: &str, start: usize) -> usize {
+    let line_begin = contents[..start].rfind('\n').map_or(0, |index| index + 1);
+    if contents[line_begin..start]
+        .chars()
+        .all(|ch| ch == ' ' || ch == '\t')
+    {
+        line_begin
+    } else {
+        start
+    }
+}
+
+/// Drop each line's leading spaces/tabs, returning the normalized string and a
+/// map from every normalized byte index to its original byte offset (plus a
+/// terminal entry mapping the end).
+fn strip_leading_ws_with_map(s: &str) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(s.len());
+    let mut map = Vec::with_capacity(s.len() + 1);
+    let mut offset = 0usize;
+    for line in s.split_inclusive('\n') {
+        let ws_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+        let base = offset + ws_len;
+        for (index, ch) in line[ws_len..].char_indices() {
+            let origin = base + index;
+            let before = out.len();
+            out.push(ch);
+            for _ in before..out.len() {
+                map.push(origin);
+            }
+        }
+        offset += line.len();
+    }
+    map.push(s.len());
+    (out, map)
+}
+
+/// Fold typographic punctuation to ASCII, returning the normalized string and
+/// the same normalized→original byte map as [`strip_leading_ws_with_map`].
+fn normalize_punct_with_map(s: &str) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(s.len());
+    let mut map = Vec::with_capacity(s.len() + 1);
+    for (index, ch) in s.char_indices() {
+        let before = out.len();
+        out.push(normalize_punct_char(ch));
+        for _ in before..out.len() {
+            map.push(index);
+        }
+    }
+    map.push(s.len());
+    (out, map)
+}
+
+fn normalize_punct_char(ch: char) -> char {
+    match ch {
+        '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+        '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+        '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
+        '\u{00A0}' | '\u{2002}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' => ' ',
+        other => other,
     }
 }
 
@@ -469,7 +691,10 @@ impl Tool for ApplyPatchTool {
     }
 
     fn description(&self) -> &str {
-        "Apply a simple text replacement patch to one workspace file. Requires approval."
+        "Replace `old` with `new` in one workspace file. `old` must identify a unique location; \
+         it is matched exactly first, then falling back to ignoring indentation and normalizing \
+         typographic punctuation. Include enough surrounding context to make `old` unique. \
+         Requires approval."
     }
 
     fn requires_approval(&self) -> bool {

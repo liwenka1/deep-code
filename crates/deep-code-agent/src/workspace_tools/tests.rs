@@ -122,6 +122,152 @@ async fn apply_patch_replaces_exactly_once_after_approval() {
         fs::read_to_string(tmp.path().join("lib.rs")).unwrap(),
         "fn new() {}\n"
     );
+    assert_eq!(
+        serde_json::from_str::<Value>(&result.content).unwrap()["match"],
+        "exact"
+    );
+}
+
+/// Run a tool call expecting it to fail, returning the error's message.
+async fn run_err(root: &Path, name: &str, arguments: Value) -> String {
+    let registry = registry(root);
+    let call = ToolCall::new("call_1", name, arguments);
+    match registry
+        .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await
+    {
+        Err(ToolError::InvalidArguments { message, .. }) => message,
+        Err(other) => panic!("expected InvalidArguments, got {other:?}"),
+        Ok(_) => panic!("expected an error"),
+    }
+}
+
+#[tokio::test]
+async fn apply_patch_fuzzy_matches_indentation_and_uses_new_indent() {
+    let tmp = tempdir().unwrap();
+    // Middle line is tab-indented; `old` carries a 4-space indent, so there is
+    // no exact substring — only the indentation-insensitive layer can match.
+    fs::write(
+        tmp.path().join("lib.rs"),
+        "fn f() {\n\tlet x = compute();\n}\n",
+    )
+    .unwrap();
+
+    let result = run(
+        tmp.path(),
+        "apply_patch",
+        json!({"path": "lib.rs", "old": "    let x = compute();", "new": "    let y = 42;"}),
+    )
+    .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    // The original tab indent is replaced by `new`'s indentation; surrounding
+    // lines are untouched.
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("lib.rs")).unwrap(),
+        "fn f() {\n    let y = 42;\n}\n"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&result.content).unwrap()["match"],
+        "fuzzy-indent"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_fuzzy_matches_smart_quotes() {
+    let tmp = tempdir().unwrap();
+    // File uses curly quotes; the model's `old` uses ASCII quotes.
+    fs::write(tmp.path().join("s.rs"), "let s = \u{201c}hi\u{201d};\n").unwrap();
+
+    let result = run(
+        tmp.path(),
+        "apply_patch",
+        json!({"path": "s.rs", "old": "\"hi\"", "new": "\"bye\""}),
+    )
+    .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("s.rs")).unwrap(),
+        "let s = \"bye\";\n"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&result.content).unwrap()["match"],
+        "fuzzy-punct"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_preserves_crlf_and_untouched_bytes() {
+    let tmp = tempdir().unwrap();
+    // CRLF line endings and curly quotes on an untouched line must survive an
+    // exact edit elsewhere — the splice only rewrites the matched range.
+    let original = "let keep = \u{201c}x\u{201d};\r\nfn old() {}\r\n";
+    fs::write(tmp.path().join("lib.rs"), original).unwrap();
+
+    run(
+        tmp.path(),
+        "apply_patch",
+        json!({"path": "lib.rs", "old": "old", "new": "new"}),
+    )
+    .await;
+
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("lib.rs")).unwrap(),
+        "let keep = \u{201c}x\u{201d};\r\nfn new() {}\r\n"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_non_unique_old_with_recovery_hint() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("dup.rs"), "x = 1;\nx = 1;\n").unwrap();
+
+    let message = run_err(
+        tmp.path(),
+        "apply_patch",
+        json!({"path": "dup.rs", "old": "x = 1;", "new": "x = 2;"}),
+    )
+    .await;
+
+    assert!(message.contains("matched 2 places"), "got: {message}");
+    assert!(message.contains("Recovery"), "got: {message}");
+    // File is untouched on a rejected edit.
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("dup.rs")).unwrap(),
+        "x = 1;\nx = 1;\n"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_missing_old_with_recovery_hint() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("lib.rs"), "fn f() {}\n").unwrap();
+
+    let message = run_err(
+        tmp.path(),
+        "apply_patch",
+        json!({"path": "lib.rs", "old": "does_not_exist", "new": "z"}),
+    )
+    .await;
+
+    assert!(message.contains("not found"), "got: {message}");
+    assert!(message.contains("Recovery"), "got: {message}");
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_identical_old_and_new() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("lib.rs"), "fn f() {}\n").unwrap();
+
+    let message = run_err(
+        tmp.path(),
+        "apply_patch",
+        json!({"path": "lib.rs", "old": "f", "new": "f"}),
+    )
+    .await;
+
+    assert!(message.contains("identical"), "got: {message}");
 }
 
 #[tokio::test]
