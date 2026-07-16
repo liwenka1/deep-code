@@ -275,8 +275,11 @@ mod tests {
         // be silently overridden and sandboxed commands could edit
         // authorized_keys.
         let home = std::env::var("HOME").expect("test environment has HOME");
-        let profile =
-            compose_profile(&SandboxPolicy::workspace_write(), home.as_ref(), home.as_ref());
+        let profile = compose_profile(
+            &SandboxPolicy::workspace_write(),
+            home.as_ref(),
+            home.as_ref(),
+        );
         let text = profile.render();
         let last_grant = text
             .rfind("(allow file-write* (subpath")

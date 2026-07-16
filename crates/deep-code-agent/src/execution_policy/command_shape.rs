@@ -48,10 +48,7 @@ impl Shape {
     }
 
     const fn sub_with(overrides: &'static [(&'static str, u8)]) -> Self {
-        Self {
-            base: 2,
-            overrides,
-        }
+        Self { base: 2, overrides }
     }
 
     /// Identity depth for a concrete subcommand (or `None` when the command
@@ -111,8 +108,14 @@ static PROGRAM_SHAPES: LazyLock<HashMap<&'static str, Shape>> = LazyLock::new(||
         ]),
     );
     m.insert("go", Shape::sub_with(&[("mod", 3), ("work", 3)]));
-    m.insert("rustup", Shape::sub_with(&[("target", 3), ("toolchain", 3)]));
-    m.insert("terraform", Shape::sub_with(&[("state", 3), ("workspace", 3)]));
+    m.insert(
+        "rustup",
+        Shape::sub_with(&[("target", 3), ("toolchain", 3)]),
+    );
+    m.insert(
+        "terraform",
+        Shape::sub_with(&[("state", 3), ("workspace", 3)]),
+    );
     m.insert("helm", Shape::sub_with(&[("repo", 3)]));
     // `gh <noun> <verb>` throughout.
     m.insert(
@@ -233,12 +236,18 @@ mod tests {
     fn identity_ends_at_subcommand_for_vcs_tools() {
         assert_eq!(identity_of("git status -s"), "git status");
         assert_eq!(identity_of("git push origin main --force"), "git push");
-        assert_eq!(identity_of("cargo check --workspace --all-features"), "cargo check");
+        assert_eq!(
+            identity_of("cargo check --workspace --all-features"),
+            "cargo check"
+        );
     }
 
     #[test]
     fn identity_keeps_operation_argument_for_script_runners() {
-        assert_eq!(identity_of("npm run build:prod --silent"), "npm run build:prod");
+        assert_eq!(
+            identity_of("npm run build:prod --silent"),
+            "npm run build:prod"
+        );
         assert_eq!(identity_of("pnpm run lint"), "pnpm run lint");
         assert_eq!(identity_of("npm install lodash"), "npm install");
     }
@@ -278,8 +287,14 @@ mod tests {
 
     #[test]
     fn identity_resolves_python_module_invocations() {
-        assert_eq!(identity_of("python -m json.tool data.json"), "python -m json.tool");
-        assert_eq!(identity_of("python3 -m http.server 8000"), "python3 -m http.server");
+        assert_eq!(
+            identity_of("python -m json.tool data.json"),
+            "python -m json.tool"
+        );
+        assert_eq!(
+            identity_of("python3 -m http.server 8000"),
+            "python3 -m http.server"
+        );
         assert_eq!(identity_of("python script.py"), "python");
     }
 
@@ -334,9 +349,15 @@ mod tests {
             identity_of("git --exec-path=/tmp/evil frobnicate"),
             "git --exec-path=/tmp/evil frobnicate"
         );
-        assert!(!covers("git frobnicate", "git --exec-path=/tmp/evil frobnicate"));
+        assert!(!covers(
+            "git frobnicate",
+            "git --exec-path=/tmp/evil frobnicate"
+        ));
         assert!(!covers("git status", "git -c core.sshCommand=evil status"));
-        assert!(!covers("git push", "git --upload-pack=/tmp/evil push origin"));
+        assert!(!covers(
+            "git push",
+            "git --upload-pack=/tmp/evil push origin"
+        ));
         // The degraded identity still matches a byte-identical rule.
         assert!(covers(
             "git --exec-path=/tmp/evil frobnicate",
@@ -355,9 +376,15 @@ mod tests {
     fn python_module_special_case_is_case_insensitive() {
         // macOS resolves PYTHON to python on its case-insensitive default
         // filesystem; the identity must not depend on the spelling.
-        assert_eq!(identity_of("PYTHON -m http.server"), "python -m http.server");
+        assert_eq!(
+            identity_of("PYTHON -m http.server"),
+            "python -m http.server"
+        );
         // A session approval of `python script.py` (key "python") must not
         // cover the module form, whatever its spelling.
-        assert_ne!(identity_of("python script.py"), identity_of("PYTHON -m http.server"));
+        assert_ne!(
+            identity_of("python script.py"),
+            identity_of("PYTHON -m http.server")
+        );
     }
 }

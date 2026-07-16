@@ -287,7 +287,6 @@ fn merge_configs(base: McpConfigFile, overlay: McpConfigFile) -> McpConfigFile {
     McpConfigFile { servers }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

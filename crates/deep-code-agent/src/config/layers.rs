@@ -429,7 +429,6 @@ fn check_global_key_permissions(path: &Path, warnings: &mut Vec<String>) {
 #[cfg(not(unix))]
 fn check_global_key_permissions(_path: &Path, _warnings: &mut Vec<String>) {}
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -317,7 +317,6 @@ fn collect_skills(workspace: &Path) -> SkillsDoctorReport {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

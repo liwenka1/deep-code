@@ -116,7 +116,10 @@ impl SkillRegistry {
             if is_hidden(&child) {
                 continue;
             }
-            if !fs::metadata(&child).map(|meta| meta.is_dir()).unwrap_or(false) {
+            if !fs::metadata(&child)
+                .map(|meta| meta.is_dir())
+                .unwrap_or(false)
+            {
                 continue;
             }
 
@@ -294,7 +297,12 @@ acting on a skill.\n\n### Available skills\n",
         let row = if summary.is_empty() {
             format!("- {} -> {}\n", skill.name, skill.path.display())
         } else {
-            format!("- {} — {} -> {}\n", skill.name, summary, skill.path.display())
+            format!(
+                "- {} — {} -> {}\n",
+                skill.name,
+                summary,
+                skill.path.display()
+            )
         };
         let cost = row.chars().count();
         if used + cost > INDEX_BUDGET {
@@ -375,7 +383,12 @@ mod tests {
     fn discover_finds_direct_and_nested_skills() {
         let tmp = TempDir::new().unwrap();
         plant_skill(tmp.path(), "top", "top", "sits at the root");
-        plant_skill(&tmp.path().join("vendor").join("acme"), "deep", "deep", "two levels down");
+        plant_skill(
+            &tmp.path().join("vendor").join("acme"),
+            "deep",
+            "deep",
+            "two levels down",
+        );
 
         let registry = SkillRegistry::discover(tmp.path());
         assert_eq!(registry.len(), 2);
@@ -406,7 +419,12 @@ mod tests {
         plant_skill(tmp.path(), "outer", "outer", "the real skill");
         // A SKILL.md nested inside a skill directory is fixture material,
         // not an independently loadable skill.
-        plant_skill(&tmp.path().join("outer"), "fixture", "inner", "must stay invisible");
+        plant_skill(
+            &tmp.path().join("outer"),
+            "fixture",
+            "inner",
+            "must stay invisible",
+        );
 
         let registry = SkillRegistry::discover(tmp.path());
         assert!(registry.get("outer").is_some());
@@ -416,7 +434,12 @@ mod tests {
     #[test]
     fn hidden_directories_are_never_entered() {
         let tmp = TempDir::new().unwrap();
-        plant_skill(&tmp.path().join(".git"), "hooks", "ghost", "inside vcs metadata");
+        plant_skill(
+            &tmp.path().join(".git"),
+            "hooks",
+            "ghost",
+            "inside vcs metadata",
+        );
         plant_skill(tmp.path(), "real", "real", "visible");
 
         let registry = SkillRegistry::discover(tmp.path());
@@ -454,11 +477,22 @@ mod tests {
             within = within.join(format!("lvl{level}"));
         }
         plant_skill(&within, "edge", "edge", "at the limit");
-        plant_skill(&within.join("lvl-extra"), "past", "past", "beyond the limit");
+        plant_skill(
+            &within.join("lvl-extra"),
+            "past",
+            "past",
+            "beyond the limit",
+        );
 
         let registry = SkillRegistry::discover(tmp.path());
-        assert!(registry.get("edge").is_some(), "depth-limit skill must load");
-        assert!(registry.get("past").is_none(), "too-deep skill must not load");
+        assert!(
+            registry.get("edge").is_some(),
+            "depth-limit skill must load"
+        );
+        assert!(
+            registry.get("past").is_none(),
+            "too-deep skill must not load"
+        );
     }
 
     #[cfg(unix)]
@@ -477,7 +511,12 @@ mod tests {
     fn workspace_merge_prefers_the_more_specific_root() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
-        plant_skill(&ws.join("skills"), "dc-test-dup", "dc-test-dup", "from workspace root");
+        plant_skill(
+            &ws.join("skills"),
+            "dc-test-dup",
+            "dc-test-dup",
+            "from workspace root",
+        );
         plant_skill(
             &ws.join(".deep-code").join("skills"),
             "dc-test-dup",
@@ -521,7 +560,15 @@ mod tests {
         let block = render_skills_block(&registry).expect("non-empty registry renders");
         assert!(block.starts_with("## Skills\n"));
         assert!(block.contains("- review — check the diff carefully -> "));
-        assert!(block.contains(&tmp.path().join("review").join("SKILL.md").display().to_string()));
+        assert!(
+            block.contains(
+                &tmp.path()
+                    .join("review")
+                    .join("SKILL.md")
+                    .display()
+                    .to_string()
+            )
+        );
     }
 
     #[test]
@@ -534,8 +581,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         plant_skill(tmp.path(), "wordy", "wordy", &"w".repeat(1_000));
 
-        let block =
-            render_skills_block(&SkillRegistry::discover(tmp.path())).expect("renders");
+        let block = render_skills_block(&SkillRegistry::discover(tmp.path())).expect("renders");
         assert!(block.contains('…'), "clamped text carries an ellipsis");
         assert!(!block.contains(&"w".repeat(DESCRIPTION_BUDGET + 1)));
     }
@@ -549,8 +595,7 @@ mod tests {
             plant_skill(tmp.path(), &name, &name, &filler);
         }
 
-        let block =
-            render_skills_block(&SkillRegistry::discover(tmp.path())).expect("renders");
+        let block = render_skills_block(&SkillRegistry::discover(tmp.path())).expect("renders");
         assert!(block.contains("more skills exist but were left out"));
         assert!(
             block.chars().count() < INDEX_BUDGET + 2_000,
@@ -567,8 +612,7 @@ mod tests {
         fs::create_dir_all(&bad).unwrap();
         fs::write(bad.join("SKILL.md"), "not a skill file").unwrap();
 
-        let block =
-            render_skills_block(&SkillRegistry::discover(tmp.path())).expect("renders");
+        let block = render_skills_block(&SkillRegistry::discover(tmp.path())).expect("renders");
         assert!(block.contains("### Skill load issues"));
     }
 

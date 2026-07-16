@@ -245,7 +245,10 @@ mod tests {
             file: PathBuf::from("a.rs"),
             items: vec![item.clone()],
         };
-        assert!(both.render().contains("mismatched types: E0308 (rust-analyzer)"));
+        assert!(
+            both.render()
+                .contains("mismatched types: E0308 (rust-analyzer)")
+        );
 
         item.source = None;
         let code_only = DiagnosticBlock {
@@ -260,7 +263,11 @@ mod tests {
     fn only_the_first_message_line_survives_rendering() {
         let block = DiagnosticBlock {
             file: PathBuf::from("a.rs"),
-            items: vec![diag(2, Severity::Warning, "unused variable\nnote: prefix with _\nhelp: ...")],
+            items: vec![diag(
+                2,
+                Severity::Warning,
+                "unused variable\nnote: prefix with _\nhelp: ...",
+            )],
         };
         let text = block.render();
         assert!(text.contains("WARNING [2:3] unused variable"));
@@ -308,7 +315,10 @@ mod tests {
                 diag(3, Severity::Warning, "w1"),
             ],
         };
-        assert_eq!(block.compact_summary(), "mixed.rs: 2 error(s), 1 warning(s)");
+        assert_eq!(
+            block.compact_summary(),
+            "mixed.rs: 2 error(s), 1 warning(s)"
+        );
 
         let hints_only = DiagnosticBlock {
             file: PathBuf::from("h.rs"),
@@ -329,6 +339,9 @@ mod tests {
                 items: vec![diag(1, Severity::Warning, "w")],
             },
         ];
-        assert_eq!(summarize_blocks(&blocks), "x.rs: 1 error(s); y.rs: 1 warning(s)");
+        assert_eq!(
+            summarize_blocks(&blocks),
+            "x.rs: 1 error(s); y.rs: 1 warning(s)"
+        );
     }
 }

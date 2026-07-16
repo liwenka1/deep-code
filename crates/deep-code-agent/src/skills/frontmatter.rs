@@ -118,7 +118,8 @@ mod tests {
 
     #[test]
     fn reads_name_description_and_body() {
-        let text = "---\nname: git-bisect\ndescription: Narrow a regression down.\n---\nRun bisect.\n";
+        let text =
+            "---\nname: git-bisect\ndescription: Narrow a regression down.\n---\nRun bisect.\n";
         let parsed = read_skill_file(text).expect("well-formed file parses");
         assert_eq!(parsed.name, "git-bisect");
         assert_eq!(parsed.description, "Narrow a regression down.");

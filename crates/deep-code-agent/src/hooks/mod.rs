@@ -340,7 +340,6 @@ pub fn load_hooks_config() -> HooksConfig {
     HooksConfig::load(&default_hooks_config_path()).unwrap_or_default()
 }
 
-
 #[derive(Debug, thiserror::Error)]
 pub enum HookError {
     #[error("failed to read hooks config at {path}: {message}")]

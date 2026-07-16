@@ -394,7 +394,11 @@ fn decode_publish(message: &Value) -> Option<Publication> {
     for raw in raw_items {
         items.push(decode_diagnostic(&file, raw)?);
     }
-    Some(Publication { file, version, items })
+    Some(Publication {
+        file,
+        version,
+        items,
+    })
 }
 
 fn decode_diagnostic(file: &Path, raw: &Value) -> Option<Diagnostic> {
@@ -467,7 +471,10 @@ mod tests {
     fn decoder_yields_a_complete_frame() {
         let mut decoder = FrameDecoder::default();
         decoder.feed(&frame(r#"{"ok":true}"#));
-        assert_eq!(decoder.next_frame().as_deref(), Some(br#"{"ok":true}"#.as_slice()));
+        assert_eq!(
+            decoder.next_frame().as_deref(),
+            Some(br#"{"ok":true}"#.as_slice())
+        );
         assert!(decoder.next_frame().is_none());
     }
 
@@ -478,7 +485,10 @@ mod tests {
         for (i, byte) in wire.iter().enumerate() {
             decoder.feed(std::slice::from_ref(byte));
             if i + 1 < wire.len() {
-                assert!(decoder.next_frame().is_none(), "premature frame at byte {i}");
+                assert!(
+                    decoder.next_frame().is_none(),
+                    "premature frame at byte {i}"
+                );
             }
         }
         assert_eq!(decoder.next_frame().as_deref(), Some(b"abc".as_slice()));
@@ -538,7 +548,11 @@ mod tests {
         assert_eq!(item.range.start_column, 5);
         assert_eq!(item.range.end_line, 3);
         assert_eq!(item.severity, Severity::Warning);
-        assert_eq!(item.code.as_deref(), Some("42"), "numeric code becomes text");
+        assert_eq!(
+            item.code.as_deref(),
+            Some("42"),
+            "numeric code becomes text"
+        );
         assert_eq!(item.source.as_deref(), Some("rustc"));
     }
 
@@ -602,7 +616,10 @@ mod tests {
         // spawned task must finish the frame anyway.
         let cancelled =
             tokio::time::timeout(Duration::from_millis(5), write_frame(&sink, &message)).await;
-        assert!(cancelled.is_err(), "the blocked write should outlive the timeout");
+        assert!(
+            cancelled.is_err(),
+            "the blocked write should outlive the timeout"
+        );
 
         let mut received = vec![0u8; expected.len()];
         far.read_exact(&mut received).await.unwrap();

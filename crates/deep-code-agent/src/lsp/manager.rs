@@ -194,32 +194,31 @@ impl LspManager {
             self.config.poll_after_edit_ms
         });
 
-        let published = match timeout(budget, transport.diagnostics_for(file, &contents, budget))
-            .await
-        {
-            Ok(Ok(items)) => items,
-            Ok(Err(error)) => {
-                eprintln!(
-                    "lsp: query for {} failed ({error}); the {} server will respawn on demand",
-                    file.display(),
-                    lang.as_key()
-                );
-                // A failed call means the connection itself is gone (dead
-                // process, closed pipes), so evict and let the spawn budget
-                // decide whether a respawn is allowed. A timeout deliberately
-                // does NOT evict: slow is not dead.
-                self.evict(lang).await;
-                return None;
-            }
-            Err(_) => {
-                eprintln!(
-                    "lsp: {} produced no diagnostics within {}ms",
-                    file.display(),
-                    budget.as_millis()
-                );
-                return None;
-            }
-        };
+        let published =
+            match timeout(budget, transport.diagnostics_for(file, &contents, budget)).await {
+                Ok(Ok(items)) => items,
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "lsp: query for {} failed ({error}); the {} server will respawn on demand",
+                        file.display(),
+                        lang.as_key()
+                    );
+                    // A failed call means the connection itself is gone (dead
+                    // process, closed pipes), so evict and let the spawn budget
+                    // decide whether a respawn is allowed. A timeout deliberately
+                    // does NOT evict: slow is not dead.
+                    self.evict(lang).await;
+                    return None;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "lsp: {} produced no diagnostics within {}ms",
+                        file.display(),
+                        budget.as_millis()
+                    );
+                    return None;
+                }
+            };
 
         let kept = self.filter_and_rank(published);
         if kept.is_empty() {
@@ -491,14 +490,16 @@ mod tests {
             Severity::Error,
             "errors rank ahead of warnings"
         );
-        assert_eq!(block.items[1].severity, Severity::Warning, "warning follows");
+        assert_eq!(
+            block.items[1].severity,
+            Severity::Warning,
+            "warning follows"
+        );
     }
 
     #[tokio::test]
     async fn the_per_file_cap_applies_after_ranking() {
-        let mut items: Vec<Diagnostic> = (1..=4)
-            .map(|n| diag(n, Severity::Warning, "w"))
-            .collect();
+        let mut items: Vec<Diagnostic> = (1..=4).map(|n| diag(n, Severity::Warning, "w")).collect();
         items.push(diag(9, Severity::Error, "the real problem"));
         let (dir, manager) = manager_with_stub(
             LspConfig {
@@ -586,7 +587,12 @@ mod tests {
         };
         // More failed attempts than the budget allows for real spawns…
         for _ in 0..4 {
-            assert!(manager.acquire_with(Language::Rust, failing).await.is_none());
+            assert!(
+                manager
+                    .acquire_with(Language::Rust, failing)
+                    .await
+                    .is_none()
+            );
         }
         assert_eq!(attempts.load(Ordering::SeqCst), 4);
 
@@ -595,7 +601,10 @@ mod tests {
             Ok(Arc::new(CannedTransport(Vec::new())) as Arc<dyn LspTransport>)
         };
         assert!(
-            manager.acquire_with(Language::Rust, working).await.is_some(),
+            manager
+                .acquire_with(Language::Rust, working)
+                .await
+                .is_some(),
             "only real spawns may count against the budget"
         );
     }
