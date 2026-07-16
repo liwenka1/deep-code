@@ -45,8 +45,8 @@ impl LaunchedRuntime {
 }
 
 /// Assemble the model-facing tool registry. Workspace and shell tools are L1
-/// (unconditional core); web is L2 (a real capability, kept built-in, with a
-/// runtime gate added later).
+/// (unconditional core); web is L2 — a real capability kept built-in but
+/// gated at runtime (see [`web_enabled`]).
 #[must_use]
 pub fn build_tool_registry(workspace: &Path) -> (ToolRegistry, JobStore) {
     let mut registry = ToolRegistry::with_mock_tools();
@@ -62,8 +62,22 @@ pub fn build_tool_registry(workspace: &Path) -> (ToolRegistry, JobStore) {
         }
         Err(error) => eprintln!("shell tools disabled: {error}"),
     }
-    registry.extend(crate::web_tools::web_tool_registry());
+    if web_enabled() {
+        registry.extend(crate::web_tools::web_tool_registry());
+    }
     (registry, job_store)
+}
+
+/// Whether the L2 web tools (`web_search`, `fetch_url`) are mounted. On by
+/// default; set `DEEP_CODE_DISABLE_WEB=1` (or `true`/`on`) to gate them off,
+/// e.g. for network-restricted or audit-sensitive sessions.
+#[must_use]
+pub fn web_enabled() -> bool {
+    web_enabled_from(std::env::var("DEEP_CODE_DISABLE_WEB").ok().as_deref())
+}
+
+fn web_enabled_from(disable_flag: Option<&str>) -> bool {
+    !matches!(disable_flag, Some("1") | Some("true") | Some("on"))
 }
 
 #[must_use]
@@ -278,4 +292,21 @@ fn attach_workspace_helpers<C: LlmClient + 'static>(
     runtime
         .with_checkpoints(workspace.to_path_buf())
         .with_diagnostics(workspace.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::web_enabled_from;
+
+    #[test]
+    fn web_gate_defaults_on_and_respects_disable_flag() {
+        // Unset or non-truthy values keep web on.
+        assert!(web_enabled_from(None));
+        assert!(web_enabled_from(Some("0")));
+        assert!(web_enabled_from(Some("")));
+        // Explicit truthy disable values gate it off.
+        assert!(!web_enabled_from(Some("1")));
+        assert!(!web_enabled_from(Some("true")));
+        assert!(!web_enabled_from(Some("on")));
+    }
 }
