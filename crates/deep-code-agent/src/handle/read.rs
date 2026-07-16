@@ -50,7 +50,7 @@ impl Tool for HandleReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a bounded projection from a handle returned by sub-agents, RLM sessions, or other large-output tools. Use mode=summary|head|tail|lines|count."
+        "Read a bounded projection from a handle returned by sub-agents or other large-output tools. Use mode=summary|head|tail|lines|count."
     }
 
     fn parameters(&self) -> Value {

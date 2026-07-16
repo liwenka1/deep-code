@@ -1,4 +1,4 @@
-//! Narrow handle store for large sub-agent transcripts and RLM artifacts.
+//! Narrow handle store for large sub-agent transcripts and other artifacts.
 
 mod read;
 mod store;

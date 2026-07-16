@@ -54,8 +54,8 @@ impl PlanModeInterceptor {
     }
 
     /// Tools permitted in plan mode: strictly read-only, no side effects. This
-    /// is deliberately narrower than the policy's read-only set — sub-agents,
-    /// MCP, and RLM-eval are blocked too, since a child or external tool could
+    /// is deliberately narrower than the policy's read-only set — sub-agents
+    /// and MCP tools are blocked too, since a child or external tool could
     /// mutate state the interceptor can't see.
     fn is_read_only(name: &str) -> bool {
         matches!(

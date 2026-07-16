@@ -16,7 +16,6 @@ pub enum ToolKind {
     Mock,
     SubAgent,
     HandleRead,
-    Rlm,
     Mcp,
     Network,
     Unknown,
@@ -134,7 +133,6 @@ impl ExecPolicy {
             "mock_echo" => ToolKind::Mock,
             "agent_open" | "agent_eval" | "agent_close" => ToolKind::SubAgent,
             "handle_read" => ToolKind::HandleRead,
-            "rlm_open" | "rlm_eval" | "rlm_configure" | "rlm_close" => ToolKind::Rlm,
             name if name.starts_with("mcp__") => ToolKind::Mcp,
             _ => ToolKind::Unknown,
         }
@@ -245,29 +243,6 @@ impl ExecPolicy {
                 risk_level: RiskLevel::Low,
                 matched_rule: Some("builtin:handle_read".to_string()),
             },
-            ToolKind::Rlm => {
-                let needs_approval = matches!(tool_name, "rlm_eval");
-                let read_only = matches!(tool_name, "rlm_open" | "rlm_configure" | "rlm_close");
-                ToolExecutionPlan {
-                    verdict: if needs_approval {
-                        PolicyVerdict::NeedsApproval {
-                            reason: "rlm_eval executes analysis code against loaded context"
-                                .to_string(),
-                        }
-                    } else {
-                        PolicyVerdict::Allow
-                    },
-                    requires_approval: needs_approval,
-                    requires_sandbox: needs_approval && self.enable_sandbox,
-                    read_only,
-                    risk_level: if needs_approval {
-                        RiskLevel::Medium
-                    } else {
-                        RiskLevel::Low
-                    },
-                    matched_rule: Some(format!("builtin:{tool_name}")),
-                }
-            }
             ToolKind::Mcp => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {
                     reason: format!("MCP tool '{tool_name}' requires approval"),
@@ -564,13 +539,5 @@ mod tests {
         let plan = policy.evaluate_tool("handle_read", &json!({"handle": "h_x", "mode": "head"}));
         assert_eq!(plan.verdict, PolicyVerdict::Allow);
         assert!(plan.read_only);
-    }
-
-    #[test]
-    fn rlm_eval_requires_approval() {
-        let policy = ExecPolicy::default();
-        let plan = policy.evaluate_tool("rlm_eval", &json!({"name": "ctx", "code": "stats"}));
-        assert!(matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }));
-        assert!(plan.requires_approval);
     }
 }

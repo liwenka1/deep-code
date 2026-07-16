@@ -52,7 +52,6 @@ impl VarHandle {
 #[serde(rename_all = "snake_case")]
 pub enum HandleKind {
     Transcript,
-    RlmResult,
     Artifact,
     Other,
 }
@@ -76,7 +75,7 @@ struct StoredHandle {
     text: String,
 }
 
-/// In-memory handle store for large tool outputs and RLM artifacts.
+/// In-memory handle store for large tool outputs.
 #[derive(Debug, Default)]
 pub struct HandleStore {
     next_id: AtomicU64,
@@ -381,8 +380,8 @@ mod tests {
     fn read_lines_and_count() {
         let mut store = HandleStore::new();
         let summary = store.insert_text(
-            "rlm:out",
-            HandleKind::RlmResult,
+            "out",
+            HandleKind::Transcript,
             "one\ntwo\nthree\n".to_string(),
             Some("sess".to_string()),
         );
@@ -396,12 +395,12 @@ mod tests {
     fn purge_session_removes_owned_handles() {
         let mut store = HandleStore::new();
         let summary = store.insert_text(
-            "rlm:out",
-            HandleKind::RlmResult,
+            "out",
+            HandleKind::Transcript,
             "data".to_string(),
-            Some("rlm_a".to_string()),
+            Some("sess_a".to_string()),
         );
-        assert_eq!(store.purge_session("rlm_a"), 1);
+        assert_eq!(store.purge_session("sess_a"), 1);
         assert!(store.get_summary(&summary.id).is_none());
     }
 }

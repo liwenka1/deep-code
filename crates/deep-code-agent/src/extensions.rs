@@ -9,16 +9,14 @@ use crate::handle::{HandleStore, register_handle_read};
 use crate::hooks::{HookDispatcher, HooksConfig, load_hooks_config};
 use crate::mcp::{McpManager, register_mcp_tools};
 use crate::plan_mode::{PlanMode, PlanModeInterceptor};
-use crate::rlm::{RlmServices, register_rlm_tools};
 use crate::skills::build_system_prompt;
 use crate::subagent::{DEFAULT_MAX_CONCURRENT, SubAgentServices, register_subagent_tools};
 use crate::tool::ToolRegistry;
 
-/// Shared parent-runtime services for handles, sub-agents, RLM, and MCP.
+/// Shared parent-runtime services for handles, sub-agents, and MCP.
 pub struct AgentExtensions<C: LlmClient + Clone + 'static> {
     pub handle_store: Arc<RwLock<HandleStore>>,
     pub subagent: Arc<SubAgentServices<C>>,
-    pub rlm: Arc<RlmServices>,
     pub mcp: Arc<RwLock<McpManager>>,
     pub hooks: Arc<HookDispatcher>,
     pub plan_mode: PlanMode,
@@ -27,9 +25,6 @@ pub struct AgentExtensions<C: LlmClient + Clone + 'static> {
 impl<C: LlmClient + Clone + 'static> AgentExtensions<C> {
     pub fn cancel_all_running(&self) {
         self.subagent.cancel_all_running();
-        if let Ok(mut manager) = self.rlm.manager.write() {
-            manager.close_all();
-        }
     }
 
     #[must_use]
@@ -122,13 +117,9 @@ pub fn attach_agent_extensions<C: LlmClient + Clone + 'static>(
     register_subagent_tools(registry, Arc::clone(&subagent));
     // L3: handle-store read is reducible to files + paginated read_file.
     register_handle_read(registry, Arc::clone(&handle_store));
-    // L3: RLM sessions are expressible with stateless shell + read_file.
-    let rlm = Arc::new(RlmServices::new(Arc::clone(&handle_store), workspace));
-    register_rlm_tools(registry, Arc::clone(&rlm));
     Arc::new(AgentExtensions {
         handle_store,
         subagent,
-        rlm,
         mcp: Arc::clone(&bootstrap.mcp),
         hooks: Arc::clone(&bootstrap.hooks),
         plan_mode: bootstrap.plan_mode.clone(),

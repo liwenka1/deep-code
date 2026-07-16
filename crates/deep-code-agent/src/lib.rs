@@ -23,7 +23,6 @@ mod paths;
 mod plan_mode;
 mod pricing;
 mod reasoning;
-mod rlm;
 mod runtime;
 mod runtime_launch;
 mod sandbox;
@@ -98,10 +97,6 @@ pub use model_registry::{
 pub use plan_mode::{PlanMode, PlanModeInterceptor};
 pub use pricing::{CostCurrency, CostEstimate, PrefixStatus, TurnTelemetry, calculate_turn_cost};
 pub use reasoning::{ReasoningEffort, ReasoningEffortSetting, select_auto_effort};
-pub use rlm::{
-    RLM_TOOL_NAMES, RlmCloseTool, RlmConfig, RlmConfigureTool, RlmEvalTool, RlmManager,
-    RlmOpenTool, RlmServices, RlmSessionInfo, is_rlm_tool, register_rlm_tools,
-};
 pub use runtime::{
     AgentRuntime, AgentRuntimeHandle, RuntimeEvent, RuntimeEventReceiver, ToolCallId, TurnId,
 };
