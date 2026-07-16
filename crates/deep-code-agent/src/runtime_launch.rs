@@ -69,9 +69,9 @@ pub fn build_tool_registry(workspace: &Path) -> (ToolRegistry, JobStore) {
 }
 
 /// Whether the L2 web tools (`web_search`, `fetch_url`) are mounted. On by
-/// default; set `DEEP_CODE_DISABLE_WEB` to any value other than
-/// `0`/`false`/`off`/`no` (case-insensitive) to gate them off, e.g. for
-/// network-restricted or audit-sensitive sessions.
+/// default; set `DEEP_CODE_DISABLE_WEB` to any non-empty value other than
+/// `0`/`false`/`off`/`no` (case-insensitive; blank counts as unset) to gate
+/// them off, e.g. for network-restricted or audit-sensitive sessions.
 #[must_use]
 pub fn web_enabled() -> bool {
     web_enabled_from(
@@ -315,7 +315,42 @@ fn attach_workspace_helpers<C: LlmClient + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use super::web_enabled_from;
+    use super::*;
+    use crate::tool::MockEchoTool;
+
+    /// Tool names in the parent registry built for `client`.
+    fn parent_tool_names<C: LlmClient + Clone + 'static>(
+        client: C,
+        config: &AgentConfig,
+        workspace: &Path,
+    ) -> Vec<String> {
+        let cancel = CancellationToken::new();
+        let (registry, _, _, _, _) =
+            build_parent_tools(Arc::new(client), config, workspace, &cancel);
+        registry.specs().into_iter().map(|spec| spec.name).collect()
+    }
+
+    #[test]
+    fn mock_echo_is_mounted_only_for_the_offline_echo_backend() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = AgentConfig {
+            api_key: Some("test-key".to_string()),
+            ..AgentConfig::builtin()
+        };
+
+        let online = DeepSeekClient::new(config.clone()).expect("client builds without network");
+        let names = parent_tool_names(online, &config, dir.path());
+        assert!(
+            !names.iter().any(|name| name == MockEchoTool::NAME),
+            "online registry must not expose the mock tool: {names:?}"
+        );
+
+        let names = parent_tool_names(EchoClient, &config, dir.path());
+        assert!(
+            names.iter().any(|name| name == MockEchoTool::NAME),
+            "offline echo registry keeps the mock tool: {names:?}"
+        );
+    }
 
     #[test]
     fn web_gate_defaults_on_and_respects_disable_flag() {
