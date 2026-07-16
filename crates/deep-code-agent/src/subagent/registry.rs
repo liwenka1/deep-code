@@ -7,7 +7,6 @@ use tokio_util::sync::CancellationToken;
 use crate::client::LlmClient;
 use crate::config::AgentConfig;
 use crate::execution_policy::ExecPolicy;
-use crate::handle::HandleStore;
 use crate::shell_tools::shell_tool_registry;
 use crate::subagent::roles::{SubAgentRole, build_system_prompt};
 use crate::tool::ToolRegistry;
@@ -31,7 +30,6 @@ pub struct SubAgentServices<C: LlmClient + Clone + 'static> {
     pub agent_config: AgentConfig,
     pub workspace: PathBuf,
     pub parent_cancel: CancellationToken,
-    pub handle_store: Arc<RwLock<HandleStore>>,
     pub agent_cancels: AgentCancelMap,
     pub exec_policy: ExecPolicy,
 }
@@ -44,12 +42,10 @@ impl<C: LlmClient + Clone + 'static> SubAgentServices<C> {
         parent_cancel: CancellationToken,
         max_concurrent: usize,
         exec_policy: ExecPolicy,
-        handle_store: Arc<RwLock<HandleStore>>,
     ) -> Self {
         let manager = Arc::new(RwLock::new(SubAgentManager::new(
             workspace.clone(),
             max_concurrent,
-            Arc::clone(&handle_store),
         )));
         Self {
             manager,
@@ -57,7 +53,6 @@ impl<C: LlmClient + Clone + 'static> SubAgentServices<C> {
             agent_config,
             workspace,
             parent_cancel,
-            handle_store,
             agent_cancels: Arc::new(RwLock::new(HashMap::new())),
             exec_policy,
         }
@@ -114,7 +109,6 @@ pub fn subagent_tool_registry<C: LlmClient + Clone + 'static>(
     workspace: PathBuf,
     parent_cancel: CancellationToken,
 ) -> (ToolRegistry, Arc<SubAgentServices<C>>) {
-    let handle_store = Arc::new(RwLock::new(HandleStore::new()));
     let services = Arc::new(SubAgentServices::new(
         client,
         agent_config,
@@ -122,7 +116,6 @@ pub fn subagent_tool_registry<C: LlmClient + Clone + 'static>(
         parent_cancel,
         super::types::DEFAULT_MAX_CONCURRENT,
         ExecPolicy::default(),
-        handle_store,
     ));
     let mut registry = ToolRegistry::new();
     register_subagent_tools(&mut registry, Arc::clone(&services));

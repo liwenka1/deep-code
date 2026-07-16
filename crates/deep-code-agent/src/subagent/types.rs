@@ -63,8 +63,6 @@ pub struct SubAgentRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured: Option<StructuredReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transcript_handle: Option<crate::handle::HandleId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub fork_context: bool,
     pub started_at_ms: u64,
@@ -103,7 +101,6 @@ pub struct SubAgentSessionProjection {
     pub terminal: bool,
     pub context_mode: String,
     pub fork_context: bool,
-    pub transcript_handle: crate::handle::VarHandle,
     pub snapshot: SubAgentRecord,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub timed_out: bool,

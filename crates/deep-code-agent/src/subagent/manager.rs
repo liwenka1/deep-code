@@ -1,10 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::handle::{HandleKind, HandleStore, VarHandle};
 use crate::subagent::output::parse_structured_report;
 use crate::subagent::types::{
     HARD_MAX_CONCURRENT, SUBAGENT_STATE_FILE, SUBAGENT_STATE_SCHEMA_VERSION, SubAgentError,
@@ -29,16 +27,11 @@ pub struct SubAgentManager {
     max_concurrent: usize,
     pub(crate) session_boot_id: String,
     agents: std::collections::HashMap<String, SubAgentRecord>,
-    handle_store: Arc<RwLock<HandleStore>>,
     state_path: PathBuf,
 }
 
 impl SubAgentManager {
-    pub fn new(
-        workspace: PathBuf,
-        max_concurrent: usize,
-        handle_store: Arc<RwLock<HandleStore>>,
-    ) -> Self {
+    pub fn new(workspace: PathBuf, max_concurrent: usize) -> Self {
         let max_concurrent = max_concurrent.clamp(1, HARD_MAX_CONCURRENT);
         let state_path = default_state_path(&workspace);
         let mut manager = Self {
@@ -46,7 +39,6 @@ impl SubAgentManager {
             max_concurrent,
             session_boot_id: new_boot_id(),
             agents: std::collections::HashMap::new(),
-            handle_store,
             state_path,
         };
         if let Err(error) = manager.load_state() {
@@ -155,20 +147,6 @@ impl SubAgentManager {
         record: &SubAgentRecord,
         timed_out: bool,
     ) -> Result<SubAgentSessionProjection, SubAgentError> {
-        let transcript_handle = record
-            .transcript_handle
-            .as_ref()
-            .and_then(|id| {
-                self.handle_store
-                    .read()
-                    .ok()
-                    .and_then(|store| store.get_summary(id))
-            })
-            .map(|summary| VarHandle::from_summary(&summary, &record.name))
-            .ok_or_else(|| SubAgentError::State {
-                message: format!("missing transcript handle for {}", record.agent_id),
-            })?;
-
         Ok(SubAgentSessionProjection {
             name: record.name.clone(),
             agent_id: record.agent_id.clone(),
@@ -180,55 +158,9 @@ impl SubAgentManager {
                 "fresh".to_string()
             },
             fork_context: record.fork_context,
-            transcript_handle,
             snapshot: record.clone(),
             timed_out,
         })
-    }
-
-    pub fn store_transcript(
-        &self,
-        record: &SubAgentRecord,
-    ) -> Result<crate::handle::HandleSummary, SubAgentError> {
-        let payload = serde_json::json!({
-            "kind": "subagent_session_snapshot",
-            "agent_id": record.agent_id,
-            "name": record.name,
-            "status": record.status.as_str(),
-            "assignment": record.assignment,
-            "result": record.result,
-            "structured": record.structured,
-            "steps_taken": record.steps_taken,
-            "started_at_ms": record.started_at_ms,
-            "finished_at_ms": record.finished_at_ms,
-        });
-        let mut store = self
-            .handle_store
-            .write()
-            .map_err(|error| SubAgentError::State {
-                message: error.to_string(),
-            })?;
-        Ok(store.insert_json_with_owner(
-            format!("agent:{}", record.agent_id),
-            HandleKind::Transcript,
-            payload,
-            Some(record.name.clone()),
-        ))
-    }
-
-    pub fn release_transcript_handles(
-        &mut self,
-        record: &SubAgentRecord,
-    ) -> Result<(), SubAgentError> {
-        if let Ok(mut store) = self.handle_store.write() {
-            store.purge_session(&record.name);
-        }
-        if record.transcript_handle.is_some() {
-            self.update(&record.agent_id, |record| {
-                record.transcript_handle = None;
-            })?;
-        }
-        Ok(())
     }
 
     pub fn finalize_success(
@@ -244,11 +176,6 @@ impl SubAgentManager {
             record.steps_taken = steps_taken;
             record.status = SubAgentStatus::Completed;
             record.finished_at_ms = Some(now_ms());
-        })?;
-        let record = self.get(agent_id).cloned().expect("record exists");
-        let handle = self.store_transcript(&record)?;
-        self.update(agent_id, |record| {
-            record.transcript_handle = Some(handle.id);
         })?;
         self.get(agent_id)
             .cloned()
@@ -268,11 +195,6 @@ impl SubAgentManager {
             record.steps_taken = steps_taken;
             record.status = SubAgentStatus::Failed;
             record.finished_at_ms = Some(now_ms());
-        })?;
-        let record = self.get(agent_id).cloned().expect("record exists");
-        let handle = self.store_transcript(&record)?;
-        self.update(agent_id, |record| {
-            record.transcript_handle = Some(handle.id);
         })?;
         self.get(agent_id)
             .cloned()
@@ -409,8 +331,7 @@ mod tests {
     #[test]
     fn concurrency_limit_blocks_running_agents() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(RwLock::new(HandleStore::new()));
-        let mut manager = SubAgentManager::new(dir.path().to_path_buf(), 1, store);
+        let mut manager = SubAgentManager::new(dir.path().to_path_buf(), 1);
         let boot = manager.session_boot_id.clone();
         let first = SubAgentRecord {
             schema_version: SUBAGENT_STATE_SCHEMA_VERSION,
@@ -421,7 +342,6 @@ mod tests {
             assignment: "task".to_string(),
             result: None,
             structured: None,
-            transcript_handle: None,
             error: None,
             fork_context: false,
             started_at_ms: now_ms(),
@@ -444,11 +364,9 @@ mod tests {
     #[test]
     fn finalize_success_parses_structured_report() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(RwLock::new(HandleStore::new()));
         let mut manager = SubAgentManager::new(
             dir.path().to_path_buf(),
             crate::subagent::types::DEFAULT_MAX_CONCURRENT,
-            store,
         );
         let boot = manager.session_boot_id.clone();
         manager
@@ -461,7 +379,6 @@ mod tests {
                 assignment: "do".to_string(),
                 result: None,
                 structured: None,
-                transcript_handle: None,
                 error: None,
                 fork_context: false,
                 started_at_ms: now_ms(),
@@ -473,49 +390,9 @@ mod tests {
         let text = "### SUMMARY\nDone.\n\n### EVIDENCE\nNone.\n\n### CHANGES\nNone.\n\n### RISKS\nNone observed.\n\n### BLOCKERS\nNone.\n";
         let record = manager.finalize_success("a1", text.to_string(), 1).unwrap();
         assert_eq!(record.status, SubAgentStatus::Completed);
-        assert!(record.transcript_handle.is_some());
         assert!(record.structured.is_some());
         let projection = manager.project(&record, false).unwrap();
-        assert_eq!(projection.transcript_handle.kind, "var_handle");
-        assert_eq!(projection.transcript_handle.session_id, "worker");
-    }
-
-    #[test]
-    fn release_transcript_handles_purges_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(RwLock::new(HandleStore::new()));
-        let mut manager = SubAgentManager::new(
-            dir.path().to_path_buf(),
-            crate::subagent::types::DEFAULT_MAX_CONCURRENT,
-            Arc::clone(&store),
-        );
-        let boot = manager.session_boot_id.clone();
-        manager
-            .insert(SubAgentRecord {
-                schema_version: SUBAGENT_STATE_SCHEMA_VERSION,
-                agent_id: "a1".to_string(),
-                name: "worker".to_string(),
-                role: "general".to_string(),
-                status: SubAgentStatus::Running,
-                assignment: "do".to_string(),
-                result: None,
-                structured: None,
-                transcript_handle: None,
-                error: None,
-                fork_context: false,
-                started_at_ms: now_ms(),
-                finished_at_ms: None,
-                steps_taken: 0,
-                session_boot_id: Some(boot),
-            })
-            .unwrap();
-        let record = manager
-            .finalize_success("a1", "done".to_string(), 1)
-            .unwrap();
-        let handle_id = record.transcript_handle.clone().expect("handle");
-        assert!(store.read().unwrap().get_summary(&handle_id).is_some());
-        manager.release_transcript_handles(&record).unwrap();
-        assert!(store.read().unwrap().get_summary(&handle_id).is_none());
+        assert_eq!(projection.snapshot.name, "worker");
     }
 
     #[test]
@@ -534,7 +411,6 @@ mod tests {
                 assignment: "t".to_string(),
                 result: None,
                 structured: None,
-                transcript_handle: None,
                 error: None,
                 fork_context: false,
                 started_at_ms: n,
@@ -550,8 +426,7 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_string(&payload).unwrap()).unwrap();
 
-        let store = Arc::new(RwLock::new(HandleStore::new()));
-        let manager = SubAgentManager::new(dir.path().to_path_buf(), 10, store);
+        let manager = SubAgentManager::new(dir.path().to_path_buf(), 10);
         // Newest MAX_HISTORY_RECORDS (started 51..=150) kept; oldest 50 dropped.
         assert!(manager.get("a1").is_none(), "oldest must be pruned");
         assert!(manager.get("a50").is_none(), "just past cap must be pruned");
@@ -562,10 +437,8 @@ mod tests {
     #[test]
     fn reload_marks_running_agents_interrupted() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(RwLock::new(HandleStore::new()));
         {
-            let mut manager =
-                SubAgentManager::new(dir.path().to_path_buf(), 10, Arc::clone(&store));
+            let mut manager = SubAgentManager::new(dir.path().to_path_buf(), 10);
             let boot = manager.session_boot_id.clone();
             manager
                 .insert(SubAgentRecord {
@@ -577,7 +450,6 @@ mod tests {
                     assignment: "task".to_string(),
                     result: None,
                     structured: None,
-                    transcript_handle: None,
                     error: None,
                     fork_context: false,
                     started_at_ms: now_ms(),
@@ -587,7 +459,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let reloaded = SubAgentManager::new(dir.path().to_path_buf(), 10, store);
+        let reloaded = SubAgentManager::new(dir.path().to_path_buf(), 10);
         let record = reloaded.get("a1").expect("record");
         assert_eq!(record.status, SubAgentStatus::Interrupted);
     }

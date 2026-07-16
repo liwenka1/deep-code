@@ -109,7 +109,6 @@ pub fn attach_agent_extensions<C: LlmClient + Clone + 'static>(
         parent_cancel,
         DEFAULT_MAX_CONCURRENT,
         exec_policy,
-        Arc::clone(&handle_store),
     ));
     // Capability tiers: L1 = unconditional core, L2 = kept but gated,
     // L3 = reducible to core primitives (slated for removal/reduction).

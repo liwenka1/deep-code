@@ -67,7 +67,7 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentOpenTool<C> {
     }
 
     fn description(&self) -> &str {
-        "Open a named child sub-agent session for focused background work. Returns agent_id, status, and transcript_handle metadata. Use agent_eval to wait/fetch and agent_close to cancel."
+        "Open a named child sub-agent session for focused background work. Returns agent_id and status. Use agent_eval to wait/fetch and agent_close to cancel."
     }
 
     fn parameters(&self) -> Value {
@@ -161,7 +161,6 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentOpenTool<C> {
             assignment: prompt.clone(),
             result: None,
             structured: None,
-            transcript_handle: None,
             error: None,
             fork_context,
             started_at_ms: now_ms(),
@@ -180,13 +179,6 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentOpenTool<C> {
                         message: error.to_string(),
                     })?;
             manager.insert(record.clone()).map_err(tool_error)?;
-            if let Some(stored) = manager.get(&agent_id).cloned()
-                && let Ok(handle) = manager.store_transcript(&stored)
-            {
-                let _ = manager.update(&agent_id, |record| {
-                    record.transcript_handle = Some(handle.id);
-                });
-            }
         }
 
         let services = std::sync::Arc::clone(&self.services);
@@ -228,13 +220,6 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentOpenTool<C> {
                         record.error = Some(message);
                         record.finished_at_ms = Some(now_ms());
                     });
-                    if let Some(record) = manager.get(&spawned_id).cloned() {
-                        let _ = manager.store_transcript(&record).map(|handle| {
-                            let _ = manager.update(&spawned_id, |record| {
-                                record.transcript_handle = Some(handle.id);
-                            });
-                        });
-                    }
                 }
                 Err(message) => {
                     let _ = manager.finalize_failure(&spawned_id, message, 0);
@@ -290,7 +275,7 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentEvalTool<C> {
     }
 
     fn description(&self) -> &str {
-        "Fetch or wait for a child sub-agent session by agent_id or name. Returns the session projection with transcript_handle metadata. Prefer wait=false and poll; blocking wait is capped to avoid stalling the parent loop."
+        "Fetch or wait for a child sub-agent session by agent_id or name. Returns the session projection. Prefer wait=false and poll; blocking wait is capped to avoid stalling the parent loop."
     }
 
     async fn run(&self, params: AgentEvalParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
@@ -416,9 +401,6 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentCloseTool<C> {
                 })?;
         let record = manager.mark_cancelled(&resolved_id).map_err(tool_error)?;
         let projection = manager.project(&record, false).map_err(tool_error)?;
-        manager
-            .release_transcript_handles(&record)
-            .map_err(tool_error)?;
         Ok(ToolOutput::text(
             serde_json::to_string_pretty(&projection).unwrap_or_default(),
         ))

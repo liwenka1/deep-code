@@ -318,13 +318,8 @@ impl App {
         let body = agents
             .iter()
             .map(|agent| {
-                let handle = agent
-                    .transcript_handle
-                    .as_ref()
-                    .map(|id| id.as_str())
-                    .unwrap_or("-");
                 format!(
-                    "- {} [{}] {} | handle={handle} | {}",
+                    "- {} [{}] {} | {}",
                     agent.name,
                     agent.status.as_str(),
                     agent.role,
