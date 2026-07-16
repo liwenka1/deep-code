@@ -44,6 +44,9 @@ impl LaunchedRuntime {
     }
 }
 
+/// Assemble the model-facing tool registry. Workspace and shell tools are L1
+/// (unconditional core); web is L2 (a real capability, kept built-in, with a
+/// runtime gate added later).
 #[must_use]
 pub fn build_tool_registry(workspace: &Path) -> (ToolRegistry, JobStore) {
     let mut registry = ToolRegistry::with_mock_tools();

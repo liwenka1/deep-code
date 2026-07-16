@@ -116,8 +116,13 @@ pub fn attach_agent_extensions<C: LlmClient + Clone + 'static>(
         exec_policy,
         Arc::clone(&handle_store),
     ));
+    // Capability tiers: L1 = unconditional core, L2 = kept but gated,
+    // L3 = reducible to core primitives (slated for removal/reduction).
+    // L2: sub-agents are a deliberate capability; kept.
     register_subagent_tools(registry, Arc::clone(&subagent));
+    // L3: handle-store read is reducible to files + paginated read_file.
     register_handle_read(registry, Arc::clone(&handle_store));
+    // L3: RLM sessions are expressible with stateless shell + read_file.
     let rlm = Arc::new(RlmServices::new(Arc::clone(&handle_store), workspace));
     register_rlm_tools(registry, Arc::clone(&rlm));
     Arc::new(AgentExtensions {
