@@ -58,6 +58,8 @@ deepcode mcp list|validate|reload|enable|disable
 常用项：`provider.model`（`pro`/`flash`/`auto`）、`provider.reasoning_effort`（`off`/`low`/`medium`/`high`/`max`）、`cost.currency`、`approval.auto_allow`（预放行的工具前缀）。
 > API Key 建议放在环境变量或全局配置；项目级配置中的 `api_key` 会被忽略，以防随仓库泄露。
 
+环境变量 `DEEP_CODE_DISABLE_WEB`：设为 `0`/`false`/`off`/`no` 以外的任意值（大小写不敏感）即可关闭联网工具（`web_search`/`fetch_url`），用于断网或审计场景；默认开启。`/status` 会显示当前 `web=on|off`。
+
 ## MCP 扩展
 
 通过 [Model Context Protocol](https://modelcontextprotocol.io) 接入外部工具服务器，
