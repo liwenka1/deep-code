@@ -43,6 +43,10 @@ pub const STREAM_TOTAL_TIMEOUT_ENV: &str = "DEEP_CODE_STREAM_TOTAL_TIMEOUT_SECS"
 pub const STREAM_MAX_BYTES_ENV: &str = "DEEP_CODE_STREAM_MAX_BYTES";
 pub const APPROVAL_AUTO_ALLOW_ENV: &str = "DEEP_CODE_APPROVAL_AUTO_ALLOW";
 pub const CHECKPOINT_MAX_SNAPSHOTS_ENV: &str = "DEEP_CODE_CHECKPOINT_MAX_SNAPSHOTS";
+/// Set to any value other than `0`/`false`/`off`/`no` (case-insensitive) to
+/// gate off the L2 web tools (`web_search`, `fetch_url`). Env-only for now —
+/// not yet a config-file field.
+pub const DISABLE_WEB_ENV: &str = "DEEP_CODE_DISABLE_WEB";
 
 pub const DEFAULT_STREAM_MAX_RETRIES: u32 = 3;
 pub const DEFAULT_STREAM_CHUNK_TIMEOUT_SECS: u64 = 300;

@@ -74,7 +74,11 @@ pub fn build_tool_registry(workspace: &Path) -> (ToolRegistry, JobStore) {
 /// network-restricted or audit-sensitive sessions.
 #[must_use]
 pub fn web_enabled() -> bool {
-    web_enabled_from(std::env::var("DEEP_CODE_DISABLE_WEB").ok().as_deref())
+    web_enabled_from(
+        std::env::var(crate::config::DISABLE_WEB_ENV)
+            .ok()
+            .as_deref(),
+    )
 }
 
 fn web_enabled_from(disable_flag: Option<&str>) -> bool {
