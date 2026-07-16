@@ -1,6 +1,6 @@
 use deep_code_agent::{
     CheckpointId, CheckpointStore, CostCurrency, JsonSessionStore, RuntimeEvent, SessionStore,
-    TurnTelemetry, format_sessions_storage_note,
+    TurnTelemetry, format_sessions_storage_note, web_enabled,
 };
 
 use crate::app::App;
@@ -292,8 +292,9 @@ impl App {
             String::new()
         };
         self.history.push(HistoryCell::system(format!(
-            "Status:\nbackend={}\nsession={session}\ncheckpoint={checkpoint}\nmode={mode}\nconfigured_model={}\nconfigured_reasoning={}\nhistory_cells={}{trimmed}{}",
+            "Status:\nbackend={}\nweb={}\nsession={session}\ncheckpoint={checkpoint}\nmode={mode}\nconfigured_model={}\nconfigured_reasoning={}\nhistory_cells={}{trimmed}{}",
             self.backend_label,
+            if web_enabled() { "on" } else { "off" },
             self.configured_model,
             self.configured_reasoning,
             self.history.len(),

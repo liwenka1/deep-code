@@ -97,7 +97,7 @@ pub use runtime::{
 };
 pub use runtime_launch::{
     DEFAULT_SYSTEM_PROMPT, LaunchedRuntime, build_tool_registry, launch_runtime,
-    runtime_system_prompt,
+    runtime_system_prompt, web_enabled,
 };
 pub use sandbox::{
     SandboxBackend, SandboxCapabilities, SandboxGuard, SandboxManager, SandboxPolicy, capabilities,

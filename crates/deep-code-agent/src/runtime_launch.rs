@@ -49,7 +49,7 @@ impl LaunchedRuntime {
 /// gated at runtime (see [`web_enabled`]).
 #[must_use]
 pub fn build_tool_registry(workspace: &Path) -> (ToolRegistry, JobStore) {
-    let mut registry = ToolRegistry::with_mock_tools();
+    let mut registry = ToolRegistry::new();
     let mut job_store = JobStore::default();
     match workspace_tool_registry(workspace.to_path_buf()) {
         Ok(workspace_tools) => registry.extend(workspace_tools),
@@ -69,15 +69,25 @@ pub fn build_tool_registry(workspace: &Path) -> (ToolRegistry, JobStore) {
 }
 
 /// Whether the L2 web tools (`web_search`, `fetch_url`) are mounted. On by
-/// default; set `DEEP_CODE_DISABLE_WEB=1` (or `true`/`on`) to gate them off,
-/// e.g. for network-restricted or audit-sensitive sessions.
+/// default; set `DEEP_CODE_DISABLE_WEB` to any value other than
+/// `0`/`false`/`off`/`no` (case-insensitive) to gate them off, e.g. for
+/// network-restricted or audit-sensitive sessions.
 #[must_use]
 pub fn web_enabled() -> bool {
     web_enabled_from(std::env::var("DEEP_CODE_DISABLE_WEB").ok().as_deref())
 }
 
 fn web_enabled_from(disable_flag: Option<&str>) -> bool {
-    !matches!(disable_flag, Some("1") | Some("true") | Some("on"))
+    match disable_flag {
+        None => true,
+        // Fail-closed: web stays on only for an explicit "not disabled" value;
+        // any other set value (including a typo) disables it, since this gate
+        // exists for network-restricted / audit sessions.
+        Some(raw) => matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        ),
+    }
 }
 
 #[must_use]
@@ -247,6 +257,11 @@ fn build_parent_tools<C: LlmClient + Clone + 'static>(
 ) {
     let bootstrap = RuntimeBootstrap::load(workspace, None);
     let (mut registry, job_store) = build_tool_registry(workspace);
+    // The mock echo tool only drives the offline echo backend's `/mock-tool`;
+    // it has no place in a real model's tool schema, so mount it only offline.
+    if client.provider_name() == EchoClient::PROVIDER {
+        registry.register(crate::tool::MockEchoTool);
+    }
     let extensions = attach_agent_extensions(
         &mut registry,
         client,
@@ -300,13 +315,19 @@ mod tests {
 
     #[test]
     fn web_gate_defaults_on_and_respects_disable_flag() {
-        // Unset or non-truthy values keep web on.
+        // Unset or explicit "not disabled" values keep web on.
         assert!(web_enabled_from(None));
         assert!(web_enabled_from(Some("0")));
+        assert!(web_enabled_from(Some("false")));
+        assert!(web_enabled_from(Some("  OFF ")));
         assert!(web_enabled_from(Some("")));
-        // Explicit truthy disable values gate it off.
+        // Explicit disable values gate it off, case-insensitively.
         assert!(!web_enabled_from(Some("1")));
         assert!(!web_enabled_from(Some("true")));
+        assert!(!web_enabled_from(Some("TRUE")));
         assert!(!web_enabled_from(Some("on")));
+        assert!(!web_enabled_from(Some("yes")));
+        // Fail-closed: an unrecognized/typo value disables rather than leaks web.
+        assert!(!web_enabled_from(Some("disabel")));
     }
 }

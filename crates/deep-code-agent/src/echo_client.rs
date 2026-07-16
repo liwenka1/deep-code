@@ -17,11 +17,12 @@ pub struct EchoClient;
 
 impl EchoClient {
     pub const MODEL: &'static str = "echo-offline";
+    pub const PROVIDER: &'static str = "echo";
 }
 
 impl LlmClient for EchoClient {
     fn provider_name(&self) -> &'static str {
-        "echo"
+        Self::PROVIDER
     }
 
     fn model(&self) -> &str {
