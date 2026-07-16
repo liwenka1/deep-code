@@ -15,7 +15,6 @@ pub enum ToolKind {
     Job,
     Mock,
     SubAgent,
-    HandleRead,
     Mcp,
     Network,
     Unknown,
@@ -132,7 +131,6 @@ impl ExecPolicy {
             "web_search" | "fetch_url" => ToolKind::Network,
             "mock_echo" => ToolKind::Mock,
             "agent_open" | "agent_eval" | "agent_close" => ToolKind::SubAgent,
-            "handle_read" => ToolKind::HandleRead,
             name if name.starts_with("mcp__") => ToolKind::Mcp,
             _ => ToolKind::Unknown,
         }
@@ -234,14 +232,6 @@ impl ExecPolicy {
                 read_only: true,
                 risk_level: RiskLevel::Low,
                 matched_rule: Some("builtin:subagent_tool".to_string()),
-            },
-            ToolKind::HandleRead => ToolExecutionPlan {
-                verdict: PolicyVerdict::Allow,
-                requires_approval: false,
-                requires_sandbox: false,
-                read_only: true,
-                risk_level: RiskLevel::Low,
-                matched_rule: Some("builtin:handle_read".to_string()),
             },
             ToolKind::Mcp => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {
@@ -531,13 +521,5 @@ mod tests {
         let plan = policy.evaluate_tool("job", &json!({"job_id": "job_1"}));
         assert!(matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }));
         assert_eq!(plan.risk_level, RiskLevel::High);
-    }
-
-    #[test]
-    fn handle_read_is_read_only() {
-        let policy = ExecPolicy::default();
-        let plan = policy.evaluate_tool("handle_read", &json!({"handle": "h_x", "mode": "head"}));
-        assert_eq!(plan.verdict, PolicyVerdict::Allow);
-        assert!(plan.read_only);
     }
 }

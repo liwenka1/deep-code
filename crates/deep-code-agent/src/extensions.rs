@@ -5,7 +5,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::LlmClient;
 use crate::config::AgentConfig;
-use crate::handle::{HandleStore, register_handle_read};
 use crate::hooks::{HookDispatcher, HooksConfig, load_hooks_config};
 use crate::mcp::{McpManager, register_mcp_tools};
 use crate::plan_mode::{PlanMode, PlanModeInterceptor};
@@ -13,9 +12,8 @@ use crate::skills::build_system_prompt;
 use crate::subagent::{DEFAULT_MAX_CONCURRENT, SubAgentServices, register_subagent_tools};
 use crate::tool::ToolRegistry;
 
-/// Shared parent-runtime services for handles, sub-agents, and MCP.
+/// Shared parent-runtime services for sub-agents and MCP.
 pub struct AgentExtensions<C: LlmClient + Clone + 'static> {
-    pub handle_store: Arc<RwLock<HandleStore>>,
     pub subagent: Arc<SubAgentServices<C>>,
     pub mcp: Arc<RwLock<McpManager>>,
     pub hooks: Arc<HookDispatcher>,
@@ -100,7 +98,6 @@ pub fn attach_agent_extensions<C: LlmClient + Clone + 'static>(
     bootstrap: &RuntimeBootstrap,
 ) -> Arc<AgentExtensions<C>> {
     attach_runtime_tools(registry, bootstrap);
-    let handle_store = Arc::new(RwLock::new(HandleStore::new()));
     let exec_policy = registry.policy().clone();
     let subagent = Arc::new(SubAgentServices::new(
         client,
@@ -114,10 +111,7 @@ pub fn attach_agent_extensions<C: LlmClient + Clone + 'static>(
     // L3 = reducible to core primitives (slated for removal/reduction).
     // L2: sub-agents are a deliberate capability; kept.
     register_subagent_tools(registry, Arc::clone(&subagent));
-    // L3: handle-store read is reducible to files + paginated read_file.
-    register_handle_read(registry, Arc::clone(&handle_store));
     Arc::new(AgentExtensions {
-        handle_store,
         subagent,
         mcp: Arc::clone(&bootstrap.mcp),
         hooks: Arc::clone(&bootstrap.hooks),

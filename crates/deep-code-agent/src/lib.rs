@@ -12,7 +12,6 @@ mod error;
 mod event;
 mod execution_policy;
 mod extensions;
-mod handle;
 mod hooks;
 mod lsp;
 mod mcp;
@@ -65,10 +64,6 @@ pub use execution_policy::{
 pub use extensions::{
     AgentExtensions, RuntimeBootstrap, attach_agent_extensions, attach_runtime_tools,
     build_runtime_system_prompt,
-};
-pub use handle::{
-    HANDLE_READ_TOOL, HandleCount, HandleId, HandleKind, HandleReadOutput, HandleReadTool,
-    HandleRecord, HandleStore, HandleSummary, VarHandle, register_handle_read,
 };
 pub use hooks::{
     HookDispatcher, HookError, HookEvent, HookSink, HooksConfig, JsonlHookSink, StdoutHookSink,

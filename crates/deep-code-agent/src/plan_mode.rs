@@ -60,7 +60,7 @@ impl PlanModeInterceptor {
     fn is_read_only(name: &str) -> bool {
         matches!(
             ExecPolicy::classify_tool(name),
-            ToolKind::ReadOnlyFile | ToolKind::Search | ToolKind::HandleRead
+            ToolKind::ReadOnlyFile | ToolKind::Search
         )
     }
 }
@@ -119,10 +119,6 @@ mod tests {
         assert_eq!(interceptor.before_tool(&call("read_file")), ToolGate::Allow);
         assert_eq!(
             interceptor.before_tool(&call("grep_files")),
-            ToolGate::Allow
-        );
-        assert_eq!(
-            interceptor.before_tool(&call("handle_read")),
             ToolGate::Allow
         );
         // Mutating / side-effecting tools are blocked.
