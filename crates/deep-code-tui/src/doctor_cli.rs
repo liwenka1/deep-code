@@ -73,17 +73,6 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
         },
         report.sandbox.detail
     );
-    println!(
-        "  mcp: {} servers (config present={})",
-        report.mcp.servers.len(),
-        report.mcp.present
-    );
-    for server in &report.mcp.servers {
-        println!(
-            "    - {} enabled={} status={} tools={}",
-            server.name, server.enabled, server.status, server.tool_count
-        );
-    }
     println!("  skills: {} loaded", report.skills.total_count);
     println!(
         "  hooks: {} (present={})",

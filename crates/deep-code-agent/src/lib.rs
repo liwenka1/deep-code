@@ -14,7 +14,6 @@ mod execution_policy;
 mod extensions;
 mod hooks;
 mod lsp;
-mod mcp;
 mod message;
 mod model;
 mod model_registry;
@@ -73,12 +72,6 @@ pub use lsp::{
     Diagnostic, DiagnosticBlock, DiagnosticRange, Language, LspConfig, LspManager, LspTransport,
     Severity, StdioLspTransport, detect_language, is_edit_tool, normalize_path, paths_equal,
     render_blocks, summarize_blocks,
-};
-pub use mcp::{
-    InMemoryMcpClient, McpConfigFile, McpError, McpManager, McpServerConfig, McpServerEntry,
-    McpServerStatus, McpServerSummary, McpTransport, McpValidationReport, default_mcp_config_path,
-    is_mcp_tool_name, load_mcp_config, qualify_tool_name, register_mcp_tools, set_server_enabled,
-    workspace_mcp_config_path,
 };
 pub use message::{Message, Role};
 pub use model::{

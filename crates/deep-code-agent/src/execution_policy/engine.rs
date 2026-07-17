@@ -15,7 +15,6 @@ pub enum ToolKind {
     Job,
     Mock,
     SubAgent,
-    Mcp,
     Network,
     Unknown,
 }
@@ -131,7 +130,6 @@ impl ExecPolicy {
             "web_search" | "fetch_url" => ToolKind::Network,
             "mock_echo" => ToolKind::Mock,
             "agent_open" | "agent_eval" | "agent_close" => ToolKind::SubAgent,
-            name if name.starts_with("mcp__") => ToolKind::Mcp,
             _ => ToolKind::Unknown,
         }
     }
@@ -232,16 +230,6 @@ impl ExecPolicy {
                 read_only: true,
                 risk_level: RiskLevel::Low,
                 matched_rule: Some("builtin:subagent_tool".to_string()),
-            },
-            ToolKind::Mcp => ToolExecutionPlan {
-                verdict: PolicyVerdict::NeedsApproval {
-                    reason: format!("MCP tool '{tool_name}' requires approval"),
-                },
-                requires_approval: true,
-                requires_sandbox: false,
-                read_only: false,
-                risk_level: RiskLevel::Medium,
-                matched_rule: Some("builtin:mcp_tool".to_string()),
             },
             ToolKind::Unknown => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {

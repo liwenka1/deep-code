@@ -7,7 +7,6 @@ use serde::Serialize;
 use crate::config::{AgentConfig, ConfigLoadReport, DEEPSEEK_API_KEY_ENV};
 use crate::error::api_key_setup_hint;
 use crate::hooks::default_hooks_config_path;
-use crate::mcp::{McpManager, McpServerStatus, default_mcp_config_path, workspace_mcp_config_path};
 use crate::model_registry::ModelRegistry;
 use crate::paths::home_dir;
 use crate::sandbox::detect_capabilities;
@@ -76,24 +75,6 @@ pub struct SandboxReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct McpServerDoctorEntry {
-    pub name: String,
-    pub enabled: bool,
-    pub status: String,
-    pub detail: String,
-    pub tool_count: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct McpDoctorReport {
-    pub config_path: String,
-    pub workspace_config_path: String,
-    pub present: bool,
-    pub servers: Vec<McpServerDoctorEntry>,
-    pub errors: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SkillsDirectoryReport {
     pub path: String,
     pub present: bool,
@@ -142,7 +123,6 @@ pub struct DoctorReport {
     pub default_model: String,
     pub deepseek: DeepSeekDoctorReport,
     pub sandbox: SandboxReport,
-    pub mcp: McpDoctorReport,
     pub skills: SkillsDoctorReport,
     pub hooks: HooksDoctorReport,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,7 +135,6 @@ impl DoctorReport {
         let config_path = default_config_path();
         let config_present = config_path.is_file();
         let sandbox = detect_capabilities();
-        let mcp = collect_mcp(workspace);
         let skills = collect_skills(workspace);
         let hooks_path = default_hooks_config_path();
         let deepseek = collect_deepseek(config);
@@ -178,7 +157,6 @@ impl DoctorReport {
                 },
                 detail: sandbox.detail,
             },
-            mcp,
             skills,
             hooks: HooksDoctorReport {
                 config_path: hooks_path.display().to_string(),
@@ -251,40 +229,6 @@ fn api_key_report(config: &AgentConfig) -> ApiKeyReport {
     ApiKeyReport { source }
 }
 
-fn collect_mcp(workspace: &Path) -> McpDoctorReport {
-    let global_path = default_mcp_config_path();
-    let workspace_path = workspace_mcp_config_path(workspace);
-    let present = global_path.is_file() || workspace_path.is_file();
-    let manager = McpManager::load_from_workspace(workspace).unwrap_or_default();
-    let report = manager.validate();
-    let servers = report
-        .servers
-        .into_iter()
-        .map(|server| {
-            let (status, detail) = match &server.status {
-                McpServerStatus::Ready => ("ok".to_string(), "ready".to_string()),
-                McpServerStatus::Disabled => ("disabled".to_string(), "disabled".to_string()),
-                McpServerStatus::Failed { error } => ("error".to_string(), error.clone()),
-            };
-            McpServerDoctorEntry {
-                name: server.name,
-                enabled: server.enabled,
-                status,
-                detail,
-                tool_count: server.tool_count,
-            }
-        })
-        .collect();
-
-    McpDoctorReport {
-        config_path: global_path.display().to_string(),
-        workspace_config_path: workspace_path.display().to_string(),
-        present,
-        servers,
-        errors: report.errors,
-    }
-}
-
 fn collect_skills(workspace: &Path) -> SkillsDoctorReport {
     let registry = discover_in_workspace(workspace);
     let dirs = [
@@ -330,7 +274,7 @@ mod tests {
         let json = report.to_json_pretty().unwrap();
         assert!(json.contains("\"version\""));
         assert!(json.contains("\"sandbox\""));
-        assert!(json.contains("\"mcp\""));
+        assert!(json.contains("\"skills\""));
     }
 
     #[test]

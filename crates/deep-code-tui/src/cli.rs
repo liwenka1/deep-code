@@ -44,10 +44,6 @@ pub enum RunMode {
     SessionExport {
         id: String,
     },
-    Mcp {
-        subcommand: String,
-        args: Vec<String>,
-    },
     Eval {
         subset: String,
         split: String,
@@ -83,10 +79,6 @@ pub fn parse_args() -> CliArgs {
         "session" => {
             args.remove(0);
             return parse_session_command(args);
-        }
-        "mcp" => {
-            args.remove(0);
-            return parse_mcp_command(args);
         }
         "doctor" => {
             args.remove(0);
@@ -348,17 +340,6 @@ fn require_value(args: &mut Vec<String>, flag: &str) -> String {
     args.remove(0)
 }
 
-fn parse_mcp_command(mut args: Vec<String>) -> CliArgs {
-    let Some(subcommand) = args.first().cloned() else {
-        eprintln!("Usage: deep-code mcp <list|enable|disable|validate|reload> [server]");
-        std::process::exit(2);
-    };
-    args.remove(0);
-    CliArgs {
-        mode: RunMode::Mcp { subcommand, args },
-    }
-}
-
 fn parse_session_command(mut args: Vec<String>) -> CliArgs {
     let Some(subcommand) = args.first().cloned() else {
         eprintln!("Usage: deep-code session <list|resume|delete|export> [id]");
@@ -476,7 +457,6 @@ pub fn run_session_command(mode: RunMode) -> anyhow::Result<()> {
         RunMode::Tui { .. }
         | RunMode::Doctor { .. }
         | RunMode::Serve { .. }
-        | RunMode::Mcp { .. }
         | RunMode::Eval { .. } => unreachable!("handled by caller"),
     }
     Ok(())
@@ -490,7 +470,6 @@ fn print_usage() {
     eprintln!("  deep-code doctor [--json]");
     eprintln!("  deep-code serve --http [--host HOST] [--port PORT]");
     eprintln!("  deep-code session list|resume|delete|export");
-    eprintln!("  deep-code mcp list|validate|reload|enable|disable");
     eprintln!("  deep-code eval [--subset lite] [--sample N] [--parallel N] [--json] [--markdown]");
 }
 

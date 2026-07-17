@@ -60,44 +60,13 @@ deepcode mcp list|validate|reload|enable|disable
 
 环境变量 `DEEP_CODE_DISABLE_WEB`：设为**非空**且非 `0`/`false`/`off`/`no` 的值（大小写不敏感；空值视为未设置）即可关闭联网工具（`web_search`/`fetch_url`），用于断网或审计场景；默认开启。`/status` 会显示当前 `web=on|off`。
 
-## MCP 扩展
+## 扩展能力(skills + shell)
 
-通过 [Model Context Protocol](https://modelcontextprotocol.io) 接入外部工具服务器，
-无需改动 deep-code 源码即可扩展工具集。
+deep-code **不内置 MCP**。它本来就有 shell,所以扩展能力的方式是**写个脚本/命令 + 一份 `SKILL.md`**:一行摘要注入系统提示、模型按需读取 SKILL.md 正文,再通过 `shell` 工具调用你的脚本。
 
-配置文件（JSON，兼容 Cursor/Claude 的 `mcpServers` 结构）：
-- 全局：`~/.deep-code/mcp.json`
-- 项目：`<workspace>/.deep-code/mcp.json`（同名 server 覆盖全局）
-
-```json
-{
-  "mcpServers": {
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
-      "enabled": true
-    },
-    "my-http-tool": {
-      "transport": "http",
-      "url": "http://127.0.0.1:8080/mcp",
-      "enabled": true
-    }
-  }
-}
-```
-
-- `transport`：`stdio`（默认，需 `command`）或 `http`（需 `url`）；`env` 为传给 stdio 子进程的环境变量。
-- MCP 工具在模型侧以 `mcp__<server>__<tool>` 命名，与内置工具一样受审批门与执行策略约束（不会因是外部工具而绕过）。
-
-管理命令：
-
-```sh
-deepcode mcp list       # 列出已配置的 server 及其工具
-deepcode mcp validate   # 校验配置（stdio 需 command、http 需 url）
-deepcode mcp enable <server>
-deepcode mcp disable <server>
-deepcode mcp reload     # 重新加载配置
-```
+- **发现**:把带 `name`/`description` frontmatter 的 `SKILL.md` 放进 skills 目录(全局 `~/.deep-code/skills/<name>/` 或项目 `<workspace>/.deep-code/skills/<name>/`);其一行摘要常驻提示,正文只在相关时才读入上下文。
+- **执行**:能力就是普通命令(`psql`、`curl`、你自己的脚本……),经 `shell` 工具运行,同样受审批门与执行策略约束。
+- **为什么不做 MCP**:对有 shell 的 agent,shell 就是通用工具协议。一份几十 token 的 SKILL.md 摘要按需加载,比把整套工具 schema 常驻每一轮请求更省上下文,还能用管道(`| head` 等)裁剪结果、只把关键片段带回上下文。确需现成的 MCP 生态 server 时,用支持 MCP 的宿主即可——deep-code 保持精简。
 
 ## 评测(SWE-bench)
 

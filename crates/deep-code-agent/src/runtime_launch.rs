@@ -259,7 +259,7 @@ fn build_parent_tools<C: LlmClient + Clone + 'static>(
     PlanMode,
     Box<dyn Fn() + Send + Sync>,
 ) {
-    let bootstrap = RuntimeBootstrap::load(workspace, None);
+    let bootstrap = RuntimeBootstrap::load(None);
     let (mut registry, job_store) = build_tool_registry(workspace);
     // The mock echo tool only drives the offline echo backend's `/mock-tool`;
     // it has no place in a real model's tool schema, so mount it only offline.

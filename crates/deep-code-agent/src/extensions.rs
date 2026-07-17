@@ -6,16 +6,14 @@ use tokio_util::sync::CancellationToken;
 use crate::client::LlmClient;
 use crate::config::AgentConfig;
 use crate::hooks::{HookDispatcher, HooksConfig, load_hooks_config};
-use crate::mcp::{McpManager, register_mcp_tools};
 use crate::plan_mode::{PlanMode, PlanModeInterceptor};
 use crate::skills::build_system_prompt;
 use crate::subagent::{DEFAULT_MAX_CONCURRENT, SubAgentServices, register_subagent_tools};
 use crate::tool::ToolRegistry;
 
-/// Shared parent-runtime services for sub-agents and MCP.
+/// Shared parent-runtime services for sub-agents.
 pub struct AgentExtensions<C: LlmClient + Clone + 'static> {
     pub subagent: Arc<SubAgentServices<C>>,
-    pub mcp: Arc<RwLock<McpManager>>,
     pub hooks: Arc<HookDispatcher>,
     pub plan_mode: PlanMode,
 }
@@ -34,22 +32,15 @@ impl<C: LlmClient + Clone + 'static> AgentExtensions<C> {
     pub fn plan_mode(&self) -> PlanMode {
         self.plan_mode.clone()
     }
-
-    pub fn reload_mcp(&self, workspace: &Path) -> Result<(), crate::mcp::McpError> {
-        let manager = McpManager::load_from_workspace(workspace)?;
-        *self.mcp.write().expect("mcp lock") = manager;
-        Ok(())
-    }
 }
 
 pub struct RuntimeBootstrap {
     pub hooks: Arc<HookDispatcher>,
-    pub mcp: Arc<RwLock<McpManager>>,
     pub plan_mode: PlanMode,
 }
 
 impl RuntimeBootstrap {
-    pub fn load(workspace: &Path, hooks_config: Option<HooksConfig>) -> Self {
+    pub fn load(hooks_config: Option<HooksConfig>) -> Self {
         let mut dispatcher =
             HookDispatcher::from_config(&hooks_config.unwrap_or_else(load_hooks_config));
         // Plan mode rides the interceptor seam: register its gate now, while the
@@ -58,14 +49,7 @@ impl RuntimeBootstrap {
         let plan_mode = PlanMode::new();
         dispatcher.add_interceptor(Arc::new(PlanModeInterceptor::new(plan_mode.clone())));
         let hooks = Arc::new(dispatcher);
-        let mcp = Arc::new(RwLock::new(
-            McpManager::load_from_workspace(workspace).unwrap_or_default(),
-        ));
-        Self {
-            hooks,
-            mcp,
-            plan_mode,
-        }
+        Self { hooks, plan_mode }
     }
 }
 
@@ -86,7 +70,6 @@ pub fn build_runtime_system_prompt(base: &str, workspace: &Path) -> String {
 
 pub fn attach_runtime_tools(registry: &mut ToolRegistry, bootstrap: &RuntimeBootstrap) {
     registry.set_hooks(Arc::clone(&bootstrap.hooks));
-    register_mcp_tools(registry, Arc::clone(&bootstrap.mcp));
 }
 
 pub fn attach_agent_extensions<C: LlmClient + Clone + 'static>(
@@ -113,7 +96,6 @@ pub fn attach_agent_extensions<C: LlmClient + Clone + 'static>(
     register_subagent_tools(registry, Arc::clone(&subagent));
     Arc::new(AgentExtensions {
         subagent,
-        mcp: Arc::clone(&bootstrap.mcp),
         hooks: Arc::clone(&bootstrap.hooks),
         plan_mode: bootstrap.plan_mode.clone(),
     })
