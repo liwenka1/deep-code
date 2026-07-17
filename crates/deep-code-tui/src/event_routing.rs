@@ -8,6 +8,9 @@ impl App {
     pub(crate) fn apply_runtime_event(&mut self, event: RuntimeEvent) {
         match event {
             RuntimeEvent::TurnStarted { turn_id, .. } => {
+                // Never drop a predecessor that streamed content but missed
+                // its terminal event — flush it into history first.
+                self.flush_active_turn();
                 self.active_turn = Some(ActiveTurn::new(turn_id));
                 self.status = format!("Streaming from {}...", self.backend_label);
             }

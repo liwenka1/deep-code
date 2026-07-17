@@ -422,7 +422,10 @@ impl App {
 
         self.clear_input();
         self.error = None;
-        self.active_turn = None;
+        // A turn that streamed content but never saw its terminal event (e.g.
+        // the stream channel closed mid-approval) would be silently discarded
+        // here; flush it into history like `record_error` does.
+        self.flush_active_turn();
         self.scroll_offset = 0;
         self.approval_scroll_offset = 0;
         self.is_streaming = true;
