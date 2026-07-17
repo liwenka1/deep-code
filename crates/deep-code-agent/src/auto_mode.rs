@@ -1,7 +1,9 @@
 //! Heuristic auto model selection for DeepSeek pro / flash routing.
 
 use crate::config::AgentConfig;
-use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO, ModelRegistry};
+use crate::model_registry::{
+    AUTO_MODEL, DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO, ModelRegistry, ResolutionKind,
+};
 use crate::reasoning::{ReasoningEffort, ReasoningEffortSetting};
 use crate::task_class::{TaskWeight, classify_keyword};
 
@@ -140,6 +142,13 @@ pub fn resolve_turn_route(
             &resolution.resolved_id,
             config.reasoning_effort.resolve(is_subagent, user_prompt),
         );
+        let route_reason = match resolution.kind {
+            ResolutionKind::Passthrough => format!(
+                "固定模型配置：{}（不在目录中，按原样使用）",
+                resolution.resolved_id
+            ),
+            _ => format!("固定模型配置：{}", resolution.resolved_id),
+        };
         return TurnRoute {
             requested_model: config.model.clone(),
             effective_model: resolution.resolved_id.clone(),
@@ -147,10 +156,12 @@ pub fn resolve_turn_route(
             reasoning_setting: config.reasoning_effort,
             effective_effort,
             auto_effort,
-            used_model_fallback: resolution.used_fallback,
-            route_reason: format!("固定模型配置：{}", resolution.resolved_id),
+            // Registry-level default/passthrough is not an API fallback: only
+            // a live pro→flash retry (streaming) may set this flag.
+            used_model_fallback: false,
+            route_reason,
             fallback_reason: None,
-            source: RouteSource::Heuristic,
+            source: RouteSource::HardRule,
         };
     }
 
@@ -293,6 +304,46 @@ mod tests {
         assert_eq!(route.effective_model, DEEPSEEK_V4_PRO);
         assert_eq!(route.effective_effort, ReasoningEffort::Max);
         assert!(route.route_reason.contains("debug"));
+    }
+
+    #[test]
+    fn fixed_model_routes_as_hard_rule_without_fallback_label() {
+        let config = AgentConfig {
+            model: DEEPSEEK_V4_PRO.to_string(),
+            ..AgentConfig::default()
+        };
+        let route = resolve_turn_route(
+            &config,
+            &ModelRegistry::default(),
+            "hello",
+            false,
+            RouteContext::default(),
+        );
+        assert_eq!(route.source, RouteSource::HardRule);
+        assert!(!route.used_model_fallback);
+        assert!(!route.label().contains("fallback"));
+    }
+
+    #[test]
+    fn passthrough_model_is_not_labelled_as_api_fallback() {
+        let config = AgentConfig {
+            model: "deepseek-v9-experimental".to_string(),
+            ..AgentConfig::default()
+        };
+        let route = resolve_turn_route(
+            &config,
+            &ModelRegistry::default(),
+            "hello",
+            false,
+            RouteContext::default(),
+        );
+        assert_eq!(route.effective_model, "deepseek-v9-experimental");
+        assert!(
+            !route.used_model_fallback,
+            "registry passthrough must not masquerade as an API fallback"
+        );
+        assert!(!route.label().contains("fallback"));
+        assert!(route.route_reason.contains("不在目录中"));
     }
 
     #[test]

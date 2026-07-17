@@ -49,6 +49,19 @@ pub struct ModelInfo {
     pub pricing: ModelPricingMeta,
 }
 
+/// How a requested model name mapped to a concrete id. `DefaultApplied` and
+/// `Passthrough` are deliberately distinct: neither is an API-level fallback,
+/// and only `Passthrough` warrants a "unknown model" warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResolutionKind {
+    /// Catalog id, alias, or `auto` — the catalog recognized the name.
+    Resolved,
+    /// Nothing usable requested; the flagship default was applied.
+    DefaultApplied,
+    /// Unrecognized name trusted as-is (may be newer than this binary).
+    Passthrough,
+}
+
 /// Outcome of turning a requested model name into a concrete id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelResolution {
@@ -56,9 +69,8 @@ pub struct ModelResolution {
     pub requested: Option<String>,
     /// The id the runtime should actually use.
     pub resolved_id: String,
-    /// True when the catalog had no say: either nothing was requested (default
-    /// applied) or the name was unrecognized and passed through on trust.
-    pub used_fallback: bool,
+    /// How the catalog arrived at `resolved_id`.
+    pub kind: ResolutionKind,
 }
 
 /// The model catalog. Construct via [`Default`] for the built-in DeepSeek
@@ -101,23 +113,23 @@ impl ModelRegistry {
             return ModelResolution {
                 requested: None,
                 resolved_id: DEEPSEEK_V4_PRO.to_string(),
-                used_fallback: true,
+                kind: ResolutionKind::DefaultApplied,
             };
         };
 
-        let answer = |resolved_id: String, used_fallback: bool| ModelResolution {
+        let answer = |resolved_id: String, kind: ResolutionKind| ModelResolution {
             requested: Some(asked.to_string()),
             resolved_id,
-            used_fallback,
+            kind,
         };
 
         if names_equal(asked, AUTO_MODEL) {
-            return answer(AUTO_MODEL.to_string(), false);
+            return answer(AUTO_MODEL.to_string(), ResolutionKind::Resolved);
         }
         if let Some(entry) = self.entry_matching(asked) {
-            return answer(entry.id.clone(), false);
+            return answer(entry.id.clone(), ResolutionKind::Resolved);
         }
-        answer(asked.trim().to_string(), true)
+        answer(asked.trim().to_string(), ResolutionKind::Passthrough)
     }
 
     /// Catalog metadata for a model id or alias, if it is a known entry.
@@ -208,7 +220,7 @@ mod tests {
         for id in [DEEPSEEK_V4_PRO, DEEPSEEK_V4_FLASH] {
             let resolution = registry.resolve(Some(id));
             assert_eq!(resolution.resolved_id, id);
-            assert!(!resolution.used_fallback);
+            assert_eq!(resolution.kind, ResolutionKind::Resolved);
             assert_eq!(resolution.requested.as_deref(), Some(id));
         }
     }
@@ -219,7 +231,7 @@ mod tests {
         for legacy in ["deepseek-chat", "DeepSeek-Reasoner", "  deepseek-chat "] {
             let resolution = registry.resolve(Some(legacy));
             assert_eq!(resolution.resolved_id, DEEPSEEK_V4_FLASH, "for {legacy:?}");
-            assert!(!resolution.used_fallback);
+            assert_eq!(resolution.kind, ResolutionKind::Resolved);
         }
     }
 
@@ -227,7 +239,7 @@ mod tests {
     fn auto_passes_through_for_the_router() {
         let resolution = ModelRegistry::default().resolve(Some("Auto"));
         assert_eq!(resolution.resolved_id, AUTO_MODEL);
-        assert!(!resolution.used_fallback);
+        assert_eq!(resolution.kind, ResolutionKind::Resolved);
     }
 
     #[test]
@@ -236,7 +248,7 @@ mod tests {
         for request in [None, Some(""), Some("   ")] {
             let resolution = registry.resolve(request);
             assert_eq!(resolution.resolved_id, DEEPSEEK_V4_PRO);
-            assert!(resolution.used_fallback);
+            assert_eq!(resolution.kind, ResolutionKind::DefaultApplied);
         }
     }
 
@@ -244,7 +256,7 @@ mod tests {
     fn unlisted_id_is_trusted_but_flagged() {
         let resolution = ModelRegistry::default().resolve(Some(" experimental-v5 "));
         assert_eq!(resolution.resolved_id, "experimental-v5");
-        assert!(resolution.used_fallback);
+        assert_eq!(resolution.kind, ResolutionKind::Passthrough);
         assert_eq!(resolution.requested.as_deref(), Some(" experimental-v5 "));
     }
 
