@@ -249,13 +249,15 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 self.emit_session_updated(tx).await;
                 self.snapshot_turn("after_turn", tx);
                 let usage = last_usage.clone();
-                let telemetry = self.build_turn_telemetry(
-                    &route,
-                    usage.as_ref(),
-                    prefix_hash,
-                    estimated_context_tokens,
-                    stream_retries,
-                );
+                let telemetry = self
+                    .build_turn_telemetry(
+                        &route,
+                        usage.as_ref(),
+                        prefix_hash,
+                        estimated_context_tokens,
+                        stream_retries,
+                    )
+                    .await;
                 self.finish_turn(usage.clone()).await;
                 emit(
                     tx,

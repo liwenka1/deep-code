@@ -7,7 +7,7 @@ use crate::pricing::{PrefixStatus, TurnTelemetry, calculate_turn_cost};
 use crate::runtime::AgentRuntime;
 
 impl<C: LlmClient + 'static> AgentRuntime<C> {
-    pub(super) fn build_turn_telemetry(
+    pub(super) async fn build_turn_telemetry(
         &self,
         route: &TurnRoute,
         usage: Option<&Usage>,
@@ -20,17 +20,19 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         let cache_hit = usage.prompt_cache_hit_tokens.unwrap_or(0);
         let cache_miss = usage.prompt_cache_miss_tokens.unwrap_or(0);
         let turn_cache_savings = crate::pricing::cache_savings(&route.effective_model, cache_hit);
-        let prior_hash = self
-            .state
-            .try_lock()
-            .ok()
-            .and_then(|state| state.last_prefix_hash);
-        let prefix_status = match prior_hash {
-            None => PrefixStatus::FirstTurn,
-            Some(previous) if previous == prefix_hash => PrefixStatus::Stable,
-            Some(_) => PrefixStatus::Changed,
-        };
-        if let Ok(mut state) = self.state.try_lock() {
+        // Single lock acquisition for the whole read-modify-read: a try_lock
+        // here would silently drop this turn's cost from the session totals
+        // whenever another task holds the state.
+        let (
+            prior_hash,
+            session_cost,
+            session_cache_hit_tokens,
+            session_cache_miss_tokens,
+            session_cache_savings,
+            cascade_triggered,
+        ) = {
+            let mut state = self.state.lock().await;
+            let prior_hash = state.last_prefix_hash;
             state.last_prefix_hash = Some(prefix_hash);
             state.session_cost.usd += turn_cost.usd;
             state.session_cost.cny += turn_cost.cny;
@@ -38,26 +40,20 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             state.session_cache_miss_tokens += u64::from(cache_miss);
             state.session_cache_savings.usd += turn_cache_savings.usd;
             state.session_cache_savings.cny += turn_cache_savings.cny;
-        }
-        let (
-            session_cost,
-            session_cache_hit_tokens,
-            session_cache_miss_tokens,
-            session_cache_savings,
-            cascade_triggered,
-        ) = self
-            .state
-            .try_lock()
-            .map(|state| {
-                (
-                    state.session_cost,
-                    u32::try_from(state.session_cache_hit_tokens).unwrap_or(u32::MAX),
-                    u32::try_from(state.session_cache_miss_tokens).unwrap_or(u32::MAX),
-                    state.session_cache_savings,
-                    state.cascade_triggered_this_turn,
-                )
-            })
-            .unwrap_or((turn_cost, cache_hit, cache_miss, turn_cache_savings, false));
+            (
+                prior_hash,
+                state.session_cost,
+                u32::try_from(state.session_cache_hit_tokens).unwrap_or(u32::MAX),
+                u32::try_from(state.session_cache_miss_tokens).unwrap_or(u32::MAX),
+                state.session_cache_savings,
+                state.cascade_triggered_this_turn,
+            )
+        };
+        let prefix_status = match prior_hash {
+            None => PrefixStatus::FirstTurn,
+            Some(previous) if previous == prefix_hash => PrefixStatus::Stable,
+            Some(_) => PrefixStatus::Changed,
+        };
         let estimated_context_tokens = usage.input_tokens().max(estimated_context_tokens);
         let context_window = context_window_for_model(&route.effective_model);
         let message_estimate = estimated_context_tokens;
