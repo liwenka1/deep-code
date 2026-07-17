@@ -193,6 +193,9 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
     let config = loaded.config;
     let resume = load_resume_record(&options)?;
     let launched = launch_runtime(&config, options.workspace.clone(), resume);
+    for warning in &launched.warnings {
+        eprintln!("warning: {warning}");
+    }
     eprintln!(
         "deep-code runtime API listening on http://{}:{} ({})",
         options.host, options.port, launched.backend_label

@@ -532,8 +532,8 @@ async fn turn_snapshots_emit_checkpoint_events() {
         },
         AgentEvent::Done { usage: None },
     ]]);
-    let runtime =
-        AgentRuntime::new(client, ToolRegistry::default()).with_checkpoints(workspace.path());
+    let runtime = AgentRuntime::new(client, ToolRegistry::default())
+        .with_checkpoints(workspace.path(), &mut Vec::new());
 
     let mut rx = runtime.submit_user("hi").await;
     let events = drain(&mut rx).await;
@@ -571,7 +571,7 @@ async fn persistent_runtime_records_checkpoint_metadata() {
         &crate::config::AgentConfig::builtin(),
     )
     .unwrap()
-    .with_checkpoints(workspace.path());
+    .with_checkpoints(workspace.path(), &mut Vec::new());
     let session_id = runtime.session_id().await.expect("session id");
 
     let mut rx = runtime.submit_user("hi").await;

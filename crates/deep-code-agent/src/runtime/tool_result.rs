@@ -433,9 +433,14 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             {
                 // Should be unreachable: the assistant entry carrying this
                 // call was pushed before the batch ran.
-                eprintln!(
-                    "warn: tool result {} had no pending exchange to attach to",
-                    result.call_id
+                emit(
+                    tx,
+                    RuntimeEvent::Warning {
+                        message: format!(
+                            "tool result {} had no pending exchange to attach to",
+                            result.call_id
+                        ),
+                    },
                 );
             }
             if let Some(turn) = state.current_turn.as_mut() {

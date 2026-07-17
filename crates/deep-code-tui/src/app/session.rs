@@ -2,6 +2,12 @@ use super::*;
 
 impl App {
     pub(crate) fn adopt_runtime(&mut self, launched: LaunchedRuntime) {
+        for warning in &launched.warnings {
+            self.history
+                .push(crate::history::HistoryCell::system(format!(
+                    "警告: {warning}"
+                )));
+        }
         self.runtime = launched.handle;
         self.backend_label = launched.backend_label;
         self.session_id = launched.session_id;

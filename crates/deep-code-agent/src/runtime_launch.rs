@@ -31,6 +31,10 @@ pub struct LaunchedRuntime {
     pub job_store: JobStore,
     pub plan_mode: PlanMode,
     pub stop_hook: Box<dyn Fn() + Send + Sync>,
+    /// Non-fatal launch degradations (persistence unavailable, checkpoints
+    /// disabled, …). The consumer must surface these — the library never
+    /// writes to stderr because a raw-mode TUI may own the screen.
+    pub warnings: Vec<String>,
 }
 
 impl LaunchedRuntime {
@@ -48,19 +52,22 @@ impl LaunchedRuntime {
 /// (unconditional core); web is L2 — a real capability kept built-in but
 /// gated at runtime (see [`web_enabled`]).
 #[must_use]
-pub fn build_tool_registry(workspace: &Path) -> (ToolRegistry, JobStore) {
+pub fn build_tool_registry(
+    workspace: &Path,
+    warnings: &mut Vec<String>,
+) -> (ToolRegistry, JobStore) {
     let mut registry = ToolRegistry::new();
     let mut job_store = JobStore::default();
     match workspace_tool_registry(workspace.to_path_buf()) {
         Ok(workspace_tools) => registry.extend(workspace_tools),
-        Err(error) => eprintln!("workspace tools disabled: {error}"),
+        Err(error) => warnings.push(format!("workspace tools disabled: {error}")),
     }
     match shell_tool_registry(workspace.to_path_buf()) {
         Ok((shell_tools, shell_jobs)) => {
             registry.extend(shell_tools);
             job_store = shell_jobs;
         }
-        Err(error) => eprintln!("shell tools disabled: {error}"),
+        Err(error) => warnings.push(format!("shell tools disabled: {error}")),
     }
     if web_enabled() {
         registry.extend(crate::web_tools::web_tool_registry());
@@ -146,14 +153,20 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
     prompt: &str,
     parent_cancel: &CancellationToken,
 ) -> LaunchedRuntime {
+    let mut warnings = Vec::new();
     let client = Arc::new(client);
-    let (tools, subagent_manager, job_store, plan_mode, shutdown) =
-        build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
+    let (tools, subagent_manager, job_store, plan_mode, shutdown) = build_parent_tools(
+        Arc::clone(&client),
+        config,
+        &workspace,
+        parent_cancel,
+        &mut warnings,
+    );
 
     if let Some((runtime, session_id)) =
         try_persisted_runtime((*client).clone(), tools, workspace.clone(), config, prompt)
     {
-        let runtime = attach_workspace_helpers(runtime, &workspace);
+        let runtime = attach_workspace_helpers(runtime, &workspace, &mut warnings);
         return LaunchedRuntime {
             handle: Arc::new(runtime),
             backend_label,
@@ -162,15 +175,22 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
             job_store,
             plan_mode,
             stop_hook: shutdown,
+            warnings,
         };
     }
 
-    eprintln!("warning: session persistence unavailable; this session will not be saved");
-    let (tools, subagent_manager, job_store, plan_mode, shutdown) =
-        build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
+    warnings.push("session persistence unavailable; this session will not be saved".to_string());
+    let (tools, subagent_manager, job_store, plan_mode, shutdown) = build_parent_tools(
+        Arc::clone(&client),
+        config,
+        &workspace,
+        parent_cancel,
+        &mut warnings,
+    );
     let runtime = attach_workspace_helpers(
         AgentRuntime::with_system_prompt((*client).clone(), tools, prompt, config.clone(), false),
         &workspace,
+        &mut warnings,
     );
     LaunchedRuntime {
         handle: Arc::new(runtime),
@@ -180,6 +200,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
         job_store,
         plan_mode,
         stop_hook: shutdown,
+        warnings,
     }
 }
 
@@ -192,22 +213,33 @@ fn launch_resumed(
     let store = match JsonSessionStore::for_workspace(&workspace) {
         Ok(store) => store,
         Err(error) => {
-            eprintln!("session store unavailable: {error}");
-            return launch_runtime(config, workspace, None);
+            let mut launched = launch_runtime(config, workspace, None);
+            launched
+                .warnings
+                .insert(0, format!("session store unavailable: {error}"));
+            return launched;
         }
     };
+    let mut warnings = Vec::new();
     record.config = ConfigSnapshot::from(config);
     record.touch();
     if let Err(error) = store.save(&record) {
-        eprintln!("failed to refresh session config snapshot: {error}");
+        warnings.push(format!(
+            "failed to refresh session config snapshot: {error}"
+        ));
     }
 
     if config.api_key.is_some()
         && let Ok(client) = DeepSeekClient::new(config.clone())
     {
         let client = Arc::new(client);
-        let (tools, subagent_manager, job_store, plan_mode, shutdown) =
-            build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
+        let (tools, subagent_manager, job_store, plan_mode, shutdown) = build_parent_tools(
+            Arc::clone(&client),
+            config,
+            &workspace,
+            parent_cancel,
+            &mut warnings,
+        );
         let runtime = attach_workspace_helpers(
             AgentRuntime::from_session_record(
                 (*client).clone(),
@@ -217,6 +249,7 @@ fn launch_resumed(
                 config.clone(),
             ),
             &workspace,
+            &mut warnings,
         );
         return LaunchedRuntime {
             handle: Arc::new(runtime),
@@ -226,15 +259,22 @@ fn launch_resumed(
             job_store,
             plan_mode,
             stop_hook: shutdown,
+            warnings,
         };
     }
 
     let client = Arc::new(EchoClient);
-    let (tools, subagent_manager, job_store, plan_mode, shutdown) =
-        build_parent_tools(Arc::clone(&client), config, &workspace, parent_cancel);
+    let (tools, subagent_manager, job_store, plan_mode, shutdown) = build_parent_tools(
+        Arc::clone(&client),
+        config,
+        &workspace,
+        parent_cancel,
+        &mut warnings,
+    );
     let runtime = attach_workspace_helpers(
         AgentRuntime::from_session_record(EchoClient, tools, record.clone(), store, config.clone()),
         &workspace,
+        &mut warnings,
     );
     LaunchedRuntime {
         handle: Arc::new(runtime),
@@ -244,6 +284,7 @@ fn launch_resumed(
         job_store,
         plan_mode,
         stop_hook: shutdown,
+        warnings,
     }
 }
 
@@ -252,6 +293,7 @@ fn build_parent_tools<C: LlmClient + Clone + 'static>(
     config: &AgentConfig,
     workspace: &Path,
     parent_cancel: &CancellationToken,
+    warnings: &mut Vec<String>,
 ) -> (
     ToolRegistry,
     SharedSubAgentManager,
@@ -260,7 +302,7 @@ fn build_parent_tools<C: LlmClient + Clone + 'static>(
     Box<dyn Fn() + Send + Sync>,
 ) {
     let bootstrap = RuntimeBootstrap::load(None);
-    let (mut registry, job_store) = build_tool_registry(workspace);
+    let (mut registry, job_store) = build_tool_registry(workspace, warnings);
     // The mock echo tool only drives the offline echo backend's `/mock-tool`;
     // it has no place in a real model's tool schema, so mount it only offline.
     if client.provider_name() == EchoClient::PROVIDER {
@@ -307,9 +349,10 @@ fn try_persisted_runtime<C: LlmClient + 'static>(
 fn attach_workspace_helpers<C: LlmClient + 'static>(
     runtime: AgentRuntime<C>,
     workspace: &Path,
+    warnings: &mut Vec<String>,
 ) -> AgentRuntime<C> {
     runtime
-        .with_checkpoints(workspace.to_path_buf())
+        .with_checkpoints(workspace.to_path_buf(), warnings)
         .with_diagnostics(workspace.to_path_buf())
 }
 
@@ -325,8 +368,13 @@ mod tests {
         workspace: &Path,
     ) -> Vec<String> {
         let cancel = CancellationToken::new();
-        let (registry, _, _, _, _) =
-            build_parent_tools(Arc::new(client), config, workspace, &cancel);
+        let (registry, _, _, _, _) = build_parent_tools(
+            Arc::new(client),
+            config,
+            workspace,
+            &cancel,
+            &mut Vec::new(),
+        );
         registry.specs().into_iter().map(|spec| spec.name).collect()
     }
 

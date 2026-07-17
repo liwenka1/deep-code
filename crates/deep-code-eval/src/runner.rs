@@ -201,6 +201,9 @@ async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> I
     }
 
     let launched = launch_runtime(&config.agent_config, workspace.path().to_path_buf(), None);
+    for warning in &launched.warnings {
+        eprintln!("warning: {warning}");
+    }
     let receiver = launched.handle.submit_user(instance_prompt(instance)).await;
 
     let outcome = timeout(config.instance_timeout, consume_events(&launched, receiver)).await;

@@ -122,10 +122,9 @@ async fn actor_loop(
             let mut slot = last_error.lock().expect("save error lock poisoned");
             match outcome {
                 Ok(()) => *slot = None,
-                Err(error) => {
-                    eprintln!("session save failed after retries: {error}");
-                    *slot = Some(error.to_string());
-                }
+                // Surfaced to the UI via `SessionUpdated.save_error`; writing
+                // to stderr here would corrupt a raw-mode terminal.
+                Err(error) => *slot = Some(error.to_string()),
             }
         }
         for ack in acks {
@@ -159,11 +158,8 @@ async fn save_with_retry(
                 .filter(|_| matches!(error, crate::session_store::SessionStoreError::Io { .. }))
             {
                 Some(&delay) => {
-                    eprintln!(
-                        "session save failed (attempt {}), retrying in {}ms: {error}",
-                        attempt + 1,
-                        delay.as_millis()
-                    );
+                    // Transient retry, invisible on purpose: only the final
+                    // failure surfaces (via `SessionUpdated.save_error`).
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                 }

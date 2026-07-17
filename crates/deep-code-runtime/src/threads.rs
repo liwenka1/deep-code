@@ -418,6 +418,7 @@ pub fn runtime_event_kind(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::WorkspaceRestored { .. } => "workspace.restored",
         RuntimeEvent::DiagnosticsUpdated { .. } => "diagnostics.updated",
         RuntimeEvent::CompactionApplied { .. } => "compaction.applied",
+        RuntimeEvent::Warning { .. } => "warning",
         RuntimeEvent::Error { .. } => "error",
     }
 }
@@ -452,7 +453,8 @@ fn event_turn_id(event: &RuntimeEvent) -> Option<TurnId> {
         | RuntimeEvent::CompactionApplied { .. }
         | RuntimeEvent::CheckpointCreated { .. }
         | RuntimeEvent::WorkspaceRestored { .. }
-        | RuntimeEvent::DiagnosticsUpdated { .. } => None,
+        | RuntimeEvent::DiagnosticsUpdated { .. }
+        | RuntimeEvent::Warning { .. } => None,
     }
 }
 

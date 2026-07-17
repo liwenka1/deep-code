@@ -11,19 +11,24 @@ use crate::session_store::CheckpointRecord;
 use crate::tool::ToolError;
 
 impl<C: LlmClient + 'static> AgentRuntime<C> {
-    /// Enable automatic before/after turn snapshots for the given workspace root.
+    /// Enable automatic before/after turn snapshots for the given workspace
+    /// root.
     ///
-    /// If checkpoint storage cannot be created, checkpoints stay disabled and the
-    /// runtime is still returned.
+    /// If checkpoint storage cannot be created, checkpoints stay disabled, the
+    /// reason is pushed to `warnings`, and the runtime is still returned.
     #[must_use]
-    pub fn with_checkpoints(mut self, workspace: impl Into<PathBuf>) -> Self {
+    pub fn with_checkpoints(
+        mut self,
+        workspace: impl Into<PathBuf>,
+        warnings: &mut Vec<String>,
+    ) -> Self {
         match CheckpointStore::new(workspace) {
             Ok(store) => {
                 self.checkpoints = Some(Arc::new(
                     store.with_max_snapshots(self.config.checkpoint_max_snapshots),
                 ));
             }
-            Err(error) => eprintln!("checkpoints disabled: {error}"),
+            Err(error) => warnings.push(format!("checkpoints disabled: {error}")),
         }
         self
     }
@@ -61,7 +66,6 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 );
             }
             Err(error) => {
-                eprintln!("checkpoint snapshot '{label}' failed: {error}");
                 emit(
                     tx,
                     RuntimeEvent::Error {

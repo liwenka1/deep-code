@@ -162,6 +162,10 @@ pub enum RuntimeEvent {
     WorkspaceRestored { id: CheckpointId },
     /// Post-edit LSP diagnostics were collected for one or more files.
     DiagnosticsUpdated { summary: String, rendered: String },
+    /// Non-fatal runtime warning for the UI to surface. Never terminal;
+    /// exists so library code never writes to stderr while a raw-mode
+    /// terminal owns the screen.
+    Warning { message: String },
     /// Runtime-level error. Terminal for the current turn.
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]

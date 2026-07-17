@@ -176,6 +176,10 @@ impl App {
                 });
                 self.status = format!("已压缩 {archived_count} 条历史消息");
             }
+            RuntimeEvent::Warning { message } => {
+                self.history
+                    .push(HistoryCell::system(format!("警告: {message}")));
+            }
             RuntimeEvent::TurnFinished { telemetry, .. } => {
                 self.flush_active_turn();
                 self.last_telemetry = telemetry.clone();
