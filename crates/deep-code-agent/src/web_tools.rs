@@ -6,11 +6,14 @@
 //! approval / `auto_allow` are the intended low-friction paths.
 //!
 //! SSRF hardening: loopback, RFC1918, link-local, CGNAT, and their IPv6
-//! equivalents are rejected before the request, and every redirect hop is
-//! re-checked (5 hops max).
+//! equivalents are rejected, and every redirect hop is re-checked (5 hops
+//! max). Validation is connect-time, not just check-time: each hop resolves
+//! the host once, validates every address, then pins the connection to a
+//! validated address via the client's DNS override, so a rebinding DNS server
+//! cannot swap in a private address between check and connect.
 
 use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -67,19 +70,9 @@ impl FetchUrlTool {
                 return Ok(ToolOutput::soft_error(format!("无法解析 URL：{error}")));
             }
         };
-        if let Err(reason) = check_url(&parsed, self.allow_private) {
-            return Ok(ToolOutput::soft_error(reason));
-        }
-
-        let client = match guarded_client(self.allow_private) {
-            Ok(client) => client,
-            Err(error) => return Ok(ToolOutput::soft_error(error)),
-        };
-        let response = match client.get(parsed).send() {
+        let response = match pinned_get(parsed, self.allow_private) {
             Ok(response) => response,
-            Err(error) => {
-                return Ok(ToolOutput::soft_error(format!("请求失败：{error}")));
-            }
+            Err(reason) => return Ok(ToolOutput::soft_error(reason)),
         };
         let status = response.status();
         if !status.is_success() {
@@ -156,15 +149,17 @@ impl WebSearchTool {
             value.clamp(1, MAX_SEARCH_RESULTS)
         });
 
-        let client = match guarded_client(false) {
-            Ok(client) => client,
-            Err(error) => return Ok(ToolOutput::soft_error(error)),
-        };
         let url = format!(
             "https://html.duckduckgo.com/html/?q={}",
             percent_encode(query)
         );
-        let response = match client.get(&url).send() {
+        let parsed = match Url::parse(&url) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return Ok(ToolOutput::soft_error(format!("无法构造搜索 URL：{error}")));
+            }
+        };
+        let response = match pinned_get(parsed, false) {
             Ok(response) => response,
             Err(error) => {
                 return Ok(ToolOutput::soft_error(format!(
@@ -237,52 +232,88 @@ struct SearchResult {
     snippet: String,
 }
 
-fn guarded_client(allow_private: bool) -> Result<Client, String> {
-    let policy = Policy::custom(move |attempt| {
-        if attempt.previous().len() >= MAX_REDIRECTS {
-            return attempt.error("重定向次数超过上限");
+/// GET with manual redirect handling. Each hop's host is resolved and
+/// validated exactly once, and the connection is pinned to the validated
+/// address, closing the check-time/connect-time DNS rebinding gap.
+fn pinned_get(start: Url, allow_private: bool) -> Result<reqwest::blocking::Response, String> {
+    let mut url = start;
+    for _ in 0..=MAX_REDIRECTS {
+        let pin = check_url(&url, allow_private)?;
+        let mut builder = Client::builder()
+            .timeout(FETCH_TIMEOUT)
+            .user_agent(USER_AGENT)
+            .redirect(Policy::none());
+        if let Some(addr) = pin
+            && let Some(host) = url.host_str()
+        {
+            builder = builder.resolve(host, addr);
         }
-        match check_url(attempt.url(), allow_private) {
-            Ok(()) => attempt.follow(),
-            Err(reason) => attempt.error(reason),
+        let client = builder
+            .build()
+            .map_err(|error| format!("初始化 HTTP 客户端失败：{error}"))?;
+        let response = client
+            .get(url.clone())
+            .send()
+            .map_err(|error| format!("请求失败：{error}"))?;
+        if response.status().is_redirection()
+            && let Some(location) = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+        {
+            url = url
+                .join(location)
+                .map_err(|error| format!("重定向地址无效：{error}"))?;
+            continue;
         }
-    });
-    Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .user_agent(USER_AGENT)
-        .redirect(policy)
-        .build()
-        .map_err(|error| format!("初始化 HTTP 客户端失败：{error}"))
+        return Ok(response);
+    }
+    Err("重定向次数超过上限".to_string())
 }
 
 /// Reject non-http(s) schemes and any host that resolves to a non-public
-/// address (SSRF guard). `allow_private` is a test-only escape hatch.
-fn check_url(url: &Url, allow_private: bool) -> Result<(), String> {
+/// address (SSRF guard). For domain hosts, returns the validated address the
+/// caller must pin its connection to; IP-literal hosts involve no DNS and
+/// need no pin. `allow_private` is a test-only escape hatch.
+fn check_url(url: &Url, allow_private: bool) -> Result<Option<SocketAddr>, String> {
     match url.scheme() {
         "http" | "https" => {}
         other => return Err(format!("不支持的协议 '{other}'：仅允许 http/https")),
     }
     let host = url.host_str().ok_or_else(|| "URL 缺少主机名".to_string())?;
     if allow_private {
-        return Ok(());
+        return Ok(None);
+    }
+    // IP-literal host: no resolution happens, so validate the literal directly.
+    if let Ok(ip) = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+    {
+        if !ip_is_public(ip) {
+            return Err(format!(
+                "已拒绝访问 {host}（非公网地址）：内网/回环地址不允许抓取"
+            ));
+        }
+        return Ok(None);
     }
     let port = url.port_or_known_default().unwrap_or(443);
-    let addrs: Vec<IpAddr> = (host, port)
+    let addrs: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
         .map_err(|error| format!("无法解析主机 {host}：{error}"))?
-        .map(|addr| addr.ip())
         .collect();
     if addrs.is_empty() {
         return Err(format!("主机 {host} 没有解析到任何地址"));
     }
-    for ip in addrs {
-        if !ip_is_public(ip) {
+    for addr in &addrs {
+        if !ip_is_public(addr.ip()) {
             return Err(format!(
-                "已拒绝访问 {host}（解析到非公网地址 {ip}）：内网/回环地址不允许抓取"
+                "已拒绝访问 {host}（解析到非公网地址 {}）：内网/回环地址不允许抓取",
+                addr.ip()
             ));
         }
     }
-    Ok(())
+    Ok(Some(addrs[0]))
 }
 
 fn ip_is_public(ip: IpAddr) -> bool {
