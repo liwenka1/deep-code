@@ -54,13 +54,26 @@ pub struct CompactionResult {
 pub fn estimate_token_count(messages: &[Message]) -> u32 {
     let mut cjk = 0usize;
     let mut other = 0usize;
-    for message in messages {
-        for ch in message.content.chars() {
+    let mut tally = |text: &str| {
+        for ch in text.chars() {
             if is_cjk(ch) {
                 cjk += 1;
             } else {
                 other += 1;
             }
+        }
+    };
+    for message in messages {
+        tally(&message.content);
+        // Tool-call arguments and reasoning replay ride the same wire and can
+        // dominate a turn (patch bodies are routinely multi-KB); skipping them
+        // systematically underestimates context and trips compaction late.
+        if let Some(reasoning) = &message.reasoning_content {
+            tally(reasoning);
+        }
+        for call in &message.tool_calls {
+            tally(&call.function.name);
+            tally(&call.function.arguments);
         }
     }
     // CJK ≈ 1 token/char; other text ≈ 4 chars/token.
@@ -298,6 +311,27 @@ mod tests {
             "ASCII should stay ~chars/4, got {ascii_tokens}"
         );
         assert!(cjk_tokens > ascii_tokens);
+    }
+
+    #[test]
+    fn tool_call_arguments_and_reasoning_count_toward_estimate() {
+        let bare = Message::user("hi");
+        let mut with_payload = Message::user("hi");
+        with_payload.reasoning_content = Some("r".repeat(400));
+        with_payload.tool_calls = vec![crate::model::ToolCallPayload {
+            id: "call_1".to_string(),
+            call_type: "function".to_string(),
+            function: crate::model::ToolCallFunctionPayload {
+                name: "apply_patch".to_string(),
+                arguments: "x".repeat(4000),
+            },
+        }];
+        let bare_tokens = estimate_token_count(std::slice::from_ref(&bare));
+        let full_tokens = estimate_token_count(&[with_payload]);
+        assert!(
+            full_tokens >= bare_tokens + 1000,
+            "multi-KB tool arguments must dominate the estimate, got {full_tokens} vs {bare_tokens}"
+        );
     }
 
     #[test]
