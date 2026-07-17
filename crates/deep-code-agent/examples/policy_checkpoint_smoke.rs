@@ -41,7 +41,7 @@ fn main() -> anyhow::Result<()> {
     let store = CheckpointStore::new(&workspace)?;
     let probe = workspace.join(".deep-code-checkpoint-probe.txt");
     fs::write(&probe, "v1")?;
-    let id = store.snapshot("smoke_before")?;
+    let (id, _) = store.snapshot("smoke_before")?;
     fs::write(&probe, "v2")?;
     store.restore(&id)?;
     let restored = fs::read_to_string(&probe)?;

@@ -66,8 +66,9 @@ impl CheckpointStore {
     }
 
     /// Capture a full workspace snapshot under side storage, then prune the
-    /// oldest snapshots beyond the retention cap.
-    pub fn snapshot(&self, label: &str) -> Result<CheckpointId, ToolError> {
+    /// oldest snapshots beyond the retention cap. Returns the id plus any
+    /// non-fatal prune warnings for the caller to surface.
+    pub fn snapshot(&self, label: &str) -> Result<(CheckpointId, Vec<String>), ToolError> {
         let id = format!(
             "{}_{}",
             sanitize_label(label),
@@ -77,32 +78,34 @@ impl CheckpointStore {
         );
         let dest = self.storage_root.join(&id);
         copy_tree(&self.workspace, &dest, true)?;
-        self.prune_old_snapshots();
-        Ok(CheckpointId(id))
+        let prune_warnings = self.prune_old_snapshots();
+        Ok((CheckpointId(id), prune_warnings))
     }
 
     /// Best-effort retention: delete the oldest snapshot directories (by the
     /// trailing millisecond timestamp in their names) beyond `max_snapshots`.
-    /// Failures are logged, never propagated — a full disk must not fail the
-    /// snapshot that just succeeded.
-    fn prune_old_snapshots(&self) {
+    /// Failures are returned as warnings, never propagated — a full disk must
+    /// not fail the snapshot that just succeeded.
+    fn prune_old_snapshots(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
         if self.max_snapshots == 0 {
-            return;
+            return warnings;
         }
         let Ok(mut ids) = self.list() else {
-            return;
+            return warnings;
         };
         if ids.len() <= self.max_snapshots {
-            return;
+            return warnings;
         }
         ids.sort_by_key(|id| snapshot_timestamp(&id.0));
         let excess = ids.len() - self.max_snapshots;
         for id in ids.into_iter().take(excess) {
             let path = self.storage_root.join(&id.0);
             if let Err(error) = fs::remove_dir_all(&path) {
-                eprintln!("checkpoint prune failed for {}: {error}", id.0);
+                warnings.push(format!("checkpoint prune failed for {}: {error}", id.0));
             }
         }
+        warnings
     }
 
     pub fn restore(&self, id: &CheckpointId) -> Result<(), ToolError> {
@@ -310,7 +313,7 @@ mod tests {
         fs::write(&file, "v1").unwrap();
 
         let store = CheckpointStore::new(workspace.path()).unwrap();
-        let id = store.snapshot("before_turn").unwrap();
+        let (id, _) = store.snapshot("before_turn").unwrap();
 
         fs::write(&file, "v2").unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "v2");
@@ -355,7 +358,7 @@ mod tests {
 
         let mut ids = Vec::new();
         for index in 0..5 {
-            ids.push(store.snapshot(&format!("s{index}")).unwrap());
+            ids.push(store.snapshot(&format!("s{index}")).unwrap().0);
             // Distinct millisecond timestamps so retention order is stable.
             std::thread::sleep(std::time::Duration::from_millis(2));
         }

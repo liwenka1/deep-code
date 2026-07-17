@@ -50,13 +50,25 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         self.checkpoints.is_some()
     }
 
-    pub(super) fn snapshot_turn(&self, label: &str, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
+    pub(super) async fn snapshot_turn(
+        &self,
+        label: &str,
+        tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
         let Some(store) = self.checkpoints.as_ref() else {
             return;
         };
-        match store.snapshot(label) {
-            Ok(id) => {
-                self.record_checkpoint(id.clone(), label);
+        // Full workspace copy: run it on the blocking pool so a large repo
+        // can't stall the async executor for the duration of the copy.
+        let store = Arc::clone(store);
+        let owned_label = label.to_string();
+        let outcome = tokio::task::spawn_blocking(move || store.snapshot(&owned_label)).await;
+        match outcome {
+            Ok(Ok((id, prune_warnings))) => {
+                for message in prune_warnings {
+                    emit(tx, RuntimeEvent::Warning { message });
+                }
+                self.record_checkpoint(id.clone(), label).await;
                 emit(
                     tx,
                     RuntimeEvent::CheckpointCreated {
@@ -65,7 +77,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                     },
                 );
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 emit(
                     tx,
                     RuntimeEvent::Error {
@@ -74,23 +86,30 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                     },
                 );
             }
+            Err(join_error) => {
+                emit(
+                    tx,
+                    RuntimeEvent::Error {
+                        turn_id: None,
+                        message: format!("检查点快照失败（{label}）：{join_error}"),
+                    },
+                );
+            }
         }
     }
 
-    fn record_checkpoint(&self, id: CheckpointId, label: &str) {
+    async fn record_checkpoint(&self, id: CheckpointId, label: &str) {
         let Some(persistence) = self.persistence.as_ref() else {
             return;
         };
         let record = CheckpointRecord::new(id, label);
-        match persistence.record.try_lock() {
-            Ok(mut session) => {
-                session.checkpoints.push(record);
-                session.touch();
-            }
-            Err(_) => {
-                eprintln!("session checkpoint metadata skipped: session record is busy");
-                return;
-            }
+        {
+            // A plain lock (not try_lock): losing the race here used to drop
+            // the checkpoint from session metadata, leaving a snapshot on disk
+            // that `/restore` could not list.
+            let mut session = persistence.record.lock().await;
+            session.checkpoints.push(record);
+            session.touch();
         }
         persistence.actor.request_save();
     }

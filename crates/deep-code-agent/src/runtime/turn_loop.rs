@@ -247,7 +247,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 drop(state);
                 self.persist().await;
                 self.emit_session_updated(tx).await;
-                self.snapshot_turn("after_turn", tx);
+                self.snapshot_turn("after_turn", tx).await;
                 let usage = last_usage.clone();
                 let telemetry = self
                     .build_turn_telemetry(

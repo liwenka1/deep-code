@@ -204,7 +204,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         let (turn_id, prompt) = self.current_turn_context().await;
         emit(&tx, RuntimeEvent::TurnStarted { turn_id, prompt });
         self.emit_session_updated(&tx).await;
-        self.snapshot_turn("before_turn", &tx);
+        self.snapshot_turn("before_turn", &tx).await;
         let runtime = self.clone();
         tokio::spawn(async move {
             runtime.run_loop(&tx).await;

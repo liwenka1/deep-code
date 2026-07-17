@@ -423,20 +423,24 @@ impl App {
     }
 
     fn restore_checkpoint(&mut self, id: &str) {
-        let Ok(cwd) = std::env::current_dir() else {
-            self.status = "Cannot resolve workspace for restore.".to_string();
+        // Route through the runtime handle (the one place that owns the
+        // configured checkpoint store) instead of keeping a second
+        // CheckpointStore construction here.
+        let checkpoint_id = CheckpointId(id.to_string());
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.status = "Cannot restore outside the async runtime.".to_string();
             return;
         };
-        let checkpoint_id = CheckpointId(id.to_string());
-        match CheckpointStore::new(cwd) {
-            Ok(store) => match store.restore(&checkpoint_id) {
-                Ok(()) => {
-                    self.last_checkpoint = Some(id.to_string());
-                    self.apply_runtime_event(RuntimeEvent::WorkspaceRestored { id: checkpoint_id });
-                }
-                Err(error) => self.status = format!("Restore failed: {error}"),
-            },
-            Err(error) => self.status = format!("Checkpoints unavailable: {error}"),
+        let runtime = std::sync::Arc::clone(&self.runtime);
+        let result = tokio::task::block_in_place(|| {
+            handle.block_on(runtime.restore_checkpoint(checkpoint_id.clone()))
+        });
+        match result {
+            Ok(()) => {
+                self.last_checkpoint = Some(id.to_string());
+                self.apply_runtime_event(RuntimeEvent::WorkspaceRestored { id: checkpoint_id });
+            }
+            Err(error) => self.status = format!("Restore failed: {error}"),
         }
     }
 }
