@@ -23,7 +23,7 @@ pub const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 
 /// Provider/runtime secrets that live in the parent process environment (the
 /// LLM client reads the API key at startup; the HTTP server reads the auth
-/// token on bind) but that NO spawned subprocess — shell, job, MCP, or LSP —
+/// token on bind) but that NO spawned subprocess — shell, job, or LSP —
 /// needs. Stripping them before spawn keeps an injected or third-party
 /// subprocess from lifting a key straight out of its own environment.
 ///

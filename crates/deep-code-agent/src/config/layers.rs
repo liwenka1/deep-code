@@ -92,7 +92,6 @@ impl AgentConfig {
     /// Load the layered configuration for a workspace:
     /// builtin → global `~/.deep-code/config.toml` → project
     /// `<workspace>/.deep-code/config.toml` (whitelisted) → environment.
-    /// CLI flags are the caller's responsibility, applied after this.
     ///
     /// Never fails: unreadable or invalid layers are skipped with a warning
     /// in the returned report.

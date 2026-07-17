@@ -127,8 +127,8 @@ jobs:
       - name: Start deep-code server
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          # 预放行常用工具,绕过交互式审批(rlm_ 也放行:分析类工具,仍在沙箱内跑)
-          DEEP_CODE_APPROVAL_AUTO_ALLOW: "read_,list_,grep_,write_,apply_,shell,job,fetch_,web_,rlm_"
+          # 预放行常用工具,绕过交互式审批
+          DEEP_CODE_APPROVAL_AUTO_ALLOW: "read_,list_,grep_,write_,apply_,shell,job,fetch_,web_"
         run: |
           # --approval-mode autonomous:漏到 server 的审批直接拒绝并继续,绝不挂起
           deepcode serve --http --port 7878 --auth-token bot-token --approval-mode autonomous &

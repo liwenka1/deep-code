@@ -9,7 +9,7 @@
 - **Auto 路由**：按任务在 `deepseek-v4-pro` / `deepseek-v4-flash` 间自动选模型与 reasoning effort；API 限流/故障时自动降级重试。
 - **会话与回滚**：会话持久化、`-c` 续接、`-r` 选择恢复；每轮 checkpoint 可 `/restore` 回滚。
 - **极简 TUI**：鼠标滚动/划选复制、粘贴折叠、补全菜单、状态行成本与上下文用量。
-- **可扩展**：LSP 诊断、MCP、子代理（sub-agents）。
+- **可扩展**：LSP 诊断、子代理（sub-agents）、skills（`SKILL.md` + shell）。
 
 ## 安装
 
@@ -45,7 +45,6 @@ deepcode doctor [--json] # 环境自检
 deepcode serve --http    # 作为 HTTP 服务运行
 deepcode eval            # SWE-bench 评测 rollout(见下文)
 deepcode session list|resume|delete|export
-deepcode mcp list|validate|reload|enable|disable
 ```
 
 常用 slash 命令：`/help` `/model` `/plan` `/apikey` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy`（`/help` 查看全部与快捷键）。

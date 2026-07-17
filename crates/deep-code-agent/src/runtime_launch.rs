@@ -22,7 +22,7 @@ use crate::workspace_tools::workspace_tool_registry;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are deep-code's coding assistant.";
 
-/// A launched runtime plus cleanup hooks for sub-agents and MCP.
+/// A launched runtime plus cleanup hooks for sub-agents.
 pub struct LaunchedRuntime {
     pub handle: Arc<dyn AgentRuntimeHandle>,
     pub backend_label: String,

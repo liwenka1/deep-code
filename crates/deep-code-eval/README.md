@@ -14,16 +14,16 @@ patch,写出官方格式的 `predictions.json`。
 export DEEPSEEK_API_KEY="sk-..."
 
 # 联调:dev split(23 题)先跑 2 题
-deep-code eval --sample 2
+deepcode eval --sample 2
 
 # dev split 全量(默认 split,便宜、适合迭代)
-deep-code eval
+deepcode eval
 
 # test split(300 题,正式对外数字用这个)
-deep-code eval --split test --parallel 4 --timeout 900
+deepcode eval --split test --parallel 4 --timeout 900
 
 # 输出目录(默认 eval-out/,含 predictions.json + report.json)
-deep-code eval --out my-run
+deepcode eval --out my-run
 ```
 
 ## 官方评分(得出真实 resolved 率)

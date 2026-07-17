@@ -378,7 +378,7 @@ pub trait Tool: Send + Sync + 'static {
 /// Object-safe tool interface the registry stores.
 ///
 /// Every [`Tool`] gets this via the blanket impl. Implement it directly only
-/// for tools whose schema is not known at compile time (MCP dynamic tools).
+/// for tools whose schema is not known at compile time.
 #[async_trait]
 pub trait ErasedTool: Send + Sync {
     fn spec(&self) -> ToolSpec;
