@@ -22,7 +22,6 @@ use deep_code_agent::{
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, oneshot};
-use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::{RUNTIME_TOKEN_ENV, token_matches};
 use crate::threads::{RuntimeEnvelope, RuntimeThread, RuntimeThreadDetail, RuntimeThreadStore};
@@ -147,6 +146,11 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
     );
     if options.auth_token.is_some() {
         eprintln!("auth: bearer token required for /v1/* routes");
+    } else {
+        eprintln!(
+            "警告：未设置 auth token，本机任意进程都可调用 /v1/* 驱动 agent 执行工具。\
+             建议 --auth-token <TOKEN> 或设置 DEEP_CODE_RUNTIME_TOKEN。"
+        );
     }
 
     let threads = RuntimeThreadStore::new();
@@ -196,15 +200,12 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state.clone());
 
+    // Deliberately no CORS layer: the consumers are same-host CLI/CI clients
+    // (curl, the GitHub bot). A permissive CORS policy would let any web page
+    // script drive the local agent when no auth token is configured.
     let app = Router::new()
         .route("/health", get(health))
         .merge(protected)
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
         .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", options.host, options.port)

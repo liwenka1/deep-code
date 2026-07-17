@@ -414,7 +414,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
- "tower-http",
 ]
 
 [[package]]
