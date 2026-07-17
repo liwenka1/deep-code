@@ -318,28 +318,65 @@ fn apply_file_overlay(
             ));
         }
     }
+    // Runtime-behavior knobs below share one rule with provider.timeout_secs:
+    // not project-configurable. A repo's config must not be able to starve
+    // streams, blow up snapshot retention, or flip cost/compaction behavior —
+    // set these globally or via environment instead.
+    let mut reject_project = |field: &str| {
+        report
+            .warnings
+            .push(format!("项目配置中的 {field} 不在白名单内，已忽略"));
+    };
     if let Some(value) = file.cost.auto_cost_saving {
-        config.auto_cost_saving = value;
+        if project {
+            reject_project("cost.auto_cost_saving");
+        } else {
+            config.auto_cost_saving = value;
+        }
     }
 
     if let Some(value) = file.context.compaction_threshold {
-        config.compaction_threshold = Some(value);
+        if project {
+            reject_project("context.compaction_threshold");
+        } else {
+            config.compaction_threshold = Some(value);
+        }
     }
 
     if let Some(value) = file.stream.max_retries {
-        config.stream_max_retries = value;
+        if project {
+            reject_project("stream.max_retries");
+        } else {
+            config.stream_max_retries = value;
+        }
     }
     if let Some(value) = file.stream.chunk_timeout_secs {
-        config.stream_chunk_timeout = Duration::from_secs(value);
+        if project {
+            reject_project("stream.chunk_timeout_secs");
+        } else {
+            config.stream_chunk_timeout = Duration::from_secs(value);
+        }
     }
     if let Some(value) = file.stream.total_timeout_secs {
-        config.stream_total_timeout = Duration::from_secs(value);
+        if project {
+            reject_project("stream.total_timeout_secs");
+        } else {
+            config.stream_total_timeout = Duration::from_secs(value);
+        }
     }
     if let Some(value) = file.stream.max_bytes {
-        config.stream_max_bytes = value;
+        if project {
+            reject_project("stream.max_bytes");
+        } else {
+            config.stream_max_bytes = value;
+        }
     }
     if let Some(value) = file.checkpoints.max_snapshots {
-        config.checkpoint_max_snapshots = value;
+        if project {
+            reject_project("checkpoints.max_snapshots");
+        } else {
+            config.checkpoint_max_snapshots = value;
+        }
     }
 
     if let Some(rules) = &file.approval.auto_allow {
@@ -523,6 +560,55 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("timeout_secs"))
         );
+    }
+
+    #[test]
+    fn project_layer_rejects_runtime_behavior_knobs() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let project = write_config(
+            project_dir.path(),
+            "[cost]\nauto_cost_saving = false\n[context]\ncompaction_threshold = 1\n[stream]\nmax_retries = 0\nchunk_timeout_secs = 1\ntotal_timeout_secs = 1\nmax_bytes = 1\n[checkpoints]\nmax_snapshots = 999\n",
+        );
+
+        let loaded = AgentConfig::load_with(None, Some(project), &no_env);
+        let builtin = AgentConfig::builtin();
+        assert_eq!(loaded.config.auto_cost_saving, builtin.auto_cost_saving);
+        assert_eq!(
+            loaded.config.compaction_threshold,
+            builtin.compaction_threshold
+        );
+        assert_eq!(loaded.config.stream_max_retries, builtin.stream_max_retries);
+        assert_eq!(
+            loaded.config.stream_chunk_timeout,
+            builtin.stream_chunk_timeout
+        );
+        assert_eq!(
+            loaded.config.stream_total_timeout,
+            builtin.stream_total_timeout
+        );
+        assert_eq!(loaded.config.stream_max_bytes, builtin.stream_max_bytes);
+        assert_eq!(
+            loaded.config.checkpoint_max_snapshots,
+            builtin.checkpoint_max_snapshots
+        );
+        for field in [
+            "cost.auto_cost_saving",
+            "context.compaction_threshold",
+            "stream.max_retries",
+            "stream.chunk_timeout_secs",
+            "stream.total_timeout_secs",
+            "stream.max_bytes",
+            "checkpoints.max_snapshots",
+        ] {
+            assert!(
+                loaded
+                    .report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(field)),
+                "missing rejection warning for {field}"
+            );
+        }
     }
 
     #[test]
