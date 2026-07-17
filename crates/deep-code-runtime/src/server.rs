@@ -131,6 +131,59 @@ impl Drop for ActiveTurnLease {
     }
 }
 
+/// Cleanup for an approval parked on a client that may disconnect: if the SSE
+/// stream is dropped while waiting on `/v1/approvals`, remove the stale slot
+/// entry (so later callers get an honest 409 instead of "accepted") and deny
+/// the runtime's pending approval so the turn completes instead of wedging
+/// mid-approval. Disarmed on the normal resume path.
+struct ApprovalSlotGuard {
+    slot: Arc<Mutex<Option<PendingApproval>>>,
+    runtime: Arc<Mutex<LaunchedRuntime>>,
+    call_id: String,
+    armed: bool,
+}
+
+impl ApprovalSlotGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ApprovalSlotGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let slot = Arc::clone(&self.slot);
+        let runtime = Arc::clone(&self.runtime);
+        let call_id = std::mem::take(&mut self.call_id);
+        tokio::spawn(async move {
+            let removed = {
+                let mut slot = slot.lock().await;
+                if slot
+                    .as_ref()
+                    .is_some_and(|pending| pending.request.call_id == call_id)
+                {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            // Only deny if the stale entry was still ours; a no-longer-pending
+            // approval makes this a benign no-op on the runtime side.
+            if removed.is_some() {
+                let runtime = runtime.lock().await;
+                drop(
+                    runtime
+                        .handle
+                        .submit_approval(ApprovalDecision::Denied)
+                        .await,
+                );
+            }
+        });
+    }
+}
+
 pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
     let options = options.resolve_auth_token();
     let loaded = AgentConfig::load(&options.workspace);
@@ -566,6 +619,7 @@ async fn prompt_sse_for_thread(
                             ApprovalDecision::Denied
                         } else {
                             let (tx, rx) = oneshot::channel();
+                            let call_id = request.call_id.clone();
                             {
                                 let mut slot = approval_gate.lock().await;
                                 *slot = Some(PendingApproval {
@@ -575,7 +629,14 @@ async fn prompt_sse_for_thread(
                                     respond: tx,
                                 });
                             }
+                            let mut slot_guard = ApprovalSlotGuard {
+                                slot: approval_gate.clone(),
+                                runtime: runtime.clone(),
+                                call_id,
+                                armed: true,
+                            };
                             let decision = rx.await.unwrap_or(ApprovalDecision::Denied);
+                            slot_guard.disarm();
                             {
                                 let mut slot = approval_gate.lock().await;
                                 *slot = None;
@@ -682,7 +743,13 @@ async fn resolve_pending_approval(
             body.call_id
         )));
     }
-    let _ = pending.respond.send(body.decision.into());
+    if pending.respond.send(body.decision.into()).is_err() {
+        // The prompt stream that parked this approval is gone (client
+        // disconnected); claiming "accepted" would be a lie.
+        return Err(ApiError::conflict(
+            "approval stream disconnected; pending approval is stale",
+        ));
+    }
     Ok(Json(ApprovalResponse {
         accepted: true,
         call_id: body.call_id,
@@ -887,6 +954,43 @@ mod tests {
         unsafe {
             std::env::remove_var(RUNTIME_TOKEN_ENV);
         }
+    }
+
+    #[tokio::test]
+    async fn stale_approval_after_disconnect_returns_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), None);
+        let (tx, rx) = oneshot::channel();
+        // The prompt stream that parked this approval is gone.
+        drop(rx);
+        {
+            let mut slot = state.approval.lock().await;
+            *slot = Some(PendingApproval {
+                request: serde_json::from_value(json!({
+                    "call_id": "call-1",
+                    "tool_name": "shell",
+                    "description": "run",
+                    "arguments": {}
+                }))
+                .unwrap(),
+                thread_id: "thread-1".to_string(),
+                turn_id: None,
+                respond: tx,
+            });
+        }
+        let result = resolve_pending_approval(
+            state,
+            ApprovalRequestBody {
+                call_id: "call-1".to_string(),
+                decision: ApprovalDecisionWire::Approved,
+            },
+            None,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("a dead approval receiver must not be reported as accepted");
+        };
+        assert_eq!(error.status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
