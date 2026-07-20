@@ -13,7 +13,6 @@ pub use policy::SandboxPolicy;
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::OnceLock;
 
 /// Detected sandbox backend for the current platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -112,6 +111,7 @@ impl SandboxManager {
     }
 
     /// Force sandbox on/off for tests.
+    #[cfg(test)]
     #[must_use]
     pub fn force_sandbox(mut self, enabled: Option<bool>) -> Self {
         self.forced = enabled;
@@ -197,14 +197,6 @@ fn bare_shell_command(command: &str, cwd: &Path) -> Command {
     };
     cmd.current_dir(cwd);
     cmd
-}
-
-static CAPABILITIES: OnceLock<SandboxCapabilities> = OnceLock::new();
-
-/// Cached capability probe.
-#[must_use]
-pub fn capabilities() -> &'static SandboxCapabilities {
-    CAPABILITIES.get_or_init(detect_capabilities)
 }
 
 #[cfg(test)]

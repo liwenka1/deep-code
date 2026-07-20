@@ -186,19 +186,6 @@ pub fn resolve_turn_route(
     }
 }
 
-/// Short prompts → Flash; difficulty keywords or long prompts → Pro.
-#[must_use]
-pub fn select_auto_model(input: &str, cost_saving: bool) -> String {
-    select_auto_model_with_reason(input, cost_saving).0
-}
-
-/// Model + human-readable reason for status surfaces (no session context).
-#[must_use]
-pub fn select_auto_model_with_reason(input: &str, cost_saving: bool) -> (String, String) {
-    let (model, reason, _) = classify_model(input, &RouteContext::default(), cost_saving);
-    (model, reason)
-}
-
 /// Flash-first model selection over the shared [`crate::task_class`] table.
 ///
 /// Returns `(model, human-readable reason, source)`. Pro is forced only by hard
@@ -261,26 +248,24 @@ mod tests {
     use super::*;
     use crate::pricing::CostCurrency;
 
+    fn auto_model(input: &str) -> String {
+        classify_model(input, &RouteContext::default(), false).0
+    }
+
     #[test]
     fn short_prompt_routes_to_flash() {
-        assert_eq!(select_auto_model("hello", false), DEEPSEEK_V4_FLASH);
+        assert_eq!(auto_model("hello"), DEEPSEEK_V4_FLASH);
     }
 
     #[test]
     fn debug_routes_to_pro() {
-        assert_eq!(
-            select_auto_model("please debug this error", false),
-            DEEPSEEK_V4_PRO
-        );
+        assert_eq!(auto_model("please debug this error"), DEEPSEEK_V4_PRO);
     }
 
     #[test]
     fn chinese_refactor_routes_to_pro() {
         assert_eq!(
-            select_auto_model(
-                "\u{5e2e}\u{6211}\u{91cd}\u{6784}\u{8fd9}\u{4e2a}\u{6a21}\u{5757}",
-                false
-            ),
+            auto_model("\u{5e2e}\u{6211}\u{91cd}\u{6784}\u{8fd9}\u{4e2a}\u{6a21}\u{5757}"),
             DEEPSEEK_V4_PRO
         );
     }
@@ -474,11 +459,12 @@ mod tests {
 
     #[test]
     fn auto_model_returns_human_readable_reason() {
-        let (model, reason) = select_auto_model_with_reason("please debug this error", false);
+        let (model, reason, _) =
+            classify_model("please debug this error", &RouteContext::default(), false);
         assert_eq!(model, DEEPSEEK_V4_PRO);
         assert!(reason.contains("debug"));
 
-        let (model, reason) = select_auto_model_with_reason("hi", false);
+        let (model, reason, _) = classify_model("hi", &RouteContext::default(), false);
         assert_eq!(model, DEEPSEEK_V4_FLASH);
         assert!(reason.contains("Flash"));
     }

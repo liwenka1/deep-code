@@ -45,11 +45,6 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         store.restore(&id)
     }
 
-    #[must_use]
-    pub fn checkpoints_enabled(&self) -> bool {
-        self.checkpoints.is_some()
-    }
-
     pub(super) async fn snapshot_turn(
         &self,
         label: &str,

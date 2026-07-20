@@ -15,26 +15,6 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         self
     }
 
-    /// Enable post-edit LSP diagnostics with explicit config.
-    #[must_use]
-    pub fn with_diagnostics_config(
-        mut self,
-        workspace: impl Into<PathBuf>,
-        config: LspConfig,
-    ) -> Self {
-        let workspace = workspace.into();
-        self.workspace = Some(workspace.clone());
-        self.lsp = Some(Arc::new(LspManager::new(config, workspace)));
-        self
-    }
-
-    #[must_use]
-    pub fn diagnostics_enabled(&self) -> bool {
-        self.lsp
-            .as_ref()
-            .is_some_and(|manager| manager.config().enabled)
-    }
-
     #[cfg(test)]
     #[must_use]
     pub fn with_lsp_manager(mut self, workspace: PathBuf, manager: LspManager) -> Self {

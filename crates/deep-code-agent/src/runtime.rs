@@ -109,16 +109,6 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         config: AgentConfig,
         is_subagent: bool,
     ) -> Self {
-        Self::with_system_prompt_flags(client, tools, system, config, is_subagent)
-    }
-
-    fn with_system_prompt_flags(
-        client: C,
-        tools: ToolRegistry,
-        system: impl Into<String>,
-        config: AgentConfig,
-        is_subagent: bool,
-    ) -> Self {
         let mut session = Session::new();
         let system_text = system.into();
         if !system_text.is_empty() {

@@ -66,15 +66,10 @@ impl ToolExecutionPlan {
 ///
 /// Shell-command gating is layered and tighten-only: the built-in structured
 /// deny rules ([`shell_deny::builtin_deny`]) always run and cannot be removed
-/// by configuration. Project/user layers may contribute `extra_denied_prefixes`
-/// (which add denials) and `trusted_shell_prefixes` (which grant auto-approval),
-/// but a trusted prefix can never override a deny — deny is evaluated first.
+/// by configuration. A `trusted_shell_prefix` grants auto-approval, but can
+/// never override a deny — deny is evaluated first.
 #[derive(Debug, Clone)]
 pub struct ExecPolicy {
-    /// Extra deny prefixes contributed by project/user layers, matched at
-    /// word boundary against each command segment. The built-in structured
-    /// deny always runs regardless of this list.
-    extra_denied_prefixes: Vec<String>,
     /// Auto-approve rules, matched by command identity (`git status` covers
     /// `git status -s` but not `git push`).
     trusted_shell_prefixes: Vec<String>,
@@ -84,7 +79,6 @@ pub struct ExecPolicy {
 impl Default for ExecPolicy {
     fn default() -> Self {
         Self {
-            extra_denied_prefixes: Vec::new(),
             trusted_shell_prefixes: vec![
                 "git status".to_string(),
                 "git diff".to_string(),
@@ -109,14 +103,6 @@ impl ExecPolicy {
     #[must_use]
     pub fn with_sandbox(mut self, enabled: bool) -> Self {
         self.enable_sandbox = enabled;
-        self
-    }
-
-    /// Add extra deny prefixes (project/user layer). These tighten the policy;
-    /// the built-in structured deny rules remain in force either way.
-    #[must_use]
-    pub fn with_denied_shell_prefixes(mut self, prefixes: Vec<String>) -> Self {
-        self.extra_denied_prefixes = prefixes;
         self
     }
 
@@ -261,33 +247,9 @@ pub fn evaluate_shell_command(policy: &ExecPolicy, command: &str) -> ToolExecuti
         };
     }
 
-    // 2. Extra deny prefixes from project/user layers, matched at word
-    //    boundary against every segment (so `foo` denies `foo --bar` but not
-    //    `foobar`, and chaining cannot smuggle a denied segment past it).
     let segments = shell_deny::segments(command);
-    for prefix in &policy.extra_denied_prefixes {
-        let needle = prefix.trim().to_ascii_lowercase();
-        if needle.is_empty() {
-            continue;
-        }
-        if segments
-            .iter()
-            .any(|segment| segment_matches_prefix(segment, &needle))
-        {
-            return ToolExecutionPlan {
-                verdict: PolicyVerdict::Deny {
-                    reason: format!("shell command denied by policy rule: {prefix}"),
-                },
-                requires_approval: false,
-                requires_sandbox: false,
-                read_only: false,
-                risk_level: RiskLevel::High,
-                matched_rule: Some(format!("deny:{prefix}")),
-            };
-        }
-    }
 
-    // 3. Auto-trust only if EVERY segment is covered by a trusted rule
+    // 2. Auto-trust only if EVERY segment is covered by a trusted rule
     //    (identity-matched, so flags vary but subcommands don't) and the
     //    command has no redirection or command substitution — those can write
     //    files or run sub-commands a trusted prefix doesn't cover.
@@ -310,7 +272,7 @@ pub fn evaluate_shell_command(policy: &ExecPolicy, command: &str) -> ToolExecuti
         };
     }
 
-    // 4. Anything else needs explicit user approval.
+    // 3. Anything else needs explicit user approval.
     ToolExecutionPlan {
         verdict: PolicyVerdict::NeedsApproval {
             reason: "shell commands can modify files, run code, or access the network".to_string(),
@@ -321,19 +283,6 @@ pub fn evaluate_shell_command(policy: &ExecPolicy, command: &str) -> ToolExecuti
         risk_level: RiskLevel::High,
         matched_rule: Some("builtin:shell_default".to_string()),
     }
-}
-
-/// Word-boundary prefix match of a deny needle against one command segment.
-fn segment_matches_prefix(segment: &str, needle: &str) -> bool {
-    let normalized: String = segment
-        .trim()
-        .to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    normalized == needle
-        || (normalized.starts_with(needle)
-            && normalized.as_bytes().get(needle.len()) == Some(&b' '))
 }
 
 /// True if the command contains shell redirection or command substitution,
@@ -443,26 +392,6 @@ mod tests {
         assert!(matches!(
             evaluate_shell_command(&policy, "git status && python deploy.py").verdict,
             PolicyVerdict::NeedsApproval { .. }
-        ));
-    }
-
-    #[test]
-    fn extra_denied_prefix_from_layer_tightens_policy() {
-        let policy =
-            ExecPolicy::default().with_denied_shell_prefixes(vec!["kubectl delete".to_string()]);
-        // Added deny matches at word boundary, even when chained.
-        assert!(matches!(
-            evaluate_shell_command(&policy, "kubectl delete pod x").verdict,
-            PolicyVerdict::Deny { .. }
-        ));
-        assert!(matches!(
-            evaluate_shell_command(&policy, "echo hi; kubectl delete ns prod").verdict,
-            PolicyVerdict::Deny { .. }
-        ));
-        // Non-matching kubectl subcommand is unaffected by the deny.
-        assert!(!matches!(
-            evaluate_shell_command(&policy, "kubectl get pods").verdict,
-            PolicyVerdict::Deny { .. }
         ));
     }
 

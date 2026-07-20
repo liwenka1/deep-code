@@ -7,9 +7,7 @@ mod write;
 use std::env;
 use std::time::Duration;
 
-pub use layers::{
-    ConfigLayer, ConfigLayerStatus, ConfigLoadReport, ConfigSources, LoadedAgentConfig,
-};
+pub use layers::{ConfigLayer, ConfigLoadReport, ConfigSources, LoadedAgentConfig};
 pub use write::{GlobalConfigUpdate, validate_api_key, write_global_config_update};
 
 use crate::error::{AgentError, AgentResult};
@@ -17,7 +15,6 @@ use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_PRO};
 use crate::pricing::CostCurrency;
 use crate::reasoning::ReasoningEffortSetting;
 
-pub const DEFAULT_DEEPSEEK_MODEL: &str = DEEPSEEK_V4_PRO;
 pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/beta";
 pub const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 

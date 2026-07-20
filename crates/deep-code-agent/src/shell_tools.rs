@@ -13,6 +13,7 @@ use serde_json::json;
 use crate::sandbox::SandboxManager;
 use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, ToolUpdate};
 use crate::workspace_policy::{WorkspacePolicy, invalid};
+#[allow(unused_imports)]
 pub use jobs::{BackgroundJobSummary, JobStore};
 use jobs::{
     ChunkFn, JobKind, JobState, JobStatus, SharedBuffer, cancel_job, job_details,
@@ -61,6 +62,7 @@ impl ShellTools {
         })
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn with_sandbox(mut self, sandbox: SandboxManager) -> Self {
         self.sandbox = sandbox;

@@ -81,7 +81,9 @@ pub fn register_subagent_tools<C: LlmClient + Clone + 'static>(
     registry.register(AgentCloseTool::new(services));
 }
 
-/// Attach sub-agent tools to an existing parent registry.
+/// Attach sub-agent tools to an existing parent registry. Test-only: the
+/// production path goes through [`crate::extensions::attach_agent_extensions`].
+#[cfg(test)]
 pub fn attach_subagent_tools<C: LlmClient + Clone + 'static>(
     registry: &mut ToolRegistry,
     client: Arc<C>,
@@ -101,25 +103,6 @@ pub fn attach_subagent_tools<C: LlmClient + Clone + 'static>(
         )
         .subagent,
     )
-}
-
-pub fn subagent_tool_registry<C: LlmClient + Clone + 'static>(
-    client: Arc<C>,
-    agent_config: AgentConfig,
-    workspace: PathBuf,
-    parent_cancel: CancellationToken,
-) -> (ToolRegistry, Arc<SubAgentServices<C>>) {
-    let services = Arc::new(SubAgentServices::new(
-        client,
-        agent_config,
-        workspace,
-        parent_cancel,
-        super::types::DEFAULT_MAX_CONCURRENT,
-        ExecPolicy::default(),
-    ));
-    let mut registry = ToolRegistry::new();
-    register_subagent_tools(&mut registry, Arc::clone(&services));
-    (registry, services)
 }
 
 /// Build a child tool registry filtered by role (no recursive sub-agent tools).

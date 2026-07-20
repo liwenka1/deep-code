@@ -14,7 +14,6 @@ use crate::tool::ToolRegistry;
 /// Shared parent-runtime services for sub-agents.
 pub struct AgentExtensions<C: LlmClient + Clone + 'static> {
     pub subagent: Arc<SubAgentServices<C>>,
-    pub hooks: Arc<HookDispatcher>,
     pub plan_mode: PlanMode,
 }
 
@@ -101,7 +100,6 @@ pub fn attach_agent_extensions<C: LlmClient + Clone + 'static>(
     register_subagent_tools(registry, Arc::clone(&subagent));
     Arc::new(AgentExtensions {
         subagent,
-        hooks: Arc::clone(&bootstrap.hooks),
         plan_mode: bootstrap.plan_mode.clone(),
     })
 }

@@ -37,85 +37,46 @@ mod workspace_policy;
 mod workspace_summary;
 mod workspace_tools;
 
-pub use auto_mode::{
-    TurnRoute, api_fallback_model, resolve_turn_route, select_auto_model,
-    select_auto_model_with_reason,
-};
+// Public surface is intentionally narrow: only what the sibling crates (TUI,
+// runtime API, eval) actually consume, plus types reachable through those
+// items' signatures. Keeping it tight lets rustc's dead_code lint see the
+// rest of the crate. Re-add an export the day a consumer needs it.
 pub use checkpoint::{CheckpointId, CheckpointStore};
 pub use client::{AgentEventStream, DeepSeekClient, LlmClient};
-pub use compaction::{
-    CompactionResult, compact_entries, context_usage_percent, effective_compaction_threshold,
-    estimate_token_count, near_compaction_threshold, should_compact, stable_prefix_fingerprint,
-};
 pub use config::{
-    AUTO_COST_SAVING_ENV, AgentConfig, COMPACTION_THRESHOLD_ENV, COST_CURRENCY_ENV, ConfigLayer,
-    ConfigLayerStatus, ConfigLoadReport, ConfigSources, DEEPSEEK_API_KEY_ENV,
-    DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, GlobalConfigUpdate, LoadedAgentConfig,
-    MODEL_ENV, REASONING_EFFORT_ENV, validate_api_key, write_global_config_update,
+    AgentConfig, ConfigLayer, ConfigLoadReport, ConfigSources, GlobalConfigUpdate,
+    LoadedAgentConfig, validate_api_key, write_global_config_update,
 };
 pub use doctor::{ConfigLayersDoctorReport, DoctorReport, default_config_path};
-pub use echo_client::EchoClient;
-pub use error::{AgentError, AgentResult, api_key_setup_hint};
-pub use event::{AgentEvent, chunk_to_events};
-pub use execution_policy::{
-    ExecPolicy, PolicyVerdict, RiskLevel, ToolExecutionPlan, ToolKind, evaluate_shell_command,
-};
-pub use extensions::{
-    AgentExtensions, RuntimeBootstrap, attach_agent_extensions, attach_runtime_tools,
-    build_runtime_system_prompt,
-};
-pub use hooks::{HookDispatcher, ToolGate, ToolInterceptor};
+pub use error::AgentResult;
+pub use event::AgentEvent;
+pub use execution_policy::{ExecPolicy, PolicyVerdict, RiskLevel, evaluate_shell_command};
 pub use lsp::{
-    Diagnostic, DiagnosticBlock, DiagnosticRange, Language, LspConfig, LspManager, LspTransport,
-    Severity, StdioLspTransport, detect_language, is_edit_tool, normalize_path, paths_equal,
-    render_blocks, summarize_blocks,
+    Diagnostic, DiagnosticRange, Language, LspConfig, LspManager, LspTransport, Severity,
+    render_blocks,
 };
-pub use message::{Message, Role};
+pub use message::Message;
 pub use model::{
-    ChatChoice, ChatRequest, ChatTool, ChatToolFunction, ChoiceDelta, FunctionCallDelta,
-    StreamChunk, ToolCallDelta, ToolCallFunctionPayload, ToolCallPayload, Usage,
+    ChatRequest, FunctionCallDelta, ToolCallDelta, ToolCallFunctionPayload, ToolCallPayload, Usage,
 };
-pub use model_registry::{
-    AUTO_MODEL, DEEPSEEK_V4_CONTEXT_WINDOW, DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO, ModelInfo,
-    ModelRegistry, ModelResolution, compaction_threshold_for_model, context_window_for_model,
-};
-pub use plan_mode::{PlanMode, PlanModeInterceptor};
-pub use pricing::{CostCurrency, CostEstimate, PrefixStatus, TurnTelemetry, calculate_turn_cost};
-pub use reasoning::{ReasoningEffort, ReasoningEffortSetting, select_auto_effort};
+pub use model_registry::{DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO, ModelRegistry};
+pub use plan_mode::PlanMode;
+pub use pricing::{CostCurrency, CostEstimate, PrefixStatus, TurnTelemetry};
 pub use runtime::{
     AgentRuntime, AgentRuntimeHandle, RuntimeEvent, RuntimeEventReceiver, ToolCallId, TurnId,
 };
-pub use runtime_launch::{
-    DEFAULT_SYSTEM_PROMPT, LaunchedRuntime, build_tool_registry, launch_runtime,
-    runtime_system_prompt, web_enabled,
-};
-pub use sandbox::{
-    SandboxBackend, SandboxCapabilities, SandboxGuard, SandboxManager, SandboxPolicy, capabilities,
-    detect_capabilities,
-};
+pub use runtime_launch::{LaunchedRuntime, launch_runtime, web_enabled};
+pub use sandbox::detect_capabilities;
 pub use session::Session;
-pub use session_entry::{EntryId, EntryKind, ExchangeResult, SessionEntry, ToolExchange};
+pub use session_entry::{EntryKind, ExchangeResult, SessionEntry, ToolExchange};
 pub use session_store::{
-    CheckpointRecord, ConfigSnapshot, JsonSessionStore, SESSION_SCHEMA_VERSION, SessionId,
-    SessionRecord, SessionStore, SessionStoreError, TurnRecord, format_sessions_storage_note,
-    new_session_id, sessions_dir_for_workspace, validate_session_id,
+    CheckpointRecord, ConfigSnapshot, JsonSessionStore, SessionId, SessionRecord, SessionStore,
+    SessionStoreError, TurnRecord, format_sessions_storage_note,
 };
-pub use shell_tools::{BackgroundJobSummary, JobStore, ShellTools, shell_tool_registry};
-pub use skills::{
-    Skill, SkillRegistry, build_system_prompt, discover_in_workspace, global_skills_dir,
-    render_skills_block, skills_directories, workspace_skills_dir,
-};
-pub use subagent::{
-    AgentCloseTool, AgentEvalTool, AgentOpenTool, DEFAULT_MAX_CONCURRENT, HARD_MAX_CONCURRENT,
-    SharedSubAgentManager, StructuredReport, SubAgentManager, SubAgentRecord, SubAgentRole,
-    SubAgentServices, SubAgentSessionProjection, SubAgentStatus, attach_subagent_tools,
-    is_subagent_tool, register_subagent_tools, subagent_tool_registry,
-};
+pub use shell_tools::JobStore;
+pub use subagent::{SharedSubAgentManager, SubAgentManager, is_subagent_tool};
 pub use tool::{
-    ApprovalDecision, ApprovalRequest, ErasedTool, MockEchoTool, Tool, ToolCall,
-    ToolCallAccumulator, ToolCx, ToolError, ToolOutput, ToolRegistry, ToolResult, ToolResultStatus,
-    ToolRunOutcome, ToolSpec, ToolUpdate, ToolUpdateFn, run_blocking,
+    ApprovalDecision, ApprovalRequest, MockEchoTool, ToolError, ToolRegistry, ToolResult,
+    ToolResultStatus,
 };
-pub use web_tools::{FetchUrlTool, WebSearchTool, web_tool_registry};
-pub use workspace_summary::{build_workspace_summary, list_workspace_files};
-pub use workspace_tools::{WorkspaceTools, workspace_tool_registry};
+pub use workspace_summary::list_workspace_files;

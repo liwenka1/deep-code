@@ -164,6 +164,7 @@ impl SkillRegistry {
     }
 
     /// Look up a skill by its metadata name.
+    #[cfg(test)]
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&Skill> {
         self.entries.iter().find(|skill| skill.name == name)

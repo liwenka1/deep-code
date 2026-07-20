@@ -28,17 +28,6 @@ pub fn context_usage_percent(estimated_tokens: u32, model: &str) -> u8 {
     ((u64::from(estimated_tokens) * 100) / u64::from(window)).min(100) as u8
 }
 
-#[must_use]
-pub fn near_compaction_threshold(
-    model: &str,
-    messages: &[Message],
-    override_tokens: Option<u32>,
-) -> bool {
-    let threshold = effective_compaction_threshold(model, override_tokens);
-    let estimated = estimate_token_count(messages);
-    estimated >= threshold.saturating_mul(80) / 100
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionResult {
     pub entries: Vec<SessionEntry>,
@@ -340,16 +329,6 @@ mod tests {
         messages.push(Message::user("x".repeat(400)));
         assert!(!should_compact(DEEPSEEK_V4_PRO, &messages, None));
         assert!(should_compact(DEEPSEEK_V4_PRO, &messages, Some(50)));
-    }
-
-    #[test]
-    fn near_compaction_at_eighty_percent() {
-        let messages = vec![Message::user("x".repeat(400))];
-        assert!(near_compaction_threshold(
-            DEEPSEEK_V4_PRO,
-            &messages,
-            Some(100)
-        ));
     }
 
     #[test]

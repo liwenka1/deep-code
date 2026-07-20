@@ -89,33 +89,6 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         }
     }
 
-    /// Attach session persistence to an existing runtime, creating a new record.
-    pub fn enable_persistence(
-        mut self,
-        workspace: impl Into<PathBuf>,
-        config: &AgentConfig,
-        system_prompt: impl Into<String>,
-    ) -> Result<Self, SessionStoreError> {
-        let workspace = workspace.into();
-        let store = JsonSessionStore::for_workspace(&workspace)?;
-        let mut record = SessionRecord::new(workspace.clone(), config, system_prompt);
-        {
-            let state = self.state.try_lock().map_err(|_| SessionStoreError::Io {
-                message: "runtime state is busy".to_string(),
-            })?;
-            record.entries = state.session.entries().to_vec();
-        }
-        store.save(&record)?;
-        self.workspace = Some(workspace);
-        self.persistence = Some(build_persistence(store, record));
-        Ok(self)
-    }
-
-    #[must_use]
-    pub fn persistence_enabled(&self) -> bool {
-        self.persistence.is_some()
-    }
-
     pub async fn session_id(&self) -> Option<SessionId> {
         let persistence = self.persistence.as_ref()?;
         Some(persistence.record.lock().await.id.clone())
