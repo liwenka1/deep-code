@@ -159,14 +159,14 @@ jobs:
             -d @/tmp/deepcode-request.json \
             > /tmp/deepcode-events.txt 2>&1
 
-          # provider 流里 text_delta=正式回答、reasoning_delta=思考,二者共用 "provider" kind。
-          # 用单遍 jq 按内层 type 分桶:-R 逐行读、fromjson? 容错解析、-j 拼接不加分隔、
-          # -r 原始输出。关键是 jq 会原样保留 delta 里的换行——旧的 $(...) 捕获会吃掉每个
-          # delta 结尾的换行,导致段落/代码块/标题全部粘连。
+          # assistant.delta=正式回答、reasoning.delta=思考,payload 是内联 tag 的
+          # RuntimeEvent(.text 字段)。用单遍 jq 按 kind 分桶:-R 逐行读、fromjson?
+          # 容错解析、-j 拼接不加分隔、-r 原始输出。关键是 jq 会原样保留 delta 里的
+          # 换行——旧的 $(...) 捕获会吃掉每个 delta 结尾的换行,导致段落/代码块/标题粘连。
           grep '^data: ' /tmp/deepcode-events.txt | sed 's/^data: //' > /tmp/deepcode-data.txt
-          jq -Rrj 'fromjson? | select(.item.kind=="provider" and .item.payload.provider.type=="text_delta") | .item.payload.provider.text' \
+          jq -Rrj 'fromjson? | select(.item.kind=="assistant.delta") | .item.payload.text' \
             /tmp/deepcode-data.txt > /tmp/deepcode-answer.txt
-          jq -Rrj 'fromjson? | select(.item.kind=="provider" and .item.payload.provider.type=="reasoning_delta") | .item.payload.provider.text' \
+          jq -Rrj 'fromjson? | select(.item.kind=="reasoning.delta") | .item.payload.text' \
             /tmp/deepcode-data.txt > /tmp/deepcode-reasoning.txt
 
           # 回答为空则 dump 原始 JSON 方便排查;否则补一个结尾换行。

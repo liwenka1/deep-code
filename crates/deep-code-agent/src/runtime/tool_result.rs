@@ -470,10 +470,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             RuntimeEvent::ToolCallFinished {
                 turn_id: Some(turn_id),
                 tool_call_id: ToolCallId::from(call.id.clone()),
-                result: result.clone(),
+                result,
             },
         );
-        emit(tx, RuntimeEvent::ToolResult { result });
     }
 }
 

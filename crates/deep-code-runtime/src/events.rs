@@ -2,8 +2,8 @@
 //!
 //! The wire shape (`RuntimeEnvelope` → `RuntimeItem` → kind/payload) is a
 //! stable contract: CI consumers extract text with jq paths like
-//! `.item.kind` / `.item.payload.provider.text`. Change it only together
-//! with those consumers.
+//! `.item.kind` / `.item.payload.text`. Change it only together with those
+//! consumers (`.github/workflows/deep-code-bot.yml`).
 
 use chrono::Utc;
 use deep_code_agent::{RuntimeEvent, TurnId};
@@ -82,10 +82,8 @@ pub fn runtime_event_kind(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::ToolCallStarted { .. } => "tool.started",
         RuntimeEvent::ToolCallUpdated { .. } => "tool.updated",
         RuntimeEvent::ToolCallProgress { .. } => "tool.progress",
-        RuntimeEvent::Provider(_) => "provider",
         RuntimeEvent::ApprovalRequired { .. } => "approval.required",
         RuntimeEvent::ApprovalResolved { .. } => "approval.resolved",
-        RuntimeEvent::ToolResult { .. } => "tool.result",
         RuntimeEvent::ToolCallFinished { .. } => "tool.finished",
         RuntimeEvent::SessionUpdated { .. } => "session.updated",
         RuntimeEvent::TurnFinished { .. } => "turn.completed",
@@ -101,12 +99,7 @@ pub fn runtime_event_kind(event: &RuntimeEvent) -> &'static str {
 
 #[must_use]
 pub fn event_payload(event: &RuntimeEvent) -> Value {
-    match event {
-        RuntimeEvent::Provider(agent) => {
-            serde_json::json!({ "category": "provider", "provider": agent })
-        }
-        other => serde_json::to_value(other).unwrap_or_else(|_| serde_json::json!({})),
-    }
+    serde_json::to_value(event).unwrap_or_else(|_| serde_json::json!({}))
 }
 
 fn event_turn_id(event: &RuntimeEvent) -> Option<TurnId> {
@@ -123,9 +116,7 @@ fn event_turn_id(event: &RuntimeEvent) -> Option<TurnId> {
         | RuntimeEvent::ToolCallProgress { turn_id, .. }
         | RuntimeEvent::ToolCallFinished { turn_id, .. }
         | RuntimeEvent::Error { turn_id, .. } => turn_id.clone(),
-        RuntimeEvent::Provider(_)
-        | RuntimeEvent::ToolResult { .. }
-        | RuntimeEvent::SessionUpdated { .. }
+        RuntimeEvent::SessionUpdated { .. }
         | RuntimeEvent::CompactionApplied { .. }
         | RuntimeEvent::CheckpointCreated { .. }
         | RuntimeEvent::WorkspaceRestored { .. }

@@ -123,10 +123,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                             tx,
                             RuntimeEvent::AssistantDelta {
                                 turn_id: turn_id.clone(),
-                                text: text.clone(),
+                                text,
                             },
                         );
-                        emit(tx, RuntimeEvent::Provider(AgentEvent::TextDelta { text }));
                     }
                     Ok(AgentEvent::ReasoningDelta { text }) => {
                         reasoning_buffer.push_str(&text);
@@ -134,25 +133,20 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                             tx,
                             RuntimeEvent::ReasoningDelta {
                                 turn_id: turn_id.clone(),
-                                text: text.clone(),
+                                text,
                             },
-                        );
-                        emit(
-                            tx,
-                            RuntimeEvent::Provider(AgentEvent::ReasoningDelta { text }),
                         );
                     }
                     Ok(AgentEvent::ToolCallDelta { delta }) => {
-                        let forwarded = delta.clone();
-                        let index = forwarded.index.unwrap_or(0);
-                        let tool_call_id = if let Some(id) = forwarded.id.clone() {
+                        let index = delta.index.unwrap_or(0);
+                        let tool_call_id = if let Some(id) = delta.id.clone() {
                             let tool_call_id = ToolCallId::from(id);
                             tool_call_ids.insert(index, tool_call_id.clone());
                             Some(tool_call_id)
                         } else {
                             tool_call_ids.get(&index).cloned()
                         };
-                        let arguments_delta = forwarded
+                        let arguments_delta = delta
                             .function
                             .as_ref()
                             .and_then(|function| function.arguments.clone());
@@ -167,10 +161,6 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                             );
                         }
                         accumulator.push_delta(delta);
-                        emit(
-                            tx,
-                            RuntimeEvent::Provider(AgentEvent::ToolCallDelta { delta: forwarded }),
-                        );
                     }
                     Ok(AgentEvent::Done { usage }) => {
                         last_usage = usage;

@@ -703,7 +703,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_sse_returns_provider_and_turn_completed() {
+    async fn prompt_sse_returns_assistant_delta_and_turn_completed() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(dir.path().to_path_buf(), None);
         let addr = spawn_test_server(state).await;
@@ -718,15 +718,16 @@ mod tests {
         assert!(response.status().is_success());
         let body = response.text().await.unwrap();
         assert!(
-            body.contains("event: provider"),
-            "expected provider SSE events, got: {body}"
+            body.contains("event: assistant.delta"),
+            "expected assistant.delta SSE events, got: {body}"
         );
         assert!(
             body.contains("event: turn.completed"),
             "expected turn.completed SSE event, got: {body}"
         );
-        // Wire contract: first envelope is the user message, seq starts at 1
-        // and increases monotonically. CI consumers depend on this shape.
+        // Wire contract (the bot workflow's jq depends on all of this): first
+        // envelope is the user message, seq starts at 1 and increases
+        // monotonically, and assistant.delta payloads carry `.text`.
         let envelopes = envelopes_from_sse(&body);
         let first = envelopes.first().expect("at least one envelope");
         assert_eq!(first.item.kind, "user.message");
@@ -739,6 +740,15 @@ mod tests {
             envelopes.iter().all(|envelope| envelope.item.item_id
                 == format!("{}_item_{}", envelope.thread_id, envelope.seq)),
             "item_id shape must stay stable"
+        );
+        let delta_text = envelopes
+            .iter()
+            .filter(|envelope| envelope.item.kind == "assistant.delta")
+            .filter_map(|envelope| envelope.item.payload.get("text")?.as_str())
+            .collect::<String>();
+        assert!(
+            !delta_text.is_empty(),
+            "assistant.delta payload must expose `.text` for the jq consumer"
         );
     }
 

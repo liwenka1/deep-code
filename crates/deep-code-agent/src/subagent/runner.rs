@@ -47,18 +47,16 @@ pub async fn run_subagent<C: LlmClient + Clone + 'static>(
             }
             RuntimeEvent::TurnCancelled { .. } => return Err("cancelled".to_string()),
             RuntimeEvent::Error { message, .. } => return Err(message),
-            RuntimeEvent::ToolResult { .. } => {
+            RuntimeEvent::ToolCallFinished { .. } => {
                 steps += 1;
             }
-            RuntimeEvent::Provider(_)
-            | RuntimeEvent::TurnStarted { .. }
+            RuntimeEvent::TurnStarted { .. }
             | RuntimeEvent::AssistantDelta { .. }
             | RuntimeEvent::ReasoningDelta { .. }
             | RuntimeEvent::ToolCallStarted { .. }
             | RuntimeEvent::ToolCallUpdated { .. }
             | RuntimeEvent::ToolCallProgress { .. }
             | RuntimeEvent::ApprovalResolved { .. }
-            | RuntimeEvent::ToolCallFinished { .. }
             | RuntimeEvent::SessionUpdated { .. } => {}
             RuntimeEvent::CheckpointCreated { .. }
             | RuntimeEvent::WorkspaceRestored { .. }

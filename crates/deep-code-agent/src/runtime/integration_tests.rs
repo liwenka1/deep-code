@@ -195,6 +195,37 @@ async fn drain(rx: &mut RuntimeEventReceiver) -> Vec<RuntimeEvent> {
 }
 
 #[tokio::test]
+async fn one_provider_delta_maps_to_exactly_one_runtime_event() {
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::TextDelta {
+            text: "hel".to_string(),
+        },
+        AgentEvent::TextDelta {
+            text: "lo".to_string(),
+        },
+        AgentEvent::ReasoningDelta {
+            text: "think".to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::default());
+
+    let mut rx = runtime.submit_user("hi").await;
+    let events = drain(&mut rx).await;
+
+    let assistant_deltas = events
+        .iter()
+        .filter(|event| matches!(event, RuntimeEvent::AssistantDelta { .. }))
+        .count();
+    let reasoning_deltas = events
+        .iter()
+        .filter(|event| matches!(event, RuntimeEvent::ReasoningDelta { .. }))
+        .count();
+    assert_eq!(assistant_deltas, 2, "no duplicate assistant delta events");
+    assert_eq!(reasoning_deltas, 1, "no duplicate reasoning delta events");
+}
+
+#[tokio::test]
 async fn approve_path_feeds_tool_result_into_next_turn() {
     let client = ScriptedClient::new(vec![
         vec![
@@ -226,7 +257,7 @@ async fn approve_path_feeds_tool_result_into_next_turn() {
     let mut saw_finish = false;
     for event in &second {
         match event {
-            RuntimeEvent::ToolResult { result } => {
+            RuntimeEvent::ToolCallFinished { result, .. } => {
                 assert_eq!(result.status, ToolResultStatus::Success);
                 assert_eq!(result.content, "mock_echo: hi");
                 saw_tool_result = true;
@@ -273,7 +304,7 @@ async fn deny_path_records_denied_tool_message_and_continues() {
     let events = drain(&mut rx).await;
 
     let denied = events.iter().find_map(|event| match event {
-        RuntimeEvent::ToolResult { result } => Some(result),
+        RuntimeEvent::ToolCallFinished { result, .. } => Some(result),
         _ => None,
     });
     let denied = denied.expect("expected ToolResult on deny path");
@@ -850,7 +881,7 @@ async fn write_file_appends_lsp_diagnostics_to_session() {
     let events = drain(&mut rx).await;
 
     let tool_result = events.iter().find_map(|event| match event {
-        RuntimeEvent::ToolResult { result } => Some(result),
+        RuntimeEvent::ToolCallFinished { result, .. } => Some(result),
         _ => None,
     });
     let tool_result = tool_result.expect("tool result after approval");

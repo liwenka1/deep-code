@@ -133,11 +133,11 @@ async fn main() -> anyhow::Result<()> {
 
 fn print_event(event: &RuntimeEvent) {
     match event {
-        RuntimeEvent::Provider(AgentEvent::TextDelta { text }) => {
+        RuntimeEvent::AssistantDelta { text, .. } => {
             println!("text: {text}");
         }
-        RuntimeEvent::Provider(AgentEvent::ToolCallDelta { delta }) => {
-            println!("tool-call-delta: {delta:?}");
+        RuntimeEvent::ToolCallUpdated { .. } => {
+            println!("tool-call-delta");
         }
         RuntimeEvent::ApprovalRequired { request, .. } => {
             println!(
@@ -145,7 +145,7 @@ fn print_event(event: &RuntimeEvent) {
                 request.tool_name, request.arguments
             );
         }
-        RuntimeEvent::ToolResult { result } => {
+        RuntimeEvent::ToolCallFinished { result, .. } => {
             println!(
                 "tool result: status={:?} content={:?}",
                 result.status, result.content

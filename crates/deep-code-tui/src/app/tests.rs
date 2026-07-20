@@ -250,9 +250,8 @@ fn tool_finished_flushes_tool_call_before_result_without_duplicate() {
     app.apply_runtime_event(RuntimeEvent::ToolCallFinished {
         turn_id: Some(turn_id),
         tool_call_id,
-        result: result.clone(),
+        result,
     });
-    app.apply_runtime_event(RuntimeEvent::ToolResult { result });
 
     let tool_call_index = app
         .history
@@ -1126,23 +1125,7 @@ fn plan_mode_survives_runtime_relaunch() {
 }
 
 #[test]
-fn provider_text_is_fallback_without_duplicating_structured_delta() {
-    let mut app = App::new();
-    app.apply_runtime_event(RuntimeEvent::Provider(
-        deep_code_agent::AgentEvent::TextDelta {
-            text: "legacy".to_string(),
-        },
-    ));
-    app.apply_runtime_event(RuntimeEvent::TurnFinished {
-        turn_id: deep_code_agent::TurnId("turn_legacy".to_string()),
-        usage: None,
-        telemetry: None,
-    });
-    assert!(matches!(
-        app.history.last(),
-        Some(HistoryCell::Assistant { text }) if text == "legacy"
-    ));
-
+fn assistant_delta_renders_exactly_once() {
     let mut app = App::new();
     let turn_id = deep_code_agent::TurnId("turn_1".to_string());
     app.apply_runtime_event(RuntimeEvent::TurnStarted {
@@ -1151,18 +1134,23 @@ fn provider_text_is_fallback_without_duplicating_structured_delta() {
     });
     app.apply_runtime_event(RuntimeEvent::AssistantDelta {
         turn_id: turn_id.clone(),
-        text: "hello".to_string(),
+        text: "hel".to_string(),
     });
-    app.apply_runtime_event(RuntimeEvent::Provider(
-        deep_code_agent::AgentEvent::TextDelta {
-            text: "hello".to_string(),
-        },
-    ));
+    app.apply_runtime_event(RuntimeEvent::AssistantDelta {
+        turn_id: turn_id.clone(),
+        text: "lo".to_string(),
+    });
     app.apply_runtime_event(RuntimeEvent::TurnFinished {
         turn_id,
         usage: None,
         telemetry: None,
     });
+    let assistant_cells = app
+        .history
+        .iter()
+        .filter(|cell| matches!(cell, HistoryCell::Assistant { .. }))
+        .count();
+    assert_eq!(assistant_cells, 1, "one delta stream → one assistant cell");
     assert!(matches!(
         app.history.last(),
         Some(HistoryCell::Assistant { text }) if text == "hello"

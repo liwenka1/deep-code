@@ -50,8 +50,6 @@ pub struct ActiveTurn {
     pub turn_id: TurnId,
     pub assistant_buffer: String,
     pub reasoning_buffer: String,
-    pub saw_structured_assistant_delta: bool,
-    pub saw_structured_reasoning_delta: bool,
     pub tools: Vec<ActiveToolCell>,
     pub diagnostics: Vec<HistoryCell>,
     pub pending_approval: Option<ApprovalRequest>,
@@ -64,34 +62,18 @@ impl ActiveTurn {
             turn_id,
             assistant_buffer: String::new(),
             reasoning_buffer: String::new(),
-            saw_structured_assistant_delta: false,
-            saw_structured_reasoning_delta: false,
             tools: Vec::new(),
             diagnostics: Vec::new(),
             pending_approval: None,
         }
     }
 
-    pub fn push_structured_assistant(&mut self, text: &str) {
-        self.saw_structured_assistant_delta = true;
+    pub fn push_assistant_delta(&mut self, text: &str) {
         self.assistant_buffer.push_str(text);
     }
 
-    pub fn push_provider_assistant(&mut self, text: &str) {
-        if !self.saw_structured_assistant_delta {
-            self.assistant_buffer.push_str(text);
-        }
-    }
-
-    pub fn push_structured_reasoning(&mut self, text: &str) {
-        self.saw_structured_reasoning_delta = true;
+    pub fn push_reasoning_delta(&mut self, text: &str) {
         self.reasoning_buffer.push_str(text);
-    }
-
-    pub fn push_provider_reasoning(&mut self, text: &str) {
-        if !self.saw_structured_reasoning_delta {
-            self.reasoning_buffer.push_str(text);
-        }
     }
 
     pub fn upsert_tool(&mut self, cell: ActiveToolCell) {
@@ -261,8 +243,8 @@ mod tests {
     #[test]
     fn preview_cells_exposes_streaming_reasoning_assistant_and_tool() {
         let mut turn = ActiveTurn::new(TurnId("turn_1".to_string()));
-        turn.push_structured_reasoning("thinking");
-        turn.push_structured_assistant("answer");
+        turn.push_reasoning_delta("thinking");
+        turn.push_assistant_delta("answer");
         turn.upsert_tool(ActiveToolCell {
             tool_call_id: ToolCallId("call_1".to_string()),
             tool_name: "mock_echo".to_string(),
@@ -341,23 +323,5 @@ mod tests {
         let preview = output.preview_tail();
         assert!(preview.contains("tail-marker"));
         assert!(preview.chars().count() <= 4_096);
-    }
-
-    #[test]
-    fn provider_deltas_are_compatibility_fallback_only() {
-        let mut turn = ActiveTurn::new(TurnId("turn_1".to_string()));
-        turn.push_structured_assistant("hello");
-        turn.push_provider_assistant("hello");
-        turn.push_provider_reasoning("legacy thinking");
-
-        let cells = turn.preview_cells();
-        assert!(matches!(
-            &cells[0],
-            HistoryCell::Reasoning { text } if text == "legacy thinking"
-        ));
-        assert!(matches!(
-            &cells[1],
-            HistoryCell::Assistant { text } if text == "hello"
-        ));
     }
 }

@@ -6,7 +6,6 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::checkpoint::CheckpointId;
-use crate::event::AgentEvent;
 use crate::model::Usage;
 use crate::pricing::TurnTelemetry;
 use crate::session_store::SessionId;
@@ -86,8 +85,6 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         arguments_delta: Option<String>,
     },
-    /// Forwarded provider event (text/reasoning/tool-call-delta).
-    Provider(AgentEvent),
     /// Runtime is requesting human approval for a tool call.
     ApprovalRequired {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,8 +112,6 @@ pub enum RuntimeEvent {
     },
     /// A tool finished (executed, denied, or failed) and its result has been
     /// recorded in the session.
-    ToolResult { result: ToolResult },
-    /// Structured tool completion event with stable ids.
     ToolCallFinished {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<TurnId>,

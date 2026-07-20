@@ -1,4 +1,4 @@
-use deep_code_agent::{AgentEvent, RuntimeEvent, ToolCallId};
+use deep_code_agent::{RuntimeEvent, ToolCallId};
 
 use crate::active_turn::{ActiveToolCell, ActiveTurn};
 use crate::app::App;
@@ -14,24 +14,11 @@ impl App {
                 self.active_turn = Some(ActiveTurn::new(turn_id));
                 self.status = format!("Streaming from {}...", self.backend_label);
             }
-            RuntimeEvent::Provider(AgentEvent::TextDelta { text }) => {
-                self.push_provider_assistant(&text);
-            }
-            RuntimeEvent::Provider(AgentEvent::ReasoningDelta { text }) => {
-                self.push_provider_reasoning(&text);
-            }
-            RuntimeEvent::Provider(AgentEvent::ToolCallDelta { .. }) => {
-                self.status = "Receiving tool call...".to_string();
-            }
-            RuntimeEvent::Provider(AgentEvent::Done { .. }) => {}
-            RuntimeEvent::Provider(AgentEvent::Error { message }) => {
-                self.record_error(message);
-            }
             RuntimeEvent::AssistantDelta { text, .. } => {
-                self.push_structured_assistant(&text);
+                self.push_assistant_delta(&text);
             }
             RuntimeEvent::ReasoningDelta { text, .. } => {
-                self.push_structured_reasoning(&text);
+                self.push_reasoning_delta(&text);
             }
             RuntimeEvent::ToolCallStarted {
                 tool_call_id,
@@ -103,9 +90,6 @@ impl App {
                     text: format!("Workspace restored from checkpoint {}", id.0),
                 });
                 self.status = format!("Restored checkpoint {}", id.0);
-            }
-            RuntimeEvent::ToolResult { result } => {
-                self.push_tool_result_cell(&result);
             }
             RuntimeEvent::ToolCallFinished {
                 tool_call_id,
@@ -227,42 +211,22 @@ impl App {
         }
     }
 
-    fn push_structured_assistant(&mut self, text: &str) {
+    fn push_assistant_delta(&mut self, text: &str) {
         if let Some(active) = self.active_turn.as_mut() {
-            active.push_structured_assistant(text);
+            active.push_assistant_delta(text);
         } else {
             let mut active = ActiveTurn::new(Default::default());
-            active.push_structured_assistant(text);
+            active.push_assistant_delta(text);
             self.active_turn = Some(active);
         }
     }
 
-    fn push_provider_assistant(&mut self, text: &str) {
+    fn push_reasoning_delta(&mut self, text: &str) {
         if let Some(active) = self.active_turn.as_mut() {
-            active.push_provider_assistant(text);
+            active.push_reasoning_delta(text);
         } else {
             let mut active = ActiveTurn::new(Default::default());
-            active.push_provider_assistant(text);
-            self.active_turn = Some(active);
-        }
-    }
-
-    fn push_structured_reasoning(&mut self, text: &str) {
-        if let Some(active) = self.active_turn.as_mut() {
-            active.push_structured_reasoning(text);
-        } else {
-            let mut active = ActiveTurn::new(Default::default());
-            active.push_structured_reasoning(text);
-            self.active_turn = Some(active);
-        }
-    }
-
-    fn push_provider_reasoning(&mut self, text: &str) {
-        if let Some(active) = self.active_turn.as_mut() {
-            active.push_provider_reasoning(text);
-        } else {
-            let mut active = ActiveTurn::new(Default::default());
-            active.push_provider_reasoning(text);
+            active.push_reasoning_delta(text);
             self.active_turn = Some(active);
         }
     }
@@ -315,24 +279,12 @@ impl App {
     }
 
     fn push_tool_result_cell(&mut self, result: &deep_code_agent::ToolResult) {
-        let summary = summarize_tool_result(&result.content);
-        let duplicate = matches!(
-            self.history.last(),
-            Some(HistoryCell::ToolResult {
-                tool_name,
-                status,
-                summary: existing_summary,
-            }) if tool_name == &result.tool_name
-                && status == &result.status
-                && existing_summary == &summary
-        );
-        if !duplicate {
-            self.history.push(HistoryCell::ToolResult {
-                tool_name: result.tool_name.clone(),
-                status: result.status,
-                summary,
-            });
-        }
+        // Exactly one ToolCallFinished per tool call — no dedup needed.
+        self.history.push(HistoryCell::ToolResult {
+            tool_name: result.tool_name.clone(),
+            status: result.status,
+            summary: summarize_tool_result(&result.content),
+        });
         if deep_code_agent::is_subagent_tool(&result.tool_name) {
             self.refresh_subagent_status();
         }
