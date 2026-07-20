@@ -11,9 +11,7 @@ use crate::echo_client::EchoClient;
 use crate::extensions::{RuntimeBootstrap, attach_agent_extensions, build_runtime_system_prompt};
 use crate::plan_mode::PlanMode;
 use crate::runtime::{AgentRuntime, AgentRuntimeHandle};
-use crate::session_store::{
-    ConfigSnapshot, JsonSessionStore, SessionId, SessionRecord, SessionStore,
-};
+use crate::session_store::{ConfigSnapshot, JsonSessionStore, SessionRecord, SessionStore};
 use crate::shell_tools::{JobStore, shell_tool_registry};
 use crate::subagent::SharedSubAgentManager;
 use crate::tool::ToolRegistry;
@@ -143,8 +141,8 @@ pub fn launch_runtime(
     )
 }
 
-/// Launch a new (non-resumed) runtime for any client: try a persisted
-/// session first, fall back to an in-memory one with a warning.
+/// Launch a new (non-resumed) runtime for any client: persist the session if
+/// the store is available, fall back to an in-memory one with a warning.
 fn launch_fresh<C: LlmClient + Clone + 'static>(
     client: C,
     backend_label: String,
@@ -155,6 +153,18 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
 ) -> LaunchedRuntime {
     let mut warnings = Vec::new();
     let client = Arc::new(client);
+    // Decide persistence before assembling tools: the fallback path must not
+    // rebuild (and silently drop) a full extensions set, and the failure
+    // reason must reach the user instead of being swallowed.
+    let persisted = match prepare_persisted_session(workspace.clone(), config, prompt) {
+        Ok(pair) => Some(pair),
+        Err(reason) => {
+            warnings.push(format!(
+                "session persistence unavailable; this session will not be saved ({reason})"
+            ));
+            None
+        }
+    };
     let (tools, subagent_manager, job_store, plan_mode, shutdown) = build_parent_tools(
         Arc::clone(&client),
         config,
@@ -162,46 +172,55 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
         parent_cancel,
         &mut warnings,
     );
-
-    if let Some((runtime, session_id)) =
-        try_persisted_runtime((*client).clone(), tools, workspace.clone(), config, prompt)
-    {
-        let runtime = attach_workspace_helpers(runtime, &workspace, &mut warnings);
-        return LaunchedRuntime {
-            handle: Arc::new(runtime),
-            backend_label,
-            session_id: Some(session_id.as_str().to_string()),
-            subagent_manager,
-            job_store,
-            plan_mode,
-            stop_hook: shutdown,
-            warnings,
-        };
-    }
-
-    warnings.push("session persistence unavailable; this session will not be saved".to_string());
-    let (tools, subagent_manager, job_store, plan_mode, shutdown) = build_parent_tools(
-        Arc::clone(&client),
-        config,
-        &workspace,
-        parent_cancel,
-        &mut warnings,
-    );
-    let runtime = attach_workspace_helpers(
-        AgentRuntime::with_system_prompt((*client).clone(), tools, prompt, config.clone(), false),
-        &workspace,
-        &mut warnings,
-    );
+    let (runtime, session_id) = match persisted {
+        Some((store, record)) => {
+            let session_id = record.id.as_str().to_string();
+            (
+                AgentRuntime::from_session_record(
+                    (*client).clone(),
+                    tools,
+                    record,
+                    store,
+                    config.clone(),
+                ),
+                Some(session_id),
+            )
+        }
+        None => (
+            AgentRuntime::with_system_prompt(
+                (*client).clone(),
+                tools,
+                prompt,
+                config.clone(),
+                false,
+            ),
+            None,
+        ),
+    };
+    let runtime = attach_workspace_helpers(runtime, &workspace, &mut warnings);
     LaunchedRuntime {
         handle: Arc::new(runtime),
         backend_label,
-        session_id: None,
+        session_id,
         subagent_manager,
         job_store,
         plan_mode,
         stop_hook: shutdown,
         warnings,
     }
+}
+
+/// Create the session store and save the fresh record, returning the reason
+/// on failure so the caller can surface it.
+fn prepare_persisted_session(
+    workspace: PathBuf,
+    config: &AgentConfig,
+    system_prompt: &str,
+) -> Result<(JsonSessionStore, SessionRecord), String> {
+    let store = JsonSessionStore::for_workspace(&workspace).map_err(|error| error.to_string())?;
+    let record = SessionRecord::new(workspace, config, system_prompt);
+    store.save(&record).map_err(|error| error.to_string())?;
+    Ok((store, record))
 }
 
 fn launch_resumed(
@@ -327,23 +346,6 @@ fn build_parent_tools<C: LlmClient + Clone + 'static>(
         extensions.plan_mode(),
         shutdown,
     )
-}
-
-fn try_persisted_runtime<C: LlmClient + 'static>(
-    client: C,
-    tools: ToolRegistry,
-    workspace: PathBuf,
-    config: &AgentConfig,
-    system_prompt: &str,
-) -> Option<(AgentRuntime<C>, SessionId)> {
-    let store = JsonSessionStore::for_workspace(&workspace).ok()?;
-    let record = SessionRecord::new(workspace, config, system_prompt);
-    let session_id = record.id.clone();
-    store.save(&record).ok()?;
-    Some((
-        AgentRuntime::from_session_record(client, tools, record, store, config.clone()),
-        session_id,
-    ))
 }
 
 fn attach_workspace_helpers<C: LlmClient + 'static>(
