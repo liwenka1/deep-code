@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::LlmClient;
 use crate::config::AgentConfig;
-use crate::hooks::{HookDispatcher, HooksConfig, load_hooks_config};
+use crate::hooks::HookDispatcher;
 use crate::plan_mode::{PlanMode, PlanModeInterceptor};
 use crate::skills::build_system_prompt;
 use crate::subagent::{DEFAULT_MAX_CONCURRENT, SubAgentServices, register_subagent_tools};
@@ -40,16 +40,21 @@ pub struct RuntimeBootstrap {
 }
 
 impl RuntimeBootstrap {
-    pub fn load(hooks_config: Option<HooksConfig>) -> Self {
-        let mut dispatcher =
-            HookDispatcher::from_config(&hooks_config.unwrap_or_else(load_hooks_config));
+    pub fn load() -> Self {
         // Plan mode rides the interceptor seam: register its gate now, while the
         // dispatcher is still mutable (Arc-wrapping freezes it). The shared
         // switch is surfaced so the TUI can toggle it.
+        let mut dispatcher = HookDispatcher::default();
         let plan_mode = PlanMode::new();
         dispatcher.add_interceptor(Arc::new(PlanModeInterceptor::new(plan_mode.clone())));
         let hooks = Arc::new(dispatcher);
         Self { hooks, plan_mode }
+    }
+}
+
+impl Default for RuntimeBootstrap {
+    fn default() -> Self {
+        Self::load()
     }
 }
 

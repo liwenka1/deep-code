@@ -615,32 +615,21 @@ impl ToolRegistry {
         }
 
         if let Some(hooks) = &self.hooks {
-            // Pre-execution seam: emits the tool_pre event and runs interceptors.
-            // A block becomes a failed tool result the model reads, and the tool
-            // never runs. Approval already resolved above — this is a separate,
-            // additional gate.
+            // Pre-execution gate seam: a block becomes a failed tool result the
+            // model reads, and the tool never runs. Approval already resolved
+            // above — this is a separate, additional gate.
             if let crate::hooks::ToolGate::Block { reason } = hooks.before_tool(call) {
                 let result = ToolResult::error(call, format!("工具调用被拦截: {reason}"));
-                hooks.emit_tool_post(call, &result);
                 return Ok(ToolRunOutcome::Result { result });
             }
         }
 
         let cx = cx.with_plan(plan);
-        match entry.tool.execute(call, &cx).await {
-            Ok(result) => {
-                if let Some(hooks) = &self.hooks {
-                    hooks.emit_tool_post(call, &result);
-                }
-                Ok(ToolRunOutcome::Result { result })
-            }
-            Err(error) => {
-                if let Some(hooks) = &self.hooks {
-                    hooks.emit_tool_post(call, &ToolResult::error(call, error.to_string()));
-                }
-                Err(error)
-            }
-        }
+        entry
+            .tool
+            .execute(call, &cx)
+            .await
+            .map(|result| ToolRunOutcome::Result { result })
     }
 }
 
@@ -748,75 +737,6 @@ struct PartialToolCall {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[tokio::test]
-    async fn hooks_emit_post_when_tool_execution_fails() {
-        use std::sync::{Arc, Mutex};
-
-        use crate::hooks::{HookEvent, HookSink};
-
-        #[derive(Default)]
-        struct RecordingSink {
-            events: Mutex<Vec<serde_json::Value>>,
-        }
-
-        impl HookSink for RecordingSink {
-            fn emit(&self, event: &HookEvent) {
-                self.events.lock().unwrap().push(event.to_json());
-            }
-        }
-
-        struct FailingTool;
-
-        #[derive(Debug, Deserialize, JsonSchema)]
-        struct FailingParams {}
-
-        #[async_trait]
-        impl Tool for FailingTool {
-            type Params = FailingParams;
-
-            fn name(&self) -> &str {
-                "failing_tool"
-            }
-
-            fn description(&self) -> &str {
-                "always fails"
-            }
-
-            async fn run(
-                &self,
-                _params: FailingParams,
-                _cx: &ToolCx,
-            ) -> Result<ToolOutput, ToolError> {
-                Err(ToolError::ExecutionFailed {
-                    name: "failing_tool".to_string(),
-                    message: "boom".to_string(),
-                })
-            }
-        }
-
-        let sink = Arc::new(RecordingSink::default());
-        let mut registry = ToolRegistry::new();
-        registry.register(FailingTool);
-        registry.set_hooks(Arc::new({
-            let mut dispatcher = crate::hooks::HookDispatcher::default();
-            dispatcher.add_sink(sink.clone());
-            dispatcher
-        }));
-
-        let call = ToolCall::new("call_fail", "failing_tool", json!({}));
-        let error = registry
-            .run_tool_call(call, Some(ApprovalDecision::Approved))
-            .await
-            .unwrap_err();
-        assert!(matches!(error, ToolError::ExecutionFailed { .. }));
-
-        let events = sink.events.lock().unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["type"], "tool_pre");
-        assert_eq!(events[1]["type"], "tool_post");
-        assert_eq!(events[1]["result"]["status"], "error");
-    }
 
     #[tokio::test]
     async fn blocking_interceptor_prevents_tool_execution() {

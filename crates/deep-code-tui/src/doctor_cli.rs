@@ -74,9 +74,5 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
         report.sandbox.detail
     );
     println!("  skills: {} loaded", report.skills.total_count);
-    println!(
-        "  hooks: {} (present={})",
-        report.hooks.config_path, report.hooks.present
-    );
     Ok(())
 }

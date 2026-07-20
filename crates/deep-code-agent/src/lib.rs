@@ -64,10 +64,7 @@ pub use extensions::{
     AgentExtensions, RuntimeBootstrap, attach_agent_extensions, attach_runtime_tools,
     build_runtime_system_prompt,
 };
-pub use hooks::{
-    HookDispatcher, HookError, HookEvent, HookSink, HooksConfig, JsonlHookSink, StdoutHookSink,
-    ToolGate, ToolInterceptor, default_hooks_config_path, load_hooks_config,
-};
+pub use hooks::{HookDispatcher, ToolGate, ToolInterceptor};
 pub use lsp::{
     Diagnostic, DiagnosticBlock, DiagnosticRange, Language, LspConfig, LspManager, LspTransport,
     Severity, StdioLspTransport, detect_language, is_edit_tool, normalize_path, paths_equal,

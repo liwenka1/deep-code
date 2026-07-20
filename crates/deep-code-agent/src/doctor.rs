@@ -6,7 +6,6 @@ use serde::Serialize;
 
 use crate::config::{AgentConfig, ConfigLoadReport, DEEPSEEK_API_KEY_ENV};
 use crate::error::api_key_setup_hint;
-use crate::hooks::default_hooks_config_path;
 use crate::model_registry::ModelRegistry;
 use crate::paths::home_dir;
 use crate::sandbox::detect_capabilities;
@@ -89,12 +88,6 @@ pub struct SkillsDoctorReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct HooksDoctorReport {
-    pub config_path: String,
-    pub present: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelDoctorEntry {
     pub id: String,
     pub context_window: u32,
@@ -124,7 +117,6 @@ pub struct DoctorReport {
     pub deepseek: DeepSeekDoctorReport,
     pub sandbox: SandboxReport,
     pub skills: SkillsDoctorReport,
-    pub hooks: HooksDoctorReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_layers: Option<ConfigLayersDoctorReport>,
 }
@@ -136,7 +128,6 @@ impl DoctorReport {
         let config_present = config_path.is_file();
         let sandbox = detect_capabilities();
         let skills = collect_skills(workspace);
-        let hooks_path = default_hooks_config_path();
         let deepseek = collect_deepseek(config);
 
         Self {
@@ -158,10 +149,6 @@ impl DoctorReport {
                 detail: sandbox.detail,
             },
             skills,
-            hooks: HooksDoctorReport {
-                config_path: hooks_path.display().to_string(),
-                present: hooks_path.is_file(),
-            },
             config_layers: None,
         }
     }
