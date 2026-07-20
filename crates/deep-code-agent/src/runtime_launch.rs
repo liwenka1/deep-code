@@ -29,6 +29,10 @@ pub struct LaunchedRuntime {
     pub job_store: JobStore,
     pub plan_mode: PlanMode,
     pub stop_hook: Box<dyn Fn() + Send + Sync>,
+    /// True when running on the offline placeholder backend (no API key):
+    /// the UI should point the user at `/apikey` instead of implying a
+    /// working model. Replaces string-sniffing on `backend_label`.
+    pub offline: bool,
     /// Non-fatal launch degradations (persistence unavailable, checkpoints
     /// disabled, …). The consumer must surface these — the library never
     /// writes to stderr because a raw-mode TUI may own the screen.
@@ -206,6 +210,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
         job_store,
         plan_mode,
         stop_hook: shutdown,
+        offline: client.provider_name() == EchoClient::PROVIDER,
         warnings,
     }
 }
@@ -278,6 +283,7 @@ fn launch_resumed(
             job_store,
             plan_mode,
             stop_hook: shutdown,
+            offline: false,
             warnings,
         };
     }
@@ -303,6 +309,7 @@ fn launch_resumed(
         job_store,
         plan_mode,
         stop_hook: shutdown,
+        offline: true,
         warnings,
     }
 }
@@ -320,13 +327,8 @@ fn build_parent_tools<C: LlmClient + Clone + 'static>(
     PlanMode,
     Box<dyn Fn() + Send + Sync>,
 ) {
-    let bootstrap = RuntimeBootstrap::load(None);
+    let bootstrap = RuntimeBootstrap::load();
     let (mut registry, job_store) = build_tool_registry(workspace, warnings);
-    // The mock echo tool only drives the offline echo backend's `/mock-tool`;
-    // it has no place in a real model's tool schema, so mount it only offline.
-    if client.provider_name() == EchoClient::PROVIDER {
-        registry.register(crate::tool::MockEchoTool);
-    }
     let extensions = attach_agent_extensions(
         &mut registry,
         client,
@@ -397,8 +399,8 @@ mod tests {
 
         let names = parent_tool_names(EchoClient, &config, dir.path());
         assert!(
-            names.iter().any(|name| name == MockEchoTool::NAME),
-            "offline echo registry keeps the mock tool: {names:?}"
+            !names.iter().any(|name| name == MockEchoTool::NAME),
+            "the mock tool is a test fixture; no production registry mounts it: {names:?}"
         );
     }
 

@@ -98,6 +98,7 @@ pub struct App {
     pub approval_focus: usize,
     pub(crate) runtime: Arc<dyn AgentRuntimeHandle>,
     pub(crate) backend_label: String,
+    pub(crate) backend_offline: bool,
     pub(crate) subagent_manager: SharedSubAgentManager,
     pub(crate) plan_mode: deep_code_agent::PlanMode,
     subagent_shutdown: Option<Box<dyn Fn() + Send + Sync>>,
@@ -261,6 +262,7 @@ impl App {
         let launched = launch_runtime(&agent_config, workspace, config.resume.clone());
         let runtime = launched.handle;
         let backend_label = launched.backend_label;
+        let backend_offline = launched.offline;
         let session_id = launched.session_id;
         let subagent_manager = launched.subagent_manager;
         let plan_mode = launched.plan_mode;
@@ -290,7 +292,7 @@ impl App {
         let mut history = vec![welcome_cell(
             &configured_model,
             &configured_reasoning,
-            backend_label.contains("offline echo"),
+            backend_offline,
             workspace_display,
             session_summary,
         )];
@@ -338,6 +340,7 @@ impl App {
             approval_focus: 0,
             runtime,
             backend_label,
+            backend_offline,
             subagent_manager,
             plan_mode,
             subagent_shutdown,

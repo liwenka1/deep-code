@@ -237,7 +237,7 @@ impl App {
             text.push_str(hint);
         }
         text.push_str(
-            "\nTip: 离线可用 /mock-tool hello 演练审批；会话存储于 .deep-code/sessions/。\nKeys: Enter send, Alt+Enter/Ctrl+J 换行, ↑↓ 滚动聊天 (多行草稿内移光标), Ctrl+P/Ctrl+N 历史, Ctrl+W 删词, Ctrl+U/K 删行, Ctrl+A/E 行首尾, Esc 取消本轮/清空输入/退出 (审批面板中为 deny), Ctrl+C 取消/清空/连按两次退出, Shift+↑/↓ 或 PageUp/PageDown 滚动正文 (鼠标可原生划选复制), y/a/n 审批, 审批面板中 ↑↓ 选择 Enter 确认.\n注意: 取消在工具边界生效，正在执行中的同步工具会先跑完；a 对 shell 按命令程序名在本会话放行（如 cargo/git，复合命令仍逐次询问）。\n配置 [approval] auto_allow 可预先放行工具前缀（仅 env 或全局配置，项目配置无效）。",
+            "\nTip: 会话存储于 .deep-code/sessions/。\nKeys: Enter send, Alt+Enter/Ctrl+J 换行, ↑↓ 滚动聊天 (多行草稿内移光标), Ctrl+P/Ctrl+N 历史, Ctrl+W 删词, Ctrl+U/K 删行, Ctrl+A/E 行首尾, Esc 取消本轮/清空输入/退出 (审批面板中为 deny), Ctrl+C 取消/清空/连按两次退出, Shift+↑/↓ 或 PageUp/PageDown 滚动正文 (鼠标可原生划选复制), y/a/n 审批, 审批面板中 ↑↓ 选择 Enter 确认.\n注意: 取消在工具边界生效，正在执行中的同步工具会先跑完；a 对 shell 按命令程序名在本会话放行（如 cargo/git，复合命令仍逐次询问）。\n配置 [approval] auto_allow 可预先放行工具前缀（仅 env 或全局配置，项目配置无效）。",
         );
         self.history.push(HistoryCell::system(text));
         self.status = "Help displayed.".to_string();

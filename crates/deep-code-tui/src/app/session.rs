@@ -10,6 +10,7 @@ impl App {
         }
         self.runtime = launched.handle;
         self.backend_label = launched.backend_label;
+        self.backend_offline = launched.offline;
         self.session_id = launched.session_id;
         self.subagent_manager = launched.subagent_manager;
         // Carry plan mode across a relaunch (/apikey, /model): the new handle is
@@ -232,7 +233,7 @@ impl App {
         let cell = welcome_cell(
             &self.configured_model,
             &self.configured_reasoning,
-            self.backend_label.contains("offline echo"),
+            self.backend_offline,
             workspace_display,
             if persistent {
                 "新会话 · 已持久化".to_string()

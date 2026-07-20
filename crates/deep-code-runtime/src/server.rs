@@ -763,10 +763,90 @@ mod tests {
         assert_eq!(error.status, StatusCode::CONFLICT);
     }
 
+    /// Minimal scripted client: first turn requests one `mock_echo` tool
+    /// call, the resumed turn finishes with text — enough to drive the HTTP
+    /// approval flow end to end without a real model.
+    struct ToolCallingClient {
+        turns: StdMutex<u32>,
+    }
+
+    impl deep_code_agent::LlmClient for ToolCallingClient {
+        fn provider_name(&self) -> &'static str {
+            "scripted"
+        }
+
+        fn model(&self) -> &str {
+            "scripted"
+        }
+
+        async fn stream_chat(
+            &self,
+            _request: deep_code_agent::ChatRequest,
+        ) -> deep_code_agent::AgentResult<deep_code_agent::AgentEventStream> {
+            let turn = {
+                let mut turns = self.turns.lock().unwrap();
+                let current = *turns;
+                *turns += 1;
+                current
+            };
+            let stream = async_stream::try_stream! {
+                if turn == 0 {
+                    yield deep_code_agent::AgentEvent::ToolCallDelta {
+                        delta: deep_code_agent::ToolCallDelta {
+                            index: Some(0),
+                            id: Some("call_1".to_string()),
+                            call_type: Some("function".to_string()),
+                            function: Some(deep_code_agent::FunctionCallDelta {
+                                name: Some(deep_code_agent::MockEchoTool::NAME.to_string()),
+                                arguments: Some(r#"{"message":"hello"}"#.to_string()),
+                            }),
+                        },
+                    };
+                } else {
+                    yield deep_code_agent::AgentEvent::TextDelta {
+                        text: "done".to_string(),
+                    };
+                }
+                yield deep_code_agent::AgentEvent::Done { usage: None };
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
+    fn tool_calling_state(workspace: PathBuf, autonomous_approvals: bool) -> AppState {
+        let runtime = deep_code_agent::AgentRuntime::new(
+            ToolCallingClient {
+                turns: StdMutex::new(0),
+            },
+            deep_code_agent::ToolRegistry::with_mock_tools(),
+        );
+        let launched = LaunchedRuntime {
+            handle: Arc::new(runtime),
+            backend_label: "scripted".to_string(),
+            session_id: None,
+            subagent_manager: Arc::new(std::sync::RwLock::new(
+                deep_code_agent::SubAgentManager::new(workspace, 2),
+            )),
+            job_store: deep_code_agent::JobStore::default(),
+            plan_mode: deep_code_agent::PlanMode::new(),
+            stop_hook: Box::new(|| {}),
+            offline: false,
+            warnings: Vec::new(),
+        };
+        AppState {
+            version: "0.1.0".to_string(),
+            auth_token: None,
+            runtime: Arc::new(Mutex::new(launched)),
+            approval: Arc::new(Mutex::new(None)),
+            active_turn: Arc::new(StdMutex::new(None)),
+            autonomous_approvals,
+        }
+    }
+
     #[tokio::test]
     async fn approval_rejects_mismatched_call_id() {
         let dir = tempfile::tempdir().unwrap();
-        let state = test_state(dir.path().to_path_buf(), None);
+        let state = tool_calling_state(dir.path().to_path_buf(), false);
         let addr = spawn_test_server(state).await;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -779,7 +859,7 @@ mod tests {
         let prompt_handle = tokio::spawn(async move {
             prompt_client
                 .post(prompt_url)
-                .json(&json!({ "prompt": "/mock-tool hello" }))
+                .json(&json!({ "prompt": "hello" }))
                 .send()
                 .await
                 .unwrap()
@@ -800,7 +880,7 @@ mod tests {
 
         let good = client
             .post(&approvals_url)
-            .json(&json!({ "call_id": "echo_call_1", "decision": "approved" }))
+            .json(&json!({ "call_id": "call_1", "decision": "approved" }))
             .send()
             .await
             .unwrap();
@@ -814,8 +894,7 @@ mod tests {
     #[tokio::test]
     async fn autonomous_mode_auto_denies_instead_of_hanging() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = test_state(dir.path().to_path_buf(), None);
-        state.autonomous_approvals = true;
+        let state = tool_calling_state(dir.path().to_path_buf(), true);
         let addr = spawn_test_server(state).await;
         // A short client timeout is the point: in interactive mode the turn
         // would park forever (no one POSTs /v1/approvals) and trip this timeout.
@@ -826,7 +905,7 @@ mod tests {
 
         let body = client
             .post(format!("http://{addr}/v1/prompt"))
-            .json(&json!({ "prompt": "/mock-tool hello" }))
+            .json(&json!({ "prompt": "hello" }))
             .send()
             .await
             .unwrap()
