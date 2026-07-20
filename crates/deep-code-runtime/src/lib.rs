@@ -1,12 +1,11 @@
-//! Local HTTP/SSE runtime API for external GUIs and supervisors.
+//! Local HTTP/SSE runtime API. Surface kept deliberately small: the only
+//! production consumer is headless automation (CI bot) driving
+//! `/v1/prompt` + `/v1/approvals` with a bearer token.
 
 mod auth;
-mod meta;
+mod events;
 mod server;
-mod sessions;
-mod threads;
 
 pub use auth::RUNTIME_TOKEN_ENV;
+pub use events::{RuntimeEnvelope, RuntimeItem};
 pub use server::{RuntimeServerOptions, run_http_server};
-pub use sessions::ActiveSessionResponse;
-pub use threads::{RuntimeEnvelope, RuntimeItem, RuntimeThread, RuntimeThreadDetail, RuntimeTurn};
