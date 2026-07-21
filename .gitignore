@@ -4,17 +4,13 @@
 # Agent side storage (checkpoints, local metadata)
 .deep-code/
 
-# --- Node (nested apps, e.g. Tauri frontend) ---
+# --- Node (npm launcher package) ---
 node_modules/
 
 # npm installer fetches the platform binary next to the launcher at install
 # time; never commit it (the launcher bin/deepcode itself IS tracked).
 /packages/deepcode/bin/deepcode-bin
 /packages/deepcode/bin/deepcode.exe
-
-# --- Build outputs ---
-dist/
-dist-ssr/
 
 # --- Local env & secrets ---
 .env
@@ -28,9 +24,6 @@ Thumbs.db
 # --- Logs ---
 *.log
 npm-debug.log*
-yarn-debug.log*
-pnpm-debug.log*
-lerna-debug.log*
 
 # --- IDE ---
 .idea/

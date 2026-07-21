@@ -3,7 +3,10 @@
 # 加载顺序（后者覆盖前者）：
 #   内置默认 -> 全局 ~/.deep-code/config.toml -> 项目 .deep-code/config.toml -> 环境变量 -> CLI 参数
 #
-# 项目层只允许调优字段：provider.model / provider.reasoning_effort / cost.* / context.* / stream.*。
+# 项目层只允许调优字段：provider.model / provider.reasoning_effort / cost.currency。
+# 其余行为旋钮（provider.timeout_secs、stream.*、checkpoints.*、context.*、
+# cost.auto_cost_saving、approval.*）在项目层一律忽略并告警——防止恶意仓库
+# 饿死流、撑爆快照保留或静默解除审批门；请在全局配置或环境变量中设置。
 # 项目层的 provider.api_key 一律忽略（防止随仓库泄露或被恶意仓库注入）；
 # 项目层覆盖 provider.base_url 会在启动时给出醒目警告。
 
