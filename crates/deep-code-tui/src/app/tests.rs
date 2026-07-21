@@ -1101,30 +1101,6 @@ fn status_line_includes_mode_backend_session_checkpoint_and_cost() {
 }
 
 #[test]
-fn status_line_shows_plan_marker_when_active() {
-    let app = App::new();
-    assert!(!app.status_line().contains("计划"));
-    app.plan_mode.set(true);
-    assert!(app.status_line().contains("计划/只读"));
-}
-
-#[test]
-fn plan_mode_survives_runtime_relaunch() {
-    let mut app = App::new();
-    app.plan_mode.set(true);
-    // A relaunch (/apikey, /model) adopts a freshly-built runtime; plan mode
-    // must carry over onto the new handle instead of silently resetting.
-    let workspace = tempfile::tempdir().unwrap();
-    let launched = deep_code_agent::launch_runtime(
-        &deep_code_agent::AgentConfig::default(),
-        workspace.path().to_path_buf(),
-        None,
-    );
-    app.adopt_runtime(launched);
-    assert!(app.plan_mode.active(), "plan mode must survive relaunch");
-}
-
-#[test]
 fn assistant_delta_renders_exactly_once() {
     let mut app = App::new();
     let turn_id = deep_code_agent::TurnId("turn_1".to_string());

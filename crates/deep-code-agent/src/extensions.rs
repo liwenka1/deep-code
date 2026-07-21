@@ -5,8 +5,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::LlmClient;
 use crate::config::AgentConfig;
-use crate::hooks::HookDispatcher;
-use crate::plan_mode::{PlanMode, PlanModeInterceptor};
 use crate::skills::build_system_prompt;
 use crate::subagent::{DEFAULT_MAX_CONCURRENT, SubAgentServices, register_subagent_tools};
 use crate::tool::ToolRegistry;
@@ -14,7 +12,6 @@ use crate::tool::ToolRegistry;
 /// Shared parent-runtime services for sub-agents.
 pub struct AgentExtensions<C: LlmClient + Clone + 'static> {
     pub subagent: Arc<SubAgentServices<C>>,
-    pub plan_mode: PlanMode,
 }
 
 impl<C: LlmClient + Clone + 'static> AgentExtensions<C> {
@@ -25,35 +22,6 @@ impl<C: LlmClient + Clone + 'static> AgentExtensions<C> {
     #[must_use]
     pub fn subagent_manager(&self) -> Arc<RwLock<crate::subagent::SubAgentManager>> {
         Arc::clone(&self.subagent.manager)
-    }
-
-    #[must_use]
-    pub fn plan_mode(&self) -> PlanMode {
-        self.plan_mode.clone()
-    }
-}
-
-pub struct RuntimeBootstrap {
-    pub hooks: Arc<HookDispatcher>,
-    pub plan_mode: PlanMode,
-}
-
-impl RuntimeBootstrap {
-    pub fn load() -> Self {
-        // Plan mode rides the interceptor seam: register its gate now, while the
-        // dispatcher is still mutable (Arc-wrapping freezes it). The shared
-        // switch is surfaced so the TUI can toggle it.
-        let mut dispatcher = HookDispatcher::default();
-        let plan_mode = PlanMode::new();
-        dispatcher.add_interceptor(Arc::new(PlanModeInterceptor::new(plan_mode.clone())));
-        let hooks = Arc::new(dispatcher);
-        Self { hooks, plan_mode }
-    }
-}
-
-impl Default for RuntimeBootstrap {
-    fn default() -> Self {
-        Self::load()
     }
 }
 
@@ -72,19 +40,13 @@ pub fn build_runtime_system_prompt(base: &str, workspace: &Path) -> String {
     format!("{prompt}\n\n{TOOL_DISCIPLINE}")
 }
 
-pub fn attach_runtime_tools(registry: &mut ToolRegistry, bootstrap: &RuntimeBootstrap) {
-    registry.set_hooks(Arc::clone(&bootstrap.hooks));
-}
-
 pub fn attach_agent_extensions<C: LlmClient + Clone + 'static>(
     registry: &mut ToolRegistry,
     client: Arc<C>,
     agent_config: AgentConfig,
     workspace: PathBuf,
     parent_cancel: CancellationToken,
-    bootstrap: &RuntimeBootstrap,
 ) -> Arc<AgentExtensions<C>> {
-    attach_runtime_tools(registry, bootstrap);
     let exec_policy = registry.policy().clone();
     let subagent = Arc::new(SubAgentServices::new(
         client,
@@ -98,10 +60,7 @@ pub fn attach_agent_extensions<C: LlmClient + Clone + 'static>(
     // L3 = reducible to core primitives (slated for removal/reduction).
     // L2: sub-agents are a deliberate capability; kept.
     register_subagent_tools(registry, Arc::clone(&subagent));
-    Arc::new(AgentExtensions {
-        subagent,
-        plan_mode: bootstrap.plan_mode.clone(),
-    })
+    Arc::new(AgentExtensions { subagent })
 }
 
 #[cfg(test)]

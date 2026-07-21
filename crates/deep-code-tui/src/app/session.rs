@@ -13,12 +13,6 @@ impl App {
         self.backend_offline = launched.offline;
         self.session_id = launched.session_id;
         self.subagent_manager = launched.subagent_manager;
-        // Carry plan mode across a relaunch (/apikey, /model): the new handle is
-        // wired to the new runtime's interceptor, so re-apply the prior state
-        // onto it instead of silently resetting to off.
-        let plan_was_on = self.plan_mode.active();
-        self.plan_mode = launched.plan_mode;
-        self.plan_mode.set(plan_was_on);
         self.subagent_shutdown = Some(launched.stop_hook);
     }
 

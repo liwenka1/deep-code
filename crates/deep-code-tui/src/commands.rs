@@ -16,7 +16,6 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str, bool)] = &[
         false,
     ),
     ("/status", "显示运行状态", false),
-    ("/plan", "切换计划模式（只读，拦截所有写/执行工具）", false),
     ("/model", "查看/切换模型 (auto|pro|flash)", true),
     ("/apikey", "设置 DeepSeek API key 并接入", true),
     ("/logout", "清除 API key 回离线模式", false),
@@ -38,10 +37,6 @@ impl App {
             }
             "/clear" => {
                 self.start_new_conversation();
-                true
-            }
-            "/plan" => {
-                self.toggle_plan_mode();
                 true
             }
             "/status" => {
@@ -103,21 +98,6 @@ impl App {
             }
             _ => false,
         }
-    }
-
-    fn toggle_plan_mode(&mut self) {
-        let now_on = self.plan_mode.toggle();
-        let message = if now_on {
-            "计划模式已开启（只读）：写文件 / shell / 网络等工具会被拦截，请先给出计划。再次 /plan 退出。"
-        } else {
-            "计划模式已关闭：工具恢复正常执行（仍受审批与策略约束）。"
-        };
-        self.history.push(HistoryCell::system(message.to_string()));
-        self.status = if now_on {
-            "计划模式（只读）".to_string()
-        } else {
-            "计划模式已关闭".to_string()
-        };
     }
 
     fn resume_session_command(&mut self, arg: &str) {

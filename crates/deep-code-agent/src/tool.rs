@@ -14,7 +14,6 @@ use tokio_util::sync::CancellationToken;
 use crate::execution_policy::{
     ExecPolicy, PolicyVerdict, RiskLevel, SafetyNotes, ToolExecutionPlan, ToolKind, safety_notes,
 };
-use crate::hooks::HookDispatcher;
 use crate::message::Message;
 use crate::model::{ChatTool, ChatToolFunction, FunctionCallDelta, ToolCallDelta};
 use crate::sandbox::SandboxPolicy;
@@ -440,7 +439,6 @@ struct RegisteredTool {
 pub struct ToolRegistry {
     tools: HashMap<String, RegisteredTool>,
     policy: ExecPolicy,
-    hooks: Option<Arc<HookDispatcher>>,
 }
 
 impl std::fmt::Debug for ToolRegistry {
@@ -463,17 +461,7 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             policy,
-            hooks: None,
         }
-    }
-
-    pub fn set_hooks(&mut self, hooks: Arc<HookDispatcher>) {
-        self.hooks = Some(hooks);
-    }
-
-    #[must_use]
-    pub fn hooks(&self) -> Option<&HookDispatcher> {
-        self.hooks.as_deref()
     }
 
     #[must_use]
@@ -506,9 +494,6 @@ impl ToolRegistry {
 
     pub fn extend(&mut self, other: ToolRegistry) {
         self.tools.extend(other.tools);
-        if self.hooks.is_none() {
-            self.hooks = other.hooks;
-        }
     }
 
     /// Clone a subset of tools from another registry.
@@ -516,7 +501,6 @@ impl ToolRegistry {
     pub fn filtered_from(source: &ToolRegistry, predicate: impl Fn(&str) -> bool) -> Self {
         let mut registry = Self::new();
         registry.policy = source.policy.clone();
-        registry.hooks = source.hooks.clone();
         for (name, entry) in &source.tools {
             if predicate(name) {
                 registry.tools.insert(name.clone(), entry.clone());
@@ -611,16 +595,6 @@ impl ToolRegistry {
                     });
                 }
                 Some(ApprovalDecision::Approved | ApprovalDecision::ApprovedForSession) => {}
-            }
-        }
-
-        if let Some(hooks) = &self.hooks {
-            // Pre-execution gate seam: a block becomes a failed tool result the
-            // model reads, and the tool never runs. Approval already resolved
-            // above — this is a separate, additional gate.
-            if let crate::hooks::ToolGate::Block { reason } = hooks.before_tool(call) {
-                let result = ToolResult::error(call, format!("工具调用被拦截: {reason}"));
-                return Ok(ToolRunOutcome::Result { result });
             }
         }
 
@@ -737,66 +711,6 @@ struct PartialToolCall {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[tokio::test]
-    async fn blocking_interceptor_prevents_tool_execution() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        use crate::hooks::{ToolGate, ToolInterceptor};
-
-        // A tool that records whether it actually ran.
-        struct SpyTool(Arc<AtomicBool>);
-        #[derive(Debug, Deserialize, JsonSchema)]
-        struct SpyParams {}
-        #[async_trait]
-        impl Tool for SpyTool {
-            type Params = SpyParams;
-            fn name(&self) -> &str {
-                "spy_tool"
-            }
-            fn description(&self) -> &str {
-                "records execution"
-            }
-            async fn run(&self, _params: SpyParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
-                self.0.store(true, Ordering::SeqCst);
-                Ok(ToolOutput::text("ran"))
-            }
-        }
-
-        struct BlockAll;
-        impl ToolInterceptor for BlockAll {
-            fn before_tool(&self, _call: &ToolCall) -> ToolGate {
-                ToolGate::Block {
-                    reason: "plan mode: writes disabled".to_string(),
-                }
-            }
-        }
-
-        let ran = Arc::new(AtomicBool::new(false));
-        let mut registry = ToolRegistry::new();
-        registry.register(SpyTool(ran.clone()));
-        registry.set_hooks(Arc::new({
-            let mut dispatcher = crate::hooks::HookDispatcher::default();
-            dispatcher.add_interceptor(Arc::new(BlockAll));
-            dispatcher
-        }));
-
-        let call = ToolCall::new("call_spy", "spy_tool", json!({}));
-        let outcome = registry
-            .run_tool_call(call, Some(ApprovalDecision::Approved))
-            .await
-            .unwrap();
-        // The tool never ran; the block surfaced as a failed tool result.
-        assert!(!ran.load(Ordering::SeqCst), "blocked tool must not execute");
-        match outcome {
-            ToolRunOutcome::Result { result } => {
-                assert_eq!(result.status, ToolResultStatus::Error);
-                assert!(result.content.contains("拦截") && result.content.contains("plan mode"));
-            }
-            other => panic!("expected a blocked result, got {other:?}"),
-        }
-    }
 
     #[tokio::test]
     async fn policy_denies_dangerous_shell_before_execution() {

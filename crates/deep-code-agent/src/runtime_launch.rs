@@ -8,8 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::client::{DeepSeekClient, LlmClient};
 use crate::config::AgentConfig;
 use crate::echo_client::EchoClient;
-use crate::extensions::{RuntimeBootstrap, attach_agent_extensions, build_runtime_system_prompt};
-use crate::plan_mode::PlanMode;
+use crate::extensions::{attach_agent_extensions, build_runtime_system_prompt};
 use crate::runtime::{AgentRuntime, AgentRuntimeHandle};
 use crate::session_store::{ConfigSnapshot, JsonSessionStore, SessionRecord, SessionStore};
 use crate::shell_tools::{JobStore, shell_tool_registry};
@@ -27,7 +26,6 @@ pub struct LaunchedRuntime {
     pub session_id: Option<String>,
     pub subagent_manager: SharedSubAgentManager,
     pub job_store: JobStore,
-    pub plan_mode: PlanMode,
     pub stop_hook: Box<dyn Fn() + Send + Sync>,
     /// True when running on the offline placeholder backend (no API key):
     /// the UI should point the user at `/apikey` instead of implying a
@@ -169,7 +167,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
             None
         }
     };
-    let (tools, subagent_manager, job_store, plan_mode, shutdown) = build_parent_tools(
+    let (tools, subagent_manager, job_store, shutdown) = build_parent_tools(
         Arc::clone(&client),
         config,
         &workspace,
@@ -208,7 +206,6 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
         session_id,
         subagent_manager,
         job_store,
-        plan_mode,
         stop_hook: shutdown,
         offline: client.provider_name() == EchoClient::PROVIDER,
         warnings,
@@ -257,7 +254,7 @@ fn launch_resumed(
         && let Ok(client) = DeepSeekClient::new(config.clone())
     {
         let client = Arc::new(client);
-        let (tools, subagent_manager, job_store, plan_mode, shutdown) = build_parent_tools(
+        let (tools, subagent_manager, job_store, shutdown) = build_parent_tools(
             Arc::clone(&client),
             config,
             &workspace,
@@ -281,7 +278,6 @@ fn launch_resumed(
             session_id: Some(record.id.as_str().to_string()),
             subagent_manager,
             job_store,
-            plan_mode,
             stop_hook: shutdown,
             offline: false,
             warnings,
@@ -289,7 +285,7 @@ fn launch_resumed(
     }
 
     let client = Arc::new(EchoClient);
-    let (tools, subagent_manager, job_store, plan_mode, shutdown) = build_parent_tools(
+    let (tools, subagent_manager, job_store, shutdown) = build_parent_tools(
         Arc::clone(&client),
         config,
         &workspace,
@@ -307,7 +303,6 @@ fn launch_resumed(
         session_id: Some(record.id.as_str().to_string()),
         subagent_manager,
         job_store,
-        plan_mode,
         stop_hook: shutdown,
         offline: true,
         warnings,
@@ -324,10 +319,8 @@ fn build_parent_tools<C: LlmClient + Clone + 'static>(
     ToolRegistry,
     SharedSubAgentManager,
     JobStore,
-    PlanMode,
     Box<dyn Fn() + Send + Sync>,
 ) {
-    let bootstrap = RuntimeBootstrap::load();
     let (mut registry, job_store) = build_tool_registry(workspace, warnings);
     let extensions = attach_agent_extensions(
         &mut registry,
@@ -335,19 +328,12 @@ fn build_parent_tools<C: LlmClient + Clone + 'static>(
         config.clone(),
         workspace.to_path_buf(),
         parent_cancel.clone(),
-        &bootstrap,
     );
     let shutdown: Box<dyn Fn() + Send + Sync> = Box::new({
         let extensions = Arc::clone(&extensions);
         move || extensions.cancel_all_running()
     });
-    (
-        registry,
-        extensions.subagent_manager(),
-        job_store,
-        extensions.plan_mode(),
-        shutdown,
-    )
+    (registry, extensions.subagent_manager(), job_store, shutdown)
 }
 
 fn attach_workspace_helpers<C: LlmClient + 'static>(
@@ -372,7 +358,7 @@ mod tests {
         workspace: &Path,
     ) -> Vec<String> {
         let cancel = CancellationToken::new();
-        let (registry, _, _, _, _) = build_parent_tools(
+        let (registry, _, _, _) = build_parent_tools(
             Arc::new(client),
             config,
             workspace,

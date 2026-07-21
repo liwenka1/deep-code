@@ -47,7 +47,7 @@ deepcode eval            # SWE-bench 评测 rollout(见下文)
 deepcode session list|resume|delete|export
 ```
 
-常用 slash 命令：`/help` `/model` `/plan` `/apikey` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy`（`/help` 查看全部与快捷键）。
+常用 slash 命令：`/help` `/model` `/apikey` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy`（`/help` 查看全部与快捷键）。
 
 ## 配置
 

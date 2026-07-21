@@ -12,13 +12,11 @@ mod error;
 mod event;
 mod execution_policy;
 mod extensions;
-mod hooks;
 mod lsp;
 mod message;
 mod model;
 mod model_registry;
 mod paths;
-mod plan_mode;
 mod pricing;
 mod reasoning;
 mod runtime;
@@ -60,7 +58,6 @@ pub use model::{
     ChatRequest, FunctionCallDelta, ToolCallDelta, ToolCallFunctionPayload, ToolCallPayload, Usage,
 };
 pub use model_registry::{DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO, ModelRegistry};
-pub use plan_mode::PlanMode;
 pub use pricing::{CostCurrency, CostEstimate, PrefixStatus, TurnTelemetry};
 pub use runtime::{
     AgentRuntime, AgentRuntimeHandle, RuntimeEvent, RuntimeEventReceiver, ToolCallId, TurnId,

@@ -828,7 +828,6 @@ mod tests {
                 deep_code_agent::SubAgentManager::new(workspace, 2),
             )),
             job_store: deep_code_agent::JobStore::default(),
-            plan_mode: deep_code_agent::PlanMode::new(),
             stop_hook: Box::new(|| {}),
             offline: false,
             warnings: Vec::new(),
