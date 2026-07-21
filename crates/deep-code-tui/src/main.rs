@@ -21,7 +21,11 @@ async fn main() -> anyhow::Result<()> {
         RunMode::Tui { intent } => {
             let store = JsonSessionStore::for_workspace(workspace_root())?;
             let record = startup::choose_startup(&store, intent)?;
-            ui::run(app::LaunchConfig { resume: record }).await
+            ui::run(app::LaunchConfig {
+                resume: record,
+                workspace: None,
+            })
+            .await
         }
         RunMode::Doctor { json } => doctor_cli::run_doctor(json),
         RunMode::Serve {

@@ -28,8 +28,7 @@ impl App {
     /// loader keeps `/resume`, `/clear`, and `/model` from drifting — a plain
     /// `AgentConfig::load` here once dropped the saved key on `/resume`.
     fn load_layered_config(&self) -> AgentConfig {
-        let workspace = workspace_root();
-        let project = workspace.join(".deep-code").join("config.toml");
+        let project = self.workspace.join(".deep-code").join("config.toml");
         AgentConfig::load_with(
             Some(self.global_config_path.clone()),
             Some(project),
@@ -56,7 +55,7 @@ impl App {
     /// state. The caller must have shut the previous runtime down first.
     fn launch_and_adopt(&mut self, resume: Option<SessionRecord>, resumed: bool) {
         let agent_config = self.load_layered_config();
-        let launched = launch_runtime(&agent_config, workspace_root(), resume);
+        let launched = launch_runtime(&agent_config, self.workspace.clone(), resume);
         self.cost_currency = agent_config.cost_currency;
         self.configured_model = agent_config.model.clone();
         self.configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
@@ -78,7 +77,7 @@ impl App {
         self.shutdown_current_runtime();
 
         let resume = self.session_id.as_ref().and_then(|id| {
-            let store = JsonSessionStore::for_workspace(workspace_root()).ok()?;
+            let store = JsonSessionStore::for_workspace(self.workspace.clone()).ok()?;
             let session_id = deep_code_agent::SessionId::parse(id).ok()?;
             store.load(&session_id).ok()
         });
@@ -105,7 +104,7 @@ impl App {
             self.status = "正在流式输出或等待审批，无法切换会话".to_string();
             return;
         }
-        let sessions = match JsonSessionStore::for_workspace(workspace_root())
+        let sessions = match JsonSessionStore::for_workspace(self.workspace.clone())
             .and_then(|store| store.list())
         {
             Ok(list) => list
@@ -167,8 +166,7 @@ impl App {
     /// Load session `id` and switch to it in place. Surfaces a readable status
     /// on a bad id / missing record rather than failing the command.
     pub(crate) fn switch_session_by_id(&mut self, id: &str) -> Result<(), String> {
-        let workspace = workspace_root();
-        let store = JsonSessionStore::for_workspace(&workspace)
+        let store = JsonSessionStore::for_workspace(&self.workspace)
             .map_err(|error| format!("无法打开会话存储: {error}"))?;
         let session_id = deep_code_agent::SessionId::parse(id)
             .map_err(|error| format!("无效的会话 id '{id}': {error}"))?;
@@ -217,7 +215,7 @@ impl App {
             return;
         }
 
-        let workspace_display = home_relative(&workspace_root());
+        let workspace_display = home_relative(&self.workspace);
         self.shutdown_current_runtime();
         self.launch_and_adopt(None, false);
 

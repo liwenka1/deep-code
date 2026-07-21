@@ -359,19 +359,13 @@ impl App {
     }
 
     fn list_sessions(&mut self) {
-        let Ok(cwd) = std::env::current_dir() else {
-            self.status = "Cannot resolve workspace for sessions.".to_string();
-            return;
-        };
-        match JsonSessionStore::for_workspace(cwd) {
+        match JsonSessionStore::for_workspace(self.workspace.clone()) {
             Ok(store) => match store.list() {
                 Ok(records) if records.is_empty() => {
                     self.status = "No saved sessions.".to_string();
                 }
                 Ok(records) => {
-                    let note = std::env::current_dir()
-                        .map(|cwd| format_sessions_storage_note(&cwd))
-                        .unwrap_or_default();
+                    let note = format_sessions_storage_note(&self.workspace);
                     self.history.push(HistoryCell::system(format!(
                         "{note}\nSessions:\n{}",
                         records
@@ -397,11 +391,7 @@ impl App {
     }
 
     fn list_checkpoints(&mut self) {
-        let Ok(cwd) = std::env::current_dir() else {
-            self.status = "Cannot resolve workspace for checkpoints.".to_string();
-            return;
-        };
-        match CheckpointStore::new(cwd) {
+        match CheckpointStore::new(&self.workspace) {
             Ok(store) => match store.list() {
                 Ok(ids) if ids.is_empty() => {
                     self.status = "No checkpoints yet.".to_string();

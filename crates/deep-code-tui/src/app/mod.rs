@@ -34,6 +34,10 @@ mod tests;
 #[derive(Debug, Clone, Default)]
 pub struct LaunchConfig {
     pub resume: Option<SessionRecord>,
+    /// Workspace override; `None` means the process working directory.
+    /// Tests must set this — a launched runtime persists sessions and
+    /// subagent state under `<workspace>/.deep-code`.
+    pub workspace: Option<PathBuf>,
 }
 
 /// Updates pushed from the bridge task into the UI thread.
@@ -112,6 +116,9 @@ pub struct App {
     history_draft: String,
     pub(crate) completion: Option<CompletionMenu>,
     pub(crate) workspace_files: Vec<String>,
+    /// Resolved once at launch; every runtime swap and store access must
+    /// reuse it instead of re-deriving from the process working directory.
+    pub(crate) workspace: PathBuf,
     /// Target of `/apikey` `/model` `/logout` writes; overridable in tests.
     pub(crate) global_config_path: PathBuf,
     /// When the current stream segment began, for the live activity
@@ -250,7 +257,7 @@ fn remove_char_at(s: &mut String, char_index: usize) -> bool {
 impl App {
     #[must_use]
     pub fn launch(config: LaunchConfig) -> Self {
-        let workspace = workspace_root();
+        let workspace = config.workspace.clone().unwrap_or_else(workspace_root);
         let workspace_files = deep_code_agent::list_workspace_files(&workspace, 2000);
         let loaded = AgentConfig::load(&workspace);
         let config_warnings = loaded.report.warnings.clone();
@@ -259,7 +266,7 @@ impl App {
         let configured_model = agent_config.model.clone();
         let configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
         let workspace_display = home_relative(&workspace);
-        let launched = launch_runtime(&agent_config, workspace, config.resume.clone());
+        let launched = launch_runtime(&agent_config, workspace.clone(), config.resume.clone());
         let runtime = launched.handle;
         let backend_label = launched.backend_label;
         let backend_offline = launched.offline;
@@ -354,6 +361,7 @@ impl App {
             history_draft: String::new(),
             completion: None,
             workspace_files,
+            workspace,
             global_config_path: default_config_path(),
             streaming_since: None,
             pasted_blocks: Vec::new(),
@@ -377,9 +385,22 @@ impl App {
         Some(format!("{frame} 生成中 {}s", elapsed.as_secs()))
     }
 
+    /// Test constructor: launch into a process-shared temp workspace so the
+    /// persisted sessions/state land in the OS temp dir instead of littering
+    /// the crate directory. The static intentionally never drops — the OS
+    /// reclaims its temp storage.
+    #[cfg(test)]
     #[must_use]
-    pub fn new() -> Self {
-        Self::launch(LaunchConfig::default())
+    pub(crate) fn new() -> Self {
+        static TEST_WORKSPACE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let workspace = TEST_WORKSPACE
+            .get_or_init(|| tempfile::tempdir().expect("test workspace"))
+            .path()
+            .to_path_buf();
+        Self::launch(LaunchConfig {
+            workspace: Some(workspace),
+            ..LaunchConfig::default()
+        })
     }
 
     /// Drop the oldest transcript cells beyond [`MAX_HISTORY_CELLS`]. Called
@@ -739,11 +760,5 @@ impl App {
             shutdown();
         }
         self.runtime.shutdown().await;
-    }
-}
-
-impl Default for App {
-    fn default() -> Self {
-        Self::new()
     }
 }
