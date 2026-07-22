@@ -13,6 +13,7 @@ mod tests;
 
 pub use manager::SubAgentManager;
 pub use registry::{SubAgentServices, is_subagent_tool, register_subagent_tools};
+pub use roles::SubAgentRole;
 pub use types::DEFAULT_MAX_CONCURRENT;
 
 pub type SharedSubAgentManager = std::sync::Arc<std::sync::RwLock<SubAgentManager>>;

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -13,11 +12,9 @@ use crate::tool::ToolRegistry;
 use crate::workspace_tools::workspace_tool_registry;
 
 use super::manager::SubAgentManager;
-use super::tools::{AgentCloseTool, AgentEvalTool, AgentOpenTool};
+use super::tools::AgentTool;
 
-pub type AgentCancelMap = Arc<RwLock<HashMap<String, CancellationToken>>>;
-
-pub const SUBAGENT_TOOL_NAMES: [&str; 3] = ["agent_open", "agent_eval", "agent_close"];
+pub const SUBAGENT_TOOL_NAMES: [&str; 1] = ["agent"];
 
 pub fn is_subagent_tool(name: &str) -> bool {
     SUBAGENT_TOOL_NAMES.contains(&name)
@@ -30,7 +27,6 @@ pub struct SubAgentServices<C: LlmClient + Clone + 'static> {
     pub agent_config: AgentConfig,
     pub workspace: PathBuf,
     pub parent_cancel: CancellationToken,
-    pub agent_cancels: AgentCancelMap,
     pub exec_policy: ExecPolicy,
 }
 
@@ -53,19 +49,14 @@ impl<C: LlmClient + Clone + 'static> SubAgentServices<C> {
             agent_config,
             workspace,
             parent_cancel,
-            agent_cancels: Arc::new(RwLock::new(HashMap::new())),
             exec_policy,
         }
     }
 
-    /// Cancel parent + per-agent tokens and mark running records cancelled.
+    /// Cancel every child (all child tokens derive from `parent_cancel`) and
+    /// mark running records cancelled.
     pub fn cancel_all_running(&self) {
         self.parent_cancel.cancel();
-        if let Ok(cancels) = self.agent_cancels.read() {
-            for token in cancels.values() {
-                token.cancel();
-            }
-        }
         if let Ok(mut manager) = self.manager.write() {
             manager.cancel_all();
         }
@@ -76,9 +67,7 @@ pub fn register_subagent_tools<C: LlmClient + Clone + 'static>(
     registry: &mut ToolRegistry,
     services: Arc<SubAgentServices<C>>,
 ) {
-    registry.register(AgentOpenTool::new(Arc::clone(&services)));
-    registry.register(AgentEvalTool::new(Arc::clone(&services)));
-    registry.register(AgentCloseTool::new(services));
+    registry.register(AgentTool::new(services));
 }
 
 /// Attach sub-agent tools to an existing parent registry. Test-only: the

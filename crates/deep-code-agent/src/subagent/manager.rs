@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::subagent::output::parse_structured_report;
 use crate::subagent::types::{
     HARD_MAX_CONCURRENT, SUBAGENT_STATE_FILE, SUBAGENT_STATE_SCHEMA_VERSION, SubAgentError,
-    SubAgentRecord, SubAgentSessionProjection, SubAgentStatus,
+    SubAgentRecord, SubAgentStatus,
 };
 
 /// Cap on retained records from *prior* sessions. The current session's agents
@@ -140,27 +140,6 @@ impl SubAgentManager {
             .ok_or_else(|| SubAgentError::NotFound {
                 id: agent_id.to_string(),
             })
-    }
-
-    pub fn project(
-        &self,
-        record: &SubAgentRecord,
-        timed_out: bool,
-    ) -> Result<SubAgentSessionProjection, SubAgentError> {
-        Ok(SubAgentSessionProjection {
-            name: record.name.clone(),
-            agent_id: record.agent_id.clone(),
-            status: record.status.as_str().to_string(),
-            terminal: record.status.is_terminal(),
-            context_mode: if record.fork_context {
-                "forked".to_string()
-            } else {
-                "fresh".to_string()
-            },
-            fork_context: record.fork_context,
-            snapshot: record.clone(),
-            timed_out,
-        })
     }
 
     pub fn finalize_success(
@@ -343,7 +322,6 @@ mod tests {
             result: None,
             structured: None,
             error: None,
-            fork_context: false,
             started_at_ms: now_ms(),
             finished_at_ms: None,
             steps_taken: 0,
@@ -380,7 +358,6 @@ mod tests {
                 result: None,
                 structured: None,
                 error: None,
-                fork_context: false,
                 started_at_ms: now_ms(),
                 finished_at_ms: None,
                 steps_taken: 0,
@@ -391,8 +368,7 @@ mod tests {
         let record = manager.finalize_success("a1", text.to_string(), 1).unwrap();
         assert_eq!(record.status, SubAgentStatus::Completed);
         assert!(record.structured.is_some());
-        let projection = manager.project(&record, false).unwrap();
-        assert_eq!(projection.snapshot.name, "worker");
+        assert_eq!(record.name, "worker");
     }
 
     #[test]
@@ -412,7 +388,6 @@ mod tests {
                 result: None,
                 structured: None,
                 error: None,
-                fork_context: false,
                 started_at_ms: n,
                 finished_at_ms: Some(n),
                 steps_taken: 0,
@@ -451,7 +426,6 @@ mod tests {
                     result: None,
                     structured: None,
                     error: None,
-                    fork_context: false,
                     started_at_ms: now_ms(),
                     finished_at_ms: None,
                     steps_taken: 0,

@@ -14,8 +14,9 @@ mod integration {
     use crate::model::ChatRequest;
     use crate::runtime::AgentRuntime;
     use crate::subagent::registry::attach_subagent_tools;
+    use crate::subagent::roles::SubAgentRole;
     use crate::subagent::types::SubAgentStatus;
-    use crate::tool::{ApprovalDecision, ApprovalRequest, ToolCall, ToolRegistry};
+    use crate::tool::{ApprovalDecision, ApprovalRequest, ToolCall, ToolCx, ToolRegistry};
 
     #[derive(Clone)]
     struct SummaryClient;
@@ -96,63 +97,116 @@ None.
         }
     }
 
-    #[tokio::test]
-    async fn panicking_child_finalizes_as_failed_not_running_forever() {
-        let dir = tempfile::tempdir().unwrap();
-        let client = Arc::new(PanicClient);
-        let cancel = CancellationToken::new();
-        let mut registry = ToolRegistry::new();
-        let services = attach_subagent_tools(
-            &mut registry,
-            Arc::clone(&client),
-            AgentConfig::default(),
-            dir.path().to_path_buf(),
-            cancel,
-        );
+    /// Never produces anything: exercises the wall-clock timeout path.
+    #[derive(Clone)]
+    struct StuckClient;
 
-        let open = ToolCall::new(
-            "call_1",
-            "agent_open",
-            json!({"prompt": "explode", "type": "explore", "name": "boom"}),
-        );
-        let open_result = registry
-            .run_tool_call(open, None)
-            .await
-            .unwrap()
-            .into_result()
-            .unwrap();
-        let opened: serde_json::Value = serde_json::from_str(&open_result.content).unwrap();
-        let agent_id = opened["agent_id"].as_str().expect("agent_id").to_string();
-
-        let mut terminal_status = None;
-        for _ in 0..100 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let manager = services.manager.read().unwrap();
-            if let Some(record) = manager.get(&agent_id)
-                && record.status.is_terminal()
-            {
-                terminal_status = Some((record.status, record.error.clone()));
-                break;
-            }
+    impl LlmClient for StuckClient {
+        fn provider_name(&self) -> &'static str {
+            "stuck"
         }
 
-        let (status, error) = terminal_status.expect("record must reach a terminal state");
-        assert_eq!(status, SubAgentStatus::Failed);
-        assert!(
-            error.is_some_and(|message| message.contains("event stream ended")),
-            "failure must carry the broken-channel reason"
-        );
+        fn model(&self) -> &str {
+            "stuck-model"
+        }
+
+        async fn stream_chat(&self, _request: ChatRequest) -> AgentResult<AgentEventStream> {
+            let stream = try_stream! {
+                futures_util::future::pending::<()>().await;
+                yield AgentEvent::Done { usage: None };
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
+    fn agent_call(id: &str, task: &str, role: &str) -> ToolCall {
+        ToolCall::new(id, "agent", json!({"task": task, "role": role}))
     }
 
     #[tokio::test]
-    async fn agent_open_respects_concurrency_cap() {
+    async fn agent_call_blocks_until_report_and_finalizes_ledger() {
         let dir = tempfile::tempdir().unwrap();
         let client = Arc::new(SummaryClient);
         let cancel = CancellationToken::new();
         let mut registry = ToolRegistry::new();
         let services = attach_subagent_tools(
             &mut registry,
-            Arc::clone(&client),
+            client,
+            AgentConfig::default(),
+            dir.path().to_path_buf(),
+            cancel,
+        );
+
+        let result = registry
+            .run_tool_call(agent_call("call_1", "summarize lib.rs", "explore"), None)
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+
+        assert_eq!(result.status, crate::tool::ToolResultStatus::Success);
+        assert!(
+            result.content.contains("Mapped the crate root"),
+            "tool result must be the child's report, got: {}",
+            result.content
+        );
+
+        let manager = services.manager.read().unwrap();
+        let records = manager.list_current_session();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, SubAgentStatus::Completed);
+        assert!(
+            records[0]
+                .structured
+                .as_ref()
+                .is_some_and(|report| report.summary.contains("Mapped")),
+            "ledger must hold the parsed structured report"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_child_returns_soft_error_and_finalizes_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Arc::new(PanicClient);
+        let cancel = CancellationToken::new();
+        let mut registry = ToolRegistry::new();
+        let services = attach_subagent_tools(
+            &mut registry,
+            client,
+            AgentConfig::default(),
+            dir.path().to_path_buf(),
+            cancel,
+        );
+
+        let result = registry
+            .run_tool_call(agent_call("call_1", "explode", "explore"), None)
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+
+        assert_eq!(result.status, crate::tool::ToolResultStatus::Error);
+        assert!(
+            result.content.contains("sub-agent failed"),
+            "model must read the failure, got: {}",
+            result.content
+        );
+        let manager = services.manager.read().unwrap();
+        assert_eq!(
+            manager.list_current_session()[0].status,
+            SubAgentStatus::Failed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_calls_beyond_cap_error_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Arc::new(SlowClient);
+        let cancel = CancellationToken::new();
+        let mut registry = ToolRegistry::new();
+        let services = attach_subagent_tools(
+            &mut registry,
+            client,
             AgentConfig::default(),
             dir.path().to_path_buf(),
             cancel,
@@ -162,205 +216,27 @@ None.
             let _ = manager.set_max_concurrent(1);
         }
 
-        let open = ToolCall::new(
-            "call_1",
-            "agent_open",
-            json!({"prompt": "explore lib.rs", "type": "explore", "name": "first"}),
+        // Both calls poll concurrently: the first inserts its Running record
+        // before its first await; the second hits the cap.
+        let (first, second) = tokio::join!(
+            registry.run_tool_call(agent_call("call_1", "slow one", "explore"), None),
+            registry.run_tool_call(agent_call("call_2", "slow two", "explore"), None),
         );
-        let second = ToolCall::new(
-            "call_2",
-            "agent_open",
-            json!({"prompt": "explore mod.rs", "type": "explore", "name": "second"}),
-        );
-
-        let first = registry.run_tool_call(open, None).await.unwrap();
-        assert!(first.is_result_success(), "open failed: {first:?}");
-        let second = registry.run_tool_call(second, None).await;
+        assert!(first.is_ok(), "first child must run: {first:?}");
+        let error = second.expect_err("second child must hit the cap");
         assert!(
-            second.is_err(),
-            "expected concurrency error, got {second:?}"
-        );
-        assert!(
-            second
-                .unwrap_err()
-                .to_string()
-                .contains("concurrency limit"),
-            "unexpected error"
+            error.to_string().contains("concurrency limit"),
+            "unexpected error: {error}"
         );
     }
 
-    #[tokio::test]
-    async fn subagent_runs_to_structured_completion() {
-        let dir = tempfile::tempdir().unwrap();
-        let client = Arc::new(SummaryClient);
-        let cancel = CancellationToken::new();
-        let mut registry = ToolRegistry::new();
-        let services = attach_subagent_tools(
-            &mut registry,
-            Arc::clone(&client),
-            AgentConfig::default(),
-            dir.path().to_path_buf(),
-            cancel,
-        );
-
-        let open = ToolCall::new(
-            "call_1",
-            "agent_open",
-            json!({"prompt": "summarize lib.rs", "type": "explore", "name": "worker"}),
-        );
-        let open_result = registry
-            .run_tool_call(open, None)
-            .await
-            .unwrap()
-            .into_result()
-            .unwrap();
-        let opened: serde_json::Value = serde_json::from_str(&open_result.content).unwrap();
-        let agent_id = opened["agent_id"].as_str().expect("agent_id").to_string();
-
-        for _ in 0..100 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let manager = services.manager.read().unwrap();
-            if manager
-                .get(&agent_id)
-                .is_some_and(|record| record.status.is_terminal())
-            {
-                break;
-            }
-        }
-
-        let eval = ToolCall::new(
-            "call_2",
-            "agent_eval",
-            json!({"agent_id": agent_id, "wait": false}),
-        );
-        let eval_result = registry
-            .run_tool_call(eval, None)
-            .await
-            .unwrap()
-            .into_result()
-            .unwrap();
-        let projection: serde_json::Value = serde_json::from_str(&eval_result.content).unwrap();
-        assert_eq!(projection["status"], "completed");
-        assert!(
-            projection["snapshot"]["structured"]["summary"]
-                .as_str()
-                .unwrap()
-                .contains("Mapped")
-        );
-    }
-
-    #[tokio::test]
-    async fn agent_close_cancels_running_agent() {
+    #[tokio::test(start_paused = true)]
+    async fn session_shutdown_cancels_inflight_child() {
         let dir = tempfile::tempdir().unwrap();
         let client = Arc::new(SlowClient);
         let cancel = CancellationToken::new();
         let mut registry = ToolRegistry::new();
         let services = attach_subagent_tools(
-            &mut registry,
-            Arc::clone(&client),
-            AgentConfig::default(),
-            dir.path().to_path_buf(),
-            cancel,
-        );
-
-        let open = ToolCall::new(
-            "call_1",
-            "agent_open",
-            json!({"prompt": "slow task", "type": "explore", "name": "slow-worker"}),
-        );
-        let open_result = registry
-            .run_tool_call(open, None)
-            .await
-            .unwrap()
-            .into_result()
-            .unwrap();
-        let opened: serde_json::Value = serde_json::from_str(&open_result.content).unwrap();
-        let agent_id = opened["agent_id"].as_str().expect("agent_id").to_string();
-
-        let close = ToolCall::new("call_2", "agent_close", json!({"agent_id": agent_id}));
-        let close_result = registry
-            .run_tool_call(close, None)
-            .await
-            .unwrap()
-            .into_result()
-            .unwrap();
-        let projection: serde_json::Value = serde_json::from_str(&close_result.content).unwrap();
-        assert_eq!(projection["status"], "cancelled");
-
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let manager = services.manager.read().unwrap();
-            if manager
-                .get(&agent_id)
-                .is_some_and(|record| record.status.is_terminal())
-            {
-                break;
-            }
-        }
-        let manager = services.manager.read().unwrap();
-        assert_eq!(
-            manager.get(&agent_id).map(|record| record.status),
-            Some(SubAgentStatus::Cancelled)
-        );
-    }
-
-    #[tokio::test]
-    async fn parent_cancel_stops_background_subagent() {
-        let dir = tempfile::tempdir().unwrap();
-        let client = Arc::new(SlowClient);
-        let cancel = CancellationToken::new();
-        let mut registry = ToolRegistry::new();
-        let services = attach_subagent_tools(
-            &mut registry,
-            Arc::clone(&client),
-            AgentConfig::default(),
-            dir.path().to_path_buf(),
-            cancel.clone(),
-        );
-
-        let open = ToolCall::new(
-            "call_1",
-            "agent_open",
-            json!({"prompt": "slow", "type": "explore", "name": "bg"}),
-        );
-        let open_result = registry
-            .run_tool_call(open, None)
-            .await
-            .unwrap()
-            .into_result()
-            .unwrap();
-        let agent_id =
-            serde_json::from_str::<serde_json::Value>(&open_result.content).unwrap()["agent_id"]
-                .as_str()
-                .expect("agent_id")
-                .to_string();
-
-        services.cancel_all_running();
-
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let manager = services.manager.read().unwrap();
-            if manager
-                .get(&agent_id)
-                .is_some_and(|record| record.status.is_terminal())
-            {
-                break;
-            }
-        }
-        let manager = services.manager.read().unwrap();
-        assert_eq!(
-            manager.get(&agent_id).map(|record| record.status),
-            Some(SubAgentStatus::Cancelled)
-        );
-    }
-
-    #[tokio::test]
-    async fn agent_eval_wait_timeout_sets_timed_out() {
-        let dir = tempfile::tempdir().unwrap();
-        let client = Arc::new(SlowClient);
-        let cancel = CancellationToken::new();
-        let mut registry = ToolRegistry::new();
-        attach_subagent_tools(
             &mut registry,
             client,
             AgentConfig::default(),
@@ -368,43 +244,107 @@ None.
             cancel,
         );
 
-        let open = ToolCall::new(
-            "call_1",
-            "agent_open",
-            json!({"prompt": "slow", "type": "explore", "name": "slow"}),
-        );
-        let open_result = registry
-            .run_tool_call(open, None)
-            .await
-            .unwrap()
-            .into_result()
-            .unwrap();
-        let agent_id =
-            serde_json::from_str::<serde_json::Value>(&open_result.content).unwrap()["agent_id"]
-                .as_str()
-                .expect("agent_id")
-                .to_string();
+        let call = registry.run_tool_call(agent_call("call_1", "slow", "explore"), None);
+        tokio::pin!(call);
+        // Let the child start, then pull the session-wide plug.
+        tokio::select! {
+            biased;
+            _ = &mut call => panic!("child must still be running"),
+            () = tokio::task::yield_now() => {}
+        }
+        services.cancel_all_running();
 
-        let eval = ToolCall::new(
-            "call_2",
-            "agent_eval",
-            json!({"agent_id": agent_id, "wait": true, "timeout_ms": 100}),
+        let result = call.await.unwrap().into_result().unwrap();
+        assert_eq!(result.status, crate::tool::ToolResultStatus::Error);
+        assert!(result.content.contains("cancelled"));
+        let manager = services.manager.read().unwrap();
+        assert_eq!(
+            manager.list_current_session()[0].status,
+            SubAgentStatus::Cancelled
         );
-        let eval_result = registry
-            .run_tool_call(eval, None)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn turn_cancel_token_cancels_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Arc::new(SlowClient);
+        let cancel = CancellationToken::new();
+        let mut registry = ToolRegistry::new();
+        let services = attach_subagent_tools(
+            &mut registry,
+            client,
+            AgentConfig::default(),
+            dir.path().to_path_buf(),
+            cancel,
+        );
+
+        let turn_cancel = CancellationToken::new();
+        let call = agent_call("call_1", "slow", "explore");
+        let plan = registry.evaluate_tool(&call);
+        let cx = ToolCx::new().with_cancel(turn_cancel.clone());
+        let run = registry.run_tool_call_with_plan(&call, None, plan, cx);
+        tokio::pin!(run);
+        tokio::select! {
+            biased;
+            _ = &mut run => panic!("child must still be running"),
+            () = tokio::task::yield_now() => {}
+        }
+        turn_cancel.cancel();
+
+        let result = run.await.unwrap().into_result().unwrap();
+        assert!(result.content.contains("cancelled"));
+        let manager = services.manager.read().unwrap();
+        assert_eq!(
+            manager.list_current_session()[0].status,
+            SubAgentStatus::Cancelled
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stuck_child_hits_wall_clock_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Arc::new(StuckClient);
+        let cancel = CancellationToken::new();
+        let mut registry = ToolRegistry::new();
+        // Widen the stream guards past the agent wall clock so this test
+        // exercises the tool's own ceiling, not the transport watchdog.
+        let config = AgentConfig {
+            stream_chunk_timeout: Duration::from_secs(7200),
+            stream_total_timeout: Duration::from_secs(7200),
+            ..AgentConfig::default()
+        };
+        let services = attach_subagent_tools(
+            &mut registry,
+            client,
+            config,
+            dir.path().to_path_buf(),
+            cancel,
+        );
+
+        let result = registry
+            .run_tool_call(agent_call("call_1", "hang forever", "explore"), None)
             .await
             .unwrap()
             .into_result()
             .unwrap();
-        let projection: serde_json::Value = serde_json::from_str(&eval_result.content).unwrap();
-        assert_eq!(projection["timed_out"], true);
-        assert_eq!(projection["status"], "running");
+
+        assert_eq!(result.status, crate::tool::ToolResultStatus::Error);
+        assert!(
+            result.content.contains("timeout"),
+            "must surface the wall-clock timeout, got: {}",
+            result.content
+        );
+        let manager = services.manager.read().unwrap();
+        assert_eq!(
+            manager.list_current_session()[0].status,
+            SubAgentStatus::Failed
+        );
     }
 
     #[tokio::test]
-    async fn subagent_denies_write_tool_approval() {
+    async fn approval_posture_allows_writes_only_for_writing_roles() {
         let runtime = AgentRuntime::new(SummaryClient, ToolRegistry::new());
-        let request = ApprovalRequest {
+        let write_request = ApprovalRequest {
             call_id: "call_1".to_string(),
             tool_name: "write_file".to_string(),
             description: "write".to_string(),
@@ -417,26 +357,46 @@ None.
             safety_reasons: Vec::new(),
             safety_suggestions: Vec::new(),
         };
+        // Dispatching a writing role is the write authorization.
         assert_eq!(
-            runtime.subagent_approval_decision(&request),
+            runtime.subagent_approval_decision(&write_request, SubAgentRole::Implementer),
+            ApprovalDecision::Approved
+        );
+        assert_eq!(
+            runtime.subagent_approval_decision(&write_request, SubAgentRole::General),
+            ApprovalDecision::Approved
+        );
+        // Read-only roles stay read-only.
+        assert_eq!(
+            runtime.subagent_approval_decision(&write_request, SubAgentRole::Explore),
+            ApprovalDecision::Denied
+        );
+        // The posture never extends past file writes: untrusted shell is
+        // denied even for implementer.
+        let shell_request = ApprovalRequest {
+            call_id: "call_2".to_string(),
+            tool_name: "shell".to_string(),
+            description: "run".to_string(),
+            arguments: json!({"command": "curl https://example.com"}),
+            risk_level: crate::execution_policy::RiskLevel::High,
+            requires_sandbox: false,
+            read_only: false,
+            matched_rule: None,
+            preview: None,
+            safety_reasons: Vec::new(),
+            safety_suggestions: Vec::new(),
+        };
+        assert_eq!(
+            runtime.subagent_approval_decision(&shell_request, SubAgentRole::Implementer),
             ApprovalDecision::Denied
         );
     }
 
     trait ToolOutcomeExt {
-        fn is_result_success(&self) -> bool;
         fn into_result(self) -> Option<crate::tool::ToolResult>;
     }
 
     impl ToolOutcomeExt for crate::tool::ToolRunOutcome {
-        fn is_result_success(&self) -> bool {
-            matches!(
-                self,
-                crate::tool::ToolRunOutcome::Result { result }
-                    if result.status == crate::tool::ToolResultStatus::Success
-            )
-        }
-
         fn into_result(self) -> Option<crate::tool::ToolResult> {
             match self {
                 crate::tool::ToolRunOutcome::Result { result } => Some(result),

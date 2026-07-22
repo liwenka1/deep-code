@@ -115,7 +115,7 @@ impl ExecPolicy {
             "job" => ToolKind::Job,
             "web_search" | "fetch_url" => ToolKind::Network,
             "mock_echo" => ToolKind::Mock,
-            "agent_open" | "agent_eval" | "agent_close" => ToolKind::SubAgent,
+            "agent" => ToolKind::SubAgent,
             _ => ToolKind::Unknown,
         }
     }

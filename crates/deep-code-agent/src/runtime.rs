@@ -331,23 +331,35 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         );
     }
 
-    /// Resolve a pending tool call for a background sub-agent.
+    /// Resolve a pending tool call for an unattended sub-agent.
     ///
-    /// Inherits the runtime [`ToolRegistry`] execution policy: only tools that
-    /// are allowed without human approval are auto-approved. Write tools and
-    /// shell commands that would normally require parent approval are denied.
-    pub fn subagent_approval_decision(&self, request: &ApprovalRequest) -> ApprovalDecision {
+    /// Fail-closed against the execution policy, with one role-posture
+    /// exception: dispatching a writing role (general/implementer) *is* the
+    /// write authorization, so workspace file writes are approved for those
+    /// roles. Shell and network still require the policy's own allow paths
+    /// (trusted prefixes / auto_allow); hard denials are never overridden.
+    pub fn subagent_approval_decision(
+        &self,
+        request: &ApprovalRequest,
+        role: crate::subagent::SubAgentRole,
+    ) -> ApprovalDecision {
         let call = ToolCall::new(
             request.call_id.clone(),
             request.tool_name.clone(),
             request.arguments.clone(),
         );
         let plan = self.tools.evaluate_tool(&call);
-        if plan.denied_reason().is_some() || plan.requires_approval {
-            ApprovalDecision::Denied
-        } else {
-            ApprovalDecision::Approved
+        if plan.denied_reason().is_some() {
+            return ApprovalDecision::Denied;
         }
+        if !plan.requires_approval {
+            return ApprovalDecision::Approved;
+        }
+        let kind = crate::execution_policy::ExecPolicy::classify_tool(&request.tool_name);
+        if role.allows_writes() && kind == crate::execution_policy::ToolKind::WriteFile {
+            return ApprovalDecision::Approved;
+        }
+        ApprovalDecision::Denied
     }
 }
 

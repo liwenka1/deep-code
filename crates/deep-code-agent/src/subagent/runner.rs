@@ -2,15 +2,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::LlmClient;
 use crate::runtime::{AgentRuntime, RuntimeEvent};
-use crate::tool::ApprovalDecision;
+use crate::subagent::roles::SubAgentRole;
 
-use super::types::DEFAULT_MAX_STEPS;
-
+/// Drive a child runtime's turn loop to completion: consume events, resolve
+/// approvals by role posture, count tool steps, and return the final
+/// assistant message.
 pub async fn run_subagent<C: LlmClient + Clone + 'static>(
-    _client: std::sync::Arc<C>,
     runtime: AgentRuntime<C>,
     cancel: CancellationToken,
     max_steps: u32,
+    role: SubAgentRole,
 ) -> Result<(String, u32), String> {
     let mut steps = 0u32;
     let mut rx = runtime.drive_turn().await;
@@ -39,10 +40,7 @@ pub async fn run_subagent<C: LlmClient + Clone + 'static>(
                 return Ok((text, steps));
             }
             RuntimeEvent::ApprovalRequired { request, .. } => {
-                let decision = runtime.subagent_approval_decision(&request);
-                if decision == ApprovalDecision::Approved {
-                    steps += 1;
-                }
+                let decision = runtime.subagent_approval_decision(&request, role);
                 rx = runtime.submit_approval(decision).await;
             }
             RuntimeEvent::TurnCancelled { .. } => return Err("cancelled".to_string()),
@@ -65,9 +63,4 @@ pub async fn run_subagent<C: LlmClient + Clone + 'static>(
             | RuntimeEvent::Warning { .. } => {}
         }
     }
-}
-
-#[must_use]
-pub fn default_max_steps() -> u32 {
-    DEFAULT_MAX_STEPS
 }

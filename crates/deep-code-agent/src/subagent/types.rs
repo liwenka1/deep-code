@@ -7,9 +7,6 @@ pub const SUBAGENT_STATE_FILE: &str = "subagents.v1.json";
 pub const DEFAULT_MAX_CONCURRENT: usize = 10;
 pub const HARD_MAX_CONCURRENT: usize = 20;
 pub const DEFAULT_MAX_STEPS: u32 = 50;
-pub const DEFAULT_EVAL_TIMEOUT_MS: u64 = 30_000;
-/// Upper bound for blocking waits inside synchronous `agent_eval` tool execution.
-pub const MAX_SYNC_EVAL_WAIT_MS: u64 = 2_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,7 +61,6 @@ pub struct SubAgentRecord {
     pub structured: Option<StructuredReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    pub fork_context: bool,
     pub started_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at_ms: Option<u64>,
@@ -91,19 +87,6 @@ impl SubAgentRecord {
             })
             .unwrap_or_else(|| self.status.as_str().to_string())
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SubAgentSessionProjection {
-    pub name: String,
-    pub agent_id: String,
-    pub status: String,
-    pub terminal: bool,
-    pub context_mode: String,
-    pub fork_context: bool,
-    pub snapshot: SubAgentRecord,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub timed_out: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
