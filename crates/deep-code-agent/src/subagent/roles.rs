@@ -56,7 +56,12 @@ impl SubAgentRole {
 
     #[must_use]
     pub fn allows_writes(self) -> bool {
-        matches!(self, Self::General | Self::Implementer)
+        // Only `implementer` may write, and (via `subagent_approval_decision`)
+        // have those writes auto-approved. The default role is `general`, so a
+        // bare `agent(task=...)` call with no role stays read-only — writing a
+        // child that mutates the workspace unattended must be an explicit
+        // `role: implementer` choice, not the silent default.
+        matches!(self, Self::Implementer)
     }
 
     #[must_use]
@@ -88,7 +93,7 @@ pub fn build_system_prompt(role: SubAgentRole) -> String {
     )
 }
 
-const GENERAL_INTRO: &str = "You are a general-purpose sub-agent spawned to handle a specific task autonomously.\nStay inside the assigned scope; put adjacent work under RISKS/BLOCKERS.\n";
+const GENERAL_INTRO: &str = "You are a general-purpose sub-agent spawned to handle a specific task autonomously.\nYou are read-only: investigate, search, and run read-only commands, but you cannot write files — if the task needs edits, report what should change under CHANGES and the parent can dispatch an `implementer`.\nStay inside the assigned scope; put adjacent work under RISKS/BLOCKERS.\n";
 
 const EXPLORE_INTRO: &str = "You are an exploration sub-agent (role: `explore`). Map the relevant code quickly and stay read-only.\nUse list_dir, grep_files, and read_file; cite `path:line-range` for each finding.\nCHANGES will almost always be \"None.\" for an explorer.\n";
 

@@ -357,16 +357,17 @@ None.
             safety_reasons: Vec::new(),
             safety_suggestions: Vec::new(),
         };
-        // Dispatching a writing role is the write authorization.
+        // Explicitly dispatching `implementer` is the write authorization.
         assert_eq!(
             runtime.subagent_approval_decision(&write_request, SubAgentRole::Implementer),
             ApprovalDecision::Approved
         );
+        // The default role (general) and every read-only role stay read-only,
+        // so a bare `agent(task=...)` call cannot write unattended.
         assert_eq!(
             runtime.subagent_approval_decision(&write_request, SubAgentRole::General),
-            ApprovalDecision::Approved
+            ApprovalDecision::Denied
         );
-        // Read-only roles stay read-only.
         assert_eq!(
             runtime.subagent_approval_decision(&write_request, SubAgentRole::Explore),
             ApprovalDecision::Denied

@@ -491,10 +491,16 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             }
             // Cascade signal: a genuine execution failure means the model
             // fumbled this tool call. Denials carry their own status and user
-            // cancellations carry a known marker, so neither counts. Enough
-            // fumbles in one turn latch escalation onto Pro (sticky for the
-            // session); the latch is read by the next turn's router.
-            if result.status == ToolResultStatus::Error && result.content != CANCELLED_TOOL_RESULT {
+            // cancellations carry a known marker, so neither counts. Sub-agent
+            // failures are excluded too — a child that timed out, was cancelled,
+            // or hit the concurrency cap is not the parent model fumbling a
+            // primitive, and must not latch a session-wide Pro escalation.
+            // Enough real fumbles in one turn latch escalation onto Pro (sticky
+            // for the session); the latch is read by the next turn's router.
+            if result.status == ToolResultStatus::Error
+                && result.content != CANCELLED_TOOL_RESULT
+                && !crate::subagent::is_subagent_tool(&call.name)
+            {
                 state.turn_tool_errors += 1;
                 if state.turn_tool_errors >= CASCADE_ESCALATE_TOOL_ERRORS
                     && !state.cascade_escalated

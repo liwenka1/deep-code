@@ -113,11 +113,19 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentTool<C> {
         );
 
         let boot_id = {
-            let manager = self.services.manager.read().map_err(poisoned)?;
+            let manager = self
+                .services
+                .manager
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             manager.session_boot_id.clone()
         };
         {
-            let mut manager = self.services.manager.write().map_err(poisoned)?;
+            let mut manager = self
+                .services
+                .manager
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             manager
                 .insert(SubAgentRecord {
                     schema_version: SUBAGENT_STATE_SCHEMA_VERSION,
@@ -137,39 +145,56 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentTool<C> {
                 .map_err(tool_error)?;
         }
 
-        // Two cancellation parents: the runtime-wide token (session shutdown)
-        // via child_token, and the turn token (user pressed cancel) via the
-        // select below.
-        let child_cancel = self.services.parent_cancel.child_token();
-        let run = std::panic::AssertUnwindSafe(async {
+        // A clone drives cancellation: cancelling `runtime` itself is
+        // impossible once it is moved into the run future, so `cancel_handle`
+        // (the same runtime, shared state) is what the timeout/cancel arms
+        // signal through. `shutdown` fires when the whole session tears down.
+        let cancel_handle = runtime.clone();
+        let shutdown = self.services.parent_cancel.clone();
+        let run = std::panic::AssertUnwindSafe(async move {
             runtime.begin_turn(task).await;
-            run_subagent(runtime, child_cancel.clone(), DEFAULT_MAX_STEPS, role).await
+            run_subagent(runtime, DEFAULT_MAX_STEPS, role).await
         })
         .catch_unwind();
         tokio::pin!(run);
 
-        let unwrap_panic = |joined: Result<Result<(String, u32), String>, _>| match joined {
-            Ok(inner) => inner,
-            Err(_) => Err("sub-agent panicked".to_string()),
-        };
-        let outcome = tokio::select! {
+        let outcome: ChildOutcome = tokio::select! {
             joined = &mut run => unwrap_panic(joined),
-            () = tokio::time::sleep(AGENT_WALL_CLOCK_TIMEOUT) => {
-                child_cancel.cancel();
-                let _ = tokio::time::timeout(CANCEL_GRACE, &mut run).await;
-                Err(format!(
-                    "wall-clock timeout after {}s",
-                    AGENT_WALL_CLOCK_TIMEOUT.as_secs()
-                ))
-            }
-            () = cx.cancel_token().cancelled() => {
-                child_cancel.cancel();
-                let _ = tokio::time::timeout(CANCEL_GRACE, &mut run).await;
-                Err("cancelled".to_string())
+            reason = async {
+                tokio::select! {
+                    () = tokio::time::sleep(AGENT_WALL_CLOCK_TIMEOUT) => format!(
+                        "wall-clock timeout after {}s",
+                        AGENT_WALL_CLOCK_TIMEOUT.as_secs()
+                    ),
+                    () = cx.cancel_token().cancelled() => "cancelled".to_string(),
+                    () = shutdown.cancelled() => "cancelled".to_string(),
+                }
+            } => {
+                // Stop the child's OWN turn loop, not just our wait: cancel_turn
+                // cancels the child runtime's state token, which run_loop
+                // observes and finalizes — so the detached loop stops streaming
+                // and writing instead of running on as an orphan.
+                cancel_handle.cancel_turn().await;
+                // Honor a child that genuinely finished inside the grace window
+                // (raced the deadline and won); otherwise the cancel/timeout
+                // reason governs.
+                match tokio::time::timeout(CANCEL_GRACE, &mut run).await {
+                    Ok(joined) => match unwrap_panic(joined) {
+                        Ok(success) => Ok(success),
+                        Err(_) => Err((0, reason)),
+                    },
+                    Err(_) => Err((0, reason)),
+                }
             }
         };
 
-        let mut manager = self.services.manager.write().map_err(poisoned)?;
+        // Recover a poisoned lock rather than stranding this record as a zombie
+        // Running entry: a prior panic under the lock must not block finalize.
+        let mut manager = self
+            .services
+            .manager
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match outcome {
             Ok((text, steps)) => {
                 let record = manager
@@ -186,12 +211,12 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentTool<C> {
                 }));
                 Ok(output)
             }
-            Err(message) if message == "cancelled" => {
+            Err((_, message)) if message == "cancelled" => {
                 let _ = manager.mark_cancelled(&agent_id);
                 Ok(ToolOutput::soft_error("sub-agent cancelled"))
             }
-            Err(message) => {
-                let _ = manager.finalize_failure(&agent_id, message.clone(), 0);
+            Err((steps, message)) => {
+                let _ = manager.finalize_failure(&agent_id, message.clone(), steps);
                 Ok(ToolOutput::soft_error(format!(
                     "sub-agent failed: {message}"
                 )))
@@ -200,9 +225,11 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentTool<C> {
     }
 }
 
-fn poisoned<T>(_: std::sync::PoisonError<T>) -> ToolError {
-    ToolError::ExecutionFailed {
-        name: AGENT_TOOL.to_string(),
-        message: "sub-agent manager lock poisoned".to_string(),
-    }
+/// A finished child run: `Ok(report, steps)` or `Err(steps, message)`.
+type ChildOutcome = Result<(String, u32), (u32, String)>;
+
+/// Flatten `catch_unwind`'s join result: a panic in the child run becomes a
+/// failure with no steps recorded.
+fn unwrap_panic(joined: Result<ChildOutcome, Box<dyn std::any::Any + Send>>) -> ChildOutcome {
+    joined.unwrap_or_else(|_| Err((0, "sub-agent panicked".to_string())))
 }

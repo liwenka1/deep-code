@@ -1,31 +1,30 @@
-use tokio_util::sync::CancellationToken;
-
 use crate::client::LlmClient;
 use crate::runtime::{AgentRuntime, RuntimeEvent};
 use crate::subagent::roles::SubAgentRole;
 
-/// Drive a child runtime's turn loop to completion: consume events, resolve
-/// approvals by role posture, count tool steps, and return the final
-/// assistant message.
+/// Drive a child runtime's turn loop to completion and return its final
+/// report. Cancellation is *not* observed here via a side token — the caller
+/// cancels the child through its own [`AgentRuntime::cancel_turn`], which the
+/// loop surfaces as [`RuntimeEvent::TurnCancelled`]. On any non-success exit
+/// the step count is still returned so the ledger records real progress.
 pub async fn run_subagent<C: LlmClient + Clone + 'static>(
     runtime: AgentRuntime<C>,
-    cancel: CancellationToken,
     max_steps: u32,
     role: SubAgentRole,
-) -> Result<(String, u32), String> {
+) -> Result<(String, u32), (u32, String)> {
     let mut steps = 0u32;
     let mut rx = runtime.drive_turn().await;
 
     loop {
-        if cancel.is_cancelled() {
-            return Err("cancelled".to_string());
-        }
         if steps >= max_steps {
-            return Err(format!("max steps exceeded ({max_steps})"));
+            return Err((steps, format!("max steps exceeded ({max_steps})")));
         }
 
         let Some(event) = rx.recv().await else {
-            return Err("sub-agent event stream ended unexpectedly".to_string());
+            return Err((
+                steps,
+                "sub-agent event stream ended unexpectedly".to_string(),
+            ));
         };
 
         match event {
@@ -37,14 +36,20 @@ pub async fn run_subagent<C: LlmClient + Clone + 'static>(
                     .find(|message| matches!(message.role, crate::message::Role::Assistant))
                     .map(|message| message.content.clone())
                     .unwrap_or_default();
+                if text.trim().is_empty() {
+                    // The turn ended without an assistant report (e.g. the model
+                    // stopped on a tool call). Surface it as a failure rather
+                    // than handing the parent an empty "success".
+                    return Err((steps, "sub-agent finished without a report".to_string()));
+                }
                 return Ok((text, steps));
             }
             RuntimeEvent::ApprovalRequired { request, .. } => {
                 let decision = runtime.subagent_approval_decision(&request, role);
                 rx = runtime.submit_approval(decision).await;
             }
-            RuntimeEvent::TurnCancelled { .. } => return Err("cancelled".to_string()),
-            RuntimeEvent::Error { message, .. } => return Err(message),
+            RuntimeEvent::TurnCancelled { .. } => return Err((steps, "cancelled".to_string())),
+            RuntimeEvent::Error { message, .. } => return Err((steps, message)),
             RuntimeEvent::ToolCallFinished { .. } => {
                 steps += 1;
             }
