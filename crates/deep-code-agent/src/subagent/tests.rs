@@ -7,11 +7,13 @@ mod integration {
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::client::{AgentEventStream, LlmClient};
     use crate::config::AgentConfig;
     use crate::error::AgentResult;
     use crate::event::AgentEvent;
-    use crate::model::ChatRequest;
+    use crate::model::{ChatRequest, FunctionCallDelta, ToolCallDelta};
     use crate::runtime::AgentRuntime;
     use crate::subagent::registry::attach_subagent_tools;
     use crate::subagent::roles::SubAgentRole;
@@ -113,6 +115,46 @@ None.
         async fn stream_chat(&self, _request: ChatRequest) -> AgentResult<AgentEventStream> {
             let stream = try_stream! {
                 futures_util::future::pending::<()>().await;
+                yield AgentEvent::Done { usage: None };
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
+    /// Emits a read-only tool call on every turn, so an uninterrupted child
+    /// loops until max_steps. Counts model calls to prove that cancellation
+    /// halts the child's own loop, not merely the parent's wait.
+    #[derive(Clone)]
+    struct LoopingClient {
+        model_calls: Arc<AtomicUsize>,
+    }
+
+    impl LlmClient for LoopingClient {
+        fn provider_name(&self) -> &'static str {
+            "looping"
+        }
+
+        fn model(&self) -> &str {
+            "looping-model"
+        }
+
+        async fn stream_chat(&self, _request: ChatRequest) -> AgentResult<AgentEventStream> {
+            let n = self.model_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let stream = try_stream! {
+                // A small per-call delay opens a window for the test to cancel
+                // mid-loop instead of the loop finishing in one logical instant.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                yield AgentEvent::ToolCallDelta {
+                    delta: ToolCallDelta {
+                        index: Some(0),
+                        id: Some(format!("loop_call_{n}")),
+                        call_type: Some("function".to_string()),
+                        function: Some(FunctionCallDelta {
+                            name: Some("list_dir".to_string()),
+                            arguments: Some(r#"{"path":"."}"#.to_string()),
+                        }),
+                    },
+                };
                 yield AgentEvent::Done { usage: None };
             };
             Ok(Box::pin(stream))
@@ -297,6 +339,71 @@ None.
         assert_eq!(
             manager.list_current_session()[0].status,
             SubAgentStatus::Cancelled
+        );
+    }
+
+    /// Regression pin for the orphan bug (F1): cancelling the parent turn must
+    /// stop the child's own run_loop, not merely abandon the wait. An
+    /// uninterrupted `LoopingClient` child would run to max_steps; a properly
+    /// cancelled one freezes its model-call count. Real time (not paused) so
+    /// the per-call delay creates a genuine mid-loop cancel window.
+    #[tokio::test]
+    async fn cancel_halts_child_loop_not_just_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let client = Arc::new(LoopingClient {
+            model_calls: Arc::clone(&model_calls),
+        });
+        let mut registry = ToolRegistry::new();
+        attach_subagent_tools(
+            &mut registry,
+            client,
+            AgentConfig::default(),
+            dir.path().to_path_buf(),
+            CancellationToken::new(),
+        );
+
+        let turn_cancel = CancellationToken::new();
+        let call = agent_call("call_1", "loop over the workspace", "explore");
+        let plan = registry.evaluate_tool(&call);
+        let cx = ToolCx::new().with_cancel(turn_cancel.clone());
+
+        let canceller = {
+            let token = turn_cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                token.cancel();
+            })
+        };
+
+        let result = registry
+            .run_tool_call_with_plan(&call, None, plan, cx)
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+        canceller.await.unwrap();
+
+        assert!(
+            result.content.contains("cancelled"),
+            "expected cancellation, got: {}",
+            result.content
+        );
+        // It did start working before the cancel...
+        let at_cancel = model_calls.load(Ordering::SeqCst);
+        assert!(at_cancel >= 1, "child never ran before cancel");
+        assert!(
+            at_cancel < 25,
+            "child ran to near max_steps despite cancel: {at_cancel} model calls"
+        );
+        // ...and — the real orphan detector — a killed run_loop makes no
+        // further model calls. A surviving orphan would keep calling every
+        // ~50ms, so the count would climb across this window.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            model_calls.load(Ordering::SeqCst),
+            at_cancel,
+            "model calls kept climbing after cancel — child run_loop is an orphan"
         );
     }
 
