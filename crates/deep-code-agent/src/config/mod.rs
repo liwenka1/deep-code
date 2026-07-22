@@ -115,11 +115,6 @@ impl AgentConfig {
     }
 
     #[must_use]
-    pub fn from_env() -> Self {
-        Self::default()
-    }
-
-    #[must_use]
     pub fn auto_model_enabled(&self) -> bool {
         self.model.trim().eq_ignore_ascii_case(AUTO_MODEL)
     }

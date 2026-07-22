@@ -15,8 +15,11 @@ mod manager;
 mod path_util;
 mod registry;
 
-pub use client::LspTransport;
-pub use diagnostics::{Diagnostic, DiagnosticRange, Severity, render_blocks, summarize_blocks};
+#[cfg(test)]
+pub(crate) use client::LspTransport;
+#[cfg(test)]
+pub(crate) use diagnostics::{Diagnostic, DiagnosticRange, Severity};
+pub use diagnostics::{render_blocks, summarize_blocks};
 #[allow(unused_imports)]
 pub use hooks::{edited_paths_for_tool, is_edit_tool, resolve_edit_paths};
 pub use manager::{LspConfig, LspManager};

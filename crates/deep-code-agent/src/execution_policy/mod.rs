@@ -7,7 +7,5 @@ pub mod command_shape;
 mod engine;
 mod shell_deny;
 
-pub use engine::{
-    ExecPolicy, PolicyVerdict, RiskLevel, ToolExecutionPlan, ToolKind, evaluate_shell_command,
-};
+pub use engine::{ExecPolicy, PolicyVerdict, RiskLevel, ToolExecutionPlan, ToolKind};
 pub use shell_deny::{SafetyNotes, safety_notes};

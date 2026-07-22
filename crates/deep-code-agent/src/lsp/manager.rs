@@ -106,10 +106,10 @@ impl LspManager {
         }
     }
 
-    /// A manager that answers `None`/empty everywhere. Lets callers hold an
-    /// `LspManager` unconditionally even when diagnostics are switched off.
+    /// A manager that answers `None`/empty everywhere (`enabled: false` path).
+    #[cfg(test)]
     #[must_use]
-    pub fn disabled() -> Self {
+    pub(crate) fn disabled() -> Self {
         Self::new(
             LspConfig {
                 enabled: false,
@@ -119,15 +119,20 @@ impl LspManager {
         )
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub fn config(&self) -> &LspConfig {
+    pub(crate) fn config(&self) -> &LspConfig {
         &self.config
     }
 
-    /// Register a stub transport for `lang`, bypassing real server spawns.
-    /// Public (not `cfg(test)`) so examples and integration tests can drive
-    /// the full pipeline without a language server installed.
-    pub async fn install_test_transport(&self, lang: Language, transport: Arc<dyn LspTransport>) {
+    /// Register a stub transport for `lang`, bypassing real server spawns, so
+    /// tests can drive the full pipeline without a language server installed.
+    #[cfg(test)]
+    pub(crate) async fn install_test_transport(
+        &self,
+        lang: Language,
+        transport: Arc<dyn LspTransport>,
+    ) {
         self.stubs.lock().await.insert(lang, transport);
     }
 
@@ -632,5 +637,38 @@ mod tests {
             .collect_for_edit("read_file", &serde_json::json!({ "path": "edited.rs" }))
             .await;
         assert!(none.is_empty(), "non-edit tools trigger no diagnostics");
+    }
+
+    /// Real language-server smoke: spawns an actual rust-analyzer against a
+    /// deliberately broken file. Run manually (cold start can take a while):
+    /// `cargo test -p deep-code-agent lsp -- --ignored`
+    #[tokio::test]
+    #[ignore = "requires rust-analyzer on PATH"]
+    async fn real_rust_analyzer_reports_diagnostics_for_broken_file() {
+        let available = std::process::Command::new("rust-analyzer")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success());
+        assert!(available, "rust-analyzer not found on PATH");
+
+        let workspace = tempfile::tempdir().unwrap();
+        let broken = workspace.path().join("broken.rs");
+        std::fs::write(&broken, "fn main() { let count: u32 = \"three\"; }").unwrap();
+
+        let config = LspConfig::default();
+        let cold_budget_ms = config.cold_start_poll_ms;
+        let manager = LspManager::new(config, workspace.path().to_path_buf());
+        let block = manager.diagnostics_for(&broken).await.unwrap_or_else(|| {
+            panic!(
+                "no diagnostics within the {cold_budget_ms}ms cold-start budget \
+                 (server too slow, spawn failed, or it found nothing wrong)"
+            )
+        });
+        let rendered = crate::lsp::render_blocks(&[block]);
+        assert!(
+            rendered.contains("broken.rs"),
+            "diagnostics must reference the broken file, got: {rendered}"
+        );
+        manager.shutdown_all().await;
     }
 }

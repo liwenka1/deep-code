@@ -48,11 +48,7 @@ pub use config::{
 pub use doctor::{ConfigLayersDoctorReport, DoctorReport, default_config_path};
 pub use error::AgentResult;
 pub use event::AgentEvent;
-pub use execution_policy::{ExecPolicy, PolicyVerdict, RiskLevel, evaluate_shell_command};
-pub use lsp::{
-    Diagnostic, DiagnosticRange, Language, LspConfig, LspManager, LspTransport, Severity,
-    render_blocks,
-};
+pub use execution_policy::{ExecPolicy, PolicyVerdict, RiskLevel};
 pub use message::Message;
 pub use model::{
     ChatRequest, FunctionCallDelta, ToolCallDelta, ToolCallFunctionPayload, ToolCallPayload, Usage,
@@ -63,7 +59,6 @@ pub use runtime::{
     AgentRuntime, AgentRuntimeHandle, RuntimeEvent, RuntimeEventReceiver, ToolCallId, TurnId,
 };
 pub use runtime_launch::{LaunchedRuntime, launch_runtime, web_enabled};
-pub use sandbox::detect_capabilities;
 pub use session::Session;
 pub use session_entry::{EntryKind, ExchangeResult, SessionEntry, ToolExchange};
 pub use session_store::{

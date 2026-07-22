@@ -292,4 +292,40 @@ mod tests {
         assert_eq!(decoder.push(frame.as_bytes()).unwrap(), Vec::new());
         assert_eq!(decoder.finish().unwrap(), vec![text_delta("hi")]);
     }
+
+    /// Real-network smoke for the full request/auth/SSE path; run manually:
+    /// `DEEPSEEK_API_KEY=... cargo test -p deep-code-agent client -- --ignored`
+    #[tokio::test]
+    #[ignore = "requires DEEPSEEK_API_KEY and network"]
+    async fn real_deepseek_streams_text_and_done() {
+        let api_key = std::env::var("DEEPSEEK_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+            .expect("set DEEPSEEK_API_KEY to run this smoke test");
+        let config = AgentConfig {
+            api_key: Some(api_key),
+            ..AgentConfig::builtin()
+        };
+        let client = DeepSeekClient::new(config.clone()).expect("client builds");
+        let request = ChatRequest::streaming(
+            config.model.clone(),
+            vec![crate::message::Message::user("Reply with exactly: pong")],
+        );
+
+        let mut events = client.stream_chat(request).await.expect("stream opens");
+        let mut text = String::new();
+        let mut saw_done = false;
+        while let Some(event) = events.next().await {
+            match event.expect("stream event decodes") {
+                AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+                AgentEvent::Done { .. } => saw_done = true,
+                _ => {}
+            }
+        }
+        assert!(saw_done, "stream must terminate with a Done event");
+        assert!(
+            !text.trim().is_empty(),
+            "model must stream non-empty text, got none"
+        );
+    }
 }
