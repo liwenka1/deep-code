@@ -17,6 +17,17 @@ use crate::tool::{
     ApprovalDecision, ToolCall, ToolCx, ToolError, ToolResult, ToolResultStatus, ToolRunOutcome,
 };
 
+/// Whether a call may run concurrently inside a tool batch. Only sub-agent
+/// calls qualify: the execution policy allows them without approval, and each
+/// spawns an isolated child runtime, so a batch of them shares no mutable
+/// state and never parks the batch on a human-in-the-loop pause.
+fn is_parallel_safe(call: &ToolCall) -> bool {
+    matches!(
+        crate::execution_policy::ExecPolicy::classify_tool(&call.name),
+        crate::execution_policy::ToolKind::SubAgent
+    )
+}
+
 pub(super) const CANCELLED_TOOL_RESULT: &str =
     "用户取消了本轮，该工具调用未执行 (cancelled by user)";
 
@@ -186,6 +197,38 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                 remaining.push_front(call);
                 self.finish_cancelled_calls(remaining, turn_id, tx).await;
                 return BatchOutcome::Cancelled;
+            }
+            // Batch-internal parallelism: a run of independent, approval-free
+            // `agent` calls issued in one turn executes concurrently — this is
+            // what makes "issue several agent calls to run children in
+            // parallel" true. Results are still recorded in issue order so the
+            // wire transcript (and prefix cache) stays deterministic. Only
+            // sub-agent calls qualify: they never park on approval and share no
+            // mutable state, so concurrency can't race the approval machinery.
+            if is_parallel_safe(&call) && remaining.front().is_some_and(is_parallel_safe) {
+                let mut group = vec![call];
+                while remaining.front().is_some_and(is_parallel_safe) {
+                    group.push(remaining.pop_front().expect("front just checked"));
+                }
+                let outcomes = futures_util::future::join_all(
+                    group
+                        .iter()
+                        .map(|call| self.run_tool(call, None, cancel, turn_id, tx)),
+                )
+                .await;
+                for (call, outcome) in group.iter().zip(outcomes) {
+                    let result = match outcome {
+                        Ok(ToolRunOutcome::Result { result }) => result,
+                        Ok(ToolRunOutcome::ApprovalRequired { .. }) => ToolResult::error(
+                            call,
+                            "parallel sub-agent unexpectedly requested approval",
+                        ),
+                        Err(error) => ToolResult::error(call, error.to_string()),
+                    };
+                    self.record_tool_result(call, result, tx, turn_id.clone())
+                        .await;
+                }
+                continue;
             }
             match self.run_tool(&call, None, cancel, turn_id, tx).await {
                 Ok(ToolRunOutcome::Result { result }) => {

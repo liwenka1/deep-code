@@ -279,6 +279,89 @@ async fn approve_path_feeds_tool_result_into_next_turn() {
     assert_eq!(messages[3].content, "thanks");
 }
 
+/// A parallel-safe tool (name `agent` → `ToolKind::SubAgent`) that blocks on a
+/// shared size-2 barrier: `run` only returns once two calls are in flight at
+/// once. Sequential batch execution deadlocks on it; concurrent execution
+/// passes.
+#[derive(Clone)]
+struct BarrierAgentTool {
+    barrier: Arc<tokio::sync::Barrier>,
+    ran: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct BarrierParams {}
+
+#[async_trait::async_trait]
+impl Tool for BarrierAgentTool {
+    type Params = BarrierParams;
+
+    fn name(&self) -> &str {
+        "agent"
+    }
+
+    fn description(&self) -> &str {
+        "Barrier-synchronized stand-in for the agent tool."
+    }
+
+    async fn run(
+        &self,
+        _params: BarrierParams,
+        _cx: &crate::tool::ToolCx,
+    ) -> Result<crate::tool::ToolOutput, ToolError> {
+        self.ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.barrier.wait().await;
+        Ok(crate::tool::ToolOutput::text("done"))
+    }
+}
+
+#[tokio::test]
+async fn batch_runs_parallel_safe_agent_calls_concurrently() {
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: indexed_tool_call_delta(0, "call_1", "agent", "{}"),
+            },
+            AgentEvent::ToolCallDelta {
+                delta: indexed_tool_call_delta(1, "call_2", "agent", "{}"),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "synthesized".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(BarrierAgentTool {
+        barrier: Arc::new(tokio::sync::Barrier::new(2)),
+        ran: Arc::clone(&ran),
+    });
+    let runtime = AgentRuntime::new(client, registry);
+
+    let mut rx = runtime.submit_user("fan out").await;
+    // A serial batch would wedge here: the first call blocks on the size-2
+    // barrier forever and the second never starts. Only concurrent execution
+    // drains within the timeout.
+    let events = tokio::time::timeout(std::time::Duration::from_secs(5), drain(&mut rx))
+        .await
+        .expect("same-batch agent calls must run concurrently, not serially");
+
+    assert_eq!(
+        ran.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "both agent calls must execute"
+    );
+    assert_eq!(
+        finished_ids(&events),
+        vec!["call_1".to_string(), "call_2".to_string()],
+        "results are recorded in issue order regardless of completion order"
+    );
+}
+
 #[tokio::test]
 async fn deny_path_records_denied_tool_message_and_continues() {
     let client = ScriptedClient::new(vec![
