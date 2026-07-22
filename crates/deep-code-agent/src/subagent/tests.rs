@@ -392,6 +392,67 @@ None.
         );
     }
 
+    /// Real end-to-end smoke: a live DeepSeek child runs the `agent` tool
+    /// against a scratch workspace and must return the structured report.
+    /// Confirms the machinery (child runtime, workspace tools, output
+    /// contract) works against the actual model. Whether the *parent* chooses
+    /// to delegate given the system-prompt guidance is a prompt-quality
+    /// question for dogfooding, not an assertion. Run manually:
+    /// `DEEPSEEK_API_KEY=... cargo test -p deep-code-agent subagent -- --ignored`
+    #[tokio::test]
+    #[ignore = "requires DEEPSEEK_API_KEY and network"]
+    async fn real_deepseek_child_returns_structured_report() {
+        let api_key = std::env::var("DEEPSEEK_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+            .expect("set DEEPSEEK_API_KEY to run this smoke test");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+        )
+        .unwrap();
+        let config = AgentConfig {
+            api_key: Some(api_key),
+            ..AgentConfig::builtin()
+        };
+        let client = Arc::new(crate::client::DeepSeekClient::new(config.clone()).expect("client"));
+        let mut registry = ToolRegistry::new();
+        attach_subagent_tools(
+            &mut registry,
+            client,
+            config,
+            dir.path().to_path_buf(),
+            CancellationToken::new(),
+        );
+
+        let result = registry
+            .run_tool_call(
+                agent_call(
+                    "call_1",
+                    "Read lib.rs in the workspace and report what its single function does. Read-only.",
+                    "explore",
+                ),
+                None,
+            )
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+
+        assert_eq!(
+            result.status,
+            crate::tool::ToolResultStatus::Success,
+            "child run failed: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("SUMMARY"),
+            "report must carry the structured contract, got: {}",
+            result.content
+        );
+    }
+
     trait ToolOutcomeExt {
         fn into_result(self) -> Option<crate::tool::ToolResult>;
     }
