@@ -284,6 +284,25 @@ text_ids! {
     ErrStreamDeadline,
     ErrStreamOverflow,
     ErrInvalidConfig,
+    // 配置加载警告(layers.rs)
+    CfgFileUnusable,
+    CfgProjectApiKeyIgnored,
+    CfgProjectBaseUrlOverride,
+    CfgUnknownReasoning,
+    CfgProjectFieldIgnored,
+    CfgUnknownCurrency,
+    CfgProjectAutoAllowIgnored,
+    CfgGlobalKeyPerms,
+    // 配置写入(write.rs)
+    CfgApiKeyEmpty,
+    CfgApiKeyWhitespace,
+    CfgApiKeyTooShort,
+    CfgReadFailed,
+    CfgParseFailed,
+    CfgDirCreateFailed,
+    CfgWriteFailed,
+    CfgReplaceFailed,
+    CfgTemplateHeader,
 }
 
 static ZH_JSON: &str = include_str!("../locales/zh.json");

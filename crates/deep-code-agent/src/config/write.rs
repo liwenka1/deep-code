@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{Document, value};
 
+use crate::i18n::{Lang, TextId, tr, tr_with};
+
 /// One field update to the global config file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GlobalConfigUpdate {
@@ -20,35 +22,53 @@ pub enum GlobalConfigUpdate {
 }
 
 /// Loose sanity check before persisting a key. Error messages never echo
-/// the input back.
-pub fn validate_api_key(text: &str) -> Result<(), String> {
+/// the input back. `lang` localizes the rejection message.
+pub fn validate_api_key(text: &str, lang: Lang) -> Result<(), String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err("API key 为空：用法 /apikey sk-xxxx".to_string());
+        return Err(tr(lang, TextId::CfgApiKeyEmpty).to_string());
     }
     if trimmed.chars().any(char::is_whitespace) {
-        return Err("API key 不应包含空白字符，请检查复制内容".to_string());
+        return Err(tr(lang, TextId::CfgApiKeyWhitespace).to_string());
     }
     if trimmed.len() < 16 {
-        return Err("API key 长度异常（过短），请检查复制是否完整".to_string());
+        return Err(tr(lang, TextId::CfgApiKeyTooShort).to_string());
     }
     Ok(())
 }
 
 /// Apply one update to the config file at `path`, creating it (with a
-/// commented template) when missing. Returns the path written.
+/// commented template) when missing. Returns the path written. `lang`
+/// localizes any I/O error and the generated template comment.
 pub fn write_global_config_update(
     path: &Path,
     update: &GlobalConfigUpdate,
+    lang: Lang,
 ) -> Result<PathBuf, String> {
     let mut document = match fs::read_to_string(path) {
-        Ok(existing) => existing
-            .parse::<Document>()
-            .map_err(|error| format!("现有配置 {} 解析失败：{error}", path.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => new_config_template()
+        Ok(existing) => existing.parse::<Document>().map_err(|error| {
+            tr_with(
+                lang,
+                TextId::CfgParseFailed,
+                &[
+                    ("path", &path.display().to_string()),
+                    ("error", &error.to_string()),
+                ],
+            )
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => new_config_template(lang)
             .parse::<Document>()
             .expect("builtin template parses"),
-        Err(error) => return Err(format!("读取 {} 失败：{error}", path.display())),
+        Err(error) => {
+            return Err(tr_with(
+                lang,
+                TextId::CfgReadFailed,
+                &[
+                    ("path", &path.display().to_string()),
+                    ("error", &error.to_string()),
+                ],
+            ));
+        }
     };
 
     let section = match update {
@@ -76,24 +96,44 @@ pub fn write_global_config_update(
     }
 
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("创建目录 {} 失败：{error}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            tr_with(
+                lang,
+                TextId::CfgDirCreateFailed,
+                &[
+                    ("path", &parent.display().to_string()),
+                    ("error", &error.to_string()),
+                ],
+            )
+        })?;
     }
     let tmp = path.with_extension("toml.tmp");
-    fs::write(&tmp, document.to_string())
-        .map_err(|error| format!("写入 {} 失败：{error}", tmp.display()))?;
-    fs::rename(&tmp, path).map_err(|error| format!("替换 {} 失败：{error}", path.display()))?;
+    fs::write(&tmp, document.to_string()).map_err(|error| {
+        tr_with(
+            lang,
+            TextId::CfgWriteFailed,
+            &[
+                ("path", &tmp.display().to_string()),
+                ("error", &error.to_string()),
+            ],
+        )
+    })?;
+    fs::rename(&tmp, path).map_err(|error| {
+        tr_with(
+            lang,
+            TextId::CfgReplaceFailed,
+            &[
+                ("path", &path.display().to_string()),
+                ("error", &error.to_string()),
+            ],
+        )
+    })?;
     restrict_permissions(path);
     Ok(path.to_path_buf())
 }
 
-fn new_config_template() -> &'static str {
-    r#"# deep-code 全局配置（由 /apikey 或 /model 命令生成）
-# 加载顺序：内置默认 -> 本文件 -> 项目 .deep-code/config.toml -> 环境变量
-# 完整示例见仓库根目录 config.example.toml
-
-[provider]
-"#
+fn new_config_template(lang: Lang) -> String {
+    format!("{}\n\n[provider]\n", tr(lang, TextId::CfgTemplateHeader))
 }
 
 #[cfg(unix)]
@@ -111,12 +151,19 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_keys_without_echoing() {
-        assert!(validate_api_key("").is_err());
-        assert!(validate_api_key("sk short").is_err());
-        assert!(validate_api_key("short").is_err());
-        let error = validate_api_key("leaky secret").unwrap_err();
+        assert!(validate_api_key("", Lang::Zh).is_err());
+        assert!(validate_api_key("sk short", Lang::Zh).is_err());
+        assert!(validate_api_key("short", Lang::Zh).is_err());
+        let error = validate_api_key("leaky secret", Lang::En).unwrap_err();
         assert!(!error.contains("leaky"), "errors must not echo the input");
-        assert!(validate_api_key("sk-0123456789abcdef").is_ok());
+        // Rejections localize with the UI language.
+        assert!(error.contains("whitespace"), "{error}");
+        assert!(
+            validate_api_key("bad key", Lang::Zh)
+                .unwrap_err()
+                .contains("空白")
+        );
+        assert!(validate_api_key("sk-0123456789abcdef", Lang::Zh).is_ok());
     }
 
     #[test]
@@ -127,6 +174,7 @@ mod tests {
         let written = write_global_config_update(
             &path,
             &GlobalConfigUpdate::ApiKey(Some("sk-0123456789abcdef".to_string())),
+            Lang::Zh,
         )
         .unwrap();
         assert_eq!(written, path);
@@ -164,6 +212,7 @@ mod tests {
         write_global_config_update(
             &path,
             &GlobalConfigUpdate::Model("deepseek-v4-flash".to_string()),
+            Lang::Zh,
         )
         .unwrap();
 
@@ -180,7 +229,12 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(&path, "[provider]\nmodel = \"auto\"\n").unwrap();
 
-        write_global_config_update(&path, &GlobalConfigUpdate::Language("en".to_string())).unwrap();
+        write_global_config_update(
+            &path,
+            &GlobalConfigUpdate::Language("en".to_string()),
+            Lang::Zh,
+        )
+        .unwrap();
 
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("[ui]"));
@@ -202,7 +256,7 @@ mod tests {
         )
         .unwrap();
 
-        write_global_config_update(&path, &GlobalConfigUpdate::ApiKey(None)).unwrap();
+        write_global_config_update(&path, &GlobalConfigUpdate::ApiKey(None), Lang::Zh).unwrap();
 
         let contents = fs::read_to_string(&path).unwrap();
         assert!(!contents.contains("api_key"));

@@ -15,9 +15,20 @@ use super::{
     REASONING_EFFORT_ENV, STREAM_CHUNK_TIMEOUT_ENV, STREAM_MAX_BYTES_ENV, STREAM_MAX_RETRIES_ENV,
     STREAM_TOTAL_TIMEOUT_ENV,
 };
+use crate::i18n::{Lang, TextId, tr_with};
 use crate::paths::home_dir;
 use crate::pricing::CostCurrency;
 use crate::reasoning::ReasoningEffortSetting;
+
+/// A config warning captured during load as `(key, params)` and rendered into
+/// the user's language only at the end — the language itself comes from the
+/// config being assembled, so it isn't known until every layer is applied.
+type PendingWarning = (TextId, Vec<(&'static str, String)>);
+
+fn render_warning(lang: Lang, (id, args): &PendingWarning) -> String {
+    let refs: Vec<(&str, &str)> = args.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    tr_with(lang, *id, &refs)
+}
 
 /// Configuration layer, ordered from weakest to strongest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -112,6 +123,7 @@ impl AgentConfig {
     ) -> LoadedAgentConfig {
         let mut config = Self::builtin();
         let mut report = ConfigLoadReport::default();
+        let mut pending: Vec<PendingWarning> = Vec::new();
 
         for (layer, path) in [
             (ConfigLayer::Global, global),
@@ -126,9 +138,12 @@ impl AgentConfig {
                     error: None,
                 }),
                 FileRead::Error(message) => {
-                    report.warnings.push(format!(
-                        "配置文件 {} 无法使用，已跳过该层：{message}",
-                        path.display()
+                    pending.push((
+                        TextId::CfgFileUnusable,
+                        vec![
+                            ("path", path.display().to_string()),
+                            ("detail", message.clone()),
+                        ],
                     ));
                     report.layers.push(ConfigLayerStatus {
                         name: layer.label(),
@@ -144,7 +159,7 @@ impl AgentConfig {
                         present: true,
                         error: None,
                     });
-                    apply_file_overlay(&mut config, &file, layer, &mut report);
+                    apply_file_overlay(&mut config, &file, layer, &mut report, &mut pending);
                     if layer == ConfigLayer::Global
                         && file
                             .provider
@@ -152,13 +167,21 @@ impl AgentConfig {
                             .as_deref()
                             .is_some_and(|key| !key.trim().is_empty())
                     {
-                        check_global_key_permissions(&path, &mut report.warnings);
+                        check_global_key_permissions(&path, &mut pending);
                     }
                 }
             }
         }
 
         apply_env_overlay(&mut config, &mut report.sources, env_lookup);
+
+        // Render deferred warnings now that the final language is known.
+        // Resolve through the same `env_lookup` seam so tests stay deterministic.
+        let lang = Lang::resolve(&config.language, env_lookup);
+        report.warnings = pending
+            .iter()
+            .map(|warning| render_warning(lang, warning))
+            .collect();
         LoadedAgentConfig { config, report }
     }
 }
@@ -235,11 +258,13 @@ fn read_config_file(path: &Path) -> FileRead {
     let raw = match fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return FileRead::Missing,
-        Err(error) => return FileRead::Error(format!("读取失败：{error}")),
+        // Carry the raw underlying error; the localized "file unusable" wrapper
+        // is applied at the warning site (the detail is inherently English).
+        Err(error) => return FileRead::Error(error.to_string()),
     };
     match toml::from_str::<ConfigFile>(&raw) {
         Ok(file) => FileRead::Parsed(Box::new(file)),
-        Err(error) => FileRead::Error(format!("TOML 解析失败：{error}")),
+        Err(error) => FileRead::Error(error.to_string()),
     }
 }
 
@@ -248,6 +273,7 @@ fn apply_file_overlay(
     file: &ConfigFile,
     layer: ConfigLayer,
     report: &mut ConfigLoadReport,
+    pending: &mut Vec<PendingWarning>,
 ) {
     let project = layer == ConfigLayer::Project;
 
@@ -258,9 +284,7 @@ fn apply_file_overlay(
         .filter(|key| !key.trim().is_empty())
     {
         if project {
-            report.warnings.push(
-                "项目配置中的 provider.api_key 已忽略：密钥只能来自环境变量或全局配置，避免随仓库泄露或被恶意仓库注入".to_string(),
-            );
+            pending.push((TextId::CfgProjectApiKeyIgnored, Vec::new()));
         } else {
             config.api_key = Some(api_key.to_string());
             report.sources.api_key = layer;
@@ -274,8 +298,9 @@ fn apply_file_overlay(
         .filter(|value| !value.trim().is_empty())
     {
         if project {
-            report.warnings.push(format!(
-                "警告：项目配置把 base_url 覆盖为 {base_url}。请确认该仓库可信——恶意端点可以拿到你的 API Key 和全部上下文"
+            pending.push((
+                TextId::CfgProjectBaseUrlOverride,
+                vec![("url", base_url.to_string())],
             ));
         }
         config.base_url = base_url.to_string();
@@ -297,18 +322,22 @@ fn apply_file_overlay(
             config.reasoning_effort = effort;
             report.sources.reasoning_effort = layer;
         } else {
-            report.warnings.push(format!(
-                "{} 配置的 provider.reasoning_effort='{value}' 无法识别，已忽略",
-                layer.label()
+            pending.push((
+                TextId::CfgUnknownReasoning,
+                vec![
+                    ("layer", layer.label().to_string()),
+                    ("value", value.to_string()),
+                ],
             ));
         }
     }
 
     if let Some(secs) = file.provider.timeout_secs {
         if project {
-            report
-                .warnings
-                .push("项目配置中的 provider.timeout_secs 不在白名单内，已忽略".to_string());
+            pending.push((
+                TextId::CfgProjectFieldIgnored,
+                vec![("field", "provider.timeout_secs".to_string())],
+            ));
         } else {
             config.timeout = Some(Duration::from_secs(secs));
         }
@@ -319,9 +348,12 @@ fn apply_file_overlay(
             config.cost_currency = currency;
             report.sources.cost_currency = layer;
         } else {
-            report.warnings.push(format!(
-                "{} 配置的 cost.currency='{value}' 无法识别，已忽略",
-                layer.label()
+            pending.push((
+                TextId::CfgUnknownCurrency,
+                vec![
+                    ("layer", layer.label().to_string()),
+                    ("value", value.to_string()),
+                ],
             ));
         }
     }
@@ -330,9 +362,10 @@ fn apply_file_overlay(
     // streams, blow up snapshot retention, or flip cost/compaction behavior —
     // set these globally or via environment instead.
     let mut reject_project = |field: &str| {
-        report
-            .warnings
-            .push(format!("项目配置中的 {field} 不在白名单内，已忽略"));
+        pending.push((
+            TextId::CfgProjectFieldIgnored,
+            vec![("field", field.to_string())],
+        ));
     };
     if let Some(value) = file.cost.auto_cost_saving {
         if project {
@@ -399,9 +432,7 @@ fn apply_file_overlay(
 
     if let Some(rules) = &file.approval.auto_allow {
         if project {
-            report.warnings.push(
-                "项目配置中的 approval.auto_allow 已忽略：仓库不得解除审批门（防止恶意仓库静默放行写入/外联工具）".to_string(),
-            );
+            pending.push((TextId::CfgProjectAutoAllowIgnored, Vec::new()));
         } else {
             config.approval_auto_allow = rules
                 .iter()
@@ -470,21 +501,21 @@ pub(super) fn apply_env_overlay(
 }
 
 #[cfg(unix)]
-fn check_global_key_permissions(path: &Path, warnings: &mut Vec<String>) {
+fn check_global_key_permissions(path: &Path, pending: &mut Vec<PendingWarning>) {
     use std::os::unix::fs::PermissionsExt;
     if let Ok(metadata) = fs::metadata(path) {
         let mode = metadata.permissions().mode();
         if mode & 0o077 != 0 {
-            warnings.push(format!(
-                "全局配置 {} 含 api_key 但对组/其他用户可读，建议执行 chmod 600",
-                path.display()
+            pending.push((
+                TextId::CfgGlobalKeyPerms,
+                vec![("path", path.display().to_string())],
             ));
         }
     }
 }
 
 #[cfg(not(unix))]
-fn check_global_key_permissions(_path: &Path, _warnings: &mut Vec<String>) {}
+fn check_global_key_permissions(_path: &Path, _pending: &mut Vec<PendingWarning>) {}
 
 #[cfg(test)]
 mod tests {
@@ -681,18 +712,48 @@ mod tests {
             .find(|layer| layer.name == "global")
             .expect("global layer status");
         assert!(layer.present);
+        // layer.error now carries the raw (English) parser error for doctor;
+        // the localized wrapper lives in the rendered warning.
         assert!(
             layer
                 .error
                 .as_deref()
-                .is_some_and(|error| error.contains("解析失败"))
+                .is_some_and(|error| !error.is_empty())
         );
+        // With no env, `auto` resolves to English, so the wrapper renders in en.
         assert!(
             loaded
                 .report
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("已跳过该层"))
+                .any(|warning| warning.contains("skipped"))
+        );
+    }
+
+    #[test]
+    fn config_warnings_render_in_configured_language() {
+        let dir = tempfile::tempdir().unwrap();
+        // A project file that trips the api_key-ignored warning, plus ui.language.
+        let make = |lang: &str| {
+            let path = dir.path().join(format!("{lang}.toml"));
+            fs::write(
+                &path,
+                format!("[provider]\napi_key = \"sk-injected\"\n[ui]\nlanguage = \"{lang}\"\n"),
+            )
+            .unwrap();
+            path
+        };
+        let zh = AgentConfig::load_with(None, Some(make("zh")), &no_env);
+        assert!(
+            zh.report.warnings.iter().any(|w| w.contains("已忽略")),
+            "{:?}",
+            zh.report.warnings
+        );
+        let en = AgentConfig::load_with(None, Some(make("en")), &no_env);
+        assert!(
+            en.report.warnings.iter().any(|w| w.contains("ignored")),
+            "{:?}",
+            en.report.warnings
         );
     }
 

@@ -121,7 +121,11 @@ impl App {
             return;
         };
         let update = deep_code_agent::GlobalConfigUpdate::Language(lang.as_setting().to_string());
-        match deep_code_agent::write_global_config_update(&self.global_config_path, &update) {
+        match deep_code_agent::write_global_config_update(
+            &self.global_config_path,
+            &update,
+            self.lang,
+        ) {
             Ok(_) => {
                 // Switch immediately — the transcript re-renders from
                 // structured cells, so history follows on the next frame.
@@ -143,12 +147,16 @@ impl App {
     }
 
     fn set_api_key(&mut self, arg: &str) {
-        if let Err(message) = deep_code_agent::validate_api_key(arg) {
+        if let Err(message) = deep_code_agent::validate_api_key(arg, self.lang) {
             self.status = message;
             return;
         }
         let update = deep_code_agent::GlobalConfigUpdate::ApiKey(Some(arg.trim().to_string()));
-        match deep_code_agent::write_global_config_update(&self.global_config_path, &update) {
+        match deep_code_agent::write_global_config_update(
+            &self.global_config_path,
+            &update,
+            self.lang,
+        ) {
             Ok(path) => match self.relaunch_runtime() {
                 Ok(()) => {
                     self.history.push(HistoryCell::system(self.tr_with(
@@ -205,7 +213,11 @@ impl App {
             },
         };
         let update = deep_code_agent::GlobalConfigUpdate::Model(resolved.clone());
-        match deep_code_agent::write_global_config_update(&self.global_config_path, &update) {
+        match deep_code_agent::write_global_config_update(
+            &self.global_config_path,
+            &update,
+            self.lang,
+        ) {
             Ok(_) => match self.relaunch_runtime() {
                 Ok(()) => {
                     self.history.push(HistoryCell::system(self.tr_with(
@@ -222,7 +234,11 @@ impl App {
 
     fn logout(&mut self) {
         let update = deep_code_agent::GlobalConfigUpdate::ApiKey(None);
-        match deep_code_agent::write_global_config_update(&self.global_config_path, &update) {
+        match deep_code_agent::write_global_config_update(
+            &self.global_config_path,
+            &update,
+            self.lang,
+        ) {
             Ok(_) => match self.relaunch_runtime() {
                 Ok(()) => {
                     self.history
