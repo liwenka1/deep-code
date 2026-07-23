@@ -61,23 +61,14 @@ impl CostEstimate {
     }
 }
 
+/// Prompt-prefix cache status for a turn. Presentation (the user-facing tag)
+/// lives in the TUI's language pack; this stays a plain data enum.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrefixStatus {
     FirstTurn,
     Stable,
     Changed,
-}
-
-impl PrefixStatus {
-    #[must_use]
-    pub fn label_zh(self) -> &'static str {
-        match self {
-            Self::FirstTurn => "prefix 首回合",
-            Self::Stable => "prefix 稳定",
-            Self::Changed => "prefix 变动",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

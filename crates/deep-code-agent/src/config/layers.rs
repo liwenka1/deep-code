@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     APPROVAL_AUTO_ALLOW_ENV, AUTO_COST_SAVING_ENV, AgentConfig, CHECKPOINT_MAX_SNAPSHOTS_ENV,
-    COMPACTION_THRESHOLD_ENV, COST_CURRENCY_ENV, DEEPSEEK_API_KEY_ENV, MODEL_ENV,
+    COMPACTION_THRESHOLD_ENV, COST_CURRENCY_ENV, DEEPSEEK_API_KEY_ENV, LANG_ENV, MODEL_ENV,
     REASONING_EFFORT_ENV, STREAM_CHUNK_TIMEOUT_ENV, STREAM_MAX_BYTES_ENV, STREAM_MAX_RETRIES_ENV,
     STREAM_TOTAL_TIMEOUT_ENV,
 };
@@ -172,6 +172,7 @@ struct ConfigFile {
     stream: StreamSection,
     approval: ApprovalSection,
     checkpoints: CheckpointsSection,
+    ui: UiSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -216,6 +217,12 @@ struct ApprovalSection {
 #[serde(default)]
 struct CheckpointsSection {
     max_snapshots: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct UiSection {
+    language: Option<String>,
 }
 
 enum FileRead {
@@ -379,6 +386,17 @@ fn apply_file_overlay(
         }
     }
 
+    // UI preference: harmless from any layer, so the project file may set it
+    // (a repo declaring its team's display language is fine).
+    if let Some(language) = file
+        .ui
+        .language
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        config.language = language.trim().to_string();
+    }
+
     if let Some(rules) = &file.approval.auto_allow {
         if project {
             report.warnings.push(
@@ -412,6 +430,9 @@ pub(super) fn apply_env_overlay(
     {
         config.reasoning_effort = effort;
         sources.reasoning_effort = ConfigLayer::Env;
+    }
+    if let Some(value) = lookup(LANG_ENV).filter(|value| !value.trim().is_empty()) {
+        config.language = value.trim().to_string();
     }
     if let Some(value) = lookup(AUTO_COST_SAVING_ENV) {
         config.auto_cost_saving = matches!(value.trim(), "1" | "true" | "yes" | "on");
@@ -485,6 +506,25 @@ mod tests {
         assert_eq!(loaded.config, AgentConfig::builtin());
         assert!(loaded.report.warnings.is_empty());
         assert_eq!(loaded.report.sources.model, ConfigLayer::Builtin);
+    }
+
+    #[test]
+    fn language_layers_file_then_env_default_auto() {
+        // Builtin default.
+        assert_eq!(AgentConfig::builtin().language, "auto");
+
+        // File layers (project overrides global; blank is ignored).
+        let global_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let global = write_config(global_dir.path(), "[ui]\nlanguage = \"en\"\n");
+        let project = write_config(project_dir.path(), "[ui]\nlanguage = \" zh \"\n");
+        let loaded = AgentConfig::load_with(Some(global.clone()), Some(project), &no_env);
+        assert_eq!(loaded.config.language, "zh");
+
+        // Env wins over files.
+        let env = |name: &str| (name == LANG_ENV).then(|| "en".to_string());
+        let loaded = AgentConfig::load_with(Some(global), None, &env);
+        assert_eq!(loaded.config.language, "en");
     }
 
     #[test]

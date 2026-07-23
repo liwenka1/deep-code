@@ -74,3 +74,8 @@
 
 # 累计内容体积上限（字节）。
 # max_bytes = 52428800
+
+[ui]
+# 界面语言：auto（跟随系统 LANG/LC_ALL）| zh | en。
+# 环境变量 DEEP_CODE_LANG 优先级最高；也可在 TUI 内用 /lang 切换并持久化。
+# language = "auto"

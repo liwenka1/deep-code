@@ -9,12 +9,14 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{Document, value};
 
-/// One field update for the `[provider]` section of the global config.
+/// One field update to the global config file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GlobalConfigUpdate {
     /// `Some(key)` sets the API key, `None` removes it (logout).
     ApiKey(Option<String>),
     Model(String),
+    /// UI language (`ui.language`): "auto" | "zh" | "en".
+    Language(String),
 }
 
 /// Loose sanity check before persisting a key. Error messages never echo
@@ -49,8 +51,12 @@ pub fn write_global_config_update(
         Err(error) => return Err(format!("读取 {} 失败：{error}", path.display())),
     };
 
-    if document.get("provider").is_none() {
-        document["provider"] = toml_edit::table();
+    let section = match update {
+        GlobalConfigUpdate::Language(_) => "ui",
+        _ => "provider",
+    };
+    if document.get(section).is_none() {
+        document[section] = toml_edit::table();
     }
     match update {
         GlobalConfigUpdate::ApiKey(Some(key)) => {
@@ -63,6 +69,9 @@ pub fn write_global_config_update(
         }
         GlobalConfigUpdate::Model(model) => {
             document["provider"]["model"] = value(model.as_str());
+        }
+        GlobalConfigUpdate::Language(language) => {
+            document["ui"]["language"] = value(language.as_str());
         }
     }
 
@@ -163,6 +172,24 @@ mod tests {
         assert!(contents.contains("api_key = \"sk-oldoldoldoldold\""));
         assert!(contents.contains("model = \"deepseek-v4-flash\""));
         assert!(contents.contains("currency = \"usd\""));
+    }
+
+    #[test]
+    fn language_update_writes_ui_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[provider]\nmodel = \"auto\"\n").unwrap();
+
+        write_global_config_update(&path, &GlobalConfigUpdate::Language("en".to_string())).unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("[ui]"));
+        assert!(contents.contains("language = \"en\""));
+        assert!(contents.contains("model = \"auto\""), "provider untouched");
+
+        // The layered loader reads it back.
+        let loaded = crate::config::AgentConfig::load_with(Some(path), None, &|_| None);
+        assert_eq!(loaded.config.language, "en");
     }
 
     #[test]

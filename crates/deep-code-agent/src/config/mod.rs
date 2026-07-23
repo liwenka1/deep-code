@@ -30,6 +30,7 @@ pub const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 pub const SUBPROCESS_SECRET_ENV: &[&str] = &[DEEPSEEK_API_KEY_ENV, "DEEP_CODE_RUNTIME_TOKEN"];
 
 pub const MODEL_ENV: &str = "DEEP_CODE_MODEL";
+pub const LANG_ENV: &str = "DEEP_CODE_LANG";
 pub const REASONING_EFFORT_ENV: &str = "DEEP_CODE_REASONING_EFFORT";
 pub const COST_CURRENCY_ENV: &str = "DEEP_CODE_COST_CURRENCY";
 pub const AUTO_COST_SAVING_ENV: &str = "DEEP_CODE_AUTO_COST_SAVING";
@@ -79,6 +80,10 @@ pub struct AgentConfig {
     /// Checkpoint retention cap: oldest snapshots beyond this count are
     /// pruned after each new snapshot (0 disables pruning).
     pub checkpoint_max_snapshots: usize,
+    /// UI language setting: `"auto"` (locale detection), `"zh"`, or `"en"`.
+    /// Stored raw; the TUI owns resolution — unknown values fall back to
+    /// detection so a typo degrades gracefully instead of failing the load.
+    pub language: String,
 }
 
 impl Default for AgentConfig {
@@ -111,6 +116,7 @@ impl AgentConfig {
             stream_max_bytes: DEFAULT_STREAM_MAX_BYTES,
             approval_auto_allow: Vec::new(),
             checkpoint_max_snapshots: crate::checkpoint::DEFAULT_MAX_SNAPSHOTS,
+            language: "auto".to_string(),
         }
     }
 
