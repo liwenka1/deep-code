@@ -241,27 +241,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         approved
     }
 
-    /// The model the auto-mode classifier runs on: Flash on DeepSeek. On any
-    /// other provider Flash won't exist, so fall back to the session's own
-    /// configured model — the judge still works (just not Flash-cheap) instead
-    /// of erroring every gated call into "ask" and silently disabling auto mode.
+    /// The model the auto-mode classifier runs on (see [`classifier_model_for`]).
     fn classifier_model(&self) -> String {
-        let configured = self.config.model.as_str();
-        // A known DeepSeek model → its cheap Flash sibling.
-        if self.registry.info_for(configured).is_some() {
-            return DEEPSEEK_V4_FLASH.to_string();
-        }
-        // "auto"/unset is DeepSeek-specific routing, so Flash is right only when
-        // the endpoint is actually DeepSeek; off DeepSeek it wouldn't exist.
-        if (configured.is_empty() || configured == AUTO_MODEL)
-            && self.config.base_url.contains("deepseek")
-        {
-            return DEEPSEEK_V4_FLASH.to_string();
-        }
-        // A concrete non-DeepSeek model (or auto/unset off DeepSeek): judge on
-        // the session's own model so auto mode still works there instead of
-        // pointing at a nonexistent Flash and silently disabling itself.
-        configured.to_string()
+        classifier_model_for(&self.config, &self.registry)
     }
 
     /// Fold a classifier call's token cost into the running session total. The
@@ -666,10 +648,51 @@ pub(super) fn runtime_error_from_tool_error(
     }
 }
 
+/// The model the auto-mode classifier runs on. Flash is the cheap judge tier on
+/// DeepSeek; a concrete non-DeepSeek model is judged on itself so auto mode
+/// works off DeepSeek too. `auto`/unset are DeepSeek-only routing sentinels →
+/// Flash; on a non-DeepSeek endpoint that combination is a misconfiguration that
+/// already breaks normal turns, so the judge failing safe to "ask" there is
+/// acceptable — and it never leaks the raw sentinel to the API layer.
+fn classifier_model_for(
+    config: &crate::config::AgentConfig,
+    registry: &crate::model_registry::ModelRegistry,
+) -> String {
+    let configured = config.model.trim();
+    if configured.is_empty()
+        || configured.eq_ignore_ascii_case(AUTO_MODEL)
+        || registry.info_for(configured).is_some()
+    {
+        return DEEPSEEK_V4_FLASH.to_string();
+    }
+    configured.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn classifier_model_maps_to_flash_or_concrete_model() {
+        use crate::config::AgentConfig;
+        use crate::model_registry::ModelRegistry;
+        let reg = ModelRegistry::default();
+        let cfg = |model: &str| AgentConfig {
+            model: model.to_string(),
+            ..AgentConfig::builtin()
+        };
+        // DeepSeek sentinels and catalog models → the cheap Flash judge.
+        assert_eq!(classifier_model_for(&cfg("auto"), &reg), DEEPSEEK_V4_FLASH);
+        assert_eq!(classifier_model_for(&cfg(""), &reg), DEEPSEEK_V4_FLASH);
+        assert_eq!(
+            classifier_model_for(&cfg("deepseek-v4-pro"), &reg),
+            DEEPSEEK_V4_FLASH
+        );
+        // A concrete non-DeepSeek model is judged on itself — the raw "auto"
+        // sentinel is never leaked to the API layer.
+        assert_eq!(classifier_model_for(&cfg("gpt-4o"), &reg), "gpt-4o");
+    }
 
     fn shell(command: &str) -> ToolCall {
         ToolCall {

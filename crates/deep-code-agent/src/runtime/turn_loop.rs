@@ -15,9 +15,9 @@ use crate::tool::ToolCallAccumulator;
 
 impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// UI language for user-facing runtime text (error diagnostics, approval
-    /// previews). Resolved once at construction from `ui.language` (falling back
-    /// to locale/English) and cached — a `/lang` switch relaunches the runtime,
-    /// which re-resolves it, so this need not re-parse the environment per call.
+    /// previews). Reads the shared [`crate::i18n::SharedLang`] atomic that the
+    /// TUI flips on `/lang` via the runtime handle, so a switch is picked up by
+    /// the next rendered string without a relaunch or a per-call env re-parse.
     pub(super) fn ui_lang(&self) -> crate::i18n::Lang {
         self.ui_lang.get()
     }
