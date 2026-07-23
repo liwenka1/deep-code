@@ -1283,8 +1283,10 @@ async fn auto_pro_retries_with_flash_after_retriable_api_error() {
     use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO};
 
     let client = FallbackTestClient::new();
+    // Pin zh so the localized fallback-reason assertion is deterministic.
     let config = AgentConfig {
         model: AUTO_MODEL.to_string(),
+        language: "zh".to_string(),
         ..AgentConfig::builtin()
     };
     let runtime = AgentRuntime::with_system_prompt(

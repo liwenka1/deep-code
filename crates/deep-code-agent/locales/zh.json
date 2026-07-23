@@ -228,5 +228,17 @@
   "SafetyInstallReason": "安装依赖会下载并执行第三方代码",
   "SafetyInstallSuggestion": "确认依赖来源可信",
 
-  "CheckpointSnapshotFailed": "检查点快照失败（{label}）：{error}"
+  "CheckpointSnapshotFailed": "检查点快照失败（{label}）：{error}",
+
+  "EchoOfflineHint": "未配置 DeepSeek API key：输入 /apikey sk-... 即刻接入，或设置环境变量 DEEPSEEK_API_KEY 后重新启动。",
+
+  "RouteFixedModel": "固定模型配置：{model}",
+  "RouteFixedModelPassthrough": "固定模型配置：{model}（不在目录中，按原样使用）",
+  "RouteCascade": "级联升级：本会话内 Flash 工具调用反复失败，改用 Pro 接管",
+  "RouteContextPressure": "上下文占用约 {percent}%（≥{threshold}% 阈值），使用 Pro 处理长上下文",
+  "RouteKeywordDeep": "命中调试/报错类关键词“{keyword}”，使用 Pro 配深推理",
+  "RouteKeywordHeavy": "命中复杂任务关键词“{keyword}”，使用 Pro 以获得更强推理和工具规划能力",
+  "RouteKeywordBorderline": "任务包含“{keyword}”，且未开启成本优先，使用 Pro",
+  "RouteFlashDefault": "默认先用 Flash（更快更省）；若工具调用反复失败，级联会升级到 Pro",
+  "RouteFallbackProToFlash": "DeepSeek 临时不可用或限流，已从 Pro 自动降级到 Flash 重试"
 }

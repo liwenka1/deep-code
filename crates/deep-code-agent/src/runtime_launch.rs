@@ -9,6 +9,7 @@ use crate::client::{DeepSeekClient, LlmClient};
 use crate::config::AgentConfig;
 use crate::echo_client::EchoClient;
 use crate::extensions::{attach_agent_extensions, build_runtime_system_prompt};
+use crate::i18n::Lang;
 use crate::runtime::{AgentRuntime, AgentRuntimeHandle};
 use crate::session_store::{ConfigSnapshot, JsonSessionStore, SessionRecord, SessionStore};
 use crate::shell_tools::{JobStore, shell_tool_registry};
@@ -134,7 +135,7 @@ pub fn launch_runtime(
     }
 
     launch_fresh(
-        EchoClient,
+        EchoClient::new(Lang::from_env(&config.language)),
         "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string(),
         config,
         workspace,
@@ -284,7 +285,7 @@ fn launch_resumed(
         };
     }
 
-    let client = Arc::new(EchoClient);
+    let client = Arc::new(EchoClient::new(Lang::from_env(&config.language)));
     let (tools, subagent_manager, job_store, shutdown) = build_parent_tools(
         Arc::clone(&client),
         config,
@@ -293,7 +294,13 @@ fn launch_resumed(
         &mut warnings,
     );
     let runtime = attach_workspace_helpers(
-        AgentRuntime::from_session_record(EchoClient, tools, record.clone(), store, config.clone()),
+        AgentRuntime::from_session_record(
+            EchoClient::new(Lang::from_env(&config.language)),
+            tools,
+            record.clone(),
+            store,
+            config.clone(),
+        ),
         &workspace,
         &mut warnings,
     );
@@ -383,7 +390,7 @@ mod tests {
             "online registry must not expose the mock tool: {names:?}"
         );
 
-        let names = parent_tool_names(EchoClient, &config, dir.path());
+        let names = parent_tool_names(EchoClient::new(Lang::Zh), &config, dir.path());
         assert!(
             !names.iter().any(|name| name == MockEchoTool::NAME),
             "the mock tool is a test fixture; no production registry mounts it: {names:?}"

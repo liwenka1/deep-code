@@ -1,6 +1,7 @@
 //! Heuristic auto model selection for DeepSeek pro / flash routing.
 
 use crate::config::AgentConfig;
+use crate::i18n::{Lang, TextId, tr, tr_with};
 use crate::model_registry::{
     AUTO_MODEL, DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO, ModelRegistry, ResolutionKind,
 };
@@ -132,6 +133,7 @@ pub fn resolve_turn_route(
     user_prompt: &str,
     is_subagent: bool,
     ctx: RouteContext,
+    lang: Lang,
 ) -> TurnRoute {
     let resolution = registry.resolve(Some(config.model.as_str()));
     let auto_model = resolution.resolved_id == AUTO_MODEL;
@@ -143,11 +145,16 @@ pub fn resolve_turn_route(
             config.reasoning_effort.resolve(is_subagent, user_prompt),
         );
         let route_reason = match resolution.kind {
-            ResolutionKind::Passthrough => format!(
-                "固定模型配置：{}（不在目录中，按原样使用）",
-                resolution.resolved_id
+            ResolutionKind::Passthrough => tr_with(
+                lang,
+                TextId::RouteFixedModelPassthrough,
+                &[("model", &resolution.resolved_id)],
             ),
-            _ => format!("固定模型配置：{}", resolution.resolved_id),
+            _ => tr_with(
+                lang,
+                TextId::RouteFixedModel,
+                &[("model", &resolution.resolved_id)],
+            ),
         };
         return TurnRoute {
             requested_model: config.model.clone(),
@@ -166,7 +173,7 @@ pub fn resolve_turn_route(
     }
 
     let (effective_model, route_reason, source) =
-        classify_model(user_prompt, &ctx, config.auto_cost_saving);
+        classify_model(user_prompt, &ctx, config.auto_cost_saving, lang);
 
     // Effort and model both derive from `task_class`, so they stay coherent.
     let effort = config.reasoning_effort.resolve(is_subagent, user_prompt);
@@ -197,11 +204,12 @@ pub(crate) fn classify_model(
     input: &str,
     ctx: &RouteContext,
     cost_saving: bool,
+    lang: Lang,
 ) -> (String, String, RouteSource) {
     if ctx.escalated {
         return (
             DEEPSEEK_V4_PRO.to_string(),
-            "级联升级：本会话内 Flash 工具调用反复失败，改用 Pro 接管".to_string(),
+            tr(lang, TextId::RouteCascade).to_string(),
             RouteSource::Cascade,
         );
     }
@@ -209,9 +217,13 @@ pub(crate) fn classify_model(
     if ctx.under_pressure() {
         return (
             DEEPSEEK_V4_PRO.to_string(),
-            format!(
-                "上下文占用约 {}%（≥{CONTEXT_PRESSURE_PERCENT}% 阈值），使用 Pro 处理长上下文",
-                ctx.usage_percent()
+            tr_with(
+                lang,
+                TextId::RouteContextPressure,
+                &[
+                    ("percent", &ctx.usage_percent().to_string()),
+                    ("threshold", &CONTEXT_PRESSURE_PERCENT.to_string()),
+                ],
             ),
             RouteSource::HardRule,
         );
@@ -220,24 +232,28 @@ pub(crate) fn classify_model(
     match classify_keyword(input) {
         Some((TaskWeight::Deep, keyword)) => (
             DEEPSEEK_V4_PRO.to_string(),
-            format!("命中调试/报错类关键词“{keyword}”，使用 Pro 配深推理"),
+            tr_with(lang, TextId::RouteKeywordDeep, &[("keyword", keyword)]),
             RouteSource::Heuristic,
         ),
         Some((TaskWeight::Heavy, keyword)) => (
             DEEPSEEK_V4_PRO.to_string(),
-            format!("命中复杂任务关键词“{keyword}”，使用 Pro 以获得更强推理和工具规划能力"),
+            tr_with(lang, TextId::RouteKeywordHeavy, &[("keyword", keyword)]),
             RouteSource::Heuristic,
         ),
         Some((TaskWeight::Borderline, keyword)) if !cost_saving => (
             DEEPSEEK_V4_PRO.to_string(),
-            format!("任务包含“{keyword}”，且未开启成本优先，使用 Pro"),
+            tr_with(
+                lang,
+                TextId::RouteKeywordBorderline,
+                &[("keyword", keyword)],
+            ),
             RouteSource::Heuristic,
         ),
         // Everything else (Light keywords, Borderline under cost-saving, no
         // keyword) starts on Flash; cascade upgrades it if Flash struggles.
         _ => (
             DEEPSEEK_V4_FLASH.to_string(),
-            "默认先用 Flash（更快更省）；若工具调用反复失败，级联会升级到 Pro".to_string(),
+            tr(lang, TextId::RouteFlashDefault).to_string(),
             RouteSource::Heuristic,
         ),
     }
@@ -249,7 +265,7 @@ mod tests {
     use crate::pricing::CostCurrency;
 
     fn auto_model(input: &str) -> String {
-        classify_model(input, &RouteContext::default(), false).0
+        classify_model(input, &RouteContext::default(), false, Lang::Zh).0
     }
 
     #[test]
@@ -283,6 +299,7 @@ mod tests {
             "debug crash",
             false,
             RouteContext::default(),
+            Lang::Zh,
         );
         assert!(route.auto_model);
         assert!(route.auto_effort);
@@ -303,6 +320,7 @@ mod tests {
             "hello",
             false,
             RouteContext::default(),
+            Lang::Zh,
         );
         assert_eq!(route.source, RouteSource::HardRule);
         assert!(!route.used_model_fallback);
@@ -321,6 +339,7 @@ mod tests {
             "hello",
             false,
             RouteContext::default(),
+            Lang::Zh,
         );
         assert_eq!(route.effective_model, "deepseek-v9-experimental");
         assert!(
@@ -343,6 +362,7 @@ mod tests {
             "debug crash",
             true,
             RouteContext::default(),
+            Lang::Zh,
         );
         assert_eq!(route.effective_effort, ReasoningEffort::Low);
     }
@@ -379,6 +399,7 @@ mod tests {
             "anything",
             false,
             RouteContext::default(),
+            Lang::Zh,
         );
         assert_eq!(route.effective_model, DEEPSEEK_V4_FLASH);
         assert_eq!(route.effective_effort, ReasoningEffort::High);
@@ -399,6 +420,7 @@ mod tests {
             "fix this error",
             false,
             RouteContext::default(),
+            Lang::Zh,
         );
         assert_eq!(route.effective_model, DEEPSEEK_V4_PRO);
         assert_eq!(route.effective_effort, ReasoningEffort::Max);
@@ -416,7 +438,14 @@ mod tests {
             context_window: 1_000_000,
             escalated: false,
         };
-        let route = resolve_turn_route(&config, &ModelRegistry::default(), "hi", false, ctx);
+        let route = resolve_turn_route(
+            &config,
+            &ModelRegistry::default(),
+            "hi",
+            false,
+            ctx,
+            Lang::Zh,
+        );
         assert_eq!(route.effective_model, DEEPSEEK_V4_PRO);
         assert_eq!(route.source, RouteSource::HardRule);
     }
@@ -434,7 +463,14 @@ mod tests {
             escalated: true,
             ..RouteContext::default()
         };
-        let route = resolve_turn_route(&config, &ModelRegistry::default(), "hi", false, ctx);
+        let route = resolve_turn_route(
+            &config,
+            &ModelRegistry::default(),
+            "hi",
+            false,
+            ctx,
+            Lang::Zh,
+        );
         assert_eq!(route.effective_model, DEEPSEEK_V4_PRO);
         assert_eq!(route.source, RouteSource::Cascade);
         assert!(route.route_reason.contains("级联升级"));
@@ -459,12 +495,16 @@ mod tests {
 
     #[test]
     fn auto_model_returns_human_readable_reason() {
-        let (model, reason, _) =
-            classify_model("please debug this error", &RouteContext::default(), false);
+        let (model, reason, _) = classify_model(
+            "please debug this error",
+            &RouteContext::default(),
+            false,
+            Lang::Zh,
+        );
         assert_eq!(model, DEEPSEEK_V4_PRO);
         assert!(reason.contains("debug"));
 
-        let (model, reason, _) = classify_model("hi", &RouteContext::default(), false);
+        let (model, reason, _) = classify_model("hi", &RouteContext::default(), false, Lang::Zh);
         assert_eq!(model, DEEPSEEK_V4_FLASH);
         assert!(reason.contains("Flash"));
     }
@@ -483,6 +523,7 @@ mod tests {
             "hello",
             false,
             RouteContext::default(),
+            Lang::Zh,
         );
         assert!(!route.auto_model);
         assert_eq!(route.effective_model, DEEPSEEK_V4_PRO);

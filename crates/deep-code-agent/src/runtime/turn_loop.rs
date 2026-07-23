@@ -50,6 +50,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             &user_prompt,
             self.is_subagent,
             route_ctx,
+            self.ui_lang(),
         );
 
         if self.maybe_compact(&route.effective_model, tx).await {

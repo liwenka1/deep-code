@@ -212,7 +212,8 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                     route.effective_effort =
                         clamp_effort_to_model(fallback, route.effective_effort);
                     route.fallback_reason = Some(
-                        "DeepSeek 临时不可用或限流，已从 Pro 自动降级到 Flash 重试".to_string(),
+                        crate::tr(self.ui_lang(), crate::TextId::RouteFallbackProToFlash)
+                            .to_string(),
                     );
                     let mut retry = request;
                     retry.model = fallback.to_string();
