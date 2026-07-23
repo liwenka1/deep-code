@@ -270,6 +270,20 @@ text_ids! {
     LangName,
     LangSwitched,
     LangUnknown,
+    // AgentError 用户可见诊断(agent crate)
+    ErrMissingApiKey,
+    ErrHttp,
+    ErrApiUnauthorized,
+    ErrApiRateLimited,
+    ErrApiServer,
+    ErrApiGeneric,
+    ErrParse,
+    ErrSerde,
+    ErrRequestTimeout,
+    ErrStreamStalled,
+    ErrStreamDeadline,
+    ErrStreamOverflow,
+    ErrInvalidConfig,
 }
 
 static ZH_JSON: &str = include_str!("../locales/zh.json");

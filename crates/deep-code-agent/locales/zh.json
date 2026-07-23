@@ -172,5 +172,19 @@
   "LangCurrent": "当前界面语言: {lang}。用法: /lang zh|en",
   "LangName": "中文",
   "LangSwitched": "界面语言已切换为中文（已写入全局配置）",
-  "LangUnknown": "未知语言 '{value}'。可用: zh, en"
+  "LangUnknown": "未知语言 '{value}'。可用: zh, en",
+
+  "ErrMissingApiKey": "缺少 DeepSeek API Key；请设置环境变量 DEEPSEEK_API_KEY，或在 https://platform.deepseek.com 获取密钥\n1. 在 https://platform.deepseek.com 注册并创建 API Key\n2. export DEEPSEEK_API_KEY=sk-...\n3. 国内网络若连接不稳定，可尝试代理或镜像端点（deep-code 默认使用 https://api.deepseek.com/beta）",
+  "ErrHttp": "HTTP 请求失败：{error}\n网络连接 DeepSeek 失败，请检查本机网络、代理设置或 DeepSeek endpoint；国内网络不稳定时建议配置可用代理。",
+  "ErrApiUnauthorized": "API 鉴权失败 ({status})：请确认 DEEPSEEK_API_KEY 是否正确、未过期，并确认当前 endpoint 为 DeepSeek 兼容地址。原始信息：{message}",
+  "ErrApiRateLimited": "API 请求被限流 ({status})：请稍后重试，或切换到 Flash/开启 auto 成本优先以降低压力。原始信息：{message}",
+  "ErrApiServer": "DeepSeek 服务暂时不可用 ({status})：可稍后重试，auto mode 会在可重试场景下尝试从 Pro 降级到 Flash。原始信息：{message}",
+  "ErrApiGeneric": "API 错误 ({status})：{message}",
+  "ErrParse": "无法解析 provider 响应：{detail}",
+  "ErrSerde": "序列化错误：{detail}",
+  "ErrRequestTimeout": "请求超时：{seconds}s 内未收到 DeepSeek 响应头\n网络或 DeepSeek 服务响应缓慢：请检查网络后重试，或调大 provider.timeout_secs。",
+  "ErrStreamStalled": "流式响应卡顿：连续 {seconds}s 未收到新数据\n网络可能卡顿或代理中断：请检查网络后重试；如确属长任务，可调大 DEEP_CODE_STREAM_CHUNK_TIMEOUT_SECS。",
+  "ErrStreamDeadline": "流式响应总时长超过 {seconds}s 上限\n本轮响应耗时过长已被终止：可拆分任务后重试，或调大 DEEP_CODE_STREAM_TOTAL_TIMEOUT_SECS。",
+  "ErrStreamOverflow": "流式响应过大：累计内容超过 {limit} 字节上限\n响应内容异常巨大已被截断保护：请缩小任务范围，或调大 DEEP_CODE_STREAM_MAX_BYTES。",
+  "ErrInvalidConfig": "配置无效：{detail}"
 }

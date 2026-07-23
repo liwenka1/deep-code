@@ -14,6 +14,12 @@ use crate::runtime::tool_result::{BatchOutcome, runtime_error_from_tool_error, t
 use crate::tool::ToolCallAccumulator;
 
 impl<C: LlmClient + 'static> AgentRuntime<C> {
+    /// UI language for user-facing error text, resolved from the runtime's
+    /// configured `ui.language` (falls back to locale/English detection).
+    pub(super) fn ui_lang(&self) -> crate::i18n::Lang {
+        crate::i18n::Lang::from_env(&self.config.language)
+    }
+
     /// Drive the model/tool loop until either the turn finishes or an
     /// approval is required. All paths emit a terminal [`RuntimeEvent`]
     /// (`TurnFinished`, `ApprovalRequired`, or `Error`) before returning.
@@ -88,7 +94,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                         tx,
                         RuntimeEvent::Error {
                             turn_id: Some(turn_id.clone()),
-                            message: error.user_message(),
+                            message: error.user_message(self.ui_lang()),
                         },
                     );
                     self.abort_turn().await;
@@ -180,7 +186,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                             tx,
                             RuntimeEvent::Error {
                                 turn_id: Some(turn_id.clone()),
-                                message: error.user_message(),
+                                message: error.user_message(self.ui_lang()),
                             },
                         );
                         had_error = true;

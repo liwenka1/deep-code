@@ -1353,8 +1353,11 @@ async fn unauthorized_api_error_does_not_fallback() {
     let client = AuthFailClient {
         calls: Arc::new(Mutex::new(0)),
     };
+    // Pin the language so the localized error assertion is deterministic
+    // regardless of the test machine's LANG.
     let config = AgentConfig {
         model: AUTO_MODEL.to_string(),
+        language: "zh".to_string(),
         ..AgentConfig::builtin()
     };
     let runtime = AgentRuntime::with_system_prompt(
@@ -1932,6 +1935,7 @@ async fn stalled_stream_times_out_with_chinese_error() {
     let client = AttemptScriptClient::new(vec![AttemptBehavior::Hang]);
     let config = AgentConfig {
         stream_chunk_timeout: std::time::Duration::from_secs(5),
+        language: "zh".to_string(),
         ..AgentConfig::builtin()
     };
     let runtime =
@@ -1951,6 +1955,7 @@ async fn oversized_stream_is_cut_off() {
     let client = AttemptScriptClient::new(vec![AttemptBehavior::Text("x".repeat(64))]);
     let config = AgentConfig {
         stream_max_bytes: 10,
+        language: "zh".to_string(),
         ..AgentConfig::builtin()
     };
     let runtime =

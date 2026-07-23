@@ -191,7 +191,7 @@ fn collect_deepseek(config: &AgentConfig) -> DeepSeekDoctorReport {
         cost_currency: format!("{:?}", config.cost_currency).to_ascii_lowercase(),
         beta_endpoint: config.uses_beta_endpoint(),
         models,
-        api_key_hint: api_key_setup_hint().to_string(),
+        api_key_hint: api_key_setup_hint(crate::i18n::Lang::from_env(&config.language)),
     }
 }
 

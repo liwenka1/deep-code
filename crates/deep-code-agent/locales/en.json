@@ -172,5 +172,19 @@
   "LangCurrent": "Current UI language: {lang}. Usage: /lang zh|en",
   "LangName": "English",
   "LangSwitched": "UI language set to English (written to the global config)",
-  "LangUnknown": "Unknown language '{value}'. Available: zh, en"
+  "LangUnknown": "Unknown language '{value}'. Available: zh, en",
+
+  "ErrMissingApiKey": "Missing DeepSeek API key; set the DEEPSEEK_API_KEY environment variable, or get one at https://platform.deepseek.com\n1. Register and create an API key at https://platform.deepseek.com\n2. export DEEPSEEK_API_KEY=sk-...\n3. If your network to DeepSeek is unstable, try a proxy or mirror endpoint (deep-code defaults to https://api.deepseek.com/beta)",
+  "ErrHttp": "HTTP request failed: {error}\nCould not reach DeepSeek — check your network, proxy settings, or the DeepSeek endpoint; configure a working proxy if your connection is unstable.",
+  "ErrApiUnauthorized": "API authentication failed ({status}): confirm DEEPSEEK_API_KEY is correct and unexpired, and that the endpoint is DeepSeek-compatible. Original message: {message}",
+  "ErrApiRateLimited": "API rate limited ({status}): retry later, or switch to Flash / enable auto cost-first to reduce load. Original message: {message}",
+  "ErrApiServer": "DeepSeek service temporarily unavailable ({status}): retry later; auto mode will try downgrading Pro→Flash on retriable failures. Original message: {message}",
+  "ErrApiGeneric": "API error ({status}): {message}",
+  "ErrParse": "Failed to parse the provider response: {detail}",
+  "ErrSerde": "Serialization error: {detail}",
+  "ErrRequestTimeout": "Request timed out: no DeepSeek response headers within {seconds}s\nNetwork or DeepSeek is slow — retry, or raise provider.timeout_secs.",
+  "ErrStreamStalled": "Stream stalled: no new data for {seconds}s\nNetwork may be stalling or the proxy dropped — retry; for genuinely long tasks raise DEEP_CODE_STREAM_CHUNK_TIMEOUT_SECS.",
+  "ErrStreamDeadline": "Stream exceeded the {seconds}s total deadline\nThis turn ran too long and was terminated — split the task and retry, or raise DEEP_CODE_STREAM_TOTAL_TIMEOUT_SECS.",
+  "ErrStreamOverflow": "Stream too large: content exceeded the {limit}-byte cap\nThe response was unusually huge and was truncated for safety — narrow the task, or raise DEEP_CODE_STREAM_MAX_BYTES.",
+  "ErrInvalidConfig": "Invalid config: {detail}"
 }
