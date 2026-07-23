@@ -11,6 +11,7 @@ pub use layers::{ConfigLayer, ConfigLoadReport, ConfigSources, LoadedAgentConfig
 pub use write::{GlobalConfigUpdate, validate_api_key, write_global_config_update};
 
 use crate::error::{AgentError, AgentResult};
+use crate::execution_policy::PermissionMode;
 use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_PRO};
 use crate::pricing::CostCurrency;
 use crate::reasoning::ReasoningEffortSetting;
@@ -84,6 +85,10 @@ pub struct AgentConfig {
     /// Stored raw; the TUI owns resolution — unknown values fall back to
     /// detection so a typo degrades gracefully instead of failing the load.
     pub language: String,
+    /// Session permission mode to start in. Project config may only set it to
+    /// `Default`/`AcceptEdits` — a repo must not be able to launch you into
+    /// `Auto`/`Yolo` (enforced in the layered loader).
+    pub default_permission_mode: PermissionMode,
 }
 
 impl Default for AgentConfig {
@@ -117,6 +122,7 @@ impl AgentConfig {
             approval_auto_allow: Vec::new(),
             checkpoint_max_snapshots: crate::checkpoint::DEFAULT_MAX_SNAPSHOTS,
             language: "auto".to_string(),
+            default_permission_mode: PermissionMode::Default,
         }
     }
 

@@ -252,6 +252,34 @@ pub fn safety_notes(command: &str) -> Vec<SafetyNote> {
     notes.notes
 }
 
+/// cc-style `acceptEdits` allowlist for shell/job commands: filesystem-mutation
+/// programs that stay inside the workspace. Every segment's program must be in
+/// the set AND no positional path may escape the workspace (absolute, `~`, or
+/// `..`). A hard deny (e.g. `rm -rf`) never reaches here — `builtin_deny`
+/// short-circuits it first — so this only ever green-lights bounded edits.
+#[must_use]
+pub fn is_workspace_fs_edit(command: &str) -> bool {
+    const FS_EDIT: &[&str] = &["mkdir", "touch", "mv", "cp", "rm", "rmdir", "sed"];
+    let segs = segments(command);
+    if segs.is_empty() {
+        return false;
+    }
+    segs.iter().all(|segment| {
+        let Some(program) = program_of(segment) else {
+            return false;
+        };
+        if !FS_EDIT.contains(&program.as_str()) {
+            return false;
+        }
+        // Reject any path that leaves the workspace (same heuristic the safety
+        // note uses): absolute, home-relative, or containing `..`.
+        !args_of(segment)
+            .iter()
+            .filter(|token| !token.starts_with('-'))
+            .any(|arg| arg.starts_with('/') || arg.starts_with('~') || arg.contains(".."))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

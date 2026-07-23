@@ -34,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 use crate::checkpoint::CheckpointStore;
 use crate::client::LlmClient;
 use crate::config::AgentConfig;
+use crate::execution_policy::SharedPermissionMode;
 use crate::lsp::LspManager;
 use crate::message::Message;
 use crate::model_registry::ModelRegistry;
@@ -60,6 +61,10 @@ pub struct AgentRuntime<C: LlmClient + 'static> {
     workspace: Option<PathBuf>,
     lsp: Option<Arc<LspManager>>,
     persistence: Option<Arc<Persistence>>,
+    /// Session permission mode, shared (lock-free) with the TUI so it can show
+    /// the current mode and flip it on Shift+Tab. The approval gate reads it
+    /// per gated call.
+    permission_mode: SharedPermissionMode,
 }
 
 // Manual `Clone` to avoid the auto-derived `where C: Clone` bound that the
@@ -78,6 +83,7 @@ impl<C: LlmClient + 'static> Clone for AgentRuntime<C> {
             workspace: self.workspace.clone(),
             lsp: self.lsp.clone(),
             persistence: self.persistence.clone(),
+            permission_mode: self.permission_mode.clone(),
         }
     }
 }
@@ -99,6 +105,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             workspace: None,
             lsp: None,
             persistence: None,
+            permission_mode: SharedPermissionMode::default(),
         }
     }
 
@@ -142,7 +149,22 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             workspace: None,
             lsp: None,
             persistence: None,
+            permission_mode: SharedPermissionMode::default(),
         }
+    }
+
+    /// Attach a shared permission-mode handle (created at launch and shared
+    /// with the TUI). Builder-style so the constructors stay unchanged.
+    #[must_use]
+    pub fn with_permission_mode(mut self, mode: SharedPermissionMode) -> Self {
+        self.permission_mode = mode;
+        self
+    }
+
+    /// The runtime's current session permission mode.
+    #[must_use]
+    pub fn permission_mode(&self) -> crate::execution_policy::PermissionMode {
+        self.permission_mode.get()
     }
 
     /// Shut down background resources such as spawned LSP servers.

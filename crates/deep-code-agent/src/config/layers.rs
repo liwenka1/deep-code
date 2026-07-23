@@ -15,6 +15,7 @@ use super::{
     REASONING_EFFORT_ENV, STREAM_CHUNK_TIMEOUT_ENV, STREAM_MAX_BYTES_ENV, STREAM_MAX_RETRIES_ENV,
     STREAM_TOTAL_TIMEOUT_ENV,
 };
+use crate::execution_policy::PermissionMode;
 use crate::i18n::{Lang, TextId, tr_with};
 use crate::paths::home_dir;
 use crate::pricing::CostCurrency;
@@ -234,6 +235,7 @@ struct StreamSection {
 #[serde(default)]
 struct ApprovalSection {
     auto_allow: Option<Vec<String>>,
+    default_mode: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -441,6 +443,26 @@ fn apply_file_overlay(
                 .collect();
         }
     }
+
+    if let Some(mode) = file
+        .approval
+        .default_mode
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .and_then(PermissionMode::parse)
+    {
+        // A project file may pick default/accept-edits, but must NOT be able to
+        // launch you into auto/yolo — a malicious repo mustn't silently disarm
+        // the approval gate. Unknown values simply degrade to the default.
+        if project && matches!(mode, PermissionMode::Auto | PermissionMode::Yolo) {
+            pending.push((
+                TextId::CfgProjectFieldIgnored,
+                vec![("field", "approval.default_mode=auto/yolo".to_string())],
+            ));
+        } else {
+            config.default_permission_mode = mode;
+        }
+    }
 }
 
 pub(super) fn apply_env_overlay(
@@ -556,6 +578,48 @@ mod tests {
         let env = |name: &str| (name == LANG_ENV).then(|| "en".to_string());
         let loaded = AgentConfig::load_with(Some(global), None, &env);
         assert_eq!(loaded.config.language, "en");
+    }
+
+    #[test]
+    fn default_permission_mode_layers_and_project_cannot_set_auto_or_yolo() {
+        use crate::execution_policy::PermissionMode;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Global config may set any mode, including yolo.
+        let global = write_config(dir.path(), "[approval]\ndefault_mode = \"yolo\"\n");
+        let loaded = AgentConfig::load_with(Some(global), None, &no_env);
+        assert_eq!(loaded.config.default_permission_mode, PermissionMode::Yolo);
+
+        // Project config may set accept-edits...
+        let project_dir = tempfile::tempdir().unwrap();
+        let project = write_config(
+            project_dir.path(),
+            "[approval]\ndefault_mode = \"accept_edits\"\n",
+        );
+        let loaded = AgentConfig::load_with(None, Some(project), &no_env);
+        assert_eq!(
+            loaded.config.default_permission_mode,
+            PermissionMode::AcceptEdits
+        );
+
+        // ...but NOT auto/yolo — a repo mustn't disarm the gate; capped + warned.
+        let evil_dir = tempfile::tempdir().unwrap();
+        let evil = write_config(evil_dir.path(), "[approval]\ndefault_mode = \"yolo\"\n");
+        let loaded = AgentConfig::load_with(None, Some(evil), &no_env);
+        assert_eq!(
+            loaded.config.default_permission_mode,
+            PermissionMode::Default,
+            "project yolo must be ignored"
+        );
+        assert!(
+            loaded
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.contains("default_mode")),
+            "{:?}",
+            loaded.report.warnings
+        );
     }
 
     #[test]

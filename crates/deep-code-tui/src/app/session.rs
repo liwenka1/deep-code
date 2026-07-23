@@ -13,6 +13,12 @@ impl App {
         self.session_id = launched.session_id;
         self.subagent_manager = launched.subagent_manager;
         self.subagent_shutdown = Some(launched.stop_hook);
+        // Carry the user's chosen permission mode onto the new runtime's shared
+        // handle so a config swap (/model, /apikey, /resume, /clear) doesn't
+        // silently reset it.
+        let previous_mode = self.permission_mode.get();
+        self.permission_mode = launched.permission_mode;
+        self.permission_mode.set(previous_mode);
     }
 
     /// Load the layered agent config the same way for every runtime swap:

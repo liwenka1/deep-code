@@ -831,6 +831,7 @@ mod tests {
             stop_hook: Box::new(|| {}),
             offline: false,
             warnings: Vec::new(),
+            permission_mode: deep_code_agent::SharedPermissionMode::default(),
         };
         AppState {
             version: "0.1.0".to_string(),

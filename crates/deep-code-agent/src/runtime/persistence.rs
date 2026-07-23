@@ -86,6 +86,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             workspace: Some(workspace.clone()),
             lsp: None,
             persistence: Some(build_persistence(store, record)),
+            permission_mode: crate::execution_policy::SharedPermissionMode::default(),
         }
     }
 

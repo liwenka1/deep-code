@@ -352,6 +352,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     if !is_ctrl_c {
         app.clear_ctrl_c_guard();
     }
+    // Any key other than Shift+Tab disarms the pending-Yolo confirm.
+    if !matches!(key.code, KeyCode::BackTab) {
+        app.clear_yolo_arm();
+    }
 
     // The `/resume` modal is a full-screen overlay: it owns all keys while open.
     if app.resume_picker_open() {
@@ -414,6 +418,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     match key.code {
+        // Shift+Tab cycles the permission mode (default → accept-edits → auto → yolo).
+        KeyCode::BackTab => app.cycle_permission_mode(),
         KeyCode::Esc => app.handle_escape(),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.handle_ctrl_c(),
         // Ctrl+V on Windows in raw mode is NOT intercepted by the terminal,
@@ -1402,30 +1408,42 @@ fn render_input_from_layout(
 }
 
 fn render_status(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
-    let text = if let Some(error) = &app.error {
-        Line::from(vec![
-            Span::styled(
-                tr(app.lang, TextId::ErrorPrefix),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(error.clone()),
-        ])
+    use deep_code_agent::PermissionMode;
+
+    // A permanent chip so the current permission mode is always visible.
+    // Yolo shouts (red bold); the rest are quiet.
+    let mode = app.permission_mode();
+    let chip_style = match mode {
+        PermissionMode::Yolo => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        PermissionMode::Auto => Style::default().fg(Color::Yellow),
+        PermissionMode::AcceptEdits => Style::default().fg(Color::Cyan),
+        PermissionMode::Default => Style::default().fg(Color::DarkGray),
+    };
+    let mut spans = vec![Span::styled(
+        format!("[{}] ", crate::app::perm_mode_label(app.lang, mode)),
+        chip_style,
+    )];
+
+    if let Some(error) = &app.error {
+        spans.push(Span::styled(
+            tr(app.lang, TextId::ErrorPrefix),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(error.clone()));
     } else if let Some(activity) = app.streaming_activity() {
         // While streaming (incl. a long time-to-first-token wait) show an
         // animated indicator so the screen never looks frozen.
-        Line::from(vec![
-            Span::styled(activity, Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!("   {}", tr(app.lang, TextId::StatusEscCancel)),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])
+        spans.push(Span::styled(activity, Style::default().fg(Color::Cyan)));
+        spans.push(Span::styled(
+            format!("   {}", tr(app.lang, TextId::StatusEscCancel)),
+            Style::default().fg(Color::DarkGray),
+        ));
     } else {
-        Line::from(app.status_line())
-    };
+        spans.push(Span::raw(app.status_line()));
+    }
 
     frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(Line::from(spans)).style(Style::default().fg(Color::DarkGray)),
         area,
     );
 }

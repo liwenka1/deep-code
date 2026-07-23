@@ -139,6 +139,12 @@ pub struct App {
     pub(crate) resume_picker: Option<ResumePicker>,
     /// UI language, resolved from config at launch; `/lang` switches it live.
     pub(crate) lang: Lang,
+    /// Session permission mode, shared (lock-free) with the runtime's approval
+    /// gate. Shift+Tab cycles it; the status line shows it.
+    pub(crate) permission_mode: deep_code_agent::SharedPermissionMode,
+    /// One-shot latch: a first Shift+Tab that would enter Yolo arms this and
+    /// shows a confirm; the next Shift+Tab confirms. Any other key disarms.
+    pub(crate) yolo_armed: bool,
 }
 
 /// In-session `/resume` modal state: the resumable sessions (newest-first) and
@@ -248,6 +254,18 @@ fn home_relative(path: &std::path::Path) -> String {
     shown
 }
 
+/// Localized short label for a permission mode, for the status indicator.
+pub(crate) fn perm_mode_label(lang: Lang, mode: deep_code_agent::PermissionMode) -> &'static str {
+    use deep_code_agent::PermissionMode;
+    let id = match mode {
+        PermissionMode::Default => TextId::PermModeDefault,
+        PermissionMode::AcceptEdits => TextId::PermModeAcceptEdits,
+        PermissionMode::Auto => TextId::PermModeAuto,
+        PermissionMode::Yolo => TextId::PermModeYolo,
+    };
+    tr(lang, id)
+}
+
 /// Remove the character at `char_index` (0-based). Returns true when removed.
 fn remove_char_at(s: &mut String, char_index: usize) -> bool {
     let start = byte_idx(s, char_index);
@@ -278,6 +296,7 @@ impl App {
         let backend_offline = launched.offline;
         let session_id = launched.session_id;
         let subagent_manager = launched.subagent_manager;
+        let permission_mode = launched.permission_mode;
         let subagent_shutdown = Some(launched.stop_hook);
         let resumed = config.resume.is_some();
         let persistent = session_id.is_some();
@@ -364,7 +383,49 @@ impl App {
             selection: None,
             resume_picker: None,
             lang,
+            permission_mode,
+            yolo_armed: false,
         }
+    }
+
+    /// Current session permission mode (for the status indicator).
+    pub(crate) fn permission_mode(&self) -> deep_code_agent::PermissionMode {
+        self.permission_mode.get()
+    }
+
+    /// Shift+Tab: advance the permission mode. Entering Yolo requires a second
+    /// press (armed here) so the most permissive mode is never one keystroke
+    /// away by accident.
+    pub(crate) fn cycle_permission_mode(&mut self) {
+        use deep_code_agent::PermissionMode;
+        if self.yolo_armed {
+            // Second consecutive Shift+Tab: confirm Yolo.
+            self.yolo_armed = false;
+            self.permission_mode.set(PermissionMode::Yolo);
+            self.status = self.mode_switched_status(PermissionMode::Yolo);
+            return;
+        }
+        let next = self.permission_mode.get().cycle();
+        if next == PermissionMode::Yolo {
+            // Arm instead of entering; the next press confirms.
+            self.yolo_armed = true;
+            self.status = self.tr(TextId::PermModeYoloArm).to_string();
+            return;
+        }
+        self.permission_mode.set(next);
+        self.status = self.mode_switched_status(next);
+    }
+
+    /// Disarm the pending-Yolo confirm (any key other than Shift+Tab).
+    pub(crate) fn clear_yolo_arm(&mut self) {
+        self.yolo_armed = false;
+    }
+
+    fn mode_switched_status(&self, mode: deep_code_agent::PermissionMode) -> String {
+        self.tr_with(
+            TextId::PermModeSwitched,
+            &[("mode", perm_mode_label(self.lang, mode))],
+        )
     }
 
     /// 当前语言下的文案(无参数)。

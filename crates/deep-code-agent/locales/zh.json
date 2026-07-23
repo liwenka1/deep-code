@@ -240,5 +240,12 @@
   "RouteKeywordHeavy": "命中复杂任务关键词“{keyword}”，使用 Pro 以获得更强推理和工具规划能力",
   "RouteKeywordBorderline": "任务包含“{keyword}”，且未开启成本优先，使用 Pro",
   "RouteFlashDefault": "默认先用 Flash（更快更省）；若工具调用反复失败，级联会升级到 Pro",
-  "RouteFallbackProToFlash": "DeepSeek 临时不可用或限流，已从 Pro 自动降级到 Flash 重试"
+  "RouteFallbackProToFlash": "DeepSeek 临时不可用或限流，已从 Pro 自动降级到 Flash 重试",
+
+  "PermModeDefault": "默认",
+  "PermModeAcceptEdits": "接受编辑",
+  "PermModeAuto": "自动",
+  "PermModeYolo": "YOLO",
+  "PermModeSwitched": "已切换到「{mode}」模式",
+  "PermModeYoloArm": "⚠ 再按一次 Shift+Tab 进入 YOLO(自动放行一切，硬拒绝仍拦)；其他键取消"
 }

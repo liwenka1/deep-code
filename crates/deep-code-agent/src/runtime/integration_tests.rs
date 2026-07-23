@@ -279,6 +279,66 @@ async fn approve_path_feeds_tool_result_into_next_turn() {
     assert_eq!(messages[3].content, "thanks");
 }
 
+#[tokio::test]
+async fn yolo_mode_auto_approves_gated_tool_without_parking() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools())
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Yolo));
+
+    // A single drive: Yolo auto-approves the gated call and the turn runs to
+    // completion without ever parking on approval.
+    let mut rx = runtime.submit_user("please echo").await;
+    let events = drain(&mut rx).await;
+
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, RuntimeEvent::ApprovalRequired { .. })),
+        "yolo must not park on approval"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ToolCallFinished { result, .. } if result.content == "mock_echo: hi"
+    )));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnFinished { .. }))
+    );
+}
+
+#[tokio::test]
+async fn default_mode_still_parks_gated_tool() {
+    // Same gated call, but Default mode (the runtime's default) parks it.
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::ToolCallDelta {
+            delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools());
+    let mut rx = runtime.submit_user("please echo").await;
+    let events = drain(&mut rx).await;
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::ApprovalRequired { .. })
+    ));
+}
+
 /// A parallel-safe tool (name `agent` → `ToolKind::SubAgent`) that blocks on a
 /// shared size-2 barrier: `run` only returns once two calls are in flight at
 /// once. Sequential batch execution deadlocks on it; concurrent execution

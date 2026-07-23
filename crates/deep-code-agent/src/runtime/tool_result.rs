@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::execution_policy::command_shape;
+use crate::execution_policy::{PermissionMode, accept_edits_approvable, command_shape};
 
 use crate::client::LlmClient;
 use crate::lsp::{is_edit_tool, render_blocks, summarize_blocks};
@@ -151,11 +151,14 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         self.emit_session_updated(tx).await;
     }
 
-    /// Whether a gated call may run without asking: the user session-allowed
-    /// the tool earlier, or a configured `auto_allow` prefix matches. Policy
-    /// hard-denials are unaffected (they short-circuit inside the registry
-    /// before any decision is consulted).
+    /// Whether a gated call may run without asking. Two independent layers:
+    /// (1) standing consent — a configured `auto_allow` prefix or a session
+    /// "a" — is mode-independent; (2) the session [`PermissionMode`] relaxes
+    /// the gate more broadly. Policy hard-denials are unaffected either way:
+    /// they short-circuit in the registry before any decision is consulted, so
+    /// even `Yolo` never runs a denied command.
     async fn auto_approval_granted(&self, call: &ToolCall) -> bool {
+        // Layer 1: standing consent (config auto_allow + session memory).
         if self
             .config
             .approval_auto_allow
@@ -164,15 +167,28 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         {
             return true;
         }
-        let state = self.state.lock().await;
-        if state.session_approved.contains(&call.name) {
-            return true;
-        }
-        // Shell isn't blanket session-approvable by name; trust at command
-        // granularity instead ("a" remembered `cargo`, `git`, …).
-        match session_shell_prefix(call) {
-            Some(prefix) => state.session_trusted_shell_prefixes.contains(&prefix),
-            None => false,
+        {
+            let state = self.state.lock().await;
+            if state.session_approved.contains(&call.name) {
+                return true;
+            }
+            // Shell isn't blanket session-approvable by name; trust at command
+            // granularity instead ("a" remembered `cargo`, `git`, …).
+            if let Some(prefix) = session_shell_prefix(call)
+                && state.session_trusted_shell_prefixes.contains(&prefix)
+            {
+                return true;
+            }
+        } // release the state lock before any mode logic (Auto may await a judge)
+
+        // Layer 2: session permission mode.
+        match self.permission_mode() {
+            PermissionMode::Default => false,
+            PermissionMode::AcceptEdits => accept_edits_approvable(&call.name, &call.arguments),
+            // P2 wires the classifier here. Until then Auto fails safe to a
+            // prompt (never silently more permissive than Default).
+            PermissionMode::Auto => false,
+            PermissionMode::Yolo => true,
         }
     }
 

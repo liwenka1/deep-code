@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::client::{DeepSeekClient, LlmClient};
 use crate::config::AgentConfig;
 use crate::echo_client::EchoClient;
+use crate::execution_policy::SharedPermissionMode;
 use crate::extensions::{attach_agent_extensions, build_runtime_system_prompt};
 use crate::i18n::Lang;
 use crate::runtime::{AgentRuntime, AgentRuntimeHandle};
@@ -36,6 +37,10 @@ pub struct LaunchedRuntime {
     /// disabled, …). The consumer must surface these — the library never
     /// writes to stderr because a raw-mode TUI may own the screen.
     pub warnings: Vec<String>,
+    /// Session permission mode, shared (lock-free) with the runtime's approval
+    /// gate. The TUI reads it for the status indicator and flips it on
+    /// Shift+Tab; both sides see the same value.
+    pub permission_mode: SharedPermissionMode,
 }
 
 impl LaunchedRuntime {
@@ -200,7 +205,9 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
             None,
         ),
     };
-    let runtime = attach_workspace_helpers(runtime, &workspace, &mut warnings);
+    let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
+    let runtime = attach_workspace_helpers(runtime, &workspace, &mut warnings)
+        .with_permission_mode(permission_mode.clone());
     LaunchedRuntime {
         handle: Arc::new(runtime),
         backend_label,
@@ -210,6 +217,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
         stop_hook: shutdown,
         offline: client.provider_name() == EchoClient::PROVIDER,
         warnings,
+        permission_mode,
     }
 }
 
@@ -262,6 +270,7 @@ fn launch_resumed(
             parent_cancel,
             &mut warnings,
         );
+        let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
         let runtime = attach_workspace_helpers(
             AgentRuntime::from_session_record(
                 (*client).clone(),
@@ -272,7 +281,8 @@ fn launch_resumed(
             ),
             &workspace,
             &mut warnings,
-        );
+        )
+        .with_permission_mode(permission_mode.clone());
         return LaunchedRuntime {
             handle: Arc::new(runtime),
             backend_label: format!("DeepSeek {} (resumed)", config.model),
@@ -282,6 +292,7 @@ fn launch_resumed(
             stop_hook: shutdown,
             offline: false,
             warnings,
+            permission_mode,
         };
     }
 
@@ -293,6 +304,7 @@ fn launch_resumed(
         parent_cancel,
         &mut warnings,
     );
+    let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
     let runtime = attach_workspace_helpers(
         AgentRuntime::from_session_record(
             EchoClient::new(Lang::from_env(&config.language)),
@@ -303,7 +315,8 @@ fn launch_resumed(
         ),
         &workspace,
         &mut warnings,
-    );
+    )
+    .with_permission_mode(permission_mode.clone());
     LaunchedRuntime {
         handle: Arc::new(runtime),
         backend_label: "offline echo (resumed)".to_string(),
@@ -313,6 +326,7 @@ fn launch_resumed(
         stop_hook: shutdown,
         offline: true,
         warnings,
+        permission_mode,
     }
 }
 

@@ -295,10 +295,86 @@ fn has_redirection_or_substitution(command: &str) -> bool {
         || command.contains("$(")
 }
 
+/// Whether a gated call is auto-approvable under `AcceptEdits` mode: a workspace
+/// file-edit tool, or an in-workspace filesystem-mutation shell/job command
+/// (cc's `acceptEdits` behavior). Everything else still prompts. Hard denials
+/// never reach this — they short-circuit in the registry before any decision.
+#[must_use]
+pub fn accept_edits_approvable(tool_name: &str, arguments: &Value) -> bool {
+    match ExecPolicy::classify_tool(tool_name) {
+        ToolKind::WriteFile => true,
+        ToolKind::Shell => arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(shell_deny::is_workspace_fs_edit),
+        ToolKind::Job if arguments.get("action").and_then(Value::as_str) == Some("start") => {
+            arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(shell_deny::is_workspace_fs_edit)
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn accept_edits_approves_file_writes_and_workspace_fs_commands() {
+        // File-edit tools always qualify.
+        assert!(accept_edits_approvable(
+            "write_file",
+            &json!({"path": "a.rs"})
+        ));
+        assert!(accept_edits_approvable(
+            "apply_patch",
+            &json!({"path": "a.rs"})
+        ));
+        // In-workspace fs commands (cc's set) qualify.
+        assert!(accept_edits_approvable(
+            "shell",
+            &json!({"command": "mkdir src/new"})
+        ));
+        assert!(accept_edits_approvable(
+            "shell",
+            &json!({"command": "mv a.txt b.txt"})
+        ));
+        // Shell that isn't a bounded fs edit does NOT qualify.
+        assert!(!accept_edits_approvable(
+            "shell",
+            &json!({"command": "cargo build"})
+        ));
+        assert!(!accept_edits_approvable(
+            "shell",
+            &json!({"command": "curl https://x"})
+        ));
+        // fs command escaping the workspace does NOT qualify.
+        assert!(!accept_edits_approvable(
+            "shell",
+            &json!({"command": "rm /etc/hosts"})
+        ));
+        assert!(!accept_edits_approvable(
+            "shell",
+            &json!({"command": "mv ../secret ."})
+        ));
+        // Network tools never qualify under accept-edits.
+        assert!(!accept_edits_approvable(
+            "fetch_url",
+            &json!({"url": "https://x"})
+        ));
+        // job start with a workspace fs command qualifies; other actions don't.
+        assert!(accept_edits_approvable(
+            "job",
+            &json!({"action": "start", "command": "touch x"})
+        ));
+        assert!(!accept_edits_approvable(
+            "job",
+            &json!({"action": "cancel"})
+        ));
+    }
 
     #[test]
     fn read_tools_are_allowed_without_approval() {

@@ -240,5 +240,12 @@
   "RouteKeywordHeavy": "Matched a complex-task keyword \"{keyword}\", using Pro for stronger reasoning and tool planning",
   "RouteKeywordBorderline": "Task contains \"{keyword}\" and cost-first is off, using Pro",
   "RouteFlashDefault": "Defaulting to Flash (faster, cheaper); cascade upgrades to Pro if tool calls keep failing",
-  "RouteFallbackProToFlash": "DeepSeek temporarily unavailable or rate-limited; auto-downgraded Pro→Flash and retried"
+  "RouteFallbackProToFlash": "DeepSeek temporarily unavailable or rate-limited; auto-downgraded Pro→Flash and retried",
+
+  "PermModeDefault": "default",
+  "PermModeAcceptEdits": "accept-edits",
+  "PermModeAuto": "auto",
+  "PermModeYolo": "YOLO",
+  "PermModeSwitched": "Switched to \"{mode}\" mode",
+  "PermModeYoloArm": "⚠ Press Shift+Tab again to enter YOLO (auto-approve everything; hard denials still block); any other key cancels"
 }

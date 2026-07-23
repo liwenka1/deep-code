@@ -487,6 +487,50 @@ fn model_command_resolves_aliases_persists_and_keeps_session() {
 }
 
 #[test]
+fn shift_tab_cycles_permission_mode_with_yolo_confirm() {
+    use deep_code_agent::PermissionMode;
+    let mut app = App::new();
+    assert_eq!(app.permission_mode(), PermissionMode::Default);
+
+    app.cycle_permission_mode();
+    assert_eq!(app.permission_mode(), PermissionMode::AcceptEdits);
+    app.cycle_permission_mode();
+    assert_eq!(app.permission_mode(), PermissionMode::Auto);
+
+    // Cycling from Auto arms Yolo but does NOT enter it yet.
+    app.cycle_permission_mode();
+    assert_eq!(
+        app.permission_mode(),
+        PermissionMode::Auto,
+        "armed, not entered"
+    );
+    assert!(app.yolo_armed);
+    // A second consecutive Shift+Tab confirms Yolo.
+    app.cycle_permission_mode();
+    assert_eq!(app.permission_mode(), PermissionMode::Yolo);
+    assert!(!app.yolo_armed);
+
+    // From Yolo it wraps back to Default (no confirm to leave).
+    app.cycle_permission_mode();
+    assert_eq!(app.permission_mode(), PermissionMode::Default);
+}
+
+#[test]
+fn any_other_key_disarms_pending_yolo() {
+    use deep_code_agent::PermissionMode;
+    let mut app = App::new();
+    app.permission_mode.set(PermissionMode::Auto);
+    app.cycle_permission_mode(); // arms yolo
+    assert!(app.yolo_armed);
+    app.clear_yolo_arm();
+    assert!(!app.yolo_armed);
+    // Next cycle from Auto arms again rather than entering yolo directly.
+    app.cycle_permission_mode();
+    assert!(app.yolo_armed);
+    assert_eq!(app.permission_mode(), PermissionMode::Auto);
+}
+
+#[test]
 fn lang_command_switches_live_and_persists() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new();

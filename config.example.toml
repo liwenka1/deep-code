@@ -62,6 +62,12 @@
 # 防止恶意仓库静默解除审批门。
 # auto_allow = ["read_", "grep_"]
 
+# 权限模式:启动时的审批档位。
+# default(每次询问)| accept_edits(自动放行工作区内编辑)| auto(AI 判断)| yolo(全放开)。
+# 项目配置只能设 default/accept_edits;auto/yolo 只能来自全局配置(防止恶意仓库静默解除审批门)。
+# 运行时按 Shift+Tab 循环切换。
+# default_mode = "default"
+
 [stream]
 # 首内容到达前的透明重试次数。
 # max_retries = 3

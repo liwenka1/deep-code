@@ -343,6 +343,13 @@ text_ids! {
     RouteKeywordBorderline,
     RouteFlashDefault,
     RouteFallbackProToFlash,
+    // 权限模式(Shift+Tab 循环 + 状态栏标识)
+    PermModeDefault,
+    PermModeAcceptEdits,
+    PermModeAuto,
+    PermModeYolo,
+    PermModeSwitched,
+    PermModeYoloArm,
 }
 
 static ZH_JSON: &str = include_str!("../locales/zh.json");
