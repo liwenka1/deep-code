@@ -7,7 +7,6 @@ mod doctor_cli;
 mod eval_cli;
 mod event_routing;
 mod history;
-mod i18n;
 mod markdown;
 mod startup;
 mod ui;

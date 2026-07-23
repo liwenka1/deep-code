@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use crate::active_turn::ActiveTurn;
 use crate::cli::workspace_root;
 use crate::history::{HistoryCell, hydrate_history};
-use crate::i18n::{Lang, TextId, tr, tr_with};
+use deep_code_agent::i18n::{Lang, TextId, tr, tr_with};
 
 mod completion;
 mod editor;

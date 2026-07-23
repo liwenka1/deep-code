@@ -3,7 +3,7 @@ use deep_code_agent::{RuntimeEvent, ToolCallId};
 use crate::active_turn::{ActiveToolCell, ActiveTurn};
 use crate::app::App;
 use crate::history::{HistoryCell, ToolApprovalState, summarize_tool_result};
-use crate::i18n::TextId;
+use deep_code_agent::i18n::TextId;
 
 impl App {
     pub(crate) fn apply_runtime_event(&mut self, event: RuntimeEvent) {

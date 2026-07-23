@@ -1,6 +1,6 @@
 use deep_code_agent::{EntryKind, SessionRecord, ToolResultStatus};
 
-use crate::i18n::{Lang, TextId, tr, tr_with};
+use deep_code_agent::i18n::{Lang, TextId, tr, tr_with};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolApprovalState {

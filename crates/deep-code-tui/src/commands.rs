@@ -5,7 +5,7 @@ use deep_code_agent::{
 
 use crate::app::App;
 use crate::history::HistoryCell;
-use crate::i18n::{Lang, TextId, tr, tr_with};
+use deep_code_agent::i18n::{Lang, TextId, tr, tr_with};
 
 /// (command, hint id, takes an argument). Single source for the completion
 /// menu and `/help`; hints are looked up from the language pack when the menu

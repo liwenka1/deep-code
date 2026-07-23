@@ -22,7 +22,7 @@ use ratatui::widgets::{Block, Padding, Paragraph};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::cli::StartupIntent;
-use crate::i18n::{Lang, TextId, tr, tr_with};
+use deep_code_agent::i18n::{Lang, TextId, tr, tr_with};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupChoice {

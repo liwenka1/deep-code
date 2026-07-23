@@ -29,7 +29,8 @@ impl Lang {
 
     /// 由语言标签(如 `zh`、`zh_CN.UTF-8`、`en-US`)判定语言。
     /// `/lang` 也复用它,让显式切换与自动探测接受同一组别名。
-    pub(crate) fn from_tag(tag: &str) -> Option<Self> {
+    #[must_use]
+    pub fn from_tag(tag: &str) -> Option<Self> {
         let lower = tag.trim().to_ascii_lowercase();
         if lower.starts_with("zh") {
             Some(Self::Zh)

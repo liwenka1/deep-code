@@ -19,8 +19,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, LaunchConfig, TranscriptSnapshot};
 use crate::history::HistoryCell;
-use crate::i18n::{Lang, TextId, tr, tr_with};
 use crate::markdown::render_markdown;
+use deep_code_agent::i18n::{Lang, TextId, tr, tr_with};
 
 /// Redraws are coalesced to at most ~30fps; streaming deltas mark the UI
 /// dirty instead of forcing a frame each.
