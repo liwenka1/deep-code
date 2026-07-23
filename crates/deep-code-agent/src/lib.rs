@@ -1,5 +1,6 @@
 //! deep-code agent core library.
 
+mod approval_classifier;
 mod approval_preview;
 mod auto_mode;
 mod checkpoint;

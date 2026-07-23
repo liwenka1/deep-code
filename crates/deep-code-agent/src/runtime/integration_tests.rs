@@ -339,6 +339,79 @@ async fn default_mode_still_parks_gated_tool() {
     ));
 }
 
+#[tokio::test]
+async fn auto_mode_runs_when_classifier_approves() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+    // Script serves one response per stream_chat call: (1) the turn emits the
+    // gated call, (2) the classifier's judge call approves, (3) the turn
+    // continues to completion.
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: r#"{"approve": true, "reason": "safe mock"}"#.to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools())
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Auto));
+
+    let mut rx = runtime.submit_user("please echo").await;
+    let events = drain(&mut rx).await;
+
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, RuntimeEvent::ApprovalRequired { .. })),
+        "classifier approved → no parking"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ToolCallFinished { result, .. } if result.content == "mock_echo: hi"
+    )));
+}
+
+#[tokio::test]
+async fn auto_mode_asks_when_classifier_denies() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+    // (1) gated call, (2) judge denies → the batch parks on approval.
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: r#"{"approve": false, "reason": "unclear"}"#.to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools())
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Auto));
+
+    let mut rx = runtime.submit_user("please echo").await;
+    let events = drain(&mut rx).await;
+    assert!(
+        matches!(events.last(), Some(RuntimeEvent::ApprovalRequired { .. })),
+        "classifier denied → ask the human"
+    );
+}
+
 /// A parallel-safe tool (name `agent` → `ToolKind::SubAgent`) that blocks on a
 /// shared size-2 barrier: `run` only returns once two calls are in flight at
 /// once. Sequential batch execution deadlocks on it; concurrent execution

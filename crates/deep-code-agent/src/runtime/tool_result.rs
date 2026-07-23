@@ -4,7 +4,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::execution_policy::{PermissionMode, accept_edits_approvable, command_shape};
+use crate::execution_policy::{PermissionMode, RiskLevel, accept_edits_approvable, command_shape};
+use crate::model_registry::DEEPSEEK_V4_FLASH;
 
 use crate::client::LlmClient;
 use crate::lsp::{is_edit_tool, render_blocks, summarize_blocks};
@@ -14,7 +15,8 @@ use crate::runtime::diagnostics::append_diagnostics;
 use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
 use crate::runtime::state::PendingToolBatch;
 use crate::tool::{
-    ApprovalDecision, ToolCall, ToolCx, ToolError, ToolResult, ToolResultStatus, ToolRunOutcome,
+    ApprovalDecision, ApprovalRequest, ToolCall, ToolCx, ToolError, ToolResult, ToolResultStatus,
+    ToolRunOutcome,
 };
 
 /// Whether a call may run concurrently inside a tool batch. Only sub-agent
@@ -157,7 +159,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// the gate more broadly. Policy hard-denials are unaffected either way:
     /// they short-circuit in the registry before any decision is consulted, so
     /// even `Yolo` never runs a denied command.
-    async fn auto_approval_granted(&self, call: &ToolCall) -> bool {
+    async fn auto_approval_granted(&self, call: &ToolCall, request: &ApprovalRequest) -> bool {
         // Layer 1: standing consent (config auto_allow + session memory).
         if self
             .config
@@ -167,7 +169,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         {
             return true;
         }
-        {
+        let user_task = {
             let state = self.state.lock().await;
             if state.session_approved.contains(&call.name) {
                 return true;
@@ -179,17 +181,43 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             {
                 return true;
             }
-        } // release the state lock before any mode logic (Auto may await a judge)
+            state.current_prompt.clone().unwrap_or_default()
+        }; // release the state lock before any mode logic (Auto awaits a judge)
 
         // Layer 2: session permission mode.
         match self.permission_mode() {
             PermissionMode::Default => false,
             PermissionMode::AcceptEdits => accept_edits_approvable(&call.name, &call.arguments),
-            // P2 wires the classifier here. Until then Auto fails safe to a
-            // prompt (never silently more permissive than Default).
-            PermissionMode::Auto => false,
+            PermissionMode::Auto => self.auto_mode_approves(call, request, &user_task).await,
             PermissionMode::Yolo => true,
         }
+    }
+
+    /// Auto mode: a Flash classifier judges the call. Two hard floors below the
+    /// judge: the top risk tier always asks (the judge can't wave it through),
+    /// and the offline echo backend can't judge, so it also asks. Everything
+    /// else the classifier decides, failing safe to a prompt.
+    async fn auto_mode_approves(
+        &self,
+        call: &ToolCall,
+        request: &ApprovalRequest,
+        user_task: &str,
+    ) -> bool {
+        if request.risk_level == RiskLevel::High {
+            return false;
+        }
+        if self.client.provider_name() == crate::echo_client::EchoClient::PROVIDER {
+            return false;
+        }
+        let action = crate::approval_classifier::action_summary(&call.arguments);
+        let input = crate::approval_classifier::ClassifierInput {
+            tool_name: &call.name,
+            action: &action,
+            risk_level: request.risk_level,
+            safety_notes: &request.safety_notes,
+            user_task,
+        };
+        crate::approval_classifier::approves(&*self.client, DEEPSEEK_V4_FLASH, &input).await
     }
 
     /// Run the queued tool calls of one assistant turn in order.
@@ -252,7 +280,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                         .await;
                 }
                 Ok(ToolRunOutcome::ApprovalRequired { mut request }) => {
-                    if self.auto_approval_granted(&call).await {
+                    if self.auto_approval_granted(&call, &request).await {
                         // Audit trail: the gate fired but a standing consent
                         // (session "a" or config auto_allow) resolved it.
                         emit(
