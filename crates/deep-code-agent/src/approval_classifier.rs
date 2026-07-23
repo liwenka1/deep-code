@@ -19,7 +19,7 @@ use crate::event::AgentEvent;
 use crate::execution_policy::{RiskLevel, SafetyNote};
 use crate::i18n::{Lang, tr};
 use crate::message::Message;
-use crate::model::ChatRequest;
+use crate::model::{ChatRequest, Usage};
 
 /// Fixed, English, model-facing instructions. Not UI text — never localized.
 const SYSTEM_PROMPT: &str = "You are a strict safety gate for a coding agent. \
@@ -45,10 +45,15 @@ pub struct ClassifierInput<'a> {
     pub user_task: &'a str,
 }
 
-/// Ask `model` (via `client`) whether `input` may auto-run. Returns `true` only
-/// on an explicit, parseable `approve: true`; every other outcome — deny,
-/// model error, unparseable text — is `false` (ask the human).
-pub async fn approves<C: LlmClient>(client: &C, model: &str, input: &ClassifierInput<'_>) -> bool {
+/// Ask `model` (via `client`) whether `input` may auto-run. The bool is `true`
+/// only on an explicit, parseable `approve: true`; every other outcome — deny,
+/// model error, unparseable text — is `false` (ask the human). The returned
+/// usage (when the stream reports it) lets the caller bill the judge call.
+pub async fn approves<C: LlmClient>(
+    client: &C,
+    model: &str,
+    input: &ClassifierInput<'_>,
+) -> (bool, Option<Usage>) {
     let notes = if input.safety_notes.is_empty() {
         "(none)".to_string()
     } else {
@@ -83,19 +88,23 @@ pub async fn approves<C: LlmClient>(client: &C, model: &str, input: &ClassifierI
     request.max_tokens = Some(MAX_ANSWER_TOKENS);
 
     let Ok(mut stream) = client.stream_chat(request).await else {
-        return false; // model unreachable → ask
+        return (false, None); // model unreachable → ask
     };
     let mut text = String::new();
+    let mut usage = None;
     while let Some(event) = stream.next().await {
         match event {
             Ok(AgentEvent::TextDelta { text: delta }) => text.push_str(&delta),
             // Errors (transport or provider) fail safe to ask.
-            Ok(AgentEvent::Error { .. }) | Err(_) => return false,
-            Ok(AgentEvent::Done { .. }) => break,
+            Ok(AgentEvent::Error { .. }) | Err(_) => return (false, usage),
+            Ok(AgentEvent::Done { usage: done_usage }) => {
+                usage = done_usage;
+                break;
+            }
             _ => {}
         }
     }
-    parse_approve(&text)
+    (parse_approve(&text), usage)
 }
 
 /// Pull the first JSON object out of the reply and read `approve`. Anything

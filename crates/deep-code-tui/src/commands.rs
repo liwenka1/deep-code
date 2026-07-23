@@ -127,9 +127,12 @@ impl App {
             self.lang,
         ) {
             Ok(_) => {
-                // Switch immediately — the transcript re-renders from
-                // structured cells, so history follows on the next frame.
+                // Switch the TUI immediately and push the new language into the
+                // running runtime (its cached UI language for error diagnostics
+                // and approval previews). A lock-free atomic via the handle —
+                // no relaunch, so the live session is never at risk.
                 self.lang = lang;
+                self.runtime.set_ui_lang(lang);
                 let message = tr(lang, TextId::LangSwitched).to_string();
                 self.history.push(HistoryCell::system(message.clone()));
                 self.status = message;

@@ -65,6 +65,10 @@ pub struct AgentRuntime<C: LlmClient + 'static> {
     /// the current mode and flip it on Shift+Tab. The approval gate reads it
     /// per gated call.
     permission_mode: SharedPermissionMode,
+    /// UI language for runtime-rendered user-facing text. Shared (lock-free) so
+    /// `/lang` can flip it live through the runtime handle without a relaunch
+    /// (see [`Self::ui_lang`] / [`Self::set_ui_lang`]).
+    ui_lang: crate::i18n::SharedLang,
 }
 
 // Manual `Clone` to avoid the auto-derived `where C: Clone` bound that the
@@ -84,6 +88,7 @@ impl<C: LlmClient + 'static> Clone for AgentRuntime<C> {
             lsp: self.lsp.clone(),
             persistence: self.persistence.clone(),
             permission_mode: self.permission_mode.clone(),
+            ui_lang: self.ui_lang.clone(),
         }
     }
 }
@@ -106,6 +111,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             lsp: None,
             persistence: None,
             permission_mode: SharedPermissionMode::default(),
+            ui_lang: crate::i18n::SharedLang::new(crate::i18n::Lang::from_env(&config.language)),
         }
     }
 
@@ -150,6 +156,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             lsp: None,
             persistence: None,
             permission_mode: SharedPermissionMode::default(),
+            ui_lang: crate::i18n::SharedLang::new(crate::i18n::Lang::from_env(&config.language)),
         }
     }
 
@@ -161,10 +168,27 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         self
     }
 
+    /// Attach the launch-created shared UI language (see [`Self::set_ui_lang`]).
+    /// Builder-style, mirroring [`Self::with_permission_mode`]; lets the offline
+    /// echo client and the runtime share one language atomic so `/lang` reaches
+    /// both.
+    #[must_use]
+    pub fn with_ui_lang(mut self, ui_lang: crate::i18n::SharedLang) -> Self {
+        self.ui_lang = ui_lang;
+        self
+    }
+
     /// The runtime's current session permission mode.
     #[must_use]
     pub fn permission_mode(&self) -> crate::execution_policy::PermissionMode {
         self.permission_mode.get()
+    }
+
+    /// Update the cached UI language live (the TUI calls this on `/lang` via the
+    /// runtime handle). A lock-free store, so the next user-facing string the
+    /// runtime renders picks it up without a relaunch.
+    pub(crate) fn set_ui_lang(&self, lang: crate::i18n::Lang) {
+        self.ui_lang.set(lang);
     }
 
     /// Shut down background resources such as spawned LSP servers.

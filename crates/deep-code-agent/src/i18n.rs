@@ -8,7 +8,9 @@
 //! 带参消息在 JSON 里写 `{name}` 占位符,经 [`tr_with`] 运行时替换。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// 支持的界面语言。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +69,51 @@ impl Lang {
     #[must_use]
     pub fn from_env(setting: &str) -> Self {
         Self::resolve(setting, &|name| std::env::var(name).ok())
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::En => 0,
+            Self::Zh => 1,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Zh,
+            // Unknown byte → English, matching `resolve`'s ultimate fallback.
+            _ => Self::En,
+        }
+    }
+}
+
+/// Process-shared, lock-free UI language. Mirrors `SharedPermissionMode`: the
+/// runtime holds it and reads it per user-facing string; the TUI flips it on
+/// `/lang` (through the runtime handle), so a live switch reaches
+/// runtime-rendered text — error diagnostics, approval previews — without
+/// relaunching the runtime.
+#[derive(Debug, Clone)]
+pub struct SharedLang(Arc<AtomicU8>);
+
+impl SharedLang {
+    #[must_use]
+    pub fn new(lang: Lang) -> Self {
+        Self(Arc::new(AtomicU8::new(lang.to_u8())))
+    }
+
+    #[must_use]
+    pub fn get(&self) -> Lang {
+        Lang::from_u8(self.0.load(Ordering::Relaxed))
+    }
+
+    pub fn set(&self, lang: Lang) {
+        self.0.store(lang.to_u8(), Ordering::Relaxed);
+    }
+}
+
+impl Default for SharedLang {
+    fn default() -> Self {
+        Self::new(Lang::En)
     }
 }
 
@@ -375,13 +422,35 @@ pub fn tr(lang: Lang, id: TextId) -> &'static str {
         .map_or_else(|| id.key(), String::as_str)
 }
 
-/// 查表并替换 `{name}` 占位符。
+/// 查表并替换 `{name}` 占位符。单趟扫描:替换进去的值不会被后续参数再次匹配
+/// (值里若恰好含 `{other}` 会原样保留),避免顺序替换导致的二次插值。
 #[must_use]
 pub fn tr_with(lang: Lang, id: TextId, args: &[(&str, &str)]) -> String {
-    let mut out = tr(lang, id).to_string();
-    for (name, value) in args {
-        out = out.replace(&format!("{{{name}}}"), value);
+    let template = tr(lang, id);
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        if let Some(close) = after.find('}') {
+            let name = &after[..close];
+            match args.iter().find(|(key, _)| *key == name) {
+                Some((_, value)) => out.push_str(value),
+                // 未知占位符:原样保留 `{name}`。
+                None => {
+                    out.push('{');
+                    out.push_str(name);
+                    out.push('}');
+                }
+            }
+            rest = &after[close + 1..];
+        } else {
+            // 未闭合的 `{`:剩余部分原样输出。
+            out.push_str(&rest[open..]);
+            return out;
+        }
     }
+    out.push_str(rest);
     out
 }
 
@@ -438,6 +507,33 @@ mod tests {
         let text = tr_with(Lang::Zh, TextId::CopiedSelection, &[("count", "12")]);
         assert!(text.contains("12"), "{text}");
         assert!(!text.contains("{count}"), "{text}");
+    }
+
+    #[test]
+    fn tr_with_does_not_resubstitute_values() {
+        // A value that itself contains another arg's placeholder token must be
+        // emitted verbatim, not re-expanded by that later arg (single-pass).
+        let out = tr_with(
+            Lang::En,
+            TextId::ModelSwitched,
+            &[("model", "{backend}"), ("backend", "deepseek")],
+        );
+        assert!(out.contains("{backend}"), "value re-substituted: {out}");
+    }
+
+    #[test]
+    fn shared_lang_get_set_and_shares_atomic() {
+        let shared = SharedLang::new(Lang::En);
+        assert_eq!(shared.get(), Lang::En);
+        shared.set(Lang::Zh);
+        assert_eq!(shared.get(), Lang::Zh);
+        // Clones share one atomic, so a TUI-side `/lang` flip is visible to the
+        // runtime that holds a clone.
+        let clone = shared.clone();
+        clone.set(Lang::En);
+        assert_eq!(shared.get(), Lang::En);
+        // Unknown byte fails safe to English.
+        assert_eq!(Lang::from_u8(9), Lang::En);
     }
 
     #[test]

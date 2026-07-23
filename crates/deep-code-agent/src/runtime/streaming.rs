@@ -22,7 +22,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use tokio::time::Instant;
 
-use crate::auto_mode::{TurnRoute, api_fallback_model, clamp_effort_to_model};
+use crate::model_route::{TurnRoute, api_fallback_model, clamp_effort_to_model};
 use crate::client::{AgentEventStream, LlmClient};
 use crate::error::{AgentError, AgentResult};
 use crate::event::AgentEvent;

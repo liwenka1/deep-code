@@ -410,7 +410,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 app.completion_down();
                 return;
             }
-            KeyCode::Tab => {
+            // A bare Tab accepts the completion, but Shift+Tab (delivered as
+            // Tab+SHIFT on some terminals) must fall through to the
+            // permission-mode cycle below rather than be swallowed here — so it
+            // behaves the same as on terminals that send BackTab.
+            KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                 let _ = app.accept_completion();
                 return;
             }
@@ -426,6 +430,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
     // Shift+Tab cycles the permission mode (default → accept-edits → auto → yolo).
     if is_shift_tab(&key) {
+        // Dismiss the completion popup if open — cycling the mode is not a
+        // completion action, and leaving the menu up over the input misleads.
+        app.close_completion();
         app.cycle_permission_mode();
         return;
     }

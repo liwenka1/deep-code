@@ -1,4 +1,4 @@
-use crate::auto_mode::TurnRoute;
+use crate::model_route::TurnRoute;
 use crate::client::LlmClient;
 use crate::compaction::{context_usage_percent, effective_compaction_threshold};
 use crate::model::Usage;

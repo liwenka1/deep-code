@@ -22,7 +22,8 @@ pub enum PermissionMode {
     /// Auto-approve workspace file edits (and cc-style in-workspace fs commands);
     /// still prompt for shell/network/anything else.
     AcceptEdits,
-    /// A classifier model judges each gated call; unsure/hostile/error → prompt.
+    /// A classifier model judges medium-risk gated calls (file writes, network);
+    /// high-risk calls such as shell always prompt. Unsure/hostile/error → prompt.
     Auto,
     /// Auto-approve everything that reaches the gate (hard denies still block).
     Yolo,

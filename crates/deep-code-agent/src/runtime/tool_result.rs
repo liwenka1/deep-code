@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::execution_policy::{PermissionMode, RiskLevel, accept_edits_approvable, command_shape};
-use crate::model_registry::DEEPSEEK_V4_FLASH;
+use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_FLASH};
 
 use crate::client::LlmClient;
 use crate::lsp::{is_edit_tool, render_blocks, summarize_blocks};
@@ -159,7 +159,12 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// the gate more broadly. Policy hard-denials are unaffected either way:
     /// they short-circuit in the registry before any decision is consulted, so
     /// even `Yolo` never runs a denied command.
-    async fn auto_approval_granted(&self, call: &ToolCall, request: &ApprovalRequest) -> bool {
+    async fn auto_approval_granted(
+        &self,
+        call: &ToolCall,
+        request: &ApprovalRequest,
+        cancel: &CancellationToken,
+    ) -> bool {
         // Layer 1: standing consent (config auto_allow + session memory).
         if self
             .config
@@ -188,20 +193,25 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         match self.permission_mode() {
             PermissionMode::Default => false,
             PermissionMode::AcceptEdits => accept_edits_approvable(&call.name, &call.arguments),
-            PermissionMode::Auto => self.auto_mode_approves(call, request, &user_task).await,
+            PermissionMode::Auto => {
+                self.auto_mode_approves(call, request, &user_task, cancel)
+                    .await
+            }
             PermissionMode::Yolo => true,
         }
     }
 
-    /// Auto mode: a Flash classifier judges the call. Two hard floors below the
-    /// judge: the top risk tier always asks (the judge can't wave it through),
-    /// and the offline echo backend can't judge, so it also asks. Everything
-    /// else the classifier decides, failing safe to a prompt.
+    /// Auto mode: a Flash classifier judges the call. Three hard floors below
+    /// the judge: the top risk tier always asks (the judge can't wave it
+    /// through), the offline echo backend can't judge, and a cancel mid-flight
+    /// aborts into "ask". Everything else the classifier decides, failing safe
+    /// to a prompt. The judge's token usage is billed to the session.
     async fn auto_mode_approves(
         &self,
         call: &ToolCall,
         request: &ApprovalRequest,
         user_task: &str,
+        cancel: &CancellationToken,
     ) -> bool {
         if request.risk_level == RiskLevel::High {
             return false;
@@ -217,7 +227,52 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             safety_notes: &request.safety_notes,
             user_task,
         };
-        crate::approval_classifier::approves(&*self.client, DEEPSEEK_V4_FLASH, &input).await
+        let model = self.classifier_model();
+        // Race the judge against cancellation so Esc during a slow classifier
+        // reply aborts the call into "ask" instead of blocking the turn.
+        let (approved, usage) = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return false,
+            verdict = crate::approval_classifier::approves(&*self.client, &model, &input) => verdict,
+        };
+        if let Some(usage) = usage {
+            self.record_classifier_cost(&model, &usage).await;
+        }
+        approved
+    }
+
+    /// The model the auto-mode classifier runs on: Flash on DeepSeek. On any
+    /// other provider Flash won't exist, so fall back to the session's own
+    /// configured model — the judge still works (just not Flash-cheap) instead
+    /// of erroring every gated call into "ask" and silently disabling auto mode.
+    fn classifier_model(&self) -> String {
+        let configured = self.config.model.as_str();
+        // A known DeepSeek model → its cheap Flash sibling.
+        if self.registry.info_for(configured).is_some() {
+            return DEEPSEEK_V4_FLASH.to_string();
+        }
+        // "auto"/unset is DeepSeek-specific routing, so Flash is right only when
+        // the endpoint is actually DeepSeek; off DeepSeek it wouldn't exist.
+        if (configured.is_empty() || configured == AUTO_MODEL)
+            && self.config.base_url.contains("deepseek")
+        {
+            return DEEPSEEK_V4_FLASH.to_string();
+        }
+        // A concrete non-DeepSeek model (or auto/unset off DeepSeek): judge on
+        // the session's own model so auto mode still works there instead of
+        // pointing at a nonexistent Flash and silently disabling itself.
+        configured.to_string()
+    }
+
+    /// Fold a classifier call's token cost into the running session total. The
+    /// judge runs on a separate (cheap) model from the turn, so its usage never
+    /// flows through the turn telemetry; without this the session cost silently
+    /// under-counts every auto-mode gated call.
+    async fn record_classifier_cost(&self, model: &str, usage: &crate::model::Usage) {
+        let cost = crate::pricing::calculate_turn_cost(model, usage);
+        let mut state = self.state.lock().await;
+        state.session_cost.usd += cost.usd;
+        state.session_cost.cny += cost.cny;
     }
 
     /// Run the queued tool calls of one assistant turn in order.
@@ -280,7 +335,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                         .await;
                 }
                 Ok(ToolRunOutcome::ApprovalRequired { mut request }) => {
-                    if self.auto_approval_granted(&call, &request).await {
+                    if self.auto_approval_granted(&call, &request, cancel).await {
                         // Audit trail: the gate fired but a standing consent
                         // (session "a" or config auto_allow) resolved it.
                         emit(

@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 
 use tokio::sync::mpsc;
 
-use crate::auto_mode::{RouteContext, resolve_turn_route};
+use crate::model_route::{RouteContext, resolve_turn_route};
 use crate::client::LlmClient;
 use crate::compaction::{estimate_token_count, stable_prefix_fingerprint};
 use crate::event::AgentEvent;
@@ -14,10 +14,12 @@ use crate::runtime::tool_result::{BatchOutcome, runtime_error_from_tool_error, t
 use crate::tool::ToolCallAccumulator;
 
 impl<C: LlmClient + 'static> AgentRuntime<C> {
-    /// UI language for user-facing error text, resolved from the runtime's
-    /// configured `ui.language` (falls back to locale/English detection).
+    /// UI language for user-facing runtime text (error diagnostics, approval
+    /// previews). Resolved once at construction from `ui.language` (falling back
+    /// to locale/English) and cached — a `/lang` switch relaunches the runtime,
+    /// which re-resolves it, so this need not re-parse the environment per call.
     pub(super) fn ui_lang(&self) -> crate::i18n::Lang {
-        crate::i18n::Lang::from_env(&self.config.language)
+        self.ui_lang.get()
     }
 
     /// Drive the model/tool loop until either the turn finishes or an

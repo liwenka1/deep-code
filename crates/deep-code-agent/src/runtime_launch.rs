@@ -10,7 +10,7 @@ use crate::config::AgentConfig;
 use crate::echo_client::EchoClient;
 use crate::execution_policy::SharedPermissionMode;
 use crate::extensions::{attach_agent_extensions, build_runtime_system_prompt};
-use crate::i18n::Lang;
+use crate::i18n::{Lang, SharedLang};
 use crate::runtime::{AgentRuntime, AgentRuntimeHandle};
 use crate::session_store::{ConfigSnapshot, JsonSessionStore, SessionRecord, SessionStore};
 use crate::shell_tools::{JobStore, shell_tool_registry};
@@ -136,16 +136,19 @@ pub fn launch_runtime(
             workspace,
             &prompt,
             &parent_cancel,
+            SharedLang::new(Lang::from_env(&config.language)),
         );
     }
 
+    let ui_lang = SharedLang::new(Lang::from_env(&config.language));
     launch_fresh(
-        EchoClient::new(Lang::from_env(&config.language)),
+        EchoClient::new(ui_lang.clone()),
         "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string(),
         config,
         workspace,
         &prompt,
         &parent_cancel,
+        ui_lang,
     )
 }
 
@@ -158,6 +161,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
     workspace: PathBuf,
     prompt: &str,
     parent_cancel: &CancellationToken,
+    ui_lang: SharedLang,
 ) -> LaunchedRuntime {
     let mut warnings = Vec::new();
     let client = Arc::new(client);
@@ -207,7 +211,8 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
     };
     let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
     let runtime = attach_workspace_helpers(runtime, &workspace, &mut warnings)
-        .with_permission_mode(permission_mode.clone());
+        .with_permission_mode(permission_mode.clone())
+        .with_ui_lang(ui_lang);
     LaunchedRuntime {
         handle: Arc::new(runtime),
         backend_label,
@@ -271,6 +276,7 @@ fn launch_resumed(
             &mut warnings,
         );
         let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
+        let ui_lang = SharedLang::new(Lang::from_env(&config.language));
         let runtime = attach_workspace_helpers(
             AgentRuntime::from_session_record(
                 (*client).clone(),
@@ -282,7 +288,8 @@ fn launch_resumed(
             &workspace,
             &mut warnings,
         )
-        .with_permission_mode(permission_mode.clone());
+        .with_permission_mode(permission_mode.clone())
+        .with_ui_lang(ui_lang);
         return LaunchedRuntime {
             handle: Arc::new(runtime),
             backend_label: format!("DeepSeek {} (resumed)", config.model),
@@ -296,7 +303,8 @@ fn launch_resumed(
         };
     }
 
-    let client = Arc::new(EchoClient::new(Lang::from_env(&config.language)));
+    let ui_lang = SharedLang::new(Lang::from_env(&config.language));
+    let client = Arc::new(EchoClient::new(ui_lang.clone()));
     let (tools, subagent_manager, job_store, shutdown) = build_parent_tools(
         Arc::clone(&client),
         config,
@@ -307,7 +315,7 @@ fn launch_resumed(
     let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
     let runtime = attach_workspace_helpers(
         AgentRuntime::from_session_record(
-            EchoClient::new(Lang::from_env(&config.language)),
+            EchoClient::new(ui_lang.clone()),
             tools,
             record.clone(),
             store,
@@ -316,7 +324,8 @@ fn launch_resumed(
         &workspace,
         &mut warnings,
     )
-    .with_permission_mode(permission_mode.clone());
+    .with_permission_mode(permission_mode.clone())
+    .with_ui_lang(ui_lang);
     LaunchedRuntime {
         handle: Arc::new(runtime),
         backend_label: "offline echo (resumed)".to_string(),
@@ -404,7 +413,7 @@ mod tests {
             "online registry must not expose the mock tool: {names:?}"
         );
 
-        let names = parent_tool_names(EchoClient::new(Lang::Zh), &config, dir.path());
+        let names = parent_tool_names(EchoClient::new(SharedLang::new(Lang::Zh)), &config, dir.path());
         assert!(
             !names.iter().any(|name| name == MockEchoTool::NAME),
             "the mock tool is a test fixture; no production registry mounts it: {names:?}"

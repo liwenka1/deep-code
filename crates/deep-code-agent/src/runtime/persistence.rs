@@ -58,6 +58,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     ) -> Self {
         let workspace = record.workspace.clone();
         let session = Session::from_entries(record.entries.clone());
+        let ui_lang = crate::i18n::SharedLang::new(crate::i18n::Lang::from_env(&config.language));
         Self {
             client: Arc::new(client),
             config,
@@ -87,6 +88,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             lsp: None,
             persistence: Some(build_persistence(store, record)),
             permission_mode: crate::execution_policy::SharedPermissionMode::default(),
+            ui_lang,
         }
     }
 

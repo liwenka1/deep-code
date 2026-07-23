@@ -1,5 +1,6 @@
 use crate::checkpoint::CheckpointId;
 use crate::client::LlmClient;
+use crate::i18n::Lang;
 use crate::message::Message;
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::RuntimeEventReceiver;
@@ -41,6 +42,10 @@ pub trait AgentRuntimeHandle: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<SessionId>> + Send + '_>>;
 
     fn shutdown(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+
+    /// Update the runtime's UI language live (no relaunch). See
+    /// [`AgentRuntime::set_ui_lang`].
+    fn set_ui_lang(&self, lang: Lang);
 }
 
 impl<C: LlmClient + 'static> AgentRuntimeHandle for AgentRuntime<C> {
@@ -89,5 +94,9 @@ impl<C: LlmClient + 'static> AgentRuntimeHandle for AgentRuntime<C> {
 
     fn shutdown(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(AgentRuntime::shutdown(self))
+    }
+
+    fn set_ui_lang(&self, lang: Lang) {
+        AgentRuntime::set_ui_lang(self, lang);
     }
 }
