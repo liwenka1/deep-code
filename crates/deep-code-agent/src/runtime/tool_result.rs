@@ -648,12 +648,14 @@ pub(super) fn runtime_error_from_tool_error(
     }
 }
 
-/// The model the auto-mode classifier runs on. Flash is the cheap judge tier on
-/// DeepSeek; a concrete non-DeepSeek model is judged on itself so auto mode
-/// works off DeepSeek too. `auto`/unset are DeepSeek-only routing sentinels →
-/// Flash; on a non-DeepSeek endpoint that combination is a misconfiguration that
-/// already breaks normal turns, so the judge failing safe to "ask" there is
-/// acceptable — and it never leaks the raw sentinel to the API layer.
+/// The model the auto-mode classifier runs on. Flash is the cheap judge tier;
+/// `auto`/unset routing sentinels and any catalog model resolve to it. A model
+/// string the catalog does not know — a passthrough id, e.g. a newer DeepSeek
+/// model the registry hasn't caught up to — is judged on itself rather than on a
+/// Flash that may not exist for it. This stays DeepSeek-centric: cost for an
+/// off-catalog model records as zero (pricing is table-driven), so an off-DeepSeek
+/// `base_url` is best-effort, not a supported multi-provider mode. Either way the
+/// raw `auto` sentinel never leaks to the API layer.
 fn classifier_model_for(
     config: &crate::config::AgentConfig,
     registry: &crate::model_registry::ModelRegistry,
@@ -689,9 +691,13 @@ mod tests {
             classifier_model_for(&cfg("deepseek-v4-pro"), &reg),
             DEEPSEEK_V4_FLASH
         );
-        // A concrete non-DeepSeek model is judged on itself — the raw "auto"
-        // sentinel is never leaked to the API layer.
-        assert_eq!(classifier_model_for(&cfg("gpt-4o"), &reg), "gpt-4o");
+        // A passthrough id the catalog doesn't know (e.g. a newer DeepSeek model
+        // the registry hasn't caught up to) is judged on itself — and the raw
+        // "auto" sentinel never leaks to the API layer.
+        assert_eq!(
+            classifier_model_for(&cfg("deepseek-v9-experimental"), &reg),
+            "deepseek-v9-experimental"
+        );
     }
 
     fn shell(command: &str) -> ToolCall {
