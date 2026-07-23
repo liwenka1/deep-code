@@ -488,6 +488,45 @@ fn model_command_resolves_aliases_persists_and_keeps_session() {
 }
 
 #[test]
+fn lang_command_switches_live_and_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new();
+    app.global_config_path = dir.path().join("config.toml");
+    assert_eq!(app.lang, Lang::Zh);
+
+    // Bare /lang reports the current language without touching config.
+    assert!(app.handle_slash_command("/lang"));
+    assert!(app.status.contains("中文"), "{}", app.status);
+    assert!(!app.global_config_path.exists());
+
+    // /lang en switches immediately, persists, and confirms in English.
+    assert!(app.handle_slash_command("/lang en"));
+    assert_eq!(app.lang, Lang::En);
+    let contents = std::fs::read_to_string(&app.global_config_path).unwrap();
+    assert!(contents.contains("language = \"en\""));
+    assert!(app.status.contains("English"), "{}", app.status);
+
+    // Runtime swaps must not flip the language back.
+    assert!(app.handle_slash_command("/clear"));
+    assert_eq!(app.lang, Lang::En);
+    assert!(app.status.contains("New conversation"), "{}", app.status);
+
+    // Unknown value is rejected without changing anything.
+    assert!(app.handle_slash_command("/lang jp"));
+    assert_eq!(app.lang, Lang::En);
+    assert!(app.status.contains("jp"), "{}", app.status);
+
+    // And back to Chinese.
+    assert!(app.handle_slash_command("/lang zh"));
+    assert_eq!(app.lang, Lang::Zh);
+    assert!(
+        std::fs::read_to_string(&app.global_config_path)
+            .unwrap()
+            .contains("language = \"zh\"")
+    );
+}
+
+#[test]
 fn logout_removes_key_from_global_config() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new();
@@ -607,7 +646,7 @@ async fn approval_a_key_resolves_for_session() {
 
     assert!(app.pending_approval.is_none());
     assert!(app.is_streaming);
-    assert!(app.status.contains("approved (session)"));
+    assert!(app.status.contains("已批准（本会话）"), "{}", app.status);
 }
 
 #[test]
@@ -1092,7 +1131,7 @@ fn status_line_includes_mode_backend_session_checkpoint_and_cost() {
     });
 
     let status = app.status_line();
-    assert!(status.contains("ready"));
+    assert!(status.contains("就绪"), "{status}");
     assert!(status.contains("session session_1"));
     assert!(status.contains("checkpoint checkpoint_1"));
     assert!(status.contains("auto->deepseek-v4-flash"));

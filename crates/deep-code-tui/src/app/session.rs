@@ -3,10 +3,9 @@ use super::*;
 impl App {
     pub(crate) fn adopt_runtime(&mut self, launched: LaunchedRuntime) {
         for warning in &launched.warnings {
-            self.history
-                .push(crate::history::HistoryCell::system(format!(
-                    "警告: {warning}"
-                )));
+            self.history.push(crate::history::HistoryCell::system(
+                self.tr_with(TextId::SystemWarning, &[("message", warning)]),
+            ));
         }
         self.runtime = launched.handle;
         self.backend_label = launched.backend_label;
@@ -53,6 +52,9 @@ impl App {
         self.cost_currency = agent_config.cost_currency;
         self.configured_model = agent_config.model.clone();
         self.configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
+        // `lang` is deliberately NOT re-resolved here: it changes only at
+        // launch and via /lang, so a runtime swap can never flip the UI
+        // language out from under the user (or the tests).
         self.resumed = resumed;
         self.adopt_runtime(launched);
     }
@@ -63,7 +65,7 @@ impl App {
     /// before the session record is re-read.
     pub(crate) fn relaunch_runtime(&mut self) -> Result<(), String> {
         if self.is_streaming || self.pending_approval.is_some() {
-            return Err("正在流式输出或等待审批，请稍后再切换配置".to_string());
+            return Err(self.tr(TextId::BusyRelaunchConfig).to_string());
         }
 
         // Flush the old runtime first so re-reading the current session below
@@ -79,7 +81,7 @@ impl App {
             // The old runtime is already down; relaunch a fresh session so the
             // app stays usable instead of pointing at a dead runtime.
             self.launch_and_adopt(None, false);
-            return Err("无法读取当前会话记录，已重启为新会话".to_string());
+            return Err(self.tr(TextId::SessionReloadFailedRestart).to_string());
         }
 
         let resumed = resume.is_some();
@@ -95,7 +97,7 @@ impl App {
     /// sessions (newest-first). No-ops with a status note when none qualify.
     pub(crate) fn open_resume_picker(&mut self) {
         if self.is_streaming || self.pending_approval.is_some() {
-            self.status = "正在流式输出或等待审批，无法切换会话".to_string();
+            self.status = self.tr(TextId::BusySwitchSession).to_string();
             return;
         }
         let sessions = match JsonSessionStore::for_workspace(self.workspace.clone())
@@ -106,12 +108,13 @@ impl App {
                 .filter(crate::startup::has_user_message)
                 .collect::<Vec<_>>(),
             Err(error) => {
-                self.status = format!("无法读取历史会话: {error}");
+                self.status =
+                    self.tr_with(TextId::SessionsReadFailed, &[("error", &error.to_string())]);
                 return;
             }
         };
         if sessions.is_empty() {
-            self.status = "没有可恢复的历史会话".to_string();
+            self.status = self.tr(TextId::NoResumableSessions).to_string();
             return;
         }
         self.close_completion();
@@ -120,7 +123,7 @@ impl App {
             sessions,
             selected: 0,
         });
-        self.status = "选择要恢复的历史会话 (↑/↓ · Enter · Esc 取消)".to_string();
+        self.status = self.tr(TextId::StatusPickSession).to_string();
     }
 
     pub(crate) fn resume_picker_up(&mut self) {
@@ -139,7 +142,7 @@ impl App {
 
     pub(crate) fn resume_picker_cancel(&mut self) {
         if self.resume_picker.take().is_some() {
-            self.status = "已取消，留在当前会话".to_string();
+            self.status = self.tr(TextId::StatusResumeCancelled).to_string();
         }
     }
 
@@ -160,13 +163,24 @@ impl App {
     /// Load session `id` and switch to it in place. Surfaces a readable status
     /// on a bad id / missing record rather than failing the command.
     pub(crate) fn switch_session_by_id(&mut self, id: &str) -> Result<(), String> {
-        let store = JsonSessionStore::for_workspace(&self.workspace)
-            .map_err(|error| format!("无法打开会话存储: {error}"))?;
-        let session_id = deep_code_agent::SessionId::parse(id)
-            .map_err(|error| format!("无效的会话 id '{id}': {error}"))?;
-        let record = store
-            .load(&session_id)
-            .map_err(|error| format!("找不到会话 '{id}': {error}"))?;
+        let store = JsonSessionStore::for_workspace(&self.workspace).map_err(|error| {
+            self.tr_with(
+                TextId::SessionStoreOpenFailed,
+                &[("error", &error.to_string())],
+            )
+        })?;
+        let session_id = deep_code_agent::SessionId::parse(id).map_err(|error| {
+            self.tr_with(
+                TextId::SessionIdInvalid,
+                &[("id", id), ("error", &error.to_string())],
+            )
+        })?;
+        let record = store.load(&session_id).map_err(|error| {
+            self.tr_with(
+                TextId::SessionNotFound,
+                &[("id", id), ("error", &error.to_string())],
+            )
+        })?;
         self.switch_session(record)
     }
 
@@ -175,10 +189,10 @@ impl App {
     /// the visible transcript. This is what `/resume` executes.
     pub(crate) fn switch_session(&mut self, record: SessionRecord) -> Result<(), String> {
         if self.is_streaming || self.pending_approval.is_some() {
-            return Err("正在流式输出或等待审批，请稍后再切换会话".to_string());
+            return Err(self.tr(TextId::BusySwitchSession).to_string());
         }
         if self.session_id.as_deref() == Some(record.id.as_str()) {
-            self.status = "已是当前会话".to_string();
+            self.status = self.tr(TextId::StatusAlreadyCurrent).to_string();
             return Ok(());
         }
 
@@ -192,10 +206,9 @@ impl App {
         self.last_telemetry = None;
         self.error = None;
         self.history.extend(hydrate_history(&record));
-        self.status = format!(
-            "已切换到会话 {} - {}",
-            record.id.as_str(),
-            self.backend_label
+        self.status = self.tr_with(
+            TextId::StatusSwitchedSession,
+            &[("id", record.id.as_str()), ("backend", &self.backend_label)],
         );
         Ok(())
     }
@@ -205,7 +218,7 @@ impl App {
     /// session is launched, and the view resets to the welcome header.
     pub(crate) fn start_new_conversation(&mut self) {
         if self.is_streaming || self.pending_approval.is_some() {
-            self.status = "正在流式输出或等待审批，无法开启新对话".to_string();
+            self.status = self.tr(TextId::BusyNewConversation).to_string();
             return;
         }
 
@@ -227,13 +240,10 @@ impl App {
             &self.configured_reasoning,
             self.backend_offline,
             workspace_display,
-            if persistent {
-                "新会话 · 已持久化".to_string()
-            } else {
-                "新会话 · 未持久化".to_string()
-            },
+            None,
+            persistent,
         );
         self.history.push(cell);
-        self.status = "已开启新对话（旧对话可用 /resume 找回）".to_string();
+        self.status = self.tr(TextId::StatusNewConversation).to_string();
     }
 }

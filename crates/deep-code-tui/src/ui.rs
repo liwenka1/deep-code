@@ -19,6 +19,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, LaunchConfig, TranscriptSnapshot};
 use crate::history::HistoryCell;
+use crate::i18n::{Lang, TextId, tr, tr_with};
 use crate::markdown::render_markdown;
 
 /// Redraws are coalesced to at most ~30fps; streaming deltas mark the UI
@@ -251,7 +252,11 @@ fn dispatch_terminal_event(
                         // is a child process that can reset the console
                         // mode on Windows; re-assert mouse capture.
                         let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
-                        app.status = format!("已复制选中文本 ({} 字)", text.chars().count());
+                        app.status = tr_with(
+                            app.lang,
+                            TextId::CopiedSelection,
+                            &[("count", &text.chars().count().to_string())],
+                        );
                     }
                 }
                 _ => {}
@@ -473,7 +478,7 @@ pub(crate) const COMPOSER_MAX_VISIBLE_ROWS: usize = 6;
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(picker) = &app.resume_picker {
-        render_resume_picker(frame, picker);
+        render_resume_picker(frame, picker, app.lang);
         return;
     }
 
@@ -515,7 +520,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
             ])
             .split(frame.area());
         let snap = render_messages(frame, app, chunks[0]);
-        render_completion_menu(frame, menu, chunks[1]);
+        render_completion_menu(frame, menu, chunks[1], app.lang);
         render_input_from_layout(frame, app, &layout, chunks[2]);
         render_status(frame, app, chunks[3]);
         snap
@@ -535,7 +540,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 /// In-app `/resume` overlay. Mirrors the standalone startup picker's minimal
 /// look, but draws inside the live alt-screen (a full-area `Clear` wipes the
 /// transcript beneath) so opening/closing it never flickers.
-fn render_resume_picker(frame: &mut Frame<'_>, picker: &crate::app::ResumePicker) {
+fn render_resume_picker(frame: &mut Frame<'_>, picker: &crate::app::ResumePicker, lang: Lang) {
     use crate::startup::{now_ms, relative_time, session_title};
     let area = frame.area();
     frame.render_widget(Clear, area);
@@ -551,7 +556,7 @@ fn render_resume_picker(frame: &mut Frame<'_>, picker: &crate::app::ResumePicker
 
     let header = Paragraph::new(vec![
         Line::from(Span::styled(
-            "历史会话",
+            tr(lang, TextId::PickerTitle),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -572,8 +577,8 @@ fn render_resume_picker(frame: &mut Frame<'_>, picker: &crate::app::ResumePicker
         .skip(start)
         .take(viewport)
         .map(|(index, record)| {
-            let time = relative_time(now, record.updated_at_ms);
-            let title = session_title(record);
+            let time = relative_time(now, record.updated_at_ms, lang);
+            let title = session_title(record, lang);
             if index == selected {
                 Line::from(vec![
                     Span::styled(
@@ -607,7 +612,7 @@ fn render_resume_picker(frame: &mut Frame<'_>, picker: &crate::app::ResumePicker
         .unwrap_or_default();
     let help = Paragraph::new(vec![
         Line::from(Span::styled(
-            "↑/↓ 选择 · Enter 恢复 · n/Esc 取消",
+            tr(lang, TextId::PickerHelpResume),
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(note, Style::default().fg(Color::DarkGray))),
@@ -620,6 +625,7 @@ fn render_completion_menu(
     frame: &mut Frame<'_>,
     menu: &crate::app::CompletionMenu,
     area: ratatui::layout::Rect,
+    lang: Lang,
 ) {
     // Window around the selection so wrapping to the last/first item keeps the
     // highlight visible instead of scrolling it off the top of the list.
@@ -652,7 +658,7 @@ fn render_completion_menu(
         .collect();
     let panel = Paragraph::new(lines).block(
         Block::default()
-            .title("补全: ↑/↓ 选择 | Tab/Enter 确认 | Esc 关闭")
+            .title(tr(lang, TextId::CompletionMenuTitle))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Blue)),
     );
@@ -674,7 +680,7 @@ fn render_messages(
     // bottom-anchored scroll then just windows it.
     let mut lines: Vec<Line<'static>> = Vec::new();
     for cell in &app.history {
-        lines.extend(cell_lines(cell, content_width));
+        lines.extend(cell_lines(cell, content_width, app.lang));
     }
     let preview = app
         .active_turn
@@ -682,7 +688,7 @@ fn render_messages(
         .map(|active| active.preview_cells())
         .unwrap_or_default();
     for cell in &preview {
-        lines.extend(cell_lines(cell, content_width));
+        lines.extend(cell_lines(cell, content_width, app.lang));
     }
 
     let max_scroll = lines.len().saturating_sub(viewport);
@@ -766,21 +772,24 @@ fn highlight_selection(
 /// streaming — so formatting is consistent throughout. `parse_blocks` treats
 /// an unclosed code fence as a code block, so a half-streamed fence renders
 /// without flicker.
-fn cell_lines(cell: &HistoryCell, width: u16) -> Vec<Line<'static>> {
+fn cell_lines(cell: &HistoryCell, width: u16, lang: Lang) -> Vec<Line<'static>> {
     let width = width as usize;
     let dim = Style::default().fg(Color::DarkGray);
     match cell {
         HistoryCell::Welcome {
             version,
             model,
+            reasoning,
             offline,
             workspace,
-            session,
+            resumed_turns,
+            persistent,
         } => {
             let cyan = Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD);
-            let label = |key: &str| Span::styled(format!("{key}   "), dim);
+            // Pad labels to a fixed char width so the values align per language.
+            let label = |id: TextId| Span::styled(format!("{:<7} ", tr(lang, id)), dim);
             let mut lines = vec![
                 Line::from(vec![
                     Span::styled("deep-code", cyan),
@@ -790,23 +799,37 @@ fn cell_lines(cell: &HistoryCell, width: u16) -> Vec<Line<'static>> {
             ];
             if *offline {
                 lines.push(Line::from(vec![
-                    label("状态"),
+                    label(TextId::WelcomeStatusLabel),
                     Span::styled(
-                        "离线模式 · 输入 /apikey sk-… 接入 DeepSeek",
+                        tr(lang, TextId::WelcomeOffline),
                         Style::default().fg(Color::Yellow),
                     ),
                 ]));
             } else {
-                lines.push(Line::from(vec![label("模型"), Span::raw(model.clone())]));
+                lines.push(Line::from(vec![
+                    label(TextId::WelcomeModelLabel),
+                    Span::raw(tr_with(
+                        lang,
+                        TextId::WelcomeModelValue,
+                        &[("model", model), ("reasoning", reasoning)],
+                    )),
+                ]));
             }
             lines.push(Line::from(vec![
-                label("目录"),
+                label(TextId::WelcomeWorkspaceLabel),
                 Span::raw(left_truncate(workspace, width.saturating_sub(8).max(8))),
             ]));
-            lines.push(Line::from(vec![label("会话"), Span::raw(session.clone())]));
+            lines.push(Line::from(vec![
+                label(TextId::WelcomeSessionLabel),
+                Span::raw(crate::history::session_summary(
+                    lang,
+                    *resumed_turns,
+                    *persistent,
+                )),
+            ]));
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
-                "输入消息开始对话 · 输入 / 查看命令 · Ctrl+C 退出",
+                tr(lang, TextId::WelcomeIntro),
                 dim,
             )));
             lines.push(Line::default());
@@ -838,7 +861,7 @@ fn cell_lines(cell: &HistoryCell, width: u16) -> Vec<Line<'static>> {
         // Tool call + result form a tight group: a green dot for the call,
         // a dim ⎿ connector for the result. No blank between them.
         HistoryCell::ToolCall { .. } => {
-            let text = cell.lines().join(" ");
+            let text = cell.lines(lang).join(" ");
             vec![Line::from(vec![
                 Span::styled("⏺ ", Style::default().fg(Color::Green)),
                 Span::raw(text),
@@ -881,6 +904,7 @@ fn cell_lines(cell: &HistoryCell, width: u16) -> Vec<Line<'static>> {
                 &[],
                 &[],
                 width,
+                lang,
             );
             lines.push(Line::default());
             lines
@@ -888,7 +912,7 @@ fn cell_lines(cell: &HistoryCell, width: u16) -> Vec<Line<'static>> {
         // Diagnostics / Checkpoint / Compaction / System: dim secondary lines.
         _ => {
             let mut lines = Vec::new();
-            for logical in cell.lines() {
+            for logical in cell.lines(lang) {
                 lines.extend(wrap_styled(&logical, width, dim));
             }
             lines.push(Line::default());
@@ -956,13 +980,13 @@ fn wrap_prefixed(
     out
 }
 
-/// Risk tier (Debug of `RiskLevel`) → (Chinese tag, accent colour). Risk is
+/// Risk tier (Debug of `RiskLevel`) → (localized tag, accent colour). Risk is
 /// shown as colour, not a `Risk: …` field. Unknown tiers fall back to amber.
-fn risk_display(risk: &str) -> (&'static str, Color) {
+fn risk_display(risk: &str, lang: Lang) -> (&'static str, Color) {
     match risk {
-        "High" => ("高风险", Color::Red),
-        "Medium" => ("中风险", Color::Yellow),
-        "Low" => ("低风险", Color::DarkGray),
+        "High" => (tr(lang, TextId::RiskHigh), Color::Red),
+        "Medium" => (tr(lang, TextId::RiskMedium), Color::Yellow),
+        "Low" => (tr(lang, TextId::RiskLow), Color::DarkGray),
         _ => ("", Color::Yellow),
     }
 }
@@ -997,14 +1021,18 @@ fn approval_lines(
     safety_reasons: &[String],
     safety_suggestions: &[String],
     width: usize,
+    lang: Lang,
 ) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
-    let (risk_tag, risk_color) = risk_display(risk);
+    let (risk_tag, risk_color) = risk_display(risk, lang);
     let risk_style = Style::default().fg(risk_color);
 
     let mut header = vec![
         Span::styled("● ", risk_style),
-        Span::styled("需要批准", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            tr(lang, TextId::ApprovalNeeded),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" · ", dim),
         Span::styled(
             tool_name.to_string(),
@@ -1035,10 +1063,10 @@ fn approval_lines(
 
     let mut meta = Vec::new();
     if requires_sandbox {
-        meta.push("需沙箱执行".to_string());
+        meta.push(tr(lang, TextId::ApprovalSandbox).to_string());
     }
     if let Some(rule) = matched_rule {
-        meta.push(format!("规则 {rule}"));
+        meta.push(tr_with(lang, TextId::ApprovalRule, &[("rule", rule)]));
     }
     if !meta.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -1052,7 +1080,10 @@ fn approval_lines(
     if !safety_reasons.is_empty() {
         let caution = Style::default().fg(Color::Yellow);
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled("  ── 注意 ──", caution)));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", tr(lang, TextId::ApprovalCautionHeader)),
+            caution,
+        )));
         for (i, reason) in safety_reasons.iter().enumerate() {
             lines.extend(wrap_prefixed("  • ", reason, width, caution, caution));
             if let Some(suggestion) = safety_suggestions.get(i) {
@@ -1063,7 +1094,10 @@ fn approval_lines(
 
     if let Some(preview) = preview.filter(|preview| !preview.trim().is_empty()) {
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled("  ── 变更预览 ──", dim)));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", tr(lang, TextId::ApprovalPreviewHeader)),
+            dim,
+        )));
         let added = Style::default().fg(Color::Green);
         let removed = Style::default().fg(Color::Red);
         for raw in preview.lines() {
@@ -1101,6 +1135,7 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout
         &request.safety_reasons,
         &request.safety_suggestions,
         width,
+        app.lang,
     );
     let body_paragraph = Paragraph::new(body)
         .block(Block::default().padding(Padding::new(1, 0, 0, 0)))
@@ -1118,9 +1153,9 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout
 
     let focus = app.approval_focus;
     let options_body: Vec<Line> = [
-        ("  y", "批准", key_y),
-        ("  a", "本会话始终允许", key_a),
-        ("  n", "拒绝（Esc）", key_n),
+        ("  y", tr(app.lang, TextId::ApprovalOptApprove), key_y),
+        ("  a", tr(app.lang, TextId::ApprovalOptSession), key_a),
+        ("  n", tr(app.lang, TextId::ApprovalOptDeny), key_n),
     ]
     .iter()
     .enumerate()
@@ -1339,7 +1374,7 @@ fn render_input_from_layout(
         frame.buffer_mut().set_string(
             text_x,
             inner_area.y,
-            "输入消息，输入 / 唤起命令",
+            tr(app.lang, TextId::ComposerPlaceholder),
             Style::default().fg(Color::DarkGray),
         );
     }
@@ -1362,7 +1397,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) 
     let text = if let Some(error) = &app.error {
         Line::from(vec![
             Span::styled(
-                "Error: ",
+                tr(app.lang, TextId::ErrorPrefix),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
             Span::raw(error.clone()),
@@ -1373,7 +1408,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) 
         Line::from(vec![
             Span::styled(activity, Style::default().fg(Color::Cyan)),
             Span::styled(
-                "   Esc 取消".to_string(),
+                format!("   {}", tr(app.lang, TextId::StatusEscCancel)),
                 Style::default().fg(Color::DarkGray),
             ),
         ])
@@ -1405,7 +1440,7 @@ mod tests {
         let cell = HistoryCell::Assistant {
             text: "x".repeat(120),
         };
-        let lines = cell_lines(&cell, 40);
+        let lines = cell_lines(&cell, 40, Lang::Zh);
         assert!(
             lines.len() >= 4,
             "120 cols at width 40 must wrap to multiple rows, got {}",
@@ -1420,15 +1455,17 @@ mod tests {
         }
     }
 
-    fn welcome_text(offline: bool) -> String {
+    fn welcome_text(offline: bool, lang: Lang) -> String {
         let cell = HistoryCell::Welcome {
             version: "0.1.0".to_string(),
-            model: "DeepSeek deepseek-chat · 推理 medium".to_string(),
+            model: "deepseek-chat".to_string(),
+            reasoning: "medium".to_string(),
             offline,
             workspace: "~/code/deep-code".to_string(),
-            session: "新会话 · 已持久化".to_string(),
+            resumed_turns: None,
+            persistent: true,
         };
-        cell_lines(&cell, 60)
+        cell_lines(&cell, 60, lang)
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
             .collect()
@@ -1436,10 +1473,10 @@ mod tests {
 
     #[test]
     fn welcome_cell_shows_model_dir_session_when_online() {
-        let text = welcome_text(false);
+        let text = welcome_text(false, Lang::Zh);
         assert!(text.contains("deep-code") && text.contains("v0.1.0"));
         assert!(text.contains("模型") && text.contains("deepseek-chat"));
-        assert!(text.contains("目录") && text.contains("会话"));
+        assert!(text.contains("目录") && text.contains("新会话 · 已持久化"));
         assert!(
             !text.contains("/apikey"),
             "online must not nag about apikey"
@@ -1448,12 +1485,20 @@ mod tests {
 
     #[test]
     fn welcome_cell_prompts_apikey_when_offline() {
-        let text = welcome_text(true);
+        let text = welcome_text(true, Lang::Zh);
         assert!(text.contains("离线模式") && text.contains("/apikey"));
         assert!(
             !text.contains("deepseek-chat"),
             "offline hides the model line"
         );
+    }
+
+    #[test]
+    fn welcome_cell_renders_english_pack() {
+        let text = welcome_text(false, Lang::En);
+        assert!(text.contains("Model") && text.contains("deepseek-chat"));
+        assert!(text.contains("New session · persisted"));
+        assert!(!text.contains("模型"), "no Chinese leaks into en: {text}");
     }
 
     #[test]
@@ -1476,10 +1521,11 @@ mod tests {
 
     #[test]
     fn risk_display_maps_tier_to_colour() {
-        assert_eq!(risk_display("High"), ("高风险", Color::Red));
-        assert_eq!(risk_display("Medium"), ("中风险", Color::Yellow));
-        assert_eq!(risk_display("Low"), ("低风险", Color::DarkGray));
-        assert_eq!(risk_display("weird").0, "");
+        assert_eq!(risk_display("High", Lang::Zh), ("高风险", Color::Red));
+        assert_eq!(risk_display("Medium", Lang::Zh), ("中风险", Color::Yellow));
+        assert_eq!(risk_display("Low", Lang::Zh), ("低风险", Color::DarkGray));
+        assert_eq!(risk_display("High", Lang::En), ("High risk", Color::Red));
+        assert_eq!(risk_display("weird", Lang::Zh).0, "");
     }
 
     #[test]
@@ -1495,6 +1541,7 @@ mod tests {
             &[],
             &[],
             60,
+            Lang::Zh,
         );
         let text: String = lines
             .iter()
@@ -1562,6 +1609,7 @@ mod tests {
             &[],
             &[],
             60,
+            Lang::Zh,
         );
         let text: String = lines
             .iter()
@@ -1597,6 +1645,7 @@ mod tests {
             &reasons,
             &suggestions,
             60,
+            Lang::Zh,
         );
         let text: String = lines
             .iter()
@@ -1624,7 +1673,7 @@ mod tests {
             };
             let mut terminal = Terminal::new(TestBackend::new(50, 12)).unwrap();
             terminal
-                .draw(|frame| render_completion_menu(frame, &menu, frame.area()))
+                .draw(|frame| render_completion_menu(frame, &menu, frame.area(), Lang::Zh))
                 .unwrap();
             let buffer = terminal.backend().buffer().clone();
             let mut text = String::new();
@@ -1657,7 +1706,7 @@ mod tests {
         let cell = HistoryCell::Assistant {
             text: "中".repeat(30), // 60 display columns
         };
-        let lines = cell_lines(&cell, 20);
+        let lines = cell_lines(&cell, 20, Lang::Zh);
         assert!(lines.len() >= 4);
         for line in &lines {
             assert!(line_width(line) <= 20);

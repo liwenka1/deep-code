@@ -3,6 +3,7 @@ use deep_code_agent::{RuntimeEvent, ToolCallId};
 use crate::active_turn::{ActiveToolCell, ActiveTurn};
 use crate::app::App;
 use crate::history::{HistoryCell, ToolApprovalState, summarize_tool_result};
+use crate::i18n::TextId;
 
 impl App {
     pub(crate) fn apply_runtime_event(&mut self, event: RuntimeEvent) {
@@ -12,7 +13,10 @@ impl App {
                 // its terminal event — flush it into history first.
                 self.flush_active_turn();
                 self.active_turn = Some(ActiveTurn::new(turn_id));
-                self.status = format!("Streaming from {}...", self.backend_label);
+                self.status = self.tr_with(
+                    TextId::StatusStreamingFrom,
+                    &[("backend", &self.backend_label)],
+                );
             }
             RuntimeEvent::AssistantDelta { text, .. } => {
                 self.push_assistant_delta(&text);
@@ -35,7 +39,8 @@ impl App {
                     approval: ToolApprovalState::NotRequired,
                     live_output: Default::default(),
                 });
-                self.status = format!("Receiving tool call: {tool_name}");
+                self.status =
+                    self.tr_with(TextId::StatusToolCallReceiving, &[("tool", &tool_name)]);
             }
             RuntimeEvent::ToolCallUpdated {
                 tool_call_id,
@@ -45,7 +50,7 @@ impl App {
                 if let Some(delta) = arguments_delta {
                     self.append_active_tool_arguments(&tool_call_id, &delta);
                 }
-                self.status = "Receiving tool call...".to_string();
+                self.status = self.tr(TextId::StatusToolCallReceivingArgs).to_string();
             }
             RuntimeEvent::ToolCallProgress {
                 tool_call_id,
@@ -54,18 +59,22 @@ impl App {
                 ..
             } => {
                 self.append_active_tool_output(&tool_call_id, &update.text);
-                self.status = format!("Running {tool_name}…");
+                self.status = self.tr_with(TextId::StatusToolRunning, &[("tool", &tool_name)]);
             }
             RuntimeEvent::ApprovalRequired { request, .. } => {
                 self.set_active_approval(request.clone());
                 let sandbox = if request.requires_sandbox {
-                    "yes"
+                    self.tr(TextId::WordYes)
                 } else {
-                    "no"
+                    self.tr(TextId::WordNo)
                 };
-                self.status = format!(
-                    "Approve '{}' (risk={:?}, sandbox={sandbox})? y/n",
-                    request.tool_name, request.risk_level
+                self.status = self.tr_with(
+                    TextId::StatusApprovalPrompt,
+                    &[
+                        ("tool", &request.tool_name),
+                        ("risk", &format!("{:?}", request.risk_level)),
+                        ("sandbox", sandbox),
+                    ],
                 );
                 self.pending_approval = Some(request);
                 self.approval_scroll_offset = 0;
@@ -77,7 +86,10 @@ impl App {
                 if let Some(active) = self.active_turn.as_mut() {
                     active.resolve_approval(decision);
                 }
-                self.status = format!("Approval resolved: {decision:?}");
+                self.status = self.tr_with(
+                    TextId::StatusApprovalResolved,
+                    &[("decision", &format!("{decision:?}"))],
+                );
             }
             RuntimeEvent::CheckpointCreated { id, label } => {
                 self.last_checkpoint = Some(id.0.clone());
@@ -87,9 +99,9 @@ impl App {
             RuntimeEvent::WorkspaceRestored { id } => {
                 self.last_checkpoint = Some(id.0.clone());
                 self.history.push(HistoryCell::System {
-                    text: format!("Workspace restored from checkpoint {}", id.0),
+                    text: self.tr_with(TextId::SystemWorkspaceRestored, &[("id", &id.0)]),
                 });
-                self.status = format!("Restored checkpoint {}", id.0);
+                self.status = self.tr_with(TextId::StatusRestored, &[("id", &id.0)]);
             }
             RuntimeEvent::ToolCallFinished {
                 tool_call_id,
@@ -119,22 +131,27 @@ impl App {
                         // Surface once per failure episode; the status line
                         // keeps warning until a save succeeds again.
                         if !self.save_error_notified {
-                            self.history.push(HistoryCell::system(format!(
-                                "⚠ 会话保存失败，当前对话未持久化：{error}"
-                            )));
+                            self.history.push(HistoryCell::system(
+                                self.tr_with(TextId::SystemSaveFailed, &[("error", &error)]),
+                            ));
                             self.save_error_notified = true;
                         }
-                        self.status = format!("⚠ 会话保存失败：{error}");
+                        self.status = self.tr_with(TextId::StatusSaveFailed, &[("error", &error)]);
                     }
                     None => {
                         if self.save_error_notified {
                             self.history
-                                .push(HistoryCell::system("会话保存已恢复正常。"));
+                                .push(HistoryCell::system(self.tr(TextId::SystemSaveRecovered)));
                             self.save_error_notified = false;
                         }
                         if let Some(compaction) = compaction {
-                            self.status =
-                                format!("Session updated: {turn_count} turn(s), {compaction}");
+                            self.status = self.tr_with(
+                                TextId::StatusSessionUpdated,
+                                &[
+                                    ("turns", &turn_count.to_string()),
+                                    ("compaction", &compaction),
+                                ],
+                            );
                         }
                     }
                 }
@@ -148,7 +165,7 @@ impl App {
                         rendered,
                     });
                 }
-                self.status = format!("Diagnostics: {summary}");
+                self.status = self.tr_with(TextId::StatusDiagnostics, &[("summary", &summary)]);
             }
             RuntimeEvent::CompactionApplied {
                 archived_count,
@@ -158,11 +175,15 @@ impl App {
                     metadata: Some(format!("archived={archived_count}")),
                     summary: summary.clone(),
                 });
-                self.status = format!("已压缩 {archived_count} 条历史消息");
+                self.status = self.tr_with(
+                    TextId::StatusCompacted,
+                    &[("count", &archived_count.to_string())],
+                );
             }
             RuntimeEvent::Warning { message } => {
-                self.history
-                    .push(HistoryCell::system(format!("警告: {message}")));
+                self.history.push(HistoryCell::system(
+                    self.tr_with(TextId::SystemWarning, &[("message", &message)]),
+                ));
             }
             RuntimeEvent::TurnFinished { telemetry, .. } => {
                 self.flush_active_turn();
@@ -170,7 +191,7 @@ impl App {
                 let checkpoint = self
                     .last_checkpoint
                     .as_ref()
-                    .map(|id| format!(" | 回滚: /restore {id}"))
+                    .map(|id| self.tr_with(TextId::StatusRollbackHint, &[("id", id)]))
                     .unwrap_or_default();
                 let session = self
                     .session_id
@@ -179,12 +200,14 @@ impl App {
                     .unwrap_or_default();
                 let telemetry_note = telemetry
                     .as_ref()
-                    .map(|value| crate::commands::format_turn_telemetry(value, self.cost_currency))
+                    .map(|value| {
+                        crate::commands::format_turn_telemetry(value, self.cost_currency, self.lang)
+                    })
                     .unwrap_or_default();
                 let ready = if self.resumed {
-                    "就绪 (resumed)"
+                    self.tr(TextId::ModeReadyResumed)
                 } else {
-                    "就绪"
+                    self.tr(TextId::ModeReady)
                 };
                 self.status = format!(
                     "{ready} - {}{}{}{telemetry_note}",
@@ -196,13 +219,16 @@ impl App {
             RuntimeEvent::TurnCancelled { .. } => {
                 self.flush_active_turn();
                 self.history
-                    .push(HistoryCell::system("本轮已取消 (cancelled)"));
+                    .push(HistoryCell::system(self.tr(TextId::SystemTurnCancelled)));
                 let session = self
                     .session_id
                     .as_ref()
                     .map(|id| format!(" | session {id}"))
                     .unwrap_or_default();
-                self.status = format!("已取消 - {}{session}", self.backend_label);
+                self.status = format!(
+                    "{}{session}",
+                    self.tr_with(TextId::StatusCancelled, &[("backend", &self.backend_label)])
+                );
                 self.pending_approval = None;
                 self.is_streaming = false;
                 self.clear_stream_receiver();

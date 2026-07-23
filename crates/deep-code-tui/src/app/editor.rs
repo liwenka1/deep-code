@@ -123,10 +123,21 @@ impl App {
         let chars = char_count(&normalized);
         if multiline || chars > 120 {
             let id = self.pasted_blocks.len() + 1;
+            // The rendered chip text is also the expansion token stored in
+            // `pasted_blocks`, so a mid-draft /lang switch cannot orphan it.
             let placeholder = if multiline {
-                format!("[粘贴 #{id} +{} 行]", normalized.lines().count().max(1))
+                self.tr_with(
+                    TextId::PasteChipLines,
+                    &[
+                        ("id", &id.to_string()),
+                        ("lines", &normalized.lines().count().max(1).to_string()),
+                    ],
+                )
             } else {
-                format!("[粘贴 #{id} · {chars} 字]")
+                self.tr_with(
+                    TextId::PasteChipChars,
+                    &[("id", &id.to_string()), ("chars", &chars.to_string())],
+                )
             };
             self.insert_str_at_cursor(&placeholder);
             self.pasted_blocks.push((placeholder, normalized));

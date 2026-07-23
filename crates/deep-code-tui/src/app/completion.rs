@@ -31,7 +31,7 @@ impl App {
                     } else {
                         (*name).to_string()
                     };
-                    (value, (*hint).to_string())
+                    (value, self.tr(*hint).to_string())
                 })
                 .collect();
             return (!items.is_empty()).then_some(CompletionMenu {

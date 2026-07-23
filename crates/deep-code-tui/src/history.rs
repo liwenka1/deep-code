@@ -1,5 +1,7 @@
 use deep_code_agent::{EntryKind, SessionRecord, ToolResultStatus};
 
+use crate::i18n::{Lang, TextId, tr, tr_with};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolApprovalState {
     NotRequired,
@@ -10,13 +12,32 @@ pub enum ToolApprovalState {
 
 impl ToolApprovalState {
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub fn label(self, lang: Lang) -> &'static str {
         match self {
-            Self::NotRequired => "not required",
-            Self::Required => "required",
-            Self::Approved => "approved",
-            Self::Denied => "denied",
+            Self::NotRequired => "",
+            Self::Required => tr(lang, TextId::BadgeRequired),
+            Self::Approved => tr(lang, TextId::BadgeApproved),
+            Self::Denied => tr(lang, TextId::BadgeDenied),
         }
+    }
+}
+
+/// Welcome 卡的会话概要行:恢复(带轮数)/新会话(是否持久化)。
+/// 供 `ui::cell_lines` 的 Welcome 渲染使用。
+#[must_use]
+pub(crate) fn session_summary(
+    lang: Lang,
+    resumed_turns: Option<usize>,
+    persistent: bool,
+) -> String {
+    match resumed_turns {
+        Some(turns) => tr_with(
+            lang,
+            TextId::SessionResumed,
+            &[("turns", &turns.to_string())],
+        ),
+        None if persistent => tr(lang, TextId::SessionNewPersistent).to_string(),
+        None => tr(lang, TextId::SessionNewEphemeral).to_string(),
     }
 }
 
@@ -24,15 +45,21 @@ impl ToolApprovalState {
 pub enum HistoryCell {
     /// The startup header: a compact, styled welcome card (rendered specially
     /// in `cell_lines`). It scrolls away naturally after the first message.
+    /// Holds raw data, not preformatted text, so a `/lang` switch re-renders
+    /// it in the new language on the next frame.
     Welcome {
         version: String,
-        /// Online model summary, e.g. "DeepSeek deepseek-chat · 推理 medium".
+        /// Raw model id, e.g. "deepseek-chat".
         model: String,
+        /// Raw reasoning setting, e.g. "medium".
+        reasoning: String,
         offline: bool,
         /// Home-relative workspace path, left-truncated at render time.
         workspace: String,
-        /// e.g. "新会话 · 已持久化" or "已恢复 · 3 轮对话".
-        session: String,
+        /// `Some(turns)` when resumed; `None` for a fresh session.
+        resumed_turns: Option<usize>,
+        /// Whether the fresh session is persisted (ignored when resumed).
+        persistent: bool,
     },
     System {
         text: String,
@@ -103,27 +130,12 @@ impl HistoryCell {
     }
 
     #[must_use]
-    pub fn lines(&self) -> Vec<String> {
+    pub fn lines(&self, lang: Lang) -> Vec<String> {
         match self {
-            Self::Welcome {
-                version,
-                model,
-                offline,
-                workspace,
-                session,
-            } => {
-                let status = if *offline {
-                    "离线模式 · 输入 /apikey sk-… 接入 DeepSeek".to_string()
-                } else {
-                    format!("模型 {model}")
-                };
-                vec![
-                    format!("deep-code v{version}"),
-                    status,
-                    format!("目录 {workspace}"),
-                    format!("会话 {session}"),
-                ]
-            }
+            // Welcome renders exclusively through `ui::cell_lines` (it needs
+            // the styled header/rule/intro), so its plain-text form is never
+            // requested — no duplicate formatting kept here.
+            Self::Welcome { .. } => Vec::new(),
             Self::System { text }
             | Self::User { text }
             | Self::Assistant { text }
@@ -140,7 +152,7 @@ impl HistoryCell {
                 let args = truncate_chars(&collapse_whitespace(arguments), 72);
                 let badge = match approval {
                     ToolApprovalState::NotRequired => String::new(),
-                    other => format!(" [{}]", other.label()),
+                    other => format!(" [{}]", other.label(lang)),
                 };
                 vec![format!("{tool_name}  {args}{badge}")]
             }
@@ -177,15 +189,15 @@ impl HistoryCell {
                 }
             }
             Self::Checkpoint { id, label } => vec![
-                format!("Label: {label}"),
+                tr_with(lang, TextId::CheckpointLabel, &[("label", label)]),
                 format!("ID: {id}"),
-                format!("Restore: /restore {id}"),
+                tr_with(lang, TextId::CheckpointRestoreHint, &[("id", id)]),
             ],
             Self::Compaction { metadata, summary } => {
-                let title = metadata
-                    .as_deref()
-                    .map(|value| format!("Compaction summary ({value})"))
-                    .unwrap_or_else(|| "Compaction summary".to_string());
+                let title = metadata.as_deref().map_or_else(
+                    || tr(lang, TextId::CompactionSummaryTitle).to_string(),
+                    |value| tr_with(lang, TextId::CompactionSummaryTitleMeta, &[("meta", value)]),
+                );
                 vec![title, summary.clone()]
             }
         }
@@ -584,13 +596,13 @@ mod tests {
             requires_sandbox: None,
             approval: ToolApprovalState::NotRequired,
         };
-        let lines = tool.lines();
+        let lines = tool.lines(Lang::Zh);
         assert_eq!(lines.len(), 1, "tool call must be one line");
         assert!(lines[0].starts_with("shell  "));
         // Whitespace/newlines collapsed; no Risk/Approval/Sandbox noise.
         assert!(!lines[0].contains('\n'));
         assert!(!lines[0].contains("Risk"));
-        assert!(!lines[0].contains("not required"));
+        assert!(!lines[0].contains('['), "ungated call carries no badge");
 
         let gated = HistoryCell::ToolCall {
             tool_name: "write_file".to_string(),
@@ -599,7 +611,8 @@ mod tests {
             requires_sandbox: Some(false),
             approval: ToolApprovalState::Approved,
         };
-        assert!(gated.lines()[0].ends_with("[approved]"));
+        assert!(gated.lines(Lang::Zh)[0].ends_with("[已批准]"));
+        assert!(gated.lines(Lang::En)[0].ends_with("[approved]"));
     }
 
     #[test]
@@ -609,7 +622,7 @@ mod tests {
             status: ToolResultStatus::Success,
             summary: "ok\nmulti\nline".to_string(),
         };
-        let lines = result.lines();
+        let lines = result.lines(Lang::Zh);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("ok multi line"));
     }
@@ -624,7 +637,11 @@ mod tests {
             requires_sandbox: None,
             approval: ToolApprovalState::NotRequired,
         };
-        assert!(tool.lines().iter().any(|line| line.contains("(truncated)")));
+        assert!(
+            tool.lines(Lang::Zh)
+                .iter()
+                .any(|line| line.contains("(truncated)"))
+        );
 
         let approval = HistoryCell::Approval {
             tool_name: "shell".to_string(),
@@ -634,7 +651,7 @@ mod tests {
             matched_rule: Some("shell".to_string()),
             arguments: long,
         };
-        let lines = approval.lines();
+        let lines = approval.lines(Lang::Zh);
         assert!(lines.iter().any(|line| line.contains("Risk: High")));
         assert!(lines.iter().any(|line| line.contains("Rule: shell")));
         assert!(lines.iter().any(|line| line.contains("(truncated)")));
@@ -647,7 +664,12 @@ mod tests {
             label: "before_turn".to_string(),
         };
         assert!(
-            cell.lines()
+            cell.lines(Lang::Zh)
+                .iter()
+                .any(|line| line == "恢复: /restore checkpoint_1")
+        );
+        assert!(
+            cell.lines(Lang::En)
                 .iter()
                 .any(|line| line == "Restore: /restore checkpoint_1")
         );

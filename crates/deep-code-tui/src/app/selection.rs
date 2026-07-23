@@ -13,7 +13,7 @@ impl App {
     /// exactly what is on screen.
     pub(crate) fn find_in_transcript(&mut self, query: &str) {
         let Some(snapshot) = self.transcript.as_ref() else {
-            self.status = "暂无可搜索的转录内容".to_string();
+            self.status = self.tr(TextId::FindNoTranscript).to_string();
             return;
         };
         let needle = query.to_lowercase();
@@ -34,9 +34,9 @@ impl App {
                 // line_index (clamped to the scrollable range).
                 self.scroll_offset = max_scroll.saturating_sub(line_index);
                 self.find_state = Some((query.to_string(), line_index));
-                self.status = format!(
-                    "找到 “{query}”（第 {} 行）· 再次 /find 向上继续",
-                    line_index + 1
+                self.status = self.tr_with(
+                    TextId::FindFound,
+                    &[("query", query), ("line", &(line_index + 1).to_string())],
                 );
             }
             None => {
@@ -45,9 +45,9 @@ impl App {
                     .take()
                     .is_some_and(|(previous, _)| previous == query);
                 if was_continuing {
-                    self.status = format!("已到 “{query}” 的最早匹配 · 再次 /find 从底部重新开始");
+                    self.status = self.tr_with(TextId::FindExhausted, &[("query", query)]);
                 } else {
-                    self.status = format!("未找到 “{query}”");
+                    self.status = self.tr_with(TextId::FindNotFound, &[("query", query)]);
                 }
             }
         }

@@ -3,6 +3,7 @@
 //! default keeps stale context from silently leaking into a new task.
 
 use std::io::{self, Stdout};
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -12,7 +13,8 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use deep_code_agent::{
-    JsonSessionStore, SessionId, SessionRecord, SessionStore, format_sessions_storage_note,
+    AgentConfig, JsonSessionStore, SessionId, SessionRecord, SessionStore,
+    format_sessions_storage_note,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style};
@@ -20,6 +22,7 @@ use ratatui::widgets::{Block, Padding, Paragraph};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::cli::StartupIntent;
+use crate::i18n::{Lang, TextId, tr, tr_with};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupChoice {
@@ -39,6 +42,7 @@ enum Resolution {
 pub fn choose_startup(
     store: &JsonSessionStore,
     intent: StartupIntent,
+    workspace: &Path,
 ) -> Result<Option<SessionRecord>> {
     // A specific id is loaded directly (and surfaces a clear "not found").
     if let StartupIntent::ResumeId(id) = &intent {
@@ -49,10 +53,16 @@ pub fn choose_startup(
     match resolve(&intent, sessions) {
         Resolution::New => Ok(None),
         Resolution::Resume(record) => Ok(Some(*record)),
-        Resolution::Pick(list) => match run_picker(&list)? {
-            StartupChoice::NewSession => Ok(None),
-            StartupChoice::Resume(index) => Ok(list.into_iter().nth(index)),
-        },
+        Resolution::Pick(list) => {
+            // Resolve the UI language only now that the picker will actually
+            // render (the `-r` path). The common launches never load config
+            // here — App::launch loads it once for the main UI.
+            let lang = Lang::from_env(&AgentConfig::load(workspace).config.language);
+            match run_picker(&list, lang)? {
+                StartupChoice::NewSession => Ok(None),
+                StartupChoice::Resume(index) => Ok(list.into_iter().nth(index)),
+            }
+        }
     }
 }
 
@@ -82,29 +92,41 @@ pub(crate) fn has_user_message(record: &SessionRecord) -> bool {
 }
 
 /// First user prompt, single-lined and truncated — the list title.
-pub(crate) fn session_title(record: &SessionRecord) -> String {
-    let first = record
-        .entries
-        .iter()
-        .find_map(|entry| match &entry.kind {
-            deep_code_agent::EntryKind::User { content } => Some(content.as_str()),
-            _ => None,
-        })
-        .unwrap_or("(空会话)");
+pub(crate) fn session_title(record: &SessionRecord, lang: Lang) -> String {
+    let first = record.entries.iter().find_map(|entry| match &entry.kind {
+        deep_code_agent::EntryKind::User { content } => Some(content.as_str()),
+        _ => None,
+    });
+    let first = match first {
+        Some(content) => content,
+        None => return tr(lang, TextId::EmptySessionTitle).to_string(),
+    };
     truncate(&first.split_whitespace().collect::<Vec<_>>().join(" "), 56)
 }
 
-/// Human-readable age, e.g. "刚刚 / 5 分钟前 / 3 小时前 / 2 天前". Pure.
-pub(crate) fn relative_time(now_ms: u64, then_ms: u64) -> String {
+/// Human-readable age, e.g. "刚刚 / 5 分钟前" or "just now / 5 min ago". Pure.
+pub(crate) fn relative_time(now_ms: u64, then_ms: u64, lang: Lang) -> String {
     let secs = now_ms.saturating_sub(then_ms) / 1000;
     if secs < 60 {
-        "刚刚".to_string()
+        tr(lang, TextId::TimeJustNow).to_string()
     } else if secs < 3600 {
-        format!("{} 分钟前", secs / 60)
+        tr_with(
+            lang,
+            TextId::TimeMinutesAgo,
+            &[("n", &(secs / 60).to_string())],
+        )
     } else if secs < 86_400 {
-        format!("{} 小时前", secs / 3600)
+        tr_with(
+            lang,
+            TextId::TimeHoursAgo,
+            &[("n", &(secs / 3600).to_string())],
+        )
     } else {
-        format!("{} 天前", secs / 86_400)
+        tr_with(
+            lang,
+            TextId::TimeDaysAgo,
+            &[("n", &(secs / 86_400).to_string())],
+        )
     }
 }
 
@@ -114,7 +136,7 @@ pub(crate) fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-fn run_picker(sessions: &[SessionRecord]) -> Result<StartupChoice> {
+fn run_picker(sessions: &[SessionRecord], lang: Lang) -> Result<StartupChoice> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -142,7 +164,7 @@ fn run_picker(sessions: &[SessionRecord]) -> Result<StartupChoice> {
 
             let header = Paragraph::new(vec![
                 Line::from(Span::styled(
-                    "历史会话",
+                    tr(lang, TextId::PickerTitle),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -161,8 +183,8 @@ fn run_picker(sessions: &[SessionRecord]) -> Result<StartupChoice> {
                 .skip(start)
                 .take(viewport)
                 .map(|(index, record)| {
-                    let time = relative_time(now, record.updated_at_ms);
-                    let title = session_title(record);
+                    let time = relative_time(now, record.updated_at_ms, lang);
+                    let title = session_title(record, lang);
                     if index == selected {
                         Line::from(vec![
                             Span::styled(
@@ -192,7 +214,7 @@ fn run_picker(sessions: &[SessionRecord]) -> Result<StartupChoice> {
 
             let help = Paragraph::new(vec![
                 Line::from(Span::styled(
-                    "↑/↓ 选择 · Enter 恢复 · n/Esc 新会话 · Ctrl+C 退出",
+                    tr(lang, TextId::PickerHelpStartup),
                     Style::default().fg(Color::DarkGray),
                 )),
                 Line::from(Span::styled(
@@ -296,7 +318,7 @@ mod tests {
             with_prompt("older", 100),
         ];
         match resolve(&StartupIntent::ContinueLatest, sessions) {
-            Resolution::Resume(r) => assert_eq!(session_title(&r), "recent"),
+            Resolution::Resume(r) => assert_eq!(session_title(&r, Lang::Zh), "recent"),
             other => panic!("expected Resume, got {other:?}"),
         }
     }
@@ -332,15 +354,16 @@ mod tests {
     #[test]
     fn relative_time_buckets() {
         let now = 1_000_000_000;
-        assert_eq!(relative_time(now, now), "刚刚");
-        assert_eq!(relative_time(now, now - 90_000), "1 分钟前");
-        assert_eq!(relative_time(now, now - 7_200_000), "2 小时前");
-        assert_eq!(relative_time(now, now - 2 * 86_400_000), "2 天前");
+        assert_eq!(relative_time(now, now, Lang::Zh), "刚刚");
+        assert_eq!(relative_time(now, now - 90_000, Lang::Zh), "1 分钟前");
+        assert_eq!(relative_time(now, now - 7_200_000, Lang::Zh), "2 小时前");
+        assert_eq!(relative_time(now, now - 2 * 86_400_000, Lang::Zh), "2 天前");
+        assert_eq!(relative_time(now, now - 90_000, Lang::En), "1 min ago");
     }
 
     #[test]
     fn title_uses_first_user_prompt_single_line() {
         let r = with_prompt("first\nsecond line of prompt", 1);
-        assert_eq!(session_title(&r), "first second line of prompt");
+        assert_eq!(session_title(&r, Lang::Zh), "first second line of prompt");
     }
 }

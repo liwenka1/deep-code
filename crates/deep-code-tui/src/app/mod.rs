@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use crate::active_turn::ActiveTurn;
 use crate::cli::workspace_root;
 use crate::history::{HistoryCell, hydrate_history};
+use crate::i18n::{Lang, TextId, tr, tr_with};
 
 mod completion;
 mod editor;
@@ -136,6 +137,8 @@ pub struct App {
     /// Open `/resume` modal: rendered as an in-app overlay (no alt-screen
     /// churn, so switching sessions doesn't flicker) over the live TUI.
     pub(crate) resume_picker: Option<ResumePicker>,
+    /// UI language, resolved from config at launch; `/lang` switches it live.
+    pub(crate) lang: Lang,
 }
 
 /// In-session `/resume` modal state: the resumable sessions (newest-first) and
@@ -217,14 +220,17 @@ fn welcome_cell(
     reasoning: &str,
     offline: bool,
     workspace: String,
-    session: String,
+    resumed_turns: Option<usize>,
+    persistent: bool,
 ) -> HistoryCell {
     HistoryCell::Welcome {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        model: format!("DeepSeek {model} · 推理 {reasoning}"),
+        model: model.to_string(),
+        reasoning: reasoning.to_string(),
         offline,
         workspace,
-        session,
+        resumed_turns,
+        persistent,
     }
 }
 
@@ -261,6 +267,7 @@ impl App {
         let loaded = AgentConfig::load(&workspace);
         let config_warnings = loaded.report.warnings.clone();
         let agent_config = loaded.config;
+        let lang = Lang::from_env(&agent_config.language);
         let cost_currency = agent_config.cost_currency;
         let configured_model = agent_config.model.clone();
         let configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
@@ -274,37 +281,26 @@ impl App {
         let subagent_shutdown = Some(launched.stop_hook);
         let resumed = config.resume.is_some();
         let persistent = session_id.is_some();
-        let session_summary = if resumed {
-            let turns = config
-                .resume
-                .as_ref()
-                .map(|record| {
-                    record
-                        .entries
-                        .iter()
-                        .filter(|entry| {
-                            matches!(entry.kind, deep_code_agent::EntryKind::User { .. })
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
-            format!("已恢复 · {turns} 轮对话")
-        } else if persistent {
-            "新会话 · 已持久化".to_string()
-        } else {
-            "新会话 · 未持久化".to_string()
-        };
+        let resumed_turns = config.resume.as_ref().map(|record| {
+            record
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry.kind, deep_code_agent::EntryKind::User { .. }))
+                .count()
+        });
         let mut history = vec![welcome_cell(
             &configured_model,
             &configured_reasoning,
             backend_offline,
             workspace_display,
-            session_summary,
+            resumed_turns,
+            persistent,
         )];
 
         if !config_warnings.is_empty() {
             history.push(HistoryCell::system(format!(
-                "配置警告:\n{}",
+                "{}\n{}",
+                tr(lang, TextId::ConfigWarningsHeader),
                 config_warnings.join("\n")
             )));
         }
@@ -313,14 +309,16 @@ impl App {
             history.extend(hydrate_history(record));
         }
 
-        let status = if let Some(id) = &session_id {
-            if resumed {
-                format!("Ready (resumed) - {backend_label} | session {id}")
-            } else {
-                format!("Ready - {backend_label} | session {id}")
-            }
+        // Same "{ready} - {backend}" shape event_routing builds on TurnFinished,
+        // composed from the shared Mode* keys rather than a dedicated launch key.
+        let ready = if resumed {
+            tr(lang, TextId::ModeReadyResumed)
         } else {
-            format!("Ready - {backend_label}")
+            tr(lang, TextId::ModeReady)
+        };
+        let status = match &session_id {
+            Some(id) => format!("{ready} - {backend_label} | session {id}"),
+            None => format!("{ready} - {backend_label}"),
         };
 
         Self {
@@ -365,7 +363,18 @@ impl App {
             transcript: None,
             selection: None,
             resume_picker: None,
+            lang,
         }
+    }
+
+    /// 当前语言下的文案(无参数)。
+    pub(crate) fn tr(&self, id: TextId) -> &'static str {
+        tr(self.lang, id)
+    }
+
+    /// 当前语言下的文案(带 `{name}` 插值)。
+    pub(crate) fn tr_with(&self, id: TextId, args: &[(&str, &str)]) -> String {
+        tr_with(self.lang, id, args)
     }
 
     /// Live activity label shown while streaming: an animated spinner plus
@@ -379,7 +388,13 @@ impl App {
         let elapsed = self.streaming_since?.elapsed();
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let frame = FRAMES[(elapsed.as_millis() / 120 % FRAMES.len() as u128) as usize];
-        Some(format!("{frame} 生成中 {}s", elapsed.as_secs()))
+        Some(format!(
+            "{frame} {}",
+            self.tr_with(
+                TextId::StreamingGenerating,
+                &[("secs", &elapsed.as_secs().to_string())],
+            )
+        ))
     }
 
     /// Test constructor: launch into a process-shared temp workspace so the
@@ -394,10 +409,14 @@ impl App {
             .get_or_init(|| tempfile::tempdir().expect("test workspace"))
             .path()
             .to_path_buf();
-        Self::launch(LaunchConfig {
+        let mut app = Self::launch(LaunchConfig {
             workspace: Some(workspace),
             ..LaunchConfig::default()
-        })
+        });
+        // Tests assert Chinese copy; pin the language so the developer's or
+        // CI machine's LANG can never flake them.
+        app.lang = Lang::Zh;
+        app
     }
 
     /// Drop the oldest transcript cells beyond [`MAX_HISTORY_CELLS`]. Called
@@ -427,7 +446,7 @@ impl App {
         // so the user can see what they actually sent.
         let display = self.input.trim().to_string();
         if display.is_empty() {
-            self.status = "Enter a prompt before sending.".to_string();
+            self.status = self.tr(TextId::StatusEmptyPrompt).to_string();
             return;
         }
         let sent = self.expand_pasted(&display);
@@ -450,7 +469,10 @@ impl App {
         self.scroll_offset = 0;
         self.approval_scroll_offset = 0;
         self.is_streaming = true;
-        self.status = format!("Streaming from {}...", self.backend_label);
+        self.status = self.tr_with(
+            TextId::StatusStreamingFrom,
+            &[("backend", &self.backend_label)],
+        );
 
         self.history.push(HistoryCell::user(sent.clone()));
 
@@ -475,7 +497,7 @@ impl App {
         } else if !self.input.is_empty() {
             self.clear_input();
             self.history_cursor = None;
-            self.status = "已清空输入 (再按 Esc 退出)".to_string();
+            self.status = self.tr(TextId::StatusInputClearedEsc).to_string();
         } else {
             self.should_quit = true;
         }
@@ -491,12 +513,12 @@ impl App {
             self.clear_input();
             self.history_cursor = None;
             self.ctrl_c_pending = false;
-            self.status = "已清空输入 (再按 Ctrl+C 退出)".to_string();
+            self.status = self.tr(TextId::StatusInputClearedCtrlC).to_string();
         } else if self.ctrl_c_pending {
             self.should_quit = true;
         } else {
             self.ctrl_c_pending = true;
-            self.status = "再按一次 Ctrl+C 退出".to_string();
+            self.status = self.tr(TextId::StatusCtrlCQuitConfirm).to_string();
         }
     }
 
@@ -506,7 +528,7 @@ impl App {
     }
 
     fn cancel_streaming_turn(&mut self) {
-        self.status = "正在取消本轮... (取消在工具边界生效)".to_string();
+        self.status = self.tr(TextId::StatusCancelling).to_string();
         let runtime = Arc::clone(&self.runtime);
         // The streaming loop emits TurnCancelled on the live channel that the
         // bridge task is already pumping; the receiver returned here stays
@@ -607,7 +629,7 @@ impl App {
 
     fn approval_scroll_max(&self) -> usize {
         self.approval_cell()
-            .map(|cell| cell.lines().len().saturating_sub(1))
+            .map(|cell| cell.lines(self.lang).len().saturating_sub(1))
             .unwrap_or(0)
     }
 
@@ -636,12 +658,12 @@ impl App {
         }
 
         let label = match decision {
-            ApprovalDecision::Approved => "approved",
-            ApprovalDecision::ApprovedForSession => "approved (session)",
-            ApprovalDecision::Denied => "denied",
+            ApprovalDecision::Approved => self.tr(TextId::DecisionApproved),
+            ApprovalDecision::ApprovedForSession => self.tr(TextId::DecisionApprovedSession),
+            ApprovalDecision::Denied => self.tr(TextId::DecisionDenied),
         };
         self.approval_scroll_offset = 0;
-        self.status = format!("Tool {label}, resuming...");
+        self.status = self.tr_with(TextId::StatusToolResolved, &[("decision", label)]);
         self.is_streaming = true;
         self.start_stream(StreamRequest::Approval(decision));
     }
@@ -693,9 +715,11 @@ impl App {
         // TurnStarted would silently discard it.
         self.flush_active_turn();
         self.error = Some(message.clone());
-        self.status = "Agent error.".to_string();
-        self.history
-            .push(HistoryCell::system(format!("Error: {message}")));
+        self.status = self.tr(TextId::StatusAgentError).to_string();
+        self.history.push(HistoryCell::system(format!(
+            "{}{message}",
+            self.tr(TextId::ErrorPrefix)
+        )));
         self.is_streaming = false;
         self.clear_stream_receiver();
     }
@@ -707,15 +731,15 @@ impl App {
     #[must_use]
     pub fn status_line(&self) -> String {
         let mode = if self.error.is_some() {
-            "error"
+            self.tr(TextId::ModeError)
         } else if self.pending_approval.is_some() {
-            "approval"
+            self.tr(TextId::ModeApproval)
         } else if self.is_streaming {
-            "streaming"
+            self.tr(TextId::ModeStreaming)
         } else if self.resumed {
-            "ready (resumed)"
+            self.tr(TextId::ModeReadyResumed)
         } else {
-            "ready"
+            self.tr(TextId::ModeReady)
         };
         let session = self
             .session_id

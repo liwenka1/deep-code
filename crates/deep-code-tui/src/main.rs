@@ -7,6 +7,7 @@ mod doctor_cli;
 mod eval_cli;
 mod event_routing;
 mod history;
+mod i18n;
 mod markdown;
 mod startup;
 mod ui;
@@ -19,8 +20,12 @@ async fn main() -> anyhow::Result<()> {
     let CliArgs { mode } = parse_args();
     match mode {
         RunMode::Tui { intent } => {
-            let store = JsonSessionStore::for_workspace(workspace_root())?;
-            let record = startup::choose_startup(&store, intent)?;
+            let workspace = workspace_root();
+            let store = JsonSessionStore::for_workspace(workspace.clone())?;
+            // The picker (only the `-r` path) resolves the UI language itself,
+            // lazily, from the workspace config — App::launch loads it again
+            // for the main UI.
+            let record = startup::choose_startup(&store, intent, &workspace)?;
             ui::run(app::LaunchConfig {
                 resume: record,
                 workspace: None,

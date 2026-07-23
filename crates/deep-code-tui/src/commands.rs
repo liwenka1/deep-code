@@ -1,31 +1,30 @@
 use deep_code_agent::{
-    CheckpointId, CheckpointStore, CostCurrency, JsonSessionStore, RuntimeEvent, SessionStore,
-    TurnTelemetry, format_sessions_storage_note, web_enabled,
+    CheckpointId, CheckpointStore, CostCurrency, JsonSessionStore, PrefixStatus, RuntimeEvent,
+    SessionStore, TurnTelemetry, format_sessions_storage_note, web_enabled,
 };
 
 use crate::app::App;
 use crate::history::HistoryCell;
+use crate::i18n::{Lang, TextId, tr, tr_with};
 
-/// (command, hint, takes an argument). Single source for the completion
-/// menu and `/help`.
-pub(crate) const SLASH_COMMANDS: &[(&str, &str, bool)] = &[
-    ("/help", "显示帮助", false),
-    (
-        "/clear",
-        "开启新对话：重置上下文并清屏（旧对话可 /resume 找回）",
-        false,
-    ),
-    ("/status", "显示运行状态", false),
-    ("/model", "查看/切换模型 (auto|pro|flash)", true),
-    ("/apikey", "设置 DeepSeek API key 并接入", true),
-    ("/logout", "清除 API key 回离线模式", false),
-    ("/copy", "复制最近一条助手回复到剪贴板", false),
-    ("/checkpoints", "列出 checkpoints", false),
-    ("/restore", "恢复 checkpoint <id>", true),
-    ("/resume", "选择历史会话 (或手动输入 <id>)", false),
-    ("/sessions", "列出会话", false),
-    ("/agents", "列出子代理", false),
-    ("/find", "搜索转录 <关键词>（重复执行向更早处翻）", true),
+/// (command, hint id, takes an argument). Single source for the completion
+/// menu and `/help`; hints are looked up from the language pack when the menu
+/// or `/help` text is built.
+pub(crate) const SLASH_COMMANDS: &[(&str, TextId, bool)] = &[
+    ("/help", TextId::HintHelp, false),
+    ("/clear", TextId::HintClear, false),
+    ("/status", TextId::HintStatus, false),
+    ("/model", TextId::HintModel, true),
+    ("/apikey", TextId::HintApikey, true),
+    ("/logout", TextId::HintLogout, false),
+    ("/copy", TextId::HintCopy, false),
+    ("/checkpoints", TextId::HintCheckpoints, false),
+    ("/restore", TextId::HintRestore, true),
+    ("/resume", TextId::HintResume, false),
+    ("/sessions", TextId::HintSessions, false),
+    ("/agents", TextId::HintAgents, false),
+    ("/find", TextId::HintFind, true),
+    ("/lang", TextId::HintLang, true),
 ];
 
 impl App {
@@ -81,7 +80,7 @@ impl App {
             _ if prompt.starts_with("/restore ") => {
                 let id = prompt.trim_start_matches("/restore ").trim();
                 if id.is_empty() {
-                    self.status = "Usage: /restore <checkpoint_id>".to_string();
+                    self.status = self.tr(TextId::UsageRestore).to_string();
                 } else {
                     self.restore_checkpoint(id);
                 }
@@ -90,13 +89,48 @@ impl App {
             _ if prompt == "/find" || prompt.starts_with("/find ") => {
                 let query = prompt.strip_prefix("/find").unwrap_or_default().trim();
                 if query.is_empty() {
-                    self.status = "Usage: /find <关键词>".to_string();
+                    self.status = self.tr(TextId::UsageFind).to_string();
                 } else {
                     self.find_in_transcript(query);
                 }
                 true
             }
+            _ if prompt == "/lang" || prompt.starts_with("/lang ") => {
+                let arg = prompt.strip_prefix("/lang").unwrap_or_default().trim();
+                self.set_lang_command(arg);
+                true
+            }
             _ => false,
+        }
+    }
+
+    /// `/lang`: show the current UI language; `/lang zh|en` switches it live
+    /// and persists the choice to the global config.
+    fn set_lang_command(&mut self, arg: &str) {
+        if arg.is_empty() {
+            let message = self.tr_with(TextId::LangCurrent, &[("lang", self.tr(TextId::LangName))]);
+            self.history.push(HistoryCell::system(message.clone()));
+            self.status = message;
+            return;
+        }
+        // Reuse the same tag parser as auto-detection so `/lang zh_CN`,
+        // `/lang english`, etc. resolve consistently instead of a second
+        // hardcoded "zh"/"en" table.
+        let Some(lang) = Lang::from_tag(arg) else {
+            self.status = self.tr_with(TextId::LangUnknown, &[("value", arg)]);
+            return;
+        };
+        let update = deep_code_agent::GlobalConfigUpdate::Language(lang.as_setting().to_string());
+        match deep_code_agent::write_global_config_update(&self.global_config_path, &update) {
+            Ok(_) => {
+                // Switch immediately — the transcript re-renders from
+                // structured cells, so history follows on the next frame.
+                self.lang = lang;
+                let message = tr(lang, TextId::LangSwitched).to_string();
+                self.history.push(HistoryCell::system(message.clone()));
+                self.status = message;
+            }
+            Err(message) => self.status = message,
         }
     }
 
@@ -117,12 +151,15 @@ impl App {
         match deep_code_agent::write_global_config_update(&self.global_config_path, &update) {
             Ok(path) => match self.relaunch_runtime() {
                 Ok(()) => {
-                    self.history.push(HistoryCell::system(format!(
-                        "API key 已保存至 {}（权限 600）。当前后端: {}",
-                        path.display(),
-                        self.backend_label
+                    self.history.push(HistoryCell::system(self.tr_with(
+                        TextId::ApiKeySaved,
+                        &[
+                            ("path", &path.display().to_string()),
+                            ("backend", &self.backend_label),
+                        ],
                     )));
-                    self.status = format!("已接入 - {}", self.backend_label);
+                    self.status =
+                        self.tr_with(TextId::StatusConnected, &[("backend", &self.backend_label)]);
                 }
                 Err(message) => self.status = message,
             },
@@ -142,12 +179,14 @@ impl App {
             ids.join(", ")
         };
         if arg.is_empty() {
-            self.history.push(HistoryCell::system(format!(
-                "当前模型: {}\n用法: /model <auto|pro|flash|完整 id>\n可用: {}",
-                self.configured_model,
-                available()
+            self.history.push(HistoryCell::system(self.tr_with(
+                TextId::ModelCurrent,
+                &[
+                    ("model", &self.configured_model),
+                    ("available", &available()),
+                ],
             )));
-            self.status = "Model info displayed.".to_string();
+            self.status = self.tr(TextId::StatusModelInfoShown).to_string();
             return;
         }
         let resolved = match arg.to_ascii_lowercase().as_str() {
@@ -157,7 +196,10 @@ impl App {
             _ => match registry.info_for(arg) {
                 Some(info) => info.id.clone(),
                 None => {
-                    self.status = format!("未知模型 '{arg}'。可用: {}", available());
+                    self.status = self.tr_with(
+                        TextId::ModelUnknown,
+                        &[("name", arg), ("available", &available())],
+                    );
                     return;
                 }
             },
@@ -166,9 +208,9 @@ impl App {
         match deep_code_agent::write_global_config_update(&self.global_config_path, &update) {
             Ok(_) => match self.relaunch_runtime() {
                 Ok(()) => {
-                    self.history.push(HistoryCell::system(format!(
-                        "模型已切换为 {resolved}（已写入全局配置）。当前后端: {}",
-                        self.backend_label
+                    self.history.push(HistoryCell::system(self.tr_with(
+                        TextId::ModelSwitched,
+                        &[("model", &resolved), ("backend", &self.backend_label)],
                     )));
                     self.status = format!("model = {resolved} - {}", self.backend_label);
                 }
@@ -183,10 +225,10 @@ impl App {
         match deep_code_agent::write_global_config_update(&self.global_config_path, &update) {
             Ok(_) => match self.relaunch_runtime() {
                 Ok(()) => {
-                    self.history.push(HistoryCell::system(
-                        "已清除 API key，回到离线模式。/apikey sk-xxx 可重新接入。".to_string(),
-                    ));
-                    self.status = format!("已登出 - {}", self.backend_label);
+                    self.history
+                        .push(HistoryCell::system(self.tr(TextId::LogoutDone)));
+                    self.status =
+                        self.tr_with(TextId::StatusLoggedOut, &[("backend", &self.backend_label)]);
                 }
                 Err(message) => self.status = message,
             },
@@ -202,25 +244,34 @@ impl App {
         match last {
             Some(text) => {
                 crate::clipboard::copy(&text);
-                self.status = format!("已复制最近回复到剪贴板 ({} 字)", text.chars().count());
+                self.status = self.tr_with(
+                    TextId::CopiedResponse,
+                    &[("count", &text.chars().count().to_string())],
+                );
             }
-            None => self.status = "没有可复制的助手回复".to_string(),
+            None => self.status = self.tr(TextId::NothingToCopy).to_string(),
         }
     }
 
     fn show_help(&mut self) {
-        let mut text = String::from("Commands:");
+        let mut text = self.tr(TextId::HelpHeader).to_string();
         for (command, hint, _) in SLASH_COMMANDS {
             text.push('\n');
             text.push_str(command);
             text.push_str(" - ");
-            text.push_str(hint);
+            text.push_str(tr(self.lang, *hint));
         }
-        text.push_str(
-            "\nTip: 会话存储于 .deep-code/sessions/。\nKeys: Enter send, Alt+Enter/Ctrl+J 换行, ↑↓ 滚动聊天 (多行草稿内移光标), Ctrl+P/Ctrl+N 历史, Ctrl+W 删词, Ctrl+U/K 删行, Ctrl+A/E 行首尾, Esc 取消本轮/清空输入/退出 (审批面板中为 deny), Ctrl+C 取消/清空/连按两次退出, Shift+↑/↓ 或 PageUp/PageDown 滚动正文 (鼠标可原生划选复制), y/a/n 审批, 审批面板中 ↑↓ 选择 Enter 确认.\n注意: 取消在工具边界生效，正在执行中的同步工具会先跑完；a 对 shell 按命令程序名在本会话放行（如 cargo/git，复合命令仍逐次询问）。\n配置 [approval] auto_allow 可预先放行工具前缀（仅 env 或全局配置，项目配置无效）。",
-        );
+        for note in [
+            TextId::HelpTipSessions,
+            TextId::HelpKeys,
+            TextId::HelpNoteCancel,
+            TextId::HelpNoteAutoAllow,
+        ] {
+            text.push('\n');
+            text.push_str(self.tr(note));
+        }
         self.history.push(HistoryCell::system(text));
-        self.status = "Help displayed.".to_string();
+        self.status = self.tr(TextId::StatusHelpShown).to_string();
     }
 
     fn show_status(&mut self) {
@@ -252,8 +303,19 @@ impl App {
                     telemetry.session_cache_miss_tokens,
                 )
                 .map_or_else(|| "—".to_string(), |pct| format!("{pct}%"));
+                let cache_line = self.tr_with(
+                    TextId::StatusCacheHitLine,
+                    &[
+                        ("turn", &turn_cache),
+                        ("session", &session_cache),
+                        (
+                            "saved",
+                            &telemetry.session_cache_savings.format(self.cost_currency),
+                        ),
+                    ],
+                );
                 format!(
-                    "\neffective_model={}\nroute={}\nroute_source={}\ncascade_triggered={}\nreasoning={}\nauto_reason={}\nturn_cost={}\nsession_cost={}\ncache_hit=本轮 {} · 会话 {}（已省 {}）\ncontext={}/{} ({}%)\ncompaction_near={}\nstream_retries={}{}",
+                    "\neffective_model={}\nroute={}\nroute_source={}\ncascade_triggered={}\nreasoning={}\nauto_reason={}\nturn_cost={}\nsession_cost={}\n{cache_line}\ncontext={}/{} ({}%)\ncompaction_near={}\nstream_retries={}{}",
                     telemetry.effective_model,
                     telemetry.route_label,
                     telemetry.route_source,
@@ -262,9 +324,6 @@ impl App {
                     telemetry.route_reason,
                     telemetry.turn_cost.format(self.cost_currency),
                     telemetry.session_cost.format(self.cost_currency),
-                    turn_cache,
-                    session_cache,
-                    telemetry.session_cache_savings.format(self.cost_currency),
                     telemetry.estimated_context_tokens,
                     telemetry.context_window,
                     telemetry.context_usage_percent,
@@ -275,7 +334,10 @@ impl App {
             })
             .unwrap_or_else(|| "\nlast_turn=none".to_string());
         let trimmed = if self.trimmed_cells > 0 {
-            format!("（已折叠最早 {} 条）", self.trimmed_cells)
+            self.tr_with(
+                TextId::StatusTrimmedSuffix,
+                &[("count", &self.trimmed_cells.to_string())],
+            )
         } else {
             String::new()
         };
@@ -288,20 +350,26 @@ impl App {
             self.history.len(),
             telemetry
         )));
-        self.status = format!("Status: {mode} - {}", self.backend_label);
+        self.status = self.tr_with(
+            TextId::StatusShown,
+            &[("mode", mode), ("backend", &self.backend_label)],
+        );
     }
 
     fn list_subagents(&mut self) {
         let manager = match self.subagent_manager.read() {
             Ok(manager) => manager,
             Err(error) => {
-                self.status = format!("Sub-agents unavailable: {error}");
+                self.status = self.tr_with(
+                    TextId::SubagentsUnavailable,
+                    &[("error", &error.to_string())],
+                );
                 return;
             }
         };
         let agents = manager.list_current_session();
         if agents.is_empty() {
-            self.status = "No sub-agents in this session.".to_string();
+            self.status = self.tr(TextId::NoSubagents).to_string();
             return;
         }
         let body = agents
@@ -317,12 +385,17 @@ impl App {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        self.history
-            .push(HistoryCell::system(format!("Sub-agents:\n{body}")));
-        self.status = format!(
-            "{} sub-agent(s), {} running",
-            agents.len(),
-            manager.running_count()
+        let running = manager.running_count();
+        self.history.push(HistoryCell::system(format!(
+            "{}\n{body}",
+            self.tr(TextId::SubagentsHeader)
+        )));
+        self.status = self.tr_with(
+            TextId::SubagentsCount,
+            &[
+                ("count", &agents.len().to_string()),
+                ("running", &running.to_string()),
+            ],
         );
     }
 
@@ -330,9 +403,12 @@ impl App {
         if let Ok(manager) = self.subagent_manager.read() {
             let running = manager.running_count();
             if running > 0 {
-                self.status = format!(
-                    "Ready - {} | {} sub-agent(s) running",
-                    self.backend_label, running
+                self.status = self.tr_with(
+                    TextId::StatusReadySubagents,
+                    &[
+                        ("backend", &self.backend_label),
+                        ("running", &running.to_string()),
+                    ],
                 );
             }
         }
@@ -342,12 +418,13 @@ impl App {
         match JsonSessionStore::for_workspace(self.workspace.clone()) {
             Ok(store) => match store.list() {
                 Ok(records) if records.is_empty() => {
-                    self.status = "No saved sessions.".to_string();
+                    self.status = self.tr(TextId::NoSavedSessions).to_string();
                 }
                 Ok(records) => {
                     let note = format_sessions_storage_note(&self.workspace);
                     self.history.push(HistoryCell::system(format!(
-                        "{note}\nSessions:\n{}",
+                        "{note}\n{}\n{}",
+                        self.tr(TextId::SessionsHeader),
                         records
                             .iter()
                             .map(|record| {
@@ -361,12 +438,22 @@ impl App {
                             .collect::<Vec<_>>()
                             .join("\n")
                     )));
-                    self.status =
-                        format!("{} session(s). CLI: deep-code session list", records.len());
+                    self.status = self.tr_with(
+                        TextId::SessionsCount,
+                        &[("count", &records.len().to_string())],
+                    );
                 }
-                Err(error) => self.status = format!("List failed: {error}"),
+                Err(error) => {
+                    self.status =
+                        self.tr_with(TextId::ListFailed, &[("error", &error.to_string())]);
+                }
             },
-            Err(error) => self.status = format!("Sessions unavailable: {error}"),
+            Err(error) => {
+                self.status = self.tr_with(
+                    TextId::SessionsUnavailable,
+                    &[("error", &error.to_string())],
+                );
+            }
         }
     }
 
@@ -374,21 +461,33 @@ impl App {
         match CheckpointStore::new(&self.workspace) {
             Ok(store) => match store.list() {
                 Ok(ids) if ids.is_empty() => {
-                    self.status = "No checkpoints yet.".to_string();
+                    self.status = self.tr(TextId::NoCheckpoints).to_string();
                 }
                 Ok(ids) => {
                     self.history.push(HistoryCell::system(format!(
-                        "Checkpoints:\n{}",
+                        "{}\n{}",
+                        self.tr(TextId::CheckpointsHeader),
                         ids.iter()
                             .map(|id| format!("- {}", id.0))
                             .collect::<Vec<_>>()
                             .join("\n")
                     )));
-                    self.status = format!("{} checkpoint(s).", ids.len());
+                    self.status = self.tr_with(
+                        TextId::CheckpointsCount,
+                        &[("count", &ids.len().to_string())],
+                    );
                 }
-                Err(error) => self.status = format!("List failed: {error}"),
+                Err(error) => {
+                    self.status =
+                        self.tr_with(TextId::ListFailed, &[("error", &error.to_string())]);
+                }
             },
-            Err(error) => self.status = format!("Checkpoints unavailable: {error}"),
+            Err(error) => {
+                self.status = self.tr_with(
+                    TextId::CheckpointsUnavailable,
+                    &[("error", &error.to_string())],
+                );
+            }
         }
     }
 
@@ -398,7 +497,7 @@ impl App {
         // CheckpointStore construction here.
         let checkpoint_id = CheckpointId(id.to_string());
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            self.status = "Cannot restore outside the async runtime.".to_string();
+            self.status = self.tr(TextId::RestoreOutsideRuntime).to_string();
             return;
         };
         let runtime = std::sync::Arc::clone(&self.runtime);
@@ -410,7 +509,9 @@ impl App {
                 self.last_checkpoint = Some(id.to_string());
                 self.apply_runtime_event(RuntimeEvent::WorkspaceRestored { id: checkpoint_id });
             }
-            Err(error) => self.status = format!("Restore failed: {error}"),
+            Err(error) => {
+                self.status = self.tr_with(TextId::RestoreFailed, &[("error", &error.to_string())]);
+            }
         }
     }
 }
@@ -423,12 +524,30 @@ pub(crate) fn cache_hit_percent(hit: u32, miss: u32) -> Option<u8> {
         .map(|percent| percent as u8)
 }
 
-pub(crate) fn format_turn_telemetry(telemetry: &TurnTelemetry, currency: CostCurrency) -> String {
+/// The user-facing tag for the prompt-prefix cache status. Presentation
+/// lives here, not in the agent crate — telemetry stays language-neutral.
+fn prefix_status_label(status: PrefixStatus, lang: Lang) -> &'static str {
+    match status {
+        PrefixStatus::FirstTurn => tr(lang, TextId::PrefixFirstTurn),
+        PrefixStatus::Stable => tr(lang, TextId::PrefixStable),
+        PrefixStatus::Changed => tr(lang, TextId::PrefixChanged),
+    }
+}
+
+pub(crate) fn format_turn_telemetry(
+    telemetry: &TurnTelemetry,
+    currency: CostCurrency,
+    lang: Lang,
+) -> String {
     let turn = telemetry.turn_cost.format(currency);
     let session = telemetry.session_cost.format(currency);
     let cache = match (telemetry.cache_hit_tokens, telemetry.cache_miss_tokens) {
         (Some(hit), Some(miss)) => match cache_hit_percent(hit, miss) {
-            Some(pct) => format!(" | 缓存命中 {pct}%"),
+            Some(pct) => tr_with(
+                lang,
+                TextId::TelemetryCacheHit,
+                &[("pct", &pct.to_string())],
+            ),
             None => String::new(),
         },
         _ => String::new(),
@@ -440,7 +559,7 @@ pub(crate) fn format_turn_telemetry(telemetry: &TurnTelemetry, currency: CostCur
         telemetry.context_usage_percent
     );
     let compaction = if telemetry.near_compaction_threshold {
-        " | 接近压缩阈值"
+        tr(lang, TextId::TelemetryNearCompaction)
     } else {
         ""
     };
@@ -450,22 +569,29 @@ pub(crate) fn format_turn_telemetry(telemetry: &TurnTelemetry, currency: CostCur
         .map(|reason| format!(" | {reason}"))
         .unwrap_or_default();
     let retries = if telemetry.stream_retries > 0 {
-        format!(" | 流重试 {} 次", telemetry.stream_retries)
+        tr_with(
+            lang,
+            TextId::TelemetryStreamRetries,
+            &[("count", &telemetry.stream_retries.to_string())],
+        )
     } else {
         String::new()
     };
     let cascade = if telemetry.cascade_triggered {
-        " | ⚡ 级联升级：Flash 工具调用连续失败，本会话改用 Pro"
+        tr(lang, TextId::TelemetryCascade)
     } else {
         ""
     };
+    let costs = tr_with(
+        lang,
+        TextId::TelemetryTurnSession,
+        &[("turn", &turn), ("session", &session)],
+    );
     format!(
-        " | {} | {} | 本回合 {} | 累计 {}{cache} | {context}{compaction} | {}{fallback}{retries}{cascade}",
+        " | {} | {} | {costs}{cache} | {context}{compaction} | {}{fallback}{retries}{cascade}",
         telemetry.route_label,
         telemetry.route_reason,
-        turn,
-        session,
-        telemetry.prefix_status.label_zh()
+        prefix_status_label(telemetry.prefix_status, lang)
     )
 }
 
