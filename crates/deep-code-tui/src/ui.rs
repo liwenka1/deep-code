@@ -345,6 +345,13 @@ fn drain_key_burst(first: KeyEvent) -> Result<(Vec<KeyEvent>, Option<Event>)> {
     Ok((keys, leftover))
 }
 
+/// Shift+Tab, which most terminals deliver as `BackTab` but some as `Tab` with
+/// the Shift modifier. Cycles the permission mode.
+fn is_shift_tab(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::BackTab)
+        || (matches!(key.code, KeyCode::Tab) && key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
 fn handle_key(app: &mut App, key: KeyEvent) {
     // Any key other than Ctrl+C disarms the "press again to quit" guard.
     let is_ctrl_c = matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
@@ -353,7 +360,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         app.clear_ctrl_c_guard();
     }
     // Any key other than Shift+Tab disarms the pending-Yolo confirm.
-    if !matches!(key.code, KeyCode::BackTab) {
+    if !is_shift_tab(&key) {
         app.clear_yolo_arm();
     }
 
@@ -417,9 +424,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
     }
 
+    // Shift+Tab cycles the permission mode (default → accept-edits → auto → yolo).
+    if is_shift_tab(&key) {
+        app.cycle_permission_mode();
+        return;
+    }
+
     match key.code {
-        // Shift+Tab cycles the permission mode (default → accept-edits → auto → yolo).
-        KeyCode::BackTab => app.cycle_permission_mode(),
         KeyCode::Esc => app.handle_escape(),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.handle_ctrl_c(),
         // Ctrl+V on Windows in raw mode is NOT intercepted by the terminal,
