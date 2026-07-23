@@ -329,6 +329,8 @@ text_ids! {
     SafetyGitRemoteSuggestion,
     SafetyInstallReason,
     SafetyInstallSuggestion,
+    // 运行时其它用户可见提示
+    CheckpointSnapshotFailed,
 }
 
 static ZH_JSON: &str = include_str!("../locales/zh.json");

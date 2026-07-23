@@ -226,5 +226,7 @@
   "SafetyGitRemoteReason": "git remote operations exchange code with external repos",
   "SafetyGitRemoteSuggestion": "Confirm the remote address; avoid pushing to unknown repos",
   "SafetyInstallReason": "Installing dependencies downloads and runs third-party code",
-  "SafetyInstallSuggestion": "Confirm the dependency source is trusted"
+  "SafetyInstallSuggestion": "Confirm the dependency source is trusted",
+
+  "CheckpointSnapshotFailed": "Checkpoint snapshot failed ({label}): {error}"
 }

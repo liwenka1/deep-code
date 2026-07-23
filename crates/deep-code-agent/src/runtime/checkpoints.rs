@@ -77,7 +77,11 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                     tx,
                     RuntimeEvent::Error {
                         turn_id: None,
-                        message: format!("检查点快照失败（{label}）：{error}"),
+                        message: crate::tr_with(
+                            self.ui_lang(),
+                            crate::TextId::CheckpointSnapshotFailed,
+                            &[("label", label), ("error", &error.to_string())],
+                        ),
                     },
                 );
             }
@@ -86,7 +90,11 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                     tx,
                     RuntimeEvent::Error {
                         turn_id: None,
-                        message: format!("检查点快照失败（{label}）：{join_error}"),
+                        message: crate::tr_with(
+                            self.ui_lang(),
+                            crate::TextId::CheckpointSnapshotFailed,
+                            &[("label", label), ("error", &join_error.to_string())],
+                        ),
                     },
                 );
             }

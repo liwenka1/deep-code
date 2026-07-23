@@ -226,5 +226,7 @@
   "SafetyGitRemoteReason": "git 远程操作会与外部仓库交换代码",
   "SafetyGitRemoteSuggestion": "确认远端地址，避免向未知仓库 push",
   "SafetyInstallReason": "安装依赖会下载并执行第三方代码",
-  "SafetyInstallSuggestion": "确认依赖来源可信"
+  "SafetyInstallSuggestion": "确认依赖来源可信",
+
+  "CheckpointSnapshotFailed": "检查点快照失败（{label}）：{error}"
 }
