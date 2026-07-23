@@ -12,6 +12,10 @@
 //! flags are the danger (`rm -rf`), whereas identity extraction skips flags.
 //! Trusted (allow) matching lives separately in [`super::command_shape`].
 
+use serde::{Deserialize, Serialize};
+
+use crate::i18n::TextId;
+
 /// Why a command segment was denied. The string is surfaced to the user and
 /// logged as the matched rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,19 +160,27 @@ pub fn builtin_deny(command: &str) -> Option<DenyReason> {
 /// diff the command — shell side effects are impractical to preview — it
 /// classifies by program/flag/path shape, reusing the same segment split as
 /// the deny checks so notes and denials always agree on what a segment is.
+/// One advisory note as language-neutral keys: why a command warrants review
+/// (`reason`) and how to make it safer (`suggestion`). The TUI renders both in
+/// the user's language — presentation stays out of the policy layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetyNote {
+    pub reason: TextId,
+    pub suggestion: TextId,
+}
+
+/// Internal builder that dedups notes as they are recorded.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SafetyNotes {
-    pub reasons: Vec<String>,
-    pub suggestions: Vec<String>,
+struct SafetyNotes {
+    notes: Vec<SafetyNote>,
 }
 
 impl SafetyNotes {
-    /// Record a (reason, suggestion) pair once — a repeated reason (e.g. two
-    /// network calls in one line) collapses to a single note.
-    fn note(&mut self, reason: &str, suggestion: &str) {
-        if !self.reasons.iter().any(|existing| existing == reason) {
-            self.reasons.push(reason.to_string());
-            self.suggestions.push(suggestion.to_string());
+    /// Record a note once — a repeated reason (e.g. two network calls in one
+    /// line) collapses to a single entry.
+    fn note(&mut self, reason: TextId, suggestion: TextId) {
+        if !self.notes.iter().any(|existing| existing.reason == reason) {
+            self.notes.push(SafetyNote { reason, suggestion });
         }
     }
 }
@@ -177,10 +189,13 @@ impl SafetyNotes {
 /// meaningful for commands that already need approval (denied commands never
 /// reach here). Returns empty notes for a plain, low-signal command.
 #[must_use]
-pub fn safety_notes(command: &str) -> SafetyNotes {
+pub fn safety_notes(command: &str) -> Vec<SafetyNote> {
     let mut notes = SafetyNotes::default();
     if command.contains('>') {
-        notes.note("重定向会写入或覆盖文件", "确认目标文件可以被覆盖");
+        notes.note(
+            TextId::SafetyRedirectReason,
+            TextId::SafetyRedirectSuggestion,
+        );
     }
     for segment in segments(command) {
         let Some(program) = program_of(segment) else {
@@ -199,24 +214,21 @@ pub fn safety_notes(command: &str) -> SafetyNotes {
             .any(|arg| arg.starts_with('/') || arg.starts_with('~') || arg.contains(".."))
         {
             notes.note(
-                "可能读写工作区之外的路径",
-                "确认路径必要,尽量使用工作区内的相对路径",
+                TextId::SafetyPathOutsideReason,
+                TextId::SafetyPathOutsideSuggestion,
             );
         }
 
         let subcommand = positional.first().map(String::as_str);
         match program.as_str() {
             "curl" | "wget" | "nc" | "ncat" | "ssh" | "scp" | "rsync" | "ftp" | "telnet" => {
-                notes.note(
-                    "会发起网络访问,可能上传或下载数据",
-                    "确认目标主机与传输内容可信",
-                );
+                notes.note(TextId::SafetyNetworkReason, TextId::SafetyNetworkSuggestion);
             }
             "rm" | "rmdir" | "unlink" | "shred" | "trash" => {
-                notes.note("会删除文件", "确认删除目标无误");
+                notes.note(TextId::SafetyDeleteReason, TextId::SafetyDeleteSuggestion);
             }
             "chmod" | "chown" => {
-                notes.note("会修改文件权限或属主", "确认权限改动必要");
+                notes.note(TextId::SafetyChmodReason, TextId::SafetyChmodSuggestion);
             }
             "git"
                 if matches!(
@@ -225,19 +237,19 @@ pub fn safety_notes(command: &str) -> SafetyNotes {
                 ) =>
             {
                 notes.note(
-                    "git 远程操作会与外部仓库交换代码",
-                    "确认远端地址,避免向未知仓库 push",
+                    TextId::SafetyGitRemoteReason,
+                    TextId::SafetyGitRemoteSuggestion,
                 );
             }
             "npm" | "pnpm" | "yarn" | "pip" | "pip3" | "gem" | "go" | "cargo"
                 if matches!(subcommand, Some("install" | "ci" | "add" | "get")) =>
             {
-                notes.note("安装依赖会下载并执行第三方代码", "确认依赖来源可信");
+                notes.note(TextId::SafetyInstallReason, TextId::SafetyInstallSuggestion);
             }
             _ => {}
         }
     }
-    notes
+    notes.notes
 }
 
 #[cfg(test)]
@@ -333,41 +345,37 @@ mod tests {
         assert!(!denied("python build.py"));
     }
 
+    fn has(notes: &[SafetyNote], reason: TextId) -> bool {
+        notes.iter().any(|note| note.reason == reason)
+    }
+
     #[test]
     fn safety_notes_flag_network_and_paths() {
         let notes = safety_notes("curl https://example.com -o /etc/hosts");
-        assert!(notes.reasons.iter().any(|r| r.contains("网络访问")));
-        assert!(notes.reasons.iter().any(|r| r.contains("工作区之外")));
-        // reasons and suggestions stay paired 1:1.
-        assert_eq!(notes.reasons.len(), notes.suggestions.len());
+        assert!(has(&notes, TextId::SafetyNetworkReason));
+        assert!(has(&notes, TextId::SafetyPathOutsideReason));
     }
 
     #[test]
     fn safety_notes_flag_git_push_and_deletes() {
-        assert!(
-            safety_notes("git push origin main")
-                .reasons
-                .iter()
-                .any(|r| r.contains("git 远程"))
-        );
-        assert!(
-            safety_notes("rm build.log")
-                .reasons
-                .iter()
-                .any(|r| r.contains("删除"))
-        );
-        assert!(
-            safety_notes("echo hi > out.txt")
-                .reasons
-                .iter()
-                .any(|r| r.contains("重定向"))
-        );
+        assert!(has(
+            &safety_notes("git push origin main"),
+            TextId::SafetyGitRemoteReason
+        ));
+        assert!(has(
+            &safety_notes("rm build.log"),
+            TextId::SafetyDeleteReason
+        ));
+        assert!(has(
+            &safety_notes("echo hi > out.txt"),
+            TextId::SafetyRedirectReason
+        ));
     }
 
     #[test]
     fn safety_notes_empty_for_plain_commands() {
-        assert!(safety_notes("cargo test --all").reasons.is_empty());
-        assert!(safety_notes("ls -la").reasons.is_empty());
+        assert!(safety_notes("cargo test --all").is_empty());
+        assert!(safety_notes("ls -la").is_empty());
     }
 
     #[test]
@@ -376,9 +384,8 @@ mod tests {
         let notes = safety_notes("curl http://a | curl http://b");
         assert_eq!(
             notes
-                .reasons
                 .iter()
-                .filter(|r| r.contains("网络访问"))
+                .filter(|note| note.reason == TextId::SafetyNetworkReason)
                 .count(),
             1
         );

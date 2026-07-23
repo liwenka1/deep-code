@@ -461,8 +461,7 @@ None.
             read_only: false,
             matched_rule: None,
             preview: None,
-            safety_reasons: Vec::new(),
-            safety_suggestions: Vec::new(),
+            safety_notes: Vec::new(),
         };
         // Explicitly dispatching `implementer` is the write authorization.
         assert_eq!(
@@ -491,8 +490,7 @@ None.
             read_only: false,
             matched_rule: None,
             preview: None,
-            safety_reasons: Vec::new(),
-            safety_suggestions: Vec::new(),
+            safety_notes: Vec::new(),
         };
         assert_eq!(
             runtime.subagent_approval_decision(&shell_request, SubAgentRole::Implementer),

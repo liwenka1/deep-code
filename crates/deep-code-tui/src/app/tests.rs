@@ -166,8 +166,7 @@ fn approval_scroll_helpers_adjust_panel_offset() {
         read_only: false,
         matched_rule: Some("write".to_string()),
         preview: None,
-        safety_reasons: Vec::new(),
-        safety_suggestions: Vec::new(),
+        safety_notes: Vec::new(),
     });
     for _ in 0..10 {
         app.scroll_approval_down();
@@ -638,8 +637,7 @@ async fn approval_a_key_resolves_for_session() {
         read_only: true,
         matched_rule: None,
         preview: None,
-        safety_reasons: Vec::new(),
-        safety_suggestions: Vec::new(),
+        safety_notes: Vec::new(),
     });
 
     app.approve_pending_tool_for_session();
@@ -987,8 +985,7 @@ fn approval_events_render_pending_and_resolved_tool_metadata() {
             read_only: false,
             matched_rule: Some("write".to_string()),
             preview: None,
-            safety_reasons: Vec::new(),
-            safety_suggestions: Vec::new(),
+            safety_notes: Vec::new(),
         },
     });
 

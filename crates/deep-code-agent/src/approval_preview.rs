@@ -12,6 +12,7 @@ use std::path::Path;
 use serde_json::Value;
 use similar::TextDiff;
 
+use crate::i18n::{Lang, TextId, tr, tr_with};
 use crate::tool::ToolCall;
 use crate::workspace_policy::WorkspacePolicy;
 
@@ -24,12 +25,16 @@ const NEW_FILE_HEAD_LINES: usize = 20;
 /// Best-effort preview: `None` means "nothing to add beyond the arguments"
 /// (unknown tool, unresolvable path, malformed args) — approval proceeds with
 /// the raw-argument display as before.
-pub(crate) fn build_approval_preview(call: &ToolCall, workspace: &Path) -> Option<String> {
+pub(crate) fn build_approval_preview(
+    call: &ToolCall,
+    workspace: &Path,
+    lang: Lang,
+) -> Option<String> {
     match call.name.as_str() {
         "apply_patch" => {
             let old = string_arg(&call.arguments, "old")?;
             let new = string_arg(&call.arguments, "new")?;
-            Some(clamp_preview(&unified_diff(old, new)))
+            Some(clamp_preview(&unified_diff(old, new), lang))
         }
         "write_file" => {
             let rel = string_arg(&call.arguments, "path")?;
@@ -38,43 +43,54 @@ pub(crate) fn build_approval_preview(call: &ToolCall, workspace: &Path) -> Optio
             // preview never reads paths the execution would reject.
             let policy = WorkspacePolicy::new(workspace.to_path_buf()).ok()?;
             let path = policy.resolve_for_write(rel, "write_file").ok()?;
-            Some(write_file_preview(&path, content))
+            Some(write_file_preview(&path, content, lang))
         }
         _ => None,
     }
 }
 
-fn write_file_preview(path: &Path, content: &str) -> String {
+fn write_file_preview(path: &Path, content: &str, lang: Lang) -> String {
     if !path.exists() {
         let total = content.lines().count();
-        let mut out = format!("新文件 · {total} 行\n");
+        let mut out = format!(
+            "{}\n",
+            tr_with(
+                lang,
+                TextId::PreviewNewFile,
+                &[("total", &total.to_string())]
+            )
+        );
         for line in content.lines().take(NEW_FILE_HEAD_LINES) {
             out.push_str("+ ");
             out.push_str(line);
             out.push('\n');
         }
         if total > NEW_FILE_HEAD_LINES {
-            out.push_str(&format!("…(+{} 行未显示)", total - NEW_FILE_HEAD_LINES));
+            out.push_str(&tr_with(
+                lang,
+                TextId::PreviewMoreLines,
+                &[("count", &(total - NEW_FILE_HEAD_LINES).to_string())],
+            ));
         }
-        return clamp_preview(&out);
+        return clamp_preview(&out, lang);
     }
     match fs::metadata(path) {
         Ok(metadata) if metadata.len() > MAX_SOURCE_BYTES => {
-            return "(现有文件超过 2 MiB，略过 diff 预览)".to_string();
+            return tr(lang, TextId::PreviewFileTooBig).to_string();
         }
-        Err(_) => return "(无法读取现有文件，略过 diff 预览)".to_string(),
+        Err(_) => return tr(lang, TextId::PreviewReadFail).to_string(),
         Ok(_) => {}
     }
     match fs::read_to_string(path) {
         Ok(existing) => {
             let diff = unified_diff(&existing, content);
             if diff.trim().is_empty() {
-                "(内容与现有文件一致，无变更)".to_string()
+                tr(lang, TextId::PreviewNoChange).to_string()
             } else {
-                clamp_preview(&diff)
+                clamp_preview(&diff, lang)
             }
         }
-        Err(_) => "(现有文件非 UTF-8，略过 diff 预览)".to_string(),
+        Err(_) => tr(lang, TextId::PreviewNotUtf8).to_string(),
     }
 }
 
@@ -90,7 +106,7 @@ fn string_arg<'a>(arguments: &'a Value, field: &str) -> Option<&'a str> {
 }
 
 /// Bound the preview for UI display: line cap first, then byte cap.
-fn clamp_preview(preview: &str) -> String {
+fn clamp_preview(preview: &str, lang: Lang) -> String {
     let lines: Vec<&str> = preview.lines().collect();
     let mut out = String::new();
     let mut shown = 0usize;
@@ -103,7 +119,11 @@ fn clamp_preview(preview: &str) -> String {
         shown += 1;
     }
     if shown < lines.len() {
-        out.push_str(&format!("…(+{} 行未显示)", lines.len() - shown));
+        out.push_str(&tr_with(
+            lang,
+            TextId::PreviewMoreLines,
+            &[("count", &(lines.len() - shown).to_string())],
+        ));
     } else if out.ends_with('\n') {
         out.pop();
     }
@@ -128,6 +148,7 @@ mod tests {
                 json!({"path": "a.rs", "old": "fn old() {}", "new": "fn new() {}"}),
             ),
             workspace.path(),
+            Lang::Zh,
         )
         .unwrap();
         assert!(preview.contains("-fn old() {}"), "{preview}");
@@ -144,6 +165,7 @@ mod tests {
                 json!({"path": "note.txt", "content": "one\nthree\n"}),
             ),
             workspace.path(),
+            Lang::Zh,
         )
         .unwrap();
         assert!(preview.contains("-two"), "{preview}");
@@ -159,6 +181,7 @@ mod tests {
                 json!({"path": "fresh.txt", "content": "hello\nworld\n"}),
             ),
             workspace.path(),
+            Lang::Zh,
         )
         .unwrap();
         assert!(preview.starts_with("新文件 · 2 行"), "{preview}");
@@ -175,6 +198,7 @@ mod tests {
         let preview = build_approval_preview(
             &call("write_file", json!({"path": "big.txt", "content": content})),
             workspace.path(),
+            Lang::Zh,
         )
         .unwrap();
         assert!(preview.lines().count() <= MAX_PREVIEW_LINES + 2);
@@ -191,6 +215,7 @@ mod tests {
                     json!({"path": "../outside.txt", "content": "x"}),
                 ),
                 workspace.path(),
+                Lang::Zh,
             )
             .is_none()
         );
@@ -200,8 +225,12 @@ mod tests {
     fn unknown_tools_produce_no_preview() {
         let workspace = tempfile::tempdir().unwrap();
         assert!(
-            build_approval_preview(&call("shell", json!({"command": "ls"})), workspace.path())
-                .is_none()
+            build_approval_preview(
+                &call("shell", json!({"command": "ls"})),
+                workspace.path(),
+                Lang::Zh
+            )
+            .is_none()
         );
     }
 }

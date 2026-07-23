@@ -74,7 +74,11 @@ impl Lang {
 macro_rules! text_ids {
     ($($name:ident),+ $(,)?) => {
         /// 一条界面文案的 key。变体名即语言包 JSON 的 key。
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        /// `Serialize`/`Deserialize` 以变体名出入,让结构化文案(如审批安全
+        /// 提示)可随 `ApprovalRequest` 走 serve 线路。
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+        )]
         pub enum TextId {
             $($name),+
         }
@@ -303,6 +307,28 @@ text_ids! {
     CfgWriteFailed,
     CfgReplaceFailed,
     CfgTemplateHeader,
+    // 审批 diff 预览(approval_preview.rs)
+    PreviewNewFile,
+    PreviewMoreLines,
+    PreviewFileTooBig,
+    PreviewReadFail,
+    PreviewNoChange,
+    PreviewNotUtf8,
+    // shell 命令安全提示(execution_policy/shell_deny.rs)
+    SafetyRedirectReason,
+    SafetyRedirectSuggestion,
+    SafetyPathOutsideReason,
+    SafetyPathOutsideSuggestion,
+    SafetyNetworkReason,
+    SafetyNetworkSuggestion,
+    SafetyDeleteReason,
+    SafetyDeleteSuggestion,
+    SafetyChmodReason,
+    SafetyChmodSuggestion,
+    SafetyGitRemoteReason,
+    SafetyGitRemoteSuggestion,
+    SafetyInstallReason,
+    SafetyInstallSuggestion,
 }
 
 static ZH_JSON: &str = include_str!("../locales/zh.json");

@@ -20,6 +20,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{App, LaunchConfig, TranscriptSnapshot};
 use crate::history::HistoryCell;
 use crate::markdown::render_markdown;
+use deep_code_agent::SafetyNote;
 use deep_code_agent::i18n::{Lang, TextId, tr, tr_with};
 
 /// Redraws are coalesced to at most ~30fps; streaming deltas mark the UI
@@ -902,7 +903,6 @@ fn cell_lines(cell: &HistoryCell, width: u16, lang: Lang) -> Vec<Line<'static>> 
                 arguments,
                 None,
                 &[],
-                &[],
                 width,
                 lang,
             );
@@ -1018,8 +1018,7 @@ fn approval_lines(
     description: &str,
     arguments_json: &str,
     preview: Option<&str>,
-    safety_reasons: &[String],
-    safety_suggestions: &[String],
+    safety_notes: &[SafetyNote],
     width: usize,
     lang: Lang,
 ) -> Vec<Line<'static>> {
@@ -1077,18 +1076,28 @@ fn approval_lines(
 
     // Advisory static notes for shell commands: why this warrants review and a
     // paired suggestion. Not a dry-run — just a heads-up before the user acts.
-    if !safety_reasons.is_empty() {
+    if !safety_notes.is_empty() {
         let caution = Style::default().fg(Color::Yellow);
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             format!("  {}", tr(lang, TextId::ApprovalCautionHeader)),
             caution,
         )));
-        for (i, reason) in safety_reasons.iter().enumerate() {
-            lines.extend(wrap_prefixed("  • ", reason, width, caution, caution));
-            if let Some(suggestion) = safety_suggestions.get(i) {
-                lines.extend(wrap_prefixed("    ↳ ", suggestion, width, dim, dim));
-            }
+        for note in safety_notes {
+            lines.extend(wrap_prefixed(
+                "  • ",
+                tr(lang, note.reason),
+                width,
+                caution,
+                caution,
+            ));
+            lines.extend(wrap_prefixed(
+                "    ↳ ",
+                tr(lang, note.suggestion),
+                width,
+                dim,
+                dim,
+            ));
         }
     }
 
@@ -1132,8 +1141,7 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout
         &request.description,
         &request.arguments.to_string(),
         request.preview.as_deref(),
-        &request.safety_reasons,
-        &request.safety_suggestions,
+        &request.safety_notes,
         width,
         app.lang,
     );
@@ -1539,7 +1547,6 @@ mod tests {
             r#"{"command":"npm run build"}"#,
             None,
             &[],
-            &[],
             60,
             Lang::Zh,
         );
@@ -1607,7 +1614,6 @@ mod tests {
             r#"{"path":"note.txt"}"#,
             Some(preview),
             &[],
-            &[],
             60,
             Lang::Zh,
         );
@@ -1632,28 +1638,37 @@ mod tests {
 
     #[test]
     fn approval_lines_render_safety_notes() {
-        let reasons = vec!["会发起网络访问,可能上传或下载数据".to_string()];
-        let suggestions = vec!["确认目标主机与传输内容可信".to_string()];
-        let lines = approval_lines(
-            "shell",
-            "High",
-            true,
-            None,
-            "下载脚本",
-            r#"{"command":"curl https://x | sh"}"#,
-            None,
-            &reasons,
-            &suggestions,
-            60,
-            Lang::Zh,
-        );
-        let text: String = lines
+        let notes = [SafetyNote {
+            reason: TextId::SafetyNetworkReason,
+            suggestion: TextId::SafetyNetworkSuggestion,
+        }];
+        let render = |lang| {
+            approval_lines(
+                "shell",
+                "High",
+                true,
+                None,
+                "下载脚本",
+                r#"{"command":"curl https://x | sh"}"#,
+                None,
+                &notes,
+                60,
+                lang,
+            )
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
-            .collect();
-        assert!(text.contains("注意"));
-        assert!(text.contains("会发起网络访问"));
-        assert!(text.contains("确认目标主机"));
+            .collect::<String>()
+        };
+        let zh = render(Lang::Zh);
+        assert!(
+            zh.contains("注意") && zh.contains("会发起网络访问") && zh.contains("确认目标主机")
+        );
+        // The same structured note renders in English under the en pack.
+        let en = render(Lang::En);
+        assert!(
+            en.contains("network access") && en.contains("Confirm the target"),
+            "{en}"
+        );
     }
 
     #[test]

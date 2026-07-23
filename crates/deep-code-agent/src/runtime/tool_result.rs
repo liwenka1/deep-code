@@ -264,10 +264,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                     }
                     // File I/O for a bounded diff at a human-in-the-loop
                     // pause: cheap relative to the wait, so no spawn_blocking.
-                    request.preview = self
-                        .workspace
-                        .as_deref()
-                        .and_then(|ws| crate::approval_preview::build_approval_preview(&call, ws));
+                    request.preview = self.workspace.as_deref().and_then(|ws| {
+                        crate::approval_preview::build_approval_preview(&call, ws, self.ui_lang())
+                    });
                     {
                         let mut state = self.state.lock().await;
                         state.pending = Some(PendingToolBatch {
@@ -399,10 +398,9 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
                     .await;
             }
             Ok(ToolRunOutcome::ApprovalRequired { mut request }) => {
-                request.preview = self
-                    .workspace
-                    .as_deref()
-                    .and_then(|ws| crate::approval_preview::build_approval_preview(&current, ws));
+                request.preview = self.workspace.as_deref().and_then(|ws| {
+                    crate::approval_preview::build_approval_preview(&current, ws, self.ui_lang())
+                });
                 {
                     let mut state = self.state.lock().await;
                     state.pending = Some(PendingToolBatch {

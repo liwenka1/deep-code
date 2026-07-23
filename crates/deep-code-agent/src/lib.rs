@@ -49,7 +49,7 @@ pub use config::{
 pub use doctor::{ConfigLayersDoctorReport, DoctorReport, default_config_path};
 pub use error::AgentResult;
 pub use event::AgentEvent;
-pub use execution_policy::{ExecPolicy, PolicyVerdict, RiskLevel};
+pub use execution_policy::{ExecPolicy, PolicyVerdict, RiskLevel, SafetyNote};
 pub use i18n::{Lang, TextId, tr, tr_with};
 pub use message::Message;
 pub use model::{
