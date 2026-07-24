@@ -88,7 +88,11 @@ pub async fn approves<C: LlmClient + ?Sized>(
     // out of its fence, then bound the length. The fence + system-prompt make
     // the action untrusted data rather than instructions.
     let action = truncate_chars(
-        &input.action.split_whitespace().collect::<Vec<_>>().join(" "),
+        &input
+            .action
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
         MAX_ACTION_CHARS,
     );
     let user = format!(

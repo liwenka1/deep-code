@@ -291,8 +291,12 @@ fn deny_pipe_to_shell(command: &str) -> Option<DenyReason> {
         return None;
     }
     let parts: Vec<&str> = command.split('|').map(str::trim).collect();
-    let fetches =
-        |seg: &str| matches!(effective_program(seg).as_deref(), Some("curl" | "wget" | "fetch"));
+    let fetches = |seg: &str| {
+        matches!(
+            effective_program(seg).as_deref(),
+            Some("curl" | "wget" | "fetch")
+        )
+    };
     let is_shell = |seg: &str| {
         matches!(
             effective_program(seg).as_deref(),
@@ -799,8 +803,12 @@ mod tests {
         // A path smuggled into a `--flag=value` or `-fVALUE` token must be
         // inspected too, not skipped as "just a flag" — otherwise a workspace
         // file gets moved/copied OUT of the workspace, auto-approved.
-        assert!(!is_workspace_fs_edit("mv --target-directory=/tmp/exfil secret.env"));
-        assert!(!is_workspace_fs_edit("cp --target-directory=/tmp/exfil secret.env"));
+        assert!(!is_workspace_fs_edit(
+            "mv --target-directory=/tmp/exfil secret.env"
+        ));
+        assert!(!is_workspace_fs_edit(
+            "cp --target-directory=/tmp/exfil secret.env"
+        ));
         assert!(!is_workspace_fs_edit("mv -t/tmp/exfil a.txt"));
         assert!(!is_workspace_fs_edit("cp --target-directory=~/out a.txt"));
         // The space-separated form was already caught (abs path is its own
