@@ -805,7 +805,9 @@ mod tests {
         );
         assert_eq!(
             ToolCx::new().with_plan(plan(true, false)).sandbox_policy(),
-            SandboxPolicy::workspace_write()
+            SandboxPolicy::WorkspaceWrite {
+                network_access: true
+            }
         );
         assert_eq!(
             ToolCx::new().with_plan(plan(false, false)).sandbox_policy(),

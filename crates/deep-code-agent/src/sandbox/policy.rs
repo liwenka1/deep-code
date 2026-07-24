@@ -46,7 +46,15 @@ impl SandboxPolicy {
     pub fn from_execution_plan(plan: Option<&ToolExecutionPlan>) -> Self {
         match plan {
             Some(plan) if plan.requires_sandbox && plan.read_only => Self::ReadOnly,
-            Some(plan) if plan.requires_sandbox => Self::workspace_write(),
+            // An approved or trusted shell command runs with network access.
+            // The sandbox's real job is filesystem containment + credential
+            // protection (both preserved below); blocking egress here only
+            // breaks `git push` / package installs / `cargo build` while reads
+            // stay open and the gated web tools remain reachable — so it buys
+            // little real secrecy at a large usability cost.
+            Some(plan) if plan.requires_sandbox => Self::WorkspaceWrite {
+                network_access: true,
+            },
             _ => Self::Unsandboxed,
         }
     }
@@ -95,9 +103,15 @@ mod tests {
             SandboxPolicy::from_execution_plan(Some(&plan(true, true))),
             SandboxPolicy::ReadOnly
         ));
-        assert!(matches!(
+        // A sandboxed, writable (shell) command is granted network access so
+        // git push / installs / cargo build work; filesystem confinement and
+        // the credential-dir write denials are unaffected.
+        assert_eq!(
             SandboxPolicy::from_execution_plan(Some(&plan(true, false))),
-            SandboxPolicy::WorkspaceWrite { .. }
-        ));
+            SandboxPolicy::WorkspaceWrite {
+                network_access: true
+            }
+        );
+        assert!(SandboxPolicy::from_execution_plan(Some(&plan(true, false))).has_network_access());
     }
 }
