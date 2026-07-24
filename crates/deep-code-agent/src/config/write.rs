@@ -143,10 +143,16 @@ fn new_config_template(lang: Lang) -> String {
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    // `mode(0o600)` only applies to a freshly created file. A stale tmp left by
+    // a prior crash (possibly 0644) would be reused and keep the key briefly
+    // world-readable — the exact window this helper exists to close — so drop it
+    // first and let `create_new` guarantee a brand-new 0600 file.
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
     let mut file = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)?;
     file.write_all(contents.as_bytes())
