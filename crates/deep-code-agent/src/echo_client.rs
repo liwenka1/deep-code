@@ -5,6 +5,7 @@
 //! returns a fixed setup hint instead of pretending to work.
 
 use async_stream::try_stream;
+use async_trait::async_trait;
 
 use crate::client::{AgentEventStream, LlmClient};
 use crate::error::AgentResult;
@@ -30,6 +31,7 @@ impl EchoClient {
     }
 }
 
+#[async_trait]
 impl LlmClient for EchoClient {
     fn provider_name(&self) -> &'static str {
         Self::PROVIDER

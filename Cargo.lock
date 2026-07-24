@@ -404,6 +404,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-stream",
+ "async-trait",
  "axum",
  "chrono",
  "deep-code-agent",

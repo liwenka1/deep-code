@@ -3,7 +3,6 @@ use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 
 use crate::model_route::{RouteContext, resolve_turn_route};
-use crate::client::LlmClient;
 use crate::compaction::{estimate_token_count, stable_prefix_fingerprint};
 use crate::event::AgentEvent;
 use crate::model::{ChatRequest, Usage};
@@ -13,7 +12,7 @@ use crate::runtime::event::{RuntimeEvent, ToolCallId, emit};
 use crate::runtime::tool_result::{BatchOutcome, runtime_error_from_tool_error, tool_call_payload};
 use crate::tool::ToolCallAccumulator;
 
-impl<C: LlmClient + 'static> AgentRuntime<C> {
+impl AgentRuntime {
     /// UI language for user-facing runtime text (error diagnostics, approval
     /// previews). Reads the shared [`crate::i18n::SharedLang`] atomic that the
     /// TUI flips on `/lang` via the runtime handle, so a switch is picked up by

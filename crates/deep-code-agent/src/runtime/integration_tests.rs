@@ -38,6 +38,7 @@ impl ScriptedClient {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmClient for ScriptedClient {
     fn provider_name(&self) -> &'static str {
         "scripted"
@@ -1376,6 +1377,7 @@ impl FallbackTestClient {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmClient for FallbackTestClient {
     fn provider_name(&self) -> &'static str {
         "fallback-test"
@@ -1467,6 +1469,7 @@ async fn unauthorized_api_error_does_not_fallback() {
         calls: Arc<Mutex<u32>>,
     }
 
+    #[async_trait::async_trait]
     impl LlmClient for AuthFailClient {
         fn provider_name(&self) -> &'static str {
             "auth-fail"
@@ -1803,6 +1806,7 @@ impl HangThenRecoverClient {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmClient for HangThenRecoverClient {
     fn provider_name(&self) -> &'static str {
         "hang-then-recover"
@@ -1959,6 +1963,7 @@ impl AttemptScriptClient {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmClient for AttemptScriptClient {
     fn provider_name(&self) -> &'static str {
         "attempt-script"

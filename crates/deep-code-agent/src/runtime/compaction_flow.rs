@@ -1,11 +1,10 @@
 use tokio::sync::mpsc;
 
-use crate::client::LlmClient;
 use crate::compaction::{compact_entries, should_compact};
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, emit};
 
-impl<C: LlmClient + 'static> AgentRuntime<C> {
+impl AgentRuntime {
     pub(super) async fn maybe_compact(
         &self,
         model: &str,

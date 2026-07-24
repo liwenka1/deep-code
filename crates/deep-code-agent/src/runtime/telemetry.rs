@@ -1,12 +1,11 @@
 use crate::model_route::TurnRoute;
-use crate::client::LlmClient;
 use crate::compaction::{context_usage_percent, effective_compaction_threshold};
 use crate::model::Usage;
 use crate::model_registry::context_window_for_model;
 use crate::pricing::{PrefixStatus, TurnTelemetry, calculate_turn_cost};
 use crate::runtime::AgentRuntime;
 
-impl<C: LlmClient + 'static> AgentRuntime<C> {
+impl AgentRuntime {
     pub(super) async fn build_turn_telemetry(
         &self,
         route: &TurnRoute,

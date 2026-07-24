@@ -3,9 +3,9 @@
 //! This module is intentionally thin: the agent runtime owns the model loop,
 //! tool registry, session, and approval gating. The UI only has to:
 //!
-//! 1. forward user prompts via [`AgentRuntimeHandle::submit_user`],
+//! 1. forward user prompts via [`AgentRuntime::submit_user`],
 //! 2. render [`RuntimeEvent`]s as they arrive,
-//! 3. forward approval decisions via [`AgentRuntimeHandle::submit_approval`].
+//! 3. forward approval decisions via [`AgentRuntime::submit_approval`].
 
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use crate::ui::{COMPOSER_MAX_VISIBLE_ROWS, layout_input};
 use deep_code_agent::{
-    AgentConfig, AgentRuntimeHandle, ApprovalDecision, ApprovalRequest, CostCurrency,
+    AgentConfig, AgentRuntime, ApprovalDecision, ApprovalRequest, CostCurrency,
     JsonSessionStore, LaunchedRuntime, RuntimeEvent, SessionRecord, SessionStore,
     SharedSubAgentManager, TurnTelemetry, default_config_path, launch_runtime,
 };
@@ -101,7 +101,7 @@ pub struct App {
     /// Currently highlighted approval option: 0 = y (approve), 1 = a (session),
     /// 2 = n (deny). Navigated with ↑/↓, acted on with Enter.
     pub approval_focus: usize,
-    pub(crate) runtime: Arc<dyn AgentRuntimeHandle>,
+    pub(crate) runtime: Arc<AgentRuntime>,
     pub(crate) backend_label: String,
     pub(crate) backend_offline: bool,
     pub(crate) subagent_manager: SharedSubAgentManager,

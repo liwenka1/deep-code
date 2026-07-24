@@ -4,13 +4,12 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::checkpoint::{CheckpointId, CheckpointStore};
-use crate::client::LlmClient;
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, emit};
 use crate::session_store::CheckpointRecord;
 use crate::tool::ToolError;
 
-impl<C: LlmClient + 'static> AgentRuntime<C> {
+impl AgentRuntime {
     /// Enable automatic before/after turn snapshots for the given workspace
     /// root.
     ///

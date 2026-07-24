@@ -807,6 +807,7 @@ mod tests {
         turns: StdMutex<u32>,
     }
 
+    #[async_trait::async_trait]
     impl deep_code_agent::LlmClient for ToolCallingClient {
         fn provider_name(&self) -> &'static str {
             "scripted"

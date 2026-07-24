@@ -13,7 +13,6 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::client::LlmClient;
 use crate::runtime::AgentRuntime;
 use crate::subagent::manager::{new_agent_id, now_ms};
 use crate::subagent::registry::{SubAgentServices, child_system_prompt, child_tool_registry};
@@ -43,12 +42,12 @@ fn tool_error(error: SubAgentError) -> ToolError {
     }
 }
 
-pub struct AgentTool<C: LlmClient + Clone + 'static> {
-    services: std::sync::Arc<SubAgentServices<C>>,
+pub struct AgentTool {
+    services: std::sync::Arc<SubAgentServices>,
 }
 
-impl<C: LlmClient + Clone + 'static> AgentTool<C> {
-    pub fn new(services: std::sync::Arc<SubAgentServices<C>>) -> Self {
+impl AgentTool {
+    pub fn new(services: std::sync::Arc<SubAgentServices>) -> Self {
         Self { services }
     }
 }
@@ -67,7 +66,7 @@ pub struct AgentParams {
 }
 
 #[async_trait]
-impl<C: LlmClient + Clone + 'static> Tool for AgentTool<C> {
+impl Tool for AgentTool {
     type Params = AgentParams;
 
     fn name(&self) -> &str {
@@ -104,8 +103,8 @@ impl<C: LlmClient + Clone + 'static> Tool for AgentTool<C> {
             name: AGENT_TOOL.to_string(),
             message: error.to_string(),
         })?;
-        let runtime = AgentRuntime::with_system_prompt(
-            (*self.services.client).clone(),
+        let runtime = AgentRuntime::with_system_prompt_shared(
+            std::sync::Arc::clone(&self.services.client),
             child_tools,
             child_system_prompt(role),
             self.services.agent_config.clone(),

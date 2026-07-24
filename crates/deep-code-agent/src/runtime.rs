@@ -16,7 +16,6 @@ mod checkpoints;
 mod compaction_flow;
 mod diagnostics;
 mod event;
-mod handle;
 mod persistence;
 mod persistence_actor;
 mod state;
@@ -44,14 +43,13 @@ use crate::session_store::{TurnRecord, now_ms};
 use crate::tool::{ApprovalDecision, ApprovalRequest, ToolCall, ToolRegistry};
 use event::emit;
 pub use event::{RuntimeEvent, RuntimeEventReceiver, ToolCallId, TurnId};
-pub use handle::AgentRuntimeHandle;
 use state::{Persistence, RuntimeState};
 
 /// Agent runtime tying together [`LlmClient`], [`ToolRegistry`], and [`Session`].
 ///
 /// Cheap to clone: state is behind an [`Arc`]/[`Mutex`].
-pub struct AgentRuntime<C: LlmClient + 'static> {
-    client: Arc<C>,
+pub struct AgentRuntime {
+    client: Arc<dyn LlmClient>,
     config: AgentConfig,
     registry: ModelRegistry,
     is_subagent: bool,
@@ -74,7 +72,7 @@ pub struct AgentRuntime<C: LlmClient + 'static> {
 // Manual `Clone` to avoid the auto-derived `where C: Clone` bound that the
 // compiler would otherwise add. `client` is already an `Arc<C>`, so cloning
 // the runtime never requires cloning `C` itself.
-impl<C: LlmClient + 'static> Clone for AgentRuntime<C> {
+impl Clone for AgentRuntime {
     fn clone(&self) -> Self {
         Self {
             client: Arc::clone(&self.client),
@@ -93,12 +91,16 @@ impl<C: LlmClient + 'static> Clone for AgentRuntime<C> {
     }
 }
 
-impl<C: LlmClient + 'static> AgentRuntime<C> {
-    pub fn new(client: C, tools: ToolRegistry) -> Self {
+impl AgentRuntime {
+    pub fn new<C: LlmClient + 'static>(client: C, tools: ToolRegistry) -> Self {
         Self::with_config(client, tools, AgentConfig::default())
     }
 
-    pub fn with_config(client: C, tools: ToolRegistry, config: AgentConfig) -> Self {
+    pub fn with_config<C: LlmClient + 'static>(
+        client: C,
+        tools: ToolRegistry,
+        config: AgentConfig,
+    ) -> Self {
         Self {
             client: Arc::new(client),
             config: config.clone(),
@@ -115,8 +117,21 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         }
     }
 
-    pub fn with_system_prompt(
+    pub fn with_system_prompt<C: LlmClient + 'static>(
         client: C,
+        tools: ToolRegistry,
+        system: impl Into<String>,
+        config: AgentConfig,
+        is_subagent: bool,
+    ) -> Self {
+        Self::with_system_prompt_shared(Arc::new(client), tools, system, config, is_subagent)
+    }
+
+    /// Like [`Self::with_system_prompt`] but from an already-shared client, so a
+    /// child agent reuses the parent's `Arc<dyn LlmClient>` rather than cloning
+    /// the concrete client.
+    pub fn with_system_prompt_shared(
+        client: Arc<dyn LlmClient>,
         tools: ToolRegistry,
         system: impl Into<String>,
         config: AgentConfig,
@@ -128,7 +143,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
             session.push_system(system_text);
         }
         Self {
-            client: Arc::new(client),
+            client,
             config: config.clone(),
             registry: ModelRegistry::default(),
             is_subagent,
@@ -187,7 +202,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
     /// Update the cached UI language live (the TUI calls this on `/lang` via the
     /// runtime handle). A lock-free store, so the next user-facing string the
     /// runtime renders picks it up without a relaunch.
-    pub(crate) fn set_ui_lang(&self, lang: crate::i18n::Lang) {
+    pub fn set_ui_lang(&self, lang: crate::i18n::Lang) {
         self.ui_lang.set(lang);
     }
 

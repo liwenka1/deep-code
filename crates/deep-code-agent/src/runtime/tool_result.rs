@@ -7,7 +7,6 @@ use tokio_util::sync::CancellationToken;
 use crate::execution_policy::{PermissionMode, RiskLevel, accept_edits_approvable, command_shape};
 use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_FLASH};
 
-use crate::client::LlmClient;
 use crate::lsp::{is_edit_tool, render_blocks, summarize_blocks};
 use crate::model::{ToolCallFunctionPayload, ToolCallPayload};
 use crate::runtime::AgentRuntime;
@@ -124,7 +123,7 @@ fn tool_progress_fn(
     })
 }
 
-impl<C: LlmClient + 'static> AgentRuntime<C> {
+impl AgentRuntime {
     /// Execute one tool call with the turn's cancellation token and a progress
     /// bridge attached. Cancellation still lands at call boundaries: the tool
     /// runs to completion so its recorded result stays paired with the

@@ -23,9 +23,9 @@ fn build_persistence(store: JsonSessionStore, record: SessionRecord) -> Arc<Pers
     Arc::new(Persistence { record, actor })
 }
 
-impl<C: LlmClient + 'static> AgentRuntime<C> {
+impl AgentRuntime {
     /// Create a runtime backed by a new on-disk session in the workspace.
-    pub fn with_new_session(
+    pub fn with_new_session<C: LlmClient + 'static>(
         client: C,
         tools: ToolRegistry,
         system: impl Into<String>,
@@ -49,7 +49,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
 
     /// Resume a runtime from a previously saved session record.
     #[must_use]
-    pub fn from_session_record(
+    pub fn from_session_record<C: LlmClient + 'static>(
         client: C,
         tools: ToolRegistry,
         record: SessionRecord,

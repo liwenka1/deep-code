@@ -21,18 +21,18 @@ pub fn is_subagent_tool(name: &str) -> bool {
 }
 
 /// Shared services wired into parent and child agent runtimes.
-pub struct SubAgentServices<C: LlmClient + Clone + 'static> {
+pub struct SubAgentServices {
     pub manager: Arc<RwLock<SubAgentManager>>,
-    pub client: Arc<C>,
+    pub client: Arc<dyn LlmClient>,
     pub agent_config: AgentConfig,
     pub workspace: PathBuf,
     pub parent_cancel: CancellationToken,
     pub exec_policy: ExecPolicy,
 }
 
-impl<C: LlmClient + Clone + 'static> SubAgentServices<C> {
+impl SubAgentServices {
     pub fn new(
-        client: Arc<C>,
+        client: Arc<dyn LlmClient>,
         agent_config: AgentConfig,
         workspace: PathBuf,
         parent_cancel: CancellationToken,
@@ -63,23 +63,20 @@ impl<C: LlmClient + Clone + 'static> SubAgentServices<C> {
     }
 }
 
-pub fn register_subagent_tools<C: LlmClient + Clone + 'static>(
-    registry: &mut ToolRegistry,
-    services: Arc<SubAgentServices<C>>,
-) {
+pub fn register_subagent_tools(registry: &mut ToolRegistry, services: Arc<SubAgentServices>) {
     registry.register(AgentTool::new(services));
 }
 
 /// Attach sub-agent tools to an existing parent registry. Test-only: the
 /// production path goes through [`crate::extensions::attach_agent_extensions`].
 #[cfg(test)]
-pub fn attach_subagent_tools<C: LlmClient + Clone + 'static>(
+pub fn attach_subagent_tools(
     registry: &mut ToolRegistry,
-    client: Arc<C>,
+    client: Arc<dyn LlmClient>,
     agent_config: AgentConfig,
     workspace: PathBuf,
     parent_cancel: CancellationToken,
-) -> Arc<SubAgentServices<C>> {
+) -> Arc<SubAgentServices> {
     Arc::clone(
         &crate::extensions::attach_agent_extensions(
             registry,

@@ -37,8 +37,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(4);
 /// `next()` is an inherent method (not the `Stream` trait) so the turn loop
 /// keeps its `stream.next().await` shape. The returned future is drop-safe:
 /// the caller's select-on-cancel aborts chunk waits and retry backoffs alike.
-pub(super) struct GuardedStream<C: LlmClient + 'static> {
-    client: Arc<C>,
+pub(super) struct GuardedStream {
+    client: Arc<dyn LlmClient>,
     request: ChatRequest,
     inner: AgentEventStream,
     chunk_timeout: Duration,
@@ -53,7 +53,7 @@ pub(super) struct GuardedStream<C: LlmClient + 'static> {
     finished: bool,
 }
 
-impl<C: LlmClient + 'static> GuardedStream<C> {
+impl GuardedStream {
     pub(super) async fn next(&mut self) -> Option<AgentResult<AgentEvent>> {
         if self.finished {
             return None;
@@ -142,7 +142,7 @@ impl<C: LlmClient + 'static> GuardedStream<C> {
     }
 }
 
-impl<C: LlmClient + 'static> AgentRuntime<C> {
+impl AgentRuntime {
     /// Open the model stream for one turn with all guards attached.
     ///
     /// Open-phase failures retry with backoff (after the auto-mode fallback
@@ -153,7 +153,7 @@ impl<C: LlmClient + 'static> AgentRuntime<C> {
         &self,
         route: &mut TurnRoute,
         request: ChatRequest,
-    ) -> AgentResult<GuardedStream<C>> {
+    ) -> AgentResult<GuardedStream> {
         let mut retries_left = self.config.stream_max_retries;
         let mut retries_used = 0u32;
         let mut backoff = INITIAL_BACKOFF;

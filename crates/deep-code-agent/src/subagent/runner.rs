@@ -1,4 +1,3 @@
-use crate::client::LlmClient;
 use crate::runtime::{AgentRuntime, RuntimeEvent};
 use crate::subagent::roles::SubAgentRole;
 
@@ -7,8 +6,8 @@ use crate::subagent::roles::SubAgentRole;
 /// cancels the child through its own [`AgentRuntime::cancel_turn`], which the
 /// loop surfaces as [`RuntimeEvent::TurnCancelled`]. On any non-success exit
 /// the step count is still returned so the ledger records real progress.
-pub async fn run_subagent<C: LlmClient + Clone + 'static>(
-    runtime: AgentRuntime<C>,
+pub async fn run_subagent(
+    runtime: AgentRuntime,
     max_steps: u32,
     role: SubAgentRole,
 ) -> Result<(String, u32), (u32, String)> {

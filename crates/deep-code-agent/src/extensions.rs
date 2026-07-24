@@ -10,11 +10,11 @@ use crate::subagent::{DEFAULT_MAX_CONCURRENT, SubAgentServices, register_subagen
 use crate::tool::ToolRegistry;
 
 /// Shared parent-runtime services for sub-agents.
-pub struct AgentExtensions<C: LlmClient + Clone + 'static> {
-    pub subagent: Arc<SubAgentServices<C>>,
+pub struct AgentExtensions {
+    pub subagent: Arc<SubAgentServices>,
 }
 
-impl<C: LlmClient + Clone + 'static> AgentExtensions<C> {
+impl AgentExtensions {
     pub fn cancel_all_running(&self) {
         self.subagent.cancel_all_running();
     }
@@ -54,13 +54,13 @@ pub fn build_runtime_system_prompt(base: &str, workspace: &Path) -> String {
     format!("{prompt}\n\n{TOOL_DISCIPLINE}\n\n{SUBAGENT_GUIDANCE}")
 }
 
-pub fn attach_agent_extensions<C: LlmClient + Clone + 'static>(
+pub fn attach_agent_extensions(
     registry: &mut ToolRegistry,
-    client: Arc<C>,
+    client: Arc<dyn LlmClient>,
     agent_config: AgentConfig,
     workspace: PathBuf,
     parent_cancel: CancellationToken,
-) -> Arc<AgentExtensions<C>> {
+) -> Arc<AgentExtensions> {
     let exec_policy = registry.policy().clone();
     let subagent = Arc::new(SubAgentServices::new(
         client,

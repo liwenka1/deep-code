@@ -11,7 +11,7 @@ use crate::echo_client::EchoClient;
 use crate::execution_policy::SharedPermissionMode;
 use crate::extensions::{attach_agent_extensions, build_runtime_system_prompt};
 use crate::i18n::{Lang, SharedLang};
-use crate::runtime::{AgentRuntime, AgentRuntimeHandle};
+use crate::runtime::AgentRuntime;
 use crate::session_store::{ConfigSnapshot, JsonSessionStore, SessionRecord, SessionStore};
 use crate::shell_tools::{JobStore, shell_tool_registry};
 use crate::subagent::SharedSubAgentManager;
@@ -23,7 +23,7 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = "You are deep-code's coding assistant.";
 
 /// A launched runtime plus cleanup hooks for sub-agents.
 pub struct LaunchedRuntime {
-    pub handle: Arc<dyn AgentRuntimeHandle>,
+    pub handle: Arc<AgentRuntime>,
     pub backend_label: String,
     pub session_id: Option<String>,
     pub subagent_manager: SharedSubAgentManager,
@@ -339,7 +339,7 @@ fn launch_resumed(
     }
 }
 
-fn build_parent_tools<C: LlmClient + Clone + 'static>(
+fn build_parent_tools<C: LlmClient + 'static>(
     client: Arc<C>,
     config: &AgentConfig,
     workspace: &Path,
@@ -366,11 +366,11 @@ fn build_parent_tools<C: LlmClient + Clone + 'static>(
     (registry, extensions.subagent_manager(), job_store, shutdown)
 }
 
-fn attach_workspace_helpers<C: LlmClient + 'static>(
-    runtime: AgentRuntime<C>,
+fn attach_workspace_helpers(
+    runtime: AgentRuntime,
     workspace: &Path,
     warnings: &mut Vec<String>,
-) -> AgentRuntime<C> {
+) -> AgentRuntime {
     runtime
         .with_checkpoints(workspace.to_path_buf(), warnings)
         .with_diagnostics(workspace.to_path_buf())

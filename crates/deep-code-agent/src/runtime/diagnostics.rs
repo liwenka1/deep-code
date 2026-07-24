@@ -1,11 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::client::LlmClient;
 use crate::lsp::{LspConfig, LspManager};
 use crate::runtime::AgentRuntime;
 
-impl<C: LlmClient + 'static> AgentRuntime<C> {
+impl AgentRuntime {
     /// Enable post-edit LSP diagnostics for the given workspace root.
     #[must_use]
     pub fn with_diagnostics(mut self, workspace: impl Into<PathBuf>) -> Self {

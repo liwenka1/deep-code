@@ -1,7 +1,7 @@
-use std::future::Future;
 use std::pin::Pin;
 
 use async_stream::try_stream;
+use async_trait::async_trait;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -13,15 +13,13 @@ use crate::model::{ChatRequest, StreamChunk};
 
 pub type AgentEventStream = Pin<Box<dyn Stream<Item = AgentResult<AgentEvent>> + Send>>;
 
+#[async_trait]
 pub trait LlmClient: Send + Sync {
     fn provider_name(&self) -> &'static str;
 
     fn model(&self) -> &str;
 
-    fn stream_chat(
-        &self,
-        request: ChatRequest,
-    ) -> impl Future<Output = AgentResult<AgentEventStream>> + Send;
+    async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream>;
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +49,7 @@ impl DeepSeekClient {
     }
 }
 
+#[async_trait]
 impl LlmClient for DeepSeekClient {
     fn provider_name(&self) -> &'static str {
         "deepseek"

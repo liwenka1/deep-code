@@ -23,6 +23,7 @@ mod integration {
     #[derive(Clone)]
     struct SummaryClient;
 
+    #[async_trait::async_trait]
     impl LlmClient for SummaryClient {
         fn provider_name(&self) -> &'static str {
             "summary"
@@ -63,6 +64,7 @@ None.
     #[derive(Clone)]
     struct PanicClient;
 
+    #[async_trait::async_trait]
     impl LlmClient for PanicClient {
         fn provider_name(&self) -> &'static str {
             "panic"
@@ -80,6 +82,7 @@ None.
     #[derive(Clone)]
     struct SlowClient;
 
+    #[async_trait::async_trait]
     impl LlmClient for SlowClient {
         fn provider_name(&self) -> &'static str {
             "slow"
@@ -103,6 +106,7 @@ None.
     #[derive(Clone)]
     struct StuckClient;
 
+    #[async_trait::async_trait]
     impl LlmClient for StuckClient {
         fn provider_name(&self) -> &'static str {
             "stuck"
@@ -129,6 +133,7 @@ None.
         model_calls: Arc<AtomicUsize>,
     }
 
+    #[async_trait::async_trait]
     impl LlmClient for LoopingClient {
         fn provider_name(&self) -> &'static str {
             "looping"
