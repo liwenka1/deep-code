@@ -1,8 +1,10 @@
 //! Targeted writes to the global config file (`~/.deep-code/config.toml`).
 //!
 //! Edits are format-preserving (`toml_edit`): user comments and unrelated
-//! fields survive an update. Writes are atomic (tmp + rename) and the file
-//! is chmod 600 afterwards — it may hold the API key.
+//! fields survive an update. Writes are atomic (tmp + rename). On Unix the file
+//! is created 0600 and re-chmod'd 0600 after the rename — it may hold the API
+//! key. On Windows there is no permission hardening: the file inherits the
+//! parent directory's ACLs (documented, not silently assumed private).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -107,7 +109,10 @@ pub fn write_global_config_update(
             )
         })?;
     }
-    let tmp = path.with_extension("toml.tmp");
+    // A per-process tmp name so two processes writing the same config never
+    // race on one fixed `config.toml.tmp` (which would surface as a spurious
+    // `create_new` EEXIST). The atomic rename below still makes the swap safe.
+    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
     write_private(&tmp, &document.to_string()).map_err(|error| {
         tr_with(
             lang,
