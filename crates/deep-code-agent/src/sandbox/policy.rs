@@ -46,12 +46,16 @@ impl SandboxPolicy {
     pub fn from_execution_plan(plan: Option<&ToolExecutionPlan>) -> Self {
         match plan {
             Some(plan) if plan.requires_sandbox && plan.read_only => Self::ReadOnly,
-            // An approved or trusted shell command runs with network access.
-            // The sandbox's real job is filesystem containment + credential
-            // protection (both preserved below); blocking egress here only
-            // breaks `git push` / package installs / `cargo build` while reads
-            // stay open and the gated web tools remain reachable — so it buys
-            // little real secrecy at a large usability cost.
+            // An approved or trusted shell command runs with network access so
+            // `git push` / package installs / `cargo build` work. This is a
+            // deliberate trade-off: because reads stay broad, granting egress
+            // opens a real exfiltration path (an approved command could read a
+            // secret and POST it out). We accept it because (a) every such
+            // command is either on the trust list or explicitly approved by the
+            // human, and (b) deep-code's OWN key store is read+write sealed in
+            // the profile. OS credential dirs (`~/.ssh`, `~/.aws`) stay readable
+            // on purpose — sealing them would break the very commands (ssh for
+            // `git push`) this grant exists to enable. See macos_seatbelt.rs.
             Some(plan) if plan.requires_sandbox => Self::WorkspaceWrite {
                 network_access: true,
             },

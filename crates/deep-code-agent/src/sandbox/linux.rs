@@ -9,7 +9,13 @@
 //!   and a few `/dev` nodes needed for redirections. `ReadOnly` grants no
 //!   workspace write at all.
 //! - **Network is blocked** (seccomp `socket`/`connect` → EPERM) unless the
-//!   policy allows it — so even broad reads can't be exfiltrated.
+//!   policy allows it. When the policy DOES allow network (approved/trusted
+//!   writable commands), the broad reads above become an exfiltration surface:
+//!   Landlock is allow-list only, so it cannot express "read everything except
+//!   `~/.ssh`", and unlike the macOS backend we can't seal individual
+//!   credential dirs against reads here. `~/.deep-code` is already unwritable
+//!   (it is not among the writable roots), but its read exposure — and that of
+//!   `~/.ssh`/`~/.aws` — is an accepted, documented residual risk on Linux.
 //! - **Dangerous syscalls** (ptrace, mount, module load, bpf, …) are always
 //!   blocked.
 //!

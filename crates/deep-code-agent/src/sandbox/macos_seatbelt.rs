@@ -138,9 +138,14 @@ fn compose_profile(policy: &SandboxPolicy, workspace: &Path, cwd: &Path) -> Seat
          (vnode-type CHARACTER-DEVICE)))",
     );
 
-    // Reads are unrestricted: deep-code's own read tools already expose the
-    // filesystem to the model, so hiding it from subprocesses would add
-    // breakage (dyld, locale data, toolchains) without adding secrecy.
+    // Reads are broad: deep-code's own read tools already expose the filesystem
+    // to the model, and toolchains (dyld, locale data, SSH keys for `git push`)
+    // need it. When network is granted, this broad read is a real exfiltration
+    // surface — an approved command could read a secret and POST it out. We do
+    // NOT blanket-deny credential reads here because that breaks the very
+    // commands the network grant exists for (ssh reading `~/.ssh` for a push).
+    // The one unconditional read-deny is deep-code's OWN secret store, added
+    // after this line so last-match-wins makes it stick (see below).
     profile.rule("(allow file-read*)");
 
     // Network is opt-in per policy. `system-socket` covers the raw/system
@@ -177,26 +182,66 @@ fn compose_profile(policy: &SandboxPolicy, workspace: &Path, cwd: &Path) -> Seat
         profile.rule(format!("(deny file-write* (subpath {param}))"));
     }
 
+    // deep-code's OWN config dir holds the plaintext API key. No sandboxed
+    // subprocess ever needs to touch it, so deny BOTH write and read — this is
+    // the one credential store we can fully seal without breaking legitimate
+    // tools, and it closes the highest-value target: a single approved network
+    // command reading the key off disk, or rewriting `provider.base_url` to a
+    // proxy. Read-deny is rendered after `(allow file-read*)` so it wins.
+    if let Some(home) = crate::paths::home_dir() {
+        let param = profile.bind_path("KEEP_DEEP_CODE", home.join(".deep-code"));
+        profile.rule(format!("(deny file-write* (subpath {param}))"));
+        profile.rule(format!("(deny file-read* (subpath {param}))"));
+    }
+
     profile
 }
 
-/// Home directories holding long-lived secrets — SSH keys, cloud credentials,
-/// GnuPG keyrings, `.netrc` passwords — that stay write-denied under every
-/// policy. Empty when `HOME` is unset (nothing to protect, nothing to bind).
+/// Home directories/files holding long-lived secrets that stay write-denied
+/// under every policy: SSH keys, cloud credentials, GnuPG keyrings, `.netrc`
+/// passwords, and the token stores of common dev tools (gh, docker, kube, npm,
+/// pip, git). Reads of these are intentionally left open — some are needed by
+/// the very network commands the sandbox now permits (`ssh` reads `~/.ssh` for
+/// `git push`); the residual read-exfiltration risk is accepted and documented.
+/// deep-code's own `~/.deep-code` is handled separately (read+write denied).
+/// Empty when `HOME` is unset (nothing to protect, nothing to bind).
 fn credential_dirs() -> Vec<(String, PathBuf)> {
     let Some(home) = crate::paths::home_dir() else {
         return Vec::new();
     };
-    [".ssh", ".aws", ".gnupg", ".netrc"]
-        .into_iter()
-        .map(|entry| {
-            let name = format!(
-                "KEEP_{}",
-                entry.trim_start_matches('.').to_ascii_uppercase()
-            );
-            (name, home.join(entry))
+    [
+        ".ssh",
+        ".aws",
+        ".gnupg",
+        ".netrc",
+        ".config/gh",
+        ".docker",
+        ".kube",
+        ".npmrc",
+        ".pypirc",
+        ".git-credentials",
+    ]
+    .into_iter()
+    .map(|entry| (credential_param_name(entry), home.join(entry)))
+    .collect()
+}
+
+/// A valid SBPL `-D` parameter name for a credential entry: `KEEP_` plus the
+/// entry with every non-alphanumeric char folded to `_` (so a subpath like
+/// `.config/gh` or a file like `.git-credentials` yields a legal identifier).
+fn credential_param_name(entry: &str) -> String {
+    let body: String = entry
+        .trim_start_matches('.')
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
         })
-        .collect()
+        .collect();
+    format!("KEEP_{body}")
 }
 
 #[cfg(test)]
@@ -291,6 +336,46 @@ mod tests {
             first_denial > last_grant,
             "credential denials must come after write grants:\n{text}"
         );
+    }
+
+    #[test]
+    fn own_config_dir_is_read_and_write_denied() {
+        // deep-code's own `~/.deep-code` (plaintext API key) must be denied for
+        // BOTH read and write, and the read-deny must render after the blanket
+        // `(allow file-read*)` so last-match-wins seals it.
+        let home = std::env::var("HOME").expect("test environment has HOME");
+        let profile = compose_profile(
+            &SandboxPolicy::WorkspaceWrite {
+                network_access: true,
+            },
+            Path::new("/tmp/dc-ws"),
+            Path::new("/tmp/dc-ws"),
+        );
+        let _ = home;
+        let text = profile.render();
+        assert!(profile.bindings.iter().any(|(n, _)| n == "KEEP_DEEP_CODE"));
+        let allow_read = text.find("(allow file-read*)").expect("blanket read grant");
+        let deny_read = text
+            .find("(deny file-read* (subpath")
+            .expect("own-store read deny");
+        assert!(
+            deny_read > allow_read,
+            "own-store read deny must come after the blanket read allow:\n{text}"
+        );
+        // And its write is denied too.
+        assert!(text.matches("(deny file-write* (subpath").count() >= 2);
+    }
+
+    #[test]
+    fn credential_param_names_are_legal_identifiers() {
+        // Subpath / dotted-file entries must fold to alnum+underscore names, or
+        // sandbox-exec rejects the `-D` binding.
+        assert_eq!(credential_param_name(".config/gh"), "KEEP_CONFIG_GH");
+        assert_eq!(
+            credential_param_name(".git-credentials"),
+            "KEEP_GIT_CREDENTIALS"
+        );
+        assert_eq!(credential_param_name(".ssh"), "KEEP_SSH");
     }
 
     #[test]
