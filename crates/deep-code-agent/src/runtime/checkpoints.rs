@@ -34,13 +34,9 @@ impl AgentRuntime {
 
     /// Restore workspace files from a checkpoint id.
     pub async fn restore_checkpoint(&self, id: CheckpointId) -> Result<(), ToolError> {
-        let store = self
-            .checkpoints
-            .as_ref()
-            .ok_or_else(|| ToolError::ExecutionFailed {
-                name: "checkpoint".to_string(),
-                message: "checkpoints are not enabled on this runtime".to_string(),
-            })?;
+        let store = self.checkpoints.as_ref().ok_or_else(|| {
+            ToolError::exec_failed("checkpoint", "checkpoints are not enabled on this runtime")
+        })?;
         store.restore(&id)
     }
 

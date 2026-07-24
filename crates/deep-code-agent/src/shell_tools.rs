@@ -62,10 +62,9 @@ fn spawn_confined(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let child = cmd.spawn().map_err(|error| ToolError::ExecutionFailed {
-        name: tool_name.to_string(),
-        message: format!("{error_context}: {error}"),
-    })?;
+    let child = cmd
+        .spawn()
+        .map_err(|error| ToolError::exec_failed(tool_name, format!("{error_context}: {error}")))?;
     let guard = sandbox.confine_spawned(&child, policy);
     Ok((child, guard))
 }
@@ -251,10 +250,10 @@ impl Tool for ShellTool {
                     exit.code(),
                 ),
                 Err(error) => {
-                    return Err(ToolError::ExecutionFailed {
-                        name: Self::NAME.to_string(),
-                        message: format!("failed to wait for command: {error}"),
-                    });
+                    return Err(ToolError::exec_failed(
+                        Self::NAME,
+                        format!("failed to wait for command: {error}"),
+                    ));
                 }
             },
             () = cx.cancel_token().cancelled() => {

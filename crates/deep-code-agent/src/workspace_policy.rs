@@ -11,15 +11,15 @@ pub(crate) struct WorkspacePolicy {
 impl WorkspacePolicy {
     pub(crate) fn new(root: impl Into<PathBuf>) -> Result<Self, ToolError> {
         let root = root.into();
-        let canonical = root
-            .canonicalize()
-            .map_err(|error| ToolError::ExecutionFailed {
-                name: "workspace".to_string(),
-                message: format!(
+        let canonical = root.canonicalize().map_err(|error| {
+            ToolError::exec_failed(
+                "workspace",
+                format!(
                     "failed to resolve workspace root {}: {error}",
                     root.display()
                 ),
-            })?;
+            )
+        })?;
         Ok(Self { root: canonical })
     }
 
@@ -51,19 +51,19 @@ impl WorkspacePolicy {
     ) -> Result<PathBuf, ToolError> {
         let candidate = self.prepare_candidate(raw, tool_name)?;
         if contains_symlink(&candidate, Some(&self.root)).map_err(|error| {
-            ToolError::ExecutionFailed {
-                name: tool_name.to_string(),
-                message: format!("failed to inspect {}: {error}", candidate.display()),
-            }
+            ToolError::exec_failed(
+                tool_name,
+                format!("failed to inspect {}: {error}", candidate.display()),
+            )
         })? {
             return Err(path_error(tool_name, raw, "symlinks are not allowed"));
         }
-        let canonical = candidate
-            .canonicalize()
-            .map_err(|error| ToolError::ExecutionFailed {
-                name: tool_name.to_string(),
-                message: format!("failed to resolve {}: {error}", candidate.display()),
-            })?;
+        let canonical = candidate.canonicalize().map_err(|error| {
+            ToolError::exec_failed(
+                tool_name,
+                format!("failed to resolve {}: {error}", candidate.display()),
+            )
+        })?;
         if !canonical.starts_with(&self.root) {
             return Err(path_error(tool_name, raw, "path escapes the workspace"));
         }
@@ -78,10 +78,10 @@ impl WorkspacePolicy {
         let candidate = self.prepare_candidate(raw, tool_name)?;
         if candidate.exists() {
             if contains_symlink(&candidate, Some(&self.root)).map_err(|error| {
-                ToolError::ExecutionFailed {
-                    name: tool_name.to_string(),
-                    message: format!("failed to inspect {}: {error}", candidate.display()),
-                }
+                ToolError::exec_failed(
+                    tool_name,
+                    format!("failed to inspect {}: {error}", candidate.display()),
+                )
             })? {
                 return Err(path_error(
                     tool_name,
@@ -89,13 +89,12 @@ impl WorkspacePolicy {
                     "symlinks in the destination path are not allowed",
                 ));
             }
-            let canonical =
-                candidate
-                    .canonicalize()
-                    .map_err(|error| ToolError::ExecutionFailed {
-                        name: tool_name.to_string(),
-                        message: format!("failed to resolve {}: {error}", candidate.display()),
-                    })?;
+            let canonical = candidate.canonicalize().map_err(|error| {
+                ToolError::exec_failed(
+                    tool_name,
+                    format!("failed to resolve {}: {error}", candidate.display()),
+                )
+            })?;
             if !canonical.starts_with(&self.root) {
                 return Err(path_error(tool_name, raw, "path escapes the workspace"));
             }
@@ -109,10 +108,10 @@ impl WorkspacePolicy {
             )
         })?;
         if contains_symlink(parent, Some(&self.root)).map_err(|error| {
-            ToolError::ExecutionFailed {
-                name: tool_name.to_string(),
-                message: format!("failed to inspect {}: {error}", parent.display()),
-            }
+            ToolError::exec_failed(
+                tool_name,
+                format!("failed to inspect {}: {error}", parent.display()),
+            )
         })? {
             return Err(path_error(
                 tool_name,
@@ -120,16 +119,15 @@ impl WorkspacePolicy {
                 "symlinks in the destination path are not allowed",
             ));
         }
-        let parent_canonical =
-            parent
-                .canonicalize()
-                .map_err(|error| ToolError::ExecutionFailed {
-                    name: tool_name.to_string(),
-                    message: format!(
-                        "destination parent {} does not exist or cannot be resolved: {error}",
-                        parent.display()
-                    ),
-                })?;
+        let parent_canonical = parent.canonicalize().map_err(|error| {
+            ToolError::exec_failed(
+                tool_name,
+                format!(
+                    "destination parent {} does not exist or cannot be resolved: {error}",
+                    parent.display()
+                ),
+            )
+        })?;
         if !parent_canonical.starts_with(&self.root) {
             return Err(path_error(tool_name, raw, "path escapes the workspace"));
         }

@@ -67,25 +67,29 @@ impl ReadFileTool {
             .unwrap_or(DEFAULT_READ_LINES)
             .clamp(1, MAX_READ_LINES);
         let path = self.root.resolve_existing(&params.path, Self::NAME)?;
-        let metadata = fs::metadata(&path).map_err(|error| ToolError::ExecutionFailed {
-            name: Self::NAME.to_string(),
-            message: format!("failed to read metadata for {}: {error}", path.display()),
+        let metadata = fs::metadata(&path).map_err(|error| {
+            ToolError::exec_failed(
+                Self::NAME,
+                format!("failed to read metadata for {}: {error}", path.display()),
+            )
         })?;
         if !metadata.is_file() {
             return Err(invalid(Self::NAME, "path is not a file"));
         }
         if metadata.len() > MAX_FILE_BYTES {
-            return Err(ToolError::ExecutionFailed {
-                name: Self::NAME.to_string(),
-                message: format!(
+            return Err(ToolError::exec_failed(
+                Self::NAME,
+                format!(
                     "{} is larger than the current 2 MiB read limit",
                     self.root.relative_display(&path)
                 ),
-            });
+            ));
         }
-        let contents = fs::read_to_string(&path).map_err(|error| ToolError::ExecutionFailed {
-            name: Self::NAME.to_string(),
-            message: format!("failed to read {} as UTF-8: {error}", path.display()),
+        let contents = fs::read_to_string(&path).map_err(|error| {
+            ToolError::exec_failed(
+                Self::NAME,
+                format!("failed to read {} as UTF-8: {error}", path.display()),
+            )
         })?;
         let lines = contents.lines().collect::<Vec<_>>();
         let total_lines = lines.len();
@@ -162,21 +166,25 @@ impl ListDirTool {
             return Err(invalid(Self::NAME, "path is not a directory"));
         }
         let mut entries = fs::read_dir(&path)
-            .map_err(|error| ToolError::ExecutionFailed {
-                name: Self::NAME.to_string(),
-                message: format!("failed to list {}: {error}", path.display()),
+            .map_err(|error| {
+                ToolError::exec_failed(
+                    Self::NAME,
+                    format!("failed to list {}: {error}", path.display()),
+                )
             })?
             .map(|entry| {
-                let entry = entry.map_err(|error| ToolError::ExecutionFailed {
-                    name: Self::NAME.to_string(),
-                    message: format!("failed to read directory entry: {error}"),
+                let entry = entry.map_err(|error| {
+                    ToolError::exec_failed(
+                        Self::NAME,
+                        format!("failed to read directory entry: {error}"),
+                    )
                 })?;
-                let file_type = entry
-                    .file_type()
-                    .map_err(|error| ToolError::ExecutionFailed {
-                        name: Self::NAME.to_string(),
-                        message: format!("failed to read entry type: {error}"),
-                    })?;
+                let file_type = entry.file_type().map_err(|error| {
+                    ToolError::exec_failed(
+                        Self::NAME,
+                        format!("failed to read entry type: {error}"),
+                    )
+                })?;
                 let kind = if file_type.is_dir() {
                     "directory"
                 } else if file_type.is_file() {
@@ -367,9 +375,11 @@ impl WriteFileTool {
 
     fn write_sync(&self, params: WriteFileParams) -> Result<ToolOutput, ToolError> {
         let path = self.root.resolve_for_write(&params.path, Self::NAME)?;
-        fs::write(&path, &params.content).map_err(|error| ToolError::ExecutionFailed {
-            name: Self::NAME.to_string(),
-            message: format!("failed to write {}: {error}", path.display()),
+        fs::write(&path, &params.content).map_err(|error| {
+            ToolError::exec_failed(
+                Self::NAME,
+                format!("failed to write {}: {error}", path.display()),
+            )
         })?;
         Ok(ToolOutput::text(json_string(json!({
             "path": self.root.relative_display(&path),
@@ -432,9 +442,11 @@ impl ApplyPatchTool {
             ));
         }
         let path = self.root.resolve_existing(&params.path, Self::NAME)?;
-        let contents = fs::read_to_string(&path).map_err(|error| ToolError::ExecutionFailed {
-            name: Self::NAME.to_string(),
-            message: format!("failed to read {} as UTF-8: {error}", path.display()),
+        let contents = fs::read_to_string(&path).map_err(|error| {
+            ToolError::exec_failed(
+                Self::NAME,
+                format!("failed to read {} as UTF-8: {error}", path.display()),
+            )
         })?;
         let display = self.root.relative_display(&path);
 
@@ -451,9 +463,11 @@ impl ApplyPatchTool {
             params.new,
             &contents[located.end..]
         );
-        fs::write(&path, updated).map_err(|error| ToolError::ExecutionFailed {
-            name: Self::NAME.to_string(),
-            message: format!("failed to write {}: {error}", path.display()),
+        fs::write(&path, updated).map_err(|error| {
+            ToolError::exec_failed(
+                Self::NAME,
+                format!("failed to write {}: {error}", path.display()),
+            )
         })?;
         Ok(ToolOutput::text(json_string(json!({
             "path": display,

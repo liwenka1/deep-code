@@ -1,7 +1,7 @@
-use crate::model_route::TurnRoute;
 use crate::compaction::{context_usage_percent, effective_compaction_threshold};
 use crate::model::Usage;
 use crate::model_registry::context_window_for_model;
+use crate::model_route::TurnRoute;
 use crate::pricing::{PrefixStatus, TurnTelemetry, calculate_turn_cost};
 use crate::runtime::AgentRuntime;
 

@@ -279,9 +279,8 @@ pub(super) async fn cancel_job(
         Some(mut child) => child
             .wait()
             .await
-            .map_err(|error| ToolError::ExecutionFailed {
-                name: tool_name.to_string(),
-                message: format!("failed to wait after cancel: {error}"),
+            .map_err(|error| {
+                ToolError::exec_failed(tool_name, format!("failed to wait after cancel: {error}"))
             })?
             .code(),
         None => None,

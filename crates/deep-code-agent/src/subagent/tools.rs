@@ -36,10 +36,7 @@ const AGENT_WALL_CLOCK_TIMEOUT: Duration = Duration::from_secs(600);
 const CANCEL_GRACE: Duration = Duration::from_secs(5);
 
 fn tool_error(error: SubAgentError) -> ToolError {
-    ToolError::ExecutionFailed {
-        name: AGENT_TOOL.to_string(),
-        message: error.to_string(),
-    }
+    ToolError::exec_failed(AGENT_TOOL, error.to_string())
 }
 
 pub struct AgentTool {
@@ -99,10 +96,7 @@ impl Tool for AgentTool {
             role,
             self.services.exec_policy.clone(),
         )
-        .map_err(|error| ToolError::ExecutionFailed {
-            name: AGENT_TOOL.to_string(),
-            message: error.to_string(),
-        })?;
+        .map_err(|error| ToolError::exec_failed(AGENT_TOOL, error.to_string()))?;
         let runtime = AgentRuntime::with_system_prompt_shared(
             std::sync::Arc::clone(&self.services.client),
             child_tools,

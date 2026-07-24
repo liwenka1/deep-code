@@ -413,7 +413,11 @@ mod tests {
             "online registry must not expose the mock tool: {names:?}"
         );
 
-        let names = parent_tool_names(EchoClient::new(SharedLang::new(Lang::Zh)), &config, dir.path());
+        let names = parent_tool_names(
+            EchoClient::new(SharedLang::new(Lang::Zh)),
+            &config,
+            dir.path(),
+        );
         assert!(
             !names.iter().any(|name| name == MockEchoTool::NAME),
             "the mock tool is a test fixture; no production registry mounts it: {names:?}"

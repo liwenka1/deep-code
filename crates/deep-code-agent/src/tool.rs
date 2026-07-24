@@ -343,6 +343,17 @@ pub enum ToolError {
     ExecutionFailed { name: String, message: String },
 }
 
+impl ToolError {
+    /// Build an [`ExecutionFailed`](ToolError::ExecutionFailed) without spelling
+    /// out the struct fields at every call site.
+    pub(crate) fn exec_failed(tool: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::ExecutionFailed {
+            name: tool.into(),
+            message: message.into(),
+        }
+    }
+}
+
 /// A tool with typed, schema-derived parameters.
 ///
 /// `Params` is the single source of truth: schemars derives the wire schema,
@@ -420,10 +431,10 @@ where
 {
     match tokio::task::spawn_blocking(body).await {
         Ok(result) => result,
-        Err(join_error) => Err(ToolError::ExecutionFailed {
-            name: tool_name.to_string(),
-            message: format!("tool execution task failed: {join_error}"),
-        }),
+        Err(join_error) => Err(ToolError::exec_failed(
+            tool_name,
+            format!("tool execution task failed: {join_error}"),
+        )),
     }
 }
 

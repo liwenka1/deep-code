@@ -29,22 +29,24 @@ pub struct CheckpointStore {
 impl CheckpointStore {
     pub fn new(workspace: impl Into<PathBuf>) -> Result<Self, ToolError> {
         let workspace = workspace.into();
-        let canonical = workspace
-            .canonicalize()
-            .map_err(|error| ToolError::ExecutionFailed {
-                name: "checkpoint".to_string(),
-                message: format!(
+        let canonical = workspace.canonicalize().map_err(|error| {
+            ToolError::exec_failed(
+                "checkpoint",
+                format!(
                     "failed to resolve workspace root {}: {error}",
                     workspace.display()
                 ),
-            })?;
+            )
+        })?;
         let storage_root = canonical.join(CHECKPOINT_DIR);
-        fs::create_dir_all(&storage_root).map_err(|error| ToolError::ExecutionFailed {
-            name: "checkpoint".to_string(),
-            message: format!(
-                "failed to create checkpoint storage {}: {error}",
-                storage_root.display()
-            ),
+        fs::create_dir_all(&storage_root).map_err(|error| {
+            ToolError::exec_failed(
+                "checkpoint",
+                format!(
+                    "failed to create checkpoint storage {}: {error}",
+                    storage_root.display()
+                ),
+            )
         })?;
         Ok(Self {
             workspace: canonical,
@@ -112,10 +114,10 @@ impl CheckpointStore {
         validate_checkpoint_id(id)?;
         let source = self.storage_root.join(&id.0);
         if !source.is_dir() {
-            return Err(ToolError::ExecutionFailed {
-                name: "checkpoint".to_string(),
-                message: format!("checkpoint '{}' does not exist", id.0),
-            });
+            return Err(ToolError::exec_failed(
+                "checkpoint",
+                format!("checkpoint '{}' does not exist", id.0),
+            ));
         }
         clear_workspace_contents(&self.workspace)?;
         copy_tree(&source, &self.workspace, false)?;
@@ -124,15 +126,15 @@ impl CheckpointStore {
 
     pub fn list(&self) -> Result<Vec<CheckpointId>, ToolError> {
         let mut ids = Vec::new();
-        let entries =
-            fs::read_dir(&self.storage_root).map_err(|error| ToolError::ExecutionFailed {
-                name: "checkpoint".to_string(),
-                message: format!("failed to list checkpoints: {error}"),
-            })?;
+        let entries = fs::read_dir(&self.storage_root).map_err(|error| {
+            ToolError::exec_failed("checkpoint", format!("failed to list checkpoints: {error}"))
+        })?;
         for entry in entries {
-            let entry = entry.map_err(|error| ToolError::ExecutionFailed {
-                name: "checkpoint".to_string(),
-                message: format!("failed to read checkpoint entry: {error}"),
+            let entry = entry.map_err(|error| {
+                ToolError::exec_failed(
+                    "checkpoint",
+                    format!("failed to read checkpoint entry: {error}"),
+                )
             })?;
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 ids.push(CheckpointId(
@@ -169,10 +171,10 @@ fn validate_checkpoint_id(id: &CheckpointId) -> Result<(), ToolError> {
     if valid {
         Ok(())
     } else {
-        Err(ToolError::ExecutionFailed {
-            name: "checkpoint".to_string(),
-            message: format!("invalid checkpoint id '{raw}'"),
-        })
+        Err(ToolError::exec_failed(
+            "checkpoint",
+            format!("invalid checkpoint id '{raw}'"),
+        ))
     }
 }
 
@@ -201,14 +203,10 @@ fn should_skip(rel: &Path) -> bool {
 fn copy_tree(source: &Path, dest: &Path, skip_meta: bool) -> Result<(), ToolError> {
     fs::create_dir_all(dest).map_err(|error| checkpoint_error("create snapshot dir", error))?;
     for entry in WalkDir::new(source).into_iter().filter_map(Result::ok) {
-        let rel =
-            entry
-                .path()
-                .strip_prefix(source)
-                .map_err(|error| ToolError::ExecutionFailed {
-                    name: "checkpoint".to_string(),
-                    message: error.to_string(),
-                })?;
+        let rel = entry
+            .path()
+            .strip_prefix(source)
+            .map_err(|error| ToolError::exec_failed("checkpoint", error.to_string()))?;
         if rel.as_os_str().is_empty() {
             continue;
         }
@@ -281,10 +279,7 @@ fn clear_workspace_contents(workspace: &Path) -> Result<(), ToolError> {
 }
 
 fn checkpoint_error(action: &str, error: std::io::Error) -> ToolError {
-    ToolError::ExecutionFailed {
-        name: "checkpoint".to_string(),
-        message: format!("{action}: {error}"),
-    }
+    ToolError::exec_failed("checkpoint", format!("{action}: {error}"))
 }
 
 #[cfg(test)]

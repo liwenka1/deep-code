@@ -22,11 +22,11 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use tokio::time::Instant;
 
-use crate::model_route::{TurnRoute, api_fallback_model, clamp_effort_to_model};
 use crate::client::{AgentEventStream, LlmClient};
 use crate::error::{AgentError, AgentResult};
 use crate::event::AgentEvent;
 use crate::model::ChatRequest;
+use crate::model_route::{TurnRoute, api_fallback_model, clamp_effort_to_model};
 use crate::runtime::AgentRuntime;
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);

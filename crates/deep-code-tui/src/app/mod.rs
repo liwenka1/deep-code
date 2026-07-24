@@ -13,9 +13,9 @@ use std::path::PathBuf;
 
 use crate::ui::{COMPOSER_MAX_VISIBLE_ROWS, layout_input};
 use deep_code_agent::{
-    AgentConfig, AgentRuntime, ApprovalDecision, ApprovalRequest, CostCurrency,
-    JsonSessionStore, LaunchedRuntime, RuntimeEvent, SessionRecord, SessionStore,
-    SharedSubAgentManager, TurnTelemetry, default_config_path, launch_runtime,
+    AgentConfig, AgentRuntime, ApprovalDecision, ApprovalRequest, CostCurrency, JsonSessionStore,
+    LaunchedRuntime, RuntimeEvent, SessionRecord, SessionStore, SharedSubAgentManager,
+    TurnTelemetry, default_config_path, launch_runtime,
 };
 use tokio::sync::mpsc;
 
