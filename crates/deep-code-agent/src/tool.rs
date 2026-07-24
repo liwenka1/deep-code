@@ -1,6 +1,12 @@
+mod accumulator;
+mod mock;
+mod registry;
 mod schema;
 
-use std::collections::HashMap;
+pub use accumulator::ToolCallAccumulator;
+pub use mock::MockEchoTool;
+pub use registry::ToolRegistry;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,10 +18,10 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::execution_policy::{
-    ExecPolicy, PolicyVerdict, RiskLevel, SafetyNote, ToolExecutionPlan, ToolKind, safety_notes,
+    ExecPolicy, RiskLevel, SafetyNote, ToolExecutionPlan, ToolKind, safety_notes,
 };
 use crate::message::Message;
-use crate::model::{ChatTool, ChatToolFunction, FunctionCallDelta, ToolCallDelta};
+use crate::model::{ChatTool, ChatToolFunction};
 use crate::sandbox::SandboxPolicy;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -438,286 +444,10 @@ where
     }
 }
 
-#[derive(Clone)]
-struct RegisteredTool {
-    spec: ToolSpec,
-    tool: Arc<dyn ErasedTool>,
-}
-
-#[derive(Default)]
-pub struct ToolRegistry {
-    tools: HashMap<String, RegisteredTool>,
-    policy: ExecPolicy,
-}
-
-impl std::fmt::Debug for ToolRegistry {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ToolRegistry")
-            .field("tools", &self.tools.keys().collect::<Vec<_>>())
-            .finish()
-    }
-}
-
-impl ToolRegistry {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[must_use]
-    pub fn with_policy(policy: ExecPolicy) -> Self {
-        Self {
-            tools: HashMap::new(),
-            policy,
-        }
-    }
-
-    #[must_use]
-    pub fn policy(&self) -> &ExecPolicy {
-        &self.policy
-    }
-
-    pub fn set_policy(&mut self, policy: ExecPolicy) {
-        self.policy = policy;
-    }
-
-    pub fn register<T: Tool>(&mut self, tool: T) {
-        self.register_erased(Arc::new(tool));
-    }
-
-    /// Register a dynamically-shaped tool. The spec (including the schemars
-    /// run for typed tools) is computed once here, not per request.
-    pub fn register_erased(&mut self, tool: Arc<dyn ErasedTool>) {
-        let spec = tool.spec();
-        self.tools
-            .insert(spec.name.clone(), RegisteredTool { spec, tool });
-    }
-
-    #[must_use]
-    pub fn with_mock_tools() -> Self {
-        let mut registry = Self::new();
-        registry.register(MockEchoTool);
-        registry
-    }
-
-    pub fn extend(&mut self, other: ToolRegistry) {
-        self.tools.extend(other.tools);
-    }
-
-    /// Clone a subset of tools from another registry.
-    #[must_use]
-    pub fn filtered_from(source: &ToolRegistry, predicate: impl Fn(&str) -> bool) -> Self {
-        let mut registry = Self::new();
-        registry.policy = source.policy.clone();
-        for (name, entry) in &source.tools {
-            if predicate(name) {
-                registry.tools.insert(name.clone(), entry.clone());
-            }
-        }
-        registry
-    }
-
-    #[must_use]
-    pub fn specs(&self) -> Vec<ToolSpec> {
-        let mut specs = self
-            .tools
-            .values()
-            .map(|entry| entry.spec.clone())
-            .collect::<Vec<_>>();
-        specs.sort_by(|left, right| left.name.cmp(&right.name));
-        specs
-    }
-
-    #[must_use]
-    pub fn chat_tools(&self) -> Vec<ChatTool> {
-        self.specs()
-            .into_iter()
-            .map(|spec| spec.to_chat_tool())
-            .collect()
-    }
-
-    pub async fn run_tool_call(
-        &self,
-        call: ToolCall,
-        decision: Option<ApprovalDecision>,
-    ) -> Result<ToolRunOutcome, ToolError> {
-        let plan = self.policy.evaluate_tool(&call.name, &call.arguments);
-        self.run_tool_call_with_plan(&call, decision, plan, ToolCx::new())
-            .await
-    }
-
-    pub fn evaluate_tool(&self, call: &ToolCall) -> ToolExecutionPlan {
-        self.policy.evaluate_tool(&call.name, &call.arguments)
-    }
-
-    pub async fn run_tool_call_with_plan(
-        &self,
-        call: &ToolCall,
-        decision: Option<ApprovalDecision>,
-        plan: ToolExecutionPlan,
-        cx: ToolCx,
-    ) -> Result<ToolRunOutcome, ToolError> {
-        let entry = self
-            .tools
-            .get(&call.name)
-            .ok_or_else(|| ToolError::UnknownTool {
-                name: call.name.clone(),
-            })?;
-        let spec = &entry.spec;
-
-        if let Some(reason) = plan.denied_reason() {
-            return Ok(ToolRunOutcome::Result {
-                result: ToolResult::error(call, format!("execution policy denied: {reason}")),
-            });
-        }
-
-        let needs_approval = plan.requires_approval || spec.requires_approval;
-        if needs_approval {
-            let description = match &plan.verdict {
-                PolicyVerdict::NeedsApproval { reason } => reason.clone(),
-                _ => spec.description.clone(),
-            };
-            match decision {
-                None => {
-                    let notes = shell_safety_notes(call);
-                    return Ok(ToolRunOutcome::ApprovalRequired {
-                        request: ApprovalRequest {
-                            call_id: call.id.clone(),
-                            tool_name: spec.name.clone(),
-                            description,
-                            arguments: call.arguments.clone(),
-                            risk_level: plan.risk_level,
-                            requires_sandbox: plan.requires_sandbox,
-                            read_only: plan.read_only,
-                            matched_rule: plan.matched_rule.clone(),
-                            // Filled by the runtime (needs workspace access).
-                            preview: None,
-                            safety_notes: notes,
-                        },
-                    });
-                }
-                Some(ApprovalDecision::Denied) => {
-                    return Ok(ToolRunOutcome::Result {
-                        result: ToolResult::denied(call),
-                    });
-                }
-                Some(ApprovalDecision::Approved | ApprovalDecision::ApprovedForSession) => {}
-            }
-        }
-
-        let cx = cx.with_plan(plan);
-        entry
-            .tool
-            .execute(call, &cx)
-            .await
-            .map(|result| ToolRunOutcome::Result { result })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct MockEchoTool;
-
-impl MockEchoTool {
-    pub const NAME: &'static str = "mock_echo";
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct MockEchoParams {
-    /// Message to echo back.
-    message: String,
-}
-
-#[async_trait]
-impl Tool for MockEchoTool {
-    type Params = MockEchoParams;
-
-    fn name(&self) -> &str {
-        Self::NAME
-    }
-
-    fn description(&self) -> &str {
-        "Safely echoes a message to validate the tool loop."
-    }
-
-    fn requires_approval(&self) -> bool {
-        true
-    }
-
-    async fn run(&self, params: MockEchoParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
-        Ok(ToolOutput::text(format!("mock_echo: {}", params.message)))
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct ToolCallAccumulator {
-    calls: HashMap<u32, PartialToolCall>,
-}
-
-impl ToolCallAccumulator {
-    pub fn push_delta(&mut self, delta: ToolCallDelta) {
-        let index = delta.index.unwrap_or(0);
-        let call = self.calls.entry(index).or_default();
-
-        if let Some(id) = delta.id {
-            call.id = Some(id);
-        }
-
-        if let Some(FunctionCallDelta { name, arguments }) = delta.function {
-            if let Some(name) = name {
-                call.name = Some(name);
-            }
-
-            if let Some(arguments) = arguments {
-                call.arguments.push_str(&arguments);
-            }
-        }
-    }
-
-    pub fn finish(self) -> Result<Vec<ToolCall>, ToolError> {
-        let mut calls = self.calls.into_iter().collect::<Vec<_>>();
-        calls.sort_by_key(|(index, _)| *index);
-
-        calls
-            .into_iter()
-            .map(|(index, call)| {
-                let id = call.id.unwrap_or_else(|| format!("call_{index}"));
-                let name = call.name.ok_or_else(|| ToolError::InvalidArguments {
-                    name: id.clone(),
-                    message: "missing function name".to_string(),
-                })?;
-                let arguments = if call.arguments.trim().is_empty() {
-                    Value::Object(Default::default())
-                } else {
-                    serde_json::from_str(&call.arguments).map_err(|error| {
-                        ToolError::InvalidArguments {
-                            name: name.clone(),
-                            message: error.to_string(),
-                        }
-                    })?
-                };
-
-                Ok(ToolCall {
-                    id,
-                    name,
-                    arguments,
-                })
-            })
-            .collect()
-    }
-}
-
-#[derive(Debug, Default)]
-struct PartialToolCall {
-    id: Option<String>,
-    name: Option<String>,
-    arguments: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution_policy::PolicyVerdict;
     use serde_json::json;
 
     #[tokio::test]
@@ -852,37 +582,5 @@ mod tests {
                 spec.name
             );
         }
-    }
-
-    #[test]
-    fn accumulator_builds_tool_call_from_streaming_deltas() {
-        let mut accumulator = ToolCallAccumulator::default();
-        accumulator.push_delta(ToolCallDelta {
-            index: Some(0),
-            id: Some("call_3".to_string()),
-            call_type: Some("function".to_string()),
-            function: Some(FunctionCallDelta {
-                name: Some(MockEchoTool::NAME.to_string()),
-                arguments: Some(r#"{"message":"hel"#.to_string()),
-            }),
-        });
-        accumulator.push_delta(ToolCallDelta {
-            index: Some(0),
-            id: None,
-            call_type: None,
-            function: Some(FunctionCallDelta {
-                name: None,
-                arguments: Some(r#"lo"}"#.to_string()),
-            }),
-        });
-
-        assert_eq!(
-            accumulator.finish().unwrap(),
-            vec![ToolCall::new(
-                "call_3",
-                MockEchoTool::NAME,
-                json!({"message": "hello"})
-            )]
-        );
     }
 }
