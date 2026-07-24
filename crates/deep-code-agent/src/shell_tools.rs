@@ -10,7 +10,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::sandbox::SandboxManager;
+use std::path::Path;
+
+use crate::sandbox::{SandboxGuard, SandboxManager, SandboxPolicy};
 use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, ToolUpdate};
 use crate::workspace_policy::{WorkspacePolicy, invalid};
 #[allow(unused_imports)]
@@ -35,6 +37,37 @@ fn scrub_secret_env(cmd: &mut tokio::process::Command) {
     for var in crate::config::SUBPROCESS_SECRET_ENV {
         cmd.env_remove(var);
     }
+}
+
+/// Build, secret-scrub, sandbox-wrap and spawn one shell subprocess, then
+/// confine it. Shared by the foreground and background job paths so both apply
+/// the identical env-scrub + sandbox treatment; they differ only afterwards in
+/// how they read output and whether they retain the child handle.
+fn spawn_confined(
+    sandbox: &SandboxManager,
+    workspace_root: &Path,
+    command: &str,
+    cwd: &Path,
+    policy: &SandboxPolicy,
+    tool_name: &str,
+    error_context: &str,
+) -> Result<(tokio::process::Child, Option<SandboxGuard>), ToolError> {
+    let std_cmd = sandbox.wrap_shell_command(command, cwd, workspace_root, policy);
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    scrub_secret_env(&mut cmd);
+    // Detach stdin from the console (an inherited child restoring console mode
+    // on exit would drop our mouse capture), pipe both output streams, and kill
+    // the process if the handle is dropped.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = cmd.spawn().map_err(|error| ToolError::ExecutionFailed {
+        name: tool_name.to_string(),
+        message: format!("{error_context}: {error}"),
+    })?;
+    let guard = sandbox.confine_spawned(&child, policy);
+    Ok((child, guard))
 }
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -169,24 +202,15 @@ impl Tool for ShellTool {
         let policy = cx.sandbox_policy();
 
         let started = Instant::now();
-        // Detach stdin from the console: an inherited child (e.g. `cmd /C` on
-        // Windows) restores default console mode on exit, dropping our mouse
-        // capture so the wheel turns into ↑/↓ keys in the TUI.
-        let std_cmd = self
-            .sandbox
-            .wrap_shell_command(&command, &cwd, self.root.root(), &policy);
-        let mut cmd = tokio::process::Command::from(std_cmd);
-        scrub_secret_env(&mut cmd);
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|error| ToolError::ExecutionFailed {
-            name: Self::NAME.to_string(),
-            message: format!("failed to start command: {error}"),
-        })?;
-
-        let job_guard = self.sandbox.confine_spawned(&child, &policy);
+        let (mut child, job_guard) = spawn_confined(
+            &self.sandbox,
+            self.root.root(),
+            &command,
+            &cwd,
+            &policy,
+            Self::NAME,
+            "failed to start command",
+        )?;
         let stdout = SharedBuffer::default();
         let stderr = SharedBuffer::default();
         let stream_budget = Arc::new(AtomicUsize::new(0));
@@ -289,23 +313,18 @@ impl JobTool {
         let cwd = self.root.resolve_cwd(params.cwd.as_deref(), Self::NAME)?;
         let policy = cx.sandbox_policy();
 
-        let std_cmd = self
-            .sandbox
-            .wrap_shell_command(&command, &cwd, self.root.root(), &policy);
-        let mut cmd = tokio::process::Command::from(std_cmd);
-        scrub_secret_env(&mut cmd);
         // Tie the process lifetime to its stored `Child`: if the JobStore is
         // dropped (app exit) the OS process is killed rather than orphaned.
         // `JobStore::shutdown` makes this deterministic on cancel/quit.
-        cmd.kill_on_drop(true);
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|error| ToolError::ExecutionFailed {
-            name: Self::NAME.to_string(),
-            message: format!("failed to start background command: {error}"),
-        })?;
-        let job_guard = self.sandbox.confine_spawned(&child, &policy);
+        let (mut child, job_guard) = spawn_confined(
+            &self.sandbox,
+            self.root.root(),
+            &command,
+            &cwd,
+            &policy,
+            Self::NAME,
+            "failed to start background command",
+        )?;
         let stdout = SharedBuffer::default();
         let stderr = SharedBuffer::default();
         if let Some(pipe) = child.stdout.take() {

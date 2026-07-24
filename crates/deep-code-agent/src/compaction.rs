@@ -7,6 +7,7 @@ use crate::message::{Message, Role};
 use crate::model_registry::{compaction_threshold_for_model, context_window_for_model};
 use crate::session::entry_wire_messages;
 use crate::session_entry::{EntryKind, SessionEntry};
+use crate::text_util::truncate_chars;
 
 /// How many trailing entries survive compaction. Entries are atomic (an
 /// assistant entry carries its whole tool batch), so unlike the old
@@ -182,14 +183,6 @@ fn summarize_archived(messages: &[Message]) -> String {
         return "（无历史内容）".to_string();
     }
     lines.join("\n")
-}
-
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    let truncated: String = value.chars().take(max_chars).collect();
-    format!("{truncated}…")
 }
 
 #[cfg(test)]

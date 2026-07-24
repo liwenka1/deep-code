@@ -20,6 +20,7 @@ use crate::execution_policy::{RiskLevel, SafetyNote};
 use crate::i18n::{Lang, tr};
 use crate::message::Message;
 use crate::model::{ChatRequest, Usage};
+use crate::text_util::truncate_chars;
 
 /// Fixed, English, model-facing instructions. Not UI text — never localized.
 const SYSTEM_PROMPT: &str = "You are a strict safety gate for a coding agent. \
@@ -49,7 +50,7 @@ pub struct ClassifierInput<'a> {
 /// only on an explicit, parseable `approve: true`; every other outcome — deny,
 /// model error, unparseable text — is `false` (ask the human). The returned
 /// usage (when the stream reports it) lets the caller bill the judge call.
-pub async fn approves<C: LlmClient>(
+pub async fn approves<C: LlmClient + ?Sized>(
     client: &C,
     model: &str,
     input: &ClassifierInput<'_>,
@@ -123,14 +124,6 @@ fn parse_approve(text: &str) -> bool {
         .ok()
         .and_then(|value| value.get("approve").and_then(Value::as_bool))
         .unwrap_or(false)
-}
-
-fn truncate_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let head: String = text.chars().take(max).collect();
-    format!("{head}…")
 }
 
 /// The human-meaningful action behind a gated call — the command, path, url, …

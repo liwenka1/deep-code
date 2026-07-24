@@ -108,7 +108,7 @@ pub fn write_global_config_update(
         })?;
     }
     let tmp = path.with_extension("toml.tmp");
-    fs::write(&tmp, document.to_string()).map_err(|error| {
+    write_private(&tmp, &document.to_string()).map_err(|error| {
         tr_with(
             lang,
             TextId::CfgWriteFailed,
@@ -134,6 +134,27 @@ pub fn write_global_config_update(
 
 fn new_config_template(lang: Lang) -> String {
     format!("{}\n\n[provider]\n", tr(lang, TextId::CfgTemplateHeader))
+}
+
+/// Write secret-bearing content to a fresh file created with private
+/// permissions from the start, so the API key is never briefly world-readable
+/// between creation and the post-rename chmod.
+#[cfg(unix)]
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    fs::write(path, contents)
 }
 
 #[cfg(unix)]

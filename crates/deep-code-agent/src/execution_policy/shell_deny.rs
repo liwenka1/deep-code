@@ -46,7 +46,11 @@ fn program_of(segment: &str) -> Option<String> {
         if token.contains('=') && !token.starts_with('-') && !token.contains('/') {
             continue;
         }
-        let base = token.rsplit(['/', '\\']).next().unwrap_or(token);
+        // Strip shell quoting around the program word so a quoted name
+        // (`'rm'`, `"rm"`) still resolves to its basename and can't dodge a
+        // deny rule. Backslash-escapes (`\rm`) fall out of the rsplit below.
+        let unquoted = token.trim_matches(['\'', '"']);
+        let base = unquoted.rsplit(['/', '\\']).next().unwrap_or(unquoted);
         return Some(base.to_ascii_lowercase());
     }
     None
@@ -152,7 +156,60 @@ pub fn builtin_deny(command: &str) -> Option<DenyReason> {
     if let Some(reason) = deny_pipe_to_shell(command) {
         return Some(reason);
     }
-    segments(command).into_iter().find_map(deny_segment)
+    if let Some(reason) = segments(command).into_iter().find_map(deny_segment) {
+        return Some(reason);
+    }
+    // A command substitution runs its own inner command that top-level segment
+    // splitting never sees (`x=$(rm -rf ~)`, `` touch `id` ``). Route each inner
+    // command back through the deny checks so a destructive one can't hide
+    // behind a benign outer program.
+    substitutions(command).into_iter().find_map(builtin_deny)
+}
+
+/// Extract the inner text of each `$(...)` and backtick command substitution.
+/// `$(...)` is matched with paren-depth counting; backticks pair left to right.
+/// Deliberately simple — an exotic nesting that defeats it still falls through
+/// to "needs approval" rather than being auto-trusted. Indices land on ASCII
+/// `$`/`(`/`)`/`` ` `` bytes, so the slices stay on UTF-8 boundaries.
+fn substitutions(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'(') {
+            let start = i + 2;
+            let mut depth = 1usize;
+            let mut j = start;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if start <= j && j <= bytes.len() {
+                out.push(&command[start..j]);
+            }
+            i = j + 1;
+        } else if bytes[i] == b'`' {
+            let start = i + 1;
+            if let Some(rel) = command[start..].find('`') {
+                out.push(&command[start..start + rel]);
+                i = start + rel + 1;
+            } else {
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Static, no-execution safety notes surfaced at the approval prompt: why a
@@ -322,6 +379,24 @@ mod tests {
     #[test]
     fn extra_whitespace_rm_is_denied() {
         assert!(denied("rm    -rf     /"));
+    }
+
+    #[test]
+    fn quoted_program_word_cannot_dodge_deny() {
+        // A quoted program name must still resolve to its basename.
+        assert!(denied("'rm' -rf /"));
+        assert!(denied("\"rm\" -rf /"));
+        assert!(denied("'sudo' reboot"));
+    }
+
+    #[test]
+    fn destructive_command_inside_substitution_is_denied() {
+        // The inner command of a substitution runs regardless of the outer one.
+        assert!(denied("x=$(rm -rf /)"));
+        assert!(denied("echo $(rm -rf /)"));
+        assert!(denied("touch `rm -rf /`"));
+        // A benign substitution stays allowed.
+        assert!(!denied("echo $(git status)"));
     }
 
     #[test]

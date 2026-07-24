@@ -1,7 +1,7 @@
 //! Axum HTTP/SSE server for the local runtime API.
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -150,8 +150,45 @@ impl Drop for ApprovalSlotGuard {
     }
 }
 
+/// A host is loopback-only if it names localhost or parses to a loopback IP.
+/// Unclassifiable hostnames are treated as non-loopback, so a missing auth
+/// token there fails closed (refuses to bind) rather than exposing the agent.
+fn host_is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::host_is_loopback;
+
+    #[test]
+    fn classifies_loopback_hosts() {
+        assert!(host_is_loopback("127.0.0.1"));
+        assert!(host_is_loopback("::1"));
+        assert!(host_is_loopback("localhost"));
+        assert!(host_is_loopback("LOCALHOST"));
+        assert!(!host_is_loopback("0.0.0.0"));
+        assert!(!host_is_loopback("192.168.1.9"));
+        assert!(!host_is_loopback("example.com"));
+    }
+}
+
 pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
     let options = options.resolve_auth_token();
+    if options.auth_token.is_none() && !host_is_loopback(&options.host) {
+        anyhow::bail!(
+            "refusing to bind non-loopback host '{}' without an auth token: \
+             any machine that can reach it could drive the agent. Pass \
+             --auth-token <TOKEN>, set {}, or bind 127.0.0.1.",
+            options.host,
+            RUNTIME_TOKEN_ENV
+        );
+    }
     let loaded = AgentConfig::load(&options.workspace);
     for warning in &loaded.report.warnings {
         eprintln!("config warning: {warning}");

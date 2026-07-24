@@ -20,6 +20,7 @@ mod model;
 mod model_registry;
 mod paths;
 mod pricing;
+mod text_util;
 mod reasoning;
 mod runtime;
 mod runtime_launch;
