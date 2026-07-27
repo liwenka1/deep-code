@@ -17,14 +17,14 @@ use axum::routing::{get, post};
 use axum::{Json, middleware};
 use deep_code_agent::{
     AgentConfig, ApprovalDecision, ApprovalRequest, JsonSessionStore, LaunchedRuntime,
-    RuntimeEvent, SessionId, SessionRecord, SessionStore, launch_runtime,
+    RuntimeEvent, SessionId, SessionRecord, SessionStore, launch_runtime, now_ms,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, oneshot};
 
 use crate::auth::{RUNTIME_TOKEN_ENV, token_matches};
-use crate::events::{EnvelopeStream, RuntimeEnvelope, now_ms};
+use crate::events::{EnvelopeStream, RuntimeEnvelope};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 7878;

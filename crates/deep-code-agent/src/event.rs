@@ -61,8 +61,6 @@ mod tests {
     #[test]
     fn chunk_to_events_emits_text_and_done() {
         let chunk = StreamChunk {
-            id: Some("chunk".to_string()),
-            model: Some("deepseek-v4-pro".to_string()),
             choices: vec![ChatChoice {
                 index: 0,
                 message: None,

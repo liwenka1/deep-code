@@ -6,7 +6,6 @@ use tokio::sync::Mutex;
 use crate::client::LlmClient;
 use crate::config::AgentConfig;
 use crate::model::Usage;
-use crate::pricing::CostEstimate;
 use crate::runtime::AgentRuntime;
 use crate::runtime::persistence_actor::PersistenceActorHandle;
 use crate::runtime::state::{Persistence, RuntimeState};
@@ -67,21 +66,7 @@ impl AgentRuntime {
             tools: Arc::new(tools),
             state: Arc::new(Mutex::new(RuntimeState {
                 session,
-                pending: None,
-                current_turn: None,
-                last_prefix_hash: None,
-                session_cost: CostEstimate::default(),
-                session_cache_hit_tokens: 0,
-                session_cache_miss_tokens: 0,
-                session_cache_savings: CostEstimate::default(),
-                current_prompt: None,
-                current_turn_id: None,
-                cancel: tokio_util::sync::CancellationToken::new(),
-                session_approved: Default::default(),
-                session_trusted_shell_prefixes: Default::default(),
-                cascade_escalated: false,
-                turn_tool_errors: 0,
-                cascade_triggered_this_turn: false,
+                ..Default::default()
             })),
             checkpoints: None,
             workspace: Some(workspace.clone()),

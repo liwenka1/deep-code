@@ -435,7 +435,8 @@ pub fn run_session_command(mode: RunMode) -> anyhow::Result<()> {
                 return Ok(());
             }
             for record in records {
-                let preview = truncate_preview(&record.preview(), 60);
+                let preview =
+                    crate::history::truncate_chars(&record.preview().replace('\n', " "), 60);
                 println!(
                     "{}\t{}\t{} msgs\t{}",
                     record.id.as_str(),
@@ -482,21 +483,6 @@ fn print_session_usage() {
     eprintln!("  deepcode session export <session_id>");
     eprintln!("  deepcode -c            # 续最近会话");
     eprintln!("  deepcode -r            # 选择历史会话");
-}
-
-fn truncate_preview(text: &str, max_chars: usize) -> String {
-    let mut chars = text.chars();
-    let mut out = String::new();
-    for _ in 0..max_chars {
-        let Some(ch) = chars.next() else {
-            return text.replace('\n', " ");
-        };
-        out.push(ch);
-    }
-    if chars.next().is_some() {
-        out.push_str("...");
-    }
-    out.replace('\n', " ")
 }
 
 fn format_timestamp(ms: u64) -> String {

@@ -42,11 +42,6 @@ impl DeepSeekClient {
             config,
         })
     }
-
-    #[must_use]
-    pub fn config(&self) -> &AgentConfig {
-        &self.config
-    }
 }
 
 #[async_trait]

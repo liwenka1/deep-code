@@ -14,7 +14,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::runtime::AgentRuntime;
-use crate::subagent::manager::{new_agent_id, now_ms};
+use crate::session_store::now_ms;
+use crate::subagent::manager::new_agent_id;
 use crate::subagent::registry::{SubAgentServices, child_system_prompt, child_tool_registry};
 use crate::subagent::roles::SubAgentRole;
 use crate::subagent::runner::run_subagent;

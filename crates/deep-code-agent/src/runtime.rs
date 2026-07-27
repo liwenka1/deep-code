@@ -37,7 +37,6 @@ use crate::execution_policy::SharedPermissionMode;
 use crate::lsp::LspManager;
 use crate::message::Message;
 use crate::model_registry::ModelRegistry;
-use crate::pricing::CostEstimate;
 use crate::session::Session;
 use crate::session_store::{TurnRecord, now_ms};
 use crate::tool::{ApprovalDecision, ApprovalRequest, ToolCall, ToolRegistry};
@@ -48,6 +47,7 @@ use state::{Persistence, RuntimeState};
 /// Agent runtime tying together [`LlmClient`], [`ToolRegistry`], and [`Session`].
 ///
 /// Cheap to clone: state is behind an [`Arc`]/[`Mutex`].
+#[derive(Clone)]
 pub struct AgentRuntime {
     client: Arc<dyn LlmClient>,
     config: AgentConfig,
@@ -67,28 +67,6 @@ pub struct AgentRuntime {
     /// `/lang` can flip it live through the runtime handle without a relaunch
     /// (see [`Self::ui_lang`] / [`Self::set_ui_lang`]).
     ui_lang: crate::i18n::SharedLang,
-}
-
-// Manual `Clone` to avoid the auto-derived `where C: Clone` bound that the
-// compiler would otherwise add. `client` is already an `Arc<C>`, so cloning
-// the runtime never requires cloning `C` itself.
-impl Clone for AgentRuntime {
-    fn clone(&self) -> Self {
-        Self {
-            client: Arc::clone(&self.client),
-            config: self.config.clone(),
-            registry: self.registry.clone(),
-            is_subagent: self.is_subagent,
-            tools: Arc::clone(&self.tools),
-            state: Arc::clone(&self.state),
-            checkpoints: self.checkpoints.clone(),
-            workspace: self.workspace.clone(),
-            lsp: self.lsp.clone(),
-            persistence: self.persistence.clone(),
-            permission_mode: self.permission_mode.clone(),
-            ui_lang: self.ui_lang.clone(),
-        }
-    }
 }
 
 impl AgentRuntime {
@@ -150,21 +128,7 @@ impl AgentRuntime {
             tools: Arc::new(tools),
             state: Arc::new(Mutex::new(RuntimeState {
                 session,
-                pending: None,
-                current_turn: None,
-                last_prefix_hash: None,
-                session_cost: CostEstimate::default(),
-                session_cache_hit_tokens: 0,
-                session_cache_miss_tokens: 0,
-                session_cache_savings: CostEstimate::default(),
-                current_prompt: None,
-                current_turn_id: None,
-                cancel: CancellationToken::new(),
-                session_approved: Default::default(),
-                session_trusted_shell_prefixes: Default::default(),
-                cascade_escalated: false,
-                turn_tool_errors: 0,
-                cascade_triggered_this_turn: false,
+                ..Default::default()
             })),
             checkpoints: None,
             workspace: None,

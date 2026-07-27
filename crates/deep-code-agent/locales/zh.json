@@ -186,7 +186,6 @@
   "ErrStreamStalled": "流式响应卡顿：连续 {seconds}s 未收到新数据\n网络可能卡顿或代理中断：请检查网络后重试；如确属长任务，可调大 DEEP_CODE_STREAM_CHUNK_TIMEOUT_SECS。",
   "ErrStreamDeadline": "流式响应总时长超过 {seconds}s 上限\n本轮响应耗时过长已被终止：可拆分任务后重试，或调大 DEEP_CODE_STREAM_TOTAL_TIMEOUT_SECS。",
   "ErrStreamOverflow": "流式响应过大：累计内容超过 {limit} 字节上限\n响应内容异常巨大已被截断保护：请缩小任务范围，或调大 DEEP_CODE_STREAM_MAX_BYTES。",
-  "ErrInvalidConfig": "配置无效：{detail}",
 
   "CfgFileUnusable": "配置文件 {path} 无法使用，已跳过该层：{detail}",
   "CfgProjectApiKeyIgnored": "项目配置中的 provider.api_key 已忽略：密钥只能来自环境变量或全局配置，避免随仓库泄露或被恶意仓库注入",

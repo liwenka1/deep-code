@@ -21,38 +21,7 @@ pub struct JobStore {
     jobs: Arc<Mutex<HashMap<String, Arc<Mutex<JobState>>>>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct BackgroundJobSummary {
-    pub id: String,
-    pub command: String,
-    pub cwd: String,
-    pub status: JobStatus,
-    pub exit_code: Option<i32>,
-    pub background: bool,
-}
-
 impl JobStore {
-    /// Summaries of shell jobs tracked for the current runtime (foreground + background).
-    pub fn list_summaries(&self) -> Vec<BackgroundJobSummary> {
-        let guard = self.jobs.lock().expect("job store lock poisoned");
-        let mut summaries: Vec<_> = guard
-            .iter()
-            .filter_map(|(id, state_arc)| {
-                let state = state_arc.lock().ok()?;
-                Some(BackgroundJobSummary {
-                    id: id.clone(),
-                    command: state.command.clone(),
-                    cwd: state.cwd.clone(),
-                    status: state.status,
-                    exit_code: state.exit_code,
-                    background: state.kind == JobKind::Background,
-                })
-            })
-            .collect();
-        summaries.sort_by(|left, right| right.id.cmp(&left.id));
-        summaries
-    }
-
     /// Kill every still-running background child. Called on runtime shutdown so
     /// a cancelled or quit session doesn't orphan long-running processes (dev
     /// servers, watchers) that keep holding ports. `kill_on_drop` is the

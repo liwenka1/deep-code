@@ -65,8 +65,6 @@ pub enum ResolutionKind {
 /// Outcome of turning a requested model name into a concrete id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelResolution {
-    /// What the caller asked for, verbatim (`None` when nothing usable was given).
-    pub requested: Option<String>,
     /// The id the runtime should actually use.
     pub resolved_id: String,
     /// How the catalog arrived at `resolved_id`.
@@ -111,17 +109,13 @@ impl ModelRegistry {
     pub fn resolve(&self, requested: Option<&str>) -> ModelResolution {
         let Some(asked) = requested.filter(|value| !value.trim().is_empty()) else {
             return ModelResolution {
-                requested: None,
                 resolved_id: DEEPSEEK_V4_PRO.to_string(),
                 kind: ResolutionKind::DefaultApplied,
             };
         };
 
-        let answer = |resolved_id: String, kind: ResolutionKind| ModelResolution {
-            requested: Some(asked.to_string()),
-            resolved_id,
-            kind,
-        };
+        let answer =
+            |resolved_id: String, kind: ResolutionKind| ModelResolution { resolved_id, kind };
 
         if names_equal(asked, AUTO_MODEL) {
             return answer(AUTO_MODEL.to_string(), ResolutionKind::Resolved);
@@ -221,7 +215,6 @@ mod tests {
             let resolution = registry.resolve(Some(id));
             assert_eq!(resolution.resolved_id, id);
             assert_eq!(resolution.kind, ResolutionKind::Resolved);
-            assert_eq!(resolution.requested.as_deref(), Some(id));
         }
     }
 
@@ -257,7 +250,6 @@ mod tests {
         let resolution = ModelRegistry::default().resolve(Some(" experimental-v5 "));
         assert_eq!(resolution.resolved_id, "experimental-v5");
         assert_eq!(resolution.kind, ResolutionKind::Passthrough);
-        assert_eq!(resolution.requested.as_deref(), Some(" experimental-v5 "));
     }
 
     #[test]

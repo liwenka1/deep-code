@@ -16,7 +16,7 @@ use crate::sandbox::{SandboxGuard, SandboxManager, SandboxPolicy};
 use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, ToolUpdate};
 use crate::workspace_policy::{WorkspacePolicy, invalid};
 #[allow(unused_imports)]
-pub use jobs::{BackgroundJobSummary, JobStore};
+pub use jobs::JobStore;
 use jobs::{
     ChunkFn, JobKind, JobState, JobStatus, SharedBuffer, cancel_job, job_details,
     job_text_snapshot, refresh_job, shell_text_output, spawn_buffer_reader,
@@ -229,7 +229,7 @@ impl Tool for ShellTool {
         }
 
         // The tool future owns the child; the store entry exposes the run to
-        // `GET /jobs` and post-hoc `job action=tail`.
+        // post-hoc `job action=status/tail`.
         let job_id = self.jobs.insert(JobState {
             kind: JobKind::Foreground,
             command: command.clone(),

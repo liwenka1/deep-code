@@ -118,8 +118,6 @@ pub struct ToolCallFunctionPayload {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamChunk {
-    pub id: Option<String>,
-    pub model: Option<String>,
     pub choices: Vec<ChatChoice>,
     pub usage: Option<Usage>,
 }

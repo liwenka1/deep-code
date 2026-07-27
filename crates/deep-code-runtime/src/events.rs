@@ -6,7 +6,7 @@
 //! consumers (`.github/workflows/deep-code-bot.yml`).
 
 use chrono::Utc;
-use deep_code_agent::{RuntimeEvent, TurnId};
+use deep_code_agent::{RuntimeEvent, TurnId, now_ms};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -123,10 +123,4 @@ fn event_turn_id(event: &RuntimeEvent) -> Option<TurnId> {
         | RuntimeEvent::DiagnosticsUpdated { .. }
         | RuntimeEvent::Warning { .. } => None,
     }
-}
-
-pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as u64)
 }

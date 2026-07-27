@@ -186,7 +186,6 @@
   "ErrStreamStalled": "Stream stalled: no new data for {seconds}s\nNetwork may be stalling or the proxy dropped — retry; for genuinely long tasks raise DEEP_CODE_STREAM_CHUNK_TIMEOUT_SECS.",
   "ErrStreamDeadline": "Stream exceeded the {seconds}s total deadline\nThis turn ran too long and was terminated — split the task and retry, or raise DEEP_CODE_STREAM_TOTAL_TIMEOUT_SECS.",
   "ErrStreamOverflow": "Stream too large: content exceeded the {limit}-byte cap\nThe response was unusually huge and was truncated for safety — narrow the task, or raise DEEP_CODE_STREAM_MAX_BYTES.",
-  "ErrInvalidConfig": "Invalid config: {detail}",
 
   "CfgFileUnusable": "Config file {path} is unusable and was skipped: {detail}",
   "CfgProjectApiKeyIgnored": "provider.api_key in the project config is ignored: the key may only come from the environment or global config, to avoid leaking through the repo or being injected by a malicious one",

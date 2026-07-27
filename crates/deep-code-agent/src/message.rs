@@ -22,15 +22,6 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallPayload>,
-    /// DeepSeek `/beta` chat-prefix-completion flag: when set on the final
-    /// assistant message, the model continues from `content` instead of
-    /// starting fresh. Skipped from the wire unless true.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub prefix: bool,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 impl Message {
@@ -42,7 +33,6 @@ impl Message {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: Vec::new(),
-            prefix: false,
         }
     }
 
@@ -54,11 +44,6 @@ impl Message {
     #[must_use]
     pub fn user(content: impl Into<String>) -> Self {
         Self::new(Role::User, content)
-    }
-
-    #[must_use]
-    pub fn assistant(content: impl Into<String>) -> Self {
-        Self::new(Role::Assistant, content)
     }
 
     /// Build an assistant message that carries `tool_calls`. Required by the
@@ -90,7 +75,6 @@ impl Message {
             },
             tool_call_id: None,
             tool_calls,
-            prefix: false,
         }
     }
 
@@ -102,7 +86,6 @@ impl Message {
             reasoning_content: None,
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: Vec::new(),
-            prefix: false,
         }
     }
 }

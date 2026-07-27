@@ -447,6 +447,9 @@ pub(crate) fn tool_result_word(status: &ToolResultStatus) -> &'static str {
     }
 }
 
+/// Truncate to at most `max_chars` characters, appending `…` when anything
+/// was cut. Returns the input unchanged when it already fits, so the ellipsis
+/// marks real elision only.
 pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
     let mut truncated = String::new();
@@ -457,7 +460,7 @@ pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
         truncated.push(ch);
     }
     if chars.next().is_some() {
-        truncated.push_str("... (truncated)");
+        truncated.push('…');
     }
     truncated
 }
@@ -637,11 +640,7 @@ mod tests {
             requires_sandbox: None,
             approval: ToolApprovalState::NotRequired,
         };
-        assert!(
-            tool.lines(Lang::Zh)
-                .iter()
-                .any(|line| line.contains("(truncated)"))
-        );
+        assert!(tool.lines(Lang::Zh).iter().any(|line| line.contains('…')));
 
         let approval = HistoryCell::Approval {
             tool_name: "shell".to_string(),
@@ -654,7 +653,7 @@ mod tests {
         let lines = approval.lines(Lang::Zh);
         assert!(lines.iter().any(|line| line.contains("Risk: High")));
         assert!(lines.iter().any(|line| line.contains("Rule: shell")));
-        assert!(lines.iter().any(|line| line.contains("(truncated)")));
+        assert!(lines.iter().any(|line| line.contains('…')));
     }
 
     #[test]

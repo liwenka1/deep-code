@@ -10,11 +10,11 @@
 //! placeholder message on demand.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::model::ToolCallPayload;
+use crate::session_store::now_ms;
 use crate::tool::ToolResultStatus;
 
 /// Stable per-entry identifier (branching foundation): unique within a
@@ -167,10 +167,4 @@ pub struct ExchangeResult {
     /// [`crate::session_store::TurnRecord`] (dual-copy design).
     pub content: String,
     pub status: ToolResultStatus,
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as u64)
 }

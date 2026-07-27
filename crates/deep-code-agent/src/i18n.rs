@@ -334,7 +334,6 @@ text_ids! {
     ErrStreamStalled,
     ErrStreamDeadline,
     ErrStreamOverflow,
-    ErrInvalidConfig,
     // 配置加载警告(layers.rs)
     CfgFileUnusable,
     CfgProjectApiKeyIgnored,

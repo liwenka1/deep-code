@@ -85,7 +85,8 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
 /// look, but draws inside the live alt-screen (a full-area `Clear` wipes the
 /// transcript beneath) so opening/closing it never flickers.
 fn render_resume_picker(frame: &mut Frame<'_>, picker: &crate::app::ResumePicker, lang: Lang) {
-    use crate::startup::{now_ms, relative_time, session_title};
+    use crate::startup::{relative_time, session_title};
+    use deep_code_agent::now_ms;
     let area = frame.area();
     frame.render_widget(Clear, area);
 

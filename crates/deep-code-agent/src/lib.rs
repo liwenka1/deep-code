@@ -43,19 +43,13 @@ mod workspace_tools;
 // items' signatures. Keeping it tight lets rustc's dead_code lint see the
 // rest of the crate. Re-add an export the day a consumer needs it.
 pub use checkpoint::{CheckpointId, CheckpointStore};
-pub use client::{AgentEventStream, DeepSeekClient, LlmClient};
-pub use config::{
-    AgentConfig, ConfigLayer, ConfigLoadReport, ConfigSources, GlobalConfigUpdate,
-    LoadedAgentConfig, validate_api_key, write_global_config_update,
-};
-pub use doctor::{ConfigLayersDoctorReport, DoctorReport, default_config_path};
+pub use client::{AgentEventStream, LlmClient};
+pub use config::{AgentConfig, GlobalConfigUpdate, validate_api_key, write_global_config_update};
+pub use doctor::{DoctorReport, default_config_path};
 pub use error::AgentResult;
 pub use event::AgentEvent;
-pub use execution_policy::{
-    ExecPolicy, PermissionMode, PolicyVerdict, RiskLevel, SafetyNote, SharedPermissionMode,
-};
+pub use execution_policy::{PermissionMode, RiskLevel, SafetyNote, SharedPermissionMode};
 pub use i18n::{Lang, TextId, tr, tr_with};
-pub use message::Message;
 pub use model::{
     ChatRequest, FunctionCallDelta, ToolCallDelta, ToolCallFunctionPayload, ToolCallPayload, Usage,
 };
@@ -66,8 +60,8 @@ pub use runtime_launch::{LaunchedRuntime, launch_runtime, web_enabled};
 pub use session::Session;
 pub use session_entry::{EntryKind, ExchangeResult, SessionEntry, ToolExchange};
 pub use session_store::{
-    CheckpointRecord, ConfigSnapshot, JsonSessionStore, SessionId, SessionRecord, SessionStore,
-    SessionStoreError, TurnRecord, format_sessions_storage_note,
+    CheckpointRecord, JsonSessionStore, SessionId, SessionRecord, SessionStore, SessionStoreError,
+    TurnRecord, format_sessions_storage_note, now_ms,
 };
 pub use shell_tools::JobStore;
 pub use subagent::{SharedSubAgentManager, SubAgentManager, is_subagent_tool};

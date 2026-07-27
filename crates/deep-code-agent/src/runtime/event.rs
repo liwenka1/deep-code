@@ -1,5 +1,4 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,7 +7,7 @@ use tokio::sync::mpsc;
 use crate::checkpoint::CheckpointId;
 use crate::model::Usage;
 use crate::pricing::TurnTelemetry;
-use crate::session_store::SessionId;
+use crate::session_store::{SessionId, now_ms};
 use crate::tool::{ApprovalRequest, ToolResult, ToolUpdate};
 
 /// Stable identifier for one user-visible agent turn.
@@ -173,10 +172,4 @@ pub type RuntimeEventReceiver = mpsc::UnboundedReceiver<RuntimeEvent>;
 
 pub(super) fn emit(tx: &mpsc::UnboundedSender<RuntimeEvent>, event: RuntimeEvent) {
     let _ = tx.send(event);
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as u64)
 }

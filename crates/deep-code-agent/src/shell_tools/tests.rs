@@ -275,16 +275,24 @@ async fn job_store_shutdown_kills_running_background_jobs() {
         panic!("expected result");
     };
     assert_eq!(details(&result)["status"], "running");
+    let job_id = details(&result)["job_id"].as_str().unwrap().to_string();
 
     // Runtime teardown must terminate the still-running child, not orphan it.
     jobs.shutdown();
 
-    let summary = jobs
-        .list_summaries()
-        .into_iter()
-        .find(|summary| summary.background)
-        .expect("background job tracked");
-    assert_eq!(summary.status, JobStatus::Cancelled);
+    let status = ToolCall::new(
+        "call_2",
+        "job",
+        json!({"action": "status", "job_id": job_id}),
+    );
+    let ToolRunOutcome::Result { result } = registry
+        .run_tool_call(status, Some(ApprovalDecision::Approved))
+        .await
+        .unwrap()
+    else {
+        panic!("expected result");
+    };
+    assert_eq!(details(&result)["status"], "cancelled");
 }
 
 #[tokio::test]

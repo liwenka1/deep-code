@@ -4,7 +4,7 @@
 
 use std::io::{self, Stdout};
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -14,7 +14,7 @@ use crossterm::terminal::{
 };
 use deep_code_agent::{
     AgentConfig, JsonSessionStore, SessionId, SessionRecord, SessionStore,
-    format_sessions_storage_note,
+    format_sessions_storage_note, now_ms,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style};
@@ -101,7 +101,7 @@ pub(crate) fn session_title(record: &SessionRecord, lang: Lang) -> String {
         Some(content) => content,
         None => return tr(lang, TextId::EmptySessionTitle).to_string(),
     };
-    truncate(&first.split_whitespace().collect::<Vec<_>>().join(" "), 56)
+    crate::history::truncate_chars(&first.split_whitespace().collect::<Vec<_>>().join(" "), 56)
 }
 
 /// Human-readable age, e.g. "刚刚 / 5 分钟前" or "just now / 5 min ago". Pure.
@@ -128,12 +128,6 @@ pub(crate) fn relative_time(now_ms: u64, then_ms: u64, lang: Lang) -> String {
             &[("n", &(secs / 86_400).to_string())],
         )
     }
-}
-
-pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
 }
 
 fn run_picker(sessions: &[SessionRecord], lang: Lang) -> Result<StartupChoice> {
@@ -259,21 +253,6 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
-}
-
-fn truncate(text: &str, max_chars: usize) -> String {
-    let mut chars = text.chars();
-    let mut out = String::new();
-    for _ in 0..max_chars {
-        let Some(ch) = chars.next() else {
-            return text.to_string();
-        };
-        out.push(ch);
-    }
-    if chars.next().is_some() {
-        out.push('…');
-    }
-    out
 }
 
 #[cfg(test)]

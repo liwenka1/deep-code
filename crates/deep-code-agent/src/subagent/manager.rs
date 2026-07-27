@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::session_store::now_ms;
 use crate::subagent::output::parse_structured_report;
 use crate::subagent::types::{
     HARD_MAX_CONCURRENT, SUBAGENT_STATE_FILE, SUBAGENT_STATE_SCHEMA_VERSION, SubAgentError,
@@ -295,12 +296,6 @@ pub fn new_agent_id() -> String {
 
 fn new_boot_id() -> String {
     format!("boot_{}", uuid::Uuid::new_v4())
-}
-
-pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as u64)
 }
 
 #[cfg(test)]

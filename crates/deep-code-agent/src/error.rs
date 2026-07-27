@@ -13,9 +13,6 @@ pub enum AgentError {
     #[error("missing DeepSeek API key")]
     MissingApiKey,
 
-    #[error("invalid config: {0}")]
-    InvalidConfig(String),
-
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 
@@ -51,9 +48,6 @@ impl AgentError {
     pub fn user_message(&self, lang: Lang) -> String {
         match self {
             Self::MissingApiKey => tr(lang, TextId::ErrMissingApiKey).to_string(),
-            Self::InvalidConfig(detail) => {
-                tr_with(lang, TextId::ErrInvalidConfig, &[("detail", detail)])
-            }
             Self::Http(error) => tr_with(lang, TextId::ErrHttp, &[("error", &error.to_string())]),
             Self::Api { status, message } => {
                 let id = if *status == reqwest::StatusCode::UNAUTHORIZED {
