@@ -188,31 +188,18 @@ impl App {
             RuntimeEvent::TurnFinished { telemetry, .. } => {
                 self.flush_active_turn();
                 self.last_telemetry = telemetry.clone();
-                let checkpoint = self
+                // The durable frame (mode/backend/session/telemetry) comes
+                // from `status_line()`; keep only the rollback hint here so
+                // nothing shows twice.
+                self.status = self
                     .last_checkpoint
                     .as_ref()
-                    .map(|id| self.tr_with(TextId::StatusRollbackHint, &[("id", id)]))
-                    .unwrap_or_default();
-                let session = self
-                    .session_id
-                    .as_ref()
-                    .map(|id| format!(" | session {id}"))
-                    .unwrap_or_default();
-                let telemetry_note = telemetry
-                    .as_ref()
-                    .map(|value| {
-                        crate::commands::format_turn_telemetry(value, self.cost_currency, self.lang)
+                    .map(|id| {
+                        self.tr_with(TextId::StatusRollbackHint, &[("id", id)])
+                            .trim_start_matches(" | ")
+                            .to_string()
                     })
                     .unwrap_or_default();
-                let ready = if self.resumed {
-                    self.tr(TextId::ModeReadyResumed)
-                } else {
-                    self.tr(TextId::ModeReady)
-                };
-                self.status = format!(
-                    "{ready} - {}{}{}{telemetry_note}",
-                    self.backend_label, checkpoint, session
-                );
                 self.is_streaming = false;
                 self.clear_stream_receiver();
             }
@@ -220,15 +207,7 @@ impl App {
                 self.flush_active_turn();
                 self.history
                     .push(HistoryCell::system(self.tr(TextId::SystemTurnCancelled)));
-                let session = self
-                    .session_id
-                    .as_ref()
-                    .map(|id| format!(" | session {id}"))
-                    .unwrap_or_default();
-                self.status = format!(
-                    "{}{session}",
-                    self.tr_with(TextId::StatusCancelled, &[("backend", &self.backend_label)])
-                );
+                self.status = self.tr(TextId::StatusCancelled).to_string();
                 self.pending_approval = None;
                 self.is_streaming = false;
                 self.clear_stream_receiver();

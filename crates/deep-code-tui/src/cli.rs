@@ -3,7 +3,10 @@
 use std::env;
 use std::path::PathBuf;
 
-use deep_code_agent::{JsonSessionStore, SessionId, SessionStore, format_sessions_storage_note};
+use deep_code_agent::{
+    AgentConfig, JsonSessionStore, Lang, SessionId, SessionStore, format_sessions_storage_note,
+    now_ms,
+};
 
 /// What the interactive TUI should open with. A bare `deep-code` starts
 /// fresh; resuming is opt-in, so stale context never leaks in by default.
@@ -73,7 +76,7 @@ pub fn parse_args() -> CliArgs {
 
     match args[0].as_str() {
         "--version" | "-V" => {
-            eprintln!("deepcode {}", env!("CARGO_PKG_VERSION"));
+            println!("deep-code {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
         }
         "session" => {
@@ -153,7 +156,7 @@ fn parse_doctor_command(mut args: Vec<String>) -> CliArgs {
                 args.remove(0);
             }
             other => {
-                eprintln!("Unknown doctor argument '{other}'. Usage: deepcode doctor [--json]");
+                eprintln!("Unknown doctor argument '{other}'. Usage: deep-code doctor [--json]");
                 std::process::exit(2);
             }
         }
@@ -215,7 +218,7 @@ fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
             }
             other => {
                 eprintln!(
-                    "Unknown serve argument '{other}'. Usage: deepcode serve --http [--host HOST] [--port PORT] [--auth-token TOKEN] [--resume ID] [--approval-mode interactive|autonomous]"
+                    "Unknown serve argument '{other}'. Usage: deep-code serve --http [--host HOST] [--port PORT] [--auth-token TOKEN] [--resume ID] [--approval-mode interactive|autonomous]"
                 );
                 std::process::exit(2);
             }
@@ -223,7 +226,7 @@ fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
     }
 
     if !http {
-        eprintln!("Usage: deepcode serve --http [--host 127.0.0.1] [--port 7878]");
+        eprintln!("Usage: deep-code serve --http [--host 127.0.0.1] [--port 7878]");
         std::process::exit(2);
     }
 
@@ -309,7 +312,7 @@ fn parse_eval_command(mut args: Vec<String>) -> CliArgs {
             }
             other => {
                 eprintln!(
-                    "Unknown eval argument '{other}'. Usage: deepcode eval \
+                    "Unknown eval argument '{other}'. Usage: deep-code eval \
 [--subset lite|verified] [--split dev|test] [--sample N] [--parallel N] \
 [--json] [--markdown] [--timeout SECS] [--out DIR]"
                 );
@@ -342,7 +345,7 @@ fn require_value(args: &mut Vec<String>, flag: &str) -> String {
 
 fn parse_session_command(mut args: Vec<String>) -> CliArgs {
     let Some(subcommand) = args.first().cloned() else {
-        eprintln!("Usage: deepcode session <list|resume|delete|export> [id]");
+        eprintln!("Usage: deep-code session <list|resume|delete|export> [id]");
         print_session_usage();
         std::process::exit(2);
     };
@@ -351,7 +354,7 @@ fn parse_session_command(mut args: Vec<String>) -> CliArgs {
     match subcommand.as_str() {
         "list" => {
             if !args.is_empty() {
-                eprintln!("Usage: deepcode session list");
+                eprintln!("Usage: deep-code session list");
                 std::process::exit(2);
             }
             CliArgs {
@@ -360,11 +363,11 @@ fn parse_session_command(mut args: Vec<String>) -> CliArgs {
         }
         "resume" => {
             let Some(id) = args.first().cloned() else {
-                eprintln!("Usage: deepcode session resume <id>");
+                eprintln!("Usage: deep-code session resume <id>");
                 std::process::exit(2);
             };
             if args.len() > 1 {
-                eprintln!("Usage: deepcode session resume <id>");
+                eprintln!("Usage: deep-code session resume <id>");
                 std::process::exit(2);
             }
             CliArgs {
@@ -375,11 +378,11 @@ fn parse_session_command(mut args: Vec<String>) -> CliArgs {
         }
         "delete" => {
             let Some(id) = args.first().cloned() else {
-                eprintln!("Usage: deepcode session delete <id>");
+                eprintln!("Usage: deep-code session delete <id>");
                 std::process::exit(2);
             };
             if args.len() > 1 {
-                eprintln!("Usage: deepcode session delete <id>");
+                eprintln!("Usage: deep-code session delete <id>");
                 std::process::exit(2);
             }
             CliArgs {
@@ -388,11 +391,11 @@ fn parse_session_command(mut args: Vec<String>) -> CliArgs {
         }
         "export" => {
             let Some(id) = args.first().cloned() else {
-                eprintln!("Usage: deepcode session export <id>");
+                eprintln!("Usage: deep-code session export <id>");
                 std::process::exit(2);
             };
             if args.len() > 1 {
-                eprintln!("Usage: deepcode session export <id>");
+                eprintln!("Usage: deep-code session export <id>");
                 std::process::exit(2);
             }
             CliArgs {
@@ -434,13 +437,15 @@ pub fn run_session_command(mode: RunMode) -> anyhow::Result<()> {
                 println!("No saved sessions.");
                 return Ok(());
             }
+            let lang = Lang::from_env(&AgentConfig::load(&workspace).config.language);
+            let now = now_ms();
             for record in records {
                 let preview =
                     crate::history::truncate_chars(&record.preview().replace('\n', " "), 60);
                 println!(
                     "{}\t{}\t{} msgs\t{}",
                     record.id.as_str(),
-                    format_timestamp(record.updated_at_ms),
+                    crate::startup::relative_time(now, record.updated_at_ms, lang),
                     record.message_count(),
                     preview
                 );
@@ -465,30 +470,24 @@ pub fn run_session_command(mode: RunMode) -> anyhow::Result<()> {
 
 fn print_usage() {
     eprintln!("Commands:");
-    eprintln!("  deepcode                # 新会话");
-    eprintln!("  deepcode -c             # 续最近会话");
-    eprintln!("  deepcode -r             # 选择历史会话");
-    eprintln!("  deepcode doctor [--json]");
-    eprintln!("  deepcode serve --http [--host HOST] [--port PORT]");
-    eprintln!("  deepcode session list|resume|delete|export");
-    eprintln!("  deepcode eval [--subset lite] [--sample N] [--parallel N] [--json] [--markdown]");
+    eprintln!("  deep-code                # 新会话");
+    eprintln!("  deep-code -c             # 续最近会话");
+    eprintln!("  deep-code -r             # 选择历史会话");
+    eprintln!("  deep-code doctor [--json]");
+    eprintln!("  deep-code serve --http [--host HOST] [--port PORT]");
+    eprintln!("  deep-code session list|resume|delete|export");
+    eprintln!("  deep-code eval [--subset lite] [--sample N] [--parallel N] [--json] [--markdown]");
 }
 
 fn print_session_usage() {
     let workspace = workspace_root();
     eprintln!("{}", format_sessions_storage_note(&workspace));
     eprintln!("Examples:");
-    eprintln!("  deepcode session list");
-    eprintln!("  deepcode session resume <session_id>");
-    eprintln!("  deepcode session export <session_id>");
-    eprintln!("  deepcode -c            # 续最近会话");
-    eprintln!("  deepcode -r            # 选择历史会话");
-}
-
-fn format_timestamp(ms: u64) -> String {
-    let secs = ms / 1000;
-    let sub = ms % 1000;
-    format!("{secs}.{sub:03}")
+    eprintln!("  deep-code session list");
+    eprintln!("  deep-code session resume <session_id>");
+    eprintln!("  deep-code session export <session_id>");
+    eprintln!("  deep-code -c            # 续最近会话");
+    eprintln!("  deep-code -r            # 选择历史会话");
 }
 
 #[cfg(test)]

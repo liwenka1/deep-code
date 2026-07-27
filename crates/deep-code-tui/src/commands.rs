@@ -1,11 +1,11 @@
 use deep_code_agent::{
-    CheckpointId, CheckpointStore, CostCurrency, JsonSessionStore, PrefixStatus, RuntimeEvent,
-    SessionStore, TurnTelemetry, format_sessions_storage_note, web_enabled,
+    CheckpointId, CheckpointStore, JsonSessionStore, PrefixStatus, RuntimeEvent, SessionStore,
+    format_sessions_storage_note, web_enabled,
 };
 
 use crate::app::App;
 use crate::history::HistoryCell;
-use deep_code_agent::i18n::{Lang, TextId, tr, tr_with};
+use deep_code_agent::i18n::{Lang, TextId, tr};
 
 /// (command, hint id, takes an argument). Single source for the completion
 /// menu and `/help`; hints are looked up from the language pack when the menu
@@ -77,8 +77,8 @@ impl App {
                 self.resume_session_command(arg);
                 true
             }
-            _ if prompt.starts_with("/restore ") => {
-                let id = prompt.trim_start_matches("/restore ").trim();
+            _ if prompt == "/restore" || prompt.starts_with("/restore ") => {
+                let id = prompt.strip_prefix("/restore").unwrap_or_default().trim();
                 if id.is_empty() {
                     self.status = self.tr(TextId::UsageRestore).to_string();
                 } else {
@@ -334,10 +334,11 @@ impl App {
                     ],
                 );
                 format!(
-                    "\neffective_model={}\nroute={}\nroute_source={}\ncascade_triggered={}\nreasoning={}\nauto_reason={}\nturn_cost={}\nsession_cost={}\n{cache_line}\ncontext={}/{} ({}%)\ncompaction_near={}\nstream_retries={}{}",
+                    "\neffective_model={}\nroute={}\nroute_source={}\nprefix={}\ncascade_triggered={}\nreasoning={}\nauto_reason={}\nturn_cost={}\nsession_cost={}\n{cache_line}\ncontext={}/{} ({}%)\ncompaction_near={}\nstream_retries={}{}",
                     telemetry.effective_model,
                     telemetry.route_label,
                     telemetry.route_source,
+                    prefix_status_label(telemetry.prefix_status, self.lang),
                     telemetry.cascade_triggered,
                     telemetry.reasoning_effort,
                     telemetry.route_reason,
@@ -369,10 +370,7 @@ impl App {
             self.history.len(),
             telemetry
         )));
-        self.status = self.tr_with(
-            TextId::StatusShown,
-            &[("mode", mode), ("backend", &self.backend_label)],
-        );
+        self.status = self.tr(TextId::StatusShown).to_string();
     }
 
     fn list_subagents(&mut self) {
@@ -424,10 +422,7 @@ impl App {
             if running > 0 {
                 self.status = self.tr_with(
                     TextId::StatusReadySubagents,
-                    &[
-                        ("backend", &self.backend_label),
-                        ("running", &running.to_string()),
-                    ],
+                    &[("running", &running.to_string())],
                 );
             }
         }
@@ -551,67 +546,6 @@ fn prefix_status_label(status: PrefixStatus, lang: Lang) -> &'static str {
         PrefixStatus::Stable => tr(lang, TextId::PrefixStable),
         PrefixStatus::Changed => tr(lang, TextId::PrefixChanged),
     }
-}
-
-pub(crate) fn format_turn_telemetry(
-    telemetry: &TurnTelemetry,
-    currency: CostCurrency,
-    lang: Lang,
-) -> String {
-    let turn = telemetry.turn_cost.format(currency);
-    let session = telemetry.session_cost.format(currency);
-    let cache = match (telemetry.cache_hit_tokens, telemetry.cache_miss_tokens) {
-        (Some(hit), Some(miss)) => match cache_hit_percent(hit, miss) {
-            Some(pct) => tr_with(
-                lang,
-                TextId::TelemetryCacheHit,
-                &[("pct", &pct.to_string())],
-            ),
-            None => String::new(),
-        },
-        _ => String::new(),
-    };
-    let context = format!(
-        "ctx {}/{} ({}%)",
-        telemetry.estimated_context_tokens,
-        telemetry.context_window,
-        telemetry.context_usage_percent
-    );
-    let compaction = if telemetry.near_compaction_threshold {
-        tr(lang, TextId::TelemetryNearCompaction)
-    } else {
-        ""
-    };
-    let fallback = telemetry
-        .fallback_reason
-        .as_deref()
-        .map(|reason| format!(" | {reason}"))
-        .unwrap_or_default();
-    let retries = if telemetry.stream_retries > 0 {
-        tr_with(
-            lang,
-            TextId::TelemetryStreamRetries,
-            &[("count", &telemetry.stream_retries.to_string())],
-        )
-    } else {
-        String::new()
-    };
-    let cascade = if telemetry.cascade_triggered {
-        tr(lang, TextId::TelemetryCascade)
-    } else {
-        ""
-    };
-    let costs = tr_with(
-        lang,
-        TextId::TelemetryTurnSession,
-        &[("turn", &turn), ("session", &session)],
-    );
-    format!(
-        " | {} | {} | {costs}{cache} | {context}{compaction} | {}{fallback}{retries}{cascade}",
-        telemetry.route_label,
-        telemetry.route_reason,
-        prefix_status_label(telemetry.prefix_status, lang)
-    )
 }
 
 #[cfg(test)]

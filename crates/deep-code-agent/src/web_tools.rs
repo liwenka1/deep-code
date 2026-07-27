@@ -25,6 +25,7 @@ use reqwest::redirect::Policy;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::i18n::{Lang, SharedLang, TextId, tr, tr_with};
 use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, run_blocking};
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
@@ -34,12 +35,13 @@ const DEFAULT_SEARCH_RESULTS: usize = 5;
 const MAX_SEARCH_RESULTS: usize = 10;
 const USER_AGENT: &str = concat!("deep-code/", env!("CARGO_PKG_VERSION"));
 
-/// Registry with both network tools, for [`crate::runtime_launch`].
+/// Registry with both network tools, for [`crate::runtime_launch`]. The
+/// shared language handle keeps tool error text in step with `/lang`.
 #[must_use]
-pub fn web_tool_registry() -> ToolRegistry {
+pub fn web_tool_registry(ui_lang: &SharedLang) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    registry.register(WebSearchTool);
-    registry.register(FetchUrlTool::default());
+    registry.register(WebSearchTool::new(ui_lang.clone()));
+    registry.register(FetchUrlTool::new(ui_lang.clone()));
     registry
 }
 
@@ -49,34 +51,44 @@ pub struct FetchUrlTool {
     /// a local server. Never set in production registries.
     allow_private: bool,
     max_bytes: usize,
-}
-
-impl Default for FetchUrlTool {
-    fn default() -> Self {
-        Self {
-            allow_private: false,
-            max_bytes: DEFAULT_MAX_FETCH_BYTES,
-        }
-    }
+    lang: SharedLang,
 }
 
 impl FetchUrlTool {
     pub const NAME: &'static str = "fetch_url";
 
+    #[must_use]
+    pub fn new(lang: SharedLang) -> Self {
+        Self {
+            allow_private: false,
+            max_bytes: DEFAULT_MAX_FETCH_BYTES,
+            lang,
+        }
+    }
+
     fn fetch_sync(&self, params: FetchUrlParams) -> Result<ToolOutput, ToolError> {
+        let lang = self.lang.get();
         let parsed = match Url::parse(&params.url) {
             Ok(parsed) => parsed,
             Err(error) => {
-                return Ok(ToolOutput::soft_error(format!("无法解析 URL：{error}")));
+                return Ok(ToolOutput::soft_error(tr_with(
+                    lang,
+                    TextId::WebUrlParseError,
+                    &[("error", &error.to_string())],
+                )));
             }
         };
-        let response = match pinned_get(parsed, self.allow_private) {
+        let response = match pinned_get(parsed, self.allow_private, lang) {
             Ok(response) => response,
             Err(reason) => return Ok(ToolOutput::soft_error(reason)),
         };
         let status = response.status();
         if !status.is_success() {
-            return Ok(ToolOutput::soft_error(format!("HTTP 状态 {status}")));
+            return Ok(ToolOutput::soft_error(tr_with(
+                lang,
+                TextId::WebHttpStatus,
+                &[("status", &status.to_string())],
+            )));
         }
         let content_type = response
             .headers()
@@ -88,7 +100,11 @@ impl FetchUrlTool {
         let mut body = Vec::new();
         let mut limited = response.take(self.max_bytes as u64 + 1);
         if let Err(error) = limited.read_to_end(&mut body) {
-            return Ok(ToolOutput::soft_error(format!("读取响应失败：{error}")));
+            return Ok(ToolOutput::soft_error(tr_with(
+                lang,
+                TextId::WebReadBodyError,
+                &[("error", &error.to_string())],
+            )));
         }
         let truncated = body.len() > self.max_bytes;
         body.truncate(self.max_bytes);
@@ -100,7 +116,8 @@ impl FetchUrlTool {
             raw.to_string()
         };
         if truncated {
-            text.push_str("\n\n[内容已按大小上限截断]");
+            text.push_str("\n\n");
+            text.push_str(tr(lang, TextId::WebContentTruncated));
         }
         Ok(ToolOutput::text(text))
     }
@@ -131,13 +148,21 @@ impl Tool for FetchUrlTool {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct WebSearchTool;
+#[derive(Debug, Clone)]
+pub struct WebSearchTool {
+    lang: SharedLang,
+}
 
 impl WebSearchTool {
     pub const NAME: &'static str = "web_search";
 
+    #[must_use]
+    pub fn new(lang: SharedLang) -> Self {
+        Self { lang }
+    }
+
     fn search_sync(&self, params: WebSearchParams) -> Result<ToolOutput, ToolError> {
+        let lang = self.lang.get();
         let query = params.query.as_str();
         if query.trim().is_empty() {
             return Err(ToolError::InvalidArguments {
@@ -156,32 +181,46 @@ impl WebSearchTool {
         let parsed = match Url::parse(&url) {
             Ok(parsed) => parsed,
             Err(error) => {
-                return Ok(ToolOutput::soft_error(format!("无法构造搜索 URL：{error}")));
+                return Ok(ToolOutput::soft_error(tr_with(
+                    lang,
+                    TextId::WebSearchUrlError,
+                    &[("error", &error.to_string())],
+                )));
             }
         };
-        let response = match pinned_get(parsed, false) {
+        let response = match pinned_get(parsed, false, lang) {
             Ok(response) => response,
             Err(error) => {
-                return Ok(ToolOutput::soft_error(format!(
-                    "搜索请求失败（国内网络可能需要代理）：{error}"
+                return Ok(ToolOutput::soft_error(tr_with(
+                    lang,
+                    TextId::WebSearchRequestError,
+                    &[("error", &error)],
                 )));
             }
         };
         let status = response.status();
         if !status.is_success() {
-            return Ok(ToolOutput::soft_error(format!("搜索返回 HTTP {status}")));
+            return Ok(ToolOutput::soft_error(tr_with(
+                lang,
+                TextId::WebSearchHttpStatus,
+                &[("status", &status.to_string())],
+            )));
         }
         let html = match response.text() {
             Ok(html) => html,
             Err(error) => {
-                return Ok(ToolOutput::soft_error(format!("读取搜索结果失败：{error}")));
+                return Ok(ToolOutput::soft_error(tr_with(
+                    lang,
+                    TextId::WebSearchReadError,
+                    &[("error", &error.to_string())],
+                )));
             }
         };
 
         let results = parse_search_results(&html, max_results);
         if results.is_empty() {
             return Ok(ToolOutput::soft_error(
-                "未解析到搜索结果：可能无匹配，或 DuckDuckGo 页面结构已变化".to_string(),
+                tr(lang, TextId::WebSearchNoResults).to_string(),
             ));
         }
         let mut out = String::new();
@@ -220,7 +259,7 @@ impl Tool for WebSearchTool {
     }
 
     async fn run(&self, params: WebSearchParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
-        let this = *self;
+        let this = self.clone();
         run_blocking(Self::NAME, move || this.search_sync(params)).await
     }
 }
@@ -235,10 +274,14 @@ struct SearchResult {
 /// GET with manual redirect handling. Each hop's host is resolved and
 /// validated exactly once, and the connection is pinned to the validated
 /// address, closing the check-time/connect-time DNS rebinding gap.
-fn pinned_get(start: Url, allow_private: bool) -> Result<reqwest::blocking::Response, String> {
+fn pinned_get(
+    start: Url,
+    allow_private: bool,
+    lang: Lang,
+) -> Result<reqwest::blocking::Response, String> {
     let mut url = start;
     for _ in 0..=MAX_REDIRECTS {
-        let pin = check_url(&url, allow_private)?;
+        let pin = check_url(&url, allow_private, lang)?;
         let mut builder = Client::builder()
             .timeout(FETCH_TIMEOUT)
             .user_agent(USER_AGENT)
@@ -248,39 +291,58 @@ fn pinned_get(start: Url, allow_private: bool) -> Result<reqwest::blocking::Resp
         {
             builder = builder.resolve(host, addr);
         }
-        let client = builder
-            .build()
-            .map_err(|error| format!("初始化 HTTP 客户端失败：{error}"))?;
-        let response = client
-            .get(url.clone())
-            .send()
-            .map_err(|error| format!("请求失败：{error}"))?;
+        let client = builder.build().map_err(|error| {
+            tr_with(
+                lang,
+                TextId::WebClientInitError,
+                &[("error", &error.to_string())],
+            )
+        })?;
+        let response = client.get(url.clone()).send().map_err(|error| {
+            tr_with(
+                lang,
+                TextId::WebRequestError,
+                &[("error", &error.to_string())],
+            )
+        })?;
         if response.status().is_redirection()
             && let Some(location) = response
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|value| value.to_str().ok())
         {
-            url = url
-                .join(location)
-                .map_err(|error| format!("重定向地址无效：{error}"))?;
+            url = url.join(location).map_err(|error| {
+                tr_with(
+                    lang,
+                    TextId::WebRedirectInvalid,
+                    &[("error", &error.to_string())],
+                )
+            })?;
             continue;
         }
         return Ok(response);
     }
-    Err("重定向次数超过上限".to_string())
+    Err(tr(lang, TextId::WebRedirectLimit).to_string())
 }
 
 /// Reject non-http(s) schemes and any host that resolves to a non-public
 /// address (SSRF guard). For domain hosts, returns the validated address the
 /// caller must pin its connection to; IP-literal hosts involve no DNS and
 /// need no pin. `allow_private` is a test-only escape hatch.
-fn check_url(url: &Url, allow_private: bool) -> Result<Option<SocketAddr>, String> {
+fn check_url(url: &Url, allow_private: bool, lang: Lang) -> Result<Option<SocketAddr>, String> {
     match url.scheme() {
         "http" | "https" => {}
-        other => return Err(format!("不支持的协议 '{other}'：仅允许 http/https")),
+        other => {
+            return Err(tr_with(
+                lang,
+                TextId::WebSchemeNotAllowed,
+                &[("scheme", other)],
+            ));
+        }
     }
-    let host = url.host_str().ok_or_else(|| "URL 缺少主机名".to_string())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| tr(lang, TextId::WebUrlNoHost).to_string())?;
     if allow_private {
         return Ok(None);
     }
@@ -291,8 +353,10 @@ fn check_url(url: &Url, allow_private: bool) -> Result<Option<SocketAddr>, Strin
         .parse::<IpAddr>()
     {
         if !ip_is_public(ip) {
-            return Err(format!(
-                "已拒绝访问 {host}（非公网地址）：内网/回环地址不允许抓取"
+            return Err(tr_with(
+                lang,
+                TextId::WebPrivateHostBlocked,
+                &[("host", host)],
             ));
         }
         return Ok(None);
@@ -300,16 +364,23 @@ fn check_url(url: &Url, allow_private: bool) -> Result<Option<SocketAddr>, Strin
     let port = url.port_or_known_default().unwrap_or(443);
     let addrs: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
-        .map_err(|error| format!("无法解析主机 {host}：{error}"))?
+        .map_err(|error| {
+            tr_with(
+                lang,
+                TextId::WebHostResolveError,
+                &[("host", host), ("error", &error.to_string())],
+            )
+        })?
         .collect();
     if addrs.is_empty() {
-        return Err(format!("主机 {host} 没有解析到任何地址"));
+        return Err(tr_with(lang, TextId::WebHostNoAddrs, &[("host", host)]));
     }
     for addr in &addrs {
         if !ip_is_public(addr.ip()) {
-            return Err(format!(
-                "已拒绝访问 {host}（解析到非公网地址 {}）：内网/回环地址不允许抓取",
-                addr.ip()
+            return Err(tr_with(
+                lang,
+                TextId::WebPrivateResolvedBlocked,
+                &[("host", host), ("addr", &addr.ip().to_string())],
             ));
         }
     }
@@ -520,18 +591,21 @@ mod tests {
             "http://[fd00::1]/",
         ] {
             let parsed = Url::parse(url).unwrap();
-            assert!(check_url(&parsed, false).is_err(), "{url} must be rejected");
+            assert!(
+                check_url(&parsed, false, Lang::Zh).is_err(),
+                "{url} must be rejected"
+            );
         }
     }
 
     #[test]
     fn ssrf_guard_accepts_public_literals_and_rejects_schemes() {
         let public = Url::parse("https://1.1.1.1/").unwrap();
-        assert!(check_url(&public, false).is_ok());
+        assert!(check_url(&public, false, Lang::Zh).is_ok());
         let file = Url::parse("file:///etc/passwd").unwrap();
-        assert!(check_url(&file, false).is_err());
+        assert!(check_url(&file, false, Lang::Zh).is_err());
         let ftp = Url::parse("ftp://example.com/").unwrap();
-        assert!(check_url(&ftp, false).is_err());
+        assert!(check_url(&ftp, false, Lang::Zh).is_err());
     }
 
     #[test]
@@ -570,6 +644,7 @@ mod tests {
         let tool = FetchUrlTool {
             allow_private: true,
             max_bytes: 16,
+            lang: SharedLang::new(Lang::Zh),
         };
         let result = ErasedTool::execute(
             &tool,
@@ -585,6 +660,7 @@ mod tests {
         let tool = FetchUrlTool {
             allow_private: true,
             max_bytes: DEFAULT_MAX_FETCH_BYTES,
+            lang: SharedLang::new(Lang::Zh),
         };
         let result = ErasedTool::execute(
             &tool,
@@ -598,7 +674,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_url_blocks_private_by_default() {
-        let tool = FetchUrlTool::default();
+        let tool = FetchUrlTool::new(SharedLang::new(Lang::Zh));
         let result = ErasedTool::execute(
             &tool,
             &call(FetchUrlTool::NAME, json!({ "url": "http://127.0.0.1:9/" })),
@@ -627,7 +703,7 @@ mod tests {
         // Missing `url` now fails serde parsing in the ErasedTool blanket impl
         // (message wording is serde's, e.g. "missing field `url`").
         let error = ErasedTool::execute(
-            &FetchUrlTool::default(),
+            &FetchUrlTool::new(SharedLang::new(Lang::Zh)),
             &call(FetchUrlTool::NAME, json!({})),
             &ToolCx::default(),
         )
@@ -637,7 +713,7 @@ mod tests {
 
         // Blank query is value-level validation inside the tool body.
         let error = ErasedTool::execute(
-            &WebSearchTool,
+            &WebSearchTool::new(SharedLang::new(Lang::Zh)),
             &call(WebSearchTool::NAME, json!({ "query": " " })),
             &ToolCx::default(),
         )
@@ -652,7 +728,7 @@ mod tests {
     #[ignore]
     async fn fetch_url_real_network() {
         let result = ErasedTool::execute(
-            &FetchUrlTool::default(),
+            &FetchUrlTool::new(SharedLang::new(Lang::Zh)),
             &call(FetchUrlTool::NAME, json!({ "url": "https://example.com/" })),
             &ToolCx::default(),
         )
@@ -665,7 +741,7 @@ mod tests {
     #[ignore]
     async fn web_search_real_network() {
         let result = ErasedTool::execute(
-            &WebSearchTool,
+            &WebSearchTool::new(SharedLang::new(Lang::Zh)),
             &call(
                 WebSearchTool::NAME,
                 json!({ "query": "rust programming language", "max_results": 3 }),

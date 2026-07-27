@@ -328,24 +328,15 @@ impl App {
             history.extend(hydrate_history(record));
         }
 
-        // Same "{ready} - {backend}" shape event_routing builds on TurnFinished,
-        // composed from the shared Mode* keys rather than a dedicated launch key.
-        let ready = if resumed {
-            tr(lang, TextId::ModeReadyResumed)
-        } else {
-            tr(lang, TextId::ModeReady)
-        };
-        let status = match &session_id {
-            Some(id) => format!("{ready} - {backend_label} | session {id}"),
-            None => format!("{ready} - {backend_label}"),
-        };
-
         Self {
             input_cursor: 0,
             input: String::new(),
             history,
             active_turn: None,
-            status,
+            // Transient note only — `status_line()` owns the mode/backend/
+            // session/telemetry frame, so seeding any of that here would show
+            // it twice.
+            status: String::new(),
             error: None,
             should_quit: false,
             ctrl_c_pending: false,
@@ -801,9 +792,16 @@ impl App {
                 )
             })
             .unwrap_or_default();
+        // `self.status` carries only the transient note (tool progress, command
+        // feedback); every durable field lives in this frame exactly once.
+        let note = if self.status.is_empty() {
+            String::new()
+        } else {
+            format!(" | {}", self.status)
+        };
         format!(
-            "{mode} - {}{session}{checkpoint} | {}{telemetry}",
-            self.backend_label, self.status
+            "{mode} - {}{session}{checkpoint}{note}{telemetry}",
+            self.backend_label
         )
     }
 

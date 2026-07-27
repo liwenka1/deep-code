@@ -61,6 +61,7 @@ impl LaunchedRuntime {
 pub fn build_tool_registry(
     workspace: &Path,
     warnings: &mut Vec<String>,
+    ui_lang: &SharedLang,
 ) -> (ToolRegistry, JobStore) {
     let mut registry = ToolRegistry::new();
     let mut job_store = JobStore::default();
@@ -76,7 +77,7 @@ pub fn build_tool_registry(
         Err(error) => warnings.push(format!("shell tools disabled: {error}")),
     }
     if web_enabled() {
-        registry.extend(crate::web_tools::web_tool_registry());
+        registry.extend(crate::web_tools::web_tool_registry(ui_lang));
     }
     (registry, job_store)
 }
@@ -183,6 +184,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
         &workspace,
         parent_cancel,
         &mut warnings,
+        &ui_lang,
     );
     let (runtime, session_id) = match persisted {
         Some((store, record)) => {
@@ -268,15 +270,16 @@ fn launch_resumed(
         && let Ok(client) = DeepSeekClient::new(config.clone())
     {
         let client = Arc::new(client);
+        let ui_lang = SharedLang::new(Lang::from_env(&config.language));
         let (tools, subagent_manager, job_store, shutdown) = build_parent_tools(
             Arc::clone(&client),
             config,
             &workspace,
             parent_cancel,
             &mut warnings,
+            &ui_lang,
         );
         let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
-        let ui_lang = SharedLang::new(Lang::from_env(&config.language));
         let runtime = attach_workspace_helpers(
             AgentRuntime::from_session_record(
                 (*client).clone(),
@@ -311,6 +314,7 @@ fn launch_resumed(
         &workspace,
         parent_cancel,
         &mut warnings,
+        &ui_lang,
     );
     let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
     let runtime = attach_workspace_helpers(
@@ -345,13 +349,14 @@ fn build_parent_tools<C: LlmClient + 'static>(
     workspace: &Path,
     parent_cancel: &CancellationToken,
     warnings: &mut Vec<String>,
+    ui_lang: &SharedLang,
 ) -> (
     ToolRegistry,
     SharedSubAgentManager,
     JobStore,
     Box<dyn Fn() + Send + Sync>,
 ) {
-    let (mut registry, job_store) = build_tool_registry(workspace, warnings);
+    let (mut registry, job_store) = build_tool_registry(workspace, warnings, ui_lang);
     let extensions = attach_agent_extensions(
         &mut registry,
         client,
@@ -394,6 +399,7 @@ mod tests {
             workspace,
             &cancel,
             &mut Vec::new(),
+            &SharedLang::default(),
         );
         registry.specs().into_iter().map(|spec| spec.name).collect()
     }

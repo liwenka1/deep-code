@@ -51,6 +51,7 @@ impl AgentTool {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AgentParams {
     /// Self-contained task brief for the child: the goal, relevant file or
     /// directory hints, and what the final report must answer. The child
