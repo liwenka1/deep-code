@@ -352,7 +352,7 @@ text_ids! {
     // 配置加载警告(layers.rs)
     CfgFileUnusable,
     CfgProjectApiKeyIgnored,
-    CfgProjectBaseUrlOverride,
+    CfgProjectBaseUrlIgnored,
     CfgUnknownReasoning,
     CfgProjectFieldIgnored,
     CfgUnknownCurrency,

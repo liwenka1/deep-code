@@ -204,7 +204,7 @@
 
   "CfgFileUnusable": "Config file {path} is unusable and was skipped: {detail}",
   "CfgProjectApiKeyIgnored": "provider.api_key in the project config is ignored: the key may only come from the environment or global config, to avoid leaking through the repo or being injected by a malicious one",
-  "CfgProjectBaseUrlOverride": "Warning: the project config overrides base_url to {url}. Make sure this repo is trusted — a malicious endpoint can capture your API key and full context",
+  "CfgProjectBaseUrlIgnored": "provider.base_url in the project config is ignored ({url}): the endpoint may only come from the environment or global config, so a malicious repo cannot redirect your API key and full context to its own server",
   "CfgUnknownReasoning": "{layer} config has an unrecognized provider.reasoning_effort='{value}'; ignored",
   "CfgProjectFieldIgnored": "{field} in the project config is not whitelisted; ignored",
   "CfgUnknownCurrency": "{layer} config has an unrecognized cost.currency='{value}'; ignored",

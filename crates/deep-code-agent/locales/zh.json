@@ -204,7 +204,7 @@
 
   "CfgFileUnusable": "配置文件 {path} 无法使用，已跳过该层：{detail}",
   "CfgProjectApiKeyIgnored": "项目配置中的 provider.api_key 已忽略：密钥只能来自环境变量或全局配置，避免随仓库泄露或被恶意仓库注入",
-  "CfgProjectBaseUrlOverride": "警告：项目配置把 base_url 覆盖为 {url}。请确认该仓库可信——恶意端点可以拿到你的 API Key 和全部上下文",
+  "CfgProjectBaseUrlIgnored": "项目配置中的 provider.base_url 已忽略({url}):端点只能来自环境变量或全局配置,避免恶意仓库把你的 API Key 和全部上下文改道到它自己的服务器",
   "CfgUnknownReasoning": "{layer} 配置的 provider.reasoning_effort='{value}' 无法识别，已忽略",
   "CfgProjectFieldIgnored": "项目配置中的 {field} 不在白名单内，已忽略",
   "CfgUnknownCurrency": "{layer} 配置的 cost.currency='{value}' 无法识别，已忽略",

@@ -306,14 +306,20 @@ fn apply_file_overlay(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
+        // Symmetric with api_key: a project file must not redirect where your
+        // credentials + full context go. A malicious repo dropping
+        // `base_url = "https://evil"` would otherwise exfiltrate the
+        // env/global-config API key on the first turn. Self-hosted endpoints
+        // still work — set base_url in the environment or global config.
         if project {
             pending.push((
-                TextId::CfgProjectBaseUrlOverride,
+                TextId::CfgProjectBaseUrlIgnored,
                 vec![("url", base_url.to_string())],
             ));
+        } else {
+            config.base_url = base_url.to_string();
+            report.sources.base_url = layer;
         }
-        config.base_url = base_url.to_string();
-        report.sources.base_url = layer;
     }
 
     if let Some(model) = file
@@ -684,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn project_layer_rejects_api_key_and_warns_on_base_url() {
+    fn project_layer_rejects_api_key_and_base_url() {
         let project_dir = tempfile::tempdir().unwrap();
         let project = write_config(
             project_dir.path(),
@@ -696,7 +702,11 @@ mod tests {
             loaded.config.api_key, None,
             "project api_key must be ignored"
         );
-        assert_eq!(loaded.config.base_url, "https://evil.example");
+        assert_eq!(
+            loaded.config.base_url,
+            AgentConfig::builtin().base_url,
+            "project base_url must be ignored — a repo can't redirect the endpoint"
+        );
         assert_eq!(
             loaded.config.timeout,
             AgentConfig::builtin().timeout,
