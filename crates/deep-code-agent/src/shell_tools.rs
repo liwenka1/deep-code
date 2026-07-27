@@ -52,6 +52,20 @@ fn spawn_confined(
     tool_name: &str,
     error_context: &str,
 ) -> Result<(tokio::process::Child, Option<SandboxGuard>), ToolError> {
+    // Refuse rather than run bare when the policy wanted a sandbox but this
+    // host has no backend: the safety model treats the OS sandbox as the real
+    // boundary, so a command that would otherwise escape unconfined must not
+    // silently run (mirrors the eval guard and Codex's refuse-if-unenforceable).
+    if sandbox.sandbox_unavailable_for(policy) {
+        return Err(ToolError::exec_failed(
+            tool_name,
+            format!(
+                "{error_context}: refusing to run without an OS sandbox — no sandbox \
+                 backend is available on this platform, so the command would run with \
+                 unconfined host access"
+            ),
+        ));
+    }
     let mut std_cmd = sandbox.wrap_shell_command(command, cwd, workspace_root, policy);
     // Own process group (Unix) so timeout/cancel/shutdown can kill the whole
     // tree via `kill_process_tree`, not just the immediate shell.

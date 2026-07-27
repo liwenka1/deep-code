@@ -136,6 +136,22 @@ impl SandboxManager {
         detect_capabilities().available
     }
 
+    /// True when `policy` demands OS confinement but this host has no backend
+    /// to provide it. Callers (shell/job spawn) refuse rather than run the
+    /// command bare: the whole safety model leans on the sandbox being the
+    /// real boundary, so a command the policy wanted confined must never
+    /// silently escape to the host. A policy that asks for no sandbox
+    /// ([`SandboxPolicy::Unsandboxed`]) runs bare by design; a test override
+    /// ([`force_sandbox`](Self::force_sandbox)) is authoritative either way.
+    #[must_use]
+    pub fn sandbox_unavailable_for(&self, policy: &SandboxPolicy) -> bool {
+        refuse_bare_execution(
+            policy.should_sandbox(),
+            self.forced,
+            detect_capabilities().available,
+        )
+    }
+
     pub fn wrap_shell_command(
         &self,
         command: &str,
@@ -193,6 +209,18 @@ impl SandboxManager {
     }
 }
 
+/// Pure decision for [`SandboxManager::sandbox_unavailable_for`], split out so
+/// the truth table is unit-testable without a platform probe. Refuse only when
+/// the policy wants a sandbox, no test override is in play, and the host has no
+/// backend.
+fn refuse_bare_execution(
+    policy_wants_sandbox: bool,
+    forced: Option<bool>,
+    available: bool,
+) -> bool {
+    policy_wants_sandbox && forced.is_none() && !available
+}
+
 fn bare_shell_command(command: &str, cwd: &Path) -> Command {
     let mut cmd = if cfg!(windows) {
         let mut cmd = Command::new("cmd");
@@ -215,5 +243,19 @@ mod tests {
     fn detect_capabilities_returns_structured_report() {
         let caps = detect_capabilities();
         assert!(!caps.detail.is_empty());
+    }
+
+    #[test]
+    fn refuse_bare_execution_only_when_wanted_unforced_and_unavailable() {
+        // The one refusing case: policy wants a sandbox, no test override, and
+        // the host has no backend.
+        assert!(refuse_bare_execution(true, None, false));
+        // Backend present → run (confined).
+        assert!(!refuse_bare_execution(true, None, true));
+        // Policy doesn't want a sandbox → bare by design, never refuse.
+        assert!(!refuse_bare_execution(false, None, false));
+        // Test override is authoritative in both directions — never refuse.
+        assert!(!refuse_bare_execution(true, Some(false), false));
+        assert!(!refuse_bare_execution(true, Some(true), false));
     }
 }
