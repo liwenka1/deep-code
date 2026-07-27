@@ -128,6 +128,45 @@ async fn shell_times_out_and_kills_the_child() {
     );
 }
 
+/// Timeout must kill the whole process tree (the child is spawned as its own
+/// process group), not just the immediate shell — otherwise grandchildren
+/// like spawned servers keep running and holding ports.
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_timeout_kills_grandchildren_too() {
+    let tmp = tempdir().unwrap();
+    let result = approved(
+        tmp.path(),
+        "shell",
+        json!({"command": "sleep 30 & echo started:$!; wait", "timeout_secs": 1}),
+    )
+    .await;
+    assert_eq!(details(&result)["status"], "timed_out");
+
+    let pid: i32 = result
+        .content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("started:"))
+        .expect("grandchild pid echoed")
+        .trim()
+        .parse()
+        .expect("pid parses");
+    // The grandchild may linger as a zombie for a beat until init reaps it;
+    // poll until the pid is gone (ESRCH) rather than asserting instantly.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "grandchild sleep (pid {pid}) survived the process-group kill"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn shell_streams_chunks_via_on_update() {
     let tmp = tempdir().unwrap();

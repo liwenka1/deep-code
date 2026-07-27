@@ -36,7 +36,7 @@ impl JobStore {
             if state.status == JobStatus::Running
                 && let Some(child) = state.child.as_mut()
             {
-                let _ = child.start_kill();
+                kill_process_tree(child);
                 state.status = JobStatus::Cancelled;
             }
         }
@@ -181,12 +181,30 @@ impl RingBuffer {
     }
 }
 
+/// Kill `child` and, on Unix, its whole process group (children are spawned
+/// as group leaders, see `spawn_confined`), so grandchildren spawned by the
+/// shell don't outlive the job. `start_kill` covers non-Unix and reaping.
+pub(super) fn kill_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // Negative pid targets the process group; the child may already have
+        // exited, in which case the signal harmlessly fails.
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    }
+    let _ = child.start_kill();
+}
+
 pub(super) type ChunkFn = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 /// Drain one child pipe into the ring buffer, optionally forwarding each
 /// chunk (live streaming for foreground shells; background jobs pass `None`
-/// because their parent turn has already ended).
-pub(super) fn spawn_buffer_reader<R>(mut pipe: R, buffer: SharedBuffer, on_chunk: Option<ChunkFn>)
+/// because their parent turn has already ended). Returns the reader task so
+/// the foreground shell can await it (EOF) before reading the buffer.
+pub(super) fn spawn_buffer_reader<R>(
+    mut pipe: R,
+    buffer: SharedBuffer,
+    on_chunk: Option<ChunkFn>,
+) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -204,7 +222,7 @@ where
                 Err(_) => break,
             }
         }
-    });
+    })
 }
 
 /// Fold a finished child's exit status into the job record (background jobs;
@@ -240,7 +258,7 @@ pub(super) async fn cancel_job(
         }
         let mut child = job.child.take();
         if let Some(child) = child.as_mut() {
-            let _ = child.start_kill();
+            kill_process_tree(child);
         }
         child
     };

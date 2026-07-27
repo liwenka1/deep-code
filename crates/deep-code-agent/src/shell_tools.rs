@@ -19,7 +19,7 @@ use crate::workspace_policy::{WorkspacePolicy, invalid};
 pub use jobs::JobStore;
 use jobs::{
     ChunkFn, JobKind, JobState, JobStatus, SharedBuffer, cancel_job, job_details,
-    job_text_snapshot, refresh_job, shell_text_output, spawn_buffer_reader,
+    job_text_snapshot, kill_process_tree, refresh_job, shell_text_output, spawn_buffer_reader,
 };
 
 /// Strip provider/runtime secrets from a tool subprocess before it is spawned.
@@ -52,7 +52,14 @@ fn spawn_confined(
     tool_name: &str,
     error_context: &str,
 ) -> Result<(tokio::process::Child, Option<SandboxGuard>), ToolError> {
-    let std_cmd = sandbox.wrap_shell_command(command, cwd, workspace_root, policy);
+    let mut std_cmd = sandbox.wrap_shell_command(command, cwd, workspace_root, policy);
+    // Own process group (Unix) so timeout/cancel/shutdown can kill the whole
+    // tree via `kill_process_tree`, not just the immediate shell.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        std_cmd.process_group(0);
+    }
     let mut cmd = tokio::process::Command::from(std_cmd);
     scrub_secret_env(&mut cmd);
     // Detach stdin from the console (an inherited child restoring console mode
@@ -213,20 +220,20 @@ impl Tool for ShellTool {
         let stdout = SharedBuffer::default();
         let stderr = SharedBuffer::default();
         let stream_budget = Arc::new(AtomicUsize::new(0));
-        if let Some(pipe) = child.stdout.take() {
+        let stdout_task = child.stdout.take().map(|pipe| {
             spawn_buffer_reader(
                 pipe,
                 stdout.clone(),
                 Some(stream_chunk_fn(cx, "stdout", Arc::clone(&stream_budget))),
-            );
-        }
-        if let Some(pipe) = child.stderr.take() {
+            )
+        });
+        let stderr_task = child.stderr.take().map(|pipe| {
             spawn_buffer_reader(
                 pipe,
                 stderr.clone(),
                 Some(stream_chunk_fn(cx, "stderr", stream_budget)),
-            );
-        }
+            )
+        });
 
         // The tool future owns the child; the store entry exposes the run to
         // post-hoc `job action=status/tail`.
@@ -257,17 +264,30 @@ impl Tool for ShellTool {
                 }
             },
             () = cx.cancel_token().cancelled() => {
-                let _ = child.kill().await;
+                kill_process_tree(&mut child);
+                let _ = child.wait().await;
                 (JobStatus::Cancelled, None)
             }
             () = tokio::time::sleep(timeout) => {
-                let _ = child.kill().await;
+                kill_process_tree(&mut child);
+                let _ = child.wait().await;
                 (JobStatus::TimedOut, None)
             }
         };
 
-        // Give the reader tasks a beat to drain the final pipe chunks.
-        tokio::task::yield_now().await;
+        // Await the reader tasks so the final pipe chunks land in the buffers
+        // (a bare yield loses them under scheduler load). EOF is prompt once
+        // the child is gone; the cap guards a lingering grandchild that
+        // inherited the pipe and keeps it open past the parent's exit.
+        let drain = async {
+            if let Some(task) = stdout_task {
+                let _ = task.await;
+            }
+            if let Some(task) = stderr_task {
+                let _ = task.await;
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(500), drain).await;
 
         let job = self.jobs.get(&job_id, Self::NAME)?;
         let mut job = job.lock().expect("job lock poisoned");
@@ -327,10 +347,10 @@ impl JobTool {
         let stdout = SharedBuffer::default();
         let stderr = SharedBuffer::default();
         if let Some(pipe) = child.stdout.take() {
-            spawn_buffer_reader(pipe, stdout.clone(), None);
+            drop(spawn_buffer_reader(pipe, stdout.clone(), None));
         }
         if let Some(pipe) = child.stderr.take() {
-            spawn_buffer_reader(pipe, stderr.clone(), None);
+            drop(spawn_buffer_reader(pipe, stderr.clone(), None));
         }
 
         let job_id = self.jobs.insert(JobState {
