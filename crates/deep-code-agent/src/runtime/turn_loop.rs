@@ -171,6 +171,14 @@ impl AgentRuntime {
                         accumulator.push_delta(delta);
                     }
                     Ok(AgentEvent::Done { usage }) => {
+                        // Price each request as it completes: a multi-tool
+                        // turn makes several, and summing here keeps turn and
+                        // session costs honest even when the turn is later
+                        // cancelled or errors out mid-way.
+                        if let Some(usage) = usage.as_ref() {
+                            self.accumulate_request_usage(&route.effective_model, usage)
+                                .await;
+                        }
                         last_usage = usage;
                     }
                     Ok(AgentEvent::Error { message }) => {

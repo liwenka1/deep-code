@@ -2310,3 +2310,83 @@ async fn begin_turn_supersedes_live_turn_without_clobbering() {
     assert_eq!(state.current_prompt.as_deref(), Some("second"));
     assert!(state.current_turn_id.is_some());
 }
+
+/// A turn that spans multiple requests (tool call → follow-up) must price
+/// every request, not just the final one. Context-shaped fields
+/// (prompt_tokens) keep final-request semantics; cache totals cover the
+/// whole turn.
+#[tokio::test]
+async fn multi_request_turn_accumulates_cost_across_requests() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+    use crate::model::Usage;
+    use crate::pricing::calculate_turn_cost;
+
+    let usage_first = Usage {
+        prompt_tokens: Some(1_000),
+        completion_tokens: Some(200),
+        total_tokens: Some(1_200),
+        reasoning_tokens: None,
+        prompt_cache_hit_tokens: Some(600),
+        prompt_cache_miss_tokens: Some(400),
+    };
+    let usage_second = Usage {
+        prompt_tokens: Some(1_500),
+        completion_tokens: Some(50),
+        total_tokens: Some(1_550),
+        reasoning_tokens: None,
+        prompt_cache_hit_tokens: Some(1_400),
+        prompt_cache_miss_tokens: Some(100),
+    };
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+            },
+            AgentEvent::Done {
+                usage: Some(usage_first.clone()),
+            },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done {
+                usage: Some(usage_second.clone()),
+            },
+        ],
+    ]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools())
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Yolo));
+
+    let mut rx = runtime.submit_user("please echo").await;
+    let events = drain(&mut rx).await;
+    let telemetry = events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::TurnFinished { telemetry, .. } => telemetry.as_ref(),
+            _ => None,
+        })
+        .expect("turn finished with telemetry");
+
+    let expected = {
+        let first = calculate_turn_cost(&telemetry.effective_model, &usage_first);
+        let second = calculate_turn_cost(&telemetry.effective_model, &usage_second);
+        (first.usd + second.usd, first.cny + second.cny)
+    };
+    assert!(
+        (telemetry.turn_cost.usd - expected.0).abs() < 1e-9
+            && (telemetry.turn_cost.cny - expected.1).abs() < 1e-9,
+        "turn cost must sum every request: got {:?}, want {expected:?}",
+        telemetry.turn_cost
+    );
+    // Final-request semantics for the context-shaped fields.
+    assert_eq!(telemetry.prompt_tokens, 1_500);
+    assert_eq!(telemetry.completion_tokens, 50);
+    // Whole-turn cache totals.
+    assert_eq!(telemetry.cache_hit_tokens, Some(2_000));
+    assert_eq!(telemetry.cache_miss_tokens, Some(500));
+    // First turn of the session: session totals equal the turn's.
+    assert!((telemetry.session_cost.usd - telemetry.turn_cost.usd).abs() < f64::EPSILON);
+    assert_eq!(telemetry.session_cache_hit_tokens, 2_000);
+    assert_eq!(telemetry.session_cache_miss_tokens, 500);
+}

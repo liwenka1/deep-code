@@ -219,6 +219,9 @@ impl AgentRuntime {
             // the rest of the session.
             state.turn_tool_errors = 0;
             state.cascade_triggered_this_turn = false;
+            state.turn_cost = Default::default();
+            state.turn_cache_hit_tokens = 0;
+            state.turn_cache_miss_tokens = 0;
         }
         self.persist().await;
     }

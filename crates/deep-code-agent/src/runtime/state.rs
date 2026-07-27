@@ -21,6 +21,12 @@ pub(super) struct RuntimeState {
     pub(super) current_turn: Option<TurnRecord>,
     pub(super) last_prefix_hash: Option<u64>,
     pub(super) session_cost: CostEstimate,
+    /// This turn's cost/cache totals, accumulated request-by-request at each
+    /// stream `Done` (a multi-tool turn makes several requests; pricing only
+    /// the last one would drop the rest). Reset by `begin_turn`.
+    pub(super) turn_cost: CostEstimate,
+    pub(super) turn_cache_hit_tokens: u64,
+    pub(super) turn_cache_miss_tokens: u64,
     /// Cumulative DeepSeek prompt-cache tokens this session (hit is ~50–120×
     /// cheaper than miss), for surfacing cache efficiency. In-memory only.
     pub(super) session_cache_hit_tokens: u64,
