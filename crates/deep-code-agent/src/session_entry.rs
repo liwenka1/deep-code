@@ -9,49 +9,13 @@
 //! simply one that was interrupted, and the wire derivation synthesizes the
 //! placeholder message on demand.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use serde::{Deserialize, Serialize};
 
 use crate::model::ToolCallPayload;
-use crate::session_store::now_ms;
 use crate::tool::ToolResultStatus;
-
-/// Stable per-entry identifier (branching foundation): unique within a
-/// process, monotonic-ish across restarts via the timestamp component.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct EntryId(pub String);
-
-impl EntryId {
-    #[must_use]
-    pub fn new() -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        Self(format!("e{}_{seq}", now_ms()))
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Default for EntryId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEntry {
-    pub id: EntryId,
-    /// The entry that preceded this one when it was first appended to a live
-    /// session (branching foundation). `None` for the root entry, for entries
-    /// loaded from a schema-v1 record that predates this field, or for entries
-    /// rebuilt from wire messages. Assigned once at append time by
-    /// [`crate::session::Session`]; loading preserves the persisted value.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent: Option<EntryId>,
     #[serde(flatten)]
     pub kind: EntryKind,
 }
@@ -59,19 +23,7 @@ pub struct SessionEntry {
 impl SessionEntry {
     #[must_use]
     pub fn new(kind: EntryKind) -> Self {
-        Self {
-            id: EntryId::new(),
-            parent: None,
-            kind,
-        }
-    }
-
-    /// Set the linear predecessor. Used by the session append path; standalone
-    /// constructors leave `parent` unset so tests and loaders stay explicit.
-    #[must_use]
-    pub fn with_parent(mut self, parent: Option<EntryId>) -> Self {
-        self.parent = parent;
-        self
+        Self { kind }
     }
 
     /// Number of wire messages this entry derives to (an assistant entry

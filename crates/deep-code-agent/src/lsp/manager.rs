@@ -21,44 +21,36 @@ use super::hooks::{edited_paths_for_tool, resolve_edit_paths};
 use super::path_util::normalize_path;
 use super::registry::{Language, detect_language, server_for};
 
-/// Tunables for the post-edit diagnostics pass.
+/// Tunables for the post-edit diagnostics pass — deliberately constants, not
+/// config: the on/off switch lives in `[lsp] enabled` (AgentConfig), and
+/// nobody realistically tunes poll budgets per project. The defaults trade
+/// signal against latency added to every edit.
 ///
-/// The defaults trade signal against latency added to every edit:
-///
-/// * `poll_after_edit_ms = 5_000` — a warm server usually re-checks a small
-///   file in well under a second; five seconds leaves headroom for slower
-///   checkers while bounding how long one unresponsive server can stall a
-///   turn.
-/// * `cold_start_poll_ms = 30_000` — the first analysis after a spawn can
-///   take tens of seconds on a large workspace (index build), so the first
-///   query per server gets a far bigger budget.
-/// * `max_diagnostics_per_file = 20` — enough to show real breakage without
-///   flooding the model context when a single syntax error cascades into
-///   dozens of follow-on complaints.
-#[derive(Debug, Clone)]
-pub struct LspConfig {
-    /// Master switch; `false` turns every entry point into a no-op.
-    pub enabled: bool,
-    /// Wait budget (ms) for diagnostics from an already-warm server.
-    pub poll_after_edit_ms: u64,
-    /// Wait budget (ms) for the first query after spawning a server.
-    pub cold_start_poll_ms: u64,
-    /// Hard cap on diagnostics kept per file after severity ranking.
-    pub max_diagnostics_per_file: usize,
-    /// Also surface warnings; off by default so only errors interrupt.
-    pub include_warnings: bool,
-}
+/// Wait budget (ms) for diagnostics from an already-warm server: a warm
+/// server usually re-checks a small file in well under a second; five seconds
+/// leaves headroom for slower checkers while bounding how long one
+/// unresponsive server can stall a turn.
+const POLL_AFTER_EDIT_MS: u64 = 5_000;
+/// Wait budget (ms) for the first query after spawning a server: the first
+/// analysis after a spawn can take tens of seconds on a large workspace
+/// (index build).
+const COLD_START_POLL_MS: u64 = 30_000;
+/// Hard cap on diagnostics kept per file after severity ranking: enough to
+/// show real breakage without flooding the model context when one syntax
+/// error cascades into dozens of follow-on complaints.
+const MAX_DIAGNOSTICS_PER_FILE: usize = 20;
+/// Also surface warnings; off so only errors interrupt the turn.
+const INCLUDE_WARNINGS: bool = false;
 
-impl Default for LspConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            poll_after_edit_ms: 5_000,
-            cold_start_poll_ms: 30_000,
-            max_diagnostics_per_file: 20,
-            include_warnings: false,
-        }
-    }
+/// Keep only errors (plus warnings when `keep_warnings`), most severe first.
+/// Hints never survive. The per-file cap is applied afterwards, on the
+/// assembled block.
+fn filter_and_rank(mut items: Vec<Diagnostic>, keep_warnings: bool) -> Vec<Diagnostic> {
+    items.retain(|item| {
+        item.severity == Severity::Error || (keep_warnings && item.severity == Severity::Warning)
+    });
+    items.sort_by_key(|item| item.severity.rank());
+    items
 }
 
 /// Spawn ceiling per language per session: the initial launch plus one
@@ -82,7 +74,6 @@ struct LangCell {
 }
 
 pub struct LspManager {
-    config: LspConfig,
     workspace: PathBuf,
     /// Per-language server state (transport, spawn budget, warning latch).
     /// The outer lock only guards the map itself and is never held across an
@@ -103,9 +94,8 @@ impl LspManager {
     /// Build a manager rooted at `workspace`. No servers are spawned here;
     /// everything is lazy.
     #[must_use]
-    pub fn new(config: LspConfig, workspace: PathBuf) -> Self {
+    pub fn new(workspace: PathBuf) -> Self {
         Self {
-            config,
             workspace,
             languages: AsyncMutex::new(HashMap::new()),
             stubs: AsyncMutex::new(HashMap::new()),
@@ -126,25 +116,6 @@ impl LspManager {
             .lock()
             .map(|mut warnings| std::mem::take(&mut *warnings))
             .unwrap_or_default()
-    }
-
-    /// A manager that answers `None`/empty everywhere (`enabled: false` path).
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn disabled() -> Self {
-        Self::new(
-            LspConfig {
-                enabled: false,
-                ..LspConfig::default()
-            },
-            PathBuf::new(),
-        )
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn config(&self) -> &LspConfig {
-        &self.config
     }
 
     /// Register a stub transport for `lang`, bypassing real server spawns, so
@@ -178,9 +149,6 @@ impl LspManager {
     /// touched from its arguments and gather one block per file that has
     /// something to report.
     pub async fn collect_for_edit(&self, tool_name: &str, input: &Value) -> Vec<DiagnosticBlock> {
-        if !self.config.enabled {
-            return Vec::new();
-        }
         let touched = edited_paths_for_tool(tool_name, input);
         if touched.is_empty() {
             return Vec::new();
@@ -196,9 +164,6 @@ impl LspManager {
     /// is nothing useful to say — manager disabled, unsupported language,
     /// unreadable file, no server, timeout, or zero surviving diagnostics.
     pub async fn diagnostics_for(&self, file: &Path) -> Option<DiagnosticBlock> {
-        if !self.config.enabled {
-            return None;
-        }
         let lang = detect_language(file);
         if lang == Language::Other {
             return None;
@@ -216,9 +181,9 @@ impl LspManager {
 
         let (transport, first_query) = self.acquire(lang).await?;
         let budget = Duration::from_millis(if first_query {
-            self.config.cold_start_poll_ms
+            COLD_START_POLL_MS
         } else {
-            self.config.poll_after_edit_ms
+            POLL_AFTER_EDIT_MS
         });
 
         let published =
@@ -247,7 +212,7 @@ impl LspManager {
                 }
             };
 
-        let kept = self.filter_and_rank(published);
+        let kept = filter_and_rank(published, INCLUDE_WARNINGS);
         if kept.is_empty() {
             return None;
         }
@@ -255,20 +220,8 @@ impl LspManager {
             file: self.display_path(file),
             items: kept,
         };
-        block.truncate(self.config.max_diagnostics_per_file);
+        block.truncate(MAX_DIAGNOSTICS_PER_FILE);
         Some(block)
-    }
-
-    /// Keep only the severities the config asks for, most severe first. The
-    /// per-file cap is applied afterwards, on the assembled block.
-    fn filter_and_rank(&self, mut items: Vec<Diagnostic>) -> Vec<Diagnostic> {
-        let keep_warnings = self.config.include_warnings;
-        items.retain(|item| {
-            item.severity == Severity::Error
-                || (keep_warnings && item.severity == Severity::Warning)
-        });
-        items.sort_by_key(|item| item.severity.rank());
-        items
     }
 
     /// Fetch (creating on first use) the shared cell for `lang`. The global
@@ -434,12 +387,9 @@ mod tests {
         async fn shutdown(&self) {}
     }
 
-    async fn manager_with_stub(
-        config: LspConfig,
-        items: Vec<Diagnostic>,
-    ) -> (tempfile::TempDir, LspManager) {
+    async fn manager_with_stub(items: Vec<Diagnostic>) -> (tempfile::TempDir, LspManager) {
         let dir = tempfile::tempdir().unwrap();
-        let manager = LspManager::new(config, dir.path().to_path_buf());
+        let manager = LspManager::new(dir.path().to_path_buf());
         manager
             .install_test_transport(Language::Rust, Arc::new(CannedTransport(items)))
             .await;
@@ -447,20 +397,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_manager_reports_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("lib.rs");
-        tokio::fs::write(&target, b"fn broken( {").await.unwrap();
-
-        let manager = LspManager::disabled();
-        assert!(manager.diagnostics_for(&target).await.is_none());
-        assert!(!manager.config().enabled);
-    }
-
-    #[tokio::test]
     async fn unsupported_extensions_are_skipped() {
-        let (dir, manager) =
-            manager_with_stub(LspConfig::default(), vec![diag(1, Severity::Error, "x")]).await;
+        let (dir, manager) = manager_with_stub(vec![diag(1, Severity::Error, "x")]).await;
         let notes = dir.path().join("notes.md");
         tokio::fs::write(&notes, b"# notes").await.unwrap();
         assert!(manager.diagnostics_for(&notes).await.is_none());
@@ -468,11 +406,8 @@ mod tests {
 
     #[tokio::test]
     async fn stub_diagnostics_come_back_with_workspace_relative_paths() {
-        let (dir, manager) = manager_with_stub(
-            LspConfig::default(),
-            vec![diag(7, Severity::Error, "cannot find type `Foo`")],
-        )
-        .await;
+        let (dir, manager) =
+            manager_with_stub(vec![diag(7, Severity::Error, "cannot find type `Foo`")]).await;
         let target = dir.path().join("src").join("types.rs");
         tokio::fs::create_dir_all(target.parent().unwrap())
             .await
@@ -491,7 +426,7 @@ mod tests {
             diag(2, Severity::Error, "syntax error"),
             diag(3, Severity::Hint, "consider renaming"),
         ];
-        let (dir, silent) = manager_with_stub(LspConfig::default(), items.clone()).await;
+        let (dir, silent) = manager_with_stub(items.clone()).await;
         let target = dir.path().join("m.rs");
         tokio::fs::write(&target, b"use x;").await.unwrap();
 
@@ -499,48 +434,26 @@ mod tests {
         assert_eq!(block.items.len(), 1, "only the error survives");
         assert_eq!(block.items[0].severity, Severity::Error);
 
-        let (dir, verbose) = manager_with_stub(
-            LspConfig {
-                include_warnings: true,
-                ..LspConfig::default()
-            },
-            items,
-        )
-        .await;
-        let target = dir.path().join("m.rs");
-        tokio::fs::write(&target, b"use x;").await.unwrap();
-
-        let block = verbose.diagnostics_for(&target).await.expect("a block");
-        assert_eq!(block.items.len(), 2, "hints stay excluded either way");
+        // Opted-in filtering is pure logic; drive it directly.
+        let kept = filter_and_rank(items, true);
+        assert_eq!(kept.len(), 2, "hints stay excluded either way");
         assert_eq!(
-            block.items[0].severity,
+            kept[0].severity,
             Severity::Error,
             "errors rank ahead of warnings"
         );
-        assert_eq!(
-            block.items[1].severity,
-            Severity::Warning,
-            "warning follows"
-        );
+        assert_eq!(kept[1].severity, Severity::Warning, "warning follows");
     }
 
-    #[tokio::test]
-    async fn the_per_file_cap_applies_after_ranking() {
+    #[test]
+    fn the_per_file_cap_applies_after_ranking() {
         let mut items: Vec<Diagnostic> = (1..=4).map(|n| diag(n, Severity::Warning, "w")).collect();
         items.push(diag(9, Severity::Error, "the real problem"));
-        let (dir, manager) = manager_with_stub(
-            LspConfig {
-                include_warnings: true,
-                max_diagnostics_per_file: 2,
-                ..LspConfig::default()
-            },
-            items,
-        )
-        .await;
-        let target = dir.path().join("big.rs");
-        tokio::fs::write(&target, b"//").await.unwrap();
-
-        let block = manager.diagnostics_for(&target).await.expect("a block");
+        let mut block = DiagnosticBlock {
+            file: PathBuf::from("big.rs"),
+            items: filter_and_rank(items, true),
+        };
+        block.truncate(2);
         assert_eq!(block.items.len(), 2, "cap of two holds");
         assert_eq!(
             block.items[0].message, "the real problem",
@@ -551,7 +464,7 @@ mod tests {
     #[tokio::test]
     async fn a_failing_transport_is_evicted_for_respawn() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = LspManager::new(LspConfig::default(), dir.path().to_path_buf());
+        let manager = LspManager::new(dir.path().to_path_buf());
         let target = dir.path().join("crash.rs");
         tokio::fs::write(&target, b"fn f() {}").await.unwrap();
 
@@ -570,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_queries_for_one_language_spawn_a_single_server() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = LspManager::new(LspConfig::default(), dir.path().to_path_buf());
+        let manager = LspManager::new(dir.path().to_path_buf());
         let spawns = AtomicU32::new(0);
 
         // Slow enough that both acquisitions overlap the launch window.
@@ -605,7 +518,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_launch_does_not_consume_the_spawn_budget() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = LspManager::new(LspConfig::default(), dir.path().to_path_buf());
+        let manager = LspManager::new(dir.path().to_path_buf());
         let attempts = AtomicU32::new(0);
 
         let failing = |_program: String, _args: Vec<String>| async {
@@ -638,11 +551,8 @@ mod tests {
 
     #[tokio::test]
     async fn collect_for_edit_resolves_tool_arguments_to_blocks() {
-        let (dir, manager) = manager_with_stub(
-            LspConfig::default(),
-            vec![diag(1, Severity::Error, "mismatched types")],
-        )
-        .await;
+        let (dir, manager) =
+            manager_with_stub(vec![diag(1, Severity::Error, "mismatched types")]).await;
         let target = dir.path().join("edited.rs");
         tokio::fs::write(&target, b"let x: u8 = -1;").await.unwrap();
 
@@ -677,9 +587,8 @@ mod tests {
         let broken = workspace.path().join("broken.rs");
         std::fs::write(&broken, "fn main() { let count: u32 = \"three\"; }").unwrap();
 
-        let config = LspConfig::default();
-        let cold_budget_ms = config.cold_start_poll_ms;
-        let manager = LspManager::new(config, workspace.path().to_path_buf());
+        let cold_budget_ms = COLD_START_POLL_MS;
+        let manager = LspManager::new(workspace.path().to_path_buf());
         let block = manager.diagnostics_for(&broken).await.unwrap_or_else(|| {
             panic!(
                 "no diagnostics within the {cold_budget_ms}ms cold-start budget \

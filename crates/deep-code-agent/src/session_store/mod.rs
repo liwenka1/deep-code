@@ -16,10 +16,8 @@ use serde::{Deserialize, Serialize};
 pub use json::JsonSessionStore;
 
 use crate::checkpoint::CheckpointId;
-use crate::config::AgentConfig;
 use crate::model::Usage;
 use crate::session_entry::{EntryKind, SessionEntry};
-use crate::tool::ToolResult;
 
 /// Current on-disk schema version. Bump when making breaking layout changes.
 /// v1 stored wire messages; v2 stores [`SessionEntry`] values (v1 files are
@@ -46,43 +44,11 @@ impl SessionId {
     }
 }
 
-/// Serializable agent config snapshot (API key is never stored).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConfigSnapshot {
-    pub base_url: String,
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
-    #[serde(default)]
-    pub auto_model: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost_currency: Option<String>,
-    pub timeout_secs: Option<u64>,
-    pub api_key_present: bool,
-}
-
-impl From<&AgentConfig> for ConfigSnapshot {
-    fn from(config: &AgentConfig) -> Self {
-        Self {
-            base_url: config.base_url.clone(),
-            model: config.model.clone(),
-            reasoning_effort: Some(config.reasoning_effort.as_setting().to_string()),
-            auto_model: config.auto_model_enabled(),
-            cost_currency: Some(format!("{:?}", config.cost_currency).to_ascii_lowercase()),
-            timeout_secs: config.timeout.map(|duration| duration.as_secs()),
-            api_key_present: config
-                .api_key
-                .as_ref()
-                .is_some_and(|key| !key.trim().is_empty()),
-        }
-    }
-}
-
-/// One user turn and its tool activity.
+/// One user turn's metadata (prompt, usage, timing). Tool outputs are not
+/// duplicated here: the model-facing copy lives in the entries' exchanges.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnRecord {
     pub user_prompt: String,
-    pub tool_results: Vec<ToolResult>,
     pub usage: Option<Usage>,
     pub started_at_ms: u64,
     pub finished_at_ms: Option<u64>,
@@ -112,7 +78,6 @@ impl TurnRecord {
     pub fn new(user_prompt: impl Into<String>) -> Self {
         Self {
             user_prompt: user_prompt.into(),
-            tool_results: Vec::new(),
             usage: None,
             started_at_ms: now_ms(),
             finished_at_ms: None,
@@ -133,7 +98,6 @@ pub struct SessionRecord {
     pub workspace: PathBuf,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
-    pub config: ConfigSnapshot,
     /// Domain-level conversation entries (schema v2). Wire messages are
     /// derived via [`crate::session::Session::wire_messages`].
     pub entries: Vec<SessionEntry>,
@@ -152,7 +116,7 @@ pub struct SessionRecord {
 
 impl SessionRecord {
     #[must_use]
-    pub fn new(workspace: PathBuf, config: &AgentConfig, system_prompt: impl Into<String>) -> Self {
+    pub fn new(workspace: PathBuf, system_prompt: impl Into<String>) -> Self {
         let now = now_ms();
         let entries = vec![SessionEntry::system(system_prompt)];
         Self {
@@ -161,7 +125,6 @@ impl SessionRecord {
             workspace,
             created_at_ms: now,
             updated_at_ms: now,
-            config: ConfigSnapshot::from(config),
             entries,
             turns: Vec::new(),
             checkpoints: Vec::new(),
@@ -294,8 +257,7 @@ mod tests {
 
     #[test]
     fn session_record_preview_uses_latest_user_entry() {
-        let mut record =
-            SessionRecord::new(PathBuf::from("/tmp/ws"), &AgentConfig::default(), "system");
+        let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "system");
         record.entries.push(SessionEntry::user("first"));
         record
             .entries
@@ -308,27 +270,39 @@ mod tests {
     }
 
     #[test]
-    fn config_snapshot_omits_api_key() {
-        let config = AgentConfig {
-            api_key: Some("secret".to_string()),
-            ..AgentConfig::default()
-        };
-        let snapshot = ConfigSnapshot::from(&config);
-        assert!(snapshot.api_key_present);
-        let json = serde_json::to_string(&snapshot).unwrap();
-        assert!(!json.contains("secret"));
-    }
-
-    #[test]
-    fn turn_record_tracks_tool_results() {
+    fn turn_record_finish_stamps_time() {
         let mut turn = TurnRecord::new("hello");
-        turn.tool_results.push(ToolResult::success(
-            "call_1",
-            "mock_echo",
-            "mock_echo: hello",
-        ));
         turn.finish(None);
         assert!(turn.finished_at_ms.is_some());
-        assert_eq!(turn.tool_results.len(), 1);
+    }
+
+    /// v2 files written before `config`, per-turn `tool_results`, and entry
+    /// `id`/`parent` were dropped still carry those keys; loading must ignore
+    /// them instead of failing.
+    #[test]
+    fn v2_files_with_since_removed_fields_still_parse() {
+        let legacy = serde_json::json!({
+            "schema_version": 2,
+            "id": "session_1_0",
+            "workspace": "/tmp/ws",
+            "created_at_ms": 1,
+            "updated_at_ms": 2,
+            "config": {"base_url": "x", "model": "m", "timeout_secs": null, "api_key_present": false},
+            "entries": [
+                {"id": "e1_0", "parent": null, "type": "system", "content": "sys"},
+                {"id": "e2_1", "parent": "e1_0", "type": "user", "content": "hi"}
+            ],
+            "turns": [{
+                "user_prompt": "hi",
+                "tool_results": [{"call_id": "c1", "tool_name": "shell", "content": "ok", "status": "success"}],
+                "usage": null,
+                "started_at_ms": 1,
+                "finished_at_ms": 2
+            }],
+        });
+        let record: SessionRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(record.entries.len(), 2);
+        assert_eq!(record.preview(), "hi");
+        assert_eq!(record.turns.len(), 1);
     }
 }

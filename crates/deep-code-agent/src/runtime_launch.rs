@@ -12,7 +12,7 @@ use crate::execution_policy::SharedPermissionMode;
 use crate::extensions::{attach_agent_extensions, build_runtime_system_prompt};
 use crate::i18n::{Lang, SharedLang};
 use crate::runtime::AgentRuntime;
-use crate::session_store::{ConfigSnapshot, JsonSessionStore, SessionRecord, SessionStore};
+use crate::session_store::{JsonSessionStore, SessionRecord, SessionStore};
 use crate::shell_tools::{JobStore, shell_tool_registry};
 use crate::subagent::SharedSubAgentManager;
 use crate::tool::ToolRegistry;
@@ -169,7 +169,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
     // Decide persistence before assembling tools: the fallback path must not
     // rebuild (and silently drop) a full extensions set, and the failure
     // reason must reach the user instead of being swallowed.
-    let persisted = match prepare_persisted_session(workspace.clone(), config, prompt) {
+    let persisted = match prepare_persisted_session(workspace.clone(), prompt) {
         Ok(pair) => Some(pair),
         Err(reason) => {
             warnings.push(format!(
@@ -212,7 +212,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
         ),
     };
     let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
-    let runtime = attach_workspace_helpers(runtime, &workspace, &mut warnings)
+    let runtime = attach_workspace_helpers(runtime, &workspace, config, &mut warnings)
         .with_permission_mode(permission_mode.clone())
         .with_ui_lang(ui_lang);
     LaunchedRuntime {
@@ -232,18 +232,17 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
 /// on failure so the caller can surface it.
 fn prepare_persisted_session(
     workspace: PathBuf,
-    config: &AgentConfig,
     system_prompt: &str,
 ) -> Result<(JsonSessionStore, SessionRecord), String> {
     let store = JsonSessionStore::for_workspace(&workspace).map_err(|error| error.to_string())?;
-    let record = SessionRecord::new(workspace, config, system_prompt);
+    let record = SessionRecord::new(workspace, system_prompt);
     store.save(&record).map_err(|error| error.to_string())?;
     Ok((store, record))
 }
 
 fn launch_resumed(
     config: &AgentConfig,
-    mut record: SessionRecord,
+    record: SessionRecord,
     parent_cancel: &CancellationToken,
 ) -> LaunchedRuntime {
     let workspace = record.workspace.clone();
@@ -258,13 +257,6 @@ fn launch_resumed(
         }
     };
     let mut warnings = Vec::new();
-    record.config = ConfigSnapshot::from(config);
-    record.touch();
-    if let Err(error) = store.save(&record) {
-        warnings.push(format!(
-            "failed to refresh session config snapshot: {error}"
-        ));
-    }
 
     if config.api_key.is_some()
         && let Ok(client) = DeepSeekClient::new(config.clone())
@@ -289,6 +281,7 @@ fn launch_resumed(
                 config.clone(),
             ),
             &workspace,
+            config,
             &mut warnings,
         )
         .with_permission_mode(permission_mode.clone())
@@ -326,6 +319,7 @@ fn launch_resumed(
             config.clone(),
         ),
         &workspace,
+        config,
         &mut warnings,
     )
     .with_permission_mode(permission_mode.clone())
@@ -374,11 +368,17 @@ fn build_parent_tools<C: LlmClient + 'static>(
 fn attach_workspace_helpers(
     runtime: AgentRuntime,
     workspace: &Path,
+    config: &AgentConfig,
     warnings: &mut Vec<String>,
 ) -> AgentRuntime {
-    runtime
-        .with_checkpoints(workspace.to_path_buf(), warnings)
-        .with_diagnostics(workspace.to_path_buf())
+    let runtime = runtime.with_checkpoints(workspace.to_path_buf(), warnings);
+    // `[lsp] enabled = false` skips the manager entirely: no server spawns,
+    // no post-edit polling latency.
+    if config.lsp_enabled {
+        runtime.with_diagnostics(workspace.to_path_buf())
+    } else {
+        runtime
+    }
 }
 
 #[cfg(test)]

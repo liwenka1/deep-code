@@ -197,6 +197,7 @@ struct ConfigFile {
     approval: ApprovalSection,
     checkpoints: CheckpointsSection,
     ui: UiSection,
+    lsp: LspSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -248,6 +249,12 @@ struct CheckpointsSection {
 #[serde(default)]
 struct UiSection {
     language: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct LspSection {
+    enabled: Option<bool>,
 }
 
 enum FileRead {
@@ -432,6 +439,12 @@ fn apply_file_overlay(
         config.language = language.trim().to_string();
     }
 
+    // Diagnostics preference: turning LSP off is harmless from any layer (a
+    // repo can only reduce what runs, never widen access).
+    if let Some(enabled) = file.lsp.enabled {
+        config.lsp_enabled = enabled;
+    }
+
     if let Some(rules) = &file.approval.auto_allow {
         if project {
             pending.push((TextId::CfgProjectAutoAllowIgnored, Vec::new()));
@@ -578,6 +591,21 @@ mod tests {
         let env = |name: &str| (name == LANG_ENV).then(|| "en".to_string());
         let loaded = AgentConfig::load_with(Some(global), None, &env);
         assert_eq!(loaded.config.language, "en");
+    }
+
+    #[test]
+    fn lsp_enabled_defaults_on_and_any_file_layer_may_turn_it_off() {
+        assert!(AgentConfig::builtin().lsp_enabled);
+
+        let global_dir = tempfile::tempdir().unwrap();
+        let global = write_config(global_dir.path(), "[lsp]\nenabled = false\n");
+        let loaded = AgentConfig::load_with(Some(global), None, &no_env);
+        assert!(!loaded.config.lsp_enabled);
+
+        let project_dir = tempfile::tempdir().unwrap();
+        let project = write_config(project_dir.path(), "[lsp]\nenabled = false\n");
+        let loaded = AgentConfig::load_with(None, Some(project), &no_env);
+        assert!(!loaded.config.lsp_enabled, "project layer may reduce");
     }
 
     #[test]

@@ -1027,9 +1027,7 @@ async fn write_file_appends_lsp_diagnostics_to_session() {
 
     use async_trait::async_trait;
 
-    use crate::lsp::{
-        Diagnostic, DiagnosticRange, Language, LspConfig, LspManager, LspTransport, Severity,
-    };
+    use crate::lsp::{Diagnostic, DiagnosticRange, Language, LspManager, LspTransport, Severity};
     use crate::workspace_tools::workspace_tool_registry;
 
     struct FakeTransport {
@@ -1051,7 +1049,7 @@ async fn write_file_appends_lsp_diagnostics_to_session() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let manager = LspManager::new(LspConfig::default(), dir.path().to_path_buf());
+    let manager = LspManager::new(dir.path().to_path_buf());
     manager
         .install_test_transport(
             Language::Rust,
@@ -1252,7 +1250,7 @@ async fn stream_error_finalizes_open_turn() {
 }
 
 #[tokio::test]
-async fn persistence_saves_tool_results_in_turn() {
+async fn persistence_saves_tool_exchange_results() {
     let workspace = tempfile::tempdir().unwrap();
     let client = ScriptedClient::new(vec![
         vec![
@@ -1288,12 +1286,20 @@ async fn persistence_saves_tool_results_in_turn() {
     let record = store.load(&session_id).unwrap();
     assert_eq!(record.turns.len(), 1);
     assert_eq!(record.turns[0].user_prompt, "please echo");
-    assert_eq!(record.turns[0].tool_results.len(), 1);
+    // Tool outputs persist through the entries' exchanges (single copy).
+    let exchange = record
+        .entries
+        .iter()
+        .find_map(|entry| match &entry.kind {
+            crate::session_entry::EntryKind::Assistant { exchanges, .. } => exchanges.first(),
+            _ => None,
+        })
+        .expect("assistant entry with an exchange");
+    assert_eq!(exchange.call.function.name, MockEchoTool::NAME);
     assert_eq!(
-        record.turns[0].tool_results[0].tool_name,
-        MockEchoTool::NAME
+        exchange.result.as_ref().expect("recorded result").content,
+        "mock_echo: hi"
     );
-    assert_eq!(record.turns[0].tool_results[0].content, "mock_echo: hi");
 }
 
 #[tokio::test]
@@ -1599,7 +1605,6 @@ async fn multi_tool_turn_executes_all_auto_calls_in_order_and_persists() {
     let record = store.load(&session_id).unwrap();
     assert_eq!(record.message_count(), 6);
     assert_eq!(record.turns.len(), 1);
-    assert_eq!(record.turns[0].tool_results.len(), 2);
 }
 
 #[tokio::test]

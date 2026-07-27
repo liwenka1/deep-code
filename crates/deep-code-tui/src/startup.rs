@@ -258,12 +258,11 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deep_code_agent::{AgentConfig, SessionEntry};
+    use deep_code_agent::SessionEntry;
     use std::path::PathBuf;
 
     fn session_with(entries: Vec<SessionEntry>, updated_at_ms: u64) -> SessionRecord {
-        let mut record =
-            SessionRecord::new(PathBuf::from("/tmp/ws"), &AgentConfig::builtin(), "system");
+        let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "system");
         record.entries = entries;
         record.updated_at_ms = updated_at_ms;
         record

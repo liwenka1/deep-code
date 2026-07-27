@@ -199,7 +199,6 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::config::AgentConfig;
     use crate::session_store::{SessionId, SessionRecord, SessionStoreError};
 
     #[derive(Default)]
@@ -257,7 +256,7 @@ mod tests {
     }
 
     fn make_record() -> SessionRecord {
-        SessionRecord::new(PathBuf::from("/tmp/ws"), &AgentConfig::default(), "system")
+        SessionRecord::new(PathBuf::from("/tmp/ws"), "system")
     }
 
     #[tokio::test(flavor = "current_thread")]

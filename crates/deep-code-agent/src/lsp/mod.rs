@@ -22,7 +22,7 @@ pub(crate) use diagnostics::{Diagnostic, DiagnosticRange, Severity};
 pub use diagnostics::{render_blocks, summarize_blocks};
 #[allow(unused_imports)]
 pub use hooks::{edited_paths_for_tool, is_edit_tool, resolve_edit_paths};
-pub use manager::{LspConfig, LspManager};
+pub use manager::LspManager;
 #[allow(unused_imports)]
 pub use path_util::{normalize_path, paths_equal};
 #[allow(unused_imports)]

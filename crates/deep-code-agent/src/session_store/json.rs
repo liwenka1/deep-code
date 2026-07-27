@@ -190,7 +190,6 @@ impl SessionStore for JsonSessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AgentConfig;
 
     #[test]
     fn json_store_rejects_invalid_session_id() {
@@ -211,8 +210,7 @@ mod tests {
     fn json_store_round_trips_session() {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
-        let mut record =
-            SessionRecord::new(dir.path().to_path_buf(), &AgentConfig::default(), "system");
+        let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
         record
             .entries
             .push(crate::session_entry::SessionEntry::user("hello"));
@@ -296,13 +294,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
 
-        let mut older =
-            SessionRecord::new(dir.path().to_path_buf(), &AgentConfig::default(), "system");
+        let mut older = SessionRecord::new(dir.path().to_path_buf(), "system");
         older.updated_at_ms = 1;
         store.save(&older).unwrap();
 
-        let mut newer =
-            SessionRecord::new(dir.path().to_path_buf(), &AgentConfig::default(), "system");
+        let mut newer = SessionRecord::new(dir.path().to_path_buf(), "system");
         newer.updated_at_ms = 2;
         store.save(&newer).unwrap();
 
@@ -315,8 +311,7 @@ mod tests {
     fn json_store_delete_removes_file() {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
-        let record =
-            SessionRecord::new(dir.path().to_path_buf(), &AgentConfig::default(), "system");
+        let record = SessionRecord::new(dir.path().to_path_buf(), "system");
         let id = record.id.clone();
         store.save(&record).unwrap();
         store.delete(&id).unwrap();
@@ -330,8 +325,7 @@ mod tests {
     fn json_store_export_is_pretty_json() {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
-        let record =
-            SessionRecord::new(dir.path().to_path_buf(), &AgentConfig::default(), "system");
+        let record = SessionRecord::new(dir.path().to_path_buf(), "system");
         store.save(&record).unwrap();
         let exported = store.export(&record.id).unwrap();
         assert!(exported.contains("\"schema_version\""));

@@ -50,6 +50,14 @@ pub struct SandboxCapabilities {
     pub detail: String,
 }
 
+/// Whether an OS sandbox backend is usable on this machine. For callers that
+/// must refuse to run rather than silently degrade to bare execution (eval
+/// blind-approves model commands on untrusted repos).
+#[must_use]
+pub fn sandbox_available() -> bool {
+    detect_capabilities().available
+}
+
 /// Probe sandbox support on this host.
 #[must_use]
 pub fn detect_capabilities() -> SandboxCapabilities {

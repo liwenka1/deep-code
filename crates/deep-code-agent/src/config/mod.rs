@@ -89,6 +89,10 @@ pub struct AgentConfig {
     /// `Default`/`AcceptEdits` — a repo must not be able to launch you into
     /// `Auto`/`Yolo` (enforced in the layered loader).
     pub default_permission_mode: PermissionMode,
+    /// Post-edit LSP diagnostics master switch (`[lsp] enabled`). On by
+    /// default; polling budgets and caps are deliberately not configurable
+    /// (constants in `lsp::manager`).
+    pub lsp_enabled: bool,
 }
 
 impl Default for AgentConfig {
@@ -123,6 +127,7 @@ impl AgentConfig {
             checkpoint_max_snapshots: crate::checkpoint::DEFAULT_MAX_SNAPSHOTS,
             language: "auto".to_string(),
             default_permission_mode: PermissionMode::Default,
+            lsp_enabled: true,
         }
     }
 

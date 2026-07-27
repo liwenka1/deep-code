@@ -19,26 +19,47 @@ use crate::session::Session;
 use crate::session_entry::EntryKind;
 use crate::tool::ToolResultStatus;
 
-use super::{
-    CheckpointRecord, ConfigSnapshot, SESSION_SCHEMA_VERSION, SessionId, SessionRecord, TurnRecord,
-};
+use crate::model::Usage;
 
-/// The v1 on-disk layout (schema_version == 1).
+use super::{CheckpointRecord, SESSION_SCHEMA_VERSION, SessionId, SessionRecord, TurnRecord};
+
+/// The v1 on-disk layout (schema_version == 1). Frozen: these shapes mirror
+/// what v1 files actually contain and must not alias the live types — the
+/// live schema is free to drop fields (v1's `config` snapshot and per-turn
+/// `tool_results` are already gone from it) without breaking this reader.
 #[derive(Debug, Deserialize)]
 pub(super) struct SessionRecordV1 {
     pub id: SessionId,
     pub workspace: PathBuf,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
-    pub config: ConfigSnapshot,
     pub messages: Vec<Message>,
-    pub turns: Vec<TurnRecord>,
+    pub turns: Vec<TurnRecordV1>,
     #[serde(default)]
     pub checkpoints: Vec<CheckpointRecord>,
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]
     pub compaction: Option<String>,
+}
+
+/// V1 turn shape: carries the audit `tool_results` the live [`TurnRecord`]
+/// no longer stores; migration mines them for result statuses, then drops them.
+#[derive(Debug, Deserialize)]
+pub(super) struct TurnRecordV1 {
+    pub user_prompt: String,
+    #[serde(default)]
+    pub tool_results: Vec<ToolResultV1>,
+    pub usage: Option<Usage>,
+    pub started_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+}
+
+/// The slice of a v1 persisted tool result that migration reads.
+#[derive(Debug, Deserialize)]
+pub(super) struct ToolResultV1 {
+    pub call_id: String,
+    pub status: ToolResultStatus,
 }
 
 pub(super) fn migrate_v1(v1: SessionRecordV1) -> SessionRecord {
@@ -85,15 +106,25 @@ pub(super) fn migrate_v1(v1: SessionRecordV1) -> SessionRecord {
         *archived_count = archived;
     }
 
+    let turns = v1
+        .turns
+        .into_iter()
+        .map(|turn| TurnRecord {
+            user_prompt: turn.user_prompt,
+            usage: turn.usage,
+            started_at_ms: turn.started_at_ms,
+            finished_at_ms: turn.finished_at_ms,
+        })
+        .collect();
+
     SessionRecord {
         schema_version: SESSION_SCHEMA_VERSION,
         id: v1.id,
         workspace: v1.workspace,
         created_at_ms: v1.created_at_ms,
         updated_at_ms: v1.updated_at_ms,
-        config: v1.config,
         entries,
-        turns: v1.turns,
+        turns,
         checkpoints: v1.checkpoints,
         summary: v1.summary,
         compaction: v1.compaction,
@@ -105,7 +136,6 @@ mod tests {
     use super::*;
     use crate::model::{ToolCallFunctionPayload, ToolCallPayload};
     use crate::session_entry::EntryKind;
-    use crate::tool::ToolResult;
 
     fn call(id: &str) -> ToolCallPayload {
         ToolCallPayload {
@@ -120,7 +150,7 @@ mod tests {
 
     fn v1(
         messages: Vec<Message>,
-        turns: Vec<TurnRecord>,
+        turns: Vec<TurnRecordV1>,
         compaction: Option<&str>,
     ) -> SessionRecordV1 {
         SessionRecordV1 {
@@ -128,7 +158,6 @@ mod tests {
             workspace: PathBuf::from("/tmp/ws"),
             created_at_ms: 1,
             updated_at_ms: 2,
-            config: ConfigSnapshot::from(&crate::config::AgentConfig::default()),
             messages,
             turns,
             checkpoints: Vec::new(),
@@ -139,11 +168,16 @@ mod tests {
 
     #[test]
     fn migrates_plain_history_and_recovers_status() {
-        let mut turn = TurnRecord::new("do it");
-        turn.tool_results.push(ToolResult::error(
-            &crate::tool::ToolCall::new("c1", "shell", serde_json::json!({})),
-            "boom",
-        ));
+        let turn = TurnRecordV1 {
+            user_prompt: "do it".to_string(),
+            tool_results: vec![ToolResultV1 {
+                call_id: "c1".to_string(),
+                status: ToolResultStatus::Error,
+            }],
+            usage: None,
+            started_at_ms: 1,
+            finished_at_ms: Some(2),
+        };
         let record = migrate_v1(v1(
             vec![
                 Message::system("sys"),

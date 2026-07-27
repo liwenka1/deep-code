@@ -57,6 +57,7 @@ pub use model_registry::{DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO, ModelRegistry};
 pub use pricing::{CostCurrency, CostEstimate, PrefixStatus, TurnTelemetry};
 pub use runtime::{AgentRuntime, RuntimeEvent, RuntimeEventReceiver, ToolCallId, TurnId};
 pub use runtime_launch::{LaunchedRuntime, launch_runtime, web_enabled};
+pub use sandbox::sandbox_available;
 pub use session::Session;
 pub use session_entry::{EntryKind, ExchangeResult, SessionEntry, ToolExchange};
 pub use session_store::{

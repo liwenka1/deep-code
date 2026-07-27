@@ -112,6 +112,15 @@ pub async fn run_bench(
     config: EvalConfig,
     bench_set: &BenchmarkSet<impl BenchmarkInstance + Clone + Send + Sync + 'static>,
 ) -> anyhow::Result<BenchReport> {
+    // Eval blind-approves every tool call over untrusted checkouts; without an
+    // OS sandbox that means model-generated commands run bare on this machine.
+    // Refuse instead of silently degrading.
+    anyhow::ensure!(
+        deep_code_agent::sandbox_available(),
+        "refusing to run eval without an OS sandbox: eval auto-approves model \
+         commands on untrusted repos, and this machine has no usable sandbox \
+         backend. Run inside a container, or on macOS/Linux with sandbox support."
+    );
     let started_at = utc_now_iso();
     let start = Instant::now();
 

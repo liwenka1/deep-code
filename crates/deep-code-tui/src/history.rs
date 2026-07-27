@@ -447,7 +447,7 @@ mod tests {
     use std::path::PathBuf;
 
     use deep_code_agent::{
-        AgentConfig, ExchangeResult, SessionEntry, SessionRecord, ToolCallPayload, ToolExchange,
+        ExchangeResult, SessionEntry, SessionRecord, ToolCallPayload, ToolExchange,
     };
 
     use super::*;
@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn hydrate_history_keeps_assistant_tool_calls_and_results() {
-        let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), &AgentConfig::default(), "");
+        let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "");
         record.entries.push(SessionEntry::user("hi"));
         record.entries.push(SessionEntry::assistant(
             "",
@@ -524,7 +524,7 @@ mod tests {
 
     #[test]
     fn hydrate_history_restores_reasoning_content() {
-        let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), &AgentConfig::default(), "");
+        let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "");
         record.entries.push(SessionEntry::user("hi"));
         record.entries.push(SessionEntry::assistant(
             "answer",
@@ -547,7 +547,7 @@ mod tests {
     fn hydrate_history_renders_pending_exchange_as_call_only() {
         // An interrupted exchange (result never recorded) shows the call but
         // fabricates no result line.
-        let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), &AgentConfig::default(), "");
+        let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "");
         record.entries.push(SessionEntry::user("go"));
         record.entries.push(SessionEntry::assistant(
             "",

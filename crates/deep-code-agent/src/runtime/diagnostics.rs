@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::lsp::{LspConfig, LspManager};
+use crate::lsp::LspManager;
 use crate::runtime::AgentRuntime;
 
 impl AgentRuntime {
@@ -10,7 +10,7 @@ impl AgentRuntime {
     pub fn with_diagnostics(mut self, workspace: impl Into<PathBuf>) -> Self {
         let workspace = workspace.into();
         self.workspace = Some(workspace.clone());
-        self.lsp = Some(Arc::new(LspManager::new(LspConfig::default(), workspace)));
+        self.lsp = Some(Arc::new(LspManager::new(workspace)));
         self
     }
 

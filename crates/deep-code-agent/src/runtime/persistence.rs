@@ -34,7 +34,7 @@ impl AgentRuntime {
     ) -> Result<Self, SessionStoreError> {
         let workspace = workspace.into();
         let store = JsonSessionStore::for_workspace(&workspace)?;
-        let record = SessionRecord::new(workspace.clone(), config, system);
+        let record = SessionRecord::new(workspace.clone(), system);
         // First write is synchronous so callers see the session file before
         // returning. Subsequent saves go through the actor.
         store.save(&record)?;

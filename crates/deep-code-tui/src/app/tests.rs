@@ -29,13 +29,9 @@ fn slash_help_clear_and_status_update_history() {
 
 #[test]
 fn resume_picker_navigates_and_cancels() {
-    use deep_code_agent::{AgentConfig, SessionEntry};
+    use deep_code_agent::SessionEntry;
     let make = |prompt: &str| {
-        let mut record = SessionRecord::new(
-            std::path::PathBuf::from("/tmp/ws"),
-            &AgentConfig::builtin(),
-            "system",
-        );
+        let mut record = SessionRecord::new(std::path::PathBuf::from("/tmp/ws"), "system");
         record.entries = vec![SessionEntry::system("system"), SessionEntry::user(prompt)];
         record
     };

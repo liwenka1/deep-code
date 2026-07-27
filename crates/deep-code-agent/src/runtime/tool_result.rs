@@ -570,9 +570,6 @@ impl AgentRuntime {
                     },
                 );
             }
-            if let Some(turn) = state.current_turn.as_mut() {
-                turn.tool_results.push(result.clone());
-            }
             // Cascade signal: a genuine execution failure means the model
             // fumbled this tool call. Denials carry their own status and user
             // cancellations carry a known marker, so neither counts. Sub-agent

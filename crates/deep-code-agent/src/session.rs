@@ -44,15 +44,8 @@ impl Session {
         self.entries = entries;
     }
 
-    /// Append a domain entry, linking its `parent` to the current last entry.
-    /// This is the single incremental-append seam: every live turn flows
-    /// through here, so the linear parent chain stays complete without callers
-    /// threading ids. Wholesale loads ([`Session::from_entries`],
-    /// [`Session::from_wire_messages`]) and rebuilds ([`Session::replace_entries`])
-    /// bypass it and preserve whatever `parent` the entries already carry.
     fn push_entry(&mut self, entry: SessionEntry) {
-        let parent = self.entries.last().map(|entry| entry.id.clone());
-        self.entries.push(entry.with_parent(parent));
+        self.entries.push(entry);
     }
 
     pub fn push_system(&mut self, content: impl Into<String>) {
@@ -345,48 +338,6 @@ mod tests {
         assert!(session.record_tool_result("c9", "ok".to_string(), ToolResultStatus::Success));
         // Double-record of the same call is rejected.
         assert!(!session.record_tool_result("c9", "again".to_string(), ToolResultStatus::Success));
-    }
-
-    #[test]
-    fn push_links_each_entry_to_its_predecessor() {
-        let mut session = Session::new();
-        session.push_system("sys");
-        session.push_user("hello");
-        session.push_assistant("hi", "", Vec::new());
-
-        let entries = session.entries();
-        // Root has no parent; each subsequent entry points at the prior id.
-        assert_eq!(entries[0].parent, None);
-        assert_eq!(entries[1].parent.as_ref(), Some(&entries[0].id));
-        assert_eq!(entries[2].parent.as_ref(), Some(&entries[1].id));
-    }
-
-    #[test]
-    fn resume_continues_the_parent_chain_from_loaded_tail() {
-        // Simulate load-then-continue: a persisted transcript is loaded via
-        // from_entries (parents preserved as stored), then a new turn is
-        // appended. The new entry must link to the loaded tail, not restart.
-        let mut original = Session::new();
-        original.push_user("first prompt");
-        original.push_assistant("first answer", "", Vec::new());
-        let persisted = original.entries().to_vec();
-        let tail_id = persisted.last().unwrap().id.clone();
-
-        let mut resumed = Session::from_entries(persisted);
-        resumed.push_user("second prompt");
-
-        let last = resumed.entries().last().unwrap();
-        assert_eq!(last.parent.as_ref(), Some(&tail_id));
-    }
-
-    #[test]
-    fn loaded_entries_keep_their_stored_parents() {
-        // from_entries must not relink; a record carrying explicit parents
-        // round-trips unchanged (branch topology survives save/load).
-        let root = SessionEntry::system("sys");
-        let child = SessionEntry::user("q").with_parent(Some(root.id.clone()));
-        let session = Session::from_entries(vec![root.clone(), child.clone()]);
-        assert_eq!(session.entries()[1].parent.as_ref(), Some(&root.id));
     }
 
     #[test]
