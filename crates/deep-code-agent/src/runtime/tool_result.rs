@@ -213,6 +213,14 @@ impl AgentRuntime {
         user_task: &str,
         cancel: &CancellationToken,
     ) -> bool {
+        // Auto is at least as permissive as AcceptEdits (it sits above it in the
+        // mode cycle), so inherit its bounded fs-edit allowances first. Without
+        // this, a "more permissive" mode would ask for a plain `mkdir src/x`
+        // that the stricter AcceptEdits waves through — shell defaults to the
+        // High risk tier, which the judge floor below always prompts on.
+        if accept_edits_approvable(&call.name, &call.arguments) {
+            return true;
+        }
         if request.risk_level == RiskLevel::High {
             return false;
         }

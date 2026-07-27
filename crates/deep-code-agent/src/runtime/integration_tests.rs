@@ -413,6 +413,61 @@ async fn auto_mode_asks_when_classifier_denies() {
     );
 }
 
+/// Mode monotonicity: Auto sits above AcceptEdits in the cycle, so it must
+/// auto-approve everything AcceptEdits does. A bounded fs-edit (`mkdir sub`)
+/// defaults to the High risk tier, which Auto's judge floor would otherwise
+/// park on — but the AcceptEdits inheritance short-circuits before the judge,
+/// so the call runs without ever emitting an approval prompt. The script has
+/// NO judge response, proving the judge was never consulted.
+#[tokio::test]
+async fn auto_mode_inherits_accept_edits_fs_grant_without_asking() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+    let workspace = tempfile::tempdir().unwrap();
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_1", "shell", r#"{"command": "mkdir sub"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let registry = crate::shell_tools::ShellTools::new(workspace.path())
+        .unwrap()
+        .with_sandbox(crate::sandbox::SandboxManager::new().force_sandbox(Some(false)))
+        .into_registry();
+    let runtime = AgentRuntime::with_new_session(
+        client,
+        registry,
+        "system",
+        workspace.path(),
+        &crate::config::AgentConfig::builtin(),
+    )
+    .unwrap()
+    .with_permission_mode(SharedPermissionMode::new(PermissionMode::Auto));
+
+    let mut rx = runtime.submit_user("make a dir").await;
+    let events = drain(&mut rx).await;
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, RuntimeEvent::ApprovalRequired { .. })),
+        "Auto must inherit AcceptEdits's bounded fs-edit grant, not park on it"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::ToolCallFinished { .. })),
+        "the mkdir should have run to completion"
+    );
+    assert!(workspace.path().join("sub").is_dir(), "mkdir actually ran");
+}
+
 /// A parallel-safe tool (name `agent` → `ToolKind::SubAgent`) that blocks on a
 /// shared size-2 barrier: `run` only returns once two calls are in flight at
 /// once. Sequential batch execution deadlocks on it; concurrent execution
