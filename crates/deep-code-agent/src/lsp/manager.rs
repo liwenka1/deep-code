@@ -91,6 +91,12 @@ pub struct LspManager {
     /// Test seam: a transport registered here bypasses spawning entirely and
     /// always answers with the warm-server wait budget.
     stubs: AsyncMutex<HashMap<Language, Arc<dyn LspTransport>>>,
+    /// Operational complaints (unreadable file, dead server, missing binary)
+    /// buffered here instead of stderr — the TUI runs in raw mode, so a
+    /// direct `eprintln!` would corrupt the screen. The runtime drains this
+    /// via [`take_warnings`](Self::take_warnings) and forwards each entry as
+    /// a `RuntimeEvent::Warning`.
+    warnings: std::sync::Mutex<Vec<String>>,
 }
 
 impl LspManager {
@@ -103,7 +109,23 @@ impl LspManager {
             workspace,
             languages: AsyncMutex::new(HashMap::new()),
             stubs: AsyncMutex::new(HashMap::new()),
+            warnings: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn warn(&self, message: String) {
+        if let Ok(mut warnings) = self.warnings.lock() {
+            warnings.push(message);
+        }
+    }
+
+    /// Drain buffered operational warnings (see the `warnings` field docs).
+    #[must_use]
+    pub fn take_warnings(&self) -> Vec<String> {
+        self.warnings
+            .lock()
+            .map(|mut warnings| std::mem::take(&mut *warnings))
+            .unwrap_or_default()
     }
 
     /// A manager that answers `None`/empty everywhere (`enabled: false` path).
@@ -184,10 +206,10 @@ impl LspManager {
         let contents = match tokio::fs::read_to_string(file).await {
             Ok(contents) => contents,
             Err(error) => {
-                eprintln!(
+                self.warn(format!(
                     "lsp: cannot read {} ({error}); skipping diagnostics",
                     file.display()
-                );
+                ));
                 return None;
             }
         };
@@ -203,11 +225,11 @@ impl LspManager {
             match timeout(budget, transport.diagnostics_for(file, &contents, budget)).await {
                 Ok(Ok(items)) => items,
                 Ok(Err(error)) => {
-                    eprintln!(
+                    self.warn(format!(
                         "lsp: query for {} failed ({error}); the {} server will respawn on demand",
                         file.display(),
                         lang.as_key()
-                    );
+                    ));
                     // A failed call means the connection itself is gone (dead
                     // process, closed pipes), so evict and let the spawn budget
                     // decide whether a respawn is allowed. A timeout deliberately
@@ -216,11 +238,11 @@ impl LspManager {
                     return None;
                 }
                 Err(_) => {
-                    eprintln!(
+                    self.warn(format!(
                         "lsp: {} produced no diagnostics within {}ms",
                         file.display(),
                         budget.as_millis()
-                    );
+                    ));
                     return None;
                 }
             };
@@ -306,10 +328,10 @@ impl LspManager {
             Err(error) => {
                 if !cell.notified_unavailable {
                     cell.notified_unavailable = true;
-                    eprintln!(
+                    self.warn(format!(
                         "lsp: `{program}` is not runnable ({error}); {} diagnostics are off",
                         lang.as_key()
-                    );
+                    ));
                 }
                 None
             }

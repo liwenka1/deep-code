@@ -529,6 +529,11 @@ impl AgentRuntime {
             && let Some(lsp) = self.lsp.as_ref()
         {
             let blocks = lsp.collect_for_edit(&call.name, &call.arguments).await;
+            // Operational LSP complaints surface as Warning events — the TUI
+            // runs in raw mode, so the manager buffers instead of printing.
+            for message in lsp.take_warnings() {
+                emit(tx, RuntimeEvent::Warning { message });
+            }
             if !blocks.is_empty() {
                 let rendered = render_blocks(&blocks);
                 let summary = summarize_blocks(&blocks);

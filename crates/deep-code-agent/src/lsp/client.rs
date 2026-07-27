@@ -444,19 +444,45 @@ fn code_text(raw: &Value) -> Option<String> {
 }
 
 /// Render a path as a `file://` URI. The path is canonicalized first so the
-/// server and our bookkeeping agree on one spelling. Unix-oriented: Windows
-/// drive letters and percent-encoding are out of scope for now.
+/// server and our bookkeeping agree on one spelling, and percent-encoded
+/// (RFC 3986: unreserved plus `/` and `:` stay literal) — without encoding,
+/// spaces or non-ASCII path segments make servers echo an escaped URI that
+/// never matches ours, and their diagnostics are silently dropped.
+/// Unix-oriented: Windows drive letters are out of scope for now.
 fn file_uri(path: &Path) -> String {
     let resolved = normalize_path(path);
     let text = resolved.to_string_lossy();
     let trimmed = text.strip_prefix('/').unwrap_or(&text);
-    format!("file:///{trimmed}")
+    let mut encoded = String::with_capacity(trimmed.len());
+    for byte in trimmed.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    format!("file:///{encoded}")
 }
 
-/// Extract the filesystem path from a `file://` URI. Any other scheme is a
-/// document we cannot attribute, so it maps to `None`.
+/// Extract the filesystem path from a `file://` URI, percent-decoding it so a
+/// server-escaped URI (spaces, non-ASCII) maps back to the real path. Any
+/// other scheme — or a malformed escape — is a document we cannot attribute,
+/// so it maps to `None`.
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
-    uri.strip_prefix("file://").map(PathBuf::from)
+    let rest = uri.strip_prefix("file://")?;
+    let mut bytes = Vec::with_capacity(rest.len());
+    let mut iter = rest.bytes();
+    while let Some(byte) = iter.next() {
+        if byte == b'%' {
+            let hex = [iter.next()?, iter.next()?];
+            let hex = std::str::from_utf8(&hex).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    Some(PathBuf::from(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 #[cfg(test)]
@@ -569,6 +595,25 @@ mod tests {
         let item = decode_diagnostic(Path::new("/w/a.ts"), &raw).expect("decodes");
         assert_eq!(item.severity, Severity::Error);
         assert_eq!(item.code.as_deref(), Some("TS2304"));
+    }
+
+    #[test]
+    fn file_uri_round_trips_spaces_and_non_ascii() {
+        let path = Path::new("/tmp/我的 项目/src/main.rs");
+        let uri = file_uri(path);
+        assert!(uri.starts_with("file:///"));
+        assert!(!uri.contains(' '), "spaces must be percent-encoded: {uri}");
+        assert_eq!(uri_to_path(&uri).as_deref(), Some(path));
+    }
+
+    #[test]
+    fn uri_to_path_decodes_server_escaped_uris() {
+        assert_eq!(
+            uri_to_path("file:///a/with%20space/%E4%B8%AD.rs").as_deref(),
+            Some(Path::new("/a/with space/中.rs"))
+        );
+        assert!(uri_to_path("file:///bad%2").is_none());
+        assert!(uri_to_path("file:///bad%zz").is_none());
     }
 
     #[test]
