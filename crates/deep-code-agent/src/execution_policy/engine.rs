@@ -337,17 +337,20 @@ mod tests {
             "shell",
             &json!({"command": "curl https://x"})
         ));
-        // Command substitution is never a bounded workspace edit.
+        // Command substitution is never a bounded workspace edit (runs an
+        // arbitrary program the allowlist never inspects).
         assert!(!accept_edits_approvable(
             "shell",
             &json!({"command": "touch $(curl http://x/leak)"})
         ));
-        // fs command escaping the workspace does NOT qualify.
-        assert!(!accept_edits_approvable(
+        // An fs command whose path escapes the workspace now DOES pass this
+        // classifier — the OS sandbox denies the out-of-workspace write at
+        // execution, so the classifier no longer duplicates that path parsing.
+        assert!(accept_edits_approvable(
             "shell",
             &json!({"command": "rm /etc/hosts"})
         ));
-        assert!(!accept_edits_approvable(
+        assert!(accept_edits_approvable(
             "shell",
             &json!({"command": "mv ../secret ."})
         ));
