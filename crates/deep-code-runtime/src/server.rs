@@ -87,6 +87,7 @@ struct PendingApproval {
 
 struct ActiveTurnLease {
     active_turn: Arc<StdMutex<Option<String>>>,
+    runtime: Arc<Mutex<LaunchedRuntime>>,
 }
 
 impl Drop for ActiveTurnLease {
@@ -94,6 +95,15 @@ impl Drop for ActiveTurnLease {
         if let Ok(mut active_turn) = self.active_turn.lock() {
             *active_turn = None;
         }
+        // The SSE stream may have been dropped mid-turn (client disconnect):
+        // cancel the now-unobserved turn instead of letting it keep running
+        // (or wedge on an approval) while the gate reads "free". After a
+        // normal completion there is no live turn and this is a no-op.
+        let runtime = Arc::clone(&self.runtime);
+        tokio::spawn(async move {
+            let runtime = runtime.lock().await;
+            drop(runtime.handle.cancel_turn().await);
+        });
     }
 }
 
@@ -309,6 +319,7 @@ fn acquire_active_turn(state: &AppState, thread_id: &str) -> Result<ActiveTurnLe
     *active_turn = Some(thread_id.to_string());
     Ok(ActiveTurnLease {
         active_turn: Arc::clone(&state.active_turn),
+        runtime: state.runtime.clone(),
     })
 }
 

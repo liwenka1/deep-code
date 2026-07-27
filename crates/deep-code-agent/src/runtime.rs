@@ -191,6 +191,16 @@ impl AgentRuntime {
 
     /// Record a user prompt and start turn bookkeeping without spawning the loop.
     pub async fn begin_turn(&self, prompt: impl Into<String>) {
+        // A previous turn may still be live (e.g. the HTTP client disconnected
+        // mid-turn and a new prompt arrived): cancel its loop so it stops
+        // streaming. The turn-id guard in `finish_turn` keeps that loop's late
+        // finalization from consuming this turn's state.
+        {
+            let state = self.state.lock().await;
+            if state.current_turn_id.is_some() {
+                state.cancel.cancel();
+            }
+        }
         self.finalize_orphan_turn().await;
         let prompt = prompt.into();
         let turn_id = TurnId::new();

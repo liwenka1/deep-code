@@ -7,6 +7,7 @@ use crate::client::LlmClient;
 use crate::config::AgentConfig;
 use crate::model::Usage;
 use crate::runtime::AgentRuntime;
+use crate::runtime::event::TurnId;
 use crate::runtime::persistence_actor::PersistenceActorHandle;
 use crate::runtime::state::{Persistence, RuntimeState};
 use crate::session::Session;
@@ -95,8 +96,14 @@ impl AgentRuntime {
         persistence.actor.request_save();
     }
 
-    pub(super) async fn finish_turn(&self, usage: Option<Usage>) {
+    /// Close `turn_id`'s record. Guarded: a superseded loop (its turn was
+    /// cancelled by a newer `begin_turn`) finalizing late must not consume the
+    /// new turn's state, so a mismatched id is a no-op.
+    pub(super) async fn finish_turn(&self, turn_id: &TurnId, usage: Option<Usage>) {
         let mut state = self.state.lock().await;
+        if state.current_turn_id.as_ref() != Some(turn_id) {
+            return;
+        }
         if let Some(mut turn) = state.current_turn.take() {
             state.current_prompt = None;
             state.current_turn_id = None;
@@ -113,14 +120,14 @@ impl AgentRuntime {
         self.persist().await;
     }
 
-    pub(super) async fn abort_turn(&self) {
-        self.finish_turn(None).await;
+    pub(super) async fn abort_turn(&self, turn_id: &TurnId) {
+        self.finish_turn(turn_id, None).await;
     }
 
     pub(super) async fn finalize_orphan_turn(&self) {
-        let has_open = self.state.lock().await.current_turn.is_some();
-        if has_open {
-            self.finish_turn(None).await;
+        let open = self.state.lock().await.current_turn_id.clone();
+        if let Some(turn_id) = open {
+            self.finish_turn(&turn_id, None).await;
         }
     }
 }

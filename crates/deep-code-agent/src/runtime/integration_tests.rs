@@ -2276,3 +2276,37 @@ async fn repeated_tool_errors_trigger_cascade_and_surface_in_telemetry() {
         "two tool-call failures in one turn must trigger cascade escalation"
     );
 }
+
+/// A new `begin_turn` while a previous turn is still live (HTTP client
+/// disconnected mid-turn, new prompt arrived) must cancel the old loop, and
+/// the old loop's late finalization must not consume the new turn's state.
+#[tokio::test]
+async fn begin_turn_supersedes_live_turn_without_clobbering() {
+    let client = ScriptedClient::new(vec![]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::default());
+
+    runtime.begin_turn("first").await;
+    let (first_id, first_token) = {
+        let state = runtime.state.lock().await;
+        (
+            state.current_turn_id.clone().expect("first turn live"),
+            state.cancel.clone(),
+        )
+    };
+
+    runtime.begin_turn("second").await;
+    assert!(
+        first_token.is_cancelled(),
+        "superseding begin_turn must cancel the previous turn's loop"
+    );
+
+    // The superseded loop finalizing late must be a no-op under the id guard.
+    runtime.finish_turn(&first_id, None).await;
+    let state = runtime.state.lock().await;
+    assert!(
+        state.current_turn.is_some(),
+        "stale finalization must not consume the new turn's record"
+    );
+    assert_eq!(state.current_prompt.as_deref(), Some("second"));
+    assert!(state.current_turn_id.is_some());
+}

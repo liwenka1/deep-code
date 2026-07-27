@@ -99,7 +99,7 @@ impl AgentRuntime {
                             message: error.user_message(self.ui_lang()),
                         },
                     );
-                    self.abort_turn().await;
+                    self.abort_turn(&turn_id).await;
                     return;
                 }
             };
@@ -221,7 +221,7 @@ impl AgentRuntime {
                         .session
                         .push_assistant(text_buffer, reasoning_buffer, Vec::new());
                 }
-                self.abort_turn().await;
+                self.abort_turn(&turn_id).await;
                 return;
             }
 
@@ -232,7 +232,7 @@ impl AgentRuntime {
                         tx,
                         runtime_error_from_tool_error(error, Some(turn_id.clone())),
                     );
-                    self.abort_turn().await;
+                    self.abort_turn(&turn_id).await;
                     return;
                 }
             };
@@ -256,7 +256,7 @@ impl AgentRuntime {
                         stream_retries,
                     )
                     .await;
-                self.finish_turn(usage.clone()).await;
+                self.finish_turn(&turn_id, usage.clone()).await;
                 emit(
                     tx,
                     RuntimeEvent::TurnFinished {

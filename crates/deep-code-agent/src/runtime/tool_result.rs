@@ -419,7 +419,7 @@ impl AgentRuntime {
         turn_id: &TurnId,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        self.finish_turn(None).await;
+        self.finish_turn(turn_id, None).await;
         emit(
             tx,
             RuntimeEvent::TurnCancelled {
