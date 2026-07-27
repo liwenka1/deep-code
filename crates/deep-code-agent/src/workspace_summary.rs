@@ -12,22 +12,28 @@ pub fn build_workspace_summary(workspace: &Path) -> String {
         return format!("工作区: {} (不可读)", workspace.display());
     };
 
-    let mut entries = Vec::new();
-    for entry in read_dir.flatten().take(MAX_ENTRIES + 4) {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') && name != ".git" {
-            continue;
-        }
-        let kind = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            "dir"
-        } else {
-            "file"
-        };
-        entries.push(format!("{name} ({kind})"));
-        if entries.len() >= MAX_ENTRIES {
-            break;
-        }
-    }
+    // Collect → filter → sort → truncate: `read_dir` order is arbitrary, and
+    // this summary lands in the system prompt, so an unstable listing would
+    // change the prompt prefix between runs and forfeit provider prompt-cache
+    // hits. Sorting also makes the truncation deterministic instead of
+    // keeping whichever entries the OS happened to yield first.
+    let mut entries: Vec<(String, bool)> = read_dir
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') && name != ".git" {
+                return None;
+            }
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            Some((name, is_dir))
+        })
+        .collect();
+    entries.sort();
+    entries.truncate(MAX_ENTRIES);
+    let entries: Vec<String> = entries
+        .into_iter()
+        .map(|(name, is_dir)| format!("{name} ({})", if is_dir { "dir" } else { "file" }))
+        .collect();
 
     if entries.is_empty() {
         return format!("工作区: {} (空目录)", workspace.display());
@@ -84,6 +90,24 @@ mod tests {
         let summary = build_workspace_summary(dir.path());
         assert!(summary.contains("README.md"));
         assert!(summary.contains("src (dir)"));
+    }
+
+    /// The summary feeds the system prompt: entries must come out sorted so
+    /// the prompt prefix is byte-stable across runs (provider cache hits).
+    #[test]
+    fn summary_entries_are_sorted() {
+        let dir = TempDir::new().unwrap();
+        for name in ["zeta.txt", "alpha.txt", "midway.txt"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        let summary = build_workspace_summary(dir.path());
+        let alpha = summary.find("alpha.txt").unwrap();
+        let midway = summary.find("midway.txt").unwrap();
+        let zeta = summary.find("zeta.txt").unwrap();
+        assert!(
+            alpha < midway && midway < zeta,
+            "entries must be sorted: {summary}"
+        );
     }
 
     #[test]

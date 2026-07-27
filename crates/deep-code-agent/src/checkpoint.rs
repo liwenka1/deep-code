@@ -214,10 +214,27 @@ fn copy_tree(source: &Path, dest: &Path, skip_meta: bool) -> Result<(), ToolErro
             continue;
         }
         let target = dest.join(rel);
-        if entry.file_type().is_dir() {
+        let file_type = entry.file_type();
+        if file_type.is_symlink() {
+            // Preserve the link itself, not its referent: a workspace symlink
+            // must survive snapshot → clear → restore instead of being
+            // silently dropped (Unix only; Windows symlinks need privileges
+            // and keep the old skip behavior).
+            #[cfg(unix)]
+            {
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|error| checkpoint_error("create snapshot parent", error))?;
+                }
+                let link_target = fs::read_link(entry.path())
+                    .map_err(|error| checkpoint_error("read snapshot symlink", error))?;
+                std::os::unix::fs::symlink(&link_target, &target)
+                    .map_err(|error| checkpoint_error("copy snapshot symlink", error))?;
+            }
+        } else if file_type.is_dir() {
             fs::create_dir_all(&target)
                 .map_err(|error| checkpoint_error("create snapshot subdir", error))?;
-        } else if entry.file_type().is_file() {
+        } else if file_type.is_file() {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|error| checkpoint_error("create snapshot parent", error))?;
@@ -267,7 +284,13 @@ fn clear_workspace_contents(workspace: &Path) -> Result<(), ToolError> {
             continue;
         }
         let path = entry.path();
-        if path.is_dir() {
+        // `file_type()` (unlike `path.is_dir()`) does not follow symlinks: a
+        // link to a directory is removed as the link it is, never traversed
+        // into its (possibly workspace-external) referent.
+        let file_type = entry
+            .file_type()
+            .map_err(|error| checkpoint_error("stat workspace entry", error))?;
+        if file_type.is_dir() {
             fs::remove_dir_all(&path)
                 .map_err(|error| checkpoint_error("clear workspace dir", error))?;
         } else {
@@ -315,6 +338,36 @@ mod tests {
 
         store.restore(&id).unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "v1");
+    }
+
+    /// A workspace symlink must survive snapshot → clear → restore as a link
+    /// (same target), not be silently dropped or traversed into.
+    #[cfg(unix)]
+    #[test]
+    fn restore_preserves_symlinks() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("shared.txt"), "external").unwrap();
+        fs::write(workspace.path().join("real.txt"), "v1").unwrap();
+        let link = workspace.path().join("link-out");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let store = CheckpointStore::new(workspace.path()).unwrap();
+        let (id, _) = store.snapshot("before_turn").unwrap();
+
+        fs::remove_file(&link).unwrap();
+        store.restore(&id).unwrap();
+
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            outside.path(),
+            "restore must recreate the symlink with its original target"
+        );
+        // The link's external referent was never cleared or copied into.
+        assert_eq!(
+            fs::read_to_string(outside.path().join("shared.txt")).unwrap(),
+            "external"
+        );
     }
 
     #[test]
