@@ -91,14 +91,6 @@ pub enum HistoryCell {
     ToolStream {
         text: String,
     },
-    Approval {
-        tool_name: String,
-        description: String,
-        risk_level: String,
-        requires_sandbox: bool,
-        matched_rule: Option<String>,
-        arguments: String,
-    },
     Diagnostics {
         summary: String,
         rendered: String,
@@ -166,21 +158,6 @@ impl HistoryCell {
                 )]
             }
             Self::ToolStream { text } => text.lines().map(str::to_string).collect(),
-            Self::Approval {
-                tool_name,
-                description,
-                risk_level,
-                requires_sandbox,
-                matched_rule,
-                arguments,
-            } => vec![
-                format!("Tool: {tool_name}"),
-                format!("Risk: {risk_level} | Sandbox: {requires_sandbox}"),
-                format!("Rule: {}", matched_rule.as_deref().unwrap_or("none")),
-                format!("Description: {}", truncate_chars(description, 200)),
-                format!("Arguments: {}", truncate_chars(arguments, 240)),
-                "Press y to approve, n to deny.".to_string(),
-            ],
             Self::Diagnostics { summary, rendered } => {
                 if rendered.is_empty() {
                     vec![summary.clone()]
@@ -631,29 +608,16 @@ mod tests {
     }
 
     #[test]
-    fn tool_and_approval_lines_truncate_long_fields() {
+    fn tool_call_lines_truncate_long_fields() {
         let long = "x".repeat(500);
         let tool = HistoryCell::ToolCall {
             tool_name: "write_file".to_string(),
-            arguments: long.clone(),
+            arguments: long,
             risk_level: None,
             requires_sandbox: None,
             approval: ToolApprovalState::NotRequired,
         };
         assert!(tool.lines(Lang::Zh).iter().any(|line| line.contains('…')));
-
-        let approval = HistoryCell::Approval {
-            tool_name: "shell".to_string(),
-            description: long.clone(),
-            risk_level: "High".to_string(),
-            requires_sandbox: true,
-            matched_rule: Some("shell".to_string()),
-            arguments: long,
-        };
-        let lines = approval.lines(Lang::Zh);
-        assert!(lines.iter().any(|line| line.contains("Risk: High")));
-        assert!(lines.iter().any(|line| line.contains("Rule: shell")));
-        assert!(lines.iter().any(|line| line.contains('…')));
     }
 
     #[test]

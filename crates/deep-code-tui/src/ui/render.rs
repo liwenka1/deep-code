@@ -430,29 +430,6 @@ fn cell_lines(cell: &HistoryCell, width: u16, lang: Lang) -> Vec<Line<'static>> 
             .lines()
             .flat_map(|logical| wrap_prefixed("    ", logical, width, dim, dim))
             .collect(),
-        HistoryCell::Approval {
-            tool_name,
-            description,
-            risk_level,
-            requires_sandbox,
-            matched_rule,
-            arguments,
-        } => {
-            let mut lines = approval_lines(
-                tool_name,
-                risk_level,
-                *requires_sandbox,
-                matched_rule.as_deref(),
-                description,
-                arguments,
-                None,
-                &[],
-                width,
-                lang,
-            );
-            lines.push(Line::default());
-            lines
-        }
         // Diagnostics / Checkpoint / Compaction / System: dim secondary lines.
         _ => {
             let mut lines = Vec::new();
@@ -689,9 +666,15 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout
         width,
         app.lang,
     );
+    // Clamp against the real rendered body (wrapped lines, safety notes, diff
+    // preview) so the user can scroll to the very end before deciding — the
+    // stored offset itself is unclamped.
+    let viewport = usize::from(chunks[0].height).max(1);
+    let max_scroll = body.len().saturating_sub(viewport);
+    let scroll = app.approval_scroll_offset.min(max_scroll);
     let body_paragraph = Paragraph::new(body)
         .block(Block::default().padding(Padding::new(1, 0, 0, 0)))
-        .scroll((app.clamped_approval_scroll_offset() as u16, 0));
+        .scroll((scroll as u16, 0));
     frame.render_widget(body_paragraph, chunks[0]);
 
     let key_y = Style::default()

@@ -659,39 +659,15 @@ impl App {
         self.approval_scroll_offset = self.approval_scroll_offset.saturating_sub(3);
     }
 
+    /// Unclamped, like the transcript's `scroll_up`: only the render layer
+    /// knows the real (width-wrapped, preview-carrying) panel height, so it
+    /// clamps against actual lines there.
     pub fn scroll_approval_down(&mut self) {
-        self.approval_scroll_offset = self
-            .approval_scroll_offset
-            .saturating_add(3)
-            .min(self.approval_scroll_max());
+        self.approval_scroll_offset = self.approval_scroll_offset.saturating_add(3);
     }
 
     pub fn scroll_approval_to_top(&mut self) {
         self.approval_scroll_offset = 0;
-    }
-
-    #[must_use]
-    pub fn clamped_approval_scroll_offset(&self) -> usize {
-        self.approval_scroll_offset.min(self.approval_scroll_max())
-    }
-
-    pub(crate) fn approval_cell(&self) -> Option<HistoryCell> {
-        self.pending_approval
-            .as_ref()
-            .map(|request| HistoryCell::Approval {
-                tool_name: request.tool_name.clone(),
-                description: request.description.clone(),
-                risk_level: format!("{:?}", request.risk_level),
-                requires_sandbox: request.requires_sandbox,
-                matched_rule: request.matched_rule.clone(),
-                arguments: request.arguments.to_string(),
-            })
-    }
-
-    fn approval_scroll_max(&self) -> usize {
-        self.approval_cell()
-            .map(|cell| cell.lines(self.lang).len().saturating_sub(1))
-            .unwrap_or(0)
     }
 
     /// Apply queued runtime updates; returns whether anything changed (the

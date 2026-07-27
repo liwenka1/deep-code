@@ -171,15 +171,14 @@ fn approval_scroll_helpers_adjust_panel_offset() {
     for _ in 0..10 {
         app.scroll_approval_down();
     }
-    assert_eq!(
-        app.approval_scroll_offset,
-        app.clamped_approval_scroll_offset()
-    );
-    assert!(app.approval_scroll_offset > 0);
+    // The stored offset is unclamped (the render layer clamps against the
+    // real wrapped panel height); the helpers just move it.
+    assert_eq!(app.approval_scroll_offset, 30);
     app.scroll_approval_up();
-    assert!(app.approval_scroll_offset < app.approval_scroll_max());
-    app.scroll_approval_down();
+    assert_eq!(app.approval_scroll_offset, 27);
     app.scroll_approval_to_top();
+    assert_eq!(app.approval_scroll_offset, 0);
+    app.scroll_approval_up();
     assert_eq!(app.approval_scroll_offset, 0);
 }
 
@@ -1043,14 +1042,8 @@ fn approval_events_render_pending_and_resolved_tool_metadata() {
             ..
         } if risk == "High" && *approval == crate::history::ToolApprovalState::Required
     )));
-    // The approval is surfaced by the dedicated panel (app.pending_approval),
-    // not duplicated inline in the transcript preview.
-    assert!(
-        !preview
-            .iter()
-            .any(|cell| matches!(cell, HistoryCell::Approval { .. })),
-        "approval must not be duplicated in the transcript preview"
-    );
+    // The approval itself is surfaced only by the dedicated panel
+    // (app.pending_approval), never as a transcript cell.
     let pending = app.pending_approval.as_ref().expect("pending approval set");
     assert_eq!(pending.matched_rule.as_deref(), Some("write"));
     assert_eq!(format!("{:?}", pending.risk_level), "High");
