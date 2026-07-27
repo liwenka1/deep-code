@@ -99,20 +99,18 @@ pub fn child_tool_registry(
     let mut registry =
         ToolRegistry::filtered_from(&workspace_tools, |name| include_workspace_tool(role, name));
     registry.set_policy(exec_policy);
-    if role.allows_shell() {
-        let (shell_tools, _) = shell_tool_registry(workspace)?;
-        registry.extend(shell_tools);
-    }
+    // All roles may use the shell: child policy auto-denies anything unapproved,
+    // so read-only roles effectively get only trusted read-only prefixes
+    // (git status/diff/log, …).
+    let (shell_tools, _) = shell_tool_registry(workspace)?;
+    registry.extend(shell_tools);
     Ok(registry)
 }
 
 fn include_workspace_tool(role: SubAgentRole, name: &str) -> bool {
     match name {
         "write_file" | "apply_patch" => role.allows_writes(),
-        _ => matches!(
-            name,
-            "read_file" | "list_dir" | "grep_files" | "write_file" | "apply_patch"
-        ),
+        _ => matches!(name, "read_file" | "list_dir" | "grep_files"),
     }
 }
 

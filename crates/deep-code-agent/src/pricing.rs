@@ -39,11 +39,6 @@ pub struct CostEstimate {
 
 impl CostEstimate {
     #[must_use]
-    pub fn is_positive(self) -> bool {
-        self.usd > 0.0 || self.cny > 0.0
-    }
-
-    #[must_use]
     pub fn amount(self, currency: CostCurrency) -> f64 {
         match currency {
             CostCurrency::Usd => self.usd,

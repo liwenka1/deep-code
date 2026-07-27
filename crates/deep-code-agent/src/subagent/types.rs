@@ -11,7 +11,6 @@ pub const DEFAULT_MAX_STEPS: u32 = 50;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubAgentStatus {
-    Pending,
     Running,
     Completed,
     Failed,
@@ -22,13 +21,12 @@ pub enum SubAgentStatus {
 impl SubAgentStatus {
     #[must_use]
     pub fn is_terminal(self) -> bool {
-        !matches!(self, Self::Pending | Self::Running)
+        !matches!(self, Self::Running)
     }
 
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Pending => "pending",
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",

@@ -20,7 +20,7 @@ impl SubAgentRole {
         match normalize(value).as_str() {
             "general" | "worker" | "default" | "general-purpose" => Ok(Self::General),
             "explore" | "explorer" | "exploration" => Ok(Self::Explore),
-            "plan" | "planning" | "awaiter" => Ok(Self::Plan),
+            "plan" | "planning" | "planner" => Ok(Self::Plan),
             "review" | "reviewer" | "code-review" | "code_review" => Ok(Self::Review),
             "implementer" | "implement" | "implementation" | "builder" => Ok(Self::Implementer),
             "verifier" | "verify" | "verification" | "validator" | "tester" => Ok(Self::Verifier),
@@ -62,14 +62,6 @@ impl SubAgentRole {
         // child that mutates the workspace unattended must be an explicit
         // `role: implementer` choice, not the silent default.
         matches!(self, Self::Implementer)
-    }
-
-    #[must_use]
-    pub fn allows_shell(self) -> bool {
-        // Review included since the git_* tools were removed: policy auto-denies
-        // anything unapproved in children, so a reviewer can effectively only
-        // run trusted read-only prefixes (git status/diff/log, …).
-        true
     }
 }
 

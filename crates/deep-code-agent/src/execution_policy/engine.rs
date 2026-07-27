@@ -50,10 +50,6 @@ pub struct ToolExecutionPlan {
 }
 
 impl ToolExecutionPlan {
-    pub fn allowed(&self) -> bool {
-        !matches!(self.verdict, PolicyVerdict::Deny { .. })
-    }
-
     pub fn denied_reason(&self) -> Option<&str> {
         match &self.verdict {
             PolicyVerdict::Deny { reason } => Some(reason),

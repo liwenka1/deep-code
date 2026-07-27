@@ -20,7 +20,6 @@ use tokio_util::sync::CancellationToken;
 use crate::execution_policy::{
     ExecPolicy, RiskLevel, SafetyNote, ToolExecutionPlan, ToolKind, safety_notes,
 };
-use crate::message::Message;
 use crate::model::{ChatTool, ChatToolFunction};
 use crate::sandbox::SandboxPolicy;
 
@@ -34,21 +33,6 @@ pub struct ToolSpec {
 }
 
 impl ToolSpec {
-    #[must_use]
-    pub fn new(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        parameters: Value,
-        requires_approval: bool,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            description: description.into(),
-            parameters,
-            requires_approval,
-        }
-    }
-
     #[must_use]
     pub fn to_chat_tool(&self) -> ChatTool {
         ChatTool {
@@ -136,11 +120,6 @@ impl ToolResult {
             details: None,
         }
     }
-
-    #[must_use]
-    pub fn to_message(&self) -> Message {
-        Message::tool(self.call_id.clone(), self.content.clone())
-    }
 }
 
 /// Incremental progress payload a tool can emit while running.
@@ -215,13 +194,6 @@ impl ToolCx {
         if let Some(on_update) = &self.on_update {
             on_update(update);
         }
-    }
-
-    pub fn update_text(&self, text: impl Into<String>) {
-        self.update(ToolUpdate {
-            text: text.into(),
-            details: None,
-        });
     }
 }
 
@@ -510,7 +482,6 @@ mod tests {
         };
 
         assert_eq!(result.status, ToolResultStatus::Denied);
-        assert_eq!(result.to_message(), Message::tool("call_2", result.content));
     }
 
     #[tokio::test]
