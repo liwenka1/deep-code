@@ -11,6 +11,11 @@
 //! Deny rules deliberately ignore identity matching: for a deny rule the
 //! flags are the danger (`rm -rf`), whereas identity extraction skips flags.
 //! Trusted (allow) matching lives separately in [`super::command_shape`].
+//!
+//! Scope, honestly: this is best-effort string analysis of an unparsed shell
+//! line, not a security boundary. A construction it fails to recognize falls
+//! through to `NeedsApproval` — the human (or, under `Yolo`, the OS sandbox)
+//! is the actual containment for what parsing misses.
 
 use serde::{Deserialize, Serialize};
 

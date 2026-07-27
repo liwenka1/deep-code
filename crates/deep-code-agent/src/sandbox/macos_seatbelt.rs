@@ -281,19 +281,6 @@ mod tests {
     }
 
     #[test]
-    fn read_only_policy_grants_no_write_roots() {
-        let ws = Path::new("/tmp/dc-ws");
-        let profile = compose_profile(&SandboxPolicy::ReadOnly, ws, ws);
-        assert!(!profile.render().contains("WRITE_ROOT_"));
-        assert!(
-            !profile
-                .bindings
-                .iter()
-                .any(|(name, _)| name.starts_with("WRITE_ROOT_"))
-        );
-    }
-
-    #[test]
     fn distinct_cwd_receives_its_own_write_grant() {
         let workspace = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();

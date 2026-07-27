@@ -156,8 +156,9 @@ impl AgentRuntime {
     /// (1) standing consent — a configured `auto_allow` prefix or a session
     /// "a" — is mode-independent; (2) the session [`PermissionMode`] relaxes
     /// the gate more broadly. Policy hard-denials are unaffected either way:
-    /// they short-circuit in the registry before any decision is consulted, so
-    /// even `Yolo` never runs a denied command.
+    /// they short-circuit in the registry before any decision is consulted.
+    /// (That covers commands the deny parser recognized — it is best-effort,
+    /// so `Yolo`'s real containment is the OS sandbox, not the deny list.)
     async fn auto_approval_granted(
         &self,
         call: &ToolCall,

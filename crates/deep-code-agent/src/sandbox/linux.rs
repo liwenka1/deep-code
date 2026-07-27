@@ -6,8 +6,7 @@
 //! - **Reads stay broad** — only write-class Landlock access rights are
 //!   *handled*, so reads are unrestricted (keeps tools working).
 //! - **Writes are confined** to the policy's writable roots, plus the temp dir
-//!   and a few `/dev` nodes needed for redirections. `ReadOnly` grants no
-//!   workspace write at all.
+//!   and a few `/dev` nodes needed for redirections.
 //! - **Network is blocked** (seccomp `socket`/`connect` → EPERM) unless the
 //!   policy allows it. When the policy DOES allow network (approved/trusted
 //!   writable commands), the broad reads above become an exfiltration surface:

@@ -512,10 +512,6 @@ mod tests {
         };
 
         assert_eq!(
-            ToolCx::new().with_plan(plan(true, true)).sandbox_policy(),
-            SandboxPolicy::ReadOnly
-        );
-        assert_eq!(
             ToolCx::new().with_plan(plan(true, false)).sandbox_policy(),
             SandboxPolicy::WorkspaceWrite {
                 network_access: true

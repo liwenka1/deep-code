@@ -9,8 +9,6 @@ pub enum SandboxPolicy {
     Unsandboxed,
     /// Read broadly; write only under workspace (and cwd).
     WorkspaceWrite { network_access: bool },
-    /// Read-only subprocess.
-    ReadOnly,
 }
 
 impl Default for SandboxPolicy {
@@ -45,7 +43,6 @@ impl SandboxPolicy {
     #[must_use]
     pub fn from_execution_plan(plan: Option<&ToolExecutionPlan>) -> Self {
         match plan {
-            Some(plan) if plan.requires_sandbox && plan.read_only => Self::ReadOnly,
             // An approved or trusted shell command runs with network access so
             // `git push` / package installs / `cargo build` work. This is a
             // deliberate trade-off: because reads stay broad, granting egress
@@ -65,7 +62,7 @@ impl SandboxPolicy {
 
     pub fn writable_roots(&self, workspace: &Path, cwd: &Path) -> Vec<PathBuf> {
         match self {
-            Self::Unsandboxed | Self::ReadOnly => Vec::new(),
+            Self::Unsandboxed => Vec::new(),
             Self::WorkspaceWrite { .. } => {
                 let mut roots = vec![workspace.to_path_buf()];
                 if cwd != workspace {
@@ -102,10 +99,6 @@ mod tests {
         assert!(matches!(
             SandboxPolicy::from_execution_plan(Some(&plan(false, false))),
             SandboxPolicy::Unsandboxed
-        ));
-        assert!(matches!(
-            SandboxPolicy::from_execution_plan(Some(&plan(true, true))),
-            SandboxPolicy::ReadOnly
         ));
         // A sandboxed, writable (shell) command is granted network access so
         // git push / installs / cargo build work; filesystem confinement and

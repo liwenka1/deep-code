@@ -2,9 +2,12 @@
 //!
 //! A mode only ever relaxes a `NeedsApproval` verdict into an auto-run. A hard
 //! `Deny` (rm -rf, fork bomb, `curl | sh`, …) is short-circuited in the policy
-//! engine before any decision is consulted, so **no mode — not even `Yolo` —
-//! can run a denied command.** That invariant is the safety floor for every
-//! mode here.
+//! engine before any decision is consulted, so no mode — not even `Yolo` —
+//! runs a command the deny list *recognized*. Be honest about what that
+//! buys: `shell_deny` is best-effort string parsing, not a security boundary.
+//! An obfuscation it fails to parse falls through as `NeedsApproval`, which
+//! `Yolo` auto-approves — so under `Yolo` the real containment is the OS
+//! sandbox (where enabled), not this floor.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
