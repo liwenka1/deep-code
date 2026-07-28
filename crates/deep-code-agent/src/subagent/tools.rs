@@ -183,10 +183,12 @@ impl Tool for AgentTool {
             }
         };
 
-        // Fold the child's own request spend into the parent session cost: it
+        // Fold the child's own request spend into the parent session totals: it
         // ran on the same API key, but its telemetry never reaches the parent
-        // turn. `cancel_handle` shares the (now-finished) child's state.
-        cx.report_cost(cancel_handle.session_cost().await);
+        // turn. Cache counters ride along so the session hit-rate/savings keep
+        // covering every request billed to it. `cancel_handle` shares the
+        // (now-finished) child's state.
+        cx.report_spend(cancel_handle.session_spend().await);
 
         // Recover a poisoned lock rather than stranding this record as a zombie
         // Running entry: a prior panic under the lock must not block finalize.

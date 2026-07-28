@@ -163,6 +163,46 @@ impl Tool for FailingTool {
     }
 }
 
+/// A tool that reports out-of-band spend (the sub-agent shape). Borrows the
+/// whitelisted read-only name so the call runs without approval (same trick
+/// as `AutoEchoTool`, which is not registered alongside it).
+#[derive(Debug, Clone, Copy)]
+struct SpendReportingTool;
+
+impl SpendReportingTool {
+    const NAME: &'static str = "read_file";
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SpendParams {}
+
+#[async_trait::async_trait]
+impl Tool for SpendReportingTool {
+    type Params = SpendParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Reports out-of-band spend."
+    }
+
+    async fn run(
+        &self,
+        _params: SpendParams,
+        cx: &crate::tool::ToolCx,
+    ) -> Result<crate::tool::ToolOutput, ToolError> {
+        cx.report_spend(crate::tool::ToolSpend {
+            cost: crate::pricing::CostEstimate { usd: 0.5, cny: 3.5 },
+            cache_hit_tokens: 300,
+            cache_miss_tokens: 100,
+            cache_savings: crate::pricing::CostEstimate { usd: 0.2, cny: 1.4 },
+        });
+        Ok(crate::tool::ToolOutput::text("spent"))
+    }
+}
+
 fn started_ids(events: &[RuntimeEvent]) -> Vec<String> {
     events
         .iter()
@@ -2467,6 +2507,50 @@ async fn cancel_turn_if_only_cancels_the_named_turn() {
     assert!(
         second_token.is_cancelled(),
         "cancel_turn_if must cancel the turn it names"
+    );
+}
+
+/// Spend a tool reports out-of-band (the sub-agent shape) must fold into the
+/// parent session's lifetime totals — cost AND cache counters, the same
+/// accounting `record_classifier_cost` uses — even though the turn's own
+/// telemetry never saw those requests.
+#[tokio::test]
+async fn tool_reported_spend_folds_into_session_totals() {
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_1", SpendReportingTool::NAME, "{}"),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let mut registry = ToolRegistry::default();
+    registry.register(SpendReportingTool);
+    let runtime = AgentRuntime::new(client, registry);
+
+    let mut rx = runtime.submit_user("go").await;
+    let events = drain(&mut rx).await;
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+
+    let state = runtime.state.lock().await;
+    assert!(
+        (state.session_cost.usd - 0.5).abs() < 1e-9 && (state.session_cost.cny - 3.5).abs() < 1e-9,
+        "reported cost must land in session_cost"
+    );
+    assert_eq!(state.session_cache_hit_tokens, 300);
+    assert_eq!(state.session_cache_miss_tokens, 100);
+    assert!(
+        (state.session_cache_savings.usd - 0.2).abs() < 1e-9,
+        "reported cache savings must land in session_cache_savings"
     );
 }
 

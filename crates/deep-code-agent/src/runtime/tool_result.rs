@@ -136,26 +136,34 @@ impl AgentRuntime {
         turn_id: &TurnId,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) -> Result<ToolRunOutcome, ToolError> {
-        // A sink for cost a tool incurs out-of-band (a sub-agent's own request
+        // A sink for spend a tool incurs out-of-band (a sub-agent's own request
         // spend never reaches this turn's telemetry). Folded into the session
-        // total after the tool returns.
-        let cost_sink = std::sync::Arc::new(std::sync::Mutex::new(crate::pricing::CostEstimate::default()));
+        // totals after the tool returns.
+        let spend_sink =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::tool::ToolSpend::default()));
         let cx = ToolCx::new()
             .with_cancel(cancel.clone())
             .with_update_fn(tool_progress_fn(tx, turn_id, call))
-            .with_cost_sink(std::sync::Arc::clone(&cost_sink));
+            .with_spend_sink(std::sync::Arc::clone(&spend_sink));
         let plan = self.tools.evaluate_tool(call);
         let outcome = self
             .tools
             .run_tool_call_with_plan(call, decision, plan, cx)
             .await;
-        let reported = *cost_sink
+        let reported = *spend_sink
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if reported.usd != 0.0 || reported.cny != 0.0 {
+        if !reported.is_zero() {
+            // Cache counters fold alongside the cost for the same reason
+            // `record_classifier_cost` folds them: the session hit-rate and
+            // savings must cover every request billed to the session.
             let mut state = self.state.lock().await;
-            state.session_cost.usd += reported.usd;
-            state.session_cost.cny += reported.cny;
+            state.session_cost.usd += reported.cost.usd;
+            state.session_cost.cny += reported.cost.cny;
+            state.session_cache_hit_tokens += reported.cache_hit_tokens;
+            state.session_cache_miss_tokens += reported.cache_miss_tokens;
+            state.session_cache_savings.usd += reported.cache_savings.usd;
+            state.session_cache_savings.cny += reported.cache_savings.cny;
         }
         outcome
     }

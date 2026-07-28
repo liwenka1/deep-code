@@ -132,6 +132,31 @@ pub struct ToolUpdate {
 
 pub type ToolUpdateFn = Arc<dyn Fn(ToolUpdate) + Send + Sync>;
 
+/// Out-of-band spend one tool run reports back to the runtime — requests the
+/// parent turn's telemetry never sees (e.g. a sub-agent's own turns on the
+/// shared key). Cache traffic rides along with the cost so folding keeps the
+/// session's hit-rate and savings covering every request billed to it, the
+/// same accounting `record_classifier_cost` uses.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ToolSpend {
+    pub cost: crate::pricing::CostEstimate,
+    pub cache_hit_tokens: u64,
+    pub cache_miss_tokens: u64,
+    pub cache_savings: crate::pricing::CostEstimate,
+}
+
+impl ToolSpend {
+    /// Whether anything was reported at all (savings can only accompany hits,
+    /// so the cache counters and cost cover every field).
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.cost.usd == 0.0
+            && self.cost.cny == 0.0
+            && self.cache_hit_tokens == 0
+            && self.cache_miss_tokens == 0
+    }
+}
+
 /// Execution context for one tool invocation.
 ///
 /// Replaces the old `tool_execution` thread-local: the sandbox plan travels
@@ -142,10 +167,10 @@ pub struct ToolCx {
     cancel: CancellationToken,
     plan: Option<ToolExecutionPlan>,
     on_update: Option<ToolUpdateFn>,
-    /// Sink for token cost a tool incurs out-of-band — spend the parent turn's
-    /// telemetry never sees, e.g. a sub-agent's own requests on the shared key.
-    /// The runtime folds it into the session total after the tool returns.
-    cost_sink: Option<Arc<std::sync::Mutex<crate::pricing::CostEstimate>>>,
+    /// Sink for spend a tool incurs out-of-band — requests the parent turn's
+    /// telemetry never sees, e.g. a sub-agent's own turns on the shared key.
+    /// The runtime folds it into the session totals after the tool returns.
+    spend_sink: Option<Arc<std::sync::Mutex<ToolSpend>>>,
 }
 
 impl ToolCx {
@@ -173,21 +198,26 @@ impl ToolCx {
     }
 
     #[must_use]
-    pub fn with_cost_sink(mut self, sink: Arc<std::sync::Mutex<crate::pricing::CostEstimate>>) -> Self {
-        self.cost_sink = Some(sink);
+    pub fn with_spend_sink(mut self, sink: Arc<std::sync::Mutex<ToolSpend>>) -> Self {
+        self.spend_sink = Some(sink);
         self
     }
 
-    /// Report token cost this tool incurred that the parent turn's telemetry
-    /// won't otherwise capture (e.g. a sub-agent's own request spend). Summed
-    /// into the sink; the runtime folds it into the session total afterward.
-    pub fn report_cost(&self, cost: crate::pricing::CostEstimate) {
-        if let Some(sink) = &self.cost_sink {
+    /// Report spend this tool incurred that the parent turn's telemetry won't
+    /// otherwise capture (e.g. a sub-agent's own requests), cache traffic
+    /// included. Summed into the sink; the runtime folds it into the session
+    /// totals afterward.
+    pub fn report_spend(&self, spend: ToolSpend) {
+        if let Some(sink) = &self.spend_sink {
             let mut total = sink
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            total.usd += cost.usd;
-            total.cny += cost.cny;
+            total.cost.usd += spend.cost.usd;
+            total.cost.cny += spend.cost.cny;
+            total.cache_hit_tokens += spend.cache_hit_tokens;
+            total.cache_miss_tokens += spend.cache_miss_tokens;
+            total.cache_savings.usd += spend.cache_savings.usd;
+            total.cache_savings.cny += spend.cache_savings.cny;
         }
     }
 
@@ -547,17 +577,41 @@ mod tests {
     }
 
     #[test]
-    fn tool_cx_cost_sink_accumulates_reported_cost() {
+    fn tool_cx_spend_sink_accumulates_reported_spend() {
         use crate::pricing::CostEstimate;
-        // No sink → report_cost is a silent no-op (most tools never report).
-        ToolCx::new().report_cost(CostEstimate { usd: 1.0, cny: 7.0 });
+        // No sink → report_spend is a silent no-op (most tools never report).
+        ToolCx::new().report_spend(ToolSpend {
+            cost: CostEstimate { usd: 1.0, cny: 7.0 },
+            ..ToolSpend::default()
+        });
 
-        let sink = Arc::new(std::sync::Mutex::new(CostEstimate::default()));
-        let cx = ToolCx::new().with_cost_sink(Arc::clone(&sink));
-        cx.report_cost(CostEstimate { usd: 0.5, cny: 3.5 });
-        cx.report_cost(CostEstimate { usd: 0.25, cny: 1.75 });
+        let sink = Arc::new(std::sync::Mutex::new(ToolSpend::default()));
+        let cx = ToolCx::new().with_spend_sink(Arc::clone(&sink));
+        cx.report_spend(ToolSpend {
+            cost: CostEstimate { usd: 0.5, cny: 3.5 },
+            cache_hit_tokens: 100,
+            cache_miss_tokens: 40,
+            cache_savings: CostEstimate { usd: 0.1, cny: 0.7 },
+        });
+        cx.report_spend(ToolSpend {
+            cost: CostEstimate {
+                usd: 0.25,
+                cny: 1.75,
+            },
+            cache_hit_tokens: 20,
+            cache_miss_tokens: 10,
+            cache_savings: CostEstimate {
+                usd: 0.05,
+                cny: 0.35,
+            },
+        });
         let total = *sink.lock().unwrap();
-        assert!((total.usd - 0.75).abs() < 1e-9 && (total.cny - 5.25).abs() < 1e-9);
+        assert!((total.cost.usd - 0.75).abs() < 1e-9 && (total.cost.cny - 5.25).abs() < 1e-9);
+        assert_eq!(total.cache_hit_tokens, 120);
+        assert_eq!(total.cache_miss_tokens, 50);
+        assert!((total.cache_savings.usd - 0.15).abs() < 1e-9);
+        assert!(!total.is_zero());
+        assert!(ToolSpend::default().is_zero());
     }
 
     #[test]

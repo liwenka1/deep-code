@@ -344,10 +344,17 @@ impl AgentRuntime {
         self.state.lock().await.current_turn_id.clone()
     }
 
-    /// This session's accumulated token cost. A sub-agent runtime exposes it so
-    /// the parent can fold the child's spend into its own session total.
-    pub async fn session_cost(&self) -> crate::pricing::CostEstimate {
-        self.state.lock().await.session_cost
+    /// This session's accumulated spend — cost plus the cache traffic behind
+    /// it. A sub-agent runtime exposes it so the parent can fold the child's
+    /// spend into its own session totals via `ToolCx::report_spend`.
+    pub async fn session_spend(&self) -> crate::tool::ToolSpend {
+        let state = self.state.lock().await;
+        crate::tool::ToolSpend {
+            cost: state.session_cost,
+            cache_hit_tokens: state.session_cache_hit_tokens,
+            cache_miss_tokens: state.session_cache_miss_tokens,
+            cache_savings: state.session_cache_savings,
+        }
     }
 
     async fn current_turn_id(&self) -> TurnId {

@@ -28,7 +28,9 @@ pub(super) struct RuntimeState {
     pub(super) turn_cache_hit_tokens: u64,
     pub(super) turn_cache_miss_tokens: u64,
     /// Cumulative DeepSeek prompt-cache tokens this session (hit is ~50–120×
-    /// cheaper than miss), for surfacing cache efficiency. In-memory only.
+    /// cheaper than miss), for surfacing cache efficiency. Like
+    /// `session_cost`, flushed into the session record on save and restored
+    /// on resume (see `persist` / `from_session_record`).
     pub(super) session_cache_hit_tokens: u64,
     pub(super) session_cache_miss_tokens: u64,
     /// Cumulative spend avoided by cache hits this session (vs all-miss).
