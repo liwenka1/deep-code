@@ -9,7 +9,8 @@ mod permission_mode;
 mod shell_deny;
 
 pub use engine::{
-    ExecPolicy, PolicyVerdict, RiskLevel, ToolExecutionPlan, ToolKind, accept_edits_approvable,
+    ExecPolicy, NetworkMode, PolicyVerdict, RiskLevel, ToolExecutionPlan, ToolKind,
+    accept_edits_approvable, network_requested,
 };
 pub use permission_mode::{PermissionMode, SharedPermissionMode};
 pub use shell_deny::{SafetyNote, safety_notes};

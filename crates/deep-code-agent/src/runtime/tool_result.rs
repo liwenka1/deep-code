@@ -217,8 +217,14 @@ impl AgentRuntime {
             PermissionMode::Default => false,
             PermissionMode::AcceptEdits => accept_edits_approvable(&call.name, &call.arguments),
             PermissionMode::Auto => {
-                self.auto_mode_approves(call, request, &user_task, cancel)
-                    .await
+                // A network declaration sits above the judge: opening egress
+                // is the human's call (or `[sandbox] network = "always"`),
+                // never something a classifier waves through. Short-circuits
+                // before the judge spends a request.
+                !request.network
+                    && self
+                        .auto_mode_approves(call, request, &user_task, cancel)
+                        .await
             }
             PermissionMode::Yolo => true,
         }

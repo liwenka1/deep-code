@@ -15,7 +15,7 @@ use super::{
     REASONING_EFFORT_ENV, STREAM_CHUNK_TIMEOUT_ENV, STREAM_MAX_BYTES_ENV, STREAM_MAX_RETRIES_ENV,
     STREAM_TOTAL_TIMEOUT_ENV,
 };
-use crate::execution_policy::PermissionMode;
+use crate::execution_policy::{NetworkMode, PermissionMode};
 use crate::i18n::{Lang, TextId, tr_with};
 use crate::paths::home_dir;
 use crate::pricing::CostCurrency;
@@ -198,6 +198,7 @@ struct ConfigFile {
     checkpoints: CheckpointsSection,
     ui: UiSection,
     lsp: LspSection,
+    sandbox: SandboxSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -255,6 +256,13 @@ struct UiSection {
 #[serde(default)]
 struct LspSection {
     enabled: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct SandboxSection {
+    /// `prompt` | `always` | `never`; see [`NetworkMode`].
+    network: Option<String>,
 }
 
 enum FileRead {
@@ -451,6 +459,25 @@ fn apply_file_overlay(
         config.lsp_enabled = enabled;
     }
 
+    // Network mode is tighten-only from the project layer: a repo may reduce
+    // (`prompt` → `never`) but must not re-arm ambient egress (`always`) —
+    // same reasoning as auto/yolo above. Unknown values degrade to unset.
+    if let Some(mode) = file
+        .sandbox
+        .network
+        .as_deref()
+        .and_then(NetworkMode::parse)
+    {
+        if project && mode == NetworkMode::Always {
+            pending.push((
+                TextId::CfgProjectFieldIgnored,
+                vec![("field", "sandbox.network=always".to_string())],
+            ));
+        } else {
+            config.sandbox_network = mode;
+        }
+    }
+
     if let Some(rules) = &file.approval.auto_allow {
         if project {
             pending.push((TextId::CfgProjectAutoAllowIgnored, Vec::new()));
@@ -612,6 +639,46 @@ mod tests {
         let project = write_config(project_dir.path(), "[lsp]\nenabled = false\n");
         let loaded = AgentConfig::load_with(None, Some(project), &no_env);
         assert!(!loaded.config.lsp_enabled, "project layer may reduce");
+    }
+
+    #[test]
+    fn sandbox_network_is_tighten_only_from_the_project_layer() {
+        use crate::execution_policy::NetworkMode;
+        assert_eq!(AgentConfig::builtin().sandbox_network, NetworkMode::Prompt);
+
+        // The user's global file may opt back into ambient egress.
+        let global_dir = tempfile::tempdir().unwrap();
+        let global = write_config(global_dir.path(), "[sandbox]\nnetwork = \"always\"\n");
+        let loaded = AgentConfig::load_with(Some(global.clone()), None, &no_env);
+        assert_eq!(loaded.config.sandbox_network, NetworkMode::Always);
+
+        // A project file may tighten (here: over a permissive global)…
+        let project_dir = tempfile::tempdir().unwrap();
+        let project = write_config(project_dir.path(), "[sandbox]\nnetwork = \"never\"\n");
+        let loaded = AgentConfig::load_with(Some(global), Some(project), &no_env);
+        assert_eq!(loaded.config.sandbox_network, NetworkMode::Never);
+
+        // …but must not re-arm ambient egress: a repo saying "always" is
+        // ignored with a warning, same class as auto/yolo mode injection.
+        let project_dir = tempfile::tempdir().unwrap();
+        let project = write_config(project_dir.path(), "[sandbox]\nnetwork = \"always\"\n");
+        let loaded = AgentConfig::load_with(None, Some(project), &no_env);
+        assert_eq!(loaded.config.sandbox_network, NetworkMode::Prompt);
+        assert!(
+            loaded
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("sandbox.network")),
+            "ignoring a repo's always must be surfaced: {:?}",
+            loaded.report.warnings
+        );
+
+        // Unknown values degrade to unset instead of failing the load.
+        let global_dir = tempfile::tempdir().unwrap();
+        let global = write_config(global_dir.path(), "[sandbox]\nnetwork = \"sometimes\"\n");
+        let loaded = AgentConfig::load_with(Some(global), None, &no_env);
+        assert_eq!(loaded.config.sandbox_network, NetworkMode::Prompt);
     }
 
     #[test]

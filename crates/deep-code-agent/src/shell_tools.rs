@@ -178,6 +178,9 @@ struct ShellParams {
     cwd: Option<String>,
     /// Timeout in seconds, default 30, max 300; the command is killed at the deadline
     timeout_secs: Option<u64>,
+    /// Set true when the command needs network access (downloads/installs, git push/pull/fetch/clone, curl). The sandbox blocks all network by default; a declaration routes through user approval.
+    #[allow(dead_code)] // consumed by the execution policy from the raw arguments
+    network: Option<bool>,
 }
 
 /// Live-stream one output chunk as a ToolUpdate, bounded by a shared budget.
@@ -204,7 +207,7 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Run a foreground shell command in the workspace; output streams live and the process is killed at the timeout. Use it for git (status/diff/log), builds, and tests; start long-running processes (dev servers) with the job tool instead."
+        "Run a foreground shell command in the workspace; output streams live and the process is killed at the timeout. Use it for git (status/diff/log), builds, and tests; start long-running processes (dev servers) with the job tool instead. Commands run sandboxed without network; set network=true when one needs it (installs, git remote ops) — a failed download/connection usually means the run lacked the network grant."
     }
 
     async fn run(&self, params: ShellParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {
@@ -461,6 +464,9 @@ struct JobParams {
     job_id: Option<String>,
     /// Tail size per stream for action=tail, default 4000, max 20000
     max_chars: Option<u64>,
+    /// start only: set true when the job needs network access — including binding/listening on a port (dev servers). The sandbox blocks all network by default; a declaration routes through user approval.
+    #[allow(dead_code)] // consumed by the execution policy from the raw arguments
+    network: Option<bool>,
 }
 
 #[async_trait]
@@ -472,7 +478,7 @@ impl Tool for JobTool {
     }
 
     fn description(&self) -> &str {
-        "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it."
+        "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it. Jobs run sandboxed without network; a dev server that binds a port needs network=true on start."
     }
 
     async fn run(&self, params: JobParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {

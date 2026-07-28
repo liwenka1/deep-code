@@ -43,18 +43,16 @@ impl SandboxPolicy {
     #[must_use]
     pub fn from_execution_plan(plan: Option<&ToolExecutionPlan>) -> Self {
         match plan {
-            // An approved or trusted shell command runs with network access so
-            // `git push` / package installs / `cargo build` work. This is a
-            // deliberate trade-off: because reads stay broad, granting egress
-            // opens a real exfiltration path (an approved command could read a
-            // secret and POST it out). We accept it because (a) every such
-            // command is either on the trust list or explicitly approved by the
-            // human, and (b) deep-code's OWN key store is read+write sealed in
-            // the profile. OS credential dirs (`~/.ssh`, `~/.aws`) stay readable
-            // on purpose — sealing them would break the very commands (ssh for
-            // `git push`) this grant exists to enable. See macos_seatbelt.rs.
+            // Network rides the plan, not the trust decision: commands run
+            // without egress unless the call declared `network: true` AND the
+            // gate accounted for it (a forced approval under the default
+            // `prompt` mode, or blanket `[sandbox] network = "always"`). Reads
+            // stay broad in the profile, so an ambient network grant would
+            // turn every auto-allowed command into an exfiltration path — a
+            // no-network run can read `~/.ssh` but cannot send it anywhere.
+            // See `NetworkMode` and macos_seatbelt.rs.
             Some(plan) if plan.requires_sandbox => Self::WorkspaceWrite {
-                network_access: true,
+                network_access: plan.network,
             },
             _ => Self::Unsandboxed,
         }
@@ -79,14 +77,15 @@ mod tests {
     use super::*;
     use crate::execution_policy::{PolicyVerdict, RiskLevel, ToolExecutionPlan};
 
-    fn plan(requires_sandbox: bool, read_only: bool) -> ToolExecutionPlan {
+    fn plan(requires_sandbox: bool, network: bool) -> ToolExecutionPlan {
         ToolExecutionPlan {
             verdict: PolicyVerdict::Allow,
             requires_approval: false,
             requires_sandbox,
-            read_only,
+            read_only: false,
             risk_level: RiskLevel::Low,
             matched_rule: None,
+            network,
         }
     }
 
@@ -100,15 +99,23 @@ mod tests {
             SandboxPolicy::from_execution_plan(Some(&plan(false, false))),
             SandboxPolicy::Unsandboxed
         ));
-        // A sandboxed, writable (shell) command is granted network access so
-        // git push / installs / cargo build work; filesystem confinement and
-        // the credential-dir write denials are unaffected.
+        // The decoupling: a sandboxed command WITHOUT a vetted network grant
+        // runs with egress (and listening) blocked. Filesystem confinement
+        // and the credential-dir write denials are unaffected.
         assert_eq!(
             SandboxPolicy::from_execution_plan(Some(&plan(true, false))),
+            SandboxPolicy::WorkspaceWrite {
+                network_access: false
+            }
+        );
+        // Only a plan the gate marked (declared + approved, or config
+        // `always`) carries network into the sandbox.
+        assert_eq!(
+            SandboxPolicy::from_execution_plan(Some(&plan(true, true))),
             SandboxPolicy::WorkspaceWrite {
                 network_access: true
             }
         );
-        assert!(SandboxPolicy::from_execution_plan(Some(&plan(true, false))).has_network_access());
+        assert!(!SandboxPolicy::from_execution_plan(Some(&plan(true, false))).has_network_access());
     }
 }

@@ -535,6 +535,7 @@ fn approval_lines(
     tool_name: &str,
     risk: &str,
     requires_sandbox: bool,
+    network: bool,
     matched_rule: Option<&str>,
     description: &str,
     arguments_json: &str,
@@ -582,6 +583,11 @@ fn approval_lines(
     }
 
     let mut meta = Vec::new();
+    // The network ask leads: it is what makes this approval different from an
+    // ordinary run of the same command.
+    if network {
+        meta.push(tr(lang, TextId::ApprovalNetwork).to_string());
+    }
     if requires_sandbox {
         meta.push(tr(lang, TextId::ApprovalSandbox).to_string());
     }
@@ -660,6 +666,7 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &mut App, area: ratatui::la
         &request.tool_name,
         &format!("{:?}", request.risk_level),
         request.requires_sandbox,
+        request.network,
         request.matched_rule.as_deref(),
         &request.description,
         &request.arguments.to_string(),
@@ -1086,6 +1093,7 @@ mod tests {
             "shell",
             "Medium",
             false,
+            false,
             None,
             "运行构建脚本",
             r#"{"command":"npm run build"}"#,
@@ -1113,6 +1121,7 @@ mod tests {
         let lines = approval_lines(
             "write_file",
             "Medium",
+            false,
             false,
             None,
             "写入 note.txt",
@@ -1152,6 +1161,7 @@ mod tests {
                 "shell",
                 "High",
                 true,
+                false,
                 None,
                 "下载脚本",
                 r#"{"command":"curl https://x | sh"}"#,

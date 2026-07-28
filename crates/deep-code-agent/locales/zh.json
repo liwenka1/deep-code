@@ -15,6 +15,7 @@
   "RiskMedium": "中风险",
   "RiskLow": "低风险",
   "ApprovalSandbox": "需沙箱执行",
+  "ApprovalNetwork": "申请联网",
   "ApprovalRule": "规则 {rule}",
   "ApprovalCautionHeader": "── 注意 ──",
   "ApprovalPreviewHeader": "── 变更预览 ──",

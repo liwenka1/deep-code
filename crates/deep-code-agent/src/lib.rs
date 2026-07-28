@@ -51,7 +51,7 @@ pub use config::{
 pub use doctor::{DoctorReport, default_config_path};
 pub use error::AgentResult;
 pub use event::AgentEvent;
-pub use execution_policy::{PermissionMode, RiskLevel, SafetyNote, SharedPermissionMode};
+pub use execution_policy::{NetworkMode, PermissionMode, RiskLevel, SafetyNote, SharedPermissionMode};
 pub use i18n::{Lang, TextId, tr, tr_with};
 pub use model::{
     ChatRequest, FunctionCallDelta, ToolCallDelta, ToolCallFunctionPayload, ToolCallPayload, Usage,

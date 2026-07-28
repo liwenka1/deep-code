@@ -314,6 +314,11 @@ pub struct ApprovalRequest {
     pub risk_level: RiskLevel,
     #[serde(default)]
     pub requires_sandbox: bool,
+    /// The call declares it needs network access (`network: true`), so
+    /// approving runs it with egress/listening enabled. Surfaced as a badge;
+    /// AcceptEdits and the Auto judge never auto-approve a declaration.
+    #[serde(default)]
+    pub network: bool,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -555,19 +560,26 @@ mod tests {
         // No plan → Unsandboxed (old thread-local default).
         assert_eq!(ToolCx::new().sandbox_policy(), SandboxPolicy::Unsandboxed);
 
-        let plan = |requires_sandbox: bool, read_only: bool| ToolExecutionPlan {
+        let plan = |requires_sandbox: bool, network: bool| ToolExecutionPlan {
             verdict: PolicyVerdict::Allow,
             requires_approval: false,
             requires_sandbox,
-            read_only,
+            read_only: false,
             risk_level: RiskLevel::Low,
             matched_rule: None,
+            network,
         };
 
         assert_eq!(
-            ToolCx::new().with_plan(plan(true, false)).sandbox_policy(),
+            ToolCx::new().with_plan(plan(true, true)).sandbox_policy(),
             SandboxPolicy::WorkspaceWrite {
                 network_access: true
+            }
+        );
+        assert_eq!(
+            ToolCx::new().with_plan(plan(true, false)).sandbox_policy(),
+            SandboxPolicy::WorkspaceWrite {
+                network_access: false
             }
         );
         assert_eq!(

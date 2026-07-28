@@ -11,7 +11,7 @@ pub use layers::{ConfigLayer, ConfigLoadReport, ConfigSources, LoadedAgentConfig
 pub use write::{GlobalConfigUpdate, validate_api_key, write_global_config_update};
 
 use crate::error::{AgentError, AgentResult};
-use crate::execution_policy::PermissionMode;
+use crate::execution_policy::{NetworkMode, PermissionMode};
 use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_PRO};
 use crate::pricing::CostCurrency;
 use crate::reasoning::ReasoningEffortSetting;
@@ -93,6 +93,12 @@ pub struct AgentConfig {
     /// default; polling budgets and caps are deliberately not configurable
     /// (constants in `lsp::manager`).
     pub lsp_enabled: bool,
+    /// How sandboxed shell/job commands get network access (`[sandbox]
+    /// network`): `prompt` (declare → approval, the default), `always`, or
+    /// `never`. A project file may tighten (`prompt`/`never`) but never widen
+    /// to `always` — a repo must not silently re-arm ambient egress (enforced
+    /// in the layered loader).
+    pub sandbox_network: NetworkMode,
 }
 
 impl Default for AgentConfig {
@@ -128,6 +134,7 @@ impl AgentConfig {
             language: "auto".to_string(),
             default_permission_mode: PermissionMode::Default,
             lsp_enabled: true,
+            sandbox_network: NetworkMode::Prompt,
         }
     }
 

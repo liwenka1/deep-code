@@ -38,6 +38,48 @@ pub enum PolicyVerdict {
     NeedsApproval { reason: String },
 }
 
+/// How sandboxed shell/job commands get network access (`[sandbox] network`).
+///
+/// Trust ("this command may run") and egress ("it may reach the network") are
+/// separate grants: reads stay broad in the sandbox, so pairing them silently
+/// turns any auto-allowed command into an exfiltration path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetworkMode {
+    /// Default: commands run without network unless the call declares
+    /// `network: true`, and a declaration always asks the human first
+    /// ("approve for session" is remembered per command identity).
+    #[default]
+    Prompt,
+    /// Every sandboxed command gets network without asking (the old coupled
+    /// behavior, as an explicit opt-in). Only the user/global layer may set it.
+    Always,
+    /// Network-declaring commands are refused outright; nothing gets egress.
+    Never,
+}
+
+impl NetworkMode {
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "prompt" => Some(Self::Prompt),
+            "always" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a shell/job call declares it needs network access (`network: true`
+/// in the arguments). The declaration comes from the model, but it can only
+/// narrow (default is no network) or route into an approval — never grant.
+#[must_use]
+pub fn network_requested(arguments: &Value) -> bool {
+    arguments
+        .get("network")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Full plan for executing a tool call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolExecutionPlan {
@@ -47,6 +89,11 @@ pub struct ToolExecutionPlan {
     pub read_only: bool,
     pub risk_level: RiskLevel,
     pub matched_rule: Option<String>,
+    /// Whether the sandbox grants network when this call runs. Only set after
+    /// the gate has accounted for it: a declared request under `Prompt` (the
+    /// plan then requires approval), or blanket `Always`.
+    #[serde(default)]
+    pub network: bool,
 }
 
 impl ToolExecutionPlan {
@@ -70,6 +117,7 @@ pub struct ExecPolicy {
     /// `git status -s` but not `git push`).
     trusted_shell_prefixes: Vec<String>,
     enable_sandbox: bool,
+    network_mode: NetworkMode,
 }
 
 impl Default for ExecPolicy {
@@ -86,6 +134,7 @@ impl Default for ExecPolicy {
                 "echo".to_string(),
             ],
             enable_sandbox: true,
+            network_mode: NetworkMode::Prompt,
         }
     }
 }
@@ -99,6 +148,12 @@ impl ExecPolicy {
     #[must_use]
     pub fn with_sandbox(mut self, enabled: bool) -> Self {
         self.enable_sandbox = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn with_network_mode(mut self, mode: NetworkMode) -> Self {
+        self.network_mode = mode;
         self
     }
 
@@ -126,6 +181,7 @@ impl ExecPolicy {
                 read_only: true,
                 risk_level: RiskLevel::Low,
                 matched_rule: Some("builtin:read_only_tool".to_string()),
+                network: false,
             },
             ToolKind::WriteFile => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {
@@ -136,6 +192,7 @@ impl ExecPolicy {
                 read_only: false,
                 risk_level: RiskLevel::Medium,
                 matched_rule: Some("builtin:write_tool".to_string()),
+                network: false,
             },
             ToolKind::Network => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {
@@ -146,6 +203,7 @@ impl ExecPolicy {
                 read_only: true,
                 risk_level: RiskLevel::Medium,
                 matched_rule: Some("builtin:network_tool".to_string()),
+                network: false,
             },
             ToolKind::Job => match arguments.get("action").and_then(Value::as_str) {
                 // Launching a background command is exactly as risky as the
@@ -155,7 +213,7 @@ impl ExecPolicy {
                         .get("command")
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    evaluate_shell_command(self, command)
+                    evaluate_shell_command(self, command, network_requested(arguments))
                 }
                 Some("status" | "tail") => ToolExecutionPlan {
                     verdict: PolicyVerdict::Allow,
@@ -164,6 +222,7 @@ impl ExecPolicy {
                     read_only: true,
                     risk_level: RiskLevel::Low,
                     matched_rule: Some("builtin:job_control".to_string()),
+                    network: false,
                 },
                 Some("cancel") => ToolExecutionPlan {
                     verdict: PolicyVerdict::NeedsApproval {
@@ -174,6 +233,7 @@ impl ExecPolicy {
                     read_only: false,
                     risk_level: RiskLevel::Low,
                     matched_rule: Some("builtin:job_control".to_string()),
+                    network: false,
                 },
                 // Missing/unknown action: gate defensively; the tool then
                 // rejects it as InvalidArguments.
@@ -186,6 +246,7 @@ impl ExecPolicy {
                     read_only: false,
                     risk_level: RiskLevel::High,
                     matched_rule: None,
+                    network: false,
                 },
             },
             ToolKind::Shell => {
@@ -193,7 +254,7 @@ impl ExecPolicy {
                     .get("command")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                evaluate_shell_command(self, command)
+                evaluate_shell_command(self, command, network_requested(arguments))
             }
             ToolKind::Mock => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {
@@ -204,6 +265,7 @@ impl ExecPolicy {
                 read_only: true,
                 risk_level: RiskLevel::Low,
                 matched_rule: Some("builtin:mock_tool".to_string()),
+                network: false,
             },
             ToolKind::SubAgent => ToolExecutionPlan {
                 verdict: PolicyVerdict::Allow,
@@ -212,6 +274,7 @@ impl ExecPolicy {
                 read_only: true,
                 risk_level: RiskLevel::Low,
                 matched_rule: Some("builtin:subagent_tool".to_string()),
+                network: false,
             },
             ToolKind::Unknown => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {
@@ -222,12 +285,17 @@ impl ExecPolicy {
                 read_only: false,
                 risk_level: RiskLevel::High,
                 matched_rule: None,
+                network: false,
             },
         }
     }
 }
 
-pub fn evaluate_shell_command(policy: &ExecPolicy, command: &str) -> ToolExecutionPlan {
+pub fn evaluate_shell_command(
+    policy: &ExecPolicy,
+    command: &str,
+    network_requested: bool,
+) -> ToolExecutionPlan {
     // 1. Built-in structured deny (basename + flag aware, segment-split).
     //    Always runs; cannot be disabled by configuration.
     if let Some(reason) = shell_deny::builtin_deny(command) {
@@ -240,24 +308,76 @@ pub fn evaluate_shell_command(policy: &ExecPolicy, command: &str) -> ToolExecuti
             read_only: false,
             risk_level: RiskLevel::High,
             matched_rule: Some(format!("deny:{}", reason.0)),
+            network: false,
         };
     }
 
-    let segments = shell_deny::segments(command);
+    // 2. `[sandbox] network = "never"`: a network-declaring command is refused
+    //    outright — running it offline anyway would just burn a doomed attempt.
+    if network_requested && policy.network_mode == NetworkMode::Never {
+        return ToolExecutionPlan {
+            verdict: PolicyVerdict::Deny {
+                reason: "network access is disabled by configuration ([sandbox] network = \
+                         \"never\")"
+                    .to_string(),
+            },
+            requires_approval: false,
+            requires_sandbox: false,
+            read_only: false,
+            risk_level: RiskLevel::Medium,
+            matched_rule: Some("deny:network_disabled".to_string()),
+            network: false,
+        };
+    }
 
-    // 2. Auto-trust only if EVERY segment is covered by a trusted rule
-    //    (identity-matched, so flags vary but subcommands don't) and the
-    //    command has no redirection or command substitution — those can write
-    //    files or run sub-commands a trusted prefix doesn't cover.
-    if !segments.is_empty()
+    // The grant the sandbox applies once this call actually runs. Under
+    // `Prompt` a declaration reaches execution only through the approval
+    // forced below (or a standing consent the user granted earlier).
+    let network = match policy.network_mode {
+        NetworkMode::Always => true,
+        NetworkMode::Prompt => network_requested,
+        NetworkMode::Never => false,
+    };
+
+    let segments = shell_deny::segments(command);
+    // Auto-trust only if EVERY segment is covered by a trusted rule
+    // (identity-matched, so flags vary but subcommands don't) and the
+    // command has no redirection or command substitution — those can write
+    // files or run sub-commands a trusted prefix doesn't cover.
+    let trusted = !segments.is_empty()
         && !shell_deny::has_redirection_or_substitution(command)
         && segments.iter().all(|segment| {
             policy
                 .trusted_shell_prefixes
                 .iter()
                 .any(|prefix| command_shape::rule_covers(prefix, segment))
-        })
-    {
+        });
+
+    // 3. A network declaration under `Prompt` always asks, trusted or not:
+    //    egress (or binding a port) is a capability the trust list never
+    //    granted. "Approve for session" then remembers the command identity,
+    //    so `git push` stops prompting after the first consent.
+    if network_requested && policy.network_mode == NetworkMode::Prompt {
+        return ToolExecutionPlan {
+            verdict: PolicyVerdict::NeedsApproval {
+                reason: "the command declares it needs network access (egress or listening)"
+                    .to_string(),
+            },
+            requires_approval: true,
+            requires_sandbox: policy.enable_sandbox,
+            read_only: false,
+            risk_level: if trusted {
+                RiskLevel::Medium
+            } else {
+                RiskLevel::High
+            },
+            matched_rule: Some("gate:network".to_string()),
+            network,
+        };
+    }
+
+    // 4. Trusted commands run without asking.
+    if trusted {
         return ToolExecutionPlan {
             verdict: PolicyVerdict::Allow,
             requires_approval: false,
@@ -265,19 +385,21 @@ pub fn evaluate_shell_command(policy: &ExecPolicy, command: &str) -> ToolExecuti
             read_only: false,
             risk_level: RiskLevel::Low,
             matched_rule: Some("trust:all_segments".to_string()),
+            network,
         };
     }
 
-    // 3. Anything else needs explicit user approval.
+    // 5. Anything else needs explicit user approval.
     ToolExecutionPlan {
         verdict: PolicyVerdict::NeedsApproval {
-            reason: "shell commands can modify files, run code, or access the network".to_string(),
+            reason: "shell commands can modify workspace files or run arbitrary code".to_string(),
         },
         requires_approval: true,
         requires_sandbox: policy.enable_sandbox,
         read_only: false,
         risk_level: RiskLevel::High,
         matched_rule: Some("builtin:shell_default".to_string()),
+        network,
     }
 }
 
@@ -287,6 +409,11 @@ pub fn evaluate_shell_command(policy: &ExecPolicy, command: &str) -> ToolExecuti
 /// never reach this — they short-circuit in the registry before any decision.
 #[must_use]
 pub fn accept_edits_approvable(tool_name: &str, arguments: &Value) -> bool {
+    // A network declaration is never covered by accept-edits: that mode's
+    // standing consent is "edit files in the workspace", not "open egress".
+    if network_requested(arguments) {
+        return false;
+    }
     match ExecPolicy::classify_tool(tool_name) {
         ToolKind::WriteFile => true,
         ToolKind::Shell => arguments
@@ -390,14 +517,14 @@ mod tests {
     #[test]
     fn denied_shell_command_is_blocked() {
         let policy = ExecPolicy::default();
-        let plan = evaluate_shell_command(&policy, "rm -rf /");
+        let plan = evaluate_shell_command(&policy, "rm -rf /", false);
         assert!(matches!(plan.verdict, PolicyVerdict::Deny { .. }));
     }
 
     #[test]
     fn untrusted_shell_command_needs_approval() {
         let policy = ExecPolicy::default();
-        let plan = evaluate_shell_command(&policy, "python exploit.py");
+        let plan = evaluate_shell_command(&policy, "python exploit.py", false);
         assert!(matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }));
         assert!(plan.requires_sandbox);
     }
@@ -405,7 +532,7 @@ mod tests {
     #[test]
     fn trusted_shell_command_can_run_without_approval() {
         let policy = ExecPolicy::default();
-        let plan = evaluate_shell_command(&policy, "cargo test -p deep-code-agent");
+        let plan = evaluate_shell_command(&policy, "cargo test -p deep-code-agent", false);
         assert_eq!(plan.verdict, PolicyVerdict::Allow);
         assert!(!plan.requires_approval);
     }
@@ -415,7 +542,7 @@ mod tests {
         let policy = ExecPolicy::default();
         // Regression: the old prefix matcher allowed `/bin/rm -rf /` through.
         assert!(matches!(
-            evaluate_shell_command(&policy, "/bin/rm -rf /").verdict,
+            evaluate_shell_command(&policy, "/bin/rm -rf /", false).verdict,
             PolicyVerdict::Deny { .. }
         ));
     }
@@ -425,7 +552,7 @@ mod tests {
         let policy = ExecPolicy::default();
         // A trusted-looking head must not smuggle a destructive tail past the gate.
         assert!(matches!(
-            evaluate_shell_command(&policy, "cargo test && rm -rf /").verdict,
+            evaluate_shell_command(&policy, "cargo test && rm -rf /", false).verdict,
             PolicyVerdict::Deny { .. }
         ));
     }
@@ -435,12 +562,12 @@ mod tests {
         let policy = ExecPolicy::default();
         // `git status` is trusted; `git push` (not trusted) must ask.
         assert!(matches!(
-            evaluate_shell_command(&policy, "git push origin main").verdict,
+            evaluate_shell_command(&policy, "git push origin main", false).verdict,
             PolicyVerdict::NeedsApproval { .. }
         ));
         // But flags on the trusted prefix stay trusted (identity-matched).
         assert_eq!(
-            evaluate_shell_command(&policy, "git status --porcelain").verdict,
+            evaluate_shell_command(&policy, "git status --porcelain", false).verdict,
             PolicyVerdict::Allow
         );
     }
@@ -450,7 +577,7 @@ mod tests {
         let policy = ExecPolicy::default();
         // `echo` is trusted, but a redirection turns it into a file write.
         assert!(matches!(
-            evaluate_shell_command(&policy, "echo pwned > /etc/passwd").verdict,
+            evaluate_shell_command(&policy, "echo pwned > /etc/passwd", false).verdict,
             PolicyVerdict::NeedsApproval { .. }
         ));
     }
@@ -460,8 +587,98 @@ mod tests {
         let policy = ExecPolicy::default();
         // `git status` trusted, `python x.py` not → whole command asks.
         assert!(matches!(
-            evaluate_shell_command(&policy, "git status && python deploy.py").verdict,
+            evaluate_shell_command(&policy, "git status && python deploy.py", false).verdict,
             PolicyVerdict::NeedsApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn network_declaration_forces_approval_even_when_trusted() {
+        let policy = ExecPolicy::default();
+        // Without the declaration `cargo build` is trusted and runs offline.
+        let offline = evaluate_shell_command(&policy, "cargo build", false);
+        assert_eq!(offline.verdict, PolicyVerdict::Allow);
+        assert!(!offline.network, "the decoupling: trust no longer grants egress");
+        // Declaring network routes the same trusted command into an approval.
+        let networked = evaluate_shell_command(&policy, "cargo build", true);
+        assert!(matches!(
+            networked.verdict,
+            PolicyVerdict::NeedsApproval { .. }
+        ));
+        assert!(networked.requires_approval);
+        assert_eq!(networked.risk_level, RiskLevel::Medium);
+        assert_eq!(networked.matched_rule.as_deref(), Some("gate:network"));
+        assert!(networked.network, "an approved run then gets the grant");
+        // Untrusted + network keeps the top tier.
+        assert_eq!(
+            evaluate_shell_command(&policy, "python x.py", true).risk_level,
+            RiskLevel::High
+        );
+    }
+
+    #[test]
+    fn network_always_mode_restores_ambient_grant_without_prompting() {
+        let policy = ExecPolicy::default().with_network_mode(NetworkMode::Always);
+        let plan = evaluate_shell_command(&policy, "cargo build", false);
+        assert_eq!(plan.verdict, PolicyVerdict::Allow);
+        assert!(plan.network, "always = every sandboxed run has network");
+        // A declaration doesn't force approval either — always is the explicit
+        // zero-friction opt-in back to the old coupled behavior.
+        let declared = evaluate_shell_command(&policy, "cargo build", true);
+        assert_eq!(declared.verdict, PolicyVerdict::Allow);
+        assert!(declared.network);
+    }
+
+    #[test]
+    fn network_never_mode_denies_declared_commands() {
+        let policy = ExecPolicy::default().with_network_mode(NetworkMode::Never);
+        let plan = evaluate_shell_command(&policy, "git push origin main", true);
+        assert!(matches!(plan.verdict, PolicyVerdict::Deny { .. }));
+        assert!(!plan.network);
+        // Undeclared commands run as usual, just without network.
+        let offline = evaluate_shell_command(&policy, "cargo build", false);
+        assert_eq!(offline.verdict, PolicyVerdict::Allow);
+        assert!(!offline.network);
+    }
+
+    #[test]
+    fn deny_still_beats_a_network_declaration() {
+        let policy = ExecPolicy::default();
+        assert!(matches!(
+            evaluate_shell_command(&policy, "rm -rf /", true).verdict,
+            PolicyVerdict::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn network_declaration_reaches_shell_and_job_start_via_evaluate_tool() {
+        let policy = ExecPolicy::default();
+        let shell =
+            policy.evaluate_tool("shell", &json!({"command": "cargo build", "network": true}));
+        assert_eq!(shell.matched_rule.as_deref(), Some("gate:network"));
+        let job = policy.evaluate_tool(
+            "job",
+            &json!({"action": "start", "command": "cargo build", "network": true}),
+        );
+        assert_eq!(job.matched_rule.as_deref(), Some("gate:network"));
+    }
+
+    #[test]
+    fn accept_edits_never_covers_a_network_declaration() {
+        // The fs-edit consent is "edit workspace files", not "open egress":
+        // the same command that auto-passes offline prompts when it asks for
+        // network.
+        assert!(accept_edits_approvable(
+            "shell",
+            &json!({"command": "mkdir src/new"})
+        ));
+        assert!(!accept_edits_approvable(
+            "shell",
+            &json!({"command": "mkdir src/new", "network": true})
+        ));
+        assert!(!accept_edits_approvable(
+            "job",
+            &json!({"action": "start", "command": "touch x", "network": true})
         ));
     }
 

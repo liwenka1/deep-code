@@ -163,6 +163,7 @@ impl ToolRegistry {
                             arguments: call.arguments.clone(),
                             risk_level: plan.risk_level,
                             requires_sandbox: plan.requires_sandbox,
+                            network: crate::execution_policy::network_requested(&call.arguments),
                             read_only: plan.read_only,
                             matched_rule: plan.matched_rule.clone(),
                             // Filled by the runtime (needs workspace access).

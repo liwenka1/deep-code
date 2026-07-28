@@ -60,10 +60,15 @@ impl LaunchedRuntime {
 #[must_use]
 pub fn build_tool_registry(
     workspace: &Path,
+    network: crate::execution_policy::NetworkMode,
     warnings: &mut Vec<String>,
     ui_lang: &SharedLang,
 ) -> (ToolRegistry, JobStore) {
     let mut registry = ToolRegistry::new();
+    // The exec policy set here is the one the runtime consults for every call,
+    // and the one sub-agent registries clone — the single place config-driven
+    // gating (network mode) enters.
+    registry.set_policy(crate::execution_policy::ExecPolicy::default().with_network_mode(network));
     let mut job_store = JobStore::default();
     match workspace_tool_registry(workspace.to_path_buf()) {
         Ok(workspace_tools) => registry.extend(workspace_tools),
@@ -350,7 +355,8 @@ fn build_parent_tools<C: LlmClient + 'static>(
     JobStore,
     Box<dyn Fn() + Send + Sync>,
 ) {
-    let (mut registry, job_store) = build_tool_registry(workspace, warnings, ui_lang);
+    let (mut registry, job_store) =
+        build_tool_registry(workspace, config.sandbox_network, warnings, ui_lang);
     let extensions = attach_agent_extensions(
         &mut registry,
         client,

@@ -457,6 +457,7 @@ None.
     async fn approval_posture_allows_writes_only_for_writing_roles() {
         let runtime = AgentRuntime::new(SummaryClient, ToolRegistry::new());
         let write_request = ApprovalRequest {
+            network: false,
             call_id: "call_1".to_string(),
             tool_name: "write_file".to_string(),
             description: "write".to_string(),
@@ -486,6 +487,7 @@ None.
         // The posture never extends past file writes: untrusted shell is
         // denied even for implementer.
         let shell_request = ApprovalRequest {
+            network: false,
             call_id: "call_2".to_string(),
             tool_name: "shell".to_string(),
             description: "run".to_string(),

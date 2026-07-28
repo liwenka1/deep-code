@@ -241,6 +241,45 @@ impl Tool for ParkUntilCancelledTool {
     }
 }
 
+/// A stand-in registered under the real `shell` name so the execution policy
+/// classifies and gates it exactly like shell — without spawning anything. It
+/// echoes whether the sandbox grant carried network, so tests can assert the
+/// end-to-end plumbing (declaration → gate → approval → sandbox policy).
+#[derive(Debug, Clone, Copy)]
+struct FakeShellTool;
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct FakeShellParams {
+    command: String,
+    #[allow(dead_code)] // consumed by the execution policy from raw arguments
+    network: Option<bool>,
+}
+
+#[async_trait::async_trait]
+impl Tool for FakeShellTool {
+    type Params = FakeShellParams;
+
+    fn name(&self) -> &str {
+        "shell"
+    }
+
+    fn description(&self) -> &str {
+        "Fake shell."
+    }
+
+    async fn run(
+        &self,
+        params: FakeShellParams,
+        cx: &crate::tool::ToolCx,
+    ) -> Result<crate::tool::ToolOutput, ToolError> {
+        Ok(crate::tool::ToolOutput::text(format!(
+            "ran `{}` net={}",
+            params.command,
+            cx.sandbox_policy().has_network_access()
+        )))
+    }
+}
+
 fn started_ids(events: &[RuntimeEvent]) -> Vec<String> {
     events
         .iter()
@@ -1079,6 +1118,160 @@ async fn session_approval_skips_future_prompts_for_same_tool() {
         runtime.session_messages().await.last().unwrap().content,
         "done"
     );
+}
+
+/// Auto mode must park a network declaration for the human WITHOUT consulting
+/// the judge: the scripted judge slot (which would approve) stays unconsumed,
+/// so the turn ends at ApprovalRequired carrying the network badge.
+#[tokio::test]
+async fn auto_mode_parks_network_declaration_without_judging() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta(
+                    "call_1",
+                    "shell",
+                    r#"{"command":"git push origin main","network":true}"#,
+                ),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        // Judge bait: consumed (and approving) only if the network floor leaks
+        // through to the classifier — the test then fails on the last event.
+        vec![
+            AgentEvent::TextDelta {
+                text: r#"{"approve": true, "reason": "leaked"}"#.to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let mut registry = ToolRegistry::default();
+    registry.register(FakeShellTool);
+    let runtime = AgentRuntime::new(client, registry)
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Auto));
+
+    let mut rx = runtime.submit_user("push it").await;
+    let events = drain(&mut rx).await;
+    let Some(RuntimeEvent::ApprovalRequired { request, .. }) = events.last() else {
+        panic!("network declaration must park for the human, got {events:?}");
+    };
+    assert!(request.network, "the approval must carry the network badge");
+}
+
+/// Yolo grants a network declaration like everything else, and the grant
+/// really reaches the sandbox policy of the executed call.
+#[tokio::test]
+async fn yolo_mode_auto_approves_network_declaration_with_grant() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta(
+                    "call_1",
+                    "shell",
+                    r#"{"command":"git push origin main","network":true}"#,
+                ),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let mut registry = ToolRegistry::default();
+    registry.register(FakeShellTool);
+    let runtime = AgentRuntime::new(client, registry)
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Yolo));
+
+    let mut rx = runtime.submit_user("push it").await;
+    let events = drain(&mut rx).await;
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, RuntimeEvent::ApprovalRequired { .. })),
+        "yolo must not park"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallFinished { result, .. }
+                if result.content.contains("net=true")
+        )),
+        "the sandbox policy of the executed call must carry the grant"
+    );
+}
+
+/// "Approve for session" on a network command remembers the command identity:
+/// the next identical declaration runs without prompting again, grant intact —
+/// this is the "converse once, then git push stops asking" UX.
+#[tokio::test]
+async fn session_approval_remembers_network_command_identity() {
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta(
+                    "call_1",
+                    "shell",
+                    r#"{"command":"git push origin main","network":true}"#,
+                ),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta(
+                    "call_2",
+                    "shell",
+                    r#"{"command":"git push origin main --tags","network":true}"#,
+                ),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let mut registry = ToolRegistry::default();
+    registry.register(FakeShellTool);
+    let runtime = AgentRuntime::new(client, registry);
+
+    let mut rx = runtime.submit_user("push twice").await;
+    let first = drain(&mut rx).await;
+    let Some(RuntimeEvent::ApprovalRequired { request, .. }) = first.last() else {
+        panic!("first declaration must prompt");
+    };
+    assert!(request.network);
+
+    let mut rx = runtime
+        .submit_approval(ApprovalDecision::ApprovedForSession)
+        .await;
+    let second = drain(&mut rx).await;
+    assert!(
+        second
+            .iter()
+            .all(|event| !matches!(event, RuntimeEvent::ApprovalRequired { .. })),
+        "the remembered identity must suppress the second prompt"
+    );
+    // Both runs executed with the grant (flags vary, identity `git push` matches).
+    let granted = second
+        .iter()
+        .filter(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallFinished { result, .. } if result.content.contains("net=true")
+        ))
+        .count();
+    assert_eq!(granted, 2, "both pushes must run with network: {second:?}");
+    assert!(matches!(
+        second.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
 }
 
 #[tokio::test]

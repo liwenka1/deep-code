@@ -153,6 +153,7 @@ fn find_in_transcript_jumps_and_continues_upward() {
 fn approval_scroll_helpers_adjust_panel_offset() {
     let mut app = App::new();
     app.pending_approval = Some(deep_code_agent::ApprovalRequest {
+        network: false,
         call_id: "call_1".to_string(),
         tool_name: "write_file".to_string(),
         description: "Write a file".to_string(),
@@ -667,6 +668,7 @@ fn escape_closes_completion_before_clearing_input() {
 async fn approval_a_key_resolves_for_session() {
     let mut app = App::new();
     app.pending_approval = Some(deep_code_agent::ApprovalRequest {
+        network: false,
         call_id: "call_1".to_string(),
         tool_name: "mock_echo".to_string(),
         description: "echo".to_string(),
@@ -1015,6 +1017,7 @@ fn approval_events_render_pending_and_resolved_tool_metadata() {
         turn_id: Some(turn_id.clone()),
         tool_call_id: Some(tool_call_id.clone()),
         request: deep_code_agent::ApprovalRequest {
+            network: false,
             call_id: "call_1".to_string(),
             tool_name: "write_file".to_string(),
             description: "Write note.txt".to_string(),
