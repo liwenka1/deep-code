@@ -253,7 +253,11 @@ impl AgentRuntime {
                 drop(state);
                 self.persist().await;
                 self.emit_session_updated(tx).await;
-                self.snapshot_turn("after_turn", tx).await;
+                // No end-of-turn snapshot: it would be near-identical to the
+                // next turn's before_turn (only edits the user makes between
+                // turns differ), and rewind/restore key off before_turn — so
+                // one snapshot per turn buys the same protection at half the
+                // copy cost and twice the retained history.
                 let usage = last_usage.clone();
                 let telemetry = self
                     .build_turn_telemetry(

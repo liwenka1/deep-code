@@ -10,15 +10,15 @@ use crate::tool::ToolError;
 const CHECKPOINT_DIR: &str = ".deep-code/checkpoints";
 const SKIP_DIRS: &[&str] = &[".git", ".deep-code", "target", "node_modules"];
 /// Default retention: snapshots beyond this count are pruned oldest-first.
-/// Every turn creates before/after snapshots, so without a cap the storage
-/// grows by two workspace copies per turn.
+/// Every turn creates one before-turn snapshot, so without a cap the storage
+/// grows by one workspace copy per turn.
 pub const DEFAULT_MAX_SNAPSHOTS: usize = 20;
 
 /// Identifier for a workspace snapshot stored outside `.git`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CheckpointId(pub String);
 
-/// Side-storage workspace snapshots (before/after turns).
+/// Side-storage workspace snapshots (taken before each turn).
 #[derive(Debug, Clone)]
 pub struct CheckpointStore {
     workspace: PathBuf,

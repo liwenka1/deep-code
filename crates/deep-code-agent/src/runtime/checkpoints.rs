@@ -10,7 +10,7 @@ use crate::session_store::CheckpointRecord;
 use crate::tool::ToolError;
 
 impl AgentRuntime {
-    /// Enable automatic before/after turn snapshots for the given workspace
+    /// Enable an automatic before-turn snapshot for the given workspace
     /// root.
     ///
     /// If checkpoint storage cannot be created, checkpoints stay disabled, the

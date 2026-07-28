@@ -958,20 +958,16 @@ async fn turn_snapshots_emit_checkpoint_events() {
     let mut rx = runtime.submit_user("hi").await;
     let events = drain(&mut rx).await;
 
-    let before = events.iter().find_map(|event| match event {
-        RuntimeEvent::CheckpointCreated { id, label } if label == "before_turn" => {
-            Some(id.0.clone())
-        }
-        _ => None,
-    });
-    let after = events.iter().find_map(|event| match event {
-        RuntimeEvent::CheckpointCreated { id, label } if label == "after_turn" => {
-            Some(id.0.clone())
-        }
-        _ => None,
-    });
-    assert!(before.is_some(), "expected before_turn checkpoint");
-    assert!(after.is_some(), "expected after_turn checkpoint");
+    let checkpoints: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::CheckpointCreated { label, .. } => Some(label.as_str()),
+            _ => None,
+        })
+        .collect();
+    // Exactly one snapshot per turn: before_turn is what rewind/restore key
+    // off; an end-of-turn copy would duplicate the next turn's before_turn.
+    assert_eq!(checkpoints, vec!["before_turn"]);
 }
 
 #[tokio::test]
@@ -1010,7 +1006,8 @@ async fn persistent_runtime_records_checkpoint_metadata() {
         record
             .checkpoints
             .iter()
-            .any(|checkpoint| checkpoint.label == "after_turn")
+            .all(|checkpoint| checkpoint.label != "after_turn"),
+        "end-of-turn snapshots were removed as redundant with the next before_turn"
     );
 }
 
