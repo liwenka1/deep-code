@@ -13,6 +13,7 @@ impl App {
         self.session_id = launched.session_id;
         self.subagent_manager = launched.subagent_manager;
         self.subagent_shutdown = Some(launched.stop_hook);
+        self.job_store = Some(launched.job_store);
         // Carry the user's chosen permission mode onto the new runtime's shared
         // handle so a config swap (/model, /apikey, /resume, /clear) doesn't
         // silently reset it.
@@ -42,6 +43,11 @@ impl App {
     fn shutdown_current_runtime(&mut self) {
         if let Some(stop) = self.subagent_shutdown.take() {
             stop();
+        }
+        // Kill the outgoing session's background jobs and their process tree
+        // before the swap, so a dev server from the old session doesn't linger.
+        if let Some(job_store) = self.job_store.take() {
+            job_store.shutdown();
         }
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let runtime = Arc::clone(&self.runtime);

@@ -13,9 +13,9 @@ use std::path::PathBuf;
 
 use crate::ui::{COMPOSER_MAX_VISIBLE_ROWS, layout_input};
 use deep_code_agent::{
-    AgentConfig, AgentRuntime, ApprovalDecision, ApprovalRequest, CostCurrency, JsonSessionStore,
-    LaunchedRuntime, RuntimeEvent, SessionRecord, SessionStore, SharedSubAgentManager,
-    TurnTelemetry, default_config_path, launch_runtime,
+    AgentConfig, AgentRuntime, ApprovalDecision, ApprovalRequest, CostCurrency, JobStore,
+    JsonSessionStore, LaunchedRuntime, RuntimeEvent, SessionRecord, SessionStore,
+    SharedSubAgentManager, TurnTelemetry, default_config_path, launch_runtime,
 };
 use tokio::sync::mpsc;
 
@@ -106,6 +106,11 @@ pub struct App {
     pub(crate) backend_offline: bool,
     pub(crate) subagent_manager: SharedSubAgentManager,
     subagent_shutdown: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Background-job store for the live runtime. Held so quitting or switching
+    /// sessions can kill its whole process tree (`kill_on_drop` alone only
+    /// reaps the direct child, leaving grandchildren — dev servers, watchers —
+    /// holding ports). `None` only before the first runtime is adopted.
+    job_store: Option<JobStore>,
     ui_rx: Option<UiUpdateReceiver>,
     pub(crate) cost_currency: CostCurrency,
     pub(crate) configured_model: String,
@@ -298,6 +303,7 @@ impl App {
         let subagent_manager = launched.subagent_manager;
         let permission_mode = launched.permission_mode;
         let subagent_shutdown = Some(launched.stop_hook);
+        let job_store = Some(launched.job_store);
         let resumed = config.resume.is_some();
         let persistent = session_id.is_some();
         let resumed_turns = config.resume.as_ref().map(|record| {
@@ -356,6 +362,7 @@ impl App {
             backend_offline,
             subagent_manager,
             subagent_shutdown,
+            job_store,
             ui_rx: None,
             cost_currency,
             configured_model,
@@ -774,11 +781,6 @@ impl App {
             .as_deref()
             .map(|id| format!(" | session {id}"))
             .unwrap_or_else(|| " | session none".to_string());
-        let checkpoint = self
-            .last_checkpoint
-            .as_deref()
-            .map(|id| format!(" | checkpoint {id}"))
-            .unwrap_or_default();
         let telemetry = self
             .last_telemetry
             .as_ref()
@@ -793,21 +795,26 @@ impl App {
             })
             .unwrap_or_default();
         // `self.status` carries only the transient note (tool progress, command
-        // feedback); every durable field lives in this frame exactly once.
+        // feedback); every durable field lives in this frame exactly once. The
+        // checkpoint id is surfaced solely through the post-turn rollback hint
+        // (`/restore {id}`) in `self.status`, so it isn't repeated here.
         let note = if self.status.is_empty() {
             String::new()
         } else {
             format!(" | {}", self.status)
         };
-        format!(
-            "{mode} - {}{session}{checkpoint}{note}{telemetry}",
-            self.backend_label
-        )
+        format!("{mode} - {}{session}{note}{telemetry}", self.backend_label)
     }
 
     pub async fn shutdown_runtime(&self) {
         if let Some(shutdown) = &self.subagent_shutdown {
             shutdown();
+        }
+        // Kill background jobs (and their whole process tree) on quit — the
+        // TUI never routed through `LaunchedRuntime::shutdown`, so without this
+        // grandchildren survived until the process exited.
+        if let Some(job_store) = &self.job_store {
+            job_store.shutdown();
         }
         self.runtime.shutdown().await;
     }

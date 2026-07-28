@@ -1124,9 +1124,12 @@ fn diagnostics_are_flushed_after_tool_call_before_result() {
 }
 
 #[test]
-fn status_line_includes_mode_backend_session_checkpoint_and_cost() {
+fn status_line_includes_mode_backend_session_and_cost() {
     let mut app = App::new();
     app.session_id = Some("session_1".to_string());
+    // A checkpoint exists, but the durable frame must NOT carry it — the id is
+    // surfaced once through the post-turn rollback hint (in `self.status`), so
+    // repeating it here would show the same id twice.
     app.last_checkpoint = Some("checkpoint_1".to_string());
     app.last_telemetry = Some(TurnTelemetry {
         route_label: "auto->deepseek-v4-flash (high)".to_string(),
@@ -1163,7 +1166,10 @@ fn status_line_includes_mode_backend_session_checkpoint_and_cost() {
     let status = app.status_line();
     assert!(status.contains("就绪"), "{status}");
     assert!(status.contains("session session_1"));
-    assert!(status.contains("checkpoint checkpoint_1"));
+    assert!(
+        !status.contains("checkpoint checkpoint_1"),
+        "checkpoint id must not be duplicated into the durable frame: {status}"
+    );
     assert!(status.contains("auto->deepseek-v4-flash"));
     assert!(status.contains("total ¥0.0020"));
     assert!(status.contains("ctx 1%"));

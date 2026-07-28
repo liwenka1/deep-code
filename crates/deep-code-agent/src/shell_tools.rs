@@ -293,6 +293,8 @@ impl Tool for ShellTool {
         // (a bare yield loses them under scheduler load). EOF is prompt once
         // the child is gone; the cap guards a lingering grandchild that
         // inherited the pipe and keeps it open past the parent's exit.
+        let stdout_abort = stdout_task.as_ref().map(|task| task.abort_handle());
+        let stderr_abort = stderr_task.as_ref().map(|task| task.abort_handle());
         let drain = async {
             if let Some(task) = stdout_task {
                 let _ = task.await;
@@ -301,7 +303,21 @@ impl Tool for ShellTool {
                 let _ = task.await;
             }
         };
-        let _ = tokio::time::timeout(Duration::from_millis(500), drain).await;
+        if tokio::time::timeout(Duration::from_millis(500), drain)
+            .await
+            .is_err()
+        {
+            // A grandchild that inherited the pipe kept it open past the cap:
+            // abort the reader tasks so they (and the pipe fds they hold) don't
+            // linger until that process finally exits (dropping the JoinHandle
+            // alone would only detach them, not stop them).
+            if let Some(abort) = stdout_abort {
+                abort.abort();
+            }
+            if let Some(abort) = stderr_abort {
+                abort.abort();
+            }
+        }
 
         let job = self.jobs.get(&job_id, Self::NAME)?;
         let mut job = job.lock().expect("job lock poisoned");

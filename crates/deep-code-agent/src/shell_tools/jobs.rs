@@ -37,6 +37,10 @@ impl JobStore {
                 && let Some(child) = state.child.as_mut()
             {
                 kill_process_tree(child);
+                // Dropping the Windows Job Object guard is what kills the whole
+                // tree there (`kill_process_tree`'s `start_kill` only reaps the
+                // direct child); `None` on Unix, so this is a no-op.
+                state.job_guard = None;
                 state.status = JobStatus::Cancelled;
             }
         }
@@ -183,7 +187,9 @@ impl RingBuffer {
 
 /// Kill `child` and, on Unix, its whole process group (children are spawned
 /// as group leaders, see `spawn_confined`), so grandchildren spawned by the
-/// shell don't outlive the job. `start_kill` covers non-Unix and reaping.
+/// shell don't outlive the job. On non-Unix `start_kill` only reaps the direct
+/// child; killing the tree there relies on dropping the job's Windows Job
+/// Object guard (see the `job_guard = None` at each kill site).
 pub(super) fn kill_process_tree(child: &mut Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
@@ -260,6 +266,9 @@ pub(super) async fn cancel_job(
         if let Some(child) = child.as_mut() {
             kill_process_tree(child);
         }
+        // Windows: dropping the Job Object guard kills the whole tree (`None`
+        // on Unix, where the child was confined into its own group pre-spawn).
+        job.job_guard = None;
         child
     };
     let exit_code = match child {

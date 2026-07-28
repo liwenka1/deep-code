@@ -642,8 +642,10 @@ fn approval_lines(
     lines
 }
 
-fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
-    let Some(request) = app.pending_approval.as_ref() else {
+fn render_approval_panel(frame: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Rect) {
+    // Cloned (not borrowed) so the clamped scroll can be written back below; the
+    // panel only renders while an approval is pending, so this is rare.
+    let Some(request) = app.pending_approval.clone() else {
         return;
     };
     // Body (scrollable) on top; the y/a/n choices pinned to the bottom rows so
@@ -667,11 +669,14 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &App, area: ratatui::layout
         app.lang,
     );
     // Clamp against the real rendered body (wrapped lines, safety notes, diff
-    // preview) so the user can scroll to the very end before deciding — the
-    // stored offset itself is unclamped.
+    // preview) so the user can scroll to the very end before deciding. Only the
+    // render layer knows the true wrapped height, so it also writes the clamped
+    // value back — otherwise PageDown past the end accumulates unbounded and a
+    // later PageUp has to burn off the overshoot before the view moves.
     let viewport = usize::from(chunks[0].height).max(1);
     let max_scroll = body.len().saturating_sub(viewport);
     let scroll = app.approval_scroll_offset.min(max_scroll);
+    app.approval_scroll_offset = scroll;
     let body_paragraph = Paragraph::new(body)
         .block(Block::default().padding(Padding::new(1, 0, 0, 0)))
         .scroll((scroll as u16, 0));
