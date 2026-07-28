@@ -17,7 +17,7 @@ use axum::routing::{get, post};
 use axum::{Json, middleware};
 use deep_code_agent::{
     AgentConfig, ApprovalDecision, ApprovalRequest, JsonSessionStore, LaunchedRuntime,
-    RuntimeEvent, SessionId, SessionRecord, SessionStore, launch_runtime, now_ms,
+    RuntimeEvent, SessionId, SessionRecord, SessionStore, TurnId, launch_runtime, now_ms,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -88,6 +88,9 @@ struct PendingApproval {
 struct ActiveTurnLease {
     active_turn: Arc<StdMutex<Option<String>>>,
     runtime: Arc<Mutex<LaunchedRuntime>>,
+    /// The turn this lease is observing, captured once the turn has begun.
+    /// Shared so the stream body can fill it and `Drop` can read it.
+    turn_id: Arc<StdMutex<Option<TurnId>>>,
 }
 
 impl Drop for ActiveTurnLease {
@@ -97,12 +100,19 @@ impl Drop for ActiveTurnLease {
         }
         // The SSE stream may have been dropped mid-turn (client disconnect):
         // cancel the now-unobserved turn instead of letting it keep running
-        // (or wedge on an approval) while the gate reads "free". After a
-        // normal completion there is no live turn and this is a no-op.
+        // (or wedge on an approval) while the gate reads "free". Cancel *only*
+        // the turn this lease was observing (`cancel_turn_if`): a normally
+        // finished lease also drops here, and a fresh request may already have
+        // begun a successor turn on this shared runtime — an untargeted cancel
+        // would clobber it. When the id was never captured (disconnect before
+        // the turn began) there is nothing this lease owns to cancel.
+        let Some(turn_id) = self.turn_id.lock().ok().and_then(|id| id.clone()) else {
+            return;
+        };
         let runtime = Arc::clone(&self.runtime);
         tokio::spawn(async move {
             let runtime = runtime.lock().await;
-            drop(runtime.handle.cancel_turn().await);
+            drop(runtime.handle.cancel_turn_if(turn_id).await);
         });
     }
 }
@@ -320,6 +330,7 @@ fn acquire_active_turn(state: &AppState, thread_id: &str) -> Result<ActiveTurnLe
     Ok(ActiveTurnLease {
         active_turn: Arc::clone(&state.active_turn),
         runtime: state.runtime.clone(),
+        turn_id: Arc::new(StdMutex::new(None)),
     })
 }
 
@@ -334,6 +345,7 @@ async fn prompt_sse(
     let thread_id = format!("prompt_{}", now_ms());
 
     let active_turn_lease = acquire_active_turn(&state, &thread_id)?;
+    let lease_turn_id = Arc::clone(&active_turn_lease.turn_id);
     let runtime = state.runtime.clone();
     let approval_gate = state.approval.clone();
     let autonomous_approvals = state.autonomous_approvals;
@@ -347,7 +359,16 @@ async fn prompt_sse(
 
         let mut event_stream = {
             let runtime = runtime.lock().await;
-            runtime.handle.submit_user(prompt).await
+            let stream = runtime.handle.submit_user(prompt).await;
+            // Record the turn this lease owns, so a disconnect cancels exactly
+            // this turn and never a successor started by the next request.
+            // Read the id before taking the (non-Send) std lock — the guard
+            // must not straddle an await.
+            let live = runtime.handle.live_turn_id().await;
+            if let Ok(mut id) = lease_turn_id.lock() {
+                *id = live;
+            }
+            stream
         };
 
         loop {

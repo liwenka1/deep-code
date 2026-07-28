@@ -287,9 +287,29 @@ impl AgentRuntime {
     /// cancellation is finalized here and its events (synthesized tool
     /// results, `TurnCancelled`) arrive on the returned receiver.
     pub async fn cancel_turn(&self) -> RuntimeEventReceiver {
+        self.cancel_turn_inner(None).await
+    }
+
+    /// Like [`cancel_turn`](Self::cancel_turn) but a no-op unless `turn_id` is
+    /// still the current turn. The SSE lease drop passes the turn it was
+    /// observing so a client disconnect cancels *that* turn — never a successor
+    /// a new request already began on this shared runtime. (A normally-finished
+    /// turn's lease still fires this on drop; the guard makes that harmless.)
+    /// The check shares one lock scope with the decision, so no new turn can
+    /// slip in between.
+    pub async fn cancel_turn_if(&self, turn_id: TurnId) -> RuntimeEventReceiver {
+        self.cancel_turn_inner(Some(turn_id)).await
+    }
+
+    async fn cancel_turn_inner(&self, only_if: Option<TurnId>) -> RuntimeEventReceiver {
         let (tx, rx) = mpsc::unbounded_channel();
         let (token, pending, streaming) = {
             let mut state = self.state.lock().await;
+            if let Some(want) = only_if.as_ref()
+                && state.current_turn_id.as_ref() != Some(want)
+            {
+                return rx;
+            }
             let token = state.cancel.clone();
             let pending = state.pending.take();
             let streaming = state.current_turn_id.is_some();
@@ -315,6 +335,13 @@ impl AgentRuntime {
     /// tests/debugging.
     pub async fn session_messages(&self) -> Vec<Message> {
         self.state.lock().await.session.wire_messages()
+    }
+
+    /// The id of the turn currently in flight, if any. The SSE server captures
+    /// this after starting a turn so its lease can later cancel *that* turn on
+    /// disconnect via [`cancel_turn_if`](Self::cancel_turn_if).
+    pub async fn live_turn_id(&self) -> Option<TurnId> {
+        self.state.lock().await.current_turn_id.clone()
     }
 
     async fn current_turn_id(&self) -> TurnId {

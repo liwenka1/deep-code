@@ -128,6 +128,12 @@ pub(super) fn migrate_v1(v1: SessionRecordV1) -> SessionRecord {
         checkpoints: v1.checkpoints,
         summary: v1.summary,
         compaction: v1.compaction,
+        // v1 never tracked lifetime cost; a migrated session starts its total
+        // from zero (the field is defaulted for the same reason on load).
+        session_cost: crate::pricing::CostEstimate::default(),
+        session_cache_hit_tokens: 0,
+        session_cache_miss_tokens: 0,
+        session_cache_savings: crate::pricing::CostEstimate::default(),
     }
 }
 

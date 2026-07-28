@@ -17,6 +17,7 @@ pub use json::JsonSessionStore;
 
 use crate::checkpoint::CheckpointId;
 use crate::model::Usage;
+use crate::pricing::CostEstimate;
 use crate::session_entry::{EntryKind, SessionEntry};
 
 /// Current on-disk schema version. Bump when making breaking layout changes.
@@ -91,6 +92,13 @@ impl TurnRecord {
 }
 
 /// Full persisted session state.
+///
+/// MUST NOT gain `#[serde(deny_unknown_fields)]` — loading old session files
+/// depends on unknown keys being ignored. Fields removed over time (e.g. the
+/// former `config` snapshot and per-turn `tool_results`) still appear in files
+/// written by older builds; deny-unknown would make every such file
+/// unloadable. The same holds for [`TurnRecord`], [`SessionEntry`], and
+/// [`EntryKind`]. New fields are added with `#[serde(default)]` instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub schema_version: u32,
@@ -112,6 +120,19 @@ pub struct SessionRecord {
     /// Compaction metadata, e.g. `archived=N` (when applied). Derived field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<String>,
+    /// Cumulative token cost over the session's whole lifetime. Persisted so a
+    /// resumed session's displayed total continues from where it left off
+    /// instead of resetting to zero. The runtime's in-memory accumulators are
+    /// flushed here on every save and restored on resume. Defaulted for old
+    /// files that predate the field (they resume at zero, as before).
+    #[serde(default)]
+    pub session_cost: CostEstimate,
+    #[serde(default)]
+    pub session_cache_hit_tokens: u64,
+    #[serde(default)]
+    pub session_cache_miss_tokens: u64,
+    #[serde(default)]
+    pub session_cache_savings: CostEstimate,
 }
 
 impl SessionRecord {
@@ -130,6 +151,10 @@ impl SessionRecord {
             checkpoints: Vec::new(),
             summary: None,
             compaction: None,
+            session_cost: CostEstimate::default(),
+            session_cache_hit_tokens: 0,
+            session_cache_miss_tokens: 0,
+            session_cache_savings: CostEstimate::default(),
         }
     }
 

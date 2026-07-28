@@ -67,6 +67,12 @@ impl AgentRuntime {
             tools: Arc::new(tools),
             state: Arc::new(Mutex::new(RuntimeState {
                 session,
+                // Restore the lifetime cost totals so a resumed session keeps
+                // counting from its saved total instead of resetting to zero.
+                session_cost: record.session_cost,
+                session_cache_hit_tokens: record.session_cache_hit_tokens,
+                session_cache_miss_tokens: record.session_cache_miss_tokens,
+                session_cache_savings: record.session_cache_savings,
                 ..Default::default()
             })),
             checkpoints: None,
@@ -87,10 +93,24 @@ impl AgentRuntime {
         let Some(persistence) = self.persistence.as_ref() else {
             return;
         };
-        let entries = self.state.lock().await.session.entries().to_vec();
+        let (entries, cost, cache_hit, cache_miss, savings) = {
+            let state = self.state.lock().await;
+            (
+                state.session.entries().to_vec(),
+                state.session_cost,
+                state.session_cache_hit_tokens,
+                state.session_cache_miss_tokens,
+                state.session_cache_savings,
+            )
+        };
         {
             let mut record = persistence.record.lock().await;
             record.entries = entries;
+            // Flush the lifetime cost totals so resume restores them.
+            record.session_cost = cost;
+            record.session_cache_hit_tokens = cache_hit;
+            record.session_cache_miss_tokens = cache_miss;
+            record.session_cache_savings = savings;
             record.touch();
         }
         persistence.actor.request_save();

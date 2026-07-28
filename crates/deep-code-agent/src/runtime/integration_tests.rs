@@ -1412,6 +1412,64 @@ async fn resumed_runtime_continues_conversation() {
     assert_eq!(messages[4].content, "world");
 }
 
+/// Lifetime session cost must survive resume: it's persisted into the record
+/// and restored, so a resumed session's total continues instead of resetting
+/// to zero (the bug was `from_session_record` starting from `Default`).
+#[tokio::test]
+async fn session_cost_persists_across_resume() {
+    use crate::model::Usage;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let runtime = AgentRuntime::with_new_session(
+        ScriptedClient::new(vec![]),
+        ToolRegistry::default(),
+        "system",
+        workspace.path(),
+        &crate::config::AgentConfig::builtin(),
+    )
+    .unwrap();
+    let session_id = runtime.session_id().await.expect("session id");
+
+    let usage = Usage {
+        prompt_tokens: Some(1_000),
+        completion_tokens: Some(500),
+        total_tokens: Some(1_500),
+        reasoning_tokens: None,
+        prompt_cache_hit_tokens: Some(400),
+        prompt_cache_miss_tokens: Some(600),
+    };
+    let model = crate::config::AgentConfig::builtin().model;
+    runtime.accumulate_request_usage(&model, &usage).await;
+    let live_cost = runtime.state.lock().await.session_cost;
+    runtime.persist().await;
+    runtime.shutdown().await;
+
+    let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let record = store.load(&session_id).unwrap();
+    assert!(
+        (record.session_cost.cny - live_cost.cny).abs() < 1e-9
+            && (record.session_cost.usd - live_cost.usd).abs() < 1e-9,
+        "persisted record must carry the lifetime cost"
+    );
+    assert_eq!(record.session_cache_hit_tokens, 400);
+    assert_eq!(record.session_cache_miss_tokens, 600);
+
+    let resumed = AgentRuntime::from_session_record(
+        ScriptedClient::new(vec![]),
+        ToolRegistry::default(),
+        record,
+        store,
+        crate::config::AgentConfig::builtin(),
+    );
+    let restored = resumed.state.lock().await;
+    assert!(
+        (restored.session_cost.cny - live_cost.cny).abs() < 1e-9,
+        "resume must restore the lifetime cost, not reset to zero"
+    );
+    assert_eq!(restored.session_cache_hit_tokens, 400);
+    assert_eq!(restored.session_cache_miss_tokens, 600);
+}
+
 /// Returns a retriable API error on the first `stream_chat`, then succeeds.
 #[derive(Clone)]
 struct FallbackTestClient {
@@ -2369,6 +2427,47 @@ async fn begin_turn_supersedes_live_turn_without_clobbering() {
     );
     assert_eq!(state.current_prompt.as_deref(), Some("second"));
     assert!(state.current_turn_id.is_some());
+}
+
+/// The SSE lease drop cancels via `cancel_turn_if(its_turn)`. A stale lease
+/// from a finished/superseded turn must NOT cancel the successor turn that a
+/// new request already began on the shared runtime — only a matching id fires.
+#[tokio::test]
+async fn cancel_turn_if_only_cancels_the_named_turn() {
+    let client = ScriptedClient::new(vec![]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::default());
+
+    runtime.begin_turn("first").await;
+    let first_id = runtime.live_turn_id().await.expect("first turn live");
+
+    // A successor turn supersedes it (fresh cancel token).
+    runtime.begin_turn("second").await;
+    let (second_id, second_token) = {
+        let state = runtime.state.lock().await;
+        (
+            state.current_turn_id.clone().expect("second turn live"),
+            state.cancel.clone(),
+        )
+    };
+
+    // Stale lease for the first turn fires late — must be a no-op.
+    drop(runtime.cancel_turn_if(first_id).await);
+    assert!(
+        !second_token.is_cancelled(),
+        "a stale turn's lease must not cancel the successor"
+    );
+    assert_eq!(
+        runtime.state.lock().await.current_prompt.as_deref(),
+        Some("second"),
+        "the successor turn stays live"
+    );
+
+    // The lease that actually owns the live turn still cancels it.
+    drop(runtime.cancel_turn_if(second_id).await);
+    assert!(
+        second_token.is_cancelled(),
+        "cancel_turn_if must cancel the turn it names"
+    );
 }
 
 /// A turn that spans multiple requests (tool call → follow-up) must price
