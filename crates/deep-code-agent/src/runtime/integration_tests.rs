@@ -203,6 +203,44 @@ impl Tool for SpendReportingTool {
     }
 }
 
+/// A tool that signals it has started and then parks on the cancel token (the
+/// long-running foreground-command shape). Borrows the whitelisted read-only
+/// name so the call runs without approval (same trick as `SpendReportingTool`).
+#[derive(Debug)]
+struct ParkUntilCancelledTool {
+    started: Arc<tokio::sync::Notify>,
+}
+
+impl ParkUntilCancelledTool {
+    const NAME: &'static str = "read_file";
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ParkParams {}
+
+#[async_trait::async_trait]
+impl Tool for ParkUntilCancelledTool {
+    type Params = ParkParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Parks until cancelled."
+    }
+
+    async fn run(
+        &self,
+        _params: ParkParams,
+        cx: &crate::tool::ToolCx,
+    ) -> Result<crate::tool::ToolOutput, ToolError> {
+        self.started.notify_one();
+        cx.cancel_token().cancelled().await;
+        Ok(crate::tool::ToolOutput::text("cancelled"))
+    }
+}
+
 fn started_ids(events: &[RuntimeEvent]) -> Vec<String> {
     events
         .iter()
@@ -2507,6 +2545,39 @@ async fn cancel_turn_if_only_cancels_the_named_turn() {
     assert!(
         second_token.is_cancelled(),
         "cancel_turn_if must cancel the turn it names"
+    );
+}
+
+/// Shutdown must cancel a live turn and wait for its loop to finalize: the
+/// tool-side cancel arms (the foreground shell's process-group kill, a
+/// sub-agent's own turn cancel) only run while the loop is still polled.
+/// Skipping this leaves them to `kill_on_drop` at process exit, which signals
+/// the group leader alone — grandchildren survive and keep their ports.
+#[tokio::test]
+async fn shutdown_cancels_live_turn_and_waits_for_finalize() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::ToolCallDelta {
+            delta: tool_call_delta("call_1", ParkUntilCancelledTool::NAME, "{}"),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let mut registry = ToolRegistry::default();
+    registry.register(ParkUntilCancelledTool {
+        started: Arc::clone(&started),
+    });
+    let runtime = AgentRuntime::new(client, registry);
+
+    let _rx = runtime.submit_user("go").await;
+    // Only proceed once the call is parked on the token; shutting down before
+    // the tool starts would exercise nothing.
+    started.notified().await;
+
+    runtime.shutdown().await;
+
+    assert!(
+        runtime.live_turn_id().await.is_none(),
+        "shutdown must cancel the live turn and see it finalized"
     );
 }
 

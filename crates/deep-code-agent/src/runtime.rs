@@ -44,6 +44,16 @@ use event::emit;
 pub use event::{RuntimeEvent, RuntimeEventReceiver, ToolCallId, TurnId};
 use state::{Persistence, RuntimeState};
 
+/// How long [`AgentRuntime::shutdown`] waits for a cancelled live turn to
+/// finalize before proceeding anyway. Sized to cover the foreground-shell
+/// cancel arm's process-group kill plus its bounded output drain (500ms);
+/// nested sub-agent bookkeeping can lag past it, but its own group kill has
+/// fired by then too, which is all shutdown needs.
+const LIVE_TURN_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Poll interval for [`AgentRuntime::shutdown`]'s bounded wait above.
+const LIVE_TURN_CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// Agent runtime tying together [`LlmClient`], [`ToolRegistry`], and [`Session`].
 ///
 /// Cheap to clone: state is behind an [`Arc`]/[`Mutex`].
@@ -170,14 +180,35 @@ impl AgentRuntime {
         self.ui_lang.set(lang);
     }
 
-    /// Shut down background resources such as spawned LSP servers.
+    /// Shut down background resources: cancel any live turn (so its tools tear
+    /// their child processes down, see [`Self::cancel_live_turn`]), then flush
+    /// persistence and stop spawned LSP servers.
     pub async fn shutdown(&self) {
+        self.cancel_live_turn().await;
         self.persist().await;
         if let Some(persistence) = self.persistence.as_ref() {
             persistence.actor.flush().await;
         }
         if let Some(lsp) = self.lsp.as_ref() {
             lsp.shutdown_all().await;
+        }
+    }
+
+    /// Cancel the in-flight turn, if any, and wait — bounded — for its loop to
+    /// observe the token and finalize. The loop runs as its own task, so it is
+    /// still polled while this waits; on cancel the foreground-shell arm kills
+    /// the child's whole process group, which the `kill_on_drop` backstop at
+    /// process exit cannot do (it signals only the group leader, so
+    /// grandchildren — a foreground-run dev server, say — would survive and
+    /// keep their port). Idle runtimes return on the first check. Best-effort:
+    /// on grace expiry the shutdown proceeds anyway — the group kill fires on
+    /// the tool's first poll after cancel, well before the bookkeeping that
+    /// this waits on (turn finalization, sub-agent grace) can lag behind.
+    async fn cancel_live_turn(&self) {
+        drop(self.cancel_turn().await);
+        let deadline = tokio::time::Instant::now() + LIVE_TURN_CANCEL_GRACE;
+        while self.live_turn_id().await.is_some() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(LIVE_TURN_CANCEL_POLL).await;
         }
     }
 
