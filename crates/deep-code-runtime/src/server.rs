@@ -265,37 +265,68 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {addr}"))?;
     // Graceful shutdown on SIGTERM/SIGINT/SIGHUP: stop accepting, drain in-flight
-    // requests (their lease drops cancel live turns), then kill background jobs.
-    // Without this a signal kill runs no destructors and orphans job trees.
-    let serve = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_requested())
-        .await
-        .context("runtime HTTP server exited with error");
+    // requests, then kill background jobs. Without this a signal kill runs no
+    // destructors and orphans job trees. The drain is bounded: an SSE turn
+    // parked on an interactive approval can never finish once the listener
+    // closes (the deciding POST can no longer arrive), and even an ordinary
+    // long turn would drag past a supervisor's stop timeout — both ending in
+    // SIGKILL with the jobs re-orphaned, exactly what this path exists to
+    // prevent. On expiry the serve future is dropped and cleanup proceeds; the
+    // process exits right after, so abandoned connection tasks die with it.
+    let serve = async {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_requested())
+            .await
+            .context("runtime HTTP server exited with error")
+    };
+    let result = tokio::select! {
+        result = serve => result,
+        () = async {
+            // A second, independent watcher: every registered listener for a
+            // signal kind gets notified, so this fires alongside the graceful
+            // one and starts the drain clock.
+            shutdown_requested().await;
+            tokio::time::sleep(SHUTDOWN_DRAIN_GRACE).await;
+        } => {
+            eprintln!(
+                "graceful drain still busy after {}s; forcing shutdown",
+                SHUTDOWN_DRAIN_GRACE.as_secs()
+            );
+            Ok(())
+        }
+    };
     {
         let runtime = shutdown_runtime.lock().await;
         runtime.job_store.shutdown();
         runtime.handle.shutdown().await;
     }
-    serve
+    result
 }
+
+/// How long a signal-initiated shutdown waits for in-flight requests before
+/// abandoning the drain and proceeding to cleanup (kill job trees, flush the
+/// session). Well under a supervisor's stop timeout (systemd defaults to 90s)
+/// so the cleanup always runs before any SIGKILL.
+const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Resolve when the OS asks the server to stop: SIGTERM / SIGINT / SIGHUP on
 /// Unix, Ctrl-C elsewhere. Drives graceful shutdown so the post-serve cleanup
 /// (killing background job trees) runs — a signal-killed process runs no
 /// destructors, so `kill_on_drop` never fires and dev servers/watchers spawned
-/// via `job start` would outlive it. Returns immediately if no handler can be
-/// installed, degrading to "no signal-driven shutdown" rather than hanging.
+/// via `job start` would outlive it. When no handler can be installed this
+/// parks forever instead of returning: resolving is what *starts* the
+/// shutdown, so an early return would drain-and-exit the server at startup.
+/// Parking merely degrades to "no signal-driven shutdown".
 #[cfg(unix)]
 async fn shutdown_requested() {
     use tokio::signal::unix::{SignalKind, signal};
 
-    let (mut term, mut hup, mut int) = match (
+    let (Ok(mut term), Ok(mut hup), Ok(mut int)) = (
         signal(SignalKind::terminate()),
         signal(SignalKind::hangup()),
         signal(SignalKind::interrupt()),
-    ) {
-        (Ok(term), Ok(hup), Ok(int)) => (term, hup, int),
-        _ => return,
+    ) else {
+        return std::future::pending().await;
     };
     tokio::select! {
         _ = term.recv() => {}
@@ -306,7 +337,10 @@ async fn shutdown_requested() {
 
 #[cfg(not(unix))]
 async fn shutdown_requested() {
-    let _ = tokio::signal::ctrl_c().await;
+    if tokio::signal::ctrl_c().await.is_err() {
+        // Same as the Unix arm: resolving would start the shutdown.
+        std::future::pending::<()>().await;
+    }
 }
 
 fn load_resume_record(options: &RuntimeServerOptions) -> Result<Option<SessionRecord>> {
