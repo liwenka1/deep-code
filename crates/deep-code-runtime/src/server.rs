@@ -240,6 +240,9 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
         active_turn: Arc::new(StdMutex::new(None)),
         autonomous_approvals: options.autonomous_approvals,
     };
+    // Kept past the router (which consumes `state`) so shutdown can reach the
+    // runtime and kill background jobs.
+    let shutdown_runtime = Arc::clone(&state.runtime);
 
     let protected = Router::new()
         .route("/v1/prompt", post(prompt_sse))
@@ -261,9 +264,49 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind {addr}"))?;
-    axum::serve(listener, app)
+    // Graceful shutdown on SIGTERM/SIGINT/SIGHUP: stop accepting, drain in-flight
+    // requests (their lease drops cancel live turns), then kill background jobs.
+    // Without this a signal kill runs no destructors and orphans job trees.
+    let serve = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_requested())
         .await
-        .context("runtime HTTP server exited with error")
+        .context("runtime HTTP server exited with error");
+    {
+        let runtime = shutdown_runtime.lock().await;
+        runtime.job_store.shutdown();
+        runtime.handle.shutdown().await;
+    }
+    serve
+}
+
+/// Resolve when the OS asks the server to stop: SIGTERM / SIGINT / SIGHUP on
+/// Unix, Ctrl-C elsewhere. Drives graceful shutdown so the post-serve cleanup
+/// (killing background job trees) runs — a signal-killed process runs no
+/// destructors, so `kill_on_drop` never fires and dev servers/watchers spawned
+/// via `job start` would outlive it. Returns immediately if no handler can be
+/// installed, degrading to "no signal-driven shutdown" rather than hanging.
+#[cfg(unix)]
+async fn shutdown_requested() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let (mut term, mut hup, mut int) = match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::hangup()),
+        signal(SignalKind::interrupt()),
+    ) {
+        (Ok(term), Ok(hup), Ok(int)) => (term, hup, int),
+        _ => return,
+    };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = hup.recv() => {}
+        _ = int.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_requested() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn load_resume_record(options: &RuntimeServerOptions) -> Result<Option<SessionRecord>> {
