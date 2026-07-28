@@ -215,12 +215,7 @@ fn deny_pipe_to_shell(command: &str) -> Option<DenyReason> {
         return None;
     }
     let parts: Vec<&str> = command.split('|').map(str::trim).collect();
-    let fetches = |seg: &str| {
-        matches!(
-            program_of(seg).as_deref(),
-            Some("curl" | "wget" | "fetch")
-        )
-    };
+    let fetches = |seg: &str| matches!(program_of(seg).as_deref(), Some("curl" | "wget" | "fetch"));
     let is_shell = |seg: &str| {
         matches!(
             program_of(seg).as_deref(),

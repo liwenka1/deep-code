@@ -462,12 +462,7 @@ fn apply_file_overlay(
     // Network mode is tighten-only from the project layer: a repo may reduce
     // (`prompt` → `never`) but must not re-arm ambient egress (`always`) —
     // same reasoning as auto/yolo above. Unknown values degrade to unset.
-    if let Some(mode) = file
-        .sandbox
-        .network
-        .as_deref()
-        .and_then(NetworkMode::parse)
-    {
+    if let Some(mode) = file.sandbox.network.as_deref().and_then(NetworkMode::parse) {
         if project && mode == NetworkMode::Always {
             pending.push((
                 TextId::CfgProjectFieldIgnored,

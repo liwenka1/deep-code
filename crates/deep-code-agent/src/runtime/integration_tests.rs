@@ -1259,10 +1259,12 @@ async fn session_approval_remembers_network_command_identity() {
     // Both runs executed with the grant (flags vary, identity `git push` matches).
     let granted = second
         .iter()
-        .filter(|event| matches!(
-            event,
-            RuntimeEvent::ToolCallFinished { result, .. } if result.content.contains("net=true")
-        ))
+        .filter(|event| {
+            matches!(
+                event,
+                RuntimeEvent::ToolCallFinished { result, .. } if result.content.contains("net=true")
+            )
+        })
         .count();
     assert_eq!(granted, 2, "both pushes must run with network: {second:?}");
     assert!(matches!(

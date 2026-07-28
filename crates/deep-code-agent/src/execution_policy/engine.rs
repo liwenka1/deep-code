@@ -618,7 +618,10 @@ mod tests {
         // Without the declaration `cargo build` is trusted and runs offline.
         let offline = evaluate_shell_command(&policy, "cargo build", false);
         assert_eq!(offline.verdict, PolicyVerdict::Allow);
-        assert!(!offline.network, "the decoupling: trust no longer grants egress");
+        assert!(
+            !offline.network,
+            "the decoupling: trust no longer grants egress"
+        );
         // Declaring network routes the same trusted command into an approval.
         let networked = evaluate_shell_command(&policy, "cargo build", true);
         assert!(matches!(

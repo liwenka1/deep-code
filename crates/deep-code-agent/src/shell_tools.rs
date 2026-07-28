@@ -66,6 +66,9 @@ fn spawn_confined(
             ),
         ));
     }
+    // `mut` is only exercised by the Unix process-group call below; on other
+    // platforms the binding is moved as-is into `Command::from`.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut std_cmd = sandbox.wrap_shell_command(command, cwd, workspace_root, policy);
     // Own process group (Unix) so timeout/cancel/shutdown can kill the whole
     // tree via `kill_process_tree`, not just the immediate shell.
