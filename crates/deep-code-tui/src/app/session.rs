@@ -58,7 +58,7 @@ impl App {
     /// Launch a fresh runtime from the current layered config (optionally
     /// resuming `resume`) and adopt it, carrying the config-derived display
     /// state. The caller must have shut the previous runtime down first.
-    fn launch_and_adopt(&mut self, resume: Option<SessionRecord>, resumed: bool) {
+    fn launch_and_adopt(&mut self, resume: Option<SessionRecord>) {
         let agent_config = self.load_layered_config();
         let launched = launch_runtime(&agent_config, self.workspace.clone(), resume);
         self.cost_currency = agent_config.cost_currency;
@@ -67,7 +67,6 @@ impl App {
         // `lang` is deliberately NOT re-resolved here: it changes only at
         // launch and via /lang, so a runtime swap can never flip the UI
         // language out from under the user (or the tests).
-        self.resumed = resumed;
         self.adopt_runtime(launched);
     }
 
@@ -92,12 +91,11 @@ impl App {
         if resume.is_none() && self.session_id.is_some() {
             // The old runtime is already down; relaunch a fresh session so the
             // app stays usable instead of pointing at a dead runtime.
-            self.launch_and_adopt(None, false);
+            self.launch_and_adopt(None);
             return Err(self.tr(TextId::SessionReloadFailedRestart).to_string());
         }
 
-        let resumed = resume.is_some();
-        self.launch_and_adopt(resume, resumed);
+        self.launch_and_adopt(resume);
         Ok(())
     }
 
@@ -209,7 +207,7 @@ impl App {
         }
 
         self.shutdown_current_runtime();
-        self.launch_and_adopt(Some(record.clone()), true);
+        self.launch_and_adopt(Some(record.clone()));
 
         self.history.clear();
         self.active_turn = None;
@@ -236,7 +234,7 @@ impl App {
 
         let workspace_display = home_relative(&self.workspace);
         self.shutdown_current_runtime();
-        self.launch_and_adopt(None, false);
+        self.launch_and_adopt(None);
 
         let persistent = self.session_id.is_some();
         self.history.clear();

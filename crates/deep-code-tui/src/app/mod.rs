@@ -87,7 +87,6 @@ pub struct App {
     pub pending_approval: Option<ApprovalRequest>,
     pub last_checkpoint: Option<String>,
     pub session_id: Option<String>,
-    pub(crate) resumed: bool,
     /// One-shot latch for the "session save failed" transcript warning; the
     /// status line keeps warning until a save succeeds again.
     pub(crate) save_error_notified: bool,
@@ -304,7 +303,6 @@ impl App {
         let permission_mode = launched.permission_mode;
         let subagent_shutdown = Some(launched.stop_hook);
         let job_store = Some(launched.job_store);
-        let resumed = config.resume.is_some();
         let persistent = session_id.is_some();
         let resumed_turns = config.resume.as_ref().map(|record| {
             record
@@ -350,7 +348,6 @@ impl App {
             pending_approval: None,
             last_checkpoint: None,
             session_id,
-            resumed,
             save_error_notified: false,
             trimmed_cells: 0,
             find_state: None,
