@@ -424,9 +424,11 @@ pub(crate) fn tool_result_word(status: &ToolResultStatus) -> &'static str {
     }
 }
 
-/// Truncate to at most `max_chars` characters, appending `…` when anything
-/// was cut. Returns the input unchanged when it already fits, so the ellipsis
-/// marks real elision only.
+/// Truncate to at most `max_chars` characters, appending ` (truncated)` when
+/// anything was cut. Returns the input unchanged when it already fits, so the
+/// marker only ever means a real system cut. An explicit word (not a bare `…`)
+/// because these strings — tool args, diff previews, diagnostics — otherwise
+/// read as if the ellipsis were authored content.
 pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
     let mut truncated = String::new();
@@ -437,7 +439,7 @@ pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
         truncated.push(ch);
     }
     if chars.next().is_some() {
-        truncated.push('…');
+        truncated.push_str(" (truncated)");
     }
     truncated
 }
@@ -617,7 +619,11 @@ mod tests {
             requires_sandbox: None,
             approval: ToolApprovalState::NotRequired,
         };
-        assert!(tool.lines(Lang::Zh).iter().any(|line| line.contains('…')));
+        assert!(
+            tool.lines(Lang::Zh)
+                .iter()
+                .any(|line| line.contains("(truncated)"))
+        );
     }
 
     #[test]
