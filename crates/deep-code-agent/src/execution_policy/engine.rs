@@ -341,11 +341,11 @@ pub fn evaluate_shell_command(
 
     let segments = shell_deny::segments(command);
     // Auto-trust only if EVERY segment is covered by a trusted rule
-    // (identity-matched, so flags vary but subcommands don't) and the
-    // command has no redirection or command substitution — those can write
-    // files or run sub-commands a trusted prefix doesn't cover.
+    // (identity-matched, so flags vary but subcommands don't) and the command
+    // has no redirection/substitution/expansion — those run programs, write
+    // paths, or expand content a trusted prefix doesn't cover.
     let trusted = !segments.is_empty()
-        && !shell_deny::has_redirection_or_substitution(command)
+        && !shell_deny::has_shell_indirection(command)
         && segments.iter().all(|segment| {
             policy
                 .trusted_shell_prefixes
@@ -579,6 +579,26 @@ mod tests {
         assert!(matches!(
             evaluate_shell_command(&policy, "echo pwned > /etc/passwd", false).verdict,
             PolicyVerdict::NeedsApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn variable_expansion_is_never_auto_trusted() {
+        let policy = ExecPolicy::default();
+        // `$VAR` expands to content the reviewer never saw, so a trusted
+        // program with an expansion still asks (the indirection gate).
+        assert!(matches!(
+            evaluate_shell_command(&policy, "echo $HOME", false).verdict,
+            PolicyVerdict::NeedsApproval { .. }
+        ));
+        assert!(matches!(
+            evaluate_shell_command(&policy, "cargo test ${FLAGS}", false).verdict,
+            PolicyVerdict::NeedsApproval { .. }
+        ));
+        // …and never rides the accept-edits allowlist either.
+        assert!(!accept_edits_approvable(
+            "shell",
+            &json!({"command": "mv $SRC dest/"})
         ));
     }
 
