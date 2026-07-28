@@ -59,6 +59,8 @@ deepcode session list|resume|delete|export
 
 环境变量 `DEEP_CODE_DISABLE_WEB`：设为**非空**且非 `0`/`false`/`off`/`no` 的值（大小写不敏感；空值视为未设置）即可关闭联网工具（`web_search`/`fetch_url`），用于断网或审计场景；默认开启。`/status` 会显示当前 `web=on|off`。
 
+shell/job 命令一律在 OS 沙箱内运行且**默认不带网络**（含端口监听）：需要联网的命令（安装依赖、`git push`、dev server）会转人工审批，"本会话记住"后同形态命令不再问；`[sandbox] network = prompt|always|never` 可调，项目层只许收紧。
+
 ## 扩展能力(skills + shell)
 
 deep-code **不内置 MCP**。它本来就有 shell,所以扩展能力的方式是**写个脚本/命令 + 一份 `SKILL.md`**:一行摘要注入系统提示、模型按需读取 SKILL.md 正文,再通过 `shell` 工具调用你的脚本。

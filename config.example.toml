@@ -7,6 +7,7 @@
 # 其余行为旋钮（provider.timeout_secs、stream.*、checkpoints.*、context.*、
 # cost.auto_cost_saving、approval.*）在项目层一律忽略并告警——防止恶意仓库
 # 饿死流、撑爆快照保留或静默解除审批门；请在全局配置或环境变量中设置。
+# 例外：sandbox.network 在项目层只许收紧（prompt/never），设 always 会被忽略并告警。
 # 项目层的 provider.api_key 一律忽略（防止随仓库泄露或被恶意仓库注入）；
 # 项目层覆盖 provider.base_url 会在启动时给出醒目警告。
 
@@ -28,8 +29,19 @@
 # timeout_secs = 60
 
 [checkpoints]
-# 检查点保留上限：每轮前后各存一份工作区快照，超出上限按最旧删除（0 = 不清理）。
+# 检查点保留上限：每轮开始前存一份工作区快照，超出上限按最旧删除（0 = 不清理）。
 # max_snapshots = 20
+
+[sandbox]
+# shell/job 命令的联网授权。命令一律在 OS 沙箱内运行,默认不带网络(含端口监听);
+# 模型认为命令需要联网时会在参数里声明 network=true,该声明强制转人工审批
+# (审批面板显示"申请联网"),"本会话记住"按命令 identity 生效(批过 git push
+# 后同形态不再问)。信任与联网是两个独立授权:沙箱内读取宽泛,若放行即联网,
+# 任何被自动放行的命令都可能把读到的内容外送——这就是默认 prompt 的原因。
+#   prompt  声明 → 审批(默认)
+#   always  所有沙箱命令直接带网(回到旧行为,零打扰;只在全局层生效)
+#   never   声明联网的命令直接拒绝
+# network = "prompt"
 
 [cost]
 # 成本展示货币：cny / usd。
@@ -66,6 +78,9 @@
 # default(每次询问)| accept_edits(自动放行工作区内编辑)| auto(AI 判断)| yolo(全放开)。
 # 项目配置只能设 default/accept_edits;auto/yolo 只能来自全局配置(防止恶意仓库静默解除审批门)。
 # 运行时按 Shift+Tab 循环切换。
+# auto 档的边界(有意取舍):AI 判官只读取命令与参数文本,不读取待写入的
+# 文件内容——write_file/apply_patch 的实质内容不经判官审阅(高风险档、联网
+# 声明与离线后端仍然硬性转人工)。在意这条边界就用 default/accept_edits。
 # default_mode = "default"
 
 [stream]
