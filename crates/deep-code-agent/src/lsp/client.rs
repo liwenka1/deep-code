@@ -451,10 +451,10 @@ fn code_text(raw: &Value) -> Option<String> {
 /// Unix-oriented: Windows drive letters are out of scope for now.
 fn file_uri(path: &Path) -> String {
     let resolved = normalize_path(path);
-    let text = resolved.to_string_lossy();
-    let trimmed = text.strip_prefix('/').unwrap_or(&text);
+    let bytes = path_to_bytes(&resolved);
+    let trimmed = bytes.strip_prefix(b"/").unwrap_or(&bytes);
     let mut encoded = String::with_capacity(trimmed.len());
-    for byte in trimmed.bytes() {
+    for &byte in trimmed {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
                 encoded.push(byte as char);
@@ -475,14 +475,54 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let mut iter = rest.bytes();
     while let Some(byte) = iter.next() {
         if byte == b'%' {
-            let hex = [iter.next()?, iter.next()?];
-            let hex = std::str::from_utf8(&hex).ok()?;
-            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            let (hi, lo) = (iter.next()?, iter.next()?);
+            // Only a well-formed `%HH` escape decodes; `%zz` or the `+`
+            // `from_str_radix` would otherwise accept is an unattributable URI.
+            if !hi.is_ascii_hexdigit() || !lo.is_ascii_hexdigit() {
+                return None;
+            }
+            bytes.push((hex_val(hi) << 4) | hex_val(lo));
         } else {
             bytes.push(byte);
         }
     }
-    Some(PathBuf::from(String::from_utf8_lossy(&bytes).into_owned()))
+    Some(path_from_bytes(bytes))
+}
+
+/// Value of a single ASCII hex digit (caller has checked `is_ascii_hexdigit`).
+fn hex_val(digit: u8) -> u8 {
+    match digit {
+        b'0'..=b'9' => digit - b'0',
+        b'a'..=b'f' => digit - b'a' + 10,
+        _ => digit - b'A' + 10,
+    }
+}
+
+/// Decoded URI bytes back to a path. On Unix a path is arbitrary bytes, so
+/// rebuild it losslessly (a non-UTF-8 segment must round-trip, not become
+/// U+FFFD and stop matching); elsewhere fall back to a lossy string.
+#[cfg(unix)]
+fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(bytes))
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// A path's raw bytes for percent-encoding — Unix byte-exact so a non-UTF-8
+/// segment round-trips; lossy elsewhere.
+#[cfg(unix)]
+fn path_to_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_to_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
 }
 
 #[cfg(test)]

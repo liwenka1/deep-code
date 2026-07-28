@@ -260,9 +260,18 @@ impl AgentRuntime {
     /// under-counts every auto-mode gated call.
     async fn record_classifier_cost(&self, model: &str, usage: &crate::model::Usage) {
         let cost = crate::pricing::calculate_turn_cost(model, usage);
+        let cache_hit = usage.prompt_cache_hit_tokens.unwrap_or(0);
+        let cache_miss = usage.prompt_cache_miss_tokens.unwrap_or(0);
+        let savings = crate::pricing::cache_savings(model, cache_hit);
         let mut state = self.state.lock().await;
         state.session_cost.usd += cost.usd;
         state.session_cost.cny += cost.cny;
+        // Fold cache tokens too, so the session cache-hit rate/savings read
+        // consistently with `accumulate_request_usage`.
+        state.session_cache_hit_tokens += u64::from(cache_hit);
+        state.session_cache_miss_tokens += u64::from(cache_miss);
+        state.session_cache_savings.usd += savings.usd;
+        state.session_cache_savings.cny += savings.cny;
     }
 
     /// Run the queued tool calls of one assistant turn in order.
@@ -523,6 +532,18 @@ impl AgentRuntime {
             == BatchOutcome::Completed
         {
             self.run_loop(tx).await;
+        }
+    }
+
+    /// Flush any buffered LSP warnings as `Warning` events. The manager buffers
+    /// (raw-mode terminals can't take a stray `eprintln`); draining here and at
+    /// turn end means an operational complaint surfaces even when no edit tool
+    /// follows the one that produced it.
+    pub(super) async fn drain_lsp_warnings(&self, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
+        if let Some(lsp) = self.lsp.as_ref() {
+            for message in lsp.take_warnings() {
+                emit(tx, RuntimeEvent::Warning { message });
+            }
         }
     }
 

@@ -19,6 +19,7 @@ pub enum AgentEvent {
 #[must_use]
 pub fn chunk_to_events(chunk: StreamChunk) -> Vec<AgentEvent> {
     let mut events = Vec::new();
+    let mut saw_finish = false;
 
     for choice in chunk.choices {
         if let Some(delta) = choice.delta {
@@ -39,14 +40,20 @@ pub fn chunk_to_events(chunk: StreamChunk) -> Vec<AgentEvent> {
             }
         }
 
-        if choice.finish_reason.is_some() {
-            events.push(AgentEvent::Done {
-                usage: chunk.usage.clone(),
-            });
-        }
+        saw_finish |= choice.finish_reason.is_some();
     }
 
-    if events.is_empty() && chunk.usage.is_some() {
+    // `usage` is request-level, so a request emits at most one `Done` carrying
+    // it. Collapsing across choices matters when a provider streams n>1 choices
+    // that each report a finish_reason — one `Done` per choice would make the
+    // turn loop count the request's usage several times.
+    if saw_finish {
+        events.push(AgentEvent::Done {
+            usage: chunk.usage.clone(),
+        });
+    } else if events.is_empty() && chunk.usage.is_some() {
+        // A trailing usage-only chunk (no finish_reason, no content) still
+        // carries the request's final usage.
         events.push(AgentEvent::Done { usage: chunk.usage });
     }
 
@@ -92,5 +99,31 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn multiple_finished_choices_emit_a_single_done() {
+        // A provider streaming n>1 choices that each report a finish_reason must
+        // still yield ONE Done — usage is request-level, so a Done per choice
+        // would make the turn loop count the request's cost several times.
+        let finished = |index| ChatChoice {
+            index,
+            message: None,
+            delta: None,
+            finish_reason: Some("stop".to_string()),
+        };
+        let chunk = StreamChunk {
+            choices: vec![finished(0), finished(1)],
+            usage: Some(Usage {
+                total_tokens: Some(5),
+                ..Usage::default()
+            }),
+        };
+
+        let dones = chunk_to_events(chunk)
+            .into_iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count();
+        assert_eq!(dones, 1, "two finished choices must collapse to one Done");
     }
 }
