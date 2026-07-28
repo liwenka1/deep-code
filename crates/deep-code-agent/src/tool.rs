@@ -142,6 +142,10 @@ pub struct ToolCx {
     cancel: CancellationToken,
     plan: Option<ToolExecutionPlan>,
     on_update: Option<ToolUpdateFn>,
+    /// Sink for token cost a tool incurs out-of-band — spend the parent turn's
+    /// telemetry never sees, e.g. a sub-agent's own requests on the shared key.
+    /// The runtime folds it into the session total after the tool returns.
+    cost_sink: Option<Arc<std::sync::Mutex<crate::pricing::CostEstimate>>>,
 }
 
 impl ToolCx {
@@ -166,6 +170,25 @@ impl ToolCx {
     pub(crate) fn with_plan(mut self, plan: ToolExecutionPlan) -> Self {
         self.plan = Some(plan);
         self
+    }
+
+    #[must_use]
+    pub fn with_cost_sink(mut self, sink: Arc<std::sync::Mutex<crate::pricing::CostEstimate>>) -> Self {
+        self.cost_sink = Some(sink);
+        self
+    }
+
+    /// Report token cost this tool incurred that the parent turn's telemetry
+    /// won't otherwise capture (e.g. a sub-agent's own request spend). Summed
+    /// into the sink; the runtime folds it into the session total afterward.
+    pub fn report_cost(&self, cost: crate::pricing::CostEstimate) {
+        if let Some(sink) = &self.cost_sink {
+            let mut total = sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            total.usd += cost.usd;
+            total.cny += cost.cny;
+        }
     }
 
     #[must_use]
@@ -521,6 +544,20 @@ mod tests {
             ToolCx::new().with_plan(plan(false, false)).sandbox_policy(),
             SandboxPolicy::Unsandboxed
         );
+    }
+
+    #[test]
+    fn tool_cx_cost_sink_accumulates_reported_cost() {
+        use crate::pricing::CostEstimate;
+        // No sink → report_cost is a silent no-op (most tools never report).
+        ToolCx::new().report_cost(CostEstimate { usd: 1.0, cny: 7.0 });
+
+        let sink = Arc::new(std::sync::Mutex::new(CostEstimate::default()));
+        let cx = ToolCx::new().with_cost_sink(Arc::clone(&sink));
+        cx.report_cost(CostEstimate { usd: 0.5, cny: 3.5 });
+        cx.report_cost(CostEstimate { usd: 0.25, cny: 1.75 });
+        let total = *sink.lock().unwrap();
+        assert!((total.usd - 0.75).abs() < 1e-9 && (total.cny - 5.25).abs() < 1e-9);
     }
 
     #[test]

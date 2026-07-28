@@ -344,6 +344,12 @@ impl AgentRuntime {
         self.state.lock().await.current_turn_id.clone()
     }
 
+    /// This session's accumulated token cost. A sub-agent runtime exposes it so
+    /// the parent can fold the child's spend into its own session total.
+    pub async fn session_cost(&self) -> crate::pricing::CostEstimate {
+        self.state.lock().await.session_cost
+    }
+
     async fn current_turn_id(&self) -> TurnId {
         self.state
             .lock()
