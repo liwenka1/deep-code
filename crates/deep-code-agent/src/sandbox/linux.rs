@@ -262,7 +262,7 @@ mod tests {
         // Target a path under $HOME (not the workspace, not the granted temp
         // dir), so only Landlock decides the outcome.
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        let escape = PathBuf::from(&home).join("deepcode_sandbox_escape_probe.txt");
+        let escape = PathBuf::from(&home).join("deep-code_sandbox_escape_probe.txt");
         let _ = std::fs::remove_file(&escape);
 
         let dir = tempfile::tempdir().unwrap();

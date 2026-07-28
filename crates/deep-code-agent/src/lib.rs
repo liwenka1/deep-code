@@ -44,7 +44,10 @@ mod workspace_tools;
 // rest of the crate. Re-add an export the day a consumer needs it.
 pub use checkpoint::{CheckpointId, CheckpointStore};
 pub use client::{AgentEventStream, LlmClient};
-pub use config::{AgentConfig, GlobalConfigUpdate, validate_api_key, write_global_config_update};
+pub use config::{
+    AgentConfig, ConfigLoadReport, ConfigSources, GlobalConfigUpdate, LoadedAgentConfig,
+    validate_api_key, write_global_config_update,
+};
 pub use doctor::{DoctorReport, default_config_path};
 pub use error::AgentResult;
 pub use event::AgentEvent;

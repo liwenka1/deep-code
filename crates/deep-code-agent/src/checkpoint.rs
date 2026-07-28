@@ -370,6 +370,43 @@ mod tests {
         );
     }
 
+    /// The `clear` half of restore must delete a workspace symlink as the link
+    /// it is, never recurse through it into a workspace-external directory. The
+    /// link is created *after* the snapshot so it is still present when restore
+    /// clears the workspace (this is the path `restore_preserves_symlinks`
+    /// doesn't reach — it removes the link before restoring).
+    #[cfg(unix)]
+    #[test]
+    fn restore_clears_symlink_without_deleting_external_target() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("shared.txt"), "external").unwrap();
+        fs::write(workspace.path().join("real.txt"), "v1").unwrap();
+
+        let store = CheckpointStore::new(workspace.path()).unwrap();
+        let (id, _) = store.snapshot("before_turn").unwrap();
+
+        // Introduce the external link only now, so it is live in the workspace
+        // when `restore` clears it.
+        let link = workspace.path().join("link-out");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        store.restore(&id).unwrap();
+
+        assert!(
+            !link.exists() && link.symlink_metadata().is_err(),
+            "clear must remove the stray symlink"
+        );
+        assert!(
+            outside.path().join("shared.txt").exists(),
+            "clear must not follow the link and delete its external target"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("shared.txt")).unwrap(),
+            "external"
+        );
+    }
+
     #[test]
     fn restore_rejects_traversal_ids_without_touching_workspace() {
         let workspace = tempfile::tempdir().unwrap();

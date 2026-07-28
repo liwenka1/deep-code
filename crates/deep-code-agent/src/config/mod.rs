@@ -7,7 +7,7 @@ mod write;
 use std::env;
 use std::time::Duration;
 
-pub use layers::{ConfigLayer, ConfigLoadReport, ConfigSources};
+pub use layers::{ConfigLayer, ConfigLoadReport, ConfigSources, LoadedAgentConfig};
 pub use write::{GlobalConfigUpdate, validate_api_key, write_global_config_update};
 
 use crate::error::{AgentError, AgentResult};
