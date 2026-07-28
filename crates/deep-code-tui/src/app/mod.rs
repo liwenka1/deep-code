@@ -765,45 +765,35 @@ impl App {
 
     #[must_use]
     pub fn status_line(&self) -> String {
-        let mode = if self.error.is_some() {
-            self.tr(TextId::ModeError)
-        } else if self.pending_approval.is_some() {
-            self.tr(TextId::ModeApproval)
-        } else if self.is_streaming {
-            self.tr(TextId::ModeStreaming)
-        } else if self.resumed {
-            self.tr(TextId::ModeReadyResumed)
-        } else {
-            self.tr(TextId::ModeReady)
-        };
-        let session = self
-            .session_id
-            .as_deref()
-            .map(|id| format!(" | session {id}"))
-            .unwrap_or_else(|| " | session none".to_string());
-        let telemetry = self
+        // CC-style minimal idle frame. The permission-mode chip is rendered
+        // separately by `render_status` (always visible), and streaming/error
+        // states have their own branches there — so this shows just the model
+        // in use, context headroom, and any transient note. Session id and
+        // cost detail live in `/status`, not on the always-on bar.
+        //
+        // The model is the *effective* one (auto-routing or a cascade can make
+        // it differ from configured), so a switch to a pricier model is visible
+        // here rather than only under `/status`. Falls back to the configured
+        // model before the first turn produces telemetry.
+        let model = self
             .last_telemetry
             .as_ref()
-            .map(|value| {
-                format!(
-                    " | {} | turn {} | total {} | ctx {}%",
-                    value.route_label,
-                    value.turn_cost.format(self.cost_currency),
-                    value.session_cost.format(self.cost_currency),
-                    value.context_usage_percent
-                )
-            })
+            .map_or(self.configured_model.as_str(), |value| {
+                value.effective_model.as_str()
+            });
+        let ctx = self
+            .last_telemetry
+            .as_ref()
+            .map(|value| format!("  ctx {}%", value.context_usage_percent))
             .unwrap_or_default();
         // `self.status` carries only the transient note (tool progress, command
-        // feedback); every durable field lives in this frame exactly once. The
-        // checkpoint id is surfaced solely through the post-turn rollback hint
-        // (`/restore {id}`) in `self.status`, so it isn't repeated here.
+        // feedback, the post-turn `/restore {id}` rollback hint).
         let note = if self.status.is_empty() {
             String::new()
         } else {
-            format!(" | {}", self.status)
+            format!("  {}", self.status)
         };
-        format!("{mode} - {}{session}{note}{telemetry}", self.backend_label)
+        format!("{model}{ctx}{note}")
     }
 
     pub async fn shutdown_runtime(&self) {
