@@ -19,9 +19,7 @@ use crate::subagent::manager::new_agent_id;
 use crate::subagent::registry::{SubAgentServices, child_system_prompt, child_tool_registry};
 use crate::subagent::roles::SubAgentRole;
 use crate::subagent::runner::run_subagent;
-use crate::subagent::types::{
-    DEFAULT_MAX_STEPS, SUBAGENT_STATE_SCHEMA_VERSION, SubAgentError, SubAgentRecord, SubAgentStatus,
-};
+use crate::subagent::types::{DEFAULT_MAX_STEPS, SubAgentError, SubAgentRecord, SubAgentStatus};
 use crate::tool::{Tool, ToolCx, ToolError, ToolOutput};
 use crate::workspace_policy::invalid;
 
@@ -107,14 +105,6 @@ impl Tool for AgentTool {
             true,
         );
 
-        let boot_id = {
-            let manager = self
-                .services
-                .manager
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            manager.session_boot_id.clone()
-        };
         {
             let mut manager = self
                 .services
@@ -123,7 +113,6 @@ impl Tool for AgentTool {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             manager
                 .insert(SubAgentRecord {
-                    schema_version: SUBAGENT_STATE_SCHEMA_VERSION,
                     agent_id: agent_id.clone(),
                     name: name.clone(),
                     role: role.as_str().to_string(),
@@ -135,7 +124,6 @@ impl Tool for AgentTool {
                     started_at_ms: now_ms(),
                     finished_at_ms: None,
                     steps_taken: 0,
-                    session_boot_id: Some(boot_id),
                 })
                 .map_err(tool_error)?;
         }

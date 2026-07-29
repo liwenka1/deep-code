@@ -39,10 +39,7 @@ impl SubAgentServices {
         max_concurrent: usize,
         exec_policy: ExecPolicy,
     ) -> Self {
-        let manager = Arc::new(RwLock::new(SubAgentManager::new(
-            workspace.clone(),
-            max_concurrent,
-        )));
+        let manager = Arc::new(RwLock::new(SubAgentManager::new(max_concurrent)));
         Self {
             manager,
             client,

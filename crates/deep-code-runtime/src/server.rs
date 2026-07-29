@@ -946,7 +946,7 @@ mod tests {
         }
     }
 
-    fn tool_calling_state(workspace: PathBuf, autonomous_approvals: bool) -> AppState {
+    fn tool_calling_state(autonomous_approvals: bool) -> AppState {
         let runtime = deep_code_agent::AgentRuntime::new(
             ToolCallingClient {
                 turns: StdMutex::new(0),
@@ -958,7 +958,7 @@ mod tests {
             backend_label: "scripted".to_string(),
             session_id: None,
             subagent_manager: Arc::new(std::sync::RwLock::new(
-                deep_code_agent::SubAgentManager::new(workspace, 2),
+                deep_code_agent::SubAgentManager::new(2),
             )),
             job_store: deep_code_agent::JobStore::default(),
             stop_hook: Box::new(|| {}),
@@ -978,8 +978,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_rejects_mismatched_call_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = tool_calling_state(dir.path().to_path_buf(), false);
+        let state = tool_calling_state(false);
         let addr = spawn_test_server(state).await;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -1026,8 +1025,7 @@ mod tests {
 
     #[tokio::test]
     async fn autonomous_mode_auto_denies_instead_of_hanging() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = tool_calling_state(dir.path().to_path_buf(), true);
+        let state = tool_calling_state(true);
         let addr = spawn_test_server(state).await;
         // A short client timeout is the point: in interactive mode the turn
         // would park forever (no one POSTs /v1/approvals) and trip this timeout.

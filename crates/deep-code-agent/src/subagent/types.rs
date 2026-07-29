@@ -2,8 +2,6 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub const SUBAGENT_STATE_SCHEMA_VERSION: u32 = 1;
-pub const SUBAGENT_STATE_FILE: &str = "subagents.v1.json";
 pub const DEFAULT_MAX_CONCURRENT: usize = 10;
 pub const HARD_MAX_CONCURRENT: usize = 20;
 pub const DEFAULT_MAX_STEPS: u32 = 50;
@@ -15,7 +13,6 @@ pub enum SubAgentStatus {
     Completed,
     Failed,
     Cancelled,
-    Interrupted,
 }
 
 impl SubAgentStatus {
@@ -31,7 +28,6 @@ impl SubAgentStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
-            Self::Interrupted => "interrupted",
         }
     }
 }
@@ -45,26 +41,22 @@ pub struct StructuredReport {
     pub blockers: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One sub-agent's live/terminal state, held in memory for the session (see
+/// [`super::manager::SubAgentManager`]). Not persisted — the durable copy of a
+/// sub-agent's work is its report in the parent transcript.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SubAgentRecord {
-    pub schema_version: u32,
     pub agent_id: String,
     pub name: String,
     pub role: String,
     pub status: SubAgentStatus,
     pub assignment: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured: Option<StructuredReport>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub started_at_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at_ms: Option<u64>,
     pub steps_taken: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_boot_id: Option<String>,
 }
 
 impl SubAgentRecord {
@@ -93,8 +85,6 @@ pub enum SubAgentError {
     InvalidRole { value: String },
     ConcurrencyLimit { cap: usize },
     InvalidArguments { message: String },
-    Io { message: String },
-    State { message: String },
 }
 
 impl fmt::Display for SubAgentError {
@@ -111,8 +101,6 @@ impl fmt::Display for SubAgentError {
                 write!(formatter, "sub-agent concurrency limit reached ({cap})")
             }
             Self::InvalidArguments { message } => write!(formatter, "{message}"),
-            Self::Io { message } => write!(formatter, "sub-agent I/O failed: {message}"),
-            Self::State { message } => write!(formatter, "sub-agent state error: {message}"),
         }
     }
 }
