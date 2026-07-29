@@ -125,14 +125,9 @@ impl JsonSessionStore {
 }
 
 impl SessionStore for JsonSessionStore {
-    fn save(&self, record: &SessionRecord) -> Result<(), SessionStoreError> {
-        validate_session_id(record.id.as_str())?;
-        let path = self.path_for(&record.id)?;
-        let json = serde_json::to_string_pretty(record).map_err(|error| {
-            SessionStoreError::Serialization {
-                message: error.to_string(),
-            }
-        })?;
+    fn save_serialized(&self, id: &SessionId, json: &str) -> Result<(), SessionStoreError> {
+        validate_session_id(id.as_str())?;
+        let path = self.path_for(id)?;
         Self::write_atomic(&path, json.as_bytes())
     }
 

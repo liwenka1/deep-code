@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use crate::session_store::{SessionRecord, SessionStore};
+use crate::session_store::{SessionRecord, SessionStore, serialize_record};
 
 /// Backoff delays between save retries. A save is attempted once, then retried
 /// after each of these delays before the failure is finally recorded. This
@@ -137,17 +137,22 @@ async fn actor_loop(
 }
 
 /// Save the record, retrying transient failures on the [`SAVE_RETRY_BACKOFF`]
-/// schedule. The record is re-snapshotted before every attempt, so a mutation
-/// that lands mid-backoff is captured by the next try (latest-wins holds).
-/// Returns the last error only once every attempt is exhausted.
+/// schedule. Each attempt serializes under the record lock and writes with the
+/// lock released — so the full record is never deep-cloned just to snapshot it,
+/// and re-serializing per attempt still captures a mutation that lands
+/// mid-backoff (latest-wins holds). Returns the last error only once every
+/// attempt is exhausted.
 async fn save_with_retry(
     store: &(dyn SessionStore + Send + Sync),
     record: &Mutex<SessionRecord>,
 ) -> Result<(), crate::session_store::SessionStoreError> {
     let mut attempt = 0usize;
     loop {
-        let snapshot = record.lock().await.clone();
-        match store.save(&snapshot) {
+        let (id, json) = {
+            let guard = record.lock().await;
+            (guard.id.clone(), serialize_record(&guard)?)
+        };
+        match store.save_serialized(&id, &json) {
             Ok(()) => return Ok(()),
             // Only transient I/O faults (ENOSPC, file lock, network-FS blip)
             // are worth retrying; serialization / invalid-id / schema errors are
@@ -217,9 +222,9 @@ mod tests {
     }
 
     impl SessionStore for CountingStore {
-        fn save(&self, record: &SessionRecord) -> Result<(), SessionStoreError> {
+        fn save_serialized(&self, _id: &SessionId, json: &str) -> Result<(), SessionStoreError> {
             self.saves.fetch_add(1, Ordering::SeqCst);
-            *self.latest.lock().unwrap() = Some(record.clone());
+            *self.latest.lock().unwrap() = Some(serde_json::from_str(json).unwrap());
             Ok(())
         }
         fn load(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError> {
@@ -237,7 +242,7 @@ mod tests {
 
     struct FailingStore;
     impl SessionStore for FailingStore {
-        fn save(&self, _record: &SessionRecord) -> Result<(), SessionStoreError> {
+        fn save_serialized(&self, _id: &SessionId, _json: &str) -> Result<(), SessionStoreError> {
             Err(SessionStoreError::Io {
                 message: "synthetic failure".to_string(),
             })
@@ -322,7 +327,7 @@ mod tests {
         fail_first: usize,
     }
     impl SessionStore for FlakyStore {
-        fn save(&self, _record: &SessionRecord) -> Result<(), SessionStoreError> {
+        fn save_serialized(&self, _id: &SessionId, _json: &str) -> Result<(), SessionStoreError> {
             if self.attempts.fetch_add(1, Ordering::SeqCst) < self.fail_first {
                 Err(SessionStoreError::Io {
                     message: "disk full".to_string(),
@@ -408,7 +413,7 @@ mod tests {
         attempts: Arc<AtomicUsize>,
     }
     impl SessionStore for PermanentFailStore {
-        fn save(&self, _record: &SessionRecord) -> Result<(), SessionStoreError> {
+        fn save_serialized(&self, _id: &SessionId, _json: &str) -> Result<(), SessionStoreError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             Err(SessionStoreError::Serialization {
                 message: "permanent".to_string(),

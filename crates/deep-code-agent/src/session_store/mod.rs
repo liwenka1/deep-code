@@ -205,9 +205,26 @@ pub enum SessionStoreError {
     InvalidId { id: String },
 }
 
+/// Serialize a record to the on-disk JSON form. Shared by the default
+/// [`SessionStore::save`] and the persistence actor, which serializes under the
+/// record lock and writes with it released — avoiding a full-record clone.
+pub(crate) fn serialize_record(record: &SessionRecord) -> Result<String, SessionStoreError> {
+    serde_json::to_string_pretty(record).map_err(|error| SessionStoreError::Serialization {
+        message: error.to_string(),
+    })
+}
+
 /// Backend-agnostic session persistence.
 pub trait SessionStore: Send + Sync {
-    fn save(&self, record: &SessionRecord) -> Result<(), SessionStoreError>;
+    /// Serialize then persist a record. Provided in terms of
+    /// [`save_serialized`](SessionStore::save_serialized); the persistence actor
+    /// calls that directly so it can serialize under the record mutex and write
+    /// with the lock released, never deep-cloning the record just to snapshot it.
+    fn save(&self, record: &SessionRecord) -> Result<(), SessionStoreError> {
+        self.save_serialized(&record.id, &serialize_record(record)?)
+    }
+    /// Write an already-serialized record body under `id`.
+    fn save_serialized(&self, id: &SessionId, json: &str) -> Result<(), SessionStoreError>;
     fn load(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError>;
     fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError>;
     fn delete(&self, id: &SessionId) -> Result<(), SessionStoreError>;
