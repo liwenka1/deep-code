@@ -20,7 +20,7 @@ use crate::subagent::registry::{SubAgentServices, child_system_prompt, child_too
 use crate::subagent::roles::SubAgentRole;
 use crate::subagent::runner::run_subagent;
 use crate::subagent::types::{DEFAULT_MAX_STEPS, SubAgentError, SubAgentRecord, SubAgentStatus};
-use crate::tool::{Tool, ToolCx, ToolError, ToolOutput};
+use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolUpdate};
 use crate::workspace_policy::invalid;
 
 const AGENT_TOOL: &str = "agent";
@@ -143,9 +143,21 @@ impl Tool for AgentTool {
         // signal through. `shutdown` fires when the whole session tears down.
         let cancel_handle = runtime.clone();
         let shutdown = self.services.parent_cancel.clone();
+        // Forward the child's per-tool-call progress lines into the parent's
+        // ToolCallProgress stream, so a long child run shows live activity in
+        // the UI instead of a frozen `agent` cell.
+        let progress = {
+            let cx = cx.clone();
+            move |text: String| {
+                cx.update(ToolUpdate {
+                    text,
+                    details: None,
+                });
+            }
+        };
         let run = std::panic::AssertUnwindSafe(async move {
             runtime.begin_turn(task).await;
-            run_subagent(runtime, DEFAULT_MAX_STEPS, role).await
+            run_subagent(runtime, DEFAULT_MAX_STEPS, role, progress).await
         })
         .catch_unwind();
         tokio::pin!(run);

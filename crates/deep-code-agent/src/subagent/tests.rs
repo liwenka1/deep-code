@@ -87,6 +87,48 @@ None.
         }
     }
 
+    /// First request: one read-only tool call; afterwards: the canonical
+    /// report. Exercises a child that does real tool work before reporting.
+    struct OneCallThenReportClient {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for OneCallThenReportClient {
+        fn provider_name(&self) -> &'static str {
+            "one-call"
+        }
+
+        fn model(&self) -> &str {
+            "one-call"
+        }
+
+        async fn stream_chat(&self, _request: ChatRequest) -> AgentResult<AgentEventStream> {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            let stream = try_stream! {
+                if first {
+                    yield AgentEvent::ToolCallDelta {
+                        delta: ToolCallDelta {
+                            index: Some(0),
+                            id: Some("probe_call_1".to_string()),
+                            call_type: Some("function".to_string()),
+                            function: Some(FunctionCallDelta {
+                                name: Some("list_dir".to_string()),
+                                arguments: Some(r#"{"path":"."}"#.to_string()),
+                            }),
+                        },
+                    };
+                } else {
+                    yield AgentEvent::TextDelta {
+                        text: "### SUMMARY\nok\n\n### EVIDENCE\nNone.\n\n### CHANGES\nNone.\n\n### RISKS\nNone.\n\n### BLOCKERS\nNone.\n".to_string(),
+                    };
+                }
+                yield AgentEvent::Done { usage: None };
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
     /// Panics while streaming — the child's run_loop task dies and the
     /// runner must map the broken event channel to a Failed record.
     #[derive(Clone)]
@@ -277,6 +319,46 @@ None.
         assert_eq!(
             models[1], services.agent_config.model,
             "implementer child must inherit the parent's configured model"
+        );
+    }
+
+    /// A child's tool calls stream one progress line each into the parent's
+    /// ToolCallProgress channel, so a long child run shows live activity.
+    #[tokio::test]
+    async fn child_tool_calls_stream_progress_to_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Arc::new(OneCallThenReportClient {
+            calls: AtomicUsize::new(0),
+        });
+        let cancel = CancellationToken::new();
+        let mut registry = ToolRegistry::new();
+        let _services = attach_subagent_tools(
+            &mut registry,
+            client,
+            AgentConfig::default(),
+            dir.path().to_path_buf(),
+            cancel,
+        );
+
+        let updates: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let update_fn: crate::tool::ToolUpdateFn = {
+            let updates = Arc::clone(&updates);
+            Arc::new(move |update| updates.lock().unwrap().push(update.text))
+        };
+        let call = agent_call("call_1", "list the workspace", "explore");
+        let plan = registry.evaluate_tool(&call);
+        let result = registry
+            .run_tool_call_with_plan(&call, None, plan, ToolCx::new().with_update_fn(update_fn))
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+
+        assert_eq!(result.status, crate::tool::ToolResultStatus::Success);
+        let updates = updates.lock().unwrap().clone();
+        assert!(
+            updates.iter().any(|line| line == "step 1: list_dir"),
+            "child tool call must stream a progress line, got: {updates:?}"
         );
     }
 

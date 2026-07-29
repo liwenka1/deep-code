@@ -6,10 +6,16 @@ use crate::subagent::roles::SubAgentRole;
 /// cancels the child through its own [`AgentRuntime::cancel_turn`], which the
 /// loop surfaces as [`RuntimeEvent::TurnCancelled`]. On any non-success exit
 /// the step count is still returned so the ledger records real progress.
+///
+/// `on_progress` receives one short line per child tool call as it starts;
+/// the parent's `agent` tool forwards these through `cx.update`, so a
+/// minutes-long child shows live activity in the parent UI instead of a
+/// frozen tool cell.
 pub async fn run_subagent(
     runtime: AgentRuntime,
     max_steps: u32,
     role: SubAgentRole,
+    on_progress: impl Fn(String),
 ) -> Result<(String, u32), (u32, String)> {
     let mut steps = 0u32;
     let mut rx = runtime.drive_turn().await;
@@ -49,13 +55,16 @@ pub async fn run_subagent(
             }
             RuntimeEvent::TurnCancelled { .. } => return Err((steps, "cancelled".to_string())),
             RuntimeEvent::Error { message, .. } => return Err((steps, message)),
+            RuntimeEvent::ToolCallStarted { tool_name, .. } => {
+                // The upcoming step: `steps` counts finished calls.
+                on_progress(format!("step {}: {tool_name}", steps + 1));
+            }
             RuntimeEvent::ToolCallFinished { .. } => {
                 steps += 1;
             }
             RuntimeEvent::TurnStarted { .. }
             | RuntimeEvent::AssistantDelta { .. }
             | RuntimeEvent::ReasoningDelta { .. }
-            | RuntimeEvent::ToolCallStarted { .. }
             | RuntimeEvent::ToolCallUpdated { .. }
             | RuntimeEvent::ToolCallProgress { .. }
             | RuntimeEvent::ApprovalResolved { .. }
