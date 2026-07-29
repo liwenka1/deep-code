@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::message::{Message, Role};
 use crate::model::ToolCallPayload;
 use crate::session_entry::{EntryKind, ExchangeResult, SessionEntry, ToolExchange};
@@ -19,9 +21,15 @@ pub(crate) const COMPACTION_SUMMARY_PREFIX: &str = "[会话摘要 / session summ
 /// which is where protocol invariants (every `tool_calls` id followed by a
 /// `role=tool` message) are enforced by construction — there is no
 /// after-the-fact repair step.
+///
+/// Entries are held behind `Arc` so the live session and the persistence
+/// record share one transcript: `persist()` copies a vector of pointers, not
+/// every entry's bytes. Entries are append-mostly; the one in-place mutation
+/// (a tool result landing in its exchange) goes through [`Arc::make_mut`],
+/// which clones only that single entry when the record still references it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Session {
-    entries: Vec<SessionEntry>,
+    entries: Vec<Arc<SessionEntry>>,
 }
 
 impl Session {
@@ -31,21 +39,21 @@ impl Session {
     }
 
     #[must_use]
-    pub fn from_entries(entries: Vec<SessionEntry>) -> Self {
+    pub fn from_entries(entries: Vec<Arc<SessionEntry>>) -> Self {
         Self { entries }
     }
 
     #[must_use]
-    pub fn entries(&self) -> &[SessionEntry] {
+    pub fn entries(&self) -> &[Arc<SessionEntry>] {
         &self.entries
     }
 
-    pub fn replace_entries(&mut self, entries: Vec<SessionEntry>) {
+    pub fn replace_entries(&mut self, entries: Vec<Arc<SessionEntry>>) {
         self.entries = entries;
     }
 
     fn push_entry(&mut self, entry: SessionEntry) {
-        self.entries.push(entry);
+        self.entries.push(Arc::new(entry));
     }
 
     pub fn push_system(&mut self, content: impl Into<String>) {
@@ -83,27 +91,37 @@ impl Session {
         content: String,
         status: ToolResultStatus,
     ) -> bool {
-        let latest_assistant =
-            self.entries
-                .iter_mut()
-                .rev()
-                .find_map(|entry| match &mut entry.kind {
-                    EntryKind::Assistant { exchanges, .. } => Some(exchanges),
-                    _ => None,
-                });
-        let Some(exchanges) = latest_assistant else {
+        // Find the newest assistant entry first, and only `make_mut` (which
+        // clones the entry while the persistence record also holds it) once a
+        // matching pending exchange is confirmed — a miss must stay copy-free.
+        let latest_assistant = self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|entry| matches!(entry.kind, EntryKind::Assistant { .. }));
+        let Some(entry) = latest_assistant else {
             return false;
         };
-        match exchanges
+        let EntryKind::Assistant { exchanges, .. } = &entry.kind else {
+            unreachable!("filtered to assistant entries above");
+        };
+        if !exchanges
+            .iter()
+            .any(|exchange| exchange.call.id == call_id && exchange.result.is_none())
+        {
+            return false;
+        }
+        let EntryKind::Assistant { exchanges, .. } = &mut Arc::make_mut(entry).kind else {
+            unreachable!("make_mut preserves the entry kind");
+        };
+        let Some(exchange) = exchanges
             .iter_mut()
             .find(|exchange| exchange.call.id == call_id && exchange.result.is_none())
-        {
-            Some(exchange) => {
-                exchange.result = Some(ExchangeResult { content, status });
-                true
-            }
-            None => false,
-        }
+        else {
+            unreachable!("presence checked above");
+        };
+        exchange.result = Some(ExchangeResult { content, status });
+        true
     }
 
     /// Derive the DeepSeek/OpenAI wire messages. Pending exchanges emit the
@@ -112,7 +130,10 @@ impl Session {
     /// construction.
     #[must_use]
     pub fn wire_messages(&self) -> Vec<Message> {
-        self.entries.iter().flat_map(entry_wire_messages).collect()
+        self.entries
+            .iter()
+            .flat_map(|entry| entry_wire_messages(entry))
+            .collect()
     }
 
     /// Group wire messages back into entries — the inverse of
@@ -171,7 +192,10 @@ impl Session {
                 }
             }
         }
-        Self { entries }
+        // Construction mutates entries freely above; sharing starts here.
+        Self {
+            entries: entries.into_iter().map(Arc::new).collect(),
+        }
     }
 }
 
@@ -344,9 +368,9 @@ mod tests {
     fn compaction_summary_round_trips_through_grouping() {
         let mut session = Session::new();
         session.replace_entries(vec![
-            SessionEntry::system("sys"),
-            SessionEntry::compaction("- 用户: 旧对话", 12),
-            SessionEntry::user("new question"),
+            Arc::new(SessionEntry::system("sys")),
+            Arc::new(SessionEntry::compaction("- 用户: 旧对话", 12)),
+            Arc::new(SessionEntry::user("new question")),
         ]);
         let wire = session.wire_messages();
         assert!(wire[1].content.starts_with("[会话摘要"));

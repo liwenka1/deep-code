@@ -32,7 +32,10 @@ fn resume_picker_navigates_and_cancels() {
     use deep_code_agent::SessionEntry;
     let make = |prompt: &str| {
         let mut record = SessionRecord::new(std::path::PathBuf::from("/tmp/ws"), "system");
-        record.entries = vec![SessionEntry::system("system"), SessionEntry::user(prompt)];
+        record.entries = vec![
+            std::sync::Arc::new(SessionEntry::system("system")),
+            std::sync::Arc::new(SessionEntry::user(prompt)),
+        ];
         record
     };
     let mut app = App::new();

@@ -104,8 +104,11 @@ pub struct SessionRecord {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     /// Domain-level conversation entries (schema v2). Wire messages are
-    /// derived via [`crate::session::Session::wire_messages`].
-    pub entries: Vec<SessionEntry>,
+    /// derived via [`crate::session::Session::wire_messages`]. Shared by
+    /// `Arc` with the live [`crate::session::Session`], so flushing the
+    /// transcript into the record copies pointers, not entry bytes; serde
+    /// serializes through the `Arc` transparently (same on-disk JSON).
+    pub entries: Vec<std::sync::Arc<SessionEntry>>,
     pub turns: Vec<TurnRecord>,
     /// Workspace snapshots created during this session.
     #[serde(default)]
@@ -136,7 +139,7 @@ impl SessionRecord {
     #[must_use]
     pub fn new(workspace: PathBuf, system_prompt: impl Into<String>) -> Self {
         let now = now_ms();
-        let entries = vec![SessionEntry::system(system_prompt)];
+        let entries = vec![std::sync::Arc::new(SessionEntry::system(system_prompt))];
         Self {
             schema_version: SESSION_SCHEMA_VERSION,
             id: new_session_id(),
@@ -183,7 +186,7 @@ impl SessionRecord {
     pub fn message_count(&self) -> usize {
         self.entries
             .iter()
-            .map(SessionEntry::wire_message_count)
+            .map(|entry| entry.wire_message_count())
             .sum()
     }
 }
@@ -297,11 +300,19 @@ mod tests {
     #[test]
     fn session_record_preview_uses_latest_user_entry() {
         let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "system");
-        record.entries.push(SessionEntry::user("first"));
         record
             .entries
-            .push(SessionEntry::assistant("ok", None, Vec::new()));
-        record.entries.push(SessionEntry::user("second"));
+            .push(std::sync::Arc::new(SessionEntry::user("first")));
+        record
+            .entries
+            .push(std::sync::Arc::new(SessionEntry::assistant(
+                "ok",
+                None,
+                Vec::new(),
+            )));
+        record
+            .entries
+            .push(std::sync::Arc::new(SessionEntry::user("second")));
 
         assert_eq!(record.preview(), "second");
         assert!(record.has_user_entry());

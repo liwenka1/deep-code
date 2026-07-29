@@ -263,7 +263,7 @@ mod tests {
 
     fn session_with(entries: Vec<SessionEntry>, updated_at_ms: u64) -> SessionRecord {
         let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "system");
-        record.entries = entries;
+        record.entries = entries.into_iter().map(std::sync::Arc::new).collect();
         record.updated_at_ms = updated_at_ms;
         record
     }

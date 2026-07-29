@@ -468,21 +468,28 @@ mod tests {
     #[test]
     fn hydrate_history_keeps_assistant_tool_calls_and_results() {
         let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "");
-        record.entries.push(SessionEntry::user("hi"));
-        record.entries.push(SessionEntry::assistant(
-            "",
-            None,
-            vec![ToolExchange {
-                call: call("call_1", "mock_echo"),
-                result: Some(ExchangeResult {
-                    content: "mock_echo: hi".to_string(),
-                    status: ToolResultStatus::Denied,
-                }),
-            }],
-        ));
         record
             .entries
-            .push(SessionEntry::compaction("older conversation summary", 2));
+            .push(std::sync::Arc::new(SessionEntry::user("hi")));
+        record
+            .entries
+            .push(std::sync::Arc::new(SessionEntry::assistant(
+                "",
+                None,
+                vec![ToolExchange {
+                    call: call("call_1", "mock_echo"),
+                    result: Some(ExchangeResult {
+                        content: "mock_echo: hi".to_string(),
+                        status: ToolResultStatus::Denied,
+                    }),
+                }],
+            )));
+        record
+            .entries
+            .push(std::sync::Arc::new(SessionEntry::compaction(
+                "older conversation summary",
+                2,
+            )));
         let mut turn = deep_code_agent::TurnRecord::new();
         turn.started_at_ms = 10;
         record.turns.push(turn);
@@ -526,12 +533,16 @@ mod tests {
     #[test]
     fn hydrate_history_restores_reasoning_content() {
         let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "");
-        record.entries.push(SessionEntry::user("hi"));
-        record.entries.push(SessionEntry::assistant(
-            "answer",
-            Some("thinking".to_string()),
-            Vec::new(),
-        ));
+        record
+            .entries
+            .push(std::sync::Arc::new(SessionEntry::user("hi")));
+        record
+            .entries
+            .push(std::sync::Arc::new(SessionEntry::assistant(
+                "answer",
+                Some("thinking".to_string()),
+                Vec::new(),
+            )));
 
         let cells = hydrate_history(&record);
         assert!(matches!(
@@ -549,12 +560,16 @@ mod tests {
         // An interrupted exchange (result never recorded) shows the call but
         // fabricates no result line.
         let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "");
-        record.entries.push(SessionEntry::user("go"));
-        record.entries.push(SessionEntry::assistant(
-            "",
-            None,
-            vec![ToolExchange::pending(call("call_1", "shell"))],
-        ));
+        record
+            .entries
+            .push(std::sync::Arc::new(SessionEntry::user("go")));
+        record
+            .entries
+            .push(std::sync::Arc::new(SessionEntry::assistant(
+                "",
+                None,
+                vec![ToolExchange::pending(call("call_1", "shell"))],
+            )));
 
         let cells = hydrate_history(&record);
         assert!(matches!(

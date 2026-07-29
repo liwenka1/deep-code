@@ -78,8 +78,11 @@ pub(super) fn migrate_v1(v1: SessionRecordV1) -> SessionRecord {
             .or_default()
             .push_back(result.status);
     }
+    // The entries were just built (refcount 1), so `make_mut` mutates in
+    // place — no cloning happens during migration.
     for entry in &mut entries {
-        let EntryKind::Assistant { exchanges, .. } = &mut entry.kind else {
+        let EntryKind::Assistant { exchanges, .. } = &mut std::sync::Arc::make_mut(entry).kind
+        else {
             continue;
         };
         for exchange in exchanges {
@@ -104,7 +107,8 @@ pub(super) fn migrate_v1(v1: SessionRecordV1) -> SessionRecord {
             .iter_mut()
             .rev()
             .find(|entry| matches!(entry.kind, EntryKind::Compaction { .. }))
-        && let EntryKind::Compaction { archived_count, .. } = &mut entry.kind
+        && let EntryKind::Compaction { archived_count, .. } =
+            &mut std::sync::Arc::make_mut(entry).kind
     {
         *archived_count = archived;
     }

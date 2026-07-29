@@ -2,6 +2,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use crate::message::{Message, Role};
 use crate::model_registry::{compaction_threshold_for_model, context_window_for_model};
@@ -31,7 +32,7 @@ pub fn context_usage_percent(estimated_tokens: u32, model: &str) -> u8 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionResult {
-    pub entries: Vec<SessionEntry>,
+    pub entries: Vec<Arc<SessionEntry>>,
     pub summary: String,
     pub archived_count: usize,
 }
@@ -103,8 +104,10 @@ pub fn stable_prefix_fingerprint(messages: &[Message]) -> u64 {
 
 /// Keep the leading system entry, summarize archived middle entries into one
 /// Compaction entry, retain the recent tail. `archived_count` counts entries.
+/// Entries come and go as `Arc`s: retained/tail entries are pointer clones,
+/// only the new Compaction entry is allocated.
 #[must_use]
-pub fn compact_entries(entries: &[SessionEntry]) -> CompactionResult {
+pub fn compact_entries(entries: &[Arc<SessionEntry>]) -> CompactionResult {
     let unchanged = || CompactionResult {
         entries: entries.to_vec(),
         summary: String::new(),
@@ -148,7 +151,10 @@ pub fn compact_entries(entries: &[SessionEntry]) -> CompactionResult {
     if let Some(system_entry) = system {
         out.push(system_entry);
     }
-    out.push(SessionEntry::compaction(summary.clone(), archived.len()));
+    out.push(Arc::new(SessionEntry::compaction(
+        summary.clone(),
+        archived.len(),
+    )));
     out.extend_from_slice(&entries[tail_start..]);
 
     CompactionResult {
@@ -160,8 +166,11 @@ pub fn compact_entries(entries: &[SessionEntry]) -> CompactionResult {
 
 /// Summarize archived entries via their derived wire messages, so the summary
 /// text stays byte-equivalent with the old message-based path.
-fn summarize_archived_entries(entries: &[SessionEntry]) -> String {
-    let wire: Vec<Message> = entries.iter().flat_map(entry_wire_messages).collect();
+fn summarize_archived_entries(entries: &[Arc<SessionEntry>]) -> String {
+    let wire: Vec<Message> = entries
+        .iter()
+        .flat_map(|entry| entry_wire_messages(entry))
+        .collect();
     summarize_archived(&wire)
 }
 
@@ -192,14 +201,14 @@ mod tests {
 
     #[test]
     fn compact_keeps_recent_tail() {
-        let mut entries = vec![SessionEntry::system("sys")];
+        let mut entries = vec![Arc::new(SessionEntry::system("sys"))];
         for index in 0..12 {
-            entries.push(SessionEntry::user(format!("u{index}")));
-            entries.push(SessionEntry::assistant(
+            entries.push(Arc::new(SessionEntry::user(format!("u{index}"))));
+            entries.push(Arc::new(SessionEntry::assistant(
                 format!("a{index}"),
                 None,
                 Vec::new(),
-            ));
+            )));
         }
         let result = compact_entries(&entries);
         assert!(result.archived_count > 0);
@@ -218,7 +227,7 @@ mod tests {
         let wire: Vec<Message> = result
             .entries
             .iter()
-            .flat_map(entry_wire_messages)
+            .flat_map(|entry| entry_wire_messages(entry))
             .collect();
         assert!(
             wire.iter()
@@ -248,26 +257,26 @@ mod tests {
         // Compact once, grow past threshold, compact again: the second summary
         // must keep the first summary's text as a byte prefix so the automatic
         // prefix cache survives the second compaction instead of a full miss.
-        let mut entries = vec![SessionEntry::system("sys")];
+        let mut entries = vec![Arc::new(SessionEntry::system("sys"))];
         for index in 0..12 {
-            entries.push(SessionEntry::user(format!("u{index}")));
-            entries.push(SessionEntry::assistant(
+            entries.push(Arc::new(SessionEntry::user(format!("u{index}"))));
+            entries.push(Arc::new(SessionEntry::assistant(
                 format!("a{index}"),
                 None,
                 Vec::new(),
-            ));
+            )));
         }
         let first = compact_entries(&entries);
         assert!(first.archived_count > 0 && !first.summary.is_empty());
 
         let mut grown = first.entries.clone();
         for index in 12..24 {
-            grown.push(SessionEntry::user(format!("u{index}")));
-            grown.push(SessionEntry::assistant(
+            grown.push(Arc::new(SessionEntry::user(format!("u{index}"))));
+            grown.push(Arc::new(SessionEntry::assistant(
                 format!("a{index}"),
                 None,
                 Vec::new(),
-            ));
+            )));
         }
         let second = compact_entries(&grown);
         assert!(second.archived_count > 0);

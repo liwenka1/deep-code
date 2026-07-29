@@ -206,9 +206,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
         let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
-        record
-            .entries
-            .push(crate::session_entry::SessionEntry::user("hello"));
+        record.entries.push(std::sync::Arc::new(
+            crate::session_entry::SessionEntry::user("hello"),
+        ));
         record.touch();
 
         store.save(&record).unwrap();
