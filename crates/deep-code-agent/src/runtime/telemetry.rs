@@ -1,9 +1,66 @@
+use serde::{Deserialize, Serialize};
+
 use crate::compaction::{context_usage_percent, effective_compaction_threshold};
 use crate::model::Usage;
 use crate::model_registry::context_window_for_model;
 use crate::model_route::TurnRoute;
-use crate::pricing::{PrefixStatus, TurnTelemetry, calculate_turn_cost};
+use crate::pricing::{CostEstimate, calculate_turn_cost};
 use crate::runtime::AgentRuntime;
+
+/// Prompt-prefix cache status for a turn. Presentation (the user-facing tag)
+/// lives in the TUI's language pack; this stays a plain data enum.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixStatus {
+    FirstTurn,
+    Stable,
+    Changed,
+}
+
+/// One turn's telemetry snapshot: routing, token/cache counts, cost, and
+/// context-pressure readouts. Built by [`AgentRuntime::build_turn_telemetry`]
+/// and surfaced on `RuntimeEvent::TurnFinished`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnTelemetry {
+    pub route_label: String,
+    pub effective_model: String,
+    pub reasoning_effort: String,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub cache_hit_tokens: Option<u32>,
+    pub cache_miss_tokens: Option<u32>,
+    /// Cumulative session cache tokens, for a session-wide hit-rate readout.
+    #[serde(default)]
+    pub session_cache_hit_tokens: u32,
+    #[serde(default)]
+    pub session_cache_miss_tokens: u32,
+    /// Cumulative spend avoided by cache hits this session (vs all-miss).
+    #[serde(default)]
+    pub session_cache_savings: CostEstimate,
+    pub prefix_status: PrefixStatus,
+    #[serde(default)]
+    pub route_reason: String,
+    /// What decided the route this turn: `hard-rule` / `heuristic` / `cascade`.
+    #[serde(default)]
+    pub route_source: String,
+    /// True on the turn where cascade escalation latched on (Flash's repeated
+    /// tool-call failures crossed the threshold). That turn still ran on Flash;
+    /// escalation takes effect from the next turn.
+    #[serde(default)]
+    pub cascade_triggered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    pub context_window: u32,
+    pub estimated_context_tokens: u32,
+    pub context_usage_percent: u8,
+    pub near_compaction_threshold: bool,
+    pub used_model_fallback: bool,
+    /// Transparent stream retries used this turn (0 when the network is fine).
+    #[serde(default)]
+    pub stream_retries: u32,
+    pub turn_cost: CostEstimate,
+    pub session_cost: CostEstimate,
+}
 
 impl AgentRuntime {
     /// Accumulate one completed request's usage into the turn- and

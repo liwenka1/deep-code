@@ -43,6 +43,7 @@ use crate::tool::{ApprovalDecision, ApprovalRequest, ToolCall, ToolRegistry};
 use event::emit;
 pub use event::{RuntimeEvent, RuntimeEventReceiver, ToolCallId, TurnId};
 use state::{Persistence, RuntimeState};
+pub use telemetry::{PrefixStatus, TurnTelemetry};
 
 /// How long [`AgentRuntime::shutdown`] waits for a cancelled live turn to
 /// finalize before proceeding anyway. Sized to cover the foreground-shell

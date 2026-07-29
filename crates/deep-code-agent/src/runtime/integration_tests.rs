@@ -2401,7 +2401,7 @@ impl LlmClient for AttemptScriptClient {
     }
 }
 
-fn turn_finished_telemetry(events: &[RuntimeEvent]) -> Option<crate::pricing::TurnTelemetry> {
+fn turn_finished_telemetry(events: &[RuntimeEvent]) -> Option<super::telemetry::TurnTelemetry> {
     events.iter().find_map(|event| match event {
         RuntimeEvent::TurnFinished { telemetry, .. } => telemetry.clone(),
         _ => None,

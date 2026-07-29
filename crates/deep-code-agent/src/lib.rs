@@ -59,8 +59,11 @@ pub use model::{
     ChatRequest, FunctionCallDelta, ToolCallDelta, ToolCallFunctionPayload, ToolCallPayload, Usage,
 };
 pub use model_registry::{DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO, ModelRegistry};
-pub use pricing::{CostCurrency, CostEstimate, PrefixStatus, TurnTelemetry};
-pub use runtime::{AgentRuntime, RuntimeEvent, RuntimeEventReceiver, ToolCallId, TurnId};
+pub use pricing::{CostCurrency, CostEstimate};
+pub use runtime::{
+    AgentRuntime, PrefixStatus, RuntimeEvent, RuntimeEventReceiver, ToolCallId, TurnId,
+    TurnTelemetry,
+};
 pub use runtime_launch::{LaunchedRuntime, launch_runtime, web_enabled};
 pub use sandbox::sandbox_available;
 pub use session::Session;

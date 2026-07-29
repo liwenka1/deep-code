@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use super::telemetry::TurnTelemetry;
 use crate::checkpoint::CheckpointId;
 use crate::model::Usage;
-use crate::pricing::TurnTelemetry;
 use crate::session_store::{SessionId, now_ms};
 use crate::tool::{ApprovalRequest, ToolResult, ToolUpdate};
 
