@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod integration {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
 
     use async_stream::try_stream;
@@ -53,6 +53,34 @@ None.
                 for token in text.split_inclusive('\n') {
                     yield AgentEvent::TextDelta { text: token.to_string() };
                 }
+                yield AgentEvent::Done { usage: None };
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
+    /// Streams the canonical report while recording each request's model id,
+    /// so tests can assert which tier a child actually ran on.
+    struct ModelRecordingClient {
+        models: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for ModelRecordingClient {
+        fn provider_name(&self) -> &'static str {
+            "model-recording"
+        }
+
+        fn model(&self) -> &str {
+            "model-recording"
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
+            self.models.lock().unwrap().push(request.model.clone());
+            let stream = try_stream! {
+                yield AgentEvent::TextDelta {
+                    text: "### SUMMARY\nok\n\n### EVIDENCE\nNone.\n\n### CHANGES\nNone.\n\n### RISKS\nNone.\n\n### BLOCKERS\nNone.\n".to_string(),
+                };
                 yield AgentEvent::Done { usage: None };
             };
             Ok(Box::pin(stream))
@@ -208,6 +236,47 @@ None.
                 .as_ref()
                 .is_some_and(|report| report.summary.contains("Mapped")),
             "ledger must hold the parsed structured report"
+        );
+    }
+
+    /// Reconnaissance roles are pinned to the flash tier; writing/planning
+    /// roles inherit the parent's configured model (the point of dispatching
+    /// them is their output quality).
+    #[tokio::test]
+    async fn reconnaissance_roles_pin_flash_and_implementer_inherits() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Arc::new(ModelRecordingClient {
+            models: StdMutex::new(Vec::new()),
+        });
+        let cancel = CancellationToken::new();
+        let mut registry = ToolRegistry::new();
+        let services = attach_subagent_tools(
+            &mut registry,
+            client.clone(),
+            AgentConfig::default(),
+            dir.path().to_path_buf(),
+            cancel,
+        );
+
+        registry
+            .run_tool_call(agent_call("call_1", "map the crate", "explore"), None)
+            .await
+            .unwrap();
+        registry
+            .run_tool_call(agent_call("call_2", "land the fix", "implementer"), None)
+            .await
+            .unwrap();
+
+        let models = client.models.lock().unwrap().clone();
+        assert_eq!(models.len(), 2, "one child request per call: {models:?}");
+        assert_eq!(
+            models[0],
+            crate::model_registry::DEEPSEEK_V4_FLASH,
+            "explore child must run on the flash tier"
+        );
+        assert_eq!(
+            models[1], services.agent_config.model,
+            "implementer child must inherit the parent's configured model"
         );
     }
 

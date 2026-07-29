@@ -56,7 +56,9 @@ pub struct AgentParams {
     /// starts with a fresh context and sees nothing else.
     task: String,
     /// Capability profile: general | explore | plan | review | implementer |
-    /// verifier. Read-only roles cannot write files. Defaults to general.
+    /// verifier (common aliases like explorer/reviewer/tester are accepted).
+    /// Read-only roles cannot write files and run on the fast model tier.
+    /// Defaults to general.
     role: Option<String>,
     /// Optional display name (shown by /agents).
     name: Option<String>,
@@ -97,11 +99,18 @@ impl Tool for AgentTool {
             self.services.exec_policy.clone(),
         )
         .map_err(|error| ToolError::exec_failed(AGENT_TOOL, error.to_string()))?;
+        // Reconnaissance roles run pinned to the flash tier (a fixed model id
+        // bypasses per-turn auto-routing in the child); other roles inherit
+        // the parent's configured model. See `SubAgentRole::model_override`.
+        let mut child_config = self.services.agent_config.clone();
+        if let Some(model) = role.model_override() {
+            child_config.model = model.to_string();
+        }
         let runtime = AgentRuntime::with_system_prompt_shared(
             std::sync::Arc::clone(&self.services.client),
             child_tools,
             child_system_prompt(role),
-            self.services.agent_config.clone(),
+            child_config,
             true,
         );
 
