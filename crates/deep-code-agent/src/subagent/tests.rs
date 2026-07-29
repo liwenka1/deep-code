@@ -260,7 +260,7 @@ None.
         );
         {
             let mut manager = services.manager.write().unwrap();
-            let _ = manager.set_max_concurrent(1);
+            manager.set_max_concurrent(1);
         }
 
         // Both calls poll concurrently: the first inserts its Running record

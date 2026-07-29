@@ -20,10 +20,7 @@ pub(crate) use client::LspTransport;
 #[cfg(test)]
 pub(crate) use diagnostics::{Diagnostic, DiagnosticRange, Severity};
 pub use diagnostics::{render_blocks, summarize_blocks};
-#[allow(unused_imports)]
-pub use hooks::{edited_paths_for_tool, is_edit_tool, resolve_edit_paths};
+pub use hooks::is_edit_tool;
 pub use manager::LspManager;
-#[allow(unused_imports)]
-pub use path_util::{normalize_path, paths_equal};
-#[allow(unused_imports)]
-pub use registry::{Language, detect_language, server_for};
+#[cfg(test)]
+pub(crate) use registry::Language;

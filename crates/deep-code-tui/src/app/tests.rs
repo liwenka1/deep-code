@@ -84,9 +84,6 @@ fn scroll_helpers_adjust_offset() {
     assert_eq!(app.scroll_offset, 3);
     app.scroll_down();
     assert_eq!(app.scroll_offset, 0);
-    app.scroll_up();
-    app.scroll_to_bottom();
-    assert_eq!(app.scroll_offset, 0);
 }
 
 #[test]
@@ -335,28 +332,12 @@ fn multi_tool_cells_flush_independently_per_finished_call() {
 }
 
 #[test]
-fn composer_newline_and_height_clamp() {
+fn composer_newline_edits_and_streaming_guard() {
     let mut app = App::new();
-    assert_eq!(
-        app.input_height(80),
-        3,
-        "empty input is one row plus borders"
-    );
-
     app.push_char('a');
     app.push_newline();
     app.push_char('b');
     assert_eq!(app.input, "a\nb");
-    assert_eq!(app.input_height(80), 4);
-
-    for _ in 0..10 {
-        app.push_newline();
-    }
-    assert_eq!(
-        app.input_height(80),
-        8,
-        "content rows clamp at 6 (+2 borders)"
-    );
 
     app.is_streaming = true;
     let before = app.input.clone();

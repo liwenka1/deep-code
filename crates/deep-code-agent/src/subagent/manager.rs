@@ -48,10 +48,12 @@ impl SubAgentManager {
         manager
     }
 
-    #[must_use]
-    pub fn set_max_concurrent(&mut self, max_concurrent: usize) -> &mut Self {
+    /// Test-only: shrink the concurrency cap after construction so the
+    /// registry-path race test can force cap=1 (the production attach path
+    /// hardcodes `DEFAULT_MAX_CONCURRENT`). No runtime reconfigures concurrency.
+    #[cfg(test)]
+    pub fn set_max_concurrent(&mut self, max_concurrent: usize) {
         self.max_concurrent = max_concurrent.clamp(1, HARD_MAX_CONCURRENT);
-        self
     }
 
     pub fn running_count(&self) -> usize {

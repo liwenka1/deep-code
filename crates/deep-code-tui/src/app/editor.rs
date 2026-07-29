@@ -348,19 +348,6 @@ impl App {
             .map_or(0, |l| l.chars().count())
     }
 
-    /// Composer area height including borders; content grows 1..=MAX visual rows.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn input_height(&self, inner_width: u16) -> u16 {
-        let layout = layout_input(
-            &self.input,
-            self.input_cursor,
-            usize::from(inner_width.max(1)),
-            COMPOSER_MAX_VISIBLE_ROWS,
-        );
-        (layout.total_rows.clamp(1, COMPOSER_MAX_VISIBLE_ROWS) as u16) + 2
-    }
-
     /// Recall the previous sent prompt (Ctrl+P). The live input is stashed as
     /// a draft and restored when navigating past the newest entry.
     pub fn history_prev(&mut self) {

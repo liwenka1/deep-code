@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use std::path::PathBuf;
 
-use crate::ui::{COMPOSER_MAX_VISIBLE_ROWS, layout_input};
 use deep_code_agent::{
     AgentConfig, AgentRuntime, ApprovalDecision, ApprovalRequest, CostCurrency, JobStore,
     JsonSessionStore, LaunchedRuntime, RuntimeEvent, SessionRecord, SessionStore,
@@ -643,11 +642,6 @@ impl App {
 
     pub fn scroll_down(&mut self) {
         self.scroll_offset = self.scroll_offset.saturating_sub(3);
-    }
-
-    #[allow(dead_code)]
-    pub fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = 0;
     }
 
     pub fn scroll_approval_up(&mut self) {

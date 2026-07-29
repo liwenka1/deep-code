@@ -1,8 +1,6 @@
 mod input;
 mod render;
 
-pub(crate) use render::layout_input;
-
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
