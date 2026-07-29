@@ -5,7 +5,6 @@ use tokio::sync::Mutex;
 
 use crate::client::LlmClient;
 use crate::config::AgentConfig;
-use crate::model::Usage;
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::TurnId;
 use crate::runtime::persistence_actor::PersistenceActorHandle;
@@ -119,15 +118,14 @@ impl AgentRuntime {
     /// Close `turn_id`'s record. Guarded: a superseded loop (its turn was
     /// cancelled by a newer `begin_turn`) finalizing late must not consume the
     /// new turn's state, so a mismatched id is a no-op.
-    pub(super) async fn finish_turn(&self, turn_id: &TurnId, usage: Option<Usage>) {
+    pub(super) async fn finish_turn(&self, turn_id: &TurnId) {
         let mut state = self.state.lock().await;
         if state.current_turn_id.as_ref() != Some(turn_id) {
             return;
         }
-        if let Some(mut turn) = state.current_turn.take() {
+        if let Some(turn) = state.current_turn.take() {
             state.current_prompt = None;
             state.current_turn_id = None;
-            turn.finish(usage);
             drop(state);
             if let Some(persistence) = self.persistence.as_ref() {
                 let mut record = persistence.record.lock().await;
@@ -141,13 +139,13 @@ impl AgentRuntime {
     }
 
     pub(super) async fn abort_turn(&self, turn_id: &TurnId) {
-        self.finish_turn(turn_id, None).await;
+        self.finish_turn(turn_id).await;
     }
 
     pub(super) async fn finalize_orphan_turn(&self) {
         let open = self.state.lock().await.current_turn_id.clone();
         if let Some(turn_id) = open {
-            self.finish_turn(&turn_id, None).await;
+            self.finish_turn(&turn_id).await;
         }
     }
 }

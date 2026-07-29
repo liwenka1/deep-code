@@ -45,7 +45,10 @@ pub(super) struct SessionRecordV1 {
 
 /// V1 turn shape: carries the audit `tool_results` the live [`TurnRecord`]
 /// no longer stores; migration mines them for result statuses, then drops them.
+/// Most fields exist only to consume the old wire format — the live record now
+/// keeps just `started_at_ms`, so the rest are deserialized and discarded.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // fields consume the v1 wire format; only started_at_ms/tool_results are read
 pub(super) struct TurnRecordV1 {
     pub user_prompt: String,
     #[serde(default)]
@@ -106,14 +109,13 @@ pub(super) fn migrate_v1(v1: SessionRecordV1) -> SessionRecord {
         *archived_count = archived;
     }
 
+    // v2 keeps only the turn's start timestamp; the old prompt/usage/finish
+    // fields were write-only and are dropped on migration.
     let turns = v1
         .turns
         .into_iter()
         .map(|turn| TurnRecord {
-            user_prompt: turn.user_prompt,
-            usage: turn.usage,
             started_at_ms: turn.started_at_ms,
-            finished_at_ms: turn.finished_at_ms,
         })
         .collect();
 

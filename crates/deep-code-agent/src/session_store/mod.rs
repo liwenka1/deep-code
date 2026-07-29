@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 pub use json::JsonSessionStore;
 
 use crate::checkpoint::CheckpointId;
-use crate::model::Usage;
 use crate::pricing::CostEstimate;
 use crate::session_entry::{EntryKind, SessionEntry};
 
@@ -45,14 +44,14 @@ impl SessionId {
     }
 }
 
-/// One user turn's metadata (prompt, usage, timing). Tool outputs are not
-/// duplicated here: the model-facing copy lives in the entries' exchanges.
+/// One user turn's boundary timestamp. Only `started_at_ms` and `turns.len()`
+/// are ever read (the turn count and the checkpoint-to-turn time window); the
+/// prompt/usage/finish-time this once carried were write-only, so they were
+/// dropped. Old session files that still contain them load fine — `SessionRecord`
+/// has no `deny_unknown_fields`, so serde ignores the extra keys.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnRecord {
-    pub user_prompt: String,
-    pub usage: Option<Usage>,
     pub started_at_ms: u64,
-    pub finished_at_ms: Option<u64>,
 }
 
 /// Checkpoint metadata retained in the session for UI/API resume projections.
@@ -76,18 +75,16 @@ impl CheckpointRecord {
 
 impl TurnRecord {
     #[must_use]
-    pub fn new(user_prompt: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         Self {
-            user_prompt: user_prompt.into(),
-            usage: None,
             started_at_ms: now_ms(),
-            finished_at_ms: None,
         }
     }
+}
 
-    pub fn finish(&mut self, usage: Option<Usage>) {
-        self.usage = usage;
-        self.finished_at_ms = Some(now_ms());
+impl Default for TurnRecord {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -311,13 +308,6 @@ mod tests {
         assert_eq!(record.message_count(), 4);
     }
 
-    #[test]
-    fn turn_record_finish_stamps_time() {
-        let mut turn = TurnRecord::new("hello");
-        turn.finish(None);
-        assert!(turn.finished_at_ms.is_some());
-    }
-
     /// v2 files written before `config`, per-turn `tool_results`, and entry
     /// `id`/`parent` were dropped still carry those keys; loading must ignore
     /// them instead of failing.
@@ -346,5 +336,8 @@ mod tests {
         assert_eq!(record.entries.len(), 2);
         assert_eq!(record.preview(), "hi");
         assert_eq!(record.turns.len(), 1);
+        // The slimmed TurnRecord keeps only started_at_ms; the old
+        // user_prompt/usage/finished_at_ms keys are ignored, not rejected.
+        assert_eq!(record.turns[0].started_at_ms, 1);
     }
 }

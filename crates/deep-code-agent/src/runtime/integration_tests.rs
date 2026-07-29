@@ -1468,7 +1468,6 @@ async fn persistence_saves_messages_and_turns() {
     let record = store.load(&session_id).unwrap();
     assert_eq!(record.message_count(), 3);
     assert_eq!(record.turns.len(), 1);
-    assert_eq!(record.turns[0].user_prompt, "hi");
 }
 
 #[tokio::test]
@@ -1570,8 +1569,6 @@ async fn stream_error_finalizes_open_turn() {
     let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
     let record = store.load(&session_id).unwrap();
     assert_eq!(record.turns.len(), 1);
-    assert_eq!(record.turns[0].user_prompt, "hi");
-    assert!(record.turns[0].finished_at_ms.is_some());
 }
 
 #[tokio::test]
@@ -1610,7 +1607,6 @@ async fn persistence_saves_tool_exchange_results() {
     let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
     let record = store.load(&session_id).unwrap();
     assert_eq!(record.turns.len(), 1);
-    assert_eq!(record.turns[0].user_prompt, "please echo");
     // Tool outputs persist through the entries' exchanges (single copy).
     let exchange = record
         .entries
@@ -2689,7 +2685,7 @@ async fn begin_turn_supersedes_live_turn_without_clobbering() {
     );
 
     // The superseded loop finalizing late must be a no-op under the id guard.
-    runtime.finish_turn(&first_id, None).await;
+    runtime.finish_turn(&first_id).await;
     let state = runtime.state.lock().await;
     assert!(
         state.current_turn.is_some(),

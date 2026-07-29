@@ -483,9 +483,8 @@ mod tests {
         record
             .entries
             .push(SessionEntry::compaction("older conversation summary", 2));
-        let mut turn = deep_code_agent::TurnRecord::new("hi");
+        let mut turn = deep_code_agent::TurnRecord::new();
         turn.started_at_ms = 10;
-        turn.finished_at_ms = Some(20);
         record.turns.push(turn);
         let mut checkpoint = deep_code_agent::CheckpointRecord::new(
             deep_code_agent::CheckpointId("checkpoint_1".to_string()),

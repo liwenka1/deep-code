@@ -241,7 +241,7 @@ impl AgentRuntime {
             // synthesize their placeholder at wire derivation.
             state.session.push_user(&prompt);
             state.pending = None;
-            state.current_turn = Some(TurnRecord::new(prompt.clone()));
+            state.current_turn = Some(TurnRecord::new());
             state.current_prompt = Some(prompt);
             state.current_turn_id = Some(turn_id);
             state.cancel = CancellationToken::new();

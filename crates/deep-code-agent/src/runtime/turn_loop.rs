@@ -268,7 +268,7 @@ impl AgentRuntime {
                         stream_retries,
                     )
                     .await;
-                self.finish_turn(&turn_id, usage.clone()).await;
+                self.finish_turn(&turn_id).await;
                 // Surface any LSP warnings buffered since the last edit tool
                 // before the turn closes, so none are stranded to the next one.
                 self.drain_lsp_warnings(tx).await;
