@@ -197,6 +197,7 @@ text_ids! {
     CopiedSelection,
     StatusEmptyPrompt,
     StatusStreamingFrom,
+    StatusSteeringQueued,
     StatusInputClearedEsc,
     StatusInputClearedCtrlC,
     StatusCtrlCQuitConfirm,

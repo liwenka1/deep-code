@@ -49,6 +49,7 @@
   "CopiedSelection": "Selection copied ({count} chars)",
   "StatusEmptyPrompt": "Enter a prompt before sending",
   "StatusStreamingFrom": "Waiting for {backend}...",
+  "StatusSteeringQueued": "Queued ({count}) — sends when the current turn finishes",
   "StatusInputClearedEsc": "Input cleared (Esc again to quit)",
   "StatusInputClearedCtrlC": "Input cleared (Ctrl+C again to quit)",
   "StatusCtrlCQuitConfirm": "Press Ctrl+C again to quit",

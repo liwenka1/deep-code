@@ -49,6 +49,7 @@
   "CopiedSelection": "已复制选中文本 ({count} 字)",
   "StatusEmptyPrompt": "请输入内容后再发送",
   "StatusStreamingFrom": "正在等待 {backend} 响应...",
+  "StatusSteeringQueued": "已排队 ({count}) — 当前回合结束后自动发送",
   "StatusInputClearedEsc": "已清空输入 (再按 Esc 退出)",
   "StatusInputClearedCtrlC": "已清空输入 (再按 Ctrl+C 退出)",
   "StatusCtrlCQuitConfirm": "再按一次 Ctrl+C 退出",

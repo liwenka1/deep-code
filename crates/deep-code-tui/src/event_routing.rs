@@ -202,6 +202,8 @@ impl App {
                     .unwrap_or_default();
                 self.is_streaming = false;
                 self.clear_stream_receiver();
+                // Fire anything the user lined up while this turn streamed.
+                self.flush_steering_queue();
             }
             RuntimeEvent::TurnCancelled { .. } => {
                 self.flush_active_turn();
@@ -210,6 +212,9 @@ impl App {
                 self.status = self.tr(TextId::StatusCancelled).to_string();
                 self.pending_approval = None;
                 self.is_streaming = false;
+                // Cancel means "changed my mind": drop prompts queued behind
+                // the abandoned turn rather than firing them at nothing.
+                self.steering_queue.clear();
                 self.clear_stream_receiver();
             }
             RuntimeEvent::Error { message, .. } => self.record_error(message),

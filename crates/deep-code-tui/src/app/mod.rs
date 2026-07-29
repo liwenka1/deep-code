@@ -83,6 +83,11 @@ pub struct App {
     /// consecutive Ctrl+C then quits. Reset by any other key.
     pub(crate) ctrl_c_pending: bool,
     pub is_streaming: bool,
+    /// Prompts typed while a turn was streaming, queued in order. Drained and
+    /// sent as one combined follow-up when the turn ends (see `submit` and the
+    /// stream-end handlers). Cleared on cancel — Esc/Ctrl+C means "changed my
+    /// mind", so nothing queued behind the cancelled turn should fire.
+    pub(crate) steering_queue: Vec<String>,
     pub pending_approval: Option<ApprovalRequest>,
     pub last_checkpoint: Option<String>,
     pub session_id: Option<String>,
@@ -344,6 +349,7 @@ impl App {
             should_quit: false,
             ctrl_c_pending: false,
             is_streaming: false,
+            steering_queue: Vec::new(),
             pending_approval: None,
             last_checkpoint: None,
             session_id,
@@ -488,7 +494,9 @@ impl App {
     }
 
     pub fn submit(&mut self) {
-        if self.is_streaming || self.pending_approval.is_some() {
+        // An approval is a modal decision — it must be answered, not typed
+        // over — so the composer stays inert until it resolves.
+        if self.pending_approval.is_some() {
             return;
         }
         self.close_completion();
@@ -510,8 +518,28 @@ impl App {
             self.remember_prompt(&sent);
         }
 
+        // Slash commands are interactive directives, not conversation — they
+        // run immediately (against the live UI) rather than queueing behind a
+        // stream, in both idle and streaming states.
         if display.starts_with('/') && self.handle_slash_command(&display) {
             self.clear_input();
+            return;
+        }
+
+        // Steering: a plain prompt typed mid-stream is queued, not dropped.
+        // It's sent as a follow-up when the turn ends — the user no longer has
+        // to wait for a long turn to finish before lining up the next message.
+        // Not added to the transcript here: the streaming turn's own output
+        // (held in `active_turn`) hasn't been flushed to `history` yet, so a
+        // user cell pushed now would render ABOVE it. The cell is added when
+        // the queue flushes, after the current turn's cells land.
+        if self.is_streaming {
+            self.steering_queue.push(sent);
+            self.clear_input();
+            self.status = self.tr_with(
+                TextId::StatusSteeringQueued,
+                &[("count", &self.steering_queue.len().to_string())],
+            );
             return;
         }
 
@@ -532,6 +560,31 @@ impl App {
         self.history.push(HistoryCell::user(sent.clone()));
 
         self.start_stream(StreamRequest::User(sent));
+    }
+
+    /// Send any prompts queued (steered) while the just-finished turn was
+    /// streaming, as one combined follow-up. Called after a turn ends cleanly;
+    /// the queued prompts are already shown in the transcript (added when
+    /// typed), so this only starts the stream. No-op when nothing is queued.
+    pub(crate) fn flush_steering_queue(&mut self) {
+        if self.steering_queue.is_empty() || self.is_streaming {
+            return;
+        }
+        // Blank-line join so multiple steered messages read as separate turns
+        // to the model rather than one run-on paragraph.
+        let combined = std::mem::take(&mut self.steering_queue).join("\n\n");
+        self.error = None;
+        self.scroll_offset = 0;
+        self.approval_scroll_offset = 0;
+        self.is_streaming = true;
+        self.status = self.tr_with(
+            TextId::StatusStreamingFrom,
+            &[("backend", &self.backend_label)],
+        );
+        // Added now (not at queue time): the just-finished turn's cells have
+        // landed in `history`, so this renders after them, in order.
+        self.history.push(HistoryCell::user(combined.clone()));
+        self.start_stream(StreamRequest::User(combined));
     }
 
     /// Clear the composer and any pending collapsed-paste blocks.
@@ -747,6 +800,10 @@ impl App {
             self.tr(TextId::ErrorPrefix)
         )));
         self.is_streaming = false;
+        // A failed turn is not a clean hand-off: don't auto-fire queued
+        // prompts into a broken state (an API-key error would just re-error
+        // each). They stay in the transcript / prompt history to resend.
+        self.steering_queue.clear();
         self.clear_stream_receiver();
     }
 

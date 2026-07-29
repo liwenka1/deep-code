@@ -893,6 +893,66 @@ fn streaming_activity_shows_only_while_streaming() {
 }
 
 #[test]
+fn steering_queues_prompt_while_streaming_without_sending() {
+    let mut app = App::new();
+    app.is_streaming = true;
+    let history_before = app.history.len();
+
+    app.input = "wait, skip the tests".to_string();
+    app.submit();
+
+    assert_eq!(app.steering_queue, vec!["wait, skip the tests"]);
+    assert!(app.input.is_empty(), "composer clears after queueing");
+    assert!(app.is_streaming, "queueing must not end the current turn");
+    assert_eq!(
+        app.history.len(),
+        history_before,
+        "queued prompt is not shown until the turn finishes (ordering)"
+    );
+    assert!(app.status.contains("排队"));
+}
+
+// `flush_steering_queue` starts a real turn (`tokio::spawn`), so this needs a
+// runtime; only the synchronous pre-spawn state is asserted.
+#[tokio::test]
+async fn steering_flush_sends_combined_queue_after_turn() {
+    let mut app = App::new();
+    app.is_streaming = true;
+    app.input = "first".to_string();
+    app.submit();
+    app.input = "second".to_string();
+    app.submit();
+    assert_eq!(app.steering_queue.len(), 2);
+
+    // Turn ends: the queue drains into one combined follow-up, now shown.
+    app.is_streaming = false;
+    app.flush_steering_queue();
+
+    assert!(app.steering_queue.is_empty(), "queue drains on flush");
+    assert!(app.is_streaming, "flush starts the follow-up turn");
+    assert!(
+        matches!(app.history.last(), Some(HistoryCell::User { text }) if text == "first\n\nsecond"),
+        "combined queued prompt is appended after the finished turn"
+    );
+}
+
+#[test]
+fn steering_queue_cleared_on_error() {
+    let mut app = App::new();
+    app.is_streaming = true;
+    app.input = "queued".to_string();
+    app.submit();
+    assert_eq!(app.steering_queue.len(), 1);
+
+    app.record_error("boom".to_string());
+    assert!(
+        app.steering_queue.is_empty(),
+        "a failed turn drops queued prompts rather than firing them into an error"
+    );
+    assert!(!app.is_streaming);
+}
+
+#[test]
 fn escape_ladder_clears_input_then_quits() {
     let mut app = App::new();
     app.input = "draft".to_string();
