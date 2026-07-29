@@ -15,6 +15,13 @@ use crate::text_util::truncate_chars;
 /// message-based tail this can never sever a `tool_calls`/`tool` pair.
 const RECENT_TAIL_ENTRIES: usize = 5;
 
+/// Cap on the prior summary carried forward as the new summary's prefix.
+/// Chars, not tokens: for CJK-heavy summaries this is roughly a same-sized
+/// token budget (~8k), a small slice of the ~800k-token compaction threshold.
+/// See the fold comment in [`compact_entries`] for why capping the HEAD keeps
+/// the prefix byte-stable and the total bounded.
+const COMPACTION_CARRY_MAX_CHARS: usize = 8_000;
+
 /// Effective compaction threshold: env override or 80% of model context window.
 #[must_use]
 pub fn effective_compaction_threshold(model: &str, override_tokens: Option<u32>) -> u32 {
@@ -137,11 +144,26 @@ pub fn compact_entries(entries: &[Arc<SessionEntry>]) -> CompactionResult {
     // rather than re-summarizing it into a lossy `- 系统: …` line that would
     // rewrite the prefix bytes. Still destructive — only the summary text is
     // additive; the archived entries are dropped as before.
+    //
+    // The carried base is capped ([`COMPACTION_CARRY_MAX_CHARS`]) or the
+    // summary grows without bound and slowly becomes the context hog
+    // compaction exists to prevent. `truncate_chars` keeps the FIRST N chars,
+    // so the clamp is idempotent — once over the cap, every later compaction
+    // reproduces byte-identical leading text (prefix cache keeps hitting) and
+    // the summary stays bounded at cap + the newest archived chunk. The cost
+    // is that middle history ages out; the frozen head and the fresh tail
+    // survive, which is the usual compression trade.
     let summary = match archived.split_first() {
         Some((first, rest)) => match &first.kind {
-            EntryKind::Compaction { summary: base, .. } if rest.is_empty() => base.clone(),
+            EntryKind::Compaction { summary: base, .. } if rest.is_empty() => {
+                truncate_chars(base, COMPACTION_CARRY_MAX_CHARS)
+            }
             EntryKind::Compaction { summary: base, .. } => {
-                format!("{base}\n{}", summarize_archived_entries(rest))
+                format!(
+                    "{}\n{}",
+                    truncate_chars(base, COMPACTION_CARRY_MAX_CHARS),
+                    summarize_archived_entries(rest)
+                )
             }
             _ => summarize_archived_entries(archived),
         },
@@ -283,6 +305,50 @@ mod tests {
         assert!(
             second.summary.starts_with(&first.summary),
             "the re-compaction summary must extend the prior one as a stable prefix"
+        );
+    }
+
+    #[test]
+    fn carried_summary_is_capped_and_prefix_stable() {
+        // An oversized prior summary must be clamped (bounded growth), and the
+        // clamp must be idempotent: compacting again reproduces the same
+        // leading bytes so the prompt-cache prefix survives.
+        let huge = "旧".repeat(COMPACTION_CARRY_MAX_CHARS * 2);
+        let build = |base: &str, start: usize| {
+            let mut entries = vec![Arc::new(SessionEntry::compaction(base, 1))];
+            for index in start..start + 8 {
+                entries.push(Arc::new(SessionEntry::user(format!("u{index}"))));
+                entries.push(Arc::new(SessionEntry::assistant(
+                    format!("a{index}"),
+                    None,
+                    Vec::new(),
+                )));
+            }
+            entries
+        };
+
+        let first = compact_entries(&build(&huge, 0));
+        assert!(first.archived_count > 0);
+        assert!(
+            first.summary.chars().count() < huge.chars().count(),
+            "oversized carry must shrink"
+        );
+
+        let second = compact_entries(&build(&first.summary, 8));
+        let stable: String = first
+            .summary
+            .chars()
+            .take(COMPACTION_CARRY_MAX_CHARS)
+            .collect();
+        assert!(
+            second.summary.starts_with(&stable),
+            "clamped head must stay byte-stable across re-compaction"
+        );
+        assert!(
+            second.summary.chars().count()
+                <= first.summary.chars().count() + second.archived_count * 400,
+            "summary growth must stay bounded near the cap, got {} chars",
+            second.summary.chars().count()
         );
     }
 
