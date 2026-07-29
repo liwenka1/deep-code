@@ -515,25 +515,11 @@ async fn prompt_sse(
 #[derive(Deserialize)]
 struct ApprovalRequestBody {
     call_id: String,
-    decision: ApprovalDecisionWire,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ApprovalDecisionWire {
-    Approved,
-    ApprovedForSession,
-    Denied,
-}
-
-impl From<ApprovalDecisionWire> for ApprovalDecision {
-    fn from(value: ApprovalDecisionWire) -> Self {
-        match value {
-            ApprovalDecisionWire::Approved => Self::Approved,
-            ApprovalDecisionWire::ApprovedForSession => Self::ApprovedForSession,
-            ApprovalDecisionWire::Denied => Self::Denied,
-        }
-    }
+    // The agent enum is `#[serde(rename_all = "snake_case")]`, so it already
+    // deserializes `approved`/`approved_for_session`/`denied` straight off the
+    // wire — no separate DTO. It's the SSE output contract too, so reusing it
+    // as the HTTP input adds no coupling that wasn't already there.
+    decision: ApprovalDecision,
 }
 
 #[derive(Serialize)]
@@ -569,7 +555,7 @@ async fn resolve_pending_approval(
             body.call_id
         )));
     }
-    if pending.respond.send(body.decision.into()).is_err() {
+    if pending.respond.send(body.decision).is_err() {
         // The prompt stream that parked this approval is gone (client
         // disconnected); claiming "accepted" would be a lie.
         return Err(ApiError::conflict(
@@ -795,7 +781,7 @@ mod tests {
             state,
             ApprovalRequestBody {
                 call_id: "call-1".to_string(),
-                decision: ApprovalDecisionWire::Approved,
+                decision: ApprovalDecision::Approved,
             },
         )
         .await;
