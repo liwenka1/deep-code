@@ -11,7 +11,9 @@ const CHECKPOINT_DIR: &str = ".deep-code/checkpoints";
 const SKIP_DIRS: &[&str] = &[".git", ".deep-code", "target", "node_modules"];
 /// Default retention: snapshots beyond this count are pruned oldest-first.
 /// Every turn creates one before-turn snapshot, so without a cap the storage
-/// grows by one workspace copy per turn.
+/// grows by one workspace copy per turn. On CoW filesystems (APFS, btrfs/XFS)
+/// snapshots clone rather than rewrite, so unchanged files cost no extra disk
+/// and the cap mostly bounds directory count, not bytes.
 pub const DEFAULT_MAX_SNAPSHOTS: usize = 20;
 
 /// Identifier for a workspace snapshot stored outside `.git`.
@@ -246,14 +248,27 @@ fn copy_tree(source: &Path, dest: &Path, skip_meta: bool) -> Result<(), ToolErro
     Ok(())
 }
 
-/// Copy a file, retrying briefly on a transient Windows lock. A freshly-written
-/// workspace file is often held for a few milliseconds by antivirus real-time
-/// scanning or a concurrent writer; on Windows that blocks even a read-copy and
-/// surfaces as `ERROR_SHARING_VIOLATION` (32) / `ERROR_LOCK_VIOLATION` (33).
-/// Unix has no such lock so those codes never occur there — the retry is a
-/// no-op cost on Linux/macOS. The lock clears fast, so a short backoff turns a
-/// flaky snapshot failure into a reliable one.
+/// Copy a file, preferring a copy-on-write clone where the filesystem supports
+/// it (APFS on macOS, btrfs/XFS reflink on Linux). A cloned snapshot shares
+/// extents with the live file, so per turn an unchanged file costs no data I/O
+/// and ~zero extra disk across the whole retention window — cloning is purely
+/// an optimization, and any clone failure (non-CoW filesystem, cross-device)
+/// falls through to the plain copy below.
+///
+/// The plain path retries briefly on a transient Windows lock. A freshly-
+/// written workspace file is often held for a few milliseconds by antivirus
+/// real-time scanning or a concurrent writer; on Windows that blocks even a
+/// read-copy and surfaces as `ERROR_SHARING_VIOLATION` (32) /
+/// `ERROR_LOCK_VIOLATION` (33). Unix has no such lock so those codes never
+/// occur there. The lock clears fast, so a short backoff turns a flaky
+/// snapshot failure into a reliable one.
 fn copy_file_retrying(source: &Path, dest: &Path) -> std::io::Result<u64> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if cow::clone_file(source, dest) {
+        // Match fs::copy's contract (bytes of content copied); a clone shares
+        // rather than rewrites them, but the length is the same.
+        return source.metadata().map(|meta| meta.len());
+    }
     const BACKOFF_MS: &[u64] = &[10, 30, 100, 300];
     let mut attempt = 0;
     loop {
@@ -270,6 +285,66 @@ fn copy_file_retrying(source: &Path, dest: &Path) -> std::io::Result<u64> {
                 }
             }
         }
+    }
+}
+
+/// Best-effort copy-on-write file clones. `clone_file` returns `false` for any
+/// failure — the caller falls back to a plain copy, so nothing here may leave a
+/// half-written destination behind.
+#[cfg(target_os = "macos")]
+mod cow {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    /// APFS `clonefile(2)`: clones content and metadata (mode included) in one
+    /// call. Flags stay 0 — callers only pass regular files (symlinks take the
+    /// dedicated branch in `copy_tree`) and always create fresh destinations,
+    /// so there is nothing to not-follow and no existing dest to contend with.
+    pub(super) fn clone_file(source: &Path, dest: &Path) -> bool {
+        let (Ok(src), Ok(dst)) = (
+            CString::new(source.as_os_str().as_bytes()),
+            CString::new(dest.as_os_str().as_bytes()),
+        ) else {
+            return false; // interior NUL — let fs::copy report it properly
+        };
+        unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) == 0 }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod cow {
+    use std::fs::File;
+    use std::os::fd::AsRawFd;
+    use std::path::Path;
+
+    /// `FICLONE` = `_IOW(0x94, 9, int)`. A stable kernel ABI constant, spelled
+    /// out so this does not depend on the libc crate exporting it.
+    const FICLONE: libc::c_ulong = 0x4004_9409;
+
+    /// btrfs/XFS reflink via the `FICLONE` ioctl. Unlike macOS `clonefile`,
+    /// this clones content only, so the source's permission bits are applied
+    /// afterwards (fs::copy preserves them; the clone path must too — a
+    /// restored script keeps its executable bit).
+    pub(super) fn clone_file(source: &Path, dest: &Path) -> bool {
+        let Ok(src) = File::open(source) else {
+            return false;
+        };
+        let Ok(dst) = File::create(dest) else {
+            return false;
+        };
+        let cloned = unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE as _, src.as_raw_fd()) } == 0;
+        drop(dst);
+        if !cloned {
+            // ext4 etc.: remove the empty dest so the fs::copy fallback starts
+            // from the same fresh-target state every other path sees.
+            let _ = std::fs::remove_file(dest);
+            return false;
+        }
+        if let Ok(meta) = source.metadata() {
+            let _ = std::fs::set_permissions(dest, meta.permissions());
+        }
+        true
     }
 }
 
@@ -312,9 +387,9 @@ mod tests {
 
     #[test]
     fn copy_file_retrying_copies_contents() {
-        // Happy path (the only path reachable cross-platform — the transient
-        // lock codes 32/33 never occur on Unix). Guards that the retry wrapper
-        // is a faithful drop-in for fs::copy.
+        // On macOS/Linux this exercises the CoW clone fast path (falling back
+        // to fs::copy on non-CoW filesystems); the contract is identical
+        // either way: same contents, fs::copy's byte count.
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("a.txt");
         let dst = dir.path().join("b.txt");
@@ -322,6 +397,22 @@ mod tests {
         let bytes = copy_file_retrying(&src, &dst).unwrap();
         assert_eq!(bytes, "payload".len() as u64);
         assert_eq!(fs::read_to_string(&dst).unwrap(), "payload");
+    }
+
+    /// Whichever path runs (clone or plain copy), the destination must keep
+    /// the source's permission bits — a restored script loses nothing.
+    #[cfg(unix)]
+    #[test]
+    fn copy_preserves_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("run.sh");
+        let dst = dir.path().join("copy.sh");
+        fs::write(&src, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
+        copy_file_retrying(&src, &dst).unwrap();
+        let mode = fs::metadata(&dst).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "executable bit must survive the copy");
     }
 
     #[test]
