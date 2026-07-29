@@ -176,7 +176,7 @@ impl WebSearchTool {
 
         let url = format!(
             "https://html.duckduckgo.com/html/?q={}",
-            percent_encode(query)
+            form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
         );
         let parsed = match Url::parse(&url) {
             Ok(parsed) => parsed,
@@ -461,51 +461,6 @@ fn decode_entities(text: &str) -> String {
         .replace("&amp;", "&")
 }
 
-fn percent_encode(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() * 3);
-    for byte in text.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char);
-            }
-            b' ' => out.push('+'),
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
-}
-
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' => {
-                if let (Some(high), Some(low)) = (
-                    bytes.get(index + 1).and_then(|b| (*b as char).to_digit(16)),
-                    bytes.get(index + 2).and_then(|b| (*b as char).to_digit(16)),
-                ) {
-                    out.push((high * 16 + low) as u8);
-                    index += 3;
-                } else {
-                    out.push(b'%');
-                    index += 1;
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                index += 1;
-            }
-            other => {
-                out.push(other);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).to_string()
-}
-
 /// Parse DuckDuckGo's HTML results page: pairs of `result__a` (title+href,
 /// with the target wrapped in a `uddg` parameter) and `result__snippet`.
 fn parse_search_results(html: &str, max_results: usize) -> Vec<SearchResult> {
@@ -539,7 +494,9 @@ fn unwrap_ddg_link(href: &str) -> String {
     if let Some(start) = href.find("uddg=") {
         let encoded = &href[start + 5..];
         let encoded = encoded.split('&').next().unwrap_or(encoded);
-        return percent_decode(encoded);
+        return percent_encoding::percent_decode_str(encoded)
+            .decode_utf8_lossy()
+            .into_owned();
     }
     href.to_string()
 }

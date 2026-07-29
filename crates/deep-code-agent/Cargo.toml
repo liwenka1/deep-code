@@ -11,9 +11,11 @@ description = "deep-code agent core library (scaffold)"
 anyhow = "1"
 async-stream = "0.3"
 async-trait = "0.1"
+form_urlencoded = "1"
 futures-core = "0.3"
 futures-util = "0.3"
 ignore = "0.4"
+percent-encoding = "2"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 schemars = { version = "1", features = ["derive"] }
