@@ -5,10 +5,11 @@
 ## 特性
 
 - **DeepSeek 流式对话**：支持 reasoning 流与工具调用（function calling）。
-- **工具审批**：写文件/执行命令等需确认（`y` 批准 / `a` 本会话始终允许 / `n` 拒绝）；shell 按命令程序名在本会话放行，只读工具直接执行。
+- **工具审批**：写文件/执行命令等需确认（`y` 批准 / `a` 本会话始终允许 / `n` 拒绝）；shell 的 `a` 按命令 identity（程序名 + 子命令）放行，批过 `git push` 不会连带放行 `git status`，只读工具直接执行。四档权限（`default` / `accept_edits` / `auto` / `yolo`）按 Shift+Tab 循环切换。
 - **Auto 路由**：按任务在 `deepseek-v4-pro` / `deepseek-v4-flash` 间自动选模型与 reasoning effort；API 限流/故障时自动降级重试。
 - **会话与回滚**：会话持久化、`-c` 续接、`-r` 选择恢复；每轮 checkpoint 可 `/restore` 回滚。
-- **极简 TUI**：鼠标滚动/划选复制、粘贴折叠、补全菜单、状态行成本与上下文用量。
+- **极简 TUI**：鼠标滚动/划选复制、粘贴折叠、补全菜单；状态行只留权限档位、生效模型与上下文占用，成本明细在 `/status`。流式中可继续输入，本回合结束后作为追问自动发出。
+- **OS 沙箱**：shell/job 命令一律在系统沙箱内运行（macOS Seatbelt / Linux Landlock+seccomp），写入限制在工作区内，且**默认不带网络**——需要联网的命令必须声明并转人工审批。没有可用沙箱后端时拒绝执行而非降级裸跑。
 - **可扩展**：LSP 诊断、子代理（sub-agents）、skills（`SKILL.md` + shell）。
 
 ## 安装
@@ -41,6 +42,8 @@ deepcode            # 启动(新会话)
 deepcode                 # 新会话
 deepcode -c              # 续最近会话
 deepcode -r              # 选择历史会话
+deepcode --new           # 显式新会话
+deepcode --help          # 命令一览（--version 查版本）
 deepcode doctor [--json] # 环境自检
 deepcode serve --http    # 作为 HTTP 服务运行
 deepcode eval            # SWE-bench 评测 rollout(见下文)

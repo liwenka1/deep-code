@@ -50,17 +50,11 @@
 # auto 模式下成本优先（倾向 Flash）。
 # auto_cost_saving = false
 
-[auto]
-# auto 模式遇到“中等难度、无明确关键词”的模糊任务时，调用一次 Flash
-# (thinking-off) 分类器结合最近上下文判定模型与思考力度。关掉则退回纯启发式
-# （不产生额外模型调用）。对应环境变量 DEEP_CODE_AUTO_ROUTER_ENABLED。
-# router_enabled = true
-
-# Flash 路由的硬超时（毫秒）；超时静默回退启发式。
-# router_timeout_ms = 2500
-
-# 交给 Flash 路由参考的最近对话轮数。
-# router_context_turns = 6
+[lsp]
+# 编辑后 LSP 诊断总开关。开启时,写文件/改补丁后会拉起对应语言服务器取一次
+# 诊断并把错误随工具结果回给模型;关掉则完全不启动语言服务器(需要的语言
+# 服务器没装、或不想让它跑时用)。轮询间隔与条数上限是常量,不可配。
+# enabled = true
 
 [context]
 # 触发压缩的 token 阈值（默认按模型上下文窗口计算，一般无需设置）。
@@ -84,6 +78,11 @@
 # auto 档的边界(有意取舍):AI 判官只读取命令与参数文本,不读取待写入的
 # 文件内容——write_file/apply_patch 的实质内容不经判官审阅(高风险档、联网
 # 声明与离线后端仍然硬性转人工)。在意这条边界就用 default/accept_edits。
+#
+# 另一条硬规则(不可配):命令文本里出现 > < ` $ 任一字符(重定向、命令替换、
+# 变量展开)就一律转人工审批,不进任何自动放行面。所以 `echo $HOME`、
+# `mkdir -p src/$MOD`、`cp a "$HOME/b"` 这类即使在 accept_edits/auto 档也会
+# 问一次——间接形态没法靠静态解析看清最终行为,交由人眼是有意的保守取舍。
 # default_mode = "default"
 
 [stream]
