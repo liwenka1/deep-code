@@ -50,11 +50,19 @@ pub(super) struct SessionRecordV1 {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)] // fields consume the v1 wire format; only started_at_ms/tool_results are read
 pub(super) struct TurnRecordV1 {
+    // Every field defaults. A v1 file missing any one of these would otherwise
+    // fail the whole-record parse, and `list` only logs read failures to a file
+    // the TUI has already redirected — so one absent key would surface to the
+    // user as "that session is gone" instead of a turn with a zero timestamp.
+    #[serde(default)]
     pub user_prompt: String,
     #[serde(default)]
     pub tool_results: Vec<ToolResultV1>,
+    #[serde(default)]
     pub usage: Option<Usage>,
+    #[serde(default)]
     pub started_at_ms: u64,
+    #[serde(default)]
     pub finished_at_ms: Option<u64>,
 }
 

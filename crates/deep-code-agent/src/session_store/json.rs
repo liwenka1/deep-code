@@ -1,10 +1,11 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::migrate::{SessionRecordV1, migrate_v1};
 use super::{
-    SESSION_SCHEMA_VERSION, SessionId, SessionRecord, SessionStore, SessionStoreError, now_ms,
+    SESSION_SCHEMA_VERSION, SessionId, SessionRecord, SessionStore, SessionStoreError,
     sessions_dir_for_workspace, validate_session_id,
 };
 
@@ -36,8 +37,20 @@ impl JsonSessionStore {
             .file_stem()
             .and_then(|value| value.to_str())
             .unwrap_or("session");
-        let tmp_path = parent.join(format!(".{stem}.{}.tmp", now_ms()));
-        {
+        // pid + nanos, not milliseconds: two processes sharing one workspace
+        // (`deep-code -c` in two terminals, or a TUI alongside `serve --resume`)
+        // each run their own save loop. On a millisecond-only name their staging
+        // files collide, the second `File::create` truncates the first mid-write,
+        // and a half-written JSON can get renamed over the live session — which
+        // then fails to parse and reads to the user as "my session disappeared".
+        let tmp_path = parent.join(format!(
+            ".{stem}.{}.{}.tmp",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        let write_result = (|| {
             let mut file = File::create(&tmp_path).map_err(|error| SessionStoreError::Io {
                 message: format!("failed to create {}: {error}", tmp_path.display()),
             })?;
@@ -48,14 +61,24 @@ impl JsonSessionStore {
             file.sync_all().map_err(|error| SessionStoreError::Io {
                 message: format!("failed to fsync {}: {error}", tmp_path.display()),
             })?;
+            Ok(())
+        })();
+        // Never leave staging files behind on a failed save: they are invisible
+        // to `list` (dot-prefixed, no `.json`) so nothing would ever clean them.
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(error);
         }
-        fs::rename(&tmp_path, path).map_err(|error| SessionStoreError::Io {
-            message: format!(
-                "failed to rename {} -> {}: {error}",
-                tmp_path.display(),
-                path.display()
-            ),
-        })?;
+        if let Err(error) = fs::rename(&tmp_path, path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(SessionStoreError::Io {
+                message: format!(
+                    "failed to rename {} -> {}: {error}",
+                    tmp_path.display(),
+                    path.display()
+                ),
+            });
+        }
         sync_directory(parent)?;
         Ok(())
     }
