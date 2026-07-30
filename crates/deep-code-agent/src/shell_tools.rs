@@ -57,19 +57,34 @@ fn spawn_confined(
     // boundary, so a command that would otherwise escape unconfined must not
     // silently run (mirrors the eval guard and Codex's refuse-if-unenforceable).
     if sandbox.sandbox_unavailable_for(policy) {
+        // Include the probe's own diagnosis and a next step. Without them this
+        // read as "this platform is unsupported" with nothing to act on — the
+        // detail says *why* (e.g. "Landlock unavailable: ..."), and `doctor`
+        // prints the full capability report.
+        let detail = crate::sandbox::detect_capabilities().detail;
         return Err(ToolError::exec_failed(
             tool_name,
             format!(
-                "{error_context}: refusing to run without an OS sandbox — no sandbox \
-                 backend is available on this platform, so the command would run with \
-                 unconfined host access"
+                "{error_context}: refusing to run without an OS sandbox — the command \
+                 would run with unconfined host access. Cause: {detail}. Run \
+                 `doctor` for the full sandbox report."
             ),
         ));
     }
     // `mut` is only exercised by the Unix process-group call below; on other
     // platforms the binding is moved as-is into `Command::from`.
     #[cfg_attr(not(unix), allow(unused_mut))]
-    let mut std_cmd = sandbox.wrap_shell_command(command, cwd, workspace_root, policy);
+    let mut std_cmd = sandbox
+        .wrap_shell_command(command, cwd, workspace_root, policy)
+        .map_err(|detail| {
+            ToolError::exec_failed(
+                tool_name,
+                format!(
+                    "{error_context}: refusing to run — the OS sandbox could not be \
+                     applied to this command: {detail}"
+                ),
+            )
+        })?;
     // Own process group (Unix) so timeout/cancel/shutdown can kill the whole
     // tree via `kill_process_tree`, not just the immediate shell.
     #[cfg(unix)]

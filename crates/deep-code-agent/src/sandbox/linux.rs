@@ -19,9 +19,9 @@
 //!   blocked.
 //!
 //! Availability is reported by [`capabilities`]; the manager only calls
-//! [`wrap_shell_command`] when Landlock is available. Any build failure here
-//! degrades to an unsandboxed command plus a warning (fail-open, matching the
-//! current non-macOS behavior).
+//! [`wrap_shell_command`] when Landlock is available. If the per-command ruleset
+//! still fails to build, that is an error — the command is refused, never run
+//! unconfined (fail-closed, matching the spawn-site guard).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -100,17 +100,13 @@ pub fn wrap_shell_command(
     cwd: &Path,
     workspace: &Path,
     policy: &SandboxPolicy,
-) -> Command {
+) -> Result<Command, String> {
     let mut cmd = super::bare_shell_command(command, cwd);
 
-    let restrictions = match build_restrictions(workspace, cwd, policy) {
-        Ok(restrictions) => restrictions,
-        Err(error) => {
-            eprintln!("warning: Linux sandbox setup failed, running unsandboxed: {error}");
-            return cmd;
-        }
-    };
-    let (ruleset, bpf) = restrictions;
+    // Fail closed. Previously this warned to stderr and returned the unconfined
+    // command, which both contradicted the refuse-if-unenforceable policy and was
+    // silent in practice (the TUI redirects stderr into a log file).
+    let (ruleset, bpf) = build_restrictions(workspace, cwd, policy)?;
     let mut ruleset = Some(ruleset);
 
     // SAFETY: the closure runs in the forked child after fork and before exec.
@@ -129,7 +125,7 @@ pub fn wrap_shell_command(
             Ok(())
         });
     }
-    cmd
+    Ok(cmd)
 }
 
 fn build_restrictions(
@@ -233,6 +229,7 @@ mod tests {
             workspace,
             &SandboxPolicy::workspace_write(),
         )
+        .expect("landlock ruleset should build on a host that reports it available")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -58,9 +58,19 @@ pub fn sandbox_available() -> bool {
     detect_capabilities().available
 }
 
-/// Probe sandbox support on this host.
+/// Probe sandbox support on this host, memoized for the process lifetime.
+///
+/// Called several times per spawned command (`should_sandbox`,
+/// `sandbox_unavailable_for`, `confine_spawned`), and on Linux each probe is a
+/// real `landlock_create_ruleset` syscall plus an fd — so this must not re-probe
+/// per call. Capability cannot change under a running process anyway.
 #[must_use]
 pub fn detect_capabilities() -> SandboxCapabilities {
+    static CACHED: std::sync::OnceLock<SandboxCapabilities> = std::sync::OnceLock::new();
+    CACHED.get_or_init(probe_capabilities).clone()
+}
+
+fn probe_capabilities() -> SandboxCapabilities {
     #[cfg(target_os = "macos")]
     {
         if macos_seatbelt::is_available() {
@@ -152,20 +162,31 @@ impl SandboxManager {
         )
     }
 
+    /// Build the confined command, or `Err(detail)` when confinement was wanted
+    /// but could not be constructed.
+    ///
+    /// Failing here is not the same as having no backend (that is caught earlier
+    /// by [`Self::sandbox_unavailable_for`]): the probe can pass and the
+    /// per-command ruleset still fail to build. The old code logged a warning and
+    /// returned the *bare* command, which contradicted the refuse-if-
+    /// unenforceable policy — and the warning was invisible, because the TUI
+    /// redirects stderr to a log file before any command runs.
     pub fn wrap_shell_command(
         &self,
         command: &str,
         cwd: &Path,
         workspace: &Path,
         policy: &SandboxPolicy,
-    ) -> Command {
+    ) -> Result<Command, String> {
         if !self.should_sandbox(policy) {
-            return bare_shell_command(command, cwd);
+            return Ok(bare_shell_command(command, cwd));
         }
 
         #[cfg(target_os = "macos")]
         {
-            macos_seatbelt::wrap_shell_command(command, cwd, workspace, policy)
+            Ok(macos_seatbelt::wrap_shell_command(
+                command, cwd, workspace, policy,
+            ))
         }
 
         #[cfg(target_os = "linux")]
@@ -176,7 +197,7 @@ impl SandboxManager {
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = workspace;
-            bare_shell_command(command, cwd)
+            Ok(bare_shell_command(command, cwd))
         }
     }
 
