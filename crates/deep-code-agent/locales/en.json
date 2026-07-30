@@ -248,6 +248,7 @@
   "SafetyInstallSuggestion": "Confirm the dependency source is trusted",
 
   "CheckpointSnapshotFailed": "Checkpoint snapshot failed ({label}): {error}",
+  "TurnStepLimitReached": "This turn hit the {limit}-request limit and was stopped to avoid burning further quota. Try again with a more focused instruction.",
 
   "EchoOfflineHint": "No DeepSeek API key configured: type /apikey sk-... to connect now, or set the DEEPSEEK_API_KEY environment variable and restart.",
 

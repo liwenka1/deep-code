@@ -119,6 +119,22 @@ impl StdioLspTransport {
             .take()
             .context("language server exposes no stdout pipe")?;
 
+        // stderr MUST be drained. It is piped (above) but nothing used to read
+        // it, so once the server filled the ~64 KiB pipe buffer it blocked
+        // forever in `write(2)` — and a blocked server stops reading stdin and
+        // stops publishing diagnostics. rust-analyzer reaches that in normal
+        // operation (flycheck output, logs), and the manager deliberately does
+        // not evict on timeout ("slow is not dead"), so every later edit paid
+        // the full poll budget and returned nothing for the rest of the session.
+        // We only need the bytes gone; discard them rather than grow a buffer.
+        if let Some(stderr) = server.stderr.take() {
+            tokio::spawn(async move {
+                let mut sink = tokio::io::sink();
+                let mut stderr = stderr;
+                let _ = tokio::io::copy(&mut stderr, &mut sink).await;
+            });
+        }
+
         let (publish_tx, publish_rx) = mpsc::channel::<Publication>(PUBLICATION_QUEUE);
         tokio::spawn(pump_server_output(stdout, publish_tx));
 
@@ -372,13 +388,29 @@ fn find_header_terminator(bytes: &[u8]) -> Option<usize> {
 }
 
 /// Pull the `Content-Length` value out of a raw header block.
+///
+/// The value is server-controlled, so it is capped. Unbounded, it was the one
+/// reachable panic in the tree: `body_start + length` overflowed (the release
+/// profile disables overflow checks, so it wrapped instead of aborting), the
+/// wrapped sum then passed the "is the body buffered yet" test, and the slice
+/// `[body_start..body_start + length]` panicked with start > end — inside a
+/// detached `tokio::spawn`, under `panic = "abort"`, i.e. taking the whole agent
+/// down. A merely large-but-valid value was almost as bad: it buffered
+/// `pending` without bound. A frame this big is a broken server, not a big file.
 fn declared_length(header: &[u8]) -> Option<usize> {
+    /// 64 MiB — orders of magnitude above any real LSP message.
+    const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
     let text = std::str::from_utf8(header).ok()?;
     for line in text.lines() {
         if let Some((name, value)) = line.split_once(':')
             && name.trim().eq_ignore_ascii_case("content-length")
         {
-            return value.trim().parse().ok();
+            return value
+                .trim()
+                .parse()
+                .ok()
+                .filter(|length| *length <= MAX_FRAME_BYTES);
         }
     }
     None
@@ -674,6 +706,33 @@ mod tests {
         });
         let publication = decode_publish(&message).expect("decodes");
         assert_eq!(publication.version, None);
+    }
+
+    #[test]
+    fn absurd_content_length_is_rejected_instead_of_panicking() {
+        // `usize::MAX` used to overflow `body_start + length`; with
+        // overflow-checks off (release) it wrapped, passed the buffered-body
+        // test, and panicked slicing start > end — inside a detached task under
+        // `panic = "abort"`, killing the process. It must now read as a
+        // malformed header: dropped, and scanning resyncs on the next frame.
+        let mut decoder = FrameDecoder::default();
+        decoder.feed(format!("Content-Length: {}\r\n\r\n", usize::MAX).as_bytes());
+        assert!(decoder.next_frame().is_none());
+
+        let body = br#"{"jsonrpc":"2.0"}"#;
+        decoder.feed(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        decoder.feed(body);
+        assert_eq!(decoder.next_frame().as_deref(), Some(body.as_slice()));
+    }
+
+    #[test]
+    fn oversized_but_parsable_content_length_is_rejected() {
+        // Not an overflow — just unbounded buffering. 64 MiB is the ceiling.
+        let mut decoder = FrameDecoder::default();
+        decoder.feed(b"Content-Length: 4000000000\r\n\r\n");
+        assert!(decoder.next_frame().is_none());
+        assert!(declared_length(b"Content-Length: 4000000000").is_none());
+        assert_eq!(declared_length(b"Content-Length: 17"), Some(17));
     }
 
     #[test]

@@ -241,7 +241,16 @@ fn should_skip(rel: &Path) -> bool {
 
 fn copy_tree(source: &Path, dest: &Path, skip_meta: bool) -> Result<(), ToolError> {
     fs::create_dir_all(dest).map_err(|error| checkpoint_error("create snapshot dir", error))?;
-    for entry in WalkDir::new(source).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(source) {
+        // A walk error must never be skipped. `filter_map(Result::ok)` dropped
+        // an unreadable directory *together with its entire subtree* and still
+        // returned `Ok`, so `snapshot` renamed a silently partial tree into
+        // place as a valid restore point. `restore` clears the workspace before
+        // copying, so restoring such a snapshot deleted the very files it had
+        // never captured — unrecoverable. Failing here instead leaves only an
+        // orphaned `.staging_*` dir, which `list`/`restore` already ignore.
+        let entry =
+            entry.map_err(|error| checkpoint_error("walk snapshot source", error.into()))?;
         let rel = entry
             .path()
             .strip_prefix(source)
@@ -518,6 +527,45 @@ mod tests {
             .filter(|name| name.starts_with(".staging_"))
             .collect();
         assert!(leftovers.is_empty(), "staging residue: {leftovers:?}");
+    }
+
+    /// An unreadable directory must fail the snapshot, not silently vanish from
+    /// it. Before this, `filter_map(Result::ok)` dropped the directory *and its
+    /// whole subtree* and still returned `Ok`, so a partial tree was published
+    /// as a valid restore point — and since `restore` clears the workspace
+    /// first, restoring it deleted the files it had never captured.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_fails_the_snapshot_instead_of_being_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("keep.txt"), "v1").unwrap();
+        let secret = workspace.path().join("locked");
+        fs::create_dir(&secret).unwrap();
+        fs::write(secret.join("inner.txt"), "hidden").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let store = CheckpointStore::new(workspace.path()).unwrap();
+        let result = store.snapshot("before_turn");
+
+        // Restore permissions first so tempdir cleanup can succeed regardless.
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Running as root ignores the permission bits entirely; only assert the
+        // real behavior when the directory is genuinely unreadable.
+        if fs::read_dir(workspace.path().join("locked")).is_ok() && result.is_ok() {
+            let ran_as_root = unsafe { libc::geteuid() } == 0;
+            assert!(ran_as_root, "unreadable dir was silently skipped");
+            return;
+        }
+        let error = result.expect_err("snapshot must fail on an unreadable subtree");
+        assert!(
+            error.to_string().contains("walk snapshot source"),
+            "unexpected error: {error}"
+        );
+        // Nothing publishable may be left behind.
+        assert!(store.list().unwrap().is_empty());
     }
 
     #[test]

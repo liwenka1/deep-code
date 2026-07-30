@@ -1,7 +1,7 @@
 mod input;
 mod render;
 
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -30,13 +30,52 @@ pub async fn run(config: LaunchConfig) -> Result<()> {
     // paint raw text over the rendered buffer. Send stderr to a log file so it
     // can never corrupt the screen.
     redirect_stderr_to_log();
+    // Must come after the redirect (so the default hook's message lands in the
+    // log) and before raw mode (so a panic in `setup_terminal` is covered too).
+    install_panic_hook();
     let mut terminal = setup_terminal()?;
     let mut app = App::launch(config);
     let result = run_loop(&mut terminal, &mut app);
     restore_terminal(&mut terminal)?;
-    result?;
+    // Shut the runtime down before propagating a loop error: `?` here used to
+    // skip `shutdown_runtime` entirely, losing the final persist/flush and
+    // leaking job process trees and LSP children on every error exit.
     app.shutdown_runtime().await;
+    result?;
     Ok(())
+}
+
+/// Restore the terminal on panic and put the message where the user can see it.
+///
+/// Three things conspire to make an unhandled panic invisible *and* leave the
+/// terminal unusable: stderr is redirected to the log file above, the release
+/// profile sets `panic = "abort"` (so no unwinding, no destructor, and
+/// `restore_terminal` never runs), and raw mode + alternate screen + mouse
+/// capture are all still active. Without this hook the user sees a frozen blank
+/// terminal with no echo and has to blind-type `reset`. Hooks still run under
+/// `panic = "abort"`, so this works in release.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let mut stdout = io::stdout();
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            stdout,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
+        // Written to stdout on purpose: stderr is the log file at this point.
+        let _ = writeln!(stdout, "\ndeep-code panicked: {info}");
+        let _ = writeln!(
+            stdout,
+            "A backtrace was written to .deep-code/deep-code.log"
+        );
+        let _ = stdout.flush();
+        // Keep the default reporting too, so the log gets the full detail.
+        previous(info);
+    }));
 }
 
 fn setup_terminal() -> Result<AppTerminal> {

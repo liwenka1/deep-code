@@ -12,6 +12,10 @@ use crate::runtime::event::{RuntimeEvent, ToolCallId, emit};
 use crate::runtime::tool_result::{BatchOutcome, runtime_error_from_tool_error, tool_call_payload};
 use crate::tool::ToolCallAccumulator;
 
+/// Maximum model requests in a single turn. Generous enough that no legitimate
+/// agentic turn hits it, low enough that a runaway loop is bounded.
+const MAX_TURN_STEPS: u32 = 100;
+
 impl AgentRuntime {
     /// UI language for user-facing runtime text (error diagnostics, approval
     /// previews). Reads the shared [`crate::i18n::SharedLang`] atomic that the
@@ -59,8 +63,32 @@ impl AgentRuntime {
         }
 
         let mut stream_retries = 0u32;
+        let mut steps = 0u32;
 
         loop {
+            // Bound the model/tool ping-pong. Every iteration is one API request
+            // whose context is larger than the last, and the only other exits
+            // are cancel, a stream error, an empty tool batch, or an approval
+            // park — so a model stuck in a grep/read spiral (or auto-approved by
+            // `auto_allow`/Yolo) would bill the user's key until they notice and
+            // press Esc. Sub-agents have had a step cap all along; the parent
+            // loop, which is the one holding the key, had none.
+            steps += 1;
+            if steps > MAX_TURN_STEPS {
+                emit(
+                    tx,
+                    RuntimeEvent::Error {
+                        turn_id: Some(turn_id.clone()),
+                        message: crate::tr_with(
+                            self.ui_lang(),
+                            crate::TextId::TurnStepLimitReached,
+                            &[("limit", &MAX_TURN_STEPS.to_string())],
+                        ),
+                    },
+                );
+                self.abort_turn(&turn_id).await;
+                return;
+            }
             if cancel.is_cancelled() {
                 self.finish_turn_cancelled(&turn_id, tx).await;
                 return;

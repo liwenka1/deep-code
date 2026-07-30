@@ -397,6 +397,7 @@ text_ids! {
     SafetyInstallSuggestion,
     // 运行时其它用户可见提示
     CheckpointSnapshotFailed,
+    TurnStepLimitReached,
     // 离线 echo 后端提示
     EchoOfflineHint,
     // 路由遥测原因(auto_mode / streaming),显示在状态栏
