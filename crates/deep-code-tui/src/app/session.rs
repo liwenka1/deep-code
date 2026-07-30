@@ -215,6 +215,10 @@ impl App {
         self.scroll_offset = 0;
         self.last_telemetry = None;
         self.error = None;
+        // Conversation-scoped, like `history`: a queue must never survive into a
+        // different session and auto-send there.
+        self.steering_queue.clear();
+        self.pending_steering_flush = false;
         self.history.extend(hydrate_history(&record));
         self.status = self.tr_with(
             TextId::StatusSwitchedSession,
@@ -245,6 +249,8 @@ impl App {
         self.last_telemetry = None;
         self.last_checkpoint = None;
         self.error = None;
+        self.steering_queue.clear();
+        self.pending_steering_flush = false;
         let cell = welcome_cell(
             &self.configured_model,
             &self.configured_reasoning,

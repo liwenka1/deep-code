@@ -42,6 +42,7 @@
   "TimeDaysAgo": "{n} 天前",
 
   "ComposerPlaceholder": "输入消息，输入 / 唤起命令",
+  "ComposerPlaceholderSteering": "可以继续输入,本回合结束后作为追问发出…",
   "CompletionMenuTitle": "补全: ↑/↓ 选择 | Tab/Enter 确认 | Esc 关闭",
   "ErrorPrefix": "错误: ",
   "StatusEscCancel": "Esc 取消",
@@ -50,6 +51,7 @@
   "StatusEmptyPrompt": "请输入内容后再发送",
   "StatusStreamingFrom": "正在等待 {backend} 响应...",
   "StatusSteeringQueued": "已排队 ({count}) — 当前回合结束后自动发送",
+  "StatusSteeringQueueFull": "队列已满 ({count}) — 草稿保留在输入框,等当前回合结束",
   "StatusInputClearedEsc": "已清空输入 (再按 Esc 退出)",
   "StatusInputClearedCtrlC": "已清空输入 (再按 Ctrl+C 退出)",
   "StatusCtrlCQuitConfirm": "再按一次 Ctrl+C 退出",

@@ -335,17 +335,27 @@ fn multi_tool_cells_flush_independently_per_finished_call() {
 }
 
 #[test]
-fn composer_newline_edits_and_streaming_guard() {
+fn composer_edits_and_stays_live_while_streaming() {
     let mut app = App::new();
     app.push_char('a');
     app.push_newline();
     app.push_char('b');
     assert_eq!(app.input, "a\nb");
 
+    // Inverted deliberately: this test used to assert "no edits while
+    // streaming", which is the guard that made mid-turn steering unreachable —
+    // `submit`'s queue branch needs a non-empty composer to fire. The composer
+    // must stay editable mid-turn for steering to exist at all.
     app.is_streaming = true;
-    let before = app.input.clone();
+    app.push_char('c');
     app.push_newline();
-    assert_eq!(app.input, before, "no edits while streaming");
+    app.push_char('d');
+    assert_eq!(
+        app.input, "a\nbc\nd",
+        "composer stays editable while streaming"
+    );
+    app.backspace();
+    assert_eq!(app.input, "a\nbc\n");
 }
 
 #[test]
@@ -950,6 +960,108 @@ fn steering_queue_cleared_on_error() {
         "a failed turn drops queued prompts rather than firing them into an error"
     );
     assert!(!app.is_streaming);
+}
+
+/// The steering flush starts a new turn, so it must survive the drain loop that
+/// triggered it. Previously the trailing `StreamFinished` of the turn that just
+/// ended nulled the successor's receiver, leaving that turn running with no UI
+/// attached: tools executed and cost accrued invisibly, and an approval request
+/// would have parked forever. Drives the real `drain_stream_updates` path.
+#[tokio::test]
+async fn steering_flush_survives_the_drain_that_triggered_it() {
+    let mut app = App::new();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    app.ui_rx = Some(rx);
+    app.is_streaming = true;
+
+    app.input = "and then deploy".to_string();
+    app.submit();
+    assert_eq!(app.steering_queue.len(), 1);
+
+    // Exactly what the bridge task emits at the end of a turn: the terminal
+    // event, then the stream-closed marker, back to back in one drain pass.
+    let turn_id = deep_code_agent::TurnId("turn_1".to_string());
+    tx.send(UiUpdate::Event(Box::new(RuntimeEvent::TurnFinished {
+        turn_id,
+        usage: None,
+        telemetry: None,
+    })))
+    .unwrap();
+    tx.send(UiUpdate::StreamFinished).unwrap();
+
+    app.drain_stream_updates();
+
+    assert!(
+        app.steering_queue.is_empty(),
+        "queue flushed after the turn"
+    );
+    assert!(app.is_streaming, "the follow-up turn is live");
+    assert!(
+        app.ui_rx.is_some(),
+        "the follow-up turn must keep its receiver — otherwise it runs orphaned"
+    );
+    assert!(
+        matches!(app.history.last(), Some(HistoryCell::User { text }) if text == "and then deploy"),
+        "the queued prompt is shown after the finished turn's cells"
+    );
+}
+
+#[test]
+fn steering_queue_dropped_when_stream_closes_without_a_terminal_event() {
+    let mut app = App::new();
+    app.is_streaming = true;
+    app.input = "queued".to_string();
+    app.submit();
+    assert_eq!(app.steering_queue.len(), 1);
+
+    // Channel closed with no TurnFinished/TurnCancelled/Error: there is no
+    // finished turn to attach a follow-up to, so it must not linger and fire at
+    // some later, unrelated turn (which would also reorder it).
+    app.apply_ui_update(UiUpdate::StreamFinished);
+
+    assert!(app.steering_queue.is_empty());
+    assert!(!app.pending_steering_flush);
+    assert!(!app.is_streaming);
+}
+
+#[test]
+fn cancel_clears_the_steering_queue_synchronously() {
+    let mut app = App::new();
+    app.is_streaming = true;
+    app.input = "never mind".to_string();
+    app.submit();
+    assert_eq!(app.steering_queue.len(), 1);
+
+    // Esc/Ctrl+C means "changed my mind". Waiting for `TurnCancelled` to clear
+    // the queue loses the race when the turn already finished: `cancel_turn` is
+    // a no-op on an idle runtime, so no `TurnCancelled` ever arrives.
+    app.handle_escape();
+
+    assert!(app.steering_queue.is_empty());
+    assert!(!app.pending_steering_flush);
+}
+
+#[test]
+fn steering_queue_is_capped_and_keeps_the_draft() {
+    let mut app = App::new();
+    app.is_streaming = true;
+    for i in 0..STEERING_QUEUE_CAP {
+        app.input = format!("msg {i}");
+        app.submit();
+    }
+    assert_eq!(app.steering_queue.len(), STEERING_QUEUE_CAP);
+
+    app.input = "one too many".to_string();
+    app.submit();
+    assert_eq!(
+        app.steering_queue.len(),
+        STEERING_QUEUE_CAP,
+        "queue stops growing at the cap"
+    );
+    assert_eq!(
+        app.input, "one too many",
+        "the refused draft stays in the composer rather than vanishing"
+    );
 }
 
 #[test]

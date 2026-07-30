@@ -88,6 +88,12 @@ pub struct App {
     /// stream-end handlers). Cleared on cancel — Esc/Ctrl+C means "changed my
     /// mind", so nothing queued behind the cancelled turn should fire.
     pub(crate) steering_queue: Vec<String>,
+    /// Set by the turn-end handler, consumed by `drain_stream_updates` once the
+    /// drain loop is finished. The flush starts a new turn, so running it inside
+    /// the loop would let a later `StreamFinished` from the turn that *just*
+    /// ended tear down the new turn's receiver. Deferring keeps stream start-up
+    /// out of the re-entrant path entirely.
+    pub(crate) pending_steering_flush: bool,
     pub pending_approval: Option<ApprovalRequest>,
     pub last_checkpoint: Option<String>,
     pub session_id: Option<String>,
@@ -179,6 +185,10 @@ pub(crate) struct TranscriptSnapshot {
 }
 
 const PROMPT_HISTORY_CAP: usize = 100;
+/// Cap on prompts queued behind one streaming turn. Reaching it keeps the text
+/// in the composer rather than dropping either end of the queue — the whole
+/// point of steering is that nothing typed gets silently discarded.
+const STEERING_QUEUE_CAP: usize = 16;
 /// Scrollback cap: transcript cells beyond this are dropped from the front
 /// (multi-hour sessions would otherwise grow memory without bound).
 pub(crate) const MAX_HISTORY_CELLS: usize = 2000;
@@ -350,6 +360,7 @@ impl App {
             ctrl_c_pending: false,
             is_streaming: false,
             steering_queue: Vec::new(),
+            pending_steering_flush: false,
             pending_approval: None,
             last_checkpoint: None,
             session_id,
@@ -534,6 +545,15 @@ impl App {
         // user cell pushed now would render ABOVE it. The cell is added when
         // the queue flushes, after the current turn's cells land.
         if self.is_streaming {
+            if self.steering_queue.len() >= STEERING_QUEUE_CAP {
+                // Leave the draft in the composer — losing it is worse than
+                // refusing to take more.
+                self.status = self.tr_with(
+                    TextId::StatusSteeringQueueFull,
+                    &[("count", &self.steering_queue.len().to_string())],
+                );
+                return;
+            }
             self.steering_queue.push(sent);
             self.clear_input();
             self.status = self.tr_with(
@@ -563,9 +583,13 @@ impl App {
     }
 
     /// Send any prompts queued (steered) while the just-finished turn was
-    /// streaming, as one combined follow-up. Called after a turn ends cleanly;
-    /// the queued prompts are already shown in the transcript (added when
-    /// typed), so this only starts the stream. No-op when nothing is queued.
+    /// streaming, as one combined follow-up. No-op when nothing is queued.
+    ///
+    /// Run only from `drain_stream_updates`, after the drain loop — never from
+    /// an event handler, see `pending_steering_flush`. The combined user cell is
+    /// pushed here rather than at queue time because the finished turn's own
+    /// cells have only just landed in `history`; pushing earlier would render
+    /// the user's message above output that was still streaming.
     pub(crate) fn flush_steering_queue(&mut self) {
         if self.steering_queue.is_empty() || self.is_streaming {
             return;
@@ -637,6 +661,13 @@ impl App {
 
     fn cancel_streaming_turn(&mut self) {
         self.status = self.tr(TextId::StatusCancelling).to_string();
+        // Cancel means "changed my mind", so drop the queue here and now rather
+        // than waiting for `TurnCancelled` to do it: if the turn had already
+        // finished and its `TurnFinished` is still sitting unread in the channel,
+        // `cancel_turn` is a no-op on the idle runtime, no `TurnCancelled` ever
+        // arrives, and the queue would be auto-sent despite the cancel.
+        self.steering_queue.clear();
+        self.pending_steering_flush = false;
         let runtime = Arc::clone(&self.runtime);
         // The streaming loop emits TurnCancelled on the live channel that the
         // bridge task is already pumping; the receiver returned here stays
@@ -725,8 +756,20 @@ impl App {
             applied = true;
         }
 
-        if self.is_streaming {
+        // Only put `rx` back when nothing claimed the slot while we were
+        // draining. A successor's receiver must never be overwritten: the turn
+        // behind it would keep running with nobody observing — tools execute,
+        // files change, cost accrues, and an approval request parks forever with
+        // no UI to answer it.
+        if self.is_streaming && self.ui_rx.is_none() {
             self.ui_rx = Some(rx);
+        }
+
+        // Now that the loop is done (and any trailing `StreamFinished` from the
+        // finished turn has been applied), it is safe to start the follow-up.
+        if std::mem::take(&mut self.pending_steering_flush) {
+            self.flush_steering_queue();
+            applied = true;
         }
         applied
     }
@@ -782,6 +825,16 @@ impl App {
         match update {
             UiUpdate::Event(event) => self.apply_runtime_event(*event),
             UiUpdate::StreamFinished => {
+                // Reaching here with `is_streaming` still set means the channel
+                // closed without any terminal event (runtime panic, or an
+                // approval submitted against an already-cancelled turn): every
+                // terminal handler clears the flag itself. There is no finished
+                // turn for a follow-up to attach to, so drop the queue instead
+                // of firing it at whatever unrelated turn comes next.
+                if self.is_streaming {
+                    self.steering_queue.clear();
+                    self.pending_steering_flush = false;
+                }
                 self.is_streaming = false;
                 self.ui_rx = None;
             }

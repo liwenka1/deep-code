@@ -190,6 +190,7 @@ text_ids! {
     TimeDaysAgo,
     // 输入区/状态栏
     ComposerPlaceholder,
+    ComposerPlaceholderSteering,
     CompletionMenuTitle,
     ErrorPrefix,
     StatusEscCancel,
@@ -198,6 +199,7 @@ text_ids! {
     StatusEmptyPrompt,
     StatusStreamingFrom,
     StatusSteeringQueued,
+    StatusSteeringQueueFull,
     StatusInputClearedEsc,
     StatusInputClearedCtrlC,
     StatusCtrlCQuitConfirm,

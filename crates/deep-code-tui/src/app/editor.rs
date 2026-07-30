@@ -1,10 +1,17 @@
+//! Composer editing operations.
+//!
+//! None of these check `is_streaming`: the composer stays fully live while a
+//! turn streams, which is what makes mid-turn steering reachable. Typing,
+//! editing, pasting and prompt-history recall all work mid-turn; `submit`
+//! decides what to do with the text (queue it as a follow-up, or send it now)
+//! — see `App::submit`. Re-adding an `is_streaming` early-return here silently
+//! turns steering back into dead code, because the queue branch in `submit`
+//! can only be reached with a non-empty composer.
+
 use super::*;
 
 impl App {
     pub fn push_char(&mut self, value: char) {
-        if self.is_streaming {
-            return;
-        }
         let cursor = self.input_cursor.min(char_count(&self.input));
         let byte = byte_idx(&self.input, cursor);
         self.input.insert(byte, value);
@@ -14,7 +21,7 @@ impl App {
     }
 
     pub fn backspace(&mut self) {
-        if self.is_streaming || self.input_cursor == 0 {
+        if self.input_cursor == 0 {
             return;
         }
         let target = self.input_cursor.saturating_sub(1);
@@ -27,9 +34,6 @@ impl App {
 
     /// Insert a newline into the composer (Alt+Enter / Ctrl+J).
     pub fn push_newline(&mut self) {
-        if self.is_streaming {
-            return;
-        }
         let cursor = self.input_cursor.min(char_count(&self.input));
         let byte = byte_idx(&self.input, cursor);
         self.input.insert(byte, '\n');
@@ -40,9 +44,6 @@ impl App {
 
     /// Delete the character after the cursor (Delete key).
     pub fn delete_forward(&mut self) {
-        if self.is_streaming {
-            return;
-        }
         if self.input_cursor >= char_count(&self.input) {
             return;
         }
@@ -54,7 +55,7 @@ impl App {
 
     /// Move cursor one character left.
     pub fn cursor_left(&mut self) {
-        if self.is_streaming || self.input_cursor == 0 {
+        if self.input_cursor == 0 {
             return;
         }
         self.input_cursor -= 1;
@@ -62,9 +63,6 @@ impl App {
 
     /// Move cursor one character right.
     pub fn cursor_right(&mut self) {
-        if self.is_streaming {
-            return;
-        }
         if self.input_cursor < char_count(&self.input) {
             self.input_cursor += 1;
         }
@@ -72,9 +70,6 @@ impl App {
 
     /// Move cursor to start of the current logical line.
     pub fn cursor_home(&mut self) {
-        if self.is_streaming {
-            return;
-        }
         let byte = byte_idx(&self.input, self.input_cursor.min(char_count(&self.input)));
         let prefix = &self.input[..byte];
         let line_start_byte = prefix.rfind('\n').map_or(0, |pos| pos + 1);
@@ -83,9 +78,6 @@ impl App {
 
     /// Move cursor to end of the current logical line.
     pub fn cursor_end(&mut self) {
-        if self.is_streaming {
-            return;
-        }
         let byte = byte_idx(&self.input, self.input_cursor.min(char_count(&self.input)));
         let tail = &self.input[byte..];
         let eol = tail.find('\n').unwrap_or(tail.len());
@@ -112,9 +104,6 @@ impl App {
     /// `pasted_blocks` and expanded back in on submit; short single-line
     /// pastes insert inline.
     pub fn paste_str(&mut self, text: String) {
-        if self.is_streaming {
-            return;
-        }
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         if normalized.is_empty() {
             return;
@@ -157,7 +146,7 @@ impl App {
 
     /// Delete the word (and any whitespace) before the cursor (Ctrl+W).
     pub fn delete_word_back(&mut self) {
-        if self.is_streaming || self.input_cursor == 0 {
+        if self.input_cursor == 0 {
             return;
         }
         let chars: Vec<char> = self.input.chars().collect();
@@ -176,7 +165,7 @@ impl App {
 
     /// Delete from the current logical line's start up to the cursor (Ctrl+U).
     pub fn kill_to_line_start(&mut self) {
-        if self.is_streaming || self.input_cursor == 0 {
+        if self.input_cursor == 0 {
             return;
         }
         let start = self.current_line_start_char();
@@ -188,9 +177,6 @@ impl App {
 
     /// Delete from the cursor to the end of the current logical line (Ctrl+K).
     pub fn kill_to_line_end(&mut self) {
-        if self.is_streaming {
-            return;
-        }
         let end = self.current_line_end_char();
         self.drain_chars(self.input_cursor, end);
         self.history_cursor = None;
@@ -199,7 +185,7 @@ impl App {
 
     /// Move cursor to the previous word start (Ctrl/Alt + Left).
     pub fn word_left(&mut self) {
-        if self.is_streaming || self.input_cursor == 0 {
+        if self.input_cursor == 0 {
             return;
         }
         let chars: Vec<char> = self.input.chars().collect();
@@ -215,9 +201,6 @@ impl App {
 
     /// Move cursor to the next word end (Ctrl/Alt + Right).
     pub fn word_right(&mut self) {
-        if self.is_streaming {
-            return;
-        }
         let chars: Vec<char> = self.input.chars().collect();
         let len = chars.len();
         let mut i = self.input_cursor.min(len);
@@ -259,9 +242,6 @@ impl App {
     /// (no-op at the top, so the draft is never clobbered); on a single-line
     /// or empty composer it recalls the previous prompt.
     pub fn on_up(&mut self) {
-        if self.is_streaming {
-            return;
-        }
         if self.input.contains('\n') {
             self.cursor_up_logical();
         } else {
@@ -271,9 +251,6 @@ impl App {
 
     /// Down arrow: mirror of [`on_up`].
     pub fn on_down(&mut self) {
-        if self.is_streaming {
-            return;
-        }
         if self.input.contains('\n') {
             self.cursor_down_logical();
         } else {
@@ -351,7 +328,7 @@ impl App {
     /// Recall the previous sent prompt (Ctrl+P). The live input is stashed as
     /// a draft and restored when navigating past the newest entry.
     pub fn history_prev(&mut self) {
-        if self.is_streaming || self.prompt_history.is_empty() {
+        if self.prompt_history.is_empty() {
             return;
         }
         let cursor = match self.history_cursor {
@@ -369,9 +346,6 @@ impl App {
 
     /// Walk back toward the draft (Ctrl+N).
     pub fn history_next(&mut self) {
-        if self.is_streaming {
-            return;
-        }
         match self.history_cursor {
             None => {}
             Some(index) if index + 1 < self.prompt_history.len() => {

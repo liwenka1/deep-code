@@ -42,6 +42,7 @@
   "TimeDaysAgo": "{n} d ago",
 
   "ComposerPlaceholder": "Type a message, / for commands",
+  "ComposerPlaceholderSteering": "Type to queue a follow-up for when this turn ends…",
   "CompletionMenuTitle": "Complete: ↑/↓ select | Tab/Enter accept | Esc close",
   "ErrorPrefix": "Error: ",
   "StatusEscCancel": "Esc to cancel",
@@ -50,6 +51,7 @@
   "StatusEmptyPrompt": "Enter a prompt before sending",
   "StatusStreamingFrom": "Waiting for {backend}...",
   "StatusSteeringQueued": "Queued ({count}) — sends when the current turn finishes",
+  "StatusSteeringQueueFull": "Queue full ({count}) — draft kept; wait for the turn to finish",
   "StatusInputClearedEsc": "Input cleared (Esc again to quit)",
   "StatusInputClearedCtrlC": "Input cleared (Ctrl+C again to quit)",
   "StatusCtrlCQuitConfirm": "Press Ctrl+C again to quit",

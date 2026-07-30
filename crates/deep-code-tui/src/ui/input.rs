@@ -367,4 +367,34 @@ mod tests {
         assert_eq!(key_text_payload(&plain(KeyCode::Up)), None);
         assert_eq!(key_text_payload(&plain(KeyCode::Backspace)), None);
     }
+
+    /// End-to-end steering guard at the layer that actually shipped broken:
+    /// real key presses routed through `handle_key` while a turn is streaming.
+    /// The previous tests all assigned `app.input` directly, so they passed
+    /// while typing mid-stream was silently discarded by `push_char`.
+    #[test]
+    fn typing_mid_stream_reaches_composer_and_enter_queues_it() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        let mut app = App::new();
+        app.is_streaming = true;
+
+        for ch in "skip tests".chars() {
+            handle_key(&mut app, plain(KeyCode::Char(ch)));
+        }
+        assert_eq!(
+            app.input, "skip tests",
+            "keys typed mid-stream must land in the composer"
+        );
+
+        handle_key(&mut app, plain(KeyCode::Enter));
+        assert_eq!(
+            app.steering_queue,
+            vec!["skip tests".to_string()],
+            "Enter mid-stream queues the prompt as a follow-up"
+        );
+        assert!(app.input.is_empty(), "composer clears once queued");
+        assert!(app.is_streaming, "queueing must not end the current turn");
+    }
 }

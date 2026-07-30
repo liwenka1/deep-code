@@ -916,17 +916,28 @@ fn render_input_from_layout(
         frame.buffer_mut().set_string(text_x, y, line_text, style);
     }
 
-    // Faint placeholder when empty and idle.
-    if app.input.is_empty() && !app.is_streaming && app.pending_approval.is_none() {
+    // Faint placeholder when the composer is empty and accepting input. While a
+    // turn streams the composer is still live (mid-turn steering), so it gets a
+    // placeholder too — a different one, since the text will be queued rather
+    // than sent immediately. Without this the feature is invisible.
+    if app.input.is_empty() && app.pending_approval.is_none() {
+        let hint = if app.is_streaming {
+            TextId::ComposerPlaceholderSteering
+        } else {
+            TextId::ComposerPlaceholder
+        };
         frame.buffer_mut().set_string(
             text_x,
             inner_area.y,
-            tr(app.lang, TextId::ComposerPlaceholder),
+            tr(app.lang, hint),
             Style::default().fg(Color::DarkGray),
         );
     }
 
-    if !app.is_streaming && app.pending_approval.is_none() {
+    // The cursor follows the composer whenever it is editable — including mid
+    // stream, otherwise steered text would be typed blind. Only the approval
+    // prompt takes focus away (keys there are y/a/n, not text).
+    if app.pending_approval.is_none() {
         let cursor_y = inner_area.y.saturating_add(
             u16::try_from(
                 layout

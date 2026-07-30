@@ -202,8 +202,9 @@ impl App {
                     .unwrap_or_default();
                 self.is_streaming = false;
                 self.clear_stream_receiver();
-                // Fire anything the user lined up while this turn streamed.
-                self.flush_steering_queue();
+                // Fire anything the user lined up while this turn streamed —
+                // but only once the drain loop is done, see the field's doc.
+                self.pending_steering_flush = true;
             }
             RuntimeEvent::TurnCancelled { .. } => {
                 self.flush_active_turn();
