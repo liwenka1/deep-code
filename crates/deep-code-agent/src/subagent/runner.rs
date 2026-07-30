@@ -22,10 +22,19 @@ pub async fn run_subagent(
 
     loop {
         if steps >= max_steps {
+            // Cancel before returning. The child's `run_loop` is a detached task
+            // and `emit` ignores a closed channel, so simply returning left it
+            // running: it kept calling the API and kept executing write tools
+            // after the parent had already reported the failure and folded its
+            // spend. The timeout arm in the `agent` tool cancels for exactly this
+            // reason; this arm did not.
+            let _ = runtime.cancel_turn().await;
             return Err((steps, format!("max steps exceeded ({max_steps})")));
         }
 
         let Some(event) = rx.recv().await else {
+            // Same reasoning: an ended stream does not stop the loop task.
+            let _ = runtime.cancel_turn().await;
             return Err((
                 steps,
                 "sub-agent event stream ended unexpectedly".to_string(),

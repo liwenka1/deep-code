@@ -1,4 +1,9 @@
 mod accumulator;
+// NOTE: this is a test fixture, but it cannot be `cfg(test)`-gated: the
+// `deep-code-runtime` tests are a separate crate and consume it, so gating would
+// need a `test-fixtures` Cargo feature plus conditional `ToolKind::Mock` match
+// arms. Judged not worth that complexity for one ~30-line tool; it is inert in
+// production (never registered outside `with_mock_tools`).
 mod mock;
 mod registry;
 mod schema;

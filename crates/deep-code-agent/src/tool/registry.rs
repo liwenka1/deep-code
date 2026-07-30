@@ -40,14 +40,6 @@ impl ToolRegistry {
     }
 
     #[must_use]
-    pub fn with_policy(policy: ExecPolicy) -> Self {
-        Self {
-            tools: HashMap::new(),
-            policy,
-        }
-    }
-
-    #[must_use]
     pub fn policy(&self) -> &ExecPolicy {
         &self.policy
     }
@@ -68,6 +60,8 @@ impl ToolRegistry {
             .insert(spec.name.clone(), RegisteredTool { spec, tool });
     }
 
+    /// Fixture registry for tests (including `deep-code-runtime`'s, which is why
+    /// this cannot be `cfg(test)` — see the note on `super::mock`).
     #[must_use]
     pub fn with_mock_tools() -> Self {
         let mut registry = Self::new();

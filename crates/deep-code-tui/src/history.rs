@@ -374,28 +374,6 @@ fn summarize_json_tool_result(value: &serde_json::Value) -> Option<String> {
                 .map_or("none".to_string(), |code| code.to_string());
             return Some(format!("{status} exit={exit} in {cwd} ({command})"));
         }
-        if object.contains_key("diff") {
-            let truncated = object
-                .get("truncated")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            return Some(format!("git diff in {cwd} (truncated={truncated})"));
-        }
-        if object.contains_key("status_output") {
-            let entries = object
-                .get("entries")
-                .and_then(serde_json::Value::as_array)
-                .map_or(0, |entries| entries.len());
-            return Some(format!("git status in {cwd}: {entries} entries"));
-        }
-        if object.contains_key("log") {
-            let lines = object
-                .get("log")
-                .and_then(serde_json::Value::as_str)
-                .map(|value| value.lines().count())
-                .unwrap_or(0);
-            return Some(format!("git log in {cwd}: {lines} lines"));
-        }
     }
 
     if let Some(job_id) = object.get("job_id").and_then(serde_json::Value::as_str) {

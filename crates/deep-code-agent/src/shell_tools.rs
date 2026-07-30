@@ -69,7 +69,7 @@ fn spawn_confined(
     // Refuse rather than run bare when the policy wanted a sandbox but this
     // host has no backend: the safety model treats the OS sandbox as the real
     // boundary, so a command that would otherwise escape unconfined must not
-    // silently run (mirrors the eval guard and Codex's refuse-if-unenforceable).
+    // silently run (mirrors the eval harness's own refuse-if-unenforceable guard).
     if sandbox.sandbox_unavailable_for(policy) {
         // Include the probe's own diagnosis and a next step. Without them this
         // read as "this platform is unsupported" with nothing to act on — the

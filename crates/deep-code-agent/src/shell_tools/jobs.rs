@@ -15,6 +15,14 @@ use crate::workspace_policy::invalid;
 
 const JOB_BUFFER_BYTES: usize = 128 * 1024;
 
+/// How many job records to keep. Every `shell` call — foreground included —
+/// inserts one so `job action=status/tail` can inspect it afterwards, and
+/// nothing ever removed one, so a long session accumulated a record per command
+/// (each owning two output buffers, plus a Job Object handle on Windows) until
+/// the process exited. Only finished jobs are evicted, so this bounds memory
+/// without ever dropping a running background job.
+const MAX_RETAINED_JOBS: usize = 32;
+
 #[derive(Debug, Clone, Default)]
 pub struct JobStore {
     next_id: Arc<AtomicU64>,
@@ -48,10 +56,9 @@ impl JobStore {
 
     pub(super) fn insert(&self, state: JobState) -> String {
         let id = format!("job_{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
-        self.jobs
-            .lock()
-            .expect("job store lock poisoned")
-            .insert(id.clone(), Arc::new(Mutex::new(state)));
+        let mut guard = self.jobs.lock().expect("job store lock poisoned");
+        guard.insert(id.clone(), Arc::new(Mutex::new(state)));
+        evict_finished_jobs(&mut guard);
         id
     }
 
@@ -63,6 +70,42 @@ impl JobStore {
             .cloned()
             .ok_or_else(|| invalid(tool_name, format!("unknown job_id '{id}'")))
     }
+}
+
+/// Drop the oldest *finished* records once the store exceeds
+/// [`MAX_RETAINED_JOBS`]. Running jobs are never evicted — their entry owns the
+/// handle `shutdown` needs to kill the process tree — so the store can still
+/// exceed the cap while many jobs run at once; it converges as they finish.
+///
+/// Takes the already-held map guard. Locking each `JobState` while holding the
+/// map lock matches `shutdown`'s order (map → state); nothing acquires them the
+/// other way round.
+fn evict_finished_jobs(jobs: &mut HashMap<String, Arc<Mutex<JobState>>>) {
+    if jobs.len() <= MAX_RETAINED_JOBS {
+        return;
+    }
+    let excess = jobs.len() - MAX_RETAINED_JOBS;
+    let mut finished: Vec<(u64, String)> = jobs
+        .iter()
+        .filter(|(_, state)| {
+            state
+                .lock()
+                .is_ok_and(|state| state.status != JobStatus::Running)
+        })
+        .map(|(id, _)| (job_sequence(id), id.clone()))
+        .collect();
+    finished.sort_unstable();
+    for (_, id) in finished.into_iter().take(excess) {
+        jobs.remove(&id);
+    }
+}
+
+/// Monotonic counter out of a `job_<n>` id, for oldest-first ordering.
+fn job_sequence(id: &str) -> u64 {
+    id.rsplit('_')
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
 }
 
 #[derive(Debug)]
@@ -160,7 +203,10 @@ struct RingBuffer {
 impl RingBuffer {
     fn new(capacity: usize) -> Self {
         Self {
-            bytes: VecDeque::with_capacity(capacity),
+            // Grown on demand, not reserved up front: `with_capacity` committed
+            // the full 128 KiB per buffer (256 KiB per `shell` call, both
+            // streams) even for `echo hi`, and every call kept a record.
+            bytes: VecDeque::new(),
             capacity,
             total_len: 0,
         }

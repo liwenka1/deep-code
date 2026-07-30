@@ -64,6 +64,14 @@ pub struct CliArgs {
     pub mode: RunMode,
 }
 
+/// Whether the argv asks for help, in any position.
+///
+/// Split out from [`parse_args`] only because that function exits the process,
+/// which makes the behaviour untestable in-crate.
+fn wants_help(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--help" || arg == "-h")
+}
+
 pub fn parse_args() -> CliArgs {
     let mut args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
@@ -72,6 +80,17 @@ pub fn parse_args() -> CliArgs {
                 intent: StartupIntent::New,
             },
         };
+    }
+
+    // A help flag ANYWHERE means help. Recognizing it only as `argv[1]` meant
+    // `doctor --help`, `serve --help`, `session --help` and `-c --help` each fell
+    // into their own unknown-argument branch and exited 2 to stderr — the exact
+    // defect that was fixed for the bare `--help`, just one level down. Safe as a
+    // flat scan: no flag here accepts `--help`/`-h` as its value, and `-h` has no
+    // other meaning in any subcommand.
+    if wants_help(&args) {
+        println!("{}", usage_text());
+        std::process::exit(0);
     }
 
     match args[0].as_str() {
@@ -605,5 +624,38 @@ mod tests {
     fn parse_doctor_json_flag() {
         let parsed = parse_doctor_command(vec!["--json".to_string()]);
         assert_eq!(parsed.mode, RunMode::Doctor { json: true });
+    }
+
+    /// `--help` past the first position used to fall into each subcommand's own
+    /// unknown-argument branch — usage printed to *stderr*, exit 2 — which is the
+    /// same defect that was fixed for the bare `--help` but only at the top level.
+    #[test]
+    fn help_is_recognized_in_any_position() {
+        let argv = |args: &[&str]| args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>();
+
+        for args in [
+            vec!["--help"],
+            vec!["-h"],
+            vec!["doctor", "--help"],
+            vec!["serve", "--help"],
+            vec!["session", "--help"],
+            vec!["session", "list", "--help"],
+            vec!["-c", "--help"],
+            vec!["eval", "--subset", "lite", "--help"],
+        ] {
+            assert!(wants_help(&argv(&args)), "{args:?} must ask for help");
+        }
+
+        for args in [
+            vec!["doctor"],
+            vec!["doctor", "--json"],
+            vec!["serve", "--http", "--port", "8080"],
+            vec!["session", "list"],
+            vec!["-c"],
+            // A value that merely contains the word must not count.
+            vec!["session", "resume", "help-me"],
+        ] {
+            assert!(!wants_help(&argv(&args)), "{args:?} must not ask for help");
+        }
     }
 }

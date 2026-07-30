@@ -47,6 +47,10 @@ ask-the-human; dangerous commands are already blocked elsewhere. Reply with \
 STRICT JSON and nothing else, exactly: {\"approve\": true} or {\"approve\": false}.";
 
 const MAX_ANSWER_TOKENS: u32 = 200;
+
+/// Wall-clock ceiling for one judge call. The user is blocked on this decision,
+/// so it must never be able to hang the turn; expiring means "ask".
+const JUDGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 /// Bound the action summary fed to the model.
 const MAX_ACTION_CHARS: usize = 400;
 
@@ -111,24 +115,36 @@ pub async fn approves<C: LlmClient + ?Sized>(
     request.temperature = Some(0.0);
     request.max_tokens = Some(MAX_ANSWER_TOKENS);
 
-    let Ok(mut stream) = client.stream_chat(request).await else {
-        return (false, None); // model unreachable → ask
-    };
-    let mut text = String::new();
-    let mut usage = None;
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(AgentEvent::TextDelta { text: delta }) => text.push_str(&delta),
-            // Errors (transport or provider) fail safe to ask.
-            Ok(AgentEvent::Error { .. }) | Err(_) => return (false, usage),
-            Ok(AgentEvent::Done { usage: done_usage }) => {
-                usage = done_usage;
-                break;
+    // Bounded, unlike every other model call in the tree: this one talks to the
+    // client directly instead of going through the guarded stream, so it had no
+    // chunk timeout, no total deadline and no byte cap. A provider that accepted
+    // the connection and then went silent (proxy drop, wifi change, laptop wake)
+    // parked the turn indefinitely — no approval prompt, no error, and the only
+    // way out was the user pressing Esc. The judge is one short JSON answer, so a
+    // tight deadline costs nothing and a timeout fails safe to "ask".
+    let judged = tokio::time::timeout(JUDGE_DEADLINE, async {
+        let Ok(mut stream) = client.stream_chat(request).await else {
+            return (false, None); // model unreachable → ask
+        };
+        let mut text = String::new();
+        let mut usage = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(AgentEvent::TextDelta { text: delta }) => text.push_str(&delta),
+                // Errors (transport or provider) fail safe to ask.
+                Ok(AgentEvent::Error { .. }) | Err(_) => return (false, usage),
+                Ok(AgentEvent::Done { usage: done_usage }) => {
+                    usage = done_usage;
+                    break;
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
-    (parse_approve(&text), usage)
+        (parse_approve(&text), usage)
+    })
+    .await;
+    // Timed out → ask, same as any other judge failure.
+    judged.unwrap_or((false, None))
 }
 
 /// Read `approve` from the model's reply. Scans each balanced `{...}` object in
