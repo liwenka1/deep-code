@@ -58,10 +58,6 @@ impl AgentRuntime {
             self.ui_lang(),
         );
 
-        if self.maybe_compact(&route.effective_model, tx).await {
-            // compaction event already emitted; continue with trimmed history
-        }
-
         let mut stream_retries = 0u32;
         let mut steps = 0u32;
 
@@ -93,6 +89,16 @@ impl AgentRuntime {
                 self.finish_turn_cancelled(&turn_id, tx).await;
                 return;
             }
+
+            // Inside the loop, not once before it. Every iteration appends an
+            // assistant message plus its tool results, so a single long agentic
+            // turn grew the context without ever re-checking the threshold — the
+            // exact shape that overflows the window, and a context-overflow 400
+            // is not retriable and has no recovery path.
+            if self.maybe_compact(&route.effective_model, tx).await {
+                // compaction event already emitted; continue with trimmed history
+            }
+
             let (messages, prefix_hash) = {
                 let state = self.state.lock().await;
                 let messages = state.session.wire_messages();

@@ -107,10 +107,29 @@ impl WorkspacePolicy {
                 "path must have a parent directory inside workspace",
             )
         })?;
-        if contains_symlink(parent, Some(&self.root)).map_err(|error| {
+        // Missing parent directories are created rather than refused. A coding
+        // agent adds new modules constantly, and failing `write_file` on
+        // `src/new_mod/thing.rs` forced the model into a separate, separately
+        // approved `mkdir -p` for a directory the write tool was already
+        // authorized to create.
+        //
+        // Containment is decided on the deepest ancestor that actually exists —
+        // canonicalized, and symlink-checked over the same existing portion —
+        // *before* anything is created, so a symlinked or otherwise escaping
+        // ancestor still cannot be used to write outside the workspace. (A
+        // non-existent path can be neither canonicalized nor stat'd, so the old
+        // code failed here rather than at any deliberate check.)
+        let mut existing = parent;
+        while !existing.exists() {
+            match existing.parent() {
+                Some(next) => existing = next,
+                None => break,
+            }
+        }
+        if contains_symlink(existing, Some(&self.root)).map_err(|error| {
             ToolError::exec_failed(
                 tool_name,
-                format!("failed to inspect {}: {error}", parent.display()),
+                format!("failed to inspect {}: {error}", existing.display()),
             )
         })? {
             return Err(path_error(
@@ -119,17 +138,28 @@ impl WorkspacePolicy {
                 "symlinks in the destination path are not allowed",
             ));
         }
-        let parent_canonical = parent.canonicalize().map_err(|error| {
+        let existing_canonical = existing.canonicalize().map_err(|error| {
             ToolError::exec_failed(
                 tool_name,
                 format!(
-                    "destination parent {} does not exist or cannot be resolved: {error}",
-                    parent.display()
+                    "destination parent {} cannot be resolved: {error}",
+                    existing.display()
                 ),
             )
         })?;
-        if !parent_canonical.starts_with(&self.root) {
+        if !existing_canonical.starts_with(&self.root) {
             return Err(path_error(tool_name, raw, "path escapes the workspace"));
+        }
+        if !parent.exists() {
+            fs::create_dir_all(parent).map_err(|error| {
+                ToolError::exec_failed(
+                    tool_name,
+                    format!(
+                        "failed to create destination directory {}: {error}",
+                        parent.display()
+                    ),
+                )
+            })?;
         }
         Ok(candidate)
     }

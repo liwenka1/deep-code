@@ -453,6 +453,16 @@ impl ApplyPatchTool {
         let located = locate_match(&contents, &params.old)
             .map_err(|error| invalid(Self::NAME, error.message(&display)))?;
 
+        // The model writes `new` with LF (that is how `read_file` showed it), so
+        // in a CRLF file splice in the file's own convention — otherwise a
+        // successful patch leaves a block of LF-only lines in an otherwise CRLF
+        // file and every later diff shows the whole region as changed.
+        let replacement = if contents.contains("\r\n") && !params.new.contains('\r') {
+            to_crlf(&params.new)
+        } else {
+            params.new.clone()
+        };
+
         // Splice the matched *original* byte range out and drop `new` in: every
         // byte outside `[start, end)` is preserved verbatim, so CRLF, BOM, and
         // any untouched typographic characters elsewhere in the file survive a
@@ -460,7 +470,7 @@ impl ApplyPatchTool {
         let updated = format!(
             "{}{}{}",
             &contents[..located.start],
-            params.new,
+            replacement,
             &contents[located.end..]
         );
         fs::write(&path, updated).map_err(|error| {
@@ -538,6 +548,11 @@ impl MatchError {
     }
 }
 
+/// Convert lone `\n` to `\r\n`, leaving any existing `\r\n` untouched.
+fn to_crlf(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
 /// Locate `old` in `contents` through a cascade of increasingly tolerant
 /// layers — exact, then indentation-insensitive, then punctuation-normalized —
 /// each requiring a UNIQUE match. Returns the range in the original bytes.
@@ -559,6 +574,36 @@ fn locate_match(contents: &str, old: &str) -> Result<Located, MatchError> {
             });
         }
         _ => {}
+    }
+
+    // 1b. CRLF: `read_file` splits with `str::lines`, which drops the `\r`, so
+    // the model faithfully copies LF-only text out of a CRLF file and then no
+    // layer here can ever match it — exact sees `\n` vs `\r\n`, the indentation
+    // layer only strips *leading* whitespace, and punctuation folding does not
+    // touch `\r`. The failure told the model to "copy `old` verbatim from
+    // read_file", which is exactly what it had just done: an unrecoverable retry
+    // loop on every multi-line edit in a CRLF repo. Re-matching with the needle
+    // converted to the file's own line ending keeps the range in original
+    // coordinates, so the surrounding CRLF is preserved rather than normalized.
+    if contents.contains("\r\n") && !old.contains('\r') && old.contains('\n') {
+        let crlf_old = to_crlf(old);
+        match contents.matches(&crlf_old).count() {
+            1 => {
+                let start = contents.find(&crlf_old).expect("counted one match");
+                return Ok(Located {
+                    start,
+                    end: start + crlf_old.len(),
+                    kind: MatchKind::Exact,
+                });
+            }
+            count if count > 1 => {
+                return Err(MatchError::NonUnique {
+                    count,
+                    kind: MatchKind::Exact,
+                });
+            }
+            _ => {}
+        }
     }
 
     // 2. Indentation-insensitive: strip each line's leading whitespace on both

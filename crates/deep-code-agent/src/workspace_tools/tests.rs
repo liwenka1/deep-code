@@ -218,6 +218,81 @@ async fn apply_patch_preserves_crlf_and_untouched_bytes() {
     );
 }
 
+/// The real CRLF case, which the single-token test above never exercised: a
+/// *multi-line* `old` copied from `read_file`, whose `str::lines` split drops
+/// every `\r`. Exact compared `\n` against `\r\n`, the indentation layer only
+/// strips *leading* whitespace, and punctuation folding does not touch `\r` — so
+/// all three layers missed, and the error told the model to "copy `old` verbatim
+/// from read_file", which is exactly what it had just done.
+#[tokio::test]
+async fn apply_patch_matches_multiline_old_in_a_crlf_file() {
+    let tmp = tempdir().unwrap();
+    let original = "fn a() {\r\n    let x = 1;\r\n    let y = 2;\r\n}\r\n";
+    fs::write(tmp.path().join("lib.rs"), original).unwrap();
+
+    let result = run(
+        tmp.path(),
+        "apply_patch",
+        // Exactly what read_file hands the model: LF only.
+        json!({
+            "path": "lib.rs",
+            "old": "    let x = 1;\n    let y = 2;",
+            "new": "    let x = 10;\n    let y = 20;",
+        }),
+    )
+    .await;
+    assert_eq!(
+        result.status,
+        ToolResultStatus::Success,
+        "{}",
+        result.content
+    );
+
+    // Patched — and still CRLF throughout, including the rewritten lines, so a
+    // successful edit does not leave an LF island in a CRLF file.
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("lib.rs")).unwrap(),
+        "fn a() {\r\n    let x = 10;\r\n    let y = 20;\r\n}\r\n"
+    );
+}
+
+/// Creating a new module is routine, and refusing it pushed the model into a
+/// separately-approved `mkdir -p` for a directory `write_file` was already
+/// authorized to create.
+#[tokio::test]
+async fn write_file_creates_missing_parent_directories() {
+    let tmp = tempdir().unwrap();
+
+    let result = run(
+        tmp.path(),
+        "write_file",
+        json!({"path": "src/deep/new_mod.rs", "content": "pub fn f() {}\n"}),
+    )
+    .await;
+    assert_eq!(
+        result.status,
+        ToolResultStatus::Success,
+        "{}",
+        result.content
+    );
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("src/deep/new_mod.rs")).unwrap(),
+        "pub fn f() {}\n"
+    );
+
+    // Creating parents must not become an escape hatch.
+    run_err(
+        tmp.path(),
+        "write_file",
+        json!({"path": "../outside/x.rs", "content": "x"}),
+    )
+    .await;
+    assert!(
+        !tmp.path().parent().unwrap().join("outside").exists(),
+        "must not create directories outside the workspace"
+    );
+}
+
 #[tokio::test]
 async fn apply_patch_rejects_non_unique_old_with_recovery_hint() {
     let tmp = tempdir().unwrap();
