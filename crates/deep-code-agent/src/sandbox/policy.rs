@@ -58,6 +58,17 @@ impl SandboxPolicy {
         }
     }
 
+    /// Writable roots: the workspace, the command's cwd when it differs, and the
+    /// system temp dir.
+    ///
+    /// The temp dir is not a convenience. Toolchains write scratch files there
+    /// unconditionally — `rustc` allocates a temp dir per invocation, git's
+    /// xcrun shim caches there, every `mktemp` caller needs it — so a profile
+    /// without it does not *confine* `cargo build`, it makes it fail outright.
+    /// Granting it is no escalation either: the sandbox exists to hold commands
+    /// inside the workspace boundary, and `$TMPDIR` is per-user ephemeral space
+    /// the user's own processes already write to. Both backends read this list,
+    /// so the grant cannot drift per-platform again.
     pub fn writable_roots(&self, workspace: &Path, cwd: &Path) -> Vec<PathBuf> {
         match self {
             Self::Unsandboxed => Vec::new(),
@@ -66,6 +77,7 @@ impl SandboxPolicy {
                 if cwd != workspace {
                     roots.push(cwd.to_path_buf());
                 }
+                roots.push(std::env::temp_dir());
                 roots
             }
         }

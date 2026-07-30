@@ -37,6 +37,30 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # Compiles & tests the macOS-only Seatbelt code. These tests actually spawn
+  # `sandbox-exec`, so this job is the only place the real profile is enforced
+  # end to end — the other two jobs `cfg`-skip all of it. macOS is also the
+  # primary development and release platform.
+  macos:
+    name: macos · clippy · test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # Pinned to match rust-toolchain.toml; bump both together.
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
   # Compiles & tests the Windows-only sandbox (Job Object) code, which the
   # Linux job's `cfg(windows)` gating skips.
   windows:

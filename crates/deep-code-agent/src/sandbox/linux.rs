@@ -164,8 +164,9 @@ fn build_landlock(
 }
 
 fn writable_paths(workspace: &Path, cwd: &Path, policy: &SandboxPolicy) -> Vec<PathBuf> {
+    // `writable_roots` already includes the temp dir (shared with the macOS
+    // profile so the two backends cannot diverge on it again).
     let mut paths = policy.writable_roots(workspace, cwd);
-    paths.push(std::env::temp_dir());
     for node in [
         "/dev/null",
         "/dev/zero",

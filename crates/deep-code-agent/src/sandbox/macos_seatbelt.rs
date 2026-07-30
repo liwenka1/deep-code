@@ -295,8 +295,35 @@ mod tests {
             .filter(|(name, _)| name.starts_with("WRITE_ROOT_"))
             .map(|(name, _)| name.as_str())
             .collect();
-        assert_eq!(write_roots, ["WRITE_ROOT_0", "WRITE_ROOT_1"]);
+        // Workspace, the distinct cwd, and the temp dir — see
+        // `SandboxPolicy::writable_roots` for why the temp dir is mandatory.
+        assert_eq!(
+            write_roots,
+            ["WRITE_ROOT_0", "WRITE_ROOT_1", "WRITE_ROOT_2"]
+        );
         assert!(profile.render().contains("WRITE_ROOT_1"));
+    }
+
+    #[test]
+    fn temp_dir_is_always_a_write_root() {
+        // Regression guard: `rustc`, `mktemp` and git's xcrun shim all write to
+        // $TMPDIR unconditionally, so dropping this grant does not confine
+        // `cargo build`, it breaks it. Both backends read `writable_roots`.
+        let workspace = tempfile::tempdir().unwrap();
+        let profile = compose_profile(
+            &SandboxPolicy::workspace_write(),
+            workspace.path(),
+            workspace.path(),
+        );
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        assert!(
+            profile
+                .bindings
+                .iter()
+                .any(|(name, path)| { name.starts_with("WRITE_ROOT_") && *path == temp }),
+            "temp dir must be granted; bindings were {:?}",
+            profile.bindings
+        );
     }
 
     #[test]
@@ -393,8 +420,20 @@ mod tests {
             return;
         }
         let workspace = tempfile::tempdir().unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
-        let escape = elsewhere.path().join("escape-attempt.txt");
+        // The escape target must sit outside every writable root, so it cannot
+        // be a tempdir — the temp dir is itself granted. $HOME is not granted
+        // (only its credential subdirs are explicitly denied), so a plain file
+        // there is the honest "absence of grant" probe. Nothing is created when
+        // the sandbox holds; the cleanup below only matters if it does not.
+        let Some(home) = crate::paths::home_dir() else {
+            eprintln!("no home dir on this host; skipping");
+            return;
+        };
+        let escape = home.join(format!(
+            ".deep-code-sandbox-escape-probe-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&escape);
 
         let status = wrap_shell_command(
             &format!("printf leaked > {}", escape.display()),
@@ -405,9 +444,39 @@ mod tests {
         .status()
         .expect("sandbox-exec should launch");
 
+        let leaked = escape.exists();
+        let _ = std::fs::remove_file(&escape);
         assert!(
-            !status.success() || !escape.exists(),
-            "write outside the workspace must be denied"
+            !status.success() && !leaked,
+            "write outside every writable root must be denied"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confined_command_can_use_the_temp_dir() {
+        if !is_available() {
+            eprintln!("seatbelt unavailable on this host; skipping");
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+
+        // Behavioral counterpart to `temp_dir_is_always_a_write_root`: without
+        // the grant this fails with "Operation not permitted", which is exactly
+        // how `cargo build`/`rustc`/`git` broke. `mktemp` needs no toolchain.
+        let output = wrap_shell_command(
+            "mktemp",
+            workspace.path(),
+            workspace.path(),
+            &SandboxPolicy::workspace_write(),
+        )
+        .output()
+        .expect("sandbox-exec should launch");
+
+        assert!(
+            output.status.success(),
+            "mktemp must work inside the sandbox; stderr was {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
