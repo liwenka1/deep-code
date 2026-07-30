@@ -95,9 +95,13 @@ fn normalize(value: &str) -> String {
 }
 
 pub fn build_system_prompt(role: SubAgentRole) -> String {
+    // Children run shell commands too and start from a blank context, so they
+    // need the same host facts the parent gets — otherwise each one rediscovers
+    // "this is not POSIX" one failed command at a time.
     format!(
-        "{}\n\n{}",
+        "{}\n\n{}\n\n{}",
         role.intro(),
+        crate::extensions::platform_block(),
         super::output::SUBAGENT_OUTPUT_FORMAT
     )
 }
@@ -129,5 +133,16 @@ mod tests {
             SubAgentRole::Review
         );
         assert!(SubAgentRole::parse("custom").is_err());
+    }
+
+    /// Children run shell too and start blank, so they need the same host facts.
+    #[test]
+    fn child_prompt_states_the_host_shell() {
+        let prompt = build_system_prompt(SubAgentRole::General);
+        let expected_shell = if cfg!(windows) { "cmd.exe /C" } else { "sh -c" };
+        assert!(
+            prompt.contains(expected_shell),
+            "child prompt must name the real shell: {prompt}"
+        );
     }
 }

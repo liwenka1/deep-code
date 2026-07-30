@@ -49,9 +49,38 @@ pub const SUBAGENT_GUIDANCE: &str = "\
 - 选角色 role：explore / review / verifier 只读（调查/评审/验证）；implementer / general 可写文件（落地改动）；拿不准用 general。\n\
 - 一次调用即阻塞到子代理完成并返回其五段报告，无需轮询或关闭；子代理产出报告即停，不会反问。";
 
+/// Host facts the model cannot observe but will otherwise guess wrong.
+///
+/// Without this the model falls back on its training bias — POSIX — and on
+/// Windows emits `ls -la`, `cat x`, `grep -r`, `$VAR`, `2>/dev/null`,
+/// `'quoted'`, none of which work under `cmd.exe /C`. Each one costs a failed
+/// round trip before it adapts. Compile-time constant, so it cannot disturb the
+/// cached prompt prefix.
+#[must_use]
+pub fn platform_block() -> &'static str {
+    if cfg!(windows) {
+        "运行环境 / Environment:\n\
+         - OS: Windows。`shell`/`job` 的命令由 `cmd.exe /C` 执行，不是 POSIX shell。\n\
+         - 用 Windows 形态：`dir`（非 ls）、`type`（非 cat）、`findstr`（非 grep）、`del`/`rd`（非 rm）、`copy`（非 cp）、`move`（非 mv）。\n\
+         - 变量写 `%VAR%`（非 `$VAR`）；丢弃输出写 `2>nul`（非 `2>/dev/null`）；路径分隔符是反斜杠。\n\
+         - `cmd.exe` 不把单引号当引号：带空格的参数请用双引号。\n\
+         - `git` 通常可用（Git for Windows）；除此之外不要假定 Unix 工具在 PATH 上。"
+    } else if cfg!(target_os = "macos") {
+        "运行环境 / Environment:\n\
+         - OS: macOS。`shell`/`job` 的命令由 `sh -c` 执行（POSIX）。\n\
+         - 命令行工具是 BSD 变体：`sed -i` 必须带备份后缀（写 `sed -i '' …`），`stat`/`date` 的参数与 GNU 不同。"
+    } else {
+        "运行环境 / Environment:\n\
+         - OS: Linux。`shell`/`job` 的命令由 `sh -c` 执行（POSIX，GNU 工具链）。"
+    }
+}
+
 pub fn build_runtime_system_prompt(base: &str, workspace: &Path) -> String {
     let prompt = build_system_prompt(base, workspace);
-    format!("{prompt}\n\n{TOOL_DISCIPLINE}\n\n{SUBAGENT_GUIDANCE}")
+    format!(
+        "{prompt}\n\n{}\n\n{TOOL_DISCIPLINE}\n\n{SUBAGENT_GUIDANCE}",
+        platform_block()
+    )
 }
 
 pub fn attach_agent_extensions(
@@ -92,5 +121,30 @@ mod tests {
         // Sub-agent guidance rides the same parent-only path.
         assert!(prompt.contains("子代理委托"));
         assert!(prompt.contains("简报必须自足"));
+    }
+
+    /// The model must be told the host's shell dialect. Regression guard: on
+    /// Windows a POSIX-flavoured prompt costs one failed command per guess
+    /// (`ls`, `$VAR`, `2>/dev/null` all fail under cmd.exe).
+    #[test]
+    fn runtime_prompt_states_the_host_shell() {
+        let dir = TempDir::new().unwrap();
+        let prompt = build_runtime_system_prompt("base", dir.path());
+        let expected_shell = if cfg!(windows) { "cmd.exe /C" } else { "sh -c" };
+        assert!(
+            prompt.contains(expected_shell),
+            "prompt must name the real shell ({expected_shell}): {prompt}"
+        );
+        if cfg!(windows) {
+            assert!(prompt.contains("%VAR%"), "Windows prompt must correct $VAR");
+        }
+        // The `\`-continuations in the literal must not leak their source
+        // indentation into every request's prompt.
+        for line in platform_block().lines() {
+            assert!(
+                !line.starts_with(' '),
+                "platform block leaks source indentation: {line:?}"
+            );
+        }
     }
 }
