@@ -311,4 +311,42 @@ mod tests {
         assert!(!refuse_bare_execution(true, Some(false), false));
         assert!(!refuse_bare_execution(true, Some(true), false));
     }
+
+    /// Diagnostic probe for Windows argument passing — changes no behaviour.
+    ///
+    /// `bare_shell_command` builds `cmd /C <command>` with `Command::arg`, which
+    /// applies the MSVC C-runtime quoting rules: an argument containing spaces or
+    /// quotes is wrapped in `"` and its inner quotes escaped as `\"`. `cmd.exe`
+    /// does not implement those rules — it treats `\` as a literal character and
+    /// `"` as a quote toggle — so any command carrying a quoted argument can
+    /// arrive mangled. `std::os::windows::process::CommandExt::raw_arg` exists
+    /// precisely for this case and is used nowhere here.
+    ///
+    /// `echo "a b"` is the minimal probe: cmd's `echo` emits its argument
+    /// verbatim, quotes included, so a correct pass-through prints exactly
+    /// `"a b"`. Backslashes in the output mean the escaping leaked through.
+    ///
+    /// This is the observable behind a real report: on Windows the model stopped
+    /// using `git commit -m "<message>"` and started writing the message to a
+    /// file to commit with `-F`, i.e. it routed around broken quoting.
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_receives_quoted_arguments_verbatim() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let output = bare_shell_command("echo \"a b\"", &cwd)
+            .output()
+            .expect("spawn cmd");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let got = stdout.trim();
+
+        assert!(
+            !got.contains('\\'),
+            "cmd received escaped quotes: stdout={got:?}. Command::arg applied \
+             MSVC quoting that cmd.exe cannot parse; the fix is raw_arg."
+        );
+        assert_eq!(
+            got, "\"a b\"",
+            "quoted argument did not survive the trip to cmd.exe: stdout={got:?}"
+        );
+    }
 }
