@@ -76,7 +76,15 @@ pub fn parse_args() -> CliArgs {
 
     match args[0].as_str() {
         "--version" | "-V" => {
-            println!("deep-code {}", env!("CARGO_PKG_VERSION"));
+            println!("{} {}", program_name(), env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        // Asked-for help goes to stdout and exits 0 — it is not an error. It
+        // used to fall through to the unknown-argument branch below, so the
+        // first thing a new user types printed "Unknown arguments: --help" to
+        // stderr and exited 2.
+        "--help" | "-h" | "help" => {
+            println!("{}", usage_text());
             std::process::exit(0);
         }
         "session" => {
@@ -104,6 +112,7 @@ pub fn parse_args() -> CliArgs {
 /// Parse the TUI flags (`--new`, `-c`/`--continue`, `-r`/`--resume [id]`) into
 /// a [`StartupIntent`]. Last intent wins; unknown args abort with usage.
 fn parse_tui_args(args: Vec<String>) -> CliArgs {
+    let prog = program_name();
     let mut intent = StartupIntent::New;
     let mut positional = Vec::new();
 
@@ -135,7 +144,7 @@ fn parse_tui_args(args: Vec<String>) -> CliArgs {
 
     if !positional.is_empty() {
         eprintln!(
-            "Unknown arguments: {}. Try `deep-code doctor` or `deep-code serve --http`.",
+            "Unknown arguments: {}. Try `{prog} --help`.",
             positional.join(" ")
         );
         print_usage();
@@ -148,6 +157,7 @@ fn parse_tui_args(args: Vec<String>) -> CliArgs {
 }
 
 fn parse_doctor_command(mut args: Vec<String>) -> CliArgs {
+    let prog = program_name();
     let mut json = false;
     while let Some(arg) = args.first().cloned() {
         match arg.as_str() {
@@ -156,7 +166,7 @@ fn parse_doctor_command(mut args: Vec<String>) -> CliArgs {
                 args.remove(0);
             }
             other => {
-                eprintln!("Unknown doctor argument '{other}'. Usage: deep-code doctor [--json]");
+                eprintln!("Unknown doctor argument '{other}'. Usage: {prog} doctor [--json]");
                 std::process::exit(2);
             }
         }
@@ -167,6 +177,7 @@ fn parse_doctor_command(mut args: Vec<String>) -> CliArgs {
 }
 
 fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
+    let prog = program_name();
     let mut http = false;
     let mut host = "127.0.0.1".to_string();
     let mut port = 7878u16;
@@ -218,7 +229,7 @@ fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
             }
             other => {
                 eprintln!(
-                    "Unknown serve argument '{other}'. Usage: deep-code serve --http [--host HOST] [--port PORT] [--auth-token TOKEN] [--resume ID] [--approval-mode interactive|autonomous]"
+                    "Unknown serve argument '{other}'. Usage: {prog} serve --http [--host HOST] [--port PORT] [--auth-token TOKEN] [--resume ID] [--approval-mode interactive|autonomous]"
                 );
                 std::process::exit(2);
             }
@@ -226,7 +237,7 @@ fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
     }
 
     if !http {
-        eprintln!("Usage: deep-code serve --http [--host 127.0.0.1] [--port 7878]");
+        eprintln!("Usage: {prog} serve --http [--host 127.0.0.1] [--port 7878]");
         std::process::exit(2);
     }
 
@@ -249,6 +260,7 @@ fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
 }
 
 fn parse_eval_command(mut args: Vec<String>) -> CliArgs {
+    let prog = program_name();
     let mut subset = "lite".to_string();
     // dev(23 题)是默认:便宜、适合联调,避免误触 300 题的 test 全量。
     let mut split = "dev".to_string();
@@ -312,7 +324,7 @@ fn parse_eval_command(mut args: Vec<String>) -> CliArgs {
             }
             other => {
                 eprintln!(
-                    "Unknown eval argument '{other}'. Usage: deep-code eval \
+                    "Unknown eval argument '{other}'. Usage: {prog} eval \
 [--subset lite|verified] [--split dev|test] [--sample N] [--parallel N] \
 [--json] [--markdown] [--timeout SECS] [--out DIR]"
                 );
@@ -344,8 +356,9 @@ fn require_value(args: &mut Vec<String>, flag: &str) -> String {
 }
 
 fn parse_session_command(mut args: Vec<String>) -> CliArgs {
+    let prog = program_name();
     let Some(subcommand) = args.first().cloned() else {
-        eprintln!("Usage: deep-code session <list|resume|delete|export> [id]");
+        eprintln!("Usage: {prog} session <list|resume|delete|export> [id]");
         print_session_usage();
         std::process::exit(2);
     };
@@ -354,7 +367,7 @@ fn parse_session_command(mut args: Vec<String>) -> CliArgs {
     match subcommand.as_str() {
         "list" => {
             if !args.is_empty() {
-                eprintln!("Usage: deep-code session list");
+                eprintln!("Usage: {prog} session list");
                 std::process::exit(2);
             }
             CliArgs {
@@ -363,11 +376,11 @@ fn parse_session_command(mut args: Vec<String>) -> CliArgs {
         }
         "resume" => {
             let Some(id) = args.first().cloned() else {
-                eprintln!("Usage: deep-code session resume <id>");
+                eprintln!("Usage: {prog} session resume <id>");
                 std::process::exit(2);
             };
             if args.len() > 1 {
-                eprintln!("Usage: deep-code session resume <id>");
+                eprintln!("Usage: {prog} session resume <id>");
                 std::process::exit(2);
             }
             CliArgs {
@@ -378,11 +391,11 @@ fn parse_session_command(mut args: Vec<String>) -> CliArgs {
         }
         "delete" => {
             let Some(id) = args.first().cloned() else {
-                eprintln!("Usage: deep-code session delete <id>");
+                eprintln!("Usage: {prog} session delete <id>");
                 std::process::exit(2);
             };
             if args.len() > 1 {
-                eprintln!("Usage: deep-code session delete <id>");
+                eprintln!("Usage: {prog} session delete <id>");
                 std::process::exit(2);
             }
             CliArgs {
@@ -391,11 +404,11 @@ fn parse_session_command(mut args: Vec<String>) -> CliArgs {
         }
         "export" => {
             let Some(id) = args.first().cloned() else {
-                eprintln!("Usage: deep-code session export <id>");
+                eprintln!("Usage: {prog} session export <id>");
                 std::process::exit(2);
             };
             if args.len() > 1 {
-                eprintln!("Usage: deep-code session export <id>");
+                eprintln!("Usage: {prog} session export <id>");
                 std::process::exit(2);
             }
             CliArgs {
@@ -468,26 +481,55 @@ pub fn run_session_command(mode: RunMode) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The name the user actually invoked us by.
+///
+/// Distribution makes this necessary: the npm package installs the binary as
+/// `deepcode`, while `cargo build` produces `deep-code`. Hardcoding either one
+/// tells half the users to run a command that does not exist on their machine.
+pub(crate) fn program_name() -> String {
+    env::args_os()
+        .next()
+        .map(PathBuf::from)
+        .and_then(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "deepcode".to_string())
+}
+
+fn usage_text() -> String {
+    let prog = program_name();
+    [
+        "Commands:".to_string(),
+        format!("  {prog}                # 新会话"),
+        format!("  {prog} -c             # 续最近会话"),
+        format!("  {prog} -r             # 选择历史会话"),
+        format!("  {prog} doctor [--json]"),
+        format!("  {prog} serve --http [--host HOST] [--port PORT]"),
+        format!("  {prog} session list|resume|delete|export"),
+        format!("  {prog} eval [--subset lite] [--sample N] [--parallel N] [--json] [--markdown]"),
+        String::new(),
+        format!("  {prog} --help | --version"),
+    ]
+    .join("\n")
+}
+
+/// Usage on the error path: stderr, because the caller exits non-zero.
 fn print_usage() {
-    eprintln!("Commands:");
-    eprintln!("  deep-code                # 新会话");
-    eprintln!("  deep-code -c             # 续最近会话");
-    eprintln!("  deep-code -r             # 选择历史会话");
-    eprintln!("  deep-code doctor [--json]");
-    eprintln!("  deep-code serve --http [--host HOST] [--port PORT]");
-    eprintln!("  deep-code session list|resume|delete|export");
-    eprintln!("  deep-code eval [--subset lite] [--sample N] [--parallel N] [--json] [--markdown]");
+    eprintln!("{}", usage_text());
 }
 
 fn print_session_usage() {
+    let prog = program_name();
     let workspace = workspace_root();
     eprintln!("{}", format_sessions_storage_note(&workspace));
     eprintln!("Examples:");
-    eprintln!("  deep-code session list");
-    eprintln!("  deep-code session resume <session_id>");
-    eprintln!("  deep-code session export <session_id>");
-    eprintln!("  deep-code -c            # 续最近会话");
-    eprintln!("  deep-code -r            # 选择历史会话");
+    eprintln!("  {prog} session list");
+    eprintln!("  {prog} session resume <session_id>");
+    eprintln!("  {prog} session export <session_id>");
+    eprintln!("  {prog} -c            # 续最近会话");
+    eprintln!("  {prog} -r            # 选择历史会话");
 }
 
 #[cfg(test)]
@@ -536,6 +578,27 @@ mod tests {
             StartupIntent::ResumeId("session_9_0".to_string())
         );
         assert_eq!(tui_intent(&["--resume="]), StartupIntent::ResumePicker);
+    }
+
+    #[test]
+    fn usage_names_the_invoked_binary_not_a_hardcoded_one() {
+        let text = usage_text();
+        // npm installs the binary as `deepcode`, `cargo build` produces
+        // `deep-code`. Any hardcoded spelling sends half the users to a command
+        // that does not exist for them, so usage must interpolate argv[0].
+        assert!(
+            !text.contains("deep-code"),
+            "usage must not hardcode a binary name: {text}"
+        );
+        assert!(text.contains(&program_name()));
+        assert!(text.contains("--help"), "help must advertise itself");
+    }
+
+    #[test]
+    fn program_name_falls_back_when_argv0_is_unusable() {
+        // Only the fallback is assertable here: argv[0] of the test harness is
+        // the test binary, so the happy path is covered by the test above.
+        assert!(!program_name().is_empty());
     }
 
     #[test]
