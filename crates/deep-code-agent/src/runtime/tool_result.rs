@@ -609,8 +609,10 @@ impl AgentRuntime {
 
         {
             let mut state = self.state.lock().await;
-            // Model history gets a size-bounded copy; the event stream and the
-            // persisted TurnRecord keep the full output.
+            // Size-bounded copy, and the only one that gets persisted — the
+            // untruncated output goes out on the event stream and is not stored
+            // anywhere (the second, lossless copy in `TurnRecord.tool_results`
+            // was removed to stop O(session²) write amplification).
             let trimmed = truncate_tool_output(&result.content);
             if !state
                 .session

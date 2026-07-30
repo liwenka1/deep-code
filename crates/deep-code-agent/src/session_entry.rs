@@ -115,8 +115,10 @@ impl ToolExchange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExchangeResult {
-    /// Trimmed model-facing content; the full result lives in the turn's
-    /// [`crate::session_store::TurnRecord`] (dual-copy design).
+    /// Model-facing content, size-bounded by `truncate_tool_output` (head+tail,
+    /// middle elided). This is the only persisted copy: the untruncated output
+    /// exists solely on the live event stream, so a large tool result cannot be
+    /// recovered in full from a session file or `session export`.
     pub content: String,
     pub status: ToolResultStatus,
 }

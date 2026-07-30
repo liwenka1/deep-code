@@ -61,8 +61,14 @@ pub(super) struct RuntimeState {
 }
 
 pub(super) struct Persistence {
-    /// Authoritative in-memory transcript. Callers mutate this under the
-    /// mutex; durable writes are funnelled through [`PersistenceActorHandle`].
+    /// The to-be-persisted *snapshot* of the transcript — NOT the authority.
+    ///
+    /// `RuntimeState.session` is authoritative; `persist()` overwrites this
+    /// record's `entries` wholesale from it. Do not mutate entries in place here
+    /// (e.g. `Arc::make_mut(&mut record.entries[i])`): the next save replaces the
+    /// whole vector, so the change is silently discarded. Mutate the session and
+    /// let `persist()` propagate. Durable writes are funnelled through
+    /// [`PersistenceActorHandle`].
     pub(super) record: Arc<Mutex<SessionRecord>>,
     pub(super) actor: PersistenceActorHandle,
 }
