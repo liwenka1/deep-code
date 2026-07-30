@@ -150,6 +150,72 @@ fn has_dos_switch(args: &[String], switch: char) -> bool {
     })
 }
 
+/// Windows system trees a recursive delete must never touch. `\Users` is
+/// deliberately absent: real projects live under it, so denying it would refuse
+/// `rd /s /q C:\Users\me\proj\node_modules` — an everyday cleanup. Destroying
+/// someone else's home tree is the out-of-workspace problem, which the approval
+/// gate owns, not this floor.
+const WINDOWS_SYSTEM_ROOTS: &[&str] = &[
+    "\\windows",
+    "\\system32",
+    "\\program files",
+    "\\programdata",
+];
+
+/// Whether a recursive-force delete (`rd /s /q`, `del /s /q`) names a target
+/// catastrophic enough to hard-refuse.
+///
+/// A blanket deny on the recurse+force shape — the exact mirror of `rm -rf` —
+/// looks symmetric but is not: on Unix `rm -r <dir>` stays available as the
+/// everyday escape, whereas `rd /s` without `/q` stops to ask for confirmation
+/// and stdin is `Stdio::null()`, so it can never complete. Denying the whole
+/// shape therefore leaves Windows with *no* working way to delete a directory
+/// tree. So this floor refuses only the shapes that are unambiguously
+/// destructive and keeps `rd /s /q node_modules` runnable.
+///
+/// Not covered here: an absolute path to somewhere else in the user's home. That
+/// is the out-of-workspace question the approval gate answers.
+fn dos_delete_target_is_catastrophic(args: &[String]) -> bool {
+    args.iter()
+        // Switches are not targets (`/s`, `/q`, `/f:x`).
+        .filter(|arg| !arg.starts_with('/'))
+        .any(|target| {
+            let target = target.trim();
+            if target.is_empty() {
+                return false;
+            }
+            // `%VAR%` cannot be resolved statically, so the target is unknown —
+            // same reasoning as `$` on the Unix side.
+            if target.contains('%') {
+                return true;
+            }
+            // The workspace itself, or anything climbing out of it.
+            if target == "." || target == ".." || target.contains("..") {
+                return true;
+            }
+            let normalized = target.to_ascii_lowercase().replace('/', "\\");
+            // Root of the current drive.
+            if normalized == "\\" {
+                return true;
+            }
+            // Drive root: `c:`, `c:\`.
+            let bytes = normalized.as_bytes();
+            let after_drive =
+                if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+                    &normalized[2..]
+                } else {
+                    normalized.as_str()
+                };
+            if after_drive.is_empty() || after_drive == "\\" {
+                return true;
+            }
+            let trimmed = after_drive.trim_end_matches('\\');
+            WINDOWS_SYSTEM_ROOTS
+                .iter()
+                .any(|root| trimmed == *root || trimmed.starts_with(&format!("{root}\\")))
+        })
+}
+
 /// Whether a `chmod` mode argument grants write to "other"/"all" (world-
 /// writable), covering octal (`777`, `0666`, `4777`) and symbolic (`o+w`,
 /// `a+w`, `+w`, `a=rwx`) forms. Best-effort — chmod modes have many shapes; it
@@ -223,17 +289,14 @@ fn deny_segment(segment: &str) -> Option<DenyReason> {
         // program: `del`/`rd` are denied only in the recurse+force form, the way
         // `rm` is denied only as `rm -rf`. Harmless on Unix, where these
         // programs either do not exist or have no `/s` switch.
-        "del" | "erase" => (has_dos_switch(&args, 's')
-            && (has_dos_switch(&args, 'q') || has_dos_switch(&args, 'f')))
-        .then_some(DenyReason("recursive force delete (del /s /q)")),
-        "rd" => (has_dos_switch(&args, 's')
-            && (has_dos_switch(&args, 'q') || has_dos_switch(&args, 'f')))
-        .then_some(DenyReason("recursive directory removal (rd /s /q)")),
-        // Unix `rmdir` only removes empty dirs (and is auto-approvable as a
-        // bounded edit); the Windows one recurses with `/s`.
-        "rmdir" => (has_dos_switch(&args, 's')
-            && (has_dos_switch(&args, 'q') || has_dos_switch(&args, 'f')))
-        .then_some(DenyReason("recursive directory removal (rmdir /s /q)")),
+        // Recursive delete is refused by TARGET, not by shape — see
+        // `dos_delete_target_is_catastrophic` for why mirroring `rm -rf`
+        // literally would leave Windows unable to delete anything.
+        // (`rmdir` is the same command as `rd`; on Unix it only removes empty
+        // dirs and has no `/s`, so the rule cannot misfire there.)
+        "del" | "erase" | "rd" | "rmdir" => (has_dos_switch(&args, 's')
+            && dos_delete_target_is_catastrophic(&args))
+        .then_some(DenyReason("recursive delete of a root or system path")),
         "format" | "diskpart" => Some(DenyReason("disk formatting/partitioning")),
         // Registry deletion: `reg delete <key> /f`. `reg query`/`reg add` stay.
         "reg" => args
@@ -722,32 +785,88 @@ mod tests {
     }
 
     /// The deny floor used to be POSIX-only, which left it empty on Windows —
-    /// the one platform whose sandbox confines nothing. Each rule mirrors the
-    /// shape of its Unix counterpart instead of banning the program outright.
+    /// the one platform whose sandbox confines nothing.
     #[test]
     fn windows_destructive_shapes_are_denied() {
-        assert!(denied("del /f /s /q C:\\Users"));
-        assert!(denied("del /s /q build"));
-        assert!(denied("rd /s /q C:\\"));
-        assert!(denied("rmdir /s /q node_modules"));
         assert!(denied("format C:"));
         assert!(denied("diskpart"));
         assert!(denied("reg delete HKLM\\Software\\X /f"));
         assert!(denied("takeown /f C:\\ /r"));
-        // Case-insensitive switches (cmd.exe accepts /S /Q).
-        assert!(denied("RD /S /Q C:\\"));
     }
 
-    /// Mirrors `rm` (denied only as `rm -rf`): the bounded forms must stay
-    /// runnable, or every ordinary cleanup turns into a hard refusal.
+    /// Recursive delete is judged by target, not by shape. Mirroring `rm -rf`
+    /// literally would refuse every `rd /s /q`, and since `rd /s` without `/q`
+    /// waits on a confirmation `Stdio::null()` can never answer, that would leave
+    /// Windows with no working way to delete a directory tree at all.
+    ///
+    /// Exercises the predicate directly with already-cleaned arguments: run
+    /// through `denied()` on a Unix host, `clean_token` would strip the
+    /// backslashes out of every Windows path (it treats `\` as an escape there)
+    /// and the cases would silently stop meaning what they say.
     #[test]
-    fn windows_bounded_forms_are_not_denied() {
+    fn catastrophic_recursive_delete_targets_are_denied() {
+        let args = |target: &str| vec!["/s".to_string(), "/q".to_string(), target.to_string()];
+        for target in [
+            "C:\\", // drive root
+            "c:",   // drive root, no separator
+            "C:/",  // forward-slash form
+            "\\",   // root of current drive
+            ".",    // the workspace itself
+            "..",
+            "..\\sibling",   // climbing out
+            "%USERPROFILE%", // unresolvable
+            "C:\\Windows",
+            "c:\\windows\\system32",
+            "C:\\Program Files\\Thing",
+            "\\ProgramData",
+        ] {
+            assert!(
+                dos_delete_target_is_catastrophic(&args(target)),
+                "{target:?} must be refused"
+            );
+        }
+    }
+
+    /// The everyday cleanups must keep working, or the floor is worse than no
+    /// floor: it would push the model into writing its own delete scripts.
+    #[test]
+    fn bounded_recursive_delete_targets_stay_runnable() {
+        let args = |target: &str| vec!["/s".to_string(), "/q".to_string(), target.to_string()];
+        for target in [
+            "node_modules",
+            "build\\out",
+            "*.log",
+            "target",
+            // A project under the user profile is the normal case; an absolute
+            // path to somewhere else in $HOME is the approval gate's problem,
+            // not this floor's.
+            "C:\\Users\\me\\proj\\node_modules",
+        ] {
+            assert!(
+                !dos_delete_target_is_catastrophic(&args(target)),
+                "{target:?} must stay runnable"
+            );
+        }
+        // Switches alone are not targets.
+        assert!(!dos_delete_target_is_catastrophic(&[
+            "/s".to_string(),
+            "/q".to_string()
+        ]));
+    }
+
+    /// End-to-end through `denied()`, limited to cases that survive
+    /// `clean_token` identically on both platforms.
+    #[test]
+    fn windows_recursive_delete_is_shape_plus_target() {
+        // No `/s` means not recursive, so never this rule's business.
         assert!(!denied("del build.log"));
-        assert!(!denied("del /q build.log"));
         assert!(!denied("rd empty_dir"));
         assert!(!denied("rmdir empty_dir"));
-        assert!(!denied("reg query HKLM\\Software"));
-        assert!(!denied("reg add HKCU\\Software\\X /v Y /d 1"));
+        assert!(!denied("rd /s /q node_modules"));
+        assert!(!denied("del /f /s /q *.log"));
+        // `.` survives cleaning on every host.
+        assert!(denied("rd /s /q ."));
+        assert!(denied("del /f /s /q .."));
     }
 
     /// `curl x | powershell` is the canonical Windows one-line installer, and it
