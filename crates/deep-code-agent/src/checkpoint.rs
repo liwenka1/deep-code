@@ -80,8 +80,26 @@ impl CheckpointStore {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_millis())
         );
+        // Copy into a staging directory and publish with a rename, so a failure
+        // part-way through can never leave a *listable* checkpoint: `list` and
+        // `restore` both reject names containing `.`, and `restore` clears the
+        // workspace before copying, so restoring a half-copied snapshot would
+        // destroy the working tree and put back only some of it.
+        //
+        // A crash between the two steps leaks a `.staging_*` directory. That is
+        // invisible to `list`/`restore` and costs only disk; it is deliberately
+        // not swept here, because another process in the same workspace could be
+        // mid-snapshot and its staging dir is none of our business.
         let dest = self.storage_root.join(&id);
-        copy_tree(&self.workspace, &dest, true)?;
+        let staging = self.storage_root.join(format!(".staging_{id}"));
+        if let Err(error) = copy_tree(&self.workspace, &staging, true) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&staging, &dest) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(checkpoint_error("publish snapshot", error));
+        }
         let prune_warnings = self.prune_old_snapshots();
         Ok((CheckpointId(id), prune_warnings))
     }
@@ -121,8 +139,22 @@ impl CheckpointStore {
                 format!("checkpoint '{}' does not exist", id.0),
             ));
         }
+        // Clear-then-copy is not atomic: a failure in between (a Windows file
+        // lock on an open binary, a full disk) leaves the workspace part-cleared
+        // and part-restored. The snapshot itself is untouched and still valid, so
+        // re-running the same restore is the recovery — say so, because the raw
+        // io error reads like the checkpoint was lost.
         clear_workspace_contents(&self.workspace)?;
-        copy_tree(&source, &self.workspace, false)?;
+        copy_tree(&source, &self.workspace, false).map_err(|error| {
+            ToolError::exec_failed(
+                "checkpoint",
+                format!(
+                    "{error}; the workspace is partially restored. Snapshot '{}' is intact — \
+                     re-run the restore to finish it.",
+                    id.0
+                ),
+            )
+        })?;
         Ok(())
     }
 
@@ -139,9 +171,14 @@ impl CheckpointStore {
                 )
             })?;
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                ids.push(CheckpointId(
-                    entry.file_name().to_string_lossy().into_owned(),
-                ));
+                let candidate = CheckpointId(entry.file_name().to_string_lossy().into_owned());
+                // Only report directories that are actually restorable. This
+                // filters in-progress `.staging_*` copies (see `snapshot`) and
+                // any hand-dropped junk, so nothing unrestorable reaches the
+                // `/checkpoints` list or the retention accounting.
+                if validate_checkpoint_id(&candidate).is_ok() {
+                    ids.push(candidate);
+                }
             }
         }
         ids.sort();
@@ -301,6 +338,11 @@ mod cow {
     /// call. Flags stay 0 — callers only pass regular files (symlinks take the
     /// dedicated branch in `copy_tree`) and always create fresh destinations,
     /// so there is nothing to not-follow and no existing dest to contend with.
+    ///
+    /// A failed `clonefile` leaves no partial destination of its own (it either
+    /// creates the clone or nothing), and the caller's `fs::copy` fallback
+    /// truncates whatever is there — so unlike the Linux path this needs no
+    /// explicit cleanup.
     pub(super) fn clone_file(source: &Path, dest: &Path) -> bool {
         let (Ok(src), Ok(dst)) = (
             CString::new(source.as_os_str().as_bytes()),
@@ -318,8 +360,15 @@ mod cow {
     use std::os::fd::AsRawFd;
     use std::path::Path;
 
-    /// `FICLONE` = `_IOW(0x94, 9, int)`. A stable kernel ABI constant, spelled
-    /// out so this does not depend on the libc crate exporting it.
+    /// `FICLONE` = `_IOW(0x94, 9, int)`, spelled out so this does not depend on
+    /// the libc crate exporting it.
+    ///
+    /// This is the *asm-generic* ioctl encoding — correct on x86_64, aarch64,
+    /// arm, riscv and s390x, i.e. every target this project ships. It is not
+    /// universal: powerpc/mips/sparc encode `_IOW` differently (`0x8004_9409`),
+    /// where this value decodes as a different direction, the ioctl returns
+    /// `ENOTTY`, and the caller silently falls back to `fs::copy`. Harmless, but
+    /// it means reflink is simply unavailable there rather than misbehaving.
     const FICLONE: libc::c_ulong = 0x4004_9409;
 
     /// btrfs/XFS reflink via the `FICLONE` ioctl. Unlike macOS `clonefile`,
@@ -413,6 +462,62 @@ mod tests {
         copy_file_retrying(&src, &dst).unwrap();
         let mode = fs::metadata(&dst).unwrap().permissions().mode();
         assert_ne!(mode & 0o111, 0, "executable bit must survive the copy");
+    }
+
+    /// A directory that is not a publishable snapshot must be invisible to both
+    /// `list` and `restore`. That is what keeps a crashed snapshot (which leaves
+    /// a `.staging_*` tree behind) from being offered as a rollback target and
+    /// then restored over a cleared workspace.
+    #[test]
+    fn staging_and_junk_directories_are_neither_listed_nor_restorable() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("note.txt"), "v1").unwrap();
+        let store = CheckpointStore::new(workspace.path()).unwrap();
+        let storage = store.storage_root.clone();
+
+        let (good, _) = store.snapshot("before_turn").unwrap();
+
+        // Simulate the crash residue and some hand-dropped junk.
+        fs::create_dir_all(storage.join(".staging_before_turn_123")).unwrap();
+        fs::create_dir_all(storage.join("has.dot")).unwrap();
+
+        let listed = store.list().unwrap();
+        assert_eq!(
+            listed,
+            vec![good.clone()],
+            "only publishable snapshots are listed"
+        );
+        assert!(
+            store
+                .restore(&CheckpointId(".staging_before_turn_123".to_string()))
+                .is_err(),
+            "a staging tree must never be restorable"
+        );
+        // The workspace was not touched by the rejected restore.
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("note.txt")).unwrap(),
+            "v1"
+        );
+    }
+
+    #[test]
+    fn snapshot_publishes_atomically() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("note.txt"), "v1").unwrap();
+        let store = CheckpointStore::new(workspace.path()).unwrap();
+        let storage = store.storage_root.clone();
+
+        let (id, _) = store.snapshot("before_turn").unwrap();
+
+        // Published under its real id, with no staging residue left behind.
+        assert!(storage.join(&id.0).is_dir());
+        let leftovers: Vec<_> = fs::read_dir(&storage)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".staging_"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging residue: {leftovers:?}");
     }
 
     #[test]
