@@ -38,9 +38,29 @@ use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
 use super::policy::SandboxPolicy;
 use super::{SandboxBackend, SandboxCapabilities};
 
-/// Landlock ABI baseline (kernel 5.13+). `BestEffort` silently downgrades any
-/// newer write-class rights on older kernels.
-const LANDLOCK_ABI: ABI = ABI::V1;
+/// ABI used to enumerate write-class rights for the enforced ruleset. Applied
+/// with `BestEffort` (see [`build_restrictions`]), so a kernel that lacks a
+/// newer right silently downgrades instead of failing — naming the newest ABI
+/// therefore costs nothing on kernel 5.13 and gains every right above it.
+///
+/// This was pinned to `V1`, which left a real hole: a right that is never
+/// *handled* is never checked, and `LANDLOCK_ACCESS_FS_TRUNCATE` only exists
+/// from ABI 3 — so `truncate -s 0 ~/.ssh/id_rsa` destroyed a file outside every
+/// writable root while the user believed the workspace boundary held.
+///
+/// `V5` and not the crate's newest (`V7`) on purpose: it is the last ABI that
+/// introduces a new *`AccessFs`* right (`REFER` in 2, `TRUNCATE` in 3,
+/// `IOCTL_DEV` in 5). 6 and 7 only add scopes, which this backend does not use.
+const LANDLOCK_ABI: ABI = ABI::V5;
+
+/// Minimum ABI that means "Landlock exists and will enforce" (kernel 5.13+).
+///
+/// Kept separate from [`LANDLOCK_ABI`] and deliberately NOT raised: [`probe`]
+/// asserts this level as a `HardRequirement`, so requiring a newer ABI here
+/// would report the sandbox unavailable on every kernel below it — and since
+/// unavailable means refuse-to-run, that would reject every shell command on
+/// virtually every Linux host.
+const PROBE_ABI: ABI = ABI::V1;
 
 /// Always-blocked syscalls (escape / privilege / host-tampering). Limited to
 /// numbers present on both x86_64 and aarch64.
@@ -64,8 +84,8 @@ const NETWORK_SYSCALLS: &[i64] = &[libc::SYS_socket, libc::SYS_connect];
 
 /// Write-class access rights: everything Landlock can govern minus the
 /// read/execute rights, so reads stay unrestricted.
-fn write_access() -> BitFlags<AccessFs> {
-    AccessFs::from_all(LANDLOCK_ABI) & !AccessFs::from_read(LANDLOCK_ABI)
+fn write_access(abi: ABI) -> BitFlags<AccessFs> {
+    AccessFs::from_all(abi) & !AccessFs::from_read(abi)
 }
 
 #[must_use]
@@ -93,7 +113,7 @@ pub fn capabilities() -> SandboxCapabilities {
 fn probe() -> Result<(), String> {
     Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
-        .handle_access(write_access())
+        .handle_access(write_access(PROBE_ABI))
         .and_then(|ruleset| ruleset.create())
         .map(|_| ())
         .map_err(|error| error.to_string())
@@ -147,7 +167,7 @@ fn build_landlock(
     cwd: &Path,
     policy: &SandboxPolicy,
 ) -> Result<RulesetCreated, String> {
-    let access = write_access();
+    let access = write_access(LANDLOCK_ABI);
     // Pre-filter to existing paths so a missing /dev node can't fail the whole
     // ruleset build (path_beneath_rules errors on paths it can't open).
     let writable: Vec<PathBuf> = writable_paths(workspace, cwd, policy)

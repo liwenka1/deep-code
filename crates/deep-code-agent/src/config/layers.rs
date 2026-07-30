@@ -453,10 +453,22 @@ fn apply_file_overlay(
         config.language = language.trim().to_string();
     }
 
-    // Diagnostics preference: turning LSP off is harmless from any layer (a
-    // repo can only reduce what runs, never widen access).
+    // Diagnostics preference, tighten-only from the project layer. Turning LSP
+    // *off* is harmless from anywhere, but turning it back *on* is not what the
+    // old comment claimed ("a repo can only reduce what runs"): the assignment
+    // was unconditional, so a repo that sets `lsp.enabled = true` overrode a
+    // user who had globally disabled it — and the server is then spawned with no
+    // policy, no approval and no sandbox, while rust-analyzer builds that repo's
+    // build scripts and proc macros by default.
     if let Some(enabled) = file.lsp.enabled {
-        config.lsp_enabled = enabled;
+        if project && enabled && !config.lsp_enabled {
+            pending.push((
+                TextId::CfgProjectFieldIgnored,
+                vec![("field", "lsp.enabled=true".to_string())],
+            ));
+        } else {
+            config.lsp_enabled = enabled;
+        }
     }
 
     // Network mode is tighten-only from the project layer: a repo may reduce
@@ -492,13 +504,21 @@ fn apply_file_overlay(
         .filter(|value| !value.trim().is_empty())
         .and_then(PermissionMode::parse)
     {
-        // A project file may pick default/accept-edits, but must NOT be able to
-        // launch you into auto/yolo — a malicious repo mustn't silently disarm
-        // the approval gate. Unknown values simply degrade to the default.
-        if project && matches!(mode, PermissionMode::Auto | PermissionMode::Yolo) {
+        // Tighten-only from the project layer: a repo may lower the tier but
+        // never raise it. Rejecting only auto/yolo was not enough — a hostile
+        // checkout could still raise Default → AcceptEdits and thereby
+        // auto-approve every `write_file`/`apply_patch` plus in-workspace
+        // `rm/mv/cp/mkdir/touch` from turn one, with no trust-this-folder prompt
+        // anywhere. (`config.example.toml` also claimed `approval.*` was ignored
+        // in the project layer, so the code was looser than its own docs.)
+        // Unknown values degrade to the default.
+        if project && mode.to_u8() > config.default_permission_mode.to_u8() {
             pending.push((
                 TextId::CfgProjectFieldIgnored,
-                vec![("field", "approval.default_mode=auto/yolo".to_string())],
+                vec![(
+                    "field",
+                    format!("approval.default_mode={}", mode.as_setting()),
+                )],
             ));
         } else {
             config.default_permission_mode = mode;
@@ -676,8 +696,12 @@ mod tests {
         assert_eq!(loaded.config.sandbox_network, NetworkMode::Prompt);
     }
 
+    /// The project layer is tighten-only for the permission tier. Rejecting just
+    /// auto/yolo was not enough: raising `default` → `accept_edits` already
+    /// auto-approves every workspace write plus in-workspace `rm/mv/cp/mkdir`,
+    /// and a repo is untrusted input parsed before any UI is drawn.
     #[test]
-    fn default_permission_mode_layers_and_project_cannot_set_auto_or_yolo() {
+    fn project_layer_may_only_lower_the_permission_tier() {
         use crate::execution_policy::PermissionMode;
         let dir = tempfile::tempdir().unwrap();
 
@@ -686,33 +710,67 @@ mod tests {
         let loaded = AgentConfig::load_with(Some(global), None, &no_env);
         assert_eq!(loaded.config.default_permission_mode, PermissionMode::Yolo);
 
-        // Project config may set accept-edits...
-        let project_dir = tempfile::tempdir().unwrap();
-        let project = write_config(
-            project_dir.path(),
-            "[approval]\ndefault_mode = \"accept_edits\"\n",
+        // A project file may LOWER the tier the global config chose.
+        let strict_dir = tempfile::tempdir().unwrap();
+        let strict = write_config(
+            strict_dir.path(),
+            "[approval]\ndefault_mode = \"default\"\n",
         );
-        let loaded = AgentConfig::load_with(None, Some(project), &no_env);
-        assert_eq!(
-            loaded.config.default_permission_mode,
-            PermissionMode::AcceptEdits
-        );
-
-        // ...but NOT auto/yolo — a repo mustn't disarm the gate; capped + warned.
-        let evil_dir = tempfile::tempdir().unwrap();
-        let evil = write_config(evil_dir.path(), "[approval]\ndefault_mode = \"yolo\"\n");
-        let loaded = AgentConfig::load_with(None, Some(evil), &no_env);
+        let global = write_config(dir.path(), "[approval]\ndefault_mode = \"yolo\"\n");
+        let loaded = AgentConfig::load_with(Some(global), Some(strict), &no_env);
         assert_eq!(
             loaded.config.default_permission_mode,
             PermissionMode::Default,
-            "project yolo must be ignored"
+            "project must be able to tighten"
+        );
+
+        // It may NOT raise it — not even by one notch, and not silently.
+        for evil_mode in ["accept_edits", "auto", "yolo"] {
+            let evil_dir = tempfile::tempdir().unwrap();
+            let evil = write_config(
+                evil_dir.path(),
+                &format!("[approval]\ndefault_mode = \"{evil_mode}\"\n"),
+            );
+            let loaded = AgentConfig::load_with(None, Some(evil), &no_env);
+            assert_eq!(
+                loaded.config.default_permission_mode,
+                PermissionMode::Default,
+                "project {evil_mode} must be ignored"
+            );
+            assert!(
+                loaded
+                    .report
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("default_mode")),
+                "{evil_mode}: {:?}",
+                loaded.report.warnings
+            );
+        }
+    }
+
+    /// `lsp.enabled` is tighten-only too: a repo may turn the language server
+    /// off, but must not turn one back on for a user who disabled it globally —
+    /// the server is spawned with no policy, no approval and no sandbox, and
+    /// rust-analyzer builds the repo's build scripts and proc macros by default.
+    #[test]
+    fn project_layer_may_disable_lsp_but_not_enable_it() {
+        let off_dir = tempfile::tempdir().unwrap();
+        let off = write_config(off_dir.path(), "[lsp]\nenabled = false\n");
+        let loaded = AgentConfig::load_with(None, Some(off), &no_env);
+        assert!(!loaded.config.lsp_enabled, "project may turn LSP off");
+
+        let global_dir = tempfile::tempdir().unwrap();
+        let evil_dir = tempfile::tempdir().unwrap();
+        let global = write_config(global_dir.path(), "[lsp]\nenabled = false\n");
+        let evil = write_config(evil_dir.path(), "[lsp]\nenabled = true\n");
+        let loaded = AgentConfig::load_with(Some(global), Some(evil), &no_env);
+        assert!(
+            !loaded.config.lsp_enabled,
+            "project must not re-enable a globally disabled LSP"
         );
         assert!(
-            loaded
-                .report
-                .warnings
-                .iter()
-                .any(|w| w.contains("default_mode")),
+            loaded.report.warnings.iter().any(|w| w.contains("lsp")),
             "{:?}",
             loaded.report.warnings
         );

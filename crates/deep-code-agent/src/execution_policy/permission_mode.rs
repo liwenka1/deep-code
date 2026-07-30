@@ -67,7 +67,10 @@ impl PermissionMode {
         }
     }
 
-    fn to_u8(self) -> u8 {
+    /// Rank on the permissiveness ladder (`Default` ⊂ `AcceptEdits` ⊂ `Auto` ⊂
+    /// `Yolo`). Also used to enforce tighten-only config merges: an untrusted
+    /// layer may lower the tier, never raise it.
+    pub(crate) fn to_u8(self) -> u8 {
         match self {
             Self::Default => 0,
             Self::AcceptEdits => 1,

@@ -140,6 +140,32 @@ static PROGRAM_SHAPES: LazyLock<HashMap<&'static str, Shape>> = LazyLock::new(||
     m
 });
 
+/// Whether a flag can make an otherwise-trusted command run a different program
+/// or write a caller-named path. Matched with or without an `=value` suffix, so
+/// both `--config=x` and `--config x` are caught.
+///
+/// Deliberately narrow: only flags that change *what executes* or *what is
+/// written*, so trusting `cargo build` still covers `--release`, `--features …`
+/// and friends without a prompt.
+fn redirects_execution(token: &str) -> bool {
+    const REDIRECTING: &[&str] = &[
+        // cargo: sets any config key, including `build.rustc-wrapper` and
+        // `target.<triple>.runner` — literally "run this program instead".
+        "--config",
+        // git: relocates the helper binaries, or names a program to run.
+        "--exec-path",
+        "--upload-pack",
+        "--receive-pack",
+        // git: runs the external diff driver named by the repo's own config.
+        "--ext-diff",
+        // Writes a caller-named path (`git diff --output=<path>`).
+        "--output",
+        "--output-file",
+    ];
+    let name = token.split('=').next().unwrap_or(token);
+    REDIRECTING.contains(&name.to_ascii_lowercase().as_str())
+}
+
 /// The identity of a tokenized command line: the positional words that name
 /// the operation, lowercased and joined by single spaces.
 ///
@@ -164,6 +190,19 @@ pub fn identity(tokens: &[&str]) -> String {
         && let [_, "-m", module, ..] = tokens
     {
         return format!("{program} -m {}", module.to_ascii_lowercase());
+    }
+
+    // Scan the whole line, not just the identity window. The loop below stops
+    // looking at tokens the moment the identity is complete, so a redirecting
+    // flag *after* the subcommand was invisible — and since a trusted rule
+    // matches on identity alone, it rode in for free:
+    // `cargo test --config 'build.rustc-wrapper="/tmp/x"'` kept the identity
+    // `cargo test`, matched the default trust list, and executed an arbitrary
+    // program with no prompt at any tier; `git diff --output=<path>` created or
+    // overwrote an arbitrary file the same way. Neither contains `$`, `>`, `<`
+    // or a backtick, so the structural-indirection gate did not catch them.
+    if tokens[1..].iter().any(|token| redirects_execution(token)) {
+        return squeeze(&tokens.join(" "));
     }
 
     let shape = PROGRAM_SHAPES.get(program.as_str());
@@ -202,6 +241,20 @@ pub fn rule_covers(rule: &str, command: &str) -> bool {
     }
 
     let tokens: Vec<&str> = command.split_whitespace().collect();
+
+    // A redirecting flag must be spelled out in the rule itself. Degrading the
+    // identity is not enough on its own, because the whole-word prefix branch
+    // below matches the *raw* command line: `cargo test` covered
+    // `cargo test --config 'build.rustc-wrapper="/tmp/x"'` through that branch
+    // even once identity matching rejected it, so an auto-trusted command could
+    // run an arbitrary program with no prompt at any permission tier.
+    if tokens
+        .iter()
+        .any(|token| redirects_execution(token) && !rule_spells_out_flag(&rule, flag_name(token)))
+    {
+        return false;
+    }
+
     if identity(&tokens) == rule {
         return true;
     }
@@ -209,6 +262,21 @@ pub fn rule_covers(rule: &str, command: &str) -> bool {
     let command = squeeze(command);
     command == rule
         || (command.starts_with(&rule) && command.as_bytes().get(rule.len()) == Some(&b' '))
+}
+
+/// A flag token without its `=value` suffix, lowercased.
+fn flag_name(token: &str) -> String {
+    token
+        .split('=')
+        .next()
+        .unwrap_or(token)
+        .to_ascii_lowercase()
+}
+
+/// Whether the (already squeezed) `rule` names `flag` explicitly, so an operator
+/// who wants to trust a redirecting flag still can — by writing it out.
+fn rule_spells_out_flag(rule: &str, flag: String) -> bool {
+    rule.split_whitespace().any(|word| flag_name(word) == flag)
 }
 
 /// Lowercase and collapse runs of whitespace to single spaces.
@@ -370,6 +438,45 @@ mod tests {
         assert!(covers("make", "make -j8 release"));
         assert!(covers("cargo build", "cargo build --release"));
         assert_eq!(identity_of("cargo build --release"), "cargo build");
+        // Inert flags must stay inert, or trusting `cargo build` becomes useless.
+        assert!(covers(
+            "cargo test",
+            "cargo test --features full -- --nocapture"
+        ));
+        assert!(covers("git diff", "git diff --stat --cached"));
+    }
+
+    /// A flag that redirects *what executes* or *what is written* must not ride
+    /// in on a trusted identity. The identity loop stops as soon as the identity
+    /// is complete, so these were invisible: `cargo test --config …` kept the
+    /// identity `cargo test`, matched the built-in trust list, and ran an
+    /// arbitrary program with no prompt at any permission tier.
+    #[test]
+    fn redirecting_flags_after_the_subcommand_break_the_identity() {
+        for command in [
+            "cargo test --config 'build.rustc-wrapper=\"/tmp/x/wrap\"'",
+            "cargo build --config target.x86_64-unknown-linux-gnu.runner=/tmp/r",
+            "git diff --output=/tmp/leak",
+            "git diff --ext-diff",
+            "git log --ext-diff",
+        ] {
+            assert_ne!(
+                identity_of(command),
+                command
+                    .split_whitespace()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                "{command:?} must not keep its two-word identity"
+            );
+        }
+        assert!(!covers(
+            "cargo test",
+            "cargo test --config 'build.rustc-wrapper=\"/tmp/x\"'"
+        ));
+        assert!(!covers("git diff", "git diff --output=/tmp/leak"));
+        // A byte-identical rule still matches the degraded identity.
+        assert!(covers("git diff --ext-diff", "git diff --ext-diff"));
     }
 
     #[test]

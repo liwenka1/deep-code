@@ -612,6 +612,45 @@ mod tests {
         ));
     }
 
+    /// The built-in trust list covers `cargo build/test/check` and `git
+    /// status/diff/log`, and matching ignored every flag after the subcommand —
+    /// so a redirecting flag rode in on a trusted identity and executed an
+    /// arbitrary program with no prompt at *any* permission tier. None of these
+    /// contain `$`, `>`, `<` or a backtick, so the structural-indirection gate
+    /// never saw them either.
+    #[test]
+    fn trusted_commands_lose_their_trust_when_a_flag_redirects_execution() {
+        let policy = ExecPolicy::default();
+        for command in [
+            "cargo test --config 'build.rustc-wrapper=\"/tmp/x/wrap\"'",
+            "cargo build --config target.x86_64-unknown-linux-gnu.runner=/tmp/r",
+            "git diff --output=/tmp/leak",
+            "git log --ext-diff",
+        ] {
+            let plan = evaluate_shell_command(&policy, command, false);
+            assert!(
+                matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }),
+                "{command:?} must reach a human, got {:?}",
+                plan.verdict
+            );
+        }
+        // The everyday trusted forms must still run unprompted.
+        for command in [
+            "cargo build",
+            "cargo test --release",
+            "cargo test --features full",
+            "git diff --stat",
+            "git log --oneline -5",
+        ] {
+            let plan = evaluate_shell_command(&policy, command, false);
+            assert_eq!(
+                plan.verdict,
+                PolicyVerdict::Allow,
+                "{command:?} must stay trusted"
+            );
+        }
+    }
+
     #[test]
     fn network_declaration_forces_approval_even_when_trusted() {
         let policy = ExecPolicy::default();
