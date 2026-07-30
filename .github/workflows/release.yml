@@ -3,9 +3,8 @@
 # 触发条件：推送 v* 标签（如 v0.1.0）
 # 执行：多平台编译 → GitHub Release → npm publish
 #
-# 首次使用前需要：
-#   1. 在 GitHub Settings → Secrets and variables → Actions 中添加 NPM_TOKEN
-#   2. npm 账户需要已验证邮箱
+# 前置条件：npm 侧把本仓库配成该包的 trusted publisher（OIDC）。
+# 不需要 NPM_TOKEN —— publish 步骤走 id-token 权限，无 token、无 OTP。
 
 name: Release
 
@@ -36,11 +35,18 @@ jobs:
             # forever; cross-compile x86_64 on the arm64 runner instead.
             os: macos-latest
             target: x86_64-apple-darwin
+          # Pinned to the OLDEST available Ubuntu runner on purpose: a
+          # `-gnu` binary requires at least the glibc it was linked against, and
+          # `ubuntu-latest` (24.04, glibc 2.39) produced binaries that refused to
+          # start on Ubuntu 22.04, Debian 12, RHEL 9 and Amazon Linux 2023 — i.e.
+          # most of the installed base. `npm i -g` succeeded and then every run
+          # died with `GLIBC_2.3x not found`. 22.04 lowers the floor to glibc
+          # 2.35. Do not "modernize" these back to `-latest`.
           - name: linux-x64
-            os: ubuntu-latest
+            os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - name: linux-arm64
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
           - name: win32-x64
             os: windows-latest
@@ -55,8 +61,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # The release pipeline used to go straight from build to npm publish with
+      # no test gate at all, so tagging a commit whose CI was red (or tagging
+      # before CI finished) shipped a broken binary as npm `latest`. Host-native
+      # (no `--target`): a cross-compiled artifact cannot be executed here, but
+      # the workspace tests still run on every platform in the matrix.
+      - name: Test
+        run: cargo test --locked --workspace
+
       - name: Build (release)
-        run: cargo build --release --package deep-code-tui --target ${{ matrix.target }}
+        run: cargo build --locked --release --package deep-code-tui --target ${{ matrix.target }}
 
       - name: Rename binary for release
         shell: bash

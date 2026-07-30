@@ -9,7 +9,8 @@
 - **Auto 路由**：按任务在 `deepseek-v4-pro` / `deepseek-v4-flash` 间自动选模型与 reasoning effort；API 限流/故障时自动降级重试。
 - **会话与回滚**：会话持久化、`-c` 续接、`-r` 选择恢复；每轮 checkpoint 可 `/restore` 回滚。
 - **极简 TUI**：鼠标滚动/划选复制、粘贴折叠、补全菜单；状态行只留权限档位、生效模型与上下文占用，成本明细在 `/status`。流式中可继续输入，本回合结束后作为追问自动发出。
-- **OS 沙箱**：shell/job 命令一律在系统沙箱内运行（macOS Seatbelt / Linux Landlock+seccomp），写入限制在工作区内，且**默认不带网络**——需要联网的命令必须声明并转人工审批。没有可用沙箱后端时拒绝执行而非降级裸跑。
+- **OS 沙箱（macOS / Linux）**：shell/job 命令在系统沙箱内运行（macOS Seatbelt / Linux Landlock+seccomp），写入限制在工作区与系统临时目录内，且**默认不带网络**——需要联网的命令必须声明并转人工审批。没有可用沙箱后端时拒绝执行而非降级裸跑。
+  **Windows 请务必知悉**：那里只有 Job Object 进程树收容，**既不限制文件写、也不拦网络**，`[sandbox] network` 在该平台是空操作。命令仍受 deny 底板与审批门约束，但"越界写会被替你拒掉"在 Windows 上不成立。`deepcode doctor` 会如实报告本机究竟约束了什么。
 - **可扩展**：LSP 诊断、子代理（sub-agents）、skills（`SKILL.md` + shell）。
 
 ## 安装
@@ -62,7 +63,7 @@ deepcode session list|resume|delete|export
 
 环境变量 `DEEP_CODE_DISABLE_WEB`：设为**非空**且非 `0`/`false`/`off`/`no` 的值（大小写不敏感；空值视为未设置）即可关闭联网工具（`web_search`/`fetch_url`），用于断网或审计场景；默认开启。`/status` 会显示当前 `web=on|off`。
 
-shell/job 命令一律在 OS 沙箱内运行且**默认不带网络**（含端口监听）：需要联网的命令（安装依赖、`git push`、dev server）会转人工审批，"本会话记住"后同形态命令不再问；`[sandbox] network = prompt|always|never` 可调，项目层只许收紧。
+在 macOS / Linux 上，shell/job 命令在 OS 沙箱内运行且**默认不带网络**（含端口监听）：需要联网的命令（安装依赖、`git push`、dev server）会转人工审批，"本会话记住"后同形态命令不再问；`[sandbox] network = prompt|always|never` 可调，项目层只许收紧。**Windows 上没有沙箱约束**，因此本段的断网与写入限制均不生效（`network` 设置是空操作），声明联网仍会转审批、deny 底板仍然生效；跑 `deepcode doctor` 看本机实况。
 
 ## 扩展能力(skills + shell)
 

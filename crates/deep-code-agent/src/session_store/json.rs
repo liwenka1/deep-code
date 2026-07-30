@@ -21,12 +21,37 @@ impl JsonSessionStore {
         fs::create_dir_all(&root).map_err(|error| SessionStoreError::Io {
             message: format!("failed to create {}: {error}", root.display()),
         })?;
+        if let Some(state_dir) = root.parent() {
+            Self::write_self_ignore(state_dir);
+        }
         Ok(Self { root })
     }
 
     fn path_for(&self, id: &SessionId) -> Result<PathBuf, SessionStoreError> {
         validate_session_id(id.as_str())?;
         Ok(self.root.join(format!("{}.json", id.as_str())))
+    }
+
+    /// Drop a `.gitignore` containing `*` into the state directory so the agent's
+    /// own bookkeeping cannot be committed into the user's repository.
+    ///
+    /// `.deep-code/` is created inside the workspace and holds full conversation
+    /// transcripts plus the log; nothing kept it out of git, so a `git add -A`
+    /// (by the user, or by the agent itself) committed the transcripts. The eval
+    /// harness already had to exclude the directory by hand, which is the same
+    /// hazard noticed in one place and not fixed at the source.
+    ///
+    /// Best-effort and write-once: never overwrite a file the user may have
+    /// customized, and never fail a session-store open over it.
+    fn write_self_ignore(state_dir: &Path) {
+        let marker = state_dir.join(".gitignore");
+        if marker.exists() {
+            return;
+        }
+        let _ = fs::write(
+            &marker,
+            "# Written by deep-code: this directory holds session transcripts and logs.\n*\n",
+        );
     }
 
     fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), SessionStoreError> {
@@ -323,6 +348,25 @@ mod tests {
         let listed = store.list().unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, newer.id);
+    }
+
+    /// The state directory holds full conversation transcripts and the log, and
+    /// it is created *inside* the user's repository — so it must exclude itself
+    /// from git rather than rely on the user (or the agent's own `git add -A`)
+    /// noticing.
+    #[test]
+    fn opening_the_store_makes_the_state_dir_self_ignoring() {
+        let dir = tempfile::tempdir().unwrap();
+        JsonSessionStore::for_workspace(dir.path()).unwrap();
+
+        let marker = dir.path().join(".deep-code").join(".gitignore");
+        let body = fs::read_to_string(&marker).expect(".gitignore must be written");
+        assert!(body.lines().any(|line| line.trim() == "*"), "{body:?}");
+
+        // Never clobber a file the user customized.
+        fs::write(&marker, "# mine\n").unwrap();
+        JsonSessionStore::for_workspace(dir.path()).unwrap();
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "# mine\n");
     }
 
     #[test]
