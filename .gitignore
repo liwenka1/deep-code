@@ -11,6 +11,9 @@ node_modules/
 # time; never commit it (the launcher bin/deepcode itself IS tracked).
 /packages/deepcode/bin/deepcode-bin
 /packages/deepcode/bin/deepcode.exe
+# Staging files the installer renames into place / cleans up on failure.
+/packages/deepcode/bin/*.download
+/packages/deepcode/bin/*.SHA256SUMS
 
 # --- Local env & secrets ---
 .env

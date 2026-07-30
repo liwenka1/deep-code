@@ -12,10 +12,31 @@ import { platform, arch } from 'node:os';
 
 // ── 配置 ──
 const REPO = 'liwenka1/deep-code';
-const VERSION = process.env.npm_package_version || '0.1.0';
+// Read the version from package.json rather than trusting `npm_package_version`,
+// which is unset under yarn berry / pnpm in some modes and when this script is
+// run directly. The old `|| '0.1.0'` fallback silently installed v0.1.0 — and
+// v0.1.0's own SHA256SUMS validates it, so a years-old binary installed with a
+// green checkmark. There is no sane default here: fail loudly instead.
+const PKG_DIR = path.dirname(fileURLToPath(import.meta.url));
+const VERSION = readVersion();
+
+function readVersion() {
+  const fromEnv = process.env.npm_package_version;
+  if (fromEnv) return fromEnv;
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(PKG_DIR, 'package.json'), 'utf8'));
+    if (pkg.version) return pkg.version;
+    throw new Error('package.json has no "version"');
+  } catch (error) {
+    console.error(`❌ deepcode: cannot determine which version to install (${error.message}).`);
+    console.error('   Reinstall with npm, or download a binary from');
+    console.error(`   https://github.com/${REPO}/releases`);
+    process.exit(1);
+  }
+}
 // `import.meta.dirname` only exists on Node 20.11+; derive it from the module
 // URL so the `engines: node >=18` floor actually works.
-const BIN_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'bin');
+const BIN_DIR = path.join(PKG_DIR, 'bin');
 // The real binary sits next to the `deepcode` JS launcher (bin/deepcode), which
 // spawns it. Distinct names so the download never clobbers the launcher.
 const BIN_NAME = platform() === 'win32' ? 'deepcode.exe' : 'deepcode-bin';
@@ -48,10 +69,16 @@ async function main() {
   const binPath = path.join(BIN_DIR, BIN_NAME);
   const downloadUrl = `https://github.com/${REPO}/releases/download/v${VERSION}/${assetName}`;
 
-  // 已有二进制则跳过（npm install 幂等）
+  // 已有二进制则跳过（npm install 幂等）。
+  // 校验和照样跑一遍：一个被截断的旧下载同样"存在"，早退会让它永久留下且
+  // 永不复检，每次 npm install 都报成功。校验失败就当没装过，重新下载。
   if (fs.existsSync(binPath)) {
-    console.log(`✅ deepcode binary already installed (${platformKey})`);
-    return;
+    if (await checksumMatches(assetName, binPath)) {
+      console.log(`✅ deepcode binary already installed (${platformKey})`);
+      return;
+    }
+    console.log('⚠️  existing deepcode binary failed checksum — re-downloading');
+    fs.rmSync(binPath, { force: true });
   }
 
   console.log(`📦 Downloading deepcode v${VERSION} for ${platformKey}...`);
@@ -60,15 +87,22 @@ async function main() {
   // 确保 bin 目录存在
   fs.mkdirSync(BIN_DIR, { recursive: true });
 
-  // 下载
-  await downloadFile(downloadUrl, binPath);
-
-  // 校验完整性（SHA256SUMS 来自同一 release）
-  await verifyChecksum(assetName, binPath);
-
-  // 设置可执行权限（非 Windows）
-  if (platform() !== 'win32') {
-    fs.chmodSync(binPath, 0o755);
+  // 下载到临时文件再改名：中途失败（连接提前关闭、磁盘满）绝不会在目标路径
+  // 上留下半个二进制，否则下次 install 的幂等早退会把它当成装好的。
+  const tmpPath = `${binPath}.download`;
+  fs.rmSync(tmpPath, { force: true });
+  try {
+    await downloadFile(downloadUrl, tmpPath);
+    // 校验完整性（SHA256SUMS 来自同一 release）
+    await verifyChecksum(assetName, tmpPath);
+    // 设置可执行权限（非 Windows）
+    if (platform() !== 'win32') {
+      fs.chmodSync(tmpPath, 0o755);
+    }
+    fs.renameSync(tmpPath, binPath);
+  } catch (error) {
+    fs.rmSync(tmpPath, { force: true });
+    throw error;
   }
 
   console.log(`✅ deepcode v${VERSION} installed successfully!`);
@@ -110,6 +144,25 @@ async function verifyChecksum(assetName, binPath) {
     );
   }
   console.log('🔒 deepcode: checksum verified.');
+}
+
+/// Non-throwing variant for the "already installed" fast path: true when the
+/// file matches the published checksum, or when there is nothing to check
+/// against (no SHA256SUMS / no entry / offline), so an unverifiable-but-present
+/// binary is still accepted rather than re-downloaded on every install.
+async function checksumMatches(assetName, binPath) {
+  const sumsUrl = `https://github.com/${REPO}/releases/download/v${VERSION}/SHA256SUMS`;
+  const sumsPath = `${binPath}.check.SHA256SUMS`;
+  try {
+    await downloadFile(sumsUrl, sumsPath);
+    const expected = parseChecksum(fs.readFileSync(sumsPath, 'utf8'), assetName);
+    if (!expected) return true;
+    return (await sha256OfFile(binPath)) === expected;
+  } catch {
+    return true;
+  } finally {
+    fs.rmSync(sumsPath, { force: true });
+  }
 }
 
 // 解析 `sha256sum` 风格的清单（`<hex>  name` 或 `<hex> *name`）。
@@ -169,10 +222,37 @@ function downloadFile(url, dest) {
         return;
       }
 
+      // A premature connection close fires 'error'/'aborted' on the *response*,
+      // not on the file — without this the promise resolved on the truncated
+      // file's 'finish' and the partial download was treated as a success.
+      response.on('error', (err) => {
+        file.close();
+        fs.rmSync(dest, { force: true });
+        reject(err);
+      });
+      response.on('aborted', () => {
+        file.close();
+        fs.rmSync(dest, { force: true });
+        reject(new Error(`Connection closed before the download finished: ${url}`));
+      });
+
+      // Cross-check the advertised length so a silently short body cannot pass.
+      const expectedBytes = Number(response.headers['content-length']) || 0;
+
       response.pipe(file);
 
       file.on('finish', () => {
         file.close();
+        if (expectedBytes > 0) {
+          const written = fs.statSync(dest).size;
+          if (written !== expectedBytes) {
+            fs.rmSync(dest, { force: true });
+            reject(new Error(
+              `Truncated download from ${url}: got ${written} of ${expectedBytes} bytes.`
+            ));
+            return;
+          }
+        }
         resolve();
       });
 
