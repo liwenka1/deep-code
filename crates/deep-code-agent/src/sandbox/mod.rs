@@ -43,11 +43,37 @@ impl SandboxBackend {
 }
 
 /// Platform sandbox capability report.
+///
+/// `available` only means "a backend exists"; it does NOT mean that backend
+/// enforces anything in particular. The two `confines_*` flags say what it
+/// actually does, and they are not the same on every platform: the Windows Job
+/// Object contains a process *tree* (so cancel/timeout can kill it) but does not
+/// restrict filesystem writes or network access at all. Anything that tells the
+/// user — or the model — that a command is "sandboxed" or "offline" must consult
+/// these rather than `available`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxCapabilities {
     pub backend: SandboxBackend,
     pub available: bool,
+    /// Backend confines writes to the policy's writable roots.
+    pub confines_filesystem: bool,
+    /// Backend blocks network access unless the policy grants it.
+    pub confines_network: bool,
     pub detail: String,
+}
+
+/// Whether this host's sandbox enforces BOTH confinement dimensions — i.e.
+/// whether calling a command "sandboxed" to the user is truthful here.
+#[must_use]
+pub fn sandbox_confines_filesystem_and_network() -> bool {
+    let caps = detect_capabilities();
+    caps.confines_filesystem && caps.confines_network
+}
+
+/// Whether this host's sandbox actually withholds the network by default.
+#[must_use]
+pub fn sandbox_confines_network() -> bool {
+    detect_capabilities().confines_network
 }
 
 /// Whether an OS sandbox backend is usable on this machine. For callers that
@@ -77,12 +103,16 @@ fn probe_capabilities() -> SandboxCapabilities {
             return SandboxCapabilities {
                 backend: SandboxBackend::MacosSeatbelt,
                 available: true,
+                confines_filesystem: true,
+                confines_network: true,
                 detail: "sandbox-exec (Seatbelt) is available".to_string(),
             };
         }
         SandboxCapabilities {
             backend: SandboxBackend::None,
             available: false,
+            confines_filesystem: false,
+            confines_network: false,
             detail: "sandbox-exec is missing or not permitted".to_string(),
         }
     }
@@ -102,6 +132,8 @@ fn probe_capabilities() -> SandboxCapabilities {
         SandboxCapabilities {
             backend: SandboxBackend::None,
             available: false,
+            confines_filesystem: false,
+            confines_network: false,
             detail: "unsupported platform".to_string(),
         }
     }

@@ -64,15 +64,39 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
     if report.api_key.source == "missing" {
         println!("  api key 引导:\n{}", report.deepseek.api_key_hint);
     }
-    println!(
-        "  sandbox: {} ({})",
-        if report.sandbox.available {
-            "available"
-        } else {
-            "unavailable"
-        },
-        report.sandbox.detail
-    );
+    // "available" is not the same as "enforcing": a backend can exist and still
+    // confine nothing (Windows Job Object). Report what it actually does.
+    let sandbox_state = match (
+        report.sandbox.available,
+        report.sandbox.confines_filesystem,
+        report.sandbox.confines_network,
+    ) {
+        (false, _, _) => "unavailable",
+        (true, true, true) => "enforcing",
+        _ => "partial",
+    };
+    println!("  sandbox: {} ({})", sandbox_state, report.sandbox.detail);
+    if report.sandbox.available
+        && !(report.sandbox.confines_filesystem && report.sandbox.confines_network)
+    {
+        println!(
+            "    workspace-write confinement: {}",
+            if report.sandbox.confines_filesystem {
+                "yes"
+            } else {
+                "NO"
+            }
+        );
+        println!(
+            "    network withheld by default: {}",
+            if report.sandbox.confines_network {
+                "yes"
+            } else {
+                "NO"
+            }
+        );
+        println!("    → [sandbox] network has no effect on this platform.");
+    }
     println!("  skills: {} loaded", report.skills.total_count);
     Ok(())
 }

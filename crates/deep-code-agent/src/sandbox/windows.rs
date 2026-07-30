@@ -30,11 +30,18 @@ const ACTIVE_PROCESS_LIMIT: u32 = 512;
 
 #[must_use]
 pub fn capabilities() -> SandboxCapabilities {
-    // Job Objects are available on every supported Windows release.
+    // Job Objects are available on every supported Windows release — but they
+    // only contain the process *tree*. They do not restrict filesystem writes
+    // and do not block network access, so both `confines_*` flags are false and
+    // callers must not describe a command here as "sandboxed" or "offline".
     SandboxCapabilities {
         backend: SandboxBackend::WindowsJobObject,
         available: true,
-        detail: "Windows Job Object (process-tree kill + limits)".to_string(),
+        confines_filesystem: false,
+        confines_network: false,
+        detail: "Windows Job Object (process-tree kill + limits only; \
+                 no filesystem or network confinement)"
+            .to_string(),
     }
 }
 

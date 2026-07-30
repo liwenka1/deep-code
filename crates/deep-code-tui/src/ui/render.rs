@@ -589,7 +589,18 @@ fn approval_lines(
         meta.push(tr(lang, TextId::ApprovalNetwork).to_string());
     }
     if requires_sandbox {
-        meta.push(tr(lang, TextId::ApprovalSandbox).to_string());
+        // `requires_sandbox` is what the *policy* asked for. Whether the host can
+        // deliver it is a separate question — the Windows Job Object confines
+        // neither writes nor network, so claiming "sandboxed execution" there
+        // would tell the user they are protected while they approve a command
+        // that is not. Say which it is.
+        meta.push(
+            if deep_code_agent::sandbox_confines_filesystem_and_network() {
+                tr(lang, TextId::ApprovalSandbox).to_string()
+            } else {
+                tr(lang, TextId::ApprovalNoSandbox).to_string()
+            },
+        );
     }
     if let Some(rule) = matched_rule {
         meta.push(tr_with(lang, TextId::ApprovalRule, &[("rule", rule)]));

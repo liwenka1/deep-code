@@ -74,11 +74,15 @@ pub fn capabilities() -> SandboxCapabilities {
         Ok(()) => SandboxCapabilities {
             backend: SandboxBackend::LinuxLandlock,
             available: true,
+            confines_filesystem: true,
+            confines_network: true,
             detail: "Landlock + seccomp available".to_string(),
         },
         Err(error) => SandboxCapabilities {
             backend: SandboxBackend::None,
             available: false,
+            confines_filesystem: false,
+            confines_network: false,
             detail: format!("Landlock unavailable: {error}"),
         },
     }

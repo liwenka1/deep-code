@@ -373,3 +373,41 @@ async fn scrub_secret_env_hides_key_from_child() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+/// The model must never be told it is confined when it is not. Both tool
+/// descriptions are picked from the host's real capability, so this asserts the
+/// two stay in agreement — on Windows (Job Object: no fs/network confinement)
+/// the "runs sandboxed without network" wording would be a lie, and a model that
+/// believes it is offline will not declare the network it silently already has.
+#[test]
+fn tool_descriptions_match_actual_sandbox_capability() {
+    use crate::tool::Tool;
+
+    let confined = crate::sandbox::sandbox_confines_network();
+    let shell = ShellTool::new(
+        WorkspacePolicy::new(".").unwrap(),
+        JobStore::default(),
+        SandboxManager::new(),
+    );
+    let job = JobTool::new(
+        WorkspacePolicy::new(".").unwrap(),
+        JobStore::default(),
+        SandboxManager::new(),
+    );
+
+    for description in [shell.description(), job.description()] {
+        if confined {
+            assert!(
+                description.contains("sandboxed without network"),
+                "confined host must advertise confinement: {description}"
+            );
+            assert!(!description.contains("NO OS sandbox"));
+        } else {
+            assert!(
+                description.contains("NO OS sandbox confinement"),
+                "unconfined host must not claim confinement: {description}"
+            );
+            assert!(!description.contains("run sandboxed without network"));
+        }
+    }
+}

@@ -163,6 +163,7 @@ text_ids! {
     RiskMedium,
     RiskLow,
     ApprovalSandbox,
+    ApprovalNoSandbox,
     ApprovalNetwork,
     ApprovalRule,
     ApprovalCautionHeader,

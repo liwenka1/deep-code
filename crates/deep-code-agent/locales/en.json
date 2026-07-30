@@ -15,6 +15,7 @@
   "RiskMedium": "Medium risk",
   "RiskLow": "Low risk",
   "ApprovalSandbox": "Sandboxed execution",
+  "ApprovalNoSandbox": "NO sandbox confinement on this host",
   "ApprovalNetwork": "Requests network access",
   "ApprovalRule": "Rule {rule}",
   "ApprovalCautionHeader": "── Caution ──",

@@ -70,6 +70,11 @@ pub struct ApiKeyReport {
 pub struct SandboxReport {
     pub available: bool,
     pub kind: Option<String>,
+    /// What the backend actually enforces. `available` alone is misleading: the
+    /// Windows Job Object exists on every host yet confines neither writes nor
+    /// network, so reporting only `available: true` reads as "you are protected".
+    pub confines_filesystem: bool,
+    pub confines_network: bool,
     pub detail: String,
 }
 
@@ -146,6 +151,8 @@ impl DoctorReport {
                 } else {
                     None
                 },
+                confines_filesystem: sandbox.confines_filesystem,
+                confines_network: sandbox.confines_network,
                 detail: sandbox.detail,
             },
             skills,

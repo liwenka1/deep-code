@@ -39,6 +39,20 @@ fn scrub_secret_env(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// Shell tool description for hosts whose sandbox really confines the command.
+const SHELL_DESC_CONFINED: &str = "Run a foreground shell command in the workspace; output streams live and the process is killed at the timeout. Use it for git (status/diff/log), builds, and tests; start long-running processes (dev servers) with the job tool instead. Commands run sandboxed without network; set network=true when one needs it (installs, git remote ops) — a failed download/connection usually means the run lacked the network grant.";
+
+/// Same, for hosts with no real confinement (see `SandboxCapabilities`). The
+/// model is told the truth so it neither trusts a boundary that is absent nor
+/// assumes it is offline when it is not.
+const SHELL_DESC_UNCONFINED: &str = "Run a foreground shell command in the workspace; output streams live and the process is killed at the timeout. Use it for git (status/diff/log), builds, and tests; start long-running processes (dev servers) with the job tool instead. This host has NO OS sandbox confinement: commands are not restricted to the workspace and do have network access. Keep writes inside the workspace yourself and avoid destructive commands. Still set network=true when a command needs the network, so the user is asked first.";
+
+/// Job tool description, confined host.
+const JOB_DESC_CONFINED: &str = "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it. Jobs run sandboxed without network; a dev server that binds a port needs network=true on start.";
+
+/// Job tool description, unconfined host.
+const JOB_DESC_UNCONFINED: &str = "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it. This host has NO OS sandbox confinement: jobs are not restricted to the workspace and do have network access. Still set network=true when starting something that binds a port or needs the network, so the user is asked first.";
+
 /// Build, secret-scrub, sandbox-wrap and spawn one shell subprocess, then
 /// confine it. Shared by the foreground and background job paths so both apply
 /// the identical env-scrub + sandbox treatment; they differ only afterwards in
@@ -225,7 +239,16 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Run a foreground shell command in the workspace; output streams live and the process is killed at the timeout. Use it for git (status/diff/log), builds, and tests; start long-running processes (dev servers) with the job tool instead. Commands run sandboxed without network; set network=true when one needs it (installs, git remote ops) — a failed download/connection usually means the run lacked the network grant."
+        // The confinement sentence must match reality per host. Telling the model
+        // "sandboxed without network" where nothing enforces it (the Windows Job
+        // Object confines neither writes nor egress) teaches it a false model of
+        // its own environment: it would skip declaring network it silently
+        // already has, and assume out-of-workspace writes get refused for it.
+        if crate::sandbox::sandbox_confines_network() {
+            SHELL_DESC_CONFINED
+        } else {
+            SHELL_DESC_UNCONFINED
+        }
     }
 
     async fn run(&self, params: ShellParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {
@@ -496,7 +519,11 @@ impl Tool for JobTool {
     }
 
     fn description(&self) -> &str {
-        "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it. Jobs run sandboxed without network; a dev server that binds a port needs network=true on start."
+        if crate::sandbox::sandbox_confines_network() {
+            JOB_DESC_CONFINED
+        } else {
+            JOB_DESC_UNCONFINED
+        }
     }
 
     async fn run(&self, params: JobParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {
