@@ -274,16 +274,39 @@ fn refuse_bare_execution(
     policy_wants_sandbox && forced.is_none() && !available
 }
 
+/// Build `cmd /C <command>` with the command line passed to `cmd.exe` verbatim.
+///
+/// `Command::arg` applies the MSVC C-runtime quoting rules: an argument holding
+/// spaces or quotes is wrapped in `"` and its inner quotes escaped as `\"`.
+/// `cmd.exe` implements none of that — it treats `\` as an ordinary character
+/// and `"` as a quote toggle — so `git commit -m "msg"` reached the shell as
+/// `git commit -m \"msg\"` and ran with literal backslashes in the message.
+/// `raw_arg` exists for exactly this case.
+///
+/// Two consequences of the old behaviour, both real: every Windows command
+/// carrying a quoted argument was silently corrupted (the observable being that
+/// the model gave up on `git commit -m` and started writing the message to a
+/// file to commit with `-F`), and what actually executed differed from the
+/// command string shown in the approval panel — the user approved one thing and
+/// `cmd` ran another.
+#[cfg(windows)]
 fn bare_shell_command(command: &str, cwd: &Path) -> Command {
-    let mut cmd = if cfg!(windows) {
-        let mut cmd = Command::new("cmd");
-        cmd.arg("/C").arg(command);
-        cmd
-    } else {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(command);
-        cmd
-    };
+    use std::os::windows::process::CommandExt;
+
+    let mut cmd = Command::new("cmd");
+    // `/C` is a bare token, so normal quoting is correct for it; only the
+    // command itself must bypass the escaping. Arguments are still joined with
+    // a space, so this yields `cmd /C <command>`.
+    cmd.arg("/C");
+    cmd.raw_arg(command);
+    cmd.current_dir(cwd);
+    cmd
+}
+
+#[cfg(not(windows))]
+fn bare_shell_command(command: &str, cwd: &Path) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(command);
     cmd.current_dir(cwd);
     cmd
 }
@@ -312,41 +335,51 @@ mod tests {
         assert!(!refuse_bare_execution(true, Some(true), false));
     }
 
-    /// Diagnostic probe for Windows argument passing — changes no behaviour.
+    /// Regression guard for Windows argument passing.
     ///
-    /// `bare_shell_command` builds `cmd /C <command>` with `Command::arg`, which
-    /// applies the MSVC C-runtime quoting rules: an argument containing spaces or
-    /// quotes is wrapped in `"` and its inner quotes escaped as `\"`. `cmd.exe`
-    /// does not implement those rules — it treats `\` as a literal character and
-    /// `"` as a quote toggle — so any command carrying a quoted argument can
-    /// arrive mangled. `std::os::windows::process::CommandExt::raw_arg` exists
-    /// precisely for this case and is used nowhere here.
+    /// This started life as a diagnostic probe and it caught a real defect:
+    /// `bare_shell_command` used `Command::arg` for the whole command line, which
+    /// applies the MSVC C-runtime quoting rules (an argument holding spaces or
+    /// quotes is wrapped in `"`, inner quotes escaped as `\"`). `cmd.exe`
+    /// implements none of that — `\` is an ordinary character and `"` a quote
+    /// toggle — so every command carrying a quoted argument arrived mangled. The
+    /// fix is `raw_arg`; this test fails loudly if anyone reverts to `arg`.
     ///
-    /// `echo "a b"` is the minimal probe: cmd's `echo` emits its argument
-    /// verbatim, quotes included, so a correct pass-through prints exactly
-    /// `"a b"`. Backslashes in the output mean the escaping leaked through.
+    /// `echo` is the right probe because cmd's `echo` emits its argument
+    /// verbatim, quotes included — a correct pass-through prints exactly what was
+    /// typed, and a stray backslash means the escaping leaked through.
     ///
-    /// This is the observable behind a real report: on Windows the model stopped
-    /// using `git commit -m "<message>"` and started writing the message to a
-    /// file to commit with `-F`, i.e. it routed around broken quoting.
+    /// The observable behind the original report: on Windows the model stopped
+    /// using `git commit -m "<message>"` and started writing the message to a file
+    /// to commit with `-F`, i.e. it routed around the broken quoting.
     #[cfg(windows)]
     #[test]
     fn windows_cmd_receives_quoted_arguments_verbatim() {
         let cwd = std::env::current_dir().expect("cwd");
-        let output = bare_shell_command("echo \"a b\"", &cwd)
-            .output()
-            .expect("spawn cmd");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let got = stdout.trim();
+        let run = |command: &str| {
+            let output = bare_shell_command(command, &cwd)
+                .output()
+                .expect("spawn cmd");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
 
+        let got = run("echo \"a b\"");
         assert!(
             !got.contains('\\'),
-            "cmd received escaped quotes: stdout={got:?}. Command::arg applied \
-             MSVC quoting that cmd.exe cannot parse; the fix is raw_arg."
+            "cmd received escaped quotes: stdout={got:?}. `Command::arg` applies \
+             MSVC quoting that cmd.exe cannot parse; use raw_arg."
         );
         assert_eq!(
             got, "\"a b\"",
             "quoted argument did not survive the trip to cmd.exe: stdout={got:?}"
+        );
+
+        // The shape from the real report: several quoted arguments in one command,
+        // which is what `git commit -m "…"` looks like to cmd.
+        let got = run("echo \"a b\" \"c d\"");
+        assert_eq!(
+            got, "\"a b\" \"c d\"",
+            "multiple quoted arguments were mangled: stdout={got:?}"
         );
     }
 }
