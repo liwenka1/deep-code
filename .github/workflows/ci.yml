@@ -61,6 +61,31 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
 
+  # Runs on the exact runner label the release workflow builds linux-arm64 on.
+  # Release is tag-triggered only, so without this job that label would first
+  # be exercised *after* the tag is pushed — and an invalid label does not
+  # fail, it queues forever. This also covers aarch64 (Landlock/seccomp) with
+  # real tests, which no other job does. Free for public repos.
+  linux-arm:
+    name: linux-arm · clippy · test
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # Pinned to match rust-toolchain.toml; bump both together.
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --workspace
+
   # Compiles & tests the Windows-only sandbox (Job Object) code, which the
   # Linux job's `cfg(windows)` gating skips.
   windows:
