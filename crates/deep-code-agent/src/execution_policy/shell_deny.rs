@@ -210,6 +210,17 @@ fn is_drive_spec(token: &str) -> bool {
     bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
+/// The other spellings `format` accepts for a raw volume: a volume GUID path
+/// (`\\?\Volume{...}`) or a device-namespace path (`\\.\C:`). Unlike a mounted-
+/// folder target these cannot collide with a repo-relative script argument, so
+/// refusing them costs nothing. (A mount-point target — `format C:\mnt\data` —
+/// is indistinguishable from an ordinary path argument and stays with the
+/// approval gate.)
+fn is_volume_or_device_path(token: &str) -> bool {
+    let lower = token.trim().to_ascii_lowercase();
+    lower.starts_with("\\\\?\\volume{") || lower.starts_with("\\\\.\\")
+}
+
 /// Whether a recursive-force delete (`rd /s /q`, `del /s /q`) names a target
 /// catastrophic enough to hard-refuse.
 ///
@@ -372,11 +383,12 @@ fn deny_segment(segment: &str) -> Option<DenyReason> {
         // `diskpart` has no benign form. `format` does collide with a repo-local
         // formatter (`./format`, `scripts/format`, a `format` bin on PATH), which
         // this floor cannot be overridden to allow — so require the shape of a
-        // real disk format: a drive spec (`format C:`, `format /fs:ntfs D:`).
+        // real disk format: a drive spec (`format C:`, `format /fs:ntfs D:`),
+        // a volume GUID path, or a device path.
         "diskpart" => Some(DenyReason("disk formatting/partitioning")),
         "format" => args
             .iter()
-            .any(|arg| is_drive_spec(arg))
+            .any(|arg| is_drive_spec(arg) || is_volume_or_device_path(arg))
             .then_some(DenyReason("disk formatting/partitioning")),
         // Registry deletion: `reg delete <key> /f`. `reg query`/`reg add` stay.
         "reg" => args
@@ -982,6 +994,34 @@ mod tests {
         assert!(is_drive_spec("D:\\"));
         assert!(!is_drive_spec("src"));
         assert!(!is_drive_spec("C:\\Windows"));
+    }
+
+    /// `format` also accepts a raw volume by GUID path or device path — shapes
+    /// that cannot collide with a repo-relative script argument. Predicate-level
+    /// (not `denied(...)`) because `clean_token` strips `\` on Unix hosts, the
+    /// same trap that voided the Windows-path cases before they were fed to the
+    /// predicate directly; the end-to-end spelling is asserted under
+    /// `cfg(windows)` below.
+    #[test]
+    fn format_denies_volume_guid_and_device_paths() {
+        assert!(is_volume_or_device_path(
+            "\\\\?\\Volume{b75e2c83-0000-0000-0000-602f00000000}"
+        ));
+        assert!(is_volume_or_device_path("\\\\.\\C:"));
+        assert!(is_volume_or_device_path("\\\\.\\PhysicalDrive0"));
+        // Ordinary paths and UNC shares are not raw volumes.
+        assert!(!is_volume_or_device_path("C:\\mnt\\data"));
+        assert!(!is_volume_or_device_path("\\\\server\\share"));
+        assert!(!is_volume_or_device_path("src"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn format_volume_paths_are_denied_end_to_end() {
+        assert!(denied(
+            "format \\\\?\\Volume{b75e2c83-0000-0000-0000-602f00000000} /fs:ntfs"
+        ));
+        assert!(denied("format \\\\.\\C:"));
     }
 
     /// The everyday cleanups must keep working, or the floor is worse than no
