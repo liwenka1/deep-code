@@ -70,10 +70,16 @@ fn install_panic_hook() {
             crossterm::cursor::Show
         );
         // Written to stdout on purpose: stderr is the log file at this point.
+        // English on purpose too: the hook is installed before any config (and
+        // thus any language) exists, and the panic payload it frames is English
+        // regardless.
         let _ = writeln!(stdout, "\ndeep-code panicked: {info}");
+        // The default hook writes the message to the log unconditionally, but a
+        // backtrace only when RUST_BACKTRACE is set — do not promise one.
         let _ = writeln!(
             stdout,
-            "A backtrace was written to .deep-code/deep-code.log"
+            "Details were written to .deep-code/deep-code.log \
+             (run with RUST_BACKTRACE=1 to capture a backtrace there)."
         );
         let _ = stdout.flush();
         // Keep the default reporting too, so the log gets the full detail.
