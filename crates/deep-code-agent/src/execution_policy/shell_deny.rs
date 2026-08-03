@@ -211,14 +211,21 @@ fn is_drive_spec(token: &str) -> bool {
 }
 
 /// The other spellings `format` accepts for a raw volume: a volume GUID path
-/// (`\\?\Volume{...}`) or a device-namespace path (`\\.\C:`). Unlike a mounted-
+/// (`\\?\Volume{...}`), a device-namespace path (`\\.\C:`), or the same bare
+/// drive behind a `\\?\` extended-length prefix (`\\?\C:`). Unlike a mounted-
 /// folder target these cannot collide with a repo-relative script argument, so
 /// refusing them costs nothing. (A mount-point target — `format C:\mnt\data` —
 /// is indistinguishable from an ordinary path argument and stays with the
-/// approval gate.)
+/// approval gate; so does an extended-length path that carries a real sub-path,
+/// `\\?\C:\dir`, which is a file argument rather than a raw volume.)
 fn is_volume_or_device_path(token: &str) -> bool {
     let lower = token.trim().to_ascii_lowercase();
-    lower.starts_with("\\\\?\\volume{") || lower.starts_with("\\\\.\\")
+    if lower.starts_with("\\\\?\\volume{") || lower.starts_with("\\\\.\\") {
+        return true;
+    }
+    // `\\?\` over a *bare* drive is the extended-length spelling of `\\.\C:`;
+    // over a sub-path it is just a long file path, which `is_drive_spec` rejects.
+    lower.strip_prefix("\\\\?\\").is_some_and(is_drive_spec)
 }
 
 /// Whether a recursive-force delete (`rd /s /q`, `del /s /q`) names a target
@@ -1009,8 +1016,13 @@ mod tests {
         ));
         assert!(is_volume_or_device_path("\\\\.\\C:"));
         assert!(is_volume_or_device_path("\\\\.\\PhysicalDrive0"));
-        // Ordinary paths and UNC shares are not raw volumes.
+        // Extended-length prefix over a bare drive is still a raw volume.
+        assert!(is_volume_or_device_path("\\\\?\\C:"));
+        assert!(is_volume_or_device_path("\\\\?\\C:\\"));
+        // Ordinary paths and UNC shares are not raw volumes; neither is an
+        // extended-length prefix carrying a real sub-path (a file argument).
         assert!(!is_volume_or_device_path("C:\\mnt\\data"));
+        assert!(!is_volume_or_device_path("\\\\?\\C:\\Windows"));
         assert!(!is_volume_or_device_path("\\\\server\\share"));
         assert!(!is_volume_or_device_path("src"));
     }
@@ -1022,6 +1034,7 @@ mod tests {
             "format \\\\?\\Volume{b75e2c83-0000-0000-0000-602f00000000} /fs:ntfs"
         ));
         assert!(denied("format \\\\.\\C:"));
+        assert!(denied("format \\\\?\\C: /q"));
     }
 
     /// The everyday cleanups must keep working, or the floor is worse than no
