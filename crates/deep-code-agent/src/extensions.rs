@@ -46,7 +46,7 @@ pub const SUBAGENT_GUIDANCE: &str = "\
 - 何时派：调查、代码审查、验证类任务，且结论远小于过程——子代理把中间的读取/搜索开销烧在它自己的上下文里，父代理只收回精简报告。彼此独立、可并行的多路调查，在同一轮内发出多个 agent 调用即并发执行。\n\
 - 何时不派：简单任务，或需要当前对话上下文的任务——子代理是全新上下文，会从零重新发现一切，反而更慢更贵。\n\
 - 简报必须自足：子代理只看得到你给的 task 文本。写清四项——目标、范围边界、已知线索（相关文件/符号路径）、验收标准（报告需要回答什么）。简报越含糊，子代理越会跑偏。\n\
-- 选角色 role：explore / review / verifier 只读（调查/评审/验证）；implementer / general 可写文件（落地改动）；拿不准用 general。\n\
+- 选角色 role：explore / review / verifier / general 一律只读（调查/评审/验证/通用，拿不准就用 general）；唯有 implementer 可写文件（落地改动），且派遣 implementer 本身需要用户批准一次——批准即授权其工作区写入。\n\
 - 一次调用即阻塞到子代理完成并返回其五段报告，无需轮询或关闭；子代理产出报告即停，不会反问。";
 
 /// Host facts the model cannot observe but will otherwise guess wrong.
