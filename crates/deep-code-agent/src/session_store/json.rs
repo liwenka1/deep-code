@@ -41,8 +41,10 @@ impl JsonSessionStore {
     /// harness already had to exclude the directory by hand, which is the same
     /// hazard noticed in one place and not fixed at the source.
     ///
-    /// Best-effort and write-once: never overwrite a file the user may have
-    /// customized, and never fail a session-store open over it.
+    /// Best-effort and written only when absent: an existing file is never
+    /// touched, whatever it says — which also means *deleting* it is not a way
+    /// to opt out (the next session writes it back). The file itself says so,
+    /// and names the edit that does opt out.
     fn write_self_ignore(state_dir: &Path) {
         let marker = state_dir.join(".gitignore");
         if marker.exists() {
@@ -50,7 +52,11 @@ impl JsonSessionStore {
         }
         let _ = fs::write(
             &marker,
-            "# Written by deep-code: this directory holds session transcripts and logs.\n*\n",
+            "# Written by deep-code: this directory holds session transcripts and logs.\n\
+             # Deleting this file does not opt out — deep-code writes it back next session.\n\
+             # To commit this directory after all, edit this file instead (e.g. remove the\n\
+             # `*` line); deep-code never touches an existing .gitignore.\n\
+             *\n",
         );
     }
 
