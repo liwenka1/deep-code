@@ -562,8 +562,10 @@ mod tests {
     fn spawning_a_writing_subagent_needs_approval_like_a_write() {
         let policy = ExecPolicy::default();
 
-        let writing =
-            policy.evaluate_tool("agent", &json!({"task": "fix the bug", "role": "implementer"}));
+        let writing = policy.evaluate_tool(
+            "agent",
+            &json!({"task": "fix the bug", "role": "implementer"}),
+        );
         assert!(writing.requires_approval, "implementer spawn must prompt");
         assert!(!writing.read_only);
         assert!(matches!(
