@@ -444,10 +444,14 @@ impl AgentRuntime {
     /// Resolve a pending tool call for an unattended sub-agent.
     ///
     /// Fail-closed against the execution policy, with one role-posture
-    /// exception: dispatching a writing role (general/implementer) *is* the
-    /// write authorization, so workspace file writes are approved for those
-    /// roles. Shell and network still require the policy's own allow paths
-    /// (trusted prefixes / auto_allow); hard denials are never overridden.
+    /// exception: dispatching a writing role (`implementer` — the only role
+    /// whose `allows_writes` is true) *is* the write authorization, so
+    /// workspace file writes are approved for it. That dispatch is in turn
+    /// gated where writes prompt: the `agent` call itself requires approval
+    /// for writing roles (see `ToolKind::SubAgent` in the policy engine), so
+    /// this consent is granted by the human, not assumed. Shell and network
+    /// still require the policy's own allow paths (trusted prefixes /
+    /// auto_allow); hard denials are never overridden.
     pub fn subagent_approval_decision(
         &self,
         request: &ApprovalRequest,

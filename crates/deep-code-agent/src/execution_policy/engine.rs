@@ -267,6 +267,27 @@ impl ExecPolicy {
                 matched_rule: Some("builtin:mock_tool".to_string()),
                 network: false,
             },
+            // Dispatching a *writing* child is itself the write authorization:
+            // `subagent_approval_decision` auto-approves the child's workspace
+            // writes on the strength of the dispatch. That authorization must
+            // therefore come from the human on the tiers where writes prompt —
+            // otherwise spawning an implementer silently downgraded Default's
+            // "approve every write" to "approve nothing". Read-only roles keep
+            // spawning without a prompt, and `accept_edits_approvable` waves the
+            // writing role through on AcceptEdits and above, so the prompt
+            // appears exactly where a plain `write_file` would have.
+            ToolKind::SubAgent if subagent_role_writes(arguments) => ToolExecutionPlan {
+                verdict: PolicyVerdict::NeedsApproval {
+                    reason: "dispatching a writing sub-agent authorizes its workspace writes"
+                        .to_string(),
+                },
+                requires_approval: true,
+                requires_sandbox: false,
+                read_only: false,
+                risk_level: RiskLevel::Medium,
+                matched_rule: Some("builtin:subagent_writing_role".to_string()),
+                network: false,
+            },
             ToolKind::SubAgent => ToolExecutionPlan {
                 verdict: PolicyVerdict::Allow,
                 requires_approval: false,
@@ -426,8 +447,26 @@ pub fn accept_edits_approvable(tool_name: &str, arguments: &Value) -> bool {
                 .and_then(Value::as_str)
                 .is_some_and(shell_deny::is_workspace_fs_edit)
         }
+        // Spawning a writing child is standing consent to its workspace writes,
+        // which is exactly what AcceptEdits already grants per-write. Only the
+        // writing role ever reaches this (read-only spawns don't prompt).
+        ToolKind::SubAgent => subagent_role_writes(arguments),
         _ => false,
     }
+}
+
+/// Whether an `agent` call's `role` argument names a role whose child may write
+/// (see [`crate::subagent::SubAgentRole::allows_writes`]). Absent role means
+/// `general` (read-only); an unparsable role fails closed to "writes" — the
+/// tool itself will reject it, but if that ever drifts, prompt rather than pass.
+fn subagent_role_writes(arguments: &Value) -> bool {
+    let role = arguments
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("general");
+    crate::subagent::SubAgentRole::parse(role)
+        .map(crate::subagent::SubAgentRole::allows_writes)
+        .unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -512,6 +551,52 @@ mod tests {
         let plan = policy.evaluate_tool("write_file", &json!({"path": "a.rs", "content": "x"}));
         assert!(matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }));
         assert!(plan.requires_approval);
+    }
+
+    /// Spawning a writing child auto-approves its workspace writes (that is the
+    /// dispatch-is-authorization posture), so the *spawn* must prompt on the
+    /// tiers where a plain `write_file` would — otherwise `agent(implementer)`
+    /// silently downgraded Default's "approve every write" to "approve nothing".
+    /// Read-only roles spawn without a prompt, exactly as before.
+    #[test]
+    fn spawning_a_writing_subagent_needs_approval_like_a_write() {
+        let policy = ExecPolicy::default();
+
+        let writing =
+            policy.evaluate_tool("agent", &json!({"task": "fix the bug", "role": "implementer"}));
+        assert!(writing.requires_approval, "implementer spawn must prompt");
+        assert!(!writing.read_only);
+        assert!(matches!(
+            writing.verdict,
+            PolicyVerdict::NeedsApproval { .. }
+        ));
+
+        for readonly_role in ["explore", "review", "verifier", "plan", "general"] {
+            let plan =
+                policy.evaluate_tool("agent", &json!({"task": "scan", "role": readonly_role}));
+            assert!(
+                !plan.requires_approval,
+                "read-only role {readonly_role} must not prompt"
+            );
+            assert_eq!(plan.verdict, PolicyVerdict::Allow);
+        }
+        // Absent role defaults to `general` (read-only); an unknown role fails
+        // closed to a prompt (the tool itself will reject it anyway).
+        let bare = policy.evaluate_tool("agent", &json!({"task": "scan"}));
+        assert!(!bare.requires_approval);
+        let unknown = policy.evaluate_tool("agent", &json!({"task": "x", "role": "root"}));
+        assert!(unknown.requires_approval);
+
+        // AcceptEdits (and Auto above it) waves the writing spawn through, the
+        // same standing consent it grants a plain workspace write.
+        assert!(accept_edits_approvable(
+            "agent",
+            &json!({"task": "fix", "role": "implementer"})
+        ));
+        assert!(!accept_edits_approvable(
+            "agent",
+            &json!({"task": "scan", "role": "explore"})
+        ));
     }
 
     #[test]

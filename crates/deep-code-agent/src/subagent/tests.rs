@@ -304,8 +304,12 @@ None.
             .run_tool_call(agent_call("call_1", "map the crate", "explore"), None)
             .await
             .unwrap();
+        // A writing role's spawn is the write authorization, so it prompts
+        // (asserted in the policy tests); approve it here to reach the child.
+        let implementer = agent_call("call_2", "land the fix", "implementer");
+        assert!(registry.evaluate_tool(&implementer).requires_approval);
         registry
-            .run_tool_call(agent_call("call_2", "land the fix", "implementer"), None)
+            .run_tool_call(implementer, Some(ApprovalDecision::Approved))
             .await
             .unwrap();
 
