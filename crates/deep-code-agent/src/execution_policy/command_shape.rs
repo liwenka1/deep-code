@@ -161,9 +161,22 @@ fn redirects_execution(token: &str) -> bool {
         // Writes a caller-named path (`git diff --output=<path>`).
         "--output",
         "--output-file",
+        // cargo: writes the whole build tree into a caller-named directory.
+        "--target-dir",
     ];
     let name = token.split('=').next().unwrap_or(token);
     REDIRECTING.contains(&name.to_ascii_lowercase().as_str())
+}
+
+/// The tokens that can still be flags: everything before a literal `--`.
+///
+/// The programs whose flags populate [`redirects_execution`] (cargo, git) all
+/// treat `--` as the end of options, so a redirecting spelling after it is
+/// data — a pathspec, or an argument handed to the test binary — not a flag.
+/// Scanning past it would only degrade the identity of harmless commands
+/// (`cargo test -- --output x`) into spurious prompts.
+fn option_tokens<'a, 'b>(tokens: &'a [&'b str]) -> impl Iterator<Item = &'a &'b str> {
+    tokens.iter().take_while(|token| **token != "--")
 }
 
 /// The identity of a tokenized command line: the positional words that name
@@ -201,7 +214,7 @@ pub fn identity(tokens: &[&str]) -> String {
     // program with no prompt at any tier; `git diff --output=<path>` created or
     // overwrote an arbitrary file the same way. Neither contains `$`, `>`, `<`
     // or a backtick, so the structural-indirection gate did not catch them.
-    if tokens[1..].iter().any(|token| redirects_execution(token)) {
+    if option_tokens(&tokens[1..]).any(|token| redirects_execution(token)) {
         return squeeze(&tokens.join(" "));
     }
 
@@ -248,8 +261,7 @@ pub fn rule_covers(rule: &str, command: &str) -> bool {
     // `cargo test --config 'build.rustc-wrapper="/tmp/x"'` through that branch
     // even once identity matching rejected it, so an auto-trusted command could
     // run an arbitrary program with no prompt at any permission tier.
-    if tokens
-        .iter()
+    if option_tokens(&tokens)
         .any(|token| redirects_execution(token) && !rule_spells_out_flag(&rule, flag_name(token)))
     {
         return false;
@@ -456,6 +468,7 @@ mod tests {
         for command in [
             "cargo test --config 'build.rustc-wrapper=\"/tmp/x/wrap\"'",
             "cargo build --config target.x86_64-unknown-linux-gnu.runner=/tmp/r",
+            "cargo build --target-dir=/tmp/spray",
             "git diff --output=/tmp/leak",
             "git diff --ext-diff",
             "git log --ext-diff",
@@ -477,6 +490,19 @@ mod tests {
         assert!(!covers("git diff", "git diff --output=/tmp/leak"));
         // A byte-identical rule still matches the degraded identity.
         assert!(covers("git diff --ext-diff", "git diff --ext-diff"));
+    }
+
+    /// `--` ends the options for every program on the redirecting list (cargo,
+    /// git), so a redirecting spelling after it is data, not a flag: cargo hands
+    /// it to the test binary, git reads it as pathspec. Degrading on it would
+    /// only turn harmless commands into spurious prompts.
+    #[test]
+    fn positionals_after_a_double_dash_are_not_flags() {
+        assert_eq!(identity_of("cargo test -- --output /tmp/x"), "cargo test");
+        assert!(covers("cargo test", "cargo test -- --config whatever"));
+        assert!(covers("git diff", "git diff -- --output=odd-filename"));
+        // Before the `--` it is still a flag and still breaks the trust.
+        assert!(!covers("cargo test", "cargo test --config evil -- x"));
     }
 
     #[test]

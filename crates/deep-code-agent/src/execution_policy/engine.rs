@@ -624,6 +624,7 @@ mod tests {
         for command in [
             "cargo test --config 'build.rustc-wrapper=\"/tmp/x/wrap\"'",
             "cargo build --config target.x86_64-unknown-linux-gnu.runner=/tmp/r",
+            "cargo build --target-dir=/tmp/spray",
             "git diff --output=/tmp/leak",
             "git log --ext-diff",
         ] {
@@ -639,6 +640,7 @@ mod tests {
             "cargo build",
             "cargo test --release",
             "cargo test --features full",
+            "cargo test -- --output /tmp/handed-to-the-test-binary",
             "git diff --stat",
             "git log --oneline -5",
         ] {
