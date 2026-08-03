@@ -48,6 +48,7 @@
   "ErrorPrefix": "错误: ",
   "StatusEscCancel": "Esc 取消",
   "StreamingGenerating": "生成中 {secs}s",
+  "StreamingToolRunning": "{tool} 运行中 · {secs}s",
   "CopiedSelection": "已复制选中文本 ({count} 字)",
   "StatusEmptyPrompt": "请输入内容后再发送",
   "StatusStreamingFrom": "正在等待 {backend} 响应...",

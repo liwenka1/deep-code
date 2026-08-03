@@ -48,6 +48,7 @@
   "ErrorPrefix": "Error: ",
   "StatusEscCancel": "Esc to cancel",
   "StreamingGenerating": "generating {secs}s",
+  "StreamingToolRunning": "running {tool} · {secs}s",
   "CopiedSelection": "Selection copied ({count} chars)",
   "StatusEmptyPrompt": "Enter a prompt before sending",
   "StatusStreamingFrom": "Waiting for {backend}...",

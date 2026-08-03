@@ -79,6 +79,11 @@ pub enum HistoryCell {
         risk_level: Option<String>,
         requires_sandbox: Option<bool>,
         approval: ToolApprovalState,
+        /// Seconds this call has been running — `Some` only in the live
+        /// transcript preview (re-computed each frame), `None` once flushed.
+        /// Distinguishes several parallel `agent` calls that would otherwise
+        /// all look identically frozen.
+        running_for_secs: Option<u64>,
     },
     ToolResult {
         tool_name: String,
@@ -139,6 +144,7 @@ impl HistoryCell {
                 tool_name,
                 arguments,
                 approval,
+                running_for_secs,
                 ..
             } => {
                 let args = truncate_chars(&collapse_whitespace(arguments), 72);
@@ -146,7 +152,10 @@ impl HistoryCell {
                     ToolApprovalState::NotRequired => String::new(),
                     other => format!(" [{}]", other.label(lang)),
                 };
-                vec![format!("{tool_name}  {args}{badge}")]
+                let clock = running_for_secs
+                    .map(|secs| format!(" · {secs}s"))
+                    .unwrap_or_default();
+                vec![format!("{tool_name}  {args}{clock}{badge}")]
             }
             Self::ToolResult {
                 status, summary, ..
@@ -217,6 +226,7 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
                         risk_level: None,
                         requires_sandbox: None,
                         approval: ToolApprovalState::NotRequired,
+                        running_for_secs: None,
                     });
                     // Pending exchanges (interrupted before a result) render
                     // the call only — no fabricated result line.
@@ -569,6 +579,7 @@ mod tests {
             risk_level: None,
             requires_sandbox: None,
             approval: ToolApprovalState::NotRequired,
+            running_for_secs: None,
         };
         let lines = tool.lines(Lang::Zh);
         assert_eq!(lines.len(), 1, "tool call must be one line");
@@ -577,6 +588,7 @@ mod tests {
         assert!(!lines[0].contains('\n'));
         assert!(!lines[0].contains("Risk"));
         assert!(!lines[0].contains('['), "ungated call carries no badge");
+        assert!(!lines[0].contains("· "), "flushed call carries no clock");
 
         let gated = HistoryCell::ToolCall {
             tool_name: "write_file".to_string(),
@@ -584,9 +596,22 @@ mod tests {
             risk_level: Some("Medium".to_string()),
             requires_sandbox: Some(false),
             approval: ToolApprovalState::Approved,
+            running_for_secs: None,
         };
         assert!(gated.lines(Lang::Zh)[0].ends_with("[已批准]"));
         assert!(gated.lines(Lang::En)[0].ends_with("[approved]"));
+
+        // A still-running call (transcript preview) shows its elapsed clock
+        // between args and badge.
+        let running = HistoryCell::ToolCall {
+            tool_name: "agent".to_string(),
+            arguments: "{\"role\":\"explore\"}".to_string(),
+            risk_level: None,
+            requires_sandbox: None,
+            approval: ToolApprovalState::NotRequired,
+            running_for_secs: Some(47),
+        };
+        assert!(running.lines(Lang::Zh)[0].contains("· 47s"));
     }
 
     #[test]
@@ -610,6 +635,7 @@ mod tests {
             risk_level: None,
             requires_sandbox: None,
             approval: ToolApprovalState::NotRequired,
+            running_for_secs: None,
         };
         assert!(
             tool.lines(Lang::Zh)

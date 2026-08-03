@@ -38,6 +38,7 @@ impl App {
                     requires_sandbox: None,
                     approval: ToolApprovalState::NotRequired,
                     live_output: Default::default(),
+                    started_at: std::time::Instant::now(),
                 });
                 self.status =
                     self.tr_with(TextId::StatusToolCallReceiving, &[("tool", &tool_name)]);

@@ -43,6 +43,10 @@ pub struct ActiveToolCell {
     pub requires_sandbox: Option<bool>,
     pub approval: ToolApprovalState,
     pub live_output: LiveOutput,
+    /// When this call started running, for the "still alive, N seconds in"
+    /// readouts (status bar + transcript preview). A minutes-long tool (agent,
+    /// a build) with no clock reads as a hang.
+    pub started_at: std::time::Instant,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,10 +87,12 @@ impl ActiveTurn {
             .find(|tool| tool.tool_call_id == cell.tool_call_id)
         {
             // A re-upsert (duplicate ToolCallStarted) must not wipe output
-            // that already streamed in.
+            // that already streamed in, nor restart the clock.
             let live_output = std::mem::take(&mut existing.live_output);
+            let started_at = existing.started_at;
             *existing = cell;
             existing.live_output = live_output;
+            existing.started_at = started_at;
         } else {
             self.tools.push(cell);
         }
@@ -118,6 +124,7 @@ impl ActiveTurn {
                 requires_sandbox: None,
                 approval: ToolApprovalState::NotRequired,
                 live_output: LiveOutput::default(),
+                started_at: std::time::Instant::now(),
             });
         }
     }
@@ -141,6 +148,7 @@ impl ActiveTurn {
                 requires_sandbox: Some(request.requires_sandbox),
                 approval: ToolApprovalState::Required,
                 live_output: LiveOutput::default(),
+                started_at: std::time::Instant::now(),
             });
         }
     }
@@ -196,6 +204,9 @@ impl ActiveTurn {
                 risk_level: tool.risk_level,
                 requires_sandbox: tool.requires_sandbox,
                 approval: tool.approval,
+                // Finished: the ToolResult line right under it says how it
+                // ended; a stale clock would just be noise.
+                running_for_secs: None,
             });
         }
         cells.append(&mut self.diagnostics);
@@ -222,6 +233,9 @@ impl ActiveTurn {
                 risk_level: tool.risk_level.clone(),
                 requires_sandbox: tool.requires_sandbox,
                 approval: tool.approval,
+                // Recomputed on every render tick, so the line reads
+                // "agent … · 47s" and visibly counts while the call runs.
+                running_for_secs: Some(tool.started_at.elapsed().as_secs()),
             });
             if !tool.live_output.is_empty() {
                 cells.push(HistoryCell::ToolStream {
@@ -253,6 +267,7 @@ mod tests {
             requires_sandbox: None,
             approval: ToolApprovalState::NotRequired,
             live_output: LiveOutput::default(),
+            started_at: std::time::Instant::now(),
         });
 
         let cells = turn.preview_cells();
@@ -276,6 +291,7 @@ mod tests {
             requires_sandbox: None,
             approval: ToolApprovalState::NotRequired,
             live_output: LiveOutput::default(),
+            started_at: std::time::Instant::now(),
         });
 
         for line in 0..10 {
@@ -302,6 +318,7 @@ mod tests {
             requires_sandbox: None,
             approval: ToolApprovalState::NotRequired,
             live_output: LiveOutput::default(),
+            started_at: std::time::Instant::now(),
         });
         assert!(!turn.tools[0].live_output.is_empty());
 

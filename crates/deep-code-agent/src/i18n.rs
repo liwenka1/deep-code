@@ -196,6 +196,7 @@ text_ids! {
     ErrorPrefix,
     StatusEscCancel,
     StreamingGenerating,
+    StreamingToolRunning,
     CopiedSelection,
     StatusEmptyPrompt,
     StatusStreamingFrom,

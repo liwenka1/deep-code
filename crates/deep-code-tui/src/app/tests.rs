@@ -902,6 +902,43 @@ fn streaming_activity_shows_only_while_streaming() {
     assert!(app.streaming_activity().is_none());
 }
 
+/// While a tool executes, the activity label must name the tool and tick its
+/// own clock — "生成中 180s" over a minutes-long `agent` call reads as a hang,
+/// which is exactly the report that motivated this.
+#[test]
+fn streaming_activity_names_the_running_tool() {
+    use crate::active_turn::{ActiveToolCell, ActiveTurn, LiveOutput};
+    use deep_code_agent::{ToolCallId, TurnId};
+
+    let mut app = App::new();
+    app.is_streaming = true;
+    app.streaming_since = Some(std::time::Instant::now());
+
+    let mut turn = ActiveTurn::new(TurnId("turn_1".to_string()));
+    turn.upsert_tool(ActiveToolCell {
+        tool_call_id: ToolCallId("call_1".to_string()),
+        tool_name: "agent".to_string(),
+        arguments: "{}".to_string(),
+        risk_level: None,
+        requires_sandbox: None,
+        approval: crate::history::ToolApprovalState::NotRequired,
+        live_output: LiveOutput::default(),
+        started_at: std::time::Instant::now(),
+    });
+    app.active_turn = Some(turn);
+
+    let activity = app.streaming_activity().expect("indicator while running");
+    assert!(
+        activity.contains("agent") && activity.contains("运行中"),
+        "tool wait must name the tool: {activity:?}"
+    );
+
+    // Tool finished and removed → falls back to the generating label.
+    app.active_turn.as_mut().unwrap().tools.clear();
+    let activity = app.streaming_activity().expect("indicator while streaming");
+    assert!(activity.contains("生成中"), "{activity:?}");
+}
+
 #[test]
 fn steering_queues_prompt_while_streaming_without_sending() {
     let mut app = App::new();

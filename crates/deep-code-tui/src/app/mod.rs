@@ -449,9 +449,10 @@ impl App {
         tr_with(self.lang, id, args)
     }
 
-    /// Live activity label shown while streaming: an animated spinner plus
-    /// elapsed seconds, so a long time-to-first-token wait reads as
-    /// "生成中" rather than a frozen screen.
+    /// Live activity label shown while a turn runs: an animated spinner plus
+    /// elapsed seconds, so a long wait reads as activity rather than a frozen
+    /// screen. While a tool is executing, the label names the tool and shows
+    /// that call's own clock instead of the generic "generating".
     #[must_use]
     pub(crate) fn streaming_activity(&self) -> Option<String> {
         if !self.is_streaming {
@@ -460,6 +461,22 @@ impl App {
         let elapsed = self.streaming_since?.elapsed();
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let frame = FRAMES[(elapsed.as_millis() / 120 % FRAMES.len() as u128) as usize];
+        // A running tool owns the wait: "generating 180s" while a sub-agent or
+        // a build runs for minutes reads as a hang. When several tools run in
+        // a batch the newest is the one whose start the user just watched;
+        // finished calls leave `tools`, so this falls back by itself.
+        if let Some(tool) = self.active_turn.as_ref().and_then(|turn| turn.tools.last()) {
+            return Some(format!(
+                "{frame} {}",
+                self.tr_with(
+                    TextId::StreamingToolRunning,
+                    &[
+                        ("tool", &tool.tool_name),
+                        ("secs", &tool.started_at.elapsed().as_secs().to_string()),
+                    ],
+                )
+            ));
+        }
         Some(format!(
             "{frame} {}",
             self.tr_with(
