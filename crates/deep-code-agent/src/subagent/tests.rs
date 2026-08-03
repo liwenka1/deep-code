@@ -361,8 +361,12 @@ None.
         assert_eq!(result.status, crate::tool::ToolResultStatus::Success);
         let updates = updates.lock().unwrap().clone();
         assert!(
-            updates.iter().any(|line| line == "step 1: list_dir"),
-            "child tool call must stream a progress line, got: {updates:?}"
+            updates.iter().any(|line| {
+                line.starts_with("[explore] +")
+                    && line.contains(" step 1/")
+                    && line.ends_with(": list_dir")
+            }),
+            "child tool call must stream a role/elapsed/step progress line, got: {updates:?}"
         );
     }
 

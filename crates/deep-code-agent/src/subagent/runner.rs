@@ -17,6 +17,7 @@ pub async fn run_subagent(
     role: SubAgentRole,
     on_progress: impl Fn(String),
 ) -> Result<(String, u32), (u32, String)> {
+    let started = std::time::Instant::now();
     let mut steps = 0u32;
     let mut rx = runtime.drive_turn().await;
 
@@ -65,8 +66,17 @@ pub async fn run_subagent(
             RuntimeEvent::TurnCancelled { .. } => return Err((steps, "cancelled".to_string())),
             RuntimeEvent::Error { message, .. } => return Err((steps, message)),
             RuntimeEvent::ToolCallStarted { tool_name, .. } => {
-                // The upcoming step: `steps` counts finished calls.
-                on_progress(format!("step {}: {tool_name}", steps + 1));
+                // The upcoming step: `steps` counts finished calls. Each line
+                // carries the role, elapsed wall clock and the step budget, so
+                // the tail visible in the parent transcript reads as a pulse —
+                // "is it stuck?" is answerable at a glance ("+41s step 7/50"),
+                // which a bare "step 7" was not.
+                on_progress(format!(
+                    "[{}] +{}s step {}/{max_steps}: {tool_name}",
+                    role.as_str(),
+                    started.elapsed().as_secs(),
+                    steps + 1,
+                ));
             }
             RuntimeEvent::ToolCallFinished { .. } => {
                 steps += 1;
