@@ -36,12 +36,15 @@ pub async fn run(config: LaunchConfig) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut app = App::launch(config);
     let result = run_loop(&mut terminal, &mut app);
-    restore_terminal(&mut terminal)?;
-    // Shut the runtime down before propagating a loop error: `?` here used to
-    // skip `shutdown_runtime` entirely, losing the final persist/flush and
-    // leaking job process trees and LSP children on every error exit.
+    // Nothing may `?` past `shutdown_runtime`: an early return here skips the
+    // final persist/flush and leaks job process trees and LSP children. The
+    // loop result used to take that exit, and after that was fixed the
+    // terminal-restore `?` still did. The loop error is reported first — it is
+    // the root cause, a failed restore is at most a symptom.
+    let restored = restore_terminal(&mut terminal);
     app.shutdown_runtime().await;
     result?;
+    restored?;
     Ok(())
 }
 
