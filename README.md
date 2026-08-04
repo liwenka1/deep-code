@@ -1,115 +1,137 @@
 # deep-code
 
-基于 DeepSeek 的终端 AI 编程助手（Rust 编写）。
+English | [简体中文](./README.zh-CN.md)
 
-## 特性
+A DeepSeek-powered terminal coding agent, written in Rust. One small binary: streaming TUI, OS-level sandboxing, role-based sub-agents, and a safety-first execution policy.
 
-- **DeepSeek 流式对话**：支持 reasoning 流与工具调用（function calling）。
-- **工具审批**：写文件/执行命令等需确认（`y` 批准 / `a` 本会话始终允许 / `n` 拒绝）；shell 的 `a` 按命令 identity（程序名 + 子命令）放行，批过 `git push` 不会连带放行 `git status`，只读工具直接执行。四档权限（`default` / `accept_edits` / `auto` / `yolo`）按 Shift+Tab 循环切换。
-- **Auto 路由**：按任务在 `deepseek-v4-pro` / `deepseek-v4-flash` 间自动选模型与 reasoning effort；API 限流/故障时自动降级重试。
-- **会话与回滚**：会话持久化、`-c` 续接、`-r` 选择恢复；每轮 checkpoint 可 `/restore` 回滚。
-- **极简 TUI**：鼠标滚动/划选复制、粘贴折叠、补全菜单；状态行只留权限档位、生效模型与上下文占用，成本明细在 `/status`。流式中可继续输入，本回合结束后作为追问自动发出。
-- **OS 沙箱（macOS / Linux）**：shell/job 命令在系统沙箱内运行（macOS Seatbelt / Linux Landlock+seccomp），写入限制在工作区与系统临时目录内，且**默认不带网络**——需要联网的命令必须声明并转人工审批。没有可用沙箱后端时拒绝执行而非降级裸跑。
-  **Windows 请务必知悉**：那里只有 Job Object 进程树收容，**既不限制文件写、也不拦网络**，`[sandbox] network` 在该平台是空操作。命令仍受 deny 底板与审批门约束，但"越界写会被替你拒掉"在 Windows 上不成立。`deepcode doctor` 会如实报告本机究竟约束了什么。
-- **可扩展**：LSP 诊断、子代理（sub-agents）、skills（`SKILL.md` + shell）。
+## Highlights
 
-## 安装
+**Small, fast, self-contained**
+
+- Single native binary (~4–5 MB) per platform — no Node/Python runtime needed at run time. Prebuilt for macOS (arm64/x64), Linux (x64/arm64, glibc ≥ 2.35), and Windows (x64); `npm i -g` fetches the right one and verifies its SHA-256. musl hosts (Alpine and most slim images) are not supported yet — the installer detects and refuses them with a clear error instead of installing a broken binary.
+
+**Safety-first execution**
+
+- **Four permission tiers** — `default` / `accept_edits` / `auto` / `yolo`, cycled with Shift+Tab. `auto` delegates routine approvals to a cheap Flash classifier with hard floors it can never override: top-risk commands and anything requesting network access always ask a human.
+- **OS sandbox (macOS / Linux)** — shell/job commands run inside macOS Seatbelt or Linux Landlock+seccomp: writes confined to the workspace and system temp dirs, **no network by default**. Commands that need egress (installs, `git push`, dev servers) must declare it and go through approval; `[sandbox] network = prompt|always|never` tunes this, and project-level config can only tighten it. If no sandbox backend is available, commands are refused rather than silently run bare.
+  **Windows, please read**: only Job Object process-tree containment exists there — **file writes and network are not restricted**, and the `network` setting is a no-op. The deny floor and the approval gate still apply, but "out-of-workspace writes get blocked for you" does not hold on Windows. `deepcode doctor` reports exactly what is enforced on your machine.
+- **Deny floor** — catastrophic commands are hard-refused at any tier and cannot be allow-listed: `rm -rf` on system roots, disk formatting (`format C:`, volume-GUID/device-path/`\\?\` spellings, `diskpart`), registry deletion, and friends — including their Windows spellings.
+- **Trust that doesn't leak** — "always allow" for shell matches on command identity (program + subcommand): trusting `git push` does not wave through `git status`, and flags that change *what executes or where it writes* (`--config`, `--exec-path`, `--output`, `--target-dir`, …) break the trust match and re-prompt. Shell metacharacters (`$`, backticks, redirection) route to approval instead of being parsed optimistically.
+
+**Sub-agents with real guardrails**
+
+- Delegate investigation or implementation to child agents via one blocking `agent` tool call; issue several calls in one turn to run children in parallel. Six roles — `general` / `explore` / `plan` / `review` / `verifier` are strictly read-only; **only `implementer` can write**, and dispatching one is itself an approval point: the human authorizes the dispatch, the child's workspace writes then proceed unattended (on the tiers where writes would prompt).
+- Reconnaissance roles (`explore` / `review` / `verifier`) are pinned to the cheap flash tier — fan-out burns tokens where it's cheapest — while children stream live progress into the parent transcript: `[explore] +41s step 7/50: grep_files`, so a long-running child never looks hung.
+- Child token spend is folded into the parent session's cost tracking.
+
+**Sessions you can trust**
+
+- Persistence + `-c` resume + `-r` picker; per-turn checkpoints with `/restore` rollback, snapshotted via copy-on-write clones where the filesystem supports it (APFS / Btrfs / XFS).
+- Automatic context compaction with a bounded summary carry; costs are tracked per request (including cache hit/miss savings and sub-agent spend), shown in `/status`, in your currency of choice.
+
+**A TUI that stays honest**
+
+- Streaming responses with DeepSeek reasoning, mouse scroll/select, paste folding, completion menus. Type while the model streams — your input queues and is sent as a follow-up when the turn ends (mid-turn steering).
+- Approval panel shows a real change preview; running tools display their own elapsed clock (`agent … · 47s`) instead of a frozen screen; the status line stays minimal (tier, effective model, context usage).
+- Bilingual UI (English / 中文), hot-switchable with `/lang`. Graceful shutdown end to end: SIGTERM/SIGINT drain properly, and process groups are killed as a tree — no orphaned dev servers squatting on ports.
+
+**Model routing**
+
+- `auto` picks between `deepseek-v4-pro` and `deepseek-v4-flash` (and the reasoning effort) per task, and degrades with retry on rate limits or upstream failures. Pin with `/model` or `provider.model`.
+
+## Install
 
 ```sh
 npm i -g @liwenkai/deepcode
 ```
 
-安装后命令为 `deepcode`（postinstall 会按平台从 GitHub Releases 下载预编译二进制并校验 SHA-256）。更新：
+The command is `deepcode` (postinstall downloads the platform binary from GitHub Releases and verifies SHA-256). To update:
 
 ```sh
 npm i -g @liwenkai/deepcode@latest
 ```
 
-## 快速开始
+## Quick start
 
 ```sh
-deepcode            # 启动(新会话)
+deepcode            # start a new session
 ```
 
-启动后设置 DeepSeek API Key（也可用环境变量 `DEEPSEEK_API_KEY`）：
+Set your DeepSeek API key on first run (or use the `DEEPSEEK_API_KEY` environment variable):
 
 ```
 /apikey sk-...
 ```
 
-## 用法
+## Usage
 
 ```
-deepcode                 # 新会话
-deepcode -c              # 续最近会话
-deepcode -r              # 选择历史会话
-deepcode --new           # 显式新会话
-deepcode --help          # 命令一览（--version 查版本）
-deepcode doctor [--json] # 环境自检
-deepcode serve --http    # 作为 HTTP 服务运行
-deepcode eval            # SWE-bench 评测 rollout(见下文)
+deepcode                 # new session
+deepcode -c              # continue the latest session
+deepcode -r              # pick a session to resume
+deepcode --new           # explicitly new session
+deepcode --help          # command overview (--version for the version)
+deepcode doctor [--json] # environment self-check
+deepcode serve --http    # run as an HTTP server
+deepcode eval            # SWE-bench rollout (see below)
 deepcode session list|resume|delete|export
 ```
 
-常用 slash 命令：`/help` `/model` `/apikey` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy`（`/help` 查看全部与快捷键）。
+Common slash commands: `/help` `/model` `/apikey` `/lang` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy` (`/help` lists everything plus keybindings).
 
-## 配置
+## Configuration
 
-配置文件：`~/.deep-code/config.toml`（可参考仓库根目录的 `config.example.toml`）。
-加载顺序：内置默认 → 全局 → 项目 `.deep-code/config.toml` → 环境变量 → CLI 参数。
+Config file: `~/.deep-code/config.toml` (see `config.example.toml` in the repo root).
+Load order: built-in defaults → global → project `.deep-code/config.toml` → environment variables → CLI flags.
 
-常用项：`provider.model`（`pro`/`flash`/`auto`）、`provider.reasoning_effort`（`off`/`low`/`medium`/`high`/`max`）、`cost.currency`、`approval.auto_allow`（预放行的工具前缀）。
-> API Key 建议放在环境变量或全局配置；项目级配置中的 `api_key` 会被忽略，以防随仓库泄露。
+Common keys: `provider.model` (`pro`/`flash`/`auto`), `provider.reasoning_effort` (`off`/`low`/`medium`/`high`/`max`), `cost.currency`, `approval.auto_allow` (pre-approved tool prefixes).
 
-环境变量 `DEEP_CODE_DISABLE_WEB`：设为**非空**且非 `0`/`false`/`off`/`no` 的值（大小写不敏感；空值视为未设置）即可关闭联网工具（`web_search`/`fetch_url`），用于断网或审计场景；默认开启。`/status` 会显示当前 `web=on|off`。
+> Keep the API key in an environment variable or the global config; `api_key` in project-level config is ignored, so it can't leak with the repo.
 
-在 macOS / Linux 上，shell/job 命令在 OS 沙箱内运行且**默认不带网络**（含端口监听）：需要联网的命令（安装依赖、`git push`、dev server）会转人工审批，"本会话记住"后同形态命令不再问；`[sandbox] network = prompt|always|never` 可调，项目层只许收紧。**Windows 上没有沙箱约束**，因此本段的断网与写入限制均不生效（`network` 设置是空操作），声明联网仍会转审批、deny 底板仍然生效；跑 `deepcode doctor` 看本机实况。
+`DEEP_CODE_DISABLE_WEB`: set to anything non-empty other than `0`/`false`/`off`/`no` (case-insensitive; empty counts as unset) to disable the web tools (`web_search`/`fetch_url`) for offline or audited environments; on by default. `/status` shows the current `web=on|off`.
 
-## 扩展能力(skills + shell)
+On macOS / Linux, shell/job commands run inside the OS sandbox with **no network by default** (including listening on ports): commands that need egress go to approval, and "remember for this session" stops re-asking for the same command shape; `[sandbox] network = prompt|always|never` tunes it, project config can only tighten. **On Windows there is no sandbox confinement**, so the no-network and write-confinement guarantees in this section do not apply there (the `network` setting is a no-op); declared network still routes to approval and the deny floor still applies. Run `deepcode doctor` for the ground truth on your machine.
 
-deep-code **不内置 MCP**。它本来就有 shell,所以扩展能力的方式是**写个脚本/命令 + 一份 `SKILL.md`**:一行摘要注入系统提示、模型按需读取 SKILL.md 正文,再通过 `shell` 工具调用你的脚本。
+## Extending (skills + shell)
 
-- **发现**:把带 `name`/`description` frontmatter 的 `SKILL.md` 放进 skills 目录(全局 `~/.deep-code/skills/<name>/` 或项目 `<workspace>/.deep-code/skills/<name>/`);其一行摘要常驻提示,正文只在相关时才读入上下文。
-- **执行**:能力就是普通命令(`psql`、`curl`、你自己的脚本……),经 `shell` 工具运行,同样受审批门与执行策略约束。
-- **为什么不做 MCP**:对有 shell 的 agent,shell 就是通用工具协议。一份几十 token 的 SKILL.md 摘要按需加载,比把整套工具 schema 常驻每一轮请求更省上下文,还能用管道(`| head` 等)裁剪结果、只把关键片段带回上下文。确需现成的 MCP 生态 server 时,用支持 MCP 的宿主即可——deep-code 保持精简。
+deep-code **does not ship MCP**. It already has a shell, so the way to add a capability is **a script/command + a `SKILL.md`**: a one-line summary lives in the system prompt, the model reads the SKILL.md body on demand, then calls your script through the `shell` tool.
 
-## 评测(SWE-bench)
+- **Discovery**: drop a `SKILL.md` with `name`/`description` frontmatter into a skills directory (global `~/.deep-code/skills/<name>/` or project `<workspace>/.deep-code/skills/<name>/`); the one-line summary is always in the prompt, the body only enters context when relevant.
+- **Execution**: a capability is just a normal command (`psql`, `curl`, your own script, …) run through the `shell` tool — subject to the same approval gate and execution policy as everything else.
+- **Why no MCP**: for an agent that has a shell, the shell *is* the universal tool protocol. A few dozen tokens of SKILL.md summary loaded on demand beats keeping a full tool schema resident in every request, and you can pipe (`| head`, …) to trim results so only the relevant slice enters context. If you need an existing MCP-ecosystem server, use a host that speaks MCP — deep-code stays lean.
 
-内置 SWE-bench rollout 驱动：拉官方数据集，驱动 agent 逐题产出 patch，
-写出官方格式的 `predictions.json`。**本地不打分**——patch 产出 ≠ 解决，
-真实 resolved 率由官方评测（sb-cli 云端，免本地 Docker）得出。
+## Eval (SWE-bench)
+
+Built-in SWE-bench rollout driver: pulls the official dataset, drives the agent through each task to produce patches, and writes an official-format `predictions.json`. **No local scoring** — a produced patch ≠ resolved; the real resolved rate comes from the official evaluation (sb-cli in the cloud, no local Docker).
 
 ```sh
-# 需已配置 DeepSeek API key（未配置会直接报错，不会空跑）
-deepcode eval --sample 2                  # 联调：dev split 先跑 2 题
-deepcode eval                             # dev 全量（23 题，约几分钱）
-deepcode eval --split test --parallel 4 --timeout 900   # test 全量（300 题）
+# Requires a configured DeepSeek API key (errors out instead of dry-running)
+deepcode eval --sample 2                  # shakedown: 2 tasks from the dev split
+deepcode eval                             # full dev split (23 tasks, a few cents)
+deepcode eval --split test --parallel 4 --timeout 900   # full test split (300 tasks)
 ```
 
-产物在 `eval-out/`（可用 `--out` 改）：`predictions.json`（官方格式）+
-`report.json`（含每题耗时、成本、模型与路由来源）。
+Artifacts land in `eval-out/` (change with `--out`): `predictions.json` (official format) + `report.json` (per-task time, cost, model and routing source).
 
-官方评分：
+Official scoring:
 
 ```sh
 pip install sb-cli
-sb-cli gen-api-key you@example.com   # 一次性，邮件验证后 export SWEBENCH_API_KEY=...
+sb-cli gen-api-key you@example.com   # one-time; after email verification export SWEBENCH_API_KEY=...
 sb-cli submit swe-bench_lite dev --predictions_path eval-out/predictions.json --run_id my-run
 ```
 
-网络提示：数据集来自 HuggingFace datasets-server，部分网络需
-`HTTPS_PROXY=http://127.0.0.1:<port>` 或用 `DEEP_CODE_HF_BASE` 指向镜像。
-参数细节见 `crates/deep-code-eval/README.md`。
+Network note: the dataset comes from the HuggingFace datasets-server; some networks need `HTTPS_PROXY=http://127.0.0.1:<port>` or `DEEP_CODE_HF_BASE` pointed at a mirror. Parameter details in `crates/deep-code-eval/README.md`.
 
-## 从源码构建
+## Build from source
 
 ```sh
 git clone https://github.com/liwenka1/deep-code
 cd deep-code
 cargo build --release -p deep-code-tui
-# 产物：target/release/deep-code
+# artifact: target/release/deep-code
 ```
 
-## 许可证
+## License
 
 MIT
