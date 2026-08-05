@@ -7,5 +7,5 @@ mod events;
 mod server;
 
 pub use auth::RUNTIME_TOKEN_ENV;
-pub use events::{RuntimeEnvelope, RuntimeItem};
+pub use events::{EnvelopeStream, RuntimeEnvelope, RuntimeItem};
 pub use server::{RuntimeServerOptions, run_http_server};

@@ -70,6 +70,7 @@ deepcode                 # new session
 deepcode -c              # continue the latest session
 deepcode -r              # pick a session to resume
 deepcode --new           # explicitly new session
+deepcode -p "..."        # headless one-shot: run a full turn, print the answer (see below)
 deepcode --help          # command overview (--version for the version)
 deepcode doctor [--json] # environment self-check
 deepcode serve --http    # run as an HTTP server
@@ -78,6 +79,21 @@ deepcode session list|resume|delete|export
 ```
 
 Common slash commands: `/help` `/model` `/apikey` `/lang` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy` (`/help` lists everything plus keybindings).
+
+### Headless one-shot (`-p`)
+
+```sh
+deepcode -p "summarize this repo"                # answer → stdout, all diagnostics → stderr
+git diff | deepcode -p "write a commit message"  # stdin is attached as data below the instruction
+deepcode -c -p "continue: add the tests"         # resume the latest session, then one shot
+deepcode -p "fix this lint" --permission-mode accept_edits
+deepcode -p "..." --output-format json           # one {"result","reasoning","cost",...} object
+deepcode -p "..." --output-format stream-json    # NDJSON, same envelopes as the serve SSE
+```
+
+- **Same approval posture as the CI bot**: a call that would prompt is auto-denied — never parked — with one stderr line per denial. Capability comes from the existing knobs: `--permission-mode accept_edits|auto|yolo`, `approval.auto_allow`, `DEEP_CODE_APPROVAL_AUTO_ALLOW` — the `auto` tier's Flash judge needs no human present, so it works headless. The deny floor stays non-negotiable.
+- **Exit codes**: `0` finished / `1` error / `2` usage / `124` timeout (`--timeout SECS`) / `130` Ctrl-C.
+- One-shot runs persist a session too: stderr prints the id, and `deepcode -c` picks the thread up interactively any time.
 
 ## Configuration
 

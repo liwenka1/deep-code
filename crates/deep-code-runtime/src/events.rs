@@ -4,6 +4,10 @@
 //! stable contract: CI consumers extract text with jq paths like
 //! `.item.kind` / `.item.payload.text`. Change it only together with those
 //! consumers (`.github/workflows/deep-code-bot.yml`).
+//!
+//! The headless CLI (`deep-code -p --output-format stream-json`) emits the
+//! same envelopes as NDJSON, one per line — deliberately, so a consumer's jq
+//! paths work unchanged against either entry point.
 
 use chrono::Utc;
 use deep_code_agent::{RuntimeEvent, TurnId, now_ms};
@@ -31,17 +35,21 @@ pub struct RuntimeEnvelope {
 
 /// Per-request envelope sequencer: wraps runtime events (or manual items)
 /// into the wire envelope with a monotonically increasing `seq`.
-pub(crate) struct EnvelopeStream {
+///
+/// Public because the SSE stream and the headless NDJSON stream must share
+/// one sequencer implementation — two copies would drift into two contracts.
+pub struct EnvelopeStream {
     thread_id: String,
     seq: u64,
 }
 
 impl EnvelopeStream {
-    pub(crate) fn new(thread_id: String) -> Self {
+    #[must_use]
+    pub fn new(thread_id: String) -> Self {
         Self { thread_id, seq: 0 }
     }
 
-    pub(crate) fn event(&mut self, event: &RuntimeEvent) -> RuntimeEnvelope {
+    pub fn event(&mut self, event: &RuntimeEvent) -> RuntimeEnvelope {
         self.wrap(
             runtime_event_kind(event).to_string(),
             event_turn_id(event),
@@ -49,7 +57,7 @@ impl EnvelopeStream {
         )
     }
 
-    pub(crate) fn manual(&mut self, kind: impl Into<String>, payload: Value) -> RuntimeEnvelope {
+    pub fn manual(&mut self, kind: impl Into<String>, payload: Value) -> RuntimeEnvelope {
         self.wrap(kind.into(), None, payload)
     }
 

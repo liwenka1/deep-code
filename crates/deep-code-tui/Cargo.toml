@@ -19,10 +19,11 @@ deep-code-eval = { path = "../deep-code-eval" }
 deep-code-runtime = { path = "../deep-code-runtime" }
 libc = "0.2"
 ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.149"
 unicode-segmentation = "1"
 unicode-width = "0.2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 
 # Redirect stderr to the log file on Windows (SetStdHandle), mirroring the
 # unix `dup2` path so stray writes can't paint over the alternate-screen TUI.
@@ -35,4 +36,6 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
+async-stream = "0.3"
+async-trait = "0.1"
 tempfile = "3"

@@ -6,6 +6,7 @@ mod commands;
 mod doctor_cli;
 mod eval_cli;
 mod event_routing;
+mod headless;
 mod history;
 mod markdown;
 mod startup;
@@ -30,6 +31,13 @@ async fn main() -> anyhow::Result<()> {
                 workspace: None,
             })
             .await
+        }
+        RunMode::Print(print_args) => {
+            // Exit code is part of the headless contract (0 ok / 1 error /
+            // 2 usage / 124 timeout / 130 interrupt), so bypass `?`-style
+            // error mapping and exit explicitly.
+            let code = headless::run_print(print_args).await;
+            std::process::exit(code);
         }
         RunMode::Doctor { json } => doctor_cli::run_doctor(json),
         RunMode::Serve {

@@ -4,9 +4,11 @@ use std::env;
 use std::path::PathBuf;
 
 use deep_code_agent::{
-    AgentConfig, JsonSessionStore, Lang, SessionId, SessionStore, format_sessions_storage_note,
-    now_ms,
+    AgentConfig, JsonSessionStore, Lang, PermissionMode, SessionId, SessionStore,
+    format_sessions_storage_note, now_ms,
 };
+
+use crate::headless::OutputFormat;
 
 /// What the interactive TUI should open with. A bare `deep-code` starts
 /// fresh; resuming is opt-in, so stale context never leaks in by default.
@@ -22,11 +24,32 @@ pub enum StartupIntent {
     ResumeId(String),
 }
 
+/// Headless one-shot mode (`-p`): run one prompt to completion without a
+/// terminal UI. Parsed here; executed by `crate::headless::run_print`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrintArgs {
+    /// Positional prompt; `None` falls back to piped stdin (both may combine,
+    /// see `headless::input`).
+    pub prompt: Option<String>,
+    /// Which session to run in: `--new` (default), `-c`, or `--resume <id>`.
+    /// The interactive picker is rejected at parse time.
+    pub intent: StartupIntent,
+    pub output: OutputFormat,
+    /// Session permission mode override for this run.
+    pub permission_mode: Option<PermissionMode>,
+    /// Wall-clock budget; on expiry the turn is cancelled and the exit code
+    /// is 124.
+    pub timeout_secs: Option<u64>,
+    /// Mirror tool activity to stderr.
+    pub verbose: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunMode {
     Tui {
         intent: StartupIntent,
     },
+    Print(PrintArgs),
     Doctor {
         json: bool,
     },
@@ -70,6 +93,13 @@ pub struct CliArgs {
 /// which makes the behaviour untestable in-crate.
 fn wants_help(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--help" || arg == "-h")
+}
+
+/// Whether the argv asks for headless print mode, in any position — `-p` may
+/// come before or after the prompt or the resume flags. Checked only after
+/// the subcommand match, so `serve`/`eval`/… keep owning their own flags.
+fn wants_print(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "-p" || arg == "--print")
 }
 
 pub fn parse_args() -> CliArgs {
@@ -125,7 +155,121 @@ pub fn parse_args() -> CliArgs {
         _ => {}
     }
 
+    if wants_print(&args) {
+        return parse_print_args(args);
+    }
+
     parse_tui_args(args)
+}
+
+/// Parse headless mode: `-p [PROMPT] [--output-format …] [--permission-mode …]
+/// [--timeout SECS] [--verbose] [--new | -c | --resume <id>]`.
+///
+/// The prompt is positional (before or after the flags); with none, stdin is
+/// the prompt. `-r`/`--resume` without an id is rejected here: the picker is
+/// interactive and headless must never block on a keyboard.
+fn parse_print_args(mut args: Vec<String>) -> CliArgs {
+    let prog = program_name();
+    let usage = format!(
+        "Usage: {prog} -p [PROMPT] [--output-format text|json|stream-json] \
+[--permission-mode default|accept_edits|auto|yolo] [--timeout SECS] [--verbose] \
+[--new | -c | --resume <id>]"
+    );
+
+    let mut prompt: Option<String> = None;
+    let mut intent = StartupIntent::New;
+    let mut output = OutputFormat::Text;
+    let mut permission_mode = None;
+    let mut timeout_secs = None;
+    let mut verbose = false;
+
+    while let Some(arg) = args.first().cloned() {
+        args.remove(0);
+        match arg.as_str() {
+            "-p" | "--print" => {}
+            "--new" => intent = StartupIntent::New,
+            "--continue" | "-c" => intent = StartupIntent::ContinueLatest,
+            "--resume" | "-r" => {
+                if let Some(id) = args.first().cloned()
+                    && !id.starts_with('-')
+                {
+                    args.remove(0);
+                    intent = StartupIntent::ResumeId(id);
+                } else {
+                    eprintln!(
+                        "--resume needs an explicit session id in headless mode (the picker is interactive)"
+                    );
+                    std::process::exit(2);
+                }
+            }
+            value if value.starts_with("--resume=") => {
+                let id = value.trim_start_matches("--resume=");
+                if id.is_empty() {
+                    eprintln!(
+                        "--resume needs an explicit session id in headless mode (the picker is interactive)"
+                    );
+                    std::process::exit(2);
+                }
+                intent = StartupIntent::ResumeId(id.to_string());
+            }
+            "--output-format" => {
+                let value = require_value(&mut args, "--output-format");
+                output = OutputFormat::parse(&value).unwrap_or_else(|| {
+                    eprintln!(
+                        "Invalid --output-format '{value}'. Use 'text', 'json', or 'stream-json'."
+                    );
+                    std::process::exit(2);
+                });
+            }
+            "--permission-mode" => {
+                let value = require_value(&mut args, "--permission-mode");
+                permission_mode = Some(PermissionMode::parse(&value).unwrap_or_else(|| {
+                    eprintln!(
+                        "Invalid --permission-mode '{value}'. Use 'default', 'accept_edits', 'auto', or 'yolo'."
+                    );
+                    std::process::exit(2);
+                }));
+            }
+            "--timeout" => {
+                let value = require_value(&mut args, "--timeout");
+                timeout_secs = Some(
+                    value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|secs| *secs > 0)
+                        .unwrap_or_else(|| {
+                            eprintln!("Invalid --timeout value '{value}' (whole seconds > 0)");
+                            std::process::exit(2);
+                        }),
+                );
+            }
+            "--verbose" => verbose = true,
+            other if !other.starts_with('-') => {
+                if prompt.is_some() {
+                    eprintln!("More than one prompt argument. Quote the prompt: -p \"…\"");
+                    eprintln!("{usage}");
+                    std::process::exit(2);
+                }
+                prompt = Some(other.to_string());
+            }
+            other => {
+                eprintln!("Unknown print argument '{other}'.");
+                eprintln!("{usage}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    CliArgs {
+        mode: RunMode::Print(PrintArgs {
+            prompt,
+            intent,
+            output,
+            permission_mode,
+            timeout_secs,
+            verbose,
+        }),
+    }
 }
 
 /// Parse the TUI flags (`--new`, `-c`/`--continue`, `-r`/`--resume [id]`) into
@@ -493,6 +637,7 @@ pub fn run_session_command(mode: RunMode) -> anyhow::Result<()> {
             println!("{}", store.export(&SessionId::parse(&id)?)?);
         }
         RunMode::Tui { .. }
+        | RunMode::Print(_)
         | RunMode::Doctor { .. }
         | RunMode::Serve { .. }
         | RunMode::Eval { .. } => unreachable!("handled by caller"),
@@ -524,6 +669,10 @@ fn usage_text() -> String {
         format!("  {prog}                # 新会话"),
         format!("  {prog} -c             # 续最近会话"),
         format!("  {prog} -r             # 选择历史会话"),
+        format!("  {prog} -p \"PROMPT\"    # 单发无头模式;无参数则读 stdin,可与 -c/--resume 组合"),
+        format!(
+            "  {prog} -p [PROMPT] [--output-format text|json|stream-json] [--permission-mode MODE] [--timeout SECS] [--verbose]"
+        ),
         format!("  {prog} doctor [--json]"),
         format!("  {prog} serve --http [--host HOST] [--port PORT]"),
         format!("  {prog} session list|resume|delete|export"),
@@ -624,6 +773,91 @@ mod tests {
     fn parse_doctor_json_flag() {
         let parsed = parse_doctor_command(vec!["--json".to_string()]);
         assert_eq!(parsed.mode, RunMode::Doctor { json: true });
+    }
+
+    fn print_args(args: &[&str]) -> PrintArgs {
+        let parsed = parse_print_args(args.iter().map(|s| (*s).to_string()).collect());
+        match parsed.mode {
+            RunMode::Print(print) => print,
+            other => panic!("expected Print, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn print_defaults_are_new_session_text_output() {
+        assert_eq!(
+            print_args(&["-p"]),
+            PrintArgs {
+                prompt: None,
+                intent: StartupIntent::New,
+                output: OutputFormat::Text,
+                permission_mode: None,
+                timeout_secs: None,
+                verbose: false,
+            }
+        );
+    }
+
+    #[test]
+    fn print_prompt_is_positional_on_either_side_of_the_flag() {
+        assert_eq!(
+            print_args(&["-p", "fix the bug"]).prompt.as_deref(),
+            Some("fix the bug")
+        );
+        assert_eq!(
+            print_args(&["fix the bug", "--print"]).prompt.as_deref(),
+            Some("fix the bug")
+        );
+    }
+
+    #[test]
+    fn print_full_flag_set_parses() {
+        let print = print_args(&[
+            "-p",
+            "do it",
+            "--output-format",
+            "json",
+            "--permission-mode",
+            "accept_edits",
+            "--timeout",
+            "60",
+            "--verbose",
+            "-c",
+        ]);
+        assert_eq!(print.prompt.as_deref(), Some("do it"));
+        assert_eq!(print.intent, StartupIntent::ContinueLatest);
+        assert_eq!(print.output, OutputFormat::Json);
+        assert_eq!(print.permission_mode, Some(PermissionMode::AcceptEdits));
+        assert_eq!(print.timeout_secs, Some(60));
+        assert!(print.verbose);
+    }
+
+    #[test]
+    fn print_resume_takes_an_explicit_id() {
+        assert_eq!(
+            print_args(&["-p", "go", "--resume", "session_9_0"]).intent,
+            StartupIntent::ResumeId("session_9_0".to_string())
+        );
+        assert_eq!(
+            print_args(&["-p", "go", "--resume=session_9_0"]).intent,
+            StartupIntent::ResumeId("session_9_0".to_string())
+        );
+    }
+
+    /// `-p` must win the routing wherever it appears among TUI-style flags,
+    /// while never leaking into real subcommands (those return before the
+    /// print check in `parse_args`).
+    #[test]
+    fn print_mode_is_detected_in_any_position() {
+        assert!(wants_print(&argv(&["-p"])));
+        assert!(wants_print(&argv(&["-c", "--print"])));
+        assert!(wants_print(&argv(&["fix it", "-p", "--verbose"])));
+        assert!(!wants_print(&argv(&["-c"])));
+        assert!(!wants_print(&argv(&["session", "list"])));
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| (*a).to_string()).collect()
     }
 
     /// `--help` past the first position used to fall into each subcommand's own

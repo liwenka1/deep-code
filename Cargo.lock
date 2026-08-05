@@ -423,12 +423,15 @@ name = "deep-code-tui"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "async-stream",
+ "async-trait",
  "crossterm 0.29.0",
  "deep-code-agent",
  "deep-code-eval",
  "deep-code-runtime",
  "libc",
  "ratatui",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

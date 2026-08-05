@@ -70,6 +70,7 @@ deepcode                 # 新会话
 deepcode -c              # 续最近会话
 deepcode -r              # 选择历史会话
 deepcode --new           # 显式新会话
+deepcode -p "..."        # 无头单发:整轮跑完,答案打到 stdout(见下)
 deepcode --help          # 命令一览(--version 查版本)
 deepcode doctor [--json] # 环境自检
 deepcode serve --http    # 作为 HTTP 服务运行
@@ -78,6 +79,21 @@ deepcode session list|resume|delete|export
 ```
 
 常用 slash 命令:`/help` `/model` `/apikey` `/lang` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy`(`/help` 查看全部与快捷键)。
+
+### 无头单发(`-p`)
+
+```sh
+deepcode -p "总结这个仓库的结构"                 # 答案 → stdout,诊断一律 → stderr
+git diff | deepcode -p "写一条 commit message"   # stdin 作为数据,拼在指令下方
+deepcode -c -p "继续:把测试补上"                 # 续最近会话,再单发一轮
+deepcode -p "修掉这个 lint" --permission-mode accept_edits
+deepcode -p "..." --output-format json           # 单个 {"result","reasoning","cost",...} 对象
+deepcode -p "..." --output-format stream-json    # NDJSON 逐事件,与 serve 的 SSE 同一套 envelope
+```
+
+- **审批姿态与 CI bot 相同**:会弹窗的调用一律自动拒绝、绝不挂起,每次拒绝在 stderr 打一行。放行能力用既有开关:`--permission-mode accept_edits|auto|yolo`、`approval.auto_allow`、`DEEP_CODE_APPROVAL_AUTO_ALLOW`——`auto` 档的 Flash 判官不需要人在场,无头下照常工作。deny 底板照旧不可越过。
+- **退出码**:`0` 完成 / `1` 出错 / `2` 用法错误 / `124` 超时(`--timeout SECS`)/ `130` Ctrl-C。
+- 单发同样落会话:stderr 会给出 id,随时 `deepcode -c` 进 TUI 接着这条线聊。
 
 ## 配置
 
