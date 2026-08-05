@@ -4,10 +4,12 @@ on:
   issue_comment:
     types: [created]
 
+# 写操作(push/PR/评论)全部走 App token,以 deepcode-agent[bot] 身份进行;
+# 默认 GITHUB_TOKEN 只剩"读对话上下文"一个用途,按最小权限收紧到 read。
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+  contents: read
+  pull-requests: read
+  issues: read
 
 # 同一 issue 串行,避免两条 /deepcode 并发起两套运行 / 双开 PR。
 # cancel-in-progress: false —— 不打断正在跑的一轮。
@@ -24,10 +26,36 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 以 deepcode-agent[bot] 的身份干活:用 App 私钥换一张短期 token。
+      # 两个动机:① 提交/PR/评论归属 bot 身份(上贡献者榜、评论带 [bot] 徽章);
+      # ② GITHUB_TOKEN 的动作不触发其他 workflow(GitHub 防环),导致 bot 分支
+      #    从来不跑 CI——App token 的 push 正常触发 ci.yml,PR 上有真实检查。
+      # 环安全:bot 自己的评论会触发本 workflow,但 job 的 owner-only if 挡住,
+      # 只留一条 skipped 记录。
+      - name: Mint app token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.DEEPCODE_APP_ID }}
+          private-key: ${{ secrets.DEEPCODE_APP_PRIVATE_KEY }}
+
+      # bot 的数字 ID 与 slug 运行时解析,作者邮箱不写死——将来 App 改名零改动。
+      - name: Resolve bot identity
+        id: bot
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          SLUG="${{ steps.app-token.outputs.app-slug }}"
+          USER_ID=$(gh api "/users/${SLUG}[bot]" --jq .id)
+          echo "name=${SLUG}[bot]" >> "$GITHUB_OUTPUT"
+          echo "email=${USER_ID}+${SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           # 取全量历史,便于 checkout / 基于既有的 per-issue 分支续写。
           fetch-depth: 0
+          # 持久化的凭据供后续 git push 使用 → push 以 bot 身份、且能触发 CI
+          token: ${{ steps.app-token.outputs.token }}
 
       # 选定本轮工作分支,让多轮改动在同一分支/PR 上累积:
       #  - 评论发在 PR 上(打法 B:审草稿 PR 后评论迭代)→ 直接续写该 PR 的 head 分支;
@@ -35,7 +63,7 @@ jobs:
       # 已知残留:不自动 rebase base——base 前进时续写的 PR 基于旧 base 累积 diff。
       - name: Prepare working branch
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           IS_PR: ${{ github.event.issue.pull_request && 'true' || '' }}
         run: |
@@ -164,15 +192,16 @@ jobs:
       - name: Commit & ensure PR
         if: steps.diff.outputs.has_changes == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           # 同样用 env 传入,避免用户输入拼进 git/gh 命令造成截断或注入
           USER_PROMPT: ${{ steps.prompt.outputs.user_prompt }}
           TRIGGER_USER: ${{ github.event.comment.user.login }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           TITLE="🤖 deep-code: $USER_PROMPT"
-          git config user.name "deep-code-bot"
-          git config user.email "bot@deep-code.dev"
+          # author 邮箱指向 bot 的 noreply 地址 → 合并进 main 后计入贡献者
+          git config user.name "${{ steps.bot.outputs.name }}"
+          git config user.email "${{ steps.bot.outputs.email }}"
           git add -A
           git commit -m "$TITLE"
           git push origin "$DC_BRANCH"
@@ -189,10 +218,11 @@ jobs:
             echo "PR #$EXISTING 已存在,push 已更新它"
           fi
 
-      # 把 deep-code 的回答贴回 Issue 评论区
+      # 把 deep-code 的回答贴回 Issue 评论区(以 deepcode-agent[bot] 身份)
       - name: Post reply
         uses: actions/github-script@v7
         with:
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const fs = require('fs');
             const readOr = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return ''; } };
@@ -232,6 +262,7 @@ jobs:
         if: failure()
         uses: actions/github-script@v7
         with:
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             github.rest.issues.createComment({
               issue_number: context.issue.number,
