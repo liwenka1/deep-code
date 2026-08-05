@@ -9,7 +9,7 @@ permissions:
   pull-requests: write
   issues: write
 
-# 同一 issue 串行,避免两条 /deepcode 并发起两套 server / 双开 PR。
+# 同一 issue 串行,避免两条 /deepcode 并发起两套运行 / 双开 PR。
 # cancel-in-progress: false —— 不打断正在跑的一轮。
 concurrency:
   group: deepcode-issue-${{ github.event.issue.number }}
@@ -61,8 +61,10 @@ jobs:
         with:
           node-version: '20'
 
+      # 版本下限显式化:-p 单发模式 0.4.0 起才有。npm 侧尚未发布新版时,
+      # 安装在这里就明确失败,而不是运行时 exit 2 让人摸不着头脑。
       - name: Install deep-code
-        run: npm i -g @liwenkai/deepcode
+        run: npm i -g '@liwenkai/deepcode@>=0.4.0'
 
       # 拉取 Issue 全部评论,拼接成对话上下文。
       # 关键:保留 bot 自己的历史评论(多轮追问/计划要靠重读它),但只取
@@ -123,59 +125,29 @@ jobs:
               + '只有在不可逆、高风险、或确实无从推断时,才先给出方案计划、本轮不改代码、结束回答等我确认后再继续。\n\n'
               + '以下是本 Issue 的对话历史,根据上下文回答问题。\n\n' + history + '\n---\n当前指令:' + currentPrompt;
 
-      # 启动 deep-code HTTP 服务(不需要 TTY)
-      - name: Start deep-code server
+      # 单发无头驱动:不再起 HTTP 服务——无端口、无 token、无 SSE 剥帧。
+      # 审批姿态(autonomous 自动拒绝、绝不挂起)内置于 -p,预放行仍走
+      # DEEP_CODE_APPROVAL_AUTO_ALLOW,与 serve 时代完全同一套语义。
+      # 失败直接体现在退出码(1 出错 / 124 超时),Report failure 步骤天然接住;
+      # --timeout 840 让进程内优雅取消(进程组整树收尸)先于 runner 的 15 分钟 SIGKILL。
+      - name: Run deep-code
+        timeout-minutes: 15
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           # 预放行常用工具,绕过交互式审批
           DEEP_CODE_APPROVAL_AUTO_ALLOW: "read_,list_,grep_,write_,apply_,shell,job,fetch_,web_"
-        run: |
-          # --approval-mode autonomous:漏到 server 的审批直接拒绝并继续,绝不挂起
-          deepcode serve --http --port 7878 --auth-token bot-token --approval-mode autonomous &
-          echo "等待服务就绪..."
-          for i in $(seq 1 15); do
-            if curl -s http://127.0.0.1:7878/health > /dev/null 2>&1; then
-              echo "服务已就绪"
-              break
-            fi
-            sleep 1
-          done
-
-      # 发送指令给 deep-code,等待完成,保存返回的 SSE 事件
-      - name: Run deep-code
-        timeout-minutes: 15
-        env:
           # 通过 env 传入 prompt,避免把 Issue 内容直接拼进 shell(含单引号会截断命令,也是注入面)
           DEEPCODE_PROMPT: ${{ steps.prompt.outputs.result }}
         run: |
-          # 用 jq 安全构造 JSON,避免换行符破坏请求
-          printf '%s' "$DEEPCODE_PROMPT" > /tmp/deepcode-prompt.txt
-          jq -n --rawfile prompt /tmp/deepcode-prompt.txt '{prompt: $prompt}' > /tmp/deepcode-request.json
+          printf '%s' "$DEEPCODE_PROMPT" \
+            | deepcode -p --output-format json --timeout 840 \
+            > /tmp/deepcode-result.json
 
-          # 调用 /v1/prompt API,返回 SSE 流
-          curl -s -N -X POST http://127.0.0.1:7878/v1/prompt \
-            -H "Authorization: Bearer bot-token" \
-            -H "Content-Type: application/json" \
-            -d @/tmp/deepcode-request.json \
-            > /tmp/deepcode-events.txt 2>&1
+          jq -r '.result // ""'    /tmp/deepcode-result.json > /tmp/deepcode-answer.txt
+          jq -r '.reasoning // ""' /tmp/deepcode-result.json > /tmp/deepcode-reasoning.txt
 
-          # assistant.delta=正式回答、reasoning.delta=思考,payload 是内联 tag 的
-          # RuntimeEvent(.text 字段)。用单遍 jq 按 kind 分桶:-R 逐行读、fromjson?
-          # 容错解析、-j 拼接不加分隔、-r 原始输出。关键是 jq 会原样保留 delta 里的
-          # 换行——旧的 $(...) 捕获会吃掉每个 delta 结尾的换行,导致段落/代码块/标题粘连。
-          grep '^data: ' /tmp/deepcode-events.txt | sed 's/^data: //' > /tmp/deepcode-data.txt
-          jq -Rrj 'fromjson? | select(.item.kind=="assistant.delta") | .item.payload.text' \
-            /tmp/deepcode-data.txt > /tmp/deepcode-answer.txt
-          jq -Rrj 'fromjson? | select(.item.kind=="reasoning.delta") | .item.payload.text' \
-            /tmp/deepcode-data.txt > /tmp/deepcode-reasoning.txt
-
-          # 回答为空则 dump 原始 JSON 方便排查;否则补一个结尾换行。
-          if [ ! -s /tmp/deepcode-answer.txt ]; then
-            echo "(debug:以下为原始 SSE 事件 JSON)" > /tmp/deepcode-answer.txt
-            head -5 /tmp/deepcode-data.txt >> /tmp/deepcode-answer.txt
-          else
-            printf '\n' >> /tmp/deepcode-answer.txt
-          fi
+          # 正常完成但无文本回答(极少见):给回帖一个可读的占位,而不是空评论
+          [ -s /tmp/deepcode-answer.txt ] || echo "(本轮未产出文本回答)" > /tmp/deepcode-answer.txt
 
       # 检查是否有文件被修改
       - name: Check diff
@@ -255,7 +227,7 @@ jobs:
               body: body
             });
 
-      # 任何步骤失败(含 15 分钟超时)都回帖,避免 issue 里静默干等
+      # 任何步骤失败(含超时与 -p 的非零退出)都回帖,避免 issue 里静默干等
       - name: Report failure
         if: failure()
         uses: actions/github-script@v7
