@@ -8,19 +8,21 @@ A DeepSeek-powered terminal coding agent, written in Rust. One small binary: str
 
 **Small, fast, self-contained**
 
-- Single native binary (~4–5 MB) per platform — no Node/Python runtime needed at run time. Prebuilt for macOS (arm64/x64), Linux (x64/arm64, glibc ≥ 2.35), and Windows (x64); `npm i -g` fetches the right one and verifies its SHA-256. musl hosts (Alpine and most slim images) are not supported yet — the installer detects and refuses them with a clear error instead of installing a broken binary.
+- Single native binary (~4–5 MB) per platform — no Node/Python runtime needed at run time. Prebuilt for macOS (arm64/x64), Linux (x64/arm64, glibc ≥ 2.35), and Windows (x64).
+- `npm i -g` fetches the right binary and verifies its SHA-256. musl hosts (Alpine and most slim images) are not supported yet — the installer detects and refuses them with a clear error instead of installing a broken binary.
 
 **Safety-first execution**
 
 - **Four permission tiers** — `default` / `accept_edits` / `auto` / `yolo`, cycled with Shift+Tab. `auto` delegates routine approvals to a cheap Flash classifier with hard floors it can never override: top-risk commands and anything requesting network access always ask a human.
-- **OS sandbox (macOS / Linux)** — shell/job commands run inside macOS Seatbelt or Linux Landlock+seccomp: writes confined to the workspace and system temp dirs, **no network by default**. Commands that need egress (installs, `git push`, dev servers) must declare it and go through approval; `[sandbox] network = prompt|always|never` tunes this, and project-level config can only tighten it. If no sandbox backend is available, commands are refused rather than silently run bare.
+- **OS sandbox (macOS / Linux)** — shell/job commands run inside macOS Seatbelt or Linux Landlock+seccomp: writes confined to the workspace and system temp dirs, **no network by default**. Commands that need egress (installs, `git push`, dev servers) must declare it and go through approval. `[sandbox] network = prompt|always|never` tunes this, and project-level config can only tighten it. If no sandbox backend is available, commands are refused rather than silently run bare.
   **Windows, please read**: only Job Object process-tree containment exists there — **file writes and network are not restricted**, and the `network` setting is a no-op. The deny floor and the approval gate still apply, but "out-of-workspace writes get blocked for you" does not hold on Windows. `deepcode doctor` reports exactly what is enforced on your machine.
 - **Deny floor** — catastrophic commands are hard-refused at any tier and cannot be allow-listed: `rm -rf` on system roots, disk formatting (`format C:`, volume-GUID/device-path/`\\?\` spellings, `diskpart`), registry deletion, and friends — including their Windows spellings.
-- **Trust that doesn't leak** — "always allow" for shell matches on command identity (program + subcommand): trusting `git push` does not wave through `git status`, and flags that change *what executes or where it writes* (`--config`, `--exec-path`, `--output`, `--target-dir`, …) break the trust match and re-prompt. Shell metacharacters (`$`, backticks, redirection) route to approval instead of being parsed optimistically.
+- **Trust that doesn't leak** — "always allow" for shell matches on command identity (program + subcommand): trusting `git push` does not wave through `git status`. Flags that change *what executes or where it writes* (`--config`, `--exec-path`, `--output`, `--target-dir`, …) break the trust match and re-prompt. Shell metacharacters (`$`, backticks, redirection) route to approval instead of being parsed optimistically.
 
 **Sub-agents with real guardrails**
 
-- Delegate investigation or implementation to child agents via one blocking `agent` tool call; issue several calls in one turn to run children in parallel. Six roles — `general` / `explore` / `plan` / `review` / `verifier` are strictly read-only; **only `implementer` can write**, and dispatching one is itself an approval point: the human authorizes the dispatch, the child's workspace writes then proceed unattended (on the tiers where writes would prompt).
+- Delegate investigation or implementation to child agents via one blocking `agent` tool call; issue several calls in one turn to run children in parallel.
+  Six roles — `general` / `explore` / `plan` / `review` / `verifier` are strictly read-only; **only `implementer` can write**, and dispatching one is itself an approval point: the human authorizes the dispatch, the child's workspace writes then proceed unattended (on the tiers where writes would prompt).
 - Reconnaissance roles (`explore` / `review` / `verifier`) are pinned to the cheap flash tier — fan-out burns tokens where it's cheapest — while children stream live progress into the parent transcript: `[explore] +41s step 7/50: grep_files`, so a long-running child never looks hung.
 - Child token spend is folded into the parent session's cost tracking.
 
@@ -37,7 +39,7 @@ A DeepSeek-powered terminal coding agent, written in Rust. One small binary: str
 
 **Model routing**
 
-- `auto` picks between `deepseek-v4-pro` and `deepseek-v4-flash` (and the reasoning effort) per task, and degrades with retry on rate limits or upstream failures. Pin with `/model` or `provider.model`.
+- `auto` picks between `deepseek-v4-pro` and `deepseek-v4-flash` (and the reasoning effort) per task, and falls back with retry on rate limits or upstream failures. Pin with `/model` or `provider.model`.
 
 ## Install
 
@@ -104,9 +106,9 @@ Common keys: `provider.model` (`pro`/`flash`/`auto`), `provider.reasoning_effort
 
 > Keep the API key in an environment variable or the global config; `api_key` in project-level config is ignored, so it can't leak with the repo.
 
-`DEEP_CODE_DISABLE_WEB`: set to anything non-empty other than `0`/`false`/`off`/`no` (case-insensitive; empty counts as unset) to disable the web tools (`web_search`/`fetch_url`) for offline or audited environments; on by default. `/status` shows the current `web=on|off`.
+`DEEP_CODE_DISABLE_WEB`: set to `1`/`true`/`on` to disable web tools (`web_search`/`fetch_url`) for offline or audited environments. Enabled by default; `/status` shows current `web=on|off`.
 
-On macOS / Linux, shell/job commands run inside the OS sandbox with **no network by default** (including listening on ports): commands that need egress go to approval, and "remember for this session" stops re-asking for the same command shape; `[sandbox] network = prompt|always|never` tunes it, project config can only tighten. **On Windows there is no sandbox confinement**, so the no-network and write-confinement guarantees in this section do not apply there (the `network` setting is a no-op); declared network still routes to approval and the deny floor still applies. Run `deepcode doctor` for the ground truth on your machine.
+On macOS / Linux, shell/job commands run inside the OS sandbox with **no network by default** (see [Highlights](#highlights) for details). `[sandbox] network = prompt|always|never` tunes this, project config can only tighten. **On Windows there is no sandbox confinement** — the no-network and write-confinement guarantees do not apply (`network` is a no-op); declared network still routes to approval and the deny floor still applies. Run `deepcode doctor` for the ground truth on your machine.
 
 ## Extending (skills + shell)
 
@@ -114,7 +116,7 @@ deep-code **does not ship MCP**. It already has a shell, so the way to add a cap
 
 - **Discovery**: drop a `SKILL.md` with `name`/`description` frontmatter into a skills directory (global `~/.deep-code/skills/<name>/` or project `<workspace>/.deep-code/skills/<name>/`); the one-line summary is always in the prompt, the body only enters context when relevant.
 - **Execution**: a capability is just a normal command (`psql`, `curl`, your own script, …) run through the `shell` tool — subject to the same approval gate and execution policy as everything else.
-- **Why no MCP**: for an agent that has a shell, the shell *is* the universal tool protocol. A few dozen tokens of SKILL.md summary loaded on demand beats keeping a full tool schema resident in every request, and you can pipe (`| head`, …) to trim results so only the relevant slice enters context. If you need an existing MCP-ecosystem server, use a host that speaks MCP — deep-code stays lean.
+- **Why no MCP**: for an agent that has a shell, the shell *is* the universal tool protocol. A few dozen tokens of SKILL.md summary loaded on demand beats keeping a full tool schema resident in every request. Pipe (`| head`, …) to trim results so only the relevant slice enters context. If you need an existing MCP-ecosystem server, use a host that speaks MCP — deep-code stays lean.
 
 ## Eval (SWE-bench)
 
