@@ -93,12 +93,19 @@ jobs:
   deepcode:
     # Floors first (bot / NONE), then the configurable gate. The comma
     # wrapping keeps CONTRIBUTOR from matching FIRST_TIME_CONTRIBUTOR.
+    #
+    # The `||` literals mirror the declared defaults on purpose. A job-level
+    # `if` in a called workflow is evaluated before the job is scheduled, and
+    # this is the one expression whose misfire is completely silent — no run,
+    # no log, just a bot that stopped answering. Spelling the fallbacks out
+    # costs nothing and removes the dependency on how the inputs context is
+    # populated at that point (see actions/runner#1602).
     if: >-
       github.event.comment.user.type != 'Bot' &&
       github.event.comment.author_association != 'NONE' &&
-      contains(github.event.comment.body, inputs.trigger) &&
+      contains(github.event.comment.body, inputs.trigger || '/deepcode') &&
       contains(
-        format(',{0},', inputs.allowed-associations),
+        format(',{0},', inputs.allowed-associations || 'OWNER'),
         format(',{0},', github.event.comment.author_association)
       )
     runs-on: ubuntu-latest
@@ -285,9 +292,12 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.deepseek-api-key }}
           DEEP_CODE_APPROVAL_AUTO_ALLOW: ${{ inputs.auto-allow }}
           DEEP_CODE_MODEL: ${{ inputs.model }}
-          DC_VERSION: ${{ inputs.version }}
-          DC_PERMISSION_MODE: ${{ inputs.permission-mode }}
-          DC_AGENT_TIMEOUT: ${{ inputs.agent-timeout }}
+          # A declared default does not cover a caller that passes an *empty*
+          # value explicitly, and an empty version here builds a dangling `@`
+          # that fails npm — so these three restate their defaults.
+          DC_VERSION: ${{ inputs.version || '>=0.4.0' }}
+          DC_PERMISSION_MODE: ${{ inputs.permission-mode || 'accept_edits' }}
+          DC_AGENT_TIMEOUT: ${{ inputs.agent-timeout || 840 }}
           DC_LANG: ${{ inputs.lang }}
           # Via env, never interpolated into the script: this text comes from
           # an issue comment.
