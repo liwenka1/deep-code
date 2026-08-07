@@ -43,11 +43,6 @@ on:
         type: string
         required: false
         default: 'deepcode/issue-'
-      version:
-        description: 'npm version range for @liwenkai/deepcode (headless -p needs >= 0.4.0).'
-        type: string
-        required: false
-        default: '>=0.4.0'
       permission-mode:
         description: 'default | accept_edits | auto | yolo. `default` auto-denies every gated call, so the bot can answer but never edit.'
         type: string
@@ -292,10 +287,9 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.deepseek-api-key }}
           DEEP_CODE_APPROVAL_AUTO_ALLOW: ${{ inputs.auto-allow }}
           DEEP_CODE_MODEL: ${{ inputs.model }}
-          # A declared default does not cover a caller that passes an *empty*
-          # value explicitly, and an empty version here builds a dangling `@`
-          # that fails npm — so these three restate their defaults.
-          DC_VERSION: ${{ inputs.version || '>=0.4.0' }}
+          # Restate the defaults: a declared default does not cover a caller
+          # that passes an empty value explicitly, and an empty one here would
+          # reach the CLI as `--permission-mode ""`.
           DC_PERMISSION_MODE: ${{ inputs.permission-mode || 'accept_edits' }}
           DC_AGENT_TIMEOUT: ${{ inputs.agent-timeout || 840 }}
           DC_LANG: ${{ inputs.lang }}
@@ -305,7 +299,7 @@ jobs:
         run: |
           set -uo pipefail
           [ -z "${DEEP_CODE_MODEL}" ] && unset DEEP_CODE_MODEL
-          npm i -g "@liwenkai/deepcode@${DC_VERSION}"
+          npm i -g @liwenkai/deepcode
 
           printf '%s' "$DEEPCODE_PROMPT" > /tmp/deepcode-prompt.txt
           deepcode -p \

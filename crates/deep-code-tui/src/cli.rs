@@ -53,7 +53,7 @@ pub struct InstallArgs {
     pub with_app: bool,
     pub app_id: Option<String>,
     pub app_key_file: Option<PathBuf>,
-    /// Ref of the reusable pipeline to pin. Defaults to this binary's version.
+    /// Ref of the reusable pipeline. Defaults to `main`; pass a tag to pin.
     pub workflow_ref: Option<String>,
     pub lang: Option<String>,
     pub permission_mode: Option<String>,

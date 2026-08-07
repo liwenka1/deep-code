@@ -117,7 +117,7 @@ on:
 jobs:
   deepcode:
     permissions: { contents: write, pull-requests: write, issues: write }
-    uses: liwenka1/deep-code/.github/workflows/deepcode-bot.yml@v0.5.0
+    uses: liwenka1/deep-code/.github/workflows/deepcode-bot.yml@main
     secrets:
       deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
 ```

@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use crate::cli::{GithubCommand, InstallArgs};
 use env::{GhStatus, RepoSlug};
 use workflow::{
-    API_KEY_SECRET, APP_ID_SECRET, APP_KEY_SECRET, DEFAULT_WORKFLOW_PATH, WorkflowSpec,
+    API_KEY_SECRET, APP_ID_SECRET, APP_KEY_SECRET, DEFAULT_WORKFLOW_PATH, DEFAULT_WORKFLOW_REF,
+    WorkflowSpec,
 };
 
 const EXIT_OK: i32 = 0;
@@ -35,12 +36,10 @@ fn install(args: InstallArgs) -> i32 {
         return EXIT_USAGE;
     };
 
-    // The default ref is this binary's own version, so an installation always
-    // pins the pipeline that shipped alongside the CLI writing it.
     let workflow_ref = args
         .workflow_ref
         .clone()
-        .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
+        .unwrap_or_else(|| DEFAULT_WORKFLOW_REF.to_string());
     let spec = WorkflowSpec {
         workflow_ref,
         with_app: args.with_app || args.app_id.is_some(),
@@ -270,7 +269,7 @@ fn print_next_steps(
     println!("  · comment `/deepcode <instruction>` on any issue to try it");
     println!();
     println!(
-        "The bot runs the pipeline pinned at {}. Only the repository OWNER can trigger it;",
+        "The bot runs the pipeline at {}. Only the repository OWNER can trigger it;",
         spec.workflow_ref
     );
     println!("widening `allowed-associations` lets anyone who can comment run shell in this CI.");
