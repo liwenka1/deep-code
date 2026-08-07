@@ -3,7 +3,7 @@
 //! The wire shape (`RuntimeEnvelope` → `RuntimeItem` → kind/payload) is a
 //! stable contract: CI consumers extract text with jq paths like
 //! `.item.kind` / `.item.payload.text`. Change it only together with those
-//! consumers (`.github/workflows/deep-code-bot.yml`).
+//! consumers (`.github/workflows/deepcode-bot.yml`).
 //!
 //! The headless CLI (`deep-code -p --output-format stream-json`) emits the
 //! same envelopes as NDJSON, one per line — deliberately, so a consumer's jq

@@ -1,0 +1,38 @@
+name: Deep Code Bot
+
+# Turns the bot ON for this repository. The pipeline itself lives in
+# `deepcode-bot.yml` (a reusable workflow, callable from any repo) — a workflow
+# cannot be both a callable library and its own event trigger, hence two files.
+#
+# This repo is that library's first consumer, and this file is exactly what
+# every other repository writes. Keeping it a thin caller rather than a private
+# copy is what stops the shared path from rotting unnoticed.
+# All inputs and the security model are documented in deepcode-bot.yml's header.
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  deepcode:
+    uses: ./.github/workflows/deepcode-bot.yml
+    # Write, not read: the called workflow declares what its no-App fallback
+    # needs, and a caller may only *lower* that grant — GitHub's documentation
+    # says a shortfall "restricts the reusable workflow from being able to
+    # execute", which is too ambiguous to gamble a live bot on. The distinction
+    # is cosmetic here anyway: checkout persists the App token in .git/config,
+    # so the workspace already holds a write credential either way.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    with:
+      lang: zh
+      permission-mode: accept_edits
+    secrets:
+      deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
+      # Present here, optional everywhere else: acting as deepcode-agent[bot]
+      # is what puts commits on the contributor list, badges the comments, and
+      # lets bot pushes trigger ci.yml.
+      app-id: ${{ secrets.DEEPCODE_APP_ID }}
+      app-private-key: ${{ secrets.DEEPCODE_APP_PRIVATE_KEY }}

@@ -97,6 +97,37 @@ deepcode -p "..." --output-format stream-json    # NDJSON 逐事件,与 serve �
 - **退出码**:`0` 完成 / `1` 出错 / `2` 用法错误 / `124` 超时(`--timeout SECS`)/ `130` Ctrl-C。
 - 单发同样落会话:stderr 会给出 id,随时 `deepcode -c` 进 TUI 接着这条线聊。
 
+## 在 CI 里用(GitHub Actions)
+
+给任意仓库装一个 `/deepcode` 机器人:评论 → 改代码 → 开草稿 PR → 回帖。一条命令:
+
+```sh
+cd your-repo
+deepcode github install          # 写 workflow + 用你的 gh 凭据设好 secret
+deepcode github status           # 查看接入状态
+```
+
+`--print` 先预览不落盘,`--with-app` 额外引导配一个 GitHub App(下面说)。装完提交那个文件、推上去就能用了。不需要托管服务,也没有任何东西要你长期运维。
+
+手写也行,内容就是这些:
+
+```yaml
+on:
+  issue_comment: { types: [created] }
+jobs:
+  deepcode:
+    permissions: { contents: write, pull-requests: write, issues: write }
+    uses: liwenka1/deep-code/.github/workflows/deepcode-bot.yml@v0.5.0
+    secrets:
+      deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
+```
+
+**可选的 bot 身份**:不配就以 `github-actions[bot]` 干活,一切正常。配一个自己的 GitHub App(`--with-app` 会一步步带你走)能多拿两样——提交计入贡献者、评论带 `[bot]` 徽章;以及 bot 推的分支**会正常触发你其他 workflow**,而 `GITHUB_TOKEN` 的推送永远不触发(GitHub 防环规则),也就是说不配 App 时 bot 开的 PR 上没有 CI 检查。
+
+触发前缀、允许触发的人、语言、模型、权限档等全部可调,说明见 [`deepcode-bot.yml`](./.github/workflows/deepcode-bot.yml) 顶部。想自己拼流程(PR review、issue 分类、定时任务)不必用这套管线,两行就够:`npm i -g @liwenkai/deepcode` 然后 `deepcode -p --output-format json`。
+
+> **放宽触发权限前请想清楚**:默认只有仓库 Owner 能触发(`allowed-associations`)。放开它等于把"在你的 CI 里、挨着你的 secrets 跑 shell"交给能评论的人。安全靠三条腿——可信触发者、CLI 的 deny 底板、PR 从不自动合并——拆一条另外两条撑不住。
+
 ## 配置
 
 配置文件:`~/.deep-code/config.toml`(可参考仓库根目录的 `config.example.toml`)。

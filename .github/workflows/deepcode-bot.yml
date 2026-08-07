@@ -1,0 +1,433 @@
+name: deep-code bot (reusable)
+
+# The batteries-included pipeline: an issue/PR comment becomes a draft PR plus
+# a reply, with the conversation thread as memory and the branch as code state.
+# Callers supply ~10 lines; everything below is shared.
+#
+# Security model — three legs, do not remove one and keep the others:
+#   1. Only trusted commenters trigger it (`allowed-associations`, default
+#      OWNER). Widening this hands anyone who can comment a prompt that runs
+#      shell in your CI next to your secrets.
+#   2. The CLI's deny floor hard-refuses catastrophic commands at every tier.
+#   3. The PR is never auto-merged, so injected content stops at a diff a
+#      human reads.
+# Bots and `NONE` association are refused unconditionally — that floor is not
+# configurable, and it is also what stops this bot's own replies from
+# retriggering it.
+#
+# Self-contained on purpose: no companion action to resolve. A `./`-relative
+# action inside a reusable workflow would resolve against the *caller's*
+# checkout, not this repository, so installing and running the CLI is inlined
+# below — it is only two commands.
+
+on:
+  workflow_call:
+    inputs:
+      trigger:
+        description: 'Comment prefix that invokes the bot.'
+        type: string
+        required: false
+        default: '/deepcode'
+      allowed-associations:
+        description: 'Comma-separated author associations allowed to trigger (no spaces). OWNER | MEMBER | COLLABORATOR | CONTRIBUTOR. `NONE` and bots are always refused.'
+        type: string
+        required: false
+        default: 'OWNER'
+      lang:
+        description: 'Language for the bot''s own canned text: zh | en.'
+        type: string
+        required: false
+        default: 'zh'
+      branch-prefix:
+        description: 'Working branch prefix; the issue number is appended.'
+        type: string
+        required: false
+        default: 'deepcode/issue-'
+      version:
+        description: 'npm version range for @liwenkai/deepcode (headless -p needs >= 0.4.0).'
+        type: string
+        required: false
+        default: '>=0.4.0'
+      permission-mode:
+        description: 'default | accept_edits | auto | yolo. `default` auto-denies every gated call, so the bot can answer but never edit.'
+        type: string
+        required: false
+        default: 'accept_edits'
+      model:
+        description: 'auto | pro | flash, or an explicit model id.'
+        type: string
+        required: false
+        default: ''
+      auto-allow:
+        description: 'Comma-separated tool-name prefixes pre-approved without prompting.'
+        type: string
+        required: false
+        default: 'read_,list_,grep_,write_,apply_,shell,job,fetch_,web_'
+      co-authored-by:
+        description: 'Optional "Name <email>" appended as a Co-Authored-By trailer. Empty (default) adds nothing.'
+        type: string
+        required: false
+        default: ''
+      timeout-minutes:
+        description: 'Hard ceiling for the agent step. Keep it above `agent-timeout` so the in-process cancel runs first.'
+        type: number
+        required: false
+        default: 15
+      agent-timeout:
+        description: 'Seconds before the CLI cancels the turn itself (tearing down tool process groups) and exits 124.'
+        type: number
+        required: false
+        default: 840
+    secrets:
+      deepseek-api-key:
+        description: 'DeepSeek API key.'
+        required: true
+      app-id:
+        description: 'Optional GitHub App id. With app-private-key, the bot acts as your App: commits count toward contributors, comments carry a [bot] badge, and pushes trigger your other workflows.'
+        required: false
+      app-private-key:
+        description: 'Optional GitHub App private key (PEM).'
+        required: false
+
+jobs:
+  deepcode:
+    # Floors first (bot / NONE), then the configurable gate. The comma
+    # wrapping keeps CONTRIBUTOR from matching FIRST_TIME_CONTRIBUTOR.
+    if: >-
+      github.event.comment.user.type != 'Bot' &&
+      github.event.comment.author_association != 'NONE' &&
+      contains(github.event.comment.body, inputs.trigger) &&
+      contains(
+        format(',{0},', inputs.allowed-associations),
+        format(',{0},', github.event.comment.author_association)
+      )
+    runs-on: ubuntu-latest
+
+    # Serialize per issue so two comments can't open duplicate PRs.
+    # cancel-in-progress: false — never cut a turn already in flight.
+    concurrency:
+      group: deepcode-issue-${{ github.event.issue.number }}
+      cancel-in-progress: false
+
+    # What the fallback (no App) path needs. A caller that configures an App
+    # can cap these to `read` in its own job — the called workflow may only
+    # lower the caller's grant, never raise it.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    env:
+      HAS_APP: ${{ secrets.app-private-key != '' }}
+
+    steps:
+      # Misconfiguration should say so here, not die at `git push` twelve
+      # minutes and one model call later.
+      - name: Validate configuration
+        env:
+          HAS_KEY: ${{ secrets.deepseek-api-key != '' }}
+          HAS_APP_ID: ${{ secrets.app-id != '' }}
+        run: |
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::error::secret 'deepseek-api-key' is empty. Add DEEPSEEK_API_KEY to the repository secrets and map it in the caller workflow."
+            exit 1
+          fi
+          if [ "$HAS_APP_ID" != "$HAS_APP" ]; then
+            echo "::error::'app-id' and 'app-private-key' must be provided together (or both omitted to use GITHUB_TOKEN)."
+            exit 1
+          fi
+
+      # Optional: act as your GitHub App instead of github-actions[bot].
+      # Beyond identity this fixes a real gap — GITHUB_TOKEN pushes do not
+      # trigger other workflows, so bot branches never run CI.
+      - name: Mint app token
+        id: app-token
+        if: env.HAS_APP == 'true'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+
+      # Resolved at runtime, never hardcoded: renaming the App must not
+      # require touching any workflow.
+      - name: Resolve bot identity
+        id: bot
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          if [ "$HAS_APP" = "true" ]; then
+            USER_ID=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
+            SLUG="$APP_SLUG"
+          else
+            SLUG="github-actions"
+            USER_ID=41898282   # the well-known github-actions[bot] user id
+          fi
+          echo "name=${SLUG}[bot]" >> "$GITHUB_OUTPUT"
+          echo "email=${USER_ID}+${SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          # Full history so an existing per-issue branch can be continued.
+          fetch-depth: 0
+          # Persist the App token (when present) for the later push.
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      # Accumulate multi-round work on one branch / one PR:
+      #  - comment on a PR  → continue that PR's head branch;
+      #  - comment on an issue → reuse <prefix><N>, creating it if absent.
+      # Known gap: the branch is not rebased, so a PR continued after the base
+      # moves accumulates its diff against the older base.
+      - name: Prepare working branch
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          IS_PR: ${{ github.event.issue.pull_request && 'true' || '' }}
+          BRANCH_PREFIX: ${{ inputs.branch-prefix }}
+        run: |
+          if [ -n "$IS_PR" ]; then
+            BRANCH=$(gh pr view "$ISSUE_NUMBER" --json headRefName -q .headRefName)
+            echo "continuing PR #$ISSUE_NUMBER on $BRANCH"
+            git fetch origin "$BRANCH"
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+          else
+            BRANCH="${BRANCH_PREFIX}${ISSUE_NUMBER}"
+            if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+              echo "continuing existing branch $BRANCH"
+              git fetch origin "$BRANCH"
+              git checkout -B "$BRANCH" "origin/$BRANCH"
+            else
+              echo "creating branch $BRANCH"
+              git checkout -B "$BRANCH"
+            fi
+          fi
+          echo "DC_BRANCH=$BRANCH" >> "$GITHUB_ENV"
+
+      # Rebuild the conversation from the thread every run — that thread, plus
+      # the branch, is the entire persistent state (no agent session is kept).
+      # The bot's own replies are kept as history but reduced to the marked
+      # body, dropping the thinking block and status tail.
+      - name: Build conversation context
+        id: prompt
+        uses: actions/github-script@v7
+        env:
+          TRIGGER: ${{ inputs.trigger }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
+          result-encoding: string
+          script: |
+            const T = {
+              zh: {
+                head: '## 对话历史\n\n', title: '### Issue 标题\n', first: '### 第一条(Issue 正文)\n',
+                prev: 'deep-code(你上一轮)', now: '当前指令:', fallback: '请分析一下这个项目',
+                rules:
+                  '【重要】你只需修改文件内容,不要执行任何 git 命令(git add/commit/push/branch 等)。git 操作由外部自动化处理。\n\n' +
+                  '【工作方式】能合理假设就直接改代码 / 出草稿 PR,并把关键假设写进回答;' +
+                  '只有在不可逆、高风险、或确实无从推断时,才先给出方案计划、本轮不改代码、结束回答等我确认后再继续。\n\n' +
+                  '以下是本 Issue 的对话历史,根据上下文回答问题。\n\n',
+              },
+              en: {
+                head: '## Conversation\n\n', title: '### Issue title\n', first: '### Opening post\n',
+                prev: 'deep-code (your previous turn)', now: 'Current instruction: ',
+                fallback: 'Give me an overview of this project',
+                rules:
+                  'IMPORTANT: only change file contents. Do not run any git command (add/commit/push/branch) — the surrounding automation handles git.\n\n' +
+                  'HOW TO WORK: when you can assume reasonably, just make the change and state your assumptions in the answer. ' +
+                  'Only when something is irreversible, high risk, or genuinely underdetermined should you present a plan, change nothing this round, and end your turn for confirmation.\n\n' +
+                  'Below is this issue\'s conversation. Answer in context.\n\n',
+              },
+            }['${{ inputs.lang }}' === 'en' ? 'en' : 'zh'];
+
+            const issue = await github.rest.issues.get({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, per_page: 100,
+            });
+
+            // Machine-readable markers beat regex archaeology; older comments
+            // predating the marker fall back to stripping known chrome.
+            const extractBotBody = (body) => {
+              const marked = body.match(/<!--dc:body-->([\s\S]*?)<!--\/dc:body-->/);
+              if (marked) return marked[1].trim();
+              return body
+                .replace(/<details>[\s\S]*?<\/details>/g, '')
+                .replace(/^##\s*🤖\s*Deep Code\s*$/m, '')
+                .replace(/^(✅|⏳|⚠️|❌).*$/gm, '')
+                .trim();
+            };
+
+            let history = T.head + T.title + issue.data.title + '\n\n';
+            if (issue.data.body) history += T.first + issue.data.body + '\n\n';
+            for (const comment of comments.data) {
+              const isBot = comment.user.type === 'Bot';
+              const content = isBot ? extractBotBody(comment.body) : comment.body;
+              if (!content) continue;
+              history += '### ' + (isBot ? T.prev : comment.user.login) + '\n' + content + '\n\n';
+            }
+
+            const trigger = process.env.TRIGGER;
+            const current = context.payload.comment.body
+              .slice(context.payload.comment.body.indexOf(trigger) + trigger.length)
+              .trim() || T.fallback;
+
+            core.setOutput('user_prompt', current);
+            return T.rules + history + '\n---\n' + T.now + current;
+
+      # One process, one turn, then exit. Failure surfaces as a non-zero exit
+      # code (1 error / 124 timeout), which the failure reporter below catches
+      # — no guessing from an empty output file.
+      - name: Run deep-code
+        timeout-minutes: ${{ inputs.timeout-minutes }}
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.deepseek-api-key }}
+          DEEP_CODE_APPROVAL_AUTO_ALLOW: ${{ inputs.auto-allow }}
+          DEEP_CODE_MODEL: ${{ inputs.model }}
+          DC_VERSION: ${{ inputs.version }}
+          DC_PERMISSION_MODE: ${{ inputs.permission-mode }}
+          DC_AGENT_TIMEOUT: ${{ inputs.agent-timeout }}
+          DC_LANG: ${{ inputs.lang }}
+          # Via env, never interpolated into the script: this text comes from
+          # an issue comment.
+          DEEPCODE_PROMPT: ${{ steps.prompt.outputs.result }}
+        run: |
+          set -uo pipefail
+          [ -z "${DEEP_CODE_MODEL}" ] && unset DEEP_CODE_MODEL
+          npm i -g "@liwenkai/deepcode@${DC_VERSION}"
+
+          printf '%s' "$DEEPCODE_PROMPT" > /tmp/deepcode-prompt.txt
+          deepcode -p \
+            --output-format json \
+            --permission-mode "$DC_PERMISSION_MODE" \
+            --timeout "$DC_AGENT_TIMEOUT" \
+            < /tmp/deepcode-prompt.txt \
+            > /tmp/deepcode-result.json
+          EXIT=$?
+
+          if ! jq -e . /tmp/deepcode-result.json >/dev/null 2>&1; then
+            echo "::error::deep-code produced no parseable report (exit $EXIT)"
+            exit "${EXIT:-1}"
+          fi
+
+          jq -r '.result    // ""' /tmp/deepcode-result.json > /tmp/deepcode-answer.txt
+          jq -r '.reasoning // ""' /tmp/deepcode-result.json > /tmp/deepcode-reasoning.txt
+          echo "denied approvals: $(jq -r '.denied_approvals // 0' /tmp/deepcode-result.json)"
+          echo "cost: ¥$(jq -r '.cost.cny // 0' /tmp/deepcode-result.json)"
+
+          if [ ! -s /tmp/deepcode-answer.txt ]; then
+            if [ "$DC_LANG" = "en" ]; then
+              echo "(no text answer this round)" > /tmp/deepcode-answer.txt
+            else
+              echo "(本轮未产出文本回答)" > /tmp/deepcode-answer.txt
+            fi
+          fi
+          exit "$EXIT"
+
+      - name: Check diff
+        id: diff
+        run: |
+          if [[ -n $(git status --porcelain) ]]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            git status --short
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit & ensure PR
+        if: steps.diff.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          # All user-derived values arrive as env, never spliced into commands.
+          USER_PROMPT: ${{ steps.prompt.outputs.user_prompt }}
+          TRIGGER_USER: ${{ github.event.comment.user.login }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          BOT_NAME: ${{ steps.bot.outputs.name }}
+          BOT_EMAIL: ${{ steps.bot.outputs.email }}
+          CO_AUTHOR: ${{ inputs.co-authored-by }}
+          LANG_CODE: ${{ inputs.lang }}
+        run: |
+          TITLE="🤖 deep-code: $USER_PROMPT"
+          MESSAGE="$TITLE"
+          # An optional extra credit line; the commit author is the bot above.
+          if [ -n "$CO_AUTHOR" ]; then
+            MESSAGE="$TITLE"$'\n\n'"Co-Authored-By: $CO_AUTHOR"
+          fi
+          if [ "$LANG_CODE" = "en" ]; then
+            BODY="Triggered by @$TRIGGER_USER in issue #$ISSUE_NUMBER"
+          else
+            BODY="由 @$TRIGGER_USER 在 Issue #$ISSUE_NUMBER 中触发"
+          fi
+
+          git config user.name "$BOT_NAME"
+          git config user.email "$BOT_EMAIL"
+          git add -A
+          git commit -m "$MESSAGE"
+          git push origin "$DC_BRANCH"
+
+          EXISTING=$(gh pr list --head "$DC_BRANCH" --state open --json number -q '.[0].number')
+          if [ -z "$EXISTING" ]; then
+            gh label create "🤖 deep-code" --color "1a9945" 2>/dev/null || true
+            gh pr create --title "$TITLE" --body "$BODY" --head "$DC_BRANCH" --label "🤖 deep-code"
+          else
+            echo "PR #$EXISTING already open; the push updated it"
+          fi
+
+      - name: Post reply
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
+          script: |
+            const T = {
+              zh: { thinking: '🤔 思考过程(点击展开)', cut: '\n>\n> …(思考已截断)',
+                    changed: '✅ **已提交到 PR,请查看本 Issue 对应的 PR。**',
+                    clean: '✅ 分析完毕,当前代码无需修改。' },
+              en: { thinking: '🤔 Reasoning (click to expand)', cut: '\n>\n> …(truncated)',
+                    changed: '✅ **Committed to a PR — see the pull request for this issue.**',
+                    clean: '✅ Analysis done; no code changes were needed.' },
+            }['${{ inputs.lang }}' === 'en' ? 'en' : 'zh'];
+
+            const fs = require('fs');
+            const readOr = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return ''; } };
+            // Streamed output sometimes loses the blank line before a heading.
+            const fixHeadings = (s) => s.replace(/([^\n])(#{1,3}\s)/g, '$1\n\n$2').trim();
+
+            // GitHub caps a comment near 65536 chars: answer first, reasoning second.
+            const answer = fixHeadings(readOr('/tmp/deepcode-answer.txt').slice(0, 55000));
+            let reasoning = readOr('/tmp/deepcode-reasoning.txt').trim();
+            const reasoningCut = reasoning.length > 20000;
+            reasoning = reasoning.slice(0, 20000);
+            const hasChanges = '${{ steps.diff.outputs.has_changes }}' === 'true';
+
+            let body = '## 🤖 Deep Code\n\n';
+            if (reasoning) {
+              const quoted = reasoning.split('\n').map((l) => '> ' + l).join('\n');
+              body += '<details>\n<summary>' + T.thinking + '</summary>\n\n'
+                + quoted + (reasoningCut ? T.cut : '') + '\n\n</details>\n\n';
+            }
+            // The marker pair is what the next run extracts as history.
+            body += '<!--dc:body-->\n' + answer + '\n<!--/dc:body-->\n\n';
+            body += hasChanges ? T.changed : T.clean;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner, repo: context.repo.repo, body,
+            });
+
+      # Any failure — timeout, non-zero exit, a broken step — gets a reply, so
+      # nobody is left watching a thread that silently went quiet.
+      - name: Report failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
+          script: |
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = '${{ inputs.lang }}' === 'en'
+              ? `❌ This deep-code run failed (timeout or error). [See the logs](${run}), or comment \`${{ inputs.trigger }}\` again to retry.`
+              : `❌ 本轮 deep-code 运行失败(可能超时或出错)。[查看日志](${run}),或重新评论 \`${{ inputs.trigger }}\` 重试。`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner, repo: context.repo.repo, body,
+            });

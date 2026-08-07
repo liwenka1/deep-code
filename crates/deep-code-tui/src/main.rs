@@ -6,6 +6,7 @@ mod commands;
 mod doctor_cli;
 mod eval_cli;
 mod event_routing;
+mod github;
 mod headless;
 mod history;
 mod markdown;
@@ -39,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
             let code = headless::run_print(print_args).await;
             std::process::exit(code);
         }
+        RunMode::Github(command) => std::process::exit(github::run(command)),
         RunMode::Doctor { json } => doctor_cli::run_doctor(json),
         RunMode::Serve {
             host,

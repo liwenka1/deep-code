@@ -97,6 +97,37 @@ deepcode -p "..." --output-format stream-json    # NDJSON, same envelopes as the
 - **Exit codes**: `0` finished / `1` error / `2` usage / `124` timeout (`--timeout SECS`) / `130` Ctrl-C.
 - One-shot runs persist a session too: stderr prints the id, and `deepcode -c` picks the thread up interactively any time.
 
+## Use it in CI (GitHub Actions)
+
+Give any repository a `/deepcode` bot — comment → edit code → open a draft PR → reply in the thread — with one command:
+
+```sh
+cd your-repo
+deepcode github install          # writes the workflow, sets the secret via your own gh login
+deepcode github status           # show what is wired up
+```
+
+`--print` previews without writing; `--with-app` also walks you through a GitHub App (below). Commit the file, push, done. No hosted service, nothing for anyone to keep running.
+
+By hand it is just this:
+
+```yaml
+on:
+  issue_comment: { types: [created] }
+jobs:
+  deepcode:
+    permissions: { contents: write, pull-requests: write, issues: write }
+    uses: liwenka1/deep-code/.github/workflows/deepcode-bot.yml@v0.5.0
+    secrets:
+      deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
+```
+
+**Optional bot identity.** Without an App the bot works fine, acting as `github-actions[bot]`. Configuring your own GitHub App (`--with-app` walks you through it) buys two things: commits count toward contributors and comments carry a `[bot]` badge; and the bot's pushes trigger your other workflows, which a `GITHUB_TOKEN` push never does — meaning without an App, bot PRs get no CI checks.
+
+Trigger prefix, who may trigger it, language, model and permission tier are all configurable — see the header of [`deepcode-bot.yml`](./.github/workflows/deepcode-bot.yml). For your own pipeline (PR review, issue triage, scheduled maintenance) you don't need this workflow at all; two lines do it: `npm i -g @liwenkai/deepcode` then `deepcode -p --output-format json`.
+
+> **Think before widening who can trigger it.** Only the repository owner can by default (`allowed-associations`). Opening that up hands anyone who can comment the ability to run shell in your CI, next to your secrets. Safety rests on three legs — trusted triggers, the CLI's deny floor, and PRs never auto-merging — and removing one is not carried by the other two.
+
 ## Configuration
 
 Config file: `~/.deep-code/config.toml` (see `config.example.toml` in the repo root).

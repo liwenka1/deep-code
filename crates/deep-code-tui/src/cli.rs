@@ -44,12 +44,44 @@ pub struct PrintArgs {
     pub verbose: bool,
 }
 
+/// `deepcode github install` — write the CI caller workflow and push the
+/// secrets it needs, using the user's own `gh` credentials.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstallArgs {
+    /// Wire up the optional GitHub App identity (prompts unless the two
+    /// `--app-*` flags are given).
+    pub with_app: bool,
+    pub app_id: Option<String>,
+    pub app_key_file: Option<PathBuf>,
+    /// Ref of the reusable pipeline to pin. Defaults to this binary's version.
+    pub workflow_ref: Option<String>,
+    pub lang: Option<String>,
+    pub permission_mode: Option<String>,
+    /// Where to write, relative to the repository root.
+    pub path: Option<PathBuf>,
+    /// Replace an existing file whose contents differ.
+    pub force: bool,
+    /// Print the workflow instead of writing anything.
+    pub print_only: bool,
+    /// Write the workflow but touch no repository secrets.
+    pub skip_secrets: bool,
+    /// Key to store; defaults to the environment or the local config.
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GithubCommand {
+    Install(InstallArgs),
+    Status,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunMode {
     Tui {
         intent: StartupIntent,
     },
     Print(PrintArgs),
+    Github(GithubCommand),
     Doctor {
         json: bool,
     },
@@ -151,6 +183,10 @@ pub fn parse_args() -> CliArgs {
         "eval" => {
             args.remove(0);
             return parse_eval_command(args);
+        }
+        "github" => {
+            args.remove(0);
+            return parse_github_command(args);
         }
         _ => {}
     }
@@ -510,6 +546,74 @@ fn parse_eval_command(mut args: Vec<String>) -> CliArgs {
     }
 }
 
+/// Parse `github install [flags]` / `github status`.
+fn parse_github_command(mut args: Vec<String>) -> CliArgs {
+    let prog = program_name();
+    let usage = format!(
+        "Usage: {prog} github install [--with-app] [--app-id ID --app-private-key FILE] \
+[--ref REF] [--lang zh|en] [--permission-mode MODE] [--path FILE] [--force] [--print] \
+[--skip-secrets]\n       {prog} github status"
+    );
+
+    let Some(subcommand) = args.first().cloned() else {
+        eprintln!("{usage}");
+        std::process::exit(2);
+    };
+    args.remove(0);
+
+    match subcommand.as_str() {
+        "status" => {
+            if !args.is_empty() {
+                eprintln!("Usage: {prog} github status");
+                std::process::exit(2);
+            }
+            CliArgs {
+                mode: RunMode::Github(GithubCommand::Status),
+            }
+        }
+        "install" => {
+            let mut install = InstallArgs::default();
+            while let Some(arg) = args.first().cloned() {
+                args.remove(0);
+                match arg.as_str() {
+                    "--with-app" => install.with_app = true,
+                    "--force" => install.force = true,
+                    "--print" | "--dry-run" => install.print_only = true,
+                    "--skip-secrets" => install.skip_secrets = true,
+                    "--app-id" => install.app_id = Some(require_value(&mut args, "--app-id")),
+                    "--app-private-key" => {
+                        install.app_key_file =
+                            Some(PathBuf::from(require_value(&mut args, "--app-private-key")));
+                    }
+                    "--ref" => install.workflow_ref = Some(require_value(&mut args, "--ref")),
+                    "--lang" => install.lang = Some(require_value(&mut args, "--lang")),
+                    "--permission-mode" => {
+                        install.permission_mode =
+                            Some(require_value(&mut args, "--permission-mode"));
+                    }
+                    "--path" => {
+                        install.path = Some(PathBuf::from(require_value(&mut args, "--path")))
+                    }
+                    "--api-key" => install.api_key = Some(require_value(&mut args, "--api-key")),
+                    other => {
+                        eprintln!("Unknown install argument '{other}'.");
+                        eprintln!("{usage}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            CliArgs {
+                mode: RunMode::Github(GithubCommand::Install(install)),
+            }
+        }
+        other => {
+            eprintln!("Unknown github subcommand '{other}'. Use install or status.");
+            eprintln!("{usage}");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn require_value(args: &mut Vec<String>, flag: &str) -> String {
     if args.is_empty() {
         eprintln!("Missing value for {flag}");
@@ -638,6 +742,7 @@ pub fn run_session_command(mode: RunMode) -> anyhow::Result<()> {
         }
         RunMode::Tui { .. }
         | RunMode::Print(_)
+        | RunMode::Github(_)
         | RunMode::Doctor { .. }
         | RunMode::Serve { .. }
         | RunMode::Eval { .. } => unreachable!("handled by caller"),
@@ -673,6 +778,8 @@ fn usage_text() -> String {
         format!(
             "  {prog} -p [PROMPT] [--output-format text|json|stream-json] [--permission-mode MODE] [--timeout SECS] [--verbose]"
         ),
+        format!("  {prog} github install [--with-app]   # 给当前仓库装上 CI bot(--print 预览)"),
+        format!("  {prog} github status                 # 查看接入状态"),
         format!("  {prog} doctor [--json]"),
         format!("  {prog} serve --http [--host HOST] [--port PORT]"),
         format!("  {prog} session list|resume|delete|export"),
