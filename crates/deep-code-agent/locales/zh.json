@@ -114,6 +114,8 @@
   "BusyNewConversation": "正在流式输出或等待审批，无法开启新对话",
   "StatusNewConversation": "已开启新对话（旧对话可用 /resume 找回）",
   "ConfigWarningsHeader": "配置警告:",
+  "ExtraRootsGrantedLabel": "附加可写目录（--add-dir）: {dirs}",
+  "RestoreExtraRootsNotCovered": "注意：附加可写目录不在检查点内，本次回滚未触及；如需回滚请在对应仓库使用 git。",
 
   "HintHelp": "显示帮助",
   "HintClear": "开启新对话：重置上下文并清屏（旧对话可 /resume 找回）",

@@ -392,7 +392,15 @@ impl AgentRuntime {
                     // File I/O for a bounded diff at a human-in-the-loop
                     // pause: cheap relative to the wait, so no spawn_blocking.
                     request.preview = self.workspace.as_deref().and_then(|ws| {
-                        crate::approval_preview::build_approval_preview(&call, ws, self.ui_lang())
+                        let roots = crate::workspace_policy::WorkspaceRoots::new(
+                            ws,
+                            self.extra_roots.clone(),
+                        );
+                        crate::approval_preview::build_approval_preview(
+                            &call,
+                            &roots,
+                            self.ui_lang(),
+                        )
                     });
                     {
                         let mut state = self.state.lock().await;
@@ -526,7 +534,13 @@ impl AgentRuntime {
             }
             Ok(ToolRunOutcome::ApprovalRequired { mut request }) => {
                 request.preview = self.workspace.as_deref().and_then(|ws| {
-                    crate::approval_preview::build_approval_preview(&current, ws, self.ui_lang())
+                    let roots =
+                        crate::workspace_policy::WorkspaceRoots::new(ws, self.extra_roots.clone());
+                    crate::approval_preview::build_approval_preview(
+                        &current,
+                        &roots,
+                        self.ui_lang(),
+                    )
                 });
                 {
                     let mut state = self.state.lock().await;

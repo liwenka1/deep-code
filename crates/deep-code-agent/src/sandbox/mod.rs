@@ -11,7 +11,7 @@ mod windows;
 
 pub use policy::SandboxPolicy;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Detected sandbox backend for the current platform.
@@ -207,7 +207,7 @@ impl SandboxManager {
         &self,
         command: &str,
         cwd: &Path,
-        workspace: &Path,
+        granted_roots: &[PathBuf],
         policy: &SandboxPolicy,
     ) -> Result<Command, String> {
         if !self.should_sandbox(policy) {
@@ -217,18 +217,21 @@ impl SandboxManager {
         #[cfg(target_os = "macos")]
         {
             Ok(macos_seatbelt::wrap_shell_command(
-                command, cwd, workspace, policy,
+                command,
+                cwd,
+                granted_roots,
+                policy,
             ))
         }
 
         #[cfg(target_os = "linux")]
         {
-            linux::wrap_shell_command(command, cwd, workspace, policy)
+            linux::wrap_shell_command(command, cwd, granted_roots, policy)
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            let _ = workspace;
+            let _ = granted_roots;
             Ok(bare_shell_command(command, cwd))
         }
     }

@@ -14,7 +14,7 @@ use similar::TextDiff;
 
 use crate::i18n::{Lang, TextId, tr, tr_with};
 use crate::tool::ToolCall;
-use crate::workspace_policy::WorkspacePolicy;
+use crate::workspace_policy::{WorkspacePolicy, WorkspaceRoots};
 
 const MAX_PREVIEW_LINES: usize = 40;
 const MAX_PREVIEW_BYTES: usize = 4 * 1024;
@@ -27,7 +27,7 @@ const NEW_FILE_HEAD_LINES: usize = 20;
 /// the raw-argument display as before.
 pub(crate) fn build_approval_preview(
     call: &ToolCall,
-    workspace: &Path,
+    roots: &WorkspaceRoots,
     lang: Lang,
 ) -> Option<String> {
     match call.name.as_str() {
@@ -39,9 +39,12 @@ pub(crate) fn build_approval_preview(
         "write_file" => {
             let rel = string_arg(&call.arguments, "path")?;
             let content = string_arg(&call.arguments, "content")?;
-            // Resolve through the same policy the tool itself uses, so the
-            // preview never reads paths the execution would reject.
-            let policy = WorkspacePolicy::new(workspace.to_path_buf()).ok()?;
+            // Resolve through the same policy (all granted roots) the tool
+            // itself uses, so the preview never reads paths the execution
+            // would reject — and never rejects paths the execution would
+            // accept, which is what a single-root policy would do to an
+            // `--add-dir` write.
+            let policy = WorkspacePolicy::new(roots.clone()).ok()?;
             let path = policy.resolve_for_write(rel, "write_file").ok()?;
             Some(write_file_preview(&path, content, lang))
         }
@@ -147,7 +150,7 @@ mod tests {
                 "apply_patch",
                 json!({"path": "a.rs", "old": "fn old() {}", "new": "fn new() {}"}),
             ),
-            workspace.path(),
+            &WorkspaceRoots::from(workspace.path()),
             Lang::Zh,
         )
         .unwrap();
@@ -164,7 +167,7 @@ mod tests {
                 "write_file",
                 json!({"path": "note.txt", "content": "one\nthree\n"}),
             ),
-            workspace.path(),
+            &WorkspaceRoots::from(workspace.path()),
             Lang::Zh,
         )
         .unwrap();
@@ -180,7 +183,7 @@ mod tests {
                 "write_file",
                 json!({"path": "fresh.txt", "content": "hello\nworld\n"}),
             ),
-            workspace.path(),
+            &WorkspaceRoots::from(workspace.path()),
             Lang::Zh,
         )
         .unwrap();
@@ -197,7 +200,7 @@ mod tests {
             .join("\n");
         let preview = build_approval_preview(
             &call("write_file", json!({"path": "big.txt", "content": content})),
-            workspace.path(),
+            &WorkspaceRoots::from(workspace.path()),
             Lang::Zh,
         )
         .unwrap();
@@ -214,7 +217,7 @@ mod tests {
                     "write_file",
                     json!({"path": "../outside.txt", "content": "x"}),
                 ),
-                workspace.path(),
+                &WorkspaceRoots::from(workspace.path()),
                 Lang::Zh,
             )
             .is_none()
@@ -227,7 +230,7 @@ mod tests {
         assert!(
             build_approval_preview(
                 &call("shell", json!({"command": "ls"})),
-                workspace.path(),
+                &WorkspaceRoots::from(workspace.path()),
                 Lang::Zh
             )
             .is_none()

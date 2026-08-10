@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use tokio_util::sync::CancellationToken;
@@ -8,6 +8,7 @@ use crate::config::AgentConfig;
 use crate::skills::build_system_prompt;
 use crate::subagent::{DEFAULT_MAX_CONCURRENT, SubAgentServices, register_subagent_tools};
 use crate::tool::ToolRegistry;
+use crate::workspace_policy::WorkspaceRoots;
 
 /// Shared parent-runtime services for sub-agents.
 pub struct AgentExtensions {
@@ -87,14 +88,14 @@ pub fn attach_agent_extensions(
     registry: &mut ToolRegistry,
     client: Arc<dyn LlmClient>,
     agent_config: AgentConfig,
-    workspace: PathBuf,
+    roots: WorkspaceRoots,
     parent_cancel: CancellationToken,
 ) -> Arc<AgentExtensions> {
     let exec_policy = registry.policy().clone();
     let subagent = Arc::new(SubAgentServices::new(
         client,
         agent_config,
-        workspace.clone(),
+        roots,
         parent_cancel,
         DEFAULT_MAX_CONCURRENT,
         exec_policy,

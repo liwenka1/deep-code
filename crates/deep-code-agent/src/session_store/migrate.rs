@@ -135,6 +135,8 @@ pub(super) fn migrate_v1(v1: SessionRecordV1) -> SessionRecord {
         schema_version: SESSION_SCHEMA_VERSION,
         id: v1.id,
         workspace: v1.workspace,
+        // v1 predates `--add-dir`; a migrated session has no extra grants.
+        extra_roots: Vec::new(),
         created_at_ms: v1.created_at_ms,
         updated_at_ms: v1.updated_at_ms,
         entries,

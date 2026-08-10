@@ -42,15 +42,15 @@ fn probe_seatbelt() -> bool {
 }
 
 /// Build a `Command` that runs `command` through `sh -c` under a Seatbelt
-/// profile derived from `policy`, with `workspace` (and `cwd`, when distinct)
-/// as the writable roots.
+/// profile derived from `policy`, with the granted roots (and `cwd`, when
+/// distinct) as the writable roots.
 pub fn wrap_shell_command(
     command: &str,
     cwd: &Path,
-    workspace: &Path,
+    granted_roots: &[PathBuf],
     policy: &SandboxPolicy,
 ) -> Command {
-    let profile = compose_profile(policy, workspace, cwd);
+    let profile = compose_profile(policy, granted_roots, cwd);
 
     let mut launcher = Command::new(SEATBELT_BINARY);
     launcher.arg("-p").arg(profile.render());
@@ -102,7 +102,11 @@ impl SeatbeltProfile {
 /// denials are appended in a fixed sequence: process baseline, blanket read,
 /// optional network, the writable roots the policy grants, and LAST the
 /// credential-directory write denials so no writable root can override them.
-fn compose_profile(policy: &SandboxPolicy, workspace: &Path, cwd: &Path) -> SeatbeltProfile {
+fn compose_profile(
+    policy: &SandboxPolicy,
+    granted_roots: &[PathBuf],
+    cwd: &Path,
+) -> SeatbeltProfile {
     let mut profile = SeatbeltProfile::deny_by_default();
 
     // Shell commands are process trees: the shell itself plus whatever it
@@ -156,12 +160,12 @@ fn compose_profile(policy: &SandboxPolicy, workspace: &Path, cwd: &Path) -> Seat
         profile.rule("(allow system-socket)");
     }
 
-    // Grant writes only under the roots the policy hands out (workspace and,
-    // when different, the command's cwd). Paths are canonicalized because
-    // Seatbelt matches the real path — on macOS /tmp is a symlink into
+    // Grant writes only under the roots the policy hands out (the granted
+    // roots and, when different, the command's cwd). Paths are canonicalized
+    // because Seatbelt matches the real path — on macOS /tmp is a symlink into
     // /private, and an uncanonicalized grant there would never match.
     let mut granted: Vec<PathBuf> = Vec::new();
-    for root in policy.writable_roots(workspace, cwd) {
+    for root in policy.writable_roots(granted_roots, cwd) {
         let resolved = root.canonicalize().unwrap_or(root);
         if !granted.contains(&resolved) {
             granted.push(resolved);
@@ -248,6 +252,11 @@ fn credential_param_name(entry: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Single-root granted list, the shape every pre-`--add-dir` call had.
+    fn single_root(ws: &Path) -> Vec<PathBuf> {
+        vec![ws.to_path_buf()]
+    }
+
     #[test]
     fn availability_probe_is_stable_and_panic_free() {
         // Two calls must agree (the verdict is cached process-wide).
@@ -257,7 +266,8 @@ mod tests {
     #[test]
     fn profile_opens_with_deny_by_default() {
         let ws = Path::new("/tmp/dc-ws");
-        let text = compose_profile(&SandboxPolicy::workspace_write(), ws, ws).render();
+        let text =
+            compose_profile(&SandboxPolicy::workspace_write(), &single_root(ws), ws).render();
         assert!(text.starts_with("(version 1)\n(deny default)"));
         assert!(text.contains("(allow file-read*)"));
     }
@@ -265,14 +275,15 @@ mod tests {
     #[test]
     fn network_rules_appear_only_when_policy_grants_network() {
         let ws = Path::new("/tmp/dc-ws");
-        let offline = compose_profile(&SandboxPolicy::workspace_write(), ws, ws).render();
+        let offline =
+            compose_profile(&SandboxPolicy::workspace_write(), &single_root(ws), ws).render();
         assert!(!offline.contains("network-outbound"));
 
         let online = compose_profile(
             &SandboxPolicy::WorkspaceWrite {
                 network_access: true,
             },
-            ws,
+            &single_root(ws),
             ws,
         )
         .render();
@@ -286,7 +297,7 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let profile = compose_profile(
             &SandboxPolicy::workspace_write(),
-            workspace.path(),
+            &single_root(workspace.path()),
             elsewhere.path(),
         );
         let write_roots: Vec<&str> = profile
@@ -305,6 +316,30 @@ mod tests {
     }
 
     #[test]
+    fn extra_granted_root_receives_its_own_write_grant() {
+        // An `--add-dir` grant must surface as a real write root in the
+        // profile — this is the kernel half of the multi-root feature; the
+        // tool layer's WorkspacePolicy is the other half.
+        let workspace = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let granted = vec![workspace.path().to_path_buf(), extra.path().to_path_buf()];
+        let profile = compose_profile(
+            &SandboxPolicy::workspace_write(),
+            &granted,
+            workspace.path(),
+        );
+        let extra_canonical = extra.path().canonicalize().unwrap();
+        assert!(
+            profile
+                .bindings
+                .iter()
+                .any(|(name, path)| name.starts_with("WRITE_ROOT_") && *path == extra_canonical),
+            "extra root must be granted; bindings were {:?}",
+            profile.bindings
+        );
+    }
+
+    #[test]
     fn temp_dir_is_always_a_write_root() {
         // Regression guard: `rustc`, `mktemp` and git's xcrun shim all write to
         // $TMPDIR unconditionally, so dropping this grant does not confine
@@ -312,7 +347,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let profile = compose_profile(
             &SandboxPolicy::workspace_write(),
-            workspace.path(),
+            &single_root(workspace.path()),
             workspace.path(),
         );
         let temp = std::env::temp_dir().canonicalize().unwrap();
@@ -336,7 +371,7 @@ mod tests {
         let home = std::env::var("HOME").expect("test environment has HOME");
         let profile = compose_profile(
             &SandboxPolicy::workspace_write(),
-            home.as_ref(),
+            &single_root(home.as_ref()),
             home.as_ref(),
         );
         let text = profile.render();
@@ -362,7 +397,7 @@ mod tests {
             &SandboxPolicy::WorkspaceWrite {
                 network_access: true,
             },
-            Path::new("/tmp/dc-ws"),
+            &single_root(Path::new("/tmp/dc-ws")),
             Path::new("/tmp/dc-ws"),
         );
         let _ = home;
@@ -399,7 +434,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let profile = compose_profile(
             &SandboxPolicy::workspace_write(),
-            workspace.path(),
+            &single_root(workspace.path()),
             workspace.path(),
         );
         let text = profile.render();
@@ -438,7 +473,7 @@ mod tests {
         let status = wrap_shell_command(
             &format!("printf leaked > {}", escape.display()),
             workspace.path(),
-            workspace.path(),
+            &single_root(workspace.path()),
             &SandboxPolicy::workspace_write(),
         )
         .status()
@@ -450,6 +485,38 @@ mod tests {
             !status.success() && !leaked,
             "write outside every writable root must be denied"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confined_command_writes_into_extra_granted_root() {
+        if !is_available() {
+            eprintln!("seatbelt unavailable on this host; skipping");
+            return;
+        }
+        // The multi-root scenario end to end at the kernel: a command run from
+        // the workspace writes into the `--add-dir` root and Seatbelt allows
+        // it. Before the grant existed this exact write was the user-visible
+        // "Operation not permitted".
+        let workspace = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let granted = vec![workspace.path().to_path_buf(), extra.path().to_path_buf()];
+        let target = extra.path().join("from-sandbox.txt");
+
+        let status = wrap_shell_command(
+            &format!("printf granted > {}", target.display()),
+            workspace.path(),
+            &granted,
+            &SandboxPolicy::workspace_write(),
+        )
+        .status()
+        .expect("sandbox-exec should launch");
+
+        assert!(
+            status.success(),
+            "write into a granted extra root must pass"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "granted");
     }
 
     #[cfg(target_os = "macos")]
@@ -467,7 +534,7 @@ mod tests {
         let output = wrap_shell_command(
             "mktemp",
             workspace.path(),
-            workspace.path(),
+            &single_root(workspace.path()),
             &SandboxPolicy::workspace_write(),
         )
         .output()
@@ -492,7 +559,7 @@ mod tests {
         let status = wrap_shell_command(
             "printf written-inside > inside.txt",
             workspace.path(),
-            workspace.path(),
+            &single_root(workspace.path()),
             &SandboxPolicy::workspace_write(),
         )
         .status()

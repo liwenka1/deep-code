@@ -94,7 +94,7 @@ impl Tool for AgentTool {
             .unwrap_or_else(|| agent_id.clone());
 
         let child_tools = child_tool_registry(
-            &self.services.workspace,
+            &self.services.roots,
             role,
             self.services.exec_policy.clone(),
         )

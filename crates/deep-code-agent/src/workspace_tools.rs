@@ -1,5 +1,4 @@
 use std::fs;
-use std::path::PathBuf;
 
 use async_trait::async_trait;
 use ignore::WalkBuilder;
@@ -9,7 +8,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, run_blocking};
-use crate::workspace_policy::{WorkspacePolicy, contains_symlink, invalid, json_string};
+use crate::workspace_policy::{
+    WorkspacePolicy, WorkspaceRoots, contains_symlink, invalid, json_string,
+};
 
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 500;
@@ -24,9 +25,9 @@ pub struct WorkspaceTools {
 }
 
 impl WorkspaceTools {
-    pub fn new(root: impl Into<PathBuf>) -> Result<Self, ToolError> {
+    pub fn new(roots: impl Into<WorkspaceRoots>) -> Result<Self, ToolError> {
         Ok(Self {
-            root: WorkspacePolicy::new(root)?,
+            root: WorkspacePolicy::new(roots)?,
         })
     }
 
@@ -41,8 +42,10 @@ impl WorkspaceTools {
     }
 }
 
-pub fn workspace_tool_registry(root: impl Into<PathBuf>) -> Result<ToolRegistry, ToolError> {
-    Ok(WorkspaceTools::new(root)?.into_registry())
+pub fn workspace_tool_registry(
+    roots: impl Into<WorkspaceRoots>,
+) -> Result<ToolRegistry, ToolError> {
+    Ok(WorkspaceTools::new(roots)?.into_registry())
 }
 
 #[derive(Debug, Clone)]
@@ -121,7 +124,7 @@ impl ReadFileTool {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReadFileParams {
-    /// Workspace-relative file path
+    /// Workspace-relative file path (absolute allowed only inside a granted root)
     path: String,
     /// 1-based line number, default 1
     start_line: Option<usize>,
@@ -214,7 +217,7 @@ impl ListDirTool {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ListDirParams {
-    /// Workspace-relative directory path, default .
+    /// Workspace-relative directory path, default . (absolute allowed only inside a granted root)
     path: Option<String>,
 }
 
@@ -278,7 +281,7 @@ impl GrepFilesTool {
             if !path.is_file() {
                 continue;
             }
-            if contains_symlink(path, Some(self.root.root())).unwrap_or(true) {
+            if contains_symlink(path, self.root.granted_roots()).unwrap_or(true) {
                 continue;
             }
             let Ok(metadata) = fs::metadata(path) else {
@@ -333,7 +336,7 @@ impl GrepFilesTool {
 struct GrepFilesParams {
     /// Regex pattern
     pattern: String,
-    /// Workspace-relative file or directory, default .
+    /// Workspace-relative file or directory, default . (absolute allowed only inside a granted root)
     path: Option<String>,
     /// Context lines before and after each match, default 2
     context_lines: Option<usize>,
@@ -391,7 +394,7 @@ impl WriteFileTool {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct WriteFileParams {
-    /// Workspace-relative file path
+    /// Workspace-relative file path (absolute allowed only inside a granted root)
     path: String,
     /// Full file contents
     content: String,
@@ -733,7 +736,7 @@ fn normalize_punct_char(ch: char) -> char {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ApplyPatchParams {
-    /// Workspace-relative file path
+    /// Workspace-relative file path (absolute allowed only inside a granted root)
     path: String,
     /// Text to replace; must occur exactly once
     old: String,

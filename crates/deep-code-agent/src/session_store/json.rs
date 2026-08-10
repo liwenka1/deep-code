@@ -277,6 +277,34 @@ mod tests {
     }
 
     #[test]
+    fn json_store_round_trips_extra_roots_and_defaults_them_on_old_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+
+        // Grants survive a save/load cycle — this is what lets `-c` restore
+        // the same write boundary the session was working under.
+        let record = SessionRecord::new(dir.path().to_path_buf(), "system")
+            .with_extra_roots(vec![extra.path().to_path_buf()]);
+        store.save(&record).unwrap();
+        let loaded = store.load(&record.id).unwrap();
+        assert_eq!(loaded.extra_roots, vec![extra.path().to_path_buf()]);
+
+        // A v2 file written before the field existed loads with no grants
+        // (serde default), not an error.
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy.as_object_mut().unwrap().remove("extra_roots");
+        legacy["id"] = serde_json::json!("session_7_0");
+        let path = dir
+            .path()
+            .join(".deep-code/sessions")
+            .join("session_7_0.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+        let pre_field = store.load(&SessionId("session_7_0".to_string())).unwrap();
+        assert!(pre_field.extra_roots.is_empty());
+    }
+
+    #[test]
     fn json_store_migrates_v1_files_on_load() {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonSessionStore::for_workspace(dir.path()).unwrap();

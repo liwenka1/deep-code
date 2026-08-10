@@ -262,6 +262,8 @@ text_ids! {
     BusyNewConversation,
     StatusNewConversation,
     ConfigWarningsHeader,
+    ExtraRootsGrantedLabel,
+    RestoreExtraRootsNotCovered,
     // 命令 hint
     HintHelp,
     HintClear,

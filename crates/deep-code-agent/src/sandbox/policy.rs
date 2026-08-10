@@ -58,26 +58,35 @@ impl SandboxPolicy {
         }
     }
 
-    /// Writable roots: the workspace, the command's cwd when it differs, and the
-    /// system temp dir.
+    /// Writable roots: every granted root (the workspace first, then any
+    /// `--add-dir` grants), the command's cwd when it is not already granted,
+    /// and the system temp dir.
     ///
     /// The temp dir is not a convenience. Toolchains write scratch files there
     /// unconditionally — `rustc` allocates a temp dir per invocation, git's
     /// xcrun shim caches there, every `mktemp` caller needs it — so a profile
     /// without it does not *confine* `cargo build`, it makes it fail outright.
     /// Granting it is no escalation either: the sandbox exists to hold commands
-    /// inside the workspace boundary, and `$TMPDIR` is per-user ephemeral space
+    /// inside the granted boundary, and `$TMPDIR` is per-user ephemeral space
     /// the user's own processes already write to. Both backends read this list,
     /// so the grant cannot drift per-platform again.
-    pub fn writable_roots(&self, workspace: &Path, cwd: &Path) -> Vec<PathBuf> {
+    pub fn writable_roots(&self, granted: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
         match self {
             Self::Unsandboxed => Vec::new(),
             Self::WorkspaceWrite { .. } => {
-                let mut roots = vec![workspace.to_path_buf()];
-                if cwd != workspace {
+                let mut roots: Vec<PathBuf> = Vec::new();
+                for root in granted {
+                    if !roots.contains(root) {
+                        roots.push(root.clone());
+                    }
+                }
+                if !roots.iter().any(|existing| existing == cwd) {
                     roots.push(cwd.to_path_buf());
                 }
-                roots.push(std::env::temp_dir());
+                let temp = std::env::temp_dir();
+                if !roots.contains(&temp) {
+                    roots.push(temp);
+                }
                 roots
             }
         }

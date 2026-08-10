@@ -101,6 +101,13 @@ pub struct SessionRecord {
     pub schema_version: u32,
     pub id: SessionId,
     pub workspace: PathBuf,
+    /// Extra writable roots granted at launch (`--add-dir`), canonical. Kept in
+    /// the record so `-c`/`--resume` restores the same boundary the session was
+    /// working under — a resume that silently dropped a grant would break the
+    /// model mid-task on paths it legitimately wrote last turn. Defaulted for
+    /// files that predate the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_roots: Vec<PathBuf>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     /// Domain-level conversation entries (schema v2). Wire messages are
@@ -144,6 +151,7 @@ impl SessionRecord {
             schema_version: SESSION_SCHEMA_VERSION,
             id: new_session_id(),
             workspace,
+            extra_roots: Vec::new(),
             created_at_ms: now,
             updated_at_ms: now,
             entries,
@@ -156,6 +164,14 @@ impl SessionRecord {
             session_cache_miss_tokens: 0,
             session_cache_savings: CostEstimate::default(),
         }
+    }
+
+    /// Record the launch-granted extra writable roots. Builder-style so the
+    /// many existing single-root `new` callers stay untouched.
+    #[must_use]
+    pub fn with_extra_roots(mut self, extra_roots: Vec<PathBuf>) -> Self {
+        self.extra_roots = extra_roots;
+        self
     }
 
     pub fn touch(&mut self) {

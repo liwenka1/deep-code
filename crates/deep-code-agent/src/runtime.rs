@@ -68,6 +68,10 @@ pub struct AgentRuntime {
     state: Arc<Mutex<RuntimeState>>,
     checkpoints: Option<Arc<CheckpointStore>>,
     workspace: Option<PathBuf>,
+    /// Extra writable roots granted at launch (`--add-dir`). Only the approval
+    /// preview consults these — every anchor role (checkpoints, LSP, session
+    /// store) stays on the primary `workspace` above.
+    extra_roots: Vec<PathBuf>,
     lsp: Option<Arc<LspManager>>,
     persistence: Option<Arc<Persistence>>,
     /// Session permission mode, shared (lock-free) with the TUI so it can show
@@ -99,6 +103,7 @@ impl AgentRuntime {
             state: Arc::new(Mutex::new(RuntimeState::default())),
             checkpoints: None,
             workspace: None,
+            extra_roots: Vec::new(),
             lsp: None,
             persistence: None,
             permission_mode: SharedPermissionMode::default(),
@@ -143,6 +148,7 @@ impl AgentRuntime {
             })),
             checkpoints: None,
             workspace: None,
+            extra_roots: Vec::new(),
             lsp: None,
             persistence: None,
             permission_mode: SharedPermissionMode::default(),

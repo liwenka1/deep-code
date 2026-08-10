@@ -81,4 +81,5 @@ pub use tool::{
     ApprovalDecision, ApprovalRequest, MockEchoTool, ToolError, ToolRegistry, ToolResult,
     ToolResultStatus,
 };
+pub use workspace_policy::WorkspaceRoots;
 pub use workspace_summary::list_workspace_files;

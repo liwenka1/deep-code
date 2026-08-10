@@ -16,6 +16,7 @@ use crate::session_store::{JsonSessionStore, SessionRecord, SessionStore};
 use crate::shell_tools::{JobStore, shell_tool_registry};
 use crate::subagent::SharedSubAgentManager;
 use crate::tool::ToolRegistry;
+use crate::workspace_policy::WorkspaceRoots;
 use crate::workspace_summary::build_workspace_summary;
 use crate::workspace_tools::workspace_tool_registry;
 
@@ -41,6 +42,10 @@ pub struct LaunchedRuntime {
     /// gate. The TUI reads it for the status indicator and flips it on
     /// Shift+Tab; both sides see the same value.
     pub permission_mode: SharedPermissionMode,
+    /// Effective extra writable roots this runtime was granted (`--add-dir`,
+    /// unioned with a resumed record's own grants). Exposed so consumers can
+    /// show the user the real boundary without re-deriving the union.
+    pub extra_roots: Vec<PathBuf>,
 }
 
 impl LaunchedRuntime {
@@ -59,7 +64,7 @@ impl LaunchedRuntime {
 /// gated at runtime (see [`web_enabled`]).
 #[must_use]
 pub fn build_tool_registry(
-    workspace: &Path,
+    roots: &WorkspaceRoots,
     network: crate::execution_policy::NetworkMode,
     warnings: &mut Vec<String>,
     ui_lang: &SharedLang,
@@ -70,11 +75,11 @@ pub fn build_tool_registry(
     // gating (network mode) enters.
     registry.set_policy(crate::execution_policy::ExecPolicy::default().with_network_mode(network));
     let mut job_store = JobStore::default();
-    match workspace_tool_registry(workspace.to_path_buf()) {
+    match workspace_tool_registry(roots.clone()) {
         Ok(workspace_tools) => registry.extend(workspace_tools),
         Err(error) => warnings.push(format!("workspace tools disabled: {error}")),
     }
-    match shell_tool_registry(workspace.to_path_buf()) {
+    match shell_tool_registry(roots.clone()) {
         Ok((shell_tools, shell_jobs)) => {
             registry.extend(shell_tools);
             job_store = shell_jobs;
@@ -114,24 +119,27 @@ fn web_enabled_from(disable_flag: Option<&str>) -> bool {
 }
 
 #[must_use]
-pub fn runtime_system_prompt(workspace: &Path) -> String {
-    let base = build_runtime_system_prompt(DEFAULT_SYSTEM_PROMPT, workspace);
-    let summary = build_workspace_summary(workspace);
+pub fn runtime_system_prompt(roots: &WorkspaceRoots) -> String {
+    let base = build_runtime_system_prompt(DEFAULT_SYSTEM_PROMPT, &roots.primary);
+    let summary = build_workspace_summary(&roots.primary, &roots.extras);
     format!("{base}\n\n{summary}")
 }
 
 pub fn launch_runtime(
     config: &AgentConfig,
-    workspace: PathBuf,
+    roots: impl Into<WorkspaceRoots>,
     resume: Option<SessionRecord>,
 ) -> LaunchedRuntime {
     let parent_cancel = CancellationToken::new();
-    let prompt = runtime_system_prompt(&workspace);
+    let roots = roots.into();
 
     if let Some(record) = resume {
-        return launch_resumed(config, record, &parent_cancel);
+        // The record's own workspace stays authoritative on resume (as
+        // before); only the extra grants from this command line are merged in.
+        return launch_resumed(config, record, roots.extras, &parent_cancel);
     }
 
+    let prompt = runtime_system_prompt(&roots);
     if config.api_key.is_some()
         && let Ok(client) = DeepSeekClient::new(config.clone())
     {
@@ -139,7 +147,7 @@ pub fn launch_runtime(
             client,
             format!("DeepSeek {}", config.model),
             config,
-            workspace,
+            roots,
             &prompt,
             &parent_cancel,
             SharedLang::new(Lang::from_env(&config.language)),
@@ -151,7 +159,7 @@ pub fn launch_runtime(
         EchoClient::new(ui_lang.clone()),
         "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string(),
         config,
-        workspace,
+        roots,
         &prompt,
         &parent_cancel,
         ui_lang,
@@ -164,7 +172,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
     client: C,
     backend_label: String,
     config: &AgentConfig,
-    workspace: PathBuf,
+    roots: WorkspaceRoots,
     prompt: &str,
     parent_cancel: &CancellationToken,
     ui_lang: SharedLang,
@@ -174,7 +182,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
     // Decide persistence before assembling tools: the fallback path must not
     // rebuild (and silently drop) a full extensions set, and the failure
     // reason must reach the user instead of being swallowed.
-    let persisted = match prepare_persisted_session(workspace.clone(), prompt) {
+    let persisted = match prepare_persisted_session(&roots, prompt) {
         Ok(pair) => Some(pair),
         Err(reason) => {
             warnings.push(format!(
@@ -186,7 +194,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
     let (tools, subagent_manager, job_store, shutdown) = build_parent_tools(
         Arc::clone(&client),
         config,
-        &workspace,
+        &roots,
         parent_cancel,
         &mut warnings,
         &ui_lang,
@@ -217,7 +225,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
         ),
     };
     let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
-    let runtime = attach_workspace_helpers(runtime, &workspace, config, &mut warnings)
+    let runtime = attach_workspace_helpers(runtime, &roots.primary, config, &mut warnings)
         .with_permission_mode(permission_mode.clone())
         .with_ui_lang(ui_lang);
     LaunchedRuntime {
@@ -230,38 +238,74 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
         offline: client.provider_name() == EchoClient::PROVIDER,
         warnings,
         permission_mode,
+        extra_roots: roots.extras,
     }
 }
 
 /// Create the session store and save the fresh record, returning the reason
 /// on failure so the caller can surface it.
 fn prepare_persisted_session(
-    workspace: PathBuf,
+    roots: &WorkspaceRoots,
     system_prompt: &str,
 ) -> Result<(JsonSessionStore, SessionRecord), String> {
-    let store = JsonSessionStore::for_workspace(&workspace).map_err(|error| error.to_string())?;
-    let record = SessionRecord::new(workspace, system_prompt);
+    let store =
+        JsonSessionStore::for_workspace(&roots.primary).map_err(|error| error.to_string())?;
+    let record = SessionRecord::new(roots.primary.clone(), system_prompt)
+        .with_extra_roots(roots.extras.clone());
     store.save(&record).map_err(|error| error.to_string())?;
     Ok((store, record))
 }
 
 fn launch_resumed(
     config: &AgentConfig,
-    record: SessionRecord,
+    mut record: SessionRecord,
+    cli_extras: Vec<PathBuf>,
     parent_cancel: &CancellationToken,
 ) -> LaunchedRuntime {
+    let mut warnings = Vec::new();
+    // A recorded grant whose directory no longer resolves is dropped HERE,
+    // with a warning, not handed to WorkspacePolicy. The policy constructor
+    // is deliberately fail-closed, and `build_tool_registry` degrades a
+    // constructor error into "that tool group is disabled" — so one stale
+    // `--add-dir` entry (a sibling repo since deleted) would otherwise strip
+    // a resumed session of ALL file and shell tools, with no way to remove
+    // the grant. At launch a human is present and the warning is visible;
+    // narrowing the session and saying so is the safe direction.
+    record.extra_roots.retain(|root| {
+        let resolvable = root
+            .canonicalize()
+            .map(|path| path.is_dir())
+            .unwrap_or(false);
+        if !resolvable {
+            warnings.push(format!(
+                "dropping recorded --add-dir grant {}: directory no longer resolves",
+                root.display()
+            ));
+        }
+        resolvable
+    });
+    // Grants persist with the session: the record's extras are restored, and
+    // any `--add-dir` passed on the resume command line is merged in. The
+    // union is written back through the record, so the next plain `-c` keeps
+    // every grant the session ever received.
+    for extra in cli_extras {
+        if !record.extra_roots.contains(&extra) {
+            record.extra_roots.push(extra);
+        }
+    }
+    let roots = WorkspaceRoots::new(record.workspace.clone(), record.extra_roots.clone());
     let workspace = record.workspace.clone();
     let store = match JsonSessionStore::for_workspace(&workspace) {
         Ok(store) => store,
         Err(error) => {
-            let mut launched = launch_runtime(config, workspace, None);
+            let mut launched = launch_runtime(config, roots, None);
             launched
                 .warnings
                 .insert(0, format!("session store unavailable: {error}"));
+            launched.warnings.splice(1..1, warnings);
             return launched;
         }
     };
-    let mut warnings = Vec::new();
 
     if config.api_key.is_some()
         && let Ok(client) = DeepSeekClient::new(config.clone())
@@ -271,7 +315,7 @@ fn launch_resumed(
         let (tools, subagent_manager, job_store, shutdown) = build_parent_tools(
             Arc::clone(&client),
             config,
-            &workspace,
+            &roots,
             parent_cancel,
             &mut warnings,
             &ui_lang,
@@ -301,6 +345,7 @@ fn launch_resumed(
             offline: false,
             warnings,
             permission_mode,
+            extra_roots: roots.extras,
         };
     }
 
@@ -309,7 +354,7 @@ fn launch_resumed(
     let (tools, subagent_manager, job_store, shutdown) = build_parent_tools(
         Arc::clone(&client),
         config,
-        &workspace,
+        &roots,
         parent_cancel,
         &mut warnings,
         &ui_lang,
@@ -339,13 +384,14 @@ fn launch_resumed(
         offline: true,
         warnings,
         permission_mode,
+        extra_roots: roots.extras,
     }
 }
 
 fn build_parent_tools<C: LlmClient + 'static>(
     client: Arc<C>,
     config: &AgentConfig,
-    workspace: &Path,
+    roots: &WorkspaceRoots,
     parent_cancel: &CancellationToken,
     warnings: &mut Vec<String>,
     ui_lang: &SharedLang,
@@ -356,12 +402,12 @@ fn build_parent_tools<C: LlmClient + 'static>(
     Box<dyn Fn() + Send + Sync>,
 ) {
     let (mut registry, job_store) =
-        build_tool_registry(workspace, config.sandbox_network, warnings, ui_lang);
+        build_tool_registry(roots, config.sandbox_network, warnings, ui_lang);
     let extensions = attach_agent_extensions(
         &mut registry,
         client,
         config.clone(),
-        workspace.to_path_buf(),
+        roots.clone(),
         parent_cancel.clone(),
     );
     let shutdown: Box<dyn Fn() + Send + Sync> = Box::new({
@@ -402,7 +448,7 @@ mod tests {
         let (registry, _, _, _) = build_parent_tools(
             Arc::new(client),
             config,
-            workspace,
+            &WorkspaceRoots::from(workspace),
             &cancel,
             &mut Vec::new(),
             &SharedLang::default(),
@@ -433,6 +479,68 @@ mod tests {
         assert!(
             !names.iter().any(|name| name == MockEchoTool::NAME),
             "the mock tool is a test fixture; no production registry mounts it: {names:?}"
+        );
+    }
+
+    #[test]
+    fn resume_unions_record_grants_with_cli_add_dirs() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().canonicalize().unwrap();
+        let recorded = tempfile::TempDir::new().unwrap();
+        let recorded_root = recorded.path().canonicalize().unwrap();
+        let cli = tempfile::TempDir::new().unwrap();
+        let cli_root = cli.path().canonicalize().unwrap();
+
+        let record =
+            SessionRecord::new(ws.clone(), "system").with_extra_roots(vec![recorded_root.clone()]);
+        // No api key → offline echo resume path; the union logic is shared
+        // with the online path (it runs before the client branch).
+        let config = AgentConfig::builtin();
+        let launched = launch_runtime(
+            &config,
+            WorkspaceRoots::new(ws, vec![cli_root.clone(), recorded_root.clone()]),
+            Some(record),
+        );
+        // Record grants come first, CLI additions after; the repeated
+        // `recorded_root` from the CLI must not duplicate.
+        assert_eq!(launched.extra_roots, vec![recorded_root, cli_root]);
+    }
+
+    #[test]
+    fn resume_drops_stale_recorded_grants_instead_of_disabling_tools() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().canonicalize().unwrap();
+        let stale = ws.join("gone");
+        std::fs::create_dir(&stale).unwrap();
+        let record = SessionRecord::new(ws, "system").with_extra_roots(vec![stale.clone()]);
+        std::fs::remove_dir(&stale).unwrap();
+
+        let launched = launch_runtime(
+            &AgentConfig::builtin(),
+            record.workspace.clone(),
+            Some(record),
+        );
+        // The stale grant is dropped with a warning; it must NOT reach
+        // WorkspacePolicy, whose fail-closed constructor would otherwise take
+        // every workspace/shell tool down with it on this resumed session —
+        // build_tool_registry degrades that error into the "disabled"
+        // warnings asserted absent below.
+        assert!(launched.extra_roots.is_empty());
+        assert!(
+            launched
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("gone")),
+            "dropped grant must be surfaced: {:?}",
+            launched.warnings
+        );
+        assert!(
+            !launched
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("tools disabled")),
+            "tools must survive a stale grant: {:?}",
+            launched.warnings
         );
     }
 

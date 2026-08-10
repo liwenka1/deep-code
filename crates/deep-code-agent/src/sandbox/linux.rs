@@ -122,7 +122,7 @@ fn probe() -> Result<(), String> {
 pub fn wrap_shell_command(
     command: &str,
     cwd: &Path,
-    workspace: &Path,
+    granted_roots: &[PathBuf],
     policy: &SandboxPolicy,
 ) -> Result<Command, String> {
     let mut cmd = super::bare_shell_command(command, cwd);
@@ -130,7 +130,7 @@ pub fn wrap_shell_command(
     // Fail closed. Previously this warned to stderr and returned the unconfined
     // command, which both contradicted the refuse-if-unenforceable policy and was
     // silent in practice (the TUI redirects stderr into a log file).
-    let (ruleset, bpf) = build_restrictions(workspace, cwd, policy)?;
+    let (ruleset, bpf) = build_restrictions(granted_roots, cwd, policy)?;
     let mut ruleset = Some(ruleset);
 
     // SAFETY: the closure runs in the forked child after fork and before exec.
@@ -153,24 +153,24 @@ pub fn wrap_shell_command(
 }
 
 fn build_restrictions(
-    workspace: &Path,
+    granted_roots: &[PathBuf],
     cwd: &Path,
     policy: &SandboxPolicy,
 ) -> Result<(RulesetCreated, BpfProgram), String> {
-    let ruleset = build_landlock(workspace, cwd, policy)?;
+    let ruleset = build_landlock(granted_roots, cwd, policy)?;
     let bpf = build_seccomp(policy)?;
     Ok((ruleset, bpf))
 }
 
 fn build_landlock(
-    workspace: &Path,
+    granted_roots: &[PathBuf],
     cwd: &Path,
     policy: &SandboxPolicy,
 ) -> Result<RulesetCreated, String> {
     let access = write_access(LANDLOCK_ABI);
     // Pre-filter to existing paths so a missing /dev node can't fail the whole
     // ruleset build (path_beneath_rules errors on paths it can't open).
-    let writable: Vec<PathBuf> = writable_paths(workspace, cwd, policy)
+    let writable: Vec<PathBuf> = writable_paths(granted_roots, cwd, policy)
         .into_iter()
         .filter(|path| path.exists())
         .collect();
@@ -183,10 +183,10 @@ fn build_landlock(
         .map_err(|error| format!("landlock ruleset: {error}"))
 }
 
-fn writable_paths(workspace: &Path, cwd: &Path, policy: &SandboxPolicy) -> Vec<PathBuf> {
+fn writable_paths(granted_roots: &[PathBuf], cwd: &Path, policy: &SandboxPolicy) -> Vec<PathBuf> {
     // `writable_roots` already includes the temp dir (shared with the macOS
     // profile so the two backends cannot diverge on it again).
-    let mut paths = policy.writable_roots(workspace, cwd);
+    let mut paths = policy.writable_roots(granted_roots, cwd);
     for node in [
         "/dev/null",
         "/dev/zero",
@@ -250,7 +250,7 @@ mod tests {
         wrap_shell_command(
             command,
             workspace,
-            workspace,
+            &[workspace.to_path_buf()],
             &SandboxPolicy::workspace_write(),
         )
         .expect("landlock ruleset should build on a host that reports it available")

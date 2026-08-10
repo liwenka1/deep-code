@@ -114,6 +114,8 @@
   "BusyNewConversation": "Streaming or awaiting approval; cannot start a new conversation",
   "StatusNewConversation": "New conversation started (/resume recovers the old one)",
   "ConfigWarningsHeader": "Config warnings:",
+  "ExtraRootsGrantedLabel": "Additional writable roots (--add-dir): {dirs}",
+  "RestoreExtraRootsNotCovered": "Note: additional writable roots are not covered by checkpoints and were not rolled back; use git in those directories if needed.",
 
   "HintHelp": "Show help",
   "HintClear": "Start a new conversation: reset context and clear the screen (/resume recovers the old one)",

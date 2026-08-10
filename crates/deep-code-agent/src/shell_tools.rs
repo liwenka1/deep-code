@@ -10,11 +10,11 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::sandbox::{SandboxGuard, SandboxManager, SandboxPolicy};
 use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, ToolUpdate};
-use crate::workspace_policy::{WorkspacePolicy, invalid};
+use crate::workspace_policy::{WorkspacePolicy, WorkspaceRoots, invalid};
 #[allow(unused_imports)]
 pub use jobs::JobStore;
 use jobs::{
@@ -59,7 +59,7 @@ const JOB_DESC_UNCONFINED: &str = "Manage background shell jobs: action=start la
 /// how they read output and whether they retain the child handle.
 fn spawn_confined(
     sandbox: &SandboxManager,
-    workspace_root: &Path,
+    granted_roots: &[PathBuf],
     command: &str,
     cwd: &Path,
     policy: &SandboxPolicy,
@@ -89,7 +89,7 @@ fn spawn_confined(
     // platforms the binding is moved as-is into `Command::from`.
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut std_cmd = sandbox
-        .wrap_shell_command(command, cwd, workspace_root, policy)
+        .wrap_shell_command(command, cwd, granted_roots, policy)
         .map_err(|detail| {
             ToolError::exec_failed(
                 tool_name,
@@ -139,9 +139,9 @@ pub struct ShellTools {
 }
 
 impl ShellTools {
-    pub fn new(root: impl Into<std::path::PathBuf>) -> Result<Self, ToolError> {
+    pub fn new(roots: impl Into<WorkspaceRoots>) -> Result<Self, ToolError> {
         Ok(Self {
-            root: WorkspacePolicy::new(root)?,
+            root: WorkspacePolicy::new(roots)?,
             jobs: JobStore::default(),
             sandbox: SandboxManager::new(),
         })
@@ -172,9 +172,9 @@ impl ShellTools {
 }
 
 pub fn shell_tool_registry(
-    root: impl Into<std::path::PathBuf>,
+    roots: impl Into<WorkspaceRoots>,
 ) -> Result<(ToolRegistry, JobStore), ToolError> {
-    let shell = ShellTools::new(root)?;
+    let shell = ShellTools::new(roots)?;
     let jobs = shell.job_store();
     Ok((shell.into_registry(), jobs))
 }
@@ -206,7 +206,7 @@ impl ShellTool {
 struct ShellParams {
     /// Shell command to execute
     command: String,
-    /// Optional workspace-relative working directory
+    /// Optional workspace-relative working directory (absolute allowed only inside a granted root)
     cwd: Option<String>,
     /// Timeout in seconds, default 30, max 300; the command is killed at the deadline
     timeout_secs: Option<u64>,
@@ -268,7 +268,7 @@ impl Tool for ShellTool {
         let started = Instant::now();
         let (mut child, job_guard) = spawn_confined(
             &self.sandbox,
-            self.root.root(),
+            self.root.granted_roots(),
             &command,
             &cwd,
             &policy,
@@ -411,7 +411,7 @@ impl JobTool {
         // `JobStore::shutdown` makes this deterministic on cancel/quit.
         let (mut child, job_guard) = spawn_confined(
             &self.sandbox,
-            self.root.root(),
+            self.root.granted_roots(),
             &command,
             &cwd,
             &policy,
@@ -499,7 +499,7 @@ struct JobParams {
     action: JobAction,
     /// Shell command to launch (required for action=start)
     command: Option<String>,
-    /// Optional workspace-relative working directory (start only)
+    /// Optional workspace-relative working directory, start only (absolute allowed only inside a granted root)
     cwd: Option<String>,
     /// Job id from a previous start (required for status/tail/cancel)
     job_id: Option<String>,

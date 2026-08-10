@@ -5,9 +5,28 @@ use std::path::Path;
 
 const MAX_ENTRIES: usize = 24;
 
-/// Build a short top-level workspace listing for prompt injection.
+/// Build a short top-level workspace listing for prompt injection, plus the
+/// extra granted roots when any exist. Naming the extras here is what makes
+/// the grant usable: the model is otherwise trained toward workspace-relative
+/// paths and would never try an absolute path into a sibling repo.
 #[must_use]
-pub fn build_workspace_summary(workspace: &Path) -> String {
+pub fn build_workspace_summary(workspace: &Path, extra_roots: &[std::path::PathBuf]) -> String {
+    let summary = primary_summary(workspace);
+    if extra_roots.is_empty() {
+        return summary;
+    }
+    let extras = extra_roots
+        .iter()
+        .map(|root| format!("- {}", root.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{summary}\n附加可写目录 / additional writable roots (use absolute paths; \
+         relative paths always resolve against the workspace):\n{extras}"
+    )
+}
+
+fn primary_summary(workspace: &Path) -> String {
     let Ok(read_dir) = fs::read_dir(workspace) else {
         return format!("工作区: {} (不可读)", workspace.display());
     };
@@ -87,9 +106,28 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("README.md"), "hi").unwrap();
         std::fs::create_dir(dir.path().join("src")).unwrap();
-        let summary = build_workspace_summary(dir.path());
+        let summary = build_workspace_summary(dir.path(), &[]);
         assert!(summary.contains("README.md"));
         assert!(summary.contains("src (dir)"));
+        assert!(
+            !summary.contains("additional writable roots"),
+            "no extras section without grants: {summary}"
+        );
+    }
+
+    #[test]
+    fn extra_roots_are_named_in_the_summary() {
+        let dir = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        let summary = build_workspace_summary(
+            dir.path(),
+            std::slice::from_ref(&extra.path().to_path_buf()),
+        );
+        assert!(summary.contains("additional writable roots"), "{summary}");
+        assert!(
+            summary.contains(&extra.path().display().to_string()),
+            "extras must be listed verbatim: {summary}"
+        );
     }
 
     /// The summary feeds the system prompt: entries must come out sorted so
@@ -100,7 +138,7 @@ mod tests {
         for name in ["zeta.txt", "alpha.txt", "midway.txt"] {
             std::fs::write(dir.path().join(name), "x").unwrap();
         }
-        let summary = build_workspace_summary(dir.path());
+        let summary = build_workspace_summary(dir.path(), &[]);
         let alpha = summary.find("alpha.txt").unwrap();
         let midway = summary.find("midway.txt").unwrap();
         let zeta = summary.find("zeta.txt").unwrap();

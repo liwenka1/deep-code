@@ -965,6 +965,7 @@ mod tests {
             offline: false,
             warnings: Vec::new(),
             permission_mode: deep_code_agent::SharedPermissionMode::default(),
+            extra_roots: Vec::new(),
         };
         AppState {
             version: "0.1.0".to_string(),

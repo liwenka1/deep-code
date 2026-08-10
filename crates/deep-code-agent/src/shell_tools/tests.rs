@@ -385,12 +385,12 @@ fn tool_descriptions_match_actual_sandbox_capability() {
 
     let confined = crate::sandbox::sandbox_confines_network();
     let shell = ShellTool::new(
-        WorkspacePolicy::new(".").unwrap(),
+        WorkspacePolicy::new(std::path::Path::new(".")).unwrap(),
         JobStore::default(),
         SandboxManager::new(),
     );
     let job = JobTool::new(
-        WorkspacePolicy::new(".").unwrap(),
+        WorkspacePolicy::new(std::path::Path::new(".")).unwrap(),
         JobStore::default(),
         SandboxManager::new(),
     );
