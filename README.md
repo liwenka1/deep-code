@@ -72,6 +72,7 @@ deepcode                 # new session
 deepcode -c              # continue the latest session
 deepcode -r              # pick a session to resume
 deepcode --new           # explicitly new session
+deepcode --add-dir DIR   # grant an extra writable directory (repeatable; works with -p/serve too)
 deepcode -p "..."        # headless one-shot: run a full turn, print the answer (see below)
 deepcode --help          # command overview (--version for the version)
 deepcode doctor [--json] # environment self-check
@@ -81,6 +82,20 @@ deepcode session list|resume|delete|export
 ```
 
 Common slash commands: `/help` `/model` `/apikey` `/lang` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy` (`/help` lists everything plus keybindings).
+
+### Working across sibling repos (`--add-dir`)
+
+For "one project, several repos" setups (an SDK repo plus its host app), grant the sibling at launch:
+
+```sh
+cd ~/code/my-sdk
+deepcode --add-dir ../host-app
+```
+
+- **Both layers open together**: the file tools accept **absolute paths** that land inside a granted directory (relative paths always resolve against the primary workspace; `..` and symlink escapes stay rejected), and the OS sandbox adds the directory as a write root — the credential-dir write denials (`~/.ssh` and friends) still outrank every grant.
+- **Grants persist with the session**: they are stored in the session record, so `deepcode -c` restores the same boundary; `--add-dir` on a resume merges in and is saved. To add a directory mid-task, restart with `deepcode -c --add-dir DIR`.
+- **Command line only**: there is deliberately no config key for this — granting an extra writable tree must be an explicit human action at launch, never something a malicious repo can self-grant through project config.
+- **Checkpoints cover the primary workspace only**: `/restore` rolls back just the workspace and says so when extra roots are granted (they are usually git repos themselves — roll back there with git).
 
 ### Headless one-shot (`-p`)
 

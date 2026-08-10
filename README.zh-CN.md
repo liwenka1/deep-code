@@ -72,6 +72,7 @@ deepcode                 # 新会话
 deepcode -c              # 续最近会话
 deepcode -r              # 选择历史会话
 deepcode --new           # 显式新会话
+deepcode --add-dir DIR   # 额外授权一个可写目录(可重复;-p/serve 同样可用)
 deepcode -p "..."        # 无头单发:整轮跑完,答案打到 stdout(见下)
 deepcode --help          # 命令一览(--version 查版本)
 deepcode doctor [--json] # 环境自检
@@ -81,6 +82,20 @@ deepcode session list|resume|delete|export
 ```
 
 常用 slash 命令:`/help` `/model` `/apikey` `/lang` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy`(`/help` 查看全部与快捷键)。
+
+### 跨仓库联调(`--add-dir`)
+
+SDK 仓库 + 宿主应用这类"一个项目拆多个仓库"的场景,在启动时把兄弟仓库授权进来:
+
+```sh
+cd ~/code/my-sdk
+deepcode --add-dir ../host-app
+```
+
+- **两层同时放行**:文件工具接受落在授权目录内的**绝对路径**(相对路径永远相对主工作区;`..` 与符号链接逃逸照旧拒绝),OS 沙箱同步把该目录加入可写根——凭据目录的写保护(`~/.ssh` 等)仍然压在所有授权之上。
+- **授权随会话保存**:记录在会话里,`deepcode -c` 恢复原有边界;续会话时再加 `--add-dir` 会并入并保存。中途想加目录,`deepcode -c --add-dir DIR` 重启即可。
+- **只能来自命令行**:配置文件不提供此项——授权额外可写目录必须是人当场的显式动作,不给恶意仓库借项目配置自授权的机会。
+- **检查点不覆盖附加目录**:`/restore` 只回滚主工作区,并会提示附加目录未回滚(它们通常本身就是 git 仓库,用各自的 git 回滚)。
 
 ### 无头单发(`-p`)
 
