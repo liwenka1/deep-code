@@ -399,8 +399,13 @@ jobs:
           MESSAGE=""
           if [ -s /tmp/deepcode-commit.txt ]; then
             CANDIDATE=$(head -n1 /tmp/deepcode-commit.txt)
+            # Not `${#CANDIDATE}`: bash counts bytes under a C locale, and a
+            # compliant Chinese subject (~3 bytes/char) would then blow the cap
+            # and demote a perfectly good message to tier 2. Pin the locale so
+            # the cap means characters everywhere.
+            CANDIDATE_CHARS=$(printf '%s' "$CANDIDATE" | LC_ALL=C.UTF-8 wc -m)
             if printf '%s' "$CANDIDATE" | grep -qE '^[a-z]+(\([^)]+\))?!?: .+' \
-              && [ "${#CANDIDATE}" -le 100 ] \
+              && [ "$CANDIDATE_CHARS" -le 100 ] \
               && ! printf '%s' "$CANDIDATE" | grep -qE '[?？]$'; then
               MESSAGE=$(cat /tmp/deepcode-commit.txt)
             else
@@ -465,22 +470,36 @@ jobs:
             H_WHAT="改动说明"; H_REQ="原始请求"
             H_TRIGGER="由 @$TRIGGER_USER 在 Issue #$ISSUE_NUMBER 中触发"
           fi
+          # A PR body caps near 65536 chars, and BOTH variable parts must fit
+          # under it together — capping the answer alone still let a huge
+          # comment blow the limit through the quote below. The prompt goes
+          # through a file so `head` truncates by reading a file, not by
+          # closing a pipe early — `printf huge | head -c small` SIGPIPEs the
+          # producer once the prompt outgrows the pipe buffer, a mine that
+          # arms itself the day someone turns pipefail on for this step.
+          printf '%s\n' "$USER_PROMPT" > /tmp/deepcode-user-prompt.txt
           {
             echo "## $H_WHAT"
             echo
-            # A PR body caps near 65536 chars; `iconv -c` drops the partial
-            # character a byte-wise cut can leave behind.
-            head -c 50000 /tmp/deepcode-answer.txt | iconv -c -f utf-8 -t utf-8
+            head -c 50000 /tmp/deepcode-answer.txt
             echo
             echo "<details>"
             echo "<summary>$H_REQ</summary>"
             echo
-            printf '%s\n' "$USER_PROMPT" | sed 's/^/> /'
+            head -c 4000 /tmp/deepcode-user-prompt.txt | sed 's/^/> /'
             echo
             echo "</details>"
             echo
             echo "$H_TRIGGER"
-          } > /tmp/deepcode-pr-body.md
+          } > /tmp/deepcode-pr-body-raw.md
+          # One iconv pass over the FINISHED body, not per part: the byte cuts
+          # above can leave a broken character, but here it sits mid-file
+          # (EILSEQ, which `-c` reliably drops) — cleaning each part separately
+          # puts the breakage at end-of-input (EINVAL), where iconv exits
+          # non-zero even with `-c` and, under this step's `-e`, would kill
+          # the whole commit over one cosmetic tail byte.
+          iconv -c -f utf-8 -t utf-8 \
+            < /tmp/deepcode-pr-body-raw.md > /tmp/deepcode-pr-body.md || true
 
           git commit -m "$MESSAGE"
           git push origin "$DC_BRANCH"
