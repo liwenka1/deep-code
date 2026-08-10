@@ -35,6 +35,8 @@ pub struct RuntimeServerOptions {
     pub port: u16,
     pub auth_token: Option<String>,
     pub workspace: PathBuf,
+    /// Extra writable roots granted at launch (`--add-dir`).
+    pub extra_roots: Vec<PathBuf>,
     pub resume_session_id: Option<String>,
     /// Headless/unattended: auto-deny (never park) any approval that reaches the
     /// server, so a gated tool that slipped past auto-allow can't hang the turn
@@ -62,6 +64,7 @@ impl Default for RuntimeServerOptions {
             port: DEFAULT_PORT,
             auth_token: None,
             workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            extra_roots: Vec::new(),
             resume_session_id: None,
             autonomous_approvals: false,
         }
@@ -215,7 +218,14 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
     }
     let config = loaded.config;
     let resume = load_resume_record(&options)?;
-    let launched = launch_runtime(&config, options.workspace.clone(), resume);
+    let launched = launch_runtime(
+        &config,
+        deep_code_agent::WorkspaceRoots::new(
+            options.workspace.clone(),
+            options.extra_roots.clone(),
+        ),
+        resume,
+    );
     for warning in &launched.warnings {
         eprintln!("warning: {warning}");
     }
@@ -722,6 +732,7 @@ mod tests {
                 port: DEFAULT_PORT,
                 auth_token: None,
                 workspace: PathBuf::from("."),
+                extra_roots: Vec::new(),
                 resume_session_id: None,
                 autonomous_approvals: false,
             }
@@ -746,6 +757,7 @@ mod tests {
                 port: DEFAULT_PORT,
                 auth_token: None,
                 workspace: PathBuf::from("."),
+                extra_roots: Vec::new(),
                 resume_session_id: None,
                 autonomous_approvals: false,
             }

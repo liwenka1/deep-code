@@ -522,6 +522,14 @@ impl App {
             Ok(()) => {
                 self.last_checkpoint = Some(id.to_string());
                 self.apply_runtime_event(RuntimeEvent::WorkspaceRestored { id: checkpoint_id });
+                // Checkpoints snapshot the primary workspace only. Restoring
+                // while extra roots are granted must say so, or "restored"
+                // quietly overpromises about trees the snapshot never held.
+                if !self.extra_roots.is_empty() {
+                    self.history.push(HistoryCell::system(
+                        self.tr(TextId::RestoreExtraRootsNotCovered).to_string(),
+                    ));
+                }
             }
             Err(error) => {
                 self.status = self.tr_with(TextId::RestoreFailed, &[("error", &error.to_string())]);

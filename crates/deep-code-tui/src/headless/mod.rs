@@ -53,7 +53,11 @@ pub async fn run_print(args: PrintArgs) -> i32 {
         Err(code) => return code,
     };
 
-    let launched = launch_runtime(&loaded.config, workspace, resume);
+    let launched = launch_runtime(
+        &loaded.config,
+        deep_code_agent::WorkspaceRoots::new(workspace, args.add_dirs.clone()),
+        resume,
+    );
     for warning in &launched.warnings {
         eprintln!("warning: {warning}");
     }

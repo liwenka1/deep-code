@@ -20,7 +20,7 @@ use deep_code_agent::JsonSessionStore;
 async fn main() -> anyhow::Result<()> {
     let CliArgs { mode } = parse_args();
     match mode {
-        RunMode::Tui { intent } => {
+        RunMode::Tui { intent, add_dirs } => {
             let workspace = workspace_root();
             let store = JsonSessionStore::for_workspace(workspace.clone())?;
             // The picker (only the `-r` path) resolves the UI language itself,
@@ -30,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
             ui::run(app::LaunchConfig {
                 resume: record,
                 workspace: None,
+                extra_roots: add_dirs,
             })
             .await
         }
@@ -48,12 +49,14 @@ async fn main() -> anyhow::Result<()> {
             auth_token,
             resume,
             autonomous_approvals,
+            add_dirs,
         } => {
             deep_code_runtime::run_http_server(deep_code_runtime::RuntimeServerOptions {
                 host,
                 port,
                 auth_token,
                 workspace: workspace_root(),
+                extra_roots: add_dirs,
                 resume_session_id: resume,
                 autonomous_approvals,
             })

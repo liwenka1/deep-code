@@ -42,6 +42,8 @@ pub struct PrintArgs {
     pub timeout_secs: Option<u64>,
     /// Mirror tool activity to stderr.
     pub verbose: bool,
+    /// Extra writable roots (`--add-dir`, repeatable), canonical.
+    pub add_dirs: Vec<PathBuf>,
 }
 
 /// `deepcode github install` — write the CI caller workflow and push the
@@ -79,6 +81,8 @@ pub enum GithubCommand {
 pub enum RunMode {
     Tui {
         intent: StartupIntent,
+        /// Extra writable roots (`--add-dir`, repeatable), canonical.
+        add_dirs: Vec<PathBuf>,
     },
     Print(PrintArgs),
     Github(GithubCommand),
@@ -94,6 +98,8 @@ pub enum RunMode {
         /// auto-allow, so a gated tool can't hang the turn waiting for a
         /// callback no one will send. `--approval-mode autonomous` or env.
         autonomous_approvals: bool,
+        /// Extra writable roots (`--add-dir`, repeatable), canonical.
+        add_dirs: Vec<PathBuf>,
     },
     SessionList,
     SessionDelete {
@@ -140,6 +146,7 @@ pub fn parse_args() -> CliArgs {
         return CliArgs {
             mode: RunMode::Tui {
                 intent: StartupIntent::New,
+                add_dirs: Vec::new(),
             },
         };
     }
@@ -209,7 +216,7 @@ fn parse_print_args(mut args: Vec<String>) -> CliArgs {
     let usage = format!(
         "Usage: {prog} -p [PROMPT] [--output-format text|json|stream-json] \
 [--permission-mode default|accept_edits|auto|yolo] [--timeout SECS] [--verbose] \
-[--new | -c | --resume <id>]"
+[--add-dir DIR]... [--new | -c | --resume <id>]"
     );
 
     let mut prompt: Option<String> = None;
@@ -218,6 +225,7 @@ fn parse_print_args(mut args: Vec<String>) -> CliArgs {
     let mut permission_mode = None;
     let mut timeout_secs = None;
     let mut verbose = false;
+    let mut add_dirs: Vec<PathBuf> = Vec::new();
 
     while let Some(arg) = args.first().cloned() {
         args.remove(0);
@@ -280,6 +288,13 @@ fn parse_print_args(mut args: Vec<String>) -> CliArgs {
                 );
             }
             "--verbose" => verbose = true,
+            "--add-dir" => {
+                let value = require_value(&mut args, "--add-dir");
+                push_add_dir(&mut add_dirs, &value);
+            }
+            value if value.starts_with("--add-dir=") => {
+                push_add_dir(&mut add_dirs, value.trim_start_matches("--add-dir="));
+            }
             other if !other.starts_with('-') => {
                 if prompt.is_some() {
                     eprintln!("More than one prompt argument. Quote the prompt: -p \"…\"");
@@ -304,7 +319,35 @@ fn parse_print_args(mut args: Vec<String>) -> CliArgs {
             permission_mode,
             timeout_secs,
             verbose,
+            add_dirs,
         }),
+    }
+}
+
+/// Resolve and collect one `--add-dir` grant. Canonicalized here — at the
+/// moment the human states their intent — so every later layer (session
+/// record, sandbox profile, system prompt) sees a single spelling, and a
+/// bad path refuses the launch instead of surfacing later as a mid-task
+/// tool denial the model cannot act on.
+fn push_add_dir(add_dirs: &mut Vec<PathBuf>, raw: &str) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        eprintln!("--add-dir needs a directory path");
+        std::process::exit(2);
+    }
+    let canonical = match PathBuf::from(trimmed).canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("--add-dir {trimmed} cannot be resolved: {error}");
+            std::process::exit(2);
+        }
+    };
+    if !canonical.is_dir() {
+        eprintln!("--add-dir {trimmed} is not a directory");
+        std::process::exit(2);
+    }
+    if !add_dirs.contains(&canonical) {
+        add_dirs.push(canonical);
     }
 }
 
@@ -313,6 +356,7 @@ fn parse_print_args(mut args: Vec<String>) -> CliArgs {
 fn parse_tui_args(args: Vec<String>) -> CliArgs {
     let prog = program_name();
     let mut intent = StartupIntent::New;
+    let mut add_dirs: Vec<PathBuf> = Vec::new();
     let mut positional = Vec::new();
 
     let mut index = 0;
@@ -336,6 +380,18 @@ fn parse_tui_args(args: Vec<String>) -> CliArgs {
                     StartupIntent::ResumeId(id.to_string())
                 };
             }
+            "--add-dir" => {
+                if index + 1 < args.len() {
+                    index += 1;
+                    push_add_dir(&mut add_dirs, &args[index]);
+                } else {
+                    eprintln!("--add-dir needs a directory path");
+                    std::process::exit(2);
+                }
+            }
+            value if value.starts_with("--add-dir=") => {
+                push_add_dir(&mut add_dirs, value.trim_start_matches("--add-dir="));
+            }
             other => positional.push(other.to_string()),
         }
         index += 1;
@@ -351,7 +407,7 @@ fn parse_tui_args(args: Vec<String>) -> CliArgs {
     }
 
     CliArgs {
-        mode: RunMode::Tui { intent },
+        mode: RunMode::Tui { intent, add_dirs },
     }
 }
 
@@ -384,9 +440,15 @@ fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
     let mut resume = None;
     // None = not given on CLI → fall back to env below.
     let mut approval_mode: Option<bool> = None;
+    let mut add_dirs: Vec<PathBuf> = Vec::new();
 
     while let Some(arg) = args.first().cloned() {
         match arg.as_str() {
+            "--add-dir" => {
+                args.remove(0);
+                let value = require_value(&mut args, "--add-dir");
+                push_add_dir(&mut add_dirs, &value);
+            }
             "--http" => {
                 http = true;
                 args.remove(0);
@@ -428,7 +490,7 @@ fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
             }
             other => {
                 eprintln!(
-                    "Unknown serve argument '{other}'. Usage: {prog} serve --http [--host HOST] [--port PORT] [--auth-token TOKEN] [--resume ID] [--approval-mode interactive|autonomous]"
+                    "Unknown serve argument '{other}'. Usage: {prog} serve --http [--host HOST] [--port PORT] [--auth-token TOKEN] [--resume ID] [--approval-mode interactive|autonomous] [--add-dir DIR]..."
                 );
                 std::process::exit(2);
             }
@@ -454,6 +516,7 @@ fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
             auth_token,
             resume,
             autonomous_approvals,
+            add_dirs,
         },
     }
 }
@@ -653,6 +716,7 @@ fn parse_session_command(mut args: Vec<String>) -> CliArgs {
             CliArgs {
                 mode: RunMode::Tui {
                     intent: StartupIntent::ResumeId(id),
+                    add_dirs: Vec::new(),
                 },
             }
         }
@@ -774,6 +838,9 @@ fn usage_text() -> String {
         format!("  {prog}                # 新会话"),
         format!("  {prog} -c             # 续最近会话"),
         format!("  {prog} -r             # 选择历史会话"),
+        format!(
+            "  {prog} --add-dir DIR  # 额外可写目录(可重复;对 -p/serve 同样可用,随会话保存)"
+        ),
         format!("  {prog} -p \"PROMPT\"    # 单发无头模式;无参数则读 stdin,可与 -c/--resume 组合"),
         format!(
             "  {prog} -p [PROMPT] [--output-format text|json|stream-json] [--permission-mode MODE] [--timeout SECS] [--verbose]"
@@ -818,6 +885,7 @@ mod tests {
             parsed.mode,
             RunMode::Tui {
                 intent: StartupIntent::ResumeId("session_123_0".to_string()),
+                add_dirs: Vec::new(),
             }
         );
     }
@@ -831,8 +899,57 @@ mod tests {
     fn tui_intent(args: &[&str]) -> StartupIntent {
         let parsed = parse_tui_args(args.iter().map(|s| (*s).to_string()).collect());
         match parsed.mode {
-            RunMode::Tui { intent } => intent,
+            RunMode::Tui { intent, .. } => intent,
             other => panic!("expected Tui, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_dir_is_repeatable_deduped_and_canonical() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_arg = first.path().to_string_lossy().into_owned();
+        let second_arg = second.path().to_string_lossy().into_owned();
+        let parsed = parse_tui_args(vec![
+            "--add-dir".to_string(),
+            first_arg.clone(),
+            format!("--add-dir={second_arg}"),
+            "--add-dir".to_string(),
+            first_arg,
+        ]);
+        match parsed.mode {
+            RunMode::Tui { add_dirs, .. } => {
+                assert_eq!(
+                    add_dirs,
+                    vec![
+                        first.path().canonicalize().unwrap(),
+                        second.path().canonicalize().unwrap(),
+                    ],
+                    "repeats dedupe, both spellings parse, values canonicalize"
+                );
+            }
+            other => panic!("expected Tui, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn print_args_carry_add_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let parsed = parse_print_args(vec![
+            "-p".to_string(),
+            "hello".to_string(),
+            "--add-dir".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+        ]);
+        match parsed.mode {
+            RunMode::Print(print_args) => {
+                assert_eq!(
+                    print_args.add_dirs,
+                    vec![dir.path().canonicalize().unwrap()]
+                );
+                assert_eq!(print_args.prompt.as_deref(), Some("hello"));
+            }
+            other => panic!("expected Print, got {other:?}"),
         }
     }
 
@@ -901,6 +1018,7 @@ mod tests {
                 permission_mode: None,
                 timeout_secs: None,
                 verbose: false,
+                add_dirs: Vec::new(),
             }
         );
     }

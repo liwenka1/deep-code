@@ -38,6 +38,8 @@ pub struct LaunchConfig {
     /// Tests must set this — a launched runtime persists sessions and
     /// subagent state under `<workspace>/.deep-code`.
     pub workspace: Option<PathBuf>,
+    /// Extra writable roots granted on the command line (`--add-dir`).
+    pub extra_roots: Vec<PathBuf>,
 }
 
 /// Updates pushed from the bridge task into the UI thread.
@@ -96,6 +98,9 @@ pub struct App {
     pub(crate) pending_steering_flush: bool,
     pub pending_approval: Option<ApprovalRequest>,
     pub last_checkpoint: Option<String>,
+    /// Effective `--add-dir` grants (CLI ∪ resumed record); consulted by
+    /// `/restore` to say honestly that these trees were not rolled back.
+    pub(crate) extra_roots: Vec<PathBuf>,
     pub session_id: Option<String>,
     /// One-shot latch for the "session save failed" transcript warning; the
     /// status line keeps warning until a save succeeds again.
@@ -308,7 +313,12 @@ impl App {
         let configured_model = agent_config.model.clone();
         let configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
         let workspace_display = home_relative(&workspace);
-        let launched = launch_runtime(&agent_config, workspace.clone(), config.resume.clone());
+        let launched = launch_runtime(
+            &agent_config,
+            deep_code_agent::WorkspaceRoots::new(workspace.clone(), config.extra_roots.clone()),
+            config.resume.clone(),
+        );
+        let extra_roots = launched.extra_roots;
         let runtime = launched.handle;
         let backend_label = launched.backend_label;
         let backend_offline = launched.offline;
@@ -342,6 +352,22 @@ impl App {
             )));
         }
 
+        // Name the effective grants (CLI ∪ resumed record) once at startup:
+        // an invisible write boundary is indistinguishable from a bug when a
+        // path outside it is denied — or quietly accepted.
+        if !extra_roots.is_empty() {
+            let dirs = extra_roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            history.push(HistoryCell::system(tr_with(
+                lang,
+                TextId::ExtraRootsGrantedLabel,
+                &[("dirs", &dirs)],
+            )));
+        }
+
         if let Some(record) = config.resume.as_ref() {
             history.extend(hydrate_history(record));
         }
@@ -363,6 +389,7 @@ impl App {
             pending_steering_flush: false,
             pending_approval: None,
             last_checkpoint: None,
+            extra_roots,
             session_id,
             save_error_notified: false,
             trimmed_cells: 0,
