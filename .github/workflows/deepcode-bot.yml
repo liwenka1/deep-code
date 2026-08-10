@@ -226,6 +226,15 @@ jobs:
                   '【重要】你只需修改文件内容,不要执行任何 git 命令(git add/commit/push/branch 等)。git 操作由外部自动化处理。\n\n' +
                   '【工作方式】能合理假设就直接改代码 / 出草稿 PR,并把关键假设写进回答;' +
                   '只有在不可逆、高风险、或确实无从推断时,才先给出方案计划、本轮不改代码、结束回答等我确认后再继续。\n\n' +
+                  '【提交说明】如果你改了文件,在回答的最末尾单独输出这一段:\n' +
+                  '<!--dc:commit-->\n' +
+                  'type(scope): 一句话说明这次改了什么\n' +
+                  '\n' +
+                  '- 关键改动分条,一条一行\n' +
+                  '<!--/dc:commit-->\n' +
+                  'type 取 feat/fix/docs/refactor/test/chore 之一,scope 是改动落点(如 readme、sandbox)。' +
+                  '首行是祈使句、写“做了什么”而不是“被要求做什么”,不超过 70 字符,不要写成疑问句。' +
+                  '这段会被取作 git commit message 与 PR 标题,不会显示在对话里;没改文件就不要输出它。\n\n' +
                   '以下是本 Issue 的对话历史,根据上下文回答问题。\n\n',
               },
               en: {
@@ -236,6 +245,15 @@ jobs:
                   'IMPORTANT: only change file contents. Do not run any git command (add/commit/push/branch) — the surrounding automation handles git.\n\n' +
                   'HOW TO WORK: when you can assume reasonably, just make the change and state your assumptions in the answer. ' +
                   'Only when something is irreversible, high risk, or genuinely underdetermined should you present a plan, change nothing this round, and end your turn for confirmation.\n\n' +
+                  'COMMIT NOTE: if you changed files, end your answer with exactly this block:\n' +
+                  '<!--dc:commit-->\n' +
+                  'type(scope): one line saying what this change does\n' +
+                  '\n' +
+                  '- key changes, one per line\n' +
+                  '<!--/dc:commit-->\n' +
+                  'Use one of feat/fix/docs/refactor/test/chore for type, and the area touched for scope (e.g. readme, sandbox). ' +
+                  'The first line is imperative and describes what was DONE, not what was asked; keep it under 70 characters and never phrase it as a question. ' +
+                  'This block becomes the git commit message and PR title and is stripped from the reply; omit it entirely if you changed no files.\n\n' +
                   'Below is this issue\'s conversation. Answer in context.\n\n',
               },
             }['${{ inputs.lang }}' === 'en' ? 'en' : 'zh'];
@@ -317,10 +335,25 @@ jobs:
 
           jq -r '.result    // ""' /tmp/deepcode-result.json > /tmp/deepcode-answer.txt
           jq -r '.reasoning // ""' /tmp/deepcode-result.json > /tmp/deepcode-reasoning.txt
+
+          # Lift the commit block out of the answer, then strip it: the commit
+          # step wants it as the message, and the issue reply should not show it.
+          # Done here rather than at commit time so both consumers see the same
+          # cleaned answer, including the no-changes path that never commits.
+          : > /tmp/deepcode-commit.txt
+          if grep -q '<!--dc:commit-->' /tmp/deepcode-answer.txt; then
+            sed -n '/<!--dc:commit-->/,/<!--\/dc:commit-->/p' /tmp/deepcode-answer.txt \
+              | sed '1d;$d' \
+              | sed -e '/./,$!d' \
+              > /tmp/deepcode-commit.txt
+            sed -i '/<!--dc:commit-->/,/<!--\/dc:commit-->/d' /tmp/deepcode-answer.txt
+          fi
           echo "denied approvals: $(jq -r '.denied_approvals // 0' /tmp/deepcode-result.json)"
           echo "cost: ¥$(jq -r '.cost.cny // 0' /tmp/deepcode-result.json)"
 
-          if [ ! -s /tmp/deepcode-answer.txt ]; then
+          # Not `-s`: stripping the commit block can leave a file of nothing but
+          # newlines, which still counts as non-empty and would post a blank reply.
+          if ! grep -q '[^[:space:]]' /tmp/deepcode-answer.txt; then
             if [ "$DC_LANG" = "en" ]; then
               echo "(no text answer this round)" > /tmp/deepcode-answer.txt
             else
@@ -352,28 +385,111 @@ jobs:
           CO_AUTHOR: ${{ inputs.co-authored-by }}
           LANG_CODE: ${{ inputs.lang }}
         run: |
-          TITLE="🤖 deep-code: $USER_PROMPT"
-          MESSAGE="$TITLE"
-          # An optional extra credit line; the commit author is the bot above.
-          if [ -n "$CO_AUTHOR" ]; then
-            MESSAGE="$TITLE"$'\n\n'"Co-Authored-By: $CO_AUTHOR"
-          fi
-          if [ "$LANG_CODE" = "en" ]; then
-            BODY="Triggered by @$TRIGGER_USER in issue #$ISSUE_NUMBER"
-          else
-            BODY="由 @$TRIGGER_USER 在 Issue #$ISSUE_NUMBER 中触发"
-          fi
-
           git config user.name "$BOT_NAME"
           git config user.email "$BOT_EMAIL"
           git add -A
+
+          # The commit subject describes what the run DID. The prompt describes
+          # what was ASKED — often a question ("能不能优化一下 README?") or even a
+          # greeting, which then lands in `git log` forever. Three sources, best
+          # first, so a model that ignores the format still cannot produce one.
+          #
+          # 1. The block the agent emitted (see the prompt's COMMIT NOTE), kept
+          #    only when it really parses as a conventional-commit subject.
+          MESSAGE=""
+          if [ -s /tmp/deepcode-commit.txt ]; then
+            CANDIDATE=$(head -n1 /tmp/deepcode-commit.txt)
+            if printf '%s' "$CANDIDATE" | grep -qE '^[a-z]+(\([^)]+\))?!?: .+' \
+              && [ "${#CANDIDATE}" -le 100 ] \
+              && ! printf '%s' "$CANDIDATE" | grep -qE '[?？]$'; then
+              MESSAGE=$(cat /tmp/deepcode-commit.txt)
+            else
+              echo "::warning::commit block did not parse as a conventional subject: $CANDIDATE"
+            fi
+          fi
+
+          # 2. Derive one from the staged paths. Says less, but is deterministic
+          #    and still beats restating the question.
+          if [ -z "$MESSAGE" ]; then
+            FILES=$(git diff --cached --name-only)
+            COUNT=$(printf '%s\n' "$FILES" | grep -c . || true)
+            if printf '%s\n' "$FILES" | grep -qvE '(\.md$|^docs/)'; then
+              if printf '%s\n' "$FILES" | grep -qvE '^\.github/'; then TYPE=chore; else TYPE=ci; fi
+            else
+              TYPE=docs
+            fi
+            if [ "$COUNT" = "1" ]; then
+              SCOPE=$(basename "$FILES" | sed 's/\.[^.]*$//' | tr '[:upper:]' '[:lower:]')
+              WHAT="$FILES"
+            else
+              # A scope only when every path shares one top-level directory.
+              # Otherwise none at all — conventional commits allow that, and it
+              # beats picking one directory and implying the rest were untouched.
+              TOPS=$(printf '%s\n' "$FILES" | grep . | grep / | cut -d/ -f1 | sort -u)
+              ROOT_FILES=$(printf '%s\n' "$FILES" | grep . | grep -vc / || true)
+              if [ "$(printf '%s\n' "$TOPS" | grep -c .)" = "1" ] && [ "$ROOT_FILES" = "0" ]; then
+                SCOPE="$TOPS"
+              else
+                SCOPE=""
+              fi
+              if [ "$LANG_CODE" = "en" ]; then WHAT="$COUNT files"; else WHAT="$COUNT 个文件"; fi
+            fi
+            # `ci(.github)` reads worse than plain `ci`, and adds nothing.
+            [ "$SCOPE" = ".github" ] && SCOPE=""
+            if [ -n "$SCOPE" ]; then PREFIX="$TYPE($SCOPE)"; else PREFIX="$TYPE"; fi
+            if [ "$LANG_CODE" = "en" ]; then
+              MESSAGE="$PREFIX: update $WHAT"
+            else
+              MESSAGE="$PREFIX: 更新 $WHAT"
+            fi
+          fi
+
+          # 3. Last resort: the old behaviour, so this can never end up empty.
+          if [ -z "$MESSAGE" ]; then
+            MESSAGE="🤖 deep-code: $USER_PROMPT"
+          fi
+
+          TITLE=$(printf '%s' "$MESSAGE" | head -n1)
+          # An optional extra credit line; the commit author is the bot above.
+          if [ -n "$CO_AUTHOR" ]; then
+            MESSAGE="$MESSAGE"$'\n\n'"Co-Authored-By: $CO_AUTHOR"
+          fi
+
+          # The PR body used to be one line naming the trigger, so the page never
+          # said what changed. The agent's answer already says it — it was only
+          # being posted to the issue.
+          if [ "$LANG_CODE" = "en" ]; then
+            H_WHAT="What changed"; H_REQ="Original request"
+            H_TRIGGER="Triggered by @$TRIGGER_USER in issue #$ISSUE_NUMBER"
+          else
+            H_WHAT="改动说明"; H_REQ="原始请求"
+            H_TRIGGER="由 @$TRIGGER_USER 在 Issue #$ISSUE_NUMBER 中触发"
+          fi
+          {
+            echo "## $H_WHAT"
+            echo
+            # A PR body caps near 65536 chars; `iconv -c` drops the partial
+            # character a byte-wise cut can leave behind.
+            head -c 50000 /tmp/deepcode-answer.txt | iconv -c -f utf-8 -t utf-8
+            echo
+            echo "<details>"
+            echo "<summary>$H_REQ</summary>"
+            echo
+            printf '%s\n' "$USER_PROMPT" | sed 's/^/> /'
+            echo
+            echo "</details>"
+            echo
+            echo "$H_TRIGGER"
+          } > /tmp/deepcode-pr-body.md
+
           git commit -m "$MESSAGE"
           git push origin "$DC_BRANCH"
 
           EXISTING=$(gh pr list --head "$DC_BRANCH" --state open --json number -q '.[0].number')
           if [ -z "$EXISTING" ]; then
             gh label create "🤖 deep-code" --color "1a9945" 2>/dev/null || true
-            gh pr create --title "$TITLE" --body "$BODY" --head "$DC_BRANCH" --label "🤖 deep-code"
+            gh pr create --title "$TITLE" --body-file /tmp/deepcode-pr-body.md \
+              --head "$DC_BRANCH" --label "🤖 deep-code"
           else
             echo "PR #$EXISTING already open; the push updated it"
           fi
