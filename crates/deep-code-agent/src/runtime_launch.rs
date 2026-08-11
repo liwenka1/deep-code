@@ -131,7 +131,18 @@ pub fn launch_runtime(
     resume: Option<SessionRecord>,
 ) -> LaunchedRuntime {
     let parent_cancel = CancellationToken::new();
-    let roots = roots.into();
+    let mut roots = roots.into();
+    // `--add-dir $(pwd)` and friends: an extra equal to the primary grants
+    // nothing (the workspace is always writable) and would list the workspace
+    // as its own "additional" root in the startup banner, summary and record.
+    // Enforcement already dedupes inside WorkspacePolicy; this keeps the
+    // display surfaces honest. Both spellings are checked because CLI extras
+    // arrive canonical while the primary may not be.
+    let primary_raw = roots.primary.clone();
+    let primary_canonical = roots.primary.canonicalize().ok();
+    roots
+        .extras
+        .retain(|extra| *extra != primary_raw && Some(extra) != primary_canonical.as_ref());
 
     if let Some(record) = resume {
         // The record's own workspace stays authoritative on resume (as
@@ -271,29 +282,43 @@ fn launch_resumed(
     // a resumed session of ALL file and shell tools, with no way to remove
     // the grant. At launch a human is present and the warning is visible;
     // narrowing the session and saying so is the safe direction.
+    let primary_canonical = record.workspace.canonicalize().ok();
     record.extra_roots.retain(|root| {
-        let resolvable = root
-            .canonicalize()
-            .map(|path| path.is_dir())
-            .unwrap_or(false);
-        if !resolvable {
+        let canonical = root.canonicalize().ok().filter(|path| path.is_dir());
+        let Some(canonical) = canonical else {
             warnings.push(format!(
                 "dropping recorded --add-dir grant {}: directory no longer resolves",
                 root.display()
             ));
-        }
-        resolvable
+            return false;
+        };
+        // A grant equal to the workspace is covered by the primary root;
+        // dropped silently (nothing is lost) so the banner and summary never
+        // list the workspace as its own "additional" root.
+        Some(canonical) != primary_canonical
     });
     // Grants persist with the session: the record's extras are restored, and
     // any `--add-dir` passed on the resume command line is merged in. The
     // union is written back through the record, so the next plain `-c` keeps
     // every grant the session ever received.
     for extra in cli_extras {
+        if primary_canonical.as_deref() == Some(extra.as_path()) {
+            continue;
+        }
         if !record.extra_roots.contains(&extra) {
             record.extra_roots.push(extra);
         }
     }
     let roots = WorkspaceRoots::new(record.workspace.clone(), record.extra_roots.clone());
+    // The model reads its write boundary from the system prompt, and the
+    // saved prompt names only the grants that existed when the session was
+    // created — a root added on `-c --add-dir` (README's own mid-task flow)
+    // would be enforceable yet invisible: the summary is what tells the model
+    // absolute paths into that root are worth trying at all. Rebuild it from
+    // the effective roots; a stale grant dropped above likewise stops being
+    // advertised. Costs one provider prefix-cache miss on the resumed
+    // conversation; an unusable grant costs the whole feature.
+    record.set_system_prompt(runtime_system_prompt(&roots));
     let workspace = record.workspace.clone();
     let store = match JsonSessionStore::for_workspace(&workspace) {
         Ok(store) => store,
@@ -306,6 +331,14 @@ fn launch_resumed(
             return launched;
         }
     };
+    // Save the merged grants and refreshed prompt NOW, not at the first
+    // turn's persist(): "grants persist with the session" must hold even for
+    // a resume that adds a grant and exits before any turn — the next plain
+    // `-c` should still see it. A failure degrades to a warning; the
+    // persistence actor retries the write on the first turn anyway.
+    if let Err(error) = store.save(&record) {
+        warnings.push(format!("failed to persist resumed session grants: {error}"));
+    }
 
     if config.api_key.is_some()
         && let Ok(client) = DeepSeekClient::new(config.clone())
@@ -542,6 +575,62 @@ mod tests {
             "tools must survive a stale grant: {:?}",
             launched.warnings
         );
+    }
+
+    #[test]
+    fn resume_refreshes_system_prompt_and_persists_grants_immediately() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().canonicalize().unwrap();
+        let extra = tempfile::TempDir::new().unwrap();
+        let extra_root = extra.path().canonicalize().unwrap();
+
+        // A session created WITHOUT the grant: its saved prompt cannot name it.
+        let store = JsonSessionStore::for_workspace(&ws).unwrap();
+        let record = SessionRecord::new(ws.clone(), "original prompt");
+        let id = record.id.clone();
+        store.save(&record).unwrap();
+
+        // Resume with `--add-dir extra` (plus a primary-equal extra that the
+        // union must skip), then exit without any turn.
+        let launched = launch_runtime(
+            &AgentConfig::builtin(),
+            WorkspaceRoots::new(ws.clone(), vec![extra_root.clone(), ws.clone()]),
+            Some(record),
+        );
+        assert_eq!(launched.extra_roots, vec![extra_root.clone()]);
+
+        // The grant must be on disk already — not parked until the first
+        // persist() that a turn would trigger.
+        let reloaded = store.load(&id).unwrap();
+        assert_eq!(reloaded.extra_roots, vec![extra_root.clone()]);
+
+        // And the stored system prompt now names the root: enforceable but
+        // unadvertised is exactly the gap this guards against.
+        let crate::session_entry::EntryKind::System { content } = &reloaded.entries[0].kind else {
+            panic!("entries[0] must stay the system prompt");
+        };
+        assert!(
+            content.contains("additional writable roots"),
+            "refreshed prompt must carry the extras section: {content}"
+        );
+        assert!(
+            content.contains(extra_root.to_string_lossy().as_ref()),
+            "refreshed prompt must name the granted root: {content}"
+        );
+    }
+
+    #[test]
+    fn fresh_launch_drops_extras_equal_to_the_primary() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().canonicalize().unwrap();
+        // `--add-dir $(pwd)`: covered by the primary, so it must not surface
+        // as an "additional" root in the banner/summary/record.
+        let launched = launch_runtime(
+            &AgentConfig::builtin(),
+            WorkspaceRoots::new(ws.clone(), vec![ws]),
+            None,
+        );
+        assert!(launched.extra_roots.is_empty());
     }
 
     #[test]

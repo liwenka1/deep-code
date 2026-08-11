@@ -449,6 +449,13 @@ fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
                 let value = require_value(&mut args, "--add-dir");
                 push_add_dir(&mut add_dirs, &value);
             }
+            // The `=` spelling too: tui and -p accept it, and a flag that
+            // parses in two entry points but errors in the third reads like a
+            // typo on the user's side rather than the truth (an omission here).
+            value if value.starts_with("--add-dir=") => {
+                args.remove(0);
+                push_add_dir(&mut add_dirs, value.trim_start_matches("--add-dir="));
+            }
             "--http" => {
                 http = true;
                 args.remove(0);
@@ -950,6 +957,29 @@ mod tests {
                 assert_eq!(print_args.prompt.as_deref(), Some("hello"));
             }
             other => panic!("expected Print, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_accepts_add_dir_in_both_spellings() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let parsed = parse_serve_command(vec![
+            "--http".to_string(),
+            "--add-dir".to_string(),
+            first.path().to_string_lossy().into_owned(),
+            format!("--add-dir={}", second.path().to_string_lossy()),
+        ]);
+        match parsed.mode {
+            RunMode::Serve { add_dirs, .. } => assert_eq!(
+                add_dirs,
+                vec![
+                    first.path().canonicalize().unwrap(),
+                    second.path().canonicalize().unwrap(),
+                ],
+                "serve takes the same two spellings as tui/-p"
+            ),
+            other => panic!("expected Serve, got {other:?}"),
         }
     }
 

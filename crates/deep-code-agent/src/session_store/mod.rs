@@ -174,6 +174,25 @@ impl SessionRecord {
         self
     }
 
+    /// Replace the stored system prompt in place. The prompt is `entries[0]`
+    /// by construction; resume rebuilds it so the model sees the *current*
+    /// granted roots — the saved prompt only ever names the grants that
+    /// existed when the session was created, and a root added on `-c
+    /// --add-dir` (or dropped as stale) would otherwise stay invisible for
+    /// the rest of the session's life. Defensive about position anyway:
+    /// v1-migrated files are shaped by old data, not this constructor.
+    pub fn set_system_prompt(&mut self, system_prompt: impl Into<String>) {
+        let entry = std::sync::Arc::new(SessionEntry::system(system_prompt.into()));
+        let slot = self
+            .entries
+            .iter()
+            .position(|existing| matches!(existing.kind, EntryKind::System { .. }));
+        match slot {
+            Some(index) => self.entries[index] = entry,
+            None => self.entries.insert(0, entry),
+        }
+    }
+
     pub fn touch(&mut self) {
         self.updated_at_ms = now_ms();
     }
@@ -333,6 +352,31 @@ mod tests {
         assert_eq!(record.preview(), "second");
         assert!(record.has_user_entry());
         assert_eq!(record.message_count(), 4);
+    }
+
+    #[test]
+    fn set_system_prompt_replaces_in_place_and_survives_a_missing_slot() {
+        let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "old prompt");
+        record
+            .entries
+            .push(std::sync::Arc::new(SessionEntry::user("hi")));
+        record.set_system_prompt("new prompt");
+        // Replaced where it sat — position and the rest of the history intact.
+        assert!(matches!(
+            &record.entries[0].kind,
+            EntryKind::System { content } if content == "new prompt"
+        ));
+        assert_eq!(record.entries.len(), 2);
+
+        // Defensive branch: a (v1-shaped) record with no system entry gets one
+        // inserted at the front rather than silently keeping none.
+        record.entries.remove(0);
+        record.set_system_prompt("fresh prompt");
+        assert!(matches!(
+            &record.entries[0].kind,
+            EntryKind::System { content } if content == "fresh prompt"
+        ));
+        assert_eq!(record.entries.len(), 2);
     }
 
     /// v2 files written before `config`, per-turn `tool_results`, and entry
