@@ -25,6 +25,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, TextId, bool)] = &[
     ("/agents", TextId::HintAgents, false),
     ("/find", TextId::HintFind, true),
     ("/lang", TextId::HintLang, true),
+    ("/add-dir", TextId::HintAddDir, true),
 ];
 
 impl App {
@@ -75,6 +76,11 @@ impl App {
             _ if prompt == "/resume" || prompt.starts_with("/resume ") => {
                 let arg = prompt.strip_prefix("/resume").unwrap_or_default().trim();
                 self.resume_session_command(arg);
+                true
+            }
+            _ if prompt == "/add-dir" || prompt.starts_with("/add-dir ") => {
+                let arg = prompt.strip_prefix("/add-dir").unwrap_or_default().trim();
+                self.add_dir_command(arg);
                 true
             }
             _ if prompt == "/restore" || prompt.starts_with("/restore ") => {

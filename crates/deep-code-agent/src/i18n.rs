@@ -264,6 +264,14 @@ text_ids! {
     ConfigWarningsHeader,
     ExtraRootsGrantedLabel,
     RestoreExtraRootsNotCovered,
+    // /add-dir
+    AddDirUsage,
+    AddDirNeedsPersistence,
+    AddDirResolveFailed,
+    AddDirNotDirectory,
+    AddDirAlreadyWorkspace,
+    AddDirAlreadyGranted,
+    AddDirGranted,
     // 命令 hint
     HintHelp,
     HintClear,
@@ -279,6 +287,7 @@ text_ids! {
     HintAgents,
     HintFind,
     HintLang,
+    HintAddDir,
     // 命令输出
     UsageRestore,
     ApiKeySaved,

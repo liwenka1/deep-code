@@ -117,6 +117,14 @@
   "ExtraRootsGrantedLabel": "附加可写目录（--add-dir）: {dirs}",
   "RestoreExtraRootsNotCovered": "注意：附加可写目录不在检查点内，本次回滚未触及；如需回滚请在对应仓库使用 git。",
 
+  "AddDirUsage": "用法: /add-dir <目录>",
+  "AddDirNeedsPersistence": "当前会话未持久化，无法中途授权；请退出后用 --add-dir 重新启动",
+  "AddDirResolveFailed": "无法解析 {path}: {error}",
+  "AddDirNotDirectory": "{path} 不是目录",
+  "AddDirAlreadyWorkspace": "{path} 就是工作区本身，无需授权",
+  "AddDirAlreadyGranted": "{path} 已在授权列表中",
+  "AddDirGranted": "已授权额外可写目录: {dir}",
+
   "HintHelp": "显示帮助",
   "HintClear": "开启新对话：重置上下文并清屏（旧对话可 /resume 找回）",
   "HintStatus": "显示运行状态",
@@ -131,6 +139,7 @@
   "HintAgents": "列出子代理",
   "HintFind": "搜索转录 <关键词>（重复执行向更早处翻）",
   "HintLang": "查看/切换界面语言 (zh|en)",
+  "HintAddDir": "授权额外可写目录 <路径>（本次运行内生效，随会话保存）",
 
   "UsageRestore": "用法: /restore <checkpoint_id>",
   "ApiKeySaved": "API key 已保存至 {path}（权限 600）。当前后端: {backend}",

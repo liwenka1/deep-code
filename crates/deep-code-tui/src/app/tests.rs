@@ -1401,3 +1401,125 @@ fn assistant_delta_renders_exactly_once() {
         Some(HistoryCell::Assistant { text }) if text == "hello"
     ));
 }
+
+#[test]
+fn add_dir_command_refuses_bad_input_without_relaunching() {
+    let mut app = App::new();
+    let original_session = app.session_id.clone();
+
+    // Empty argument → usage note.
+    assert!(app.handle_slash_command("/add-dir"));
+    assert!(app.status.contains("用法"), "status: {}", app.status);
+
+    // Unresolvable path → resolve error, nothing granted.
+    assert!(app.handle_slash_command("/add-dir does-not-exist-anywhere"));
+    assert!(app.status.contains("无法解析"), "status: {}", app.status);
+
+    // The workspace itself grants nothing → friendly no-op.
+    let ws = app.workspace.clone();
+    assert!(app.handle_slash_command(&format!("/add-dir {}", ws.display())));
+    assert!(app.status.contains("工作区本身"), "status: {}", app.status);
+
+    assert!(app.extra_roots.is_empty());
+    assert_eq!(
+        app.session_id, original_session,
+        "refused input must not relaunch the runtime"
+    );
+}
+
+#[test]
+fn add_dir_blocked_while_streaming() {
+    let mut app = App::new();
+    app.is_streaming = true;
+    let dir = tempfile::tempdir().unwrap();
+    assert!(app.handle_slash_command(&format!("/add-dir {}", dir.path().display())));
+    assert!(app.extra_roots.is_empty());
+    assert!(app.status.contains("流式"), "status: {}", app.status);
+}
+
+#[test]
+fn add_dir_grants_relaunches_and_persists_immediately() {
+    let mut app = App::new();
+    let session_before = app.session_id.clone().expect("test sessions persist");
+    let extra = tempfile::tempdir().unwrap();
+    let canonical = extra.path().canonicalize().unwrap();
+
+    assert!(app.handle_slash_command(&format!("/add-dir {}", extra.path().display())));
+
+    assert_eq!(app.extra_roots, vec![canonical.clone()]);
+    assert!(app.status.contains("已授权"), "status: {}", app.status);
+    // The transcript names the new boundary right where the action happened.
+    assert!(matches!(
+        app.history.last(),
+        Some(HistoryCell::System { text }) if text.contains(&canonical.display().to_string())
+    ));
+    // Same session resumed, and the grant is already on disk — not parked
+    // until a turn's persist().
+    assert_eq!(app.session_id.as_deref(), Some(session_before.as_str()));
+    let store = JsonSessionStore::for_workspace(app.workspace.clone()).unwrap();
+    let record = store
+        .load(&deep_code_agent::SessionId::parse(&session_before).unwrap())
+        .unwrap();
+    assert_eq!(record.extra_roots, vec![canonical.clone()]);
+
+    // Granting the same directory again is a no-op with a note.
+    assert!(app.handle_slash_command(&format!("/add-dir {}", extra.path().display())));
+    assert!(
+        app.status.contains("已在授权列表"),
+        "status: {}",
+        app.status
+    );
+    assert_eq!(app.extra_roots.len(), 1);
+}
+
+#[test]
+fn clear_carries_grants_into_the_new_session() {
+    let mut app = App::new();
+    let extra = tempfile::tempdir().unwrap();
+    let canonical = extra.path().canonicalize().unwrap();
+    assert!(app.handle_slash_command(&format!("/add-dir {}", extra.path().display())));
+    let granted_session = app.session_id.clone();
+
+    assert!(app.handle_slash_command("/clear"));
+
+    assert_ne!(
+        app.session_id, granted_session,
+        "clear starts a new session"
+    );
+    // Grants are process-scoped: the human granted them for this run, so the
+    // fresh session inherits them (and is born with them persisted).
+    assert_eq!(app.extra_roots, vec![canonical.clone()]);
+    assert!(matches!(
+        app.history.last(),
+        Some(HistoryCell::System { text }) if text.contains(&canonical.display().to_string())
+    ));
+    let store = JsonSessionStore::for_workspace(app.workspace.clone()).unwrap();
+    let id = app.session_id.clone().expect("new session persists");
+    let record = store
+        .load(&deep_code_agent::SessionId::parse(&id).unwrap())
+        .unwrap();
+    assert_eq!(record.extra_roots, vec![canonical]);
+}
+
+#[test]
+fn switch_session_adopts_and_banners_the_records_grants() {
+    let mut app = App::new();
+    let extra = tempfile::tempdir().unwrap();
+    let canonical = extra.path().canonicalize().unwrap();
+    // A session in this workspace carrying its own grant, created out of band
+    // (as if by an earlier `--add-dir` run).
+    let store = JsonSessionStore::for_workspace(app.workspace.clone()).unwrap();
+    let record = SessionRecord::new(app.workspace.clone(), "system")
+        .with_extra_roots(vec![canonical.clone()]);
+    store.save(&record).unwrap();
+
+    app.switch_session(record).unwrap();
+
+    // The display state must describe the adopted runtime's boundary, not the
+    // (grantless) one this App launched with — and say so in the transcript.
+    assert_eq!(app.extra_roots, vec![canonical.clone()]);
+    assert!(matches!(
+        app.history.last(),
+        Some(HistoryCell::System { text }) if text.contains(&canonical.display().to_string())
+    ));
+}

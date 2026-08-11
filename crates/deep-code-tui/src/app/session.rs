@@ -14,6 +14,12 @@ impl App {
         self.subagent_manager = launched.subagent_manager;
         self.subagent_shutdown = Some(launched.stop_hook);
         self.job_store = Some(launched.job_store);
+        // Track the adopted runtime's effective grants, not the ones this App
+        // started with: a swap can change them (`/resume` into a session whose
+        // record carries grants, `/add-dir`), and every display surface that
+        // reads this field — the `/restore` honesty note, the grants banner —
+        // must describe the boundary the live runtime actually enforces.
+        self.extra_roots = launched.extra_roots;
         // Carry the user's chosen permission mode onto the new runtime's shared
         // handle so a config swap (/model, /apikey, /resume, /clear) doesn't
         // silently reset it.
@@ -60,7 +66,17 @@ impl App {
     /// state. The caller must have shut the previous runtime down first.
     fn launch_and_adopt(&mut self, resume: Option<SessionRecord>) {
         let agent_config = self.load_layered_config();
-        let launched = launch_runtime(&agent_config, self.workspace.clone(), resume);
+        // Grants are process-scoped: the human expressed them for this run
+        // (launch flags or `/add-dir`), so every swap re-passes the current
+        // set. A `/clear` session is born with them, and a `/resume` unions
+        // them into the target record — the same semantics `-c --add-dir`
+        // already has. Dropping them on a swap instead would deny the model
+        // mid-task on paths it legitimately wrote a moment earlier.
+        let launched = launch_runtime(
+            &agent_config,
+            deep_code_agent::WorkspaceRoots::new(self.workspace.clone(), self.extra_roots.clone()),
+            resume,
+        );
         self.cost_currency = agent_config.cost_currency;
         self.configured_model = agent_config.model.clone();
         self.configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
@@ -68,6 +84,93 @@ impl App {
         // launch and via /lang, so a runtime swap can never flip the UI
         // language out from under the user (or the tests).
         self.adopt_runtime(launched);
+    }
+
+    /// Append the effective-grants line to the transcript. Called wherever the
+    /// visible history is rebuilt or the grant set changes — an invisible
+    /// write boundary is indistinguishable from a bug when a path outside it
+    /// is denied, or quietly accepted.
+    pub(crate) fn push_extra_roots_banner(&mut self) {
+        if self.extra_roots.is_empty() {
+            return;
+        }
+        let dirs = self
+            .extra_roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.history.push(crate::history::HistoryCell::system(
+            self.tr_with(TextId::ExtraRootsGrantedLabel, &[("dirs", &dirs)]),
+        ));
+    }
+
+    /// `/add-dir DIR` — grant an extra writable root mid-session. Mirrors the
+    /// CLI flag: the path is canonicalized at the moment the human states the
+    /// intent, then applied by relaunching the runtime into the current
+    /// session, which is the same union → persist → prompt-rebuild path that
+    /// `-c --add-dir` exercises. Slash commands can only be typed at the
+    /// keyboard, so this opens no model-reachable widening channel.
+    pub(crate) fn add_dir_command(&mut self, raw: &str) {
+        if self.is_streaming || self.pending_approval.is_some() {
+            self.status = self.tr(TextId::BusyRelaunchConfig).to_string();
+            return;
+        }
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            self.status = self.tr(TextId::AddDirUsage).to_string();
+            return;
+        }
+        // Applying a grant means relaunching into the current record; a
+        // session that never persisted has no record to resume, and the
+        // relaunch would silently drop the whole conversation. Refuse and
+        // name the working alternative instead.
+        if self.session_id.is_none() {
+            self.status = self.tr(TextId::AddDirNeedsPersistence).to_string();
+            return;
+        }
+        let candidate = std::path::Path::new(trimmed);
+        let absolute = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            self.workspace.join(candidate)
+        };
+        let canonical = match absolute.canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = self.tr_with(
+                    TextId::AddDirResolveFailed,
+                    &[("path", trimmed), ("error", &error.to_string())],
+                );
+                return;
+            }
+        };
+        if !canonical.is_dir() {
+            self.status = self.tr_with(TextId::AddDirNotDirectory, &[("path", trimmed)]);
+            return;
+        }
+        if self.workspace.canonicalize().ok().as_ref() == Some(&canonical) {
+            self.status = self.tr_with(TextId::AddDirAlreadyWorkspace, &[("path", trimmed)]);
+            return;
+        }
+        if self.extra_roots.contains(&canonical) {
+            self.status = self.tr_with(TextId::AddDirAlreadyGranted, &[("path", trimmed)]);
+            return;
+        }
+        self.extra_roots.push(canonical.clone());
+        match self.relaunch_runtime() {
+            Ok(()) => {
+                self.push_extra_roots_banner();
+                self.status = self.tr_with(
+                    TextId::AddDirGranted,
+                    &[("dir", &canonical.display().to_string())],
+                );
+            }
+            // The fallback runtime (fresh session) was still adopted with the
+            // grant, so the boundary is what the user asked for; surface why
+            // the conversation view may have reset instead of claiming success.
+            Err(message) => self.status = message,
+        }
     }
 
     /// Rebuild the runtime with the (re-loaded) layered config, resuming the
@@ -220,6 +323,10 @@ impl App {
         self.steering_queue.clear();
         self.pending_steering_flush = false;
         self.history.extend(hydrate_history(&record));
+        // The switched-to boundary can differ from the one on screen so far
+        // (the record's own grants ∪ this run's); restate it with the rebuilt
+        // transcript.
+        self.push_extra_roots_banner();
         self.status = self.tr_with(
             TextId::StatusSwitchedSession,
             &[("id", record.id.as_str()), ("backend", &self.backend_label)],
@@ -260,6 +367,9 @@ impl App {
             persistent,
         );
         self.history.push(cell);
+        // The fresh session inherits this run's grants (see launch_and_adopt);
+        // name them so the new transcript starts with the true boundary.
+        self.push_extra_roots_banner();
         self.status = self.tr(TextId::StatusNewConversation).to_string();
     }
 }

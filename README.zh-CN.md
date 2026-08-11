@@ -81,7 +81,7 @@ deepcode eval            # SWE-bench 评测 rollout(见下文)
 deepcode session list|resume|delete|export
 ```
 
-常用 slash 命令:`/help` `/model` `/apikey` `/lang` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy`(`/help` 查看全部与快捷键)。
+常用 slash 命令:`/help` `/model` `/apikey` `/lang` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy` `/add-dir`(`/help` 查看全部与快捷键)。
 
 ### 跨仓库联调(`--add-dir`)
 
@@ -93,8 +93,9 @@ deepcode --add-dir ../host-app
 ```
 
 - **两层同时放行**:文件工具接受落在授权目录内的**绝对路径**(相对路径永远相对主工作区;`..` 与符号链接逃逸照旧拒绝),OS 沙箱同步把该目录加入可写根——对 shell 命令,凭据目录的写保护(`~/.ssh` 等)仍然压在所有授权之上。内建文件工具的边界就是授权根本身,所以只授权你真愿意交出去的目录树。
-- **授权随会话保存**:记录在会话里,`deepcode -c` 恢复原有边界;续会话时再加 `--add-dir` 会并入并保存。中途想加目录,`deepcode -c --add-dir DIR` 重启即可。
-- **只能来自命令行**:配置文件不提供此项——授权额外可写目录必须是人当场的显式动作,不给恶意仓库借项目配置自授权的机会。
+- **授权随会话保存**:记录在会话里,`deepcode -c` 恢复原有边界;续会话时再加 `--add-dir` 会并入并保存。中途想加目录,在 TUI 里执行 `/add-dir DIR`——校验一致、当场生效并落盘;或 `deepcode -c --add-dir DIR` 重启。
+- **授权跟随本次运行**:同一次 `deepcode` 运行内授权跟人走——`/clear` 开启的新对话继承当前授权(启动横幅与转录始终列出生效集合)。
+- **只能是人的显式动作**:配置文件不提供此项——授权要么是启动参数,要么是键盘敲出的 `/add-dir` 命令,不给恶意仓库借项目配置自授权的机会(模型无法调用 slash 命令)。
 - **检查点不覆盖附加目录**:`/restore` 只回滚主工作区,并会提示附加目录未回滚(它们通常本身就是 git 仓库,用各自的 git 回滚)。
 
 ### 无头单发(`-p`)

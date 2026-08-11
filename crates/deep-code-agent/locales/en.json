@@ -117,6 +117,14 @@
   "ExtraRootsGrantedLabel": "Additional writable roots (--add-dir): {dirs}",
   "RestoreExtraRootsNotCovered": "Note: additional writable roots are not covered by checkpoints and were not rolled back; use git in those directories if needed.",
 
+  "AddDirUsage": "Usage: /add-dir <directory>",
+  "AddDirNeedsPersistence": "This session is not persisted; restart with --add-dir instead",
+  "AddDirResolveFailed": "cannot resolve {path}: {error}",
+  "AddDirNotDirectory": "{path} is not a directory",
+  "AddDirAlreadyWorkspace": "{path} is the workspace itself; already writable",
+  "AddDirAlreadyGranted": "{path} is already granted",
+  "AddDirGranted": "Granted additional writable root: {dir}",
+
   "HintHelp": "Show help",
   "HintClear": "Start a new conversation: reset context and clear the screen (/resume recovers the old one)",
   "HintStatus": "Show runtime status",
@@ -131,6 +139,7 @@
   "HintAgents": "List sub-agents",
   "HintFind": "Search the transcript for <keyword> (repeat to search upward)",
   "HintLang": "Show/switch UI language (zh|en)",
+  "HintAddDir": "Grant an extra writable directory <path> (this run; saved with the session)",
 
   "UsageRestore": "Usage: /restore <checkpoint_id>",
   "ApiKeySaved": "API key saved to {path} (mode 600). Backend: {backend}",
