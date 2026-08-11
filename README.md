@@ -92,7 +92,7 @@ cd ~/code/my-sdk
 deepcode --add-dir ../host-app
 ```
 
-- **Both layers open together**: the file tools accept **absolute paths** that land inside a granted directory (relative paths always resolve against the primary workspace; `..` and symlink escapes stay rejected), and the OS sandbox adds the directory as a write root — the credential-dir write denials (`~/.ssh` and friends) still outrank every grant.
+- **Both layers open together**: the file tools accept **absolute paths** that land inside a granted directory (relative paths always resolve against the primary workspace; `..` and symlink escapes stay rejected), and the OS sandbox adds the directory as a write root — for shell commands, the credential-dir write denials (`~/.ssh` and friends) still outrank every grant. The built-in file tools are bounded by the granted roots themselves, so only grant trees you mean to hand over.
 - **Grants persist with the session**: they are stored in the session record, so `deepcode -c` restores the same boundary; `--add-dir` on a resume merges in and is saved. To add a directory mid-task, restart with `deepcode -c --add-dir DIR`.
 - **Command line only**: there is deliberately no config key for this — granting an extra writable tree must be an explicit human action at launch, never something a malicious repo can self-grant through project config.
 - **Checkpoints cover the primary workspace only**: `/restore` rolls back just the workspace and says so when extra roots are granted (they are usually git repos themselves — roll back there with git).
