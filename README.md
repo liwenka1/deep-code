@@ -97,6 +97,7 @@ deepcode --add-dir ../host-app
 - **Grants follow the run**: within one `deepcode` run they stay with you — a new conversation started by `/clear` inherits the current grants (the startup banner and transcript always name the effective set).
 - **Human action only**: there is deliberately no config key for this — granting an extra writable tree is either the launch flag or the `/add-dir` command typed at the keyboard, never something a malicious repo can self-grant through project config (the model cannot invoke slash commands).
 - **Checkpoints cover the primary workspace only**: `/restore` rolls back just the workspace and says so when extra roots are granted (they are usually git repos themselves — roll back there with git).
+- **Denials don't burn tokens**: a write refused by the boundary is a failure no retry can fix, so it is handled as its own class — the first denial tells the model exactly that (naming `/add-dir`), three in one turn stop the turn with the same guidance for you, and none of them trigger the Pro escalation that ordinary repeated tool failures do.
 
 ### Headless one-shot (`-p`)
 

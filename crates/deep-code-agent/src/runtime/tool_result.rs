@@ -644,6 +644,25 @@ impl AgentRuntime {
                     },
                 );
             }
+            // Boundary denials are counted apart from ordinary failures
+            // because the two classes need opposite responses. An ordinary
+            // failure is the model fumbling something a stronger model might
+            // fix — that's what the cascade below is for. A boundary denial is
+            // the granted-roots fence holding: deterministic, and only the
+            // user can change it (`/add-dir`). Escalating on it would pay Pro
+            // prices for retries the kernel refuses either way, so it feeds
+            // its own counter, read by the turn loop's circuit breaker.
+            let boundary_denial = is_boundary_denial(call, &result);
+            if boundary_denial {
+                state.turn_boundary_denials += 1;
+                // The denied path (when the call carries one — file tools do,
+                // shell doesn't) makes the breaker's guidance concrete: the
+                // user sees "/add-dir <dir>" with the real directory. Last
+                // write wins; any one of them names the tree the model wants.
+                if let Some(path) = call.arguments.get("path").and_then(|value| value.as_str()) {
+                    state.last_boundary_denial_path = Some(path.to_string());
+                }
+            }
             // Cascade signal: a genuine execution failure means the model
             // fumbled this tool call. Denials carry their own status and user
             // cancellations carry a known marker, so neither counts. Sub-agent
@@ -653,6 +672,7 @@ impl AgentRuntime {
             // Enough real fumbles in one turn latch escalation onto Pro (sticky
             // for the session); the latch is read by the next turn's router.
             if result.status == ToolResultStatus::Error
+                && !boundary_denial
                 && result.content != CANCELLED_TOOL_RESULT
                 && !crate::subagent::is_subagent_tool(&call.name)
             {
@@ -712,6 +732,37 @@ pub(super) fn tool_call_payload(call: &ToolCall) -> ToolCallPayload {
             arguments,
         },
     }
+}
+
+/// Whether a tool result is a *boundary denial*: a write the granted-roots
+/// fence refused, at either enforcement layer. Detected by the in-band
+/// markers the producers embed — the tool layer's [`OUTSIDE_ROOTS`] rejection
+/// (an Error result) and the sandbox's [`WRITE_DENIAL_NOTE`] appended to a
+/// failed shell/job run (a Success result carrying a failed exit code) —
+/// via the shared constants, so classification cannot drift from production.
+///
+/// The note check is gated to shell/job calls: those are the only producers,
+/// and the gate keeps a `read_file`/`grep_files` result whose *content*
+/// happens to quote the marker from ever counting. Sub-agent results are
+/// excluded outright — a child quoting a denial in its final answer is
+/// reporting one, not hitting one, and the child's own runtime already
+/// classified the original.
+///
+/// [`OUTSIDE_ROOTS`]: crate::workspace_policy::OUTSIDE_ROOTS
+/// [`WRITE_DENIAL_NOTE`]: crate::sandbox::WRITE_DENIAL_NOTE
+fn is_boundary_denial(call: &ToolCall, result: &ToolResult) -> bool {
+    if crate::subagent::is_subagent_tool(&call.name) {
+        return false;
+    }
+    if result.status == ToolResultStatus::Error
+        && result
+            .content
+            .contains(crate::workspace_policy::OUTSIDE_ROOTS)
+    {
+        return true;
+    }
+    matches!(call.name.as_str(), "shell" | "job")
+        && result.content.contains(crate::sandbox::WRITE_DENIAL_NOTE)
 }
 
 pub(super) fn runtime_error_from_tool_error(

@@ -2661,6 +2661,127 @@ async fn repeated_tool_errors_trigger_cascade_and_surface_in_telemetry() {
     );
 }
 
+/// One scripted `write_file` delta targeting `path`, at batch `index`.
+fn outside_write_delta(index: u32, path: &std::path::Path) -> AgentEvent {
+    AgentEvent::ToolCallDelta {
+        delta: indexed_tool_call_delta(
+            index,
+            &format!("c{index}"),
+            "write_file",
+            &serde_json::json!({"path": path.to_string_lossy(), "content": "x"}).to_string(),
+        ),
+    }
+}
+
+#[tokio::test]
+async fn boundary_denials_trip_the_breaker_with_add_dir_guidance() {
+    // Three write_file calls to an absolute path outside every granted root —
+    // three boundary denials in one batch. The breaker must end the turn with
+    // guidance naming /add-dir and the denied path, instead of feeding the
+    // errors back for a fourth attempt; the scripted second response must
+    // never be requested.
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    // Canonical spelling: the raw tempdir path goes through a symlink on
+    // macOS (`/var` → `/private/var`), which trips the symlink ban before
+    // containment — a different rejection class than the one under test.
+    let target = outside.path().canonicalize().unwrap().join("f.txt");
+    let client = ScriptedClient::new(vec![
+        vec![
+            outside_write_delta(0, &target),
+            outside_write_delta(1, &target),
+            outside_write_delta(2, &target),
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "unreachable".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let config = AgentConfig {
+        approval_auto_allow: vec!["write_file".to_string()],
+        ..AgentConfig::builtin()
+    };
+    let registry =
+        crate::workspace_tools::workspace_tool_registry(workspace.path().to_path_buf()).unwrap();
+    let runtime = AgentRuntime::with_config(client, registry, config);
+
+    let mut rx = runtime.submit_user("edit the sibling repo").await;
+    let events = drain(&mut rx).await;
+
+    let message = events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the breaker must surface a user-facing error event");
+    assert!(
+        message.contains("/add-dir"),
+        "breaker guidance must name the remedy: {message}"
+    );
+    assert!(
+        message.contains(target.to_string_lossy().as_ref()),
+        "breaker guidance should name the denied path: {message}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnFinished { .. })),
+        "the turn must abort at the breaker, not finish into another model round"
+    );
+}
+
+#[tokio::test]
+async fn boundary_denials_do_not_latch_cascade_escalation() {
+    // Two boundary denials — exactly the count that latches the cascade when
+    // the failures are ordinary — then a clean finish. Telemetry must NOT
+    // flag an escalation: a stronger model cannot move the granted-roots
+    // fence, so paying Pro prices for these retries is pure waste.
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    // Canonical for the same reason as the breaker test above.
+    let target = outside.path().canonicalize().unwrap().join("f.txt");
+    let client = ScriptedClient::new(vec![
+        vec![
+            outside_write_delta(0, &target),
+            outside_write_delta(1, &target),
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "understood, asking the user".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let config = AgentConfig {
+        model: crate::model_registry::AUTO_MODEL.to_string(),
+        approval_auto_allow: vec!["write_file".to_string()],
+        ..AgentConfig::builtin()
+    };
+    let registry =
+        crate::workspace_tools::workspace_tool_registry(workspace.path().to_path_buf()).unwrap();
+    let runtime = AgentRuntime::with_config(client, registry, config);
+
+    let mut rx = runtime.submit_user("edit the sibling repo").await;
+    let events = drain(&mut rx).await;
+    let telemetry = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            RuntimeEvent::TurnFinished { telemetry, .. } => telemetry.clone(),
+            _ => None,
+        })
+        .expect("two denials stay under the breaker; the turn finishes normally");
+    assert!(
+        !telemetry.cascade_triggered,
+        "boundary denials must not latch the Pro escalation"
+    );
+}
+
 /// A new `begin_turn` while a previous turn is still live (HTTP client
 /// disconnected mid-turn, new prompt arrived) must cancel the old loop, and
 /// the old loop's late finalization must not consume the new turn's state.

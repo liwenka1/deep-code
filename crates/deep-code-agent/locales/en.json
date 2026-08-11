@@ -117,6 +117,8 @@
   "ExtraRootsGrantedLabel": "Additional writable roots (--add-dir): {dirs}",
   "RestoreExtraRootsNotCovered": "Note: additional writable roots are not covered by checkpoints and were not rolled back; use git in those directories if needed.",
 
+  "BoundaryDenialBreaker": "Turn stopped: the model tried {limit} times to write outside the granted roots; further retries cannot succeed. Grant the directory with /add-dir <dir> and resend your last message, or narrow the task.",
+  "BoundaryDenialBreakerWithPath": "Turn stopped: the model repeatedly tried to write outside the granted roots (last target: {path}). Grant the directory with /add-dir and resend your last message, or narrow the task.",
   "AddDirUsage": "Usage: /add-dir <directory>",
   "AddDirNeedsPersistence": "This session is not persisted; restart with --add-dir instead",
   "AddDirResolveFailed": "cannot resolve {path}: {error}",

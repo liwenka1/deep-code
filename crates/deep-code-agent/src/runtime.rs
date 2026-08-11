@@ -257,6 +257,8 @@ impl AgentRuntime {
             // the rest of the session.
             state.turn_tool_errors = 0;
             state.cascade_triggered_this_turn = false;
+            state.turn_boundary_denials = 0;
+            state.last_boundary_denial_path = None;
             state.turn_cost = Default::default();
             state.turn_cache_hit_tokens = 0;
             state.turn_cache_miss_tokens = 0;

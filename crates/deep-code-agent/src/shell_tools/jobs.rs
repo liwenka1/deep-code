@@ -116,6 +116,10 @@ pub(super) struct JobState {
     pub(super) started_at: Instant,
     pub(super) status: JobStatus,
     pub(super) exit_code: Option<i32>,
+    /// Whether the command ran under the OS sandbox. A failure only qualifies
+    /// as a possible write-boundary denial when it did — an unconfined run's
+    /// EPERM is a plain permission problem, not the granted-roots fence.
+    pub(super) sandboxed: bool,
     pub(super) stdout: SharedBuffer,
     pub(super) stderr: SharedBuffer,
     /// Present for background jobs; foreground children are owned by the
@@ -374,7 +378,22 @@ pub(super) fn shell_text_output(job_id: &str, job: &JobState, max_chars: usize) 
             "\n[output truncated — full tail: job action=tail job_id={job_id}]"
         ));
     }
+    if let Some(note) = write_denial_note(job) {
+        out.push('\n');
+        out.push_str(note);
+    }
     out
+}
+
+/// The boundary-denial note for a failed sandboxed command whose stderr looks
+/// like the OS refusing a write, or `None` when the failure doesn't qualify.
+/// One decision point for both the foreground result and job snapshots, so a
+/// background job's denial reads the same as a foreground one.
+fn write_denial_note(job: &JobState) -> Option<&'static str> {
+    (job.status == JobStatus::Failed
+        && job.sandboxed
+        && crate::sandbox::write_denial_signature(job.exit_code, &job.stderr.text()))
+    .then_some(crate::sandbox::WRITE_DENIAL_NOTE)
 }
 
 /// Model-facing plain-text snapshot for job status/tail.
@@ -410,6 +429,10 @@ pub(super) fn job_text_snapshot(job_id: &str, job: &JobState, max_chars: usize) 
     }
     if stdout.is_empty() && stderr.is_empty() {
         out.push_str("(no output)\n");
+    }
+    if let Some(note) = write_denial_note(job) {
+        out.push_str(note);
+        out.push('\n');
     }
     out
 }
@@ -459,5 +482,61 @@ mod tests {
         assert_eq!(buffer.total_len(), JOB_BUFFER_BYTES + 10);
         assert_eq!(buffer.omitted_len(), 10);
         assert_eq!(buffer.text().len(), JOB_BUFFER_BYTES);
+    }
+
+    fn finished_job(status: JobStatus, sandboxed: bool, stderr_text: &str) -> JobState {
+        let stderr = SharedBuffer::default();
+        stderr.push(stderr_text.as_bytes());
+        JobState {
+            kind: JobKind::Foreground,
+            command: "printf x > /outside/f".to_string(),
+            cwd: ".".to_string(),
+            started_at: Instant::now(),
+            status,
+            exit_code: Some(if status == JobStatus::Completed { 0 } else { 1 }),
+            sandboxed,
+            stdout: SharedBuffer::default(),
+            stderr,
+            child: None,
+            job_guard: None,
+        }
+    }
+
+    /// The denial note reaches the model through BOTH renderings — the
+    /// foreground result and the job status/tail snapshot — and only when the
+    /// failure was a sandboxed run whose stderr carries a denial signature.
+    /// The exact constant matters: the runtime classifies boundary denials by
+    /// finding it in the content.
+    #[test]
+    fn denial_note_lands_in_shell_output_and_job_snapshot_only_when_it_applies() {
+        let denied = finished_job(JobStatus::Failed, true, "sh: Operation not permitted");
+        assert!(
+            shell_text_output("job_1", &denied, 4096).contains(crate::sandbox::WRITE_DENIAL_NOTE)
+        );
+        assert!(
+            job_text_snapshot("job_1", &denied, 4096).contains(crate::sandbox::WRITE_DENIAL_NOTE)
+        );
+
+        // Same failure without the sandbox: a plain permission problem — the
+        // granted-roots fence was not involved, so no note.
+        let bare = finished_job(JobStatus::Failed, false, "sh: Operation not permitted");
+        assert!(
+            !shell_text_output("job_2", &bare, 4096).contains(crate::sandbox::WRITE_DENIAL_NOTE)
+        );
+
+        // Sandboxed failure with an unrelated stderr: no note.
+        let unrelated = finished_job(JobStatus::Failed, true, "error: expected `;`");
+        assert!(
+            !shell_text_output("job_3", &unrelated, 4096)
+                .contains(crate::sandbox::WRITE_DENIAL_NOTE)
+        );
+
+        // Success never carries the note, whatever stderr says.
+        let ok = finished_job(
+            JobStatus::Completed,
+            true,
+            "warning: Operation not permitted",
+        );
+        assert!(!shell_text_output("job_4", &ok, 4096).contains(crate::sandbox::WRITE_DENIAL_NOTE));
     }
 }

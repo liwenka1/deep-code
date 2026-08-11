@@ -117,6 +117,8 @@
   "ExtraRootsGrantedLabel": "附加可写目录（--add-dir）: {dirs}",
   "RestoreExtraRootsNotCovered": "注意：附加可写目录不在检查点内，本次回滚未触及；如需回滚请在对应仓库使用 git。",
 
+  "BoundaryDenialBreaker": "本轮已中止：模型连续 {limit} 次尝试写入授权根之外，继续重试不可能成功。要授权目录请执行 /add-dir <目录> 后重发上一条消息，或调整任务范围。",
+  "BoundaryDenialBreakerWithPath": "本轮已中止：模型反复尝试写入授权根之外（最近目标: {path}）。执行 /add-dir 授权对应目录后重发上一条消息，或调整任务范围。",
   "AddDirUsage": "用法: /add-dir <目录>",
   "AddDirNeedsPersistence": "当前会话未持久化，无法中途授权；请退出后用 --add-dir 重新启动",
   "AddDirResolveFailed": "无法解析 {path}: {error}",

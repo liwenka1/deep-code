@@ -297,10 +297,15 @@ impl WorkspacePolicy {
 }
 
 /// Message for a path whose canonical form is not under any granted root. It
-/// names `--add-dir` so a model (or user) that meant to touch a sibling repo
-/// learns the sanctioned way to get it granted instead of retrying blind.
-const OUTSIDE_ROOTS: &str =
-    "path is outside every granted root (the workspace and --add-dir directories)";
+/// names both grant channels — the `/add-dir` command and the `--add-dir`
+/// flag — so a model (or user) that meant to touch a sibling repo learns the
+/// sanctioned way to get it granted instead of retrying blind. Also the
+/// in-band marker `record_tool_result` uses to classify the failure as a
+/// boundary denial (circuit breaker + cascade exemption); producer and
+/// consumer share the constant so they cannot drift.
+pub(crate) const OUTSIDE_ROOTS: &str = "path is outside every granted root (the workspace and \
+--add-dir directories); if the user intends this path, ask them to grant it with the /add-dir \
+command (or relaunch with --add-dir)";
 
 pub(crate) fn invalid(name: impl Into<String>, message: impl Into<String>) -> ToolError {
     ToolError::InvalidArguments {
@@ -424,6 +429,13 @@ mod tests {
         assert!(read.is_err(), "read outside all roots must be rejected");
         let write = policy.resolve_for_write(&raw.to_string_lossy(), "write_file");
         assert!(write.is_err(), "write outside all roots must be rejected");
+        // The rejection teaches the remedy: a model that meant to touch a
+        // sibling repo must learn the grant channels, not retry blind.
+        let message = write.unwrap_err().to_string();
+        assert!(
+            message.contains("/add-dir"),
+            "rejection must name the grant channel: {message}"
+        );
     }
 
     #[test]

@@ -14,6 +14,48 @@ pub use policy::SandboxPolicy;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Model-facing note appended to a sandboxed command's output when its failure
+/// looks like the OS sandbox denying a write. A boundary denial is the one
+/// failure class no retry can fix — the kernel refuses regardless of the
+/// command's spelling — so without this note the model reads a bare
+/// "Operation not permitted" and reaches for sudo/chmod/path variants,
+/// burning rounds on an outcome only the user can change.
+///
+/// This exact string doubles as the in-band marker the runtime uses to
+/// classify the result as a boundary denial (circuit breaker + cascade
+/// exemption); producer and consumer share the constant so they cannot drift.
+pub(crate) const WRITE_DENIAL_NOTE: &str = "[note] this command ran inside the OS sandbox: writes \
+are allowed only under the granted roots (the workspace and --add-dir directories). If this \
+failure was a write outside them, retrying — including with sudo or chmod — cannot succeed. If \
+the user intends that directory to be writable, ask them to grant it with the /add-dir command \
+(or relaunch with --add-dir).";
+
+/// Heuristic: does a failed *sandboxed* command's output look like the OS
+/// denying a write? Matches the denial texts the two backends produce —
+/// Seatbelt surfaces EPERM ("Operation not permitted"), Landlock EACCES
+/// ("Permission denied") — plus EROFS for read-only remounts. Callers must
+/// additionally know the command actually ran sandboxed and failed; this
+/// function only inspects the text. Centralized here (not string-matched at
+/// call sites) so the signature list has one home and one set of tests.
+///
+/// It is a heuristic: a plain EACCES on a root-owned file matches too. The
+/// consumers are sized for that — the appended note is phrased as a
+/// possibility, and the runtime's circuit breaker needs repeated hits before
+/// it acts.
+#[must_use]
+pub(crate) fn write_denial_signature(exit_code: Option<i32>, stderr: &str) -> bool {
+    if exit_code == Some(0) {
+        return false;
+    }
+    [
+        "Operation not permitted",
+        "Permission denied",
+        "Read-only file system",
+    ]
+    .iter()
+    .any(|signature| stderr.contains(signature))
+}
+
 /// Detected sandbox backend for the current platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SandboxBackend {
@@ -322,6 +364,32 @@ mod tests {
     fn detect_capabilities_returns_structured_report() {
         let caps = detect_capabilities();
         assert!(!caps.detail.is_empty());
+    }
+
+    #[test]
+    fn write_denial_signature_matches_backend_denial_texts() {
+        // The three texts the backends actually produce: Seatbelt EPERM,
+        // Landlock EACCES, and a read-only remount.
+        assert!(write_denial_signature(
+            Some(1),
+            "sh: /other/repo/f.txt: Operation not permitted"
+        ));
+        assert!(write_denial_signature(
+            Some(1),
+            "touch: cannot touch '/other/repo/f.txt': Permission denied"
+        ));
+        assert!(write_denial_signature(Some(1), "Read-only file system"));
+        // A killed child reports no exit code; the stderr text still decides.
+        assert!(write_denial_signature(None, "Operation not permitted"));
+
+        // A successful command is never a denial, whatever stderr says.
+        assert!(!write_denial_signature(
+            Some(0),
+            "warning: Operation not permitted (ignored)"
+        ));
+        // Ordinary failures don't match.
+        assert!(!write_denial_signature(Some(1), "error: expected `;`"));
+        assert!(!write_denial_signature(Some(2), ""));
     }
 
     #[test]

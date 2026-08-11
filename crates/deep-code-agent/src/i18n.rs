@@ -265,6 +265,8 @@ text_ids! {
     ExtraRootsGrantedLabel,
     RestoreExtraRootsNotCovered,
     // /add-dir
+    BoundaryDenialBreaker,
+    BoundaryDenialBreakerWithPath,
     AddDirUsage,
     AddDirNeedsPersistence,
     AddDirResolveFailed,

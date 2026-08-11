@@ -58,6 +58,19 @@ pub(super) struct RuntimeState {
     /// telemetry can surface the escalation at the moment it triggers (the
     /// triggering turn still finishes on Flash). Reset at the start of each turn.
     pub(super) cascade_triggered_this_turn: bool,
+    /// Boundary denials (writes refused by the granted-roots fence — tool-layer
+    /// path rejections and sandboxed shell write denials) observed in the
+    /// current turn; reset at the start of each turn. Counted apart from
+    /// `turn_tool_errors` because the two classes need opposite responses: an
+    /// ordinary failure is something a stronger model might fix (cascade), a
+    /// boundary denial is something only the user can fix (`/add-dir`) — the
+    /// turn loop trips a circuit breaker on this counter instead of retrying.
+    pub(super) turn_boundary_denials: u32,
+    /// The most recent boundary-denied path (from the tool call's `path`
+    /// argument), when one was extractable — shell denials don't carry one.
+    /// Used to make the breaker's guidance concrete ("/add-dir <this dir>").
+    /// Reset at the start of each turn.
+    pub(super) last_boundary_denial_path: Option<String>,
 }
 
 pub(super) struct Persistence {

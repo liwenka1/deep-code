@@ -16,13 +16,63 @@ use crate::tool::ToolCallAccumulator;
 /// agentic turn hits it, low enough that a runaway loop is bounded.
 const MAX_TURN_STEPS: u32 = 100;
 
+/// Boundary denials tolerated in one turn before the loop stops feeding them
+/// back to the model. A denial is deterministic — the kernel/policy refuses
+/// the same write however it is spelled — so past this point every further
+/// round is spend with no possible payoff; the turn ends with guidance naming
+/// the fix only the user can apply (`/add-dir`). Three, not one: a single
+/// denial can be incidental (a build script brushing a read-only cache, a
+/// probing command) and the first hit already carries the full explanation —
+/// the breaker exists for a model that ignores it.
+const BOUNDARY_DENIAL_BREAKER: u32 = 3;
+
 impl AgentRuntime {
     /// UI language for user-facing runtime text (error diagnostics, approval
     /// previews). Reads the shared [`crate::i18n::SharedLang`] atomic that the
     /// TUI flips on `/lang` via the runtime handle, so a switch is picked up by
-    /// the next rendered string without a relaunch or a per-call env re-parse.
+    /// the next rendered string without a relaunch or a per-call approval-mode
+    /// env re-parse.
     pub(super) fn ui_lang(&self) -> crate::i18n::Lang {
         self.ui_lang.get()
+    }
+
+    /// End the turn when its boundary denials crossed the breaker threshold.
+    /// Mirrors the step-limit exit: a user-facing Error event with the remedy
+    /// (`/add-dir`, with the denied directory when one was captured), then
+    /// `abort_turn`. Returns whether the caller should stop looping.
+    async fn boundary_breaker_tripped(
+        &self,
+        turn_id: &crate::runtime::event::TurnId,
+        tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> bool {
+        let denied_path = {
+            let state = self.state.lock().await;
+            if state.turn_boundary_denials < BOUNDARY_DENIAL_BREAKER {
+                return false;
+            }
+            state.last_boundary_denial_path.clone()
+        };
+        let message = match denied_path {
+            Some(path) => crate::tr_with(
+                self.ui_lang(),
+                crate::TextId::BoundaryDenialBreakerWithPath,
+                &[("path", &path)],
+            ),
+            None => crate::tr_with(
+                self.ui_lang(),
+                crate::TextId::BoundaryDenialBreaker,
+                &[("limit", &BOUNDARY_DENIAL_BREAKER.to_string())],
+            ),
+        };
+        emit(
+            tx,
+            RuntimeEvent::Error {
+                turn_id: Some(turn_id.clone()),
+                message,
+            },
+        );
+        self.abort_turn(turn_id).await;
+        true
     }
 
     /// Drive the model/tool loop until either the turn finishes or an
@@ -343,8 +393,17 @@ impl AgentRuntime {
                 .process_tool_batch(VecDeque::from(calls), &turn_id, &cancel, tx)
                 .await
             {
-                // Loop again: feed tool results back into the next chat turn.
-                BatchOutcome::Completed => continue,
+                // Loop again: feed tool results back into the next chat turn —
+                // unless the batch pushed the turn's boundary denials past the
+                // breaker, in which case another model round cannot help (the
+                // fence is deterministic; only the user can move it) and the
+                // turn ends with guidance instead of more spend.
+                BatchOutcome::Completed => {
+                    if self.boundary_breaker_tripped(&turn_id, tx).await {
+                        return;
+                    }
+                    continue;
+                }
                 BatchOutcome::AwaitingApproval | BatchOutcome::Cancelled => return,
             }
         }
