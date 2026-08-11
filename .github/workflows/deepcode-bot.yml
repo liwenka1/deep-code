@@ -340,13 +340,25 @@ jobs:
           # step wants it as the message, and the issue reply should not show it.
           # Done here rather than at commit time so both consumers see the same
           # cleaned answer, including the no-changes path that never commits.
+          # Only when BOTH markers exist in order: a `sed` range whose end
+          # never matches runs to EOF, so a truncated block (opener, no
+          # closer) would eat every line of the answer after the opener. A
+          # malformed block instead stays visible in the reply and the commit
+          # message falls through to tier 2.
+          # The trailing `|| true` keeps a no-match grep (exit 1) from killing
+          # the step if this shell ever runs with pipefail — same mine class
+          # the printf|head removal already disarmed.
           : > /tmp/deepcode-commit.txt
-          if grep -q '<!--dc:commit-->' /tmp/deepcode-answer.txt; then
+          DC_OPEN=$(grep -n -m1 '<!--dc:commit-->' /tmp/deepcode-answer.txt | cut -d: -f1 || true)
+          DC_CLOSE=$(grep -n -m1 '<!--/dc:commit-->' /tmp/deepcode-answer.txt | cut -d: -f1 || true)
+          if [ -n "$DC_OPEN" ] && [ -n "$DC_CLOSE" ] && [ "$DC_OPEN" -lt "$DC_CLOSE" ]; then
             sed -n '/<!--dc:commit-->/,/<!--\/dc:commit-->/p' /tmp/deepcode-answer.txt \
               | sed '1d;$d' \
               | sed -e '/./,$!d' \
               > /tmp/deepcode-commit.txt
             sed -i '/<!--dc:commit-->/,/<!--\/dc:commit-->/d' /tmp/deepcode-answer.txt
+          elif [ -n "$DC_OPEN" ]; then
+            echo "::warning::dc:commit block is malformed (no closing marker after the opener); leaving the answer untouched"
           fi
           echo "denied approvals: $(jq -r '.denied_approvals // 0' /tmp/deepcode-result.json)"
           echo "cost: ¥$(jq -r '.cost.cny // 0' /tmp/deepcode-result.json)"
