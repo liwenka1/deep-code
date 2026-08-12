@@ -17,6 +17,7 @@ mod checkpoints;
 mod compaction_flow;
 mod diagnostics;
 mod event;
+mod failure_class;
 mod persistence;
 mod persistence_actor;
 mod state;
