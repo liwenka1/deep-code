@@ -1040,7 +1040,7 @@ fn truncate_tool_output_keeps_head_and_tail() {
 
 #[test]
 fn session_allow_excludes_shell_class_tools() {
-    use crate::runtime::tool_result::session_allowable;
+    use crate::runtime::approval_flow::session_allowable;
     assert!(session_allowable("mock_echo"));
     assert!(session_allowable("write_file"));
     assert!(

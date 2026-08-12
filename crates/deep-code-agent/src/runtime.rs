@@ -12,6 +12,7 @@
 //!   execute immediately, approval-gated calls park the rest of the batch
 //!   until the decision arrives (one approval prompt at a time).
 
+mod approval_flow;
 mod checkpoints;
 mod compaction_flow;
 mod diagnostics;
