@@ -1,0 +1,209 @@
+# Release Prep —— 一键发版入口
+#
+# 触发：Actions 页面 workflow_dispatch，输入版本号（如 0.4.4，不带 v）。
+# 执行：deepcode 起草 CHANGELOG 新节 → bump 三个版本文件 → chore(release)
+#       commit → 打 v 标签 → 推送。推送用 GitHub App 身份 —— 这是硬要求，
+#       不是装饰：GITHUB_TOKEN 推的 tag 不会触发其他 workflow，release.yml
+#       会静默不跑，发版等于没发生。缺 App secrets 时这里直接失败。
+#
+# 全链路 fail-closed：起草失败/输出不成 bullets/版本不一致/标签已存在/
+# main 在运行期间被推进（push 非快进被拒，tag 一并不推），任何一处失败都
+# 停在 tag 之前，不存在"版本推了、changelog 是坏的"的中间态。
+#
+# changelog 由模型起草、无人过目——这是知情选择（见 CHANGELOG.md 顶部
+# 锚点注释）。事后修正路径：main 上补 docs commit + 编辑 GitHub Release
+# 正文；tag 树里的那份历史文件不可改，是全自动的固有代价。
+
+name: Release Prep
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.4.4, no leading v)'
+        required: true
+
+# 同一时刻只允许一次发版准备在跑，杜绝并发双开互相踩 tag。
+concurrency:
+  group: release-prep
+  cancel-in-progress: false
+
+permissions:
+  contents: read # 写操作全部走 App token，GITHUB_TOKEN 保持最小权限
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ inputs.version }}
+      HAS_APP: ${{ secrets.DEEPCODE_APP_ID != '' && secrets.DEEPCODE_APP_PRIVATE_KEY != '' }}
+      HAS_KEY: ${{ secrets.DEEPSEEK_API_KEY != '' }}
+    steps:
+      - name: Preflight (branch, secrets, version shape)
+        run: |
+          if [ "$GITHUB_REF_NAME" != "main" ]; then
+            echo "::error::releases cut from main only (got: $GITHUB_REF_NAME)"
+            exit 1
+          fi
+          if [ "$HAS_APP" != "true" ]; then
+            echo "::error::DEEPCODE_APP_ID / DEEPCODE_APP_PRIVATE_KEY secrets are required: a GITHUB_TOKEN-pushed tag does not trigger release.yml, so the release would silently not happen."
+            exit 1
+          fi
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::error::DEEPSEEK_API_KEY secret is required to draft the changelog."
+            exit 1
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must be MAJOR.MINOR.PATCH without a leading v (got: $VERSION)"
+            exit 1
+          fi
+
+      - name: Mint app token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.DEEPCODE_APP_ID }}
+          private-key: ${{ secrets.DEEPCODE_APP_PRIVATE_KEY }}
+
+      # Resolved at runtime, never hardcoded: renaming the App must not
+      # require touching any workflow. (Same pattern as deepcode-bot.yml.)
+      - name: Resolve bot identity
+        id: bot
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          USER_ID=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
+          echo "name=${APP_SLUG}[bot]" >> "$GITHUB_OUTPUT"
+          echo "email=${USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags: the draft range is <last tag>..HEAD, and the
+          # App token persists for the final push.
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Verify tag is new and there is something to release
+        id: range
+        run: |
+          if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+            echo "::error::tag v${VERSION} already exists"
+            exit 1
+          fi
+          PREV_TAG=$(git describe --tags --abbrev=0)
+          COUNT=$(git rev-list --count "${PREV_TAG}..HEAD")
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::no commits since ${PREV_TAG} — nothing to release"
+            exit 1
+          fi
+          echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          echo "drafting from ${COUNT} commits since ${PREV_TAG}"
+
+      - name: Install Rust toolchain
+        # Pinned to match rust-toolchain.toml; bump both together.
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Install deepcode
+        run: npm i -g @liwenkai/deepcode
+
+      # The drafter reads the existing CHANGELOG.md for style and turns the
+      # commit subjects (stdin) into user-facing bullets. Contract is narrow
+      # on purpose — bullets only, no header, no fences — so the validation
+      # below can be strict. Web tools off: nothing here needs egress.
+      - name: Draft changelog section
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEP_CODE_DISABLE_WEB: '1'
+          PREV_TAG: ${{ steps.range.outputs.prev_tag }}
+        run: |
+          git log --no-merges --format='%s' "${PREV_TAG}..HEAD" \
+            | grep -v '^chore(release)' \
+            | deepcode -p "Draft the CHANGELOG entries for deep-code v${VERSION}. stdin has the commit subjects since ${PREV_TAG}, written in Chinese. First read CHANGELOG.md to match its voice and format exactly. Then distill the commits into user-facing bullets in English: only changes a user would notice (features, behavior changes, fixes with visible effect, security changes); merge commits belonging to one feature into one bullet; drop internal refactors, tests, docs and CI plumbing unless they change user-facing behavior; prefix security-behavior bullets with '**Security:**'; where a security nuance is uncertain, stay close to the commit wording rather than embellishing. Output ONLY the bullet lines, each starting with '- ' (wrapped continuation lines indented two spaces). No heading, no code fences, no commentary." \
+              --timeout 240 > /tmp/bullets.md
+          echo "=== draft ==="
+          cat /tmp/bullets.md
+
+      - name: Validate and insert section
+        env:
+          PREV_TAG: ${{ steps.range.outputs.prev_tag }}
+        run: |
+          if ! [ -s /tmp/bullets.md ]; then
+            echo "::error::drafter produced no output"
+            exit 1
+          fi
+          # Count-based checks (not `grep -q -v`, whose exit status differs
+          # between GNU and BSD grep): zero foreign lines, at least one bullet.
+          FOREIGN=$(grep -cvE '^- |^  |^$' /tmp/bullets.md || true)
+          if [ "$FOREIGN" -ne 0 ]; then
+            echo "::error::draft contains ${FOREIGN} line(s) that are neither bullets nor continuations — refusing to publish it"
+            exit 1
+          fi
+          BULLETS=$(grep -cE '^- ' /tmp/bullets.md || true)
+          if [ "$BULLETS" -eq 0 ]; then
+            echo "::error::draft contains no bullets"
+            exit 1
+          fi
+          if ! grep -q '<!-- next-section -->' CHANGELOG.md; then
+            echo "::error::CHANGELOG.md is missing the '<!-- next-section -->' anchor"
+            exit 1
+          fi
+          {
+            echo
+            echo "## [${VERSION}] - $(date -u +%F)"
+            echo
+            cat /tmp/bullets.md
+          } > /tmp/section.md
+          sed -i '/<!-- next-section -->/r /tmp/section.md' CHANGELOG.md
+          echo "[${VERSION}]: https://github.com/liwenka1/deep-code/compare/${PREV_TAG}...v${VERSION}" >> CHANGELOG.md
+
+      - name: Bump versions
+        run: |
+          sed -i -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"$/version = \"${VERSION}\"/" Cargo.toml
+          grep -q "^version = \"${VERSION}\"$" Cargo.toml || {
+            echo "::error::failed to bump Cargo.toml"; exit 1; }
+          (cd packages/deepcode && npm version "${VERSION}" --no-git-tag-version >/dev/null)
+          # Sync the lockfile's workspace-member versions (path deps only).
+          cargo update --workspace
+
+      # Same checks release.yml runs at tag time; failing here is cheaper.
+      - name: Verify consistency
+        run: |
+          NPM=$(grep -m1 '"version"' packages/deepcode/package.json \
+            | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+          CARGO=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$VERSION  npm=$NPM  cargo=$CARGO"
+          [ "$VERSION" = "$NPM" ] || { echo "::error::package.json is $NPM"; exit 1; }
+          [ "$VERSION" = "$CARGO" ] || { echo "::error::Cargo.toml is $CARGO"; exit 1; }
+          grep -q "^## \[${VERSION}\]" CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no section for ${VERSION}"; exit 1; }
+
+      # main and the tag go in ONE push: if main advanced mid-run the push is
+      # rejected as non-fast-forward and the tag is not pushed either.
+      - name: Commit, tag, push
+        env:
+          BOT_NAME: ${{ steps.bot.outputs.name }}
+          BOT_EMAIL: ${{ steps.bot.outputs.email }}
+        run: |
+          git config user.name "$BOT_NAME"
+          git config user.email "$BOT_EMAIL"
+          git add CHANGELOG.md Cargo.toml Cargo.lock packages/deepcode/package.json
+          git commit -m "chore(release): ${VERSION}"
+          git tag "v${VERSION}"
+          git push origin "HEAD:main" "refs/tags/v${VERSION}"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Released v${VERSION}"
+            echo
+            echo "Published changelog section (review; fix-ups go to main as a docs commit):"
+            echo
+            cat /tmp/section.md
+          } >> "$GITHUB_STEP_SUMMARY"

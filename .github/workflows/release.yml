@@ -118,6 +118,13 @@ jobs:
             echo "::error::git tag v$TAG does not match Cargo.toml ($CARGO)"
             exit 1
           fi
+          # Changelog gate: a release without its CHANGELOG section fails
+          # here, whether the tag came from release-prep or was pushed by
+          # hand. Fail-closed: the fix is a section, not a bypass.
+          if ! grep -q "^## \[${TAG}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no section for ${TAG} — run the Release Prep workflow (or add the section) before tagging"
+            exit 1
+          fi
 
       - uses: actions/download-artifact@v4
         with:
