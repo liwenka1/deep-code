@@ -4,10 +4,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::lsp::{is_edit_tool, render_blocks, summarize_blocks};
 use crate::model::{ToolCallFunctionPayload, ToolCallPayload};
 use crate::runtime::AgentRuntime;
-use crate::runtime::diagnostics::append_diagnostics;
 use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
 use crate::runtime::state::PendingToolBatch;
 use crate::tool::{
@@ -297,18 +295,6 @@ impl AgentRuntime {
         );
     }
 
-    /// Flush any buffered LSP warnings as `Warning` events. The manager buffers
-    /// (raw-mode terminals can't take a stray `eprintln`); draining here and at
-    /// turn end means an operational complaint surfaces even when no edit tool
-    /// follows the one that produced it.
-    pub(super) async fn drain_lsp_warnings(&self, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
-        if let Some(lsp) = self.lsp.as_ref() {
-            for message in lsp.take_warnings() {
-                emit(tx, RuntimeEvent::Warning { message });
-            }
-        }
-    }
-
     pub(super) async fn record_tool_result(
         &self,
         call: &ToolCall,
@@ -316,29 +302,7 @@ impl AgentRuntime {
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
         turn_id: TurnId,
     ) {
-        if result.status == ToolResultStatus::Success
-            && is_edit_tool(&call.name)
-            && let Some(lsp) = self.lsp.as_ref()
-        {
-            let blocks = lsp.collect_for_edit(&call.name, &call.arguments).await;
-            // Operational LSP complaints surface as Warning events — the TUI
-            // runs in raw mode, so the manager buffers instead of printing.
-            for message in lsp.take_warnings() {
-                emit(tx, RuntimeEvent::Warning { message });
-            }
-            if !blocks.is_empty() {
-                let rendered = render_blocks(&blocks);
-                let summary = summarize_blocks(&blocks);
-                result.content = append_diagnostics(&result.content, &rendered);
-                emit(
-                    tx,
-                    RuntimeEvent::DiagnosticsUpdated {
-                        summary: summary.clone(),
-                        rendered,
-                    },
-                );
-            }
-        }
+        self.attach_edit_diagnostics(call, &mut result, tx).await;
 
         {
             let mut state = self.state.lock().await;
