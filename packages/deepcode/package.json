@@ -1,6 +1,6 @@
 {
   "name": "@liwenkai/deepcode",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "AI coding assistant in your terminal — powered by DeepSeek",
   "bin": {
     "deepcode": "bin/deepcode"
@@ -27,8 +27,15 @@
     "package.json",
     "bin/deepcode"
   ],
-  "os": ["darwin", "linux", "win32"],
-  "cpu": ["x64", "arm64"],
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
   "engines": {
     "node": ">=18"
   }

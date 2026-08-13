@@ -6,6 +6,11 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [0.4.4] - 2026-08-13
+
+- `deep-code eval`: long benchmark runs get a fallback and observability, and
+  run artifacts are committed to git.
+
 ## [0.4.3] - 2026-08-11
 
 - `/add-dir`: grant an extra writable directory mid-session from the TUI —
@@ -172,3 +177,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.2.1]: https://github.com/liwenka1/deep-code/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/liwenka1/deep-code/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/liwenka1/deep-code/releases/tag/v0.1.5
+[0.4.4]: https://github.com/liwenka1/deep-code/compare/v0.4.3...v0.4.4
