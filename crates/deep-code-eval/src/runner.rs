@@ -35,6 +35,9 @@ pub struct EvalConfig {
     pub agent_config: AgentConfig,
     /// Timeout per instance (wall-clock).
     pub instance_timeout: Duration,
+    /// Where to copy each instance's session transcript before its throwaway
+    /// workspace is dropped. `None` discards them.
+    pub transcripts_dir: Option<PathBuf>,
 }
 
 impl Default for EvalConfig {
@@ -47,6 +50,7 @@ impl Default for EvalConfig {
             parallelism: 1,
             agent_config: AgentConfig::default(),
             instance_timeout: Duration::from_secs(300),
+            transcripts_dir: None,
         }
     }
 }
@@ -94,6 +98,9 @@ pub struct BenchReport {
     pub bench: String,
     pub subset: String,
     pub split: String,
+    /// `model_name_or_path` for the official predictions — identifies this
+    /// submission by agent version and routing config.
+    pub model_name: String,
     pub started_at: String,
     pub duration_ms: u64,
     pub total: usize,
@@ -126,28 +133,53 @@ pub async fn run_bench(
 
     let instances: Vec<_> = bench_set.instances.clone();
     let semaphore = Arc::new(Semaphore::new(config.parallelism.max(1)));
-    let results = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(instances.len())));
 
     let mut handles = Vec::with_capacity(instances.len());
     for instance in instances {
         let permit = semaphore.clone().acquire_owned().await?;
         let config = config.clone();
-        let results = Arc::clone(&results);
+        let instance_id = instance.instance_id().to_string();
 
-        handles.push(tokio::spawn(async move {
-            let _permit = permit;
-            let result = run_single(&config, &instance).await;
-            results.lock().await.push(result);
-        }));
-    }
-    for handle in handles {
-        let _ = handle.await;
+        handles.push((
+            instance_id,
+            tokio::spawn(async move {
+                let _permit = permit;
+                run_single(&config, &instance).await
+            }),
+        ));
     }
 
-    let mut final_results = results.lock().await.clone();
-    // Completion order is nondeterministic under parallelism; sort for stable
-    // reports and diffable predictions.
+    // Results come back through the join, not a shared sink, so an instance
+    // whose task panicked or was aborted still lands in the report as an
+    // error. It would otherwise vanish: official scoring counts a missing
+    // instance as unresolved, and `total` derived from the collected results
+    // would agree with itself — a short report costing real score with
+    // nothing flagging the gap.
+    let mut final_results = Vec::with_capacity(handles.len());
+    for (instance_id, handle) in handles {
+        match handle.await {
+            Ok(result) => final_results.push(result),
+            Err(join_error) => {
+                eprintln!("  💥 {instance_id}: instance task did not finish ({join_error})");
+                final_results.push(InstanceResult {
+                    instance_id,
+                    status: InstanceStatus::Error,
+                    patch: String::new(),
+                    duration_ms: 0,
+                    cost_cny: 0.0,
+                    model: None,
+                    route_source: None,
+                    cascade_triggered: false,
+                    error: Some(format!("instance task did not finish: {join_error}")),
+                });
+            }
+        }
+    }
+    // Join order follows spawn order, but don't inherit the loader's ordering
+    // as an invariant: sort so reports and predictions stay diffable.
     final_results.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+
+    let model_name = submission_name(&config.agent_config.model);
 
     let count =
         |status: InstanceStatus| final_results.iter().filter(|r| r.status == status).count();
@@ -155,6 +187,7 @@ pub async fn run_bench(
         bench: config.bench,
         subset: config.subset,
         split: config.split,
+        model_name,
         started_at,
         duration_ms: start.elapsed().as_millis() as u64,
         total: final_results.len(),
@@ -165,6 +198,20 @@ pub async fn run_bench(
         total_cost_cny: final_results.iter().map(|r| r.cost_cny).sum(),
         results: final_results,
     })
+}
+
+/// `model_name_or_path` for the official predictions: agent version plus the
+/// routing config. A bare "deep-code" would make two runs from different
+/// versions or model pins indistinguishable on a leaderboard. An unset model
+/// reports the routing sentinel (`auto`) rather than inventing a model id —
+/// which models `auto` actually picked is recorded per instance in the report.
+fn submission_name(pinned_model: &str) -> String {
+    let pinned = pinned_model.trim();
+    format!(
+        "deep-code-{}-{}",
+        env!("CARGO_PKG_VERSION"),
+        if pinned.is_empty() { "auto" } else { pinned }
+    )
 }
 
 /// Task framing around the raw issue text: without it, many issue reports read
@@ -228,6 +275,18 @@ async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> I
     };
     // Fully stop the runtime before extracting the diff.
     launched.shutdown().await;
+
+    // Preserve the transcript while the workspace still exists. The report
+    // records THAT an instance struggled (cascade, error, timeout), never what
+    // the agent actually did — and the workspace is a temp dir that takes the
+    // session with it. Without this, diagnosing a low score means re-running
+    // the whole split. Copied before patch extraction so even an extraction
+    // failure keeps its evidence.
+    if let Some(dir) = config.transcripts_dir.as_deref()
+        && let Err(error) = save_transcript(workspace.path(), dir, &instance_id).await
+    {
+        eprintln!("warning: transcript not saved for {instance_id}: {error}");
+    }
 
     let patch = match extract_git_diff(workspace.path()).await {
         Ok(patch) => patch,
@@ -323,6 +382,32 @@ async fn drain(mut receiver: RuntimeEventReceiver) {
     while receiver.recv().await.is_some() {}
 }
 
+/// Copy one instance's session transcripts out of its throwaway workspace,
+/// into `<dest_root>/<instance_id>/`. Only `sessions/` — `checkpoints/` next
+/// to it are full workspace snapshots, gigabytes across a split.
+async fn save_transcript(
+    workspace: &Path,
+    dest_root: &Path,
+    instance_id: &str,
+) -> anyhow::Result<()> {
+    let sessions = workspace.join(".deep-code").join("sessions");
+    if !sessions.is_dir() {
+        return Ok(()); // persistence was unavailable for this instance
+    }
+    let dest = dest_root.join(instance_id);
+    tokio::fs::create_dir_all(&dest).await?;
+    let mut entries = tokio::fs::read_dir(&sessions).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "json")
+            && let Some(name) = path.file_name()
+        {
+            tokio::fs::copy(&path, dest.join(name)).await?;
+        }
+    }
+    Ok(())
+}
+
 // ── Repo checkout with a per-repo cache ─────────────────────────────────────
 
 /// Bare-clone cache: SWE-bench reuses the same repos for many instances
@@ -338,15 +423,31 @@ fn cache_dir() -> PathBuf {
         .join("swebench-repos")
 }
 
+/// How much of a failed git command's stderr to carry into the error.
+const GIT_ERROR_TAIL: usize = 400;
+
 async fn git(args: &[&str]) -> anyhow::Result<()> {
-    let status = tokio::process::Command::new("git")
+    let output = tokio::process::Command::new("git")
         .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .output()
         .await?;
-    if !status.success() {
-        anyhow::bail!("git {} failed", args.join(" "));
+    if !output.status.success() {
+        // Keep the reason. A bare "git clone failed" reads identically whether
+        // the network dropped, the disk filled, or the commit is gone — and
+        // cloning is the most failure-prone step of a multi-hour rollout, on
+        // the machine least likely to be watched while it runs.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        let reason = if trimmed.is_empty() {
+            "(no stderr)".to_string()
+        } else {
+            // Tail-bounded and char-safe (paths and messages may be non-ASCII).
+            let chars: Vec<char> = trimmed.chars().collect();
+            chars[chars.len().saturating_sub(GIT_ERROR_TAIL)..]
+                .iter()
+                .collect()
+        };
+        anyhow::bail!("git {} failed: {reason}", args.join(" "));
     }
     Ok(())
 }
@@ -428,6 +529,80 @@ fn utc_now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transcript_copy_takes_sessions_and_leaves_checkpoints() {
+        let workspace = tempfile::tempdir().unwrap();
+        let agent_dir = workspace.path().join(".deep-code");
+        tokio::fs::create_dir_all(agent_dir.join("sessions"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(agent_dir.join("checkpoints").join("ckpt_1"))
+            .await
+            .unwrap();
+        tokio::fs::write(agent_dir.join("sessions/session_1.json"), b"{}")
+            .await
+            .unwrap();
+        tokio::fs::write(agent_dir.join("sessions/notes.txt"), b"x")
+            .await
+            .unwrap();
+        tokio::fs::write(agent_dir.join("checkpoints/ckpt_1/big.bin"), b"snapshot")
+            .await
+            .unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        save_transcript(workspace.path(), out.path(), "repo__repo-1")
+            .await
+            .unwrap();
+
+        let dest = out.path().join("repo__repo-1");
+        assert!(dest.join("session_1.json").is_file());
+        assert!(
+            !dest.join("notes.txt").exists(),
+            "only session json travels"
+        );
+        // The load-bearing one: checkpoints are full workspace snapshots, so
+        // copying them would mean gigabytes across a 300-instance split.
+        assert!(!dest.join("ckpt_1").exists());
+        assert!(!dest.join("big.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn transcript_copy_tolerates_a_missing_sessions_dir() {
+        // Persistence can be unavailable for an instance (the launch reports it
+        // as a warning); that must not fail the instance or the rollout.
+        let workspace = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        assert!(
+            save_transcript(workspace.path(), out.path(), "x__x-1")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_failure_carries_the_reason() {
+        let error = git(&["-C", "/deep-code-no-such-path", "status"])
+            .await
+            .expect_err("git must fail on a nonexistent directory")
+            .to_string();
+        assert!(error.contains("git -C"), "{error}");
+        // The whole point of capturing stderr: locale-independent check that a
+        // reason arrived instead of the placeholder.
+        assert!(!error.contains("(no stderr)"), "{error}");
+    }
+
+    #[test]
+    fn submission_name_carries_version_and_routing() {
+        let auto = submission_name("auto");
+        assert!(auto.starts_with("deep-code-"), "{auto}");
+        assert!(auto.contains(env!("CARGO_PKG_VERSION")), "{auto}");
+        assert!(auto.ends_with("-auto"), "{auto}");
+        // An unset model reports the sentinel, never a bare agent name.
+        assert_eq!(submission_name("   "), auto);
+        // A pin is carried verbatim so two runs stay distinguishable.
+        assert!(submission_name("deepseek-v4-pro").ends_with("-deepseek-v4-pro"));
+    }
 
     #[test]
     fn iso_timestamp_shape() {

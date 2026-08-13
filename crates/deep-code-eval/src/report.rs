@@ -28,7 +28,7 @@ pub fn to_predictions_json(report: &BenchReport) -> anyhow::Result<String> {
         .iter()
         .map(|r| Prediction {
             instance_id: &r.instance_id,
-            model_name_or_path: "deep-code",
+            model_name_or_path: &report.model_name,
             model_patch: &r.patch,
         })
         .collect();

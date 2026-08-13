@@ -4,6 +4,11 @@
 # Agent side storage (checkpoints, local metadata)
 .deep-code/
 
+# Eval rollout output (regenerated per run; a full split carries 300 patches
+# plus their transcripts). Receipts for a PUBLISHED number get copied into
+# docs/eval/<run_id>/ deliberately, not tracked from the working directory.
+/eval-out/
+
 # --- Node (npm launcher package) ---
 node_modules/
 

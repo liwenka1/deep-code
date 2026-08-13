@@ -51,6 +51,10 @@ pub async fn run_eval(
         parallelism: parallel,
         agent_config,
         instance_timeout: std::time::Duration::from_secs(timeout_secs),
+        // Each instance runs in a temp workspace that is deleted right after;
+        // keep its transcript so a struggling instance can be diagnosed
+        // without re-running the split.
+        transcripts_dir: Some(out_dir.join("transcripts")),
     };
 
     println!("Loading SWE-bench {subset}/{split} ...");
@@ -91,6 +95,13 @@ pub async fn run_eval(
     println!("已写出:");
     println!("  {}", predictions_path.display());
     println!("  {}", report_path.display());
+    let transcripts_dir = out_dir.join("transcripts");
+    if transcripts_dir.is_dir() {
+        println!(
+            "  {}/<instance_id>/  (会话记录,供复盘)",
+            transcripts_dir.display()
+        );
+    }
     println!();
     println!("下一步(官方评分,得出真实 resolved 率):");
     println!(
