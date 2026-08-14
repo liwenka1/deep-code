@@ -6,7 +6,12 @@
 //! - **Reads stay broad** — only write-class Landlock access rights are
 //!   *handled*, so reads are unrestricted (keeps tools working).
 //! - **Writes are confined** to the policy's writable roots, plus the temp dir
-//!   and a few `/dev` nodes needed for redirections.
+//!   and a few `/dev` nodes needed for redirections. How *completely* depends on
+//!   the kernel: Landlock gained the right governing `truncate(2)` in ABI 3
+//!   (Linux 6.2) and the one governing device `ioctl(2)` in ABI 5 (Linux 6.10),
+//!   and a right the kernel cannot handle is a right it never checks. Older
+//!   kernels are reported as [`Enforcement::Partial`] rather than confined, so
+//!   no surface claims a boundary the host is not holding.
 //! - **Network is blocked** (seccomp `socket`/`connect` → EPERM) unless the
 //!   policy allows it. When the policy DOES allow network (approved/trusted
 //!   writable commands), the broad reads above become an exfiltration surface:
@@ -36,12 +41,15 @@ use landlock::{
 use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
 
 use super::policy::SandboxPolicy;
-use super::{SandboxBackend, SandboxCapabilities};
+use super::{Enforcement, EnforcementGap, SandboxBackend, SandboxCapabilities};
 
 /// ABI used to enumerate write-class rights for the enforced ruleset. Applied
 /// with `BestEffort` (see [`build_restrictions`]), so a kernel that lacks a
-/// newer right silently downgrades instead of failing — naming the newest ABI
-/// therefore costs nothing on kernel 5.13 and gains every right above it.
+/// newer right downgrades instead of failing — naming the newest ABI therefore
+/// costs nothing on kernel 5.13 and gains every right above it. The downgrade
+/// is silent to the *ruleset*, which is why [`landlock_gaps`] reports it to the
+/// user instead of letting [`capabilities`] claim a boundary the kernel is not
+/// holding.
 ///
 /// This was pinned to `V1`, which left a real hole: a right that is never
 /// *handled* is never checked, and `LANDLOCK_ACCESS_FS_TRUNCATE` only exists
@@ -61,6 +69,18 @@ const LANDLOCK_ABI: ABI = ABI::V5;
 /// unavailable means refuse-to-run, that would reject every shell command on
 /// virtually every Linux host.
 const PROBE_ABI: ABI = ABI::V1;
+
+/// The ABI levels that each add a write-class `AccessFs` right, paired with the
+/// gap left when this kernel predates them.
+///
+/// `REFER` (ABI 2) is deliberately absent: Landlock denies cross-directory link
+/// and rename by default on every kernel that lacks it, so its absence is
+/// stricter than its presence, not a hole. ABI 6 and 7 add only scopes, which
+/// this backend does not handle.
+const WRITE_RIGHT_LEVELS: &[(ABI, EnforcementGap)] = &[
+    (ABI::V3, EnforcementGap::LandlockTruncate),
+    (ABI::V5, EnforcementGap::LandlockIoctlDev),
+];
 
 /// Always-blocked syscalls (escape / privilege / host-tampering). Limited to
 /// numbers present on both x86_64 and aarch64.
@@ -91,18 +111,33 @@ fn write_access(abi: ABI) -> BitFlags<AccessFs> {
 #[must_use]
 pub fn capabilities() -> SandboxCapabilities {
     match probe() {
-        Ok(()) => SandboxCapabilities {
-            backend: SandboxBackend::LinuxLandlock,
-            available: true,
-            confines_filesystem: true,
-            confines_network: true,
-            detail: "Landlock + seccomp available".to_string(),
-        },
+        Ok(()) => {
+            let filesystem = Enforcement::from_gaps(landlock_gaps());
+            let detail = if filesystem.is_full() {
+                "Landlock + seccomp available".to_string()
+            } else {
+                let gaps: Vec<&str> = filesystem.gaps().iter().map(|gap| gap.detail()).collect();
+                format!(
+                    "Landlock + seccomp available; this kernel cannot enforce: {}",
+                    gaps.join("; ")
+                )
+            };
+            SandboxCapabilities {
+                backend: SandboxBackend::LinuxLandlock,
+                available: true,
+                filesystem,
+                // seccomp denies the `socket`/`connect` syscalls outright, so
+                // unlike Landlock there is no per-kernel right to negotiate:
+                // the filter either loads or the command is refused.
+                network: Enforcement::Full,
+                detail,
+            }
+        }
         Err(error) => SandboxCapabilities {
             backend: SandboxBackend::None,
             available: false,
-            confines_filesystem: false,
-            confines_network: false,
+            filesystem: Enforcement::None,
+            network: Enforcement::None,
             detail: format!("Landlock unavailable: {error}"),
         },
     }
@@ -111,12 +146,37 @@ pub fn capabilities() -> SandboxCapabilities {
 /// Truthful availability probe: `HardRequirement` makes ruleset creation error
 /// when the kernel lacks Landlock, instead of silently no-opping.
 fn probe() -> Result<(), String> {
+    probe_at(PROBE_ABI)
+}
+
+/// Whether this kernel enforces every write-class right `abi` defines.
+///
+/// `HardRequirement` is what makes this an answer rather than a guess: it turns
+/// an unsupported right into a ruleset-creation error instead of a silent
+/// downgrade.
+fn probe_at(abi: ABI) -> Result<(), String> {
     Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
-        .handle_access(write_access(PROBE_ABI))
+        .handle_access(write_access(abi))
         .and_then(|ruleset| ruleset.create())
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+/// Which write-class rights this kernel cannot enforce.
+///
+/// The `landlock` crate exposes no runtime ABI query on purpose — it documents
+/// that choosing an ABI from the running kernel makes sandbox behavior
+/// non-deterministic — so ask the kernel the only way it answers: try to create
+/// a `HardRequirement` ruleset at each level that adds a right, and collect the
+/// ones it refuses. At most two extra `landlock_create_ruleset` syscalls, made
+/// once per process behind [`super::detect_capabilities`]'s memo.
+fn landlock_gaps() -> Vec<EnforcementGap> {
+    WRITE_RIGHT_LEVELS
+        .iter()
+        .filter(|(abi, _)| probe_at(*abi).is_err())
+        .map(|(_, gap)| *gap)
+        .collect()
 }
 
 pub fn wrap_shell_command(

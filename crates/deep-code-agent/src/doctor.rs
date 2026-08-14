@@ -8,7 +8,7 @@ use crate::config::{AgentConfig, ConfigLoadReport, DEEPSEEK_API_KEY_ENV};
 use crate::error::api_key_setup_hint;
 use crate::model_registry::ModelRegistry;
 use crate::paths::home_dir;
-use crate::sandbox::detect_capabilities;
+use crate::sandbox::{Enforcement, detect_capabilities};
 use crate::skills::{discover_in_workspace, global_skills_dir, workspace_skills_dir};
 
 /// Path of the global user config file loaded by [`AgentConfig::load`].
@@ -73,8 +73,13 @@ pub struct SandboxReport {
     /// What the backend actually enforces. `available` alone is misleading: the
     /// Windows Job Object exists on every host yet confines neither writes nor
     /// network, so reporting only `available: true` reads as "you are protected".
-    pub confines_filesystem: bool,
-    pub confines_network: bool,
+    ///
+    /// Each dimension carries its own level because a backend can be complete in
+    /// one and not the other — Landlock on a pre-6.2 kernel confines writes
+    /// apart from `truncate(2)` while seccomp still withholds the network
+    /// outright. A supervisor reading this must be able to tell those apart.
+    pub filesystem: Enforcement,
+    pub network: Enforcement,
     pub detail: String,
 }
 
@@ -151,8 +156,8 @@ impl DoctorReport {
                 } else {
                     None
                 },
-                confines_filesystem: sandbox.confines_filesystem,
-                confines_network: sandbox.confines_network,
+                filesystem: sandbox.filesystem,
+                network: sandbox.network,
                 detail: sandbox.detail,
             },
             skills,

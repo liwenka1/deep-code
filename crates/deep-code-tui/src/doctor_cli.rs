@@ -1,8 +1,20 @@
 //! `deep-code doctor` command.
 
-use deep_code_agent::{AgentConfig, DoctorReport};
+use deep_code_agent::{AgentConfig, DoctorReport, Enforcement};
 
 use crate::cli::workspace_root;
+
+/// One confinement dimension, as the non-JSON report words it. `partial` is its
+/// own answer on purpose: collapsing it into `yes` would repeat the claim this
+/// report exists to avoid, and into `NO` would understate a boundary that does
+/// hold for everything except the named gaps.
+fn enforcement_label(enforcement: &Enforcement) -> &'static str {
+    match enforcement {
+        Enforcement::Full => "yes",
+        Enforcement::Partial { .. } => "partial",
+        Enforcement::None => "NO",
+    }
+}
 
 pub fn run_doctor(json: bool) -> anyhow::Result<()> {
     let workspace = workspace_root();
@@ -66,36 +78,40 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
     }
     // "available" is not the same as "enforcing": a backend can exist and still
     // confine nothing (Windows Job Object). Report what it actually does.
-    let sandbox_state = match (
-        report.sandbox.available,
-        report.sandbox.confines_filesystem,
-        report.sandbox.confines_network,
-    ) {
-        (false, _, _) => "unavailable",
-        (true, true, true) => "enforcing",
-        _ => "partial",
+    let fully_enforcing = report.sandbox.filesystem.is_full() && report.sandbox.network.is_full();
+    let sandbox_state = if !report.sandbox.available {
+        "unavailable"
+    } else if fully_enforcing {
+        "enforcing"
+    } else {
+        "partial"
     };
     println!("  sandbox: {} ({})", sandbox_state, report.sandbox.detail);
-    if report.sandbox.available
-        && !(report.sandbox.confines_filesystem && report.sandbox.confines_network)
-    {
+    if report.sandbox.available && !fully_enforcing {
         println!(
             "    workspace-write confinement: {}",
-            if report.sandbox.confines_filesystem {
-                "yes"
-            } else {
-                "NO"
-            }
+            enforcement_label(&report.sandbox.filesystem)
         );
         println!(
             "    network withheld by default: {}",
-            if report.sandbox.confines_network {
-                "yes"
-            } else {
-                "NO"
-            }
+            enforcement_label(&report.sandbox.network)
         );
-        println!("    → [sandbox] network has no effect on this platform.");
+        for gap in report
+            .sandbox
+            .filesystem
+            .gaps()
+            .iter()
+            .chain(report.sandbox.network.gaps())
+        {
+            println!("      ! {}", gap.detail());
+        }
+        // Only say this where it is true. A Landlock host with an older kernel
+        // is partial on writes while seccomp still withholds the network, and
+        // the old unconditional line told those users their `network` setting
+        // was inert when it was doing its job.
+        if !report.sandbox.network.is_enforced() {
+            println!("    → [sandbox] network has no effect on this platform.");
+        }
     }
     println!("  skills: {} loaded", report.skills.total_count);
     Ok(())

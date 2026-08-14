@@ -594,13 +594,20 @@ fn approval_lines(
         // neither writes nor network, so claiming "sandboxed execution" there
         // would tell the user they are protected while they approve a command
         // that is not. Say which it is.
-        meta.push(
-            if deep_code_agent::sandbox_confines_filesystem_and_network() {
-                tr(lang, TextId::ApprovalSandbox).to_string()
-            } else {
-                tr(lang, TextId::ApprovalNoSandbox).to_string()
-            },
-        );
+        //
+        // Three answers, not two: a host can also confine everything except a
+        // right its kernel is too old to express (Landlock before 6.2 does not
+        // govern `truncate(2)`). Rounding that up to "sandboxed" is the same
+        // overclaim in a quieter form, and rounding it down to "no sandbox"
+        // would push users off a boundary that is holding.
+        let text = match deep_code_agent::sandbox_enforcement() {
+            deep_code_agent::Enforcement::Full => tr(lang, TextId::ApprovalSandbox),
+            deep_code_agent::Enforcement::Partial { .. } => {
+                tr(lang, TextId::ApprovalPartialSandbox)
+            }
+            deep_code_agent::Enforcement::None => tr(lang, TextId::ApprovalNoSandbox),
+        };
+        meta.push(text.to_string());
     }
     if let Some(rule) = matched_rule {
         meta.push(tr_with(lang, TextId::ApprovalRule, &[("rule", rule)]));

@@ -23,7 +23,7 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
 
-use super::{SandboxBackend, SandboxCapabilities};
+use super::{Enforcement, SandboxBackend, SandboxCapabilities};
 
 /// Cap on concurrent processes in a job — generous, just a fork-bomb backstop.
 const ACTIVE_PROCESS_LIMIT: u32 = 512;
@@ -32,13 +32,15 @@ const ACTIVE_PROCESS_LIMIT: u32 = 512;
 pub fn capabilities() -> SandboxCapabilities {
     // Job Objects are available on every supported Windows release — but they
     // only contain the process *tree*. They do not restrict filesystem writes
-    // and do not block network access, so both `confines_*` flags are false and
+    // and do not block network access, so both dimensions report `None` and
     // callers must not describe a command here as "sandboxed" or "offline".
+    // This is absence of a mechanism, not a gap within one: `Partial` would
+    // claim a boundary exists with holes, when none exists at all.
     SandboxCapabilities {
         backend: SandboxBackend::WindowsJobObject,
         available: true,
-        confines_filesystem: false,
-        confines_network: false,
+        filesystem: Enforcement::None,
+        network: Enforcement::None,
         detail: "Windows Job Object (process-tree kill + limits only; \
                  no filesystem or network confinement)"
             .to_string(),

@@ -15,6 +15,7 @@
 
 - **四档权限**——`default` / `accept_edits` / `auto` / `yolo`,Shift+Tab 循环切换。`auto` 档把日常审批交给低价 Flash 判官,但有它永远越不过的硬底:最高风险命令与任何申请联网的调用,一律问人。
 - **OS 沙箱(macOS / Linux)**——shell/job 命令在 macOS Seatbelt 或 Linux Landlock+seccomp 内运行:写入限制在工作区与系统临时目录,**默认不带网络**。需要联网的命令(装依赖、`git push`、dev server)必须声明并转人工审批。`[sandbox] network = prompt|always|never` 可调,项目层配置只许收紧。没有可用沙箱后端时拒绝执行,而非静默裸跑。
+  **Linux 上写入约束有多完整取决于内核**:Landlock 管辖 `truncate(2)` 的权限位从 ABI 3(Linux 6.2)才有,管辖设备 `ioctl(2)` 的从 ABI 5(Linux 6.10)才有,而内核表达不了的权限就是它从不检查的权限。在更老的内核上(Ubuntu 22.04、Debian 12、RHEL 9),工作区外的其余写入照旧被拒——创建、删除、开写——所以残留风险是破坏性的(区外文件可被清空),不涉及泄露。`deepcode doctor` 会列出具体缺口,审批面板在这类主机上显示"部分约束"而非"需沙箱执行"。断网保证不受影响:seccomp 直接拒绝 `socket`/`connect` 系统调用,没有按内核协商的权限位。
   **Windows 请务必知悉**:那里只有 Job Object 进程树收容,**既不限制文件写、也不拦网络**,`network` 设置在该平台是空操作。deny 底板与审批门仍然生效,但"越界写会被替你拒掉"在 Windows 上不成立。`deepcode doctor` 会如实报告本机究竟约束了什么。
 - **deny 底板**——毁灭性命令在任何档位都硬拒、不可加白:系统根上的 `rm -rf`、磁盘格式化(`format C:`、卷 GUID/设备路径/`\\?\` 拼法、`diskpart`)、注册表删除等——包括它们的 Windows 形态。
 - **不外溢的信任**——shell 的"始终允许"按命令 identity(程序 + 子命令)匹配:信任了 `git push` 不会连带放行 `git status`。会改变*执行什么/写到哪*的 flag(`--config`、`--exec-path`、`--output`、`--target-dir` 等)会击穿信任匹配、重新弹审批。shell 元字符(`$`、反引号、重定向)一律转审批,不做乐观解析。

@@ -15,6 +15,7 @@
   "RiskMedium": "中风险",
   "RiskLow": "低风险",
   "ApprovalSandbox": "需沙箱执行",
+  "ApprovalPartialSandbox": "本机沙箱为部分约束(deepcode doctor)",
   "ApprovalNoSandbox": "本机无沙箱约束",
   "ApprovalNetwork": "申请联网",
   "ApprovalRule": "规则 {rule}",

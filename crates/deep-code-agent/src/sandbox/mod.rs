@@ -14,6 +14,8 @@ pub use policy::SandboxPolicy;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::Serialize;
+
 /// Model-facing note appended to a sandboxed command's output when its failure
 /// looks like the OS sandbox denying a write. A boundary denial is the one
 /// failure class no retry can fix — the kernel refuses regardless of the
@@ -84,10 +86,108 @@ impl SandboxBackend {
     }
 }
 
+/// A confinement dimension this host enforces, but not completely.
+///
+/// Every gap here is a right the OS itself cannot express on this machine, not
+/// a rule we chose to skip — the backend already requests the widest set the
+/// kernel offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementGap {
+    /// `truncate(2)`/`ftruncate(2)` on a path outside the writable roots is not
+    /// refused: `LANDLOCK_ACCESS_FS_TRUNCATE` arrived in ABI 3 (Linux 6.2), and
+    /// a right the kernel never *handles* is a right it never checks. Every
+    /// other write outside the roots — create, delete, open-for-write — is
+    /// still refused, so the exposure is destructive (a file can be emptied),
+    /// never disclosing.
+    LandlockTruncate,
+    /// `ioctl(2)` on an already-opened character or block device is not
+    /// refused: `LANDLOCK_ACCESS_FS_IOCTL_DEV` arrived in ABI 5 (Linux 6.10).
+    /// Opening a device for writing outside the roots is still refused, so this
+    /// needs a device the policy already grants.
+    LandlockIoctlDev,
+}
+
+impl EnforcementGap {
+    /// One line naming what stays unenforced and the kernel that would fix it.
+    #[must_use]
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::LandlockTruncate => {
+                "truncate(2) outside the writable roots is not refused (needs Landlock ABI 3, Linux 6.2+)"
+            }
+            Self::LandlockIoctlDev => {
+                "ioctl(2) on an opened device is not refused (needs Landlock ABI 5, Linux 6.10+)"
+            }
+        }
+    }
+}
+
+/// How completely a backend confines one dimension (writes, or network).
+///
+/// A bool cannot say "enforced, except for this", and that state is real:
+/// Landlock confines writes on every kernel from 5.13, yet the right that
+/// governs `truncate(2)` only exists from ABI 3 (Linux 6.2). Reporting the
+/// older kernel as a plain `true` promises a boundary that does not hold —
+/// which is the one thing a safety report must never do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "level", rename_all = "snake_case")]
+pub enum Enforcement {
+    /// Nothing in this dimension is confined.
+    None,
+    /// Confined apart from `gaps`, which this host cannot express.
+    Partial { gaps: Vec<EnforcementGap> },
+    /// Confined with no known gap.
+    Full,
+}
+
+impl Enforcement {
+    /// Build from the gaps a backend found: no gaps means [`Self::Full`].
+    #[must_use]
+    pub fn from_gaps(gaps: Vec<EnforcementGap>) -> Self {
+        if gaps.is_empty() {
+            Self::Full
+        } else {
+            Self::Partial { gaps }
+        }
+    }
+
+    /// Whether this dimension is confined at all. Use for "is the network
+    /// withheld by default"-style questions, where a partial answer still means
+    /// the guarantee exists.
+    #[must_use]
+    pub fn is_enforced(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Whether this dimension is confined with no known gap. Use before telling
+    /// a human that a command is "sandboxed".
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    #[must_use]
+    pub fn gaps(&self) -> &[EnforcementGap] {
+        match self {
+            Self::Partial { gaps } => gaps,
+            Self::None | Self::Full => &[],
+        }
+    }
+
+    fn rank(&self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Partial { .. } => 1,
+            Self::Full => 2,
+        }
+    }
+}
+
 /// Platform sandbox capability report.
 ///
 /// `available` only means "a backend exists"; it does NOT mean that backend
-/// enforces anything in particular. The two `confines_*` flags say what it
+/// enforces anything in particular. The two [`Enforcement`] fields say what it
 /// actually does, and they are not the same on every platform: the Windows Job
 /// Object contains a process *tree* (so cancel/timeout can kill it) but does not
 /// restrict filesystem writes or network access at all. Anything that tells the
@@ -97,25 +197,29 @@ impl SandboxBackend {
 pub struct SandboxCapabilities {
     pub backend: SandboxBackend,
     pub available: bool,
-    /// Backend confines writes to the policy's writable roots.
-    pub confines_filesystem: bool,
-    /// Backend blocks network access unless the policy grants it.
-    pub confines_network: bool,
+    /// How completely writes are confined to the policy's writable roots.
+    pub filesystem: Enforcement,
+    /// How completely network access is withheld unless the policy grants it.
+    pub network: Enforcement,
     pub detail: String,
 }
 
-/// Whether this host's sandbox enforces BOTH confinement dimensions — i.e.
-/// whether calling a command "sandboxed" to the user is truthful here.
+/// The weaker of this host's two confinement dimensions — the most any surface
+/// may honestly claim about a command it is about to run.
 #[must_use]
-pub fn sandbox_confines_filesystem_and_network() -> bool {
+pub fn sandbox_enforcement() -> Enforcement {
     let caps = detect_capabilities();
-    caps.confines_filesystem && caps.confines_network
+    if caps.filesystem.rank() <= caps.network.rank() {
+        caps.filesystem
+    } else {
+        caps.network
+    }
 }
 
 /// Whether this host's sandbox actually withholds the network by default.
 #[must_use]
 pub fn sandbox_confines_network() -> bool {
-    detect_capabilities().confines_network
+    detect_capabilities().network.is_enforced()
 }
 
 /// Whether an OS sandbox backend is usable on this machine. For callers that
@@ -142,19 +246,22 @@ fn probe_capabilities() -> SandboxCapabilities {
     #[cfg(target_os = "macos")]
     {
         if macos_seatbelt::is_available() {
+            // The profile names its writable roots and its network rule
+            // outright, so there is no kernel-version negotiation to degrade:
+            // sandbox-exec either applies the profile or fails to launch.
             return SandboxCapabilities {
                 backend: SandboxBackend::MacosSeatbelt,
                 available: true,
-                confines_filesystem: true,
-                confines_network: true,
+                filesystem: Enforcement::Full,
+                network: Enforcement::Full,
                 detail: "sandbox-exec (Seatbelt) is available".to_string(),
             };
         }
         SandboxCapabilities {
             backend: SandboxBackend::None,
             available: false,
-            confines_filesystem: false,
-            confines_network: false,
+            filesystem: Enforcement::None,
+            network: Enforcement::None,
             detail: "sandbox-exec is missing or not permitted".to_string(),
         }
     }
@@ -174,8 +281,8 @@ fn probe_capabilities() -> SandboxCapabilities {
         SandboxCapabilities {
             backend: SandboxBackend::None,
             available: false,
-            confines_filesystem: false,
-            confines_network: false,
+            filesystem: Enforcement::None,
+            network: Enforcement::None,
             detail: "unsupported platform".to_string(),
         }
     }
@@ -364,6 +471,80 @@ mod tests {
     fn detect_capabilities_returns_structured_report() {
         let caps = detect_capabilities();
         assert!(!caps.detail.is_empty());
+    }
+
+    #[test]
+    fn no_gaps_is_full_and_any_gap_is_partial() {
+        assert_eq!(Enforcement::from_gaps(Vec::new()), Enforcement::Full);
+        assert_eq!(
+            Enforcement::from_gaps(vec![EnforcementGap::LandlockTruncate]),
+            Enforcement::Partial {
+                gaps: vec![EnforcementGap::LandlockTruncate],
+            }
+        );
+    }
+
+    #[test]
+    fn partial_is_enforced_but_not_full() {
+        // The distinction the whole report exists for: a partial dimension still
+        // holds a boundary (so "is the network withheld" stays true), yet must
+        // never be described to a human as "sandboxed".
+        let partial = Enforcement::from_gaps(vec![EnforcementGap::LandlockTruncate]);
+        assert!(partial.is_enforced());
+        assert!(!partial.is_full());
+        assert!(!Enforcement::None.is_enforced());
+        assert!(Enforcement::Full.is_full());
+    }
+
+    #[test]
+    fn gaps_are_listed_only_for_partial() {
+        assert!(Enforcement::None.gaps().is_empty());
+        assert!(Enforcement::Full.gaps().is_empty());
+        assert_eq!(
+            Enforcement::from_gaps(vec![
+                EnforcementGap::LandlockTruncate,
+                EnforcementGap::LandlockIoctlDev,
+            ])
+            .gaps(),
+            [
+                EnforcementGap::LandlockTruncate,
+                EnforcementGap::LandlockIoctlDev
+            ]
+        );
+    }
+
+    #[test]
+    fn enforcement_ranks_none_below_partial_below_full() {
+        let partial = Enforcement::from_gaps(vec![EnforcementGap::LandlockIoctlDev]);
+        assert!(Enforcement::None.rank() < partial.rank());
+        assert!(partial.rank() < Enforcement::Full.rank());
+    }
+
+    #[test]
+    fn every_gap_explains_itself() {
+        // The gap list is what `doctor` prints and what the READMEs promise is
+        // nameable, so an empty or duplicated line would be a silent regression.
+        for gap in [
+            EnforcementGap::LandlockTruncate,
+            EnforcementGap::LandlockIoctlDev,
+        ] {
+            assert!(!gap.detail().is_empty());
+        }
+        assert_ne!(
+            EnforcementGap::LandlockTruncate.detail(),
+            EnforcementGap::LandlockIoctlDev.detail()
+        );
+    }
+
+    #[test]
+    fn sandbox_enforcement_reports_the_weaker_dimension() {
+        // Linux before 6.2 is the real shape: writes partial, network full. The
+        // approval panel must show the write answer, not the network one.
+        let caps = detect_capabilities();
+        let weaker = sandbox_enforcement();
+        assert!(weaker.rank() <= caps.filesystem.rank());
+        assert!(weaker.rank() <= caps.network.rank());
+        assert!(weaker == caps.filesystem || weaker == caps.network);
     }
 
     #[test]

@@ -68,7 +68,7 @@ pub use runtime::{
     TurnTelemetry,
 };
 pub use runtime_launch::{LaunchedRuntime, launch_runtime, web_enabled};
-pub use sandbox::{sandbox_available, sandbox_confines_filesystem_and_network};
+pub use sandbox::{Enforcement, EnforcementGap, sandbox_available, sandbox_enforcement};
 pub use session::Session;
 pub use session_entry::{EntryKind, ExchangeResult, SessionEntry, ToolExchange};
 pub use session_store::{
