@@ -601,13 +601,19 @@ fn approval_lines(
         // overclaim in a quieter form, and rounding it down to "no sandbox"
         // would push users off a boundary that is holding.
         let text = match deep_code_agent::sandbox_enforcement() {
-            deep_code_agent::Enforcement::Full => tr(lang, TextId::ApprovalSandbox),
-            deep_code_agent::Enforcement::Partial { .. } => {
-                tr(lang, TextId::ApprovalPartialSandbox)
-            }
-            deep_code_agent::Enforcement::None => tr(lang, TextId::ApprovalNoSandbox),
+            deep_code_agent::Enforcement::Full => tr(lang, TextId::ApprovalSandbox).to_string(),
+            // Names the binary the user actually invoked. This string used to
+            // hardcode `deepcode`, which is only the npm spelling — a source
+            // build installs `deep-code`, so the one actionable step in a
+            // security-path message was a command those users do not have.
+            deep_code_agent::Enforcement::Partial { .. } => tr_with(
+                lang,
+                TextId::ApprovalPartialSandbox,
+                &[("program", &crate::cli::program_name())],
+            ),
+            deep_code_agent::Enforcement::None => tr(lang, TextId::ApprovalNoSandbox).to_string(),
         };
-        meta.push(text.to_string());
+        meta.push(text);
     }
     if let Some(rule) = matched_rule {
         meta.push(tr_with(lang, TextId::ApprovalRule, &[("rule", rule)]));

@@ -78,16 +78,26 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
     }
     // "available" is not the same as "enforcing": a backend can exist and still
     // confine nothing (Windows Job Object). Report what it actually does.
-    let fully_enforcing = report.sandbox.filesystem.is_full() && report.sandbox.network.is_full();
+    // One definition of "what does this host enforce overall", shared with the
+    // approval panel and the tool descriptions. Deriving it here by hand meant
+    // two, and they had drifted: a Windows host (a backend that exists and
+    // confines nothing) printed `partial`, claiming a boundary with holes where
+    // there is no boundary at all — while the two lines below it said `NO`.
+    let overall = Enforcement::weakest(
+        report.sandbox.filesystem.clone(),
+        report.sandbox.network.clone(),
+    );
     let sandbox_state = if !report.sandbox.available {
         "unavailable"
-    } else if fully_enforcing {
-        "enforcing"
     } else {
-        "partial"
+        match overall {
+            Enforcement::Full => "enforcing",
+            Enforcement::Partial { .. } => "partial",
+            Enforcement::None => "not enforcing",
+        }
     };
     println!("  sandbox: {} ({})", sandbox_state, report.sandbox.detail);
-    if report.sandbox.available && !fully_enforcing {
+    if report.sandbox.available && !overall.is_full() {
         println!(
             "    workspace-write confinement: {}",
             enforcement_label(&report.sandbox.filesystem)

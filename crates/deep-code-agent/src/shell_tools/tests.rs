@@ -384,10 +384,21 @@ async fn scrub_secret_env_hides_key_from_child() {
 /// kernel cannot express must say so here as well as in the approval panel.
 /// The model is the surface that actually issues the write, so rounding a gap
 /// up to "confined" here is the costliest place to do it.
+///
+/// A partial host is checked gap-by-gap rather than against one fixed phrase.
+/// Two reasons: the caveats differ (the `truncate` gap denies part of the write
+/// boundary, the device-`ioctl` gap does not), and the `Full` arm is unreachable
+/// on any Linux below 6.10 — so a single shared phrase let the promises that
+/// only `Full` asserted go uncovered on exactly the hosts that ship.
 #[test]
 fn tool_descriptions_match_actual_sandbox_capability() {
-    use crate::sandbox::Enforcement;
+    use crate::sandbox::EnforcementGap;
     use crate::tool::Tool;
+
+    const ALL_GAPS: &[EnforcementGap] = &[
+        EnforcementGap::LandlockTruncate,
+        EnforcementGap::LandlockIoctlDev,
+    ];
 
     let enforcement = crate::sandbox::sandbox_enforcement();
     let shell = ShellTool::new(
@@ -401,36 +412,40 @@ fn tool_descriptions_match_actual_sandbox_capability() {
         SandboxManager::new(),
     );
 
-    // The phrase each state must (and must not) carry. `too old to enforce
-    // every part` is the caveat that separates partial from full: without it,
-    // the two texts make the same promise.
     for description in [shell.description(), job.description()] {
-        match enforcement {
-            Enforcement::Full => {
-                assert!(
-                    description.contains("sandboxed without network"),
-                    "confined host must advertise confinement: {description}"
-                );
-                assert!(!description.contains("NO OS sandbox"));
-                assert!(
-                    !description.contains("too old to enforce every part"),
-                    "a fully enforcing host must not warn about gaps: {description}"
-                );
-            }
-            Enforcement::Partial { .. } => {
-                assert!(
-                    description.contains("too old to enforce every part"),
-                    "partial host must name the caveat: {description}"
-                );
-                assert!(!description.contains("NO OS sandbox"));
-            }
-            Enforcement::None => {
-                assert!(
-                    description.contains("NO OS sandbox confinement"),
-                    "unconfined host must not claim confinement: {description}"
-                );
-                assert!(!description.contains("run sandboxed without network"));
-            }
+        // Asserted for Full AND Partial: a gap qualifies the boundary, it does
+        // not withdraw it, so the confinement promise has to survive either way.
+        // Only `None` may drop it.
+        if enforcement.is_enforced() {
+            assert!(
+                description.contains("sandboxed without network"),
+                "a confining host must advertise confinement: {description}"
+            );
+            assert!(
+                description.contains("granted roots"),
+                "a confining host must name the write boundary: {description}"
+            );
+            assert!(!description.contains("NO OS sandbox"));
+        }
+        // Exactly this host's gaps are named — no more, no less. "No more" is
+        // the half that matters: it is what stops the device-ioctl gap from
+        // carrying the truncate gap's much stronger warning.
+        for gap in ALL_GAPS {
+            let present = enforcement.gaps().contains(gap);
+            assert_eq!(
+                description.contains(gap.model_caveat()),
+                present,
+                "{gap:?} caveat present={} but host gaps={:?}: {description}",
+                !present,
+                enforcement.gaps()
+            );
+        }
+        if !enforcement.is_enforced() {
+            assert!(
+                description.contains("NO OS sandbox confinement"),
+                "unconfined host must not claim confinement: {description}"
+            );
+            assert!(!description.contains("sandboxed without network"));
         }
     }
 }

@@ -9,9 +9,12 @@
 //!   and a few `/dev` nodes needed for redirections. How *completely* depends on
 //!   the kernel: Landlock gained the right governing `truncate(2)` in ABI 3
 //!   (Linux 6.2) and the one governing device `ioctl(2)` in ABI 5 (Linux 6.10),
-//!   and a right the kernel cannot handle is a right it never checks. Older
-//!   kernels are reported as [`Enforcement::Partial`] rather than confined, so
-//!   no surface claims a boundary the host is not holding.
+//!   and a right the kernel cannot handle is a right it never checks. Kernels
+//!   missing either are reported as [`Enforcement::Partial`] rather than
+//!   confined, so no surface claims a boundary the host is not holding — and
+//!   because the two gaps are not the same gap, each carries its own wording
+//!   rather than one blanket "this boundary is not a safety net" (see
+//!   [`EnforcementGap`]).
 //! - **Network is blocked** (seccomp `socket`/`connect` → EPERM) unless the
 //!   policy allows it. When the policy DOES allow network (approved/trusted
 //!   writable commands), the broad reads above become an exfiltration surface:
@@ -41,7 +44,7 @@ use std::process::Command;
 
 use landlock::{
     ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetCreated,
-    RulesetCreatedAttr, path_beneath_rules,
+    RulesetCreatedAttr, RulesetError, path_beneath_rules,
 };
 use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
 
@@ -169,61 +172,98 @@ fn write_access(abi: ABI) -> BitFlags<AccessFs> {
 
 #[must_use]
 pub fn capabilities() -> SandboxCapabilities {
-    match probe() {
-        Ok(()) => {
-            let filesystem = Enforcement::from_gaps(landlock_gaps());
-            // A count, not the sentences: every gap is enumerable through
-            // `gaps()`, and `doctor` prints one line each from there. Spelling
-            // them out here too put the same text on screen twice.
-            let detail = if filesystem.is_full() {
-                "Landlock + seccomp available".to_string()
-            } else {
-                format!(
-                    "Landlock + seccomp available; {} write-class right(s) this kernel cannot enforce",
-                    filesystem.gaps().len()
-                )
-            };
-            SandboxCapabilities {
-                backend: SandboxBackend::LinuxLandlock,
-                available: true,
-                filesystem,
-                // Full, and unlike Landlock not negotiated per kernel: the
-                // filter either loads or the command is refused. That is a
-                // claim about the filter *loading*, so it only holds while
-                // nothing can submit network work behind seccomp's back —
-                // which is why io_uring is in `DANGEROUS_SYSCALLS`.
-                network: Enforcement::Full,
-                detail,
-            }
-        }
-        Err(error) => SandboxCapabilities {
+    // Any failure lands on "no backend", which makes the manager refuse to run
+    // commands at all. That is the correct direction: every alternative
+    // publishes a confinement claim this host has not been shown to hold.
+    match enforced_capabilities() {
+        Ok(capabilities) => capabilities,
+        Err(detail) => SandboxCapabilities {
             backend: SandboxBackend::None,
             available: false,
             filesystem: Enforcement::None,
             network: Enforcement::None,
-            detail: format!("Landlock unavailable: {error}"),
+            detail,
         },
     }
+}
+
+fn enforced_capabilities() -> Result<SandboxCapabilities, String> {
+    probe().map_err(|error| format!("Landlock unavailable: {error}"))?;
+    // The network claim below is a claim about a seccomp filter, so it may only
+    // be made where one can be built. `target_arch` is the only thing that knows,
+    // and `capabilities()` never used to ask: on a Linux this crate compiles for
+    // but seccompiler has no `TargetArch` for (riscv64, s390x, ppc64le, armv7),
+    // the report said `Full`/`Full` and `doctor` said "enforcing" while
+    // `build_seccomp` failed for every command — an overclaim paired with a tool
+    // that could not run anything, and no diagnostic naming seccomp.
+    target_arch().map_err(|error| format!("seccomp unavailable: {error}"))?;
+
+    let filesystem = Enforcement::from_gaps(landlock_gaps()?);
+    // A count, not the sentences: every gap is enumerable through
+    // `gaps()`, and `doctor` prints one line each from there. Spelling
+    // them out here too put the same text on screen twice.
+    let detail = if filesystem.is_full() {
+        "Landlock + seccomp available".to_string()
+    } else {
+        format!(
+            "Landlock + seccomp available; {} write-class right(s) this kernel cannot enforce",
+            filesystem.gaps().len()
+        )
+    };
+    Ok(SandboxCapabilities {
+        backend: SandboxBackend::LinuxLandlock,
+        available: true,
+        filesystem,
+        // Full, and unlike Landlock not negotiated per kernel: the filter either
+        // loads or the command is refused. That is a claim about the filter
+        // *loading*, so it only holds while nothing can submit network work
+        // behind seccomp's back — which is why io_uring is denied on every
+        // policy, and why the escape syscalls that hand over a ready-made socket
+        // (`pidfd_getfd`) or another process's memory (`process_vm_readv`) are in
+        // `DANGEROUS_SYSCALLS`.
+        network: Enforcement::Full,
+        detail,
+    })
 }
 
 /// Truthful availability probe: `HardRequirement` makes ruleset creation error
 /// when the kernel lacks Landlock, instead of silently no-opping.
 fn probe() -> Result<(), String> {
-    probe_at(PROBE_ABI)
-}
-
-/// Whether this kernel enforces every write-class right `abi` defines.
-///
-/// `HardRequirement` is what makes this an answer rather than a guess: it turns
-/// an unsupported right into a ruleset-creation error instead of a silent
-/// downgrade.
-fn probe_at(abi: ABI) -> Result<(), String> {
     Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
-        .handle_access(write_access(abi))
+        .handle_access(write_access(PROBE_ABI))
         .and_then(|ruleset| ruleset.create())
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+/// Whether this kernel can *handle* every write-class right `abi` defines.
+///
+/// `HardRequirement` is what makes this an answer rather than a guess: it turns
+/// an unsupported right into an error instead of a silent downgrade.
+///
+/// Deliberately stops at `handle_access` and never calls `create()`. Under
+/// `HardRequirement` the crate resolves compatibility against the running
+/// kernel's ABI, which it learns once from
+/// `landlock_create_ruleset(NULL, 0, …_VERSION)` — a call that returns a version
+/// number, not a descriptor — so the verdict is already final at this point.
+/// Creating a ruleset would only add a file descriptor per probe and, far worse,
+/// fold resource failures into the verdict: an EMFILE under fd pressure used to
+/// be indistinguishable from "this kernel lacks the right", and
+/// [`super::detect_capabilities`] memoizes for the process lifetime, so one
+/// transient error permanently taught every surface to report a fabricated ABI
+/// gap on a host that was in fact enforcing it.
+fn handles_write_rights(abi: ABI) -> Result<bool, String> {
+    match Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(write_access(abi))
+    {
+        Ok(_) => Ok(true),
+        // The one error a `HardRequirement` compatibility refusal produces, and
+        // the only one that means "this kernel is missing the right".
+        Err(RulesetError::HandleAccesses(_)) => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Which write-class rights this kernel cannot enforce.
@@ -235,18 +275,17 @@ fn probe_at(abi: ABI) -> Result<(), String> {
 /// ones it refuses. At most two extra `landlock_create_ruleset` syscalls, made
 /// once per process behind [`super::detect_capabilities`]'s memo.
 ///
-/// Any error counts as a gap, including a non-compat one (ENOMEM, EMFILE) that
-/// has nothing to do with the ABI. That is deliberate and barely reachable:
-/// [`probe`] has already created a ruleset at ABI 1 by the time this runs, and
-/// mistaking a fluke for a gap can only make the report understate what the
-/// host enforces — never overstate it, which is the only direction that would
-/// matter.
-fn landlock_gaps() -> Vec<EnforcementGap> {
-    WRITE_RIGHT_LEVELS
-        .iter()
-        .filter(|(abi, _)| probe_at(*abi).is_err())
-        .map(|(_, gap)| *gap)
-        .collect()
+/// Only a compatibility refusal counts as a gap; anything else is propagated so
+/// the caller can refuse rather than publish a diagnosis it did not earn (see
+/// [`handles_write_rights`]).
+fn landlock_gaps() -> Result<Vec<EnforcementGap>, String> {
+    let mut gaps = Vec::new();
+    for (abi, gap) in WRITE_RIGHT_LEVELS {
+        if !handles_write_rights(*abi)? {
+            gaps.push(*gap);
+        }
+    }
+    Ok(gaps)
 }
 
 pub fn wrap_shell_command(
@@ -497,6 +536,51 @@ mod tests {
                     "io_uring syscall {syscall} must not be in the EPERM filter under {policy:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn every_write_right_the_ruleset_requests_has_a_gap_to_report() {
+        // `build_landlock` asks for `write_access(LANDLOCK_ABI)` under
+        // `BestEffort`, which drops unsupported rights SILENTLY — `landlock_gaps`
+        // is the only thing that turns that silence into a report, and it probes
+        // exactly the levels named in `WRITE_RIGHT_LEVELS`. Nothing else ties the
+        // two together, so raising `LANDLOCK_ABI` for a newly added right without
+        // adding its gap here would make a kernel that cannot enforce it report
+        // `Full` — the exact ABI-V1 truncate hole this module's docs describe as
+        // having already shipped once, reintroduced one level up.
+        let highest = WRITE_RIGHT_LEVELS
+            .last()
+            .expect("at least one write-right level")
+            .0;
+        assert_eq!(
+            write_access(highest),
+            write_access(LANDLOCK_ABI),
+            "WRITE_RIGHT_LEVELS tops out below the ABI the ruleset actually requests: \
+             a right gained by raising LANDLOCK_ABI would never be probed for"
+        );
+
+        // Each listed level must strictly widen the one below it. A level that
+        // adds nothing is probing for a gap that cannot exist, which would
+        // attach a gap label to a kernel that has the right — the understating
+        // direction, but still a wrong answer on the majority of hosts.
+        //
+        // Note this walks the *listed* levels, not every ABI: ABI 2 is absent on
+        // purpose (`REFER`), and it needs no entry of its own because a kernel
+        // without it also fails the ABI 3 probe — `write_access(V3)` is a
+        // superset, so the gap is reported either way.
+        let mut previous = write_access(PROBE_ABI);
+        for (abi, gap) in WRITE_RIGHT_LEVELS {
+            let rights = write_access(*abi);
+            assert!(
+                rights.contains(previous),
+                "{abi:?} must widen the level below it, not replace it"
+            );
+            assert_ne!(
+                rights, previous,
+                "{abi:?} ({gap:?}) adds no write-class right over the level below"
+            );
+            previous = rights;
         }
     }
 

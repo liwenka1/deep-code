@@ -15,7 +15,7 @@
   "RiskMedium": "Medium risk",
   "RiskLow": "Low risk",
   "ApprovalSandbox": "Sandboxed execution",
-  "ApprovalPartialSandbox": "Partial sandbox on this host (deepcode doctor)",
+  "ApprovalPartialSandbox": "Partial sandbox on this host ({program} doctor)",
   "ApprovalNoSandbox": "NO sandbox confinement on this host",
   "ApprovalNetwork": "Requests network access",
   "ApprovalRule": "Rule {rule}",

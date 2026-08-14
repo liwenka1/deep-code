@@ -80,6 +80,23 @@ pub struct SandboxReport {
     /// outright. A supervisor reading this must be able to tell those apart.
     pub filesystem: Enforcement,
     pub network: Enforcement,
+    /// The pre-0.4.5 shape of the two fields above, retained so a supervisor
+    /// written against the old schema keeps working.
+    ///
+    /// Dropping them was a silent break in the worst direction. `jq -e
+    /// '.sandbox.confines_network'` started returning `null` — falsy — so a
+    /// fully enforcing host read as unconfined; and a Python or JS supervisor
+    /// doing `if report["sandbox"]["filesystem"]:` now tests a *dict*, which is
+    /// truthy even when it says `{"level": "none"}` — so a Windows host, which
+    /// confines nothing, read as confined. That is the exact overclaim the
+    /// `Enforcement` split was introduced to eliminate, reappearing on the
+    /// machine-readable surface.
+    ///
+    /// Derived from `is_full`, not `is_enforced`: a boolean cannot express
+    /// "confined except for this", and of the two available lies the one that
+    /// understates protection is the one that fails safe.
+    pub confines_filesystem: bool,
+    pub confines_network: bool,
     pub detail: String,
 }
 
@@ -156,6 +173,8 @@ impl DoctorReport {
                 } else {
                     None
                 },
+                confines_filesystem: sandbox.filesystem.is_full(),
+                confines_network: sandbox.network.is_full(),
                 filesystem: sandbox.filesystem,
                 network: sandbox.network,
                 detail: sandbox.detail,
@@ -274,6 +293,46 @@ mod tests {
         assert!(json.contains("\"version\""));
         assert!(json.contains("\"sandbox\""));
         assert!(json.contains("\"skills\""));
+    }
+
+    /// `doctor --json` is the documented contract for local supervisors, and a
+    /// rename here is invisible at build time — it only surfaces in someone
+    /// else's script. So pin the keys and, for the compatibility booleans, the
+    /// relationship they must keep to the structured fields they mirror.
+    #[test]
+    fn sandbox_json_keeps_its_documented_keys() {
+        let workspace = TempDir::new().unwrap();
+        let config = AgentConfig::default();
+        let report = DoctorReport::collect(workspace.path(), &config);
+        let value: serde_json::Value =
+            serde_json::from_str(&report.to_json_pretty().unwrap()).unwrap();
+        let sandbox = &value["sandbox"];
+
+        let object = sandbox.as_object().expect("sandbox is a JSON object");
+        for key in [
+            "available",
+            // `kind` is null when no backend exists, so assert the key is
+            // present rather than populated.
+            "kind",
+            "filesystem",
+            "network",
+            "confines_filesystem",
+            "confines_network",
+            "detail",
+        ] {
+            assert!(object.contains_key(key), "sandbox.{key} missing from JSON");
+        }
+        // The structured field is an object carrying a level; the boolean is the
+        // old shape. A supervisor keying on either must reach the same verdict.
+        assert!(sandbox["filesystem"]["level"].is_string());
+        assert_eq!(
+            sandbox["confines_filesystem"],
+            serde_json::Value::Bool(report.sandbox.filesystem.is_full())
+        );
+        assert_eq!(
+            sandbox["confines_network"],
+            serde_json::Value::Bool(report.sandbox.network.is_full())
+        );
     }
 
     #[test]

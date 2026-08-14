@@ -42,17 +42,6 @@ fn scrub_secret_env(cmd: &mut tokio::process::Command) {
 /// Shell tool description for hosts whose sandbox really confines the command.
 const SHELL_DESC_CONFINED: &str = "Run a foreground shell command in the workspace; output streams live and the process is killed at the timeout. Use it for git (status/diff/log), builds, and tests; start long-running processes (dev servers) with the job tool instead. Commands run sandboxed without network; set network=true when one needs it (installs, git remote ops) — a failed download/connection usually means the run lacked the network grant. Writes are confined to the granted roots (the workspace and --add-dir directories): a write outside them fails with e.g. 'Operation not permitted', and no retry, sudo or chmod can succeed — ask the user to grant the directory with /add-dir instead.";
 
-/// Same, for hosts that confine with a gap the OS itself cannot express —
-/// Landlock on a pre-6.2 kernel does not govern `truncate(2)`, so a file
-/// outside the granted roots can still be emptied.
-///
-/// Rounding this up to [`SHELL_DESC_CONFINED`] would teach the model that the
-/// boundary catches every out-of-workspace write, which is exactly the false
-/// model the capability report exists to prevent; rounding it down to
-/// [`SHELL_DESC_UNCONFINED`] would push it off a boundary that does hold for
-/// creates, deletes and opens.
-const SHELL_DESC_PARTIAL: &str = "Run a foreground shell command in the workspace; output streams live and the process is killed at the timeout. Use it for git (status/diff/log), builds, and tests; start long-running processes (dev servers) with the job tool instead. Commands run sandboxed without network; set network=true when one needs it (installs, git remote ops) — a failed download/connection usually means the run lacked the network grant. Writes are confined to the granted roots (the workspace and --add-dir directories): a write outside them fails with e.g. 'Operation not permitted', and no retry, sudo or chmod can succeed — ask the user to grant the directory with /add-dir instead. This host's kernel is too old to enforce every part of that boundary, so do not treat it as a safety net: keep writes inside the granted roots yourself, and never aim a destructive command at a path outside them expecting the OS to refuse it.";
-
 /// Same, for hosts with no real confinement (see `SandboxCapabilities`). The
 /// model is told the truth so it neither trusts a boundary that is absent nor
 /// assumes it is offline when it is not.
@@ -61,29 +50,43 @@ const SHELL_DESC_UNCONFINED: &str = "Run a foreground shell command in the works
 /// Job tool description, confined host.
 const JOB_DESC_CONFINED: &str = "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it. Jobs run sandboxed without network; a dev server that binds a port needs network=true on start. Writes are confined to the granted roots (workspace and --add-dir directories); a denied write cannot be fixed by retrying — ask the user to grant the directory with /add-dir.";
 
-/// Job tool description, confined host with a gap its kernel cannot express
-/// (see [`SHELL_DESC_PARTIAL`]).
-const JOB_DESC_PARTIAL: &str = "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it. Jobs run sandboxed without network; a dev server that binds a port needs network=true on start. Writes are confined to the granted roots (workspace and --add-dir directories); a denied write cannot be fixed by retrying — ask the user to grant the directory with /add-dir. This host's kernel is too old to enforce every part of that boundary, so keep writes inside the granted roots yourself rather than relying on the OS to refuse them.";
-
 /// Job tool description, unconfined host.
 const JOB_DESC_UNCONFINED: &str = "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it. This host has NO OS sandbox confinement: jobs are not restricted to the workspace and do have network access. Still set network=true when starting something that binds a port or needs the network, so the user is asked first.";
 
-/// Picks the description matching what this host actually enforces.
+/// Builds the description matching what this host actually enforces.
 ///
-/// The `partial` wording assumes the network is still withheld, which holds on
-/// every platform that can reach it: the only partial dimension that exists is
-/// Landlock's filesystem one, and a host with no network confinement has no
-/// filesystem confinement either (Windows), so it lands on `unconfined`.
-fn describe_by_enforcement(
-    full: &'static str,
-    partial: &'static str,
-    none: &'static str,
-) -> &'static str {
+/// A partial host gets the confined body plus one sentence *per gap*, taken from
+/// [`crate::sandbox::EnforcementGap::model_caveat`], rather than a fixed "kernel is
+/// too old" paragraph. The fixed paragraph was wrong on most Linux machines: it
+/// denied the write boundary outright, while the only gap below Linux 6.10 is
+/// the device-`ioctl` one, which leaves that boundary fully intact. The model is
+/// the surface that actually issues the write, so it is the last place a gap may
+/// be rounded — in either direction.
+fn describe(confined: &'static str, unconfined: &'static str) -> String {
     match crate::sandbox::sandbox_enforcement() {
-        Enforcement::Full => full,
-        Enforcement::Partial { .. } => partial,
-        Enforcement::None => none,
+        Enforcement::Full => confined.to_string(),
+        Enforcement::None => unconfined.to_string(),
+        Enforcement::Partial { gaps } => {
+            let mut text = confined.to_string();
+            for gap in gaps {
+                text.push(' ');
+                text.push_str(gap.model_caveat());
+            }
+            text
+        }
     }
+}
+
+/// Memoized: `description()` is called for every tool-registry build (each
+/// subagent gets one) and the answer cannot change under a running process.
+fn shell_description() -> &'static str {
+    static DESC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DESC.get_or_init(|| describe(SHELL_DESC_CONFINED, SHELL_DESC_UNCONFINED))
+}
+
+fn job_description() -> &'static str {
+    static DESC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DESC.get_or_init(|| describe(JOB_DESC_CONFINED, JOB_DESC_UNCONFINED))
 }
 
 /// Build, secret-scrub, sandbox-wrap and spawn one shell subprocess, then
@@ -283,11 +286,7 @@ impl Tool for ShellTool {
         // confinement must be chosen by what confines writes. The two can now
         // differ in level, and the model is the thing that actually issues the
         // write, so it is the last surface that may round a gap away.
-        describe_by_enforcement(
-            SHELL_DESC_CONFINED,
-            SHELL_DESC_PARTIAL,
-            SHELL_DESC_UNCONFINED,
-        )
+        shell_description()
     }
 
     async fn run(&self, params: ShellParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {
@@ -560,7 +559,7 @@ impl Tool for JobTool {
     }
 
     fn description(&self) -> &str {
-        describe_by_enforcement(JOB_DESC_CONFINED, JOB_DESC_PARTIAL, JOB_DESC_UNCONFINED)
+        job_description()
     }
 
     async fn run(&self, params: JobParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {

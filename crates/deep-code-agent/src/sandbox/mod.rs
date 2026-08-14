@@ -103,8 +103,16 @@ pub enum EnforcementGap {
     LandlockTruncate,
     /// `ioctl(2)` on an already-opened character or block device is not
     /// refused: `LANDLOCK_ACCESS_FS_IOCTL_DEV` arrived in ABI 5 (Linux 6.10).
-    /// Opening a device for writing outside the roots is still refused, so this
-    /// needs a device the policy already grants.
+    ///
+    /// This does NOT weaken the path-write boundary — an ordinary write, create,
+    /// delete or truncate outside the roots is still refused wherever the
+    /// corresponding right exists. What it exposes is the device itself: this
+    /// backend leaves reads unhandled on purpose, so a device node the user can
+    /// open at all is reachable read-only, and an `ioctl` on it is then
+    /// unchecked. Where that device is a disk (root in a container, or a user in
+    /// `disk`/`kvm`), `SG_IO` carries a raw write; where it is a terminal, it
+    /// carries `TIOCSTI`. So the reach is bounded by which device nodes the
+    /// invoking user can open — not by which paths the policy granted.
     LandlockIoctlDev,
 }
 
@@ -117,7 +125,47 @@ impl EnforcementGap {
                 "truncate(2) outside the writable roots is not refused (needs Landlock ABI 3, Linux 6.2+)"
             }
             Self::LandlockIoctlDev => {
-                "ioctl(2) on an opened device is not refused (needs Landlock ABI 5, Linux 6.10+)"
+                "ioctl(2) on an opened device node is not refused (needs Landlock ABI 5, Linux 6.10+)"
+            }
+        }
+    }
+
+    /// Whether this gap weakens the *path*-write boundary — the promise that a
+    /// write aimed at a path outside the granted roots is refused.
+    ///
+    /// The distinction is not academic: it decides what the model is told, and
+    /// the two gaps differ. ABI 5 landed in Linux 6.10 (July 2024), so on every
+    /// mainstream kernel below it — Ubuntu 24.04's 6.8 included — the only gap
+    /// is [`Self::LandlockIoctlDev`]. Letting that one select a blanket "do not
+    /// treat this boundary as a safety net" told the model something false on
+    /// the majority of Linux hosts, and pushed it off a boundary that was fully
+    /// intact. Understating enforcement is a cheaper mistake than overstating
+    /// it, but it is still a wrong answer, and a warning every host shows is a
+    /// warning nobody reads.
+    #[must_use]
+    pub fn weakens_path_writes(self) -> bool {
+        match self {
+            Self::LandlockTruncate => true,
+            Self::LandlockIoctlDev => false,
+        }
+    }
+
+    /// The sentence handed to the *model* for this gap. Distinct from
+    /// [`Self::detail`], which is written for a human reading `doctor`: the
+    /// model needs to know what to do differently, not which ABI is missing.
+    #[must_use]
+    pub fn model_caveat(self) -> &'static str {
+        match self {
+            Self::LandlockTruncate => {
+                "This host's kernel does not enforce truncate(2) outside the granted roots, so a \
+                 file outside them can still be emptied even though creating, deleting and opening \
+                 it for writing are refused: do not aim a truncating or destructive command at a \
+                 path outside the granted roots expecting the OS to refuse it."
+            }
+            Self::LandlockIoctlDev => {
+                "This host's kernel does not govern ioctl(2) on device nodes. Ordinary writes \
+                 outside the granted roots are still refused, so the write boundary holds; just do \
+                 not drive devices under /dev directly."
             }
         }
     }
@@ -181,7 +229,14 @@ impl Enforcement {
     /// One unconfined dimension makes the whole answer [`Self::None`]: a report
     /// that says "unconfined" understates nothing, so the other dimension's
     /// gaps have nothing left to add there.
-    fn weakest(filesystem: Self, network: Self) -> Self {
+    ///
+    /// Public because `doctor` needs the same answer the approval panel and the
+    /// tool descriptions get. It used to re-derive it by hand, which is two
+    /// definitions of "what does this host enforce overall" — and they had
+    /// already drifted: the hand-rolled one printed `partial` for a Windows host
+    /// that confines nothing.
+    #[must_use]
+    pub fn weakest(filesystem: Self, network: Self) -> Self {
         match (filesystem, network) {
             (Self::None, _) | (_, Self::None) => Self::None,
             (Self::Full, Self::Full) => Self::Full,
