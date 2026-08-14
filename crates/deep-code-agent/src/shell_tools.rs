@@ -12,7 +12,7 @@ use serde_json::json;
 
 use std::path::{Path, PathBuf};
 
-use crate::sandbox::{SandboxGuard, SandboxManager, SandboxPolicy};
+use crate::sandbox::{Enforcement, SandboxGuard, SandboxManager, SandboxPolicy};
 use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, ToolUpdate};
 use crate::workspace_policy::{WorkspacePolicy, WorkspaceRoots, invalid};
 #[allow(unused_imports)]
@@ -42,6 +42,17 @@ fn scrub_secret_env(cmd: &mut tokio::process::Command) {
 /// Shell tool description for hosts whose sandbox really confines the command.
 const SHELL_DESC_CONFINED: &str = "Run a foreground shell command in the workspace; output streams live and the process is killed at the timeout. Use it for git (status/diff/log), builds, and tests; start long-running processes (dev servers) with the job tool instead. Commands run sandboxed without network; set network=true when one needs it (installs, git remote ops) — a failed download/connection usually means the run lacked the network grant. Writes are confined to the granted roots (the workspace and --add-dir directories): a write outside them fails with e.g. 'Operation not permitted', and no retry, sudo or chmod can succeed — ask the user to grant the directory with /add-dir instead.";
 
+/// Same, for hosts that confine with a gap the OS itself cannot express —
+/// Landlock on a pre-6.2 kernel does not govern `truncate(2)`, so a file
+/// outside the granted roots can still be emptied.
+///
+/// Rounding this up to [`SHELL_DESC_CONFINED`] would teach the model that the
+/// boundary catches every out-of-workspace write, which is exactly the false
+/// model the capability report exists to prevent; rounding it down to
+/// [`SHELL_DESC_UNCONFINED`] would push it off a boundary that does hold for
+/// creates, deletes and opens.
+const SHELL_DESC_PARTIAL: &str = "Run a foreground shell command in the workspace; output streams live and the process is killed at the timeout. Use it for git (status/diff/log), builds, and tests; start long-running processes (dev servers) with the job tool instead. Commands run sandboxed without network; set network=true when one needs it (installs, git remote ops) — a failed download/connection usually means the run lacked the network grant. Writes are confined to the granted roots (the workspace and --add-dir directories): a write outside them fails with e.g. 'Operation not permitted', and no retry, sudo or chmod can succeed — ask the user to grant the directory with /add-dir instead. This host's kernel is too old to enforce every part of that boundary, so do not treat it as a safety net: keep writes inside the granted roots yourself, and never aim a destructive command at a path outside them expecting the OS to refuse it.";
+
 /// Same, for hosts with no real confinement (see `SandboxCapabilities`). The
 /// model is told the truth so it neither trusts a boundary that is absent nor
 /// assumes it is offline when it is not.
@@ -50,8 +61,30 @@ const SHELL_DESC_UNCONFINED: &str = "Run a foreground shell command in the works
 /// Job tool description, confined host.
 const JOB_DESC_CONFINED: &str = "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it. Jobs run sandboxed without network; a dev server that binds a port needs network=true on start. Writes are confined to the granted roots (workspace and --add-dir directories); a denied write cannot be fixed by retrying — ask the user to grant the directory with /add-dir.";
 
+/// Job tool description, confined host with a gap its kernel cannot express
+/// (see [`SHELL_DESC_PARTIAL`]).
+const JOB_DESC_PARTIAL: &str = "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it. Jobs run sandboxed without network; a dev server that binds a port needs network=true on start. Writes are confined to the granted roots (workspace and --add-dir directories); a denied write cannot be fixed by retrying — ask the user to grant the directory with /add-dir. This host's kernel is too old to enforce every part of that boundary, so keep writes inside the granted roots yourself rather than relying on the OS to refuse them.";
+
 /// Job tool description, unconfined host.
 const JOB_DESC_UNCONFINED: &str = "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it. This host has NO OS sandbox confinement: jobs are not restricted to the workspace and do have network access. Still set network=true when starting something that binds a port or needs the network, so the user is asked first.";
+
+/// Picks the description matching what this host actually enforces.
+///
+/// The `partial` wording assumes the network is still withheld, which holds on
+/// every platform that can reach it: the only partial dimension that exists is
+/// Landlock's filesystem one, and a host with no network confinement has no
+/// filesystem confinement either (Windows), so it lands on `unconfined`.
+fn describe_by_enforcement(
+    full: &'static str,
+    partial: &'static str,
+    none: &'static str,
+) -> &'static str {
+    match crate::sandbox::sandbox_enforcement() {
+        Enforcement::Full => full,
+        Enforcement::Partial { .. } => partial,
+        Enforcement::None => none,
+    }
+}
 
 /// Build, secret-scrub, sandbox-wrap and spawn one shell subprocess, then
 /// confine it. Shared by the foreground and background job paths so both apply
@@ -244,11 +277,17 @@ impl Tool for ShellTool {
         // Object confines neither writes nor egress) teaches it a false model of
         // its own environment: it would skip declaring network it silently
         // already has, and assume out-of-workspace writes get refused for it.
-        if crate::sandbox::sandbox_confines_network() {
-            SHELL_DESC_CONFINED
-        } else {
-            SHELL_DESC_UNCONFINED
-        }
+        //
+        // Keyed on `sandbox_enforcement` — the weaker of both dimensions —
+        // and not on the network one alone: a description that promises write
+        // confinement must be chosen by what confines writes. The two can now
+        // differ in level, and the model is the thing that actually issues the
+        // write, so it is the last surface that may round a gap away.
+        describe_by_enforcement(
+            SHELL_DESC_CONFINED,
+            SHELL_DESC_PARTIAL,
+            SHELL_DESC_UNCONFINED,
+        )
     }
 
     async fn run(&self, params: ShellParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {
@@ -521,11 +560,7 @@ impl Tool for JobTool {
     }
 
     fn description(&self) -> &str {
-        if crate::sandbox::sandbox_confines_network() {
-            JOB_DESC_CONFINED
-        } else {
-            JOB_DESC_UNCONFINED
-        }
+        describe_by_enforcement(JOB_DESC_CONFINED, JOB_DESC_PARTIAL, JOB_DESC_UNCONFINED)
     }
 
     async fn run(&self, params: JobParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {

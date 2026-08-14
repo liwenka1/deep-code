@@ -379,11 +379,17 @@ async fn scrub_secret_env_hides_key_from_child() {
 /// two stay in agreement — on Windows (Job Object: no fs/network confinement)
 /// the "runs sandboxed without network" wording would be a lie, and a model that
 /// believes it is offline will not declare the network it silently already has.
+///
+/// Three states, not two: a host that confines writes apart from a right its
+/// kernel cannot express must say so here as well as in the approval panel.
+/// The model is the surface that actually issues the write, so rounding a gap
+/// up to "confined" here is the costliest place to do it.
 #[test]
 fn tool_descriptions_match_actual_sandbox_capability() {
+    use crate::sandbox::Enforcement;
     use crate::tool::Tool;
 
-    let confined = crate::sandbox::sandbox_confines_network();
+    let enforcement = crate::sandbox::sandbox_enforcement();
     let shell = ShellTool::new(
         WorkspacePolicy::new(std::path::Path::new(".")).unwrap(),
         JobStore::default(),
@@ -395,19 +401,36 @@ fn tool_descriptions_match_actual_sandbox_capability() {
         SandboxManager::new(),
     );
 
+    // The phrase each state must (and must not) carry. `too old to enforce
+    // every part` is the caveat that separates partial from full: without it,
+    // the two texts make the same promise.
     for description in [shell.description(), job.description()] {
-        if confined {
-            assert!(
-                description.contains("sandboxed without network"),
-                "confined host must advertise confinement: {description}"
-            );
-            assert!(!description.contains("NO OS sandbox"));
-        } else {
-            assert!(
-                description.contains("NO OS sandbox confinement"),
-                "unconfined host must not claim confinement: {description}"
-            );
-            assert!(!description.contains("run sandboxed without network"));
+        match enforcement {
+            Enforcement::Full => {
+                assert!(
+                    description.contains("sandboxed without network"),
+                    "confined host must advertise confinement: {description}"
+                );
+                assert!(!description.contains("NO OS sandbox"));
+                assert!(
+                    !description.contains("too old to enforce every part"),
+                    "a fully enforcing host must not warn about gaps: {description}"
+                );
+            }
+            Enforcement::Partial { .. } => {
+                assert!(
+                    description.contains("too old to enforce every part"),
+                    "partial host must name the caveat: {description}"
+                );
+                assert!(!description.contains("NO OS sandbox"));
+            }
+            Enforcement::None => {
+                assert!(
+                    description.contains("NO OS sandbox confinement"),
+                    "unconfined host must not claim confinement: {description}"
+                );
+                assert!(!description.contains("run sandboxed without network"));
+            }
         }
     }
 }

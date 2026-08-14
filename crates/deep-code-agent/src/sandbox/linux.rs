@@ -82,8 +82,8 @@ const WRITE_RIGHT_LEVELS: &[(ABI, EnforcementGap)] = &[
     (ABI::V5, EnforcementGap::LandlockIoctlDev),
 ];
 
-/// Always-blocked syscalls (escape / privilege / host-tampering). Limited to
-/// numbers present on both x86_64 and aarch64.
+/// Always-blocked syscalls (escape / privilege / host-tampering / filter
+/// bypass). Limited to numbers present on both x86_64 and aarch64.
 const DANGEROUS_SYSCALLS: &[i64] = &[
     libc::SYS_ptrace,
     libc::SYS_mount,
@@ -96,10 +96,25 @@ const DANGEROUS_SYSCALLS: &[i64] = &[
     libc::SYS_finit_module,
     libc::SYS_delete_module,
     libc::SYS_bpf,
+    // io_uring is a second way to submit the work a syscall would do, and
+    // seccomp only sees syscalls: `IORING_OP_SOCKET` + `IORING_OP_CONNECT`
+    // open a connection without ever calling `socket(2)` or `connect(2)`, so
+    // leaving the ring reachable would make `NETWORK_SYSCALLS` advisory
+    // rather than enforced — and this backend reports the network dimension as
+    // fully enforced. Blocked unconditionally, not only under a no-network
+    // policy, so the filter means the same thing whatever the policy says.
+    // `io_uring_setup` returning EPERM is a case every user of the interface
+    // already handles (it is how they cope with older kernels): they fall back
+    // to epoll/blocking I/O.
+    libc::SYS_io_uring_setup,
+    libc::SYS_io_uring_enter,
+    libc::SYS_io_uring_register,
 ];
 
 /// Blocked when the policy forbids network. Denying `socket` stops any new
-/// socket (no network of any family); `connect` is belt-and-suspenders.
+/// socket (no network of any family); `connect` is belt-and-suspenders. The
+/// interface that could sidestep both — io_uring — is denied above, on every
+/// policy.
 const NETWORK_SYSCALLS: &[i64] = &[libc::SYS_socket, libc::SYS_connect];
 
 /// Write-class access rights: everything Landlock can govern minus the
@@ -113,22 +128,26 @@ pub fn capabilities() -> SandboxCapabilities {
     match probe() {
         Ok(()) => {
             let filesystem = Enforcement::from_gaps(landlock_gaps());
+            // A count, not the sentences: every gap is enumerable through
+            // `gaps()`, and `doctor` prints one line each from there. Spelling
+            // them out here too put the same text on screen twice.
             let detail = if filesystem.is_full() {
                 "Landlock + seccomp available".to_string()
             } else {
-                let gaps: Vec<&str> = filesystem.gaps().iter().map(|gap| gap.detail()).collect();
                 format!(
-                    "Landlock + seccomp available; this kernel cannot enforce: {}",
-                    gaps.join("; ")
+                    "Landlock + seccomp available; {} write-class right(s) this kernel cannot enforce",
+                    filesystem.gaps().len()
                 )
             };
             SandboxCapabilities {
                 backend: SandboxBackend::LinuxLandlock,
                 available: true,
                 filesystem,
-                // seccomp denies the `socket`/`connect` syscalls outright, so
-                // unlike Landlock there is no per-kernel right to negotiate:
-                // the filter either loads or the command is refused.
+                // Full, and unlike Landlock not negotiated per kernel: the
+                // filter either loads or the command is refused. That is a
+                // claim about the filter *loading*, so it only holds while
+                // nothing can submit network work behind seccomp's back —
+                // which is why io_uring is in `DANGEROUS_SYSCALLS`.
                 network: Enforcement::Full,
                 detail,
             }
@@ -171,6 +190,13 @@ fn probe_at(abi: ABI) -> Result<(), String> {
 /// a `HardRequirement` ruleset at each level that adds a right, and collect the
 /// ones it refuses. At most two extra `landlock_create_ruleset` syscalls, made
 /// once per process behind [`super::detect_capabilities`]'s memo.
+///
+/// Any error counts as a gap, including a non-compat one (ENOMEM, EMFILE) that
+/// has nothing to do with the ABI. That is deliberate and barely reachable:
+/// [`probe`] has already created a ruleset at ABI 1 by the time this runs, and
+/// mistaking a fluke for a gap can only make the report understate what the
+/// host enforces — never overstate it, which is the only direction that would
+/// matter.
 fn landlock_gaps() -> Vec<EnforcementGap> {
     WRITE_RIGHT_LEVELS
         .iter()
@@ -262,7 +288,13 @@ fn writable_paths(granted_roots: &[PathBuf], cwd: &Path, policy: &SandboxPolicy)
     paths
 }
 
-fn build_seccomp(policy: &SandboxPolicy) -> Result<BpfProgram, String> {
+/// Syscalls this policy denies. An empty rule vector means "no argument
+/// condition": every call of that number takes the filter's match action.
+///
+/// Split out from [`build_seccomp`] because the compiled BPF is opaque, and
+/// "which syscalls does a given policy actually deny" is the property worth
+/// testing.
+fn seccomp_rules(policy: &SandboxPolicy) -> BTreeMap<i64, Vec<seccompiler::SeccompRule>> {
     let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = BTreeMap::new();
     for syscall in DANGEROUS_SYSCALLS {
         rules.insert(*syscall, Vec::new());
@@ -272,9 +304,12 @@ fn build_seccomp(policy: &SandboxPolicy) -> Result<BpfProgram, String> {
             rules.insert(*syscall, Vec::new());
         }
     }
+    rules
+}
 
+fn build_seccomp(policy: &SandboxPolicy) -> Result<BpfProgram, String> {
     let filter = SeccompFilter::new(
-        rules,
+        seccomp_rules(policy),
         SeccompAction::Allow,
         SeccompAction::Errno(libc::EPERM as u32),
         target_arch()?,
@@ -319,6 +354,48 @@ mod tests {
         .stderr(Stdio::piped())
         .output()
         .expect("spawn sandboxed command")
+    }
+
+    #[test]
+    fn io_uring_is_denied_under_every_policy() {
+        // The ring is a second way to submit the work a syscall would do, and
+        // seccomp only sees syscalls — an `IORING_OP_SOCKET`/`IORING_OP_CONNECT`
+        // pair reaches the network without `socket(2)` or `connect(2)`. So this
+        // is what lets `capabilities()` report the network dimension as `Full`
+        // rather than `Partial`: if the ring were reachable, that report would
+        // be the same kind of overclaim the filesystem gaps exist to avoid.
+        // Denied on the network-granted policy too, so the guarantee does not
+        // depend on which policy happens to be in force.
+        for policy in [
+            SandboxPolicy::workspace_write(),
+            SandboxPolicy::WorkspaceWrite {
+                network_access: true,
+            },
+        ] {
+            let rules = seccomp_rules(&policy);
+            for syscall in [
+                libc::SYS_io_uring_setup,
+                libc::SYS_io_uring_enter,
+                libc::SYS_io_uring_register,
+            ] {
+                assert!(
+                    rules.contains_key(&syscall),
+                    "syscall {syscall} must be denied under {policy:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn network_syscalls_are_denied_only_without_a_network_grant() {
+        let denied = seccomp_rules(&SandboxPolicy::workspace_write());
+        let granted = seccomp_rules(&SandboxPolicy::WorkspaceWrite {
+            network_access: true,
+        });
+        for syscall in NETWORK_SYSCALLS {
+            assert!(denied.contains_key(syscall));
+            assert!(!granted.contains_key(syscall));
+        }
     }
 
     #[test]

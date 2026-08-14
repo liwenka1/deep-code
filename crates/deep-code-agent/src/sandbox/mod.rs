@@ -175,11 +175,23 @@ impl Enforcement {
         }
     }
 
-    fn rank(&self) -> u8 {
-        match self {
-            Self::None => 0,
-            Self::Partial { .. } => 1,
-            Self::Full => 2,
+    /// The weaker of two dimensions, keeping every gap either one names — the
+    /// most a single answer may claim about a host that must satisfy both.
+    ///
+    /// One unconfined dimension makes the whole answer [`Self::None`]: a report
+    /// that says "unconfined" understates nothing, so the other dimension's
+    /// gaps have nothing left to add there.
+    fn weakest(filesystem: Self, network: Self) -> Self {
+        match (filesystem, network) {
+            (Self::None, _) | (_, Self::None) => Self::None,
+            (Self::Full, Self::Full) => Self::Full,
+            (filesystem, network) => {
+                // Gap variants belong to one dimension each, so appending
+                // cannot duplicate.
+                let mut gaps = filesystem.gaps().to_vec();
+                gaps.extend_from_slice(network.gaps());
+                Self::Partial { gaps }
+            }
         }
     }
 }
@@ -205,21 +217,12 @@ pub struct SandboxCapabilities {
 }
 
 /// The weaker of this host's two confinement dimensions — the most any surface
-/// may honestly claim about a command it is about to run.
+/// may honestly claim about a command it is about to run — carrying the gaps of
+/// both, so a partial answer can still name everything that is missing.
 #[must_use]
 pub fn sandbox_enforcement() -> Enforcement {
     let caps = detect_capabilities();
-    if caps.filesystem.rank() <= caps.network.rank() {
-        caps.filesystem
-    } else {
-        caps.network
-    }
-}
-
-/// Whether this host's sandbox actually withholds the network by default.
-#[must_use]
-pub fn sandbox_confines_network() -> bool {
-    detect_capabilities().network.is_enforced()
+    Enforcement::weakest(caps.filesystem, caps.network)
 }
 
 /// Whether an OS sandbox backend is usable on this machine. For callers that
@@ -514,10 +517,40 @@ mod tests {
     }
 
     #[test]
-    fn enforcement_ranks_none_below_partial_below_full() {
-        let partial = Enforcement::from_gaps(vec![EnforcementGap::LandlockIoctlDev]);
-        assert!(Enforcement::None.rank() < partial.rank());
-        assert!(partial.rank() < Enforcement::Full.rank());
+    fn weakest_never_claims_more_than_either_dimension() {
+        // Every combination, because the host running this test only ever
+        // exercises one of them (macOS is Full/Full, Windows None/None).
+        let truncate = Enforcement::from_gaps(vec![EnforcementGap::LandlockTruncate]);
+        let ioctl = Enforcement::from_gaps(vec![EnforcementGap::LandlockIoctlDev]);
+        let levels = [Enforcement::None, truncate.clone(), Enforcement::Full];
+
+        for filesystem in &levels {
+            for network in &levels {
+                let weakest = Enforcement::weakest(filesystem.clone(), network.clone());
+                assert_eq!(
+                    weakest.is_full(),
+                    filesystem.is_full() && network.is_full(),
+                    "{filesystem:?} + {network:?}"
+                );
+                assert_eq!(
+                    weakest.is_enforced(),
+                    filesystem.is_enforced() && network.is_enforced(),
+                    "{filesystem:?} + {network:?}"
+                );
+            }
+        }
+
+        // Two partial dimensions: the answer names both gaps rather than
+        // silently reporting one dimension's and dropping the other's.
+        assert_eq!(
+            Enforcement::weakest(truncate, ioctl),
+            Enforcement::Partial {
+                gaps: vec![
+                    EnforcementGap::LandlockTruncate,
+                    EnforcementGap::LandlockIoctlDev
+                ],
+            }
+        );
     }
 
     #[test]
@@ -542,9 +575,24 @@ mod tests {
         // approval panel must show the write answer, not the network one.
         let caps = detect_capabilities();
         let weaker = sandbox_enforcement();
-        assert!(weaker.rank() <= caps.filesystem.rank());
-        assert!(weaker.rank() <= caps.network.rank());
-        assert!(weaker == caps.filesystem || weaker == caps.network);
+        assert_eq!(
+            weaker.is_full(),
+            caps.filesystem.is_full() && caps.network.is_full()
+        );
+        assert_eq!(
+            weaker.is_enforced(),
+            caps.filesystem.is_enforced() && caps.network.is_enforced()
+        );
+        // A `None` summary has nothing left to qualify (see `weakest`); anything
+        // else must carry every gap either dimension named.
+        if weaker.is_enforced() {
+            for gap in caps.filesystem.gaps().iter().chain(caps.network.gaps()) {
+                assert!(
+                    weaker.gaps().contains(gap),
+                    "{gap:?} was reported by a dimension but dropped from the summary"
+                );
+            }
+        }
     }
 
     #[test]
