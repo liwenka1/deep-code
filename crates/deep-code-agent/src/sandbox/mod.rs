@@ -239,7 +239,9 @@ impl Enforcement {
     pub fn weakest(filesystem: Self, network: Self) -> Self {
         match (filesystem, network) {
             (Self::None, _) | (_, Self::None) => Self::None,
-            (Self::Full, Self::Full) => Self::Full,
+            // Both parameters are owned, so when one side is `Full` the other
+            // side's allocation is already the answer — no rebuild.
+            (Self::Full, other) | (other, Self::Full) => other,
             (filesystem, network) => {
                 // Gap variants belong to one dimension each, so appending
                 // cannot duplicate.
@@ -274,10 +276,18 @@ pub struct SandboxCapabilities {
 /// The weaker of this host's two confinement dimensions — the most any surface
 /// may honestly claim about a command it is about to run — carrying the gaps of
 /// both, so a partial answer can still name everything that is missing.
+///
+/// Borrowed and memoized, not returned by value: the approval panel calls this
+/// while rendering, i.e. once per frame for as long as a prompt is on screen,
+/// and every call used to clone the whole capability report (a `String` plus a
+/// `Vec` per partial dimension) to read two discriminants.
 #[must_use]
-pub fn sandbox_enforcement() -> Enforcement {
-    let caps = detect_capabilities();
-    Enforcement::weakest(caps.filesystem, caps.network)
+pub fn sandbox_enforcement() -> &'static Enforcement {
+    static CACHED: std::sync::OnceLock<Enforcement> = std::sync::OnceLock::new();
+    CACHED.get_or_init(|| {
+        let caps = detect_capabilities();
+        Enforcement::weakest(caps.filesystem, caps.network)
+    })
 }
 
 /// Whether an OS sandbox backend is usable on this machine. For callers that
