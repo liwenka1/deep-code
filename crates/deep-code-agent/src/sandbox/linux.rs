@@ -20,8 +20,13 @@
 //!   credential dirs against reads here. `~/.deep-code` is already unwritable
 //!   (it is not among the writable roots), but its read exposure — and that of
 //!   `~/.ssh`/`~/.aws` — is an accepted, documented residual risk on Linux.
-//! - **Dangerous syscalls** (ptrace, mount, module load, bpf, …) are always
-//!   blocked.
+//!   The `/dev` nodes are granted write *without* `IOCTL_DEV`: redirection needs
+//!   the write bit, and the ioctl bit reaches `TIOCSTI`.
+//! - **Dangerous syscalls** are always blocked — the debugger family (`ptrace`
+//!   and its no-`ptrace(2)` twins `process_vm_readv`/`pidfd_getfd`), both mount
+//!   APIs, namespace entry, module load, `bpf`, … — plus `io_uring`, which is
+//!   denied with ENOSYS rather than EPERM so its refusal is never mistaken for a
+//!   filesystem boundary denial.
 //!
 //! Availability is reported by [`capabilities`]; the manager only calls
 //! [`wrap_shell_command`] when Landlock is available. If the per-command ruleset
@@ -82,30 +87,69 @@ const WRITE_RIGHT_LEVELS: &[(ABI, EnforcementGap)] = &[
     (ABI::V5, EnforcementGap::LandlockIoctlDev),
 ];
 
-/// Always-blocked syscalls (escape / privilege / host-tampering / filter
-/// bypass). Limited to numbers present on both x86_64 and aarch64.
+/// Always-blocked syscalls (escape / privilege / host-tampering), denied with
+/// EPERM. Limited to numbers present on both x86_64 and aarch64.
+///
+/// Grouped by the escape each entry closes, because the list is a denylist over
+/// an `Allow` default: an entry that is merely *plausible* is cheap, and a
+/// missing one is silent. Every syscall here is one a coding agent has no
+/// legitimate use for, so the false-positive cost is near zero.
 const DANGEROUS_SYSCALLS: &[i64] = &[
+    // Debugger attach: reads and writes another process's memory. The child
+    // runs as the SAME uid as the agent, whose heap holds the API key and whose
+    // fds include live TLS sockets to the model endpoint.
     libc::SYS_ptrace,
+    // `ptrace`'s lighter twins: same PTRACE_MODE_ATTACH permission check, no
+    // `ptrace(2)` call. Blocking `ptrace` alone left the primitive reachable —
+    // `process_vm_readv(getppid(), …)` lifts the key straight out of the parent,
+    // and `pidfd_getfd` steals an already-connected socket, which would reach
+    // the network with `socket`/`connect` denied and the ring shut.
+    libc::SYS_process_vm_readv,
+    libc::SYS_process_vm_writev,
+    libc::SYS_pidfd_getfd,
+    libc::SYS_pidfd_open,
+    // Mount manipulation. `mount(2)` is the classic spelling; the file-descriptor
+    // mount API added in 5.2 does the same job without ever calling it, so
+    // blocking only `mount` left the whole operation reachable by its new name.
     libc::SYS_mount,
     libc::SYS_umount2,
     libc::SYS_pivot_root,
     libc::SYS_chroot,
+    libc::SYS_fsopen,
+    libc::SYS_fsconfig,
+    libc::SYS_fsmount,
+    libc::SYS_move_mount,
+    libc::SYS_open_tree,
+    // Namespace escape/entry. `unshare(CLONE_NEWUSER)` hands the child
+    // capabilities in a fresh namespace; `setns` walks into an existing one.
+    libc::SYS_unshare,
+    libc::SYS_setns,
+    // Filesystem-handle reopen: resolves a path by opaque handle, sidestepping
+    // the directory traversal Landlock reasons about.
+    libc::SYS_name_to_handle_at,
+    libc::SYS_open_by_handle_at,
+    // Kernel introspection / side channels / host tampering.
+    libc::SYS_perf_event_open,
+    libc::SYS_userfaultfd,
     libc::SYS_reboot,
     libc::SYS_kexec_load,
+    libc::SYS_kexec_file_load,
     libc::SYS_init_module,
     libc::SYS_finit_module,
     libc::SYS_delete_module,
     libc::SYS_bpf,
-    // io_uring is a second way to submit the work a syscall would do, and
-    // seccomp only sees syscalls: `IORING_OP_SOCKET` + `IORING_OP_CONNECT`
-    // open a connection without ever calling `socket(2)` or `connect(2)`, so
-    // leaving the ring reachable would make `NETWORK_SYSCALLS` advisory
-    // rather than enforced — and this backend reports the network dimension as
-    // fully enforced. Blocked unconditionally, not only under a no-network
-    // policy, so the filter means the same thing whatever the policy says.
-    // `io_uring_setup` returning EPERM is a case every user of the interface
-    // already handles (it is how they cope with older kernels): they fall back
-    // to epoll/blocking I/O.
+];
+
+/// io_uring, denied with ENOSYS rather than EPERM (see [`build_seccomp`]).
+///
+/// The ring is a second way to submit the work a syscall would do, and seccomp
+/// only sees syscalls: `IORING_OP_SOCKET` + `IORING_OP_CONNECT` open a
+/// connection without ever calling `socket(2)` or `connect(2)`, so leaving it
+/// reachable would make [`NETWORK_SYSCALLS`] advisory rather than enforced —
+/// and this backend reports the network dimension as fully enforced. Denied
+/// under every policy, so the filter means the same thing whatever the policy
+/// says.
+const IO_URING_SYSCALLS: &[i64] = &[
     libc::SYS_io_uring_setup,
     libc::SYS_io_uring_enter,
     libc::SYS_io_uring_register,
@@ -113,8 +157,8 @@ const DANGEROUS_SYSCALLS: &[i64] = &[
 
 /// Blocked when the policy forbids network. Denying `socket` stops any new
 /// socket (no network of any family); `connect` is belt-and-suspenders. The
-/// interface that could sidestep both — io_uring — is denied above, on every
-/// policy.
+/// interface that could sidestep both — io_uring — is denied separately, on
+/// every policy.
 const NETWORK_SYSCALLS: &[i64] = &[libc::SYS_socket, libc::SYS_connect];
 
 /// Write-class access rights: everything Landlock can govern minus the
@@ -225,13 +269,25 @@ pub fn wrap_shell_command(
     // `apply_filter`), which is acceptable in the post-fork pre-exec window.
     unsafe {
         cmd.pre_exec(move || {
-            if let Some(created) = ruleset.take() {
-                created
-                    .restrict_self()
-                    .map_err(|error| io::Error::other(format!("landlock: {error}")))?;
+            // `restrict_self` consumes the ruleset and `pre_exec` takes an
+            // `FnMut`, so the ruleset lives in an `Option`. A second spawn of
+            // the same `Command` therefore finds `None` — which must be an
+            // error, not a skip: silently applying seccomp without Landlock
+            // would exec a child with unrestricted writes while every surface
+            // still reported it confined. Fail-closed, matching the module doc.
+            let created = ruleset.take().ok_or_else(|| {
+                io::Error::other(
+                    "landlock: sandboxed Command was spawned twice; the ruleset is \
+                     single-use, so the second child would run unconfined",
+                )
+            })?;
+            created
+                .restrict_self()
+                .map_err(|error| io::Error::other(format!("landlock: {error}")))?;
+            for program in &bpf {
+                seccompiler::apply_filter(program)
+                    .map_err(|error| io::Error::other(format!("seccomp: {error}")))?;
             }
-            seccompiler::apply_filter(&bpf)
-                .map_err(|error| io::Error::other(format!("seccomp: {error}")))?;
             Ok(())
         });
     }
@@ -242,7 +298,7 @@ fn build_restrictions(
     granted_roots: &[PathBuf],
     cwd: &Path,
     policy: &SandboxPolicy,
-) -> Result<(RulesetCreated, BpfProgram), String> {
+) -> Result<(RulesetCreated, Vec<BpfProgram>), String> {
     let ruleset = build_landlock(granted_roots, cwd, policy)?;
     let bpf = build_seccomp(policy)?;
     Ok((ruleset, bpf))
@@ -254,26 +310,42 @@ fn build_landlock(
     policy: &SandboxPolicy,
 ) -> Result<RulesetCreated, String> {
     let access = write_access(LANDLOCK_ABI);
+    // Device nodes are granted write so redirections work (`2> /dev/null`,
+    // `echo x > /dev/tty`) — nothing more. Handing them the full write set also
+    // hands them `IOCTL_DEV`, which is a different power entirely: `ioctl` on a
+    // terminal reaches `TIOCSTI`, which pushes characters into the controlling
+    // terminal's input queue for the user's own shell to execute after this
+    // process exits — outside Landlock, seccomp, the deny floor and the approval
+    // gate alike. Redirection needs the write bit, not the ioctl bit, so grant
+    // only what it needs.
+    let device_access = access & !AccessFs::IoctlDev;
     // Pre-filter to existing paths so a missing /dev node can't fail the whole
     // ruleset build (path_beneath_rules errors on paths it can't open).
-    let writable: Vec<PathBuf> = writable_paths(granted_roots, cwd, policy)
-        .into_iter()
-        .filter(|path| path.exists())
-        .collect();
+    let existing = |paths: Vec<PathBuf>| -> Vec<PathBuf> {
+        paths.into_iter().filter(|path| path.exists()).collect()
+    };
+    let writable = existing(writable_paths(granted_roots, cwd, policy));
+    let devices = existing(device_paths());
 
     Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(access)
         .and_then(|ruleset| ruleset.create())
         .and_then(|created| created.add_rules(path_beneath_rules(&writable, access)))
+        .and_then(|created| created.add_rules(path_beneath_rules(&devices, device_access)))
         .map_err(|error| format!("landlock ruleset: {error}"))
 }
 
 fn writable_paths(granted_roots: &[PathBuf], cwd: &Path, policy: &SandboxPolicy) -> Vec<PathBuf> {
     // `writable_roots` already includes the temp dir (shared with the macOS
     // profile so the two backends cannot diverge on it again).
-    let mut paths = policy.writable_roots(granted_roots, cwd);
-    for node in [
+    policy.writable_roots(granted_roots, cwd)
+}
+
+/// `/dev` nodes a shell needs for redirections. Granted `device_access` (write
+/// without `IOCTL_DEV`) rather than the full write set — see [`build_landlock`].
+fn device_paths() -> Vec<PathBuf> {
+    [
         "/dev/null",
         "/dev/zero",
         "/dev/full",
@@ -282,10 +354,10 @@ fn writable_paths(granted_roots: &[PathBuf], cwd: &Path, policy: &SandboxPolicy)
         "/dev/pts",
         "/dev/random",
         "/dev/urandom",
-    ] {
-        paths.push(PathBuf::from(node));
-    }
-    paths
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect()
 }
 
 /// Syscalls this policy denies. An empty rule vector means "no argument
@@ -307,18 +379,52 @@ fn seccomp_rules(policy: &SandboxPolicy) -> BTreeMap<i64, Vec<seccompiler::Secco
     rules
 }
 
-fn build_seccomp(policy: &SandboxPolicy) -> Result<BpfProgram, String> {
-    let filter = SeccompFilter::new(
-        seccomp_rules(policy),
-        SeccompAction::Allow,
-        SeccompAction::Errno(libc::EPERM as u32),
-        target_arch()?,
-    )
-    .map_err(|error| format!("seccomp filter: {error}"))?;
+/// io_uring's rules, kept apart from [`seccomp_rules`] because they are denied
+/// with a different errno.
+fn io_uring_rules() -> BTreeMap<i64, Vec<seccompiler::SeccompRule>> {
+    IO_URING_SYSCALLS
+        .iter()
+        .map(|syscall| (*syscall, Vec::new()))
+        .collect()
+}
 
-    filter
+/// Two filters, because a `SeccompFilter` carries ONE match action and io_uring
+/// must not answer with the same errno as everything else.
+///
+/// EPERM on the ring was a real bug, not a cosmetic one: `write_denial_signature`
+/// classifies "Operation not permitted" from a sandboxed command as a *filesystem
+/// boundary denial*, so a `cargo test` on a `tokio-uring` crate got
+/// [`super::WRITE_DENIAL_NOTE`] appended — telling the model to ask for
+/// `/add-dir` over a failure that has nothing to do with paths — and three in one
+/// turn tripped the runtime's boundary-denial circuit breaker, which is also
+/// exempt from cascade escalation. So the real failure could never escalate.
+///
+/// ENOSYS is both inert to that classifier and the *truthful* answer: it is what
+/// a kernel without io_uring returns, which is exactly the case every user of the
+/// interface already handles by falling back to epoll/blocking I/O.
+///
+/// Stacked filters are safe here: the kernel runs both and takes the
+/// highest-precedence result. io_uring appears only in the ENOSYS filter (the
+/// EPERM one lets it through to its `Allow` default), and `SECCOMP_RET_ERRNO`
+/// outranks `SECCOMP_RET_ALLOW`, so ENOSYS is what the caller sees.
+fn build_seccomp(policy: &SandboxPolicy) -> Result<Vec<BpfProgram>, String> {
+    let arch = target_arch()?;
+    let compile = |rules, errno: i32, label: &str| -> Result<BpfProgram, String> {
+        SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(errno as u32),
+            arch,
+        )
+        .map_err(|error| format!("seccomp filter ({label}): {error}"))?
         .try_into()
-        .map_err(|error| format!("seccomp compile: {error}"))
+        .map_err(|error| format!("seccomp compile ({label}): {error}"))
+    };
+
+    Ok(vec![
+        compile(seccomp_rules(policy), libc::EPERM, "denied")?,
+        compile(io_uring_rules(), libc::ENOSYS, "io_uring")?,
+    ])
 }
 
 fn target_arch() -> Result<TargetArch, String> {
@@ -357,30 +463,38 @@ mod tests {
     }
 
     #[test]
-    fn io_uring_is_denied_under_every_policy() {
+    fn io_uring_is_denied_under_every_policy_and_never_with_eperm() {
         // The ring is a second way to submit the work a syscall would do, and
         // seccomp only sees syscalls — an `IORING_OP_SOCKET`/`IORING_OP_CONNECT`
         // pair reaches the network without `socket(2)` or `connect(2)`. So this
         // is what lets `capabilities()` report the network dimension as `Full`
         // rather than `Partial`: if the ring were reachable, that report would
         // be the same kind of overclaim the filesystem gaps exist to avoid.
-        // Denied on the network-granted policy too, so the guarantee does not
-        // depend on which policy happens to be in force.
+        let ring = io_uring_rules();
+        for syscall in IO_URING_SYSCALLS {
+            assert!(
+                ring.contains_key(syscall),
+                "syscall {syscall} must be denied"
+            );
+        }
+
+        // ...and it must stay out of the EPERM filter, on EVERY policy. EPERM is
+        // what `write_denial_signature` reads as a filesystem boundary denial, so
+        // an io_uring failure carrying it would get `WRITE_DENIAL_NOTE` appended
+        // — sending the model after an `/add-dir` grant for a failure that has
+        // no path in it — and three per turn would trip the boundary-denial
+        // circuit breaker, which is exempt from cascade escalation.
         for policy in [
             SandboxPolicy::workspace_write(),
             SandboxPolicy::WorkspaceWrite {
                 network_access: true,
             },
         ] {
-            let rules = seccomp_rules(&policy);
-            for syscall in [
-                libc::SYS_io_uring_setup,
-                libc::SYS_io_uring_enter,
-                libc::SYS_io_uring_register,
-            ] {
+            let denied = seccomp_rules(&policy);
+            for syscall in IO_URING_SYSCALLS {
                 assert!(
-                    rules.contains_key(&syscall),
-                    "syscall {syscall} must be denied under {policy:?}"
+                    !denied.contains_key(syscall),
+                    "io_uring syscall {syscall} must not be in the EPERM filter under {policy:?}"
                 );
             }
         }
