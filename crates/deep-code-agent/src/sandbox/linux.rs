@@ -27,9 +27,10 @@
 //!   the write bit, and the ioctl bit reaches `TIOCSTI`.
 //! - **Dangerous syscalls** are always blocked — the debugger family (`ptrace`
 //!   and its no-`ptrace(2)` twins `process_vm_readv`/`pidfd_getfd`), both mount
-//!   APIs, namespace entry, module load, `bpf`, … — plus `io_uring`, which is
-//!   denied with ENOSYS rather than EPERM so its refusal is never mistaken for a
-//!   filesystem boundary denial.
+//!   APIs, namespace entry AND creation (`unshare`/`setns` outright,
+//!   `clone(CLONE_NEWUSER)` by argument filter), module load, `bpf`, … — plus
+//!   an ENOSYS-answered set, `io_uring` and `clone3`, where EPERM would be
+//!   mistaken for a boundary denial or break every libc's fallback path.
 //!
 //! Availability is reported by [`capabilities`]; the manager only calls
 //! [`wrap_shell_command`] when Landlock is available. If the per-command ruleset
@@ -125,6 +126,12 @@ const DANGEROUS_SYSCALLS: &[i64] = &[
     libc::SYS_open_tree,
     // Namespace escape/entry. `unshare(CLONE_NEWUSER)` hands the child
     // capabilities in a fresh namespace; `setns` walks into an existing one.
+    // The third spelling — *creating* the namespace at process creation — is
+    // closed elsewhere, because neither fits an unconditional list: `clone`
+    // carries an argument filter in [`seccomp_rules`] (denying it outright
+    // would deny fork itself), and `clone3` is answered ENOSYS in
+    // [`enosys_rules`] (its flags live in a struct seccomp cannot read, and
+    // ENOSYS is the one errno every libc answers by falling back to `clone`).
     libc::SYS_unshare,
     libc::SYS_setns,
     // Filesystem-handle reopen: resolves a path by opaque handle, sidestepping
@@ -436,36 +443,84 @@ fn device_paths() -> Vec<PathBuf> {
     .collect()
 }
 
-/// Syscalls this policy denies. An empty rule vector means "no argument
-/// condition": every call of that number takes the filter's match action.
+/// Syscalls this policy denies with EPERM. An empty rule vector means "no
+/// argument condition": every call of that number takes the filter's match
+/// action. `clone` is the one *conditional* entry — an unconditional deny
+/// there would deny fork itself.
 ///
 /// Split out from [`build_seccomp`] because the compiled BPF is opaque, and
 /// "which syscalls does a given policy actually deny" is the property worth
 /// testing.
-fn seccomp_rules(policy: &SandboxPolicy) -> BTreeMap<i64, Vec<seccompiler::SeccompRule>> {
+fn seccomp_rules(
+    policy: &SandboxPolicy,
+) -> Result<BTreeMap<i64, Vec<seccompiler::SeccompRule>>, String> {
     let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = BTreeMap::new();
     for syscall in DANGEROUS_SYSCALLS {
         rules.insert(*syscall, Vec::new());
     }
+    rules.insert(libc::SYS_clone, vec![deny_new_user_namespace()?]);
     if !policy.has_network_access() {
         for syscall in NETWORK_SYSCALLS {
             rules.insert(*syscall, Vec::new());
         }
     }
-    rules
+    Ok(rules)
 }
 
-/// io_uring's rules, kept apart from [`seccomp_rules`] because they are denied
-/// with a different errno.
-fn io_uring_rules() -> BTreeMap<i64, Vec<seccompiler::SeccompRule>> {
+/// The rule refusing `clone(2)` when `CLONE_NEWUSER` is among its flags.
+///
+/// [`DANGEROUS_SYSCALLS`] already refuses namespace *entry* (`unshare`,
+/// `setns`); this closes *creation*, which stayed reachable by spelling the
+/// same request as a process-creation flag. Landlock and seccomp both survive
+/// a namespace transition, so this is not about the write or network boundary
+/// — a fresh user namespace grants full capabilities inside itself, which is
+/// the gateway most local privilege-escalation exploits of the last decade
+/// walk through, and nothing a build or test has a legitimate claim to.
+///
+/// The flags are argument 0 in the raw calling convention of both
+/// architectures [`target_arch`] admits, and `MaskedEq` keys on the single
+/// `CLONE_NEWUSER` bit: threads (`CLONE_THREAD|CLONE_VM|…`) and plain forks
+/// carry any other combination and pass untouched. Known collateral: browser
+/// sandboxes launched *inside* this sandbox (Puppeteer/Playwright headless
+/// Chromium) clone with `CLONE_NEWUSER` and must run `--no-sandbox`, the same
+/// answer they already need on distros that restrict unprivileged userns.
+fn deny_new_user_namespace() -> Result<seccompiler::SeccompRule, String> {
+    let new_user = libc::CLONE_NEWUSER as u64;
+    let condition = seccompiler::SeccompCondition::new(
+        0,
+        seccompiler::SeccompCmpArgLen::Qword,
+        seccompiler::SeccompCmpOp::MaskedEq(new_user),
+        new_user,
+    )
+    .map_err(|error| format!("seccomp clone condition: {error}"))?;
+    seccompiler::SeccompRule::new(vec![condition])
+        .map_err(|error| format!("seccomp clone rule: {error}"))
+}
+
+/// The ENOSYS-denied set, kept apart from [`seccomp_rules`] because it carries
+/// a different errno: io_uring (see [`IO_URING_SYSCALLS`]) plus `clone3`.
+///
+/// `clone3` cannot be argument-filtered — its flags live in a userspace struct
+/// and seccomp reads registers, not memory — so allowing it would leave
+/// `CLONE_NEWUSER` reachable by the modern spelling while the classic one is
+/// refused. It cannot take EPERM either: glibc only falls back to `clone(2)`
+/// on ENOSYS and treats EPERM as a real answer (the Docker seccomp incident —
+/// `fork` failing with "Operation not permitted" across every container — is
+/// this exact mistake, and EPERM would additionally trip
+/// `write_denial_signature`, same as io_uring did). ENOSYS is what a pre-5.3
+/// kernel returns, so every libc and runtime already answers it by using
+/// `clone(2)` — where [`deny_new_user_namespace`] is waiting.
+fn enosys_rules() -> BTreeMap<i64, Vec<seccompiler::SeccompRule>> {
     IO_URING_SYSCALLS
         .iter()
-        .map(|syscall| (*syscall, Vec::new()))
+        .copied()
+        .chain([libc::SYS_clone3])
+        .map(|syscall| (syscall, Vec::new()))
         .collect()
 }
 
-/// Two filters, because a `SeccompFilter` carries ONE match action and io_uring
-/// must not answer with the same errno as everything else.
+/// Two filters, because a `SeccompFilter` carries ONE match action and the
+/// ENOSYS set must not answer with the same errno as everything else.
 ///
 /// EPERM on the ring was a real bug, not a cosmetic one: `write_denial_signature`
 /// classifies "Operation not permitted" from a sandboxed command as a *filesystem
@@ -476,13 +531,15 @@ fn io_uring_rules() -> BTreeMap<i64, Vec<seccompiler::SeccompRule>> {
 /// exempt from cascade escalation. So the real failure could never escalate.
 ///
 /// ENOSYS is both inert to that classifier and the *truthful* answer: it is what
-/// a kernel without io_uring returns, which is exactly the case every user of the
-/// interface already handles by falling back to epoll/blocking I/O.
+/// a kernel without io_uring (or without `clone3`) returns, which is exactly the
+/// case every user of those interfaces already handles by falling back —
+/// epoll/blocking I/O for the ring, `clone(2)` for `clone3`.
 ///
 /// Stacked filters are safe here: the kernel runs both and takes the
-/// highest-precedence result. io_uring appears only in the ENOSYS filter (the
-/// EPERM one lets it through to its `Allow` default), and `SECCOMP_RET_ERRNO`
-/// outranks `SECCOMP_RET_ALLOW`, so ENOSYS is what the caller sees.
+/// highest-precedence result. The ENOSYS set appears only in the ENOSYS filter
+/// (the EPERM one lets it through to its `Allow` default), and
+/// `SECCOMP_RET_ERRNO` outranks `SECCOMP_RET_ALLOW`, so ENOSYS is what the
+/// caller sees.
 fn build_seccomp(policy: &SandboxPolicy) -> Result<Vec<BpfProgram>, String> {
     let arch = target_arch()?;
     let compile = |rules, errno: i32, label: &str| -> Result<BpfProgram, String> {
@@ -498,8 +555,8 @@ fn build_seccomp(policy: &SandboxPolicy) -> Result<Vec<BpfProgram>, String> {
     };
 
     Ok(vec![
-        compile(seccomp_rules(policy), libc::EPERM, "denied")?,
-        compile(io_uring_rules(), libc::ENOSYS, "io_uring")?,
+        compile(seccomp_rules(policy)?, libc::EPERM, "denied")?,
+        compile(enosys_rules(), libc::ENOSYS, "enosys")?,
     ])
 }
 
@@ -546,10 +603,10 @@ mod tests {
         // is what lets `capabilities()` report the network dimension as `Full`
         // rather than `Partial`: if the ring were reachable, that report would
         // be the same kind of overclaim the filesystem gaps exist to avoid.
-        let ring = io_uring_rules();
+        let enosys = enosys_rules();
         for syscall in IO_URING_SYSCALLS {
             assert!(
-                ring.contains_key(syscall),
+                enosys.contains_key(syscall),
                 "syscall {syscall} must be denied"
             );
         }
@@ -566,7 +623,7 @@ mod tests {
                 network_access: true,
             },
         ] {
-            let denied = seccomp_rules(&policy);
+            let denied = seccomp_rules(&policy).expect("EPERM rules must build");
             for syscall in IO_URING_SYSCALLS {
                 assert!(
                     !denied.contains_key(syscall),
@@ -574,6 +631,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn user_namespace_creation_is_refused_under_every_policy() {
+        // Three spellings, three closures: `unshare`/`setns` sit in the
+        // unconditional EPERM list, `clone` carries an argument rule keyed on
+        // the CLONE_NEWUSER bit, and `clone3` gets ENOSYS so every libc walks
+        // back to the filterable spelling. Checked under both policies because
+        // a network grant must widen exactly one thing (sockets), not this.
+        for policy in [
+            SandboxPolicy::workspace_write(),
+            SandboxPolicy::WorkspaceWrite {
+                network_access: true,
+            },
+        ] {
+            let rules = seccomp_rules(&policy).expect("EPERM rules must build");
+            for syscall in [libc::SYS_unshare, libc::SYS_setns] {
+                assert!(
+                    rules
+                        .get(&syscall)
+                        .is_some_and(|conditions| conditions.is_empty()),
+                    "namespace entry syscall {syscall} must be denied unconditionally"
+                );
+            }
+            assert!(
+                rules
+                    .get(&libc::SYS_clone)
+                    .is_some_and(|conditions| !conditions.is_empty()),
+                "clone must be denied CONDITIONALLY under {policy:?}: no rule leaves \
+                 CLONE_NEWUSER reachable, an unconditional one denies fork itself"
+            );
+            assert!(
+                !rules.contains_key(&libc::SYS_clone3),
+                "clone3 belongs to the ENOSYS filter alone: glibc only falls back to \
+                 clone(2) on ENOSYS, and an EPERM entry here would race that answer"
+            );
+        }
+        assert!(
+            enosys_rules().contains_key(&libc::SYS_clone3),
+            "clone3 must be answered ENOSYS so libcs fall back to clone(2)"
+        );
     }
 
     #[test]
