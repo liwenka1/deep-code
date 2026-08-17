@@ -290,6 +290,31 @@ pub fn sandbox_enforcement() -> &'static Enforcement {
     })
 }
 
+/// Model-facing sentences for refusals this sandbox imposes BY DESIGN — rights
+/// the kernel could grant that the backend deliberately withholds.
+///
+/// The complement of [`EnforcementGap`]: a gap names what this host *cannot*
+/// enforce, so no surface overclaims; a design note names what the sandbox
+/// *chose* to refuse, so the refusal is read as intent rather than as a
+/// write-boundary denial to be fixed with a path grant. Both exist for the
+/// same reader — the model — because both failure shapes surface as
+/// "Permission denied".
+///
+/// Empty on every platform but Linux: Seatbelt allows pty allocation and
+/// device ioctl outright (see `macos_seatbelt.rs`), and a backend that
+/// confines nothing has nothing it refuses on purpose.
+#[must_use]
+pub fn sandbox_design_notes() -> &'static [&'static str] {
+    #[cfg(target_os = "linux")]
+    {
+        linux::design_notes()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        &[]
+    }
+}
+
 /// Whether an OS sandbox backend is usable on this machine. For callers that
 /// must refuse to run rather than silently degrade to bare execution (eval
 /// blind-approves model commands on untrusted repos).
@@ -657,6 +682,36 @@ mod tests {
                     "{gap:?} was reported by a dimension but dropped from the summary"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn design_notes_and_ioctl_gap_are_mutually_exclusive() {
+        // A design note says "the sandbox refuses device ioctl"; the gap says
+        // "the kernel cannot check it". A description carrying both would tell
+        // the model the same operation is simultaneously unchecked and refused.
+        // And a host with no backend refuses nothing *by design* — there is no
+        // design there to speak for.
+        let caps = detect_capabilities();
+        let notes = sandbox_design_notes();
+        if !caps.available {
+            assert!(
+                notes.is_empty(),
+                "an unavailable backend cannot refuse anything by design"
+            );
+        }
+        if caps
+            .filesystem
+            .gaps()
+            .contains(&EnforcementGap::LandlockIoctlDev)
+        {
+            assert!(
+                notes.is_empty(),
+                "device ioctl cannot be both ungoverned and deliberately denied"
+            );
+        }
+        for note in notes {
+            assert!(!note.is_empty());
         }
     }
 

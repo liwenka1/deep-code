@@ -62,31 +62,58 @@ const JOB_DESC_UNCONFINED: &str = "Manage background shell jobs: action=start la
 /// the device-`ioctl` one, which leaves that boundary fully intact. The model is
 /// the surface that actually issues the write, so it is the last place a gap may
 /// be rounded — in either direction.
-fn describe(confined: &'static str, unconfined: &'static str) -> String {
-    match crate::sandbox::sandbox_enforcement() {
-        Enforcement::Full => confined.to_string(),
-        Enforcement::None => unconfined.to_string(),
-        Enforcement::Partial { gaps } => {
-            let mut text = confined.to_string();
-            for gap in gaps {
-                text.push(' ');
-                text.push_str(gap.model_caveat());
-            }
-            text
-        }
+///
+/// Any confined host (Full or Partial) additionally gets `notes` — refusals the
+/// sandbox imposes *by design* ([`crate::sandbox::sandbox_design_notes`]). A
+/// deliberate denial the model will run into must be disclosed for the same
+/// reason a gap must: its failure text ("Permission denied") reads exactly like
+/// a write-boundary denial, and a model that cannot tell them apart chases
+/// `/add-dir` over a failure no grant can fix.
+fn describe(
+    confined: &'static str,
+    unconfined: &'static str,
+    enforcement: &Enforcement,
+    notes: &[&str],
+) -> String {
+    if !enforcement.is_enforced() {
+        return unconfined.to_string();
     }
+    let mut text = confined.to_string();
+    for gap in enforcement.gaps() {
+        text.push(' ');
+        text.push_str(gap.model_caveat());
+    }
+    for note in notes {
+        text.push(' ');
+        text.push_str(note);
+    }
+    text
 }
 
 /// Memoized: `description()` is called for every tool-registry build (each
 /// subagent gets one) and the answer cannot change under a running process.
 fn shell_description() -> &'static str {
     static DESC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    DESC.get_or_init(|| describe(SHELL_DESC_CONFINED, SHELL_DESC_UNCONFINED))
+    DESC.get_or_init(|| {
+        describe(
+            SHELL_DESC_CONFINED,
+            SHELL_DESC_UNCONFINED,
+            crate::sandbox::sandbox_enforcement(),
+            crate::sandbox::sandbox_design_notes(),
+        )
+    })
 }
 
 fn job_description() -> &'static str {
     static DESC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    DESC.get_or_init(|| describe(JOB_DESC_CONFINED, JOB_DESC_UNCONFINED))
+    DESC.get_or_init(|| {
+        describe(
+            JOB_DESC_CONFINED,
+            JOB_DESC_UNCONFINED,
+            crate::sandbox::sandbox_enforcement(),
+            crate::sandbox::sandbox_design_notes(),
+        )
+    })
 }
 
 /// Build, secret-scrub, sandbox-wrap and spawn one shell subprocess, then

@@ -288,6 +288,41 @@ fn landlock_gaps() -> Result<Vec<EnforcementGap>, String> {
     Ok(gaps)
 }
 
+/// The model-facing sentence for the deliberate device-ioctl denial. Kept in
+/// sync with [`build_landlock`], which strips `IOCTL_DEV` from the `/dev`
+/// grants — if that grant ever comes back, this sentence becomes a lie.
+const DEVICE_IOCTL_DESIGN_NOTE: &str = "This sandbox deliberately refuses \
+    ioctl(2) on device nodes (an ioctl on the controlling terminal reaches \
+    TIOCSTI — keystroke injection into the user's shell), so allocating a \
+    pseudo-terminal fails inside it: expect/pexpect/script-style tools report \
+    'Permission denied' from /dev/ptmx. That refusal is by design and names no \
+    path — /add-dir cannot fix it; run such tools in non-interactive (pipe) \
+    mode instead.";
+
+/// What this backend refuses on purpose, told to the model only where the
+/// refusal is actually live (see [`super::sandbox_design_notes`]).
+///
+/// The ioctl note is conditional on the kernel *governing* the right at all —
+/// ABI 5+, i.e. the [`EnforcementGap::LandlockIoctlDev`] gap is absent. Below
+/// that the right is never checked, ptys work, and the gap's own
+/// `model_caveat` describes the exposure instead. Note and gap are therefore
+/// mutually exclusive by construction; a test in `super` pins that, because a
+/// description carrying both would tell the model device ioctl is
+/// simultaneously unchecked and refused.
+pub(super) fn design_notes() -> &'static [&'static str] {
+    let capabilities = super::detect_capabilities();
+    let ioctl_governed = capabilities.available
+        && !capabilities
+            .filesystem
+            .gaps()
+            .contains(&EnforcementGap::LandlockIoctlDev);
+    if ioctl_governed {
+        &[DEVICE_IOCTL_DESIGN_NOTE]
+    } else {
+        &[]
+    }
+}
+
 pub fn wrap_shell_command(
     command: &str,
     cwd: &Path,
@@ -356,7 +391,9 @@ fn build_landlock(
     // terminal's input queue for the user's own shell to execute after this
     // process exits — outside Landlock, seccomp, the deny floor and the approval
     // gate alike. Redirection needs the write bit, not the ioctl bit, so grant
-    // only what it needs.
+    // only what it needs. The visible cost — pty allocation failing on kernels
+    // that enforce the right — is disclosed to the model through
+    // [`DEVICE_IOCTL_DESIGN_NOTE`]; restoring this grant would orphan that text.
     let device_access = access & !AccessFs::IoctlDev;
     // Pre-filter to existing paths so a missing /dev node can't fail the whole
     // ruleset build (path_beneath_rules errors on paths it can't open).

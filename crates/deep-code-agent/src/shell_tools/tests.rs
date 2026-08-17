@@ -440,6 +440,18 @@ fn tool_descriptions_match_actual_sandbox_capability() {
                 enforcement.gaps()
             );
         }
+        // Design notes ride along wherever the host is confined: a refusal the
+        // sandbox imposes on purpose surfaces as the same "Permission denied" a
+        // boundary denial does, so it must be disclosed on Full hosts too.
+        // (Empty off Linux and wherever the ioctl gap exists instead — the
+        // exclusivity is pinned in `sandbox::tests`.)
+        for note in crate::sandbox::sandbox_design_notes() {
+            assert_eq!(
+                description.contains(note),
+                enforcement.is_enforced(),
+                "a design note must appear exactly on confined hosts: {description}"
+            );
+        }
         if !enforcement.is_enforced() {
             assert!(
                 description.contains("NO OS sandbox confinement"),
@@ -448,4 +460,45 @@ fn tool_descriptions_match_actual_sandbox_capability() {
             assert!(!description.contains("sandboxed without network"));
         }
     }
+}
+
+/// [`describe`] with fabricated inputs, because the interesting host shapes
+/// cannot all be real at once: no CI runner is a Linux 6.10+ kernel, so the
+/// "design note present" side would otherwise ship untested — the exact
+/// silent-skip trap the gap caveats fell into before 2ae27bf.
+#[test]
+fn describe_appends_gap_caveats_then_design_notes() {
+    use crate::sandbox::{Enforcement, EnforcementGap};
+
+    const NOTE: &str = "DESIGN-NOTE-SENTINEL.";
+
+    // Full host with a designed refusal: body intact, note appended.
+    let full = describe(
+        SHELL_DESC_CONFINED,
+        SHELL_DESC_UNCONFINED,
+        &Enforcement::Full,
+        &[NOTE],
+    );
+    assert!(full.starts_with(SHELL_DESC_CONFINED));
+    assert!(full.ends_with(NOTE));
+
+    // Partial host: its gap caveat comes first, the note still lands.
+    let partial = describe(
+        SHELL_DESC_CONFINED,
+        SHELL_DESC_UNCONFINED,
+        &Enforcement::from_gaps(vec![EnforcementGap::LandlockTruncate]),
+        &[NOTE],
+    );
+    assert!(partial.contains(EnforcementGap::LandlockTruncate.model_caveat()));
+    assert!(partial.ends_with(NOTE));
+
+    // Unconfined host: nothing is appended to a body that promises nothing —
+    // a note about what the sandbox refuses would imply there is one.
+    let none = describe(
+        SHELL_DESC_CONFINED,
+        SHELL_DESC_UNCONFINED,
+        &Enforcement::None,
+        &[NOTE],
+    );
+    assert_eq!(none, SHELL_DESC_UNCONFINED);
 }
