@@ -721,10 +721,12 @@ mod tests {
 
     #[test]
     fn network_syscalls_are_denied_only_without_a_network_grant() {
-        let denied = seccomp_rules(&SandboxPolicy::workspace_write());
+        let denied =
+            seccomp_rules(&SandboxPolicy::workspace_write()).expect("EPERM rules must build");
         let granted = seccomp_rules(&SandboxPolicy::WorkspaceWrite {
             network_access: true,
-        });
+        })
+        .expect("EPERM rules must build");
         for syscall in NETWORK_SYSCALLS {
             assert!(denied.contains_key(syscall));
             assert!(!granted.contains_key(syscall));
