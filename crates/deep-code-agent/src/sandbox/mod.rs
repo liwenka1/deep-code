@@ -336,7 +336,11 @@ pub fn sandbox_available() -> bool {
 /// like that may pass quietly. So CI sets the env var (see
 /// `.github/workflows/ci.yml`), turning "no backend" from a skip into a failure
 /// that names what was missing.
-#[cfg(test)]
+///
+/// Compiled only where a backend exists to probe: the call sites live in the
+/// `linux`/`macos_seatbelt` test modules, so on Windows this would be dead
+/// code and `-D warnings` would refuse the build.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn require_backend_or_skip(available: bool, backend: &str) -> bool {
     if available {
         return false;
