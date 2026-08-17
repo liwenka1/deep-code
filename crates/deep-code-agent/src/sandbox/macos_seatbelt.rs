@@ -450,8 +450,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn confined_command_cannot_write_outside_granted_roots() {
-        if !is_available() {
-            eprintln!("seatbelt unavailable on this host; skipping");
+        if crate::sandbox::require_backend_or_skip(is_available(), "Seatbelt") {
             return;
         }
         let workspace = tempfile::tempdir().unwrap();
@@ -490,8 +489,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn confined_command_writes_into_extra_granted_root() {
-        if !is_available() {
-            eprintln!("seatbelt unavailable on this host; skipping");
+        if crate::sandbox::require_backend_or_skip(is_available(), "Seatbelt") {
             return;
         }
         // The multi-root scenario end to end at the kernel: a command run from
@@ -522,8 +520,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn confined_command_can_use_the_temp_dir() {
-        if !is_available() {
-            eprintln!("seatbelt unavailable on this host; skipping");
+        if crate::sandbox::require_backend_or_skip(is_available(), "Seatbelt") {
             return;
         }
         let workspace = tempfile::tempdir().unwrap();
@@ -550,8 +547,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn confined_command_writes_within_granted_root() {
-        if !is_available() {
-            eprintln!("seatbelt unavailable on this host; skipping");
+        if crate::sandbox::require_backend_or_skip(is_available(), "Seatbelt") {
             return;
         }
         let workspace = tempfile::tempdir().unwrap();

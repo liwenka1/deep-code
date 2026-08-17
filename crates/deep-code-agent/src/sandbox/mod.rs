@@ -323,6 +323,34 @@ pub fn sandbox_available() -> bool {
     detect_capabilities().available
 }
 
+/// Test-only: whether a sandbox-enforcement test should bail because this host
+/// has no usable backend — but a HARD FAILURE instead when
+/// `DEEPCODE_REQUIRE_SANDBOX` is set.
+///
+/// Each enforcement test opens with `if unavailable { return }` so it can run
+/// on a developer laptop or an old kernel with nothing to enforce. On CI that
+/// same escape hatch is a liability: if a runner silently loses Landlock or
+/// Seatbelt (a base-image change, a nested container, a dropped capability),
+/// every one of these tests becomes a no-op and the job still reports green —
+/// and the sandbox's own enforcement tests are the last place a regression
+/// like that may pass quietly. So CI sets the env var (see
+/// `.github/workflows/ci.yml`), turning "no backend" from a skip into a failure
+/// that names what was missing.
+#[cfg(test)]
+pub(crate) fn require_backend_or_skip(available: bool, backend: &str) -> bool {
+    if available {
+        return false;
+    }
+    assert!(
+        std::env::var_os("DEEPCODE_REQUIRE_SANDBOX").is_none(),
+        "DEEPCODE_REQUIRE_SANDBOX is set but the {backend} backend is unavailable \
+         on this host: a sandbox-enforcement test would skip, reporting green \
+         without ever exercising confinement. Failing instead."
+    );
+    eprintln!("{backend} unavailable on this host; skipping enforcement test");
+    true
+}
+
 /// Probe sandbox support on this host, memoized for the process lifetime.
 ///
 /// Called several times per spawned command (`should_sandbox`,

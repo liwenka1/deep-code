@@ -733,7 +733,7 @@ mod tests {
 
     #[test]
     fn write_inside_workspace_is_allowed() {
-        if !capabilities().available {
+        if crate::sandbox::require_backend_or_skip(capabilities().available, "Landlock") {
             return; // No Landlock on this host (e.g. old kernel); nothing to assert.
         }
         let dir = tempfile::tempdir().unwrap();
@@ -748,7 +748,7 @@ mod tests {
 
     #[test]
     fn write_outside_workspace_is_blocked() {
-        if !capabilities().available {
+        if crate::sandbox::require_backend_or_skip(capabilities().available, "Landlock") {
             return;
         }
         // Target a path under $HOME (not the workspace, not the granted temp

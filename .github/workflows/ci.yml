@@ -35,6 +35,11 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test
+        # This runner has Landlock+seccomp; make their absence a failure, not a
+        # silent skip, so a base-image change that drops the backend is caught
+        # here rather than shipping unconfined (see `require_backend_or_skip`).
+        env:
+          DEEPCODE_REQUIRE_SANDBOX: "1"
         run: cargo test --locked --workspace
 
   # Compiles & tests the macOS-only Seatbelt code. These tests actually spawn
@@ -59,6 +64,10 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test
+        # Seatbelt is present on every macOS runner; require it so a nested or
+        # restricted environment that forbids sandbox-exec fails loudly.
+        env:
+          DEEPCODE_REQUIRE_SANDBOX: "1"
         run: cargo test --locked --workspace
 
   # Runs on the exact runner label the release workflow builds linux-arm64 on.
@@ -84,6 +93,9 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test
+        # aarch64 Landlock+seccomp, same requirement as the x86_64 job.
+        env:
+          DEEPCODE_REQUIRE_SANDBOX: "1"
         run: cargo test --locked --workspace
 
   # Compiles & tests the Windows-only sandbox (Job Object) code, which the
