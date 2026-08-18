@@ -28,7 +28,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Current version: 0.4.4 — enter the NEW version to release (no leading v)'
+        description: 'Current version: 0.4.6 — enter the NEW version to release (no leading v)'
         required: true
 
 # 同一时刻只允许一次发版准备在跑，杜绝并发双开互相踩 tag。
