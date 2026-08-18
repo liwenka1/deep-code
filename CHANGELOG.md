@@ -6,6 +6,11 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [0.4.6] - 2026-08-18
+
+- Code blocks in the TUI transcript are now syntax-highlighted by language, with a per-line cache so only the newly streamed tail is re-highlighted as it arrives.
+- The transcript now renders GFM pipe tables, and a run of pipes only becomes a table once the separator row has arrived — partial rows are not misrendered as one.
+
 ## [0.4.5] - 2026-08-18
 
 - **Security:** the Linux sandbox now closes the third spelling of unprivileged
@@ -193,3 +198,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.1.5]: https://github.com/liwenka1/deep-code/releases/tag/v0.1.5
 [0.4.4]: https://github.com/liwenka1/deep-code/compare/v0.4.3...v0.4.4
 [0.4.5]: https://github.com/liwenka1/deep-code/compare/v0.4.4...v0.4.5
+[0.4.6]: https://github.com/liwenka1/deep-code/compare/v0.4.5...v0.4.6

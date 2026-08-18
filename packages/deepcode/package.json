@@ -1,6 +1,6 @@
 {
   "name": "@liwenkai/deepcode",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "AI coding assistant in your terminal — powered by DeepSeek",
   "bin": {
     "deepcode": "bin/deepcode"
