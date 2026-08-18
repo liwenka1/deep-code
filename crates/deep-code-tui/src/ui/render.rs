@@ -316,7 +316,8 @@ fn highlight_selection(
 /// Assistant text always renders as markdown — including while still
 /// streaming — so formatting is consistent throughout. `parse_blocks` treats
 /// an unclosed code fence as a code block, so a half-streamed fence renders
-/// without flicker.
+/// without flicker; a pipe-table header stays plain text until its separator
+/// row arrives — the same no-flicker rule from the other direction.
 fn cell_lines(cell: &HistoryCell, width: u16, lang: Lang) -> Vec<Line<'static>> {
     let width = width as usize;
     let dim = Style::default().fg(Color::DarkGray);
