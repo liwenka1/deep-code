@@ -8,7 +8,7 @@ A DeepSeek-powered terminal coding agent, written in Rust. One small binary: str
 
 **Small, fast, self-contained**
 
-- Single native binary (~4–5 MB) per platform — no Node/Python runtime needed at run time. Prebuilt for macOS (arm64/x64), Linux (x64/arm64, glibc ≥ 2.35), and Windows (x64).
+- Single native binary (~4–6 MB) per platform — no Node/Python runtime needed at run time. Prebuilt for macOS (arm64/x64), Linux (x64/arm64, glibc ≥ 2.35), and Windows (x64).
 - `npm i -g` fetches the right binary and verifies its SHA-256. musl hosts (Alpine and most slim images) are not supported yet — the installer detects and refuses them with a clear error instead of installing a broken binary.
 
 **Safety-first execution**
@@ -34,7 +34,7 @@ A DeepSeek-powered terminal coding agent, written in Rust. One small binary: str
 
 **A TUI that stays honest**
 
-- Streaming responses with DeepSeek reasoning, mouse scroll/select, paste folding, completion menus. Type while the model streams — your input queues and is sent as a follow-up when the turn ends (mid-turn steering).
+- Streaming responses with DeepSeek reasoning, mouse scroll/select, paste folding, completion menus. Code blocks are syntax-highlighted (75 bundled grammars, 24-bit or 256-color to match the terminal), and pipe tables lay out as real columns — CJK-aware widths, cells wrapping in place, degrading to plain text when the window can't hold them. Type while the model streams — your input queues and is sent as a follow-up when the turn ends (mid-turn steering).
 - Approval panel shows a real change preview; running tools display their own elapsed clock (`agent … · 47s`) instead of a frozen screen; the status line stays minimal (tier, effective model, context usage).
 - Bilingual UI (English / 中文), hot-switchable with `/lang`. Graceful shutdown end to end: SIGTERM/SIGINT drain properly, and process groups are killed as a tree — no orphaned dev servers squatting on ports.
 
