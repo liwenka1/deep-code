@@ -1,6 +1,7 @@
 # Release Prep —— 一键发版入口
 #
-# 触发：Actions 页面 workflow_dispatch，输入版本号（如 0.4.4，不带 v）。
+# 触发：Actions 页面 workflow_dispatch，输入要发布的新版本号（不带 v；
+#       输入框提示会显示当前已发布的版本，见下）。
 # 执行：deepcode 起草 CHANGELOG 新节 → bump 三个版本文件 → chore(release)
 #       commit → 打 v 标签 → 推送。推送用 GitHub App 身份 —— 这是硬要求，
 #       不是装饰：GITHUB_TOKEN 推的 tag 不会触发其他 workflow，release.yml
@@ -13,6 +14,13 @@
 # changelog 由模型起草、无人过目——这是知情选择（见 CHANGELOG.md 顶部
 # 锚点注释）。事后修正路径：main 上补 docs commit + 编辑 GitHub Release
 # 正文；tag 树里的那份历史文件不可改，是全自动的固有代价。
+#
+# 输入框提示里的 "Current version: X" 由发版流程自我维护：dispatch 的
+# description 是静态 YAML（GitHub 不支持在这里取动态值），所以发布成功后
+# 由最后一步把它刷成刚发布的版本、单独 commit 单独 push。best-effort：
+# 改的是 workflow 文件，App 需要 Workflows 写权限；缺权限或 main 恰好被
+# 推进时只告警不失败——发版本身不受影响，代价是提示停在上一个成功刷新
+# 的版本，直到下次刷新自愈。
 
 name: Release Prep
 
@@ -20,7 +28,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (e.g. 0.4.4, no leading v)'
+        description: 'Current version: 0.4.4 — enter the NEW version to release (no leading v)'
         required: true
 
 # 同一时刻只允许一次发版准备在跑，杜绝并发双开互相踩 tag。
@@ -197,6 +205,28 @@ jobs:
           git commit -m "chore(release): ${VERSION}"
           git tag "v${VERSION}"
           git push origin "HEAD:main" "refs/tags/v${VERSION}"
+
+      # 发布已完成；把 dispatch 输入框的提示刷成 "Current version: 刚发布的
+      # 版本"，下次打开触发页时"当前版本"才是真话。刻意不进上面的原子推送：
+      # 这行字是纯提示，不配拥有挡住一次成功发版的能力。失败的两种已知形态
+      # （App 缺 Workflows 写权限被 GitHub 拒推、main 运行期间被推进导致
+      # 非快进）都只告警跳过。
+      - name: Refresh dispatch hint (best-effort)
+        run: |
+          NEW_HINT="Current version: ${VERSION} — enter the NEW version to release (no leading v)"
+          sed -i -E "s|^( +description: ).*$|\1'${NEW_HINT}'|" .github/workflows/release-prep.yml
+          if ! grep -qF "${NEW_HINT}" .github/workflows/release-prep.yml; then
+            echo "::warning::dispatch-hint description line not found; hint left as-is"
+            exit 0
+          fi
+          if git diff --quiet -- .github/workflows/release-prep.yml; then
+            echo "dispatch hint already current"
+            exit 0
+          fi
+          git add .github/workflows/release-prep.yml
+          git commit -m "docs(ci): 发版入口提示刷新为当前版本 ${VERSION}"
+          git push origin "HEAD:main" \
+            || echo "::warning::hint refresh not pushed (App lacks the Workflows write permission, or main advanced mid-run); the release itself is complete — the hint self-heals on the next successful refresh."
 
       - name: Summary
         run: |
