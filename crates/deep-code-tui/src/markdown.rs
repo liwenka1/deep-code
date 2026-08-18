@@ -140,17 +140,33 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
                 ));
             }
             MarkdownBlock::CodeBlock { language, lines } => {
-                let marker = match language {
+                let marker = match &language {
                     Some(language) => format!("``` {language}"),
                     None => "```".to_string(),
                 };
                 out.push(Line::styled(marker, fence_style()));
-                for code in lines {
-                    out.extend(wrap_spans(
-                        vec![(format!("  {code}"), code_style())],
-                        width,
-                        2,
-                    ));
+                // Unknown language tokens (or no token) keep the plain
+                // single-color style rather than guessing a grammar.
+                let highlighted = language
+                    .as_deref()
+                    .and_then(|token| crate::highlight::highlight_block(token, &lines));
+                match highlighted {
+                    Some(rows) => {
+                        for row in rows {
+                            let mut spans = vec![("  ".to_string(), Style::default())];
+                            spans.extend(row);
+                            out.extend(wrap_spans(spans, width, 2));
+                        }
+                    }
+                    None => {
+                        for code in lines {
+                            out.extend(wrap_spans(
+                                vec![(format!("  {code}"), code_style())],
+                                width,
+                                2,
+                            ));
+                        }
+                    }
                 }
                 out.push(Line::styled("```", fence_style()));
             }
@@ -749,6 +765,32 @@ mod tests {
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(texts.iter().any(|text| text.contains("aaa")));
         assert!(texts.iter().all(|text| !text.contains('│')));
+    }
+
+    #[test]
+    fn fenced_code_with_known_language_gets_highlighted_spans() {
+        let lines = render_markdown("```rust\nfn main() { let s = \"hi\"; }\n```", 60);
+        let colors: std::collections::HashSet<_> = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter_map(|span| span.style.fg)
+            .collect();
+        // Fence markers are DarkGray; real highlighting adds several more.
+        assert!(
+            colors.len() > 2,
+            "expected highlight colors, got {colors:?}"
+        );
+    }
+
+    #[test]
+    fn fenced_code_with_unknown_language_keeps_plain_style() {
+        let lines = render_markdown("```zzz-unknown\nplain text\n```", 60);
+        let code_span = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref().contains("plain text"))
+            .expect("code line span");
+        assert_eq!(code_span.style.fg, Some(Color::Cyan));
     }
 
     #[test]

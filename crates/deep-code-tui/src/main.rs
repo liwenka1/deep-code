@@ -8,6 +8,7 @@ mod eval_cli;
 mod event_routing;
 mod github;
 mod headless;
+mod highlight;
 mod history;
 mod markdown;
 mod startup;
