@@ -6,6 +6,20 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [0.4.5] - 2026-08-18
+
+- **Security:** the Linux sandbox now closes the third spelling of unprivileged
+  user-namespace creation, adds seccomp stand-ins for `ptrace` and the new
+  mount API, and switches `io_uring` to an `ENOSYS` denial — sealing the path
+  that let `io_uring` bypass seccomp.
+- **Security:** the sandbox capability report the model sees is now
+  three-state and no longer over-claims — it reflects what Landlock actually
+  enforces rather than asserting protections the kernel never applied.
+- Device `ioctl` refusals that the sandbox makes by design are now told to the
+  model as such, so it stops chasing `/add-dir`; each gap is worded
+  separately, so an `ioctl` gap no longer negates an otherwise intact write
+  boundary.
+
 ## [0.4.4] - 2026-08-13
 
 - `deep-code eval`: long benchmark runs get a fallback and observability, and
@@ -178,3 +192,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.2.0]: https://github.com/liwenka1/deep-code/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/liwenka1/deep-code/releases/tag/v0.1.5
 [0.4.4]: https://github.com/liwenka1/deep-code/compare/v0.4.3...v0.4.4
+[0.4.5]: https://github.com/liwenka1/deep-code/compare/v0.4.4...v0.4.5
