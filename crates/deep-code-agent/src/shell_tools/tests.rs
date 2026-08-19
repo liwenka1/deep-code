@@ -128,6 +128,60 @@ async fn shell_times_out_and_kills_the_child() {
     );
 }
 
+/// End-to-end spill: an output past the inline window lands byte-complete in
+/// a file under the workspace's `.deep-code/spill/`, the result text names
+/// that file, and the structured details carry the path. The HEAD assertion
+/// is the point of the feature — before spill, everything before the tail
+/// window was physically unrecoverable.
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_overflow_spills_full_stream_and_result_names_the_file() {
+    let tmp = tempdir().unwrap();
+    let registry = registry(tmp.path());
+    // ~28 KB: past the 20k inline window, within the 128 KiB ring — the
+    // range that used to truncate silently.
+    let call = ToolCall::new("call_1", "shell", json!({"command": "seq 1 6000"}));
+    let ToolRunOutcome::Result { result } = registry
+        .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await
+        .unwrap()
+    else {
+        panic!("expected result");
+    };
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert!(
+        result.content.contains("complete stream saved"),
+        "result must point at the spill file: {}",
+        result.content
+    );
+
+    let spill_path = details(&result)["stdout_spill_path"]
+        .as_str()
+        .expect("details carry the spill path")
+        .to_string();
+    assert!(spill_path.contains(".deep-code"));
+    let saved = std::fs::read_to_string(&spill_path).unwrap();
+    assert!(
+        saved.starts_with("1\n2\n"),
+        "spill must preserve the head the inline tail cut off"
+    );
+    assert!(saved.ends_with("6000\n"), "…and the very end of the stream");
+
+    // The spilled stream stays readable after the job record is gone: the
+    // reader task closed its handle at EOF, the file itself persists.
+    assert!(std::path::Path::new(&spill_path).exists());
+}
+
+/// Small outputs must stay diskless: no spill file, no spill directory.
+#[tokio::test]
+async fn small_output_leaves_no_spill_dir_behind() {
+    let tmp = tempdir().unwrap();
+    let result = approved(tmp.path(), "shell", json!({"command": "echo hi"})).await;
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert!(details(&result)["stdout_spill_path"].is_null());
+    assert!(!tmp.path().join(".deep-code/spill").exists());
+}
+
 /// Timeout must kill the whole process tree (the child is spawned as its own
 /// process group), not just the immediate shell — otherwise grandchildren
 /// like spawned servers keep running and holding ports.
@@ -405,11 +459,13 @@ fn tool_descriptions_match_actual_sandbox_capability() {
         WorkspacePolicy::new(std::path::Path::new(".")).unwrap(),
         JobStore::default(),
         SandboxManager::new(),
+        std::path::PathBuf::from(".deep-code/spill/test"),
     );
     let job = JobTool::new(
         WorkspacePolicy::new(std::path::Path::new(".")).unwrap(),
         JobStore::default(),
         SandboxManager::new(),
+        std::path::PathBuf::from(".deep-code/spill/test"),
     );
 
     for description in [shell.description(), job.description()] {
@@ -492,13 +548,13 @@ fn describe_appends_gap_caveats_then_design_notes() {
     assert!(partial.contains(EnforcementGap::LandlockTruncate.model_caveat()));
     assert!(partial.ends_with(NOTE));
 
-    // Unconfined host: nothing is appended to a body that promises nothing —
-    // a note about what the sandbox refuses would imply there is one.
+    // Unconfined host: no sandbox note lands on a body that promises no
+    // sandbox — only the sandbox-independent spill sentence joins the body.
     let none = describe(
         SHELL_DESC_CONFINED,
         SHELL_DESC_UNCONFINED,
         &Enforcement::None,
         &[NOTE],
     );
-    assert_eq!(none, SHELL_DESC_UNCONFINED);
+    assert_eq!(none, format!("{SHELL_DESC_UNCONFINED}{SPILL_DESC}"));
 }

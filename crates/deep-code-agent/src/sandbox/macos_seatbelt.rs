@@ -488,6 +488,39 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn confined_command_reads_the_workspace_spill_dir() {
+        if crate::sandbox::require_backend_or_skip(is_available(), "Seatbelt") {
+            return;
+        }
+        // Behavioral pin for the spill design: overflow files live under the
+        // WORKSPACE's `.deep-code/spill` precisely so a sandboxed `grep`/`tail`
+        // can mine them. The read-deny sealing the HOME `~/.deep-code` secret
+        // store must not catch a workspace directory of the same name.
+        let workspace = tempfile::tempdir().unwrap();
+        let spill = workspace.path().join(".deep-code/spill/run-1");
+        std::fs::create_dir_all(&spill).unwrap();
+        let log = spill.join("job_1.stdout.log");
+        std::fs::write(&log, "first-error: E0308\n").unwrap();
+
+        let output = wrap_shell_command(
+            &format!("grep -c first-error {}", log.display()),
+            workspace.path(),
+            &single_root(workspace.path()),
+            &SandboxPolicy::workspace_write(),
+        )
+        .output()
+        .expect("sandbox-exec should launch");
+
+        assert!(
+            output.status.success(),
+            "sandboxed read of a workspace spill file must pass: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn confined_command_writes_into_extra_granted_root() {
         if crate::sandbox::require_backend_or_skip(is_available(), "Seatbelt") {
             return;

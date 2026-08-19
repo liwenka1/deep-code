@@ -1,4 +1,6 @@
 use std::collections::{HashMap, VecDeque};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -14,6 +16,19 @@ use crate::tool::ToolError;
 use crate::workspace_policy::invalid;
 
 const JOB_BUFFER_BYTES: usize = 128 * 1024;
+
+/// Bytes past which a stream spills to disk. Equal to `MAX_OUTPUT_CHARS`
+/// on purpose: UTF-8 chars are at least one byte, so a stream at most this
+/// many BYTES is at most that many chars — fully visible inline — and
+/// anything beyond it may lose content to `tail_chars` or the ring. Well
+/// under the ring capacity, so at the moment of crossing the ring still
+/// holds every byte and the file can start from byte zero.
+const SPILL_THRESHOLD_BYTES: usize = super::MAX_OUTPUT_CHARS;
+
+/// Per-stream cap on a spill file. The file keeps the HEAD (where compilers
+/// put the root-cause error) and stops there; the ring independently keeps
+/// the live tail, so both ends survive even a pathological firehose.
+const SPILL_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// How many job records to keep. Every `shell` call — foreground included —
 /// inserts one so `job action=status/tail` can inspect it afterwards, and
@@ -54,12 +69,18 @@ impl JobStore {
         }
     }
 
-    pub(super) fn insert(&self, state: JobState) -> String {
-        let id = format!("job_{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
+    /// Allocate the next job id without inserting anything. Split from
+    /// [`Self::insert_with_id`] because the spill file paths are named after
+    /// the id and must exist before the output buffers (and thus the state)
+    /// are constructed.
+    pub(super) fn reserve_id(&self) -> String {
+        format!("job_{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    pub(super) fn insert_with_id(&self, id: &str, state: JobState) {
         let mut guard = self.jobs.lock().expect("job store lock poisoned");
-        guard.insert(id.clone(), Arc::new(Mutex::new(state)));
+        guard.insert(id.to_string(), Arc::new(Mutex::new(state)));
         evict_finished_jobs(&mut guard);
-        id
     }
 
     pub(super) fn get(&self, id: &str, tool_name: &str) -> Result<Arc<Mutex<JobState>>, ToolError> {
@@ -171,6 +192,16 @@ impl Default for SharedBuffer {
 }
 
 impl SharedBuffer {
+    /// A buffer that additionally spills the complete stream to `path` once
+    /// it grows past [`SPILL_THRESHOLD_BYTES`]. Below the threshold nothing
+    /// touches the disk — `echo hi` must not leave a file behind.
+    pub(super) fn with_spill(path: PathBuf) -> Self {
+        Self(Arc::new(Mutex::new(RingBuffer::with_spill(
+            JOB_BUFFER_BYTES,
+            path,
+        ))))
+    }
+
     fn push(&self, bytes: &[u8]) {
         self.0
             .lock()
@@ -195,6 +226,37 @@ impl SharedBuffer {
             .expect("output buffer lock poisoned")
             .omitted_len()
     }
+
+    /// Path and size of the spill file, when one was actually written.
+    pub(super) fn spill_info(&self) -> Option<SpillInfo> {
+        self.0
+            .lock()
+            .expect("output buffer lock poisoned")
+            .spill
+            .as_ref()
+            .and_then(Spill::info)
+    }
+
+    /// Close the spill file handle (stream is done). The file itself stays on
+    /// disk — transcript references must outlive the job record.
+    fn finish_spill(&self) {
+        if let Some(spill) = self
+            .0
+            .lock()
+            .expect("output buffer lock poisoned")
+            .spill
+            .as_mut()
+        {
+            spill.file = None;
+        }
+    }
+}
+
+/// Facts about a written spill file, for the model-facing note and details.
+pub(super) struct SpillInfo {
+    pub(super) path: PathBuf,
+    pub(super) bytes: u64,
+    pub(super) capped: bool,
 }
 
 #[derive(Debug)]
@@ -202,6 +264,7 @@ struct RingBuffer {
     bytes: VecDeque<u8>,
     capacity: usize,
     total_len: usize,
+    spill: Option<Spill>,
 }
 
 impl RingBuffer {
@@ -213,10 +276,22 @@ impl RingBuffer {
             bytes: VecDeque::new(),
             capacity,
             total_len: 0,
+            spill: None,
         }
     }
 
+    fn with_spill(capacity: usize, path: PathBuf) -> Self {
+        let mut buffer = Self::new(capacity);
+        buffer.spill = Some(Spill::new(path));
+        buffer
+    }
+
     fn push(&mut self, bytes: &[u8]) {
+        // Spill sees the chunk before the ring mutates: at creation time it
+        // backfills from the ring, which must still hold every prior byte.
+        if let Some(spill) = self.spill.as_mut() {
+            spill.offer(self.total_len, &self.bytes, bytes);
+        }
         self.total_len += bytes.len();
         for byte in bytes {
             if self.bytes.len() == self.capacity {
@@ -232,6 +307,101 @@ impl RingBuffer {
 
     fn omitted_len(&self) -> usize {
         self.total_len.saturating_sub(self.bytes.len())
+    }
+}
+
+/// Byte-exact overflow copy of one stream, created lazily at the threshold.
+///
+/// Best-effort by design: an I/O failure disables the spill and the command
+/// result falls back to the ring-only path — output capture must never make
+/// the command itself fail. This is a UX layer, not a security boundary.
+#[derive(Debug)]
+struct Spill {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    written: u64,
+    failed: bool,
+}
+
+impl Spill {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            file: None,
+            written: 0,
+            failed: false,
+        }
+    }
+
+    /// Feed one incoming chunk. `prior_total` and `backlog` describe the ring
+    /// BEFORE the chunk is applied; on the first threshold crossing the whole
+    /// backlog (equal to the entire stream so far, see the threshold constant)
+    /// is written ahead of the chunk, so the file always starts at byte zero.
+    fn offer(&mut self, prior_total: usize, backlog: &VecDeque<u8>, chunk: &[u8]) {
+        if self.failed || self.written >= SPILL_MAX_BYTES {
+            return;
+        }
+        // Written but no handle = the stream already finished; never re-create
+        // (File::create would truncate the finished file down to the backlog).
+        // Unreachable while the reader task is the only pusher — insurance.
+        if self.file.is_none() && self.written > 0 {
+            return;
+        }
+        if self.file.is_none() {
+            if prior_total + chunk.len() <= SPILL_THRESHOLD_BYTES {
+                return;
+            }
+            debug_assert_eq!(
+                prior_total,
+                backlog.len(),
+                "spill must be created before the ring ever drops a byte"
+            );
+            let created = self
+                .path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::File::create(&self.path));
+            let file = match created {
+                Ok(file) => file,
+                Err(_) => {
+                    self.failed = true;
+                    return;
+                }
+            };
+            self.file = Some(file);
+            let (front, back) = backlog.as_slices();
+            self.write(front);
+            self.write(back);
+        }
+        self.write(chunk);
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        if self.failed || bytes.is_empty() {
+            return;
+        }
+        let room = usize::try_from(SPILL_MAX_BYTES - self.written).unwrap_or(usize::MAX);
+        let take = bytes.len().min(room);
+        if take == 0 {
+            return;
+        }
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        if file.write_all(&bytes[..take]).is_err() {
+            self.failed = true;
+            self.file = None;
+            return;
+        }
+        self.written += take as u64;
+    }
+
+    fn info(&self) -> Option<SpillInfo> {
+        (!self.failed && self.written > 0).then(|| SpillInfo {
+            path: self.path.clone(),
+            bytes: self.written,
+            capped: self.written >= SPILL_MAX_BYTES,
+        })
     }
 }
 
@@ -278,6 +448,9 @@ where
                 Err(_) => break,
             }
         }
+        // Stream over: release the spill file handle (data is already
+        // written unbuffered; the file stays on disk for later reads).
+        buffer.finish_spill();
     })
 }
 
@@ -373,16 +546,51 @@ pub(super) fn shell_text_output(job_id: &str, job: &JobState, max_chars: usize) 
         )),
     }
 
-    if job.stdout.omitted_len() > 0 || job.stderr.omitted_len() > 0 {
-        out.push_str(&format!(
-            "\n[output truncated — full tail: job action=tail job_id={job_id}]"
-        ));
+    if let Some(note) = truncation_note(job_id, job, max_chars) {
+        out.push('\n');
+        out.push_str(&note);
     }
     if let Some(note) = write_denial_note(job) {
         out.push('\n');
         out.push_str(note);
     }
     out
+}
+
+/// The truncation note for both renderings, or `None` when the inline text
+/// carries the complete streams.
+///
+/// Two honesty fixes over the old ring-only check: the note now also fires
+/// when `tail_chars` alone cut content (a 20k–128k stream previously
+/// truncated with NO indication at all), and when a spill file exists it
+/// names the absolute path and size — an actionable pointer instead of the
+/// dead-end `job action=tail` (whose window is capped and whose record is
+/// evicted after 32 jobs; the file outlives both).
+fn truncation_note(job_id: &str, job: &JobState, max_chars: usize) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut lost_without_file = false;
+    for (label, buffer) in [("stdout", &job.stdout), ("stderr", &job.stderr)] {
+        let full = buffer.text();
+        let lost = buffer.omitted_len() > 0 || full.chars().count() > max_chars;
+        if !lost {
+            continue;
+        }
+        match buffer.spill_info() {
+            Some(info) => lines.push(format!(
+                "[{label} truncated — complete stream saved: '{}' ({}{}); grep or read that file for the parts not shown]",
+                info.path.display(),
+                format_bytes(info.bytes),
+                if info.capped { ", head only" } else { "" }
+            )),
+            None => lost_without_file = true,
+        }
+    }
+    if lost_without_file {
+        lines.push(format!(
+            "[output truncated — fuller tail: job action=tail job_id={job_id}]"
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// The boundary-denial note for a failed sandboxed command whose stderr looks
@@ -430,6 +638,10 @@ pub(super) fn job_text_snapshot(job_id: &str, job: &JobState, max_chars: usize) 
     if stdout.is_empty() && stderr.is_empty() {
         out.push_str("(no output)\n");
     }
+    if let Some(note) = truncation_note(job_id, job, max_chars) {
+        out.push_str(&note);
+        out.push('\n');
+    }
     if let Some(note) = write_denial_note(job) {
         out.push_str(note);
         out.push('\n');
@@ -451,7 +663,21 @@ pub(super) fn job_details(job_id: &str, job: &JobState) -> Value {
         "stderr_len": job.stderr.total_len(),
         "stdout_truncated": job.stdout.omitted_len() > 0,
         "stderr_truncated": job.stderr.omitted_len() > 0,
+        "stdout_spill_path": job.stdout.spill_info().map(|info| info.path.display().to_string()),
+        "stderr_spill_path": job.stderr.spill_info().map(|info| info.path.display().to_string()),
     })
+}
+
+/// Human-readable byte size for the truncation note (whole units, one
+/// decimal from MB up — precision is noise at these magnitudes).
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{} KB", bytes / 1024)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
 }
 
 fn format_elapsed(ms: u64) -> String {
@@ -482,6 +708,125 @@ mod tests {
         assert_eq!(buffer.total_len(), JOB_BUFFER_BYTES + 10);
         assert_eq!(buffer.omitted_len(), 10);
         assert_eq!(buffer.text().len(), JOB_BUFFER_BYTES);
+    }
+
+    #[test]
+    fn spill_below_threshold_touches_no_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spill/job_1.stdout.log");
+        let buffer = SharedBuffer::with_spill(path.clone());
+        // Exactly at the threshold is still fully visible inline — no file,
+        // and crucially no directory either (`echo hi` must stay diskless).
+        buffer.push(&vec![b'a'; SPILL_THRESHOLD_BYTES]);
+        assert!(!path.exists());
+        assert!(!tmp.path().join("spill").exists());
+        assert!(buffer.spill_info().is_none());
+    }
+
+    #[test]
+    fn spill_preserves_the_complete_stream_from_byte_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Nested path exercises the lazy create_dir_all.
+        let path = tmp.path().join("run-1/job_2.stdout.log");
+        let buffer = SharedBuffer::with_spill(path.clone());
+        let mut expected = Vec::new();
+        for index in 0..4u8 {
+            // 4 × 8 KiB crosses the threshold mid-stream: the first chunks
+            // arrive before any file exists and must be backfilled.
+            let chunk = vec![b'a' + index; 8 * 1024];
+            buffer.push(&chunk);
+            expected.extend_from_slice(&chunk);
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            expected,
+            "spill file must hold the byte-exact stream from byte zero"
+        );
+        let info = buffer.spill_info().expect("spill was written");
+        assert_eq!(info.bytes, expected.len() as u64);
+        assert!(!info.capped);
+    }
+
+    #[test]
+    fn spill_write_caps_at_max_bytes_and_stops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capped.log");
+        let mut spill = Spill::new(path.clone());
+        let backlog: VecDeque<u8> = vec![b'h'; SPILL_THRESHOLD_BYTES].into();
+        spill.offer(backlog.len(), &backlog, b"-tail");
+        assert!(path.exists());
+
+        // Fake being two bytes short of the cap; a three-byte chunk must be
+        // clipped to the cap, mark the spill capped, and further offers are
+        // no-ops (the file keeps the HEAD; the ring keeps the live tail).
+        spill.written = SPILL_MAX_BYTES - 2;
+        spill.offer(0, &VecDeque::new(), b"xyz");
+        let info = spill.info().expect("spill exists");
+        assert_eq!(info.bytes, SPILL_MAX_BYTES);
+        assert!(info.capped);
+        spill.offer(0, &VecDeque::new(), b"more");
+        assert_eq!(spill.written, SPILL_MAX_BYTES);
+    }
+
+    fn plain_job(stdout: SharedBuffer) -> JobState {
+        JobState {
+            kind: JobKind::Foreground,
+            command: "cargo test".to_string(),
+            cwd: ".".to_string(),
+            started_at: Instant::now(),
+            status: JobStatus::Completed,
+            exit_code: Some(0),
+            sandboxed: true,
+            stdout,
+            stderr: SharedBuffer::default(),
+            child: None,
+            job_guard: None,
+        }
+    }
+
+    #[test]
+    fn truncation_note_names_the_spill_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("job_9.stdout.log");
+        let stdout = SharedBuffer::with_spill(path.clone());
+        stdout.push(&vec![b'x'; SPILL_THRESHOLD_BYTES + 5]);
+        let job = plain_job(stdout);
+
+        let text = shell_text_output("job_9", &job, SPILL_THRESHOLD_BYTES);
+        assert!(
+            text.contains(&path.display().to_string()),
+            "note must carry the absolute spill path: {text}"
+        );
+        assert!(
+            !text.contains("job action=tail"),
+            "the file pointer supersedes the tail hint: {text}"
+        );
+        assert!(
+            job_text_snapshot("job_9", &job, SPILL_THRESHOLD_BYTES)
+                .contains(&path.display().to_string())
+        );
+        let details = job_details("job_9", &job);
+        assert_eq!(
+            details["stdout_spill_path"].as_str(),
+            Some(path.display().to_string().as_str())
+        );
+        assert!(details["stderr_spill_path"].is_null());
+    }
+
+    #[test]
+    fn silent_tail_cut_now_carries_a_truncation_note() {
+        // 20k–128k bytes: the ring drops nothing (omitted == 0) but
+        // `tail_chars` cuts — this range previously truncated with NO note.
+        let stdout = SharedBuffer::default();
+        stdout.push(&vec![b'y'; 30_000]);
+        let job = plain_job(stdout);
+        assert_eq!(job.stdout.omitted_len(), 0, "precondition: ring intact");
+
+        let text = shell_text_output("job_3", &job, 20_000);
+        assert!(
+            text.contains("job action=tail job_id=job_3"),
+            "cut without a spill file must fall back to the tail hint: {text}"
+        );
     }
 
     fn finished_job(status: JobStatus, sandboxed: bool, stderr_text: &str) -> JobState {

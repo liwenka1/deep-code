@@ -43,6 +43,53 @@ async fn read_file_returns_structured_lines() {
     assert_eq!(output["truncated"], true);
 }
 
+/// Behavioral contract for shell-output spill files (which live under the
+/// workspace's `.deep-code/spill/`): the default walk must NOT surface them —
+/// logs polluting code searches would be worse than no spill at all — while
+/// an explicit path into the directory (what the truncation note tells the
+/// model to do) must search them, and `read_file` must page through them.
+#[tokio::test]
+async fn spill_files_are_hidden_from_default_grep_but_reachable_explicitly() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("main.rs"), "NEEDLE in code\n").unwrap();
+    let spill = tmp.path().join(".deep-code/spill/run-1");
+    fs::create_dir_all(&spill).unwrap();
+    fs::write(spill.join("job_1.stdout.log"), "NEEDLE in log\n").unwrap();
+
+    // Default walk: only the source hit; the hidden `.deep-code` never shows.
+    let result = run(tmp.path(), "grep_files", json!({"pattern": "NEEDLE"})).await;
+    let output: Value = serde_json::from_str(&result.content).unwrap();
+    let matched: Vec<&str> = output["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(matched, vec!["main.rs"], "spill must not pollute code grep");
+
+    // Explicit path into the spill dir: the log line is found.
+    let result = run(
+        tmp.path(),
+        "grep_files",
+        json!({"pattern": "NEEDLE", "path": ".deep-code/spill"}),
+    )
+    .await;
+    let output: Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(output["matches"][0]["line"], "NEEDLE in log");
+
+    // read_file reaches the same file — the granted-root resolution covers
+    // the spill path with no special casing.
+    let result = run(
+        tmp.path(),
+        "read_file",
+        json!({"path": ".deep-code/spill/run-1/job_1.stdout.log"}),
+    )
+    .await;
+    assert_eq!(result.status, ToolResultStatus::Success);
+    let output: Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(output["lines"][0]["text"], "NEEDLE in log");
+}
+
 #[tokio::test]
 async fn list_dir_returns_structured_entries() {
     let tmp = tempdir().unwrap();

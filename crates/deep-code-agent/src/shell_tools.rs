@@ -39,6 +39,12 @@ fn scrub_secret_env(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// Teaches the model to mine the spill file instead of re-running commands
+/// with grep/head filters just to see a different slice of the output.
+/// Appended to all four shell/job descriptions — spilling is not a sandbox
+/// concern, so confined and unconfined hosts behave identically.
+const SPILL_DESC: &str = " When output overflows the inline window, the complete stream is saved to a file under .deep-code/spill/ and the result names its absolute path — grep or read that file instead of re-running the command with filters.";
+
 /// Shell tool description for hosts whose sandbox really confines the command.
 const SHELL_DESC_CONFINED: &str = "Run a foreground shell command in the workspace; output streams live and the process is killed at the timeout. Use it for git (status/diff/log), builds, and tests; start long-running processes (dev servers) with the job tool instead. Commands run sandboxed without network; set network=true when one needs it (installs, git remote ops) — a failed download/connection usually means the run lacked the network grant. Writes are confined to the granted roots (the workspace and --add-dir directories): a write outside them fails with e.g. 'Operation not permitted', and no retry, sudo or chmod can succeed — ask the user to grant the directory with /add-dir instead.";
 
@@ -76,9 +82,12 @@ fn describe(
     notes: &[&str],
 ) -> String {
     if !enforcement.is_enforced() {
-        return unconfined.to_string();
+        return format!("{unconfined}{SPILL_DESC}");
     }
-    let mut text = confined.to_string();
+    // Spill is tool behavior, not a sandbox property: it joins the body on
+    // both branches, BEFORE the enforcement caveats — design notes keep the
+    // last word about what the sandbox refuses.
+    let mut text = format!("{confined}{SPILL_DESC}");
     for gap in enforcement.gaps() {
         text.push(' ');
         text.push_str(gap.model_caveat());
@@ -199,14 +208,41 @@ pub struct ShellTools {
     root: WorkspacePolicy,
     jobs: JobStore,
     sandbox: SandboxManager,
+    spill_dir: PathBuf,
+}
+
+/// Per-instance spill directory under the primary root's `.deep-code`.
+///
+/// Inside the workspace on purpose: that keeps every read path open with zero
+/// policy changes — `read_file`/`grep_files` resolve it as granted, sandboxed
+/// shell commands can read it on all three platforms (the Seatbelt read-deny
+/// covers only the HOME `~/.deep-code` secret store), checkpoints and the
+/// default grep walk already skip `.deep-code`. The launch component makes
+/// names collision-free across processes AND across the per-subagent tool
+/// registries within one process (each builds its own `ShellTools`, so job
+/// ids alone would collide). Created lazily by the first spill — a session
+/// that never overflows leaves no directory behind.
+fn new_spill_dir(primary_root: &Path) -> PathBuf {
+    static LAUNCH_SEQ: AtomicUsize = AtomicUsize::new(0);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    primary_root.join(".deep-code").join("spill").join(format!(
+        "run-{millis}-{}-{}",
+        std::process::id(),
+        LAUNCH_SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 impl ShellTools {
     pub fn new(roots: impl Into<WorkspaceRoots>) -> Result<Self, ToolError> {
+        let root = WorkspacePolicy::new(roots)?;
+        let spill_dir = new_spill_dir(root.root());
         Ok(Self {
-            root: WorkspacePolicy::new(roots)?,
+            root,
             jobs: JobStore::default(),
             sandbox: SandboxManager::new(),
+            spill_dir,
         })
     }
 
@@ -228,8 +264,14 @@ impl ShellTools {
             self.root.clone(),
             self.jobs.clone(),
             self.sandbox.clone(),
+            self.spill_dir.clone(),
         ));
-        registry.register(JobTool::new(self.root, self.jobs, self.sandbox));
+        registry.register(JobTool::new(
+            self.root,
+            self.jobs,
+            self.sandbox,
+            self.spill_dir,
+        ));
         registry
     }
 }
@@ -250,18 +292,33 @@ struct ShellTool {
     root: WorkspacePolicy,
     jobs: JobStore,
     sandbox: SandboxManager,
+    spill_dir: PathBuf,
 }
 
 impl ShellTool {
     const NAME: &'static str = "shell";
 
-    fn new(root: WorkspacePolicy, jobs: JobStore, sandbox: SandboxManager) -> Self {
+    fn new(
+        root: WorkspacePolicy,
+        jobs: JobStore,
+        sandbox: SandboxManager,
+        spill_dir: PathBuf,
+    ) -> Self {
         Self {
             root,
             jobs,
             sandbox,
+            spill_dir,
         }
     }
+}
+
+/// One spill-backed buffer pair for a reserved job id.
+fn spill_buffers(spill_dir: &Path, job_id: &str) -> (SharedBuffer, SharedBuffer) {
+    (
+        SharedBuffer::with_spill(spill_dir.join(format!("{job_id}.stdout.log"))),
+        SharedBuffer::with_spill(spill_dir.join(format!("{job_id}.stderr.log"))),
+    )
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -340,8 +397,8 @@ impl Tool for ShellTool {
             Self::NAME,
             "failed to start command",
         )?;
-        let stdout = SharedBuffer::default();
-        let stderr = SharedBuffer::default();
+        let job_id = self.jobs.reserve_id();
+        let (stdout, stderr) = spill_buffers(&self.spill_dir, &job_id);
         let stream_budget = Arc::new(AtomicUsize::new(0));
         let stdout_task = child.stdout.take().map(|pipe| {
             spawn_buffer_reader(
@@ -360,19 +417,22 @@ impl Tool for ShellTool {
 
         // The tool future owns the child; the store entry exposes the run to
         // post-hoc `job action=status/tail`.
-        let job_id = self.jobs.insert(JobState {
-            kind: JobKind::Foreground,
-            command: command.clone(),
-            cwd: self.root.relative_display(&cwd),
-            started_at: started,
-            status: JobStatus::Running,
-            exit_code: None,
-            sandboxed: self.sandbox.should_sandbox(&policy),
-            stdout: stdout.clone(),
-            stderr: stderr.clone(),
-            child: None,
-            job_guard,
-        });
+        self.jobs.insert_with_id(
+            &job_id,
+            JobState {
+                kind: JobKind::Foreground,
+                command: command.clone(),
+                cwd: self.root.relative_display(&cwd),
+                started_at: started,
+                status: JobStatus::Running,
+                exit_code: None,
+                sandboxed: self.sandbox.should_sandbox(&policy),
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+                child: None,
+                job_guard,
+            },
+        );
 
         let (status, exit_code) = tokio::select! {
             result = child.wait() => match result {
@@ -446,16 +506,23 @@ struct JobTool {
     root: WorkspacePolicy,
     jobs: JobStore,
     sandbox: SandboxManager,
+    spill_dir: PathBuf,
 }
 
 impl JobTool {
     const NAME: &'static str = "job";
 
-    fn new(root: WorkspacePolicy, jobs: JobStore, sandbox: SandboxManager) -> Self {
+    fn new(
+        root: WorkspacePolicy,
+        jobs: JobStore,
+        sandbox: SandboxManager,
+        spill_dir: PathBuf,
+    ) -> Self {
         Self {
             root,
             jobs,
             sandbox,
+            spill_dir,
         }
     }
 
@@ -484,8 +551,8 @@ impl JobTool {
             Self::NAME,
             "failed to start background command",
         )?;
-        let stdout = SharedBuffer::default();
-        let stderr = SharedBuffer::default();
+        let job_id = self.jobs.reserve_id();
+        let (stdout, stderr) = spill_buffers(&self.spill_dir, &job_id);
         if let Some(pipe) = child.stdout.take() {
             drop(spawn_buffer_reader(pipe, stdout.clone(), None));
         }
@@ -493,19 +560,22 @@ impl JobTool {
             drop(spawn_buffer_reader(pipe, stderr.clone(), None));
         }
 
-        let job_id = self.jobs.insert(JobState {
-            kind: JobKind::Background,
-            command: command.clone(),
-            cwd: self.root.relative_display(&cwd),
-            started_at: Instant::now(),
-            status: JobStatus::Running,
-            exit_code: None,
-            sandboxed: self.sandbox.should_sandbox(&policy),
-            stdout,
-            stderr,
-            child: Some(child),
-            job_guard,
-        });
+        self.jobs.insert_with_id(
+            &job_id,
+            JobState {
+                kind: JobKind::Background,
+                command: command.clone(),
+                cwd: self.root.relative_display(&cwd),
+                started_at: Instant::now(),
+                status: JobStatus::Running,
+                exit_code: None,
+                sandboxed: self.sandbox.should_sandbox(&policy),
+                stdout,
+                stderr,
+                child: Some(child),
+                job_guard,
+            },
+        );
 
         let job = self.jobs.get(&job_id, Self::NAME)?;
         let details = {
