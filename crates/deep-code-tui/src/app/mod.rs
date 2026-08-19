@@ -728,8 +728,13 @@ impl App {
     }
 
     /// "a": approve and remember the tool for this session. The runtime
-    /// downgrades shell-class tools to a one-time approve.
+    /// downgrades shell-class tools to a one-time approve. Ignored for a
+    /// root-grant request — that option is not offered (each grant is about
+    /// one directory), so the key must not act either.
     pub fn approve_pending_tool_for_session(&mut self) {
+        if self.pending_is_root_grant() {
+            return;
+        }
         self.resolve_pending_tool(ApprovalDecision::ApprovedForSession);
     }
 
@@ -737,10 +742,26 @@ impl App {
         self.resolve_pending_tool(ApprovalDecision::Denied);
     }
 
+    /// Whether the pending approval is a `request_write_root`. Its panel
+    /// drops the "approve for session" option: a blanket "always widen the
+    /// boundary" consent must not exist, per-directory decisions only.
+    pub fn pending_is_root_grant(&self) -> bool {
+        self.pending_approval
+            .as_ref()
+            .is_some_and(|request| request.tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL)
+    }
+
+    /// How many options the approval panel offers (y/a/n, or y/n for a
+    /// root-grant request).
+    fn approval_option_count(&self) -> usize {
+        if self.pending_is_root_grant() { 2 } else { 3 }
+    }
+
     /// Move the approval highlight to the previous option (wrap around).
     pub fn approval_focus_up(&mut self) {
+        let last = self.approval_option_count() - 1;
         self.approval_focus = if self.approval_focus == 0 {
-            2
+            last
         } else {
             self.approval_focus - 1
         };
@@ -748,7 +769,8 @@ impl App {
 
     /// Move the approval highlight to the next option (wrap around).
     pub fn approval_focus_down(&mut self) {
-        self.approval_focus = if self.approval_focus == 2 {
+        let last = self.approval_option_count() - 1;
+        self.approval_focus = if self.approval_focus >= last {
             0
         } else {
             self.approval_focus + 1
@@ -757,6 +779,14 @@ impl App {
 
     /// Execute the currently highlighted approval action.
     pub fn execute_focused_approval(&mut self) {
+        if self.pending_is_root_grant() {
+            // Two options: 0 = approve, 1 = deny.
+            match self.approval_focus {
+                0 => self.approve_pending_tool(),
+                _ => self.deny_pending_tool(),
+            }
+            return;
+        }
         match self.approval_focus {
             0 => self.approve_pending_tool(),
             1 => self.approve_pending_tool_for_session(),

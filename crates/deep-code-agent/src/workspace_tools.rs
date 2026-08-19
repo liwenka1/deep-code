@@ -8,9 +8,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, run_blocking};
-use crate::workspace_policy::{
-    WorkspacePolicy, WorkspaceRoots, contains_symlink, invalid, json_string,
-};
+#[cfg(test)]
+use crate::workspace_policy::WorkspaceRoots;
+use crate::workspace_policy::{WorkspacePolicy, contains_symlink, invalid, json_string};
 
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 500;
@@ -25,10 +25,18 @@ pub struct WorkspaceTools {
 }
 
 impl WorkspaceTools {
+    /// Test convenience: own-policy construction. Production launches build
+    /// ONE shared policy and use [`Self::with_policy`].
+    #[cfg(test)]
     pub fn new(roots: impl Into<WorkspaceRoots>) -> Result<Self, ToolError> {
-        Ok(Self {
-            root: WorkspacePolicy::new(roots)?,
-        })
+        Ok(Self::with_policy(WorkspacePolicy::new(roots)?))
+    }
+
+    /// Build on an existing (shared) boundary policy — see
+    /// [`crate::shell_tools::ShellTools::with_policy`] for why launches share
+    /// one policy across tool groups.
+    pub(crate) fn with_policy(root: WorkspacePolicy) -> Self {
+        Self { root }
     }
 
     pub fn into_registry(self) -> ToolRegistry {
@@ -42,10 +50,17 @@ impl WorkspaceTools {
     }
 }
 
+/// Test convenience wrapper over [`workspace_tool_registry_from`].
+#[cfg(test)]
 pub fn workspace_tool_registry(
     roots: impl Into<WorkspaceRoots>,
 ) -> Result<ToolRegistry, ToolError> {
     Ok(WorkspaceTools::new(roots)?.into_registry())
+}
+
+/// Registry from a shared boundary policy (see [`WorkspaceTools::with_policy`]).
+pub(crate) fn workspace_tool_registry_from(policy: WorkspacePolicy) -> ToolRegistry {
+    WorkspaceTools::with_policy(policy).into_registry()
 }
 
 #[derive(Debug, Clone)]
@@ -281,7 +296,7 @@ impl GrepFilesTool {
             if !path.is_file() {
                 continue;
             }
-            if contains_symlink(path, self.root.granted_roots()).unwrap_or(true) {
+            if contains_symlink(path, &self.root.granted_roots()).unwrap_or(true) {
                 continue;
             }
             let Ok(metadata) = fs::metadata(path) else {

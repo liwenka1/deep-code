@@ -21,6 +21,7 @@ mod model_route;
 mod paths;
 mod pricing;
 mod reasoning;
+mod root_grant;
 mod runtime;
 mod runtime_launch;
 mod sandbox;
@@ -63,6 +64,7 @@ pub use model::{
 };
 pub use model_registry::{DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO, ModelRegistry};
 pub use pricing::{CostCurrency, CostEstimate};
+pub use root_grant::REQUEST_WRITE_ROOT_TOOL;
 pub use runtime::{
     AgentRuntime, PrefixStatus, RuntimeEvent, RuntimeEventReceiver, ToolCallId, TurnId,
     TurnTelemetry,

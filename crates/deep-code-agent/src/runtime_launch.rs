@@ -13,12 +13,12 @@ use crate::extensions::{attach_agent_extensions, build_runtime_system_prompt};
 use crate::i18n::{Lang, SharedLang};
 use crate::runtime::AgentRuntime;
 use crate::session_store::{JsonSessionStore, SessionRecord, SessionStore};
-use crate::shell_tools::{JobStore, shell_tool_registry};
+use crate::shell_tools::{JobStore, shell_tool_registry_from};
 use crate::subagent::SharedSubAgentManager;
 use crate::tool::ToolRegistry;
-use crate::workspace_policy::WorkspaceRoots;
+use crate::workspace_policy::{WorkspacePolicy, WorkspaceRoots};
 use crate::workspace_summary::build_workspace_summary;
-use crate::workspace_tools::workspace_tool_registry;
+use crate::workspace_tools::workspace_tool_registry_from;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are deep-code's coding assistant.";
 
@@ -62,34 +62,47 @@ impl LaunchedRuntime {
 /// Assemble the model-facing tool registry. Workspace and shell tools are L1
 /// (unconditional core); web is L2 — a real capability kept built-in but
 /// gated at runtime (see [`web_enabled`]).
+///
+/// Both filesystem-touching groups are built on ONE shared
+/// [`WorkspacePolicy`], returned alongside the registry: it is the session's
+/// live write boundary, and the runtime widens it in place when the user
+/// approves a `request_write_root` — every registered tool and each newly
+/// spawned sandboxed command sees the grant immediately, no rebuild. When the
+/// boundary cannot be constructed (unresolvable root), both groups are
+/// disabled and `request_write_root` is not mounted either — there is no
+/// boundary to widen.
 #[must_use]
 pub fn build_tool_registry(
     roots: &WorkspaceRoots,
     network: crate::execution_policy::NetworkMode,
     warnings: &mut Vec<String>,
     ui_lang: &SharedLang,
-) -> (ToolRegistry, JobStore) {
+) -> (ToolRegistry, JobStore, Option<WorkspacePolicy>) {
     let mut registry = ToolRegistry::new();
     // The exec policy set here is the one the runtime consults for every call,
     // and the one sub-agent registries clone — the single place config-driven
     // gating (network mode) enters.
     registry.set_policy(crate::execution_policy::ExecPolicy::default().with_network_mode(network));
     let mut job_store = JobStore::default();
-    match workspace_tool_registry(roots.clone()) {
-        Ok(workspace_tools) => registry.extend(workspace_tools),
-        Err(error) => warnings.push(format!("workspace tools disabled: {error}")),
-    }
-    match shell_tool_registry(roots.clone()) {
-        Ok((shell_tools, shell_jobs)) => {
-            registry.extend(shell_tools);
-            job_store = shell_jobs;
+    let boundary = match WorkspacePolicy::new(roots.clone()) {
+        Ok(policy) => Some(policy),
+        Err(error) => {
+            warnings.push(format!("workspace tools disabled: {error}"));
+            warnings.push(format!("shell tools disabled: {error}"));
+            None
         }
-        Err(error) => warnings.push(format!("shell tools disabled: {error}")),
+    };
+    if let Some(policy) = &boundary {
+        registry.extend(workspace_tool_registry_from(policy.clone()));
+        let (shell_tools, shell_jobs) = shell_tool_registry_from(policy.clone());
+        registry.extend(shell_tools);
+        job_store = shell_jobs;
+        registry.register(crate::root_grant::RequestWriteRootTool);
     }
     if web_enabled() {
         registry.extend(crate::web_tools::web_tool_registry(ui_lang));
     }
-    (registry, job_store)
+    (registry, job_store, boundary)
 }
 
 /// Whether the L2 web tools (`web_search`, `fetch_url`) are mounted. On by
@@ -202,7 +215,13 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
             None
         }
     };
-    let (tools, subagent_manager, job_store, shutdown) = build_parent_tools(
+    let ParentTools {
+        registry: tools,
+        subagent_manager,
+        job_store,
+        shutdown,
+        boundary,
+    } = build_parent_tools(
         Arc::clone(&client),
         config,
         &roots,
@@ -237,6 +256,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
     };
     let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
     let runtime = attach_workspace_helpers(runtime, &roots.primary, config, &mut warnings)
+        .with_boundary(boundary)
         .with_permission_mode(permission_mode.clone())
         .with_ui_lang(ui_lang);
     LaunchedRuntime {
@@ -345,7 +365,13 @@ fn launch_resumed(
     {
         let client = Arc::new(client);
         let ui_lang = SharedLang::new(Lang::from_env(&config.language));
-        let (tools, subagent_manager, job_store, shutdown) = build_parent_tools(
+        let ParentTools {
+            registry: tools,
+            subagent_manager,
+            job_store,
+            shutdown,
+            boundary,
+        } = build_parent_tools(
             Arc::clone(&client),
             config,
             &roots,
@@ -366,6 +392,7 @@ fn launch_resumed(
             config,
             &mut warnings,
         )
+        .with_boundary(boundary)
         .with_permission_mode(permission_mode.clone())
         .with_ui_lang(ui_lang);
         return LaunchedRuntime {
@@ -384,7 +411,13 @@ fn launch_resumed(
 
     let ui_lang = SharedLang::new(Lang::from_env(&config.language));
     let client = Arc::new(EchoClient::new(ui_lang.clone()));
-    let (tools, subagent_manager, job_store, shutdown) = build_parent_tools(
+    let ParentTools {
+        registry: tools,
+        subagent_manager,
+        job_store,
+        shutdown,
+        boundary,
+    } = build_parent_tools(
         Arc::clone(&client),
         config,
         &roots,
@@ -405,6 +438,7 @@ fn launch_resumed(
         config,
         &mut warnings,
     )
+    .with_boundary(boundary)
     .with_permission_mode(permission_mode.clone())
     .with_ui_lang(ui_lang);
     LaunchedRuntime {
@@ -428,26 +462,52 @@ fn build_parent_tools<C: LlmClient + 'static>(
     parent_cancel: &CancellationToken,
     warnings: &mut Vec<String>,
     ui_lang: &SharedLang,
-) -> (
-    ToolRegistry,
-    SharedSubAgentManager,
-    JobStore,
-    Box<dyn Fn() + Send + Sync>,
-) {
-    let (mut registry, job_store) =
+) -> ParentTools {
+    let (mut registry, job_store, boundary) =
         build_tool_registry(roots, config.sandbox_network, warnings, ui_lang);
-    let extensions = attach_agent_extensions(
-        &mut registry,
-        client,
-        config.clone(),
-        roots.clone(),
-        parent_cancel.clone(),
-    );
-    let shutdown: Box<dyn Fn() + Send + Sync> = Box::new({
-        let extensions = Arc::clone(&extensions);
-        move || extensions.cancel_all_running()
-    });
-    (registry, extensions.subagent_manager(), job_store, shutdown)
+    // Sub-agents inherit the parent's live boundary; without one (workspace
+    // unresolvable — the fs tool groups are disabled too) there is nothing a
+    // child could correctly work inside, so the dispatch tool stays unmounted.
+    let (subagent_manager, shutdown): (SharedSubAgentManager, Box<dyn Fn() + Send + Sync>) =
+        if let Some(policy) = &boundary {
+            let extensions = attach_agent_extensions(
+                &mut registry,
+                client,
+                config.clone(),
+                policy.clone(),
+                parent_cancel.clone(),
+            );
+            let shutdown: Box<dyn Fn() + Send + Sync> = Box::new({
+                let extensions = Arc::clone(&extensions);
+                move || extensions.cancel_all_running()
+            });
+            (extensions.subagent_manager(), shutdown)
+        } else {
+            warnings.push("sub-agent tools disabled: no workspace boundary".to_string());
+            let idle = Arc::new(std::sync::RwLock::new(
+                crate::subagent::SubAgentManager::new(0),
+            ));
+            (idle, Box::new(|| ()))
+        };
+    ParentTools {
+        registry,
+        subagent_manager,
+        job_store,
+        shutdown,
+        boundary,
+    }
+}
+
+/// Everything a launch assembles around the parent registry, in one bundle
+/// (five positional returns had become unreadable at the call sites).
+struct ParentTools {
+    registry: ToolRegistry,
+    subagent_manager: SharedSubAgentManager,
+    job_store: JobStore,
+    shutdown: Box<dyn Fn() + Send + Sync>,
+    /// The session's live write boundary; `None` when the workspace could not
+    /// be resolved (fs tool groups disabled).
+    boundary: Option<WorkspacePolicy>,
 }
 
 fn attach_workspace_helpers(
@@ -478,7 +538,7 @@ mod tests {
         workspace: &Path,
     ) -> Vec<String> {
         let cancel = CancellationToken::new();
-        let (registry, _, _, _) = build_parent_tools(
+        let tools = build_parent_tools(
             Arc::new(client),
             config,
             &WorkspaceRoots::from(workspace),
@@ -486,7 +546,12 @@ mod tests {
             &mut Vec::new(),
             &SharedLang::default(),
         );
-        registry.specs().into_iter().map(|spec| spec.name).collect()
+        tools
+            .registry
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect()
     }
 
     #[test]
@@ -513,6 +578,25 @@ mod tests {
             !names.iter().any(|name| name == MockEchoTool::NAME),
             "the mock tool is a test fixture; no production registry mounts it: {names:?}"
         );
+    }
+
+    /// The grant doorbell mounts with the fs tool groups — same boundary,
+    /// same launch — so any session that can hit the write fence can also
+    /// request the fix.
+    #[test]
+    fn request_write_root_is_mounted_with_the_fs_tools() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = AgentConfig::builtin();
+        let names = parent_tool_names(
+            EchoClient::new(SharedLang::new(Lang::Zh)),
+            &config,
+            dir.path(),
+        );
+        assert!(
+            names.iter().any(|name| name == "request_write_root"),
+            "grant doorbell missing: {names:?}"
+        );
+        assert!(names.iter().any(|name| name == "write_file"));
     }
 
     #[test]

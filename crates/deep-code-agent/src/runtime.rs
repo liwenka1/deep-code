@@ -70,10 +70,13 @@ pub struct AgentRuntime {
     state: Arc<Mutex<RuntimeState>>,
     checkpoints: Option<Arc<CheckpointStore>>,
     workspace: Option<PathBuf>,
-    /// Extra writable roots granted at launch (`--add-dir`). Only the approval
-    /// preview consults these — every anchor role (checkpoints, LSP, session
-    /// store) stays on the primary `workspace` above.
-    extra_roots: Vec<PathBuf>,
+    /// The session's live write boundary — the same shared policy instance
+    /// every fs/shell tool holds. The approval preview reads it, and a
+    /// user-approved `request_write_root` widens it in place (the ONLY
+    /// mid-session mutation; see `apply_root_grant`). Every anchor role
+    /// (checkpoints, LSP, session store) stays on the primary `workspace`
+    /// above. `None` for bare test runtimes without fs tools.
+    boundary: Option<crate::workspace_policy::WorkspacePolicy>,
     lsp: Option<Arc<LspManager>>,
     persistence: Option<Arc<Persistence>>,
     /// Session permission mode, shared (lock-free) with the TUI so it can show
@@ -105,7 +108,7 @@ impl AgentRuntime {
             state: Arc::new(Mutex::new(RuntimeState::default())),
             checkpoints: None,
             workspace: None,
-            extra_roots: Vec::new(),
+            boundary: None,
             lsp: None,
             persistence: None,
             permission_mode: SharedPermissionMode::default(),
@@ -150,7 +153,7 @@ impl AgentRuntime {
             })),
             checkpoints: None,
             workspace: None,
-            extra_roots: Vec::new(),
+            boundary: None,
             lsp: None,
             persistence: None,
             permission_mode: SharedPermissionMode::default(),
@@ -163,6 +166,18 @@ impl AgentRuntime {
     #[must_use]
     pub fn with_permission_mode(mut self, mode: SharedPermissionMode) -> Self {
         self.permission_mode = mode;
+        self
+    }
+
+    /// Attach the session's live write boundary — the same shared
+    /// [`crate::workspace_policy::WorkspacePolicy`] the launch threaded
+    /// through every fs/shell tool group. Builder-style, launch-only.
+    #[must_use]
+    pub(crate) fn with_boundary(
+        mut self,
+        boundary: Option<crate::workspace_policy::WorkspacePolicy>,
+    ) -> Self {
+        self.boundary = boundary;
         self
     }
 
@@ -480,6 +495,13 @@ impl AgentRuntime {
             return ApprovalDecision::Approved;
         }
         let kind = crate::execution_policy::ExecPolicy::classify_tool(&request.tool_name);
+        // A child never widens the boundary: its approvals are auto-decided
+        // here, and a root grant exists precisely to be decided by the human.
+        // (The fall-through denies anyway; spelled out so it reads as policy,
+        // not coincidence.)
+        if kind == crate::execution_policy::ToolKind::RootGrant {
+            return ApprovalDecision::Denied;
+        }
         if role.allows_writes() && kind == crate::execution_policy::ToolKind::WriteFile {
             return ApprovalDecision::Approved;
         }

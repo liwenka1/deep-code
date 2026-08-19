@@ -93,6 +93,7 @@ pub fn runtime_event_kind(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::ApprovalRequired { .. } => "approval.required",
         RuntimeEvent::ApprovalResolved { .. } => "approval.resolved",
         RuntimeEvent::ToolCallFinished { .. } => "tool.finished",
+        RuntimeEvent::RootGranted { .. } => "root.granted",
         RuntimeEvent::SessionUpdated { .. } => "session.updated",
         RuntimeEvent::TurnFinished { .. } => "turn.completed",
         RuntimeEvent::TurnCancelled { .. } => "turn.cancelled",
@@ -123,6 +124,7 @@ fn event_turn_id(event: &RuntimeEvent) -> Option<TurnId> {
         | RuntimeEvent::ApprovalResolved { turn_id, .. }
         | RuntimeEvent::ToolCallProgress { turn_id, .. }
         | RuntimeEvent::ToolCallFinished { turn_id, .. }
+        | RuntimeEvent::RootGranted { turn_id, .. }
         | RuntimeEvent::Error { turn_id, .. } => turn_id.clone(),
         RuntimeEvent::SessionUpdated { .. }
         | RuntimeEvent::CompactionApplied { .. }

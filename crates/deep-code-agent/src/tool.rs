@@ -324,6 +324,11 @@ pub struct ApprovalRequest {
     /// AcceptEdits and the Auto judge never auto-approve a declaration.
     #[serde(default)]
     pub network: bool,
+    /// The model's stated reason for the call (`justification` argument),
+    /// verbatim. Shown at the prompt labelled as the model's claim — it is
+    /// advisory for the human and never an input to any auto-approval path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub justification: Option<String>,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -529,6 +534,43 @@ mod tests {
                 result: ToolResult::success("call_1", MockEchoTool::NAME, "mock_echo: hello tools")
             }
         );
+    }
+
+    /// A `justification` argument reaches the approval request verbatim (any
+    /// tool), and its absence stays `None` — the field is the model's claim
+    /// for the human, extracted from the raw arguments.
+    #[tokio::test]
+    async fn approval_request_carries_the_models_justification() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (registry, _) = crate::shell_tools::shell_tool_registry(workspace.path()).unwrap();
+        let with = ToolCall::new(
+            "call_1",
+            "shell",
+            json!({
+                "command": "cargo fetch",
+                "network": true,
+                "justification": "  needs crates.io to resolve deps  ",
+            }),
+        );
+        let ToolRunOutcome::ApprovalRequired { request } =
+            registry.run_tool_call(with, None).await.unwrap()
+        else {
+            panic!("network declaration must require approval");
+        };
+        assert!(request.network);
+        assert_eq!(
+            request.justification.as_deref(),
+            Some("needs crates.io to resolve deps"),
+            "trimmed claim reaches the prompt"
+        );
+
+        let without = ToolCall::new("call_2", "shell", json!({"command": "cargo fetch"}));
+        let ToolRunOutcome::ApprovalRequired { request } =
+            registry.run_tool_call(without, None).await.unwrap()
+        else {
+            panic!("untrusted shell prompts");
+        };
+        assert_eq!(request.justification, None);
     }
 
     #[tokio::test]

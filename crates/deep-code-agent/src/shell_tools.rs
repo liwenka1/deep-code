@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 
 use crate::sandbox::{Enforcement, SandboxGuard, SandboxManager, SandboxPolicy};
 use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, ToolUpdate};
-use crate::workspace_policy::{WorkspacePolicy, WorkspaceRoots, invalid};
+#[cfg(test)]
+use crate::workspace_policy::WorkspaceRoots;
+use crate::workspace_policy::{WorkspacePolicy, invalid};
 #[allow(unused_imports)]
 pub use jobs::JobStore;
 use jobs::{
@@ -46,7 +48,7 @@ fn scrub_secret_env(cmd: &mut tokio::process::Command) {
 const SPILL_DESC: &str = " When output overflows the inline window, the complete stream is saved to a file under .deep-code/spill/ and the result names its absolute path — grep or read that file instead of re-running the command with filters.";
 
 /// Shell tool description for hosts whose sandbox really confines the command.
-const SHELL_DESC_CONFINED: &str = "Run a foreground shell command in the workspace; output streams live and the process is killed at the timeout. Use it for git (status/diff/log), builds, and tests; start long-running processes (dev servers) with the job tool instead. Commands run sandboxed without network; set network=true when one needs it (installs, git remote ops) — a failed download/connection usually means the run lacked the network grant. Writes are confined to the granted roots (the workspace and --add-dir directories): a write outside them fails with e.g. 'Operation not permitted', and no retry, sudo or chmod can succeed — ask the user to grant the directory with /add-dir instead.";
+const SHELL_DESC_CONFINED: &str = "Run a foreground shell command in the workspace; output streams live and the process is killed at the timeout. Use it for git (status/diff/log), builds, and tests; start long-running processes (dev servers) with the job tool instead. Commands run sandboxed without network; set network=true when one needs it (installs, git remote ops) — a failed download/connection usually means the run lacked the network grant. Writes are confined to the granted roots (the workspace and --add-dir directories): a write outside them fails with e.g. 'Operation not permitted', and no retry, sudo or chmod can succeed — request the directory with the request_write_root tool instead (the user decides).";
 
 /// Same, for hosts with no real confinement (see `SandboxCapabilities`). The
 /// model is told the truth so it neither trusts a boundary that is absent nor
@@ -54,7 +56,7 @@ const SHELL_DESC_CONFINED: &str = "Run a foreground shell command in the workspa
 const SHELL_DESC_UNCONFINED: &str = "Run a foreground shell command in the workspace; output streams live and the process is killed at the timeout. Use it for git (status/diff/log), builds, and tests; start long-running processes (dev servers) with the job tool instead. This host has NO OS sandbox confinement: commands are not restricted to the workspace and do have network access. Keep writes inside the workspace yourself and avoid destructive commands. Still set network=true when a command needs the network, so the user is asked first.";
 
 /// Job tool description, confined host.
-const JOB_DESC_CONFINED: &str = "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it. Jobs run sandboxed without network; a dev server that binds a port needs network=true on start. Writes are confined to the granted roots (workspace and --add-dir directories); a denied write cannot be fixed by retrying — ask the user to grant the directory with /add-dir.";
+const JOB_DESC_CONFINED: &str = "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it. Jobs run sandboxed without network; a dev server that binds a port needs network=true on start. Writes are confined to the granted roots (workspace and --add-dir directories); a denied write cannot be fixed by retrying — request the directory with the request_write_root tool instead (the user decides).";
 
 /// Job tool description, unconfined host.
 const JOB_DESC_UNCONFINED: &str = "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it. This host has NO OS sandbox confinement: jobs are not restricted to the workspace and do have network access. Still set network=true when starting something that binds a port or needs the network, so the user is asked first.";
@@ -235,15 +237,25 @@ fn new_spill_dir(primary_root: &Path) -> PathBuf {
 }
 
 impl ShellTools {
+    /// Test convenience: own-policy construction. Production launches build
+    /// ONE shared policy and use [`Self::with_policy`].
+    #[cfg(test)]
     pub fn new(roots: impl Into<WorkspaceRoots>) -> Result<Self, ToolError> {
-        let root = WorkspacePolicy::new(roots)?;
+        Ok(Self::with_policy(WorkspacePolicy::new(roots)?))
+    }
+
+    /// Build on an existing (shared) boundary policy instead of constructing
+    /// one. This is how a launch threads ONE policy through every tool group,
+    /// so a mid-session `request_write_root` grant reaches shell commands and
+    /// file tools alike without rebuilding any registry.
+    pub(crate) fn with_policy(root: WorkspacePolicy) -> Self {
         let spill_dir = new_spill_dir(root.root());
-        Ok(Self {
+        Self {
             root,
             jobs: JobStore::default(),
             sandbox: SandboxManager::new(),
             spill_dir,
-        })
+        }
     }
 
     #[cfg(test)]
@@ -276,12 +288,19 @@ impl ShellTools {
     }
 }
 
+/// Test convenience wrapper over [`shell_tool_registry_from`].
+#[cfg(test)]
 pub fn shell_tool_registry(
     roots: impl Into<WorkspaceRoots>,
 ) -> Result<(ToolRegistry, JobStore), ToolError> {
-    let shell = ShellTools::new(roots)?;
+    Ok(shell_tool_registry_from(WorkspacePolicy::new(roots)?))
+}
+
+/// Registry from a shared boundary policy (see [`ShellTools::with_policy`]).
+pub(crate) fn shell_tool_registry_from(policy: WorkspacePolicy) -> (ToolRegistry, JobStore) {
+    let shell = ShellTools::with_policy(policy);
     let jobs = shell.job_store();
-    Ok((shell.into_registry(), jobs))
+    (shell.into_registry(), jobs)
 }
 
 /// Foreground shell: streams output live via `cx.update`, kills the child at
@@ -333,6 +352,9 @@ struct ShellParams {
     /// Set true when the command needs network access (downloads/installs, git push/pull/fetch/clone, curl). The sandbox blocks all network by default; a declaration routes through user approval.
     #[allow(dead_code)] // consumed by the execution policy from the raw arguments
     network: Option<bool>,
+    /// One short sentence for the human at the approval prompt: why this command needs what it asks for (most useful with network=true). Shown as your claim, verbatim.
+    #[allow(dead_code)] // surfaced to the approval prompt from the raw arguments
+    justification: Option<String>,
 }
 
 /// Live-stream one output chunk as a ToolUpdate, bounded by a shared budget.
@@ -390,7 +412,7 @@ impl Tool for ShellTool {
         let started = Instant::now();
         let (mut child, job_guard) = spawn_confined(
             &self.sandbox,
-            self.root.granted_roots(),
+            &self.root.granted_roots(),
             &command,
             &cwd,
             &policy,
@@ -544,7 +566,7 @@ impl JobTool {
         // `JobStore::shutdown` makes this deterministic on cancel/quit.
         let (mut child, job_guard) = spawn_confined(
             &self.sandbox,
-            self.root.granted_roots(),
+            &self.root.granted_roots(),
             &command,
             &cwd,
             &policy,
@@ -645,6 +667,9 @@ struct JobParams {
     /// start only: set true when the job needs network access — including binding/listening on a port (dev servers). The sandbox blocks all network by default; a declaration routes through user approval.
     #[allow(dead_code)] // consumed by the execution policy from the raw arguments
     network: Option<bool>,
+    /// One short sentence for the human at the approval prompt: why this job needs what it asks for (most useful with network=true). Shown as your claim, verbatim.
+    #[allow(dead_code)] // surfaced to the approval prompt from the raw arguments
+    justification: Option<String>,
 }
 
 #[async_trait]

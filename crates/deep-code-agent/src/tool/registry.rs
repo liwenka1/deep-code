@@ -158,6 +158,9 @@ impl ToolRegistry {
                             risk_level: plan.risk_level,
                             requires_sandbox: plan.requires_sandbox,
                             network: crate::execution_policy::network_requested(&call.arguments),
+                            justification: crate::execution_policy::justification_claimed(
+                                &call.arguments,
+                            ),
                             read_only: plan.read_only,
                             matched_rule: plan.matched_rule.clone(),
                             // Filled by the runtime (needs workspace access).

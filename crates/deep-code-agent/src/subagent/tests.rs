@@ -625,6 +625,7 @@ None.
             requires_sandbox: false,
             read_only: false,
             matched_rule: None,
+            justification: None,
             preview: None,
             safety_notes: Vec::new(),
         };
@@ -655,11 +656,33 @@ None.
             requires_sandbox: false,
             read_only: false,
             matched_rule: None,
+            justification: None,
             preview: None,
             safety_notes: Vec::new(),
         };
         assert_eq!(
             runtime.subagent_approval_decision(&shell_request, SubAgentRole::Implementer),
+            ApprovalDecision::Denied
+        );
+        // A root grant is auto-denied for every role — widening the boundary
+        // is a parent-loop conversation with the human, and a child's
+        // approvals never reach one.
+        let grant_request = ApprovalRequest {
+            network: false,
+            call_id: "call_3".to_string(),
+            tool_name: "request_write_root".to_string(),
+            description: "widen".to_string(),
+            arguments: json!({"path": "/tmp/x", "justification": "y"}),
+            risk_level: crate::execution_policy::RiskLevel::High,
+            requires_sandbox: false,
+            read_only: false,
+            matched_rule: None,
+            justification: Some("y".to_string()),
+            preview: None,
+            safety_notes: Vec::new(),
+        };
+        assert_eq!(
+            runtime.subagent_approval_decision(&grant_request, SubAgentRole::Implementer),
             ApprovalDecision::Denied
         );
     }

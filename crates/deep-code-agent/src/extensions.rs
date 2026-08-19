@@ -8,7 +8,7 @@ use crate::config::AgentConfig;
 use crate::skills::build_system_prompt;
 use crate::subagent::{DEFAULT_MAX_CONCURRENT, SubAgentServices, register_subagent_tools};
 use crate::tool::ToolRegistry;
-use crate::workspace_policy::WorkspaceRoots;
+use crate::workspace_policy::WorkspacePolicy;
 
 /// Shared parent-runtime services for sub-agents.
 pub struct AgentExtensions {
@@ -88,14 +88,14 @@ pub fn attach_agent_extensions(
     registry: &mut ToolRegistry,
     client: Arc<dyn LlmClient>,
     agent_config: AgentConfig,
-    roots: WorkspaceRoots,
+    boundary: WorkspacePolicy,
     parent_cancel: CancellationToken,
 ) -> Arc<AgentExtensions> {
     let exec_policy = registry.policy().clone();
     let subagent = Arc::new(SubAgentServices::new(
         client,
         agent_config,
-        roots,
+        boundary,
         parent_cancel,
         DEFAULT_MAX_CONCURRENT,
         exec_policy,

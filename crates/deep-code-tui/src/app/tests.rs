@@ -149,6 +149,44 @@ fn find_in_transcript_jumps_and_continues_upward() {
     assert!(app.status.contains("未找到"));
 }
 
+/// A root-grant approval offers two options (y/n): the hidden "approve for
+/// session" key must be inert, and the focus cycle must wrap at two.
+#[test]
+fn root_grant_approval_drops_the_session_option() {
+    let mut app = App::new();
+    app.pending_approval = Some(deep_code_agent::ApprovalRequest {
+        network: false,
+        call_id: "call_1".to_string(),
+        tool_name: deep_code_agent::REQUEST_WRITE_ROOT_TOOL.to_string(),
+        description: "widen".to_string(),
+        arguments: serde_json::json!({ "path": "/tmp/x", "justification": "y" }),
+        risk_level: deep_code_agent::RiskLevel::High,
+        requires_sandbox: false,
+        read_only: false,
+        matched_rule: None,
+        justification: Some("y".to_string()),
+        preview: None,
+        safety_notes: Vec::new(),
+    });
+    assert!(app.pending_is_root_grant());
+
+    // 'a' is not an offered option, so the key must do nothing at all.
+    app.approve_pending_tool_for_session();
+    assert!(
+        app.pending_approval.is_some(),
+        "the hidden session-approve key must be inert for a root grant"
+    );
+
+    // Two options: focus wraps 0 → 1 → 0 in both directions.
+    assert_eq!(app.approval_focus, 0);
+    app.approval_focus_down();
+    assert_eq!(app.approval_focus, 1);
+    app.approval_focus_down();
+    assert_eq!(app.approval_focus, 0);
+    app.approval_focus_up();
+    assert_eq!(app.approval_focus, 1);
+}
+
 #[test]
 fn approval_scroll_helpers_adjust_panel_offset() {
     let mut app = App::new();
@@ -162,6 +200,7 @@ fn approval_scroll_helpers_adjust_panel_offset() {
         requires_sandbox: true,
         read_only: false,
         matched_rule: Some("write".to_string()),
+        justification: None,
         preview: None,
         safety_notes: Vec::new(),
     });
@@ -671,6 +710,7 @@ async fn approval_a_key_resolves_for_session() {
         requires_sandbox: false,
         read_only: true,
         matched_rule: None,
+        justification: None,
         preview: None,
         safety_notes: Vec::new(),
     });
@@ -1219,6 +1259,7 @@ fn approval_events_render_pending_and_resolved_tool_metadata() {
             requires_sandbox: true,
             read_only: false,
             matched_rule: Some("write".to_string()),
+            justification: None,
             preview: None,
             safety_notes: Vec::new(),
         },

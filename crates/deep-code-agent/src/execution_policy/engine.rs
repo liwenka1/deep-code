@@ -16,6 +16,11 @@ pub enum ToolKind {
     Mock,
     SubAgent,
     Network,
+    /// `request_write_root`: the model asking to widen the write boundary.
+    /// Its whole point is the human decision, so it is never auto-approvable
+    /// by any mode, standing consent, or session memory (see
+    /// `auto_approval_granted`), and never session-allowable.
+    RootGrant,
     Unknown,
 }
 
@@ -78,6 +83,21 @@ pub fn network_requested(arguments: &Value) -> bool {
         .get("network")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// The model's stated reason for a gated call (`justification` in the
+/// arguments), for the human at the approval prompt. Advisory text only: it
+/// is the model's own claim, never fed back to the auto-mode judge (a
+/// classifier reading the requester's sales pitch would let a prompt
+/// injection argue itself through) and never a gate input.
+#[must_use]
+pub fn justification_claimed(arguments: &Value) -> Option<String> {
+    arguments
+        .get("justification")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 /// Full plan for executing a tool call.
@@ -167,6 +187,7 @@ impl ExecPolicy {
             "web_search" | "fetch_url" => ToolKind::Network,
             "mock_echo" => ToolKind::Mock,
             "agent" => ToolKind::SubAgent,
+            "request_write_root" => ToolKind::RootGrant,
             _ => ToolKind::Unknown,
         }
     }
@@ -295,6 +316,24 @@ impl ExecPolicy {
                 read_only: true,
                 risk_level: RiskLevel::Low,
                 matched_rule: Some("builtin:subagent_tool".to_string()),
+                network: false,
+            },
+            // Widening the write boundary is the highest-consequence request a
+            // model can make: everything the sandbox and the path fence deny
+            // today becomes allowed under the new root. Always a prompt, top
+            // risk tier — and the approval gate hard-excludes it from every
+            // auto-approval channel on top of this plan.
+            ToolKind::RootGrant => ToolExecutionPlan {
+                verdict: PolicyVerdict::NeedsApproval {
+                    reason: "grants write access to a directory outside the current roots, \
+                             for the rest of the session"
+                        .to_string(),
+                },
+                requires_approval: true,
+                requires_sandbox: false,
+                read_only: false,
+                risk_level: RiskLevel::High,
+                matched_rule: Some("builtin:root_grant".to_string()),
                 network: false,
             },
             ToolKind::Unknown => ToolExecutionPlan {
@@ -551,6 +590,44 @@ mod tests {
         let plan = policy.evaluate_tool("write_file", &json!({"path": "a.rs", "content": "x"}));
         assert!(matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }));
         assert!(plan.requires_approval);
+    }
+
+    /// A root grant is a boundary change: pinned to the top risk tier and a
+    /// prompt (the approval gate additionally hard-excludes it from every
+    /// auto-approval channel; that side is pinned in the runtime tests).
+    #[test]
+    fn root_grant_is_high_risk_and_always_prompts() {
+        assert_eq!(
+            ExecPolicy::classify_tool("request_write_root"),
+            ToolKind::RootGrant
+        );
+        let policy = ExecPolicy::default();
+        let plan = policy.evaluate_tool(
+            "request_write_root",
+            &json!({"path": "/tmp/x", "justification": "build output lives there"}),
+        );
+        assert!(matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }));
+        assert!(plan.requires_approval);
+        assert_eq!(plan.risk_level, RiskLevel::High);
+        // And AcceptEdits' bounded fs-edit allowance never covers it.
+        assert!(!accept_edits_approvable(
+            "request_write_root",
+            &json!({"path": "/tmp/x", "justification": "y"})
+        ));
+    }
+
+    #[test]
+    fn justification_claimed_extracts_trimmed_nonempty_text() {
+        assert_eq!(
+            justification_claimed(&json!({"justification": "  need network for cargo fetch  "})),
+            Some("need network for cargo fetch".to_string())
+        );
+        assert_eq!(
+            justification_claimed(&json!({"justification": "   "})),
+            None
+        );
+        assert_eq!(justification_claimed(&json!({"justification": 7})), None);
+        assert_eq!(justification_claimed(&json!({"command": "ls"})), None);
     }
 
     /// Spawning a writing child auto-approves its workspace writes (that is the

@@ -117,6 +117,14 @@ pub enum RuntimeEvent {
         tool_call_id: ToolCallId,
         result: ToolResult,
     },
+    /// The user approved a `request_write_root`: `path` (canonical) is a
+    /// writable root for the rest of the session, enforcement already live.
+    /// UIs use this to update their own boundary display/state.
+    RootGranted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<TurnId>,
+        path: String,
+    },
     /// The authoritative session transcript changed.
     SessionUpdated {
         #[serde(default, skip_serializing_if = "Option::is_none")]

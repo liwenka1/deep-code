@@ -94,11 +94,10 @@ impl Tool for AgentTool {
             .unwrap_or_else(|| agent_id.clone());
 
         let child_tools = child_tool_registry(
-            &self.services.roots,
+            &self.services.boundary,
             role,
             self.services.exec_policy.clone(),
-        )
-        .map_err(|error| ToolError::exec_failed(AGENT_TOOL, error.to_string()))?;
+        );
         // Reconnaissance roles run pinned to the flash tier (a fixed model id
         // bypasses per-turn auto-routing in the child); other roles inherit
         // the parent's configured model. See `SubAgentRole::model_override`.

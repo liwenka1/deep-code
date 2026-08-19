@@ -486,6 +486,75 @@ mod tests {
         );
     }
 
+    /// Kernel-level pin for the mid-session grant: a directory added to the
+    /// live `WorkspacePolicy` via `grant_extra` (the approved
+    /// `request_write_root` path) must be writable for the NEXT sandboxed
+    /// command — through the same policy clone the shell tool has held since
+    /// launch, with no relaunch and no registry rebuild.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confined_command_writes_into_a_root_granted_mid_session() {
+        if crate::sandbox::require_backend_or_skip(is_available(), "Seatbelt") {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        // The grant target must start OUTSIDE every writable root, so it
+        // cannot be a tempdir (the temp dir is itself always granted). A
+        // HOME subdirectory is the honest "no grant" starting point, exactly
+        // like the escape probe in the denial test above.
+        let Some(home) = crate::paths::home_dir() else {
+            eprintln!("no home dir on this host; skipping");
+            return;
+        };
+        let target = home.join(format!(
+            ".deep-code-sandbox-grant-probe-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&target).unwrap();
+        let target = target.canonicalize().unwrap();
+        let probe = target.join("artifact.txt");
+
+        let policy =
+            crate::workspace_policy::WorkspacePolicy::new(workspace.path().to_path_buf()).unwrap();
+        let tool_held_clone = policy.clone(); // held since "launch"
+        let write_cmd = format!("echo built > {}", probe.display());
+        let run = |roots: &[PathBuf]| {
+            wrap_shell_command(
+                &write_cmd,
+                workspace.path(),
+                roots,
+                &SandboxPolicy::workspace_write(),
+            )
+            .output()
+            .expect("sandbox-exec should launch")
+        };
+
+        // Before the grant the kernel refuses the write; after `grant_extra`
+        // on the SHARED policy the same spelling succeeds through the clone
+        // the tool has held since launch — the widened list reaches the
+        // sandbox per-spawn, no relaunch, no registry rebuild.
+        let denied = run(&tool_held_clone.granted_roots());
+        policy.grant_extra(&target).unwrap();
+        let allowed = run(&tool_held_clone.granted_roots());
+        let written = std::fs::read_to_string(&probe);
+        let _ = std::fs::remove_dir_all(&target);
+
+        assert!(
+            !denied.status.success(),
+            "write outside the roots must be denied first"
+        );
+        assert!(
+            allowed.status.success(),
+            "granted root must be writable: {}",
+            String::from_utf8_lossy(&allowed.stderr)
+        );
+        assert_eq!(
+            written.unwrap().trim(),
+            "built",
+            "the write landed in the granted directory"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn confined_command_reads_the_workspace_spill_dir() {

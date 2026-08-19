@@ -182,6 +182,27 @@ async fn small_output_leaves_no_spill_dir_behind() {
     assert!(!tmp.path().join(".deep-code/spill").exists());
 }
 
+/// `justification` is a declared schema field: a call carrying it must parse
+/// and run (regression guard — `deny_unknown_fields` rejected it before the
+/// field existed, which would have made the tool description a trap).
+#[tokio::test]
+async fn shell_accepts_a_justification_argument() {
+    let tmp = tempdir().unwrap();
+    let result = approved(
+        tmp.path(),
+        "shell",
+        json!({"command": "echo ok", "justification": "prove the field parses"}),
+    )
+    .await;
+    assert_eq!(
+        result.status,
+        ToolResultStatus::Success,
+        "{}",
+        result.content
+    );
+    assert!(result.content.contains("ok"));
+}
+
 /// Timeout must kill the whole process tree (the child is spawned as its own
 /// process group), not just the immediate shell — otherwise grandchildren
 /// like spawned servers keep running and holding ports.
@@ -480,6 +501,10 @@ fn tool_descriptions_match_actual_sandbox_capability() {
             assert!(
                 description.contains("granted roots"),
                 "a confining host must name the write boundary: {description}"
+            );
+            assert!(
+                description.contains("request_write_root"),
+                "a described boundary must teach its grant channel: {description}"
             );
             assert!(!description.contains("NO OS sandbox"));
         }

@@ -56,7 +56,6 @@ impl AgentRuntime {
         config: AgentConfig,
     ) -> Self {
         let workspace = record.workspace.clone();
-        let extra_roots = record.extra_roots.clone();
         let session = Session::from_entries(record.entries.clone());
         let ui_lang = crate::i18n::SharedLang::new(crate::i18n::Lang::from_env(&config.language));
         Self {
@@ -77,7 +76,7 @@ impl AgentRuntime {
             })),
             checkpoints: None,
             workspace: Some(workspace.clone()),
-            extra_roots,
+            boundary: None,
             lsp: None,
             persistence: Some(build_persistence(store, record)),
             permission_mode: crate::execution_policy::SharedPermissionMode::default(),

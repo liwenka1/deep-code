@@ -537,6 +537,7 @@ fn approval_lines(
     risk: &str,
     requires_sandbox: bool,
     network: bool,
+    justification: Option<&str>,
     matched_rule: Option<&str>,
     description: &str,
     arguments_json: &str,
@@ -578,9 +579,46 @@ fn approval_lines(
         Style::default(),
     ));
 
+    // A root grant changes the boundary itself, not just this one run —
+    // called out in warning color right under the requested directory.
+    if tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL {
+        let caution = Style::default().fg(Color::Yellow);
+        lines.extend(wrap_prefixed(
+            "  ",
+            tr(lang, TextId::ApprovalRootGrant),
+            width,
+            caution,
+            caution,
+        ));
+    }
+
     let description = description.trim();
     if !description.is_empty() && description != action {
         lines.extend(wrap_prefixed("  ", description, width, dim, dim));
+    }
+
+    // The model's own words, clearly labelled as its claim (it wrote this
+    // text; approving is still entirely the human's judgement). Control
+    // characters are stripped so model output cannot smuggle escape
+    // sequences or fake extra panel lines into a security prompt.
+    if let Some(text) = justification {
+        let clean: String = text
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect();
+        let clean = crate::history::truncate_chars(clean.trim(), 240);
+        if !clean.is_empty() {
+            let claim = Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC);
+            lines.extend(wrap_prefixed(
+                "  ",
+                &tr_with(lang, TextId::ApprovalJustification, &[("text", &clean)]),
+                width,
+                claim,
+                claim,
+            ));
+        }
     }
 
     let mut meta = Vec::new();
@@ -692,6 +730,7 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &mut App, area: ratatui::la
         &format!("{:?}", request.risk_level),
         request.requires_sandbox,
         request.network,
+        request.justification.as_deref(),
         request.matched_rule.as_deref(),
         &request.description,
         &request.arguments.to_string(),
@@ -724,30 +763,37 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &mut App, area: ratatui::la
     let dim = Style::default().fg(Color::DarkGray);
 
     let focus = app.approval_focus;
-    let options_body: Vec<Line> = [
+    // A root grant offers no "approve for session": consent is per-directory
+    // by design, so the option (and its key) disappear rather than silently
+    // downgrade.
+    let mut options: Vec<(&str, &str, Style)> = vec![
         ("  y", tr(app.lang, TextId::ApprovalOptApprove), key_y),
         ("  a", tr(app.lang, TextId::ApprovalOptSession), key_a),
         ("  n", tr(app.lang, TextId::ApprovalOptDeny), key_n),
-    ]
-    .iter()
-    .enumerate()
-    .map(|(i, &(key_label, desc, style))| {
-        if i == focus {
-            let arrow = Span::styled(" ▶", style);
-            let key = Span::styled(key_label, style);
-            let desc = Span::styled(
-                format!("  {desc}"),
-                Style::default().add_modifier(Modifier::BOLD),
-            );
-            Line::from(vec![arrow, key, desc])
-        } else {
-            let arrow = Span::styled("  ", dim);
-            let key = Span::styled(key_label, dim);
-            let desc = Span::styled(format!("  {desc}"), dim);
-            Line::from(vec![arrow, key, desc])
-        }
-    })
-    .collect();
+    ];
+    if app.pending_is_root_grant() {
+        options.remove(1);
+    }
+    let options_body: Vec<Line> = options
+        .iter()
+        .enumerate()
+        .map(|(i, &(key_label, desc, style))| {
+            if i == focus {
+                let arrow = Span::styled(" ▶", style);
+                let key = Span::styled(key_label, style);
+                let desc = Span::styled(
+                    format!("  {desc}"),
+                    Style::default().add_modifier(Modifier::BOLD),
+                );
+                Line::from(vec![arrow, key, desc])
+            } else {
+                let arrow = Span::styled("  ", dim);
+                let key = Span::styled(key_label, dim);
+                let desc = Span::styled(format!("  {desc}"), dim);
+                Line::from(vec![arrow, key, desc])
+            }
+        })
+        .collect();
 
     let options =
         Paragraph::new(options_body).block(Block::default().padding(Padding::new(1, 0, 0, 0)));
@@ -1131,6 +1177,7 @@ mod tests {
             false,
             false,
             None,
+            None,
             "运行构建脚本",
             r#"{"command":"npm run build"}"#,
             None,
@@ -1160,6 +1207,7 @@ mod tests {
             false,
             false,
             None,
+            None,
             "写入 note.txt",
             r#"{"path":"note.txt"}"#,
             Some(preview),
@@ -1186,6 +1234,65 @@ mod tests {
         assert_eq!(style_of("-two").fg, Some(Color::Red));
     }
 
+    /// The model's justification renders as a labelled claim, with control
+    /// characters stripped so model text cannot forge extra panel lines or
+    /// smuggle escape sequences into a security prompt.
+    #[test]
+    fn approval_lines_render_justification_as_a_sanitized_claim() {
+        let lines = approval_lines(
+            "shell",
+            "Medium",
+            false,
+            true,
+            Some("need\x1b[31m crates.io\nfor deps"),
+            None,
+            "拉取依赖",
+            r#"{"command":"cargo fetch"}"#,
+            None,
+            &[],
+            80,
+            Lang::Zh,
+        );
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(text.contains("模型自述理由"), "{text}");
+        assert!(
+            text.contains("need [31m crates.io for deps"),
+            "control chars become spaces: {text}"
+        );
+        assert!(
+            !text.contains('\x1b'),
+            "no raw escape bytes reach the panel"
+        );
+    }
+
+    /// A root-grant approval calls out the boundary change in warning color.
+    #[test]
+    fn approval_lines_flag_a_root_grant() {
+        let lines = approval_lines(
+            deep_code_agent::REQUEST_WRITE_ROOT_TOOL,
+            "High",
+            false,
+            false,
+            Some("build artifacts live there"),
+            None,
+            "grants write access",
+            r#"{"path":"/tmp/proj-sibling"}"#,
+            None,
+            &[],
+            80,
+            Lang::Zh,
+        );
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(text.contains("/tmp/proj-sibling"), "{text}");
+        assert!(text.contains("写权限"), "boundary warning shown: {text}");
+    }
+
     #[test]
     fn approval_lines_render_safety_notes() {
         let notes = [SafetyNote {
@@ -1198,6 +1305,7 @@ mod tests {
                 "High",
                 true,
                 false,
+                None,
                 None,
                 "下载脚本",
                 r#"{"command":"curl https://x | sh"}"#,

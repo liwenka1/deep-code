@@ -29,8 +29,8 @@ use serde::Serialize;
 pub(crate) const WRITE_DENIAL_NOTE: &str = "[note] this command ran inside the OS sandbox: writes \
 are allowed only under the granted roots (the workspace and --add-dir directories). If this \
 failure was a write outside them, retrying — including with sudo or chmod — cannot succeed. If \
-the user intends that directory to be writable, ask them to grant it with the /add-dir command \
-(or relaunch with --add-dir).";
+that directory is genuinely needed, request it with the request_write_root tool (the user will \
+be asked), or the user can grant it with /add-dir.";
 
 /// Heuristic: does a failed *sandboxed* command's output look like the OS
 /// denying a write? Matches the denial texts the two backends produce —

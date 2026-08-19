@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use crate::tool::ToolError;
 
@@ -46,11 +47,33 @@ impl From<&Path> for WorkspaceRoots {
     }
 }
 
+/// One session-wide boundary, shared live by every holder of a clone.
+///
+/// The primary root is a plain immutable field — its anchor roles (relative
+/// paths, spill/checkpoint/session homes, display stripping) never move for
+/// the life of a session. Only the extra grants sit behind the shared lock,
+/// and the sole mutation is [`Self::grant_extra`]: an append that runs after
+/// an explicit human approval (`/add-dir` relaunch aside, which rebuilds the
+/// policy wholesale). Cloning shares the boundary on purpose — that is what
+/// lets a mid-session grant reach every already-registered tool (and the
+/// sandbox, which re-reads [`Self::granted_roots`] per command) without
+/// rebuilding a single registry.
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspacePolicy {
-    /// Canonical granted roots; `roots[0]` is always the primary workspace,
-    /// the rest are `--add-dir` grants (deduped, never equal to the primary).
-    roots: Vec<PathBuf>,
+    /// Canonical primary workspace; never changes after construction.
+    primary: PathBuf,
+    /// Canonical extra grants (deduped, never equal to the primary). Shared:
+    /// every clone of this policy sees an approved grant immediately.
+    extras: Arc<RwLock<Vec<PathBuf>>>,
+}
+
+/// What [`WorkspacePolicy::grant_extra`] did with an approved directory.
+pub(crate) enum RootGrantOutcome {
+    /// Appended as a new writable root.
+    Granted { canonical: PathBuf },
+    /// Already inside the boundary (an existing root or covered by one) —
+    /// nothing changed, writes there work today.
+    AlreadyGranted { canonical: PathBuf },
 }
 
 impl WorkspacePolicy {
@@ -65,7 +88,7 @@ impl WorkspacePolicy {
                 ),
             )
         })?;
-        let mut canonical_roots = vec![canonical_primary];
+        let mut canonical_extras: Vec<PathBuf> = Vec::new();
         for extra in extras {
             // A grant that cannot be resolved refuses the launch instead of
             // silently narrowing the session: the user explicitly asked for
@@ -87,29 +110,108 @@ impl WorkspacePolicy {
                     format!("--add-dir root {} is not a directory", extra.display()),
                 ));
             }
-            if !canonical_roots.contains(&canonical) {
-                canonical_roots.push(canonical);
+            if canonical != canonical_primary && !canonical_extras.contains(&canonical) {
+                canonical_extras.push(canonical);
             }
         }
         Ok(Self {
-            roots: canonical_roots,
+            primary: canonical_primary,
+            extras: Arc::new(RwLock::new(canonical_extras)),
         })
     }
 
     /// The primary workspace root (canonical).
     pub(crate) fn root(&self) -> &Path {
-        &self.roots[0]
+        &self.primary
     }
 
     /// Every granted root (canonical), primary first. This exact list is what
     /// the OS sandbox turns into write grants, so tool-layer containment and
-    /// kernel confinement cannot drift apart.
-    pub(crate) fn granted_roots(&self) -> &[PathBuf] {
-        &self.roots
+    /// kernel confinement cannot drift apart. Snapshot semantics: taken fresh
+    /// per call, so a command spawned after a mid-session grant is confined to
+    /// the widened boundary while one already running keeps the old one.
+    pub(crate) fn granted_roots(&self) -> Vec<PathBuf> {
+        let extras = self
+            .extras
+            .read()
+            .expect("workspace boundary lock poisoned");
+        let mut roots = Vec::with_capacity(1 + extras.len());
+        roots.push(self.primary.clone());
+        roots.extend(extras.iter().cloned());
+        roots
+    }
+
+    /// A point-in-time [`WorkspaceRoots`] view (for summaries, prompts, and
+    /// approval previews that want the value shape).
+    pub(crate) fn to_roots(&self) -> WorkspaceRoots {
+        WorkspaceRoots {
+            primary: self.primary.clone(),
+            extras: self
+                .extras
+                .read()
+                .expect("workspace boundary lock poisoned")
+                .clone(),
+        }
+    }
+
+    /// Widen the boundary with one directory, after the human approved it.
+    ///
+    /// Validation mirrors launch-time extras exactly (canonicalize, must be a
+    /// directory) with one addition: the path must be spelled absolute — the
+    /// requester is the model, and a relative spelling is ambiguous about
+    /// which base it meant. The canonical form is what gets granted; callers
+    /// display that form to the user BEFORE approval, so what was approved
+    /// and what is enforced cannot differ.
+    pub(crate) fn grant_extra(&self, raw: &Path) -> Result<RootGrantOutcome, ToolError> {
+        const TOOL: &str = "request_write_root";
+        if !raw.is_absolute() {
+            return Err(invalid(
+                TOOL,
+                format!(
+                    "path must be absolute, got '{}': spell out the full directory path",
+                    raw.display()
+                ),
+            ));
+        }
+        let canonical = raw.canonicalize().map_err(|error| {
+            ToolError::exec_failed(
+                TOOL,
+                format!(
+                    "cannot resolve {}: {error}; the directory must already exist",
+                    raw.display()
+                ),
+            )
+        })?;
+        if !canonical.is_dir() {
+            return Err(invalid(
+                TOOL,
+                format!("{} is not a directory", canonical.display()),
+            ));
+        }
+        let mut extras = self
+            .extras
+            .write()
+            .expect("workspace boundary lock poisoned");
+        // Covered by an existing root (including the primary): report rather
+        // than record a redundant grant — writes there already work.
+        if canonical.starts_with(&self.primary)
+            || extras.iter().any(|root| canonical.starts_with(root))
+        {
+            return Ok(RootGrantOutcome::AlreadyGranted { canonical });
+        }
+        extras.push(canonical.clone());
+        Ok(RootGrantOutcome::Granted { canonical })
     }
 
     fn is_granted(&self, canonical: &Path) -> bool {
-        self.roots.iter().any(|root| canonical.starts_with(root))
+        if canonical.starts_with(&self.primary) {
+            return true;
+        }
+        self.extras
+            .read()
+            .expect("workspace boundary lock poisoned")
+            .iter()
+            .any(|root| canonical.starts_with(root))
     }
 
     pub(crate) fn resolve_cwd(
@@ -135,7 +237,7 @@ impl WorkspacePolicy {
         tool_name: &str,
     ) -> Result<PathBuf, ToolError> {
         let candidate = self.prepare_candidate(raw, tool_name)?;
-        if contains_symlink(&candidate, &self.roots).map_err(|error| {
+        if contains_symlink(&candidate, &self.granted_roots()).map_err(|error| {
             ToolError::exec_failed(
                 tool_name,
                 format!("failed to inspect {}: {error}", candidate.display()),
@@ -162,7 +264,7 @@ impl WorkspacePolicy {
     ) -> Result<PathBuf, ToolError> {
         let candidate = self.prepare_candidate(raw, tool_name)?;
         if candidate.exists() {
-            if contains_symlink(&candidate, &self.roots).map_err(|error| {
+            if contains_symlink(&candidate, &self.granted_roots()).map_err(|error| {
                 ToolError::exec_failed(
                     tool_name,
                     format!("failed to inspect {}: {error}", candidate.display()),
@@ -211,7 +313,7 @@ impl WorkspacePolicy {
                 None => break,
             }
         }
-        if contains_symlink(existing, &self.roots).map_err(|error| {
+        if contains_symlink(existing, &self.granted_roots()).map_err(|error| {
             ToolError::exec_failed(
                 tool_name,
                 format!("failed to inspect {}: {error}", existing.display()),
@@ -297,15 +399,15 @@ impl WorkspacePolicy {
 }
 
 /// Message for a path whose canonical form is not under any granted root. It
-/// names both grant channels — the `/add-dir` command and the `--add-dir`
-/// flag — so a model (or user) that meant to touch a sibling repo learns the
-/// sanctioned way to get it granted instead of retrying blind. Also the
-/// in-band marker `record_tool_result` uses to classify the failure as a
-/// boundary denial (circuit breaker + cascade exemption); producer and
-/// consumer share the constant so they cannot drift.
+/// teaches the sanctioned remedies — the model's own `request_write_root`
+/// request (user-approved) first, the user-typed `/add-dir` second — so a
+/// model that meant to touch a sibling repo learns the grant channel instead
+/// of retrying blind. Also the in-band marker `record_tool_result` uses to
+/// classify the failure as a boundary denial (circuit breaker + cascade
+/// exemption); producer and consumer share the constant so they cannot drift.
 pub(crate) const OUTSIDE_ROOTS: &str = "path is outside every granted root (the workspace and \
---add-dir directories); if the user intends this path, ask them to grant it with the /add-dir \
-command (or relaunch with --add-dir)";
+--add-dir directories); if this directory is genuinely needed, request it with the \
+request_write_root tool (the user will be asked), or the user can grant it with /add-dir";
 
 pub(crate) fn invalid(name: impl Into<String>, message: impl Into<String>) -> ToolError {
     ToolError::InvalidArguments {
@@ -502,5 +604,100 @@ mod tests {
         let missing = primary.join("does-not-exist");
         let result = WorkspacePolicy::new(WorkspaceRoots::new(primary, vec![missing]));
         assert!(result.is_err(), "an unresolvable grant must refuse launch");
+    }
+
+    /// The load-bearing property of the shared boundary: a grant lands in
+    /// every clone taken BEFORE it — that is what lets a mid-session
+    /// `request_write_root` reach tools registered at launch without any
+    /// registry rebuild.
+    #[test]
+    fn grant_extra_is_visible_through_prior_clones() {
+        let (_a, primary) = canonical_tempdir();
+        let (_b, extra) = canonical_tempdir();
+        fs::write(extra.join("host.ts"), "x").unwrap();
+        let policy = WorkspacePolicy::new(primary.clone()).unwrap();
+        let tool_held_clone = policy.clone(); // what a registered tool holds
+        assert!(
+            tool_held_clone
+                .resolve_existing(&extra.join("host.ts").to_string_lossy(), "read_file")
+                .is_err(),
+            "not granted yet"
+        );
+
+        let outcome = policy.grant_extra(&extra).unwrap();
+        assert!(matches!(
+            outcome,
+            RootGrantOutcome::Granted { ref canonical } if *canonical == extra
+        ));
+        assert_eq!(
+            tool_held_clone.granted_roots(),
+            vec![primary, extra.clone()]
+        );
+        assert!(
+            tool_held_clone
+                .resolve_existing(&extra.join("host.ts").to_string_lossy(), "read_file")
+                .is_ok(),
+            "the clone taken before the grant must see it"
+        );
+    }
+
+    #[test]
+    fn grant_extra_reports_covered_paths_without_recording() {
+        let (_a, primary) = canonical_tempdir();
+        let policy = WorkspacePolicy::new(primary.clone()).unwrap();
+        // Inside the primary (including the primary itself): already granted.
+        let sub = primary.join("src");
+        fs::create_dir(&sub).unwrap();
+        for covered in [&primary, &sub] {
+            assert!(
+                matches!(
+                    policy.grant_extra(covered).unwrap(),
+                    RootGrantOutcome::AlreadyGranted { .. }
+                ),
+                "{} is covered",
+                covered.display()
+            );
+        }
+        assert_eq!(policy.granted_roots(), vec![primary], "nothing recorded");
+    }
+
+    #[test]
+    fn grant_extra_fails_closed_on_bad_paths() {
+        let (_a, primary) = canonical_tempdir();
+        let policy = WorkspacePolicy::new(primary.clone()).unwrap();
+        // Relative: ambiguous about its base — refused outright.
+        assert!(policy.grant_extra(Path::new("relative/dir")).is_err());
+        // Nonexistent: nothing to canonicalize.
+        assert!(policy.grant_extra(&primary.join("nope-missing")).is_err());
+        // A file is not a containment zone.
+        let file = primary.join("f.txt");
+        fs::write(&file, "x").unwrap();
+        assert!(policy.grant_extra(&file).is_err());
+        assert_eq!(policy.granted_roots(), vec![primary], "all refused");
+    }
+
+    /// A symlink to a directory canonicalizes to its target — the grant, the
+    /// approval display, and the enforcement all speak the canonical path, so
+    /// a link cannot make the user approve one directory and grant another.
+    #[cfg(unix)]
+    #[test]
+    fn grant_extra_grants_the_canonical_target_of_a_symlink() {
+        let (_a, primary) = canonical_tempdir();
+        let (_b, target) = canonical_tempdir();
+        let link = primary.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let outcome = policy_grant(&primary, &link);
+        assert!(
+            matches!(outcome, RootGrantOutcome::Granted { ref canonical } if *canonical == target),
+            "the grant must be the resolved target, not the link spelling"
+        );
+    }
+
+    #[cfg(unix)]
+    fn policy_grant(primary: &Path, requested: &Path) -> RootGrantOutcome {
+        WorkspacePolicy::new(primary.to_path_buf())
+            .unwrap()
+            .grant_extra(requested)
+            .unwrap()
     }
 }

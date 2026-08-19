@@ -104,6 +104,20 @@ impl App {
                 });
                 self.status = self.tr_with(TextId::StatusRestored, &[("id", &id.0)]);
             }
+            RuntimeEvent::RootGranted { path, .. } => {
+                // Keep the TUI's own grant list in sync: `/add-dir` relaunches
+                // pass `self.extra_roots` back to the launcher, so a grant the
+                // RUNTIME performed must land here too or the next relaunch
+                // would forget it (the union with the session record is the
+                // backstop, this keeps the display honest right now).
+                let granted = std::path::PathBuf::from(&path);
+                if !self.extra_roots.contains(&granted) {
+                    self.extra_roots.push(granted);
+                }
+                self.history.push(HistoryCell::System {
+                    text: self.tr_with(TextId::SystemRootGranted, &[("path", &path)]),
+                });
+            }
             RuntimeEvent::ToolCallFinished {
                 tool_call_id,
                 result,

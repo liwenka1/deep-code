@@ -88,10 +88,13 @@ pub async fn run_subagent(
             | RuntimeEvent::ToolCallProgress { .. }
             | RuntimeEvent::ApprovalResolved { .. }
             | RuntimeEvent::SessionUpdated { .. } => {}
+            // RootGranted cannot fire in a child (root grants are auto-denied
+            // for sub-agents); listed for exhaustiveness.
             RuntimeEvent::CheckpointCreated { .. }
             | RuntimeEvent::WorkspaceRestored { .. }
             | RuntimeEvent::DiagnosticsUpdated { .. }
             | RuntimeEvent::CompactionApplied { .. }
+            | RuntimeEvent::RootGranted { .. }
             | RuntimeEvent::Warning { .. } => {}
         }
     }

@@ -3013,3 +3013,269 @@ async fn multi_request_turn_accumulates_cost_across_requests() {
     assert_eq!(telemetry.session_cache_hit_tokens, 2_000);
     assert_eq!(telemetry.session_cache_miss_tokens, 500);
 }
+
+// ---------------------------------------------------------------------------
+// request_write_root: the model-side doorbell for widening the write boundary
+// ---------------------------------------------------------------------------
+
+/// Registry + shared boundary for the root-grant tests: workspace tools and
+/// the request tool built on ONE policy, exactly like a real launch.
+fn root_grant_fixture(
+    workspace: &std::path::Path,
+) -> (ToolRegistry, crate::workspace_policy::WorkspacePolicy) {
+    let policy = crate::workspace_policy::WorkspacePolicy::new(workspace.to_path_buf()).unwrap();
+    let mut registry = crate::workspace_tools::workspace_tool_registry_from(policy.clone());
+    registry.register(crate::root_grant::RequestWriteRootTool);
+    (registry, policy)
+}
+
+fn request_root_script(target: &std::path::Path) -> Vec<AgentEvent> {
+    vec![
+        AgentEvent::ToolCallDelta {
+            delta: tool_call_delta(
+                "call_grant",
+                "request_write_root",
+                &serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "justification": "the build writes its artifacts there",
+                })
+                .to_string(),
+            ),
+        },
+        AgentEvent::Done { usage: None },
+    ]
+}
+
+/// Yolo auto-approves everything EXCEPT a root grant: widening the sandbox is
+/// the one decision Yolo's containment story cannot delegate to itself.
+#[tokio::test]
+async fn yolo_mode_still_parks_a_root_grant() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let (registry, policy) = root_grant_fixture(workspace.path());
+    let client = ScriptedClient::new(vec![request_root_script(outside.path())]);
+    let runtime = AgentRuntime::new(client, registry)
+        .with_boundary(Some(policy))
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Yolo));
+
+    let mut rx = runtime.submit_user("build it").await;
+    let events = drain(&mut rx).await;
+    assert!(
+        matches!(events.last(), Some(RuntimeEvent::ApprovalRequired { .. })),
+        "a root grant must park even under Yolo: {events:?}"
+    );
+}
+
+/// Neither standing consent channel may cover a root grant: not a config
+/// `auto_allow` prefix, not a recorded session approval.
+#[tokio::test]
+async fn standing_consents_never_cover_a_root_grant() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let (registry, policy) = root_grant_fixture(workspace.path());
+    let client = ScriptedClient::new(vec![request_root_script(outside.path())]);
+    let config = crate::config::AgentConfig {
+        approval_auto_allow: vec!["request_write_root".to_string()],
+        ..crate::config::AgentConfig::builtin()
+    };
+    let runtime = AgentRuntime::with_config(client, registry, config).with_boundary(Some(policy));
+    runtime
+        .state
+        .lock()
+        .await
+        .session_approved
+        .insert("request_write_root".to_string());
+
+    let mut rx = runtime.submit_user("build it").await;
+    let events = drain(&mut rx).await;
+    assert!(
+        matches!(events.last(), Some(RuntimeEvent::ApprovalRequired { .. })),
+        "config auto_allow and session memory must not skip the human: {events:?}"
+    );
+}
+
+/// The full approved path: the request parks (even under AcceptEdits), the
+/// human approves, the boundary widens LIVE (a write_file into the new root
+/// succeeds in the same session without any relaunch), the UI event fires,
+/// and the request carried the model's justification to the prompt.
+#[tokio::test]
+async fn approved_root_grant_widens_the_boundary_live() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().canonicalize().unwrap();
+    let (registry, policy) = root_grant_fixture(workspace.path());
+
+    let file_in_new_root = target.join("artifact.txt");
+    let client = ScriptedClient::new(vec![
+        request_root_script(&target),
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta(
+                    "call_write",
+                    "write_file",
+                    &serde_json::json!({
+                        "path": file_in_new_root.to_string_lossy(),
+                        "content": "built",
+                    })
+                    .to_string(),
+                ),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    // AcceptEdits: write_file auto-approves, the root grant must NOT.
+    let runtime = AgentRuntime::new(client, registry)
+        .with_boundary(Some(policy.clone()))
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::AcceptEdits));
+
+    let mut rx = runtime.submit_user("build into the sibling dir").await;
+    let first = drain(&mut rx).await;
+    let request = first
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::ApprovalRequired { request, .. } => Some(request.clone()),
+            _ => None,
+        })
+        .expect("root grant parks under AcceptEdits");
+    assert_eq!(
+        request.justification.as_deref(),
+        Some("the build writes its artifacts there"),
+        "the model's reason must reach the prompt"
+    );
+
+    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let events = drain(&mut rx).await;
+
+    let granted_path = events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::RootGranted { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .expect("RootGranted event notifies the UI");
+    assert_eq!(granted_path, target.display().to_string());
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ToolCallFinished { result, .. }
+            if result.tool_name == "request_write_root"
+                && result.status == ToolResultStatus::Success
+                && result.content.contains("granted")
+    )));
+    // The load-bearing assertion: the SAME session's next tool call writes
+    // into the just-granted root — no relaunch, no new registry.
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ToolCallFinished { result, .. }
+            if result.tool_name == "write_file" && result.status == ToolResultStatus::Success
+    )));
+    assert_eq!(std::fs::read_to_string(&file_in_new_root).unwrap(), "built");
+    assert_eq!(
+        policy.granted_roots().len(),
+        2,
+        "boundary records the grant"
+    );
+}
+
+/// Denial is final and says so: the result tells the model not to re-request,
+/// nothing is granted, and no UI event fires.
+#[tokio::test]
+async fn denied_root_grant_grants_nothing_and_says_so() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let (registry, policy) = root_grant_fixture(workspace.path());
+    let client = ScriptedClient::new(vec![
+        request_root_script(outside.path()),
+        vec![
+            AgentEvent::TextDelta {
+                text: "ok".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::new(client, registry).with_boundary(Some(policy.clone()));
+
+    let mut rx = runtime.submit_user("build it").await;
+    drain(&mut rx).await;
+    let mut rx = runtime.submit_approval(ApprovalDecision::Denied).await;
+    let events = drain(&mut rx).await;
+
+    let result = events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::ToolCallFinished { result, .. }
+                if result.tool_name == "request_write_root" =>
+            {
+                Some(result.clone())
+            }
+            _ => None,
+        })
+        .expect("denied call still records a result");
+    assert_eq!(result.status, ToolResultStatus::Denied);
+    assert!(
+        result.content.contains("Do not request this path again"),
+        "denial must be final and say so: {}",
+        result.content
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, RuntimeEvent::RootGranted { .. })),
+        "no grant event on denial"
+    );
+    assert_eq!(policy.granted_roots().len(), 1, "boundary unchanged");
+}
+
+/// The grant persists with the session, like an `--add-dir`: after approval
+/// the saved record carries the new root, so a resume restores it.
+#[tokio::test]
+async fn approved_root_grant_persists_into_the_session_record() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().canonicalize().unwrap();
+    let (registry, policy) = root_grant_fixture(workspace.path());
+
+    let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let record = crate::session_store::SessionRecord::new(workspace.path().to_path_buf(), "system");
+    let session_id = record.id.clone();
+    store.save(&record).unwrap();
+
+    let client = ScriptedClient::new(vec![
+        request_root_script(&target),
+        vec![
+            AgentEvent::TextDelta {
+                text: "ok".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::from_session_record(
+        client,
+        registry,
+        record,
+        store,
+        crate::config::AgentConfig::builtin(),
+    )
+    .with_boundary(Some(policy));
+
+    let mut rx = runtime.submit_user("build it").await;
+    drain(&mut rx).await;
+    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    drain(&mut rx).await;
+    runtime.shutdown().await; // flush the persistence actor
+
+    let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let saved = store.load(&session_id).unwrap();
+    assert!(
+        saved.extra_roots.contains(&target),
+        "the grant must survive in the record (resume restores it): {:?}",
+        saved.extra_roots
+    );
+}

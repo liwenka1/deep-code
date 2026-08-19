@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::execution_policy::{PermissionMode, RiskLevel, accept_edits_approvable, command_shape};
 use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_FLASH};
 use crate::runtime::AgentRuntime;
-use crate::runtime::event::{RuntimeEvent, ToolCallId, emit};
+use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
 use crate::runtime::state::PendingToolBatch;
 use crate::runtime::tool_result::BatchOutcome;
 use crate::tool::{ApprovalDecision, ApprovalRequest, ToolCall, ToolResult, ToolRunOutcome};
@@ -19,11 +19,23 @@ use crate::tool::{ApprovalDecision, ApprovalRequest, ToolCall, ToolResult, ToolR
 /// arguments, so a blanket session consent would be misleading. The `job`
 /// tool is excluded for the same reason — a session-allow granted on a
 /// `cancel` prompt must not blanket-approve future `action=start` commands.
+/// Root grants are excluded too: each request is about one specific
+/// directory, and "always widen the boundary without asking" must not be a
+/// recordable consent.
 pub(super) fn session_allowable(tool_name: &str) -> bool {
     !matches!(
         crate::execution_policy::ExecPolicy::classify_tool(tool_name),
-        crate::execution_policy::ToolKind::Shell | crate::execution_policy::ToolKind::Job
+        crate::execution_policy::ToolKind::Shell
+            | crate::execution_policy::ToolKind::Job
+            | crate::execution_policy::ToolKind::RootGrant
     )
+}
+
+/// Whether a call is the `request_write_root` doorbell (see
+/// [`crate::execution_policy::ToolKind::RootGrant`]).
+fn is_root_grant(tool_name: &str) -> bool {
+    crate::execution_policy::ExecPolicy::classify_tool(tool_name)
+        == crate::execution_policy::ToolKind::RootGrant
 }
 
 /// Identity key of a *simple* shell command — e.g. `git status` from
@@ -82,6 +94,15 @@ impl AgentRuntime {
         request: &ApprovalRequest,
         cancel: &CancellationToken,
     ) -> bool {
+        // Widening the write boundary is a human decision in EVERY mode and
+        // through EVERY consent channel: above Layer 1 so a config
+        // `auto_allow` prefix cannot become a standing root-grant (grants
+        // must stay explicit per-directory actions), and above Layer 2 so
+        // even Yolo prompts — Yolo's real containment is the OS sandbox, and
+        // this call is precisely a request to widen that containment.
+        if is_root_grant(&call.name) {
+            return false;
+        }
         // Layer 1: standing consent (config auto_allow + session memory).
         if self
             .config
@@ -238,6 +259,36 @@ impl AgentRuntime {
         } else {
             decision
         };
+        // `request_write_root` never executes as a registry tool: granting is
+        // a runtime state transition (widen the shared boundary, persist,
+        // notify UIs), performed here — the single point every decision path
+        // (TUI keypress, serve HTTP, headless/sub-agent auto-deny) flows
+        // through via `submit_approval`.
+        if is_root_grant(&current.name) {
+            let result = match decision {
+                ApprovalDecision::Denied => {
+                    let mut result = ToolResult::denied(&current);
+                    result.content = format!(
+                        "User declined the write-root request for '{}'. Do not request this \
+                         path again; continue within the granted roots, or the user can grant \
+                         it later with /add-dir.",
+                        root_grant_requested_path(&current)
+                    );
+                    result
+                }
+                _ => self.apply_root_grant(&current, &turn_id, tx).await,
+            };
+            self.record_tool_result(&current, result, tx, turn_id.clone())
+                .await;
+            if self
+                .process_tool_batch(remaining, &turn_id, &cancel, tx)
+                .await
+                == BatchOutcome::Completed
+            {
+                self.run_loop(tx).await;
+            }
+            return;
+        }
         match self
             .run_tool(&current, Some(decision), &cancel, &turn_id, tx)
             .await
@@ -247,15 +298,7 @@ impl AgentRuntime {
                     .await;
             }
             Ok(ToolRunOutcome::ApprovalRequired { mut request }) => {
-                request.preview = self.workspace.as_deref().and_then(|ws| {
-                    let roots =
-                        crate::workspace_policy::WorkspaceRoots::new(ws, self.extra_roots.clone());
-                    crate::approval_preview::build_approval_preview(
-                        &current,
-                        &roots,
-                        self.ui_lang(),
-                    )
-                });
+                request.preview = self.approval_preview(&current);
                 {
                     let mut state = self.state.lock().await;
                     state.pending = Some(PendingToolBatch {
@@ -291,6 +334,95 @@ impl AgentRuntime {
             self.run_loop(tx).await;
         }
     }
+
+    /// Human-reviewable preview for a gated call, built against the live
+    /// boundary so absolute paths into mid-session grants resolve too.
+    pub(super) fn approval_preview(&self, call: &ToolCall) -> Option<String> {
+        let boundary = self.boundary.as_ref()?;
+        crate::approval_preview::build_approval_preview(call, &boundary.to_roots(), self.ui_lang())
+    }
+
+    /// Perform an APPROVED `request_write_root`: widen the shared boundary,
+    /// persist the grant next to the `--add-dir` ones (it must survive
+    /// resume), and notify UIs. Returns the model-facing result; failures are
+    /// soft (status=Error text) so the model can correct the path and — with
+    /// a fresh approval — try again.
+    async fn apply_root_grant(
+        &self,
+        call: &ToolCall,
+        turn_id: &TurnId,
+        tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> ToolResult {
+        use crate::workspace_policy::RootGrantOutcome;
+        let raw = root_grant_requested_path(call);
+        if raw.is_empty() {
+            return ToolResult::error(
+                call,
+                "invalid request_write_root arguments: path is required",
+            );
+        }
+        let Some(boundary) = self.boundary.as_ref() else {
+            return ToolResult::error(
+                call,
+                "this session has no workspace boundary to widen (filesystem tools are disabled)",
+            );
+        };
+        match boundary.grant_extra(std::path::Path::new(&raw)) {
+            Ok(RootGrantOutcome::Granted { canonical }) => {
+                // Same durability contract as --add-dir: the grant is part of
+                // the session, so a resume must restore it.
+                if let Some(persistence) = self.persistence.as_ref() {
+                    {
+                        let mut record = persistence.record.lock().await;
+                        if !record.extra_roots.contains(&canonical) {
+                            record.extra_roots.push(canonical.clone());
+                        }
+                        record.touch();
+                    }
+                    persistence.actor.request_save();
+                }
+                let path = canonical.display().to_string();
+                emit(
+                    tx,
+                    RuntimeEvent::RootGranted {
+                        turn_id: Some(turn_id.clone()),
+                        path: path.clone(),
+                    },
+                );
+                ToolResult::success(
+                    &call.id,
+                    &call.name,
+                    format!(
+                        "Write access granted: '{path}' is now a writable root for the rest of \
+                         this session (writes there work immediately; the grant persists across \
+                         resume). Reference files under it by absolute path."
+                    ),
+                )
+            }
+            Ok(RootGrantOutcome::AlreadyGranted { canonical }) => ToolResult::success(
+                &call.id,
+                &call.name,
+                format!(
+                    "'{}' is already inside the granted roots — writes there work today; \
+                     no new grant was needed.",
+                    canonical.display()
+                ),
+            ),
+            Err(error) => ToolResult::error(call, error.to_string()),
+        }
+    }
+}
+
+/// The `path` argument of a `request_write_root` call, trimmed ("" when
+/// absent/malformed — the caller degrades that into an invalid-arguments
+/// result rather than panicking on model output).
+fn root_grant_requested_path(call: &ToolCall) -> String {
+    call.arguments
+        .get("path")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The model the auto-mode classifier runs on. Flash is the cheap judge tier;
@@ -435,5 +567,15 @@ mod tests {
             arguments: json!({ "path": "x", "content": "y" }),
         };
         assert_eq!(session_shell_prefix(&call), None);
+    }
+
+    /// "Approve for session" must not be recordable for a root grant: each
+    /// request is about one directory, and a standing "always widen the
+    /// boundary" consent must not exist.
+    #[test]
+    fn root_grant_is_never_session_allowable() {
+        assert!(!session_allowable("request_write_root"));
+        // Sanity: ordinary tools stay recordable.
+        assert!(session_allowable("write_file"));
     }
 }
