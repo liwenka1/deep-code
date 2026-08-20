@@ -234,6 +234,33 @@ impl WorkspacePolicy {
                     ),
                 ));
             }
+            // Credential stores and deep-code's own config directory. The OS
+            // sandbox already denies writes to exactly these under every
+            // policy, precisely so that a writable root cannot reach them —
+            // but `read_file`/`write_file` run in-process and never meet the
+            // sandbox, so without this floor an approved grant would hand
+            // over what the kernel fence refuses. `~/.deep-code` is the worst
+            // of them: it holds the plaintext API key, and `auto_allow` is
+            // honoured only from that file, so a write there outlives the
+            // session the approval prompt scopes itself to.
+            //
+            // Overlap in EITHER direction is refused: the target may not be
+            // inside a secret store, nor an ancestor that would cover one.
+            // Deliberately narrower than `--add-dir`, which stays the human's
+            // own call — here the model chooses the target and a plausible
+            // spelling is all it takes.
+            if let Some(secret) = sensitive_overlap(&canonical, &crate::paths::sensitive_paths()) {
+                return Err(invalid(
+                    TOOL,
+                    format!(
+                        "refusing to grant '{}': it overlaps the credential store '{}', \
+                         which is never writable through a request; request the narrowest \
+                         directory that unblocks the task",
+                        canonical.display(),
+                        secret.display()
+                    ),
+                ));
+            }
         }
         Ok(canonical)
     }
@@ -472,6 +499,17 @@ impl WorkspacePolicy {
 pub(crate) const OUTSIDE_ROOTS: &str = "path is outside every granted root (the workspace and \
 --add-dir directories); if this directory is genuinely needed, request it with the \
 request_write_root tool (the user will be asked), or the user can grant it with /add-dir";
+
+/// The first secret store `canonical` overlaps, in either direction: the
+/// candidate sitting inside one, or being an ancestor that would cover one.
+/// Split out from [`WorkspacePolicy::resolve_grant_target`] so the rule itself
+/// is testable without needing real credential directories on the host.
+fn sensitive_overlap<'a>(canonical: &Path, secrets: &'a [PathBuf]) -> Option<&'a Path> {
+    secrets
+        .iter()
+        .find(|secret| canonical.starts_with(secret) || secret.starts_with(canonical))
+        .map(PathBuf::as_path)
+}
 
 pub(crate) fn invalid(name: impl Into<String>, message: impl Into<String>) -> ToolError {
     ToolError::InvalidArguments {
@@ -789,6 +827,84 @@ mod tests {
                 "the reason must name the problem: {error}"
             );
         }
+        assert_eq!(policy.granted_roots(), vec![primary], "nothing granted");
+    }
+
+    /// The credential floor's rule, pinned without needing real secret
+    /// directories on the host: overlap in EITHER direction is refused, and an
+    /// unrelated sibling is not.
+    #[test]
+    fn sensitive_overlap_refuses_both_directions() {
+        let secrets = [PathBuf::from("/home/u/.ssh"), PathBuf::from("/home/u/.aws")];
+        // The candidate IS the store, or sits inside it.
+        for inside in ["/home/u/.ssh", "/home/u/.ssh/keys"] {
+            assert_eq!(
+                sensitive_overlap(Path::new(inside), &secrets),
+                Some(Path::new("/home/u/.ssh")),
+                "{inside} overlaps a credential store"
+            );
+        }
+        // The candidate is an ancestor that would cover a store.
+        assert_eq!(
+            sensitive_overlap(Path::new("/home/u"), &secrets),
+            Some(Path::new("/home/u/.ssh"))
+        );
+        // Unrelated siblings stay grantable — the floor must not swallow
+        // ordinary project directories.
+        for outside in ["/home/u/projects", "/home/u/.sshfoo", "/srv/build"] {
+            assert_eq!(
+                sensitive_overlap(Path::new(outside), &secrets),
+                None,
+                "{outside} must remain grantable"
+            );
+        }
+    }
+
+    /// The wiring half: the shared list really does name the credential stores
+    /// and deep-code's own config directory, so the rule above is applied to
+    /// the paths that matter. Pinned separately from the sandbox's use of the
+    /// same constant — that is what keeps the kernel fence and this fence from
+    /// drifting apart.
+    #[test]
+    fn sensitive_paths_cover_the_credential_stores_and_deep_code_home() {
+        let Some(home) = crate::paths::home_dir().and_then(|home| home.canonicalize().ok()) else {
+            eprintln!("no resolvable home dir on this host; skipping");
+            return;
+        };
+        let secrets = crate::paths::sensitive_paths();
+        for entry in [".ssh", ".aws", ".git-credentials", ".deep-code"] {
+            assert!(
+                secrets.contains(&home.join(entry)),
+                "{entry} must be refused by the request channel: {secrets:?}"
+            );
+        }
+    }
+
+    /// End-to-end through the real resolver: deep-code's own config directory
+    /// holds the plaintext API key and the only `auto_allow` layer that is
+    /// honoured, and `read_file`/`write_file` never meet the sandbox that
+    /// denies it — so the request channel must refuse it outright. Runs where
+    /// that directory exists (any real install); skips otherwise.
+    #[test]
+    fn grant_extra_refuses_deep_code_home() {
+        let (_a, primary) = canonical_tempdir();
+        let policy = WorkspacePolicy::new(primary.clone()).unwrap();
+        let Some(home) = crate::paths::home_dir().and_then(|home| home.canonicalize().ok()) else {
+            eprintln!("no resolvable home dir on this host; skipping");
+            return;
+        };
+        let config_dir = home.join(crate::paths::DEEP_CODE_DIR);
+        if !config_dir.is_dir() || primary.starts_with(&config_dir) {
+            eprintln!("no ~/.deep-code on this host; skipping");
+            return;
+        }
+        let Err(error) = policy.grant_extra(&config_dir) else {
+            panic!("granting {} must be refused", config_dir.display());
+        };
+        assert!(
+            error.to_string().contains("credential store"),
+            "the reason must name the problem: {error}"
+        );
         assert_eq!(policy.granted_roots(), vec![primary], "nothing granted");
     }
 

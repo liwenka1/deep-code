@@ -193,7 +193,7 @@ fn compose_profile(
     // command reading the key off disk, or rewriting `provider.base_url` to a
     // proxy. Read-deny is rendered after `(allow file-read*)` so it wins.
     if let Some(home) = crate::paths::home_dir() {
-        let param = profile.bind_path("KEEP_DEEP_CODE", home.join(".deep-code"));
+        let param = profile.bind_path("KEEP_DEEP_CODE", home.join(crate::paths::DEEP_CODE_DIR));
         profile.rule(format!("(deny file-write* (subpath {param}))"));
         profile.rule(format!("(deny file-read* (subpath {param}))"));
     }
@@ -209,25 +209,19 @@ fn compose_profile(
 /// `git push`); the residual read-exfiltration risk is accepted and documented.
 /// deep-code's own `~/.deep-code` is handled separately (read+write denied).
 /// Empty when `HOME` is unset (nothing to protect, nothing to bind).
+///
+/// The entry list lives in [`crate::paths::CREDENTIAL_ENTRIES`], shared with
+/// the write-grant floor in `workspace_policy::resolve_grant_target`: the
+/// kernel fence here and the in-process path fence there must refuse the same
+/// set, or a grant could hand over what this profile denies.
 fn credential_dirs() -> Vec<(String, PathBuf)> {
     let Some(home) = crate::paths::home_dir() else {
         return Vec::new();
     };
-    [
-        ".ssh",
-        ".aws",
-        ".gnupg",
-        ".netrc",
-        ".config/gh",
-        ".docker",
-        ".kube",
-        ".npmrc",
-        ".pypirc",
-        ".git-credentials",
-    ]
-    .into_iter()
-    .map(|entry| (credential_param_name(entry), home.join(entry)))
-    .collect()
+    crate::paths::CREDENTIAL_ENTRIES
+        .iter()
+        .map(|entry| (credential_param_name(entry), home.join(entry)))
+        .collect()
 }
 
 /// A valid SBPL `-D` parameter name for a credential entry: `KEEP_` plus the
