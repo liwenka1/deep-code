@@ -76,11 +76,14 @@
 # 注意：放行是整个工具的常备同意，连带跳过 [sandbox] network 的逐条联网
 # 审批——配了 "shell" 后，声明 network=true 的命令会直接带网执行不再询问。
 # 想要零打扰联网请用 [sandbox] network = "always"，而不是放行整个 shell。
+# 唯一的例外：request_write_root（模型申请可写根）不受本节影响，命中前缀
+# 也照样弹审批——扩大写边界是一次只能由人做的决定，不存在常备同意。
 # auto_allow = ["read_", "grep_"]
 
 # 权限模式:启动时的审批档位。
-# default(每次询问)| accept_edits(自动放行工作区内编辑)| auto(AI 判断)| yolo(全放开)。
+# default(每次询问)| accept_edits(自动放行工作区内编辑)| auto(AI 判断)| yolo(除写根申请外全放开)。
 # 项目配置只能设 default/accept_edits;auto/yolo 只能来自全局配置(防止恶意仓库静默解除审批门)。
+# 注意 yolo 不是字面意义的"全放开":request_write_root 在任何档位都要弹审批。
 # 运行时按 Shift+Tab 循环切换。
 # auto 档的边界(有意取舍):AI 判官只读取命令与参数文本,不读取待写入的
 # 文件内容——write_file/apply_patch 的实质内容不经判官审阅(高风险档、联网

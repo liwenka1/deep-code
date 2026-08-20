@@ -192,10 +192,19 @@ fn compose_profile(
     // tools, and it closes the highest-value target: a single approved network
     // command reading the key off disk, or rewriting `provider.base_url` to a
     // proxy. Read-deny is rendered after `(allow file-read*)` so it wins.
+    // Canonicalized for the same reason as `credential_dirs_under`: an
+    // unresolved spelling is a deny the kernel never matches.
     if let Some(home) = crate::paths::home_dir() {
-        let param = profile.bind_path("KEEP_DEEP_CODE", home.join(crate::paths::DEEP_CODE_DIR));
-        profile.rule(format!("(deny file-write* (subpath {param}))"));
-        profile.rule(format!("(deny file-read* (subpath {param}))"));
+        let home = home.canonicalize().unwrap_or(home);
+        let joined = home.join(crate::paths::DEEP_CODE_DIR);
+        let resolved = joined.canonicalize().ok().filter(|path| *path != joined);
+        for (name, dir) in std::iter::once(("KEEP_DEEP_CODE", joined))
+            .chain(resolved.map(|path| ("KEEP_DEEP_CODE_R", path)))
+        {
+            let param = profile.bind_path(name, dir);
+            profile.rule(format!("(deny file-write* (subpath {param}))"));
+            profile.rule(format!("(deny file-read* (subpath {param}))"));
+        }
     }
 
     profile
@@ -218,10 +227,39 @@ fn credential_dirs() -> Vec<(String, PathBuf)> {
     let Some(home) = crate::paths::home_dir() else {
         return Vec::new();
     };
-    crate::paths::CREDENTIAL_ENTRIES
-        .iter()
-        .map(|entry| (credential_param_name(entry), home.join(entry)))
-        .collect()
+    credential_dirs_under(&home)
+}
+
+/// The credential denials for a given home, both spellings where they differ.
+///
+/// Canonicalized, because Seatbelt matches the path the kernel resolves. A deny
+/// bound to an unresolved `$HOME` silently fails to match wherever HOME or the
+/// entry itself traverses a symlink — and dotfile managers routinely symlink
+/// `~/.aws`, `~/.kube`, `~/.netrc` or `~/.git-credentials` into a checkout. The
+/// write GRANTS in this same file were already canonicalized for exactly this
+/// reason (`/tmp` is a symlink into `/private` on macOS); the denials were not,
+/// so the kernel fence that the in-process grant floor defers to could be a
+/// no-op while the floor itself still refused — two fences, two answers, and
+/// the weaker one was the one holding the key material.
+///
+/// Both the joined and the resolved spelling are emitted when they differ: a
+/// sandboxed command can reach the store by either name. Split from
+/// [`credential_dirs`] so the rule is testable without touching the real HOME.
+fn credential_dirs_under(home: &Path) -> Vec<(String, PathBuf)> {
+    // A home that cannot be resolved still gets denials, at its unresolved
+    // spelling — losing the fence entirely is the worse failure.
+    let resolved_home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    let mut dirs = Vec::new();
+    for entry in crate::paths::CREDENTIAL_ENTRIES {
+        let joined = resolved_home.join(entry);
+        if let Ok(resolved) = joined.canonicalize()
+            && resolved != joined
+        {
+            dirs.push((format!("{}_R", credential_param_name(entry)), resolved));
+        }
+        dirs.push((credential_param_name(entry), joined));
+    }
+    dirs
 }
 
 /// A valid SBPL `-D` parameter name for a credential entry: `KEEP_` plus the
@@ -249,6 +287,42 @@ mod tests {
     /// Single-root granted list, the shape every pre-`--add-dir` call had.
     fn single_root(ws: &Path) -> Vec<PathBuf> {
         vec![ws.to_path_buf()]
+    }
+
+    /// A symlinked credential store is denied by the path the kernel resolves,
+    /// not only by the spelling under `$HOME`.
+    ///
+    /// Seatbelt matches resolved paths, so `(deny file-write* (subpath
+    /// $HOME/.aws))` never fires when `~/.aws` is a symlink into a dotfiles
+    /// checkout — which is how dotfile managers set these up. The write grants
+    /// in this file were already canonicalized for exactly this reason; the
+    /// denials were not, leaving the kernel fence that the in-process grant
+    /// floor defers to as a silent no-op.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_credential_store_is_denied_by_its_resolved_path() {
+        let home = tempfile::TempDir::new().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let real = tempfile::TempDir::new().unwrap();
+        let real = real.path().canonicalize().unwrap();
+        // `~/.aws` → a directory outside home, the dotfiles-manager shape.
+        std::os::unix::fs::symlink(&real, home.join(".aws")).unwrap();
+
+        let dirs = credential_dirs_under(&home);
+        let paths: Vec<&Path> = dirs.iter().map(|(_, dir)| dir.as_path()).collect();
+        assert!(
+            paths.contains(&real.as_path()),
+            "the resolved store must be denied too: {paths:?}"
+        );
+        assert!(
+            paths.contains(&home.join(".aws").as_path()),
+            "and the spelling under home stays denied: {paths:?}"
+        );
+        // Parameter names must stay distinct, or one binding overwrites the
+        // other and only a single deny is emitted.
+        let names: std::collections::BTreeSet<&str> =
+            dirs.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names.len(), dirs.len(), "duplicate SBPL parameter name");
     }
 
     #[test]

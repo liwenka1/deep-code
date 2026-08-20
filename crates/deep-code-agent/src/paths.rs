@@ -55,9 +55,14 @@ pub(crate) const CREDENTIAL_ENTRIES: &[&str] = &[
 /// Empty when the environment names no home (nothing to locate, nothing to
 /// protect).
 pub(crate) fn sensitive_paths() -> Vec<PathBuf> {
-    let Some(home) = home_dir().and_then(|home| home.canonicalize().ok()) else {
+    let Some(home) = home_dir() else {
         return Vec::new();
     };
+    // A home that will not canonicalize still gets a floor, at its unresolved
+    // spelling. Dropping the whole list here removed the credential floor
+    // entirely — the wrong direction to fail for the one check standing between
+    // a requested grant and the plaintext API key.
+    let home = home.canonicalize().unwrap_or(home);
     let mut paths = Vec::new();
     for entry in CREDENTIAL_ENTRIES
         .iter()

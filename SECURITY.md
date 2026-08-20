@@ -38,6 +38,14 @@ A report is in scope when it breaks a promise one of those layers makes:
 - **Credential exposure** — the tool itself leaking the API key (to
   subprocesses, logs, or the transcript) or defeating the credential-dir
   write denials.
+- **Model-requested write grants** (`request_write_root`) — for this one the
+  approval panel *is* the boundary, so anything that misleads or skips it
+  counts: a grant landing somewhere other than the resolved target the panel
+  showed, model-supplied text pushing that target off screen or counterfeiting
+  it, a decision resolved on a panel the user never saw, the home/root/
+  credential floor bypassed by a channel that restores grants without
+  re-checking them (a session record, say), or any mode or config that
+  auto-approves the prompt — `yolo` deliberately does not.
 - **CI bot privilege escalation** — triggering the bot past
   `allowed-associations`, or injection through issue/comment content that
   executes outside the agent's policy.
@@ -48,9 +56,10 @@ Out of scope (not vulnerabilities):
 
 - Model output quality, hallucinations, or the model *attempting* a denied
   action that policy then blocks — the block working is the design.
-- Anything that requires `yolo` mode, a root the user granted, or a
-  malicious value the user typed into config — those are the user's own
-  authority, exercised.
+- Anything that requires `yolo` mode, a root the user *typed*
+  (`--add-dir`, `/add-dir`), or a malicious value the user typed into
+  config — those are the user's own authority, exercised. A root the
+  **model** requested is different, and in scope: see below.
 - **Windows filesystem/network confinement**, which does not exist and is
   [documented as such](./README.md#highlights) — reports assuming it are
   answering a promise never made. (Job-object containment and deny-floor
@@ -100,6 +109,12 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
   symlink 花招。
 - **凭据暴露**——工具自身泄露 API key(进子进程、日志、transcript),
   或击穿凭据目录写保护。
+- **模型申请的写授权**(`request_write_root`)——这一项的边界**就是**那块
+  审批面板,所以任何误导它或跳过它的手段都算:实际授予的目录与面板显示的
+  解析结果不一致、模型可控文本把该目录挤出屏幕或伪造出一行、在用户从未
+  看到的面板上被结算掉、家目录/文件系统根/凭据地板被某条"恢复授权时不再
+  复检"的通道绕过(比如 session record),以及任何档位或配置能自动放行这
+  个提示——`yolo` 刻意不能。
 - **CI bot 提权**——绕过 `allowed-associations` 触发 bot,或通过
   issue/评论内容注入并在策略之外执行。
 - **安装器完整性**——击穿 npm 安装器的 SHA-256 校验或平台检查。
@@ -108,8 +123,9 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
 
 - 模型输出质量、幻觉,或模型*试图*执行被拒动作而策略成功拦截——拦住
   即是设计本身。
-- 任何需要 `yolo` 模式、用户已授权的根、或用户亲手写入配置的恶意值才
-  成立的攻击——那是用户自己的权限在行使。
+- 任何需要 `yolo` 模式、用户**亲手敲的**根(`--add-dir`、`/add-dir`)、或
+  用户亲手写入配置的恶意值才成立的攻击——那是用户自己的权限在行使。
+  **模型**申请来的根不算,见上面那条,它在范围内。
 - **Windows 的文件系统/网络约束**:本就不存在且[已如实写明](./README.zh-CN.md),
   以其存在为前提的报告回应的是一个从未做出的承诺。(Windows 上的
   Job-object 约束和 deny floor 的绕过仍在范围内。)

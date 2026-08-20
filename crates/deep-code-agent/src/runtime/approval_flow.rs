@@ -457,7 +457,7 @@ impl AgentRuntime {
             RootGrantOutcome::Granted { canonical } => {
                 // Same durability contract as --add-dir: the grant is part of
                 // the session, so a resume must restore it.
-                if let Some(persistence) = self.persistence.as_ref() {
+                let persisted = if let Some(persistence) = self.persistence.as_ref() {
                     {
                         let mut record = persistence.record.lock().await;
                         if !record.extra_roots.contains(&canonical) {
@@ -466,7 +466,10 @@ impl AgentRuntime {
                         record.touch();
                     }
                     persistence.actor.request_save();
-                }
+                    true
+                } else {
+                    false
+                };
                 let path = canonical.display().to_string();
                 emit(
                     tx,
@@ -475,13 +478,23 @@ impl AgentRuntime {
                         path: path.clone(),
                     },
                 );
+                // Durability is claimed only when there is a record to carry
+                // it. A session whose store was unavailable runs in memory
+                // (`launch_runtime` degrades to that with a warning), and there
+                // the grant genuinely does not survive — telling the model
+                // otherwise is a false statement it would plan around.
+                let durability = if persisted {
+                    "the grant persists across resume"
+                } else {
+                    "this session is not being persisted, so the grant ends with it"
+                };
                 ToolResult::success(
                     &call.id,
                     &call.name,
                     format!(
                         "Write access granted: '{path}' is now a writable root for the rest of \
-                         this session (writes there work immediately; the grant persists across \
-                         resume). Reference files under it by absolute path."
+                         this session (writes there work immediately; {durability}). Reference \
+                         files under it by absolute path."
                     ),
                 )
             }
