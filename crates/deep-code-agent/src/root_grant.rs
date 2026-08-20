@@ -30,11 +30,31 @@ filesystem root.";
 #[serde(deny_unknown_fields)]
 pub(crate) struct RequestWriteRootParams {
     /// Absolute path to an existing directory; the narrowest one that unblocks the task
-    #[allow(dead_code)] // consumed by the runtime approval layer from the raw arguments
     path: String,
     /// One short sentence for the user: why the task needs to write there. Shown as your claim, verbatim.
     #[allow(dead_code)] // surfaced to the approval prompt from the raw arguments
     justification: String,
+}
+
+/// Validate a `request_write_root` call's arguments against the declared
+/// schema and return the requested path, trimmed.
+///
+/// The runtime intercepts this tool before [`Tool::run`], so the
+/// `deny_unknown_fields` above would never actually be enforced — the grant
+/// path reads `path` straight off the raw JSON. That gap is not cosmetic: the
+/// approval panel picks the line it shows the human by scanning arguments for
+/// the first familiar key, and `command` outranks `path` there, so an extra
+/// key the schema forbids could put attacker-chosen text where the human
+/// looks while the grant still landed on `path`. Validating here makes the
+/// declared contract the enforced one, before anyone is prompted.
+pub(crate) fn parse_arguments(arguments: &serde_json::Value) -> Result<String, String> {
+    let params: RequestWriteRootParams = serde_json::from_value(arguments.clone())
+        .map_err(|error| format!("invalid request_write_root arguments: {error}"))?;
+    let path = params.path.trim();
+    if path.is_empty() {
+        return Err("invalid request_write_root arguments: path is required".to_string());
+    }
+    Ok(path.to_string())
 }
 
 /// Schema-bearing registry entry; the grant itself happens in the runtime.

@@ -375,12 +375,15 @@ impl AgentRuntime {
         if !is_root_grant(&call.name) {
             return RootGrantPrompt::NotRootGrant;
         }
-        let raw = root_grant_requested_path(call);
-        if raw.is_empty() {
-            return RootGrantPrompt::Refused(
-                "invalid request_write_root arguments: path is required".to_string(),
-            );
-        }
+        // Strict schema check first: an argument set the tool's own
+        // `deny_unknown_fields` would reject must never reach the human,
+        // because an extra key can decide which line the panel shows the
+        // human while the grant still lands on `path` — see
+        // [`crate::root_grant::parse_arguments`].
+        let raw = match crate::root_grant::parse_arguments(&call.arguments) {
+            Ok(path) => path,
+            Err(reason) => return RootGrantPrompt::Refused(reason),
+        };
         let Some(boundary) = self.boundary.as_ref() else {
             return RootGrantPrompt::Refused(
                 "this session has no workspace boundary to widen (filesystem tools are disabled)"
@@ -413,7 +416,12 @@ impl AgentRuntime {
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) -> ToolResult {
         use crate::workspace_policy::RootGrantOutcome;
-        let raw = root_grant_requested_path(call);
+        // Re-validated, not just re-read: the grant must agree with the prompt
+        // about which argument set it is acting on, not merely about the path.
+        let raw = match crate::root_grant::parse_arguments(&call.arguments) {
+            Ok(path) => path,
+            Err(reason) => return ToolResult::error(call, reason),
+        };
         let Some(boundary) = self.boundary.as_ref() else {
             return ToolResult::error(
                 call,

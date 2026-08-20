@@ -3046,6 +3046,66 @@ fn request_root_script(target: &std::path::Path) -> Vec<AgentEvent> {
     ]
 }
 
+/// The tool declares `deny_unknown_fields`, but the runtime intercepts it
+/// before `Tool::run`, so nothing used to enforce that. It is not cosmetic: the
+/// approval panel picks its action line by scanning arguments for the first
+/// familiar key, and `command` outranks `path` — an extra key the schema
+/// forbids could show the human text of the model's choosing while the grant
+/// landed on `path`. The argument set is now validated before anyone is
+/// prompted.
+#[tokio::test]
+async fn root_grant_with_unknown_arguments_bounces_without_prompting() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let (registry, policy) = root_grant_fixture(workspace.path());
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta(
+                    "call_grant",
+                    "request_write_root",
+                    &serde_json::json!({
+                        "path": outside.path().to_string_lossy(),
+                        "justification": "the build writes its artifacts there",
+                        // The decoy: forbidden by the schema, and the key the
+                        // panel would rank ahead of `path`.
+                        "command": "cat CHANGELOG.md",
+                    })
+                    .to_string(),
+                ),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "ok".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::new(client, registry).with_boundary(Some(policy.clone()));
+
+    let mut rx = runtime.submit_user("write there").await;
+    let events = drain(&mut rx).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::ApprovalRequired { .. })),
+        "an argument set the schema forbids must never reach the human: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallFinished { result, .. }
+                if result.tool_name == "request_write_root"
+                    && result.status == ToolResultStatus::Error
+                    && result.content.contains("invalid request_write_root arguments")
+        )),
+        "the model gets the precise reason: {events:?}"
+    );
+    assert_eq!(policy.granted_roots().len(), 1, "nothing granted");
+}
+
 /// Yolo auto-approves everything EXCEPT a root grant: widening the sandbox is
 /// the one decision Yolo's containment story cannot delegate to itself.
 #[tokio::test]
