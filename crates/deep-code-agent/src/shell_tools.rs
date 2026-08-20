@@ -250,6 +250,14 @@ fn new_spill_dir(primary_root: &Path) -> PathBuf {
 /// while a fresh one must keep working.
 const SPILL_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
+/// Gate so retention runs once per process. Every interactive mode (tui, `-p`,
+/// serve) has one primary root and every sub-agent shares it, so the first
+/// shell registry built names the spill home to sweep. The one caller that
+/// launches repeatedly in a single process — the eval runner, a fresh
+/// `tempdir` per instance — loses nothing: nothing in a directory created
+/// seconds ago can outlive a week-old cutoff.
+static SPILL_PRUNE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 /// Best-effort removal of spill runs whose directory mtime — and every file
 /// inside — predates `cutoff`. Two clocks on purpose: a NEW spill file moves
 /// the directory mtime, but APPENDS to an existing file move only that
@@ -305,15 +313,20 @@ impl ShellTools {
     /// so a mid-session `request_write_root` grant reaches shell commands and
     /// file tools alike without rebuilding any registry.
     pub(crate) fn with_policy(root: WorkspacePolicy) -> Self {
-        // Construction is the retention hook: it runs at every launch (and
-        // sub-agent spawn), detached — removing a stale spill tree can be
-        // hundreds of MB of I/O, which must not stall the launch. Racing
-        // this instance's own run dir below is harmless: a freshly created
+        // Construction is the retention hook, detached: removing a stale spill
+        // tree can be hundreds of MB of I/O, which must not stall the launch.
+        // Racing this instance's own run dir is harmless — a freshly created
         // dir can never test stale against a week-old cutoff.
-        if let Some(cutoff) = std::time::SystemTime::now().checked_sub(SPILL_RETENTION) {
-            let home = spill_home(root.root());
-            std::thread::spawn(move || prune_stale_spill_runs(&home, cutoff));
-        }
+        //
+        // Once per process, not once per construction: every sub-agent spawn
+        // builds a shell registry too, and each would otherwise re-walk the
+        // same spill home to reach the same verdict, one more thread each.
+        SPILL_PRUNE.get_or_init(|| {
+            if let Some(cutoff) = std::time::SystemTime::now().checked_sub(SPILL_RETENTION) {
+                let home = spill_home(root.root());
+                std::thread::spawn(move || prune_stale_spill_runs(&home, cutoff));
+            }
+        });
         let spill_dir = new_spill_dir(root.root());
         Self {
             root,
