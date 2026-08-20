@@ -157,15 +157,17 @@ impl WorkspacePolicy {
     /// Resolve and vet a model-requested grant target, granting nothing.
     ///
     /// Validation mirrors launch-time extras (canonicalize, must be a
-    /// directory) plus two request-channel rules. The path must be spelled
+    /// directory) plus three request-channel rules. The path must be spelled
     /// absolute — the requester is the model, and a relative spelling is
-    /// ambiguous about which base it meant. And the resolved directory must
-    /// not cover the home directory or be the filesystem root: the tool
-    /// description already promises the model never to ask for those, and a
-    /// promise the code does not check is one a symlink can break — a link
-    /// inside the workspace can dress `$HOME` up as an innocuous-looking
-    /// spelling. (A target already inside the boundary skips that floor:
-    /// covering it again changes nothing and reports as AlreadyGranted.)
+    /// ambiguous about which base it meant. The resolved name must be free of
+    /// control characters, or the approval panel could not display it
+    /// faithfully. And the resolved directory must not cover the home
+    /// directory or be the filesystem root: the tool description already
+    /// promises the model never to ask for those, and a promise the code
+    /// does not check is one a symlink can break — a link inside the
+    /// workspace can dress `$HOME` up as an innocuous-looking spelling. (A
+    /// target already inside the boundary skips that last floor: covering it
+    /// again changes nothing and reports as AlreadyGranted.)
     ///
     /// This is the single resolution step of the grant flow: the approval
     /// prompt displays exactly this canonical path, and after the human says
@@ -196,6 +198,20 @@ impl WorkspacePolicy {
             return Err(invalid(
                 TOOL,
                 format!("{} is not a directory", canonical.display()),
+            ));
+        }
+        // A name embedding control characters cannot be displayed faithfully
+        // on the approval panel (an embedded newline or escape byte could
+        // fabricate panel lines inside a security prompt), and the panel IS
+        // the approval — so the request is refused before anyone is asked.
+        // Legitimate directories don't carry control bytes in their names.
+        if canonical.to_string_lossy().chars().any(char::is_control) {
+            return Err(invalid(
+                TOOL,
+                format!(
+                    "refusing {canonical:?}: the directory name contains control characters, \
+                     which cannot be displayed faithfully in an approval prompt"
+                ),
             ));
         }
         if !self.is_granted(&canonical) {
@@ -747,6 +763,30 @@ mod tests {
                 policy.grant_extra(target).is_err(),
                 "{} must be refused: it covers the home directory",
                 target.display()
+            );
+        }
+        assert_eq!(policy.granted_roots(), vec![primary], "nothing granted");
+    }
+
+    /// A directory whose name embeds control characters is refused before
+    /// anyone is prompted: the panel could not display it faithfully (an
+    /// embedded newline or escape byte fabricates panel lines), and a prompt
+    /// the human cannot read is not an approval. The TUI additionally
+    /// sanitizes what it renders — this is the fail-closed layer underneath.
+    #[cfg(unix)]
+    #[test]
+    fn grant_extra_refuses_names_with_control_characters() {
+        let (_a, primary) = canonical_tempdir();
+        let policy = WorkspacePolicy::new(primary.clone()).unwrap();
+        for name in ["evil\ndir", "evil\x1b[2Kdir"] {
+            let evil = primary.join(name);
+            fs::create_dir(&evil).unwrap();
+            let Err(error) = policy.grant_extra(&evil) else {
+                panic!("control characters in the name must refuse: {name:?}");
+            };
+            assert!(
+                error.to_string().contains("control characters"),
+                "the reason must name the problem: {error}"
             );
         }
         assert_eq!(policy.granted_roots(), vec![primary], "nothing granted");

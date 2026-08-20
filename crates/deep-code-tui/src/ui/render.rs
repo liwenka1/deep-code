@@ -528,6 +528,19 @@ fn extract_action(arguments_json: &str) -> String {
     crate::history::collapse_whitespace(arguments_json)
 }
 
+/// Model-influenced text about to become an approval panel line: control
+/// characters become spaces — an embedded newline or terminal escape could
+/// otherwise fabricate extra panel lines inside a security prompt — and the
+/// length is capped. Every free-text line of the panel (the action, the
+/// resolved grant target, the justification) passes through here.
+fn sanitize_panel_text(text: &str, max_chars: usize) -> String {
+    let clean: String = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    crate::history::truncate_chars(clean.trim(), max_chars)
+}
+
 /// Minimal, borderless approval block matching the welcome/picker style: a
 /// risk-coloured `●` + tool, the action it will take (prominent), an optional
 /// dim description, and only meaningful metadata (sandbox / matched rule).
@@ -571,7 +584,7 @@ fn approval_lines(
     }
     let mut lines = vec![Line::from(header)];
 
-    let action = crate::history::truncate_chars(&extract_action(arguments_json), 240);
+    let action = sanitize_panel_text(&extract_action(arguments_json), 240);
     lines.extend(wrap_prefixed(
         "  ",
         &action,
@@ -600,16 +613,22 @@ fn approval_lines(
                 let target_style = Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD);
+                // Sanitized like every panel line. The runtime already
+                // refuses targets with control characters in the name, so
+                // this is the defense-in-depth layer, not the only one.
+                let shown = sanitize_panel_text(target, 240);
                 lines.extend(wrap_prefixed(
                     "  ",
-                    &tr_with(lang, TextId::ApprovalRootGrantTarget, &[("path", target)]),
+                    &tr_with(lang, TextId::ApprovalRootGrantTarget, &[("path", &shown)]),
                     width,
                     target_style,
                     target_style,
                 ));
-                // The request spelled a different path than it resolves to
-                // (symlink somewhere in it): say so, or an innocuous-looking
-                // spelling could pass for the real target.
+                // The request resolves somewhere its spelling doesn't say
+                // (symlink in it): call that out, or an innocuous-looking
+                // spelling could pass for the real target. Compared by path
+                // components, so a benign respelling — trailing slash, `.`
+                // segments — is not accused of resolving elsewhere.
                 let requested = serde_json::from_str::<serde_json::Value>(arguments_json)
                     .ok()
                     .and_then(|arguments| {
@@ -617,7 +636,12 @@ fn approval_lines(
                             .get("path")
                             .and_then(|value| value.as_str().map(|path| path.trim().to_string()))
                     });
-                if requested.as_deref() != Some(target) {
+                let resolves_elsewhere = requested.as_deref().is_none_or(|raw| {
+                    std::path::Path::new(raw)
+                        .components()
+                        .ne(std::path::Path::new(target).components())
+                });
+                if resolves_elsewhere {
                     lines.extend(wrap_prefixed(
                         "  ",
                         tr(lang, TextId::ApprovalRootGrantSymlink),
@@ -646,15 +670,9 @@ fn approval_lines(
     }
 
     // The model's own words, clearly labelled as its claim (it wrote this
-    // text; approving is still entirely the human's judgement). Control
-    // characters are stripped so model output cannot smuggle escape
-    // sequences or fake extra panel lines into a security prompt.
+    // text; approving is still entirely the human's judgement).
     if let Some(text) = justification {
-        let clean: String = text
-            .chars()
-            .map(|ch| if ch.is_control() { ' ' } else { ch })
-            .collect();
-        let clean = crate::history::truncate_chars(clean.trim(), 240);
+        let clean = sanitize_panel_text(text, 240);
         if !clean.is_empty() {
             let claim = Style::default()
                 .fg(Color::DarkGray)
@@ -1412,6 +1430,75 @@ mod tests {
             .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
             .collect();
         assert!(text.contains("无法解析"), "{text}");
+    }
+
+    /// A benign respelling of the same directory — trailing slash, `.`
+    /// segments — is NOT accused of resolving elsewhere: the caution must
+    /// keep meaning "a link took this somewhere its spelling doesn't say",
+    /// or it becomes noise the user learns to skip.
+    #[test]
+    fn approval_lines_do_not_warn_on_lexical_respellings() {
+        for spelling in ["/tmp/proj-sibling/", "/tmp/./proj-sibling"] {
+            let lines = approval_lines(
+                deep_code_agent::REQUEST_WRITE_ROOT_TOOL,
+                "High",
+                false,
+                false,
+                None,
+                Some("/tmp/proj-sibling"),
+                None,
+                "grants write access",
+                &format!(r#"{{"path":"{spelling}"}}"#),
+                None,
+                &[],
+                80,
+                Lang::Zh,
+            );
+            let text: String = lines
+                .iter()
+                .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+                .collect();
+            assert!(
+                !text.contains("符号链接"),
+                "{spelling:?} spells the target itself — no caution: {text}"
+            );
+        }
+    }
+
+    /// Every free-text panel line is control-character-sanitized, not just
+    /// the justification: a directory name (or command) embedding a newline
+    /// or escape byte must not fabricate extra lines in a security prompt.
+    /// (The runtime refuses such grant targets outright; this pins the
+    /// defense-in-depth layer for anything that still reaches a panel.)
+    #[test]
+    fn approval_lines_sanitize_the_resolved_target_and_action() {
+        let lines = approval_lines(
+            deep_code_agent::REQUEST_WRITE_ROOT_TOOL,
+            "High",
+            false,
+            false,
+            None,
+            Some("/tmp/evil\n[fake panel line]"),
+            None,
+            "grants write access",
+            "{\"path\":\"/tmp/evil\\u001b[2K\"}",
+            None,
+            &[],
+            120,
+            Lang::Zh,
+        );
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(
+            text.contains("/tmp/evil [fake panel line]"),
+            "the newline must render as a space, not a line break: {text}"
+        );
+        assert!(
+            !text.contains('\u{1b}'),
+            "escape bytes must not reach the panel: {text}"
+        );
     }
 
     #[test]
