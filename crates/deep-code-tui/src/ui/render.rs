@@ -546,9 +546,12 @@ fn neutralize_control_chars(text: &str) -> String {
 
 /// Model-influenced text about to become an approval panel line: control
 /// characters become spaces (see [`neutralize_control_chars`]) and the length
-/// is capped. EVERY free-text argument of [`approval_lines`] passes through one
-/// of the two — pinned by `approval_lines_sanitize_every_text_field`, which
-/// enumerates the signature rather than the fields any one change touched.
+/// is capped. Every free-text argument of [`approval_lines`] passes through one
+/// of the two, except `risk`: [`risk_display`] maps it to a `&'static str`, so
+/// that one cannot echo its input at all. Pinned by
+/// `approval_lines_sanitize_every_text_field`, which asserts one marker per
+/// field — and renders the root-grant branch as well, or the fields gated
+/// behind it would be passed in and never drawn, pinning nothing.
 fn sanitize_panel_text(text: &str, max_chars: usize) -> String {
     crate::history::truncate_chars(neutralize_control_chars(text).trim(), max_chars)
 }
@@ -1525,48 +1528,83 @@ mod tests {
         );
     }
 
-    /// Feeds an escape byte into EVERY free-text argument at once and asserts
-    /// none of them reaches the panel. Written against the signature rather
-    /// than against one change's fields on purpose: the two gaps this replaced
-    /// (`description`, and the `write_file` diff `preview` — the widest
-    /// model-controlled text here) were both missed by per-field tests that
-    /// only covered the lines their own commit had touched.
+    /// Feeds a control-character payload into EVERY free-text argument and
+    /// asserts field by field that the text survives with the control bytes
+    /// gone. Two rules this test exists to enforce, both learned the hard way:
+    ///
+    /// - One marker per field, asserted individually. A `count() >= n`
+    ///   assertion stood here before and hid a live gap: `resolved_target`
+    ///   was never rendered at all, and the remaining fields alone satisfied
+    ///   the count. Dropping its sanitiser kept the test green.
+    /// - Fields gated on `tool_name` need a pass with that tool name. The
+    ///   root-grant lines render only for `REQUEST_WRITE_ROOT_TOOL`, so a
+    ///   single generic-tool pass pins nothing about them.
     #[test]
     fn approval_lines_sanitize_every_text_field() {
-        const EVIL: &str = "\u{1b}[2K\rINJECTED";
+        const ESC: &str = "\u{1b}[2K\r";
         let notes = [SafetyNote {
             reason: TextId::SafetyNetworkReason,
             suggestion: TextId::SafetyNetworkSuggestion,
         }];
-        let lines = approval_lines(
-            &format!("shell{EVIL}"),
-            &format!("High{EVIL}"),
-            true,
-            true,
-            Some(&format!("justification {EVIL}")),
-            Some(&format!("/tmp/target{EVIL}")),
-            Some(&format!("builtin:rule{EVIL}")),
-            &format!("description {EVIL}"),
-            &format!("{{\"command\":\"echo hi{}\"}}", "\\u001b[2K"),
-            Some(&format!("+ added line\n- removed{EVIL}\n  context{EVIL}")),
-            &notes,
-            120,
-            Lang::Zh,
-        );
-        let text: String = lines
-            .iter()
-            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
-            .collect();
-        // The payload's visible tail must survive — proving each field was
-        // rendered and merely neutralised, not silently dropped.
+        // Every field carries a distinct uppercase marker so a missing one
+        // names itself. `arguments_json` smuggles its escape as the JSON
+        // escape sequence, which serde decodes into a real control byte —
+        // the model controls that blob, so that path must be covered too.
+        let render = |tool: &str| -> String {
+            let lines = approval_lines(
+                tool,
+                &format!("High{ESC}RISK"),
+                true,
+                true,
+                Some(&format!("{ESC}JUSTIFICATION")),
+                Some(&format!("/tmp/target{ESC}TARGET")),
+                Some(&format!("builtin:rule{ESC}RULE")),
+                &format!("description{ESC}DESCRIPTION"),
+                &format!("{{\"command\":\"echo hi{}ACTION\"}}", "\\u001b[2K"),
+                Some(&format!(
+                    "+ added{ESC}ADDED\n- removed{ESC}REMOVED\n  context{ESC}CONTEXT"
+                )),
+                &notes,
+                120,
+                Lang::Zh,
+            );
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+                .collect()
+        };
+        let generic = render(&format!("shell{ESC}TOOLNAME"));
+        let root_grant = render(deep_code_agent::REQUEST_WRITE_ROOT_TOOL);
+
+        // Each marker must still render — proving the field was neutralised,
+        // not silently dropped. `RISK` is absent by design and deliberately
+        // not asserted: `risk_display` maps an unknown tier to a
+        // `&'static str`, so that argument cannot echo its input at all.
+        for marker in [
+            "TOOLNAME",
+            "JUSTIFICATION",
+            "RULE",
+            "DESCRIPTION",
+            "ACTION",
+            "ADDED",
+            "REMOVED",
+            "CONTEXT",
+        ] {
+            assert!(
+                generic.contains(marker),
+                "{marker} never reached the panel: {generic}"
+            );
+        }
         assert!(
-            text.matches("INJECTED").count() >= 6,
-            "every field should still render its text: {text}"
+            root_grant.contains("TARGET"),
+            "resolved_target never reached the panel: {root_grant}"
         );
-        assert!(
-            !text.chars().any(char::is_control),
-            "a control character reached the approval panel: {text:?}"
-        );
+        for text in [&generic, &root_grant] {
+            assert!(
+                !text.chars().any(char::is_control),
+                "a control character reached the approval panel: {text:?}"
+            );
+        }
     }
 
     #[test]
