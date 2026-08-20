@@ -23,6 +23,8 @@
   "ApprovalRootGrantTarget": "实际授予（解析后）：{path}",
   "ApprovalRootGrantSymlink": "解析结果与请求拼写不同（路径含符号链接）——请以上面的解析目录为准",
   "ApprovalRootGrantUnresolved": "构建此提示时无法解析该目录——批准也不会授予任何权限",
+  "ApprovalRootGrantRequested": "请求的原始拼写（不可信）：{path}",
+  "ApprovalMoreBelow": "↓ 下方还有 {count} 行——决定前请用 PageDown 读完",
   "ApprovalRule": "规则 {rule}",
   "ApprovalCautionHeader": "── 注意 ──",
   "ApprovalPreviewHeader": "── 变更预览 ──",

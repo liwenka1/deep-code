@@ -432,6 +432,81 @@ pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
     truncated
 }
 
+/// Truncate to at most `max_cols` terminal **columns**, appending
+/// ` (truncated)` when anything was cut.
+///
+/// The column/character distinction is not cosmetic where the result is laid
+/// out into a fixed number of rows: a cap of 240 *characters* is up to 480
+/// columns of CJK, which wraps to twice the rows the caller budgeted for. On
+/// the approval panel that arithmetic decided whether the resolved grant target
+/// stayed on screen, so model-influenced text is capped by the same unit the
+/// layout spends. Counted per grapheme, so a combining mark or an emoji
+/// sequence is measured (and kept) whole.
+pub(crate) fn truncate_display_width(text: &str, max_cols: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+
+    let mut truncated = String::new();
+    let mut used = 0_usize;
+    let mut graphemes = text.graphemes(true);
+    for grapheme in graphemes.by_ref() {
+        let width = UnicodeWidthStr::width(grapheme);
+        if used + width > max_cols {
+            return format!("{truncated} (truncated)");
+        }
+        truncated.push_str(grapheme);
+        used += width;
+    }
+    // Consumed the whole input without exceeding the cap.
+    text.to_string()
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::{truncate_chars, truncate_display_width};
+    use unicode_width::UnicodeWidthStr;
+
+    /// The cap is columns, and a double-width script must not be able to spend
+    /// twice the budget the caller reserved.
+    ///
+    /// This is the arithmetic that decided whether the approval panel's
+    /// resolved grant target stayed on screen: capping *characters* let 240 CJK
+    /// characters claim 480 columns — seven rows at 80 columns — where the
+    /// caller had budgeted for at most 240.
+    #[test]
+    fn a_column_cap_is_not_a_character_cap() {
+        let wide = "构".repeat(240);
+        assert_eq!(
+            UnicodeWidthStr::width(truncate_chars(&wide, 240).as_str()),
+            480,
+            "the character cap is what allowed a double-width overrun"
+        );
+        let capped = truncate_display_width(&wide, 240);
+        assert!(
+            UnicodeWidthStr::width(capped.as_str()) <= 240 + " (truncated)".len(),
+            "columns must stay within the cap, got {}",
+            UnicodeWidthStr::width(capped.as_str())
+        );
+        assert!(capped.ends_with(" (truncated)"), "a real cut is announced");
+    }
+
+    #[test]
+    fn text_that_fits_is_returned_unchanged() {
+        assert_eq!(truncate_display_width("/tmp/x", 240), "/tmp/x");
+        // Exactly at the cap is not a cut.
+        let exact = "构".repeat(5);
+        assert_eq!(truncate_display_width(&exact, 10), exact);
+    }
+
+    /// A grapheme is never split down the middle: a cap landing inside a
+    /// double-width glyph drops it whole rather than emitting half of it.
+    #[test]
+    fn a_cap_inside_a_wide_glyph_drops_it_whole() {
+        let capped = truncate_display_width("构构构", 5);
+        assert_eq!(capped, "构构 (truncated)");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

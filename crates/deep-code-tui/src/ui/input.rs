@@ -211,6 +211,14 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.handle_ctrl_c();
             }
+            // A decision needs a panel the user has actually seen. The run loop
+            // can apply the approval event, skip the frame, and then read a key
+            // that was already queued — typed before the prompt existed, so it
+            // is not an answer to it. Swallowed until the panel has been drawn
+            // once; navigation and scrolling stay live, because neither of them
+            // resolves anything.
+            KeyCode::Char('y' | 'Y' | 'a' | 'A' | 'n' | 'N') | KeyCode::Enter | KeyCode::Esc
+                if !app.approval_armed => {}
             KeyCode::Char('y') | KeyCode::Char('Y') => app.approve_pending_tool(),
             KeyCode::Char('a') | KeyCode::Char('A') => app.approve_pending_tool_for_session(),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.deny_pending_tool(),
@@ -220,6 +228,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::PageUp => app.scroll_approval_up(),
             KeyCode::PageDown => app.scroll_approval_down(),
             KeyCode::Home => app.scroll_approval_to_top(),
+            // Pairs with Home, and with the overflow indicator that now tells
+            // the user there is more below.
+            KeyCode::End => app.scroll_approval_to_bottom(),
             _ => {}
         }
         return;
@@ -366,6 +377,74 @@ mod tests {
         );
         assert_eq!(key_text_payload(&plain(KeyCode::Up)), None);
         assert_eq!(key_text_payload(&plain(KeyCode::Backspace)), None);
+    }
+
+    /// A decision key that was already in the queue when the approval arrived
+    /// must not resolve it.
+    ///
+    /// The run loop applies runtime events, may skip the frame, then reads
+    /// whatever key is waiting — so a `y` typed as the first letter of a
+    /// steering message could resolve a boundary prompt that had never been
+    /// drawn. The user's evidence for this was their own composer text still
+    /// sitting unsent while the write boundary had widened.
+    #[tokio::test]
+    async fn a_key_queued_before_the_panel_was_drawn_cannot_resolve_it() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        let mut app = App::new();
+        app.park_approval(deep_code_agent::ApprovalRequest {
+            network: false,
+            call_id: "call_1".to_string(),
+            tool_name: "mock_echo".to_string(),
+            description: "echo".to_string(),
+            arguments: serde_json::json!({}),
+            risk_level: deep_code_agent::RiskLevel::Low,
+            requires_sandbox: false,
+            read_only: true,
+            matched_rule: None,
+            justification: None,
+            resolved_target: None,
+            preview: None,
+            safety_notes: Vec::new(),
+        });
+
+        // Nothing has been drawn: every decision key is inert.
+        for code in [
+            KeyCode::Char('y'),
+            KeyCode::Char('n'),
+            KeyCode::Char('a'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+        ] {
+            handle_key(&mut app, plain(code));
+            assert!(
+                app.pending_approval.is_some(),
+                "{code:?} resolved a panel the user has not seen"
+            );
+        }
+
+        // Scrolling stays live — it cannot resolve anything, and a user who
+        // needs to read past the fold before the panel arms must be able to.
+        handle_key(&mut app, plain(KeyCode::PageDown));
+        assert!(app.pending_approval.is_some());
+        assert_eq!(app.approval_scroll_offset, 3, "PageDown still scrolls");
+        handle_key(&mut app, plain(KeyCode::End));
+        assert_eq!(
+            app.approval_scroll_offset,
+            usize::MAX,
+            "End jumps to the bottom (the render layer clamps it to the last line)"
+        );
+        handle_key(&mut app, plain(KeyCode::Home));
+        assert_eq!(app.approval_scroll_offset, 0);
+
+        // Drawing the panel is what arms it (see `render_approval_panel`).
+        app.approval_armed = true;
+        handle_key(&mut app, plain(KeyCode::Char('y')));
+        assert!(
+            app.pending_approval.is_none(),
+            "once the panel has been drawn, y must approve as before"
+        );
     }
 
     /// End-to-end steering guard at the layer that actually shipped broken:

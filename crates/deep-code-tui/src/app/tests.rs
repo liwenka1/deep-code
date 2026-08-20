@@ -188,6 +188,57 @@ fn root_grant_approval_drops_the_session_option() {
     assert_eq!(app.approval_focus, 1);
 }
 
+/// An arriving root grant starts focused on **deny**; every other prompt keeps
+/// the approve default.
+///
+/// `Enter` acts on the focused option, and it is the key a hurried user presses
+/// on reflex. For a prompt that widens the session's write boundary for good,
+/// that reflex has to land on the reversible answer — approving is still one
+/// `y` away, which is no harder than before.
+#[test]
+fn a_parked_root_grant_starts_focused_on_deny() {
+    let grant = deep_code_agent::ApprovalRequest {
+        network: false,
+        call_id: "call_grant".to_string(),
+        tool_name: deep_code_agent::REQUEST_WRITE_ROOT_TOOL.to_string(),
+        description: "widen".to_string(),
+        arguments: serde_json::json!({ "path": "/tmp/x", "justification": "y" }),
+        risk_level: deep_code_agent::RiskLevel::High,
+        requires_sandbox: false,
+        read_only: false,
+        matched_rule: None,
+        justification: Some("y".to_string()),
+        resolved_target: Some("/tmp/x".to_string()),
+        preview: None,
+        safety_notes: Vec::new(),
+    };
+    let ordinary = deep_code_agent::ApprovalRequest {
+        tool_name: "shell".to_string(),
+        risk_level: deep_code_agent::RiskLevel::Medium,
+        justification: None,
+        resolved_target: None,
+        ..grant.clone()
+    };
+
+    let mut app = App::new();
+    app.park_approval(grant);
+    // Root grant renders y/n, so 1 is deny.
+    assert_eq!(
+        app.approval_focus, 1,
+        "a boundary-widening prompt must not default to approve"
+    );
+    assert!(
+        !app.approval_armed,
+        "a freshly parked panel has not been drawn yet"
+    );
+
+    app.park_approval(ordinary);
+    assert_eq!(
+        app.approval_focus, 0,
+        "ordinary prompts keep the approve default"
+    );
+}
+
 #[test]
 fn approval_scroll_helpers_adjust_panel_offset() {
     let mut app = App::new();

@@ -23,6 +23,8 @@
   "ApprovalRootGrantTarget": "Grant target (resolved): {path}",
   "ApprovalRootGrantSymlink": "Resolves elsewhere than the requested spelling — judge by the resolved directory above",
   "ApprovalRootGrantUnresolved": "This directory could not be resolved when the prompt was built — approving grants nothing",
+  "ApprovalRootGrantRequested": "Requested spelling (untrusted): {path}",
+  "ApprovalMoreBelow": "↓ {count} more line(s) — PageDown to read before deciding",
   "ApprovalRule": "Rule {rule}",
   "ApprovalCautionHeader": "── Caution ──",
   "ApprovalPreviewHeader": "── Preview ──",

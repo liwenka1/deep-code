@@ -559,15 +559,22 @@ fn neutralize_control_chars(text: &str) -> String {
 }
 
 /// Model-influenced text about to become an approval panel line: control
-/// characters become spaces (see [`neutralize_control_chars`]) and the length
-/// is capped. Every free-text argument of [`approval_lines`] passes through one
+/// characters become spaces (see [`neutralize_control_chars`]) and the width is
+/// capped. Every free-text argument of [`approval_lines`] passes through one
 /// of the two, except `risk`: [`risk_display`] maps it to a `&'static str`, so
 /// that one cannot echo its input at all. Pinned by
 /// `approval_lines_sanitize_every_text_field`, which asserts one marker per
 /// field — and renders the root-grant branch as well, or the fields gated
 /// behind it would be passed in and never drawn, pinning nothing.
-fn sanitize_panel_text(text: &str, max_chars: usize) -> String {
-    crate::history::truncate_chars(neutralize_control_chars(text).trim(), max_chars)
+///
+/// The cap is in terminal **columns**, not characters: the panel reserves rows
+/// by measuring its own wrapped body, so a cap the layout cannot convert to
+/// rows is not a bound at all. Capping 240 *characters* let 240 CJK characters
+/// claim 480 columns — seven rows at an 80-column terminal — which is how
+/// model-supplied text could still push the resolved grant target past the
+/// bottom edge after the height itself had been made content-sized.
+fn sanitize_panel_text(text: &str, max_cols: usize) -> String {
+    crate::history::truncate_display_width(neutralize_control_chars(text).trim(), max_cols)
 }
 
 /// Minimal, borderless approval block matching the welcome/picker style: a
@@ -614,21 +621,34 @@ fn approval_lines(
     let mut lines = vec![Line::from(header)];
 
     let action = sanitize_panel_text(&extract_action(tool_name, arguments_json), 240);
-    lines.extend(wrap_prefixed(
-        "  ",
-        &action,
-        width,
-        Style::default(),
-        Style::default(),
-    ));
+    let is_root_grant = tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL;
+    if !is_root_grant {
+        lines.extend(wrap_prefixed(
+            "  ",
+            &action,
+            width,
+            Style::default(),
+            Style::default(),
+        ));
+    }
 
     // A root grant changes the boundary itself, not just this one run —
-    // called out in warning color right under the requested directory,
-    // together with the directory the grant would ACTUALLY land on: the
-    // runtime resolves the request once for this prompt and later refuses
-    // the grant unless it still resolves identically, so this line — not the
-    // model's raw spelling in the arguments — is what the human is judging.
-    if tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL {
+    // called out in warning color, together with the directory the grant would
+    // ACTUALLY land on: the runtime resolves the request once for this prompt
+    // and later refuses the grant unless it still resolves identically, so
+    // this line — not the model's raw spelling in the arguments — is what the
+    // human is judging.
+    //
+    // These lines come BEFORE the requested spelling, and the spelling is
+    // rendered labelled rather than as a bare action line. Both facts are
+    // load-bearing. The spelling is model-controlled and of model-chosen
+    // width, so as the first body element it could push the resolved target
+    // off the bottom of a content-sized panel; and a bare, unlabelled action
+    // line wraps into continuation rows that are indistinguishable from a
+    // field row, which let a spelling ending in `.../Grant target (resolved):
+    // /tmp/safe` paint a counterfeit target above the real one. Putting the
+    // resolved directory first and labelling the spelling removes both.
+    if is_root_grant {
         let caution = Style::default().fg(Color::Yellow);
         lines.extend(wrap_prefixed(
             "  ",
@@ -691,6 +711,19 @@ fn approval_lines(
                 caution,
             )),
         }
+        // The model's own spelling comes last and says so: it is what was
+        // asked for, not what approving would grant.
+        lines.extend(wrap_prefixed(
+            "  ",
+            &tr_with(
+                lang,
+                TextId::ApprovalRootGrantRequested,
+                &[("path", &action)],
+            ),
+            width,
+            dim,
+            dim,
+        ));
     }
 
     // Neutralised but not capped: tool descriptions run past any line cap, and
@@ -922,6 +955,11 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &mut App, area: ratatui::la
     if app.pending_approval.is_none() {
         return;
     }
+    // This panel is now on screen, so from here a decision key is an answer to
+    // something the user can actually see. Armed before drawing rather than
+    // after: a frame that fails mid-render must not leave the prompt
+    // permanently deaf to y/n.
+    app.approval_armed = true;
     // Body (scrollable) on top; the y/a/n choices pinned to the bottom rows so
     // they stay visible even when a long command wraps.
     let chunks = Layout::default()
@@ -931,19 +969,53 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &mut App, area: ratatui::la
 
     let width = usize::from(chunks[0].width.saturating_sub(2)).max(8);
     let body = approval_body(app, width);
+    let body_len = body.len();
+    // A body taller than its area gives up its last row to an overflow
+    // indicator. Without one, a panel that ends mid-content looks like the
+    // whole prompt — and "there is more you have not read" is precisely what a
+    // boundary prompt must not hide. Reserving the row cannot create the
+    // overflow it reports: this branch is only taken when the body already
+    // exceeds the untrimmed height.
+    let overflows = body_len > usize::from(chunks[0].height);
+    let (content_area, hint_area) = if overflows {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(chunks[0]);
+        (rows[0], Some(rows[1]))
+    } else {
+        (chunks[0], None)
+    };
     // Clamp against the real rendered body (wrapped lines, safety notes, diff
     // preview) so the user can scroll to the very end before deciding. Only the
     // render layer knows the true wrapped height, so it also writes the clamped
     // value back — otherwise PageDown past the end accumulates unbounded and a
     // later PageUp has to burn off the overshoot before the view moves.
-    let viewport = usize::from(chunks[0].height).max(1);
-    let max_scroll = body.len().saturating_sub(viewport);
+    let viewport = usize::from(content_area.height).max(1);
+    let max_scroll = body_len.saturating_sub(viewport);
     let scroll = app.approval_scroll_offset.min(max_scroll);
     app.approval_scroll_offset = scroll;
     let body_paragraph = Paragraph::new(body)
         .block(Block::default().padding(Padding::new(1, 0, 0, 0)))
         .scroll((scroll as u16, 0));
-    frame.render_widget(body_paragraph, chunks[0]);
+    frame.render_widget(body_paragraph, content_area);
+    if let Some(hint_area) = hint_area
+        && max_scroll > scroll
+    {
+        let hint = tr_with(
+            app.lang,
+            TextId::ApprovalMoreBelow,
+            &[("count", &(max_scroll - scroll).to_string())],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  {hint}"),
+                Style::default().fg(Color::Yellow),
+            )))
+            .block(Block::default().padding(Padding::new(1, 0, 0, 0))),
+            hint_area,
+        );
+    }
 
     let key_y = Style::default()
         .fg(Color::Green)
@@ -1827,6 +1899,17 @@ mod tests {
     /// against the source string can hold. The layout being pinned here is
     /// language-independent.
     fn root_grant_screen(width: u16, height: u16, resolved_target: &str) -> String {
+        root_grant_screen_requesting(width, height, "/tmp/workspace/build-cache", resolved_target)
+    }
+
+    /// As [`root_grant_screen`], but the model's requested spelling is the
+    /// caller's — the field it fully controls, in both length and glyph width.
+    fn root_grant_screen_requesting(
+        width: u16,
+        height: u16,
+        requested: &str,
+        resolved_target: &str,
+    ) -> String {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -1837,7 +1920,7 @@ mod tests {
             tool_name: deep_code_agent::REQUEST_WRITE_ROOT_TOOL.to_string(),
             description: "grants write access to a directory outside the current roots".to_string(),
             arguments: serde_json::json!({
-                "path": "/tmp/workspace/build-cache",
+                "path": requested,
                 "justification": "the build writes its artifacts there",
             }),
             risk_level: deep_code_agent::RiskLevel::High,
@@ -1896,6 +1979,130 @@ mod tests {
                 "the choices must stay visible at {width}x{height}:\n{screen}"
             );
         }
+    }
+
+    /// The model controls the *width* of its requested spelling, so the panel
+    /// must not let that spelling decide whether the resolved target is on
+    /// screen.
+    ///
+    /// This is the second form of the bug a content-sized panel was meant to
+    /// end. Sizing to content fixed the fixed-height version; it did not stop
+    /// the spelling — rendered first, and capped at 240 *characters* — from
+    /// claiming 480 columns of CJK, seven rows of an 80-column terminal, and
+    /// pushing the resolved directory back off the bottom. Whatever the
+    /// spelling costs, the target, the boundary warning and the choices stay
+    /// visible, and anything below the fold is announced.
+    #[test]
+    fn a_wide_requested_spelling_cannot_push_the_resolved_target_off_screen() {
+        let target = "/home/u/.config/private-keys";
+        // 240 characters — the old cap — of a double-width glyph.
+        let requested = format!("/{}", "构".repeat(240));
+        for (width, height) in [(80, 24), (60, 20), (100, 40)] {
+            let screen = root_grant_screen_requesting(width, height, &requested, target);
+            assert!(
+                screen.contains(target),
+                "the resolved target must survive a wide spelling at {width}x{height}:\n{screen}"
+            );
+            // A fragment, not the whole sentence: at 60 columns the warning
+            // legitimately wraps, and a wrapped line is not a missing one.
+            assert!(
+                screen.contains("Grants WRITE access"),
+                "the boundary warning must survive it at {width}x{height}:\n{screen}"
+            );
+            assert!(
+                screen.contains(tr(Lang::En, TextId::ApprovalOptDeny)),
+                "the choices must survive it at {width}x{height}:\n{screen}"
+            );
+        }
+    }
+
+    /// The resolved directory is rendered BEFORE the model's spelling, and the
+    /// spelling is labelled as the untrusted request.
+    ///
+    /// Order is a security property here, not typography. An unlabelled action
+    /// line wraps into continuation rows carrying the same two-space indent as
+    /// a field row, so a spelling ending in `.../Grant target (resolved):
+    /// /tmp/safe` paints a counterfeit target line. Drawing the real one first
+    /// means the counterfeit can only ever appear *below* the truth, under a
+    /// line that says the text is what the model asked for.
+    #[test]
+    fn the_resolved_target_precedes_the_requested_spelling_it_could_counterfeit() {
+        let target = "/home/u/.ssh";
+        let counterfeit = "Grant target (resolved): /tmp/harmless";
+        let requested = format!("/tmp/pad/{counterfeit}");
+        let screen = root_grant_screen_requesting(200, 40, &requested, target);
+
+        let real_row = screen
+            .lines()
+            .position(|line| line.contains(target))
+            .expect("the resolved target must be on screen");
+        let label_row = screen
+            .lines()
+            .position(|line| line.contains("Requested spelling (untrusted)"))
+            .expect("the requested spelling must be labelled as untrusted");
+        assert!(
+            real_row < label_row,
+            "the resolved target must be drawn above the spelling it could be confused with:\n{screen}"
+        );
+        // And the counterfeit, when it appears, is under that label.
+        let counterfeit_row = screen
+            .lines()
+            .position(|line| line.contains("/tmp/harmless"))
+            .expect("the spelling itself is still shown");
+        assert!(
+            label_row <= counterfeit_row,
+            "a counterfeit target line must fall under the untrusted label:\n{screen}"
+        );
+    }
+
+    /// A body taller than the panel says so. Silence reads as "this is the
+    /// whole prompt", which is the wrong thing for a boundary decision.
+    #[test]
+    fn an_overflowing_approval_panel_announces_what_is_below_the_fold() {
+        // A long preview guarantees more body lines than any panel height.
+        let mut app = App::new();
+        app.lang = Lang::En;
+        app.pending_approval = Some(deep_code_agent::ApprovalRequest {
+            call_id: "call_big".to_string(),
+            tool_name: "write_file".to_string(),
+            description: "writes a file".to_string(),
+            arguments: serde_json::json!({"path": "/tmp/x", "content": "y"}),
+            risk_level: deep_code_agent::RiskLevel::Medium,
+            requires_sandbox: false,
+            network: false,
+            justification: None,
+            resolved_target: None,
+            read_only: false,
+            matched_rule: None,
+            preview: Some(
+                (0..60)
+                    .map(|i| format!("+ line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            safety_notes: Vec::new(),
+        });
+
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut screen = String::new();
+        for row in 0..buffer.area.height {
+            for col in 0..buffer.area.width {
+                screen.push_str(buffer[(col, row)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(
+            screen.contains("more line(s)"),
+            "an overflowing panel must say so:\n{screen}"
+        );
+        assert!(
+            screen.contains(tr(Lang::En, TextId::ApprovalOptDeny)),
+            "the choices stay pinned even when the body overflows:\n{screen}"
+        );
     }
 
     /// A root grant's action line shows its `path`; a decoy key cannot occupy

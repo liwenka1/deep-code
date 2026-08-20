@@ -77,10 +77,7 @@ impl App {
                         ("sandbox", sandbox),
                     ],
                 );
-                self.pending_approval = Some(request);
-                self.approval_scroll_offset = 0;
-                self.approval_focus = 0;
-                self.is_streaming = false;
+                self.park_approval(request);
                 self.clear_stream_receiver();
             }
             RuntimeEvent::ApprovalResolved { decision, .. } => {

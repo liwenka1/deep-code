@@ -171,6 +171,8 @@ text_ids! {
     ApprovalRootGrantTarget,
     ApprovalRootGrantSymlink,
     ApprovalRootGrantUnresolved,
+    ApprovalRootGrantRequested,
+    ApprovalMoreBelow,
     ApprovalRule,
     ApprovalCautionHeader,
     ApprovalPreviewHeader,

@@ -113,8 +113,20 @@ pub struct App {
     pub scroll_offset: usize,
     pub approval_scroll_offset: usize,
     /// Currently highlighted approval option: 0 = y (approve), 1 = a (session),
-    /// 2 = n (deny). Navigated with ↑/↓, acted on with Enter.
+    /// 2 = n (deny). Navigated with ↑/↓, acted on with Enter. A root grant
+    /// offers only y/n and starts focused on deny — see
+    /// [`Self::set_active_approval`].
     pub approval_focus: usize,
+    /// Whether the pending panel has been drawn at least once.
+    ///
+    /// The run loop applies runtime events, may skip the frame (there is a
+    /// minimum interval between draws while a turn streams), and then reads
+    /// whatever key is already queued. A key typed *before* the approval
+    /// existed would otherwise be dispatched against it: a `y` meant as the
+    /// first letter of a steering message resolved a boundary prompt the user
+    /// had never seen. Decision keys are ignored until the panel has actually
+    /// been on screen for a frame; scrolling and Ctrl-C are not gated.
+    pub(crate) approval_armed: bool,
     pub(crate) runtime: Arc<AgentRuntime>,
     pub(crate) backend_label: String,
     pub(crate) backend_offline: bool,
@@ -397,6 +409,7 @@ impl App {
             scroll_offset: 0,
             approval_scroll_offset: 0,
             approval_focus: 0,
+            approval_armed: false,
             runtime,
             backend_label,
             backend_offline,
@@ -751,6 +764,24 @@ impl App {
             .is_some_and(|request| request.tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL)
     }
 
+    /// Park an arriving approval: reset the view, choose the starting option,
+    /// and disarm the decision keys until the panel has been drawn.
+    ///
+    /// A root grant starts focused on **deny**. Every other prompt is a
+    /// question about one action; this one widens the session's write boundary
+    /// for good, and the reflex `Enter` belongs to the reversible answer. The
+    /// user still approves with `y` or by moving the highlight — nothing is
+    /// harder to reach, the default is just the safe one.
+    pub(crate) fn park_approval(&mut self, request: ApprovalRequest) {
+        let deny_by_default = request.tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL;
+        self.pending_approval = Some(request);
+        self.approval_scroll_offset = 0;
+        // Root grant renders y/n, so deny is index 1.
+        self.approval_focus = usize::from(deny_by_default);
+        self.approval_armed = false;
+        self.is_streaming = false;
+    }
+
     /// How many options the approval panel offers (y/a/n, or y/n for a
     /// root-grant request).
     fn approval_option_count(&self) -> usize {
@@ -815,6 +846,13 @@ impl App {
 
     pub fn scroll_approval_to_top(&mut self) {
         self.approval_scroll_offset = 0;
+    }
+
+    /// Jump to the end of the panel body. Deliberately unclamped for the same
+    /// reason as [`Self::scroll_approval_down`]: the render layer owns the real
+    /// height and clamps this back to the last line.
+    pub fn scroll_approval_to_bottom(&mut self) {
+        self.approval_scroll_offset = usize::MAX;
     }
 
     /// Apply queued runtime updates; returns whether anything changed (the
