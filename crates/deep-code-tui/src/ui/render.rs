@@ -528,17 +528,29 @@ fn extract_action(arguments_json: &str) -> String {
     crate::history::collapse_whitespace(arguments_json)
 }
 
-/// Model-influenced text about to become an approval panel line: control
-/// characters become spaces — an embedded newline or terminal escape could
-/// otherwise fabricate extra panel lines inside a security prompt — and the
-/// length is capped. Every free-text line of the panel (the action, the
-/// resolved grant target, the justification) passes through here.
-fn sanitize_panel_text(text: &str, max_chars: usize) -> String {
-    let clean: String = text
-        .chars()
+/// Control characters become spaces. ratatui carries an escape byte through to
+/// the terminal verbatim, so text reaching a panel line with `\x1b` or `\r`
+/// intact can erase or overwrite the lines around it — inside the very prompt
+/// the human is reading to decide. Zero-width characters need no handling here:
+/// ratatui drops them before they reach a cell, so bidi overrides cannot flip
+/// a panel line either.
+///
+/// Kept separate from [`sanitize_panel_text`] for the two callers that must not
+/// trim or cap: a diff line's leading spaces carry its alignment, and a tool
+/// description is longer than any line cap.
+fn neutralize_control_chars(text: &str) -> String {
+    text.chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .collect();
-    crate::history::truncate_chars(clean.trim(), max_chars)
+        .collect()
+}
+
+/// Model-influenced text about to become an approval panel line: control
+/// characters become spaces (see [`neutralize_control_chars`]) and the length
+/// is capped. EVERY free-text argument of [`approval_lines`] passes through one
+/// of the two — pinned by `approval_lines_sanitize_every_text_field`, which
+/// enumerates the signature rather than the fields any one change touched.
+fn sanitize_panel_text(text: &str, max_chars: usize) -> String {
+    crate::history::truncate_chars(neutralize_control_chars(text).trim(), max_chars)
 }
 
 /// Minimal, borderless approval block matching the welcome/picker style: a
@@ -572,7 +584,7 @@ fn approval_lines(
         ),
         Span::styled(" · ", dim),
         Span::styled(
-            tool_name.to_string(),
+            sanitize_panel_text(tool_name, 120),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -664,6 +676,10 @@ fn approval_lines(
         }
     }
 
+    // Neutralised but not capped: tool descriptions run past any line cap, and
+    // they are written by this crate, not the model — the filter is uniformity
+    // with the rest of the panel, not a boundary of its own.
+    let description = neutralize_control_chars(description);
     let description = description.trim();
     if !description.is_empty() && description != action {
         lines.extend(wrap_prefixed("  ", description, width, dim, dim));
@@ -721,7 +737,8 @@ fn approval_lines(
         meta.push(text);
     }
     if let Some(rule) = matched_rule {
-        meta.push(tr_with(lang, TextId::ApprovalRule, &[("rule", rule)]));
+        let rule = sanitize_panel_text(rule, 120);
+        meta.push(tr_with(lang, TextId::ApprovalRule, &[("rule", &rule)]));
     }
     if !meta.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -766,12 +783,19 @@ fn approval_lines(
         let added = Style::default().fg(Color::Green);
         let removed = Style::default().fg(Color::Red);
         for raw in preview.lines() {
-            let style = match raw.as_bytes().first() {
+            // The widest model-controlled text on the panel: a write_file diff
+            // is that call's own `content` argument (apply_patch's `old`/`new`)
+            // rendered verbatim, so it gets the same neutralisation as the
+            // action and the justification. Not trimmed — a diff line's leading
+            // spaces are its alignment. Colour is decided from the neutralised
+            // text so a leading escape byte cannot borrow the `+` styling.
+            let line = neutralize_control_chars(raw);
+            let style = match line.as_bytes().first() {
                 Some(b'+') => added,
                 Some(b'-') => removed,
                 _ => dim,
             };
-            lines.extend(wrap_prefixed("  ", raw, width, style, style));
+            lines.extend(wrap_prefixed("  ", &line, width, style, style));
         }
     }
     lines
@@ -1498,6 +1522,83 @@ mod tests {
         assert!(
             !text.contains('\u{1b}'),
             "escape bytes must not reach the panel: {text}"
+        );
+    }
+
+    /// Feeds an escape byte into EVERY free-text argument at once and asserts
+    /// none of them reaches the panel. Written against the signature rather
+    /// than against one change's fields on purpose: the two gaps this replaced
+    /// (`description`, and the `write_file` diff `preview` — the widest
+    /// model-controlled text here) were both missed by per-field tests that
+    /// only covered the lines their own commit had touched.
+    #[test]
+    fn approval_lines_sanitize_every_text_field() {
+        const EVIL: &str = "\u{1b}[2K\rINJECTED";
+        let notes = [SafetyNote {
+            reason: TextId::SafetyNetworkReason,
+            suggestion: TextId::SafetyNetworkSuggestion,
+        }];
+        let lines = approval_lines(
+            &format!("shell{EVIL}"),
+            &format!("High{EVIL}"),
+            true,
+            true,
+            Some(&format!("justification {EVIL}")),
+            Some(&format!("/tmp/target{EVIL}")),
+            Some(&format!("builtin:rule{EVIL}")),
+            &format!("description {EVIL}"),
+            &format!("{{\"command\":\"echo hi{}\"}}", "\\u001b[2K"),
+            Some(&format!("+ added line\n- removed{EVIL}\n  context{EVIL}")),
+            &notes,
+            120,
+            Lang::Zh,
+        );
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        // The payload's visible tail must survive — proving each field was
+        // rendered and merely neutralised, not silently dropped.
+        assert!(
+            text.matches("INJECTED").count() >= 6,
+            "every field should still render its text: {text}"
+        );
+        assert!(
+            !text.chars().any(char::is_control),
+            "a control character reached the approval panel: {text:?}"
+        );
+    }
+
+    #[test]
+    fn approval_lines_preview_keeps_diff_alignment() {
+        let lines = approval_lines(
+            "write_file",
+            "Medium",
+            false,
+            false,
+            None,
+            None,
+            None,
+            "write tools can modify workspace files",
+            "{\"path\":\"a.txt\"}",
+            Some("  fn main() {\n+     let x = 1;"),
+            &[],
+            120,
+            Lang::Zh,
+        );
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        // Neutralising must not trim: a diff line's leading spaces are what
+        // line it up under the context above it.
+        assert!(
+            text.contains("  fn main() {"),
+            "context line lost its indentation: {text}"
+        );
+        assert!(
+            text.contains("+     let x = 1;"),
+            "added line lost its indentation: {text}"
         );
     }
 
