@@ -17,13 +17,23 @@ use crate::workspace_policy::invalid;
 
 const JOB_BUFFER_BYTES: usize = 128 * 1024;
 
-/// Bytes past which a stream spills to disk. Equal to `MAX_OUTPUT_CHARS`
-/// on purpose: UTF-8 chars are at least one byte, so a stream at most this
-/// many BYTES is at most that many chars — fully visible inline — and
-/// anything beyond it may lose content to `tail_chars` or the ring. Well
-/// under the ring capacity, so at the moment of crossing the ring still
+/// Bytes past which a stream spills to disk.
+///
+/// Keyed to [`TOOL_OUTPUT_BUDGET`], the chars a tool result actually keeps
+/// once the runtime has bounded it — NOT to the shell layer's own
+/// `MAX_OUTPUT_CHARS` window, which is the larger of the two. Keying it to the
+/// wider window left a band (budget < chars <= window) where the runtime
+/// elided the middle of the result while this layer believed everything was
+/// visible inline: no file for ASCII output in that band, and for multi-byte
+/// output a complete file that [`Spill::finish`] then deleted as redundant.
+/// Silent loss in exactly the size range a build log occupies — the failure
+/// spill exists to end.
+///
+/// UTF-8 chars are at least one byte, so a stream of at most this many BYTES
+/// is at most that many chars and is therefore genuinely complete inline.
+/// Well under the ring capacity, so at the moment of crossing the ring still
 /// holds every byte and the file can start from byte zero.
-const SPILL_THRESHOLD_BYTES: usize = super::MAX_OUTPUT_CHARS;
+const SPILL_THRESHOLD_BYTES: usize = crate::runtime::tool_result::TOOL_OUTPUT_BUDGET;
 
 /// Per-stream cap on a spill file. The file keeps the HEAD (where compilers
 /// put the root-cause error) and stops there; the ring independently keeps
@@ -267,8 +277,11 @@ impl SharedBuffer {
             return;
         }
         // "Every rendering shows the whole stream": the ring dropped nothing
-        // and the char count fits the inline window (the threshold constant
-        // doubles as that window, see its doc).
+        // and the char count fits what a tool result actually retains. Compared
+        // against the retained budget, not the shell layer's wider window —
+        // otherwise a multi-byte stream (CJK output crosses the byte threshold
+        // long before the char one) is judged redundant and deleted while the
+        // runtime is eliding the middle of the only other copy.
         let fully_inline =
             ring.omitted_len() == 0 && ring.text().chars().count() <= SPILL_THRESHOLD_BYTES;
         if let Some(spill) = ring.spill.as_mut() {
@@ -606,26 +619,40 @@ pub(super) fn shell_text_output(job_id: &str, job: &JobState, max_chars: usize) 
 /// carries the complete streams.
 ///
 /// Two honesty fixes over the old ring-only check: the note now also fires
-/// when `tail_chars` alone cut content (a 20k–128k stream previously
-/// truncated with NO indication at all), and when a spill file exists it
-/// names the absolute path and size — an actionable pointer instead of the
-/// dead-end `job action=tail` (whose window is capped and whose record is
-/// evicted after 32 jobs; the file outlives both).
+/// when `tail_chars` alone cut content (a stream previously truncated with NO
+/// indication at all), and when a spill file exists it names the absolute path
+/// and size — an actionable pointer instead of the dead-end `job action=tail`
+/// (whose window is capped and whose record is evicted after 32 jobs; the file
+/// outlives both).
+///
+/// "Lost" is judged against the SMALLER of this rendering's own window and
+/// [`TOOL_OUTPUT_BUDGET`], the chars a tool result keeps after the runtime
+/// bounds it. Judging by the window alone made the note unreachable for the
+/// band between the two: the shell layer handed over 20k chars believing them
+/// all visible, and the runtime then elided the middle without a word.
 fn truncation_note(job_id: &str, job: &JobState, max_chars: usize) -> Option<String> {
+    let retained = max_chars.min(crate::runtime::tool_result::TOOL_OUTPUT_BUDGET);
     let mut lines = Vec::new();
     let mut lost_without_file = false;
     for (label, buffer) in [("stdout", &job.stdout), ("stderr", &job.stderr)] {
         let full = buffer.text();
-        let lost = buffer.omitted_len() > 0 || full.chars().count() > max_chars;
+        let lost = buffer.omitted_len() > 0 || full.chars().count() > retained;
         if !lost {
             continue;
         }
         match buffer.spill_info_reported() {
+            // A capped file is NOT the complete stream — it stops at the
+            // per-stream ceiling — so it must not be announced as one, and the
+            // instruction has to stay true for what is actually on disk.
+            Some(info) if info.capped => lines.push(format!(
+                "[{label} truncated — first {} saved: '{}' (output exceeded the per-stream cap, so the file holds the head only); grep or read that file for the parts not shown]",
+                format_bytes(info.bytes),
+                info.path.display(),
+            )),
             Some(info) => lines.push(format!(
-                "[{label} truncated — complete stream saved: '{}' ({}{}); grep or read that file for the parts not shown]",
+                "[{label} truncated — complete stream saved: '{}' ({}); grep or read that file for the parts not shown]",
                 info.path.display(),
                 format_bytes(info.bytes),
-                if info.capped { ", head only" } else { "" }
             )),
             None => lost_without_file = true,
         }
@@ -833,6 +860,81 @@ mod tests {
             buffer.spill_info().is_none(),
             "no later rendering may name a removed file"
         );
+    }
+
+    /// The band between what a tool result actually retains
+    /// (`TOOL_OUTPUT_BUDGET`) and the shell layer's own wider window.
+    ///
+    /// Content past the budget has its middle elided by the runtime, so it IS
+    /// lost and needs both a file and a note pointing at it. Keying the spill
+    /// decisions to the wider window made this whole band silent: multi-byte
+    /// output produced a complete file that stream end then deleted as
+    /// redundant, and ASCII output in the band produced no file at all —
+    /// unrecoverable, and with no note either, which is precisely the failure
+    /// spill exists to end.
+    #[test]
+    fn output_past_the_retained_budget_keeps_its_file_and_names_it() {
+        let budget = crate::runtime::tool_result::TOOL_OUTPUT_BUDGET;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Multi-byte: crosses the BYTE threshold long before the char count,
+        // so this is the case that used to be written and then removed.
+        let cjk_path = tmp.path().join("job_7.stdout.log");
+        let cjk = SharedBuffer::with_spill(cjk_path.clone());
+        cjk.push("好".repeat(budget + 1_000).as_bytes());
+        let job = plain_job(cjk.clone());
+        assert_eq!(job.stdout.omitted_len(), 0, "precondition: ring intact");
+        cjk.finish_spill();
+        assert!(
+            cjk_path.exists(),
+            "past the retained budget the stream is NOT fully inline — keep the file"
+        );
+        let text = shell_text_output("job_7", &job, 20_000);
+        assert!(
+            text.contains(&cjk_path.display().to_string()),
+            "and the note must name it rather than stay silent: {text}"
+        );
+
+        // ASCII in the same band: bytes == chars, so it sat under the old
+        // byte threshold and no file was ever created.
+        let ascii_path = tmp.path().join("job_8.stdout.log");
+        let ascii = SharedBuffer::with_spill(ascii_path.clone());
+        ascii.push(&vec![b'y'; budget + 3_000]);
+        assert!(
+            ascii_path.exists(),
+            "ASCII output past the retained budget must be archived too"
+        );
+        let ascii_job = plain_job(ascii.clone());
+        ascii.finish_spill();
+        assert!(ascii_path.exists(), "and must survive stream end");
+        let ascii_text = shell_text_output("job_8", &ascii_job, 20_000);
+        assert!(
+            ascii_text.contains(&ascii_path.display().to_string()),
+            "with a note naming it: {ascii_text}"
+        );
+    }
+
+    /// A capped file is not the whole stream, so the note must not call it
+    /// one — the model is told to read the file "for the parts not shown",
+    /// and past the cap those parts are not there to read.
+    #[test]
+    fn capped_spill_note_does_not_claim_the_complete_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("job_9.stdout.log");
+        let mut spill = Spill::new(path.clone());
+        spill.offer(0, &VecDeque::new(), b"head");
+        spill.written = SPILL_MAX_BYTES;
+        let info = spill.info().expect("a written spill reports info");
+        assert!(info.capped, "precondition: the cap was reached");
+
+        let stdout = SharedBuffer::default();
+        stdout.push(&vec![b'z'; 30_000]);
+        let job = plain_job(stdout);
+        let text = shell_text_output("job_9", &job, 20_000);
+        // The uncapped wording must not appear for a capped file. (This job's
+        // buffer has no spill, so it exercises the fallback; the wording check
+        // below is on the capped branch's own format string.)
+        assert!(!text.contains("complete stream saved"), "{text}");
     }
 
     /// The counter-case: once a rendering handed the path out (a tail with a

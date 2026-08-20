@@ -348,7 +348,13 @@ impl AgentRuntime {
     }
 }
 
-const TOOL_OUTPUT_BUDGET: usize = 12_000;
+/// Chars a single tool result keeps before its middle is elided. This — not
+/// the shell layer's own `MAX_OUTPUT_CHARS` window — is the real ceiling on
+/// what the model ever reads back from a tool, because every result passes
+/// through [`truncate_tool_output`] on its way into the transcript. The spill
+/// machinery keys its "did anything get lost?" decisions on this value for
+/// exactly that reason; see `shell_tools::jobs::SPILL_THRESHOLD_BYTES`.
+pub(crate) const TOOL_OUTPUT_BUDGET: usize = 12_000;
 const TOOL_OUTPUT_HEAD: usize = 4_000;
 const TOOL_OUTPUT_TAIL: usize = 4_000;
 

@@ -23,7 +23,9 @@ mod persistence_actor;
 mod state;
 mod streaming;
 mod telemetry;
-mod tool_result;
+/// Crate-visible for `TOOL_OUTPUT_BUDGET`: the shell layer's spill decisions
+/// have to be keyed to the same ceiling this module enforces on tool results.
+pub(crate) mod tool_result;
 mod turn_loop;
 
 use std::path::PathBuf;
