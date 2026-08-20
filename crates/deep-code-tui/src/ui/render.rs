@@ -38,11 +38,12 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let input_height = Constraint::Length(visual_rows as u16 + 2);
 
     let snapshot: TranscriptSnapshot = if app.pending_approval.is_some() {
+        let panel_rows = approval_panel_rows(app, frame.area());
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),
-                Constraint::Length(6),
+                Constraint::Length(panel_rows),
                 input_height,
                 Constraint::Length(1),
             ])
@@ -515,12 +516,25 @@ fn risk_display(risk: &str, lang: Lang) -> (&'static str, Color) {
 
 /// The human-meaningful action behind a tool call — the shell command, the file
 /// path, etc. — instead of the raw JSON blob. Falls back to compact arguments.
-fn extract_action(arguments_json: &str) -> String {
+///
+/// `tool_name` decides which key may occupy the line, rather than letting the
+/// first familiar key win for every tool. It matters for
+/// `request_write_root`, whose subject is unambiguously `path`: the generic
+/// scan puts `command` ahead of `path`, so an extra key would render
+/// attacker-chosen text on the action line of a boundary prompt. The runtime
+/// now refuses such an argument set outright, and pinning the key here means
+/// the panel does not depend on that refusal to show the right subject.
+fn extract_action(tool_name: &str, arguments_json: &str) -> String {
+    let keys: &[&str] = if tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL {
+        &["path"]
+    } else {
+        &["command", "path", "file_path", "url", "pattern", "query"]
+    };
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments_json)
         && let Some(object) = value.as_object()
     {
-        for key in ["command", "path", "file_path", "url", "pattern", "query"] {
-            if let Some(text) = object.get(key).and_then(serde_json::Value::as_str) {
+        for key in keys {
+            if let Some(text) = object.get(*key).and_then(serde_json::Value::as_str) {
                 return crate::history::collapse_whitespace(text);
             }
         }
@@ -599,7 +613,7 @@ fn approval_lines(
     }
     let mut lines = vec![Line::from(header)];
 
-    let action = sanitize_panel_text(&extract_action(arguments_json), 240);
+    let action = sanitize_panel_text(&extract_action(tool_name, arguments_json), 240);
     lines.extend(wrap_prefixed(
         "  ",
         &action,
@@ -804,35 +818,119 @@ fn approval_lines(
     lines
 }
 
-fn render_approval_panel(frame: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Rect) {
-    // Cloned (not borrowed) so the clamped scroll can be written back below; the
-    // panel only renders while an approval is pending, so this is rare.
-    let Some(request) = app.pending_approval.clone() else {
-        return;
+/// Rows the y/a/n choice block occupies at the bottom of the panel.
+const APPROVAL_OPTION_ROWS: u16 = 3;
+/// Floor for the whole panel — the historical fixed size.
+const APPROVAL_PANEL_MIN_ROWS: u16 = 6;
+/// Ceiling for the whole panel. Past this the body scrolls: a long diff
+/// preview must not push the transcript off the screen.
+const APPROVAL_PANEL_MAX_ROWS: u16 = 16;
+
+/// Everything an [`ApprovalRequest`] contributes to the panel.
+///
+/// The production path to [`approval_lines`] goes through this struct so that
+/// `approval_lines_sanitize_every_text_field` can destructure it exhaustively:
+/// adding a field here fails to compile until that test accounts for it. The
+/// positional signature alone was not a guard — a new parameter is silenced at
+/// every call site by passing `None`, and the sanitisation test stayed green
+/// while the field rendered raw. Two real gaps (`preview`, `description`)
+/// reached users that way.
+///
+/// [`ApprovalRequest`]: deep_code_agent::ApprovalRequest
+struct ApprovalPanelText<'a> {
+    tool_name: &'a str,
+    risk: String,
+    requires_sandbox: bool,
+    network: bool,
+    justification: Option<&'a str>,
+    resolved_target: Option<&'a str>,
+    matched_rule: Option<&'a str>,
+    description: &'a str,
+    arguments_json: String,
+    preview: Option<&'a str>,
+    safety_notes: &'a [SafetyNote],
+}
+
+impl<'a> ApprovalPanelText<'a> {
+    fn from_request(request: &'a deep_code_agent::ApprovalRequest) -> Self {
+        Self {
+            tool_name: &request.tool_name,
+            risk: format!("{:?}", request.risk_level),
+            requires_sandbox: request.requires_sandbox,
+            network: request.network,
+            justification: request.justification.as_deref(),
+            resolved_target: request.resolved_target.as_deref(),
+            matched_rule: request.matched_rule.as_deref(),
+            description: &request.description,
+            arguments_json: request.arguments.to_string(),
+            preview: request.preview.as_deref(),
+            safety_notes: &request.safety_notes,
+        }
+    }
+
+    fn render(&self, width: usize, lang: Lang) -> Vec<Line<'static>> {
+        approval_lines(
+            self.tool_name,
+            &self.risk,
+            self.requires_sandbox,
+            self.network,
+            self.justification,
+            self.resolved_target,
+            self.matched_rule,
+            self.description,
+            &self.arguments_json,
+            self.preview,
+            self.safety_notes,
+            width,
+            lang,
+        )
+    }
+}
+
+/// The panel body for the pending approval, wrapped to `width`.
+///
+/// Shared by the renderer and [`approval_panel_rows`] so the height the layout
+/// reserves is measured from the very lines that will be drawn — a panel sized
+/// from a second, drifting estimate is how the resolved-target line ends up
+/// just off the bottom edge.
+fn approval_body(app: &App, width: usize) -> Vec<Line<'static>> {
+    let Some(request) = app.pending_approval.as_ref() else {
+        return Vec::new();
     };
+    ApprovalPanelText::from_request(request).render(width, app.lang)
+}
+
+/// Rows to reserve for the approval panel, sized to its content.
+///
+/// A fixed height silently truncated the prompt: three body rows meant a
+/// `request_write_root` showed its header, action and boundary warning while
+/// the resolved directory — the line the human is told to judge by, and the
+/// whole point of resolving before prompting — sat one row below the edge with
+/// no overflow indicator. Growing to fit puts every decision-critical line on
+/// screen; content past [`APPROVAL_PANEL_MAX_ROWS`] (a long diff preview)
+/// still scrolls, and the panel never takes more than half the frame.
+fn approval_panel_rows(app: &App, area: ratatui::layout::Rect) -> u16 {
+    let width = usize::from(area.width.saturating_sub(2)).max(8);
+    let wanted = u16::try_from(approval_body(app, width).len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(APPROVAL_OPTION_ROWS);
+    let ceiling = APPROVAL_PANEL_MAX_ROWS.min((area.height / 2).max(APPROVAL_PANEL_MIN_ROWS));
+    wanted.clamp(APPROVAL_PANEL_MIN_ROWS, ceiling)
+}
+
+fn render_approval_panel(frame: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Rect) {
+    if app.pending_approval.is_none() {
+        return;
+    }
     // Body (scrollable) on top; the y/a/n choices pinned to the bottom rows so
     // they stay visible even when a long command wraps.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .constraints([Constraint::Min(1), Constraint::Length(APPROVAL_OPTION_ROWS)])
         .split(area);
 
     let width = usize::from(chunks[0].width.saturating_sub(2)).max(8);
-    let body = approval_lines(
-        &request.tool_name,
-        &format!("{:?}", request.risk_level),
-        request.requires_sandbox,
-        request.network,
-        request.justification.as_deref(),
-        request.resolved_target.as_deref(),
-        request.matched_rule.as_deref(),
-        &request.description,
-        &request.arguments.to_string(),
-        request.preview.as_deref(),
-        &request.safety_notes,
-        width,
-        app.lang,
-    );
+    let body = approval_body(app, width);
     // Clamp against the real rendered body (wrapped lines, safety notes, diff
     // preview) so the user can scroll to the very end before deciding. Only the
     // render layer knows the true wrapped height, so it also writes the clamped
@@ -1245,13 +1343,28 @@ mod tests {
     #[test]
     fn extract_action_pulls_command_or_path() {
         assert_eq!(
-            extract_action(r#"{"command":"npm run build"}"#),
+            extract_action("shell", r#"{"command":"npm run build"}"#),
             "npm run build"
         );
         assert_eq!(
-            extract_action(r#"{"path":"src/foo.rs","content":"x"}"#),
+            extract_action("write_file", r#"{"path":"src/foo.rs","content":"x"}"#),
             "src/foo.rs"
         );
+    }
+
+    /// A write-root request's action line is its `path` and nothing else. The
+    /// generic key scan ranks `command` first, so without the tool-specific
+    /// list an extra key would put text of the model's choosing on the action
+    /// line of a boundary prompt while the grant landed on `path`.
+    #[test]
+    fn extract_action_for_a_root_grant_ignores_a_decoy_command_key() {
+        let decoy = r#"{"path":"/home/u/.deep-code","command":"cat CHANGELOG.md"}"#;
+        assert_eq!(
+            extract_action(deep_code_agent::REQUEST_WRITE_ROOT_TOOL, decoy),
+            "/home/u/.deep-code"
+        );
+        // Same payload under any other tool keeps the generic precedence.
+        assert_eq!(extract_action("shell", decoy), "cat CHANGELOG.md");
     }
 
     #[test]
@@ -1528,9 +1641,9 @@ mod tests {
         );
     }
 
-    /// Feeds a control-character payload into EVERY free-text argument and
+    /// Feeds a control-character payload into EVERY free-text field and
     /// asserts field by field that the text survives with the control bytes
-    /// gone. Two rules this test exists to enforce, both learned the hard way:
+    /// gone. Three rules this test exists to enforce, all learned the hard way:
     ///
     /// - One marker per field, asserted individually. A `count() >= n`
     ///   assertion stood here before and hid a live gap: `resolved_target`
@@ -1539,6 +1652,13 @@ mod tests {
     /// - Fields gated on `tool_name` need a pass with that tool name. The
     ///   root-grant lines render only for `REQUEST_WRITE_ROOT_TOOL`, so a
     ///   single generic-tool pass pins nothing about them.
+    /// - A NEW field must not be able to slip past this test. The positional
+    ///   signature was never the guard it looked like: a new parameter is
+    ///   silenced at every call site with `None`, and this test — whose
+    ///   comment used to claim it covered "every free-text argument" — stayed
+    ///   green while the field rendered raw. So the payload is built as an
+    ///   [`ApprovalPanelText`] and destructured exhaustively below; adding a
+    ///   field to that struct stops compiling until it is handled here.
     #[test]
     fn approval_lines_sanitize_every_text_field() {
         const ESC: &str = "\u{1b}[2K\r";
@@ -1550,25 +1670,45 @@ mod tests {
         // names itself. `arguments_json` smuggles its escape as the JSON
         // escape sequence, which serde decodes into a real control byte —
         // the model controls that blob, so that path must be covered too.
+        let justification = format!("{ESC}JUSTIFICATION");
+        let resolved_target = format!("/tmp/target{ESC}TARGET");
+        let matched_rule = format!("builtin:rule{ESC}RULE");
+        let description = format!("description{ESC}DESCRIPTION");
+        let arguments_json = format!("{{\"command\":\"echo hi{}ACTION\"}}", "\\u001b[2K");
+        let preview = format!("+ added{ESC}ADDED\n- removed{ESC}REMOVED\n  context{ESC}CONTEXT");
+
         let render = |tool: &str| -> String {
-            let lines = approval_lines(
-                tool,
-                &format!("High{ESC}RISK"),
-                true,
-                true,
-                Some(&format!("{ESC}JUSTIFICATION")),
-                Some(&format!("/tmp/target{ESC}TARGET")),
-                Some(&format!("builtin:rule{ESC}RULE")),
-                &format!("description{ESC}DESCRIPTION"),
-                &format!("{{\"command\":\"echo hi{}ACTION\"}}", "\\u001b[2K"),
-                Some(&format!(
-                    "+ added{ESC}ADDED\n- removed{ESC}REMOVED\n  context{ESC}CONTEXT"
-                )),
-                &notes,
-                120,
-                Lang::Zh,
-            );
-            lines
+            let payload = ApprovalPanelText {
+                tool_name: tool,
+                risk: format!("High{ESC}RISK"),
+                requires_sandbox: true,
+                network: true,
+                justification: Some(&justification),
+                resolved_target: Some(&resolved_target),
+                matched_rule: Some(&matched_rule),
+                description: &description,
+                arguments_json: arguments_json.clone(),
+                preview: Some(&preview),
+                safety_notes: &notes,
+            };
+            // Exhaustive destructuring: the compiler rejects this the moment a
+            // field is added to the struct, forcing the new field to be given
+            // a marker and asserted below rather than silently rendering raw.
+            let ApprovalPanelText {
+                tool_name: _,
+                risk: _,
+                requires_sandbox: _,
+                network: _,
+                justification: _,
+                resolved_target: _,
+                matched_rule: _,
+                description: _,
+                arguments_json: _,
+                preview: _,
+                safety_notes: _,
+            } = &payload;
+            payload
+                .render(120, Lang::Zh)
                 .iter()
                 .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
                 .collect()
@@ -1675,6 +1815,134 @@ mod tests {
         assert!(
             en.contains("network access") && en.contains("Confirm the target"),
             "{en}"
+        );
+    }
+
+    /// Builds the whole frame for a pending `request_write_root` and returns
+    /// what is actually in the terminal cells.
+    ///
+    /// Rendered in English on purpose: a double-width glyph occupies two cells
+    /// and the continuation cell reads back as a space, so concatenating cells
+    /// from a Chinese panel yields `实 际 ...` and no substring assertion
+    /// against the source string can hold. The layout being pinned here is
+    /// language-independent.
+    fn root_grant_screen(width: u16, height: u16, resolved_target: &str) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new();
+        app.lang = Lang::En;
+        app.pending_approval = Some(deep_code_agent::ApprovalRequest {
+            call_id: "call_grant".to_string(),
+            tool_name: deep_code_agent::REQUEST_WRITE_ROOT_TOOL.to_string(),
+            description: "grants write access to a directory outside the current roots".to_string(),
+            arguments: serde_json::json!({
+                "path": "/tmp/workspace/build-cache",
+                "justification": "the build writes its artifacts there",
+            }),
+            risk_level: deep_code_agent::RiskLevel::High,
+            requires_sandbox: false,
+            network: false,
+            justification: Some("the build writes its artifacts there".to_string()),
+            resolved_target: Some(resolved_target.to_string()),
+            read_only: false,
+            matched_rule: Some("builtin:root_grant".to_string()),
+            preview: None,
+            safety_notes: Vec::new(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut rows = Vec::new();
+        for row in 0..buffer.area.height {
+            let mut line = String::new();
+            for col in 0..buffer.area.width {
+                line.push_str(buffer[(col, row)].symbol());
+            }
+            rows.push(line);
+        }
+        rows.join("\n")
+    }
+
+    /// The resolved directory has to be ON SCREEN — not merely present in the
+    /// body vector that `approval_lines` returns.
+    ///
+    /// Every other approval test inspects that vector, which is why a panel
+    /// pinned to six rows (three of them the y/n block) went unnoticed: the
+    /// header, action and boundary warning filled the viewport and the
+    /// resolved target — the one line the panel tells the human to judge by,
+    /// and the entire reason the runtime resolves before prompting — sat below
+    /// the bottom edge with no overflow indicator. Asserted at several sizes
+    /// because the old height was a constant, so it failed identically on a
+    /// large terminal.
+    #[test]
+    fn root_grant_panel_shows_the_resolved_target_on_screen() {
+        let target = "/home/u/.config/private-keys";
+        for (width, height) in [(80, 24), (100, 40), (200, 60)] {
+            let screen = root_grant_screen(width, height, target);
+            assert!(
+                screen.contains(target),
+                "the resolved target must be visible at {width}x{height}:\n{screen}"
+            );
+            // The boundary warning and the y/n choices share the panel with
+            // it — none of the three may push another off the edge.
+            assert!(
+                screen.contains(tr(Lang::En, TextId::ApprovalRootGrant)),
+                "the boundary warning must stay visible at {width}x{height}:\n{screen}"
+            );
+            assert!(
+                screen.contains(tr(Lang::En, TextId::ApprovalOptDeny)),
+                "the choices must stay visible at {width}x{height}:\n{screen}"
+            );
+        }
+    }
+
+    /// A root grant's action line shows its `path`; a decoy key cannot occupy
+    /// the line the human reads, all the way through to the rendered cells.
+    #[test]
+    fn root_grant_panel_never_shows_a_decoy_command_on_the_action_line() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new();
+        app.lang = Lang::En;
+        app.pending_approval = Some(deep_code_agent::ApprovalRequest {
+            call_id: "call_grant".to_string(),
+            tool_name: deep_code_agent::REQUEST_WRITE_ROOT_TOOL.to_string(),
+            description: "grants write access".to_string(),
+            arguments: serde_json::json!({
+                "path": "/home/u/.deep-code",
+                "command": "cat CHANGELOG.md",
+            }),
+            risk_level: deep_code_agent::RiskLevel::High,
+            requires_sandbox: false,
+            network: false,
+            justification: None,
+            resolved_target: Some("/home/u/.deep-code".to_string()),
+            read_only: false,
+            matched_rule: None,
+            preview: None,
+            safety_notes: Vec::new(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut screen = String::new();
+        for row in 0..buffer.area.height {
+            for col in 0..buffer.area.width {
+                screen.push_str(buffer[(col, row)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(
+            !screen.contains("cat CHANGELOG.md"),
+            "a decoy key must never reach the panel:\n{screen}"
+        );
+        assert!(
+            screen.contains("/home/u/.deep-code"),
+            "the real subject must be shown:\n{screen}"
         );
     }
 
