@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::{ToolCallFunctionPayload, ToolCallPayload};
 use crate::runtime::AgentRuntime;
+use crate::runtime::approval_flow::RootGrantPrompt;
 use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
 use crate::runtime::failure_class::record_failure_signals;
 use crate::runtime::state::PendingToolBatch;
@@ -194,6 +195,26 @@ impl AgentRuntime {
                             .await;
                         continue;
                     }
+                    // A root grant is triaged before the human is involved:
+                    // resolve the requested path ONCE, show that canonical
+                    // form on the panel and park it with the batch (the grant
+                    // must land on it, see `apply_root_grant`), and bounce an
+                    // unresolvable or refused request straight back to the
+                    // model — the human is never prompted for a grant that
+                    // cannot actually be performed.
+                    let root_grant_target = match self.root_grant_prompt_target(&call) {
+                        RootGrantPrompt::NotRootGrant => None,
+                        RootGrantPrompt::Resolved(canonical) => Some(canonical),
+                        RootGrantPrompt::Refused(reason) => {
+                            let result = ToolResult::error(&call, reason);
+                            self.record_tool_result(&call, result, tx, turn_id.clone())
+                                .await;
+                            continue;
+                        }
+                    };
+                    request.resolved_target = root_grant_target
+                        .as_ref()
+                        .map(|canonical| canonical.display().to_string());
                     // File I/O for a bounded diff at a human-in-the-loop
                     // pause: cheap relative to the wait, so no spawn_blocking.
                     request.preview = self.approval_preview(&call);
@@ -203,6 +224,7 @@ impl AgentRuntime {
                             current: call,
                             remaining,
                             turn_id: turn_id.clone(),
+                            root_grant_target,
                         });
                     }
                     self.flush_session_update(tx).await;
@@ -239,6 +261,7 @@ impl AgentRuntime {
             current,
             mut remaining,
             turn_id,
+            root_grant_target: _,
         } = pending;
         remaining.push_front(current);
         self.finish_cancelled_calls(remaining, &turn_id, tx).await;

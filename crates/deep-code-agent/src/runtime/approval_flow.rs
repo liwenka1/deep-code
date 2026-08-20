@@ -33,9 +33,23 @@ pub(super) fn session_allowable(tool_name: &str) -> bool {
 
 /// Whether a call is the `request_write_root` doorbell (see
 /// [`crate::execution_policy::ToolKind::RootGrant`]).
-fn is_root_grant(tool_name: &str) -> bool {
+pub(super) fn is_root_grant(tool_name: &str) -> bool {
     crate::execution_policy::ExecPolicy::classify_tool(tool_name)
         == crate::execution_policy::ToolKind::RootGrant
+}
+
+/// Prompt-time triage of a `request_write_root` call (see
+/// [`AgentRuntime::root_grant_prompt_target`]).
+pub(super) enum RootGrantPrompt {
+    /// Not a root-grant call at all.
+    NotRootGrant,
+    /// The request resolves; this canonical directory is what the prompt
+    /// must display and what the eventual grant must land on.
+    Resolved(std::path::PathBuf),
+    /// The request can never be granted (unresolvable, not a directory, or
+    /// refused outright: home / filesystem root). The human is not prompted;
+    /// the message goes straight back to the model.
+    Refused(String),
 }
 
 /// Identity key of a *simple* shell command — e.g. `git status` from
@@ -229,6 +243,7 @@ impl AgentRuntime {
             current,
             remaining,
             turn_id,
+            root_grant_target,
         } = pending;
         if cancel.is_cancelled() {
             let mut calls = remaining;
@@ -276,7 +291,10 @@ impl AgentRuntime {
                     );
                     result
                 }
-                _ => self.apply_root_grant(&current, &turn_id, tx).await,
+                _ => {
+                    self.apply_root_grant(&current, root_grant_target.as_deref(), &turn_id, tx)
+                        .await
+                }
             };
             self.record_tool_result(&current, result, tx, turn_id.clone())
                 .await;
@@ -305,6 +323,10 @@ impl AgentRuntime {
                         current,
                         remaining,
                         turn_id: turn_id.clone(),
+                        // A root grant never reaches this re-prompt path (it
+                        // is intercepted above, before run_tool); None keeps
+                        // the grant fail-closed if that ever changes.
+                        root_grant_target: None,
                     });
                 }
                 emit(
@@ -342,33 +364,89 @@ impl AgentRuntime {
         crate::approval_preview::build_approval_preview(call, &boundary.to_roots(), self.ui_lang())
     }
 
+    /// Prompt-time triage of a call about to be parked for approval. For a
+    /// `request_write_root` this resolves the requested path ONCE: the same
+    /// canonical value goes to the panel (`ApprovalRequest::resolved_target`)
+    /// and into the pending batch, so what the human reads and what the grant
+    /// is checked against cannot drift. A request that cannot resolve (or is
+    /// refused outright) never reaches the human at all — the model gets the
+    /// precise reason instead of a puzzled denial.
+    pub(super) fn root_grant_prompt_target(&self, call: &ToolCall) -> RootGrantPrompt {
+        if !is_root_grant(&call.name) {
+            return RootGrantPrompt::NotRootGrant;
+        }
+        let raw = root_grant_requested_path(call);
+        if raw.is_empty() {
+            return RootGrantPrompt::Refused(
+                "invalid request_write_root arguments: path is required".to_string(),
+            );
+        }
+        let Some(boundary) = self.boundary.as_ref() else {
+            return RootGrantPrompt::Refused(
+                "this session has no workspace boundary to widen (filesystem tools are disabled)"
+                    .to_string(),
+            );
+        };
+        match boundary.resolve_grant_target(std::path::Path::new(&raw)) {
+            Ok(canonical) => RootGrantPrompt::Resolved(canonical),
+            Err(error) => RootGrantPrompt::Refused(error.to_string()),
+        }
+    }
+
     /// Perform an APPROVED `request_write_root`: widen the shared boundary,
     /// persist the grant next to the `--add-dir` ones (it must survive
     /// resume), and notify UIs. Returns the model-facing result; failures are
     /// soft (status=Error text) so the model can correct the path and — with
     /// a fresh approval — try again.
+    ///
+    /// `prompt_target` is the canonical directory resolved when the prompt
+    /// was built — the path the human actually read. The request is resolved
+    /// AGAIN here and must land on that exact value: a symlink retargeted
+    /// between prompt and approval (the requester can write inside the
+    /// workspace without approval, so it can shuffle links there) refuses
+    /// instead of granting a directory the human never saw.
     async fn apply_root_grant(
         &self,
         call: &ToolCall,
+        prompt_target: Option<&std::path::Path>,
         turn_id: &TurnId,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) -> ToolResult {
         use crate::workspace_policy::RootGrantOutcome;
         let raw = root_grant_requested_path(call);
-        if raw.is_empty() {
-            return ToolResult::error(
-                call,
-                "invalid request_write_root arguments: path is required",
-            );
-        }
         let Some(boundary) = self.boundary.as_ref() else {
             return ToolResult::error(
                 call,
                 "this session has no workspace boundary to widen (filesystem tools are disabled)",
             );
         };
-        match boundary.grant_extra(std::path::Path::new(&raw)) {
-            Ok(RootGrantOutcome::Granted { canonical }) => {
+        let Some(prompt_target) = prompt_target else {
+            // No recorded target means no resolved directory was displayed;
+            // granting anything would be granting sight-unseen. Fail closed.
+            return ToolResult::error(
+                call,
+                "no resolved directory was recorded when the user was prompted; nothing was \
+                 granted — call request_write_root again",
+            );
+        };
+        let fresh = match boundary.resolve_grant_target(std::path::Path::new(&raw)) {
+            Ok(canonical) => canonical,
+            Err(error) => return ToolResult::error(call, error.to_string()),
+        };
+        if fresh != prompt_target {
+            return ToolResult::error(
+                call,
+                format!(
+                    "nothing was granted: '{raw}' resolved to '{}' when the user was prompted \
+                     but resolves to '{}' now — the path changed underneath the approval; call \
+                     request_write_root again so the user can judge the current target",
+                    prompt_target.display(),
+                    fresh.display()
+                ),
+            );
+        }
+        match boundary.grant_resolved(fresh) {
+            RootGrantOutcome::Granted { canonical } => {
                 // Same durability contract as --add-dir: the grant is part of
                 // the session, so a resume must restore it.
                 if let Some(persistence) = self.persistence.as_ref() {
@@ -399,7 +477,7 @@ impl AgentRuntime {
                     ),
                 )
             }
-            Ok(RootGrantOutcome::AlreadyGranted { canonical }) => ToolResult::success(
+            RootGrantOutcome::AlreadyGranted { canonical } => ToolResult::success(
                 &call.id,
                 &call.name,
                 format!(
@@ -408,7 +486,6 @@ impl AgentRuntime {
                     canonical.display()
                 ),
             ),
-            Err(error) => ToolResult::error(call, error.to_string()),
         }
     }
 }

@@ -93,4 +93,10 @@ pub(super) struct PendingToolBatch {
     pub(super) current: ToolCall,
     pub(super) remaining: VecDeque<ToolCall>,
     pub(super) turn_id: TurnId,
+    /// For a parked `request_write_root` only: the canonical directory that
+    /// was resolved when the prompt was built — the exact path the human saw.
+    /// The grant re-resolves the request on approval and must land on this
+    /// value, or it refuses (see `apply_root_grant`): a symlink shuffled
+    /// between prompt and approval cannot substitute the target.
+    pub(super) root_grant_target: Option<std::path::PathBuf>,
 }

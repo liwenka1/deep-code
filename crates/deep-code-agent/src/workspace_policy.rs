@@ -52,12 +52,12 @@ impl From<&Path> for WorkspaceRoots {
 /// The primary root is a plain immutable field — its anchor roles (relative
 /// paths, spill/checkpoint/session homes, display stripping) never move for
 /// the life of a session. Only the extra grants sit behind the shared lock,
-/// and the sole mutation is [`Self::grant_extra`]: an append that runs after
-/// an explicit human approval (`/add-dir` relaunch aside, which rebuilds the
-/// policy wholesale). Cloning shares the boundary on purpose — that is what
-/// lets a mid-session grant reach every already-registered tool (and the
-/// sandbox, which re-reads [`Self::granted_roots`] per command) without
-/// rebuilding a single registry.
+/// and the sole mutation is [`Self::grant_resolved`]: an append that runs
+/// after an explicit human approval (`/add-dir` relaunch aside, which
+/// rebuilds the policy wholesale). Cloning shares the boundary on purpose —
+/// that is what lets a mid-session grant reach every already-registered tool
+/// (and the sandbox, which re-reads [`Self::granted_roots`] per command)
+/// without rebuilding a single registry.
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspacePolicy {
     /// Canonical primary workspace; never changes after construction.
@@ -154,15 +154,25 @@ impl WorkspacePolicy {
         }
     }
 
-    /// Widen the boundary with one directory, after the human approved it.
+    /// Resolve and vet a model-requested grant target, granting nothing.
     ///
-    /// Validation mirrors launch-time extras exactly (canonicalize, must be a
-    /// directory) with one addition: the path must be spelled absolute — the
-    /// requester is the model, and a relative spelling is ambiguous about
-    /// which base it meant. The canonical form is what gets granted; callers
-    /// display that form to the user BEFORE approval, so what was approved
-    /// and what is enforced cannot differ.
-    pub(crate) fn grant_extra(&self, raw: &Path) -> Result<RootGrantOutcome, ToolError> {
+    /// Validation mirrors launch-time extras (canonicalize, must be a
+    /// directory) plus two request-channel rules. The path must be spelled
+    /// absolute — the requester is the model, and a relative spelling is
+    /// ambiguous about which base it meant. And the resolved directory must
+    /// not cover the home directory or be the filesystem root: the tool
+    /// description already promises the model never to ask for those, and a
+    /// promise the code does not check is one a symlink can break — a link
+    /// inside the workspace can dress `$HOME` up as an innocuous-looking
+    /// spelling. (A target already inside the boundary skips that floor:
+    /// covering it again changes nothing and reports as AlreadyGranted.)
+    ///
+    /// This is the single resolution step of the grant flow: the approval
+    /// prompt displays exactly this canonical path, and after the human says
+    /// yes the runtime resolves AGAIN and refuses on mismatch (see
+    /// `apply_root_grant`) — so what was approved and what gets enforced
+    /// cannot differ, no matter what happened to the path in between.
+    pub(crate) fn resolve_grant_target(&self, raw: &Path) -> Result<PathBuf, ToolError> {
         const TOOL: &str = "request_write_root";
         if !raw.is_absolute() {
             return Err(invalid(
@@ -188,6 +198,35 @@ impl WorkspacePolicy {
                 format!("{} is not a directory", canonical.display()),
             ));
         }
+        if !self.is_granted(&canonical) {
+            if canonical.parent().is_none() {
+                return Err(invalid(
+                    TOOL,
+                    "refusing to grant the filesystem root; request the narrowest directory \
+                     that unblocks the task",
+                ));
+            }
+            if let Some(home) = crate::paths::home_dir().and_then(|home| home.canonicalize().ok())
+                && home.starts_with(&canonical)
+            {
+                return Err(invalid(
+                    TOOL,
+                    format!(
+                        "refusing to grant '{}': it would make the entire home directory \
+                         writable; request the narrowest directory that unblocks the task",
+                        canonical.display()
+                    ),
+                ));
+            }
+        }
+        Ok(canonical)
+    }
+
+    /// Widen the boundary with a target vetted by
+    /// [`Self::resolve_grant_target`], after the human approved that exact
+    /// path. Takes the canonical form on purpose: the caller proves it is
+    /// granting what was displayed by passing the displayed value.
+    pub(crate) fn grant_resolved(&self, canonical: PathBuf) -> RootGrantOutcome {
         let mut extras = self
             .extras
             .write()
@@ -197,10 +236,19 @@ impl WorkspacePolicy {
         if canonical.starts_with(&self.primary)
             || extras.iter().any(|root| canonical.starts_with(root))
         {
-            return Ok(RootGrantOutcome::AlreadyGranted { canonical });
+            return RootGrantOutcome::AlreadyGranted { canonical };
         }
         extras.push(canonical.clone());
-        Ok(RootGrantOutcome::Granted { canonical })
+        RootGrantOutcome::Granted { canonical }
+    }
+
+    /// One-step resolve-and-grant, for tests that need no prompt in between.
+    /// The interactive flow deliberately never uses this: it resolves at
+    /// prompt time, displays that path, and re-resolves at grant time,
+    /// refusing on mismatch.
+    #[cfg(test)]
+    pub(crate) fn grant_extra(&self, raw: &Path) -> Result<RootGrantOutcome, ToolError> {
+        Ok(self.grant_resolved(self.resolve_grant_target(raw)?))
     }
 
     fn is_granted(&self, canonical: &Path) -> bool {
@@ -676,9 +724,39 @@ mod tests {
         assert_eq!(policy.granted_roots(), vec![primary], "all refused");
     }
 
-    /// A symlink to a directory canonicalizes to its target — the grant, the
-    /// approval display, and the enforcement all speak the canonical path, so
-    /// a link cannot make the user approve one directory and grant another.
+    /// The request channel refuses the home directory, every ancestor of it
+    /// (each would cover the whole home), and the filesystem root — the tool
+    /// description promises the model never to ask for those, and this makes
+    /// the promise enforced rather than advisory. `--add-dir` stays the
+    /// human's own call and is deliberately not subject to this floor.
+    #[test]
+    fn grant_extra_refuses_home_and_its_ancestors() {
+        let (_a, primary) = canonical_tempdir();
+        let policy = WorkspacePolicy::new(primary.clone()).unwrap();
+        let Some(home) = crate::paths::home_dir().and_then(|home| home.canonicalize().ok()) else {
+            eprintln!("no resolvable home dir on this host; skipping");
+            return;
+        };
+        if home.starts_with(&primary) || primary.starts_with(&home) {
+            // A workspace inside (or above) home would legitimately cover it.
+            eprintln!("tempdir overlaps home on this host; skipping");
+            return;
+        }
+        for target in home.ancestors() {
+            assert!(
+                policy.grant_extra(target).is_err(),
+                "{} must be refused: it covers the home directory",
+                target.display()
+            );
+        }
+        assert_eq!(policy.granted_roots(), vec![primary], "nothing granted");
+    }
+
+    /// A symlink to a directory canonicalizes to its target — the resolution
+    /// step speaks only canonical paths, so the prompt displays the real
+    /// target and the grant records that same value. (That prompt-vs-grant
+    /// equality is enforced by the runtime's re-resolve-and-compare; pinned
+    /// in the runtime integration tests.)
     #[cfg(unix)]
     #[test]
     fn grant_extra_grants_the_canonical_target_of_a_symlink() {

@@ -165,6 +165,7 @@ fn root_grant_approval_drops_the_session_option() {
         read_only: false,
         matched_rule: None,
         justification: Some("y".to_string()),
+        resolved_target: Some("/tmp/x".to_string()),
         preview: None,
         safety_notes: Vec::new(),
     });
@@ -201,6 +202,7 @@ fn approval_scroll_helpers_adjust_panel_offset() {
         read_only: false,
         matched_rule: Some("write".to_string()),
         justification: None,
+        resolved_target: None,
         preview: None,
         safety_notes: Vec::new(),
     });
@@ -711,6 +713,7 @@ async fn approval_a_key_resolves_for_session() {
         read_only: true,
         matched_rule: None,
         justification: None,
+        resolved_target: None,
         preview: None,
         safety_notes: Vec::new(),
     });
@@ -1260,6 +1263,7 @@ fn approval_events_render_pending_and_resolved_tool_metadata() {
             read_only: false,
             matched_rule: Some("write".to_string()),
             justification: None,
+            resolved_target: None,
             preview: None,
             safety_notes: Vec::new(),
         },

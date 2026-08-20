@@ -163,7 +163,8 @@ impl ToolRegistry {
                             ),
                             read_only: plan.read_only,
                             matched_rule: plan.matched_rule.clone(),
-                            // Filled by the runtime (needs workspace access).
+                            // Both filled by the runtime (need workspace access).
+                            resolved_target: None,
                             preview: None,
                             safety_notes: notes,
                         },

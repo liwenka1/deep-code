@@ -3279,3 +3279,116 @@ async fn approved_root_grant_persists_into_the_session_record() {
         saved.extra_roots
     );
 }
+
+/// The TOCTOU pin: the prompt shows the directory the request resolved to at
+/// prompt time, and the grant re-resolves on approval and must land on that
+/// exact value. A symlink retargeted between the two (the requester CAN
+/// write inside the workspace without approval, so it can shuffle links
+/// there) is refused — the user never grants a directory they never saw.
+#[cfg(unix)]
+#[tokio::test]
+async fn root_grant_refuses_when_the_target_changes_under_the_approval() {
+    let workspace = tempfile::tempdir().unwrap();
+    let shown = tempfile::tempdir().unwrap();
+    let swapped = tempfile::tempdir().unwrap();
+    let shown = shown.path().canonicalize().unwrap();
+    let swapped = swapped.path().canonicalize().unwrap();
+    let link = workspace.path().join("build-cache");
+    std::os::unix::fs::symlink(&shown, &link).unwrap();
+
+    let (registry, policy) = root_grant_fixture(workspace.path());
+    let client = ScriptedClient::new(vec![
+        request_root_script(&link),
+        vec![
+            AgentEvent::TextDelta {
+                text: "ok".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::new(client, registry).with_boundary(Some(policy.clone()));
+
+    let mut rx = runtime.submit_user("cache the build").await;
+    let first = drain(&mut rx).await;
+    let request = first
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::ApprovalRequired { request, .. } => Some(request.clone()),
+            _ => None,
+        })
+        .expect("resolvable request parks for approval");
+    assert_eq!(
+        request.resolved_target.as_deref(),
+        Some(shown.display().to_string().as_str()),
+        "the prompt names the RESOLVED directory, not the link spelling"
+    );
+
+    // Retarget the link while the human is looking at the prompt.
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&swapped, &link).unwrap();
+
+    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let events = drain(&mut rx).await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallFinished { result, .. }
+                if result.tool_name == "request_write_root"
+                    && result.status == ToolResultStatus::Error
+                    && result.content.contains("changed underneath the approval")
+        )),
+        "the grant must refuse the swapped target: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::RootGranted { .. })),
+        "no grant event may fire"
+    );
+    assert_eq!(
+        policy.granted_roots().len(),
+        1,
+        "the boundary must be untouched: {:?}",
+        policy.granted_roots()
+    );
+}
+
+/// A request that can never be granted (unresolvable path — same for the
+/// home/root refusals) bounces straight back to the model with the reason;
+/// the human is never prompted for a grant that cannot happen.
+#[tokio::test]
+async fn unresolvable_root_grant_bounces_without_prompting() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (registry, policy) = root_grant_fixture(workspace.path());
+    let missing = workspace.path().join("does-not-exist");
+    let client = ScriptedClient::new(vec![
+        request_root_script(&missing),
+        vec![
+            AgentEvent::TextDelta {
+                text: "ok".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::new(client, registry).with_boundary(Some(policy.clone()));
+
+    let mut rx = runtime.submit_user("write there").await;
+    let events = drain(&mut rx).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::ApprovalRequired { .. })),
+        "no human prompt for an impossible grant: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallFinished { result, .. }
+                if result.tool_name == "request_write_root"
+                    && result.status == ToolResultStatus::Error
+                    && result.content.contains("cannot resolve")
+        )),
+        "the model gets the precise reason: {events:?}"
+    );
+    assert_eq!(policy.granted_roots().len(), 1, "nothing granted");
+}

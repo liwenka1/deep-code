@@ -329,6 +329,14 @@ pub struct ApprovalRequest {
     /// advisory for the human and never an input to any auto-approval path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub justification: Option<String>,
+    /// For `request_write_root`: the canonical directory the grant would
+    /// actually widen to, resolved when this prompt was built. The panel
+    /// must judge by THIS path — the raw `path` argument may be a symlink
+    /// spelling of somewhere else — and the runtime refuses the grant unless
+    /// the request still resolves to this exact value at approval time.
+    /// Runtime-filled; `None` for every other tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_target: Option<String>,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

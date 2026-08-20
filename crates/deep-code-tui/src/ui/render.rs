@@ -538,6 +538,7 @@ fn approval_lines(
     requires_sandbox: bool,
     network: bool,
     justification: Option<&str>,
+    resolved_target: Option<&str>,
     matched_rule: Option<&str>,
     description: &str,
     arguments_json: &str,
@@ -580,7 +581,11 @@ fn approval_lines(
     ));
 
     // A root grant changes the boundary itself, not just this one run —
-    // called out in warning color right under the requested directory.
+    // called out in warning color right under the requested directory,
+    // together with the directory the grant would ACTUALLY land on: the
+    // runtime resolves the request once for this prompt and later refuses
+    // the grant unless it still resolves identically, so this line — not the
+    // model's raw spelling in the arguments — is what the human is judging.
     if tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL {
         let caution = Style::default().fg(Color::Yellow);
         lines.extend(wrap_prefixed(
@@ -590,6 +595,49 @@ fn approval_lines(
             caution,
             caution,
         ));
+        match resolved_target {
+            Some(target) => {
+                let target_style = Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD);
+                lines.extend(wrap_prefixed(
+                    "  ",
+                    &tr_with(lang, TextId::ApprovalRootGrantTarget, &[("path", target)]),
+                    width,
+                    target_style,
+                    target_style,
+                ));
+                // The request spelled a different path than it resolves to
+                // (symlink somewhere in it): say so, or an innocuous-looking
+                // spelling could pass for the real target.
+                let requested = serde_json::from_str::<serde_json::Value>(arguments_json)
+                    .ok()
+                    .and_then(|arguments| {
+                        arguments
+                            .get("path")
+                            .and_then(|value| value.as_str().map(|path| path.trim().to_string()))
+                    });
+                if requested.as_deref() != Some(target) {
+                    lines.extend(wrap_prefixed(
+                        "  ",
+                        tr(lang, TextId::ApprovalRootGrantSymlink),
+                        width,
+                        caution,
+                        caution,
+                    ));
+                }
+            }
+            // Defensive: with prompt-time triage a root grant is only parked
+            // WITH a resolved target; still, never render a boundary prompt
+            // that silently lacks the one line that matters.
+            None => lines.extend(wrap_prefixed(
+                "  ",
+                tr(lang, TextId::ApprovalRootGrantUnresolved),
+                width,
+                caution,
+                caution,
+            )),
+        }
     }
 
     let description = description.trim();
@@ -731,6 +779,7 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &mut App, area: ratatui::la
         request.requires_sandbox,
         request.network,
         request.justification.as_deref(),
+        request.resolved_target.as_deref(),
         request.matched_rule.as_deref(),
         &request.description,
         &request.arguments.to_string(),
@@ -1178,6 +1227,7 @@ mod tests {
             false,
             None,
             None,
+            None,
             "运行构建脚本",
             r#"{"command":"npm run build"}"#,
             None,
@@ -1206,6 +1256,7 @@ mod tests {
             "Medium",
             false,
             false,
+            None,
             None,
             None,
             "写入 note.txt",
@@ -1246,6 +1297,7 @@ mod tests {
             true,
             Some("need\x1b[31m crates.io\nfor deps"),
             None,
+            None,
             "拉取依赖",
             r#"{"command":"cargo fetch"}"#,
             None,
@@ -1268,7 +1320,10 @@ mod tests {
         );
     }
 
-    /// A root-grant approval calls out the boundary change in warning color.
+    /// A root-grant approval calls out the boundary change in warning color
+    /// and names the resolved directory the grant would actually land on.
+    /// When the request's spelling already IS that directory, no symlink
+    /// caution appears.
     #[test]
     fn approval_lines_flag_a_root_grant() {
         let lines = approval_lines(
@@ -1277,6 +1332,7 @@ mod tests {
             false,
             false,
             Some("build artifacts live there"),
+            Some("/tmp/proj-sibling"),
             None,
             "grants write access",
             r#"{"path":"/tmp/proj-sibling"}"#,
@@ -1291,6 +1347,71 @@ mod tests {
             .collect();
         assert!(text.contains("/tmp/proj-sibling"), "{text}");
         assert!(text.contains("写权限"), "boundary warning shown: {text}");
+        assert!(
+            text.contains("实际授予（解析后）"),
+            "resolved target labelled: {text}"
+        );
+        assert!(
+            !text.contains("符号链接"),
+            "no symlink caution when the spelling matches the target: {text}"
+        );
+    }
+
+    /// A request whose spelling resolves elsewhere (symlink) must say so and
+    /// show the real target — the human judges the resolved directory, not
+    /// the model's innocuous-looking spelling.
+    #[test]
+    fn approval_lines_warn_when_a_root_grant_resolves_elsewhere() {
+        let lines = approval_lines(
+            deep_code_agent::REQUEST_WRITE_ROOT_TOOL,
+            "High",
+            false,
+            false,
+            None,
+            Some("/Users/x/secrets"),
+            None,
+            "grants write access",
+            r#"{"path":"/tmp/workspace/build-cache"}"#,
+            None,
+            &[],
+            80,
+            Lang::Zh,
+        );
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(
+            text.contains("/Users/x/secrets"),
+            "the REAL target is shown: {text}"
+        );
+        assert!(
+            text.contains("符号链接"),
+            "spelling-vs-target mismatch is called out: {text}"
+        );
+
+        // Defensive rendering: a root grant somehow parked without a resolved
+        // target must say the prompt cannot vouch for a directory.
+        let unresolved = approval_lines(
+            deep_code_agent::REQUEST_WRITE_ROOT_TOOL,
+            "High",
+            false,
+            false,
+            None,
+            None,
+            None,
+            "grants write access",
+            r#"{"path":"/tmp/gone"}"#,
+            None,
+            &[],
+            80,
+            Lang::Zh,
+        );
+        let text: String = unresolved
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(text.contains("无法解析"), "{text}");
     }
 
     #[test]
@@ -1305,6 +1426,7 @@ mod tests {
                 "High",
                 true,
                 false,
+                None,
                 None,
                 None,
                 "下载脚本",

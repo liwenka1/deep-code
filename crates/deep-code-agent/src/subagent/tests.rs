@@ -626,6 +626,7 @@ None.
             read_only: false,
             matched_rule: None,
             justification: None,
+            resolved_target: None,
             preview: None,
             safety_notes: Vec::new(),
         };
@@ -657,6 +658,7 @@ None.
             read_only: false,
             matched_rule: None,
             justification: None,
+            resolved_target: None,
             preview: None,
             safety_notes: Vec::new(),
         };
@@ -678,6 +680,7 @@ None.
             read_only: false,
             matched_rule: None,
             justification: Some("y".to_string()),
+            resolved_target: Some("/tmp/x".to_string()),
             preview: None,
             safety_notes: Vec::new(),
         };
