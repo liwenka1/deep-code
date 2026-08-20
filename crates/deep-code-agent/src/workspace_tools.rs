@@ -282,6 +282,11 @@ impl GrepFilesTool {
         let search_path = self.root.resolve_existing(path_arg, Self::NAME)?;
         let mut files_searched = 0usize;
         let mut matches = Vec::new();
+        // Boundary snapshot taken once: `granted_roots()` locks and clones per
+        // call, and this loop visits every file in the tree — per-file calls
+        // would be thousands of lock+clone rounds for a boundary that cannot
+        // change within one tool call.
+        let granted_roots = self.root.granted_roots();
 
         for entry in WalkBuilder::new(&search_path)
             .standard_filters(true)
@@ -296,7 +301,7 @@ impl GrepFilesTool {
             if !path.is_file() {
                 continue;
             }
-            if contains_symlink(path, &self.root.granted_roots()).unwrap_or(true) {
+            if contains_symlink(path, &granted_roots).unwrap_or(true) {
                 continue;
             }
             let Ok(metadata) = fs::metadata(path) else {
