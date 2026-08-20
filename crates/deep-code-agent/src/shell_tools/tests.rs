@@ -616,3 +616,32 @@ fn prune_stale_spill_runs_removes_only_stale_run_dirs() {
     // Missing home: silently nothing.
     prune_stale_spill_runs(&tmp.path().join("absent"), future);
 }
+
+/// Appends move only a FILE's mtime, never the run directory's — so a run
+/// whose dir looks stale but whose newest file is fresher than the cutoff is
+/// a still-writing job and must survive. Pinned by pushing the file mtime
+/// past the cutoff instead of backdating the dir (portable everywhere).
+#[test]
+fn prune_keeps_a_run_whose_files_outdate_its_directory() {
+    let tmp = tempdir().unwrap();
+    let home = spill_home(tmp.path());
+    let run = home.join("run-1755000000000-42-1");
+    std::fs::create_dir_all(&run).unwrap();
+    let log = run.join("job_1.stdout.log");
+    std::fs::write(&log, "streaming").unwrap();
+    let now = std::time::SystemTime::now();
+    std::fs::File::options()
+        .write(true)
+        .open(&log)
+        .unwrap()
+        .set_modified(now + Duration::from_secs(7200))
+        .unwrap();
+
+    // Dir mtime (now) is stale against this cutoff; the file is not.
+    prune_stale_spill_runs(&home, now + Duration::from_secs(3600));
+    assert!(run.is_dir(), "a fresh file must keep its run alive");
+
+    // Past the file's mtime too: the run is genuinely dead.
+    prune_stale_spill_runs(&home, now + Duration::from_secs(3 * 3600));
+    assert!(!run.exists(), "stale dir with stale files is removed");
+}

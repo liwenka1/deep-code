@@ -227,8 +227,10 @@ impl SharedBuffer {
             .omitted_len()
     }
 
-    /// Path and size of the spill file, when one was actually written.
-    pub(super) fn spill_info(&self) -> Option<SpillInfo> {
+    /// Path and size of the spill file, when one was actually written —
+    /// without the reporting side effect, so a probe cannot pin an orphan.
+    #[cfg(test)]
+    fn spill_info(&self) -> Option<SpillInfo> {
         self.0
             .lock()
             .expect("output buffer lock poisoned")
@@ -237,17 +239,40 @@ impl SharedBuffer {
             .and_then(Spill::info)
     }
 
-    /// Close the spill file handle (stream is done). The file itself stays on
-    /// disk — transcript references must outlive the job record.
+    /// Like `spill_info`, and additionally remembers that the path is about
+    /// to leave this process (a note, a details payload): a reported file
+    /// must stay valid, so stream end never removes it. Every rendering that
+    /// names the path goes through here; the side-effect-free getter stays
+    /// for tests.
+    pub(super) fn spill_info_reported(&self) -> Option<SpillInfo> {
+        let mut ring = self.0.lock().expect("output buffer lock poisoned");
+        let spill = ring.spill.as_mut()?;
+        let info = spill.info();
+        if info.is_some() {
+            spill.reported = true;
+        }
+        info
+    }
+
+    /// Stream over: close the spill file handle. The file itself normally
+    /// stays on disk — transcript references must outlive the job record —
+    /// with one exception: a file nothing will ever reference (see
+    /// [`Spill::finish`]) is removed instead of lingering until retention.
     fn finish_spill(&self) {
-        if let Some(spill) = self
-            .0
-            .lock()
-            .expect("output buffer lock poisoned")
-            .spill
-            .as_mut()
-        {
-            spill.file = None;
+        let mut ring = self.0.lock().expect("output buffer lock poisoned");
+        let Some(spill) = ring.spill.as_ref() else {
+            return;
+        };
+        if spill.written == 0 {
+            return;
+        }
+        // "Every rendering shows the whole stream": the ring dropped nothing
+        // and the char count fits the inline window (the threshold constant
+        // doubles as that window, see its doc).
+        let fully_inline =
+            ring.omitted_len() == 0 && ring.text().chars().count() <= SPILL_THRESHOLD_BYTES;
+        if let Some(spill) = ring.spill.as_mut() {
+            spill.finish(fully_inline);
         }
     }
 }
@@ -321,6 +346,10 @@ struct Spill {
     file: Option<std::fs::File>,
     written: u64,
     failed: bool,
+    /// Whether the path was ever handed out (truncation note, job details).
+    /// A reported file must survive stream end — the reader may come back
+    /// for it any time later.
+    reported: bool,
 }
 
 impl Spill {
@@ -330,6 +359,7 @@ impl Spill {
             file: None,
             written: 0,
             failed: false,
+            reported: false,
         }
     }
 
@@ -403,6 +433,20 @@ impl Spill {
             capped: self.written >= SPILL_MAX_BYTES,
         })
     }
+
+    /// Stream over: drop the handle. When the whole stream turned out fully
+    /// visible inline (`fully_inline`) and the path never left the process,
+    /// the file is an orphan no rendering will ever name — bytes crossed the
+    /// threshold but chars did not, multi-byte output does that — so it is
+    /// removed here rather than left as unreferenced disk until retention.
+    fn finish(&mut self, fully_inline: bool) {
+        self.file = None;
+        if fully_inline && !self.reported && !self.failed && self.written > 0 {
+            let _ = std::fs::remove_file(&self.path);
+            // Zero written = no file, for every later `info()`.
+            self.written = 0;
+        }
+    }
 }
 
 /// Kill `child` and, on Unix, its whole process group (children are spawned
@@ -449,7 +493,8 @@ where
             }
         }
         // Stream over: release the spill file handle (data is already
-        // written unbuffered; the file stays on disk for later reads).
+        // written unbuffered). The file stays on disk for later reads —
+        // unless it turned out to be an orphan nothing will ever name.
         buffer.finish_spill();
     })
 }
@@ -575,7 +620,7 @@ fn truncation_note(job_id: &str, job: &JobState, max_chars: usize) -> Option<Str
         if !lost {
             continue;
         }
-        match buffer.spill_info() {
+        match buffer.spill_info_reported() {
             Some(info) => lines.push(format!(
                 "[{label} truncated — complete stream saved: '{}' ({}{}); grep or read that file for the parts not shown]",
                 info.path.display(),
@@ -663,8 +708,8 @@ pub(super) fn job_details(job_id: &str, job: &JobState) -> Value {
         "stderr_len": job.stderr.total_len(),
         "stdout_truncated": job.stdout.omitted_len() > 0,
         "stderr_truncated": job.stderr.omitted_len() > 0,
-        "stdout_spill_path": job.stdout.spill_info().map(|info| info.path.display().to_string()),
-        "stderr_spill_path": job.stderr.spill_info().map(|info| info.path.display().to_string()),
+        "stdout_spill_path": job.stdout.spill_info_reported().map(|info| info.path.display().to_string()),
+        "stderr_spill_path": job.stderr.spill_info_reported().map(|info| info.path.display().to_string()),
     })
 }
 
@@ -766,6 +811,53 @@ mod tests {
         assert!(info.capped);
         spill.offer(0, &VecDeque::new(), b"more");
         assert_eq!(spill.written, SPILL_MAX_BYTES);
+    }
+
+    /// A stream can cross the BYTE threshold while staying under the CHAR
+    /// window (multi-byte output): the file is written defensively, but every
+    /// rendering shows the whole stream, so no note or details entry will
+    /// ever name it. Stream end must remove that orphan instead of leaving
+    /// unreferenced disk for retention to find a week later.
+    #[test]
+    fn unnamed_fully_inline_spill_is_removed_at_stream_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("job_5.stdout.log");
+        let buffer = SharedBuffer::with_spill(path.clone());
+        let text = "好".repeat(8_400); // 25,200 bytes, 8,400 chars
+        buffer.push(text.as_bytes());
+        assert!(path.exists(), "crossed the byte threshold — file written");
+
+        buffer.finish_spill();
+        assert!(!path.exists(), "an unnamed fully-inline spill is an orphan");
+        assert!(
+            buffer.spill_info().is_none(),
+            "no later rendering may name a removed file"
+        );
+    }
+
+    /// The counter-case: once a rendering handed the path out (a tail with a
+    /// small window can do that mid-run), the file must survive stream end —
+    /// the model may come back and grep it any time later.
+    #[test]
+    fn reported_spill_survives_stream_end_even_when_fully_inline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("job_6.stdout.log");
+        let stdout = SharedBuffer::with_spill(path.clone());
+        stdout.push("好".repeat(8_400).as_bytes());
+        let job = plain_job(stdout.clone());
+
+        // A 100-char window loses content → the snapshot names the file.
+        let snapshot = job_text_snapshot("job_6", &job, 100);
+        assert!(
+            snapshot.contains(&path.display().to_string()),
+            "precondition: the path escaped to the model: {snapshot}"
+        );
+
+        stdout.finish_spill();
+        assert!(
+            path.exists(),
+            "a named path must stay valid after the stream"
+        );
     }
 
     fn plain_job(stdout: SharedBuffer) -> JobState {

@@ -250,12 +250,14 @@ fn new_spill_dir(primary_root: &Path) -> PathBuf {
 /// while a fresh one must keep working.
 const SPILL_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Best-effort removal of spill runs whose directory mtime predates `cutoff`.
-/// The mtime moves whenever a stream spills a NEW file into the run, so a
-/// long-lived active session keeps its own run alive. Only `run-*`
-/// directories are touched (symlinked entries are skipped — their file type
-/// reads as symlink, not dir), the spill home itself is never created here,
-/// and every failure is ignored: retention is disk hygiene, not correctness.
+/// Best-effort removal of spill runs whose directory mtime — and every file
+/// inside — predates `cutoff`. Two clocks on purpose: a NEW spill file moves
+/// the directory mtime, but APPENDS to an existing file move only that
+/// file's own, so a week-old run whose job is still streaming survives via
+/// the newest-file check. Only `run-*` directories are touched (symlinked
+/// entries are skipped — their file type reads as symlink, not dir), the
+/// spill home itself is never created here, and every failure is ignored:
+/// retention is disk hygiene, not correctness.
 fn prune_stale_spill_runs(spill_home: &Path, cutoff: std::time::SystemTime) {
     let Ok(entries) = std::fs::read_dir(spill_home) else {
         return;
@@ -269,14 +271,25 @@ fn prune_stale_spill_runs(spill_home: &Path, cutoff: std::time::SystemTime) {
         if !is_run || !is_dir {
             continue;
         }
-        let stale = entry
+        let dir_stale = entry
             .metadata()
             .and_then(|meta| meta.modified())
             .is_ok_and(|mtime| mtime < cutoff);
-        if stale {
+        let files_stale = || newest_file_mtime(&entry.path()).is_none_or(|newest| newest < cutoff);
+        if dir_stale && files_stale() {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// Newest modification time among a run's files; `None` for an unreadable or
+/// empty run (the directory's own mtime already voted stale by then).
+fn newest_file_mtime(run: &Path) -> Option<std::time::SystemTime> {
+    std::fs::read_dir(run)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok()?.modified().ok())
+        .max()
 }
 
 impl ShellTools {
@@ -293,11 +306,13 @@ impl ShellTools {
     /// file tools alike without rebuilding any registry.
     pub(crate) fn with_policy(root: WorkspacePolicy) -> Self {
         // Construction is the retention hook: it runs at every launch (and
-        // sub-agent spawn — one cheap readdir), before this instance's own
-        // run dir can exist, so pruning can never eat the dir it is about
-        // to hand out.
+        // sub-agent spawn), detached — removing a stale spill tree can be
+        // hundreds of MB of I/O, which must not stall the launch. Racing
+        // this instance's own run dir below is harmless: a freshly created
+        // dir can never test stale against a week-old cutoff.
         if let Some(cutoff) = std::time::SystemTime::now().checked_sub(SPILL_RETENTION) {
-            prune_stale_spill_runs(&spill_home(root.root()), cutoff);
+            let home = spill_home(root.root());
+            std::thread::spawn(move || prune_stale_spill_runs(&home, cutoff));
         }
         let spill_dir = new_spill_dir(root.root());
         Self {
