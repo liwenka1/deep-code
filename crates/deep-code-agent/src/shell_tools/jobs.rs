@@ -35,6 +35,25 @@ const JOB_BUFFER_BYTES: usize = 128 * 1024;
 /// holds every byte and the file can start from byte zero.
 const SPILL_THRESHOLD_BYTES: usize = crate::runtime::tool_result::TOOL_OUTPUT_BUDGET;
 
+/// Room left for the framing the renderer adds around the two streams:
+/// `[stderr]`, the trailing `[exit N · Nms]`, the notes. Small and generous —
+/// it only has to keep the sum below the budget, not predict it exactly.
+const SPILL_FRAMING_RESERVE: usize = 256;
+
+/// The largest a stream can be and still be *certainly* redundant with the
+/// inline copy — i.e. safe to delete its spill file at stream end.
+///
+/// It is half the budget, not the whole budget, because stdout and stderr are
+/// rendered into ONE tool result and the runtime bounds their SUM. Judging each
+/// stream against the full budget is not a bound at all: two streams of 7k CJK
+/// characters each cross the byte threshold (so both files get written), each
+/// then judges itself inline (7k <= 12k) and deletes its file — and the runtime
+/// proceeds to elide 6k characters out of the middle of the only copy left,
+/// with nothing on disk and no note. Anything above this size keeps its file,
+/// which is exactly the band where two streams can combine into a loss.
+const SPILL_JOINT_INLINE_CHARS: usize =
+    (crate::runtime::tool_result::TOOL_OUTPUT_BUDGET - SPILL_FRAMING_RESERVE) / 2;
+
 /// Per-stream cap on a spill file. The file keeps the HEAD (where compilers
 /// put the root-cause error) and stops there; the ring independently keeps
 /// the live tail, so both ends survive even a pathological firehose.
@@ -277,13 +296,13 @@ impl SharedBuffer {
             return;
         }
         // "Every rendering shows the whole stream": the ring dropped nothing
-        // and the char count fits what a tool result actually retains. Compared
-        // against the retained budget, not the shell layer's wider window —
-        // otherwise a multi-byte stream (CJK output crosses the byte threshold
-        // long before the char one) is judged redundant and deleted while the
-        // runtime is eliding the middle of the only other copy.
+        // and the char count fits what a tool result actually retains —
+        // alongside a sibling stream of the same size. See
+        // [`SPILL_JOINT_INLINE_CHARS`]: judging one stream against the WHOLE
+        // budget is not a bound, because stdout and stderr are rendered into
+        // one result whose sum is what gets bounded.
         let fully_inline =
-            ring.omitted_len() == 0 && ring.text().chars().count() <= SPILL_THRESHOLD_BYTES;
+            ring.omitted_len() == 0 && ring.text().chars().count() <= SPILL_JOINT_INLINE_CHARS;
         if let Some(spill) = ring.spill.as_mut() {
             spill.finish(fully_inline);
         }
@@ -604,7 +623,9 @@ pub(super) fn shell_text_output(job_id: &str, job: &JobState, max_chars: usize) 
         )),
     }
 
-    if let Some(note) = truncation_note(job_id, job, max_chars) {
+    // Measured on the body as it now stands — both streams and the framing —
+    // because that total is what the runtime will bound.
+    if let Some(note) = truncation_note(job_id, job, max_chars, out.chars().count()) {
         out.push('\n');
         out.push_str(&note);
     }
@@ -630,13 +651,29 @@ pub(super) fn shell_text_output(job_id: &str, job: &JobState, max_chars: usize) 
 /// bounds it. Judging by the window alone made the note unreachable for the
 /// band between the two: the shell layer handed over 20k chars believing them
 /// all visible, and the runtime then elided the middle without a word.
-fn truncation_note(job_id: &str, job: &JobState, max_chars: usize) -> Option<String> {
-    let retained = max_chars.min(crate::runtime::tool_result::TOOL_OUTPUT_BUDGET);
+fn truncation_note(
+    job_id: &str,
+    job: &JobState,
+    max_chars: usize,
+    rendered_chars: usize,
+) -> Option<String> {
+    let budget = crate::runtime::tool_result::TOOL_OUTPUT_BUDGET;
+    let retained = max_chars.min(budget);
+    // The runtime bounds the WHOLE rendered result — both streams plus the
+    // framing between them — so once that total is over budget the middle is
+    // being elided no matter how modest either stream looks alone. Judging the
+    // streams one at a time missed exactly that: `seq 1 1500; seq 1 1500 >&2`
+    // is two 6,393-char streams, neither over the budget, ~12.8k rendered, and
+    // ~4.8k characters silently dropped with no note and no file. Framing was
+    // uncounted even for a single stream, which put the boundary ~17 chars off.
+    let result_elided = rendered_chars > budget;
     let mut lines = Vec::new();
     let mut lost_without_file = false;
     for (label, buffer) in [("stdout", &job.stdout), ("stderr", &job.stderr)] {
         let full = buffer.text();
-        let lost = buffer.omitted_len() > 0 || full.chars().count() > retained;
+        let lost = buffer.omitted_len() > 0
+            || full.chars().count() > retained
+            || (result_elided && !full.is_empty());
         if !lost {
             continue;
         }
@@ -710,7 +747,7 @@ pub(super) fn job_text_snapshot(job_id: &str, job: &JobState, max_chars: usize) 
     if stdout.is_empty() && stderr.is_empty() {
         out.push_str("(no output)\n");
     }
-    if let Some(note) = truncation_note(job_id, job, max_chars) {
+    if let Some(note) = truncation_note(job_id, job, max_chars, out.chars().count()) {
         out.push_str(&note);
         out.push('\n');
     }
@@ -840,17 +877,21 @@ mod tests {
         assert_eq!(spill.written, SPILL_MAX_BYTES);
     }
 
-    /// A stream can cross the BYTE threshold while staying under the CHAR
+    /// A stream can cross the BYTE threshold while staying well under the CHAR
     /// window (multi-byte output): the file is written defensively, but every
     /// rendering shows the whole stream, so no note or details entry will
     /// ever name it. Stream end must remove that orphan instead of leaving
     /// unreferenced disk for retention to find a week later.
+    ///
+    /// "Well under" is [`SPILL_JOINT_INLINE_CHARS`], not the whole budget: a
+    /// stream is only certainly redundant if it still fits beside a sibling of
+    /// its own size. See the sibling test below.
     #[test]
     fn unnamed_fully_inline_spill_is_removed_at_stream_end() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("job_5.stdout.log");
         let buffer = SharedBuffer::with_spill(path.clone());
-        let text = "好".repeat(8_400); // 25,200 bytes, 8,400 chars
+        let text = "好".repeat(5_000); // 15,000 bytes, 5,000 chars
         buffer.push(text.as_bytes());
         assert!(path.exists(), "crossed the byte threshold — file written");
 
@@ -859,6 +900,35 @@ mod tests {
         assert!(
             buffer.spill_info().is_none(),
             "no later rendering may name a removed file"
+        );
+    }
+
+    /// A stream big enough to combine with a sibling into an over-budget result
+    /// KEEPS its file, even though on its own it fits the budget.
+    ///
+    /// This is the deletion half of the two-stream loss. 8,400 CJK characters
+    /// crosses the byte threshold (file written) and is under the 12,000-char
+    /// budget, so the old per-stream test judged it redundant and deleted it —
+    /// while a 4,000-char sibling was enough to push the rendered sum over the
+    /// budget and have the runtime elide the middle of the only copy left.
+    #[test]
+    fn a_stream_that_could_combine_with_a_sibling_keeps_its_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("job_6.stdout.log");
+        let buffer = SharedBuffer::with_spill(path.clone());
+        let text = "好".repeat(8_400); // 25,200 bytes, 8,400 chars
+        buffer.push(text.as_bytes());
+        assert!(path.exists(), "crossed the byte threshold — file written");
+        let chars = buffer.text().chars().count();
+        assert!(
+            chars > SPILL_JOINT_INLINE_CHARS && chars < SPILL_THRESHOLD_BYTES,
+            "precondition: {chars} chars fits the budget alone, not beside a sibling"
+        );
+
+        buffer.finish_spill();
+        assert!(
+            path.exists(),
+            "a stream that a sibling can push over budget must keep its file"
         );
     }
 
@@ -917,24 +987,40 @@ mod tests {
     /// A capped file is not the whole stream, so the note must not call it
     /// one — the model is told to read the file "for the parts not shown",
     /// and past the cap those parts are not there to read.
+    ///
+    /// The job's buffer carries the capped spill, so the rendering really takes
+    /// the capped arm. An earlier version of this test built a standalone
+    /// `Spill` and then rendered a job whose buffer had no spill at all: the
+    /// assertion landed on the `lost_without_file` fallback and passed no
+    /// matter what the capped arm said. Reverting the wording left the whole
+    /// suite green.
     #[test]
     fn capped_spill_note_does_not_claim_the_complete_stream() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("job_9.stdout.log");
-        let mut spill = Spill::new(path.clone());
-        spill.offer(0, &VecDeque::new(), b"head");
-        spill.written = SPILL_MAX_BYTES;
-        let info = spill.info().expect("a written spill reports info");
-        assert!(info.capped, "precondition: the cap was reached");
+        let buffer = SharedBuffer::with_spill(path.clone());
+        buffer.push(&vec![b'z'; SPILL_THRESHOLD_BYTES + 5]);
+        assert!(path.exists(), "precondition: a file was written");
+        // Reach the cap without writing 64 MB.
+        buffer
+            .0
+            .lock()
+            .expect("output buffer lock poisoned")
+            .spill
+            .as_mut()
+            .expect("precondition: the buffer has a spill")
+            .written = SPILL_MAX_BYTES;
 
-        let stdout = SharedBuffer::default();
-        stdout.push(&vec![b'z'; 30_000]);
-        let job = plain_job(stdout);
+        let job = plain_job(buffer);
         let text = shell_text_output("job_9", &job, 20_000);
-        // The uncapped wording must not appear for a capped file. (This job's
-        // buffer has no spill, so it exercises the fallback; the wording check
-        // below is on the capped branch's own format string.)
-        assert!(!text.contains("complete stream saved"), "{text}");
+        assert!(
+            text.contains("the file holds the head only"),
+            "a capped file must be described as a head, not a whole stream: {text}"
+        );
+        assert!(
+            !text.contains("complete stream saved"),
+            "the uncapped wording must not appear for a capped file: {text}"
+        );
     }
 
     /// The counter-case: once a rendering handed the path out (a tail with a
@@ -1005,6 +1091,43 @@ mod tests {
             Some(path.display().to_string().as_str())
         );
         assert!(details["stderr_spill_path"].is_null());
+    }
+
+    /// Two streams that each fit the budget can still overflow it together, and
+    /// that overflow used to be reported by nobody.
+    ///
+    /// `seq 1 1500; seq 1 1500 >&2` is the shape: 6,393 characters per stream,
+    /// neither over the 12,000-char budget, ~12.8k rendered into one result,
+    /// ~4.8k characters elided out of the middle by the runtime — with no note,
+    /// no spill file, and not even the `job action=tail` fallback. Judging the
+    /// streams one at a time cannot see it; the note is keyed to the rendered
+    /// total instead.
+    #[test]
+    fn two_streams_that_each_fit_the_budget_still_report_their_joint_loss() {
+        let stdout = SharedBuffer::default();
+        let stderr = SharedBuffer::default();
+        stdout.push(&vec![b'o'; 6_393]);
+        stderr.push(&vec![b'e'; 6_393]);
+        let mut job = plain_job(stdout);
+        job.stderr = stderr;
+
+        let budget = crate::runtime::tool_result::TOOL_OUTPUT_BUDGET;
+        assert!(
+            job.stdout.text().chars().count() < budget
+                && job.stderr.text().chars().count() < budget,
+            "precondition: neither stream alone exceeds what a result retains"
+        );
+        assert_eq!(job.stdout.omitted_len(), 0, "precondition: ring intact");
+
+        let text = shell_text_output("job_7", &job, 20_000);
+        assert!(
+            text.chars().count() > budget,
+            "precondition: together they overflow the result budget"
+        );
+        assert!(
+            text.contains("job action=tail job_id=job_7"),
+            "a joint overflow with no spill file must still point somewhere: {text}"
+        );
     }
 
     #[test]
