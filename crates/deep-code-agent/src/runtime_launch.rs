@@ -158,9 +158,15 @@ pub fn launch_runtime(
         .retain(|extra| *extra != primary_raw && Some(extra) != primary_canonical.as_ref());
 
     if let Some(record) = resume {
-        // The record's own workspace stays authoritative on resume (as
-        // before); only the extra grants from this command line are merged in.
-        return launch_resumed(config, record, roots.extras, &parent_cancel);
+        // The workspace the CALLER launched in wins over the one the record
+        // claims, and the record's grants are re-vetted. Both because the
+        // record is a model-writable file: it lives at
+        // `<workspace>/.deep-code/sessions/<id>.json`, inside the primary
+        // writable root, and `-c` selects the newest by an `updated_at_ms`
+        // read out of that same file. Taking `record.workspace` on trust let a
+        // written record move the primary root anywhere — `/` included — and
+        // took the session store along with it.
+        return launch_resumed(config, record, primary_raw, roots.extras, &parent_cancel);
     }
 
     let prompt = runtime_system_prompt(&roots);
@@ -290,10 +296,40 @@ fn prepare_persisted_session(
 fn launch_resumed(
     config: &AgentConfig,
     mut record: SessionRecord,
+    caller_workspace: PathBuf,
     cli_extras: Vec<PathBuf>,
     parent_cancel: &CancellationToken,
 ) -> LaunchedRuntime {
     let mut warnings = Vec::new();
+    // The primary root is where the USER launched, not where the record says
+    // the session lived. The record is an ordinary write target for the model
+    // (it sits inside the primary root) and `-c` ranks candidates by a
+    // timestamp field read out of the file itself, so `record.workspace` is
+    // model-controlled input — taking it on trust moved both the write
+    // boundary and the session store wherever it pointed.
+    //
+    // It also happens to be the right answer for the honest case: a workspace
+    // that was moved or copied resumes against where it is now instead of the
+    // path it was recorded at.
+    // Compared canonically so a benign respelling (`/tmp` vs `/private/tmp` on
+    // macOS, a trailing slash) is not reported as a redirect on every resume.
+    // Anything that does not resolve to the same directory — including a
+    // recorded path that no longer resolves at all — yields to the caller's.
+    let same_workspace = match (
+        record.workspace.canonicalize().ok(),
+        caller_workspace.canonicalize().ok(),
+    ) {
+        (Some(recorded), Some(caller)) => recorded == caller,
+        _ => false,
+    };
+    if !same_workspace {
+        warnings.push(format!(
+            "resumed session was recorded at {}; using the current workspace {} instead",
+            record.workspace.display(),
+            caller_workspace.display()
+        ));
+        record.workspace = caller_workspace;
+    }
     // A recorded grant whose directory no longer resolves is dropped HERE,
     // with a warning, not handed to WorkspacePolicy. The policy constructor
     // is deliberately fail-closed, and `build_tool_registry` degrades a
@@ -312,6 +348,18 @@ fn launch_resumed(
             ));
             return false;
         };
+        // Re-vetted against the same floors a model-requested grant clears,
+        // for the same reason: a record is a file the model can write, so a
+        // root arriving this way has nobody vouching for it either. Without
+        // this, writing `extra_roots: ["/"]` (or `~/.ssh`) into a record and
+        // letting `-c` pick it up skipped every check the approval flow adds.
+        if let Some(reason) = crate::workspace_policy::refuse_as_unattended_root(&canonical) {
+            warnings.push(format!(
+                "dropping recorded grant {}: {reason}",
+                canonical.display()
+            ));
+            return false;
+        }
         // A grant equal to the workspace is covered by the primary root;
         // dropped silently (nothing is lost) so the banner and summary never
         // list the workspace as its own "additional" root.
@@ -657,6 +705,99 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("tools disabled")),
             "tools must survive a stale grant: {:?}",
+            launched.warnings
+        );
+    }
+
+    /// A session record does not get to say which workspace it belongs to.
+    ///
+    /// The record is an ordinary `write_file` target for the model — it lives
+    /// at `<workspace>/.deep-code/sessions/<id>.json`, inside the primary
+    /// writable root — and `-c` ranks candidates by an `updated_at_ms` read out
+    /// of the file itself. Trusting `record.workspace` therefore let a written
+    /// record move the primary write root (to `/`, say) and take the session
+    /// store with it, without any prompt: not a defeated approval, a skipped
+    /// one.
+    #[test]
+    fn resume_uses_the_callers_workspace_not_the_records_claim() {
+        let caller = tempfile::TempDir::new().unwrap();
+        let caller_ws = caller.path().canonicalize().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let claimed = elsewhere.path().canonicalize().unwrap();
+
+        let record = SessionRecord::new(claimed.clone(), "system");
+        let id = record.id.clone();
+        let launched = launch_runtime(&AgentConfig::builtin(), caller_ws.clone(), Some(record));
+
+        assert!(
+            launched
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("recorded at")),
+            "the redirect must be surfaced, not applied silently: {:?}",
+            launched.warnings
+        );
+        assert!(
+            JsonSessionStore::for_workspace(&caller_ws)
+                .unwrap()
+                .load(&id)
+                .is_ok(),
+            "the resumed session belongs to the workspace the user launched in"
+        );
+        assert!(
+            JsonSessionStore::for_workspace(&claimed)
+                .unwrap()
+                .load(&id)
+                .is_err(),
+            "the record's claim must not redirect the session store"
+        );
+    }
+
+    /// A recorded grant is re-vetted against the very floors a model-requested
+    /// grant has to clear, because a record is a file the model can write.
+    ///
+    /// Before this, every floor the approval flow added — home, filesystem
+    /// root, credential overlap, display-equals-grant — was reachable around by
+    /// writing `extra_roots` into a record and letting `-c` pick it up. Those
+    /// checks all live in `resolve_grant_target`, which the resume path never
+    /// called.
+    #[test]
+    fn resume_refuses_a_recorded_grant_a_request_could_never_have_won() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().canonicalize().unwrap();
+        let Some(home) = crate::paths::home_dir().and_then(|home| home.canonicalize().ok()) else {
+            eprintln!("no resolvable home dir on this host; skipping");
+            return;
+        };
+        if home.starts_with(&ws) || ws.starts_with(&home) {
+            eprintln!("tempdir overlaps home on this host; skipping");
+            return;
+        }
+
+        let record = SessionRecord::new(ws.clone(), "system")
+            .with_extra_roots(vec![home.clone(), PathBuf::from("/")]);
+        let launched = launch_runtime(&AgentConfig::builtin(), ws.clone(), Some(record));
+
+        assert!(
+            launched.extra_roots.is_empty(),
+            "neither the home directory nor the filesystem root may be restored as a \
+             write root: {:?}",
+            launched.extra_roots
+        );
+        assert!(
+            launched
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("home directory")),
+            "the refusal must be surfaced: {:?}",
+            launched.warnings
+        );
+        assert!(
+            launched
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("filesystem root")),
+            "the refusal must be surfaced: {:?}",
             launched.warnings
         );
     }

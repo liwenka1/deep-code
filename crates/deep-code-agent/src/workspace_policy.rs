@@ -214,53 +214,17 @@ impl WorkspacePolicy {
                 ),
             ));
         }
-        if !self.is_granted(&canonical) {
-            if canonical.parent().is_none() {
-                return Err(invalid(
-                    TOOL,
-                    "refusing to grant the filesystem root; request the narrowest directory \
-                     that unblocks the task",
-                ));
-            }
-            if let Some(home) = crate::paths::home_dir().and_then(|home| home.canonicalize().ok())
-                && home.starts_with(&canonical)
-            {
-                return Err(invalid(
-                    TOOL,
-                    format!(
-                        "refusing to grant '{}': it would make the entire home directory \
-                         writable; request the narrowest directory that unblocks the task",
-                        canonical.display()
-                    ),
-                ));
-            }
-            // Credential stores and deep-code's own config directory. The OS
-            // sandbox already denies writes to exactly these under every
-            // policy, precisely so that a writable root cannot reach them —
-            // but `read_file`/`write_file` run in-process and never meet the
-            // sandbox, so without this floor an approved grant would hand
-            // over what the kernel fence refuses. `~/.deep-code` is the worst
-            // of them: it holds the plaintext API key, and `auto_allow` is
-            // honoured only from that file, so a write there outlives the
-            // session the approval prompt scopes itself to.
-            //
-            // Overlap in EITHER direction is refused: the target may not be
-            // inside a secret store, nor an ancestor that would cover one.
-            // Deliberately narrower than `--add-dir`, which stays the human's
-            // own call — here the model chooses the target and a plausible
-            // spelling is all it takes.
-            if let Some(secret) = sensitive_overlap(&canonical, &crate::paths::sensitive_paths()) {
-                return Err(invalid(
-                    TOOL,
-                    format!(
-                        "refusing to grant '{}': it overlaps the credential store '{}', \
-                         which is never writable through a request; request the narrowest \
-                         directory that unblocks the task",
-                        canonical.display(),
-                        secret.display()
-                    ),
-                ));
-            }
+        if !self.is_granted(&canonical)
+            && let Some(reason) = refuse_as_unattended_root(&canonical)
+        {
+            return Err(invalid(
+                TOOL,
+                format!(
+                    "refusing to grant '{}': {reason}; request the narrowest directory that \
+                     unblocks the task",
+                    canonical.display()
+                ),
+            ));
         }
         Ok(canonical)
     }
@@ -509,6 +473,55 @@ fn sensitive_overlap<'a>(canonical: &Path, secrets: &'a [PathBuf]) -> Option<&'a
         .iter()
         .find(|secret| canonical.starts_with(secret) || secret.starts_with(canonical))
         .map(PathBuf::as_path)
+}
+
+/// Why this canonical directory may not become a writable root through any
+/// channel the human did not type — or `None` when it may.
+///
+/// Two channels are subject to it, and both for the same reason: nobody is
+/// vouching for the path at the moment it takes effect.
+///
+/// 1. `request_write_root` — the model chooses the target, so a plausible
+///    spelling is all it takes. Refused before anyone is prompted.
+/// 2. A grant restored from a session record on resume. The record lives at
+///    `<workspace>/.deep-code/sessions/<id>.json`, **inside the primary
+///    writable root**, so it is an ordinary `write_file` target for the model;
+///    and `-c` picks the newest record by an `updated_at_ms` read straight out
+///    of that file. Without this floor every check above was bypassable by
+///    writing a record with `extra_roots: ["/"]` and a large timestamp — the
+///    approval prompt was not defeated, it was skipped.
+///
+/// `--add-dir` is deliberately NOT subject to it: that path is the human's own
+/// command line, exercised knowingly, and refusing `--add-dir ~` would break a
+/// legitimate (if unwise) choice. The distinction is authorship, not danger.
+pub(crate) fn refuse_as_unattended_root(canonical: &Path) -> Option<String> {
+    if canonical.parent().is_none() {
+        return Some("it is the filesystem root".to_string());
+    }
+    if let Some(home) = crate::paths::home_dir().and_then(|home| home.canonicalize().ok())
+        && home.starts_with(canonical)
+    {
+        return Some("it would make the entire home directory writable".to_string());
+    }
+    // Credential stores and deep-code's own config directory. The OS sandbox
+    // already denies writes to exactly these under every policy, precisely so
+    // that a writable root cannot reach them — but `read_file`/`write_file` run
+    // in-process and never meet the sandbox, so without this floor a grant
+    // would hand over what the kernel fence refuses. `~/.deep-code` is the
+    // worst of them: it holds the plaintext API key, and `auto_allow` is
+    // honoured only from that file, so a write there outlives the session any
+    // approval prompt scopes itself to.
+    //
+    // Overlap in EITHER direction is refused: the target may not be inside a
+    // secret store, nor an ancestor that would cover one.
+    if let Some(secret) = sensitive_overlap(canonical, &crate::paths::sensitive_paths()) {
+        return Some(format!(
+            "it overlaps the credential store '{}', which is never writable through an \
+             unattended grant",
+            secret.display()
+        ));
+    }
+    None
 }
 
 pub(crate) fn invalid(name: impl Into<String>, message: impl Into<String>) -> ToolError {
