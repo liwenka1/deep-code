@@ -213,6 +213,11 @@ pub struct ShellTools {
     spill_dir: PathBuf,
 }
 
+/// The workspace's spill home: `<primary>/.deep-code/spill`.
+fn spill_home(primary_root: &Path) -> PathBuf {
+    primary_root.join(".deep-code").join("spill")
+}
+
 /// Per-instance spill directory under the primary root's `.deep-code`.
 ///
 /// Inside the workspace on purpose: that keeps every read path open with zero
@@ -229,11 +234,49 @@ fn new_spill_dir(primary_root: &Path) -> PathBuf {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis());
-    primary_root.join(".deep-code").join("spill").join(format!(
+    spill_home(primary_root).join(format!(
         "run-{millis}-{}-{}",
         std::process::id(),
         LAUNCH_SEQ.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+/// How long a spill run outlives its session. Spill files must survive the
+/// job record and the process — a transcript names their paths and a resumed
+/// session may still mine last week's build log — but not forever: a single
+/// overflowing job can leave up to 128 MB behind (64 MB per stream), and
+/// nothing else ever deletes it. Checkpoints prune by count; spill prunes by
+/// age, because a reference from an old transcript loses value with time
+/// while a fresh one must keep working.
+const SPILL_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Best-effort removal of spill runs whose directory mtime predates `cutoff`.
+/// The mtime moves whenever a stream spills a NEW file into the run, so a
+/// long-lived active session keeps its own run alive. Only `run-*`
+/// directories are touched (symlinked entries are skipped — their file type
+/// reads as symlink, not dir), the spill home itself is never created here,
+/// and every failure is ignored: retention is disk hygiene, not correctness.
+fn prune_stale_spill_runs(spill_home: &Path, cutoff: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(spill_home) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_run = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("run-"));
+        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if !is_run || !is_dir {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|mtime| mtime < cutoff);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 impl ShellTools {
@@ -249,6 +292,13 @@ impl ShellTools {
     /// so a mid-session `request_write_root` grant reaches shell commands and
     /// file tools alike without rebuilding any registry.
     pub(crate) fn with_policy(root: WorkspacePolicy) -> Self {
+        // Construction is the retention hook: it runs at every launch (and
+        // sub-agent spawn — one cheap readdir), before this instance's own
+        // run dir can exist, so pruning can never eat the dir it is about
+        // to hand out.
+        if let Some(cutoff) = std::time::SystemTime::now().checked_sub(SPILL_RETENTION) {
+            prune_stale_spill_runs(&spill_home(root.root()), cutoff);
+        }
         let spill_dir = new_spill_dir(root.root());
         Self {
             root,

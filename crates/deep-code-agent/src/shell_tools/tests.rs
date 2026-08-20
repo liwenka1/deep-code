@@ -583,3 +583,36 @@ fn describe_appends_gap_caveats_then_design_notes() {
     );
     assert_eq!(none, format!("{SHELL_DESC_UNCONFINED}{SPILL_DESC}"));
 }
+
+/// Retention contract for spill runs: stale `run-*` directories are removed,
+/// fresh ones and everything that is not a spill run survive, and a missing
+/// spill home is a silent no-op. Cutoffs are passed explicitly so the test
+/// needs no mtime forgery: "everything is stale" (future cutoff) and
+/// "nothing is stale" (epoch cutoff) pin both sides.
+#[test]
+fn prune_stale_spill_runs_removes_only_stale_run_dirs() {
+    let tmp = tempdir().unwrap();
+    let home = spill_home(tmp.path());
+    let run = home.join("run-1755000000000-42-0");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(run.join("job_1.stdout.log"), "log").unwrap();
+    let unrelated_dir = home.join("keep-me");
+    std::fs::create_dir_all(&unrelated_dir).unwrap();
+    let unrelated_file = home.join("run-shaped-file");
+    std::fs::write(&unrelated_file, "not a dir").unwrap();
+
+    // Epoch cutoff: nothing can predate it — everything stays.
+    prune_stale_spill_runs(&home, std::time::UNIX_EPOCH);
+    assert!(run.is_dir(), "fresh runs survive a harmless cutoff");
+
+    // Future cutoff: every run is stale — only run dirs go.
+    let future = std::time::SystemTime::now() + Duration::from_secs(3600);
+    prune_stale_spill_runs(&home, future);
+    assert!(!run.exists(), "stale run dirs are removed");
+    assert!(unrelated_dir.is_dir(), "non-run dirs are never touched");
+    assert!(unrelated_file.is_file(), "files are never touched");
+    assert!(home.is_dir(), "the spill home itself stays");
+
+    // Missing home: silently nothing.
+    prune_stale_spill_runs(&tmp.path().join("absent"), future);
+}
