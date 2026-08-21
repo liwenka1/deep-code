@@ -642,6 +642,108 @@ fn sanitize_panel_text(text: &str, max_cols: usize) -> String {
     crate::history::truncate_display_width(neutralize_control_chars(text).trim(), max_cols)
 }
 
+/// The decision-critical head of a `request_write_root` panel: the boundary
+/// caution, the directory the grant would ACTUALLY land on, a symlink warning
+/// when the spelling resolves elsewhere, and — last, and labelled as such —
+/// the model's own spelling.
+///
+/// Split out so the panel can render it as a PINNED block, outside the
+/// scrollable region. Scrolling used to carry it away: `End` (bound for
+/// reading a long justification) clamps to the bottom of the body, which put
+/// the resolved target above the viewport with no "more above" marker and the
+/// panel still armed — the same "approve a directory you were never shown"
+/// the content-sized panel was meant to end, reached by a keystroke instead of
+/// a small terminal.
+///
+/// One source of truth: `approval_lines` extends with exactly this, so the
+/// count the panel pins cannot drift from what it draws.
+fn root_grant_lines(
+    resolved_target: Option<&str>,
+    action: &str,
+    arguments_json: &str,
+    width: usize,
+    lang: Lang,
+) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = Vec::new();
+    let caution = Style::default().fg(Color::Yellow);
+    lines.extend(wrap_prefixed(
+        "  ",
+        tr(lang, TextId::ApprovalRootGrant),
+        width,
+        caution,
+        caution,
+    ));
+    match resolved_target {
+        Some(target) => {
+            let target_style = Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD);
+            // Sanitized like every panel line. The runtime already
+            // refuses targets with control characters in the name, so
+            // this is the defense-in-depth layer, not the only one.
+            let shown = sanitize_panel_text(target, 240);
+            lines.extend(wrap_prefixed(
+                "  ",
+                &tr_with(lang, TextId::ApprovalRootGrantTarget, &[("path", &shown)]),
+                width,
+                target_style,
+                target_style,
+            ));
+            // The request resolves somewhere its spelling doesn't say
+            // (symlink in it): call that out, or an innocuous-looking
+            // spelling could pass for the real target. Compared by path
+            // components, so a benign respelling — trailing slash, `.`
+            // segments — is not accused of resolving elsewhere.
+            let requested = serde_json::from_str::<serde_json::Value>(arguments_json)
+                .ok()
+                .and_then(|arguments| {
+                    arguments
+                        .get("path")
+                        .and_then(|value| value.as_str().map(|path| path.trim().to_string()))
+                });
+            let resolves_elsewhere = requested.as_deref().is_none_or(|raw| {
+                std::path::Path::new(raw)
+                    .components()
+                    .ne(std::path::Path::new(target).components())
+            });
+            if resolves_elsewhere {
+                lines.extend(wrap_prefixed(
+                    "  ",
+                    tr(lang, TextId::ApprovalRootGrantSymlink),
+                    width,
+                    caution,
+                    caution,
+                ));
+            }
+        }
+        // Defensive: with prompt-time triage a root grant is only parked
+        // WITH a resolved target; still, never render a boundary prompt
+        // that silently lacks the one line that matters.
+        None => lines.extend(wrap_prefixed(
+            "  ",
+            tr(lang, TextId::ApprovalRootGrantUnresolved),
+            width,
+            caution,
+            caution,
+        )),
+    }
+    // The model's own spelling comes last and says so: it is what was
+    // asked for, not what approving would grant.
+    lines.extend(wrap_prefixed(
+        "  ",
+        &tr_with(
+            lang,
+            TextId::ApprovalRootGrantRequested,
+            &[("path", action)],
+        ),
+        width,
+        dim,
+        dim,
+    ));
+    lines
+}
+
 /// Minimal, borderless approval block matching the welcome/picker style: a
 /// risk-coloured `●` + tool, the action it will take (prominent), an optional
 /// dim description, and only meaningful metadata (sandbox / matched rule).
@@ -714,80 +816,12 @@ fn approval_lines(
     // /tmp/safe` paint a counterfeit target above the real one. Putting the
     // resolved directory first and labelling the spelling removes both.
     if is_root_grant {
-        let caution = Style::default().fg(Color::Yellow);
-        lines.extend(wrap_prefixed(
-            "  ",
-            tr(lang, TextId::ApprovalRootGrant),
+        lines.extend(root_grant_lines(
+            resolved_target,
+            &action,
+            arguments_json,
             width,
-            caution,
-            caution,
-        ));
-        match resolved_target {
-            Some(target) => {
-                let target_style = Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD);
-                // Sanitized like every panel line. The runtime already
-                // refuses targets with control characters in the name, so
-                // this is the defense-in-depth layer, not the only one.
-                let shown = sanitize_panel_text(target, 240);
-                lines.extend(wrap_prefixed(
-                    "  ",
-                    &tr_with(lang, TextId::ApprovalRootGrantTarget, &[("path", &shown)]),
-                    width,
-                    target_style,
-                    target_style,
-                ));
-                // The request resolves somewhere its spelling doesn't say
-                // (symlink in it): call that out, or an innocuous-looking
-                // spelling could pass for the real target. Compared by path
-                // components, so a benign respelling — trailing slash, `.`
-                // segments — is not accused of resolving elsewhere.
-                let requested = serde_json::from_str::<serde_json::Value>(arguments_json)
-                    .ok()
-                    .and_then(|arguments| {
-                        arguments
-                            .get("path")
-                            .and_then(|value| value.as_str().map(|path| path.trim().to_string()))
-                    });
-                let resolves_elsewhere = requested.as_deref().is_none_or(|raw| {
-                    std::path::Path::new(raw)
-                        .components()
-                        .ne(std::path::Path::new(target).components())
-                });
-                if resolves_elsewhere {
-                    lines.extend(wrap_prefixed(
-                        "  ",
-                        tr(lang, TextId::ApprovalRootGrantSymlink),
-                        width,
-                        caution,
-                        caution,
-                    ));
-                }
-            }
-            // Defensive: with prompt-time triage a root grant is only parked
-            // WITH a resolved target; still, never render a boundary prompt
-            // that silently lacks the one line that matters.
-            None => lines.extend(wrap_prefixed(
-                "  ",
-                tr(lang, TextId::ApprovalRootGrantUnresolved),
-                width,
-                caution,
-                caution,
-            )),
-        }
-        // The model's own spelling comes last and says so: it is what was
-        // asked for, not what approving would grant.
-        lines.extend(wrap_prefixed(
-            "  ",
-            &tr_with(
-                lang,
-                TextId::ApprovalRootGrantRequested,
-                &[("path", &action)],
-            ),
-            width,
-            dim,
-            dim,
+            lang,
         ));
     }
 
@@ -1041,7 +1075,49 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &mut App, area: ratatui::la
         .split(area);
 
     let width = usize::from(chunks[0].width.saturating_sub(2)).max(8);
-    let body = approval_body(app, width);
+    let mut body = approval_body(app, width);
+
+    // A root grant's head does not scroll. It is the same lines `approval_body`
+    // already produced (drained off the front, so the two cannot drift), lifted
+    // out of the scrollable region and drawn above it: the resolved directory
+    // must be on screen at the moment the decision keys are live, and `End` —
+    // the natural keystroke for reading a long justification — otherwise
+    // clamped the body to its bottom and carried that line above the viewport,
+    // armed and with no "more above" marker. Same "approve a directory you were
+    // never shown" the content-sized panel was meant to end, reached by a
+    // keystroke instead of a short terminal.
+    let pinned_rows = if app.pending_is_root_grant() {
+        app.pending_approval
+            .as_ref()
+            .map(|request| {
+                root_grant_lines(
+                    request.resolved_target.as_deref(),
+                    &extract_action(&request.tool_name, &request.arguments.to_string()),
+                    &request.arguments.to_string(),
+                    width,
+                    app.lang,
+                )
+                .len()
+            })
+            .unwrap_or(0)
+            .min(body.len())
+    } else {
+        0
+    };
+    let pinned: Vec<Line<'static>> = body.drain(..pinned_rows).collect();
+    let (pinned_area, chunk_body) = if pinned.is_empty() {
+        (None, chunks[0])
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(u16::try_from(pinned.len()).unwrap_or(u16::MAX)),
+                Constraint::Min(0),
+            ])
+            .split(chunks[0]);
+        (Some(rows[0]), rows[1])
+    };
+    let chunks = [chunk_body, chunks[1]];
     let body_len = body.len();
     // A body taller than its area gives up its last row to an overflow
     // indicator. Without one, a panel that ends mid-content looks like the
@@ -1068,6 +1144,12 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &mut App, area: ratatui::la
     let max_scroll = body_len.saturating_sub(viewport);
     let scroll = app.approval_scroll_offset.min(max_scroll);
     app.approval_scroll_offset = scroll;
+    if let Some(pinned_area) = pinned_area {
+        frame.render_widget(
+            Paragraph::new(pinned).block(Block::default().padding(Padding::new(1, 0, 0, 0))),
+            pinned_area,
+        );
+    }
     let body_paragraph = Paragraph::new(body)
         .block(Block::default().padding(Padding::new(1, 0, 0, 0)))
         .scroll((scroll as u16, 0));
@@ -1394,7 +1476,12 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) 
             tr(app.lang, TextId::ErrorPrefix),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::raw(error.clone()));
+        // `RuntimeEvent::Error` carries tool failures, which quote the paths
+        // and commands the model chose — and this row is drawn in the SAME
+        // frame as the approval panel, outliving the turn that produced it.
+        // An escape here reaches the terminal exactly like one in the
+        // transcript did, so it gets the same treatment.
+        spans.push(Span::raw(neutralize_control_chars(error)));
     } else if let Some(activity) = app.streaming_activity() {
         // While streaming (incl. a long time-to-first-token wait) show an
         // animated indicator so the screen never looks frozen.
@@ -2136,6 +2223,90 @@ mod tests {
             "at heights {blind:?} the user can press Deny/Approve without ever \
              being shown the directory being granted"
         );
+    }
+
+    /// The status row is drawn in the SAME frame as the approval panel and
+    /// outlives the turn that produced it, and `RuntimeEvent::Error` quotes
+    /// the paths and commands the model chose — so an escape there reaches the
+    /// terminal exactly like one in the transcript did.
+    #[test]
+    fn a_recorded_error_cannot_carry_an_escape_into_the_status_row() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new();
+        app.lang = Lang::En;
+        app.record_error("write_file failed: \u{1b}[8m/tmp/\u{1b}[12;3Hx".to_string());
+        app.pending_approval = Some(root_grant_request("/tmp/x", "/home/u/.ssh"));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        for row in 0..buffer.area.height {
+            for col in 0..buffer.area.width {
+                assert!(
+                    !buffer[(col, row)].symbol().chars().any(char::is_control),
+                    "control char reached cell ({col},{row}) via the status row"
+                );
+            }
+        }
+    }
+
+    /// Scrolling must not be able to carry the resolved target off screen
+    /// while the decision keys are live.
+    ///
+    /// `End` is bound for reading a long justification or diff preview, and it
+    /// clamps the body to its bottom — which used to put the resolved
+    /// directory above the viewport, with the panel still armed and no "more
+    /// above" marker anywhere. That is the same "approve a directory you were
+    /// never shown" a content-sized panel was meant to end, reached with a
+    /// keystroke instead of a short terminal. The root-grant head is pinned
+    /// outside the scrollable region, so no scroll position can lose it.
+    #[test]
+    fn scrolling_cannot_carry_the_resolved_target_off_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let target = "/home/u/.ssh";
+        let mut app = App::new();
+        app.lang = Lang::En;
+        let mut request = root_grant_request("/tmp/x", target);
+        // Body far taller than any viewport, so scrolling really has somewhere
+        // to go.
+        request.justification = Some("justification ".repeat(400));
+        request.preview = Some("preview line\n".repeat(40));
+        app.pending_approval = Some(request);
+
+        let screen = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+            terminal.draw(|frame| render(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height)
+                .flat_map(|row| (0..buffer.area.width).map(move |col| (col, row)))
+                .map(|(col, row)| buffer[(col, row)].symbol().to_string())
+                .collect::<String>()
+        };
+
+        assert!(
+            screen(&mut app).contains(target),
+            "precondition: visible at rest"
+        );
+
+        for (label, scroll) in [
+            ("End", App::scroll_approval_to_bottom as fn(&mut App)),
+            ("PageDown", App::scroll_approval_down as fn(&mut App)),
+        ] {
+            app.approval_scroll_offset = 0;
+            for _ in 0..40 {
+                scroll(&mut app);
+            }
+            let after = screen(&mut app);
+            assert!(
+                after.contains(target),
+                "{label} scrolled the resolved target out of view while armed={}",
+                app.approval_armed
+            );
+        }
     }
 
     /// Nothing painted must mean nothing decidable. `approval_armed` used to
