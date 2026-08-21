@@ -108,6 +108,14 @@ pub struct SessionRecord {
     /// files that predate the field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_roots: Vec<PathBuf>,
+    /// Authorship tag over [`Self::extra_roots`], stamped on every save (see
+    /// [`crate::session_integrity`]). The record is a file the model can write
+    /// and on resume its grants become the write boundary, so the grants must
+    /// prove they came from this host rather than merely appearing in the
+    /// file. A list that does not verify is dropped on resume. Absent — and
+    /// unnecessary — when nothing is granted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_roots_mac: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     /// Domain-level conversation entries (schema v2). Wire messages are
@@ -152,6 +160,7 @@ impl SessionRecord {
             id: new_session_id(),
             workspace,
             extra_roots: Vec::new(),
+            extra_roots_mac: None,
             created_at_ms: now,
             updated_at_ms: now,
             entries,
@@ -243,7 +252,18 @@ pub enum SessionStoreError {
 /// Serialize a record to the on-disk JSON form. Shared by the default
 /// [`SessionStore::save`] and the persistence actor, which serializes under the
 /// record lock and writes with it released — avoiding a full-record clone.
-pub(crate) fn serialize_record(record: &SessionRecord) -> Result<String, SessionStoreError> {
+/// Seal the record's grant list, then serialize.
+///
+/// Sealing belongs to saving, which is why this (and [`SessionStore::save`])
+/// take `&mut`: the tag has to describe the grants as they are being written,
+/// and every persistence path funnels through here, so there is no way to
+/// write a record whose grants are unsigned or stale.
+pub(crate) fn serialize_record(record: &mut SessionRecord) -> Result<String, SessionStoreError> {
+    record.extra_roots_mac = crate::session_integrity::sign_roots(
+        record.id.as_str(),
+        &record.workspace,
+        &record.extra_roots,
+    );
     serde_json::to_string_pretty(record).map_err(|error| SessionStoreError::Serialization {
         message: error.to_string(),
     })
@@ -255,8 +275,8 @@ pub trait SessionStore: Send + Sync {
     /// [`save_serialized`](SessionStore::save_serialized); the persistence actor
     /// calls that directly so it can serialize under the record mutex and write
     /// with the lock released, never deep-cloning the record just to snapshot it.
-    fn save(&self, record: &SessionRecord) -> Result<(), SessionStoreError> {
-        self.save_serialized(&record.id, &serialize_record(record)?)
+    fn save(&self, record: &mut SessionRecord) -> Result<(), SessionStoreError> {
+        self.save_serialized(&record.id.clone(), &serialize_record(record)?)
     }
     /// Write an already-serialized record body under `id`.
     fn save_serialized(&self, id: &SessionId, json: &str) -> Result<(), SessionStoreError>;

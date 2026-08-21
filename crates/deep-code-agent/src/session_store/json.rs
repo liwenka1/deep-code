@@ -265,7 +265,7 @@ mod tests {
         ));
         record.touch();
 
-        store.save(&record).unwrap();
+        store.save(&mut record).unwrap();
         let loaded = store.load(&record.id).unwrap();
 
         assert_eq!(loaded.id, record.id);
@@ -284,9 +284,9 @@ mod tests {
 
         // Grants survive a save/load cycle — this is what lets `-c` restore
         // the same write boundary the session was working under.
-        let record = SessionRecord::new(dir.path().to_path_buf(), "system")
+        let mut record = SessionRecord::new(dir.path().to_path_buf(), "system")
             .with_extra_roots(vec![extra.path().to_path_buf()]);
-        store.save(&record).unwrap();
+        store.save(&mut record).unwrap();
         let loaded = store.load(&record.id).unwrap();
         assert_eq!(loaded.extra_roots, vec![extra.path().to_path_buf()]);
 
@@ -338,13 +338,13 @@ mod tests {
             .join("session_1_0.json");
         std::fs::write(&path, serde_json::to_string_pretty(&v1_json).unwrap()).unwrap();
 
-        let loaded = store.load(&SessionId("session_1_0".to_string())).unwrap();
+        let mut loaded = store.load(&SessionId("session_1_0".to_string())).unwrap();
         assert_eq!(loaded.schema_version, super::SESSION_SCHEMA_VERSION);
         assert_eq!(loaded.entries.len(), 3);
         assert_eq!(loaded.preview(), "hi");
 
         // Saving writes the file back as v2; reloading stays stable.
-        store.save(&loaded).unwrap();
+        store.save(&mut loaded).unwrap();
         let reloaded = store.load(&loaded.id).unwrap();
         assert_eq!(reloaded.entries, loaded.entries);
     }
@@ -373,11 +373,11 @@ mod tests {
 
         let mut older = SessionRecord::new(dir.path().to_path_buf(), "system");
         older.updated_at_ms = 1;
-        store.save(&older).unwrap();
+        store.save(&mut older).unwrap();
 
         let mut newer = SessionRecord::new(dir.path().to_path_buf(), "system");
         newer.updated_at_ms = 2;
-        store.save(&newer).unwrap();
+        store.save(&mut newer).unwrap();
 
         let listed = store.list().unwrap();
         assert_eq!(listed.len(), 2);
@@ -407,9 +407,9 @@ mod tests {
     fn json_store_delete_removes_file() {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
-        let record = SessionRecord::new(dir.path().to_path_buf(), "system");
+        let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
         let id = record.id.clone();
-        store.save(&record).unwrap();
+        store.save(&mut record).unwrap();
         store.delete(&id).unwrap();
         assert!(matches!(
             store.load(&id),
@@ -421,8 +421,8 @@ mod tests {
     fn json_store_export_is_pretty_json() {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
-        let record = SessionRecord::new(dir.path().to_path_buf(), "system");
-        store.save(&record).unwrap();
+        let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
+        store.save(&mut record).unwrap();
         let exported = store.export(&record.id).unwrap();
         assert!(exported.contains("\"schema_version\""));
         assert!(exported.contains('\n'));

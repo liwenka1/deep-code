@@ -410,6 +410,7 @@ dependencies = [
  "percent-encoding",
  "regex",
  "reqwest",
+ "ring",
  "schemars",
  "seccompiler",
  "serde",

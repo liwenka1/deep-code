@@ -1605,9 +1605,9 @@ fn switch_session_adopts_and_banners_the_records_grants() {
     // A session in this workspace carrying its own grant, created out of band
     // (as if by an earlier `--add-dir` run).
     let store = JsonSessionStore::for_workspace(app.workspace.clone()).unwrap();
-    let record = SessionRecord::new(app.workspace.clone(), "system")
+    let mut record = SessionRecord::new(app.workspace.clone(), "system")
         .with_extra_roots(vec![canonical.clone()]);
-    store.save(&record).unwrap();
+    store.save(&mut record).unwrap();
 
     app.switch_session(record).unwrap();
 

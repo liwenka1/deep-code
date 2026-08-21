@@ -17,6 +17,9 @@ futures-util = "0.3"
 ignore = "0.4"
 percent-encoding = "2"
 regex = "1"
+# HMAC-SHA256 + CSPRNG for the session-record grant tag. Already in the tree
+# via rustls (reqwest), so depending on it directly adds no new build cost.
+ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 schemars = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive", "rc"] }

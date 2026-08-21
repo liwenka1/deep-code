@@ -27,6 +27,7 @@ mod runtime_launch;
 mod sandbox;
 mod session;
 mod session_entry;
+mod session_integrity;
 mod session_store;
 mod shell_tools;
 mod skills;

@@ -354,11 +354,22 @@ async fn consume_events(
             return outcome;
         };
         match event {
-            RuntimeEvent::ApprovalRequired { .. } => {
-                receiver = launched
-                    .handle
-                    .submit_approval(ApprovalDecision::Approved)
-                    .await;
+            RuntimeEvent::ApprovalRequired { ref request, .. } => {
+                // The benchmark approves everything so a run is unattended —
+                // but not a request to WIDEN the write boundary. This harness
+                // exists to run a model over untrusted checkouts, and a
+                // granted root is a real sandbox write grant, so a prompt
+                // injected into a benchmark repo could ask for the
+                // evaluator's own `~/.cargo` and get a yes with nobody
+                // present. Every other unattended channel (headless `-p`,
+                // serve, sub-agents) already refuses this one; this was the
+                // only place that said yes.
+                let decision = if request.tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL {
+                    ApprovalDecision::Denied
+                } else {
+                    ApprovalDecision::Approved
+                };
+                receiver = launched.handle.submit_approval(decision).await;
             }
             RuntimeEvent::TurnFinished { telemetry, .. } => {
                 outcome.telemetry = telemetry;

@@ -149,8 +149,8 @@ async fn save_with_retry(
     let mut attempt = 0usize;
     loop {
         let (id, json) = {
-            let guard = record.lock().await;
-            (guard.id.clone(), serialize_record(&guard)?)
+            let mut guard = record.lock().await;
+            (guard.id.clone(), serialize_record(&mut guard)?)
         };
         match store.save_serialized(&id, &json) {
             Ok(()) => return Ok(()),

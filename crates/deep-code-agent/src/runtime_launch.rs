@@ -287,9 +287,9 @@ fn prepare_persisted_session(
 ) -> Result<(JsonSessionStore, SessionRecord), String> {
     let store =
         JsonSessionStore::for_workspace(&roots.primary).map_err(|error| error.to_string())?;
-    let record = SessionRecord::new(roots.primary.clone(), system_prompt)
+    let mut record = SessionRecord::new(roots.primary.clone(), system_prompt)
         .with_extra_roots(roots.extras.clone());
-    store.save(&record).map_err(|error| error.to_string())?;
+    store.save(&mut record).map_err(|error| error.to_string())?;
     Ok((store, record))
 }
 
@@ -301,6 +301,36 @@ fn launch_resumed(
     parent_cancel: &CancellationToken,
 ) -> LaunchedRuntime {
     let mut warnings = Vec::new();
+    // Do the grants in this record actually come from this host?
+    //
+    // The floor below can only refuse what is *categorically* off limits —
+    // the filesystem root, the home directory, credential stores. It cannot
+    // refuse `~/.cargo` (a `rustc-wrapper` there runs on the next build),
+    // `~/Library/LaunchAgents` (runs at next login) or `~/.config/git` (alias
+    // code execution), because those are ordinary directories that a human
+    // might well grant on purpose. No enumeration of dangerous paths is ever
+    // complete, so the grants are authenticated instead of judged: a record
+    // the model wrote can still say anything, it just cannot be believed.
+    //
+    // Checked against the RECORDED workspace, before the substitution below
+    // rewrites it — that is what the tag was signed over. A workspace that
+    // really moved therefore fails to verify and resumes without its extra
+    // grants, which is the safe direction: those roots were vetted relative
+    // to somewhere else, and the move is already being reported anyway.
+    if !crate::session_integrity::verify_roots(
+        record.id.as_str(),
+        &record.workspace,
+        &record.extra_roots,
+        record.extra_roots_mac.as_deref(),
+    ) {
+        warnings.push(format!(
+            "dropping {} write grant(s) recorded in this session: they carry no valid \
+             authorship tag for this machine, and the session file is itself writable by \
+             the model. Re-grant with --add-dir if you meant them.",
+            record.extra_roots.len()
+        ));
+        record.extra_roots.clear();
+    }
     // The primary root is where the USER launched, not where the record says
     // the session lived. The record is an ordinary write target for the model
     // (it sits inside the primary root) and `-c` ranks candidates by a
@@ -339,7 +369,17 @@ fn launch_resumed(
     // the grant. At launch a human is present and the warning is visible;
     // narrowing the session and saying so is the safe direction.
     let primary_canonical = crate::paths::canonicalize(&record.workspace).ok();
-    record.extra_roots.retain(|root| {
+    // `retain_mut`, and the canonical value is written back: the floor below
+    // vets `canonical`, but what gets ENFORCED is whatever this vector holds —
+    // `WorkspacePolicy::new` canonicalizes it again on its own. Keeping the raw
+    // spelling made those two disagree, which is the display-versus-grant split
+    // the approval panel was hardened against, reappearing on the persistence
+    // channel: a record naming `<workspace>/docs` (a symlink the model planted)
+    // showed the user a path inside the repo on the startup banner and in the
+    // rebuilt system prompt, while the boundary was wherever the link pointed.
+    // A bare `..` was worse still — displayed verbatim, enforced against the
+    // process cwd.
+    record.extra_roots.retain_mut(|root| {
         let canonical = crate::paths::canonicalize(root)
             .ok()
             .filter(|path| path.is_dir());
@@ -365,7 +405,11 @@ fn launch_resumed(
         // A grant equal to the workspace is covered by the primary root;
         // dropped silently (nothing is lost) so the banner and summary never
         // list the workspace as its own "additional" root.
-        Some(canonical) != primary_canonical
+        if Some(&canonical) == primary_canonical.as_ref() {
+            return false;
+        }
+        *root = canonical;
+        true
     });
     // Grants persist with the session: the record's extras are restored, and
     // any `--add-dir` passed on the resume command line is merged in. The
@@ -406,7 +450,7 @@ fn launch_resumed(
     // a resume that adds a grant and exits before any turn — the next plain
     // `-c` should still see it. A failure degrades to a warning; the
     // persistence actor retries the write on the first turn anyway.
-    if let Err(error) = store.save(&record) {
+    if let Err(error) = store.save(&mut record) {
         warnings.push(format!("failed to persist resumed session grants: {error}"));
     }
 
@@ -649,6 +693,19 @@ mod tests {
         assert!(names.iter().any(|name| name == "write_file"));
     }
 
+    /// Stamp a record's grants the way a real save does. Tests that build a
+    /// record in memory and hand it straight to `launch_runtime` would
+    /// otherwise all exercise the unsigned-record rejection instead of the
+    /// behaviour they are actually about.
+    fn signed(mut record: SessionRecord) -> SessionRecord {
+        record.extra_roots_mac = crate::session_integrity::sign_roots(
+            record.id.as_str(),
+            &record.workspace,
+            &record.extra_roots,
+        );
+        record
+    }
+
     #[test]
     fn resume_unions_record_grants_with_cli_add_dirs() {
         let workspace = tempfile::TempDir::new().unwrap();
@@ -658,8 +715,9 @@ mod tests {
         let cli = tempfile::TempDir::new().unwrap();
         let cli_root = cli.path().canonicalize().unwrap();
 
-        let record =
-            SessionRecord::new(ws.clone(), "system").with_extra_roots(vec![recorded_root.clone()]);
+        let record = signed(
+            SessionRecord::new(ws.clone(), "system").with_extra_roots(vec![recorded_root.clone()]),
+        );
         // No api key → offline echo resume path; the union logic is shared
         // with the online path (it runs before the client branch).
         let config = AgentConfig::builtin();
@@ -679,7 +737,7 @@ mod tests {
         let ws = workspace.path().canonicalize().unwrap();
         let stale = ws.join("gone");
         std::fs::create_dir(&stale).unwrap();
-        let record = SessionRecord::new(ws, "system").with_extra_roots(vec![stale.clone()]);
+        let record = signed(SessionRecord::new(ws, "system").with_extra_roots(vec![stale.clone()]));
         std::fs::remove_dir(&stale).unwrap();
 
         let launched = launch_runtime(
@@ -776,8 +834,12 @@ mod tests {
             return;
         }
 
-        let record = SessionRecord::new(ws.clone(), "system")
-            .with_extra_roots(vec![home.clone(), PathBuf::from("/")]);
+        // Signed, so this test is about the FLOOR: even a grant list this
+        // host really did author may not name home or the filesystem root.
+        let record = signed(
+            SessionRecord::new(ws.clone(), "system")
+                .with_extra_roots(vec![home.clone(), PathBuf::from("/")]),
+        );
         let launched = launch_runtime(&AgentConfig::builtin(), ws.clone(), Some(record));
 
         assert!(
@@ -804,6 +866,98 @@ mod tests {
         );
     }
 
+    /// What the resume surfaces show and what it enforces must be the same
+    /// path. The floor vets the canonical form, but the vector that survives
+    /// is what `WorkspacePolicy` re-canonicalizes and what the banner, the
+    /// rebuilt system prompt and `LaunchedRuntime::extra_roots` display — so
+    /// keeping the record's raw spelling reintroduced, on the persistence
+    /// channel, exactly the display-versus-grant split the approval panel was
+    /// hardened against. Here the record names a path inside the workspace
+    /// that is really a symlink pointing out of it.
+    #[cfg(unix)]
+    #[test]
+    fn resume_displays_the_root_it_actually_enforces() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().canonicalize().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let real_target = outside.path().canonicalize().unwrap();
+
+        // A spelling that reads as "inside the repo" but resolves out of it.
+        let innocuous = ws.join("docs");
+        std::os::unix::fs::symlink(&real_target, &innocuous).unwrap();
+
+        let mut record = SessionRecord::new(ws.clone(), "prompt");
+        record.extra_roots = vec![innocuous.clone()];
+        let record = signed(record);
+
+        let launched = launch_runtime(
+            &AgentConfig::builtin(),
+            WorkspaceRoots::new(ws.clone(), Vec::new()),
+            Some(record),
+        );
+
+        assert_eq!(
+            launched.extra_roots,
+            vec![real_target.clone()],
+            "the displayed root must be the one enforced, not the record's spelling"
+        );
+        assert!(
+            !launched.extra_roots.contains(&innocuous),
+            "the innocuous-looking spelling must not be what the user is shown"
+        );
+    }
+
+    /// The record is a file the model can write, and on resume its grants
+    /// become the write boundary. The floor can only refuse what is
+    /// categorically off limits — it cannot refuse `~/.cargo`, whose
+    /// `rustc-wrapper` runs on the next build, or `~/Library/LaunchAgents`,
+    /// which runs at next login, because a human might grant either on
+    /// purpose. So the grants are authenticated rather than judged: a list
+    /// nobody on this host signed is dropped, loudly.
+    #[test]
+    fn resume_drops_recorded_grants_that_carry_no_authorship_tag() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().canonicalize().unwrap();
+        let smuggled = tempfile::TempDir::new().unwrap();
+        let smuggled_root = smuggled.path().canonicalize().unwrap();
+
+        // Exactly what a forged record looks like: a real, resolvable
+        // directory that clears every floor, and no tag.
+        let mut record = SessionRecord::new(ws.clone(), "system");
+        record.extra_roots = vec![smuggled_root.clone()];
+        assert!(record.extra_roots_mac.is_none());
+
+        let launched = launch_runtime(&AgentConfig::builtin(), ws.clone(), Some(record));
+
+        assert!(
+            launched.extra_roots.is_empty(),
+            "an unsigned grant must not become a write root: {:?}",
+            launched.extra_roots
+        );
+        assert!(
+            launched
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("authorship tag")),
+            "the drop must be surfaced: {:?}",
+            launched.warnings
+        );
+
+        // A tag for a DIFFERENT grant list must not carry this one either.
+        let mut tampered = SessionRecord::new(ws.clone(), "system");
+        tampered.extra_roots = vec![ws.join("docs")];
+        std::fs::create_dir(ws.join("docs")).unwrap();
+        let tampered = signed(tampered);
+        let mut tampered = tampered;
+        tampered.extra_roots = vec![smuggled_root];
+        let launched = launch_runtime(&AgentConfig::builtin(), ws, Some(tampered));
+        assert!(
+            launched.extra_roots.is_empty(),
+            "a tag lifted from another grant list must not verify: {:?}",
+            launched.extra_roots
+        );
+    }
+
     #[test]
     fn resume_refreshes_system_prompt_and_persists_grants_immediately() {
         let workspace = tempfile::TempDir::new().unwrap();
@@ -813,9 +967,9 @@ mod tests {
 
         // A session created WITHOUT the grant: its saved prompt cannot name it.
         let store = JsonSessionStore::for_workspace(&ws).unwrap();
-        let record = SessionRecord::new(ws.clone(), "original prompt");
+        let mut record = SessionRecord::new(ws.clone(), "original prompt");
         let id = record.id.clone();
-        store.save(&record).unwrap();
+        store.save(&mut record).unwrap();
 
         // Resume with `--add-dir extra` (plus a primary-equal extra that the
         // union must skip), then exit without any turn.

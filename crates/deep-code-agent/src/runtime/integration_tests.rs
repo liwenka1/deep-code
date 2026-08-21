@@ -3303,9 +3303,10 @@ async fn approved_root_grant_persists_into_the_session_record() {
     let (registry, policy) = root_grant_fixture(workspace.path());
 
     let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
-    let record = crate::session_store::SessionRecord::new(workspace.path().to_path_buf(), "system");
+    let mut record =
+        crate::session_store::SessionRecord::new(workspace.path().to_path_buf(), "system");
     let session_id = record.id.clone();
-    store.save(&record).unwrap();
+    store.save(&mut record).unwrap();
 
     let client = ScriptedClient::new(vec![
         request_root_script(&target),
