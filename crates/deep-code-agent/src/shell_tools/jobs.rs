@@ -367,6 +367,83 @@ impl RingBuffer {
     }
 }
 
+/// The directories deep-code itself creates below the workspace: the run
+/// directory, the spill home, and `.deep-code`. Everything above them is the
+/// user's own workspace path — a developer whose project lives behind a
+/// symlink is not an attack, and refusing to spill there would be a
+/// regression, so the checks below stop at this depth.
+const OWNED_SPILL_DIRS: usize = 3;
+
+/// Create a spill file, refusing at every step to follow a symlink.
+///
+/// This `create` runs in the UNCONFINED parent process, while the spill tree
+/// lives inside the workspace — a directory the model may freely write. Job
+/// ids are sequential and the run directory is handed to the model verbatim
+/// in every truncation note, so the *next* spill path is fully predictable: a
+/// symlink planted there had the parent write the command's output through
+/// it, to any path the uid can reach. Planting it is an ordinary write inside
+/// a granted root, so no sandbox on any platform refuses it.
+///
+/// Three locks. Every directory we own must be a real directory —
+/// `symlink_metadata`, not `metadata`, because the latter resolves the link
+/// and then answers about its target. The file is opened `O_CREAT | O_EXCL`,
+/// so an existing file or a symlink at the final component fails outright
+/// instead of being truncated. `O_NOFOLLOW` states the same refusal directly
+/// to the kernel. A failure here disables the spill like any other I/O error:
+/// the result falls back to the ring, and `info()` never names a file that
+/// was not written.
+fn create_spill_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let owned: Vec<_> = path.ancestors().skip(1).take(OWNED_SPILL_DIRS).collect();
+    for dir in owned.into_iter().rev() {
+        ensure_real_dir(dir)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // 0600 because spill content is raw command output — `env` dumps,
+        // registry logins, tokens a build prints. `config::write` already
+        // holds this line for the API key; a world-readable copy of the same
+        // secrets under the workspace would undo it.
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+/// The directory must exist and be a real directory, or be created as one.
+fn ensure_real_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "spill directory is a symlink or a file",
+        )),
+        Err(_) => create_private_dir(dir),
+    }
+}
+
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
+        Ok(()) => Ok(()),
+        // Lost the race to the job's other stream — fine, as long as what
+        // landed there is a real directory and not a link planted meanwhile.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            match std::fs::symlink_metadata(dir) {
+                Ok(meta) if meta.is_dir() => Ok(()),
+                _ => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Byte-exact overflow copy of one stream, created lazily at the threshold.
 ///
 /// Best-effort by design: an I/O failure disables the spill and the command
@@ -418,12 +495,7 @@ impl Spill {
                 backlog.len(),
                 "spill must be created before the ring ever drops a byte"
             );
-            let created = self
-                .path
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|()| std::fs::File::create(&self.path));
-            let file = match created {
+            let file = match create_spill_file(&self.path) {
                 Ok(file) => file,
                 Err(_) => {
                     self.failed = true;
@@ -830,6 +902,89 @@ mod tests {
         assert!(!path.exists());
         assert!(!tmp.path().join("spill").exists());
         assert!(buffer.spill_info().is_none());
+    }
+
+    /// The spill tree sits inside the workspace, so the model can plant a
+    /// symlink at the *next* job's path — the run directory is disclosed in
+    /// every truncation note and job ids are sequential. Writing the file is
+    /// done by the unconfined parent, so following that link would write the
+    /// command's own output to any path the uid can reach, with every sandbox
+    /// bypassed. Both spellings of the plant are refused, and the failure is
+    /// silent-and-honest: no file is claimed.
+    #[cfg(unix)]
+    #[test]
+    fn spill_refuses_to_write_through_a_planted_symlink() {
+        for plant_the_directory in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let victim = outside.path().join("victim.txt");
+            std::fs::write(&victim, "ORIGINAL\n").unwrap();
+
+            let run = tmp.path().join(".deep-code/spill/run-1");
+            let path = run.join("job_1.stdout.log");
+            if plant_the_directory {
+                std::fs::create_dir_all(run.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink(outside.path(), &run).unwrap();
+            } else {
+                std::fs::create_dir_all(&run).unwrap();
+                std::os::unix::fs::symlink(&victim, &path).unwrap();
+            }
+
+            let buffer = SharedBuffer::with_spill(path);
+            buffer.push(&vec![b'a'; SPILL_THRESHOLD_BYTES + 1]);
+
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                "ORIGINAL\n",
+                "spill overwrote a file outside the workspace \
+                 (directory planted: {plant_the_directory})"
+            );
+            // A planted *directory* link cannot truncate `victim.txt` past
+            // `O_EXCL`, but it can still land the command's output beside it,
+            // in a directory the attacker chose — `~/.ssh`, `/etc/cron.d`.
+            let leaked: Vec<_> = std::fs::read_dir(outside.path())
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name())
+                .filter(|name| name != "victim.txt")
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "spill wrote outside the workspace through a planted symlink \
+                 (directory planted: {plant_the_directory}): {leaked:?}"
+            );
+            assert!(
+                buffer.spill_info().is_none(),
+                "a refused spill must not claim a file"
+            );
+        }
+    }
+
+    /// Spill content is raw command output — `env`, registry logins, tokens a
+    /// build prints. It must not be readable by other users on the host.
+    #[cfg(unix)]
+    #[test]
+    fn spill_file_and_directory_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".deep-code/spill/run-1/job_1.stdout.log");
+        let buffer = SharedBuffer::with_spill(path.clone());
+        buffer.push(&vec![b'a'; SPILL_THRESHOLD_BYTES + 1]);
+
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "spill file must not be group/world readable"
+        );
+        assert_eq!(
+            dir_mode, 0o700,
+            "spill run dir must not be group/world readable"
+        );
     }
 
     #[test]
