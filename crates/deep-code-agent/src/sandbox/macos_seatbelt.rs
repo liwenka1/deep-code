@@ -166,7 +166,7 @@ fn compose_profile(
     // /private, and an uncanonicalized grant there would never match.
     let mut granted: Vec<PathBuf> = Vec::new();
     for root in policy.writable_roots(granted_roots, cwd) {
-        let resolved = root.canonicalize().unwrap_or(root);
+        let resolved = crate::paths::canonicalize(&root).unwrap_or(root);
         if !granted.contains(&resolved) {
             granted.push(resolved);
         }
@@ -195,9 +195,11 @@ fn compose_profile(
     // Canonicalized for the same reason as `credential_dirs_under`: an
     // unresolved spelling is a deny the kernel never matches.
     if let Some(home) = crate::paths::home_dir() {
-        let home = home.canonicalize().unwrap_or(home);
+        let home = crate::paths::canonicalize(&home).unwrap_or(home);
         let joined = home.join(crate::paths::DEEP_CODE_DIR);
-        let resolved = joined.canonicalize().ok().filter(|path| *path != joined);
+        let resolved = crate::paths::canonicalize(&joined)
+            .ok()
+            .filter(|path| *path != joined);
         for (name, dir) in std::iter::once(("KEEP_DEEP_CODE", joined))
             .chain(resolved.map(|path| ("KEEP_DEEP_CODE_R", path)))
         {
@@ -248,11 +250,11 @@ fn credential_dirs() -> Vec<(String, PathBuf)> {
 fn credential_dirs_under(home: &Path) -> Vec<(String, PathBuf)> {
     // A home that cannot be resolved still gets denials, at its unresolved
     // spelling — losing the fence entirely is the worse failure.
-    let resolved_home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    let resolved_home = crate::paths::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     let mut dirs = Vec::new();
     for entry in crate::paths::CREDENTIAL_ENTRIES {
         let joined = resolved_home.join(entry);
-        if let Ok(resolved) = joined.canonicalize()
+        if let Ok(resolved) = crate::paths::canonicalize(&joined)
             && resolved != joined
         {
             dirs.push((format!("{}_R", credential_param_name(entry)), resolved));

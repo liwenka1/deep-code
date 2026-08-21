@@ -15,6 +15,55 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The data-volume alias macOS splices into the system volume's namespace.
+#[cfg(target_os = "macos")]
+const FIRMLINK_DATA_PREFIX: &str = "/System/Volumes/Data";
+
+/// `Path::canonicalize`, then brought back into the ONE namespace every floor
+/// in this crate is written in.
+///
+/// On macOS `/Users/x` and `/System/Volumes/Data/Users/x` are the same
+/// directory — same device, same inode — because the data volume is firmlinked
+/// into the read-only system volume. `realpath(3)` does **not** collapse one
+/// spelling into the other: each canonicalizes to itself. Every floor here
+/// compares canonical paths with `starts_with`, and that prefix test then
+/// misses in both directions — a grant requested at the Data spelling is not
+/// "inside the home directory", does not "overlap a credential store", and is
+/// not `~/.deep-code`, while writing through it lands on exactly those files.
+/// The kernel fence does not cover the gap either: Seatbelt normalizes
+/// firmlinks, but `read_file`/`write_file` are in-process and never meet it.
+///
+/// The prefix is stripped only when the shorter spelling names the very same
+/// inode, so a directory that merely happens to live under
+/// `/System/Volumes/Data` keeps its own identity. Everywhere else this is
+/// plain `canonicalize`.
+pub(crate) fn canonicalize(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    let resolved = path.canonicalize()?;
+    #[cfg(target_os = "macos")]
+    {
+        Ok(strip_firmlink(resolved))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(resolved)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn strip_firmlink(path: PathBuf) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(rest) = path.strip_prefix(FIRMLINK_DATA_PREFIX) else {
+        return path;
+    };
+    let stripped = std::path::Path::new("/").join(rest);
+    let same_inode = match (stripped.metadata(), path.metadata()) {
+        (Ok(short), Ok(long)) => short.dev() == long.dev() && short.ino() == long.ino(),
+        _ => false,
+    };
+    if same_inode { stripped } else { path }
+}
+
 /// deep-code's own per-user directory, holding the global config — which is
 /// the trust root: `api_key` in plaintext, and `approval.auto_allow`, honoured
 /// *only* from this layer (a project config is refused, see
@@ -62,7 +111,7 @@ pub(crate) fn sensitive_paths() -> Vec<PathBuf> {
     // spelling. Dropping the whole list here removed the credential floor
     // entirely — the wrong direction to fail for the one check standing between
     // a requested grant and the plaintext API key.
-    let home = home.canonicalize().unwrap_or(home);
+    let home = canonicalize(&home).unwrap_or(home);
     let mut paths = Vec::new();
     for entry in CREDENTIAL_ENTRIES
         .iter()
@@ -70,7 +119,7 @@ pub(crate) fn sensitive_paths() -> Vec<PathBuf> {
         .chain(std::iter::once(DEEP_CODE_DIR))
     {
         let joined = home.join(entry);
-        if let Ok(resolved) = joined.canonicalize()
+        if let Ok(resolved) = canonicalize(&joined)
             && resolved != joined
         {
             paths.push(resolved);

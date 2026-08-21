@@ -79,7 +79,7 @@ pub(crate) enum RootGrantOutcome {
 impl WorkspacePolicy {
     pub(crate) fn new(roots: impl Into<WorkspaceRoots>) -> Result<Self, ToolError> {
         let WorkspaceRoots { primary, extras } = roots.into();
-        let canonical_primary = primary.canonicalize().map_err(|error| {
+        let canonical_primary = crate::paths::canonicalize(&primary).map_err(|error| {
             ToolError::exec_failed(
                 "workspace",
                 format!(
@@ -95,7 +95,7 @@ impl WorkspacePolicy {
             // this directory to be writable, and proceeding with fewer rights
             // than they believe they granted is how confusing mid-task
             // denials happen.
-            let canonical = extra.canonicalize().map_err(|error| {
+            let canonical = crate::paths::canonicalize(&extra).map_err(|error| {
                 ToolError::exec_failed(
                     "workspace",
                     format!(
@@ -185,7 +185,7 @@ impl WorkspacePolicy {
                 ),
             ));
         }
-        let canonical = raw.canonicalize().map_err(|error| {
+        let canonical = crate::paths::canonicalize(raw).map_err(|error| {
             ToolError::exec_failed(
                 TOOL,
                 format!(
@@ -300,7 +300,7 @@ impl WorkspacePolicy {
         })? {
             return Err(path_error(tool_name, raw, "symlinks are not allowed"));
         }
-        let canonical = candidate.canonicalize().map_err(|error| {
+        let canonical = crate::paths::canonicalize(&candidate).map_err(|error| {
             ToolError::exec_failed(
                 tool_name,
                 format!("failed to resolve {}: {error}", candidate.display()),
@@ -331,7 +331,7 @@ impl WorkspacePolicy {
                     "symlinks in the destination path are not allowed",
                 ));
             }
-            let canonical = candidate.canonicalize().map_err(|error| {
+            let canonical = crate::paths::canonicalize(&candidate).map_err(|error| {
                 ToolError::exec_failed(
                     tool_name,
                     format!("failed to resolve {}: {error}", candidate.display()),
@@ -380,7 +380,7 @@ impl WorkspacePolicy {
                 "symlinks in the destination path are not allowed",
             ));
         }
-        let existing_canonical = existing.canonicalize().map_err(|error| {
+        let existing_canonical = crate::paths::canonicalize(existing).map_err(|error| {
             ToolError::exec_failed(
                 tool_name,
                 format!(
@@ -498,7 +498,8 @@ pub(crate) fn refuse_as_unattended_root(canonical: &Path) -> Option<String> {
     if canonical.parent().is_none() {
         return Some("it is the filesystem root".to_string());
     }
-    if let Some(home) = crate::paths::home_dir().and_then(|home| home.canonicalize().ok())
+    if let Some(home) =
+        crate::paths::home_dir().and_then(|home| crate::paths::canonicalize(&home).ok())
         && home.starts_with(canonical)
     {
         return Some("it would make the entire home directory writable".to_string());
@@ -919,6 +920,53 @@ mod tests {
             "the reason must name the problem: {error}"
         );
         assert_eq!(policy.granted_roots(), vec![primary], "nothing granted");
+    }
+
+    /// macOS gives the home directory two canonical spellings for one inode —
+    /// `/Users/x` and the firmlinked `/System/Volumes/Data/Users/x` — and
+    /// `realpath(3)` collapses neither, so each resolves to itself. Every
+    /// floor here is a `starts_with` on canonical paths, so the Data spelling
+    /// used to walk through all of them: not "inside home", not "overlapping
+    /// a credential store", not `~/.deep-code` — while a write through it
+    /// lands on exactly those files. Seatbelt is no backstop, because
+    /// `read_file`/`write_file` are in-process and never meet it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_firmlink_spelling_resolves_into_the_namespace_the_floors_use() {
+        let Some(home) = crate::paths::home_dir().and_then(|home| home.canonicalize().ok()) else {
+            eprintln!("no resolvable home dir on this host; skipping");
+            return;
+        };
+        let data_home = Path::new("/System/Volumes/Data").join(home.strip_prefix("/").unwrap());
+        if !data_home.is_dir() {
+            eprintln!("no firmlinked data volume on this host; skipping");
+            return;
+        }
+
+        // The normalization itself: both spellings must land on one path, or
+        // no prefix-based floor downstream can be sound.
+        assert_eq!(
+            crate::paths::canonicalize(&data_home).unwrap(),
+            home,
+            "the firmlink spelling must resolve into the same namespace as home"
+        );
+
+        // And the floor that consumes it. Home itself is always present; the
+        // credential entries are only asserted where the host has them.
+        let mut checked = vec![data_home.clone()];
+        for entry in [".ssh", crate::paths::DEEP_CODE_DIR] {
+            if data_home.join(entry).is_dir() {
+                checked.push(data_home.join(entry));
+            }
+        }
+        for candidate in checked {
+            let canonical = crate::paths::canonicalize(&candidate).unwrap();
+            assert!(
+                refuse_as_unattended_root(&canonical).is_some(),
+                "the firmlink spelling {} walked through the floor",
+                candidate.display()
+            );
+        }
     }
 
     /// A symlink to a directory canonicalizes to its target — the resolution

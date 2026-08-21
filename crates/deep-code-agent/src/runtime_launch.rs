@@ -152,7 +152,7 @@ pub fn launch_runtime(
     // display surfaces honest. Both spellings are checked because CLI extras
     // arrive canonical while the primary may not be.
     let primary_raw = roots.primary.clone();
-    let primary_canonical = roots.primary.canonicalize().ok();
+    let primary_canonical = crate::paths::canonicalize(&roots.primary).ok();
     roots
         .extras
         .retain(|extra| *extra != primary_raw && Some(extra) != primary_canonical.as_ref());
@@ -316,8 +316,8 @@ fn launch_resumed(
     // Anything that does not resolve to the same directory — including a
     // recorded path that no longer resolves at all — yields to the caller's.
     let same_workspace = match (
-        record.workspace.canonicalize().ok(),
-        caller_workspace.canonicalize().ok(),
+        crate::paths::canonicalize(&record.workspace).ok(),
+        crate::paths::canonicalize(&caller_workspace).ok(),
     ) {
         (Some(recorded), Some(caller)) => recorded == caller,
         _ => false,
@@ -338,9 +338,11 @@ fn launch_resumed(
     // a resumed session of ALL file and shell tools, with no way to remove
     // the grant. At launch a human is present and the warning is visible;
     // narrowing the session and saying so is the safe direction.
-    let primary_canonical = record.workspace.canonicalize().ok();
+    let primary_canonical = crate::paths::canonicalize(&record.workspace).ok();
     record.extra_roots.retain(|root| {
-        let canonical = root.canonicalize().ok().filter(|path| path.is_dir());
+        let canonical = crate::paths::canonicalize(root)
+            .ok()
+            .filter(|path| path.is_dir());
         let Some(canonical) = canonical else {
             warnings.push(format!(
                 "dropping recorded --add-dir grant {}: directory no longer resolves",
