@@ -70,6 +70,32 @@ fn strip_firmlink(path: PathBuf) -> PathBuf {
 /// `config::layers`). Writing this file is therefore not a session-scoped act.
 pub(crate) const DEEP_CODE_DIR: &str = ".deep-code";
 
+/// [`canonicalize`], but for a path that need not exist yet: resolve the
+/// deepest ancestor that *does* exist and re-append the rest.
+///
+/// `Path::canonicalize` is all-or-nothing, and only one credential entry has
+/// an intermediate component — `.config/gh`. So on the common dotfile-manager
+/// layout where `~/.config` is a symlink into `~/dotfiles/config` and `gh`
+/// has not been created yet, resolving the whole path fails and only the
+/// unresolved `$HOME/.config/gh` reaches the floor. `~/dotfiles/config` is
+/// then grantable in both directions of the overlap test, and the Seatbelt
+/// deny misses it too — defeating the stated intent that an entry must not
+/// become reachable merely because the user has not created it yet.
+pub(crate) fn canonicalize_existing_prefix(path: &std::path::Path) -> Option<PathBuf> {
+    let mut trailing = Vec::new();
+    let mut probe = path;
+    loop {
+        if let Ok(resolved) = canonicalize(probe) {
+            let mut out = resolved;
+            out.extend(trailing.iter().rev());
+            return Some(out);
+        }
+        let name = probe.file_name()?;
+        trailing.push(name.to_os_string());
+        probe = probe.parent()?;
+    }
+}
+
 /// Home-relative locations holding long-lived secrets: SSH keys, cloud
 /// credentials, GnuPG keyrings, `.netrc` passwords, and the token stores of
 /// common dev tools. The macOS sandbox turns each of these into a
@@ -119,7 +145,10 @@ pub(crate) fn sensitive_paths() -> Vec<PathBuf> {
         .chain(std::iter::once(DEEP_CODE_DIR))
     {
         let joined = home.join(entry);
-        if let Ok(resolved) = canonicalize(&joined)
+        // Resolves through an intermediate symlink even when the leaf does
+        // not exist yet — `.config/gh` behind a dotfiles-managed `~/.config`
+        // is the case that matters.
+        if let Some(resolved) = canonicalize_existing_prefix(&joined)
             && resolved != joined
         {
             paths.push(resolved);

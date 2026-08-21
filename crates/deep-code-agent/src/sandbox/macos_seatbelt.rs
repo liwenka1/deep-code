@@ -270,34 +270,20 @@ fn credential_dirs_under(home: &Path) -> Vec<(String, PathBuf)> {
     // spelling — losing the fence entirely is the worse failure.
     let resolved_home = crate::paths::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     let mut dirs = Vec::new();
-    for entry in crate::paths::CREDENTIAL_ENTRIES {
+    for (index, entry) in crate::paths::CREDENTIAL_ENTRIES.iter().enumerate() {
         let joined = resolved_home.join(entry);
-        if let Ok(resolved) = crate::paths::canonicalize(&joined)
+        // Resolves through an intermediate symlink even when the leaf does not
+        // exist yet: `.config/gh` is the one two-level entry, and behind a
+        // dotfiles-managed `~/.config` the all-or-nothing `canonicalize` gives
+        // up and leaves the real location undenied.
+        if let Some(resolved) = crate::paths::canonicalize_existing_prefix(&joined)
             && resolved != joined
         {
-            dirs.push((format!("{}_R", credential_param_name(entry)), resolved));
+            dirs.push((format!("KEEP_{index}_R"), resolved));
         }
-        dirs.push((credential_param_name(entry), joined));
+        dirs.push((format!("KEEP_{index}"), joined));
     }
     dirs
-}
-
-/// A valid SBPL `-D` parameter name for a credential entry: `KEEP_` plus the
-/// entry with every non-alphanumeric char folded to `_` (so a subpath like
-/// `.config/gh` or a file like `.git-credentials` yields a legal identifier).
-fn credential_param_name(entry: &str) -> String {
-    let body: String = entry
-        .trim_start_matches('.')
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("KEEP_{body}")
 }
 
 #[cfg(test)]
@@ -542,15 +528,30 @@ mod tests {
     }
 
     #[test]
-    fn credential_param_names_are_legal_identifiers() {
-        // Subpath / dotted-file entries must fold to alnum+underscore names, or
-        // sandbox-exec rejects the `-D` binding.
-        assert_eq!(credential_param_name(".config/gh"), "KEEP_CONFIG_GH");
-        assert_eq!(
-            credential_param_name(".git-credentials"),
-            "KEEP_GIT_CREDENTIALS"
-        );
-        assert_eq!(credential_param_name(".ssh"), "KEEP_SSH");
+    fn credential_param_names_are_legal_and_collision_free() {
+        // sandbox-exec takes the LAST `-D` for a repeated name and silently
+        // drops the earlier binding, so two entries that fold to the same
+        // identifier would evaporate one deny with no error at all. Naming by
+        // index makes a collision impossible instead of merely unlikely: the
+        // old scheme folded every non-alphanumeric to `_`, so a future
+        // `.ssh-r` entry would have collided with `.ssh`'s resolved variant.
+        let Some(home) = crate::paths::home_dir() else {
+            eprintln!("no home dir on this host; skipping");
+            return;
+        };
+        let dirs = credential_dirs_under(&home);
+        let mut names: Vec<&str> = dirs.iter().map(|(name, _)| name.as_str()).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "duplicate -D name would drop a deny");
+        for (name, _) in &dirs {
+            assert!(
+                name.chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+                "{name} is not a legal SBPL identifier"
+            );
+        }
     }
 
     #[test]

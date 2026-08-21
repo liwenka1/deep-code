@@ -459,6 +459,14 @@ struct Spill {
     /// A reported file must survive stream end — the reader may come back
     /// for it any time later.
     reported: bool,
+    /// Whether the stream ended. Its own field rather than `written == 0`,
+    /// which `discard_if_unreported` resets: sharing one field left the
+    /// "never re-create a finished file" guard below inoperative exactly
+    /// after a discard, so a later `offer` would take the create branch and
+    /// write a file holding only the ring tail while `info()` reported it as
+    /// the complete stream. Unreachable while the reader task is the only
+    /// pusher — which is precisely why it should not depend on that.
+    finished: bool,
 }
 
 impl Spill {
@@ -469,6 +477,7 @@ impl Spill {
             written: 0,
             failed: false,
             reported: false,
+            finished: false,
         }
     }
 
@@ -480,10 +489,11 @@ impl Spill {
         if self.failed || self.written >= SPILL_MAX_BYTES {
             return;
         }
-        // Written but no handle = the stream already finished; never re-create
-        // (File::create would truncate the finished file down to the backlog).
-        // Unreachable while the reader task is the only pusher — insurance.
-        if self.file.is_none() && self.written > 0 {
+        // The stream already finished; never re-create (File::create would
+        // truncate the finished file down to the backlog, and after a discard
+        // it would resurrect a file nothing is going to read). Unreachable
+        // while the reader task is the only pusher — insurance.
+        if self.finished {
             return;
         }
         if self.file.is_none() {
@@ -543,6 +553,7 @@ impl Spill {
     /// the sibling stream and therefore happens later.
     fn finish(&mut self) {
         self.file = None;
+        self.finished = true;
     }
 
     /// Delete a file whose path never left the process: bytes crossed the
@@ -985,6 +996,35 @@ mod tests {
                 "a refused spill must not claim a file"
             );
         }
+    }
+
+    /// A finished stream never re-creates its file, even after the orphan
+    /// discard reset `written` to zero. The guard used to read `written > 0`,
+    /// which the discard itself falsified — so a late chunk would take the
+    /// create branch and write a file holding only the ring tail, while
+    /// `info()` announced it as the complete stream. Unreachable with one
+    /// pusher, which is exactly why the guard should not rely on that.
+    #[test]
+    fn a_finished_spill_never_reopens_even_after_its_file_was_discarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".deep-code/spill/run-1/job_1.stdout.log");
+        let buffer = SharedBuffer::with_spill(path.clone());
+        buffer.push(&vec![b'a'; SPILL_THRESHOLD_BYTES + 1]);
+        assert!(path.exists(), "precondition: a file was written");
+
+        buffer.finish_spill();
+        buffer.discard_unreported_spill();
+        assert!(!path.exists(), "precondition: the orphan was discarded");
+
+        buffer.push(&vec![b'b'; SPILL_THRESHOLD_BYTES + 1]);
+        assert!(
+            !path.exists(),
+            "a finished stream resurrected its spill file"
+        );
+        assert!(
+            buffer.spill_info().is_none(),
+            "and must not claim one either"
+        );
     }
 
     /// Spill content is raw command output — `env`, registry logins, tokens a
