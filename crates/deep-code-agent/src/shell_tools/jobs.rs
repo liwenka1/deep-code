@@ -17,42 +17,39 @@ use crate::workspace_policy::invalid;
 
 const JOB_BUFFER_BYTES: usize = 128 * 1024;
 
-/// Bytes past which a stream spills to disk.
-///
-/// Keyed to [`TOOL_OUTPUT_BUDGET`], the chars a tool result actually keeps
-/// once the runtime has bounded it — NOT to the shell layer's own
-/// `MAX_OUTPUT_CHARS` window, which is the larger of the two. Keying it to the
-/// wider window left a band (budget < chars <= window) where the runtime
-/// elided the middle of the result while this layer believed everything was
-/// visible inline: no file for ASCII output in that band, and for multi-byte
-/// output a complete file that [`Spill::finish`] then deleted as redundant.
-/// Silent loss in exactly the size range a build log occupies — the failure
-/// spill exists to end.
-///
-/// UTF-8 chars are at least one byte, so a stream of at most this many BYTES
-/// is at most that many chars and is therefore genuinely complete inline.
-/// Well under the ring capacity, so at the moment of crossing the ring still
-/// holds every byte and the file can start from byte zero.
-const SPILL_THRESHOLD_BYTES: usize = crate::runtime::tool_result::TOOL_OUTPUT_BUDGET;
-
 /// Room left for the framing the renderer adds around the two streams:
 /// `[stderr]`, the trailing `[exit N · Nms]`, the notes. Small and generous —
 /// it only has to keep the sum below the budget, not predict it exactly.
 const SPILL_FRAMING_RESERVE: usize = 256;
 
-/// The largest a stream can be and still be *certainly* redundant with the
-/// inline copy — i.e. safe to delete its spill file at stream end.
+/// The one size that decides everything about a spill: below it a stream needs
+/// no file, at or above it a stream keeps one.
 ///
-/// It is half the budget, not the whole budget, because stdout and stderr are
-/// rendered into ONE tool result and the runtime bounds their SUM. Judging each
-/// stream against the full budget is not a bound at all: two streams of 7k CJK
-/// characters each cross the byte threshold (so both files get written), each
-/// then judges itself inline (7k <= 12k) and deletes its file — and the runtime
-/// proceeds to elide 6k characters out of the middle of the only copy left,
-/// with nothing on disk and no note. Anything above this size keeps its file,
-/// which is exactly the band where two streams can combine into a loss.
+/// Half the budget, not the whole budget, because stdout and stderr render
+/// into ONE tool result and the runtime bounds their SUM. Judging a stream
+/// against the full budget is not a bound at all — two 7k-char streams each
+/// fit 12k on their own, and their 14k sum has its middle elided.
+///
+/// Creation and deletion read the SAME number, which is the point. They used
+/// to disagree: files were created past the full budget and deleted below half
+/// of it, so the band between lost output with no file at all —
+/// `seq 1 1500; seq 1 1500 >&2` renders 12,872 chars against a 12,000 budget,
+/// and neither 6,893-byte stream ever crossed a 12,000-byte threshold.
+///
+/// Compared against BYTES on the way in and CHARS on the way out, and that
+/// asymmetry is deliberate: a UTF-8 char is at least one byte, so "under this
+/// many bytes" implies "under this many chars" and the create side can never
+/// skip a file a later char count would have wanted. The reverse slack —
+/// multi-byte output writing a file it turns out not to need — is cleaned up
+/// by [`SharedBuffer::discard_unreported_spill`] once both streams are known.
+///
+/// Well under the ring capacity, so at the moment of crossing the ring still
+/// holds every byte and the file can start from byte zero.
 const SPILL_JOINT_INLINE_CHARS: usize =
     (crate::runtime::tool_result::TOOL_OUTPUT_BUDGET - SPILL_FRAMING_RESERVE) / 2;
+
+/// Alias for the create side, in the units the create side compares.
+const SPILL_THRESHOLD_BYTES: usize = SPILL_JOINT_INLINE_CHARS;
 
 /// Per-stream cap on a spill file. The file keeps the HEAD (where compilers
 /// put the root-cause error) and stops there; the ring independently keeps
@@ -283,28 +280,31 @@ impl SharedBuffer {
         info
     }
 
-    /// Stream over: close the spill file handle. The file itself normally
-    /// stays on disk — transcript references must outlive the job record —
-    /// with one exception: a file nothing will ever reference (see
-    /// [`Spill::finish`]) is removed instead of lingering until retention.
+    /// Stream over: release the spill file handle. The file stays on disk —
+    /// transcript references must outlive the job record — and whether it was
+    /// worth writing is decided later, by [`Self::discard_unreported_spill`].
     fn finish_spill(&self) {
         let mut ring = self.0.lock().expect("output buffer lock poisoned");
-        let Some(spill) = ring.spill.as_ref() else {
-            return;
-        };
-        if spill.written == 0 {
-            return;
-        }
-        // "Every rendering shows the whole stream": the ring dropped nothing
-        // and the char count fits what a tool result actually retains —
-        // alongside a sibling stream of the same size. See
-        // [`SPILL_JOINT_INLINE_CHARS`]: judging one stream against the WHOLE
-        // budget is not a bound, because stdout and stderr are rendered into
-        // one result whose sum is what gets bounded.
-        let fully_inline =
-            ring.omitted_len() == 0 && ring.text().chars().count() <= SPILL_JOINT_INLINE_CHARS;
         if let Some(spill) = ring.spill.as_mut() {
-            spill.finish(fully_inline);
+            spill.finish();
+        }
+    }
+
+    /// Remove a spill file that no rendering named, now that the caller knows
+    /// it was redundant.
+    ///
+    /// This decision cannot be made at stream end, which is where it used to
+    /// live. A reader task sees one stream, and one stream is not what the
+    /// runtime bounds: a 4,100-char CJK stderr crossed the byte threshold,
+    /// got its file written, then judged itself entirely visible inline
+    /// (4,100 fits any budget) and deleted it — while the 9,000-char stdout
+    /// beside it pushed the joint result to 13,188 chars and 5,188 of them
+    /// were elided out of the only copy left. The sibling is only in hand
+    /// once the result text exists, so the call belongs there.
+    fn discard_unreported_spill(&self) {
+        let mut ring = self.0.lock().expect("output buffer lock poisoned");
+        if let Some(spill) = ring.spill.as_mut() {
+            spill.discard_if_unreported();
         }
     }
 }
@@ -538,14 +538,19 @@ impl Spill {
         })
     }
 
-    /// Stream over: drop the handle. When the whole stream turned out fully
-    /// visible inline (`fully_inline`) and the path never left the process,
-    /// the file is an orphan no rendering will ever name — bytes crossed the
-    /// threshold but chars did not, multi-byte output does that — so it is
-    /// removed here rather than left as unreferenced disk until retention.
-    fn finish(&mut self, fully_inline: bool) {
+    /// Stream over: drop the handle. Nothing is deleted here — see
+    /// [`SharedBuffer::discard_unreported_spill`] for why that decision needs
+    /// the sibling stream and therefore happens later.
+    fn finish(&mut self) {
         self.file = None;
-        if fully_inline && !self.reported && !self.failed && self.written > 0 {
+    }
+
+    /// Delete a file whose path never left the process: bytes crossed the
+    /// threshold but the output turned out fully visible inline anyway
+    /// (multi-byte output does that), so no rendering will ever name it and
+    /// it would otherwise sit unreferenced until retention.
+    fn discard_if_unreported(&mut self) {
+        if !self.reported && !self.failed && self.written > 0 {
             let _ = std::fs::remove_file(&self.path);
             // Zero written = no file, for every later `info()`.
             self.written = 0;
@@ -696,14 +701,36 @@ pub(super) fn shell_text_output(job_id: &str, job: &JobState, max_chars: usize) 
     }
 
     // Measured on the body as it now stands — both streams and the framing —
-    // because that total is what the runtime will bound.
-    if let Some(note) = truncation_note(job_id, job, max_chars, out.chars().count()) {
+    // because that total is what the runtime will bound. The denial note is
+    // 386 chars and is appended below, so it counts toward that total here
+    // even though it is not written yet: measuring without it put a failed
+    // sandboxed build at 12,039 rendered chars against a 12,000 budget with
+    // `result_elided` computed as false, so 4,039 characters went out with no
+    // truncation note, no file and no tail hint.
+    let denial = write_denial_note(job);
+    let pending_denial_chars = denial.map_or(0, |note| note.chars().count() + 1);
+    let rendered_chars = out.chars().count() + pending_denial_chars;
+    if let Some(note) = truncation_note(job_id, job, max_chars, rendered_chars) {
         out.push('\n');
         out.push_str(&note);
     }
-    if let Some(note) = write_denial_note(job) {
+    if let Some(note) = denial {
         out.push('\n');
         out.push_str(note);
+    }
+
+    // Both streams are complete and the joint result has been measured, so
+    // this is the first point where "that file was redundant" can be decided
+    // truthfully. `truncation_note` has already claimed every file it names,
+    // so whatever is still unclaimed here belongs to a result that shows
+    // everything inline. Runs before `job_details`, which would otherwise
+    // hand the model a path to a file with nothing in it worth reading.
+    if rendered_chars <= crate::runtime::tool_result::TOOL_OUTPUT_BUDGET
+        && job.stdout.omitted_len() == 0
+        && job.stderr.omitted_len() == 0
+    {
+        job.stdout.discard_unreported_spill();
+        job.stderr.discard_unreported_spill();
     }
     out
 }
@@ -1034,23 +1061,30 @@ mod tests {
 
     /// A stream can cross the BYTE threshold while staying well under the CHAR
     /// window (multi-byte output): the file is written defensively, but every
-    /// rendering shows the whole stream, so no note or details entry will
-    /// ever name it. Stream end must remove that orphan instead of leaving
-    /// unreferenced disk for retention to find a week later.
+    /// rendering shows the whole stream, so no note or details entry will ever
+    /// name it. That orphan must be removed rather than left as unreferenced
+    /// disk for retention to find a week later.
     ///
-    /// "Well under" is [`SPILL_JOINT_INLINE_CHARS`], not the whole budget: a
-    /// stream is only certainly redundant if it still fits beside a sibling of
-    /// its own size. See the sibling test below.
+    /// Removed when the RESULT is rendered, not at stream end. At stream end
+    /// only one stream is known, and one stream is not what the runtime
+    /// bounds — see the asymmetric case below.
     #[test]
-    fn unnamed_fully_inline_spill_is_removed_at_stream_end() {
+    fn unnamed_fully_inline_spill_is_removed_once_the_result_is_rendered() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("job_5.stdout.log");
         let buffer = SharedBuffer::with_spill(path.clone());
-        let text = "好".repeat(5_000); // 15,000 bytes, 5,000 chars
-        buffer.push(text.as_bytes());
+        buffer.push("好".repeat(5_000).as_bytes()); // 15,000 bytes, 5,000 chars
         assert!(path.exists(), "crossed the byte threshold — file written");
 
+        let job = plain_job(buffer.clone());
         buffer.finish_spill();
+        assert!(path.exists(), "stream end alone decides nothing");
+
+        let rendered = shell_text_output("job_5", &job, 20_000);
+        assert!(
+            !rendered.contains(&path.display().to_string()),
+            "precondition: nothing named the file: {rendered}"
+        );
         assert!(!path.exists(), "an unnamed fully-inline spill is an orphan");
         assert!(
             buffer.spill_info().is_none(),
@@ -1058,33 +1092,124 @@ mod tests {
         );
     }
 
-    /// A stream big enough to combine with a sibling into an over-budget result
-    /// KEEPS its file, even though on its own it fits the budget.
+    /// The canonical two-stream case, end to end: neither stream is remarkable
+    /// on its own, their sum is over budget, and a file must exist.
     ///
-    /// This is the deletion half of the two-stream loss. 8,400 CJK characters
-    /// crosses the byte threshold (file written) and is under the 12,000-char
-    /// budget, so the old per-stream test judged it redundant and deleted it —
-    /// while a 4,000-char sibling was enough to push the rendered sum over the
-    /// budget and have the runtime elide the middle of the only copy left.
+    /// This exact command was in the constant's own doc comment as the bug it
+    /// was meant to prevent, while the code still created files against the
+    /// full budget: two 6,893-byte streams, a 12,872-char result, a 12,000-char
+    /// budget — and no file on either stream, so the only thing the model was
+    /// told was to try `job action=tail`, whose window is capped at the same
+    /// budget and cannot show the head either.
     #[test]
-    fn a_stream_that_could_combine_with_a_sibling_keeps_its_file() {
+    fn a_joint_overflow_always_leaves_a_file_to_read() {
+        let budget = crate::runtime::tool_result::TOOL_OUTPUT_BUDGET;
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("job_6.stdout.log");
-        let buffer = SharedBuffer::with_spill(path.clone());
-        let text = "好".repeat(8_400); // 25,200 bytes, 8,400 chars
-        buffer.push(text.as_bytes());
-        assert!(path.exists(), "crossed the byte threshold — file written");
-        let chars = buffer.text().chars().count();
-        assert!(
-            chars > SPILL_JOINT_INLINE_CHARS && chars < SPILL_THRESHOLD_BYTES,
-            "precondition: {chars} chars fits the budget alone, not beside a sibling"
-        );
+        let out_path = tmp.path().join("job_j.stdout.log");
+        let err_path = tmp.path().join("job_j.stderr.log");
+        let stdout = SharedBuffer::with_spill(out_path.clone());
+        let stderr = SharedBuffer::with_spill(err_path.clone());
+        // `seq 1 1500` twice: 6,893 bytes each, neither near the budget alone.
+        let stream: String = (1..=1500).map(|n| format!("{n}\n")).collect();
+        assert!(stream.len() < budget, "precondition: one stream fits");
+        stdout.push(stream.as_bytes());
+        stderr.push(stream.as_bytes());
 
-        buffer.finish_spill();
+        let job = two_stream_job(stdout.clone(), stderr.clone());
+        stdout.finish_spill();
+        stderr.finish_spill();
+        let rendered = shell_text_output("job_j", &job, 20_000);
+
         assert!(
-            path.exists(),
-            "a stream that a sibling can push over budget must keep its file"
+            rendered.chars().count() > budget,
+            "precondition: the pair is over budget"
         );
+        assert!(
+            rendered.contains(&out_path.display().to_string())
+                || rendered.contains(&err_path.display().to_string()),
+            "an over-budget result must name a file the model can actually read, \
+             not just suggest `job action=tail`: {rendered}"
+        );
+    }
+
+    /// The write-denial note is 386 characters and is appended to the result
+    /// AFTER the truncation note has been decided, so its length has to be
+    /// counted before the decision, not after. Measuring without it put a
+    /// failed sandboxed build at 12,039 rendered chars against a 12,000-char
+    /// budget with `result_elided` computed as false: 4,039 characters were
+    /// elided by the runtime with no note, no file and no tail hint.
+    #[test]
+    fn the_denial_note_counts_toward_the_budget_it_pushes_the_result_past() {
+        let budget = crate::runtime::tool_result::TOOL_OUTPUT_BUDGET;
+        let tmp = tempfile::tempdir().unwrap();
+        let err_path = tmp.path().join("job_d.stderr.log");
+        let stderr = SharedBuffer::with_spill(err_path.clone());
+        // Just under budget on its own; the denial note is what tips it over.
+        let denial_len = crate::sandbox::WRITE_DENIAL_NOTE.chars().count();
+        stderr.push(b"mkdir: /etc/x: Operation not permitted\n");
+        stderr.push(&vec![b'e'; budget - denial_len / 2]);
+
+        let mut job = two_stream_job(SharedBuffer::default(), stderr.clone());
+        job.status = JobStatus::Failed;
+        job.exit_code = Some(1);
+        job.sandboxed = true;
+        stderr.finish_spill();
+
+        let rendered = shell_text_output("job_d", &job, 20_000);
+        assert!(
+            rendered.contains(crate::sandbox::WRITE_DENIAL_NOTE),
+            "precondition: this job carries the denial note"
+        );
+        assert!(
+            rendered.chars().count() > budget,
+            "precondition: the result is over budget once the note is on it"
+        );
+        assert!(
+            rendered.contains(&err_path.display().to_string()),
+            "over budget means content is being elided — say so and name the file: {rendered}"
+        );
+    }
+
+    /// Two streams that each look harmless keep their files, because what the
+    /// runtime bounds is their SUM.
+    ///
+    /// The asymmetric pair is the case a per-stream rule cannot get right: a
+    /// 4,100-char CJK stderr crosses the byte threshold, then judges itself
+    /// entirely visible inline and deletes its file — while the 9,000-char
+    /// stdout beside it pushes the rendered result past the budget and the
+    /// middle is elided out of the only copy left. Both files must survive.
+    #[test]
+    fn an_asymmetric_pair_keeps_both_files_when_their_sum_is_over_budget() {
+        let budget = crate::runtime::tool_result::TOOL_OUTPUT_BUDGET;
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("job_6.stdout.log");
+        let err_path = tmp.path().join("job_6.stderr.log");
+        let stdout = SharedBuffer::with_spill(out_path.clone());
+        let stderr = SharedBuffer::with_spill(err_path.clone());
+        stdout.push(&vec![b'y'; 9_000]); // 9,000 chars, comfortably under budget
+        stderr.push("好".repeat(4_100).as_bytes()); // 12,300 bytes, 4,100 chars
+        assert!(out_path.exists() && err_path.exists(), "both files written");
+
+        let job = two_stream_job(stdout.clone(), stderr.clone());
+        stdout.finish_spill();
+        stderr.finish_spill();
+
+        let rendered = shell_text_output("job_6", &job, 20_000);
+        assert!(
+            rendered.chars().count() > budget,
+            "precondition: the pair renders over budget"
+        );
+        assert!(
+            out_path.exists() && err_path.exists(),
+            "neither file may be deleted when the joint result loses content"
+        );
+        for path in [&out_path, &err_path] {
+            assert!(
+                rendered.contains(&path.display().to_string()),
+                "and the note must name {}: {rendered}",
+                path.display()
+            );
+        }
     }
 
     /// The band between what a tool result actually retains
@@ -1154,7 +1279,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("job_9.stdout.log");
         let buffer = SharedBuffer::with_spill(path.clone());
-        buffer.push(&vec![b'z'; SPILL_THRESHOLD_BYTES + 5]);
+        buffer.push(&vec![
+            b'z';
+            crate::runtime::tool_result::TOOL_OUTPUT_BUDGET + 5
+        ]);
         assert!(path.exists(), "precondition: a file was written");
         // Reach the cap without writing 64 MB.
         buffer
@@ -1201,6 +1329,13 @@ mod tests {
             path.exists(),
             "a named path must stay valid after the stream"
         );
+    }
+
+    fn two_stream_job(stdout: SharedBuffer, stderr: SharedBuffer) -> JobState {
+        JobState {
+            stderr,
+            ..plain_job(stdout)
+        }
     }
 
     fn plain_job(stdout: SharedBuffer) -> JobState {
