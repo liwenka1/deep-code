@@ -38,20 +38,40 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let input_height = Constraint::Length(visual_rows as u16 + 2);
 
     let snapshot: TranscriptSnapshot = if app.pending_approval.is_some() {
-        let panel_rows = approval_panel_rows(app, frame.area());
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(5),
-                Constraint::Length(panel_rows),
-                input_height,
-                Constraint::Length(1),
-            ])
-            .split(frame.area());
-        let snap = render_messages(frame, app, chunks[0]);
-        render_approval_panel(frame, app, chunks[1]);
-        render_input_from_layout(frame, app, &layout, chunks[2]);
-        render_status(frame, app, chunks[3]);
+        // Carved by hand, not by the constraint solver. `Constraint::Min(5)`
+        // on the transcript carries MIN_SIZE_GE strength (STRONG*100) while
+        // the panel's `Constraint::Length` carries LENGTH_SIZE_EQ (STRONG*10),
+        // so on any frame too short for both, the transcript took its five
+        // rows and the panel absorbed the entire deficit: at 80x12 a panel
+        // asking for 6 rows was handed 3, its body 1, and the overflow hint 0
+        // — the human saw a single header line naming no directory, with
+        // nothing to say more existed, and `y` still granted.
+        //
+        // Priority when the frame cannot hold everything: status row, then
+        // the panel in full, then the composer, and the transcript takes what
+        // is left (possibly nothing). Answering an approval needs neither a
+        // composer nor scrollback.
+        let area = frame.area();
+        let panel_rows = approval_panel_rows(app, area);
+        let mut rest = area.height;
+        let status_h = rest.min(1);
+        rest -= status_h;
+        let panel_h = panel_rows.min(rest);
+        rest -= panel_h;
+        let input_h = (visual_rows as u16 + 2).min(rest);
+        rest -= input_h;
+        let transcript_h = rest;
+
+        let row = |offset: u16, height: u16| ratatui::layout::Rect {
+            x: area.x,
+            y: area.y + offset,
+            width: area.width,
+            height,
+        };
+        let snap = render_messages(frame, app, row(0, transcript_h));
+        render_approval_panel(frame, app, row(transcript_h, panel_h));
+        render_input_from_layout(frame, app, &layout, row(transcript_h + panel_h, input_h));
+        render_status(frame, app, row(transcript_h + panel_h + input_h, status_h));
         snap
     } else if let Some(menu) = &app.completion {
         let menu_height = (menu.items.len() as u16).min(COMPLETION_VISIBLE_ROWS as u16) + 2;
@@ -941,25 +961,33 @@ fn approval_body(app: &App, width: usize) -> Vec<Line<'static>> {
 /// whole point of resolving before prompting — sat one row below the edge with
 /// no overflow indicator. Growing to fit puts every decision-critical line on
 /// screen; content past [`APPROVAL_PANEL_MAX_ROWS`] (a long diff preview)
-/// still scrolls, and the panel never takes more than half the frame.
+/// still scrolls.
+///
+/// The old ceiling also capped the panel at half the frame, which read as
+/// politeness but was the bug: on a 15-row terminal half a frame cannot hold
+/// the prompt, and the rows that fell off the bottom were the resolved target
+/// and the overflow indicator both. A share of the screen is not something to
+/// negotiate when the alternative is asking the human to approve a directory
+/// the panel never named — so the only ceiling left is the frame itself
+/// (minus the status row), and [`APPROVAL_PANEL_MAX_ROWS`] on top of it.
 fn approval_panel_rows(app: &App, area: ratatui::layout::Rect) -> u16 {
     let width = usize::from(area.width.saturating_sub(2)).max(8);
     let wanted = u16::try_from(approval_body(app, width).len())
         .unwrap_or(u16::MAX)
         .saturating_add(APPROVAL_OPTION_ROWS);
-    let ceiling = APPROVAL_PANEL_MAX_ROWS.min((area.height / 2).max(APPROVAL_PANEL_MIN_ROWS));
-    wanted.clamp(APPROVAL_PANEL_MIN_ROWS, ceiling)
+    // Everything below the status row may be taken. `floor` is itself capped
+    // by `ceiling`, because `clamp` panics when min > max and a 6-row terminal
+    // would otherwise reach that.
+    let available = area.height.saturating_sub(1);
+    let ceiling = APPROVAL_PANEL_MAX_ROWS.min(available);
+    let floor = APPROVAL_PANEL_MIN_ROWS.min(ceiling);
+    wanted.clamp(floor, ceiling)
 }
 
 fn render_approval_panel(frame: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Rect) {
     if app.pending_approval.is_none() {
         return;
     }
-    // This panel is now on screen, so from here a decision key is an answer to
-    // something the user can actually see. Armed before drawing rather than
-    // after: a frame that fails mid-render must not leave the prompt
-    // permanently deaf to y/n.
-    app.approval_armed = true;
     // Body (scrollable) on top; the y/a/n choices pinned to the bottom rows so
     // they stay visible even when a long command wraps.
     let chunks = Layout::default()
@@ -1059,9 +1087,22 @@ fn render_approval_panel(frame: &mut Frame<'_>, app: &mut App, area: ratatui::la
         })
         .collect();
 
+    let option_count = options_body.len();
     let options =
         Paragraph::new(options_body).block(Block::default().padding(Padding::new(1, 0, 0, 0)));
     frame.render_widget(options, chunks[1]);
+
+    // Armed only now, and only if the rows a decision rests on were actually
+    // painted: at least one body row, and room for EVERY choice. A viewport
+    // showing `y Approve` while `n Deny` fell off the bottom is the worst of
+    // the two, since deny is where the focus starts on a root grant.
+    //
+    // This used to be the first statement in the function, set
+    // unconditionally, so a panel squeezed to zero rows — not one cell drawn
+    // — still accepted `y`: the queued-keystroke guard was off exactly when
+    // the user could see nothing. A frame with no room leaves the prompt
+    // disarmed; the next one (a resize, a redraw) arms it.
+    app.approval_armed = content_area.height > 0 && usize::from(chunks[1].height) >= option_count;
 }
 
 // ---------------------------------------------------------------------------
@@ -1902,20 +1943,12 @@ mod tests {
         root_grant_screen_requesting(width, height, "/tmp/workspace/build-cache", resolved_target)
     }
 
-    /// As [`root_grant_screen`], but the model's requested spelling is the
-    /// caller's — the field it fully controls, in both length and glyph width.
-    fn root_grant_screen_requesting(
-        width: u16,
-        height: u16,
+    /// A `request_write_root` approval as the runtime parks it.
+    fn root_grant_request(
         requested: &str,
         resolved_target: &str,
-    ) -> String {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let mut app = App::new();
-        app.lang = Lang::En;
-        app.pending_approval = Some(deep_code_agent::ApprovalRequest {
+    ) -> deep_code_agent::ApprovalRequest {
+        deep_code_agent::ApprovalRequest {
             call_id: "call_grant".to_string(),
             tool_name: deep_code_agent::REQUEST_WRITE_ROOT_TOOL.to_string(),
             description: "grants write access to a directory outside the current roots".to_string(),
@@ -1932,7 +1965,23 @@ mod tests {
             matched_rule: Some("builtin:root_grant".to_string()),
             preview: None,
             safety_notes: Vec::new(),
-        });
+        }
+    }
+
+    /// As [`root_grant_screen`], but the model's requested spelling is the
+    /// caller's — the field it fully controls, in both length and glyph width.
+    fn root_grant_screen_requesting(
+        width: u16,
+        height: u16,
+        requested: &str,
+        resolved_target: &str,
+    ) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new();
+        app.lang = Lang::En;
+        app.pending_approval = Some(root_grant_request(requested, resolved_target));
 
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -1959,6 +2008,67 @@ mod tests {
     /// the bottom edge with no overflow indicator. Asserted at several sizes
     /// because the old height was a constant, so it failed identically on a
     /// large terminal.
+    /// A small terminal is the third form of the same bug, and the one every
+    /// other test in this file was blind to: they all use heights of 20 or
+    /// more. A tmux split, a VS Code panel or a short window put the frame at
+    /// 12-15 rows, and there the constraint solver handed the transcript its
+    /// `Min(5)` and let the panel absorb the whole deficit — at 11 and 12 rows
+    /// the `Deny` choice was on screen and pressable while the directory being
+    /// granted was not, with no overflow indicator either.
+    ///
+    /// Swept row by row rather than at a couple of sizes, because the failure
+    /// was a boundary: it appeared at exactly the heights nobody sampled.
+    #[test]
+    fn root_grant_panel_shows_the_resolved_target_on_every_usable_height() {
+        let target = "/home/u/.ssh";
+        let mut blind = Vec::new();
+        for height in 8..=24u16 {
+            let screen = root_grant_screen(80, height, target);
+            // Where a decision can be made, the decision's subject must be
+            // legible. (Below that the panel simply has no room, and the
+            // arming guard keeps the keys inert — pinned separately.)
+            if screen.contains(tr(Lang::En, TextId::ApprovalOptDeny)) && !screen.contains(target) {
+                blind.push(height);
+            }
+        }
+        assert!(
+            blind.is_empty(),
+            "at heights {blind:?} the user can press Deny/Approve without ever \
+             being shown the directory being granted"
+        );
+    }
+
+    /// Nothing painted must mean nothing decidable. `approval_armed` used to
+    /// be set as the first statement of `render_approval_panel`, before and
+    /// regardless of any drawing, so a frame with no room for the panel still
+    /// accepted `y` — the queued-keystroke guard was disabled precisely when
+    /// the user could see nothing at all.
+    #[test]
+    fn a_panel_with_no_room_to_draw_does_not_arm_the_decision_keys() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for (width, height) in [(20, 1), (20, 2), (40, 3)] {
+            let mut app = App::new();
+            app.lang = Lang::En;
+            app.pending_approval = Some(root_grant_request("/tmp/x", "/home/u/.ssh"));
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+            let buffer = terminal.backend().buffer().clone();
+            let painted: String = (0..buffer.area.height)
+                .flat_map(|row| (0..buffer.area.width).map(move |col| (col, row)))
+                .map(|(col, row)| buffer[(col, row)].symbol().to_string())
+                .collect();
+            let drew_choices = painted.contains(tr(Lang::En, TextId::ApprovalOptDeny));
+            assert_eq!(
+                app.approval_armed, drew_choices,
+                "at {width}x{height} the panel armed={} while drew_choices={drew_choices}",
+                app.approval_armed
+            );
+        }
+    }
+
     #[test]
     fn root_grant_panel_shows_the_resolved_target_on_screen() {
         let target = "/home/u/.config/private-keys";
