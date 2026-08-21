@@ -232,10 +232,22 @@ fn a_parked_root_grant_starts_focused_on_deny() {
         "a freshly parked panel has not been drawn yet"
     );
 
-    app.park_approval(ordinary);
+    app.park_approval(ordinary.clone());
     assert_eq!(
         app.approval_focus, 0,
-        "ordinary prompts keep the approve default"
+        "ordinary local prompts keep the approve default"
+    );
+
+    // Anything reaching the network joins the root grant: `curl … | sh` is one
+    // reflex keystroke either way, and y/a/n puts deny at index 2.
+    let networked = deep_code_agent::ApprovalRequest {
+        network: true,
+        ..ordinary
+    };
+    app.park_approval(networked);
+    assert_eq!(
+        app.approval_focus, 2,
+        "a networked prompt must not default to approve"
     );
 }
 

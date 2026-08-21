@@ -186,6 +186,24 @@ fn compose_profile(
         profile.rule(format!("(deny file-write* (subpath {param}))"));
     }
 
+    // Nine of the ten entries are direct children of `$HOME`, so the subpath
+    // deny also covers their own inode: renaming or unlinking `~/.ssh` is
+    // refused along with writing inside it. `.config/gh` is the one with an
+    // intermediate component, and `~/.config` itself is not denied — so with
+    // HOME as a write root the deny is walked around rather than broken:
+    //
+    //     mv ~/.config ~/.c && echo 'oauth_token: …' > ~/.c/gh/hosts.yml \
+    //         && mv ~/.c ~/.config
+    //
+    // Denying unlink on `~/.config` alone stops the move while leaving every
+    // ordinary write under `~/.config/...` allowed, which is the narrowest
+    // rule that closes it.
+    if let Some(home) = crate::paths::home_dir() {
+        let home = crate::paths::canonicalize(&home).unwrap_or(home);
+        let param = profile.bind_path("KEEP_XDG_CONFIG", home.join(".config"));
+        profile.rule(format!("(deny file-write-unlink (literal {param}))"));
+    }
+
     // deep-code's OWN config dir holds the plaintext API key. No sandboxed
     // subprocess ever needs to touch it, so deny BOTH write and read — this is
     // the one credential store we can fully seal without breaking legitimate
@@ -340,6 +358,44 @@ mod tests {
             compose_profile(&SandboxPolicy::workspace_write(), &single_root(ws), ws).render();
         assert!(text.starts_with("(version 1)\n(deny default)"));
         assert!(text.contains("(allow file-read*)"));
+    }
+
+    /// `~/.config/gh` is the only credential entry with an intermediate
+    /// component, and `~/.config` itself carries no deny — so with HOME as a
+    /// write root the `(deny file-write* (subpath …/.config/gh))` rule is not
+    /// broken but simply walked around:
+    ///
+    ///     mv ~/.config ~/.c && echo 'oauth_token: …' > ~/.c/gh/hosts.yml \
+    ///         && mv ~/.c ~/.config
+    ///
+    /// Denying unlink on the directory itself stops the move while leaving
+    /// every ordinary write under `~/.config/...` allowed.
+    #[test]
+    fn the_gh_token_store_cannot_be_moved_out_from_under_its_deny() {
+        let Some(home) = crate::paths::home_dir() else {
+            eprintln!("no home dir on this host; skipping");
+            return;
+        };
+        let home = crate::paths::canonicalize(&home).unwrap_or(home);
+        let ws = Path::new("/tmp/dc-ws");
+        let text =
+            compose_profile(&SandboxPolicy::workspace_write(), &single_root(ws), ws).render();
+
+        let config = home.join(".config").display().to_string();
+        assert!(
+            text.contains("(param \"KEEP_XDG_CONFIG\")") || text.contains(&config),
+            "the profile must bind ~/.config: {text}"
+        );
+        assert!(
+            text.contains("(deny file-write-unlink (literal (param \"KEEP_XDG_CONFIG\")))"),
+            "renaming ~/.config must be refused, or the gh deny is walked around: {text}"
+        );
+        // And only unlink — ordinary writes elsewhere under ~/.config stay
+        // allowed, so this does not quietly become a blanket denial.
+        assert!(
+            !text.contains("(deny file-write* (subpath (param \"KEEP_XDG_CONFIG\")))"),
+            "the whole of ~/.config must not become read-only: {text}"
+        );
     }
 
     #[test]

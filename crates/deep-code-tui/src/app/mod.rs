@@ -767,17 +767,28 @@ impl App {
     /// Park an arriving approval: reset the view, choose the starting option,
     /// and disarm the decision keys until the panel has been drawn.
     ///
-    /// A root grant starts focused on **deny**. Every other prompt is a
-    /// question about one action; this one widens the session's write boundary
-    /// for good, and the reflex `Enter` belongs to the reversible answer. The
-    /// user still approves with `y` or by moving the highlight — nothing is
-    /// harder to reach, the default is just the safe one.
+    /// The reflex `Enter` belongs to the reversible answer, so two classes
+    /// start focused on **deny**: a root grant, which widens the session's
+    /// write boundary for good rather than authorizing one action; and
+    /// anything reaching the network, where a mis-keyed yes costs whatever the
+    /// far end sends back or receives — `curl … | sh` is one keystroke either
+    /// way. The user still approves with `y` or by moving the highlight;
+    /// nothing became harder to reach, the default just changed side.
+    ///
+    /// A *local* High-risk action deliberately keeps approve as its default.
+    /// The genuinely unrecoverable ones are hard-refused by the deny floor
+    /// before a prompt exists at all, and flipping the whole tier would train
+    /// the user to reach for `y` reflexively instead — which is the habit this
+    /// is here to protect.
     pub(crate) fn park_approval(&mut self, request: ApprovalRequest) {
-        let deny_by_default = request.tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL;
+        let is_root_grant = request.tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL;
+        let deny_by_default = is_root_grant || request.network;
         self.pending_approval = Some(request);
         self.approval_scroll_offset = 0;
-        // Root grant renders y/n, so deny is index 1.
-        self.approval_focus = usize::from(deny_by_default);
+        // Deny is last either way, but a root grant renders y/n (consent is
+        // per-directory, so there is no "allow for session") against y/a/n.
+        let options = if is_root_grant { 2 } else { 3 };
+        self.approval_focus = if deny_by_default { options - 1 } else { 0 };
         self.approval_armed = false;
         self.is_streaming = false;
     }

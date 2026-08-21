@@ -446,16 +446,34 @@ pub(crate) fn truncate_display_width(text: &str, max_cols: usize) -> String {
     use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
 
+    // Columns alone do not bound the string. A grapheme cluster carries any
+    // number of combining marks and still measures one column, so
+    // `"r" + U+0301 × 20000` passes a 240-column cap completely untouched:
+    // 40 KB in one terminal cell, re-emitted on every redraw, which terminals
+    // answer either by stacking the marks over neighbouring rows — the
+    // resolved-target line among them — or by stalling. `justification` is an
+    // unvalidated model-supplied string, so this is directly reachable. Four
+    // marks is more than any legitimate script stacks.
+    const MAX_MARKS_PER_CLUSTER: usize = 4;
+
     let mut truncated = String::new();
     let mut used = 0_usize;
-    let mut graphemes = text.graphemes(true);
-    for grapheme in graphemes.by_ref() {
+    let mut clipped_a_cluster = false;
+    for grapheme in text.graphemes(true) {
         let width = UnicodeWidthStr::width(grapheme);
         if used + width > max_cols {
             return format!("{truncated} (truncated)");
         }
-        truncated.push_str(grapheme);
+        if grapheme.chars().count() > MAX_MARKS_PER_CLUSTER + 1 {
+            clipped_a_cluster = true;
+            truncated.extend(grapheme.chars().take(MAX_MARKS_PER_CLUSTER + 1));
+        } else {
+            truncated.push_str(grapheme);
+        }
         used += width;
+    }
+    if clipped_a_cluster {
+        return format!("{truncated} (truncated)");
     }
     // Consumed the whole input without exceeding the cap.
     text.to_string()
@@ -465,6 +483,27 @@ pub(crate) fn truncate_display_width(text: &str, max_cols: usize) -> String {
 mod width_tests {
     use super::{truncate_chars, truncate_display_width};
     use unicode_width::UnicodeWidthStr;
+
+    /// A column cap is not a length cap: one grapheme cluster carries any
+    /// number of combining marks and still measures a single column, so
+    /// without a per-cluster bound `"r" + U+0301 × 20000` walked through a
+    /// 240-column cap untouched — 40 KB in one terminal cell, redrawn every
+    /// frame, stacking marks over the rows around it (the approval panel's
+    /// resolved-target line among them).
+    #[test]
+    fn a_column_cap_also_bounds_marks_inside_one_cluster() {
+        let zalgo = format!("r{}", "\u{301}".repeat(20_000));
+        let capped = truncate_display_width(&zalgo, 240);
+        assert!(
+            capped.chars().count() < 40,
+            "one cluster kept {} chars through a 240-column cap",
+            capped.chars().count()
+        );
+        assert!(capped.contains("(truncated)"), "and must say it was cut");
+        // Legitimate stacking is untouched.
+        let vietnamese = "ế";
+        assert_eq!(truncate_display_width(vietnamese, 240), vietnamese);
+    }
 
     /// The cap is columns, and a double-width script must not be able to spend
     /// twice the budget the caller reserved.
