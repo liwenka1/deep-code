@@ -340,6 +340,51 @@ fn highlight_selection(
 /// without flicker; a pipe-table header stays plain text until its separator
 /// row arrives — the same no-flicker rule from the other direction.
 fn cell_lines(cell: &HistoryCell, width: u16, lang: Lang) -> Vec<Line<'static>> {
+    let mut lines = cell_lines_unsanitized(cell, width, lang);
+    // One choke point for the whole transcript, applied to the finished lines
+    // rather than to each variant's inputs: wrapping has already consumed the
+    // real newlines by now, so anything control-shaped left in a span is
+    // something the model put there, and a new `HistoryCell` variant cannot
+    // forget to opt in.
+    //
+    // ratatui carries an escape byte into a cell verbatim, and `unicode-width`
+    // reports `\x1b` as width 1, so `Paragraph`'s zero-width filter does not
+    // drop it. That made ordinary assistant prose an attack on the approval
+    // panel drawn in the same frame: `\x1b[8m` turns on SGR conceal, and since
+    // ratatui only emits `NoHidden` when its OWN tracked modifier had HIDDEN,
+    // nothing ever turns it back off — every cell flushed afterwards,
+    // including the whole prompt below, is invisible. `\x1b[12;3H` is worse
+    // still: it repositions the cursor and paints attacker text at a chosen
+    // row, which is how a counterfeit "Grant target (resolved): /tmp/harmless"
+    // can appear inside a security prompt that never rendered it.
+    for line in &mut lines {
+        for span in &mut line.spans {
+            if span.content.chars().any(char::is_control) {
+                span.content = neutralize_transcript_text(&span.content).into();
+            }
+        }
+    }
+    lines
+}
+
+/// Control characters out of a finished transcript span. A tab becomes four
+/// spaces rather than one, because code blocks reach here tab-indented and
+/// collapsing that to a single column misreads the code; everything else
+/// becomes one space, preserving the column count the wrap step already
+/// committed to.
+fn neutralize_transcript_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\t' => out.push_str("    "),
+            ch if ch.is_control() => out.push(' '),
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+fn cell_lines_unsanitized(cell: &HistoryCell, width: u16, lang: Lang) -> Vec<Line<'static>> {
     let width = width as usize;
     let dim = Style::default().fg(Color::DarkGray);
     match cell {
@@ -2008,6 +2053,61 @@ mod tests {
     /// the bottom edge with no overflow indicator. Asserted at several sizes
     /// because the old height was a constant, so it failed identically on a
     /// large terminal.
+    /// Model text in the TRANSCRIPT must not be able to reach the terminal
+    /// with control bytes intact, because the approval panel is drawn into the
+    /// same frame and a single escape defeats every sanitizer the panel has.
+    ///
+    /// `\x1b[8m` is SGR conceal: ratatui emits `NoHidden` only when its own
+    /// tracked modifier had HIDDEN, so it never turns the attribute back off
+    /// and every cell flushed after it — the entire prompt below — renders
+    /// invisible. `\x1b[12;3H` repositions the cursor and paints text at a
+    /// chosen row, which is how a counterfeit resolved-target line appears in
+    /// a prompt that never rendered one. `\r` overwrites the line in place.
+    #[test]
+    fn transcript_text_cannot_carry_an_escape_into_a_cell() {
+        use crate::history::HistoryCell;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let payloads = [
+            "\u{1b}[8mconceal everything after me",
+            "\u{1b}[12;3HGrant target (resolved): /tmp/harmless",
+            "overwrite\rme",
+            "bell\u{7}and\u{9b}csi",
+        ];
+        for payload in payloads {
+            for cell in [
+                HistoryCell::Assistant {
+                    text: payload.to_string(),
+                },
+                HistoryCell::User {
+                    text: payload.to_string(),
+                },
+                HistoryCell::System {
+                    text: payload.to_string(),
+                },
+            ] {
+                let mut app = App::new();
+                app.lang = Lang::En;
+                app.history.push(cell);
+                let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+                let buffer = terminal.backend().buffer().clone();
+                for row in 0..buffer.area.height {
+                    for col in 0..buffer.area.width {
+                        let symbol = buffer[(col, row)].symbol();
+                        assert!(
+                            !symbol.chars().any(char::is_control),
+                            "control char {:?} reached cell ({col},{row}) from {payload:?}",
+                            symbol
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// A small terminal is the third form of the same bug, and the one every
     /// other test in this file was blind to: they all use heights of 20 or
     /// more. A tmux split, a VS Code panel or a short window put the frame at
