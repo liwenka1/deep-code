@@ -186,22 +186,27 @@ fn compose_profile(
         profile.rule(format!("(deny file-write* (subpath {param}))"));
     }
 
-    // Nine of the ten entries are direct children of `$HOME`, so the subpath
-    // deny also covers their own inode: renaming or unlinking `~/.ssh` is
-    // refused along with writing inside it. `.config/gh` is the one with an
-    // intermediate component, and `~/.config` itself is not denied — so with
-    // HOME as a write root the deny is walked around rather than broken:
+    // A single-component entry (`~/.ssh`) is fully sealed by the subpath deny
+    // above: it covers the entry's own inode, so renaming or unlinking it is
+    // refused along with writing inside it. A multi-component entry
+    // (`~/.config/gh`, `~/Library/Keychains`) is not — its parent is an
+    // ordinary writable directory when HOME is a granted root, so the deny on
+    // the leaf is walked around by moving that parent aside and back:
     //
-    //     mv ~/.config ~/.c && echo 'oauth_token: …' > ~/.c/gh/hosts.yml \
-    //         && mv ~/.c ~/.config
+    //     mv ~/Library ~/L && echo 'secret' > ~/L/Keychains/… \
+    //         && mv ~/L ~/Library
     //
-    // Denying unlink on `~/.config` alone stops the move while leaving every
-    // ordinary write under `~/.config/...` allowed, which is the narrowest
-    // rule that closes it.
+    // Deny unlink on each intermediate directory to close it — a `literal`, so
+    // only that directory's own rename is refused while the ordinary writes
+    // beneath it a working tool needs stay allowed, the narrowest rule that
+    // works. Enumerated from the entry list (see `credential_parent_dirs_under`)
+    // rather than hand-picked, so a new multi-component entry is covered on the
+    // spot instead of the next time someone remembers this block exists.
     if let Some(home) = crate::paths::home_dir() {
-        let home = crate::paths::canonicalize(&home).unwrap_or(home);
-        let param = profile.bind_path("KEEP_XDG_CONFIG", home.join(".config"));
-        profile.rule(format!("(deny file-write-unlink (literal {param}))"));
+        for (index, dir) in credential_parent_dirs_under(&home).into_iter().enumerate() {
+            let param = profile.bind_path(&format!("KEEP_PARENT_{index}"), dir);
+            profile.rule(format!("(deny file-write-unlink (literal {param}))"));
+        }
     }
 
     // deep-code's OWN config dir holds the plaintext API key. No sandboxed
@@ -273,15 +278,56 @@ fn credential_dirs_under(home: &Path) -> Vec<(String, PathBuf)> {
     for (index, entry) in crate::paths::CREDENTIAL_ENTRIES.iter().enumerate() {
         let joined = resolved_home.join(entry);
         // Resolves through an intermediate symlink even when the leaf does not
-        // exist yet: `.config/gh` is the one two-level entry, and behind a
-        // dotfiles-managed `~/.config` the all-or-nothing `canonicalize` gives
-        // up and leaves the real location undenied.
+        // exist yet: for a multi-component entry (`.config/gh`,
+        // `Library/Keychains`) behind a dotfiles-managed parent the
+        // all-or-nothing `canonicalize` gives up, leaving the real location
+        // undenied unless the existing prefix is resolved on its own.
         if let Some(resolved) = crate::paths::canonicalize_existing_prefix(&joined)
             && resolved != joined
         {
             dirs.push((format!("KEEP_{index}_R"), resolved));
         }
         dirs.push((format!("KEEP_{index}"), joined));
+    }
+    dirs
+}
+
+/// The intermediate directories of every multi-component credential entry, so
+/// each can be denied `file-write-unlink`.
+///
+/// `(deny file-write* (subpath X))` covers X and everything beneath it,
+/// including X's own inode, so a single-component entry (`~/.ssh`) is fully
+/// sealed: renaming or unlinking it is refused along with writing inside it. A
+/// multi-component entry is not — its parent is an ordinary writable directory
+/// when HOME is a granted root, so the deny on the leaf is walked around by
+/// moving that parent aside and back:
+///
+///     mv ~/Library ~/L && echo … > ~/L/Keychains/… && mv ~/L ~/Library
+///
+/// Locking each intermediate directory against unlink closes that walk-around.
+/// Deduplicated, since `.config/gh` and `.config/gcloud` share `~/.config`. The
+/// paths are the literal spelling under the resolved home — a rename acts on
+/// the name, not on wherever a symlinked name points, and a symlinked leaf is
+/// already covered by the resolved spelling `credential_dirs_under` emits.
+///
+/// Derived from [`crate::paths::CREDENTIAL_ENTRIES`], not hand-listed: adding
+/// `Library/Keychains` to that list is what surfaced this gap, so a future
+/// multi-component entry must not depend on someone remembering to lock its
+/// parent by hand.
+fn credential_parent_dirs_under(home: &Path) -> Vec<PathBuf> {
+    let resolved_home = crate::paths::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for entry in crate::paths::CREDENTIAL_ENTRIES {
+        // Every ancestor between the resolved home and the leaf; the leaf
+        // itself is left out, sealed by its own subpath deny.
+        let components: Vec<_> = Path::new(entry).components().collect();
+        let mut prefix = resolved_home.clone();
+        for component in &components[..components.len().saturating_sub(1)] {
+            prefix.push(component.as_os_str());
+            if !dirs.contains(&prefix) {
+                dirs.push(prefix.clone());
+            }
+        }
     }
     dirs
 }
@@ -346,41 +392,103 @@ mod tests {
         assert!(text.contains("(allow file-read*)"));
     }
 
-    /// `~/.config/gh` is the only credential entry with an intermediate
-    /// component, and `~/.config` itself carries no deny — so with HOME as a
-    /// write root the `(deny file-write* (subpath …/.config/gh))` rule is not
-    /// broken but simply walked around:
+    /// Every credential entry with an intermediate component gets that
+    /// component locked, so the subpath deny on the leaf cannot be walked
+    /// around by renaming the parent aside. `~/.config` (shared by gh and
+    /// gcloud) and `~/Library` (Keychains) are the cases today; a
+    /// single-component entry contributes nothing, being sealed by its own
+    /// subpath deny.
     ///
-    ///     mv ~/.config ~/.c && echo 'oauth_token: …' > ~/.c/gh/hosts.yml \
-    ///         && mv ~/.c ~/.config
-    ///
-    /// Denying unlink on the directory itself stops the move while leaving
-    /// every ordinary write under `~/.config/...` allowed.
+    /// Enumerated from `CREDENTIAL_ENTRIES` so a future multi-component entry
+    /// is pinned automatically — a hand-listed subset is exactly how
+    /// `~/Library` came to be missing after `Library/Keychains` was added.
     #[test]
-    fn the_gh_token_store_cannot_be_moved_out_from_under_its_deny() {
+    fn every_multi_component_credential_parent_is_locked() {
+        let home = tempfile::TempDir::new().unwrap();
+        let home = home.path().canonicalize().unwrap();
+
+        let parents = credential_parent_dirs_under(&home);
+
+        for entry in crate::paths::CREDENTIAL_ENTRIES {
+            // Walk every ancestor between the leaf and home; each must be
+            // locked. Handles deeper nesting too, not just two-level entries.
+            let mut ancestor = Path::new(entry).parent();
+            while let Some(rel) = ancestor {
+                if rel.as_os_str().is_empty() {
+                    break;
+                }
+                let abs = home.join(rel);
+                assert!(
+                    parents.contains(&abs),
+                    "ancestor {} of entry {entry:?} must be locked against rename: {parents:?}",
+                    abs.display()
+                );
+                ancestor = rel.parent();
+            }
+        }
+        // Leaves are NOT here: they are sealed by their own subpath deny, and
+        // locking them would forbid the legitimate writes a tool makes inside.
+        assert!(
+            !parents.contains(&home.join(".config/gh")),
+            "a leaf must not be locked here: {parents:?}"
+        );
+        // No duplicates: gh and gcloud share `~/.config`, locked once.
+        let unique: std::collections::BTreeSet<&PathBuf> = parents.iter().collect();
+        assert_eq!(
+            unique.len(),
+            parents.len(),
+            "duplicate parent lock: {parents:?}"
+        );
+    }
+
+    /// The profile must actually emit a `file-write-unlink` deny for each
+    /// intermediate directory (and only unlink, so the tree does not turn
+    /// read-only). The regression this guards: `~/Library`, the parent of the
+    /// newly added `Library/Keychains`, must be one of them — not just
+    /// `~/.config`, which was the only one the previous hand-coded block knew.
+    #[test]
+    fn intermediate_credential_dirs_are_locked_against_rename() {
         let Some(home) = crate::paths::home_dir() else {
             eprintln!("no home dir on this host; skipping");
             return;
         };
-        let home = crate::paths::canonicalize(&home).unwrap_or(home);
         let ws = Path::new("/tmp/dc-ws");
-        let text =
-            compose_profile(&SandboxPolicy::workspace_write(), &single_root(ws), ws).render();
+        let profile = compose_profile(&SandboxPolicy::workspace_write(), &single_root(ws), ws);
+        let text = profile.render();
 
-        let config = home.join(".config").display().to_string();
+        for dir in credential_parent_dirs_under(&home) {
+            let param = profile
+                .bindings
+                .iter()
+                .find(|(_, path)| *path == dir)
+                .map(|(name, _)| name.clone())
+                .unwrap_or_else(|| {
+                    panic!("{} must be bound: {:?}", dir.display(), profile.bindings)
+                });
+            assert!(
+                text.contains(&format!(
+                    "(deny file-write-unlink (literal (param \"{param}\")))"
+                )),
+                "renaming {} must be refused, or its nested store's deny is walked around: {text}",
+                dir.display()
+            );
+            // Only unlink — ordinary writes elsewhere under it stay allowed.
+            assert!(
+                !text.contains(&format!("(deny file-write* (subpath (param \"{param}\")))")),
+                "the whole of {} must not become read-only: {text}",
+                dir.display()
+            );
+        }
+
+        // The specific regression: Keychains' parent is locked, not only
+        // `~/.config`.
+        let library = crate::paths::canonicalize(&home)
+            .unwrap_or(home)
+            .join("Library");
         assert!(
-            text.contains("(param \"KEEP_XDG_CONFIG\")") || text.contains(&config),
-            "the profile must bind ~/.config: {text}"
-        );
-        assert!(
-            text.contains("(deny file-write-unlink (literal (param \"KEEP_XDG_CONFIG\")))"),
-            "renaming ~/.config must be refused, or the gh deny is walked around: {text}"
-        );
-        // And only unlink — ordinary writes elsewhere under ~/.config stay
-        // allowed, so this does not quietly become a blanket denial.
-        assert!(
-            !text.contains("(deny file-write* (subpath (param \"KEEP_XDG_CONFIG\")))"),
-            "the whole of ~/.config must not become read-only: {text}"
+            profile.bindings.iter().any(|(_, path)| *path == library),
+            "~/Library must be locked so Keychains' deny cannot be moved out from under it: {:?}",
+            profile.bindings
         );
     }
 
