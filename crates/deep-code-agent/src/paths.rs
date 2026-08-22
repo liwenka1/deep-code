@@ -98,14 +98,31 @@ pub(crate) fn canonicalize_existing_prefix(path: &std::path::Path) -> Option<Pat
 
 /// Home-relative locations holding long-lived secrets: SSH keys, cloud
 /// credentials, GnuPG keyrings, `.netrc` passwords, and the token stores of
-/// common dev tools. The macOS sandbox turns each of these into a
-/// `deny file-write*` that outranks every writable root, and
-/// [`sensitive_paths`] turns the same list into a refusal in the model-facing
-/// grant channel — one list, so the kernel fence and the tool fence cannot
-/// disagree about what counts as a credential store.
+/// common dev tools.
+///
+/// [`sensitive_paths`] turns this list into a refusal in the model-facing grant
+/// channel, on every platform. The **macOS** sandbox additionally turns each
+/// entry into a `deny file-write*` that outranks every writable root — but that
+/// second fence is macOS-only: Landlock is allow-list-only and cannot express a
+/// denial inside a granted root, and Windows has no filesystem confinement at
+/// all. So this is one list with one guaranteed enforcer and a second on macOS,
+/// not one list behind two fences everywhere; a granted root that CONTAINS a
+/// credential store still reaches it on Linux and Windows. (`--add-dir` is
+/// deliberately exempt from the floor anyway — see
+/// `workspace_policy::refuse_as_unattended_root`.)
+///
+/// Scope: credential *stores*, not everything that converts to code execution.
+/// `~/.cargo`, `~/Library/LaunchAgents` and `~/.gitconfig` are absent on
+/// purpose — see `session_integrity`, which argues that no enumeration of
+/// dangerous directories can be complete and authenticates the author of a
+/// grant instead of judging its path. What this list must not do is be
+/// *inconsistent* within its own category, which is why the cloud trio is
+/// AWS/GCP/Azure rather than AWS alone.
 pub(crate) const CREDENTIAL_ENTRIES: &[&str] = &[
     ".ssh",
     ".aws",
+    ".config/gcloud",
+    ".azure",
     ".gnupg",
     ".netrc",
     ".config/gh",
@@ -114,6 +131,11 @@ pub(crate) const CREDENTIAL_ENTRIES: &[&str] = &[
     ".npmrc",
     ".pypirc",
     ".git-credentials",
+    // Sibling agents' token stores, for the same reason `~/.deep-code` is
+    // covered: an OAuth token plus a hooks/settings file that runs commands.
+    ".claude",
+    // The largest single secret store on the project's primary platform.
+    "Library/Keychains",
 ];
 
 /// Absolute paths that a model-requested write grant must never reach: the

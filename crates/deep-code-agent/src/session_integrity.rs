@@ -21,16 +21,30 @@
 //! works — it just cannot carry authority any more.
 //!
 //! **Where the key is safe, and where it is not.** The key lives in
-//! `~/.deep-code`, which the grant floor refuses to make writable and which
-//! Seatbelt denies reading outright. The model's own file tools are bounded by
-//! the granted roots on every platform, so they can never reach it. A
-//! sandboxed shell cannot either on macOS (Seatbelt read-deny) or on Linux
-//! (Landlock is allow-list-only for writes, and `~/.deep-code` is not a
-//! granted root) — but Linux Landlock cannot express a read denial at all, so
-//! a shell command there can *read* the key, and reading it is enough to forge
-//! a tag. That is the same already-documented gap as "Linux credential reads",
-//! not a new one, and it is stated as such in the README rather than papered
-//! over.
+//! `~/.deep-code`, which the model-requested grant channel refuses to make
+//! writable and which Seatbelt denies reading outright. Within the roots a
+//! session is actually given, the file tools cannot reach it.
+//!
+//! Three ways it is reachable, each a consequence of a decision made
+//! elsewhere:
+//!
+//! - A root the HUMAN grants that contains it — a session launched at `$HOME`,
+//!   or `--add-dir ~`. `refuse_as_unattended_root` deliberately does not police
+//!   those ("the distinction is authorship, not danger"), so `write_file` can
+//!   overwrite the key with 32 bytes of its choosing, and the next process
+//!   loads them. Worth separating from the credential-store case that decision
+//!   was made for: handing over your own secrets is your call, but this key is
+//!   the anchor the grant system trusts, and consenting to a wide boundary in
+//!   one workspace does not imply consenting to unattended grants in another.
+//! - A sandboxed shell on **Linux**: Landlock cannot express a read denial at
+//!   all, so a command there can read the key, and reading it is enough to
+//!   forge a tag. The same already-documented gap as "Linux credential reads".
+//! - A shell on **Windows**, which has no filesystem confinement whatsoever
+//!   (`sandbox::windows` reports `Enforcement::None`) — so read *and* write.
+//!
+//! What the tag buys in all three cases is that forging now requires reaching
+//! the key, rather than merely writing the session file — which the model can
+//! already write, as an ordinary file inside its own workspace.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

@@ -902,10 +902,27 @@ mod tests {
             return;
         };
         let secrets = crate::paths::sensitive_paths();
-        for entry in [".ssh", ".aws", ".git-credentials", ".deep-code"] {
+        // Enumerated from the list itself, plus deep-code's own directory, so
+        // that adding an entry to `CREDENTIAL_ENTRIES` is pinned by this test
+        // automatically. A hand-written subset was not a guard: it named four
+        // entries, so a new one could be added to the list and dropped from
+        // `sensitive_paths` without anything going red.
+        for entry in crate::paths::CREDENTIAL_ENTRIES
+            .iter()
+            .copied()
+            .chain(std::iter::once(crate::paths::DEEP_CODE_DIR))
+        {
             assert!(
                 secrets.contains(&home.join(entry)),
                 "{entry} must be refused by the request channel: {secrets:?}"
+            );
+        }
+        // The cloud trio in particular: `.aws` alone was the inconsistency —
+        // GCP and Azure credentials are the same category and the same risk.
+        for entry in [".aws", ".config/gcloud", ".azure"] {
+            assert!(
+                secrets.contains(&home.join(entry)),
+                "{entry} must be covered: {secrets:?}"
             );
         }
     }
