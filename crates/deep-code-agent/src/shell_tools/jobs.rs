@@ -711,16 +711,7 @@ pub(super) fn shell_text_output(job_id: &str, job: &JobState, max_chars: usize) 
         )),
     }
 
-    // Measured on the body as it now stands — both streams and the framing —
-    // because that total is what the runtime will bound. The denial note is
-    // 386 chars and is appended below, so it counts toward that total here
-    // even though it is not written yet: measuring without it put a failed
-    // sandboxed build at 12,039 rendered chars against a 12,000 budget with
-    // `result_elided` computed as false, so 4,039 characters went out with no
-    // truncation note, no file and no tail hint.
-    let denial = write_denial_note(job);
-    let pending_denial_chars = denial.map_or(0, |note| note.chars().count() + 1);
-    let rendered_chars = out.chars().count() + pending_denial_chars;
+    let (rendered_chars, denial) = rendered_with_pending_denial(&out, job);
     if let Some(note) = truncation_note(job_id, job, max_chars, rendered_chars) {
         out.push('\n');
         out.push_str(&note);
@@ -744,6 +735,28 @@ pub(super) fn shell_text_output(job_id: &str, job: &JobState, max_chars: usize) 
         job.stderr.discard_unreported_spill();
     }
     out
+}
+
+/// How large `out` will be once the write-denial note has been appended, plus
+/// the note itself so the caller does not look it up twice.
+///
+/// Both renderings append that note AFTER asking `truncation_note` whether
+/// anything was dropped, so both have to count it BEFORE asking. It is 386
+/// chars ([`crate::sandbox::WRITE_DENIAL_NOTE`]): measuring without it put a
+/// failed sandboxed build at 12,039 rendered chars against a 12,000 budget
+/// with `result_elided` computed as false, so 4,039 characters went out with
+/// no truncation note, no spill file and no tail hint.
+///
+/// Shared rather than open-coded because it was open-coded: the fix landed in
+/// `shell_text_output` and `job_text_snapshot` kept passing a bare
+/// `out.chars().count()`, so `job action=tail` on a failed sandboxed job went
+/// on silently dropping ~4k chars while the commit that fixed it claimed both
+/// renderings now agreed. One function is what makes that claim checkable.
+fn rendered_with_pending_denial(out: &str, job: &JobState) -> (usize, Option<&'static str>) {
+    let denial = write_denial_note(job);
+    // `+ 1` for the newline each caller writes before the note.
+    let pending = denial.map_or(0, |note| note.chars().count() + 1);
+    (out.chars().count() + pending, denial)
 }
 
 /// The truncation note for both renderings, or `None` when the inline text
@@ -857,11 +870,12 @@ pub(super) fn job_text_snapshot(job_id: &str, job: &JobState, max_chars: usize) 
     if stdout.is_empty() && stderr.is_empty() {
         out.push_str("(no output)\n");
     }
-    if let Some(note) = truncation_note(job_id, job, max_chars, out.chars().count()) {
+    let (rendered_chars, denial) = rendered_with_pending_denial(&out, job);
+    if let Some(note) = truncation_note(job_id, job, max_chars, rendered_chars) {
         out.push_str(&note);
         out.push('\n');
     }
-    if let Some(note) = write_denial_note(job) {
+    if let Some(note) = denial {
         out.push_str(note);
         out.push('\n');
     }
@@ -1203,6 +1217,47 @@ mod tests {
         assert!(
             rendered.chars().count() > budget,
             "precondition: the result is over budget once the note is on it"
+        );
+        assert!(
+            rendered.contains(&err_path.display().to_string()),
+            "over budget means content is being elided — say so and name the file: {rendered}"
+        );
+    }
+
+    /// The same budget, through the OTHER rendering — `job action=tail` /
+    /// `job action=status` rather than the shell result.
+    ///
+    /// The fix that taught the budget about the 386-char denial note landed in
+    /// `shell_text_output` only; `job_text_snapshot` kept measuring a bare
+    /// `out.chars().count()` and appending the note afterwards, so a failed
+    /// sandboxed job inspected with `job action=tail` still crossed the budget
+    /// with `result_elided` false — no truncation note, no file named, and the
+    /// runtime then elided ~4k chars out of the only copy. The commit that
+    /// fixed the sibling claimed both renderings had been unified.
+    #[test]
+    fn the_denial_note_counts_toward_the_budget_in_the_job_snapshot_too() {
+        let budget = crate::runtime::tool_result::TOOL_OUTPUT_BUDGET;
+        let tmp = tempfile::tempdir().unwrap();
+        let err_path = tmp.path().join("job_t.stderr.log");
+        let stderr = SharedBuffer::with_spill(err_path.clone());
+        let denial_len = crate::sandbox::WRITE_DENIAL_NOTE.chars().count();
+        stderr.push(b"mkdir: /etc/x: Operation not permitted\n");
+        stderr.push(&vec![b'e'; budget - denial_len / 2]);
+
+        let mut job = two_stream_job(SharedBuffer::default(), stderr.clone());
+        job.status = JobStatus::Failed;
+        job.exit_code = Some(1);
+        job.sandboxed = true;
+        stderr.finish_spill();
+
+        let rendered = job_text_snapshot("job_t", &job, 20_000);
+        assert!(
+            rendered.contains(crate::sandbox::WRITE_DENIAL_NOTE),
+            "precondition: this job carries the denial note"
+        );
+        assert!(
+            rendered.chars().count() > budget,
+            "precondition: the snapshot is over budget once the note is on it"
         );
         assert!(
             rendered.contains(&err_path.display().to_string()),
