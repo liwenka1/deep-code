@@ -318,7 +318,23 @@ impl WorkspacePolicy {
         tool_name: &str,
     ) -> Result<PathBuf, ToolError> {
         let candidate = self.prepare_candidate(raw, tool_name)?;
-        if candidate.exists() {
+        // `symlink_metadata`, NOT `exists()`: the latter follows symlinks, so a
+        // symlink whose target does not exist yet reported `false` and fell to
+        // the non-existent branch below — which walks up from `parent` and
+        // therefore never stats the leaf at all. The unresolved path was then
+        // handed back and `fs::write` (`O_CREAT`, no `O_NOFOLLOW`) created the
+        // link's target: `ln -s ~/.ssh/authorized_keys ws/notes.txt` followed by
+        // `write_file notes.txt` wrote outside every granted root, with the
+        // panel showing "new file notes.txt". Planting the link is an ordinary
+        // permitted write inside a root, and these tools run in-process where no
+        // sandbox sees them, so this bypassed both fences at once — including
+        // the credential floor whose whole reason for existing is that
+        // `read_file`/`write_file` never meet the kernel fence.
+        //
+        // A link that exists is a link whether or not its target does. Both
+        // spellings now take this branch, where `contains_symlink` (which stats
+        // with `symlink_metadata` too) refuses the leaf.
+        if candidate.symlink_metadata().is_ok() {
             if contains_symlink(&candidate, &self.granted_roots()).map_err(|error| {
                 ToolError::exec_failed(
                     tool_name,

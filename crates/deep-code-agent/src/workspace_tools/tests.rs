@@ -452,3 +452,45 @@ async fn write_file_rejects_existing_target_symlink() {
     ));
     assert_eq!(fs::read_to_string(outside_file).unwrap(), "secret");
 }
+
+/// The complement of the test above, and the case that actually escaped: the
+/// link's target does not exist yet.
+///
+/// `Path::exists()` follows symlinks, so a dangling link reported "no such
+/// path" and `resolve_for_write` took its non-existent branch — which starts
+/// its walk at `parent` and never stats the leaf. `fs::write` then created the
+/// target. Planting the link is a permitted write inside the root, the file
+/// tools run in-process where no sandbox sees them, and `write_file`
+/// auto-approves under `accept_edits`, so this was an unattended arbitrary
+/// write with the panel captioned "new file notes.txt".
+///
+/// Asserts on the filesystem, not on the error type: what matters is that
+/// nothing was created outside the root, whichever way the refusal is spelled.
+#[cfg(unix)]
+#[tokio::test]
+async fn write_file_rejects_dangling_target_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let outside_file = outside.path().join("authorized_keys");
+    symlink(&outside_file, tmp.path().join("notes.txt")).unwrap();
+
+    let registry = registry(tmp.path());
+    let call = ToolCall::new(
+        "call_1",
+        "write_file",
+        json!({"path": "notes.txt", "content": "pwned"}),
+    );
+
+    let outcome = registry
+        .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await;
+
+    assert!(
+        !outside_file.exists(),
+        "write escaped to {} (outside every granted root)",
+        outside_file.display()
+    );
+    assert!(matches!(outcome, Err(ToolError::InvalidArguments { .. })));
+}
