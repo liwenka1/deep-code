@@ -312,25 +312,10 @@ fn launch_resumed(
     // complete, so the grants are authenticated instead of judged: a record
     // the model wrote can still say anything, it just cannot be believed.
     //
-    // Checked against the RECORDED workspace, before the substitution below
-    // rewrites it — that is what the tag was signed over. A workspace that
-    // really moved therefore fails to verify and resumes without its extra
-    // grants, which is the safe direction: those roots were vetted relative
-    // to somewhere else, and the move is already being reported anyway.
-    if !crate::session_integrity::verify_roots(
-        record.id.as_str(),
-        &record.workspace,
-        &record.extra_roots,
-        record.extra_roots_mac.as_deref(),
-    ) {
-        warnings.push(format!(
-            "dropping {} write grant(s) recorded in this session: they carry no valid \
-             authorship tag for this machine, and the session file is itself writable by \
-             the model. Re-grant with --add-dir if you meant them.",
-            record.extra_roots.len()
-        ));
-        record.extra_roots.clear();
-    }
+    // Verified LAST, after the roots below have been resolved, and only for a
+    // record that belongs to the workspace being resumed. Both conditions are
+    // load-bearing; see `verify_recorded_grants`.
+    //
     // The primary root is where the USER launched, not where the record says
     // the session lived. The record is an ordinary write target for the model
     // (it sits inside the primary root) and `-c` ranks candidates by a
@@ -345,6 +330,10 @@ fn launch_resumed(
     // macOS, a trailing slash) is not reported as a redirect on every resume.
     // Anything that does not resolve to the same directory — including a
     // recorded path that no longer resolves at all — yields to the caller's.
+    //
+    // Kept for the tag check below: the signature covers this string, so
+    // verifying has to use it and not the substituted value.
+    let recorded_workspace = record.workspace.clone();
     let same_workspace = match (
         crate::paths::canonicalize(&record.workspace).ok(),
         crate::paths::canonicalize(&caller_workspace).ok(),
@@ -359,6 +348,39 @@ fn launch_resumed(
             caller_workspace.display()
         ));
         record.workspace = caller_workspace;
+    }
+    // Does this record's grant list come from this host AND belong to this
+    // workspace? Checked over the list as recorded — before the resolution pass
+    // below removes anything — so that a since-deleted sibling repo costs only
+    // its own grant instead of invalidating the tag for the rest.
+    //
+    // `same_workspace` is a CONDITION of the tag, not merely context for it.
+    // The signature covers the workspace, but it is verified against the
+    // record's own `workspace` field, so a record copied verbatim into a
+    // different workspace verifies happily — and the substitution just above
+    // then swaps in the caller's workspace while leaving the grants in place.
+    // A grant approved in one checkout could be lifted into every other
+    // checkout on the host, which is exactly what putting the workspace in the
+    // signed message was supposed to prevent. Requiring the two to agree is
+    // what makes its presence there mean anything. The honest moved-workspace
+    // case loses its grants as well: those roots were vetted relative to
+    // somewhere else, the move is already reported, and narrowing is the safe
+    // direction.
+    let authentic = same_workspace
+        && crate::session_integrity::verify_roots(
+            record.id.as_str(),
+            &recorded_workspace,
+            &record.extra_roots,
+            record.extra_roots_mac.as_deref(),
+        );
+    if !authentic && !record.extra_roots.is_empty() {
+        warnings.push(format!(
+            "dropping {} write grant(s) recorded in this session: they carry no valid \
+             authorship tag for this workspace, and the session file is itself writable by \
+             the model. Re-grant with --add-dir if you meant them.",
+            record.extra_roots.len()
+        ));
+        record.extra_roots.clear();
     }
     // A recorded grant whose directory no longer resolves is dropped HERE,
     // with a warning, not handed to WorkspacePolicy. The policy constructor
@@ -406,6 +428,24 @@ fn launch_resumed(
         // dropped silently (nothing is lost) so the banner and summary never
         // list the workspace as its own "additional" root.
         if Some(&canonical) == primary_canonical.as_ref() {
+            return false;
+        }
+        // The tag authenticates this path's SPELLING. Every path that reaches
+        // the record through `serialize_record` was already canonical when it
+        // was signed, so a recorded root that no longer resolves to itself is a
+        // root whose meaning changed after it was approved — a symlink planted
+        // over an approved directory redirects the grant without forging
+        // anything, because the signature covers `<ws>/docs` while what gets
+        // enforced is wherever `<ws>/docs` now points. Dropping just this root
+        // rather than the whole list keeps one swapped entry from costing the
+        // others, and the tag check below still covers the list as a whole.
+        if &canonical != root {
+            warnings.push(format!(
+                "dropping recorded grant {}: it now resolves to {}, so it is no longer the \
+                 directory that was approved",
+                root.display(),
+                canonical.display()
+            ));
             return false;
         }
         *root = canonical;
@@ -866,17 +906,26 @@ mod tests {
         );
     }
 
-    /// What the resume surfaces show and what it enforces must be the same
-    /// path. The floor vets the canonical form, but the vector that survives
-    /// is what `WorkspacePolicy` re-canonicalizes and what the banner, the
-    /// rebuilt system prompt and `LaunchedRuntime::extra_roots` display — so
-    /// keeping the record's raw spelling reintroduced, on the persistence
-    /// channel, exactly the display-versus-grant split the approval panel was
-    /// hardened against. Here the record names a path inside the workspace
-    /// that is really a symlink pointing out of it.
+    /// A signed root whose spelling has come to resolve somewhere else is
+    /// dropped, not silently redirected.
+    ///
+    /// The tag authenticates the path's SPELLING, and every root that reaches
+    /// the record through `serialize_record` was canonical when it was signed.
+    /// So a recorded root that no longer resolves to itself is a root whose
+    /// meaning changed after approval: planting a symlink over an approved
+    /// directory redirects the grant without forging anything, because the
+    /// signature covers `<ws>/docs` while what gets enforced is wherever
+    /// `<ws>/docs` now points.
+    ///
+    /// This test used to assert the opposite — that the redirect is enforced,
+    /// on the grounds that displaying the resolved path keeps display and
+    /// enforcement in agreement. That property is real and still holds (see
+    /// `resume_keeps_a_signed_root_that_still_resolves_to_itself`), but pinning
+    /// it this way also pinned the escalation: it made "a signed grant may be
+    /// redirected out of the workspace" a regression-gated contract.
     #[cfg(unix)]
     #[test]
-    fn resume_displays_the_root_it_actually_enforces() {
+    fn resume_drops_a_signed_root_that_now_resolves_elsewhere() {
         let workspace = tempfile::TempDir::new().unwrap();
         let ws = workspace.path().canonicalize().unwrap();
         let outside = tempfile::TempDir::new().unwrap();
@@ -896,14 +945,93 @@ mod tests {
             Some(record),
         );
 
-        assert_eq!(
-            launched.extra_roots,
-            vec![real_target.clone()],
-            "the displayed root must be the one enforced, not the record's spelling"
+        assert!(
+            launched.extra_roots.is_empty(),
+            "a redirected grant must be dropped, not enforced: {:?}",
+            launched.extra_roots
         );
         assert!(
-            !launched.extra_roots.contains(&innocuous),
-            "the innocuous-looking spelling must not be what the user is shown"
+            !launched.extra_roots.contains(&real_target),
+            "the symlink's target must not become the boundary"
+        );
+        assert!(
+            launched
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no longer the directory that was approved")),
+            "the drop must be surfaced: {:?}",
+            launched.warnings
+        );
+    }
+
+    /// A validly signed record copied VERBATIM into another workspace must not
+    /// carry its grants across.
+    ///
+    /// The key is per-user, not per-workspace, and the tag was verified against
+    /// the record's own `workspace` field — so copying the whole file, that
+    /// field included, verified happily; the workspace substitution then
+    /// replaced it with the caller's and left the grants standing. Every
+    /// session record on the host is world-readable to a shell command (reads
+    /// are unrestricted under both sandboxes), so a grant approved once in any
+    /// checkout could be lifted into every other checkout. Nothing is forged
+    /// here — which is why the tag alone could not catch it, and why
+    /// `same_workspace` has to be a condition of accepting the grants.
+    #[test]
+    fn a_verbatim_record_copy_does_not_carry_grants_into_another_workspace() {
+        let original = tempfile::TempDir::new().unwrap();
+        let original_ws = original.path().canonicalize().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let other_ws = elsewhere.path().canonicalize().unwrap();
+        let juicy = tempfile::TempDir::new().unwrap();
+        let granted = juicy.path().canonicalize().unwrap();
+
+        // Signed for `original_ws` — a genuine, human-approved grant there.
+        let mut record = SessionRecord::new(original_ws.clone(), "prompt");
+        record.extra_roots = vec![granted.clone()];
+        let record = signed(record);
+        // Resumed from a DIFFERENT workspace, byte-for-byte unchanged.
+        let launched = launch_runtime(
+            &AgentConfig::builtin(),
+            WorkspaceRoots::new(other_ws, Vec::new()),
+            Some(record),
+        );
+
+        assert!(
+            launched.extra_roots.is_empty(),
+            "a grant signed for another workspace must not be restored here: {:?}",
+            launched.extra_roots
+        );
+        assert!(
+            !launched.extra_roots.contains(&granted),
+            "the lifted grant must not become the boundary"
+        );
+    }
+
+    /// The other half: an honest signed root survives, and what is displayed is
+    /// what is enforced. Without this, the test above could be satisfied by
+    /// dropping every recorded grant.
+    #[test]
+    fn resume_keeps_a_signed_root_that_still_resolves_to_itself() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().canonicalize().unwrap();
+        let extra = tempfile::TempDir::new().unwrap();
+        let granted = extra.path().canonicalize().unwrap();
+
+        let mut record = SessionRecord::new(ws.clone(), "prompt");
+        record.extra_roots = vec![granted.clone()];
+        let record = signed(record);
+
+        let launched = launch_runtime(
+            &AgentConfig::builtin(),
+            WorkspaceRoots::new(ws.clone(), Vec::new()),
+            Some(record),
+        );
+
+        assert_eq!(
+            launched.extra_roots,
+            vec![granted],
+            "an authentic grant must survive resume: {:?}",
+            launched.warnings
         );
     }
 
