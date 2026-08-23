@@ -23,6 +23,40 @@ fn is_parallel_safe(call: &ToolCall) -> bool {
     )
 }
 
+/// Under `Yolo`, sandboxed commands get ambient egress (unless config says
+/// `never`, which stays absolute).
+///
+/// The per-call network gate exists so a HUMAN sees egress requests before
+/// they run. Yolo removes the human from the loop, and with it everything the
+/// gate protected: a hostile call would just declare `network: true` and be
+/// auto-approved like anything else, so keeping the gate under yolo stops no
+/// attacker — it only strands honest commands that forgot to declare
+/// (`git push`, `npm install`, a trusted `cargo build` fetching crates)
+/// offline, failing with raw connection errors nobody is around to interpret.
+///
+/// Sited in `run_tool` rather than the policy engine so it reads the LIVE
+/// mode per call (Shift+Tab mid-session applies immediately, in both
+/// directions) and covers every execution path — direct runs and the
+/// approved re-run — in one place. Sub-agents are untouched: a child runtime
+/// never has yolo (children do not inherit the parent's mode), and a granted
+/// child's egress rides its own `Always` policy instead.
+fn yolo_ambient_network(
+    plan: crate::execution_policy::ToolExecutionPlan,
+    mode: crate::execution_policy::PermissionMode,
+    network_mode: crate::execution_policy::NetworkMode,
+) -> crate::execution_policy::ToolExecutionPlan {
+    if mode == crate::execution_policy::PermissionMode::Yolo
+        && network_mode != crate::execution_policy::NetworkMode::Never
+        && plan.requires_sandbox
+    {
+        return crate::execution_policy::ToolExecutionPlan {
+            network: true,
+            ..plan
+        };
+    }
+    plan
+}
+
 pub(super) const CANCELLED_TOOL_RESULT: &str =
     "用户取消了本轮，该工具调用未执行 (cancelled by user)";
 
@@ -79,7 +113,11 @@ impl AgentRuntime {
             .with_cancel(cancel.clone())
             .with_update_fn(tool_progress_fn(tx, turn_id, call))
             .with_spend_sink(std::sync::Arc::clone(&spend_sink));
-        let plan = self.tools.evaluate_tool(call);
+        let plan = yolo_ambient_network(
+            self.tools.evaluate_tool(call),
+            self.permission_mode(),
+            self.config.sandbox_network,
+        );
         let outcome = self
             .tools
             .run_tool_call_with_plan(call, decision, plan, cx)
@@ -395,5 +433,61 @@ pub(super) fn runtime_error_from_tool_error(
     RuntimeEvent::Error {
         turn_id,
         message: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution_policy::{ExecPolicy, NetworkMode, PermissionMode};
+    use serde_json::json;
+
+    /// The plan an UNDECLARED command gets: this is the exact shape that used
+    /// to run offline under yolo — `git push` (untrusted, prompts) and
+    /// `cargo build` (trusted, silent) both carried `network: false`.
+    fn undeclared_shell_plan(command: &str) -> crate::execution_policy::ToolExecutionPlan {
+        ExecPolicy::default().evaluate_tool("shell", &json!({ "command": command }))
+    }
+
+    #[test]
+    fn yolo_grants_ambient_egress_to_sandboxed_commands() {
+        for command in ["cargo build", "git push origin main", "npm install"] {
+            let plan = undeclared_shell_plan(command);
+            assert!(plan.requires_sandbox && !plan.network, "precondition");
+            let yolo = yolo_ambient_network(plan, PermissionMode::Yolo, NetworkMode::Prompt);
+            assert!(yolo.network, "{command} must get egress under yolo");
+        }
+        // A declared command keeps its grant — the override is idempotent.
+        let declared = ExecPolicy::default()
+            .evaluate_tool("shell", &json!({"command": "git push", "network": true}));
+        assert!(declared.network, "precondition");
+        assert!(yolo_ambient_network(declared, PermissionMode::Yolo, NetworkMode::Prompt).network);
+    }
+
+    /// `never` is the user's absolute refusal and yolo must not override it;
+    /// non-yolo modes keep the human-gated behavior untouched; and plans that
+    /// never enter the sandbox (in-process tools) gain nothing — Unsandboxed
+    /// execution is not a network grant.
+    #[test]
+    fn ambient_egress_stops_at_never_other_modes_and_unsandboxed_plans() {
+        let plan = undeclared_shell_plan("git push origin main");
+        assert!(
+            !yolo_ambient_network(plan.clone(), PermissionMode::Yolo, NetworkMode::Never).network,
+            "never stays absolute"
+        );
+        for mode in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Auto,
+        ] {
+            assert!(
+                !yolo_ambient_network(plan.clone(), mode, NetworkMode::Prompt).network,
+                "{mode:?} must keep the human-gated behavior"
+            );
+        }
+        let write = ExecPolicy::default()
+            .evaluate_tool("write_file", &json!({"path": "a.rs", "content": "x"}));
+        assert!(!write.requires_sandbox, "precondition");
+        assert!(!yolo_ambient_network(write, PermissionMode::Yolo, NetworkMode::Prompt).network);
     }
 }
