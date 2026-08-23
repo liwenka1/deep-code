@@ -6,6 +6,57 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [0.4.7] - 2026-08-23
+
+- The model can now request additional writable roots, and the approval panel
+  shows the model's stated reason.
+- **Security:** writable-root requests are validated strictly against the
+  declared schema so bait keys never reach you, reject targets that overlap
+  credential directories (sharing the sandbox's own list), hard-refuse
+  control-character names, and bind the displayed target to the granted one —
+  the home directory and filesystem root are refused outright.
+- Shell output that would be truncated now spills to disk in full: the
+  truncation hint names a readable file path, spill loss is measured against
+  the budget the result actually retained (closing a silent 12k-20k loss), the
+  newest run file is treated as live, orphaned files are removed when the
+  stream ends, and run directories idle for a week are cleaned up at startup.
+- **Security:** spilled output refuses to follow symlinks and is written with
+  `0600` files and `0700` directories.
+- Sub-agents can declare `network=true` when they are dispatched; the request
+  goes through approval and, once granted, the child runs with egress.
+- In `yolo` tier, sandboxed commands now keep network egress always on, instead
+  of requiring a per-command declaration that otherwise left them running
+  offline with nothing to do.
+- When the sandbox fails for lack of network, the model now gets the network
+  hint instead of a misleading write hint, and `/tmp` joins the unix write
+  roots.
+- A sub-agent's auto-rejected result now reports what actually happened instead
+  of masquerading as a user rejection.
+- The approval panel now pins its header for every tool, sizes to its content,
+  draws the resolved target first for write-root requests, allocates frames by
+  hand so a short terminal no longer pushes that target off-screen, truncates
+  model text by display column, pins the path in the action row, and defaults
+  focus to deny — and does not arm an approval it cannot render.
+- Control characters are now sanitized across the transcript and every
+  approval-panel field — including preview, description, the write-root prompt
+  header, and status-line error text — and a single ESC no longer disables
+  sanitization for the rest of the panel.
+- **Security:** the credential floor now blocks `rename` across the
+  intermediate directories of every multi-segment entry (not just `.config`),
+  adds the big-three cloud providers' credentials and keychains to the
+  protected list, resolves credential paths by their deepest existing
+  ancestor, and normalizes paths into one namespace so a macOS firmlink
+  spelling can no longer slip past the whole floor — `~/.config` can no longer
+  be moved out wholesale.
+- **Security:** write grants in a session record are verified by signature
+  against the same workspace instead of guessing at danger, so re-resolving a
+  grant to a different root no longer redirects it; resume now uses the
+  caller's workspace as the primary root, re-runs recorded grants through the
+  floor, and shows the same set it enforces.
+- **Security:** write resolution now branches on `lstat`, so a dangling
+  symlink no longer writes through the grant root, and the macOS Seatbelt
+  credential deny is bound to the resolved path.
+
 ## [0.4.6] - 2026-08-18
 
 - Code blocks in the TUI transcript are now syntax-highlighted by language, with a per-line cache so only the newly streamed tail is re-highlighted as it arrives.
@@ -199,3 +250,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.4.4]: https://github.com/liwenka1/deep-code/compare/v0.4.3...v0.4.4
 [0.4.5]: https://github.com/liwenka1/deep-code/compare/v0.4.4...v0.4.5
 [0.4.6]: https://github.com/liwenka1/deep-code/compare/v0.4.5...v0.4.6
+[0.4.7]: https://github.com/liwenka1/deep-code/compare/v0.4.6...v0.4.7
