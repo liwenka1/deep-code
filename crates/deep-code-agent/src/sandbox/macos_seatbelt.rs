@@ -302,7 +302,9 @@ fn credential_dirs_under(home: &Path) -> Vec<(String, PathBuf)> {
 /// when HOME is a granted root, so the deny on the leaf is walked around by
 /// moving that parent aside and back:
 ///
-///     mv ~/Library ~/L && echo … > ~/L/Keychains/… && mv ~/L ~/Library
+/// ```text
+/// mv ~/Library ~/L && echo … > ~/L/Keychains/… && mv ~/L ~/Library
+/// ```
 ///
 /// Locking each intermediate directory against unlink closes that walk-around.
 /// Deduplicated, since `.config/gh` and `.config/gcloud` share `~/.config`. The

@@ -429,6 +429,9 @@ fn ensure_real_dir(dir: &std::path::Path) -> std::io::Result<()> {
 }
 
 fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    // `mut` is consumed by the unix-only `mode` call below; Windows builds
+    // see it unused and clippy runs with `-D warnings` there.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
