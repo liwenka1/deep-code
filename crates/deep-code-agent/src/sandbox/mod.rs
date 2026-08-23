@@ -58,6 +58,69 @@ pub(crate) fn write_denial_signature(exit_code: Option<i32>, stderr: &str) -> bo
     .any(|signature| stderr.contains(signature))
 }
 
+/// Model-facing note for a failed sandboxed command that ran WITHOUT the
+/// network grant and whose output looks like a network failure. Offline runs
+/// fail with raw connection errors that say nothing about the sandbox;
+/// without this note the model retries hosts and mirrors — or worse, reads a
+/// socket EPERM as a write-boundary denial and asks for a write root. The
+/// recovery is naming the actual missing grant.
+pub(crate) const NETWORK_DENIAL_NOTE: &str = "[note] this command ran inside the OS sandbox \
+WITHOUT the network grant: all egress and listening were blocked. If the failure above is a \
+download/DNS/connection/bind error, retrying as-is cannot succeed — re-run with network=true \
+(the user is asked once) if the command genuinely needs the network.";
+
+/// Heuristic: does a failed no-network *sandboxed* command's stderr look like
+/// the sandbox blocking network access? Two families, both captured under the
+/// real Seatbelt profile:
+/// - resolver/connect failures spelled out — curl "Could not resolve host" /
+///   "Failed to connect to", node "getaddrinfo ENOTFOUND", macOS getaddrinfo
+///   "nodename nor servname provided", glibc "Temporary failure in name
+///   resolution" / "Name or service not known".
+/// - a permission error next to a network word — the kernel refuses socket
+///   ops with EPERM, so python's bind failure reads "PermissionError: [Errno
+///   1] Operation not permitted" with "s.bind((" in the traceback, node's
+///   listen reports "listen EPERM: operation not permitted".
+///
+/// Known miss, accepted: a bare EPERM with no network word anywhere
+/// (`nc: Operation not permitted`) is textually indistinguishable from a
+/// write denial and falls through to the write note. "Connection refused" /
+/// timeouts are deliberately absent — those are real network diagnostics
+/// (nothing listening, host down) that the sandbox does not produce, and
+/// claiming them would misdirect genuine debugging. Callers must additionally
+/// know the run was sandboxed without network and failed; this function only
+/// inspects the text.
+#[must_use]
+pub(crate) fn network_denial_signature(exit_code: Option<i32>, stderr: &str) -> bool {
+    if exit_code == Some(0) {
+        return false;
+    }
+    const DIRECT: [&str; 10] = [
+        "Could not resolve host",
+        "Could not resolve hostname",
+        "Failed to connect to",
+        "Couldn't connect to server",
+        "getaddrinfo",
+        "nodename nor servname provided",
+        "Temporary failure in name resolution",
+        "Name or service not known",
+        "Network is unreachable",
+        "No route to host",
+    ];
+    if DIRECT.iter().any(|signature| stderr.contains(signature)) {
+        return true;
+    }
+    const PERMISSION: [&str; 3] = [
+        "Operation not permitted",
+        "operation not permitted",
+        "Permission denied",
+    ];
+    const NETWORK_WORDS: [&str; 5] = ["bind", "listen", "socket", "connect", "port"];
+    PERMISSION
+        .iter()
+        .any(|signature| stderr.contains(signature))
+        && NETWORK_WORDS.iter().any(|word| stderr.contains(word))
+}
+
 /// Detected sandbox backend for the current platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SandboxBackend {
@@ -771,6 +834,60 @@ mod tests {
         // Ordinary failures don't match.
         assert!(!write_denial_signature(Some(1), "error: expected `;`"));
         assert!(!write_denial_signature(Some(2), ""));
+    }
+
+    /// Every stderr below was captured under the real no-network Seatbelt
+    /// profile (curl by name, curl by IP, node, python bind), so the list
+    /// matches what the sandbox actually produces — not what it plausibly
+    /// might.
+    #[test]
+    fn network_denial_signature_matches_offline_sandbox_texts() {
+        // DNS family.
+        assert!(network_denial_signature(
+            Some(6),
+            "curl: (6) Could not resolve host: example.com"
+        ));
+        assert!(network_denial_signature(
+            Some(1),
+            "Error: getaddrinfo ENOTFOUND example.com"
+        ));
+        assert!(network_denial_signature(
+            Some(128),
+            "fatal: unable to access 'https://github.com/x/': Could not resolve host: github.com"
+        ));
+        // Connect-by-IP family (DNS bypassed, connect refused by the kernel).
+        assert!(network_denial_signature(
+            Some(7),
+            "curl: (7) Failed to connect to 1.1.1.1 port 80 after 1 ms: Couldn't connect to \
+             server"
+        ));
+        // Socket EPERM next to a network word: python bind, node listen.
+        assert!(network_denial_signature(
+            Some(1),
+            "s.bind((\"127.0.0.1\", 0))\nPermissionError: [Errno 1] Operation not permitted"
+        ));
+        assert!(network_denial_signature(
+            Some(1),
+            "Error: listen EPERM: operation not permitted 127.0.0.1:8899"
+        ));
+
+        // A write denial with no network word is NOT a network failure —
+        // this is the boundary that keeps the write note working.
+        assert!(!network_denial_signature(
+            Some(1),
+            "mkdir: /etc/x: Operation not permitted"
+        ));
+        // Success never qualifies, whatever stderr says.
+        assert!(!network_denial_signature(
+            Some(0),
+            "warning: Could not resolve host (retried ok)"
+        ));
+        // "Connection refused" alone is a real diagnostic (nothing listening
+        // on the other end), not a sandbox artifact — deliberately unmatched.
+        assert!(!network_denial_signature(
+            Some(1),
+            "nc: 127.0.0.1 8080: Connection refused"
+        ));
     }
 
     #[test]

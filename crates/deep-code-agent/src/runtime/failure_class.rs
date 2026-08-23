@@ -89,3 +89,33 @@ fn is_boundary_denial(call: &ToolCall, result: &ToolResult) -> bool {
     matches!(call.name.as_str(), "shell" | "job")
         && result.content.contains(crate::sandbox::WRITE_DENIAL_NOTE)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The network note must never feed the write-boundary breaker: its
+    /// remedy is `network=true` on the next call, not `/add-dir`, and the
+    /// breaker's advice names the latter. Guarded by test because the two
+    /// notes share a producer and a prefix — a refactor folding them into one
+    /// constant would silently route offline network failures into "grant a
+    /// directory" advice again.
+    #[test]
+    fn network_denial_note_is_not_a_write_boundary_denial() {
+        let call = ToolCall::new("c1", "shell", serde_json::json!({"command": "git push"}));
+        let mut result = ToolResult::success(
+            "c1",
+            "shell",
+            format!("fatal: ...\n{}", crate::sandbox::NETWORK_DENIAL_NOTE),
+        );
+        assert!(
+            !is_boundary_denial(&call, &result),
+            "a network denial is not the granted-roots fence"
+        );
+        result.content = format!("sh: ...\n{}", crate::sandbox::WRITE_DENIAL_NOTE);
+        assert!(
+            is_boundary_denial(&call, &result),
+            "the write note keeps feeding the breaker"
+        );
+    }
+}

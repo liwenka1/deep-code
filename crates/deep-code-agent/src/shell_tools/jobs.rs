@@ -167,6 +167,11 @@ pub(super) struct JobState {
     /// as a possible write-boundary denial when it did — an unconfined run's
     /// EPERM is a plain permission problem, not the granted-roots fence.
     pub(super) sandboxed: bool,
+    /// Whether the sandboxed run carried the network grant. Distinguishes the
+    /// two denial notes: a no-network run's connection failure gets the
+    /// network note (re-run with network=true), never the write note — whose
+    /// advice, request_write_root, would point the model exactly wrong.
+    pub(super) network: bool,
     pub(super) stdout: SharedBuffer,
     pub(super) stderr: SharedBuffer,
     /// Present for background jobs; foreground children are owned by the
@@ -737,15 +742,15 @@ pub(super) fn shell_text_output(job_id: &str, job: &JobState, max_chars: usize) 
     out
 }
 
-/// How large `out` will be once the write-denial note has been appended, plus
-/// the note itself so the caller does not look it up twice.
+/// How large `out` will be once the denial note has been appended, plus the
+/// note itself so the caller does not look it up twice.
 ///
 /// Both renderings append that note AFTER asking `truncation_note` whether
-/// anything was dropped, so both have to count it BEFORE asking. It is 386
-/// chars ([`crate::sandbox::WRITE_DENIAL_NOTE`]): measuring without it put a
-/// failed sandboxed build at 12,039 rendered chars against a 12,000 budget
-/// with `result_elided` computed as false, so 4,039 characters went out with
-/// no truncation note, no spill file and no tail hint.
+/// anything was dropped, so both have to count it BEFORE asking (the notes
+/// run ~350-400 chars): measuring without it put a failed sandboxed build at
+/// 12,039 rendered chars against a 12,000 budget with `result_elided`
+/// computed as false, so 4,039 characters went out with no truncation note,
+/// no spill file and no tail hint.
 ///
 /// Shared rather than open-coded because it was open-coded: the fix landed in
 /// `shell_text_output` and `job_text_snapshot` kept passing a bare
@@ -753,7 +758,7 @@ pub(super) fn shell_text_output(job_id: &str, job: &JobState, max_chars: usize) 
 /// on silently dropping ~4k chars while the commit that fixed it claimed both
 /// renderings now agreed. One function is what makes that claim checkable.
 fn rendered_with_pending_denial(out: &str, job: &JobState) -> (usize, Option<&'static str>) {
-    let denial = write_denial_note(job);
+    let denial = denial_note(job);
     // `+ 1` for the newline each caller writes before the note.
     let pending = denial.map_or(0, |note| note.chars().count() + 1);
     (out.chars().count() + pending, denial)
@@ -825,15 +830,28 @@ fn truncation_note(
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-/// The boundary-denial note for a failed sandboxed command whose stderr looks
-/// like the OS refusing a write, or `None` when the failure doesn't qualify.
-/// One decision point for both the foreground result and job snapshots, so a
-/// background job's denial reads the same as a foreground one.
-fn write_denial_note(job: &JobState) -> Option<&'static str> {
-    (job.status == JobStatus::Failed
-        && job.sandboxed
-        && crate::sandbox::write_denial_signature(job.exit_code, &job.stderr.text()))
-    .then_some(crate::sandbox::WRITE_DENIAL_NOTE)
+/// The sandbox-denial note for a failed sandboxed command, or `None` when the
+/// failure doesn't qualify. One decision point for both the foreground result
+/// and job snapshots, so a background job's denial reads the same as a
+/// foreground one.
+///
+/// Network is judged FIRST, and only for runs that had no network grant: an
+/// offline run's connection failure is the root cause even when EPERM noise
+/// is also present (git under the sandbox always carries xcrun's "Operation
+/// not permitted" cache-write warnings), and the write note's advice —
+/// request_write_root — would point the model exactly wrong. A run that HAD
+/// the grant never gets the network note: its EPERM can only be the write
+/// fence, so it falls through to the write check unchanged.
+fn denial_note(job: &JobState) -> Option<&'static str> {
+    if job.status != JobStatus::Failed || !job.sandboxed {
+        return None;
+    }
+    let stderr = job.stderr.text();
+    if !job.network && crate::sandbox::network_denial_signature(job.exit_code, &stderr) {
+        return Some(crate::sandbox::NETWORK_DENIAL_NOTE);
+    }
+    crate::sandbox::write_denial_signature(job.exit_code, &stderr)
+        .then_some(crate::sandbox::WRITE_DENIAL_NOTE)
 }
 
 /// Model-facing plain-text snapshot for job status/tail.
@@ -1442,6 +1460,7 @@ mod tests {
             status: JobStatus::Completed,
             exit_code: Some(0),
             sandboxed: true,
+            network: false,
             stdout,
             stderr: SharedBuffer::default(),
             child: None,
@@ -1542,6 +1561,7 @@ mod tests {
             status,
             exit_code: Some(if status == JobStatus::Completed { 0 } else { 1 }),
             sandboxed,
+            network: false,
             stdout: SharedBuffer::default(),
             stderr,
             child: None,
@@ -1585,5 +1605,85 @@ mod tests {
             "warning: Operation not permitted",
         );
         assert!(!shell_text_output("job_4", &ok, 4096).contains(crate::sandbox::WRITE_DENIAL_NOTE));
+    }
+
+    /// The misdirection-chain regression: a no-network run's failure must get
+    /// the NETWORK note, never the write note — even when EPERM noise is also
+    /// present. Both stderr shapes below were captured under the real Seatbelt
+    /// profile: git under the sandbox always carries xcrun's "Operation not
+    /// permitted" cache-write warnings next to its real DNS error, and a port
+    /// bind fails as a bare PermissionError with "bind" only in the traceback.
+    /// Before this note existed, both matched the write signature and the
+    /// model was told to request_write_root — exactly wrong.
+    #[test]
+    fn offline_network_failures_get_the_network_note_not_the_write_note() {
+        let git_offline = finished_job(
+            JobStatus::Failed,
+            true,
+            "git: error: couldn't create cache file '/tmp/xcrun_db-x' (errno=Operation not \
+             permitted)\nfatal: unable to access 'https://github.com/x/y.git/': Could not \
+             resolve host: github.com",
+        );
+        let rendered = shell_text_output("job_5", &git_offline, 8192);
+        assert!(
+            rendered.contains(crate::sandbox::NETWORK_DENIAL_NOTE),
+            "offline DNS failure must get the network note: {rendered}"
+        );
+        assert!(
+            !rendered.contains(crate::sandbox::WRITE_DENIAL_NOTE),
+            "the xcrun EPERM noise must not misdirect to request_write_root: {rendered}"
+        );
+
+        let bind_offline = finished_job(
+            JobStatus::Failed,
+            true,
+            "    import socket; s=socket.socket(); s.bind((\"127.0.0.1\", 0))\nPermissionError: \
+             [Errno 1] Operation not permitted",
+        );
+        let rendered = shell_text_output("job_6", &bind_offline, 8192);
+        assert!(
+            rendered.contains(crate::sandbox::NETWORK_DENIAL_NOTE),
+            "a socket EPERM in a no-network run is the network fence: {rendered}"
+        );
+        assert!(!rendered.contains(crate::sandbox::WRITE_DENIAL_NOTE));
+
+        // Both renderings agree, same as the write note.
+        assert!(
+            job_text_snapshot("job_6", &bind_offline, 8192)
+                .contains(crate::sandbox::NETWORK_DENIAL_NOTE)
+        );
+    }
+
+    /// A run that HAD the network grant never gets the network note: its
+    /// EPERM can only be the write fence (or a real remote-side problem), so
+    /// the write signature keeps judging it — and a write denial in a plain
+    /// offline run (no network words in stderr) keeps its note unchanged.
+    #[test]
+    fn granted_runs_and_plain_write_denials_keep_the_write_note() {
+        let mut granted = finished_job(
+            JobStatus::Failed,
+            true,
+            "PermissionError: [Errno 1] Operation not permitted while calling bind",
+        );
+        granted.network = true;
+        let rendered = shell_text_output("job_7", &granted, 8192);
+        assert!(
+            !rendered.contains(crate::sandbox::NETWORK_DENIAL_NOTE),
+            "a granted run must not be told it lacks the grant: {rendered}"
+        );
+        assert!(
+            rendered.contains(crate::sandbox::WRITE_DENIAL_NOTE),
+            "EPERM under a granted run falls through to the write check: {rendered}"
+        );
+
+        // The pre-existing shape: offline run, write EPERM, no network words.
+        let write_denied = finished_job(
+            JobStatus::Failed,
+            true,
+            "mkdir: /etc/x: Operation not permitted",
+        );
+        let rendered = shell_text_output("job_8", &write_denied, 8192);
+        assert!(rendered.contains(crate::sandbox::WRITE_DENIAL_NOTE));
+        assert!(!rendered.contains(crate::sandbox::NETWORK_DENIAL_NOTE));
     }
 }

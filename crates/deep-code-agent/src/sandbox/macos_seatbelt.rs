@@ -526,11 +526,16 @@ mod tests {
             .filter(|(name, _)| name.starts_with("WRITE_ROOT_"))
             .map(|(name, _)| name.as_str())
             .collect();
-        // Workspace, the distinct cwd, and the temp dir — see
-        // `SandboxPolicy::writable_roots` for why the temp dir is mandatory.
+        // Workspace, the distinct cwd, the temp dir, and /tmp — see
+        // `SandboxPolicy::writable_roots` for why the last two are mandatory.
         assert_eq!(
             write_roots,
-            ["WRITE_ROOT_0", "WRITE_ROOT_1", "WRITE_ROOT_2"]
+            [
+                "WRITE_ROOT_0",
+                "WRITE_ROOT_1",
+                "WRITE_ROOT_2",
+                "WRITE_ROOT_3"
+            ]
         );
         assert!(profile.render().contains("WRITE_ROOT_1"));
     }
@@ -852,6 +857,33 @@ mod tests {
             "write into a granted extra root must pass"
         );
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "granted");
+    }
+
+    /// Behavioral counterpart to `tmp_is_always_a_writable_root_on_unix`: the
+    /// xcrun fallback path. Inside the sandbox `confstr` fails, so tools that
+    /// cannot learn the real `$TMPDIR` write to `/tmp` — that write must pass,
+    /// or every sandboxed `git` run carries EPERM noise that misclassifies
+    /// its failures as write-boundary denials.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confined_command_can_write_to_slash_tmp() {
+        if crate::sandbox::require_backend_or_skip(is_available(), "Seatbelt") {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let probe = format!("/tmp/.deep-code-tmp-probe-{}", std::process::id());
+
+        let status = wrap_shell_command(
+            &format!("printf tmp-ok > {probe} && rm -f {probe}"),
+            workspace.path(),
+            &single_root(workspace.path()),
+            &SandboxPolicy::workspace_write(),
+        )
+        .status()
+        .expect("sandbox-exec should launch");
+
+        let _ = std::fs::remove_file(&probe);
+        assert!(status.success(), "a write to /tmp must pass in the sandbox");
     }
 
     #[cfg(target_os = "macos")]

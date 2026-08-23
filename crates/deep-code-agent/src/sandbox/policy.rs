@@ -60,7 +60,7 @@ impl SandboxPolicy {
 
     /// Writable roots: every granted root (the workspace first, then any
     /// `--add-dir` grants), the command's cwd when it is not already granted,
-    /// and the system temp dir.
+    /// the system temp dir, and (unix) `/tmp`.
     ///
     /// The temp dir is not a convenience. Toolchains write scratch files there
     /// unconditionally — `rustc` allocates a temp dir per invocation, git's
@@ -70,6 +70,18 @@ impl SandboxPolicy {
     /// inside the granted boundary, and `$TMPDIR` is per-user ephemeral space
     /// the user's own processes already write to. Both backends read this list,
     /// so the grant cannot drift per-platform again.
+    ///
+    /// `/tmp` rides the same argument. On Linux it IS the temp dir; on macOS
+    /// the temp dir is `$TMPDIR` (`/var/folders/…`) and `/tmp` is a separate
+    /// place tools land on when they cannot ask for the real one: inside the
+    /// sandbox `confstr(_CS_DARWIN_USER_TEMP_DIR)` fails (the dirhelper mach
+    /// service is behind deny-default), so Apple's xcrun shim — run by every
+    /// `git` invocation — falls back to `/tmp` and, without this grant, spams
+    /// "Operation not permitted" on stderr. That noise isn't cosmetic: it
+    /// carries the write-denial signature, so a git run that failed for a
+    /// different reason gets misclassified as a write-boundary denial.
+    /// Sticky world-writable `/tmp` is space every unconfined process already
+    /// writes to; granting it widens nothing that matters.
     pub fn writable_roots(&self, granted: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
         match self {
             Self::Unsandboxed => Vec::new(),
@@ -86,6 +98,12 @@ impl SandboxPolicy {
                 let temp = std::env::temp_dir();
                 if !roots.contains(&temp) {
                     roots.push(temp);
+                }
+                if cfg!(unix) {
+                    let tmp = PathBuf::from("/tmp");
+                    if !roots.contains(&tmp) {
+                        roots.push(tmp);
+                    }
                 }
                 roots
             }
@@ -108,6 +126,31 @@ mod tests {
             matched_rule: None,
             network,
         }
+    }
+
+    /// `/tmp` must be writable on unix even when the process temp dir is
+    /// elsewhere (macOS: `$TMPDIR` under /var/folders). Tools that cannot ask
+    /// for the real temp dir fall back to `/tmp` — inside the sandbox
+    /// `confstr(_CS_DARWIN_USER_TEMP_DIR)` fails, so Apple's xcrun shim (run
+    /// by every git invocation) lands exactly there, and without the grant
+    /// its EPERM noise misclassifies unrelated failures as write denials.
+    #[cfg(unix)]
+    #[test]
+    fn tmp_is_always_a_writable_root_on_unix() {
+        let ws = Path::new("/w");
+        let roots = SandboxPolicy::workspace_write().writable_roots(&[ws.to_path_buf()], ws);
+        assert!(
+            roots.contains(&PathBuf::from("/tmp")),
+            "unix roots must include /tmp: {roots:?}"
+        );
+        // And exactly once, even when the temp dir already is /tmp (Linux).
+        assert_eq!(
+            roots
+                .iter()
+                .filter(|root| *root == &PathBuf::from("/tmp"))
+                .count(),
+            1
+        );
     }
 
     #[test]
