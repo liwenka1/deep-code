@@ -690,6 +690,65 @@ None.
         );
     }
 
+    /// The dispatch-time network grant is what separates an online child from
+    /// an offline one: a granted child gets the web tools and ambient egress
+    /// for allow-listed commands; an ungranted child gets neither. The
+    /// trusted-command wall must not widen either way — network changes
+    /// whether allow-listed commands get egress, never which commands run.
+    #[test]
+    fn network_grant_changes_child_tools_and_egress_only() {
+        let workspace = tempfile::tempdir().unwrap();
+        let boundary =
+            crate::workspace_policy::WorkspacePolicy::new(workspace.path().to_path_buf())
+                .expect("test workspace must resolve");
+        let lang = crate::i18n::SharedLang::new(crate::i18n::Lang::En);
+        let build = |network: bool| {
+            crate::subagent::registry::child_tool_registry(
+                &boundary,
+                SubAgentRole::Explore,
+                crate::execution_policy::ExecPolicy::default(),
+                network,
+                &lang,
+            )
+        };
+        let tool_names = |registry: &ToolRegistry| -> Vec<String> {
+            registry
+                .specs()
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect()
+        };
+        let trusted = ToolCall::new("c1", "shell", json!({"command": "cargo build"}));
+        let untrusted = ToolCall::new("c2", "shell", json!({"command": "curl https://x.dev"}));
+
+        let offline = build(false);
+        let names = tool_names(&offline);
+        assert!(
+            !names.contains(&"fetch_url".to_string()),
+            "offline child must have no web tools: {names:?}"
+        );
+        assert!(
+            !offline.evaluate_tool(&trusted).network,
+            "offline child commands run without egress"
+        );
+
+        let online = build(true);
+        let names = tool_names(&online);
+        assert!(
+            names.contains(&"fetch_url".to_string()) && names.contains(&"web_search".to_string()),
+            "granted child gets the web tools: {names:?}"
+        );
+        let plan = online.evaluate_tool(&trusted);
+        assert!(
+            plan.network && !plan.requires_approval,
+            "granted child's allow-listed commands run with ambient egress: {plan:?}"
+        );
+        assert!(
+            online.evaluate_tool(&untrusted).requires_approval,
+            "the network grant must not widen which commands may run"
+        );
+    }
+
     /// Real end-to-end smoke: a live DeepSeek child runs the `agent` tool
     /// against a scratch workspace and must return the structured report.
     /// Confirms the machinery (child runtime, workspace tools, output

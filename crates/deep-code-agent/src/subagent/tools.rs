@@ -60,6 +60,12 @@ pub struct AgentParams {
     /// Read-only roles cannot write files and run on the fast model tier.
     /// Defaults to general.
     role: Option<String>,
+    /// Set true when the child task needs network access (fetching docs/URLs,
+    /// installing dependencies). Routes the dispatch through user approval; an
+    /// approved networked child gets the web tools (fetch_url, web_search) and
+    /// its allow-listed sandboxed commands run with egress. Children without
+    /// this grant have no network at all.
+    network: Option<bool>,
     /// Optional display name (shown by /agents).
     name: Option<String>,
 }
@@ -76,7 +82,9 @@ impl Tool for AgentTool {
         "Run a focused child agent to completion and return its report. Blocks until the child \
          finishes; issue several agent calls in one turn to run children in parallel. Use for \
          investigations or delegated changes whose conclusion is much smaller than the work — \
-         the child burns its own context, the parent only receives the report."
+         the child burns its own context, the parent only receives the report. Children have no \
+         network unless dispatched with network=true (goes through user approval): a granted \
+         child gets fetch_url/web_search and its allow-listed commands run with egress."
     }
 
     async fn run(&self, params: AgentParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {
@@ -86,6 +94,13 @@ impl Tool for AgentTool {
         }
         let role =
             SubAgentRole::parse(params.role.as_deref().unwrap_or("general")).map_err(tool_error)?;
+        // Reaching execution IS the network consent, exactly like
+        // `role.allows_writes()` for writes: a `network: true` dispatch only
+        // gets here through its approval gate (or a mode/config the user chose
+        // that waves it through — yolo, `[sandbox] network = "always"`, a
+        // standing auto_allow). Under `network = "never"` the policy denies
+        // the dispatch before this point.
+        let network = params.network.unwrap_or(false);
 
         let agent_id = new_agent_id();
         let name = params
@@ -93,10 +108,18 @@ impl Tool for AgentTool {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| agent_id.clone());
 
+        // The child runtime renders its own strings from the child config's
+        // language; the web tools follow the same source so a granted child's
+        // fetch errors read in the same language as the rest of its session.
+        let child_ui_lang = crate::i18n::SharedLang::new(crate::i18n::Lang::from_env(
+            &self.services.agent_config.language,
+        ));
         let child_tools = child_tool_registry(
             &self.services.boundary,
             role,
             self.services.exec_policy.clone(),
+            network,
+            &child_ui_lang,
         );
         // Reconnaissance roles run pinned to the flash tier (a fixed model id
         // bypasses per-turn auto-routing in the child); other roles inherit
@@ -108,7 +131,7 @@ impl Tool for AgentTool {
         let runtime = AgentRuntime::with_system_prompt_shared(
             std::sync::Arc::clone(&self.services.client),
             child_tools,
-            child_system_prompt(role),
+            child_system_prompt(role, network),
             child_config,
             true,
         );

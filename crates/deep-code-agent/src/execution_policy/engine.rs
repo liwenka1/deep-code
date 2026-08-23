@@ -297,27 +297,82 @@ impl ExecPolicy {
             // spawning without a prompt, and `accept_edits_approvable` waves the
             // writing role through on AcceptEdits and above, so the prompt
             // appears exactly where a plain `write_file` would have.
-            ToolKind::SubAgent if subagent_role_writes(arguments) => ToolExecutionPlan {
-                verdict: PolicyVerdict::NeedsApproval {
-                    reason: "dispatching a writing sub-agent authorizes its workspace writes"
-                        .to_string(),
-                },
-                requires_approval: true,
-                requires_sandbox: false,
-                read_only: false,
-                risk_level: RiskLevel::Medium,
-                matched_rule: Some("builtin:subagent_writing_role".to_string()),
-                network: false,
-            },
-            ToolKind::SubAgent => ToolExecutionPlan {
-                verdict: PolicyVerdict::Allow,
-                requires_approval: false,
-                requires_sandbox: false,
-                read_only: true,
-                risk_level: RiskLevel::Low,
-                matched_rule: Some("builtin:subagent_tool".to_string()),
-                network: false,
-            },
+            //
+            // A `network: true` dispatch is the network authorization the same
+            // way: a child runs unattended, so egress consent cannot be
+            // collected at its own prompts (they are auto-denied) — it is
+            // collected here, where a human still sees the request. An
+            // approved networked child gets the web tools and ambient egress
+            // for its allow-listed commands (see `child_tool_registry`); the
+            // trusted-command wall itself does not widen.
+            ToolKind::SubAgent => {
+                let writes = subagent_role_writes(arguments);
+                let network = network_requested(arguments);
+                // `[sandbox] network = "never"`: a networked dispatch is
+                // refused outright, same as a network-declaring shell command
+                // — the child would only burn a doomed attempt offline.
+                if network && self.network_mode == NetworkMode::Never {
+                    return ToolExecutionPlan {
+                        verdict: PolicyVerdict::Deny {
+                            reason: "network access is disabled by configuration ([sandbox] \
+                                     network = \"never\"), so a networked sub-agent cannot run"
+                                .to_string(),
+                        },
+                        requires_approval: false,
+                        requires_sandbox: false,
+                        read_only: false,
+                        risk_level: RiskLevel::Medium,
+                        matched_rule: Some("deny:network_disabled".to_string()),
+                        network: false,
+                    };
+                }
+                // Under `always`, egress is already ambient for every sandboxed
+                // command by explicit config — a networked dispatch adds no
+                // consent question. The write authorization still does.
+                let network_gated = network && self.network_mode == NetworkMode::Prompt;
+                if writes || network_gated {
+                    let reason = match (writes, network_gated) {
+                        (true, true) => {
+                            "dispatching a writing sub-agent with network access authorizes \
+                             its workspace writes and its egress — anything it reads may be \
+                             sent to external hosts"
+                        }
+                        (false, true) => {
+                            "dispatching a networked sub-agent authorizes its egress — \
+                             anything it reads may be sent to external hosts"
+                        }
+                        _ => "dispatching a writing sub-agent authorizes its workspace writes",
+                    };
+                    ToolExecutionPlan {
+                        verdict: PolicyVerdict::NeedsApproval {
+                            reason: reason.to_string(),
+                        },
+                        requires_approval: true,
+                        requires_sandbox: false,
+                        read_only: !writes,
+                        risk_level: RiskLevel::Medium,
+                        matched_rule: Some(
+                            if network_gated {
+                                "builtin:subagent_network_dispatch"
+                            } else {
+                                "builtin:subagent_writing_role"
+                            }
+                            .to_string(),
+                        ),
+                        network: false,
+                    }
+                } else {
+                    ToolExecutionPlan {
+                        verdict: PolicyVerdict::Allow,
+                        requires_approval: false,
+                        requires_sandbox: false,
+                        read_only: true,
+                        risk_level: RiskLevel::Low,
+                        matched_rule: Some("builtin:subagent_tool".to_string()),
+                        network: false,
+                    }
+                }
+            }
             // Widening the write boundary is the highest-consequence request a
             // model can make: everything the sandbox and the path fence deny
             // today becomes allowed under the new root. Always a prompt, top
@@ -676,6 +731,99 @@ mod tests {
             "agent",
             &json!({"task": "scan", "role": "explore"})
         ));
+    }
+
+    /// A `network: true` dispatch is the child's egress consent, collected at
+    /// the only prompt a human ever sees (the child's own prompts are
+    /// auto-denied unattended) — so it must ask even for read-only roles.
+    /// Undeclared dispatches keep spawning silently, exactly as before.
+    #[test]
+    fn spawning_a_networked_subagent_needs_approval_even_readonly() {
+        let policy = ExecPolicy::default();
+
+        let networked = policy.evaluate_tool(
+            "agent",
+            &json!({"task": "research the crate docs", "role": "explore", "network": true}),
+        );
+        assert!(
+            networked.requires_approval,
+            "networked spawn must prompt even for a read-only role"
+        );
+        assert!(networked.read_only, "explore + network stays read-only");
+        assert_eq!(
+            networked.matched_rule.as_deref(),
+            Some("builtin:subagent_network_dispatch")
+        );
+        // The prompt says what is actually being consented to.
+        let PolicyVerdict::NeedsApproval { reason } = &networked.verdict else {
+            panic!("networked spawn must need approval: {networked:?}");
+        };
+        assert!(
+            reason.contains("egress"),
+            "reason must name egress: {reason}"
+        );
+
+        // network: false (or absent) is not a declaration — spawn stays silent.
+        for arguments in [
+            json!({"task": "scan", "role": "explore", "network": false}),
+            json!({"task": "scan", "role": "explore"}),
+        ] {
+            let plan = policy.evaluate_tool("agent", &arguments);
+            assert_eq!(plan.verdict, PolicyVerdict::Allow, "{arguments}");
+        }
+
+        // Writing + network combines both consents into the one prompt.
+        let both = policy.evaluate_tool(
+            "agent",
+            &json!({"task": "add dep", "role": "implementer", "network": true}),
+        );
+        let PolicyVerdict::NeedsApproval { reason } = &both.verdict else {
+            panic!("writing networked spawn must need approval: {both:?}");
+        };
+        assert!(
+            reason.contains("writes") && reason.contains("egress"),
+            "combined dispatch must name both grants: {reason}"
+        );
+        assert!(!both.read_only);
+
+        // AcceptEdits' standing consent is "edit files", never "open egress":
+        // the same writing role that sails through offline prompts when it
+        // declares network.
+        assert!(!accept_edits_approvable(
+            "agent",
+            &json!({"task": "add dep", "role": "implementer", "network": true})
+        ));
+    }
+
+    /// `[sandbox] network` config governs dispatches the same way it governs
+    /// shell commands: `never` refuses a networked child outright; `always`
+    /// makes egress ambient so the dispatch has nothing extra to ask (a
+    /// writing role still asks for its writes).
+    #[test]
+    fn networked_subagent_dispatch_follows_the_network_mode() {
+        let never = ExecPolicy::default().with_network_mode(NetworkMode::Never);
+        let refused = never.evaluate_tool("agent", &json!({"task": "fetch docs", "network": true}));
+        assert!(
+            matches!(refused.verdict, PolicyVerdict::Deny { .. }),
+            "never must refuse a networked dispatch: {refused:?}"
+        );
+
+        let always = ExecPolicy::default().with_network_mode(NetworkMode::Always);
+        let readonly =
+            always.evaluate_tool("agent", &json!({"task": "fetch docs", "network": true}));
+        assert_eq!(
+            readonly.verdict,
+            PolicyVerdict::Allow,
+            "always already grants ambient egress; nothing left to ask"
+        );
+        let writing = always.evaluate_tool(
+            "agent",
+            &json!({"task": "add dep", "role": "implementer", "network": true}),
+        );
+        assert!(
+            writing.requires_approval,
+            "the write consent is untouched by network=always"
+        );
     }
 
     #[test]

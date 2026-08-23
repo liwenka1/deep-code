@@ -94,17 +94,35 @@ fn normalize(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace('-', "_")
 }
 
-pub fn build_system_prompt(role: SubAgentRole) -> String {
+pub fn build_system_prompt(role: SubAgentRole, network: bool) -> String {
     // Children run shell commands too and start from a blank context, so they
     // need the same host facts the parent gets — otherwise each one rediscovers
-    // "this is not POSIX" one failed command at a time.
+    // "this is not POSIX" one failed command at a time. The network line must
+    // match the dispatch grant for the same reason the shell descriptions
+    // match enforcement: a child that believes it is online when it is not
+    // burns its step budget retrying doomed downloads.
+    let network_block = if network {
+        NETWORK_GRANTED_BLOCK
+    } else {
+        NETWORK_DENIED_BLOCK
+    };
     format!(
-        "{}\n\n{}\n\n{}",
+        "{}\n{}\n\n{}\n\n{}",
         role.intro(),
+        network_block,
         crate::extensions::platform_block(),
         super::output::SUBAGENT_OUTPUT_FORMAT
     )
 }
+
+const NETWORK_GRANTED_BLOCK: &str = "Network: this dispatch was approved WITH network access. \
+You have fetch_url and web_search, and allow-listed sandboxed commands run with egress — no \
+per-command network declaration is needed.";
+
+const NETWORK_DENIED_BLOCK: &str = "Network: you have NO network access. Web tools are absent \
+and network-declaring commands are auto-denied, so do not attempt downloads or remote calls. \
+If the task genuinely needs the network, state that in your final report so the parent can \
+re-dispatch with network=true.";
 
 const GENERAL_INTRO: &str = "You are a general-purpose sub-agent spawned to handle a specific task autonomously.\nYou are read-only: investigate, search, and run read-only commands, but you cannot write files — if the task needs edits, report what should change under CHANGES and the parent can dispatch an `implementer`.\nStay inside the assigned scope; put adjacent work under RISKS/BLOCKERS.\n";
 
@@ -138,11 +156,38 @@ mod tests {
     /// Children run shell too and start blank, so they need the same host facts.
     #[test]
     fn child_prompt_states_the_host_shell() {
-        let prompt = build_system_prompt(SubAgentRole::General);
+        let prompt = build_system_prompt(SubAgentRole::General, false);
         let expected_shell = if cfg!(windows) { "cmd.exe /C" } else { "sh -c" };
         assert!(
             prompt.contains(expected_shell),
             "child prompt must name the real shell: {prompt}"
+        );
+    }
+
+    /// The prompt's network line must match the dispatch grant — a child that
+    /// believes it is online when it is not burns its steps on doomed
+    /// downloads, and one that believes it is offline never uses the web
+    /// tools it was granted.
+    #[test]
+    fn child_prompt_states_the_real_network_grant() {
+        let offline = build_system_prompt(SubAgentRole::Explore, false);
+        assert!(
+            offline.contains("NO network access"),
+            "offline child must be told so: {offline}"
+        );
+        assert!(
+            offline.contains("network=true"),
+            "offline child must know the re-dispatch path: {offline}"
+        );
+
+        let online = build_system_prompt(SubAgentRole::Explore, true);
+        assert!(
+            online.contains("WITH network access"),
+            "granted child must be told so: {online}"
+        );
+        assert!(
+            online.contains("fetch_url"),
+            "granted child must know its web tools: {online}"
         );
     }
 }
