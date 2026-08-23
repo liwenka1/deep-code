@@ -25,6 +25,7 @@ A DeepSeek-powered terminal coding agent, written in Rust. One small binary: str
 
 - Delegate investigation or implementation to child agents via one blocking `agent` tool call; issue several calls in one turn to run children in parallel.
   Six roles — `general` / `explore` / `plan` / `review` / `verifier` are strictly read-only; **only `implementer` can write**, and dispatching one is itself an approval point: the human authorizes the dispatch, the child's workspace writes then proceed unattended (on the tiers where writes would prompt).
+  Network is dispatch-scoped the same way: children have **no network at all** unless dispatched with `network: true`, which is its own approval point (the prompt says what it means — anything the child reads may be sent to external hosts). A granted child gets `fetch_url`/`web_search` and egress for its allow-listed commands; the command allow-list itself never widens. Denied prompts inside a child state the real reason — auto-denied by policy, no user saw it — and name the recovery (work within the grant, or report back for a re-dispatch), instead of pretending a user refused.
 - Reconnaissance roles (`explore` / `review` / `verifier`) are pinned to the cheap flash tier — fan-out burns tokens where it's cheapest — while children stream live progress into the parent transcript: `[explore] +41s step 7/50: grep_files`, so a long-running child never looks hung.
 - Child token spend is folded into the parent session's cost tracking.
 
