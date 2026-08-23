@@ -232,10 +232,15 @@ impl AgentRuntime {
         state.session_cache_savings.cny += savings.cny;
     }
 
+    /// `denial_note`, when present and the decision denies, replaces the
+    /// stock "denied by user" result text — the unattended sub-agent path
+    /// resolves approvals by policy, and telling the child a user refused
+    /// would be a false statement (see `subagent_approval_decision`).
     pub(super) async fn handle_approval(
         &self,
         pending: PendingToolBatch,
         decision: ApprovalDecision,
+        denial_note: Option<String>,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
         let cancel = self.state.lock().await.cancel.clone();
@@ -283,12 +288,16 @@ impl AgentRuntime {
             let result = match decision {
                 ApprovalDecision::Denied => {
                     let mut result = ToolResult::denied(&current);
-                    result.content = format!(
-                        "User declined the write-root request for '{}'. Do not request this \
-                         path again; continue within the granted roots, or the user can grant \
-                         it later with /add-dir.",
-                        root_grant_requested_path(&current)
-                    );
+                    // The unattended note wins: "user declined" is only true
+                    // when a user actually saw the prompt.
+                    result.content = denial_note.clone().unwrap_or_else(|| {
+                        format!(
+                            "User declined the write-root request for '{}'. Do not request \
+                             this path again; continue within the granted roots, or the user \
+                             can grant it later with /add-dir.",
+                            root_grant_requested_path(&current)
+                        )
+                    });
                     result
                 }
                 _ => {
@@ -311,7 +320,14 @@ impl AgentRuntime {
             .run_tool(&current, Some(decision), &cancel, &turn_id, tx)
             .await
         {
-            Ok(ToolRunOutcome::Result { result }) => {
+            Ok(ToolRunOutcome::Result { mut result }) => {
+                // Same substitution as the root-grant arm above: an unattended
+                // denial carries its real reason instead of "denied by user".
+                if result.status == crate::tool::ToolResultStatus::Denied
+                    && let Some(note) = denial_note
+                {
+                    result.content = note;
+                }
                 self.record_tool_result(&current, result, tx, turn_id.clone())
                     .await;
             }

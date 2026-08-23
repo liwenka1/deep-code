@@ -303,6 +303,20 @@ impl AgentRuntime {
     ///
     /// If there is no pending approval, returns an error event on the stream.
     pub async fn submit_approval(&self, decision: ApprovalDecision) -> RuntimeEventReceiver {
+        self.submit_approval_with_denial_note(decision, None).await
+    }
+
+    /// Like [`Self::submit_approval`], with an explanation recorded as the
+    /// tool-result text when the decision is a denial. The unattended
+    /// sub-agent loop passes the real reason (a policy auto-deny) so the
+    /// child model is not told "denied by user" when no user ever saw the
+    /// request — a child that believes a human refused stops asking for
+    /// things the parent could in fact re-dispatch with the right grant.
+    pub async fn submit_approval_with_denial_note(
+        &self,
+        decision: ApprovalDecision,
+        denial_note: Option<String>,
+    ) -> RuntimeEventReceiver {
         let (tx, rx) = mpsc::unbounded_channel();
         let (pending, cancelled) = {
             let mut state = self.state.lock().await;
@@ -332,7 +346,9 @@ impl AgentRuntime {
                     decision,
                 },
             );
-            runtime.handle_approval(pending, decision, &tx).await;
+            runtime
+                .handle_approval(pending, decision, denial_note, &tx)
+                .await;
         });
         rx
     }
@@ -476,14 +492,25 @@ impl AgentRuntime {
     /// workspace file writes are approved for it. That dispatch is in turn
     /// gated where writes prompt: the `agent` call itself requires approval
     /// for writing roles (see `ToolKind::SubAgent` in the policy engine), so
-    /// this consent is granted by the human, not assumed. Shell and network
-    /// still require the policy's own allow paths (trusted prefixes /
+    /// this consent is granted by the human, not assumed. The network grant
+    /// works the same way at dispatch (`network: true`), but never reaches
+    /// this decision: a granted child's exec policy is `Always`, so its
+    /// allow-listed commands carry egress without prompting. Shell otherwise
+    /// still requires the policy's own allow paths (trusted prefixes /
     /// auto_allow); hard denials are never overridden.
+    ///
+    /// Returns the decision plus, for denials, the REAL reason to record as
+    /// the tool result. These prompts are resolved by policy with no human in
+    /// the loop, and the stock "denied by user" text would teach the child a
+    /// false fact — someone saw the request and refused. Each note says what
+    /// actually happened and names the recovery that exists (work within the
+    /// grant, or report back so the parent can re-dispatch).
     pub fn subagent_approval_decision(
         &self,
         request: &ApprovalRequest,
         role: crate::subagent::SubAgentRole,
-    ) -> ApprovalDecision {
+        network_granted: bool,
+    ) -> (ApprovalDecision, Option<String>) {
         let call = ToolCall::new(
             request.call_id.clone(),
             request.tool_name.clone(),
@@ -491,10 +518,14 @@ impl AgentRuntime {
         );
         let plan = self.tools.evaluate_tool(&call);
         if plan.denied_reason().is_some() {
-            return ApprovalDecision::Denied;
+            // Unreachable in practice — a hard deny never parks as an
+            // approval (the registry returns the policy error before asking).
+            // No note: the registry's own denial text covers it if that ever
+            // changes.
+            return (ApprovalDecision::Denied, None);
         }
         if !plan.requires_approval {
-            return ApprovalDecision::Approved;
+            return (ApprovalDecision::Approved, None);
         }
         let kind = crate::execution_policy::ExecPolicy::classify_tool(&request.tool_name);
         // A child never widens the boundary: its approvals are auto-decided
@@ -502,14 +533,62 @@ impl AgentRuntime {
         // (The fall-through denies anyway; spelled out so it reads as policy,
         // not coincidence.)
         if kind == crate::execution_policy::ToolKind::RootGrant {
-            return ApprovalDecision::Denied;
+            return (
+                ApprovalDecision::Denied,
+                Some(SUBAGENT_ROOT_GRANT_DENIAL.to_string()),
+            );
         }
         if role.allows_writes() && kind == crate::execution_policy::ToolKind::WriteFile {
-            return ApprovalDecision::Approved;
+            return (ApprovalDecision::Approved, None);
         }
-        ApprovalDecision::Denied
+        // A network-declaring command in an UNGRANTED child: what is missing
+        // is the grant, not the command — point at the re-dispatch path. (In
+        // a granted child egress is ambient, so a network-declaring prompt
+        // can only mean the command itself is outside the allow-list; the
+        // allow-list note below is then the honest one.)
+        if request.network && !network_granted {
+            return (
+                ApprovalDecision::Denied,
+                Some(SUBAGENT_NETWORK_DENIAL.to_string()),
+            );
+        }
+        if matches!(
+            kind,
+            crate::execution_policy::ToolKind::Shell | crate::execution_policy::ToolKind::Job
+        ) {
+            return (
+                ApprovalDecision::Denied,
+                Some(SUBAGENT_SHELL_DENIAL.to_string()),
+            );
+        }
+        (
+            ApprovalDecision::Denied,
+            Some(SUBAGENT_UNATTENDED_DENIAL.to_string()),
+        )
     }
 }
+
+/// Denial texts for the unattended sub-agent gate, recorded as the denied
+/// call's tool result INSTEAD of the stock "denied by user" text — nobody saw
+/// these prompts, and each names the recovery that actually exists.
+const SUBAGENT_ROOT_GRANT_DENIAL: &str = "Denied by sub-agent policy (no user saw this \
+request): sub-agents can never be granted write roots. If the task needs writes outside the \
+granted roots, state that in your final report — the user can grant the directory in the \
+parent session with /add-dir.";
+
+const SUBAGENT_NETWORK_DENIAL: &str = "Denied by sub-agent policy (no user saw this \
+request): this sub-agent was dispatched WITHOUT network access, so network-declaring \
+commands are auto-denied. Do not retry network work; state the need in your final report so \
+the parent can re-dispatch this task with network=true.";
+
+const SUBAGENT_SHELL_DENIAL: &str = "Denied by sub-agent policy (no user saw this request): \
+sub-agents run unattended, so shell commands outside the trusted allow-list (git \
+status/diff/log, cargo build/test/check, …) are auto-denied. Work within read tools and \
+allow-listed commands, or state what you need in your final report.";
+
+const SUBAGENT_UNATTENDED_DENIAL: &str = "Denied by sub-agent policy (no user saw this \
+request): sub-agents run unattended, so calls that need approval are auto-denied. Work \
+within your granted tools, or state what you need in your final report.";
 
 #[cfg(test)]
 #[path = "runtime/integration_tests.rs"]

@@ -632,17 +632,22 @@ None.
         };
         // Explicitly dispatching `implementer` is the write authorization.
         assert_eq!(
-            runtime.subagent_approval_decision(&write_request, SubAgentRole::Implementer),
-            ApprovalDecision::Approved
+            runtime.subagent_approval_decision(&write_request, SubAgentRole::Implementer, false),
+            (ApprovalDecision::Approved, None)
         );
         // The default role (general) and every read-only role stay read-only,
         // so a bare `agent(task=...)` call cannot write unattended.
-        assert_eq!(
-            runtime.subagent_approval_decision(&write_request, SubAgentRole::General),
-            ApprovalDecision::Denied
+        let (decision, note) =
+            runtime.subagent_approval_decision(&write_request, SubAgentRole::General, false);
+        assert_eq!(decision, ApprovalDecision::Denied);
+        assert!(
+            note.as_deref().is_some_and(|note| note.contains("no user")),
+            "an unattended denial must say no user saw it: {note:?}"
         );
         assert_eq!(
-            runtime.subagent_approval_decision(&write_request, SubAgentRole::Explore),
+            runtime
+                .subagent_approval_decision(&write_request, SubAgentRole::Explore, false)
+                .0,
             ApprovalDecision::Denied
         );
         // The posture never extends past file writes: untrusted shell is
@@ -662,9 +667,13 @@ None.
             preview: None,
             safety_notes: Vec::new(),
         };
-        assert_eq!(
-            runtime.subagent_approval_decision(&shell_request, SubAgentRole::Implementer),
-            ApprovalDecision::Denied
+        let (decision, note) =
+            runtime.subagent_approval_decision(&shell_request, SubAgentRole::Implementer, false);
+        assert_eq!(decision, ApprovalDecision::Denied);
+        assert!(
+            note.as_deref()
+                .is_some_and(|note| note.contains("allow-list")),
+            "a plain shell denial names the allow-list wall: {note:?}"
         );
         // A root grant is auto-denied for every role — widening the boundary
         // is a parent-loop conversation with the human, and a child's
@@ -684,9 +693,57 @@ None.
             preview: None,
             safety_notes: Vec::new(),
         };
-        assert_eq!(
-            runtime.subagent_approval_decision(&grant_request, SubAgentRole::Implementer),
-            ApprovalDecision::Denied
+        let (decision, note) =
+            runtime.subagent_approval_decision(&grant_request, SubAgentRole::Implementer, false);
+        assert_eq!(decision, ApprovalDecision::Denied);
+        assert!(
+            note.as_deref()
+                .is_some_and(|note| note.contains("/add-dir")),
+            "a root-grant denial points at the parent-session path: {note:?}"
+        );
+    }
+
+    /// A network-declaring command denied in an UNGRANTED child must name the
+    /// missing grant and the re-dispatch path — the command may be perfectly
+    /// legitimate, the dispatch just lacked network. In a GRANTED child the
+    /// same prompt can only mean the command is outside the allow-list
+    /// (granted egress is ambient and never prompts), so the note must be the
+    /// allow-list one, not a false "you have no network".
+    #[tokio::test]
+    async fn network_denial_note_matches_the_dispatch_grant() {
+        let runtime = AgentRuntime::new(SummaryClient, ToolRegistry::new());
+        let networked_shell = ApprovalRequest {
+            network: true,
+            call_id: "call_1".to_string(),
+            tool_name: "shell".to_string(),
+            description: "run".to_string(),
+            arguments: json!({"command": "git fetch origin", "network": true}),
+            risk_level: crate::execution_policy::RiskLevel::High,
+            requires_sandbox: true,
+            read_only: false,
+            matched_rule: None,
+            justification: None,
+            resolved_target: None,
+            preview: None,
+            safety_notes: Vec::new(),
+        };
+
+        let (decision, note) =
+            runtime.subagent_approval_decision(&networked_shell, SubAgentRole::General, false);
+        assert_eq!(decision, ApprovalDecision::Denied);
+        let note = note.expect("ungranted network denial carries a note");
+        assert!(
+            note.contains("network=true") && note.contains("no user"),
+            "must name the re-dispatch path and the unattended fact: {note}"
+        );
+
+        let (decision, note) =
+            runtime.subagent_approval_decision(&networked_shell, SubAgentRole::General, true);
+        assert_eq!(decision, ApprovalDecision::Denied);
+        let note = note.expect("granted-child denial still carries a note");
+        assert!(
+            note.contains("allow-list") && !note.contains("WITHOUT network"),
+            "a granted child must not be told it has no network: {note}"
         );
     }
 

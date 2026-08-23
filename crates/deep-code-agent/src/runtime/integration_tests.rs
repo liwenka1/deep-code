@@ -707,6 +707,59 @@ async fn deny_path_records_denied_tool_message_and_continues() {
     );
 }
 
+/// An unattended denial (the sub-agent auto-decider) carries its real reason,
+/// which must replace the stock "denied by user" text end to end: no user saw
+/// the prompt, and a child told that a human refused stops asking for things
+/// the parent could re-dispatch.
+#[tokio::test]
+async fn unattended_denial_note_replaces_the_denied_by_user_text() {
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "ok".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools());
+
+    let mut rx = runtime.submit_user("please echo").await;
+    drain(&mut rx).await;
+
+    let note = "Denied by sub-agent policy (no user saw this request): test note.";
+    let mut rx = runtime
+        .submit_approval_with_denial_note(ApprovalDecision::Denied, Some(note.to_string()))
+        .await;
+    let events = drain(&mut rx).await;
+
+    let denied = events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::ToolCallFinished { result, .. } => Some(result),
+            _ => None,
+        })
+        .expect("expected ToolResult on deny path");
+    assert_eq!(denied.status, ToolResultStatus::Denied);
+    assert_eq!(
+        denied.content, note,
+        "the note must replace the stock text verbatim"
+    );
+
+    let messages = runtime.session_messages().await;
+    assert!(
+        messages
+            .iter()
+            .any(|m| matches!(m.role, crate::message::Role::Tool) && m.content == note),
+        "the recorded tool message must carry the note, not 'denied by user'"
+    );
+}
+
 #[tokio::test]
 async fn plain_response_yields_assistant_message_and_finish() {
     let client = ScriptedClient::new(vec![vec![

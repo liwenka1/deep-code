@@ -7,6 +7,10 @@ use crate::subagent::roles::SubAgentRole;
 /// loop surfaces as [`RuntimeEvent::TurnCancelled`]. On any non-success exit
 /// the step count is still returned so the ledger records real progress.
 ///
+/// `network` is the dispatch-time grant; the auto-decider needs it to tell a
+/// "you have no network" denial from a plain allow-list denial, so the child
+/// is pointed at the recovery that actually applies.
+///
 /// `on_progress` receives one short line per child tool call as it starts;
 /// the parent's `agent` tool forwards these through `cx.update`, so a
 /// minutes-long child shows live activity in the parent UI instead of a
@@ -15,6 +19,7 @@ pub async fn run_subagent(
     runtime: AgentRuntime,
     max_steps: u32,
     role: SubAgentRole,
+    network: bool,
     on_progress: impl Fn(String),
 ) -> Result<(String, u32), (u32, String)> {
     let started = std::time::Instant::now();
@@ -60,8 +65,11 @@ pub async fn run_subagent(
                 return Ok((text, steps));
             }
             RuntimeEvent::ApprovalRequired { request, .. } => {
-                let decision = runtime.subagent_approval_decision(&request, role);
-                rx = runtime.submit_approval(decision).await;
+                let (decision, denial_note) =
+                    runtime.subagent_approval_decision(&request, role, network);
+                rx = runtime
+                    .submit_approval_with_denial_note(decision, denial_note)
+                    .await;
             }
             RuntimeEvent::TurnCancelled { .. } => return Err((steps, "cancelled".to_string())),
             RuntimeEvent::Error { message, .. } => return Err((steps, message)),

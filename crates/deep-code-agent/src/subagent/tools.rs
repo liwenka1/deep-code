@@ -179,7 +179,7 @@ impl Tool for AgentTool {
         };
         let run = std::panic::AssertUnwindSafe(async move {
             runtime.begin_turn(task).await;
-            run_subagent(runtime, DEFAULT_MAX_STEPS, role, progress).await
+            run_subagent(runtime, DEFAULT_MAX_STEPS, role, network, progress).await
         })
         .catch_unwind();
         tokio::pin!(run);
