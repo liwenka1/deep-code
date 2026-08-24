@@ -44,7 +44,7 @@ on:
         required: false
         default: 'deepcode/issue-'
       permission-mode:
-        description: 'default | accept_edits | auto | yolo. `default` auto-denies every gated call, so the bot can answer but never edit.'
+        description: 'default | accept_edits | auto | yolo. `default` auto-denies every gated call except the auto-allow names below, so the bot can answer but never edit.'
         type: string
         required: false
         default: 'accept_edits'
@@ -54,10 +54,10 @@ on:
         required: false
         default: ''
       auto-allow:
-        description: 'Comma-separated tool-name prefixes pre-approved without prompting.'
+        description: 'Comma-separated tool names pre-approved without prompting. Matched exactly — prefixes like `read_` grant nothing.'
         type: string
         required: false
-        default: 'read_,list_,grep_,write_,apply_,shell,job,fetch_,web_'
+        default: 'read_file,list_dir,grep_files,write_file,apply_patch,shell,job,fetch_url,web_search'
       co-authored-by:
         description: 'Optional "Name <email>" appended as a Co-Authored-By trailer. Empty (default) adds nothing.'
         type: string

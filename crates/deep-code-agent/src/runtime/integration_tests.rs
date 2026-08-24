@@ -3214,7 +3214,8 @@ async fn yolo_mode_still_parks_a_root_grant() {
 }
 
 /// Neither standing consent channel may cover a root grant: not a config
-/// `auto_allow` prefix, not a recorded session approval.
+/// `auto_allow` entry (exact tool name — this test spells it out in full),
+/// not a recorded session approval.
 #[tokio::test]
 async fn standing_consents_never_cover_a_root_grant() {
     let workspace = tempfile::tempdir().unwrap();
