@@ -357,6 +357,16 @@ fn cell_lines(cell: &HistoryCell, width: u16, lang: Lang) -> Vec<Line<'static>> 
     // still: it repositions the cursor and paints attacker text at a chosen
     // row, which is how a counterfeit "Grant target (resolved): /tmp/harmless"
     // can appear inside a security prompt that never rendered it.
+    //
+    // The same width-0 filter is also a defense this code LEANS on without
+    // owning it: bidi controls (U+202E and family) and other zero-width code
+    // points are not `char::is_control`, so they pass through here untouched.
+    // They stay harmless only because of measured, undocumented ratatui
+    // behavior: the bidi/ZWSP/SHY/FEFF/WJ family is dropped outright, while
+    // ZWNJ/ZWJ ride inside the preceding grapheme cluster's cell — never a
+    // column of their own. Both halves are pinned:
+    // `transcript_text_cannot_carry_an_escape_into_a_cell` and
+    // `zero_width_code_points_cannot_reorder_or_pad_the_frame`.
     for line in &mut lines {
         for span in &mut line.spans {
             if span.content.chars().any(char::is_control) {
@@ -2268,6 +2278,123 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The other half of the same defense — and, unlike the escape test, a
+    /// pin on UNDOCUMENTED ratatui behavior with nothing else underneath it.
+    ///
+    /// The transcript sanitizer leaves zero-width code points alone
+    /// (`char::is_control` covers Cc, not format characters), so whatever
+    /// they do on screen is decided entirely inside ratatui, which never
+    /// promised any of it. Measured on 0.29 — this test is the tripwire for
+    /// the next upgrade:
+    ///
+    /// * Every bidi control (LRE/RLE/PDF/LRO/RLO and the isolate family),
+    ///   the zero-width space, the soft hyphen, U+FEFF and the word joiner
+    ///   are DROPPED while lines are composed — a model cannot reorder or
+    ///   invisibly pad the frame an approval panel shares.
+    /// * ZWNJ/ZWJ are NOT dropped: they ride inside the preceding grapheme
+    ///   cluster's cell. Safe for a different reason — no bidi semantics and
+    ///   no column of their own — so the assertion is the invariant rather
+    ///   than the mechanism: no cell may consist of zero-width content alone.
+    #[test]
+    fn zero_width_code_points_cannot_reorder_or_pad_the_frame() {
+        use crate::history::HistoryCell;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Per-CELL view: pad detection needs cell boundaries, which a joined
+        // row string erases.
+        fn cells_for(text: &str) -> Vec<Vec<String>> {
+            let mut app = App::new();
+            app.lang = Lang::En;
+            app.history.push(HistoryCell::Assistant {
+                text: text.to_string(),
+            });
+            let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height)
+                .map(|row| {
+                    (0..buffer.area.width)
+                        .map(|col| buffer[(col, row)].symbol().to_string())
+                        .collect()
+                })
+                .collect()
+        }
+        fn flatten(cells: &[Vec<String>]) -> String {
+            cells
+                .iter()
+                .map(|row| row.concat())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let dropped = [
+            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}', '\u{200b}', '\u{ad}', '\u{feff}', '\u{2060}',
+        ];
+        let mut payload = String::from("A");
+        for (index, ch) in dropped.iter().enumerate() {
+            payload.push(*ch);
+            payload.push(char::from(b'B' + u8::try_from(index).unwrap()));
+        }
+        let visible: String = payload.chars().filter(char::is_ascii).collect();
+        let screen = flatten(&cells_for(&payload));
+        for ch in dropped {
+            assert!(
+                !screen.contains(ch),
+                "U+{:04X} reached a cell — the ratatui filter this defense \
+                 leans on has changed; the transcript needs its own strip",
+                ch as u32
+            );
+        }
+        // Dropped means DROPPED: the interleaved letters stay adjacent and
+        // in logical order — not reordered by a bidi override, not spaced
+        // out by width-1 placeholders.
+        assert!(
+            screen.contains(&visible),
+            "visible letters must stay adjacent and ordered:\n{screen}"
+        );
+
+        // The joiners ride instead of dropping. The invariant that matters is
+        // not the mechanism but its consequences: no zero-width content ever
+        // gets a cell of its own (an invisible pad column), and the letters
+        // around a joiner sit in directly adjacent columns.
+        let is_zero_width = |c: char| dropped.contains(&c) || c == '\u{200c}' || c == '\u{200d}';
+        let rider_cells = cells_for("X\u{200c}Y\u{200d}Z");
+        for (row_index, row) in rider_cells.iter().enumerate() {
+            for (col_index, symbol) in row.iter().enumerate() {
+                assert!(
+                    symbol.is_empty() || !symbol.chars().all(is_zero_width),
+                    "cell ({col_index},{row_index}) holds only zero-width \
+                     content {symbol:?} — an invisible pad column"
+                );
+            }
+        }
+        // Selected by ALL THREE letters, not the first 'X': UI chrome (status
+        // hints and the like) can legally contain a stray capital letter, and
+        // which chrome shows varies with unrelated test order on the thread.
+        let letter_row = rider_cells
+            .iter()
+            .find(|row| {
+                ['X', 'Y', 'Z']
+                    .iter()
+                    .all(|letter| row.iter().any(|cell| cell.contains(*letter)))
+            })
+            .expect("the rider payload must render on one row");
+        let column_of = |letter: char| {
+            letter_row
+                .iter()
+                .position(|cell| cell.contains(letter))
+                .unwrap_or_else(|| panic!("letter {letter:?} missing from the frame"))
+        };
+        let (x, y, z) = (column_of('X'), column_of('Y'), column_of('Z'));
+        assert!(
+            y == x + 1 && z == y + 1,
+            "letters around joiners must occupy adjacent columns, got \
+             X@{x} Y@{y} Z@{z}"
+        );
     }
 
     /// A small terminal is the third form of the same bug, and the one every
