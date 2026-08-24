@@ -433,19 +433,36 @@ async fn rejects_parent_traversal() {
     ));
 }
 
-#[cfg(unix)]
+/// Symlink a FILE target (existing or not) on both families, so these
+/// boundary tests run on the Windows CI job too — Windows has
+/// symlinks/junctions and ships this exact production code, but the tests
+/// were `cfg(unix)` and never exercised it there. `false` = this
+/// platform/user cannot create symlinks (Windows below Developer Mode /
+/// non-admin lacks the privilege); callers skip loudly rather than pass
+/// vacuously.
+fn symlink_file_for_test(target: &std::path::Path, link: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
+    }
+}
+
 #[tokio::test]
 async fn rejects_symlink_paths() {
-    use std::os::unix::fs::symlink;
-
     let tmp = tempdir().unwrap();
     let outside = tempdir().unwrap();
     fs::write(outside.path().join("secret.txt"), "secret").unwrap();
-    symlink(
-        outside.path().join("secret.txt"),
-        tmp.path().join("link.txt"),
-    )
-    .unwrap();
+    if !symlink_file_for_test(
+        &outside.path().join("secret.txt"),
+        &tmp.path().join("link.txt"),
+    ) {
+        eprintln!("skipping: symlinks unavailable on this platform/user");
+        return;
+    }
     let registry = registry(tmp.path());
     let call = ToolCall::new("call_1", "read_file", json!({"path": "link.txt"}));
 
@@ -455,16 +472,16 @@ async fn rejects_symlink_paths() {
     ));
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn write_file_rejects_existing_target_symlink() {
-    use std::os::unix::fs::symlink;
-
     let tmp = tempdir().unwrap();
     let outside = tempdir().unwrap();
     let outside_file = outside.path().join("secret.txt");
     fs::write(&outside_file, "secret").unwrap();
-    symlink(&outside_file, tmp.path().join("link.txt")).unwrap();
+    if !symlink_file_for_test(&outside_file, &tmp.path().join("link.txt")) {
+        eprintln!("skipping: symlinks unavailable on this platform/user");
+        return;
+    }
 
     let registry = registry(tmp.path());
     let call = ToolCall::new(
@@ -495,15 +512,15 @@ async fn write_file_rejects_existing_target_symlink() {
 ///
 /// Asserts on the filesystem, not on the error type: what matters is that
 /// nothing was created outside the root, whichever way the refusal is spelled.
-#[cfg(unix)]
 #[tokio::test]
 async fn write_file_rejects_dangling_target_symlink() {
-    use std::os::unix::fs::symlink;
-
     let tmp = tempdir().unwrap();
     let outside = tempdir().unwrap();
     let outside_file = outside.path().join("authorized_keys");
-    symlink(&outside_file, tmp.path().join("notes.txt")).unwrap();
+    if !symlink_file_for_test(&outside_file, &tmp.path().join("notes.txt")) {
+        eprintln!("skipping: symlinks unavailable on this platform/user");
+        return;
+    }
 
     let registry = registry(tmp.path());
     let call = ToolCall::new(

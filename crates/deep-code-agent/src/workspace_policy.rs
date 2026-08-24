@@ -624,14 +624,33 @@ mod tests {
         assert!(!contains_symlink(&file, std::slice::from_ref(&root)).unwrap());
     }
 
-    #[cfg(unix)]
+    /// Symlink a DIRECTORY target on both families, so the symlink-boundary
+    /// tests run on the Windows CI job too — Windows has symlinks/junctions
+    /// and ships this exact production code, but these tests were `cfg(unix)`
+    /// and never exercised it there. `false` = this platform/user cannot
+    /// create symlinks (Windows below Developer Mode / non-admin lacks the
+    /// privilege); callers skip loudly rather than pass vacuously.
+    fn symlink_dir_for_test(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+        }
+    }
+
     #[test]
     fn contains_symlink_still_detects_a_symlink_segment() {
         let (_dir, root) = canonical_tempdir();
         let target = root.join("real");
         fs::create_dir(&target).unwrap();
         let link = root.join("link");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+        if !symlink_dir_for_test(&target, &link) {
+            eprintln!("skipping: symlinks unavailable on this platform/user");
+            return;
+        }
         assert!(contains_symlink(&link.join("inner"), std::slice::from_ref(&root)).unwrap());
     }
 
@@ -740,7 +759,6 @@ mod tests {
         assert_eq!(resolved, primary.join("fresh.txt"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlink_segment_under_extra_root_is_rejected() {
         let (_a, primary) = canonical_tempdir();
@@ -748,7 +766,10 @@ mod tests {
         let (_c, outside) = canonical_tempdir();
         fs::write(outside.join("secret.txt"), "x").unwrap();
         let link = extra.join("link");
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        if !symlink_dir_for_test(&outside, &link) {
+            eprintln!("skipping: symlinks unavailable on this platform/user");
+            return;
+        }
         let policy = WorkspacePolicy::new(WorkspaceRoots::new(primary, vec![extra])).unwrap();
         let raw = link.join("secret.txt");
         assert!(
@@ -1048,13 +1069,15 @@ mod tests {
     /// target and the grant records that same value. (That prompt-vs-grant
     /// equality is enforced by the runtime's re-resolve-and-compare; pinned
     /// in the runtime integration tests.)
-    #[cfg(unix)]
     #[test]
     fn grant_extra_grants_the_canonical_target_of_a_symlink() {
         let (_a, primary) = canonical_tempdir();
         let (_b, target) = canonical_tempdir();
         let link = primary.join("link");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+        if !symlink_dir_for_test(&target, &link) {
+            eprintln!("skipping: symlinks unavailable on this platform/user");
+            return;
+        }
         let outcome = policy_grant(&primary, &link);
         assert!(
             matches!(outcome, RootGrantOutcome::Granted { ref canonical } if *canonical == target),
@@ -1062,7 +1085,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     fn policy_grant(primary: &Path, requested: &Path) -> RootGrantOutcome {
         WorkspacePolicy::new(primary.to_path_buf())
             .unwrap()
