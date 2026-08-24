@@ -154,7 +154,7 @@ jobs:
 配置文件:`~/.deep-code/config.toml`(可参考仓库根目录的 `config.example.toml`)。
 加载顺序:内置默认 → 全局 → 项目 `.deep-code/config.toml` → 环境变量 → CLI 参数。
 
-常用项:`provider.model`(`pro`/`flash`/`auto`)、`provider.reasoning_effort`(`off`/`low`/`medium`/`high`/`max`)、`cost.currency`、`approval.auto_allow`(预放行的工具前缀)。
+常用项:`provider.model`(`pro`/`flash`/`auto`)、`provider.reasoning_effort`(`off`/`low`/`medium`/`high`/`max`)、`cost.currency`、`approval.auto_allow`(预放行的工具全名,精确匹配、不是前缀)。
 
 > API Key 建议放在环境变量或全局配置;项目级配置中的 `api_key` 会被忽略,以防随仓库泄露。
 

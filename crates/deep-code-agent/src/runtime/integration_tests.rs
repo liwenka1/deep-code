@@ -1327,7 +1327,7 @@ async fn session_approval_remembers_network_command_identity() {
 }
 
 #[tokio::test]
-async fn config_auto_allow_prefix_runs_gated_tool_without_prompt() {
+async fn config_auto_allow_exact_name_runs_gated_tool_without_prompt() {
     let client = ScriptedClient::new(vec![
         vec![
             AgentEvent::ToolCallDelta {
@@ -1343,7 +1343,7 @@ async fn config_auto_allow_prefix_runs_gated_tool_without_prompt() {
         ],
     ]);
     let config = AgentConfig {
-        approval_auto_allow: vec!["mock_".to_string()],
+        approval_auto_allow: vec![MockEchoTool::NAME.to_string()],
         ..AgentConfig::builtin()
     };
     let runtime = AgentRuntime::with_system_prompt(
@@ -1361,7 +1361,7 @@ async fn config_auto_allow_prefix_runs_gated_tool_without_prompt() {
         events
             .iter()
             .all(|event| !matches!(event, RuntimeEvent::ApprovalRequired { .. })),
-        "auto_allow prefix must pre-approve the gated call"
+        "auto_allow name must pre-approve the gated call"
     );
     assert!(events.iter().any(|event| matches!(
         event,
@@ -1375,6 +1375,39 @@ async fn config_auto_allow_prefix_runs_gated_tool_without_prompt() {
         events.last(),
         Some(RuntimeEvent::TurnFinished { .. })
     ));
+}
+
+/// The complement: an entry that is merely a PREFIX of the tool's name grants
+/// nothing. Standing consent is an exact-name match — `"mock_"` (or `"s"`)
+/// must not stretch over whatever tools happen to share the spelling, so the
+/// call parks for a human instead of running.
+#[tokio::test]
+async fn config_auto_allow_prefix_of_a_name_does_not_pre_approve() {
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::ToolCallDelta {
+            delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let config = AgentConfig {
+        approval_auto_allow: vec!["mock_".to_string()],
+        ..AgentConfig::builtin()
+    };
+    let runtime = AgentRuntime::with_system_prompt(
+        client,
+        ToolRegistry::with_mock_tools(),
+        "system",
+        config,
+        false,
+    );
+
+    let mut rx = runtime.submit_user("echo").await;
+    let events = drain(&mut rx).await;
+
+    assert!(
+        matches!(events.last(), Some(RuntimeEvent::ApprovalRequired { .. })),
+        "a prefix of a tool name must not pre-approve it: {events:?}"
+    );
 }
 
 #[tokio::test]

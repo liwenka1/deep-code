@@ -96,7 +96,7 @@ pub(super) fn session_shell_prefix(call: &ToolCall) -> Option<String> {
 
 impl AgentRuntime {
     /// Whether a gated call may run without asking. Two independent layers:
-    /// (1) standing consent — a configured `auto_allow` prefix or a session
+    /// (1) standing consent — a configured `auto_allow` name or a session
     /// "a" — is mode-independent; (2) the session [`PermissionMode`] relaxes
     /// the gate more broadly. Policy hard-denials are unaffected either way:
     /// they short-circuit in the registry before any decision is consulted.
@@ -110,7 +110,7 @@ impl AgentRuntime {
     ) -> bool {
         // Widening the write boundary is a human decision in EVERY mode and
         // through EVERY consent channel: above Layer 1 so a config
-        // `auto_allow` prefix cannot become a standing root-grant (grants
+        // `auto_allow` entry cannot become a standing root-grant (grants
         // must stay explicit per-directory actions), and above Layer 2 so
         // even Yolo prompts — Yolo's real containment is the OS sandbox, and
         // this call is precisely a request to widen that containment.
@@ -118,12 +118,11 @@ impl AgentRuntime {
             return false;
         }
         // Layer 1: standing consent (config auto_allow + session memory).
-        if self
-            .config
-            .approval_auto_allow
-            .iter()
-            .any(|prefix| !prefix.is_empty() && call.name.starts_with(prefix))
-        {
+        // Exact name match, not a prefix: standing consent must not stretch.
+        // A prefix `"s"` would have covered every s-tool at once, and a tool
+        // added later whose name happens to extend a consented entry would
+        // have shipped pre-approved without anyone deciding that.
+        if self.config.approval_auto_allow.contains(&call.name) {
             return true;
         }
         let user_task = {

@@ -154,7 +154,7 @@ Trigger prefix, who may trigger it, language, model and permission tier are all 
 Config file: `~/.deep-code/config.toml` (see `config.example.toml` in the repo root).
 Load order: built-in defaults → global → project `.deep-code/config.toml` → environment variables → CLI flags.
 
-Common keys: `provider.model` (`pro`/`flash`/`auto`), `provider.reasoning_effort` (`off`/`low`/`medium`/`high`/`max`), `cost.currency`, `approval.auto_allow` (pre-approved tool prefixes).
+Common keys: `provider.model` (`pro`/`flash`/`auto`), `provider.reasoning_effort` (`off`/`low`/`medium`/`high`/`max`), `cost.currency`, `approval.auto_allow` (pre-approved tool names, matched exactly — never prefixes).
 
 > Keep the API key in an environment variable or the global config; `api_key` in project-level config is ignored, so it can't leak with the repo.
 
