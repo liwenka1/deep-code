@@ -623,12 +623,46 @@ fn build_parent_tools<C: LlmClient + 'static>(
             ));
             (idle, Box::new(|| ()))
         };
+    // Checked against the FINISHED registry (extensions included): standing
+    // consent is an exact-name match, so an entry no registered tool answers
+    // to can never fire — and stays silently "configured" forever unless
+    // someone says so here, the first place config and the full tool set meet.
+    warn_unmatched_auto_allow(&registry, &config.approval_auto_allow, warnings);
     ParentTools {
         registry,
         subagent_manager,
         job_store,
         shutdown,
         boundary,
+    }
+}
+
+/// One warning per dead `approval.auto_allow` entry: a name nothing registered
+/// answers to (a pre-0.4.8 prefix spelling like `"read_"`, or a typo), and the
+/// one registered name that is exempt by design. Entries matching an ungated
+/// tool stay silent — harmless today, meaningful if the tool ever gains a gate.
+fn warn_unmatched_auto_allow(
+    registry: &ToolRegistry,
+    auto_allow: &[String],
+    warnings: &mut Vec<String>,
+) {
+    if auto_allow.is_empty() {
+        return;
+    }
+    let names: Vec<String> = registry.specs().into_iter().map(|spec| spec.name).collect();
+    for entry in auto_allow {
+        if entry == crate::root_grant::REQUEST_WRITE_ROOT_TOOL {
+            warnings.push(format!(
+                "approval.auto_allow entry \"{entry}\" has no effect: widening \
+                 the write boundary always prompts"
+            ));
+        } else if !names.iter().any(|name| name == entry) {
+            warnings.push(format!(
+                "approval.auto_allow entry \"{entry}\" matches no tool name — \
+                 matching is exact (not a prefix), so it never pre-approves \
+                 anything"
+            ));
+        }
     }
 }
 
@@ -686,6 +720,58 @@ mod tests {
             .into_iter()
             .map(|spec| spec.name)
             .collect()
+    }
+
+    /// A dead standing-consent entry must say so: an exact-name miss (the old
+    /// prefix spelling) and the by-design exempt root-grant tool each warn; an
+    /// entry that names a registered tool stays silent.
+    #[test]
+    fn dead_auto_allow_entries_warn() {
+        let mut warnings = Vec::new();
+        warn_unmatched_auto_allow(
+            &ToolRegistry::with_mock_tools(),
+            &[
+                MockEchoTool::NAME.to_string(),
+                "mock_".to_string(),
+                crate::root_grant::REQUEST_WRITE_ROOT_TOOL.to_string(),
+            ],
+            &mut warnings,
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("\"mock_\"") && warnings[0].contains("exact"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("request_write_root") && warnings[1].contains("always prompts"),
+            "{warnings:?}"
+        );
+    }
+
+    /// The check is wired into the real launch assembly, after every
+    /// registration (extensions included) — not just unit-testable in theory.
+    #[test]
+    fn launch_assembly_warns_about_dead_auto_allow_entries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = AgentConfig {
+            approval_auto_allow: vec!["read_".to_string()],
+            ..AgentConfig::builtin()
+        };
+        let mut warnings = Vec::new();
+        let cancel = CancellationToken::new();
+        let ui_lang = SharedLang::default();
+        let _tools = build_parent_tools(
+            Arc::new(EchoClient::new(ui_lang.clone())),
+            &config,
+            &WorkspaceRoots::from(dir.path()),
+            &cancel,
+            &mut warnings,
+            &ui_lang,
+        );
+        assert!(
+            warnings.iter().any(|warning| warning.contains("\"read_\"")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
