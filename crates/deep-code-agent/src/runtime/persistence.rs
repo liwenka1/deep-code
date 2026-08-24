@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,9 +11,9 @@ use crate::runtime::event::TurnId;
 use crate::runtime::persistence_actor::PersistenceActorHandle;
 use crate::runtime::state::{Persistence, RuntimeState};
 use crate::session::Session;
-use crate::session_store::{
-    JsonSessionStore, SessionId, SessionRecord, SessionStore, SessionStoreError,
-};
+#[cfg(test)]
+use crate::session_store::SessionStoreError;
+use crate::session_store::{JsonSessionStore, SessionId, SessionRecord, SessionStore};
 use crate::tool::ToolRegistry;
 
 fn build_persistence(store: JsonSessionStore, record: SessionRecord) -> Arc<Persistence> {
@@ -24,7 +25,15 @@ fn build_persistence(store: JsonSessionStore, record: SessionRecord) -> Arc<Pers
 
 impl AgentRuntime {
     /// Create a runtime backed by a new on-disk session in the workspace.
-    pub fn with_new_session<C: LlmClient + 'static>(
+    ///
+    /// `#[cfg(test)]`: no production path constructs a runtime this way — the
+    /// launch code in `runtime_launch` builds the session record itself and
+    /// goes through [`Self::from_session_record`], then attaches the shared
+    /// write boundary. This shortcut exists for integration tests that need a
+    /// disk-backed session without a full launch (and, like every raw
+    /// constructor, it leaves `boundary: None`).
+    #[cfg(test)]
+    pub(crate) fn with_new_session<C: LlmClient + 'static>(
         client: C,
         tools: ToolRegistry,
         system: impl Into<String>,
@@ -47,8 +56,14 @@ impl AgentRuntime {
     }
 
     /// Resume a runtime from a previously saved session record.
-    #[must_use]
-    pub fn from_session_record<C: LlmClient + 'static>(
+    ///
+    /// `pub(crate)`: this constructor leaves `boundary: None`, so a runtime
+    /// built from it alone cannot land a model-requested root grant — the
+    /// launch paths in `runtime_launch` are the entries that follow up with
+    /// `with_boundary` and hand out the same shared policy to the tool
+    /// groups. Exposing this as a public "resume entry" invited exactly that
+    /// trap: an external caller could not attach the boundary at all.
+    pub(crate) fn from_session_record<C: LlmClient + 'static>(
         client: C,
         tools: ToolRegistry,
         record: SessionRecord,
