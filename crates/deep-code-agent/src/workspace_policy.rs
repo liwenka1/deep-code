@@ -365,18 +365,19 @@ impl WorkspacePolicy {
                 "path must have a parent directory inside a granted root",
             )
         })?;
-        // Missing parent directories are created rather than refused. A coding
-        // agent adds new modules constantly, and failing `write_file` on
-        // `src/new_mod/thing.rs` forced the model into a separate, separately
-        // approved `mkdir -p` for a directory the write tool was already
-        // authorized to create.
-        //
         // Containment is decided on the deepest ancestor that actually exists —
         // canonicalized, and symlink-checked over the same existing portion —
-        // *before* anything is created, so a symlinked or otherwise escaping
-        // ancestor still cannot be used to write outside the granted roots. (A
-        // non-existent path can be neither canonicalized nor stat'd, so the old
-        // code failed here rather than at any deliberate check.)
+        // so a symlinked or otherwise escaping ancestor still cannot be used
+        // to write outside the granted roots. (A non-existent path can be
+        // neither canonicalized nor stat'd, so the old code failed here rather
+        // than at any deliberate check.)
+        //
+        // Resolution itself touches NOTHING on disk. It also runs at
+        // preview/approval time, before any human decision, and a denied
+        // write must leave no trace — missing parents used to be created
+        // right here, which meant rendering the approval panel planted
+        // directories the user then declined. Execution creates them via
+        // [`Self::prepare_for_write`] after the decision.
         let mut existing = parent;
         while !existing.exists() {
             match existing.parent() {
@@ -408,7 +409,28 @@ impl WorkspacePolicy {
         if !self.is_granted(&existing_canonical) {
             return Err(path_error(tool_name, raw, OUTSIDE_ROOTS));
         }
-        if !parent.exists() {
+        Ok(candidate)
+    }
+
+    /// [`Self::resolve_for_write`] plus the one side effect execution needs:
+    /// missing parent directories are created rather than refused. A coding
+    /// agent adds new modules constantly, and failing `write_file` on
+    /// `src/new_mod/thing.rs` forced the model into a separate, separately
+    /// approved `mkdir -p` for a directory the write tool was already
+    /// authorized to create.
+    ///
+    /// Kept out of resolution itself so that preview/approval can resolve the
+    /// same path without leaving anything on disk (see the note inside
+    /// [`Self::resolve_for_write`]). Only the executing tool calls this.
+    pub(crate) fn prepare_for_write(
+        &self,
+        raw: &str,
+        tool_name: &str,
+    ) -> Result<PathBuf, ToolError> {
+        let candidate = self.resolve_for_write(raw, tool_name)?;
+        if let Some(parent) = candidate.parent()
+            && !parent.exists()
+        {
             fs::create_dir_all(parent).map_err(|error| {
                 ToolError::exec_failed(
                     tool_name,
@@ -638,17 +660,36 @@ mod tests {
     }
 
     #[test]
-    fn write_into_extra_root_creates_missing_parents_inside_it() {
+    fn prepare_for_write_creates_missing_parents_inside_extra_root() {
         let (_a, primary) = canonical_tempdir();
         let (_b, extra) = canonical_tempdir();
         let policy =
             WorkspacePolicy::new(WorkspaceRoots::new(primary, vec![extra.clone()])).unwrap();
         let target = extra.join("src/new_mod/thing.rs");
         let resolved = policy
-            .resolve_for_write(&target.to_string_lossy(), "write_file")
+            .prepare_for_write(&target.to_string_lossy(), "write_file")
             .unwrap();
         assert_eq!(resolved, target);
         assert!(extra.join("src/new_mod").is_dir());
+    }
+
+    /// Resolution must be a pure question. It runs at preview/approval time,
+    /// before the human decides, and a denied write must leave no trace —
+    /// creating `src/new_mod` while merely RENDERING the approval panel is a
+    /// side effect the user never consented to. (Execution creates parents
+    /// via `prepare_for_write`, pinned by the test above.)
+    #[test]
+    fn resolve_for_write_leaves_the_disk_untouched() {
+        let (_dir, root) = canonical_tempdir();
+        let policy = WorkspacePolicy::new(root.clone()).unwrap();
+        let resolved = policy
+            .resolve_for_write("src/new_mod/thing.rs", "write_file")
+            .unwrap();
+        assert_eq!(resolved, root.join("src/new_mod/thing.rs"));
+        assert!(
+            !root.join("src").exists(),
+            "resolving a write must not create its parent directories"
+        );
     }
 
     #[test]

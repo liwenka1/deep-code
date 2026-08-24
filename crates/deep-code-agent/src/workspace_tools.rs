@@ -410,7 +410,10 @@ impl WriteFileTool {
     }
 
     fn write_sync(&self, params: WriteFileParams) -> Result<ToolOutput, ToolError> {
-        let path = self.root.resolve_for_write(&params.path, Self::NAME)?;
+        // `prepare_`, not `resolve_`: execution is the one place allowed to
+        // create missing parent directories — preview/approval resolve the
+        // same path side-effect-free.
+        let path = self.root.prepare_for_write(&params.path, Self::NAME)?;
         fs::write(&path, &params.content).map_err(|error| {
             ToolError::exec_failed(
                 Self::NAME,

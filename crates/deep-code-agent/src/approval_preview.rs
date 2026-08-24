@@ -175,6 +175,29 @@ mod tests {
         assert!(preview.contains("+three"), "{preview}");
     }
 
+    /// Rendering an approval prompt must not touch the workspace: the mkdir
+    /// that write execution needs used to live inside path RESOLUTION, so
+    /// previewing `src/new_mod/thing.rs` planted `src/new_mod/` before the
+    /// user decided — and a denial left it behind. The preview still renders
+    /// (the user sees the new-file summary); the disk stays as it was.
+    #[test]
+    fn write_file_preview_creates_no_directories() {
+        let workspace = tempfile::tempdir().unwrap();
+        let preview = build_approval_preview(
+            &call(
+                "write_file",
+                json!({"path": "src/new_mod/thing.rs", "content": "hi\n"}),
+            ),
+            &WorkspaceRoots::from(workspace.path()),
+            Lang::Zh,
+        );
+        assert!(preview.is_some(), "nested new-file preview must render");
+        assert!(
+            !workspace.path().join("src").exists(),
+            "previewing an approval must not mkdir into the workspace"
+        );
+    }
+
     #[test]
     fn write_file_preview_summarizes_new_files() {
         let workspace = tempfile::tempdir().unwrap();
