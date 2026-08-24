@@ -281,6 +281,7 @@ impl GrepFilesTool {
             .map_err(|error| invalid(Self::NAME, format!("invalid regex pattern: {error}")))?;
         let search_path = self.root.resolve_existing(path_arg, Self::NAME)?;
         let mut files_searched = 0usize;
+        let mut skipped_oversized = 0usize;
         let mut matches = Vec::new();
         // Boundary snapshot taken once: `granted_roots()` locks and clones per
         // call, and this loop visits every file in the tree — per-file calls
@@ -307,7 +308,11 @@ impl GrepFilesTool {
             let Ok(metadata) = fs::metadata(path) else {
                 continue;
             };
+            // Counted, not silently dropped: a file the walk refused to search
+            // is a place a match may be hiding, and "0 matches" without that
+            // count reads as "searched everything, found nothing".
             if metadata.len() > MAX_FILE_BYTES {
+                skipped_oversized += 1;
                 continue;
             }
             let Ok(contents) = fs::read_to_string(path) else {
@@ -341,13 +346,21 @@ impl GrepFilesTool {
             }
         }
 
-        Ok(ToolOutput::text(json_string(json!({
+        let mut result = json!({
             "pattern": pattern,
             "path": self.root.relative_display(&search_path),
             "files_searched": files_searched,
+            "skipped_oversized": skipped_oversized,
             "truncated": matches.len() >= max_results,
             "matches": matches
-        }))))
+        });
+        if skipped_oversized > 0 {
+            result["note"] = json!(format!(
+                "{skipped_oversized} file(s) over the 2 MiB search limit were \
+                 not searched; grep them through the shell tool"
+            ));
+        }
+        Ok(ToolOutput::text(json_string(result)))
     }
 }
 

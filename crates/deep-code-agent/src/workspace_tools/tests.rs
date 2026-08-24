@@ -123,6 +123,35 @@ async fn grep_files_returns_matches_with_context() {
     assert_eq!(output["matches"][0]["context_after"][0]["text"], "omega");
 }
 
+/// Files over the size limit are refused by the walk — but refused OUT LOUD.
+/// A silent skip reads as "searched everything, found nothing", and the
+/// needle buried in the big file below is exactly the match that lie would
+/// hide. `read_file` already reports its 2 MiB limit explicitly; this pins
+/// the same honesty onto grep.
+#[tokio::test]
+async fn grep_files_reports_oversized_files_instead_of_skipping_silently() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("small.txt"), "needle in the small file\n").unwrap();
+    let mut big = String::from("needle at the head\n");
+    big.push_str(&"x".repeat(2 * 1024 * 1024));
+    fs::write(tmp.path().join("big.log"), big).unwrap();
+
+    let result = run(tmp.path(), "grep_files", json!({"pattern": "needle"})).await;
+    let output: Value = serde_json::from_str(&result.content).unwrap();
+
+    assert_eq!(output["skipped_oversized"], 1);
+    assert!(
+        output["note"]
+            .as_str()
+            .expect("a skipped file must leave a note")
+            .contains("2 MiB"),
+        "note must name the limit: {output}"
+    );
+    // The big file was truly not searched: only the small file matched.
+    assert_eq!(output["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(output["matches"][0]["path"], "small.txt");
+}
+
 #[tokio::test]
 async fn write_file_requires_approval_and_writes_after_approval() {
     let tmp = tempdir().unwrap();
