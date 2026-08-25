@@ -63,6 +63,11 @@ impl AgentRuntime {
     /// `with_boundary` and hand out the same shared policy to the tool
     /// groups. Exposing this as a public "resume entry" invited exactly that
     /// trap: an external caller could not attach the boundary at all.
+    ///
+    /// `#[must_use]`: construction spawns the persistence actor — a dropped
+    /// return value would leave that actor running against a session record
+    /// nobody holds, with zero compiler noise.
+    #[must_use]
     pub(crate) fn from_session_record<C: LlmClient + 'static>(
         client: C,
         tools: ToolRegistry,
