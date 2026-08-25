@@ -428,14 +428,31 @@ impl WorkspacePolicy {
         tool_name: &str,
     ) -> Result<PathBuf, ToolError> {
         let candidate = self.resolve_for_write(raw, tool_name)?;
-        if let Some(parent) = candidate.parent()
-            && !parent.exists()
-        {
+        // The disk can change between the resolve above and the mkdir below.
+        // That same-instant window existed when the mkdir lived inside
+        // resolution and is inherited, not widened, by the split; it is also
+        // not closable from here — the missing segments could not be
+        // canonicalized at check time precisely because they did not exist.
+        if let Some(parent) = candidate.parent() {
+            // No exists() pre-check: create_dir_all already succeeds on an
+            // existing directory, and a gate here would only read like a
+            // semantic guard while widening the race window above.
             fs::create_dir_all(parent).map_err(|error| {
+                // One way this fails is a symlink planted (or dangling) among
+                // the segments resolution vetted as merely missing — surfacing
+                // as "File exists" for a directory the tool was told to
+                // create. Diagnose it in the resolve-time wording, so the
+                // model learns the rule instead of retrying into word salad.
+                let diagnosis = if contains_symlink(parent, &self.granted_roots()).unwrap_or(false)
+                {
+                    " (symlinks in the destination path are not allowed)"
+                } else {
+                    ""
+                };
                 ToolError::exec_failed(
                     tool_name,
                     format!(
-                        "failed to create destination directory {}: {error}",
+                        "failed to create destination directory {}: {error}{diagnosis}",
                         parent.display()
                     ),
                 )
@@ -676,6 +693,30 @@ mod tests {
             .unwrap();
         assert_eq!(resolved, target);
         assert!(extra.join("src/new_mod").is_dir());
+    }
+
+    /// A dangling symlink posing as a missing PARENT segment gets past
+    /// resolution — `exists()` follows links, so the ancestor walk treats it
+    /// as absent — and only trips inside `create_dir_all`, as a bare "File
+    /// exists" for a directory the tool was told to create. The prepare-side
+    /// failure must name the symlink rule, or the model retries into word
+    /// salad instead of learning it.
+    #[test]
+    fn prepare_for_write_names_the_symlink_when_mkdir_hits_one() {
+        let (_dir, root) = canonical_tempdir();
+        let (_out, outside) = canonical_tempdir();
+        let policy = WorkspacePolicy::new(root.clone()).unwrap();
+        if !symlink_dir_for_test(&outside.join("gone"), &root.join("src")) {
+            return;
+        }
+        let error = policy
+            .prepare_for_write("src/new_mod/thing.rs", "write_file")
+            .expect_err("a symlinked parent segment must fail the write");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("symlinks in the destination path are not allowed"),
+            "the failure must teach the rule: {message}"
+        );
     }
 
     /// Resolution must be a pure question. It runs at preview/approval time,
