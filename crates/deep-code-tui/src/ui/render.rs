@@ -358,18 +358,27 @@ fn cell_lines(cell: &HistoryCell, width: u16, lang: Lang) -> Vec<Line<'static>> 
     // row, which is how a counterfeit "Grant target (resolved): /tmp/harmless"
     // can appear inside a security prompt that never rendered it.
     //
-    // The same width-0 filter is also a defense this code LEANS on without
-    // owning it: bidi controls (U+202E and family) and other zero-width code
-    // points are not `char::is_control`, so they pass through here untouched.
-    // They stay harmless only because of measured, undocumented ratatui
-    // behavior: the bidi/ZWSP/SHY/FEFF/WJ family is dropped outright, while
-    // ZWNJ/ZWJ ride inside the preceding grapheme cluster's cell — never a
-    // column of their own. Both halves are pinned:
+    // The bidi/zero-width family is stripped here too, and OWNED here: none
+    // of [`BIDI_AND_ZERO_WIDTH`] is `char::is_control`, and this defense used
+    // to lean on measured, undocumented ratatui 0.29 behavior (the family was
+    // dropped during line composition) — load-bearing for the approval panel,
+    // since a bidi override can reorder what the user reads in the same
+    // frame, yet one dependency bump away from vanishing. Stripping them in
+    // the sanitizer renders identically today (they measured width 0 at wrap
+    // time, and deletion keeps it 0) and survives any ratatui change. ZWNJ/
+    // ZWJ are deliberately NOT stripped — legitimate joiners in emoji and
+    // e.g. Persian text — and stay safe by a measured invariant instead:
+    // they ride inside the preceding grapheme cluster's cell, never a column
+    // of their own. Pinned by
     // `transcript_text_cannot_carry_an_escape_into_a_cell` and
     // `zero_width_code_points_cannot_reorder_or_pad_the_frame`.
     for line in &mut lines {
         for span in &mut line.spans {
-            if span.content.chars().any(char::is_control) {
+            if span
+                .content
+                .chars()
+                .any(|ch| ch.is_control() || is_bidi_or_zero_width(ch))
+            {
                 span.content = neutralize_transcript_text(&span.content).into();
             }
         }
@@ -377,16 +386,49 @@ fn cell_lines(cell: &HistoryCell, width: u16, lang: Lang) -> Vec<Line<'static>> 
     lines
 }
 
-/// Control characters out of a finished transcript span. A tab becomes four
-/// spaces rather than one, because code blocks reach here tab-indented and
-/// collapsing that to a single column misreads the code; everything else
-/// becomes one space, preserving the column count the wrap step already
-/// committed to.
+/// The full Unicode `Bidi_Control` set (ALM, LRM/RLM, LRE/RLE/PDF/LRO/RLO,
+/// the isolates) plus the zero-width spacing/format characters (ZWSP, SHY,
+/// WJ, U+FEFF). Everything here is invisible, carries reordering or padding
+/// potential, and has no legitimate role in a terminal transcript — unlike
+/// ZWNJ/ZWJ, which join real graphemes and are left alone. The probe test
+/// iterates THIS array, so the strip and its tripwire cannot drift apart.
+const BIDI_AND_ZERO_WIDTH: [char; 16] = [
+    '\u{061c}', // ALM
+    '\u{00ad}', // SHY
+    '\u{200b}', // ZWSP
+    '\u{200e}', // LRM
+    '\u{200f}', // RLM
+    '\u{202a}', // LRE
+    '\u{202b}', // RLE
+    '\u{202c}', // PDF
+    '\u{202d}', // LRO
+    '\u{202e}', // RLO
+    '\u{2060}', // WJ
+    '\u{2066}', // LRI
+    '\u{2067}', // RLI
+    '\u{2068}', // FSI
+    '\u{2069}', // PDI
+    '\u{feff}', // ZWNBSP/BOM
+];
+
+fn is_bidi_or_zero_width(ch: char) -> bool {
+    BIDI_AND_ZERO_WIDTH.contains(&ch)
+}
+
+/// Control and bidi/zero-width characters out of a finished transcript span.
+/// A tab becomes four spaces rather than one, because code blocks reach here
+/// tab-indented and collapsing that to a single column misreads the code;
+/// other controls become one space, preserving the column count the wrap step
+/// already committed to. The [`BIDI_AND_ZERO_WIDTH`] family is DELETED
+/// instead — the wrap step measured those at width 0, so removal is what
+/// keeps the committed columns, and a substitute space would hand them the
+/// visible column they never had.
 fn neutralize_transcript_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
             '\t' => out.push_str("    "),
+            ch if is_bidi_or_zero_width(ch) => {}
             ch if ch.is_control() => out.push(' '),
             ch => out.push(ch),
         }
@@ -2280,23 +2322,19 @@ mod tests {
         }
     }
 
-    /// The other half of the same defense — and, unlike the escape test, a
-    /// pin on UNDOCUMENTED ratatui behavior with nothing else underneath it.
+    /// The other half of the same defense, in two parts with different owners:
     ///
-    /// The transcript sanitizer leaves zero-width code points alone
-    /// (`char::is_control` covers Cc, not format characters), so whatever
-    /// they do on screen is decided entirely inside ratatui, which never
-    /// promised any of it. Measured on 0.29 — this test is the tripwire for
-    /// the next upgrade:
-    ///
-    /// * Every bidi control (LRE/RLE/PDF/LRO/RLO and the isolate family),
-    ///   the zero-width space, the soft hyphen, U+FEFF and the word joiner
-    ///   are DROPPED while lines are composed — a model cannot reorder or
-    ///   invisibly pad the frame an approval panel shares.
-    /// * ZWNJ/ZWJ are NOT dropped: they ride inside the preceding grapheme
-    ///   cluster's cell. Safe for a different reason — no bidi semantics and
-    ///   no column of their own — so the assertion is the invariant rather
-    ///   than the mechanism: no cell may consist of zero-width content alone.
+    /// * The whole [`BIDI_AND_ZERO_WIDTH`] family (every Unicode Bidi_Control
+    ///   plus ZWSP/SHY/WJ/U+FEFF) is stripped by OUR sanitizer — a model
+    ///   cannot reorder or invisibly pad the frame an approval panel shares.
+    ///   The probe iterates the production array itself, so a character added
+    ///   to the strip is probed automatically and one removed fails here.
+    /// * ZWNJ/ZWJ are deliberately NOT stripped (legitimate joiners) and stay
+    ///   safe by measured, undocumented ratatui 0.29 behavior: they ride
+    ///   inside the preceding grapheme cluster's cell. That half is still a
+    ///   tripwire on an upgrade, and the assertion is the invariant rather
+    ///   than the mechanism — the letters around a joiner must sit in
+    ///   directly adjacent columns, which no zero-width pad column survives.
     #[test]
     fn zero_width_code_points_cannot_reorder_or_pad_the_frame() {
         use crate::history::HistoryCell;
@@ -2330,48 +2368,33 @@ mod tests {
                 .join("\n")
         }
 
-        let dropped = [
-            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
-            '\u{2068}', '\u{2069}', '\u{200b}', '\u{ad}', '\u{feff}', '\u{2060}',
-        ];
         let mut payload = String::from("A");
-        for (index, ch) in dropped.iter().enumerate() {
+        for (index, ch) in BIDI_AND_ZERO_WIDTH.iter().enumerate() {
             payload.push(*ch);
             payload.push(char::from(b'B' + u8::try_from(index).unwrap()));
         }
         let visible: String = payload.chars().filter(char::is_ascii).collect();
         let screen = flatten(&cells_for(&payload));
-        for ch in dropped {
+        for ch in BIDI_AND_ZERO_WIDTH {
             assert!(
                 !screen.contains(ch),
-                "U+{:04X} reached a cell — the ratatui filter this defense \
-                 leans on has changed; the transcript needs its own strip",
+                "U+{:04X} reached a cell — the transcript sanitizer must \
+                 strip the whole BIDI_AND_ZERO_WIDTH family",
                 ch as u32
             );
         }
-        // Dropped means DROPPED: the interleaved letters stay adjacent and
-        // in logical order — not reordered by a bidi override, not spaced
-        // out by width-1 placeholders.
+        // Stripped means STRIPPED, not substituted: the interleaved letters
+        // stay adjacent and in logical order — not reordered by a bidi
+        // override, not spaced out by width-1 placeholders.
         assert!(
             screen.contains(&visible),
             "visible letters must stay adjacent and ordered:\n{screen}"
         );
 
-        // The joiners ride instead of dropping. The invariant that matters is
-        // not the mechanism but its consequences: no zero-width content ever
-        // gets a cell of its own (an invisible pad column), and the letters
-        // around a joiner sit in directly adjacent columns.
-        let is_zero_width = |c: char| dropped.contains(&c) || c == '\u{200c}' || c == '\u{200d}';
+        // The joiners ride instead of being stripped. Adjacency IS the pad
+        // check: a joiner that got a cell of its own would push 'Y' or 'Z'
+        // one column right and fail below.
         let rider_cells = cells_for("X\u{200c}Y\u{200d}Z");
-        for (row_index, row) in rider_cells.iter().enumerate() {
-            for (col_index, symbol) in row.iter().enumerate() {
-                assert!(
-                    symbol.is_empty() || !symbol.chars().all(is_zero_width),
-                    "cell ({col_index},{row_index}) holds only zero-width \
-                     content {symbol:?} — an invisible pad column"
-                );
-            }
-        }
         // Selected by ALL THREE letters, not the first 'X': UI chrome (status
         // hints and the like) can legally contain a stray capital letter, and
         // which chrome shows varies with unrelated test order on the thread.
