@@ -118,4 +118,11 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test
+        # The hosted runner is elevated and CAN create symlinks, so the
+        # symlink-boundary tests' "no privilege → skip" branch must never be
+        # taken here: libtest captures the skip message, making a skipped
+        # security test indistinguishable from a passing one. Same insurance
+        # as DEEPCODE_REQUIRE_SANDBOX on the unix jobs.
+        env:
+          DEEPCODE_REQUIRE_SYMLINKS: "1"
         run: cargo test --locked --workspace

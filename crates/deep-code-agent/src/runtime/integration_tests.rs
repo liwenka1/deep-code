@@ -3433,7 +3433,11 @@ async fn approved_root_grant_persists_into_the_session_record() {
 /// exact value. A symlink retargeted between the two (the requester CAN
 /// write inside the workspace without approval, so it can shuffle links
 /// there) is refused — the user never grants a directory they never saw.
-#[cfg(unix)]
+///
+/// Runs on Windows too: the policy-side symlink tests went cross-platform in
+/// 93c4280, and this is the runtime half they explicitly delegate the
+/// prompt-vs-grant equality to — green there means nothing if this half never
+/// compiles on the platform.
 #[tokio::test]
 async fn root_grant_refuses_when_the_target_changes_under_the_approval() {
     let workspace = tempfile::tempdir().unwrap();
@@ -3442,7 +3446,9 @@ async fn root_grant_refuses_when_the_target_changes_under_the_approval() {
     let shown = shown.path().canonicalize().unwrap();
     let swapped = swapped.path().canonicalize().unwrap();
     let link = workspace.path().join("build-cache");
-    std::os::unix::fs::symlink(&shown, &link).unwrap();
+    if !crate::test_symlinks::symlink_dir_for_test(&shown, &link) {
+        return;
+    }
 
     let (registry, policy) = root_grant_fixture(workspace.path());
     let client = ScriptedClient::new(vec![
@@ -3471,9 +3477,14 @@ async fn root_grant_refuses_when_the_target_changes_under_the_approval() {
         "the prompt names the RESOLVED directory, not the link spelling"
     );
 
-    // Retarget the link while the human is looking at the prompt.
-    std::fs::remove_file(&link).unwrap();
-    std::os::unix::fs::symlink(&swapped, &link).unwrap();
+    // Retarget the link while the human is looking at the prompt. The first
+    // creation succeeded, so this process provably holds the privilege — a
+    // failure here is a test bug and the helper panics rather than skips.
+    crate::test_symlinks::remove_symlink_dir_for_test(&link);
+    assert!(
+        crate::test_symlinks::symlink_dir_for_test(&swapped, &link),
+        "re-linking must work once the first symlink succeeded"
+    );
 
     let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
     let events = drain(&mut rx).await;

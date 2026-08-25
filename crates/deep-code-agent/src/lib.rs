@@ -33,6 +33,8 @@ mod shell_tools;
 mod skills;
 mod subagent;
 mod task_class;
+#[cfg(test)]
+mod test_symlinks;
 mod text_util;
 mod tool;
 mod web_tools;

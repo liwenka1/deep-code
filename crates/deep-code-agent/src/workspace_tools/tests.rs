@@ -433,23 +433,9 @@ async fn rejects_parent_traversal() {
     ));
 }
 
-/// Symlink a FILE target (existing or not) on both families, so these
-/// boundary tests run on the Windows CI job too — Windows has
-/// symlinks/junctions and ships this exact production code, but the tests
-/// were `cfg(unix)` and never exercised it there. `false` = this
-/// platform/user cannot create symlinks (Windows below Developer Mode /
-/// non-admin lacks the privilege); callers skip loudly rather than pass
-/// vacuously.
-fn symlink_file_for_test(target: &std::path::Path, link: &std::path::Path) -> bool {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, link).is_ok()
-    }
-    #[cfg(windows)]
-    {
-        std::os::windows::fs::symlink_file(target, link).is_ok()
-    }
-}
+// Skip/triage policy (unix bugs panic, Windows may lack the privilege,
+// DEEPCODE_REQUIRE_SYMLINKS hardens CI) lives in `crate::test_symlinks`.
+use crate::test_symlinks::symlink_file_for_test;
 
 #[tokio::test]
 async fn rejects_symlink_paths() {
@@ -460,7 +446,6 @@ async fn rejects_symlink_paths() {
         &outside.path().join("secret.txt"),
         &tmp.path().join("link.txt"),
     ) {
-        eprintln!("skipping: symlinks unavailable on this platform/user");
         return;
     }
     let registry = registry(tmp.path());
@@ -479,7 +464,6 @@ async fn write_file_rejects_existing_target_symlink() {
     let outside_file = outside.path().join("secret.txt");
     fs::write(&outside_file, "secret").unwrap();
     if !symlink_file_for_test(&outside_file, &tmp.path().join("link.txt")) {
-        eprintln!("skipping: symlinks unavailable on this platform/user");
         return;
     }
 
@@ -518,7 +502,6 @@ async fn write_file_rejects_dangling_target_symlink() {
     let outside = tempdir().unwrap();
     let outside_file = outside.path().join("authorized_keys");
     if !symlink_file_for_test(&outside_file, &tmp.path().join("notes.txt")) {
-        eprintln!("skipping: symlinks unavailable on this platform/user");
         return;
     }
 

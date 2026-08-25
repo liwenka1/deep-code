@@ -624,22 +624,9 @@ mod tests {
         assert!(!contains_symlink(&file, std::slice::from_ref(&root)).unwrap());
     }
 
-    /// Symlink a DIRECTORY target on both families, so the symlink-boundary
-    /// tests run on the Windows CI job too — Windows has symlinks/junctions
-    /// and ships this exact production code, but these tests were `cfg(unix)`
-    /// and never exercised it there. `false` = this platform/user cannot
-    /// create symlinks (Windows below Developer Mode / non-admin lacks the
-    /// privilege); callers skip loudly rather than pass vacuously.
-    fn symlink_dir_for_test(target: &Path, link: &Path) -> bool {
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(target, link).is_ok()
-        }
-        #[cfg(windows)]
-        {
-            std::os::windows::fs::symlink_dir(target, link).is_ok()
-        }
-    }
+    // Skip/triage policy (unix bugs panic, Windows may lack the privilege,
+    // DEEPCODE_REQUIRE_SYMLINKS hardens CI) lives in `crate::test_symlinks`.
+    use crate::test_symlinks::symlink_dir_for_test;
 
     #[test]
     fn contains_symlink_still_detects_a_symlink_segment() {
@@ -648,7 +635,6 @@ mod tests {
         fs::create_dir(&target).unwrap();
         let link = root.join("link");
         if !symlink_dir_for_test(&target, &link) {
-            eprintln!("skipping: symlinks unavailable on this platform/user");
             return;
         }
         assert!(contains_symlink(&link.join("inner"), std::slice::from_ref(&root)).unwrap());
@@ -767,7 +753,6 @@ mod tests {
         fs::write(outside.join("secret.txt"), "x").unwrap();
         let link = extra.join("link");
         if !symlink_dir_for_test(&outside, &link) {
-            eprintln!("skipping: symlinks unavailable on this platform/user");
             return;
         }
         let policy = WorkspacePolicy::new(WorkspaceRoots::new(primary, vec![extra])).unwrap();
@@ -1075,7 +1060,6 @@ mod tests {
         let (_b, target) = canonical_tempdir();
         let link = primary.join("link");
         if !symlink_dir_for_test(&target, &link) {
-            eprintln!("skipping: symlinks unavailable on this platform/user");
             return;
         }
         let outcome = policy_grant(&primary, &link);
