@@ -344,8 +344,23 @@ fn summarize_json_tool_result(value: &serde_json::Value) -> Option<String> {
             .get("truncated")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        // The refusal ledgers ride along or the human is lied to: grep counts
+        // files it refused to search (oversized/unreadable), and a summary
+        // reading "0 matches across 5 files" while three were skipped is
+        // exactly the "searched everything, found nothing" misread the counts
+        // exist to prevent — surfaced to the model in the JSON, so the person
+        // watching the panel deserves the same honesty.
+        let skipped = ["skipped_oversized", "skipped_unreadable"]
+            .iter()
+            .filter_map(|key| object.get(*key).and_then(serde_json::Value::as_u64))
+            .sum::<u64>();
+        let skipped = if skipped > 0 {
+            format!(", skipped={skipped}")
+        } else {
+            String::new()
+        };
         return Some(format!(
-            "{path}: {} matches across {files_searched} files (truncated={truncated})",
+            "{path}: {} matches across {files_searched} files (truncated={truncated}{skipped})",
             matches.len()
         ));
     }
@@ -565,6 +580,26 @@ mod tests {
                 arguments: "{\"message\":\"hi\"}".to_string(),
             },
         }
+    }
+
+    /// The grep summary line must carry the refusal ledgers: "0 matches
+    /// across N files" with skipped files hidden is the misread the counts
+    /// were added to prevent — for the human this line is all there is.
+    #[test]
+    fn grep_summary_surfaces_skipped_files() {
+        let with_skips = summarize_tool_result(
+            r#"{"path":"logs","files_searched":5,"matches":[],"truncated":false,
+                "skipped_oversized":2,"skipped_unreadable":1}"#,
+        );
+        assert_eq!(
+            with_skips,
+            "logs: 0 matches across 5 files (truncated=false, skipped=3)"
+        );
+        let clean = summarize_tool_result(
+            r#"{"path":"src","files_searched":5,"matches":[],"truncated":false,
+                "skipped_oversized":0,"skipped_unreadable":0}"#,
+        );
+        assert_eq!(clean, "src: 0 matches across 5 files (truncated=false)");
     }
 
     #[test]
