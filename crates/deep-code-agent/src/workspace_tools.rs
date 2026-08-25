@@ -324,7 +324,15 @@ impl GrepFilesTool {
                 Err(_) => continue,
             };
             let path = entry.path();
-            if !path.is_file() {
+            // From the walker's readdir data — `path.is_file()` would re-stat
+            // the full path (following symlinks, at odds with
+            // `follow_links(false)`) once per entry; `ListDirTool` already
+            // reads the entry the same way. A symlink never counts as a file
+            // here, which is where the boundary wants it anyway.
+            let Some(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() {
                 continue;
             }
             match contains_symlink(path, &granted_roots) {
@@ -341,7 +349,10 @@ impl GrepFilesTool {
                     continue;
                 }
             }
-            let Ok(metadata) = fs::metadata(path) else {
+            // `entry.metadata()` = lstat: correct for the plain file the two
+            // checks above just established, without a third follow-the-path
+            // traversal.
+            let Ok(metadata) = entry.metadata() else {
                 skipped_unreadable += 1;
                 push_capped(
                     &mut skipped_unreadable_paths,

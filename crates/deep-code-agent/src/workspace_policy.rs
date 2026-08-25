@@ -591,22 +591,35 @@ pub(crate) fn json_string(value: impl serde::Serialize) -> String {
     serde_json::to_string_pretty(&value).expect("serializing tool output should not fail")
 }
 
+/// `skip` entries must be CANONICAL directories (they are the granted roots):
+/// that is what licenses not stat'ing them or their ancestors at all.
 pub(crate) fn contains_symlink(path: &Path, skip: &[PathBuf]) -> std::io::Result<bool> {
+    // Fast-forward past the deepest skip root covering `path`. Canonical
+    // roots cannot be symlinks and neither can their ancestors, yet the old
+    // exact-match skip still lstat'd every segment ABOVE the root — grep
+    // calls this once per file, so a workspace five directories deep paid
+    // root-depth × file-count pure-waste syscalls per search. Segments at or
+    // above the covering root are skipped without touching the disk; every
+    // segment below it — the ones the caller actually chose — is checked
+    // exactly as before.
+    let start = skip
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .map(|root| root.components().count())
+        .max()
+        .unwrap_or(0);
     let mut current = PathBuf::new();
-    for component in path.components() {
+    for (index, component) in path.components().enumerate() {
         current.push(component.as_os_str());
+        if index < start {
+            continue;
+        }
         // Only named segments can be symlinks. Prefix/RootDir must be
         // accumulated into `current` but not stat'd on their own: on Windows
         // `canonicalize` yields verbatim paths (`\\?\D:\...`) whose first
         // component is the bare disk prefix `\\?\D:`, and `symlink_metadata`
         // on it fails with ERROR_INVALID_FUNCTION (os error 1).
         if !matches!(component, Component::Normal(_)) {
-            continue;
-        }
-        // Granted roots are canonical, so neither they nor their ancestors can
-        // be symlinks; skipping them keeps the walk focused on the segments
-        // the caller actually chose.
-        if skip.contains(&current) {
             continue;
         }
         if fs::symlink_metadata(&current)?.file_type().is_symlink() {
