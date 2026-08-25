@@ -123,33 +123,69 @@ async fn grep_files_returns_matches_with_context() {
     assert_eq!(output["matches"][0]["context_after"][0]["text"], "omega");
 }
 
-/// Files over the size limit are refused by the walk — but refused OUT LOUD.
-/// A silent skip reads as "searched everything, found nothing", and the
-/// needle buried in the big file below is exactly the match that lie would
-/// hide. `read_file` already reports its 2 MiB limit explicitly; this pins
-/// the same honesty onto grep.
+/// Files over the size limit are refused by the walk — but refused OUT LOUD
+/// and BY NAME. A silent skip reads as "searched everything, found nothing",
+/// and the needle buried in the big file below is exactly the match that lie
+/// would hide. `read_file` already reports its limit explicitly; this pins
+/// the same honesty onto grep. The limit in the note is asserted against the
+/// constant, not a literal, so bumping `MAX_FILE_BYTES` cannot leave the
+/// prose lying while this test stays green.
 #[tokio::test]
 async fn grep_files_reports_oversized_files_instead_of_skipping_silently() {
     let tmp = tempdir().unwrap();
     fs::write(tmp.path().join("small.txt"), "needle in the small file\n").unwrap();
     let mut big = String::from("needle at the head\n");
-    big.push_str(&"x".repeat(2 * 1024 * 1024));
+    big.push_str(&"x".repeat(usize::try_from(crate::workspace_tools::MAX_FILE_BYTES).unwrap()));
     fs::write(tmp.path().join("big.log"), big).unwrap();
 
     let result = run(tmp.path(), "grep_files", json!({"pattern": "needle"})).await;
     let output: Value = serde_json::from_str(&result.content).unwrap();
 
     assert_eq!(output["skipped_oversized"], 1);
+    assert_eq!(
+        output["skipped_oversized_paths"],
+        json!(["big.log"]),
+        "the skipped file must be named, or the caller cannot go look: {output}"
+    );
     assert!(
         output["note"]
             .as_str()
             .expect("a skipped file must leave a note")
-            .contains("2 MiB"),
+            .contains(&format!("{} MiB", crate::workspace_tools::MAX_FILE_MIB)),
         "note must name the limit: {output}"
     );
     // The big file was truly not searched: only the small file matched.
     assert_eq!(output["matches"].as_array().unwrap().len(), 1);
     assert_eq!(output["matches"][0]["path"], "small.txt");
+}
+
+/// The other refusal ledger: a file that cannot be read (here: invalid UTF-8)
+/// used to vanish without a trace — not in `files_searched`, not in any
+/// count — which is the same "searched everything" lie in a different branch.
+#[tokio::test]
+async fn grep_files_reports_unreadable_files_instead_of_skipping_silently() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("small.txt"), "needle in the small file\n").unwrap();
+    fs::write(tmp.path().join("binary.bin"), [0xFF, 0xFE, b'n', 0x80]).unwrap();
+
+    let result = run(tmp.path(), "grep_files", json!({"pattern": "needle"})).await;
+    let output: Value = serde_json::from_str(&result.content).unwrap();
+
+    assert_eq!(output["skipped_unreadable"], 1, "{output}");
+    assert_eq!(
+        output["skipped_unreadable_paths"],
+        json!(["binary.bin"]),
+        "{output}"
+    );
+    assert!(
+        output["note"]
+            .as_str()
+            .expect("a skipped file must leave a note")
+            .contains("1 unreadable"),
+        "{output}"
+    );
+    assert_eq!(output["files_searched"], 1, "{output}");
+    assert_eq!(output["matches"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]

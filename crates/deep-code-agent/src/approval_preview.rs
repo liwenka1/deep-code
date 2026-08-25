@@ -18,8 +18,9 @@ use crate::workspace_policy::{WorkspacePolicy, WorkspaceRoots};
 
 const MAX_PREVIEW_LINES: usize = 40;
 const MAX_PREVIEW_BYTES: usize = 4 * 1024;
-/// Mirrors the read tool's source-size guard.
-const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
+/// The read tool's source-size guard — the same constant, not a copy, so a
+/// bumped limit cannot leave the preview refusing files the tools accept.
+const MAX_SOURCE_BYTES: u64 = crate::workspace_tools::MAX_FILE_BYTES;
 const NEW_FILE_HEAD_LINES: usize = 20;
 
 /// Best-effort preview: `None` means "nothing to add beyond the arguments"

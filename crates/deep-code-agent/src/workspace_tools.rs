@@ -14,10 +14,25 @@ use crate::workspace_policy::{WorkspacePolicy, contains_symlink, invalid, json_s
 
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 500;
-const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// Size cap for reading/searching a single file. `pub(crate)` so every
+/// user-facing mention of the limit (read_file's error, grep's note, the
+/// approval preview's source guard) derives from this one number instead of
+/// hardcoding "2 MiB" — a bumped constant must not leave the prose lying.
+pub(crate) const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const DEFAULT_GREP_RESULTS: usize = 100;
 const MAX_GREP_RESULTS: usize = 500;
 const DEFAULT_CONTEXT_LINES: usize = 2;
+/// Cap on each skipped-path list in grep results: enough to act on, small
+/// enough that a tree full of oversized artifacts cannot flood the output.
+const SKIPPED_PATHS_LISTED: usize = 10;
+
+/// The size cap in MiB, for prose. The compile-time assert keeps the division
+/// exact: a cap that stops being a MiB multiple would otherwise truncate into
+/// understating the limit.
+pub(crate) const MAX_FILE_MIB: u64 = {
+    assert!(MAX_FILE_BYTES.is_multiple_of(1024 * 1024));
+    MAX_FILE_BYTES / (1024 * 1024)
+};
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceTools {
@@ -98,7 +113,7 @@ impl ReadFileTool {
             return Err(ToolError::exec_failed(
                 Self::NAME,
                 format!(
-                    "{} is larger than the current 2 MiB read limit",
+                    "{} is larger than the current {MAX_FILE_MIB} MiB read limit",
                     self.root.relative_display(&path)
                 ),
             ));
@@ -281,7 +296,17 @@ impl GrepFilesTool {
             .map_err(|error| invalid(Self::NAME, format!("invalid regex pattern: {error}")))?;
         let search_path = self.root.resolve_existing(path_arg, Self::NAME)?;
         let mut files_searched = 0usize;
+        // Refusals are counted, not silently dropped: a file this loop refuses
+        // to search is a place a match may be hiding, and "0 matches" without
+        // the counts reads as "searched everything, found nothing". Two
+        // ledgers — the size cap, and files that could not be read (IO error,
+        // non-UTF-8). Symlinked paths are deliberately NOT a ledger: the
+        // boundary refuses them on every tool, grep is not special. Paths are
+        // listed (capped) so the caller can actually go look.
         let mut skipped_oversized = 0usize;
+        let mut skipped_oversized_paths: Vec<String> = Vec::new();
+        let mut skipped_unreadable = 0usize;
+        let mut skipped_unreadable_paths: Vec<String> = Vec::new();
         let mut matches = Vec::new();
         // Boundary snapshot taken once: `granted_roots()` locks and clones per
         // call, and this loop visits every file in the tree — per-file calls
@@ -302,20 +327,42 @@ impl GrepFilesTool {
             if !path.is_file() {
                 continue;
             }
-            if contains_symlink(path, &granted_roots).unwrap_or(true) {
-                continue;
+            match contains_symlink(path, &granted_roots) {
+                // Boundary policy, not a coverage gap (see the ledger note).
+                Ok(true) => continue,
+                Ok(false) => {}
+                // An lstat that itself failed: fail closed AND on the record.
+                Err(_) => {
+                    skipped_unreadable += 1;
+                    push_capped(
+                        &mut skipped_unreadable_paths,
+                        self.root.relative_display(path),
+                    );
+                    continue;
+                }
             }
             let Ok(metadata) = fs::metadata(path) else {
+                skipped_unreadable += 1;
+                push_capped(
+                    &mut skipped_unreadable_paths,
+                    self.root.relative_display(path),
+                );
                 continue;
             };
-            // Counted, not silently dropped: a file the walk refused to search
-            // is a place a match may be hiding, and "0 matches" without that
-            // count reads as "searched everything, found nothing".
             if metadata.len() > MAX_FILE_BYTES {
                 skipped_oversized += 1;
+                push_capped(
+                    &mut skipped_oversized_paths,
+                    self.root.relative_display(path),
+                );
                 continue;
             }
             let Ok(contents) = fs::read_to_string(path) else {
+                skipped_unreadable += 1;
+                push_capped(
+                    &mut skipped_unreadable_paths,
+                    self.root.relative_display(path),
+                );
                 continue;
             };
             files_searched += 1;
@@ -351,16 +398,47 @@ impl GrepFilesTool {
             "path": self.root.relative_display(&search_path),
             "files_searched": files_searched,
             "skipped_oversized": skipped_oversized,
+            "skipped_unreadable": skipped_unreadable,
             "truncated": matches.len() >= max_results,
             "matches": matches
         });
-        if skipped_oversized > 0 {
+        if !skipped_oversized_paths.is_empty() {
+            result["skipped_oversized_paths"] = json!(skipped_oversized_paths);
+        }
+        if !skipped_unreadable_paths.is_empty() {
+            result["skipped_unreadable_paths"] = json!(skipped_unreadable_paths);
+        }
+        if skipped_oversized > 0 || skipped_unreadable > 0 {
+            let mut parts = Vec::new();
+            if skipped_oversized > 0 {
+                parts.push(format!(
+                    "{skipped_oversized} file(s) over the {MAX_FILE_MIB} MiB search limit"
+                ));
+            }
+            if skipped_unreadable > 0 {
+                parts.push(format!("{skipped_unreadable} unreadable file(s)"));
+            }
+            // No promise the caller cannot keep: shell grep needs approval in
+            // gated contexts (a sub-agent's is auto-denied outright), so the
+            // paths themselves are the reliable part of this note — enough to
+            // report the gap even when no tool can close it.
             result["note"] = json!(format!(
-                "{skipped_oversized} file(s) over the 2 MiB search limit were \
-                 not searched; grep them through the shell tool"
+                "not searched: {} — see the skipped_*_paths lists (first {} each); \
+                 the shell tool can grep them where approval allows",
+                parts.join(" and "),
+                SKIPPED_PATHS_LISTED
             ));
         }
         Ok(ToolOutput::text(json_string(result)))
+    }
+}
+
+/// Append to a skipped-path list unless it already holds
+/// [`SKIPPED_PATHS_LISTED`] entries (the sibling counter keeps the true
+/// total; the list is a sample to act on, not the census).
+fn push_capped(paths: &mut Vec<String>, path: String) {
+    if paths.len() < SKIPPED_PATHS_LISTED {
+        paths.push(path);
     }
 }
 
