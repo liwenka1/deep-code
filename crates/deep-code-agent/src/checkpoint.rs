@@ -423,7 +423,10 @@ fn clear_workspace_contents(workspace: &Path) -> Result<(), ToolError> {
         let file_type = entry
             .file_type()
             .map_err(|error| checkpoint_error("stat workspace entry", error))?;
-        if file_type.is_dir() {
+        if file_type.is_symlink() {
+            remove_symlink(&path, &file_type)
+                .map_err(|error| checkpoint_error("clear workspace symlink", error))?;
+        } else if file_type.is_dir() {
             fs::remove_dir_all(&path)
                 .map_err(|error| checkpoint_error("clear workspace dir", error))?;
         } else {
@@ -432,6 +435,32 @@ fn clear_workspace_contents(workspace: &Path) -> Result<(), ToolError> {
         }
     }
     Ok(())
+}
+
+/// Delete a symlink as the LINK, on either platform.
+///
+/// Unix records every symlink as a file entry, so `remove_file` is the whole
+/// story. Windows records a symlink to a directory — and a junction, whose
+/// reparse tag sets the name-surrogate bit — as a DIRECTORY entry:
+/// `is_dir()` still reports false (it is `!is_symlink && is_directory`), so
+/// the old single `remove_file` branch reached `DeleteFileW`, which refuses a
+/// directory entry with access denied, and the whole `restore` aborted. A
+/// junction needs no privilege to create (`mklink /J`), so any Windows
+/// workspace holding one could not be restored at all.
+///
+/// `crate::test_symlinks::remove_symlink_dir_for_test` encodes the same rule
+/// for tests; this is the production half it was missing.
+fn remove_symlink(path: &Path, file_type: &fs::FileType) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if file_type.is_symlink_dir() {
+            return fs::remove_dir(path);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = file_type;
+    fs::remove_file(path)
 }
 
 fn checkpoint_error(action: &str, error: std::io::Error) -> ToolError {
@@ -619,7 +648,12 @@ mod tests {
     /// link is created *after* the snapshot so it is still present when restore
     /// clears the workspace (this is the path `restore_preserves_symlinks`
     /// doesn't reach — it removes the link before restoring).
-    #[cfg(unix)]
+    ///
+    /// Runs on Windows too, and that is the point: `clear_workspace_contents`
+    /// is not cfg-gated, and a DIRECTORY symlink is the one case whose Windows
+    /// spelling genuinely differs (`remove_file` refuses it). Leaving this
+    /// `#[cfg(unix)]` is how that platform-specific abort stayed invisible
+    /// through the cross-platform pass in 93c4280/d84b22c.
     #[test]
     fn restore_clears_symlink_without_deleting_external_target() {
         let workspace = tempfile::tempdir().unwrap();
@@ -633,7 +667,9 @@ mod tests {
         // Introduce the external link only now, so it is live in the workspace
         // when `restore` clears it.
         let link = workspace.path().join("link-out");
-        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        if !crate::test_symlinks::symlink_dir_for_test(outside.path(), &link) {
+            return;
+        }
 
         store.restore(&id).unwrap();
 
