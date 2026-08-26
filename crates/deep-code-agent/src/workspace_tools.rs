@@ -378,9 +378,13 @@ impl GrepFilesTool {
                     continue;
                 }
             }
-            // `entry.metadata()` = lstat: correct for the plain file the two
-            // checks above just established, without a third follow-the-path
-            // traversal.
+            // `entry.metadata()` reuses the walker's own stat instead of a
+            // third follow-the-path traversal. It is an lstat for the tree
+            // walk; the one exception is a search rooted AT a file, where
+            // `WalkBuilder` forces `follow_links` on regardless of our
+            // setting. Harmless either way — the two checks above already
+            // established this entry is a plain file, and `search_path` came
+            // out of `resolve_existing` symlink-free.
             let Ok(metadata) = entry.metadata() else {
                 skipped_unreadable += 1;
                 push_capped(

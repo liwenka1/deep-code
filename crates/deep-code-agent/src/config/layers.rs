@@ -998,7 +998,7 @@ mod tests {
         let project_dir = tempfile::tempdir().unwrap();
         let project = write_config(
             project_dir.path(),
-            "[approval]\nauto_allow = [\"write_\"]\n",
+            "[approval]\nauto_allow = [\"write_file\"]\n",
         );
         let loaded = AgentConfig::load_with(None, Some(project), &no_env);
         assert!(loaded.config.approval_auto_allow.is_empty());
@@ -1014,21 +1014,25 @@ mod tests {
         let global_dir = tempfile::tempdir().unwrap();
         let global = write_config(
             global_dir.path(),
-            "[approval]\nauto_allow = [\"read_\", \" grep_ \", \"\"]\n",
+            "[approval]\nauto_allow = [\"read_file\", \" grep_files \", \"\"]\n",
         );
         let loaded = AgentConfig::load_with(Some(global), None, &no_env);
         assert_eq!(
             loaded.config.approval_auto_allow,
-            vec!["read_".to_string(), "grep_".to_string()]
+            vec!["read_file".to_string(), "grep_files".to_string()]
         );
 
-        // Env wins and parses comma-separated prefixes.
-        let env =
-            |name: &str| (name == APPROVAL_AUTO_ALLOW_ENV).then(|| "mock_, git_ ,,".to_string());
+        // Env wins, and splits on commas with surrounding space trimmed and
+        // empty entries dropped. Spelled with real tool names: matching is by
+        // exact name, so a fixture full of `read_`-style prefixes reads as an
+        // endorsed config while being exactly what launch now warns about.
+        let env = |name: &str| {
+            (name == APPROVAL_AUTO_ALLOW_ENV).then(|| "read_file, grep_files ,,".to_string())
+        };
         let loaded = AgentConfig::load_with(None, None, &env);
         assert_eq!(
             loaded.config.approval_auto_allow,
-            vec!["mock_".to_string(), "git_".to_string()]
+            vec!["read_file".to_string(), "grep_files".to_string()]
         );
     }
 

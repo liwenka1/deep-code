@@ -438,14 +438,21 @@ impl WorkspacePolicy {
             // existing directory, and a gate here would only read like a
             // semantic guard while widening the race window above.
             fs::create_dir_all(parent).map_err(|error| {
-                // One way this fails is a symlink planted (or dangling) among
-                // the segments resolution vetted as merely missing — surfacing
-                // as "File exists" for a directory the tool was told to
-                // create. Diagnose it in the resolve-time wording, so the
-                // model learns the rule instead of retrying into word salad.
+                // Two failures reach here wearing the same errno (17, "File
+                // exists"), and neither reads as its own cause: a symlink
+                // planted or dangling among the segments resolution vetted as
+                // merely missing, and an ordinary FILE sitting where a
+                // directory has to go. Name whichever it is, so the model
+                // learns the rule instead of retrying into word salad.
+                //
+                // `unwrap_or(false)` on the probe: if the inspection itself
+                // fails we do not know, and guessing "symlink" would be a
+                // false accusation — the bare OS error is the honest fallback.
                 let diagnosis = if contains_symlink(parent, &self.granted_roots()).unwrap_or(false)
                 {
                     " (symlinks in the destination path are not allowed)"
+                } else if first_file_segment(parent).is_some() {
+                    " (a file already exists on that path, so the directory cannot be created)"
                 } else {
                     ""
                 };
@@ -591,6 +598,23 @@ pub(crate) fn json_string(value: impl serde::Serialize) -> String {
     serde_json::to_string_pretty(&value).expect("serializing tool output should not fail")
 }
 
+/// The first ancestor segment of `path` that exists and is NOT a directory —
+/// the plain file blocking a `create_dir_all`. `None` when nothing on the path
+/// is a non-directory, which is the ordinary case for every other failure.
+fn first_file_segment(path: &Path) -> Option<PathBuf> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if !meta.is_dir() => return Some(current),
+            // Missing from here down: nothing left to block anything.
+            Err(_) => return None,
+            Ok(_) => {}
+        }
+    }
+    None
+}
+
 /// `skip` entries must be CANONICAL directories (they are the granted roots):
 /// that is what licenses not stat'ing them or their ancestors at all.
 pub(crate) fn contains_symlink(path: &Path, skip: &[PathBuf]) -> std::io::Result<bool> {
@@ -729,6 +753,29 @@ mod tests {
         assert!(
             message.contains("symlinks in the destination path are not allowed"),
             "the failure must teach the rule: {message}"
+        );
+    }
+
+    /// The OTHER errno-17 cause: an ordinary file sitting where a directory
+    /// has to go. `create_dir_all` reports it as the same bare "File exists"
+    /// the symlink case produces, and the two need completely different fixes,
+    /// so the message has to say which one happened.
+    #[test]
+    fn prepare_for_write_names_the_file_blocking_the_directory() {
+        let (_dir, root) = canonical_tempdir();
+        let policy = WorkspacePolicy::new(root.clone()).unwrap();
+        fs::write(root.join("src"), "not a directory").unwrap();
+        let error = policy
+            .prepare_for_write("src/new_mod/thing.rs", "write_file")
+            .expect_err("a file blocking the destination directory must fail the write");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("a file already exists on that path"),
+            "the failure must name the blocker, not just echo the errno: {message}"
+        );
+        assert!(
+            !message.contains("symlinks in the destination path"),
+            "a plain file must not be reported as a symlink: {message}"
         );
     }
 
