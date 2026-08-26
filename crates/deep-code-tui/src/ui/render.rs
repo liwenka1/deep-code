@@ -363,15 +363,17 @@ fn cell_lines(cell: &HistoryCell, width: u16, lang: Lang) -> Vec<Line<'static>> 
     // to lean on measured, undocumented ratatui 0.29 behavior (the family was
     // dropped during line composition) — load-bearing for the approval panel,
     // since a bidi override can reorder what the user reads in the same
-    // frame, yet one dependency bump away from vanishing. Stripping them in
-    // the sanitizer renders identically today (they measured width 0 at wrap
-    // time, and deletion keeps it 0) and survives any ratatui change. ZWNJ/
-    // ZWJ are deliberately NOT stripped — legitimate joiners in emoji and
-    // e.g. Persian text — and stay safe by a measured invariant instead:
-    // they ride inside the preceding grapheme cluster's cell, never a column
-    // of their own. Pinned by
-    // `transcript_text_cannot_carry_an_escape_into_a_cell` and
-    // `zero_width_code_points_cannot_reorder_or_pad_the_frame`.
+    // frame, yet one dependency bump away from vanishing. ZWNJ/ZWJ and the
+    // variation selectors are deliberately NOT stripped — legitimate joiners
+    // in emoji and e.g. Persian text — and stay safe by a measured invariant
+    // instead: they ride inside the preceding grapheme cluster's cell, never
+    // a column of their own.
+    //
+    // Pinned by `transcript_text_cannot_carry_an_escape_into_a_cell`,
+    // `zero_width_code_points_cannot_reorder_or_pad_the_frame` (the ratatui
+    // tripwire) and `neutralize_strips_every_invisible_code_point` (the one
+    // that fails if OUR strip is removed — the frame-level test cannot, since
+    // ratatui drops the family on its own and so cannot tell the two apart).
     for line in &mut lines {
         for span in &mut line.spans {
             if span
@@ -386,15 +388,28 @@ fn cell_lines(cell: &HistoryCell, width: u16, lang: Lang) -> Vec<Line<'static>> 
     lines
 }
 
-/// The full Unicode `Bidi_Control` set (ALM, LRM/RLM, LRE/RLE/PDF/LRO/RLO,
-/// the isolates) plus the zero-width spacing/format characters (ZWSP, SHY,
-/// WJ, U+FEFF). Everything here is invisible, carries reordering or padding
-/// potential, and has no legitimate role in a terminal transcript — unlike
-/// ZWNJ/ZWJ, which join real graphemes and are left alone. The probe test
-/// iterates THIS array, so the strip and its tripwire cannot drift apart.
-const BIDI_AND_ZERO_WIDTH: [char; 16] = [
+/// Invisible code points a model must not be able to place on screen: the
+/// full Unicode `Bidi_Control` set (ALM, LRM/RLM, LRE/RLE/PDF/LRO/RLO, the
+/// isolates), the zero-width spacing/format characters (ZWSP, SHY, WJ,
+/// U+FEFF), the interlinear-annotation trio, and the Hangul fillers. Every
+/// one is invisible, carries reordering or padding potential, and has no
+/// legitimate role in a terminal transcript.
+///
+/// Deliberately ABSENT: ZWNJ/ZWJ and the variation selectors. Those join or
+/// restyle real graphemes (emoji, Persian) and deleting them would corrupt
+/// legitimate text; they stay safe by a measured invariant instead — each
+/// rides inside the preceding grapheme cluster's cell, never a column of its
+/// own. Also absent: NBSP and the other fixed-width spaces, which are honest
+/// about the columns they take.
+///
+/// The deprecated tag block is matched as a RANGE by
+/// [`is_bidi_or_zero_width`] rather than listed here — 96 more entries would
+/// drown the enumerable ones.
+const BIDI_AND_ZERO_WIDTH: [char; 22] = [
     '\u{061c}', // ALM
     '\u{00ad}', // SHY
+    '\u{115f}', // HANGUL CHOSEONG FILLER (invisible, measures 2 columns)
+    '\u{1160}', // HANGUL JUNGSEONG FILLER
     '\u{200b}', // ZWSP
     '\u{200e}', // LRM
     '\u{200f}', // RLM
@@ -408,29 +423,56 @@ const BIDI_AND_ZERO_WIDTH: [char; 16] = [
     '\u{2067}', // RLI
     '\u{2068}', // FSI
     '\u{2069}', // PDI
+    '\u{3164}', // HANGUL FILLER
+    '\u{fff9}', // INTERLINEAR ANNOTATION ANCHOR
+    '\u{fffa}', // INTERLINEAR ANNOTATION SEPARATOR
+    '\u{fffb}', // INTERLINEAR ANNOTATION TERMINATOR
     '\u{feff}', // ZWNBSP/BOM
 ];
 
+/// The deprecated Unicode tag block: invisible, `Cf` (so `char::is_control`
+/// misses it), and NOT dropped by ratatui — a tag attaches to the preceding
+/// grapheme cluster and rides into the cell. That smuggles arbitrary hidden
+/// ASCII through a line that looks clean, and on from there into the
+/// transcript snapshot and the clipboard.
+const TAG_BLOCK: std::ops::RangeInclusive<char> = '\u{e0000}'..='\u{e007f}';
+
 fn is_bidi_or_zero_width(ch: char) -> bool {
-    BIDI_AND_ZERO_WIDTH.contains(&ch)
+    BIDI_AND_ZERO_WIDTH.contains(&ch) || TAG_BLOCK.contains(&ch)
+}
+
+/// The one rule both sanitizers share, so the transcript and the approval
+/// panel can never again drift apart: a control character becomes a single
+/// space (preserving the column the wrap step already counted for it), and
+/// anything [`is_bidi_or_zero_width`] is DELETED. Deletion, not substitution:
+/// most of that family measured 0 columns at wrap time so removing them keeps
+/// the count exact, the few that measured 1-2 only shrink the line (never
+/// past the committed width), and a substitute space would hand every one of
+/// them the visible column they were counterfeiting.
+fn neutralize_char_into(out: &mut String, ch: char) {
+    if is_bidi_or_zero_width(ch) {
+        return;
+    }
+    out.push(if ch.is_control() { ' ' } else { ch });
 }
 
 /// Control and bidi/zero-width characters out of a finished transcript span.
-/// A tab becomes four spaces rather than one, because code blocks reach here
-/// tab-indented and collapsing that to a single column misreads the code;
-/// other controls become one space, preserving the column count the wrap step
-/// already committed to. The [`BIDI_AND_ZERO_WIDTH`] family is DELETED
-/// instead — the wrap step measured those at width 0, so removal is what
-/// keeps the committed columns, and a substitute space would hand them the
-/// visible column they never had.
+///
+/// One exception on top of [`neutralize_char_into`]: a tab becomes four
+/// spaces rather than one, because code blocks reach here tab-indented and
+/// collapsing that to a single column misreads the code. That is the one
+/// place this function does NOT preserve the wrap step's column count —
+/// `UnicodeWidthStr` scores `\t` as 0, so each tab adds four columns after
+/// the budget was set. ratatui truncates the overflow rather than bleeding
+/// into a neighbouring widget, so a deeply tab-indented line loses its tail;
+/// that is the accepted trade for readable indentation.
 fn neutralize_transcript_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
-        match ch {
-            '\t' => out.push_str("    "),
-            ch if is_bidi_or_zero_width(ch) => {}
-            ch if ch.is_control() => out.push(' '),
-            ch => out.push(ch),
+        if ch == '\t' {
+            out.push_str("    ");
+        } else {
+            neutralize_char_into(&mut out, ch);
         }
     }
     out
@@ -659,30 +701,43 @@ fn extract_action(tool_name: &str, arguments_json: &str) -> String {
     crate::history::collapse_whitespace(arguments_json)
 }
 
-/// Control characters become spaces. ratatui carries an escape byte through to
-/// the terminal verbatim, so text reaching a panel line with `\x1b` or `\r`
+/// [`neutralize_char_into`] over a whole string: control characters become
+/// spaces, bidi/zero-width are deleted. ratatui carries an escape byte through
+/// to the terminal verbatim, so text reaching a panel line with `\x1b` or `\r`
 /// intact can erase or overwrite the lines around it — inside the very prompt
-/// the human is reading to decide. Zero-width characters need no handling here:
-/// ratatui drops them before they reach a cell, so bidi overrides cannot flip
-/// a panel line either.
+/// the human is reading to decide.
+///
+/// The bidi/zero-width half is OURS, not ratatui's. This function used to say
+/// zero-width needed no handling because ratatui drops those before they reach
+/// a cell — measured, true, and undocumented. The transcript stopped renting
+/// that in 9cb8e76 while the approval panel kept renting it, which left the
+/// one surface whose whole job is being read correctly (a bidi override can
+/// reorder a resolved grant target in the same frame) depending on a
+/// dependency's incidental behavior. Both paths now share
+/// [`neutralize_char_into`].
 ///
 /// Kept separate from [`sanitize_panel_text`] for the two callers that must not
 /// trim or cap: a diff line's leading spaces carry its alignment, and a tool
 /// description is longer than any line cap.
-fn neutralize_control_chars(text: &str) -> String {
-    text.chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .collect()
+fn neutralize_display_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        neutralize_char_into(&mut out, ch);
+    }
+    out
 }
 
 /// Model-influenced text about to become an approval panel line: control
-/// characters become spaces (see [`neutralize_control_chars`]) and the width is
-/// capped. Every free-text argument of [`approval_lines`] passes through one
-/// of the two, except `risk`: [`risk_display`] maps it to a `&'static str`, so
-/// that one cannot echo its input at all. Pinned by
+/// characters become spaces and the invisible reordering/padding family is
+/// deleted (see [`neutralize_display_text`]), and the width is capped. Every
+/// free-text argument of [`approval_lines`] passes through one of the two,
+/// except `risk`: [`risk_display`] maps it to a `&'static str`, so that one
+/// cannot echo its input at all. Pinned by
 /// `approval_lines_sanitize_every_text_field`, which asserts one marker per
-/// field — and renders the root-grant branch as well, or the fields gated
-/// behind it would be passed in and never drawn, pinning nothing.
+/// field — with both an escape sequence and a bidi override in every marker,
+/// so a field that loses either half names itself — and renders the
+/// root-grant branch as well, or the fields gated behind it would be passed
+/// in and never drawn, pinning nothing.
 ///
 /// The cap is in terminal **columns**, not characters: the panel reserves rows
 /// by measuring its own wrapped body, so a cap the layout cannot convert to
@@ -691,7 +746,7 @@ fn neutralize_control_chars(text: &str) -> String {
 /// model-supplied text could still push the resolved grant target past the
 /// bottom edge after the height itself had been made content-sized.
 fn sanitize_panel_text(text: &str, max_cols: usize) -> String {
-    crate::history::truncate_display_width(neutralize_control_chars(text).trim(), max_cols)
+    crate::history::truncate_display_width(neutralize_display_text(text).trim(), max_cols)
 }
 
 /// The decision-critical head of a `request_write_root` panel: the boundary
@@ -926,7 +981,7 @@ fn approval_lines(
     // Neutralised but not capped: tool descriptions run past any line cap, and
     // they are written by this crate, not the model — the filter is uniformity
     // with the rest of the panel, not a boundary of its own.
-    let description = neutralize_control_chars(description);
+    let description = neutralize_display_text(description);
     let description = description.trim();
     if !description.is_empty() && description != action {
         lines.extend(wrap_prefixed("  ", description, width, dim, dim));
@@ -1036,7 +1091,7 @@ fn approval_lines(
             // action and the justification. Not trimmed — a diff line's leading
             // spaces are its alignment. Colour is decided from the neutralised
             // text so a leading escape byte cannot borrow the `+` styling.
-            let line = neutralize_control_chars(raw);
+            let line = neutralize_display_text(raw);
             let style = match line.as_bytes().first() {
                 Some(b'+') => added,
                 Some(b'-') => removed,
@@ -1608,7 +1663,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) 
         // frame as the approval panel, outliving the turn that produced it.
         // An escape here reaches the terminal exactly like one in the
         // transcript did, so it gets the same treatment.
-        spans.push(Span::raw(neutralize_control_chars(error)));
+        spans.push(Span::raw(neutralize_display_text(error)));
     } else if let Some(activity) = app.streaming_activity() {
         // While streaming (incl. a long time-to-first-token wait) show an
         // animated indicator so the screen never looks frozen.
@@ -2033,7 +2088,11 @@ mod tests {
     ///   field to that struct stops compiling until it is handled here.
     #[test]
     fn approval_lines_sanitize_every_text_field() {
-        const ESC: &str = "\u{1b}[2K\r";
+        // Both attack shapes in one prefix, so a field that sanitizes only
+        // controls (the pre-fix panel behavior) fails the bidi assertion at
+        // the bottom without needing a second set of markers: RLO can reorder
+        // what the human reads, ZWSP can pad it.
+        const ESC: &str = "\u{1b}[2K\r\u{202e}\u{200b}";
         let notes = [SafetyNote {
             reason: TextId::SafetyNetworkReason,
             suggestion: TextId::SafetyNetworkSuggestion,
@@ -2115,6 +2174,15 @@ mod tests {
             assert!(
                 !text.chars().any(char::is_control),
                 "a control character reached the approval panel: {text:?}"
+            );
+            // The second half of the same marker. The panel used to run a
+            // control-only sanitizer and rely on ratatui to drop the invisible
+            // family for it, which left a bidi override free to reorder the
+            // resolved grant target inside the very prompt being judged.
+            assert!(
+                !text.chars().any(is_bidi_or_zero_width),
+                "an invisible reordering/padding code point reached the \
+                 approval panel: {text:?}"
             );
         }
     }
@@ -2322,19 +2390,96 @@ mod tests {
         }
     }
 
-    /// The other half of the same defense, in two parts with different owners:
+    /// The sanitizer-level half, and the only one that fails if OUR strip is
+    /// deleted. The expected set is HARDCODED on purpose: the frame test
+    /// derives its payload from [`BIDI_AND_ZERO_WIDTH`], so it shrinks along
+    /// with the array and cannot notice a removal — and ratatui drops that
+    /// family unaided, so a frame assertion cannot tell our work from its own.
+    /// Spelling the code points out here means dropping one from production
+    /// has to be a deliberate edit in two places.
     ///
-    /// * The whole [`BIDI_AND_ZERO_WIDTH`] family (every Unicode Bidi_Control
-    ///   plus ZWSP/SHY/WJ/U+FEFF) is stripped by OUR sanitizer — a model
-    ///   cannot reorder or invisibly pad the frame an approval panel shares.
-    ///   The probe iterates the production array itself, so a character added
-    ///   to the strip is probed automatically and one removed fails here.
-    /// * ZWNJ/ZWJ are deliberately NOT stripped (legitimate joiners) and stay
-    ///   safe by measured, undocumented ratatui 0.29 behavior: they ride
-    ///   inside the preceding grapheme cluster's cell. That half is still a
-    ///   tripwire on an upgrade, and the assertion is the invariant rather
-    ///   than the mechanism — the letters around a joiner must sit in
-    ///   directly adjacent columns, which no zero-width pad column survives.
+    /// It also pins the complement: ZWNJ/ZWJ and the variation selectors must
+    /// SURVIVE. They join or restyle real graphemes, and an over-broad strip
+    /// would silently corrupt emoji and Persian text — a regression no
+    /// "did it reach a cell" assertion could ever surface.
+    #[test]
+    fn neutralize_strips_every_invisible_code_point() {
+        const MUST_STRIP: [char; 22] = [
+            '\u{00ad}', '\u{061c}', '\u{115f}', '\u{1160}', '\u{200b}', '\u{200e}', '\u{200f}',
+            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2060}', '\u{2066}',
+            '\u{2067}', '\u{2068}', '\u{2069}', '\u{3164}', '\u{feff}', '\u{fff9}', '\u{fffa}',
+            '\u{fffb}',
+        ];
+        // Both endpoints and an interior point of the tag range.
+        const MUST_STRIP_TAGS: [char; 3] = ['\u{e0000}', '\u{e0041}', '\u{e007f}'];
+        // U+E0100 sits just past the tag block: the range must not swallow it.
+        const MUST_SURVIVE: [char; 4] = ['\u{200c}', '\u{200d}', '\u{fe0f}', '\u{e0100}'];
+
+        for ch in MUST_STRIP.into_iter().chain(MUST_STRIP_TAGS) {
+            let probe = format!("a{ch}b");
+            assert_eq!(
+                neutralize_transcript_text(&probe),
+                "ab",
+                "U+{:04X} must be stripped from a transcript span",
+                ch as u32
+            );
+            assert_eq!(
+                neutralize_display_text(&probe),
+                "ab",
+                "U+{:04X} must be stripped from a panel line too — the two \
+                 sanitizers share one rule",
+                ch as u32
+            );
+        }
+        for ch in MUST_SURVIVE {
+            let probe = format!("a{ch}b");
+            assert_eq!(
+                neutralize_display_text(&probe),
+                probe,
+                "U+{:04X} joins or restyles real graphemes and must survive",
+                ch as u32
+            );
+        }
+        assert_eq!(
+            BIDI_AND_ZERO_WIDTH.len(),
+            MUST_STRIP.len(),
+            "production array and this test's hardcoded set must stay in step"
+        );
+
+        // The other half of the shared rule: a control becomes exactly one
+        // space (the column the wrap step already counted), and only the
+        // transcript widens a tab.
+        assert_eq!(neutralize_display_text("a\u{1b}[2Kb\rc"), "a [2Kb c");
+        assert_eq!(neutralize_display_text("a\tb"), "a b");
+        assert_eq!(neutralize_transcript_text("a\tb"), "a    b");
+    }
+
+    /// The frame-level half of the defense: end to end through `render`, no
+    /// invisible code point reaches a cell and nothing gets reordered or
+    /// padded.
+    ///
+    /// What this test can and cannot prove, stated exactly, because the
+    /// previous wording ("a character added to the strip is probed
+    /// automatically and one removed fails here") was only half true:
+    ///
+    /// * ADDED is covered — the payload iterates the production array, so a
+    ///   new entry is probed with no edit here.
+    /// * REMOVED is NOT covered for the enumerable family, and cannot be.
+    ///   The payload and the assertion loop read the same array, so shrinking
+    ///   it shrinks the test; and ratatui drops that family on its own
+    ///   (`Paragraph` skips width-0 symbols), so "did not reach a cell" holds
+    ///   even with our strip deleted outright. Removal is caught by
+    ///   `neutralize_strips_every_invisible_code_point`, which asserts against
+    ///   a hardcoded set at the sanitizer boundary.
+    /// * The tag-block character below IS a real frame-level tripwire: ratatui
+    ///   does not drop it (a tag attaches to the preceding grapheme cluster
+    ///   and rides into the cell), so its absence proves OUR strip ran.
+    /// * ZWNJ/ZWJ and the variation selectors are deliberately NOT stripped
+    ///   (legitimate joiners) and stay safe by measured, undocumented ratatui
+    ///   0.29 behavior: they ride inside the preceding cluster's cell. That
+    ///   half is a tripwire on an upgrade, and the assertion is the invariant
+    ///   rather than the mechanism — the letters around a joiner must sit in
+    ///   directly adjacent columns, which no pad column survives.
     #[test]
     fn zero_width_code_points_cannot_reorder_or_pad_the_frame() {
         use crate::history::HistoryCell;
@@ -2368,18 +2513,23 @@ mod tests {
                 .join("\n")
         }
 
+        const TAG: char = '\u{e0041}';
         let mut payload = String::from("A");
         for (index, ch) in BIDI_AND_ZERO_WIDTH.iter().enumerate() {
             payload.push(*ch);
             payload.push(char::from(b'B' + u8::try_from(index).unwrap()));
         }
+        // The tag block rides into a cell on its own, so unlike the family
+        // above, this one fails the moment our strip stops running.
+        payload.push(TAG);
+        payload.push('X');
         let visible: String = payload.chars().filter(char::is_ascii).collect();
         let screen = flatten(&cells_for(&payload));
-        for ch in BIDI_AND_ZERO_WIDTH {
+        for ch in BIDI_AND_ZERO_WIDTH.into_iter().chain([TAG]) {
             assert!(
                 !screen.contains(ch),
                 "U+{:04X} reached a cell — the transcript sanitizer must \
-                 strip the whole BIDI_AND_ZERO_WIDTH family",
+                 strip every invisible code point",
                 ch as u32
             );
         }
