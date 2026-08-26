@@ -188,6 +188,53 @@ async fn grep_files_reports_unreadable_files_instead_of_skipping_silently() {
     assert_eq!(output["matches"].as_array().unwrap().len(), 1);
 }
 
+/// A directory the walk itself cannot open takes its ENTIRE subtree with it —
+/// by far the largest refusal grep can make, and until now the only one that
+/// vanished without a count or a path. The per-file ledgers were honest while
+/// the level above them was not.
+#[cfg(unix)]
+#[tokio::test]
+async fn grep_files_reports_an_unreadable_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("small.txt"), "needle in the small file\n").unwrap();
+    let locked = tmp.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::write(locked.join("buried.txt"), "needle\n").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    // root ignores the mode bits, so the refusal this test needs never happens
+    // there; skip rather than assert something the environment cannot produce.
+    if fs::read_dir(&locked).is_ok() {
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipping: this user can read a 0000 directory (root?)");
+        return;
+    }
+
+    let result = run(tmp.path(), "grep_files", json!({"pattern": "needle"})).await;
+    // Restore before asserting: a panic here must not leave a tempdir that
+    // cannot be cleaned up.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    let output: Value = serde_json::from_str(&result.content).unwrap();
+
+    assert_eq!(output["skipped_unreadable"], 1, "{output}");
+    assert_eq!(
+        output["skipped_unreadable_paths"],
+        json!(["locked"]),
+        "the unreadable directory must be named: {output}"
+    );
+    assert!(
+        output["note"]
+            .as_str()
+            .expect("a skipped directory must leave a note")
+            .contains("1 unreadable"),
+        "{output}"
+    );
+    // The buried match was genuinely not found — that is the point of saying so.
+    assert_eq!(output["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(output["matches"][0]["path"], "small.txt");
+}
+
 #[tokio::test]
 async fn write_file_requires_approval_and_writes_after_approval() {
     let tmp = tempdir().unwrap();
