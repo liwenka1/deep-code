@@ -250,7 +250,7 @@
 
   "PreviewNewFile": "New file · {total} lines",
   "PreviewMoreLines": "…(+{count} more lines)",
-  "PreviewFileTooBig": "(existing file exceeds 2 MiB, skipping diff preview)",
+  "PreviewFileTooBig": "(existing file exceeds {limit} MiB, skipping diff preview)",
   "PreviewReadFail": "(cannot read existing file, skipping diff preview)",
   "PreviewNoChange": "(identical to existing file, no change)",
   "PreviewNotUtf8": "(existing file is not UTF-8, skipping diff preview)",

@@ -250,7 +250,7 @@
 
   "PreviewNewFile": "新文件 · {total} 行",
   "PreviewMoreLines": "…(+{count} 行未显示)",
-  "PreviewFileTooBig": "(现有文件超过 2 MiB，略过 diff 预览)",
+  "PreviewFileTooBig": "(现有文件超过 {limit} MiB，略过 diff 预览)",
   "PreviewReadFail": "(无法读取现有文件，略过 diff 预览)",
   "PreviewNoChange": "(内容与现有文件一致，无变更)",
   "PreviewNotUtf8": "(现有文件非 UTF-8，略过 diff 预览)",

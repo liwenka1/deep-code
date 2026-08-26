@@ -80,7 +80,17 @@ fn write_file_preview(path: &Path, content: &str, lang: Lang) -> String {
     }
     match fs::metadata(path) {
         Ok(metadata) if metadata.len() > MAX_SOURCE_BYTES => {
-            return tr(lang, TextId::PreviewFileTooBig).to_string();
+            // The number comes from the same constant that decided the refusal
+            // one line up. It used to be baked into the locale string, so this
+            // was the one of the three user-facing mentions of the limit that
+            // `MAX_FILE_BYTES`'s own doc comment claimed to have unified and
+            // hadn't: bumping the cap would refuse at the new size while the
+            // panel still said "2 MiB".
+            return tr_with(
+                lang,
+                TextId::PreviewFileTooBig,
+                &[("limit", &crate::workspace_tools::MAX_FILE_MIB.to_string())],
+            );
         }
         Err(_) => return tr(lang, TextId::PreviewReadFail).to_string(),
         Ok(_) => {}
@@ -174,6 +184,33 @@ mod tests {
         .unwrap();
         assert!(preview.contains("-two"), "{preview}");
         assert!(preview.contains("+three"), "{preview}");
+    }
+
+    /// The limit named in the message must come from the constant that decided
+    /// the refusal. `MAX_FILE_BYTES`'s doc comment claims all three
+    /// user-facing mentions derive from it and names "the approval preview's
+    /// source guard" as one of them — but this one lived in the locale string
+    /// as a literal "2 MiB", so a bumped cap would refuse at the new size while
+    /// telling the user the old one. The other two are pinned in
+    /// `workspace_tools::tests`; this is the third.
+    #[test]
+    fn write_file_preview_reports_the_limit_from_the_constant() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("big.bin"),
+            vec![b'x'; usize::try_from(MAX_SOURCE_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        let preview = build_approval_preview(
+            &call("write_file", json!({"path": "big.bin", "content": "hi\n"})),
+            &WorkspaceRoots::from(workspace.path()),
+            Lang::En,
+        )
+        .unwrap();
+        assert!(
+            preview.contains(&format!("{} MiB", crate::workspace_tools::MAX_FILE_MIB)),
+            "the preview must name the limit it actually enforced: {preview}"
+        );
     }
 
     /// Rendering an approval prompt must not touch the workspace: the mkdir
