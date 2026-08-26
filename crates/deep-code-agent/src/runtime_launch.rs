@@ -637,10 +637,20 @@ fn build_parent_tools<C: LlmClient + 'static>(
     }
 }
 
-/// One warning per dead `approval.auto_allow` entry: a name nothing registered
-/// answers to (a pre-0.4.8 prefix spelling like `"read_"`, or a typo), and the
-/// one registered name that is exempt by design. Entries matching an ungated
-/// tool stay silent — harmless today, meaningful if the tool ever gains a gate.
+/// Warn about `approval.auto_allow` entries that pre-approve nothing, saying
+/// WHICH of the three reasons applies. The registry is only what this session
+/// mounted, not the tool universe, so treating every miss as "no such tool"
+/// accused correct configs of being typos: run with `DEEP_CODE_DISABLE_WEB=1`
+/// (a documented opt-out this repo's own release workflow sets) and a perfectly
+/// good `fetch_url` entry was told it "matches no tool name — matching is
+/// exact", every clause of which is false. Worse, one failed workspace boundary
+/// unmounts nine tools at once and produced nine such lines on top of the real
+/// "workspace tools disabled" one.
+///
+/// [`ExecPolicy::classify_tool`] is the tool-name universe (an exhaustive match
+/// on exact names), so it separates "not mounted here" from "no such tool".
+/// Entries matching a mounted, ungated tool stay silent — harmless today,
+/// meaningful if the tool ever gains a gate.
 fn warn_unmatched_auto_allow(
     registry: &ToolRegistry,
     auto_allow: &[String],
@@ -650,19 +660,41 @@ fn warn_unmatched_auto_allow(
         return;
     }
     let names: Vec<String> = registry.specs().into_iter().map(|spec| spec.name).collect();
+    let mut seen: Vec<&str> = Vec::new();
+    let mut unmounted: Vec<&str> = Vec::new();
     for entry in auto_allow {
+        // A repeated entry is one mistake, not two.
+        if seen.contains(&entry.as_str()) {
+            continue;
+        }
+        seen.push(entry.as_str());
         if entry == crate::root_grant::REQUEST_WRITE_ROOT_TOOL {
             warnings.push(format!(
                 "approval.auto_allow entry \"{entry}\" has no effect: widening \
                  the write boundary always prompts"
             ));
-        } else if !names.iter().any(|name| name == entry) {
+        } else if names.iter().any(|name| name == entry) {
+            // Mounted and gated (or ungated): the entry does its job.
+        } else if crate::execution_policy::ExecPolicy::classify_tool(entry)
+            != crate::execution_policy::ToolKind::Unknown
+        {
+            unmounted.push(entry);
+        } else {
             warnings.push(format!(
                 "approval.auto_allow entry \"{entry}\" matches no tool name — \
                  matching is exact (not a prefix), so it never pre-approves \
                  anything"
             ));
         }
+    }
+    // One line however many are unmounted: they always share a single cause
+    // (a disabled group, a failed boundary), which has already reported itself.
+    if !unmounted.is_empty() {
+        warnings.push(format!(
+            "approval.auto_allow entries name tools this session did not mount, \
+             so they pre-approve nothing here: {}",
+            unmounted.join(", ")
+        ));
     }
 }
 
@@ -722,9 +754,11 @@ mod tests {
             .collect()
     }
 
-    /// A dead standing-consent entry must say so: an exact-name miss (the old
-    /// prefix spelling) and the by-design exempt root-grant tool each warn; an
-    /// entry that names a registered tool stays silent.
+    /// A dead standing-consent entry must say so, and say WHICH kind of dead
+    /// it is: an exact-name miss (the old prefix spelling), the by-design
+    /// exempt root-grant tool, and — separately — a real tool name this
+    /// session simply did not mount. An entry naming a registered tool stays
+    /// silent, and a repeat of any entry is one mistake, not two.
     #[test]
     fn dead_auto_allow_entries_warn() {
         let mut warnings = Vec::new();
@@ -733,11 +767,16 @@ mod tests {
             &[
                 MockEchoTool::NAME.to_string(),
                 "mock_".to_string(),
+                "mock_".to_string(),
                 crate::root_grant::REQUEST_WRITE_ROOT_TOOL.to_string(),
+                // Real tools, absent from the mock registry — exactly the shape
+                // `DEEP_CODE_DISABLE_WEB=1` produces for a correct config.
+                "fetch_url".to_string(),
+                "web_search".to_string(),
             ],
             &mut warnings,
         );
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
         assert!(
             warnings[0].contains("\"mock_\"") && warnings[0].contains("exact"),
             "{warnings:?}"
@@ -745,6 +784,14 @@ mod tests {
         assert!(
             warnings[1].contains("request_write_root") && warnings[1].contains("always prompts"),
             "{warnings:?}"
+        );
+        // One line for both, and it must NOT accuse them of being typos.
+        assert!(
+            warnings[2].contains("fetch_url")
+                && warnings[2].contains("web_search")
+                && warnings[2].contains("did not mount")
+                && !warnings[2].contains("matches no tool name"),
+            "an unmounted-but-real tool must not be reported as a misspelling: {warnings:?}"
         );
     }
 

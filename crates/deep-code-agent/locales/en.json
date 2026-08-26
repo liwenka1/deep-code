@@ -167,7 +167,7 @@
   "HelpTipSessions": "Tip: sessions are stored under .deep-code/sessions/.",
   "HelpKeys": "Keys: Enter send, Alt+Enter/Ctrl+J newline, ↑↓ scroll chat (moves the cursor inside a multi-line draft), Ctrl+P/Ctrl+N history, Ctrl+W delete word, Ctrl+U/K kill line, Ctrl+A/E line start/end, Esc cancel turn/clear input/quit (deny in the approval panel), Ctrl+C cancel/clear/press twice to quit, Shift+↑/↓ or PageUp/PageDown scroll the transcript (mouse drag selects and copies), y/a/n approve, ↑↓ + Enter in the approval panel.",
   "HelpNoteCancel": "Note: cancellation takes effect at tool boundaries — a synchronous tool that is already running finishes first. 'a' allows shell by program name for this session (e.g. cargo/git; compound commands still prompt each time).",
-  "HelpNoteAutoAllow": "Config [approval] auto_allow pre-approves tool prefixes (env or global config only; the project file is ignored).",
+  "HelpNoteAutoAllow": "Config [approval] auto_allow pre-approves tools by EXACT name, never by prefix (env or global config only; the project file is ignored).",
   "StatusHelpShown": "Help displayed",
   "StatusCacheHitLine": "cache_hit=turn {turn} · session {session} (saved {saved})",
   "StatusTrimmedSuffix": " (oldest {count} cells folded)",
