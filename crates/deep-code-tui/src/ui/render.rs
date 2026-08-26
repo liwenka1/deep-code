@@ -144,7 +144,12 @@ fn render_resume_picker(frame: &mut Frame<'_>, picker: &crate::app::ResumePicker
         .take(viewport)
         .map(|(index, record)| {
             let time = relative_time(now, record.updated_at_ms, lang);
-            let title = session_title(record, lang);
+            // Session records live at `<workspace>/.deep-code/sessions`, inside
+            // the tree the model can write, and `session_title` builds the row
+            // from the first user message with `split_whitespace` — which keeps
+            // `\x1b` (not whitespace) intact. Sanitize like every other
+            // model-reachable string.
+            let title = neutralize_display_text(&session_title(record, lang));
             if index == selected {
                 Line::from(vec![
                     Span::styled(
@@ -207,7 +212,14 @@ fn render_completion_menu(
         .map(|(index, (value, hint))| {
             let marker = if index == menu.selected { "▶ " } else { "  " };
             let mut spans = vec![Span::raw(marker.to_string())];
-            let value_span = Span::raw(value.clone());
+            // `value` is a workspace FILENAME (`@` completion reads
+            // `list_workspace_files`), so it is whatever is on disk — a cloned
+            // repo or a model write can name a file `evil\x1b[8mhidden.txt`.
+            // `Paragraph` filters zero-width symbols but not `\x1b`, which
+            // measures 1, so an unsanitized menu row flushes the escape to the
+            // terminal; SGR conceal turned on here survives into later frames,
+            // including an approval panel. Nothing else guards this path.
+            let value_span = Span::raw(neutralize_display_text(value));
             if index == menu.selected {
                 spans.push(value_span.bold());
             } else {
@@ -2986,6 +2998,46 @@ mod tests {
         assert!(
             screen.contains("/home/u/.deep-code"),
             "the real subject must be shown:\n{screen}"
+        );
+    }
+
+    /// The `@` menu lists workspace FILENAMES, so its rows are whatever is on
+    /// disk — a cloned repo or a model write can name a file
+    /// `evil\x1b[8mhidden.txt`. This path had no sanitizer of its own, and
+    /// `Paragraph` filters zero-width symbols but not `\x1b` (width 1), so the
+    /// raw escape reached the terminal; SGR conceal turned on there survives
+    /// into later frames, including an approval panel.
+    #[test]
+    fn completion_menu_neutralizes_hostile_filenames() {
+        use crate::app::{CompletionKind, CompletionMenu};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let menu = CompletionMenu {
+            kind: CompletionKind::File,
+            items: vec![("evil\u{1b}[8m\u{202e}hidden.txt".to_string(), String::new())],
+            selected: 0,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(50, 6)).unwrap();
+        terminal
+            .draw(|frame| render_completion_menu(frame, &menu, frame.area(), Lang::En))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut screen = String::new();
+        for row in 0..buffer.area.height {
+            for col in 0..buffer.area.width {
+                screen.push_str(buffer[(col, row)].symbol());
+            }
+        }
+        assert!(
+            !screen
+                .chars()
+                .any(|ch| ch.is_control() || is_bidi_or_zero_width(ch)),
+            "a hostile filename reached a cell unsanitized: {screen:?}"
+        );
+        assert!(
+            screen.contains("hidden.txt"),
+            "the row must still render, only neutralized: {screen}"
         );
     }
 
