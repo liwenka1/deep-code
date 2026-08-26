@@ -330,15 +330,25 @@ impl App {
             deep_code_agent::WorkspaceRoots::new(workspace.clone(), config.extra_roots.clone()),
             config.resume.clone(),
         );
-        let extra_roots = launched.extra_roots;
-        let runtime = launched.handle;
-        let backend_label = launched.backend_label;
-        let backend_offline = launched.offline;
-        let session_id = launched.session_id;
-        let subagent_manager = launched.subagent_manager;
-        let permission_mode = launched.permission_mode;
-        let subagent_shutdown = Some(launched.stop_hook);
-        let job_store = Some(launched.job_store);
+        // Exhaustive destructuring, not field-by-field moves: the previous
+        // shape read nine fields and silently ignored `warnings`, and nothing
+        // — not the compiler, not review — pointed at the gap. Naming every
+        // field means a new one must be given a home here, and dropping one
+        // has to be spelled `field: _` on purpose.
+        let deep_code_agent::LaunchedRuntime {
+            handle: runtime,
+            backend_label,
+            session_id,
+            subagent_manager,
+            job_store,
+            stop_hook,
+            offline: backend_offline,
+            warnings: launch_warnings,
+            permission_mode,
+            extra_roots,
+        } = launched;
+        let subagent_shutdown = Some(stop_hook);
+        let job_store = Some(job_store);
         let persistent = session_id.is_some();
         let resumed_turns = config.resume.as_ref().map(|record| {
             record
@@ -361,6 +371,22 @@ impl App {
                 "{}\n{}",
                 tr(lang, TextId::ConfigWarningsHeader),
                 config_warnings.join("\n")
+            )));
+        }
+
+        // `LaunchedRuntime::warnings` documents "the consumer must surface
+        // these" — the library cannot write to stderr because raw mode owns
+        // the screen. Only `adopt_runtime` (the runtime-SWAP path: /clear,
+        // /resume, /model, /add-dir) was ever wired, so at startup — the one
+        // moment a dead `auto_allow` entry, a disabled tool group, an
+        // unavailable session store or a checkpoint failure is actually
+        // decided — every warning was dropped on the floor. Same rendering as
+        // the swap path, so a warning reads identically whenever it arrives.
+        for warning in &launch_warnings {
+            history.push(HistoryCell::system(tr_with(
+                lang,
+                TextId::SystemWarning,
+                &[("message", warning)],
             )));
         }
 

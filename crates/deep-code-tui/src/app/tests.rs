@@ -1631,3 +1631,42 @@ fn switch_session_adopts_and_banners_the_records_grants() {
         Some(HistoryCell::System { text }) if text.contains(&canonical.display().to_string())
     ));
 }
+
+/// Launch degradations must reach the transcript. `LaunchedRuntime::warnings`
+/// documents "the consumer must surface these" — the library cannot write to
+/// stderr because raw mode owns the screen — yet only `adopt_runtime` (the
+/// runtime-SWAP path) was ever wired. So at STARTUP, the one moment a dead
+/// `auto_allow` entry, a disabled tool group, an unavailable session store or a
+/// failed checkpoint init is actually decided, every warning went on the floor.
+///
+/// The workspace here is a path UNDER A FILE: `create_dir_all` and
+/// `canonicalize` both fail on it on every platform, so the degradation is
+/// deterministic rather than dependent on directory permissions.
+#[test]
+fn launch_surfaces_runtime_warnings_in_the_transcript() {
+    let blocker = tempfile::NamedTempFile::new().unwrap();
+    let app = App::launch(LaunchConfig {
+        workspace: Some(blocker.path().join("workspace")),
+        ..LaunchConfig::default()
+    });
+    let warnings: Vec<&str> = app
+        .history
+        .iter()
+        .filter_map(|cell| match cell {
+            crate::history::HistoryCell::System { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|text| text.contains("workspace tools disabled")),
+        "a launch that lost the write boundary must say so: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|text| text.contains("session persistence unavailable")),
+        "a launch that cannot persist must say so: {warnings:?}"
+    );
+}

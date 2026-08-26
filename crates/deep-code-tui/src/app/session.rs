@@ -2,29 +2,46 @@ use super::*;
 
 impl App {
     pub(crate) fn adopt_runtime(&mut self, launched: LaunchedRuntime) {
-        for warning in &launched.warnings {
+        // Exhaustive destructuring for the same reason `App::launch` uses it:
+        // a field added to `LaunchedRuntime` must be given a home in BOTH
+        // consumers, and skipping one has to be written down as `field: _`.
+        // Field-by-field moves are how the startup path came to ignore
+        // `warnings` for its whole life without anyone noticing.
+        let LaunchedRuntime {
+            handle,
+            backend_label,
+            session_id,
+            subagent_manager,
+            job_store,
+            stop_hook,
+            offline,
+            warnings,
+            permission_mode,
+            extra_roots,
+        } = launched;
+        for warning in &warnings {
             self.history.push(crate::history::HistoryCell::system(
                 self.tr_with(TextId::SystemWarning, &[("message", warning)]),
             ));
         }
-        self.runtime = launched.handle;
-        self.backend_label = launched.backend_label;
-        self.backend_offline = launched.offline;
-        self.session_id = launched.session_id;
-        self.subagent_manager = launched.subagent_manager;
-        self.subagent_shutdown = Some(launched.stop_hook);
-        self.job_store = Some(launched.job_store);
+        self.runtime = handle;
+        self.backend_label = backend_label;
+        self.backend_offline = offline;
+        self.session_id = session_id;
+        self.subagent_manager = subagent_manager;
+        self.subagent_shutdown = Some(stop_hook);
+        self.job_store = Some(job_store);
         // Track the adopted runtime's effective grants, not the ones this App
         // started with: a swap can change them (`/resume` into a session whose
         // record carries grants, `/add-dir`), and every display surface that
         // reads this field — the `/restore` honesty note, the grants banner —
         // must describe the boundary the live runtime actually enforces.
-        self.extra_roots = launched.extra_roots;
+        self.extra_roots = extra_roots;
         // Carry the user's chosen permission mode onto the new runtime's shared
         // handle so a config swap (/model, /apikey, /resume, /clear) doesn't
         // silently reset it.
         let previous_mode = self.permission_mode.get();
-        self.permission_mode = launched.permission_mode;
+        self.permission_mode = permission_mode;
         self.permission_mode.set(previous_mode);
     }
 
