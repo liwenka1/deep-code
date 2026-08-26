@@ -481,6 +481,26 @@ impl GrepFilesTool {
     }
 }
 
+/// `fs::write` with `O_NOFOLLOW` where the platform has it: a symlink at the
+/// final component fails the open instead of being written through.
+///
+/// Windows has no equivalent flag, and `create_new` is not usable here because
+/// overwriting an existing file is the tool's normal job. There the guarantee
+/// is the resolve-time `symlink_metadata` check alone, as before.
+fn write_no_follow(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+
+    options.open(path)?.write_all(content)
+}
+
 /// Append to a skipped-path list unless it already holds
 /// [`SKIPPED_PATHS_LISTED`] entries (the sibling counter keeps the true
 /// total; the list is a sample to act on, not the census).
@@ -550,7 +570,19 @@ impl WriteFileTool {
         // create missing parent directories — preview/approval resolve the
         // same path side-effect-free.
         let path = self.root.prepare_for_write(&params.path, Self::NAME)?;
-        fs::write(&path, &params.content).map_err(|error| {
+        // `fs::write` opens `O_CREAT|O_WRONLY|O_TRUNC` and FOLLOWS a symlink at
+        // the final component. Resolution rejects a symlink that is already
+        // there, but it cannot rule out one planted in the window between that
+        // check and this open — and planting it is an ordinary permitted write
+        // inside a granted root, while these tools run in-process where no
+        // sandbox sees them. `O_NOFOLLOW` states the refusal to the kernel, so
+        // the leaf half of that race closes regardless of timing. The same
+        // lock `jobs::create_spill_file` already uses.
+        //
+        // It does NOT cover a directory symlink planted at an intermediate
+        // segment — `O_NOFOLLOW` only inspects the last component — which
+        // stays the residue described in `prepare_for_write`.
+        write_no_follow(&path, params.content.as_bytes()).map_err(|error| {
             ToolError::exec_failed(
                 Self::NAME,
                 format!("failed to write {}: {error}", path.display()),

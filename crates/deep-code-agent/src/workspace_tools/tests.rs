@@ -235,6 +235,37 @@ async fn grep_files_reports_an_unreadable_directory() {
     assert_eq!(output["matches"][0]["path"], "small.txt");
 }
 
+/// The leaf half of the resolve -> write race, exercised at the syscall lock
+/// rather than through resolution. Resolution refuses a symlink that is
+/// already sitting at the target, but it cannot refuse one planted in the
+/// window between that check and the open — and planting it is an ordinary
+/// permitted write inside a granted root. `O_NOFOLLOW` makes the refusal
+/// timing-independent, so this asserts on the primitive directly: whatever
+/// resolution decided, the write itself will not follow a link.
+///
+/// unix-only because the flag is: Windows has no equivalent, and there the
+/// guarantee remains resolution's `symlink_metadata` check alone.
+#[cfg(unix)]
+#[test]
+fn write_no_follow_refuses_a_symlinked_target() {
+    let tmp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let victim = outside.path().join("victim.txt");
+    fs::write(&victim, "ORIGINAL\n").unwrap();
+    let planted = tmp.path().join("notes.txt");
+    assert!(crate::test_symlinks::symlink_file_for_test(
+        &victim, &planted
+    ));
+
+    let error = super::write_no_follow(&planted, b"OVERWRITTEN\n")
+        .expect_err("a symlinked target must not be written through");
+    assert_eq!(
+        fs::read_to_string(&victim).unwrap(),
+        "ORIGINAL\n",
+        "the link's target was overwritten anyway: {error}"
+    );
+}
+
 #[tokio::test]
 async fn write_file_requires_approval_and_writes_after_approval() {
     let tmp = tempdir().unwrap();
