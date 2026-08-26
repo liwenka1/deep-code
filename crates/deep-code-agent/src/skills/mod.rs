@@ -496,13 +496,17 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    /// `SkillRegistry::discover` is cross-platform, so its cycle termination
+    /// is tested cross-platform: a discovery walk that loops forever is not a
+    /// unix-only way to hang.
     #[test]
     fn symlink_cycles_terminate_without_duplicates() {
         let tmp = TempDir::new().unwrap();
         let nest = tmp.path().join("nest");
         plant_skill(&nest, "looped", "looped", "reachable through a cycle");
-        std::os::unix::fs::symlink(tmp.path(), nest.join("back-up")).unwrap();
+        if !crate::test_symlinks::symlink_dir_for_test(tmp.path(), &nest.join("back-up")) {
+            return;
+        }
 
         let registry = SkillRegistry::discover(tmp.path());
         assert_eq!(registry.len(), 1, "cycle must not multiply skills");

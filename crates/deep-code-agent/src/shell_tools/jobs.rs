@@ -984,7 +984,14 @@ mod tests {
     /// command's own output to any path the uid can reach, with every sandbox
     /// bypassed. Both spellings of the plant are refused, and the failure is
     /// silent-and-honest: no file is claimed.
-    #[cfg(unix)]
+    ///
+    /// Runs on Windows too. The doc above says "no sandbox on any platform
+    /// refuses it", yet this stayed `#[cfg(unix)]` and left the one platform
+    /// with no filesystem confinement at all completely uncovered. Both locks
+    /// that matter here are cross-platform: `ensure_real_dir` uses
+    /// `symlink_metadata`, whose `is_dir()` is false for a Windows directory
+    /// symlink, and `create_new(true)` refuses an existing entry at the final
+    /// component. (`O_NOFOLLOW` and the 0600 mode are the unix-only extras.)
     #[test]
     fn spill_refuses_to_write_through_a_planted_symlink() {
         for plant_the_directory in [false, true] {
@@ -997,10 +1004,14 @@ mod tests {
             let path = run.join("job_1.stdout.log");
             if plant_the_directory {
                 std::fs::create_dir_all(run.parent().unwrap()).unwrap();
-                std::os::unix::fs::symlink(outside.path(), &run).unwrap();
+                if !crate::test_symlinks::symlink_dir_for_test(outside.path(), &run) {
+                    return;
+                }
             } else {
                 std::fs::create_dir_all(&run).unwrap();
-                std::os::unix::fs::symlink(&victim, &path).unwrap();
+                if !crate::test_symlinks::symlink_file_for_test(&victim, &path) {
+                    return;
+                }
             }
 
             let buffer = SharedBuffer::with_spill(path);

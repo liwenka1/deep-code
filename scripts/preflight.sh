@@ -15,12 +15,21 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 
 case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*)
-    # Mirror ci.yml's windows job, which sets NEITHER require variable: an
-    # unconditional DEEPCODE_REQUIRE_SANDBOX here hard-failed on the one
-    # platform whose CI never demands it. DEEPCODE_REQUIRE_SYMLINKS is CI's
-    # business too — the hosted runner is elevated, while a local Windows box
-    # without Developer Mode genuinely cannot create symlinks, and the
-    # symlink tests are designed to skip there.
+    # Neither require variable is set here, and the two have different reasons.
+    #
+    # DEEPCODE_REQUIRE_SANDBOX: ci.yml's windows job does not set it either
+    # (only the three unix jobs do), and an unconditional one here hard-failed
+    # on the one platform whose CI never demands it.
+    #
+    # DEEPCODE_REQUIRE_SYMLINKS: ci.yml's windows job DOES set it — this is a
+    # deliberate divergence, not a mirror. The hosted runner is elevated and
+    # can always create symlinks, so demanding it there turns a runner that
+    # lost the privilege into a red build; a local Windows box without
+    # Developer Mode genuinely cannot, and the tests are designed to skip.
+    # The cost of that choice, stated plainly: on Windows a green preflight
+    # does NOT imply a green CI, and the gap is exactly the symlink boundary
+    # tests. Set DEEPCODE_REQUIRE_SYMLINKS=1 by hand to close it on a box that
+    # has the privilege.
     cargo test --locked --workspace --all-targets
     cargo test --locked --workspace --doc
     ;;

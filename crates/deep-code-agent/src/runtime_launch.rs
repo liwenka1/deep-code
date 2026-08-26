@@ -1009,7 +1009,12 @@ mod tests {
     /// `resume_keeps_a_signed_root_that_still_resolves_to_itself`), but pinning
     /// it this way also pinned the escalation: it made "a signed grant may be
     /// redirected out of the workspace" a regression-gated contract.
-    #[cfg(unix)]
+    ///
+    /// Runs on Windows too: this is the RESUME half of the same TOCTOU story
+    /// whose approval half d84b22c deliberately moved off `#[cfg(unix)]`
+    /// (`root_grant_refuses_when_the_target_changes_under_the_approval`), and
+    /// the resume path itself is cross-platform. Covering one half and not the
+    /// other is how a boundary looks guarded on a platform where it is not.
     #[test]
     fn resume_drops_a_signed_root_that_now_resolves_elsewhere() {
         let workspace = tempfile::TempDir::new().unwrap();
@@ -1019,7 +1024,9 @@ mod tests {
 
         // A spelling that reads as "inside the repo" but resolves out of it.
         let innocuous = ws.join("docs");
-        std::os::unix::fs::symlink(&real_target, &innocuous).unwrap();
+        if !crate::test_symlinks::symlink_dir_for_test(&real_target, &innocuous) {
+            return;
+        }
 
         let mut record = SessionRecord::new(ws.clone(), "prompt");
         record.extra_roots = vec![innocuous.clone()];

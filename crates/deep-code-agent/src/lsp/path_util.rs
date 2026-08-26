@@ -18,17 +18,21 @@ pub fn paths_equal(left: &Path, right: &Path) -> bool {
 mod tests {
     use super::*;
 
+    /// The `#[cfg(unix)]` used to sit on the BODY, not the test: on Windows
+    /// this wrote a file, asserted nothing, and reported `ok` — a vacuously
+    /// green test, the exact shape d84b22c set out to kill. The shared helper
+    /// skips out loud instead, and only where symlinks are genuinely
+    /// impossible.
     #[test]
     fn paths_equal_follows_symlinks() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target.txt");
         std::fs::write(&target, b"x").unwrap();
-        #[cfg(unix)]
-        {
-            let link = dir.path().join("link.txt");
-            std::os::unix::fs::symlink(&target, &link).unwrap();
-            assert!(paths_equal(&target, &link));
+        let link = dir.path().join("link.txt");
+        if !crate::test_symlinks::symlink_file_for_test(&target, &link) {
+            return;
         }
+        assert!(paths_equal(&target, &link));
     }
 
     #[test]
