@@ -144,7 +144,22 @@ impl CheckpointStore {
         // and part-restored. The snapshot itself is untouched and still valid, so
         // re-running the same restore is the recovery — say so, because the raw
         // io error reads like the checkpoint was lost.
-        clear_workspace_contents(&self.workspace)?;
+        //
+        // Both halves get that framing, not just the copy. A failure HERE is
+        // the strictly worse state — files already deleted, nothing put back
+        // yet — and it used to propagate raw: the user was told an unlink
+        // failed and nothing told them their workspace had just been partly
+        // emptied.
+        clear_workspace_contents(&self.workspace).map_err(|error| {
+            ToolError::exec_failed(
+                "checkpoint",
+                format!(
+                    "{error}; the workspace is partially cleared and nothing has been restored \
+                     yet. Snapshot '{}' is intact — re-run the restore to finish it.",
+                    id.0
+                ),
+            )
+        })?;
         copy_tree(&source, &self.workspace, false).map_err(|error| {
             ToolError::exec_failed(
                 "checkpoint",
@@ -266,8 +281,16 @@ fn copy_tree(source: &Path, dest: &Path, skip_meta: bool) -> Result<(), ToolErro
         if file_type.is_symlink() {
             // Preserve the link itself, not its referent: a workspace symlink
             // must survive snapshot → clear → restore instead of being
-            // silently dropped (Unix only; Windows symlinks need privileges
-            // and keep the old skip behavior).
+            // silently dropped.
+            //
+            // Unix only — [`snapshot_can_capture_symlink`] carries the reason
+            // Windows cannot, and the delete side reads that same answer, so a
+            // link this arm fails to record is one `clear_workspace_contents`
+            // refuses to remove. (The wording here used to say Windows "keeps
+            // the old skip behavior". For a directory symlink the old behavior
+            // was an aborted restore, not a skip — and once 45d181a made the
+            // delete succeed, "skip on one side, delete on the other" was
+            // silent permanent loss.)
             #[cfg(unix)]
             {
                 if let Some(parent) = target.parent() {
@@ -406,17 +429,54 @@ mod cow {
     }
 }
 
+/// Whether [`copy_tree`] records symlinks on this platform.
+///
+/// Unix: yes, as the link itself. Windows: no — a junction has no
+/// privilege-free creation API in `std` at all, and a directory symlink needs
+/// `SeCreateSymbolicLinkPrivilege` (or Developer Mode), which an ordinary
+/// account lacks, so `copy_tree`'s symlink arm is `#[cfg(unix)]`.
+///
+/// [`clear_workspace_contents`] keys the delete side off this same answer.
+/// Snapshot and clear must agree on exactly one set of entries, or `restore`
+/// destroys something it cannot put back.
+const fn snapshot_can_capture_symlink() -> bool {
+    cfg!(unix)
+}
+
+/// Empty the workspace of everything [`copy_tree`] put into the snapshot — and
+/// of nothing else.
+///
+/// Symmetry with the snapshot side is the entire contract here: this may
+/// delete only what `restore` is able to write back. It used to break that
+/// twice, in both directions.
+///
+/// 1. `should_skip` excludes [`SKIP_DIRS`] at **any** depth, while this loop
+///    compared only the top-level entry name. So `sub/.git` never entered the
+///    snapshot and `fs::remove_dir_all(sub)` deleted it regardless — a
+///    vendored git clone (normally gitignored, so `git` itself cannot recover
+///    it) lost its whole history, and `restore` still reported success. The
+///    walk below asks `should_skip` about the same relative path the snapshot
+///    side judges, so the two sets are the same set by construction.
+/// 2. Windows symlinks: see the `is_symlink` arm.
 fn clear_workspace_contents(workspace: &Path) -> Result<(), ToolError> {
-    for entry in
-        fs::read_dir(workspace).map_err(|error| checkpoint_error("read workspace", error))?
-    {
+    clear_dir_contents(workspace, workspace).map(|_| ())
+}
+
+/// Returns whether anything under `dir` was deliberately KEPT, which is what
+/// tells the caller not to remove `dir` itself: a directory holding a skipped
+/// `.git` must survive to hold it.
+fn clear_dir_contents(workspace: &Path, dir: &Path) -> Result<bool, ToolError> {
+    let mut kept = false;
+    for entry in fs::read_dir(dir).map_err(|error| checkpoint_error("read workspace", error))? {
         let entry = entry.map_err(|error| checkpoint_error("read workspace entry", error))?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if SKIP_DIRS.iter().any(|skip| *skip == name.as_ref()) {
+        let path = entry.path();
+        // Judged on the path relative to the workspace root, exactly as
+        // `copy_tree` judges it — not on the bare entry name.
+        let relative = path.strip_prefix(workspace).unwrap_or(&path);
+        if should_skip(relative) {
+            kept = true;
             continue;
         }
-        let path = entry.path();
         // `file_type()` (unlike `path.is_dir()`) does not follow symlinks: a
         // link to a directory is removed as the link it is, never traversed
         // into its (possibly workspace-external) referent.
@@ -424,17 +484,34 @@ fn clear_workspace_contents(workspace: &Path) -> Result<(), ToolError> {
             .file_type()
             .map_err(|error| checkpoint_error("stat workspace entry", error))?;
         if file_type.is_symlink() {
-            remove_symlink(&path, &file_type)
-                .map_err(|error| checkpoint_error("clear workspace symlink", error))?;
+            // Deleted only where the snapshot can capture it. Where it cannot
+            // — Windows — removing the link destroys something `restore`
+            // provably cannot recreate, and `restore` still returns Ok, so
+            // the loss is silent and permanent. Before 45d181a the same link
+            // aborted the restore outright; the cure for a loud abort is not
+            // a quiet deletion. Kept instead, which leaves the link standing
+            // rather than the workspace short of one.
+            if snapshot_can_capture_symlink() {
+                remove_symlink(&path, &file_type)
+                    .map_err(|error| checkpoint_error("clear workspace symlink", error))?;
+            } else {
+                kept = true;
+            }
         } else if file_type.is_dir() {
-            fs::remove_dir_all(&path)
-                .map_err(|error| checkpoint_error("clear workspace dir", error))?;
+            // Recurse rather than `remove_dir_all`: the subtree may hold a
+            // skipped directory, and blowing it away is bug 1 above.
+            if clear_dir_contents(workspace, &path)? {
+                kept = true;
+            } else {
+                fs::remove_dir(&path)
+                    .map_err(|error| checkpoint_error("clear workspace dir", error))?;
+            }
         } else {
             fs::remove_file(&path)
                 .map_err(|error| checkpoint_error("clear workspace file", error))?;
         }
     }
-    Ok(())
+    Ok(kept)
 }
 
 /// Delete a symlink as the LINK, on either platform.
@@ -611,6 +688,49 @@ mod tests {
 
         store.restore(&id).unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "v1");
+    }
+
+    /// `should_skip` excludes `SKIP_DIRS` at any depth, so a NESTED `.git` is
+    /// never captured. The delete side used to match only top-level names and
+    /// reach it through `remove_dir_all` on the parent — deleting, with no
+    /// warning and an `Ok` from `restore`, the entire history of a vendored
+    /// clone that is normally gitignored and therefore unrecoverable.
+    ///
+    /// The parent directory has to survive too: it is only there to hold the
+    /// thing being kept.
+    #[test]
+    fn restore_keeps_nested_skip_dirs_it_never_snapshotted() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let nested = root.join("vendor/lib");
+        fs::create_dir_all(nested.join(".git")).unwrap();
+        fs::create_dir_all(nested.join("node_modules")).unwrap();
+        fs::write(nested.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        fs::write(nested.join("node_modules/pkg.js"), "module.exports={}").unwrap();
+        fs::write(nested.join("main.rs"), "v1").unwrap();
+
+        let store = CheckpointStore::new(root).unwrap();
+        let (id, _) = store.snapshot("before_turn").unwrap();
+        fs::write(nested.join("main.rs"), "v2").unwrap();
+        store.restore(&id).unwrap();
+
+        // The tracked file round-trips, as always.
+        assert_eq!(fs::read_to_string(nested.join("main.rs")).unwrap(), "v1");
+        // And the untracked-by-design ones are still there. Existence is
+        // asserted before contents so a deletion reports itself by name
+        // instead of panicking inside `read_to_string`.
+        assert!(
+            nested.join(".git/HEAD").is_file(),
+            "restore deleted a nested .git the snapshot never captured"
+        );
+        assert_eq!(
+            fs::read_to_string(nested.join(".git/HEAD")).unwrap(),
+            "ref: refs/heads/main"
+        );
+        assert!(
+            nested.join("node_modules/pkg.js").is_file(),
+            "restore deleted nested node_modules the snapshot never captured"
+        );
     }
 
     /// A workspace symlink must survive snapshot → clear → restore as a link
