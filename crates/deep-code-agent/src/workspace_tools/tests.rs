@@ -266,6 +266,101 @@ fn write_no_follow_refuses_a_symlinked_target() {
     );
 }
 
+/// Drives one write tool against the real race and reports whether the
+/// out-of-boundary victim survived.
+///
+/// A flipper thread alternates the in-workspace target between a regular file
+/// (holding text `apply_patch` can match) and a symlink pointing outside every
+/// granted root, while `write` is called in a loop. Individual calls are
+/// expected to fail in every way imaginable — ELOOP, missing file, no match —
+/// and their results are deliberately ignored: the only question asked is
+/// whether the victim outside the boundary ever changed.
+#[cfg(unix)]
+fn victim_survives_a_planted_symlink(write: impl Fn(&Path) -> bool) -> String {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let victim = outside.path().join("victim.txt");
+    fs::write(&victim, "ORIGINAL\n").unwrap();
+    let target = tmp.path().join("notes.txt");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let flipper = std::thread::spawn({
+        let (stop, target, victim) = (Arc::clone(&stop), target.clone(), victim.clone());
+        move || {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = fs::remove_file(&target);
+                let _ = std::os::unix::fs::symlink(&victim, &target);
+                let _ = fs::remove_file(&target);
+                let _ = fs::write(&target, "filler\nOLD\n");
+            }
+        }
+    });
+
+    // Bounded: `O_NOFOLLOW` makes the victim untouchable regardless of timing,
+    // so a correct implementation can never fail this no matter how the loop
+    // interleaves. A regressed one escapes within a few dozen iterations.
+    for _ in 0..3000 {
+        if !write(tmp.path()) {
+            break;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    flipper.join().unwrap();
+    fs::read_to_string(&victim).unwrap()
+}
+
+/// The CALL-SITE half of the `O_NOFOLLOW` guarantee, for both tools that write.
+///
+/// `write_no_follow_refuses_a_symlinked_target` above calls the helper
+/// directly, so it proves the primitive and says nothing about whether the
+/// tools use it. That gap is not hypothetical: it is exactly how `apply_patch`
+/// kept a plain `fs::write` through the round that hardened `write_file` —
+/// reverting either call site left the entire workspace green.
+///
+/// `apply_patch`'s window is the wider of the two (resolve, read, fuzzy
+/// `locate_match`, CRLF pass, then open), which is why it escapes fastest when
+/// unlocked; it is also the same `ToolKind::WriteFile` as its twin, so it
+/// auto-approves under `accept_edits`.
+#[cfg(unix)]
+#[test]
+fn write_file_never_follows_a_symlink_planted_mid_write() {
+    let survived = victim_survives_a_planted_symlink(|root| {
+        let policy = WorkspacePolicy::new(root.to_path_buf()).unwrap();
+        let tool = WriteFileTool::new(policy);
+        let _ = tool.write_sync(WriteFileParams {
+            path: "notes.txt".to_string(),
+            content: "PWNED\n".to_string(),
+        });
+        true
+    });
+    assert_eq!(
+        survived, "ORIGINAL\n",
+        "write_file followed a symlink out of the workspace"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_patch_never_follows_a_symlink_planted_mid_write() {
+    let survived = victim_survives_a_planted_symlink(|root| {
+        let policy = WorkspacePolicy::new(root.to_path_buf()).unwrap();
+        let tool = ApplyPatchTool::new(policy);
+        let _ = tool.patch_sync(ApplyPatchParams {
+            path: "notes.txt".to_string(),
+            old: "OLD".to_string(),
+            new: "PWNED".to_string(),
+        });
+        true
+    });
+    assert_eq!(
+        survived, "ORIGINAL\n",
+        "apply_patch followed a symlink out of the workspace"
+    );
+}
+
 #[tokio::test]
 async fn write_file_requires_approval_and_writes_after_approval() {
     let tmp = tempdir().unwrap();

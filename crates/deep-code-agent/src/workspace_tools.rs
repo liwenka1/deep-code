@@ -505,6 +505,34 @@ fn write_no_follow(path: &std::path::Path, content: &[u8]) -> std::io::Result<()
     options.open(path)?.write_all(content)
 }
 
+/// [`write_no_follow`]'s failure, mapped to a message that names the rule.
+///
+/// `O_NOFOLLOW` refuses a symlinked final component with `ELOOP`, whose stock
+/// text is "Too many levels of symbolic links" — for a *single* link. Handed
+/// that bare, the model reads a loop it must have built rather than the
+/// boundary it just hit, and retries into word salad. This is the same
+/// unreadable-errno problem [`WorkspacePolicy::prepare_for_write`] grew a
+/// diagnosis for; the write leaf gets the matching half.
+///
+/// Only the last component is in question: resolution already refused a
+/// symlink that was there beforehand, and an intermediate loop would have
+/// failed the canonicalize before this open. So `ELOOP` here means the leaf,
+/// and it means the race — which is exactly what the caller needs told.
+fn write_failed(tool_name: &str, path: &std::path::Path, error: &std::io::Error) -> ToolError {
+    #[cfg(unix)]
+    let diagnosis = if error.raw_os_error() == Some(libc::ELOOP) {
+        " (the final path component is a symlink; symlinks are never written through)"
+    } else {
+        ""
+    };
+    #[cfg(not(unix))]
+    let diagnosis = "";
+    ToolError::exec_failed(
+        tool_name,
+        format!("failed to write {}: {error}{diagnosis}", path.display()),
+    )
+}
+
 /// Append to a skipped-path list unless it already holds
 /// [`SKIPPED_PATHS_LISTED`] entries (the sibling counter keeps the true
 /// total; the list is a sample to act on, not the census).
@@ -586,12 +614,8 @@ impl WriteFileTool {
         // It does NOT cover a directory symlink planted at an intermediate
         // segment — `O_NOFOLLOW` only inspects the last component — which
         // stays the residue described in `prepare_for_write`.
-        write_no_follow(&path, params.content.as_bytes()).map_err(|error| {
-            ToolError::exec_failed(
-                Self::NAME,
-                format!("failed to write {}: {error}", path.display()),
-            )
-        })?;
+        write_no_follow(&path, params.content.as_bytes())
+            .map_err(|error| write_failed(Self::NAME, &path, &error))?;
         Ok(ToolOutput::text(json_string(json!({
             "path": self.root.relative_display(&path),
             "bytes_written": params.content.len()
@@ -684,12 +708,16 @@ impl ApplyPatchTool {
             replacement,
             &contents[located.end..]
         );
-        fs::write(&path, updated).map_err(|error| {
-            ToolError::exec_failed(
-                Self::NAME,
-                format!("failed to write {}: {error}", path.display()),
-            )
-        })?;
+        // `write_no_follow`, not `fs::write`, for the reason spelled out at
+        // `WriteFileTool::write_sync` — and here the window is WIDER, not
+        // narrower: `resolve_existing` above is followed by a read, a fuzzy
+        // `locate_match`, and a CRLF pass before this open, all of which a
+        // concurrent `job` can outlive. `apply_patch` is the same
+        // `ToolKind::WriteFile` as `write_file` and auto-approves under
+        // `accept_edits`, so leaving it on the following open made the lock on
+        // its twin decorative.
+        write_no_follow(&path, updated.as_bytes())
+            .map_err(|error| write_failed(Self::NAME, &path, &error))?;
         Ok(ToolOutput::text(json_string(json!({
             "path": display,
             "replacements": 1,
