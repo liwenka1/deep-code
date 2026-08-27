@@ -438,12 +438,19 @@ impl WorkspacePolicy {
             // existing directory, and a gate here would only read like a
             // semantic guard while widening the race window above.
             fs::create_dir_all(parent).map_err(|error| {
-                // Two failures reach here wearing the same errno (17, "File
-                // exists"), and neither reads as its own cause: a symlink
-                // planted or dangling among the segments resolution vetted as
-                // merely missing, and an ordinary FILE sitting where a
-                // directory has to go. Name whichever it is, so the model
-                // learns the rule instead of retrying into word salad.
+                // Two failures reach here, and neither errno reads as its own
+                // cause: a symlink planted or dangling among the segments
+                // resolution vetted as merely missing, and an ordinary FILE
+                // sitting where a directory has to go. Name whichever it is,
+                // so the model learns the rule instead of retrying into word
+                // salad.
+                //
+                // Not one shared errno, as this note used to claim. The
+                // symlink is EEXIST(17); the file is EEXIST only when it
+                // blocks at the FINAL segment of `parent`, and ENOTDIR(20)
+                // whenever it blocks further up — which is the shape
+                // `prepare_for_write_names_the_file_blocking_the_directory`
+                // actually builds. Unreadable either way, which is the point.
                 //
                 // `unwrap_or(false)` on the probe: if the inspection itself
                 // fails we do not know, and guessing "symlink" would be a
@@ -740,6 +747,41 @@ mod tests {
             .unwrap();
         assert_eq!(resolved, target);
         assert!(extra.join("src/new_mod").is_dir());
+    }
+
+    /// The `starts_with` filter on the fast-forward is load-bearing and had
+    /// nothing pinning it: deleting it — so `start` becomes the deepest root
+    /// granted, covering this path or not — left the whole lib suite green
+    /// while making `contains_symlink` skip every segment under a SHALLOWER
+    /// root. With `--add-dir` granting something deeper than the primary
+    /// workspace, that is the boundary silently ceasing to detect symlinks in
+    /// the workspace itself.
+    ///
+    /// The off-by-one direction was already covered (`start + 1` fails three
+    /// tests); this is the other axis, and it needs two roots at different
+    /// depths to show up at all.
+    #[test]
+    fn contains_symlink_still_checks_a_shallow_root_when_a_deeper_one_is_granted() {
+        let (_a, primary) = canonical_tempdir();
+        let (_b, base) = canonical_tempdir();
+        // An extra root several levels deeper than the primary, as `--add-dir`
+        // into a nested project directory would produce.
+        let deeper = base.join("a/b/c/d");
+        fs::create_dir_all(&deeper).unwrap();
+        let deeper = deeper.canonicalize().unwrap();
+
+        let target = primary.join("real");
+        fs::create_dir(&target).unwrap();
+        let link = primary.join("link");
+        if !symlink_dir_for_test(&target, &link) {
+            return;
+        }
+
+        let roots = [primary, deeper];
+        assert!(
+            contains_symlink(&link.join("inner"), &roots).unwrap(),
+            "a symlink under the shallow root must still be caught while a deeper root is granted"
+        );
     }
 
     /// A dangling symlink posing as a missing PARENT segment gets past

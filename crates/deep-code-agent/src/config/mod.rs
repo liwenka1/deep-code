@@ -74,9 +74,15 @@ pub struct AgentConfig {
     pub stream_total_timeout: Duration,
     /// Abort when cumulative streamed content exceeds this size.
     pub stream_max_bytes: u64,
-    /// Tool-name prefixes the user pre-approved: gated calls matching one of
-    /// these run without prompting. Only env and the global config file may
-    /// set this — project files are ignored (a repo must not disarm gates).
+    /// Full tool names the user pre-approved: a gated call whose name matches
+    /// one of these EXACTLY runs without prompting. Not a prefix — `read_`
+    /// grants nothing, and a tool added later whose name extends a consented
+    /// entry does not ship pre-approved.
+    ///
+    /// Consulted before the permission mode, so an entry here runs even in
+    /// `default`; `request_write_root` is refused in every mode regardless.
+    /// Only env and the global config file may set this — project files are
+    /// ignored (a repo must not disarm gates).
     pub approval_auto_allow: Vec<String>,
     /// Checkpoint retention cap: oldest snapshots beyond this count are
     /// pruned after each new snapshot (0 disables pruning).

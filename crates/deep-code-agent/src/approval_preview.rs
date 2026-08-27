@@ -211,6 +211,19 @@ mod tests {
             preview.contains(&format!("{} MiB", crate::workspace_tools::MAX_FILE_MIB)),
             "the preview must name the limit it actually enforced: {preview}"
         );
+        // ...and the assertion above, alone, is a tautology at today's value:
+        // `contains("2 MiB")` is equally true of a locale string with "2 MiB"
+        // hardcoded, so reverting the derivation outright left this test — and
+        // all eight in this module — green. What actually distinguishes the two
+        // is whether the pack still carries the placeholder, so assert on that
+        // directly, in both languages, rather than on a rendering that cannot
+        // tell them apart until someone bumps the constant.
+        for lang in [Lang::En, Lang::Zh] {
+            assert!(
+                crate::i18n::tr(lang, crate::i18n::TextId::PreviewFileTooBig).contains("{limit}"),
+                "{lang:?} must take the limit as a parameter, not spell it out"
+            );
+        }
     }
 
     /// Rendering an approval prompt must not touch the workspace: the mkdir

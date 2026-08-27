@@ -499,10 +499,12 @@ fn neutralize_char_into(out: &mut String, ch: char) {
 /// spaces rather than one, because code blocks reach here tab-indented and
 /// collapsing that to a single column misreads the code. That is the one
 /// place this function does NOT preserve the wrap step's column count —
-/// `UnicodeWidthStr` scores `\t` as 0, so each tab adds four columns after
-/// the budget was set. ratatui truncates the overflow rather than bleeding
-/// into a neighbouring widget, so a deeply tab-indented line loses its tail;
-/// that is the accepted trade for readable indentation.
+/// `UnicodeWidthStr::width("\t")` is 1 (it is `UnicodeWidthChar` that returns
+/// `None`, and the wrap step measures graphemes through the `Str` form), so
+/// each tab adds three columns beyond the budget, not four. ratatui truncates
+/// the overflow rather than bleeding into a neighbouring widget, so a deeply
+/// tab-indented line loses its tail; that is the accepted trade for readable
+/// indentation.
 fn neutralize_transcript_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
