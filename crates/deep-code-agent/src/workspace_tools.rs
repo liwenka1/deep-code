@@ -298,23 +298,37 @@ impl GrepFilesTool {
         let mut files_searched = 0usize;
         // Refusals are counted, not silently dropped: a file this loop refuses
         // to search is a place a match may be hiding, and "0 matches" without
-        // the counts reads as "searched everything, found nothing". Two
-        // ledgers — the size cap, and anything that could not be read (an IO
-        // error, non-UTF-8 content, or a directory the walk itself could not
-        // open, which takes its whole subtree with it). Paths are listed
-        // (capped) so the caller can actually go look.
+        // the counts reads as "searched everything, found nothing". Four
+        // ledgers, split by what the caller would DO about each — one bucket
+        // holding four unrelated causes is a list of actionless action items:
         //
-        // Two deliberate non-ledgers, for different reasons. Symlinked paths:
-        // the boundary refuses them on every tool, grep is not special.
-        // `standard_filters` exclusions (hidden files, .gitignore/.ignore):
-        // these are the LARGEST class of unsearched files by far, and counting
-        // them per call would drown the real refusals in thousands of
-        // `target/` entries — so they are declared once, in `description()`,
-        // where the caller learns the rule instead of re-reading a census.
+        // * oversized — over the size cap, greppable by other means
+        // * binary — not UTF-8, so no regex over text was ever going to match
+        // * symlink — refused by the boundary, not by a coverage limit
+        // * unreadable — a genuine IO failure, incl. a directory the walk
+        //   could not open, which takes its whole subtree with it
+        //
+        // Paths are listed (capped) so the caller can actually go look.
+        //
+        // One deliberate non-ledger: `standard_filters` exclusions (hidden
+        // files, .gitignore/.ignore/.git/info/exclude, the global excludes
+        // file, and ignore files in ancestors ABOVE the workspace). These are
+        // the LARGEST class of unsearched files by far, and counting them per
+        // call would drown the real refusals in thousands of `target/`
+        // entries — so they are declared once, in `description()`, where the
+        // caller learns the rule instead of re-reading a census.
         let mut skipped_oversized = 0usize;
         let mut skipped_oversized_paths: Vec<String> = Vec::new();
+        let mut skipped_binary = 0usize;
+        let mut skipped_binary_paths: Vec<String> = Vec::new();
+        let mut skipped_symlinks = 0usize;
+        let mut skipped_symlink_paths: Vec<String> = Vec::new();
         let mut skipped_unreadable = 0usize;
         let mut skipped_unreadable_paths: Vec<String> = Vec::new();
+        // A directory the walk could not open hides an unknown number of files
+        // beneath it, so every count above becomes a floor rather than a
+        // census — the same caveat truncation carries, from a different cause.
+        let mut subtree_lost = false;
         let mut matches = Vec::new();
         // Boundary snapshot taken once: `granted_roots()` locks and clones per
         // call, and this loop visits every file in the tree — per-file calls
@@ -333,20 +347,33 @@ impl GrepFilesTool {
                 // vanished mid-walk) surfaces here, and dropping it silently
                 // discarded everything beneath it — the same "searched
                 // everything, found nothing" lie the per-file ledgers exist to
-                // prevent, one level up and far larger. Counted as unreadable
-                // like any other refusal; `ignore` carries the offending path
-                // on the error, so the caller still gets somewhere to look.
+                // prevent, one level up and far larger.
+                //
+                // But ONLY an IO failure costs coverage. `Walk` yields `Err`
+                // for non-fatal problems too — most commonly a glob it could
+                // not parse in an ignore file, and `standard_filters(true)`
+                // implies `parents(true)`, so that includes ignore files in
+                // every ANCESTOR of the search path — after which the walk
+                // proceeds and searches everything anyway. Counting those
+                // invented a permanent phantom gap that fired on every call in
+                // such a workspace: the exact mirror of the lie this ledger
+                // exists to prevent, and one that teaches the model to
+                // distrust a correct "0 matches". The reported "path" was an
+                // ignore file too, possibly outside every granted root, which
+                // the note then told the caller to go shell-grep.
                 Err(error) => {
+                    if !error.is_io() {
+                        continue;
+                    }
+                    subtree_lost = true;
                     skipped_unreadable += 1;
                     push_capped(
                         &mut skipped_unreadable_paths,
-                        match &error {
-                            ignore::Error::WithPath { path, .. } => {
-                                self.root.relative_display(path)
-                            }
-                            // No path on the error (a loop or a partial read):
+                        match ignore_error_path(&error) {
+                            Some(path) => self.root.relative_display(path),
+                            // No path on the error (a loop, a partial read):
                             // the message is all there is, and it beats silence.
-                            other => other.to_string(),
+                            None => error.to_string(),
                         },
                     );
                     continue;
@@ -361,12 +388,34 @@ impl GrepFilesTool {
             let Some(file_type) = entry.file_type() else {
                 continue;
             };
+            // A symlink is refused, and refused ON THE RECORD — this is where
+            // `follow_links(false)` surfaces it, before `contains_symlink`
+            // below ever sees it, so counting only there caught links in
+            // ancestor directories and let a directly-linked file vanish.
+            if file_type.is_symlink() {
+                skipped_symlinks += 1;
+                push_capped(&mut skipped_symlink_paths, self.root.relative_display(path));
+                continue;
+            }
             if !file_type.is_file() {
+                // Directories (the walk descends into them separately) and
+                // non-regular files — FIFO, socket, device. Nothing a text
+                // regex was ever going to search, and nothing the caller could
+                // do about it, so this one stays uncounted on purpose.
                 continue;
             }
             match contains_symlink(path, &granted_roots) {
-                // Boundary policy, not a coverage gap (see the ledger note).
-                Ok(true) => continue,
+                // Boundary policy rather than a coverage limit — but still a
+                // place a match may be hiding, and grep is the ONE tool where
+                // the caller cannot tell the difference: `read_file` and
+                // `apply_patch` answer a symlinked path with an explicit
+                // "symlinks are not allowed", while here it used to be
+                // indistinguishable from the file not existing.
+                Ok(true) => {
+                    skipped_symlinks += 1;
+                    push_capped(&mut skipped_symlink_paths, self.root.relative_display(path));
+                    continue;
+                }
                 Ok(false) => {}
                 // An lstat that itself failed: fail closed AND on the record.
                 Err(_) => {
@@ -401,13 +450,27 @@ impl GrepFilesTool {
                 );
                 continue;
             }
-            let Ok(contents) = fs::read_to_string(path) else {
-                skipped_unreadable += 1;
-                push_capped(
-                    &mut skipped_unreadable_paths,
-                    self.root.relative_display(path),
-                );
-                continue;
+            let contents = match fs::read_to_string(path) {
+                Ok(contents) => contents,
+                // `InvalidData` is "not UTF-8" — a PNG, not a permission
+                // problem. Filed together they produced an unanswerable list:
+                // any repo with non-ignored images reported a dozen
+                // "unreadable" files on every call, each one an action item
+                // the caller cannot triage and none of which a text regex was
+                // ever going to match.
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    skipped_binary += 1;
+                    push_capped(&mut skipped_binary_paths, self.root.relative_display(path));
+                    continue;
+                }
+                Err(_) => {
+                    skipped_unreadable += 1;
+                    push_capped(
+                        &mut skipped_unreadable_paths,
+                        self.root.relative_display(path),
+                    );
+                    continue;
+                }
             };
             files_searched += 1;
             let lines = contents.lines().collect::<Vec<_>>();
@@ -437,35 +500,64 @@ impl GrepFilesTool {
             }
         }
 
+        let truncated = matches.len() >= max_results;
         let mut result = json!({
             "pattern": pattern,
             "path": self.root.relative_display(&search_path),
             "files_searched": files_searched,
             "skipped_oversized": skipped_oversized,
+            "skipped_binary": skipped_binary,
+            "skipped_symlinks": skipped_symlinks,
             "skipped_unreadable": skipped_unreadable,
-            "truncated": matches.len() >= max_results,
+            "truncated": truncated,
             "matches": matches
         });
-        if !skipped_oversized_paths.is_empty() {
-            result["skipped_oversized_paths"] = json!(skipped_oversized_paths);
-        }
-        if !skipped_unreadable_paths.is_empty() {
-            result["skipped_unreadable_paths"] = json!(skipped_unreadable_paths);
-        }
-        if skipped_oversized > 0 || skipped_unreadable > 0 {
-            let mut parts = Vec::new();
-            if skipped_oversized > 0 {
-                parts.push(format!(
-                    "{skipped_oversized} file(s) over the {MAX_FILE_MIB} MiB search limit"
-                ));
+        let mut parts = Vec::new();
+        for (count, paths, key, phrase) in [
+            (
+                skipped_oversized,
+                skipped_oversized_paths,
+                "skipped_oversized_paths",
+                format!("{skipped_oversized} file(s) over the {MAX_FILE_MIB} MiB search limit"),
+            ),
+            (
+                skipped_binary,
+                skipped_binary_paths,
+                "skipped_binary_paths",
+                format!("{skipped_binary} non-UTF-8 file(s)"),
+            ),
+            (
+                skipped_symlinks,
+                skipped_symlink_paths,
+                "skipped_symlink_paths",
+                format!("{skipped_symlinks} symlinked path(s), refused by the workspace boundary"),
+            ),
+            (
+                skipped_unreadable,
+                skipped_unreadable_paths,
+                "skipped_unreadable_paths",
+                format!("{skipped_unreadable} unreadable path(s)"),
+            ),
+        ] {
+            if count == 0 {
+                continue;
             }
-            if skipped_unreadable > 0 {
-                parts.push(format!("{skipped_unreadable} unreadable file(s)"));
-            }
-            // Truncation stops the walk mid-tree, so what was counted so far is
-            // a floor, not a census. Saying "not searched: 3" when the walk
-            // never finished would be a different flavour of the same lie.
-            let census = if matches.len() >= max_results {
+            let listed = paths.len();
+            result[key] = json!(paths);
+            parts.push(if listed < count {
+                format!("{phrase} (first {listed} listed)")
+            } else {
+                phrase
+            });
+        }
+        if !parts.is_empty() {
+            // What was counted is a floor, not a census, whenever the walk did
+            // not finish. TWO causes, not one: truncation stops it mid-tree,
+            // and a directory it could not open hides an unknown number of
+            // files beneath it — the second used to be missing here, so a
+            // mode-000 directory holding ten thousand files reported "not
+            // searched: 1 unreadable file(s)" with no hedge at all.
+            let census = if truncated || subtree_lost {
                 "at least "
             } else {
                 ""
@@ -473,12 +565,12 @@ impl GrepFilesTool {
             // No promise the caller cannot keep: shell grep needs approval in
             // gated contexts, so the paths themselves are the reliable part of
             // this note — enough to report the gap even when no tool can close
-            // it.
+            // it. Symlinked paths are the exception the sentence must not
+            // over-promise on: the boundary refuses those to every tool.
             result["note"] = json!(format!(
-                "not searched: {census}{} — see the skipped_*_paths lists (first {} each); \
-                 the shell tool can grep them where approval allows",
-                parts.join(" and "),
-                SKIPPED_PATHS_LISTED
+                "not searched: {census}{} — see the skipped_*_paths lists; the shell tool can \
+                 grep the non-symlinked ones where approval allows",
+                parts.join(", ")
             ));
         }
         Ok(ToolOutput::text(json_string(result)))
@@ -533,6 +625,21 @@ fn write_failed(tool_name: &str, path: &std::path::Path, error: &std::io::Error)
     )
 }
 
+/// The path an `ignore` walk error is about, dug out of its wrappers.
+///
+/// `WithDepth` and `WithLineNumber` nest AROUND `WithPath`, so matching only
+/// the outermost variant misses the path on exactly the errors that carry the
+/// most context.
+fn ignore_error_path(error: &ignore::Error) -> Option<&std::path::Path> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            ignore_error_path(err)
+        }
+        _ => None,
+    }
+}
+
 /// Append to a skipped-path list unless it already holds
 /// [`SKIPPED_PATHS_LISTED`] entries (the sibling counter keeps the true
 /// total; the list is a sample to act on, not the census).
@@ -569,14 +676,25 @@ impl Tool for GrepFilesTool {
     /// ledgers in the output cover files the loop refused one at a time, but
     /// the walker's standard filters drop far more before the loop ever sees
     /// them — and those never appear in any count, so a caller reading
-    /// "0 matches" has no way to learn that `.gitignore` hid the answer.
+    /// "0 matches" has no way to learn that an ignore rule hid the answer.
     /// Saying so here is the only place that gap can be closed.
+    ///
+    /// So it has to name ALL of `standard_filters(true)`, which is six rules,
+    /// not the two the old wording listed: `hidden`, `parents`, `ignore`,
+    /// `git_ignore`, `git_global`, `git_exclude`. The three that were missing
+    /// are exactly the ones a caller cannot guess. This very repository
+    /// excludes `docs/` through `.git/info/exclude` — not hidden, not in any
+    /// `.gitignore` — so "is the bot design documented?" answered `0 matches`
+    /// against a contract that could not explain it.
     fn description(&self) -> &str {
         "Search UTF-8 workspace files with a regex. Returns structured matches with file, line \
-         number, and context. Hidden files and anything excluded by .gitignore/.ignore are NOT \
-         searched and are not counted anywhere — use the shell tool if you need those. Files \
-         refused individually (over the size limit, or unreadable) are reported in \
-         skipped_oversized/skipped_unreadable with their paths."
+         number, and context. NOT searched and NOT counted anywhere: hidden files, and anything \
+         excluded by .gitignore/.ignore, .git/info/exclude, the global core.excludesFile, or an \
+         ignore file in any parent directory above the workspace — use the shell tool if you \
+         need those. Files refused individually are reported with their paths in \
+         skipped_oversized (over the size limit), skipped_binary (not UTF-8), skipped_symlinks \
+         (refused by the workspace boundary), and skipped_unreadable (IO failure; a directory \
+         that cannot be opened hides its whole subtree)."
     }
 
     async fn run(&self, params: GrepFilesParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {

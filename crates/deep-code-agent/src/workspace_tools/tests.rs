@@ -159,11 +159,17 @@ async fn grep_files_reports_oversized_files_instead_of_skipping_silently() {
     assert_eq!(output["matches"][0]["path"], "small.txt");
 }
 
-/// The other refusal ledger: a file that cannot be read (here: invalid UTF-8)
-/// used to vanish without a trace — not in `files_searched`, not in any
-/// count — which is the same "searched everything" lie in a different branch.
+/// A file that cannot be decoded used to vanish without a trace — not in
+/// `files_searched`, not in any count — the same "searched everything" lie in
+/// a different branch.
+///
+/// It gets its OWN ledger rather than sharing "unreadable" with a permission
+/// failure, because the two need opposite responses and only one of them is
+/// worth acting on. Any repo with non-ignored images reported a dozen
+/// "unreadable" files on every single call; a text regex was never going to
+/// match a PNG, so each was an action item the caller could not triage.
 #[tokio::test]
-async fn grep_files_reports_unreadable_files_instead_of_skipping_silently() {
+async fn grep_files_files_a_non_utf8_file_as_binary_not_unreadable() {
     let tmp = tempdir().unwrap();
     fs::write(tmp.path().join("small.txt"), "needle in the small file\n").unwrap();
     fs::write(tmp.path().join("binary.bin"), [0xFF, 0xFE, b'n', 0x80]).unwrap();
@@ -171,21 +177,89 @@ async fn grep_files_reports_unreadable_files_instead_of_skipping_silently() {
     let result = run(tmp.path(), "grep_files", json!({"pattern": "needle"})).await;
     let output: Value = serde_json::from_str(&result.content).unwrap();
 
-    assert_eq!(output["skipped_unreadable"], 1, "{output}");
+    assert_eq!(output["skipped_binary"], 1, "{output}");
     assert_eq!(
-        output["skipped_unreadable_paths"],
+        output["skipped_binary_paths"],
         json!(["binary.bin"]),
         "{output}"
+    );
+    assert_eq!(
+        output["skipped_unreadable"], 0,
+        "a decode failure is not a permission failure: {output}"
     );
     assert!(
         output["note"]
             .as_str()
             .expect("a skipped file must leave a note")
-            .contains("1 unreadable"),
+            .contains("1 non-UTF-8"),
         "{output}"
     );
     assert_eq!(output["files_searched"], 1, "{output}");
     assert_eq!(output["matches"].as_array().unwrap().len(), 1);
+}
+
+/// A glob `ignore` cannot parse — in a `.gitignore` here, or in any ancestor,
+/// since `standard_filters(true)` implies `parents(true)` — is reported
+/// through the SAME `Err` channel as an unreadable directory, and then the
+/// walk proceeds and searches everything anyway.
+///
+/// Counting it invented a phantom gap that fired on every call in such a
+/// workspace: the exact mirror of the lie the ledger exists to prevent. The
+/// "path" was an ignore file, and with the bad glob in a parent it was a path
+/// outside every granted root — which the note then told the caller to go
+/// shell-grep.
+#[tokio::test]
+async fn grep_files_does_not_invent_a_refusal_from_a_bad_ignore_glob() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join(".gitignore"), "foo{bar\n").unwrap();
+    fs::write(tmp.path().join("a.txt"), "needle one\n").unwrap();
+    fs::write(tmp.path().join("b.txt"), "needle two\n").unwrap();
+
+    let result = run(tmp.path(), "grep_files", json!({"pattern": "needle"})).await;
+    let output: Value = serde_json::from_str(&result.content).unwrap();
+
+    assert_eq!(output["files_searched"], 2, "{output}");
+    assert_eq!(output["matches"].as_array().unwrap().len(), 2, "{output}");
+    assert_eq!(
+        output["skipped_unreadable"], 0,
+        "nothing was skipped, so nothing may be reported as skipped: {output}"
+    );
+    assert!(
+        output["note"].is_null(),
+        "a fully-searched tree must carry no not-searched note: {output}"
+    );
+}
+
+/// A symlinked file is refused by the boundary, not by a coverage limit — but
+/// grep is the one tool where the caller cannot tell that apart from the file
+/// not existing. `read_file` and `apply_patch` answer such a path with an
+/// explicit "symlinks are not allowed"; here it used to be silence.
+#[cfg(unix)]
+#[tokio::test]
+async fn grep_files_reports_a_symlinked_file_rather_than_dropping_it() {
+    let tmp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let target = outside.path().join("secret.txt");
+    fs::write(&target, "needle in the linked file\n").unwrap();
+    fs::write(tmp.path().join("plain.txt"), "needle in the plain file\n").unwrap();
+    assert!(crate::test_symlinks::symlink_file_for_test(
+        &target,
+        &tmp.path().join("link.txt")
+    ));
+
+    let result = run(tmp.path(), "grep_files", json!({"pattern": "needle"})).await;
+    let output: Value = serde_json::from_str(&result.content).unwrap();
+
+    assert_eq!(output["skipped_symlinks"], 1, "{output}");
+    assert_eq!(
+        output["skipped_symlink_paths"],
+        json!(["link.txt"]),
+        "{output}"
+    );
+    // Refused, so its contents never reached the caller.
+    assert_eq!(output["files_searched"], 1, "{output}");
+    assert_eq!(output["matches"].as_array().unwrap().len(), 1, "{output}");
+    assert_eq!(output["matches"][0]["path"], "plain.txt");
 }
 
 /// A directory the walk itself cannot open takes its ENTIRE subtree with it —

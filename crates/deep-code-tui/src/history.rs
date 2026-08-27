@@ -345,15 +345,25 @@ fn summarize_json_tool_result(value: &serde_json::Value) -> Option<String> {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         // The refusal ledgers ride along or the human is lied to: grep counts
-        // files it refused to search (oversized/unreadable), and a summary
-        // reading "0 matches across 5 files" while three were skipped is
-        // exactly the "searched everything, found nothing" misread the counts
-        // exist to prevent — surfaced to the model in the JSON, so the person
-        // watching the panel deserves the same honesty.
-        let skipped = ["skipped_oversized", "skipped_unreadable"]
-            .iter()
-            .filter_map(|key| object.get(*key).and_then(serde_json::Value::as_u64))
-            .sum::<u64>();
+        // files it refused to search, and a summary reading "0 matches across
+        // 5 files" while three were skipped is exactly the "searched
+        // everything, found nothing" misread the counts exist to prevent —
+        // surfaced to the model in the JSON, so the person watching the panel
+        // deserves the same honesty.
+        //
+        // ALL of them. This list has to track the tool's ledgers or a newly
+        // split-out bucket silently stops reaching the line — which is what
+        // splitting binary/symlink out of "unreadable" would otherwise have
+        // done, quietly shrinking the number the human is shown.
+        let skipped = [
+            "skipped_oversized",
+            "skipped_binary",
+            "skipped_symlinks",
+            "skipped_unreadable",
+        ]
+        .iter()
+        .filter_map(|key| object.get(*key).and_then(serde_json::Value::as_u64))
+        .sum::<u64>();
         let skipped = if skipped > 0 {
             format!(", skipped={skipped}")
         } else {
@@ -587,17 +597,21 @@ mod tests {
     /// were added to prevent — for the human this line is all there is.
     #[test]
     fn grep_summary_surfaces_skipped_files() {
+        // Every ledger the tool emits, so a bucket that stops being summed
+        // here shows up as a wrong total rather than as nothing at all.
         let with_skips = summarize_tool_result(
             r#"{"path":"logs","files_searched":5,"matches":[],"truncated":false,
-                "skipped_oversized":2,"skipped_unreadable":1}"#,
+                "skipped_oversized":2,"skipped_binary":3,"skipped_symlinks":4,
+                "skipped_unreadable":1}"#,
         );
         assert_eq!(
             with_skips,
-            "logs: 0 matches across 5 files (truncated=false, skipped=3)"
+            "logs: 0 matches across 5 files (truncated=false, skipped=10)"
         );
         let clean = summarize_tool_result(
             r#"{"path":"src","files_searched":5,"matches":[],"truncated":false,
-                "skipped_oversized":0,"skipped_unreadable":0}"#,
+                "skipped_oversized":0,"skipped_binary":0,"skipped_symlinks":0,
+                "skipped_unreadable":0}"#,
         );
         assert_eq!(clean, "src: 0 matches across 5 files (truncated=false)");
     }
