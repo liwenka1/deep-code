@@ -22,6 +22,7 @@ use ratatui::widgets::{Block, Padding, Paragraph};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::cli::StartupIntent;
+use crate::ui::render::neutralize_display_text;
 use deep_code_agent::i18n::{Lang, TextId, tr, tr_with};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,9 +139,12 @@ fn run_picker(sessions: &[SessionRecord], lang: Lang) -> Result<StartupChoice> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
+    // `record.workspace` is a path deserialized from the session JSON, which
+    // lives in the tree the model can write — the same poisoned record that
+    // owns the title above owns this line.
     let note = sessions
         .first()
-        .map(|r| format_sessions_storage_note(&r.workspace))
+        .map(|r| neutralize_display_text(&format_sessions_storage_note(&r.workspace)))
         .unwrap_or_default();
     let now = now_ms();
     let mut selected = 0usize;
@@ -178,7 +182,16 @@ fn run_picker(sessions: &[SessionRecord], lang: Lang) -> Result<StartupChoice> {
                 .take(viewport)
                 .map(|(index, record)| {
                     let time = relative_time(now, record.updated_at_ms, lang);
-                    let title = session_title(record, lang);
+                    // Same rule, same reason, as the in-app twin in
+                    // `ui::render::render_resume_picker`: session records live
+                    // at `<workspace>/.deep-code/sessions`, inside the tree the
+                    // model can write, `list()` validates only the FILENAME and
+                    // never the record body, and `session_title` builds this row
+                    // with `split_whitespace`, which keeps `\x1b` intact. This
+                    // copy runs on a real backend before `App` exists — it is
+                    // the first thing the user sees — and was left unsanitized
+                    // when the twin was fixed.
+                    let title = neutralize_display_text(&session_title(record, lang));
                     if index == selected {
                         Line::from(vec![
                             Span::styled(

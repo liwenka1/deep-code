@@ -1,5 +1,9 @@
 mod input;
-mod render;
+// `pub(crate)` for the sanitizer alone: `startup.rs` draws its own resume
+// picker on a real backend before `App` exists, and it has to neutralize the
+// same model- and repo-controlled strings this module does. Two renderers
+// painting the same screen deserve one filter, not a copy each.
+pub(crate) mod render;
 
 use std::io::{self, Stdout, Write};
 use std::time::{Duration, Instant};

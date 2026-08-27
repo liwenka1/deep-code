@@ -176,10 +176,17 @@ fn render_resume_picker(frame: &mut Frame<'_>, picker: &crate::app::ResumePicker
     let list = Paragraph::new(rows).block(Block::default().padding(Padding::new(1, 0, 0, 0)));
     frame.render_widget(list, chunks[1]);
 
+    // `record.workspace` is a path deserialized from the session JSON, which
+    // lives in the tree the model can write — the same poisoned record that
+    // owns the title above owns this line, 30 rows further down the function.
     let note = picker
         .sessions
         .first()
-        .map(|record| deep_code_agent::format_sessions_storage_note(&record.workspace))
+        .map(|record| {
+            neutralize_display_text(&deep_code_agent::format_sessions_storage_note(
+                &record.workspace,
+            ))
+        })
         .unwrap_or_default();
     let help = Paragraph::new(vec![
         Line::from(Span::styled(
@@ -731,7 +738,7 @@ fn extract_action(tool_name: &str, arguments_json: &str) -> String {
 /// Kept separate from [`sanitize_panel_text`] for the two callers that must not
 /// trim or cap: a diff line's leading spaces carry its alignment, and a tool
 /// description is longer than any line cap.
-fn neutralize_display_text(text: &str) -> String {
+pub(crate) fn neutralize_display_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         neutralize_char_into(&mut out, ch);
@@ -1675,17 +1682,32 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) 
         // frame as the approval panel, outliving the turn that produced it.
         // An escape here reaches the terminal exactly like one in the
         // transcript did, so it gets the same treatment.
+        //
+        // ALL THREE branches, not just this one. The other two carry the tool
+        // NAME straight off the model's tool call — `streaming_activity`
+        // formats `ActiveToolCell::tool_name`, and `status_line` splices
+        // `App::status`, which `event_routing` fills from `tool_name` on every
+        // `ToolCallStarted` and on `ApprovalRequired`. That last one prints
+        // the model's chosen name on this row in the same frame as the
+        // approval panel — and this row is drawn AFTER the panel, so an
+        // escape here repaints the thing the human is reading to decide.
+        // Sanitizing only the error branch is why that survived three rounds:
+        // the one test scanning this row populates `app.error`, so the `if`
+        // shadowed both `else`s.
         spans.push(Span::raw(neutralize_display_text(error)));
     } else if let Some(activity) = app.streaming_activity() {
         // While streaming (incl. a long time-to-first-token wait) show an
         // animated indicator so the screen never looks frozen.
-        spans.push(Span::styled(activity, Style::default().fg(Color::Cyan)));
+        spans.push(Span::styled(
+            neutralize_display_text(&activity),
+            Style::default().fg(Color::Cyan),
+        ));
         spans.push(Span::styled(
             format!("   {}", tr(app.lang, TextId::StatusEscCancel)),
             Style::default().fg(Color::DarkGray),
         ));
     } else {
-        spans.push(Span::raw(app.status_line()));
+        spans.push(Span::raw(neutralize_display_text(&app.status_line())));
     }
 
     frame.render_widget(
@@ -2715,6 +2737,74 @@ mod tests {
                     !buffer[(col, row)].symbol().chars().any(char::is_control),
                     "control char reached cell ({col},{row}) via the status row"
                 );
+            }
+        }
+    }
+
+    /// The status row's OTHER two branches — the ones the test above cannot
+    /// reach, because populating `app.error` makes the `if` shadow both
+    /// `else`s. That shadow is why these two shipped unsanitized while their
+    /// sibling one line up was carefully filtered.
+    ///
+    /// Both carry the tool NAME straight off the model's tool call:
+    /// `streaming_activity` formats `ActiveToolCell::tool_name`, and
+    /// `status_line` splices `App::status`, which `event_routing` fills from
+    /// `tool_name` on `ToolCallStarted` and on `ApprovalRequired`. The
+    /// approval case is the sharp one — the model's chosen name lands on this
+    /// row in the same frame as the approval panel, and the status row is
+    /// drawn AFTER the panel, so an escape here repaints the prompt the human
+    /// is reading to decide.
+    #[test]
+    fn every_status_row_branch_neutralizes_a_model_supplied_tool_name() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // `\u{1b}[8m` is SGR conceal — it survives into later frames, the
+        // approval panel among them. `\u{202e}` reorders what is read.
+        const HOSTILE: &str = "ev\u{1b}[8mil\u{202e}x";
+
+        for branch in ["status_line", "streaming_activity"] {
+            let mut app = App::new();
+            app.lang = Lang::En;
+            // Left as None so neither `else` is shadowed by the error arm.
+            app.error = None;
+            app.pending_approval = Some(root_grant_request("/tmp/x", "/home/u/.ssh"));
+            if branch == "streaming_activity" {
+                app.is_streaming = true;
+                app.streaming_since = Some(std::time::Instant::now());
+                let mut turn = crate::active_turn::ActiveTurn::new(deep_code_agent::TurnId(
+                    "turn_1".to_string(),
+                ));
+                turn.upsert_tool(crate::active_turn::ActiveToolCell {
+                    tool_call_id: deep_code_agent::ToolCallId("call_1".to_string()),
+                    tool_name: HOSTILE.to_string(),
+                    arguments: "{}".to_string(),
+                    risk_level: None,
+                    requires_sandbox: None,
+                    approval: crate::history::ToolApprovalState::NotRequired,
+                    live_output: crate::active_turn::LiveOutput::default(),
+                    started_at: std::time::Instant::now(),
+                });
+                app.active_turn = Some(turn);
+            } else {
+                app.status = format!("running tool {HOSTILE}");
+            }
+
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            for row in 0..buffer.area.height {
+                for col in 0..buffer.area.width {
+                    let symbol = buffer[(col, row)].symbol();
+                    assert!(
+                        !symbol.chars().any(char::is_control),
+                        "control char reached cell ({col},{row}) via {branch}"
+                    );
+                    assert!(
+                        !symbol.chars().any(is_bidi_or_zero_width),
+                        "bidi/zero-width reached cell ({col},{row}) via {branch}"
+                    );
+                }
             }
         }
     }
