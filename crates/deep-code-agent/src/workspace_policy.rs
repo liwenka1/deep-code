@@ -605,6 +605,16 @@ fn first_file_segment(path: &Path) -> Option<PathBuf> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        // Prefix/RootDir accumulate into `current` but are never stat'd on
+        // their own — the same rule [`contains_symlink`] states below, and for
+        // the same reason: these paths are canonical, so on Windows the first
+        // component is a verbatim prefix (`\\?\C:`) that is not a stattable
+        // path by itself. Statting it fails, and reading that failure as
+        // "nothing exists from here down" abandoned the walk on component one,
+        // so the diagnosis silently never fired on Windows.
+        if !matches!(component, Component::Normal(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(meta) if !meta.is_dir() => return Some(current),
             // Missing from here down: nothing left to block anything.
