@@ -1670,3 +1670,43 @@ fn launch_surfaces_runtime_warnings_in_the_transcript() {
         "a launch that cannot persist must say so: {warnings:?}"
     );
 }
+
+/// ...and must SURVIVE the rebuild that follows a swap.
+///
+/// `adopt_runtime` used to push the warnings straight into `history`, while
+/// both callers that rebuild the transcript — `/clear` and `/resume` — call
+/// `history.clear()` immediately afterwards. So the one path that produces the
+/// security-relevant warnings ("dropping N write grant(s): they carry no valid
+/// authorship tag", "dropping recorded grant X: it now resolves to Y") wrote
+/// them and erased them in the same breath, leaving the user a restated
+/// boundary with nothing explaining why it had narrowed.
+///
+/// The exhaustive destructuring in `adopt_runtime` guards against a field
+/// never READ; this is the failure one step past that — read, then discarded.
+#[test]
+fn a_swap_that_degrades_keeps_its_warnings_after_the_transcript_is_rebuilt() {
+    let blocker = tempfile::NamedTempFile::new().unwrap();
+    let mut app = App::launch(LaunchConfig {
+        workspace: Some(blocker.path().join("workspace")),
+        ..LaunchConfig::default()
+    });
+
+    // `/clear` relaunches into the same broken workspace, so the relaunch
+    // degrades exactly like the launch did.
+    assert!(app.handle_slash_command("/clear"));
+
+    let warnings: Vec<&str> = app
+        .history
+        .iter()
+        .filter_map(|cell| match cell {
+            crate::history::HistoryCell::System { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|text| text.contains("workspace tools disabled")),
+        "the rebuilt transcript dropped the swap's warnings: {warnings:?}"
+    );
+}

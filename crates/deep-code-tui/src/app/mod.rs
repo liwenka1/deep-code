@@ -155,6 +155,10 @@ pub struct App {
     /// When the current stream segment began, for the live activity
     /// indicator. Only read while `is_streaming`.
     pub(crate) streaming_since: Option<std::time::Instant>,
+    /// Startup-degradation warnings from the most recent runtime swap, parked
+    /// by `adopt_runtime` until its caller has finished rebuilding the
+    /// transcript. See `App::flush_launch_warnings`.
+    pub(crate) pending_launch_warnings: Vec<String>,
     /// Collapsed pastes: `(placeholder token, real content)`. Large pastes
     /// show a compact `[粘贴 #N …]` chip in the composer; the real content is
     /// expanded back in on submit. Reset once a turn is sent or input cleared.
@@ -455,6 +459,7 @@ impl App {
             workspace,
             global_config_path: default_config_path(),
             streaming_since: None,
+            pending_launch_warnings: Vec::new(),
             pasted_blocks: Vec::new(),
             transcript: None,
             selection: None,

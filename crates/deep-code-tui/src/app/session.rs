@@ -19,11 +19,20 @@ impl App {
             permission_mode,
             extra_roots,
         } = launched;
-        for warning in &warnings {
-            self.history.push(crate::history::HistoryCell::system(
-                self.tr_with(TextId::SystemWarning, &[("message", warning)]),
-            ));
-        }
+        // Parked, not pushed. Two of the three callers rebuild the transcript
+        // AFTER adopting — `switch_session` clears then hydrates, and
+        // `start_new_conversation` clears then writes the welcome cell — so
+        // pushing here meant the warnings were written and then immediately
+        // thrown away. `/resume` is exactly the path that produces the
+        // security-relevant ones ("dropping N write grant(s): they carry no
+        // valid authorship tag", "dropping recorded grant X: it now resolves
+        // to Y"), and the user saw the new boundary banner with nothing
+        // explaining why grants had vanished.
+        //
+        // The exhaustive destructuring above catches a field never READ; it
+        // cannot catch one read and then discarded. Each caller now decides
+        // where the warnings land via `flush_launch_warnings`.
+        self.pending_launch_warnings = warnings;
         self.runtime = handle;
         self.backend_label = backend_label;
         self.backend_offline = offline;
@@ -43,6 +52,18 @@ impl App {
         let previous_mode = self.permission_mode.get();
         self.permission_mode = permission_mode;
         self.permission_mode.set(previous_mode);
+    }
+
+    /// Drain the warnings parked by [`Self::adopt_runtime`] into the visible
+    /// transcript. Called once per swap, at the point where the transcript is
+    /// finished being rebuilt, so a startup degradation is never written
+    /// somewhere a subsequent `history.clear()` will erase it.
+    pub(crate) fn flush_launch_warnings(&mut self) {
+        for warning in std::mem::take(&mut self.pending_launch_warnings) {
+            self.history.push(crate::history::HistoryCell::system(
+                self.tr_with(TextId::SystemWarning, &[("message", &warning)]),
+            ));
+        }
     }
 
     /// Load the layered agent config the same way for every runtime swap:
@@ -212,10 +233,14 @@ impl App {
             // The old runtime is already down; relaunch a fresh session so the
             // app stays usable instead of pointing at a dead runtime.
             self.launch_and_adopt(None);
+            self.flush_launch_warnings();
             return Err(self.tr(TextId::SessionReloadFailedRestart).to_string());
         }
 
         self.launch_and_adopt(resume);
+        // No rebuild on this path (`/model`, `/apikey`, `/add-dir` keep the
+        // transcript), so the warnings belong at the end of it, immediately.
+        self.flush_launch_warnings();
         Ok(())
     }
 
@@ -340,6 +365,11 @@ impl App {
         self.steering_queue.clear();
         self.pending_steering_flush = false;
         self.history.extend(hydrate_history(&record));
+        // After the rebuild, so the clear above cannot erase them: resuming is
+        // the path that drops grants carrying no valid authorship tag, and the
+        // banner below would otherwise state a narrowed boundary with nothing
+        // saying why.
+        self.flush_launch_warnings();
         // The switched-to boundary can differ from the one on screen so far
         // (the record's own grants ∪ this run's); restate it with the rebuilt
         // transcript.
@@ -384,6 +414,9 @@ impl App {
             persistent,
         );
         self.history.push(cell);
+        // After the welcome cell, and after the clear above — which used to
+        // erase these before anyone could read them.
+        self.flush_launch_warnings();
         // The fresh session inherits this run's grants (see launch_and_adopt);
         // name them so the new transcript starts with the true boundary.
         self.push_extra_roots_banner();
