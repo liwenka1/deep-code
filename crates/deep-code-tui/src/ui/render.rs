@@ -410,9 +410,10 @@ fn cell_lines(cell: &HistoryCell, width: u16, lang: Lang) -> Vec<Line<'static>> 
 /// Invisible code points a model must not be able to place on screen: the
 /// full Unicode `Bidi_Control` set (ALM, LRM/RLM, LRE/RLE/PDF/LRO/RLO, the
 /// isolates), the zero-width spacing/format characters (ZWSP, SHY, WJ,
-/// U+FEFF), the interlinear-annotation trio, and the Hangul fillers. Every
-/// one is invisible, carries reordering or padding potential, and has no
-/// legitimate role in a terminal transcript.
+/// U+FEFF), the interlinear-annotation trio, the line/paragraph separators,
+/// and all FOUR Hangul fillers — U+FFA0 was missing while the doc claimed the
+/// set. Every one is invisible, carries reordering or padding potential, and
+/// has no legitimate role in a terminal transcript.
 ///
 /// Deliberately ABSENT: ZWNJ/ZWJ and the variation selectors. Those join or
 /// restyle real graphemes (emoji, Persian) and deleting them would corrupt
@@ -421,43 +422,60 @@ fn cell_lines(cell: &HistoryCell, width: u16, lang: Lang) -> Vec<Line<'static>> 
 /// own. Also absent: NBSP and the other fixed-width spaces, which are honest
 /// about the columns they take.
 ///
-/// The deprecated tag block is matched as a RANGE by
-/// [`is_bidi_or_zero_width`] rather than listed here — 96 more entries would
-/// drown the enumerable ones.
-const BIDI_AND_ZERO_WIDTH: [char; 22] = [
-    '\u{061c}', // ALM
-    '\u{00ad}', // SHY
-    '\u{115f}', // HANGUL CHOSEONG FILLER (invisible, measures 2 columns)
-    '\u{1160}', // HANGUL JUNGSEONG FILLER
-    '\u{200b}', // ZWSP
-    '\u{200e}', // LRM
-    '\u{200f}', // RLM
-    '\u{202a}', // LRE
-    '\u{202b}', // RLE
-    '\u{202c}', // PDF
-    '\u{202d}', // LRO
-    '\u{202e}', // RLO
-    '\u{2060}', // WJ
-    '\u{2066}', // LRI
-    '\u{2067}', // RLI
-    '\u{2068}', // FSI
-    '\u{2069}', // PDI
-    '\u{3164}', // HANGUL FILLER
-    '\u{fff9}', // INTERLINEAR ANNOTATION ANCHOR
-    '\u{fffa}', // INTERLINEAR ANNOTATION SEPARATOR
-    '\u{fffb}', // INTERLINEAR ANNOTATION TERMINATOR
-    '\u{feff}', // ZWNBSP/BOM
+/// Contiguous families live in [`INVISIBLE_RANGES`] rather than here.
+const BIDI_AND_ZERO_WIDTH: [char; 15] = [
+    '\u{00ad}',  // SHY
+    '\u{061c}',  // ALM
+    '\u{115f}',  // HANGUL CHOSEONG FILLER (invisible, measures 2 columns)
+    '\u{1160}',  // HANGUL JUNGSEONG FILLER
+    '\u{180e}',  // MONGOLIAN VOWEL SEPARATOR
+    '\u{200b}',  // ZWSP
+    '\u{200e}',  // LRM
+    '\u{200f}',  // RLM
+    '\u{2028}',  // LINE SEPARATOR
+    '\u{2029}',  // PARAGRAPH SEPARATOR
+    '\u{3164}',  // HANGUL FILLER
+    '\u{feff}',  // ZWNBSP/BOM
+    '\u{ffa0}',  // HALFWIDTH HANGUL FILLER
+    '\u{110bd}', // KAITHI NUMBER SIGN
+    '\u{110cd}', // KAITHI NUMBER SIGN ABOVE
 ];
 
-/// The deprecated Unicode tag block: invisible, `Cf` (so `char::is_control`
-/// misses it), and NOT dropped by ratatui — a tag attaches to the preceding
-/// grapheme cluster and rides into the cell. That smuggles arbitrary hidden
-/// ASCII through a line that looks clean, and on from there into the
-/// transcript snapshot and the clipboard.
-const TAG_BLOCK: std::ops::RangeInclusive<char> = '\u{e0000}'..='\u{e007f}';
+/// The contiguous half, kept as ranges because enumerating them would drown
+/// the code points a reader actually needs to see.
+///
+/// Two of these close gaps that the "stop renting ratatui's behavior" pass
+/// left open, in the two different shapes such a gap comes in:
+///
+/// * U+2028/U+2029 were a REAL hole. They are `Zl`/`Zp`, so `char::is_control`
+///   says no; they measure one column, so ratatui does NOT drop them; and they
+///   are line/paragraph separators, so an emulator that honours them shifts
+///   the frame by a row — after which ratatui's diff-based redraw paints every
+///   later frame at the wrong offset. That is an approval-panel repaint
+///   primitive reachable through a pipeline whose stated model is "wrapping
+///   already consumed the real newlines".
+/// * The width-0 families (invisible operators, deprecated format controls,
+///   musical/shorthand/Egyptian format controls, U+FFA0, U+180E) were SAFE —
+///   but safe only because ratatui skips zero-width symbols, which is exactly
+///   the undocumented, one-bump-away behavior this defense was rewritten to
+///   stop leaning on. Same class, same fix: own it here.
+const INVISIBLE_RANGES: [std::ops::RangeInclusive<char>; 7] = [
+    '\u{202a}'..='\u{202e}',   // LRE RLE PDF LRO RLO
+    '\u{2060}'..='\u{206f}',   // WJ, invisible operators, isolates, deprecated
+    '\u{fff9}'..='\u{fffb}',   // interlinear annotation trio
+    '\u{13430}'..='\u{1343f}', // Egyptian hieroglyph format controls
+    '\u{1bca0}'..='\u{1bca3}', // shorthand format controls
+    '\u{1d173}'..='\u{1d17a}', // musical format controls
+    // The deprecated tag block: invisible, `Cf` (so `char::is_control` misses
+    // it), and NOT dropped by ratatui — a tag attaches to the preceding
+    // grapheme cluster and rides into the cell. That smuggles arbitrary hidden
+    // ASCII through a line that looks clean, and on into the transcript
+    // snapshot and the clipboard.
+    '\u{e0000}'..='\u{e007f}',
+];
 
 fn is_bidi_or_zero_width(ch: char) -> bool {
-    BIDI_AND_ZERO_WIDTH.contains(&ch) || TAG_BLOCK.contains(&ch)
+    BIDI_AND_ZERO_WIDTH.contains(&ch) || INVISIBLE_RANGES.iter().any(|range| range.contains(&ch))
 }
 
 /// The one rule both sanitizers share, so the transcript and the approval
@@ -2438,11 +2456,53 @@ mod tests {
     /// "did it reach a cell" assertion could ever surface.
     #[test]
     fn neutralize_strips_every_invisible_code_point() {
-        const MUST_STRIP: [char; 22] = [
-            '\u{00ad}', '\u{061c}', '\u{115f}', '\u{1160}', '\u{200b}', '\u{200e}', '\u{200f}',
-            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2060}', '\u{2066}',
-            '\u{2067}', '\u{2068}', '\u{2069}', '\u{3164}', '\u{feff}', '\u{fff9}', '\u{fffa}',
-            '\u{fffb}',
+        // The whole stripped set, spelled out here independently of the
+        // production tables, then compared code point by code point over all
+        // of Unicode. That is stronger than the old length check in both
+        // directions at once: a code point quietly DROPPED from production
+        // fails, and one quietly ADDED (an over-broad range swallowing a
+        // legitimate joiner) fails too — neither of which a "did it reach a
+        // cell" assertion can see, since ratatui drops most of this family
+        // unaided.
+        const EXPECTED: &[std::ops::RangeInclusive<u32>] = &[
+            0x00ad..=0x00ad,   // SHY
+            0x061c..=0x061c,   // ALM
+            0x115f..=0x1160,   // Hangul choseong/jungseong fillers
+            0x180e..=0x180e,   // MONGOLIAN VOWEL SEPARATOR
+            0x200b..=0x200b,   // ZWSP
+            0x200e..=0x200f,   // LRM RLM
+            0x2028..=0x2029,   // LINE / PARAGRAPH SEPARATOR
+            0x202a..=0x202e,   // LRE RLE PDF LRO RLO
+            0x2060..=0x206f,   // WJ, invisible operators, isolates, deprecated
+            0x3164..=0x3164,   // HANGUL FILLER
+            0xfeff..=0xfeff,   // ZWNBSP/BOM
+            0xffa0..=0xffa0,   // HALFWIDTH HANGUL FILLER
+            0xfff9..=0xfffb,   // interlinear annotation trio
+            0x110bd..=0x110bd, // KAITHI NUMBER SIGN
+            0x110cd..=0x110cd, // KAITHI NUMBER SIGN ABOVE
+            0x13430..=0x1343f, // Egyptian hieroglyph format controls
+            0x1bca0..=0x1bca3, // shorthand format controls
+            0x1d173..=0x1d17a, // musical format controls
+            0xe0000..=0xe007f, // deprecated tag block
+        ];
+        for code_point in 0u32..=0x0010_ffff {
+            let Some(ch) = char::from_u32(code_point) else {
+                continue;
+            };
+            let expected = EXPECTED.iter().any(|range| range.contains(&code_point));
+            assert_eq!(
+                is_bidi_or_zero_width(ch),
+                expected,
+                "U+{code_point:04X}: production and this test's independent set disagree"
+            );
+        }
+
+        // A representative probe per family still goes through the real
+        // sanitizers, so the tables being right is not mistaken for the
+        // sanitizers using them.
+        const MUST_STRIP: [char; 12] = [
+            '\u{00ad}', '\u{061c}', '\u{115f}', '\u{200b}', '\u{2028}', '\u{2029}', '\u{202e}',
+            '\u{2060}', '\u{3164}', '\u{feff}', '\u{ffa0}', '\u{fffb}',
         ];
         // Both endpoints and an interior point of the tag range.
         const MUST_STRIP_TAGS: [char; 3] = ['\u{e0000}', '\u{e0041}', '\u{e007f}'];
@@ -2474,12 +2534,6 @@ mod tests {
                 ch as u32
             );
         }
-        assert_eq!(
-            BIDI_AND_ZERO_WIDTH.len(),
-            MUST_STRIP.len(),
-            "production array and this test's hardcoded set must stay in step"
-        );
-
         // The other half of the shared rule: a control becomes exactly one
         // space (the column the wrap step already counted), and only the
         // transcript widens a tab.
