@@ -44,7 +44,7 @@ on:
         required: false
         default: 'deepcode/issue-'
       permission-mode:
-        description: 'default | accept_edits | auto | yolo. `default` auto-denies every gated call except the auto-allow names below, so the bot can answer but never edit.'
+        description: 'default | accept_edits | auto | yolo. auto-allow is consulted BEFORE the mode, so `default` is not a read-only posture on its own — with the default auto-allow list it still writes, patches and runs shell. For answer-only, set auto-allow to read_file,list_dir,grep_files as well.'
         type: string
         required: false
         default: 'accept_edits'
@@ -320,17 +320,28 @@ jobs:
           npm i -g @liwenkai/deepcode
 
           printf '%s' "$DEEPCODE_PROMPT" > /tmp/deepcode-prompt.txt
+          # `|| EXIT=$?` because GitHub launches this step as `bash -e {0}`,
+          # and the `set -uo pipefail` above does NOT clear the inherited -e.
+          # Without it the shell died right here on any non-zero exit, so
+          # `EXIT=$?` could only ever observe 0 and the whole variable was
+          # dead code.
+          EXIT=0
           deepcode -p \
             --output-format json \
             --permission-mode "$DC_PERMISSION_MODE" \
             --timeout "$DC_AGENT_TIMEOUT" \
             < /tmp/deepcode-prompt.txt \
-            > /tmp/deepcode-result.json
-          EXIT=$?
+            > /tmp/deepcode-result.json || EXIT=$?
 
           if ! jq -e . /tmp/deepcode-result.json >/dev/null 2>&1; then
             echo "::error::deep-code produced no parseable report (exit $EXIT)"
-            exit "${EXIT:-1}"
+            # NOT `${EXIT:-1}`: that falls back to 1 only when EXIT is unset or
+            # empty, and it is neither — it is "0" in exactly the case this
+            # guard exists for (deepcode exited 0 having written unparseable
+            # stdout). The step then went green with an error annotation nobody
+            # reads, `failure()` stayed false, and the bot posted a ✅ reply
+            # with an empty body.
+            exit $(( EXIT == 0 ? 1 : EXIT ))
           fi
 
           jq -r '.result    // ""' /tmp/deepcode-result.json > /tmp/deepcode-answer.txt

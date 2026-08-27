@@ -10,6 +10,12 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only by default. A push to main inherits the repository default
+# otherwise, which can be read/write — this workflow only ever needs to check
+# out and build, and release-prep.yml already declares the same floor.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 

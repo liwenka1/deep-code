@@ -66,7 +66,23 @@ jobs:
       # before CI finished) shipped a broken binary as npm `latest`. Host-native
       # (no `--target`): a cross-compiled artifact cannot be executed here, but
       # the workspace tests still run on every platform in the matrix.
+      # Same insurance ci.yml carries, and it matters more here: this is the
+      # last gate before npm publish, so a runner that silently lost the
+      # symlink privilege (or a sandbox backend) would let the whole
+      # boundary suite skip — libtest captures the skip message, making a
+      # skipped security test indistinguishable from a passing one — and ship
+      # green. Both variables are read at runtime and fail closed.
+      # Both set unconditionally rather than per-OS: these are read with
+      # `var_os` and fail CLOSED (set-but-empty and "0" demand the capability
+      # too), so a matrix expression yielding "" on Windows would be a demand,
+      # not an exemption. `DEEPCODE_REQUIRE_SANDBOX` is inert on Windows today
+      # — the skip path it hardens is `cfg(any(linux, macos))` — and if a
+      # Windows backend ever appears, requiring it at the release gate is the
+      # right default anyway.
       - name: Test
+        env:
+          DEEPCODE_REQUIRE_SYMLINKS: "1"
+          DEEPCODE_REQUIRE_SANDBOX: "1"
         run: cargo test --locked --workspace
 
       - name: Build (release)
