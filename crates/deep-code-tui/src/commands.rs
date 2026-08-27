@@ -268,6 +268,12 @@ impl App {
         });
         match last {
             Some(text) => {
+                // Sanitized like everything else the model wrote. This text
+                // goes to the system clipboard and from there, typically,
+                // into a terminal or an editor — an unfiltered `\x1b` or `\r`
+                // is a paste that repaints or submits itself. Tabs and
+                // newlines survive; see `sanitize_for_clipboard`.
+                let text = crate::ui::render::sanitize_for_clipboard(&text);
                 crate::clipboard::copy(&text);
                 self.status = self.tr_with(
                     TextId::CopiedResponse,
@@ -586,5 +592,26 @@ mod tests {
         let mut empty = App::new();
         empty.copy_last_response();
         assert!(empty.status.contains("没有可复制"));
+    }
+
+    /// The clipboard is a terminal-bound surface too: pasted `\x1b` repaints,
+    /// pasted `\r` can submit. Drag-select copy was already safe because it
+    /// reads the sanitized frame; `/copy` read the raw cell text, so the two
+    /// copy paths in the same app disagreed.
+    ///
+    /// Structure has to survive though — `\n` and `\t` are the code block the
+    /// user is copying, not stray bytes on a rendered row.
+    #[test]
+    fn copy_last_response_sanitizes_without_flattening_code() {
+        let sanitized = crate::ui::render::sanitize_for_clipboard(
+            "fn main() {\n\tlet x = 1;\u{1b}[2K\r\u{202e}\n}",
+        );
+        assert_eq!(sanitized, "fn main() {\n\tlet x = 1; [2K \n}");
+        assert!(
+            !sanitized.chars().any(|ch| ch == '\u{1b}' || ch == '\r'),
+            "an escape or carriage return reached the clipboard: {sanitized:?}"
+        );
+        // Indentation and line structure intact.
+        assert!(sanitized.contains("\n\tlet x"));
     }
 }

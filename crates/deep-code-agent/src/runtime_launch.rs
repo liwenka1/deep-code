@@ -687,12 +687,17 @@ fn warn_unmatched_auto_allow(
             ));
         }
     }
-    // One line however many are unmounted: they always share a single cause
-    // (a disabled group, a failed boundary), which has already reported itself.
+    // One line however many are unmounted — but it has to carry the cause
+    // itself rather than defer to a warning elsewhere. A failed boundary does
+    // report itself; `DEEP_CODE_DISABLE_WEB` does NOT (the state is visible
+    // only under `/status`), and that is precisely the case this warning was
+    // written for: `fetch_url, web_search` named with no reason anywhere.
     if !unmounted.is_empty() {
         warnings.push(format!(
             "approval.auto_allow entries name tools this session did not mount, \
-             so they pre-approve nothing here: {}",
+             so they pre-approve nothing here: {} (a tool group can be off — \
+             DEEP_CODE_DISABLE_WEB gates web_search/fetch_url — or the write \
+             boundary failed to resolve, which warns separately)",
             unmounted.join(", ")
         ));
     }

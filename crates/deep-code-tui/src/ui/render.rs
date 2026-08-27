@@ -493,6 +493,30 @@ fn neutralize_char_into(out: &mut String, ch: char) {
     out.push(if ch.is_control() { ' ' } else { ch });
 }
 
+/// Model text on its way to the OS clipboard.
+///
+/// The invisible-family deletion is shared with the display sanitizers, but
+/// the control rule has to differ: `\n` and `\t` ARE the document here, not
+/// stray bytes on a rendered row, so mapping them to spaces — correct for a
+/// single line of a panel — would flatten every code block being copied.
+/// Everything else control-shaped becomes a space: `\x1b` above all, and `\r`,
+/// which can make a paste into a shell submit itself.
+///
+/// Drag-select copy was already safe (it reads the sanitized frame lines), so
+/// `/copy` reaching for the raw cell text was the two copy paths in one app
+/// disagreeing — a wiring gap, not a missing capability.
+pub(crate) fn sanitize_for_clipboard(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '\n' || ch == '\t' {
+            out.push(ch);
+        } else {
+            neutralize_char_into(&mut out, ch);
+        }
+    }
+    out
+}
+
 /// Control and bidi/zero-width characters out of a finished transcript span.
 ///
 /// One exception on top of [`neutralize_char_into`]: a tab becomes four
