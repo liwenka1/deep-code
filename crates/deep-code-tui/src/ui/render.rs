@@ -234,8 +234,13 @@ fn render_completion_menu(
                 spans.push(value_span);
             }
             if !hint.is_empty() {
+                // Sanitized for the same reason as `value` above, not because
+                // today's hints are hostile: they are i18n for slash items and
+                // empty for file items. An unfiltered span sitting beside a
+                // filtered one is how the last several of these got in — the
+                // asymmetry reads as a deliberate exemption.
                 spans.push(Span::styled(
-                    format!("  {hint}"),
+                    format!("  {}", neutralize_display_text(hint)),
                     Style::default().fg(Color::DarkGray),
                 ));
             }
@@ -3290,6 +3295,55 @@ mod tests {
         assert!(
             screen.contains("hidden.txt"),
             "the row must still render, only neutralized: {screen}"
+        );
+    }
+
+    /// Both resume-picker sanitizations were unpinned: deleting either the row
+    /// title's filter or the storage-note's left all 200 tests green. Session
+    /// records live at `<workspace>/.deep-code/sessions`, inside the tree the
+    /// model can write, and `list()` validates only the FILENAME — never the
+    /// body — so both fields are model-reachable.
+    #[test]
+    fn resume_picker_neutralizes_every_model_reachable_field() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut record = deep_code_agent::SessionRecord::new(
+            std::path::PathBuf::from("/ws\u{1b}[8m\u{2028}evil"),
+            "system",
+        );
+        record
+            .entries
+            .push(std::sync::Arc::new(deep_code_agent::SessionEntry::new(
+                deep_code_agent::EntryKind::User {
+                    content: "sess\u{1b}[8m\u{202e}ion".to_string(),
+                },
+            )));
+        let picker = crate::app::ResumePicker {
+            sessions: vec![record],
+            selected: 0,
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
+        terminal
+            .draw(|frame| render_resume_picker(frame, &picker, Lang::En))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut screen = String::new();
+        for row in 0..buffer.area.height {
+            for col in 0..buffer.area.width {
+                screen.push_str(buffer[(col, row)].symbol());
+            }
+        }
+        assert!(
+            !screen
+                .chars()
+                .any(|ch| ch.is_control() || is_bidi_or_zero_width(ch)),
+            "a hostile session record reached a cell: {screen:?}"
+        );
+        assert!(
+            screen.contains("ion"),
+            "the row must still render: {screen}"
         );
     }
 

@@ -229,12 +229,25 @@ fn classify(
 /// are the honest answer to "why didn't it edit anything"; tool traffic only
 /// with `--verbose`.
 fn trace_to_stderr(event: &RuntimeEvent, verbose: bool, tool_names: &mut HashMap<String, String>) {
+    // Every field below is model-chosen, and in `-p` mode stderr is a real
+    // terminal: `redirect_stderr_to_log` is called from `ui::run` only, so the
+    // TUI's protection does not extend here. An `\x1b[8m` in a hallucinated
+    // tool name conceals everything printed after it — including the
+    // `approval auto-denied` line, which is the honest answer to "why did it
+    // not edit anything". Same data the status row was just sanitized for, on
+    // the same surface class.
+    //
+    // Only this decoration is filtered. `--output-format`'s payload on STDOUT
+    // stays verbatim, because that is a pipe contract and the caller may be
+    // parsing it; nobody pipes `→ read_file`.
+    let clean = crate::ui::render::neutralize_display_text;
     match event {
-        RuntimeEvent::Warning { message } => eprintln!("warning: {message}"),
+        RuntimeEvent::Warning { message } => eprintln!("warning: {}", clean(message)),
         RuntimeEvent::ApprovalRequired { request, .. } => {
             eprintln!(
                 "approval auto-denied: {} — {}",
-                request.tool_name, request.description
+                clean(&request.tool_name),
+                clean(&request.description)
             );
         }
         RuntimeEvent::ToolCallStarted {
@@ -243,13 +256,13 @@ fn trace_to_stderr(event: &RuntimeEvent, verbose: bool, tool_names: &mut HashMap
             ..
         } if verbose => {
             tool_names.insert(tool_call_id.as_str().to_string(), tool_name.clone());
-            eprintln!("→ {tool_name}");
+            eprintln!("→ {}", clean(tool_name));
         }
         RuntimeEvent::ToolCallFinished { tool_call_id, .. } if verbose => {
             let name = tool_names
                 .remove(tool_call_id.as_str())
                 .unwrap_or_else(|| "tool".to_string());
-            eprintln!("← {name}");
+            eprintln!("← {}", clean(&name));
         }
         _ => {}
     }
