@@ -124,6 +124,48 @@ fn restore_terminal(terminal: &mut AppTerminal) -> Result<()> {
     Ok(())
 }
 
+/// Where the log may be opened — `None` when the path is not ours to write.
+///
+/// This runs on every launch, before anything else, and then `dup2`s the result
+/// onto fd 2: from that point the whole process's stderr — LSP noise,
+/// persistence errors, panic payloads — flows into whatever it opened. Both
+/// halves of the path were previously taken on trust:
+///
+/// * `.deep-code` was created with a bare `create_dir_all`, which follows a
+///   symlink at that component, so a repository shipping `.deep-code` as a link
+///   moved the log (and the session transcripts beside it) outside the
+///   workspace;
+/// * the leaf was opened `create(true).append(true)`, which follows a link
+///   there too — so `.deep-code/deep-code.log → ~/.zshrc` turned every launch
+///   into an unbounded append to a file that already existed and gets executed.
+///
+/// Planting either link is an ordinary permitted write inside a granted root,
+/// so no sandbox refuses it, and this process is not sandboxed anyway. It is
+/// the same rule already enforced for the spill files and `write_self_ignore`;
+/// this was the last writer of that directory not obeying it.
+///
+/// On unix the refusal is also stated to the kernel with `O_NOFOLLOW`, which
+/// makes it atomic. Windows `OpenOptions` has no equivalent flag, so there the
+/// check-then-open window remains — narrower than the original hole by the
+/// whole directory level, and knowingly left rather than papered over.
+#[cfg(any(unix, windows))]
+fn open_log_path() -> Option<std::path::PathBuf> {
+    open_log_path_in(&crate::cli::workspace_root())
+}
+
+/// Split from [`open_log_path`] purely so it can be tested: the caller reads
+/// process-global state, this half takes the root as an argument.
+#[cfg(any(unix, windows))]
+fn open_log_path_in(workspace: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = workspace.join(".deep-code");
+    deep_code_agent::ensure_owned_dirs(&dir, 1).ok()?;
+    let path = dir.join("deep-code.log");
+    if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return None;
+    }
+    Some(path)
+}
+
 /// Point the process's stderr at `.deep-code/deep-code.log` so background tasks
 /// (LSP, persistence) and panics can't paint over the alternate-screen TUI.
 /// Best-effort: if the log can't be opened, stderr is left as-is.
@@ -131,17 +173,16 @@ fn restore_terminal(terminal: &mut AppTerminal) -> Result<()> {
 fn redirect_stderr_to_log() {
     use std::os::unix::io::AsRawFd;
 
-    let path = crate::cli::workspace_root()
-        .join(".deep-code")
-        .join("deep-code.log");
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let Some(path) = open_log_path() else {
+        return;
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
     }
-    let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    else {
+    let Ok(file) = options.open(&path) else {
         return;
     };
     // SAFETY: `file` holds a valid fd for the duration of this call, and
@@ -162,12 +203,9 @@ fn redirect_stderr_to_log() {
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
 
-    let path = crate::cli::workspace_root()
-        .join(".deep-code")
-        .join("deep-code.log");
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    let Some(path) = open_log_path() else {
+        return;
+    };
     let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -232,3 +270,78 @@ fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
 
 /// Soft upper bound for composer visible rows before scrolling.
 pub(crate) const COMPOSER_MAX_VISIBLE_ROWS: usize = 6;
+
+#[cfg(all(test, any(unix, windows)))]
+mod tests {
+    use super::open_log_path_in;
+
+    /// Cross-platform half of the guard: `.deep-code` has to be a real
+    /// directory. Anything else there is not ours to write under, and the old
+    /// bare `create_dir_all` + open would have gone straight through it.
+    #[test]
+    fn a_state_dir_that_is_not_a_directory_is_refused() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join(".deep-code"), "not a directory").unwrap();
+
+        assert!(
+            open_log_path_in(workspace.path()).is_none(),
+            "stderr was pointed at a path under a non-directory .deep-code"
+        );
+    }
+
+    #[test]
+    fn a_real_state_dir_yields_the_log_path() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        let path = open_log_path_in(workspace.path()).expect("a clean workspace must be usable");
+
+        assert_eq!(path, workspace.path().join(".deep-code/deep-code.log"));
+        assert!(
+            path.parent().unwrap().is_dir(),
+            "the log directory must have been created"
+        );
+    }
+
+    /// The leaf. `create(true).append(true)` follows a symlink, so
+    /// `.deep-code/deep-code.log -> ~/.zshrc` turned every launch into an
+    /// unbounded append onto a file that already existed — panics, LSP output,
+    /// persistence errors, all of it, from the unsandboxed parent process.
+    ///
+    /// `#[cfg(unix)]` because `crate::test_symlinks` lives in the agent crate
+    /// behind `#[cfg(test)]` and so is not reachable from here; the sibling
+    /// test above covers the directory half on every platform.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_log_is_refused_rather_than_appended_through() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("shell-rc");
+        std::fs::write(&victim, "# original\n").unwrap();
+        let state_dir = workspace.path().join(".deep-code");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::os::unix::fs::symlink(&victim, state_dir.join("deep-code.log")).unwrap();
+
+        assert!(
+            open_log_path_in(workspace.path()).is_none(),
+            "stderr was pointed through a symlink at {}",
+            victim.display()
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "# original\n");
+    }
+
+    /// And the directory half of the same escape: a symlinked `.deep-code`
+    /// relocates the log — and the session transcripts beside it — wholesale.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_state_dir_is_refused() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join(".deep-code")).unwrap();
+
+        assert!(
+            open_log_path_in(workspace.path()).is_none(),
+            "stderr was pointed outside the workspace"
+        );
+        assert!(!outside.path().join("deep-code.log").exists());
+    }
+}

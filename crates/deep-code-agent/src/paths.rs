@@ -96,6 +96,67 @@ pub(crate) fn canonicalize_existing_prefix(path: &std::path::Path) -> Option<Pat
     }
 }
 
+/// Create the chain of directories deep-code owns at `deepest`, refusing to
+/// accept a symlink at any level.
+///
+/// `levels` counts upward from `deepest` inclusive, and stops there on purpose:
+/// above our own directories the path belongs to the user, and a project living
+/// behind a symlinked parent is a normal setup, not an attack.
+///
+/// The rule this enforces is that **every directory we own must be a real
+/// directory**. `create_dir_all` alone follows a symlink at any component, so a
+/// repository that ships `.deep-code` as a link to somewhere else silently
+/// relocated everything written under it — session transcripts, the stderr log,
+/// checkpoints — outside the workspace, from the unsandboxed parent process.
+/// Planting that link is an ordinary permitted write inside a granted root, so
+/// no sandbox on any platform refuses it; this is the check that does.
+///
+/// `symlink_metadata`, never `metadata`: the latter resolves the link and then
+/// answers about its target, which is the question that lets the link through.
+pub fn ensure_owned_dirs(deepest: &std::path::Path, levels: usize) -> std::io::Result<()> {
+    let owned: Vec<_> = deepest.ancestors().take(levels).collect();
+    for dir in owned.into_iter().rev() {
+        ensure_real_dir(dir)?;
+    }
+    Ok(())
+}
+
+/// The directory must exist and be a real directory, or be created as one.
+fn ensure_real_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} is a symlink or a file, not a directory", dir.display()),
+        )),
+        Err(_) => create_private_dir(dir),
+    }
+}
+
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    // `mut` is consumed by the unix-only `mode` call below; Windows builds
+    // see it unused and clippy runs with `-D warnings` there.
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
+        Ok(()) => Ok(()),
+        // Lost the race to a concurrent writer — fine, as long as what landed
+        // there is a real directory and not a link planted meanwhile.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            match std::fs::symlink_metadata(dir) {
+                Ok(meta) if meta.is_dir() => Ok(()),
+                _ => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Home-relative locations holding long-lived secrets: SSH keys, cloud
 /// credentials, GnuPG keyrings, `.netrc` passwords, and the token stores of
 /// common dev tools.

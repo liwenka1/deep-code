@@ -9,6 +9,10 @@ use super::{
     sessions_dir_for_workspace, validate_session_id,
 };
 
+/// `<workspace>/.deep-code` and the `sessions` directory inside it — the two
+/// levels deep-code owns here. Above them the path is the user's.
+const OWNED_STATE_DIRS: usize = 2;
+
 /// JSON file backend: one pretty-printed file per session.
 #[derive(Debug, Clone)]
 pub struct JsonSessionStore {
@@ -18,8 +22,17 @@ pub struct JsonSessionStore {
 impl JsonSessionStore {
     pub fn for_workspace(workspace: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
         let root = sessions_dir_for_workspace(workspace.as_ref());
-        fs::create_dir_all(&root).map_err(|error| SessionStoreError::Io {
-            message: format!("failed to create {}: {error}", root.display()),
+        // `.deep-code` and `sessions` under it are both ours, so both must be
+        // real directories. Plain `create_dir_all` follows a symlink at either
+        // level, and a repository shipping `.deep-code` as a link then
+        // relocated every session transcript outside the workspace. That is the
+        // same escape `write_self_ignore` closes one level down at the leaf —
+        // which buys nothing if the directory holding the leaf was already
+        // redirected.
+        crate::paths::ensure_owned_dirs(&root, OWNED_STATE_DIRS).map_err(|error| {
+            SessionStoreError::Io {
+                message: format!("failed to create {}: {error}", root.display()),
+            }
         })?;
         if let Some(state_dir) = root.parent() {
             Self::write_self_ignore(state_dir);
@@ -419,7 +432,12 @@ mod tests {
     /// target instead — outside the workspace, from the unsandboxed parent
     /// process, and reachable by nothing more than opening a repository that
     /// ships this path as a symlink.
-    #[cfg(unix)]
+    ///
+    /// Uses the shared helper rather than a raw `#[cfg(unix)]` symlink: the bug
+    /// is real on Windows too (`fs::write` follows a file symlink there as
+    /// well), so a unix-only test cannot see a Windows-only regression, and the
+    /// helper is what carries `DEEPCODE_REQUIRE_SYMLINKS` so a runner that
+    /// quietly loses the privilege turns red instead of sweeping this green.
     #[test]
     fn a_dangling_marker_symlink_is_not_written_through() {
         let dir = tempfile::tempdir().unwrap();
@@ -427,13 +445,47 @@ mod tests {
         let victim = outside.path().join("victim.txt");
         let state_dir = dir.path().join(".deep-code");
         fs::create_dir_all(&state_dir).unwrap();
-        std::os::unix::fs::symlink(&victim, state_dir.join(".gitignore")).unwrap();
+        let marker = state_dir.join(".gitignore");
+        if !crate::test_symlinks::symlink_file_for_test(&victim, &marker) {
+            return;
+        }
 
         JsonSessionStore::for_workspace(dir.path()).unwrap();
 
         assert!(
             !victim.exists(),
             "the marker write followed a dangling symlink out of the workspace"
+        );
+        assert!(
+            fs::symlink_metadata(&marker).is_ok_and(|meta| meta.file_type().is_symlink()),
+            "the link itself must be left alone, not replaced by a marker file"
+        );
+    }
+
+    /// The level above the leaf. `write_self_ignore` refuses a link at
+    /// `.gitignore`, which buys nothing if `.deep-code` itself is a link: the
+    /// `create_dir_all` that ran first would already have followed it and put
+    /// `sessions/` — every transcript of every conversation — outside the
+    /// workspace, in the unsandboxed parent process.
+    #[test]
+    fn a_symlinked_state_dir_does_not_relocate_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join(".deep-code");
+        if !crate::test_symlinks::symlink_dir_for_test(outside.path(), &state_dir) {
+            return;
+        }
+
+        let refused = JsonSessionStore::for_workspace(dir.path());
+
+        assert!(
+            refused.is_err(),
+            "a symlinked .deep-code must be refused, not followed"
+        );
+        assert!(
+            !outside.path().join("sessions").exists(),
+            "session storage was created outside the workspace: {}",
+            outside.path().display()
         );
     }
 

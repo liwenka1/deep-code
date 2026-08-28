@@ -398,10 +398,10 @@ const OWNED_SPILL_DIRS: usize = 3;
 /// the result falls back to the ring, and `info()` never names a file that
 /// was not written.
 fn create_spill_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    let owned: Vec<_> = path.ancestors().skip(1).take(OWNED_SPILL_DIRS).collect();
-    for dir in owned.into_iter().rev() {
-        ensure_real_dir(dir)?;
-    }
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "spill path has no parent")
+    })?;
+    crate::paths::ensure_owned_dirs(parent, OWNED_SPILL_DIRS)?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -414,42 +414,6 @@ fn create_spill_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     options.open(path)
-}
-
-/// The directory must exist and be a real directory, or be created as one.
-fn ensure_real_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(dir) {
-        Ok(meta) if meta.is_dir() => Ok(()),
-        Ok(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "spill directory is a symlink or a file",
-        )),
-        Err(_) => create_private_dir(dir),
-    }
-}
-
-fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    // `mut` is consumed by the unix-only `mode` call below; Windows builds
-    // see it unused and clippy runs with `-D warnings` there.
-    #[cfg_attr(not(unix), allow(unused_mut))]
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    match builder.create(dir) {
-        Ok(()) => Ok(()),
-        // Lost the race to the job's other stream — fine, as long as what
-        // landed there is a real directory and not a link planted meanwhile.
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            match std::fs::symlink_metadata(dir) {
-                Ok(meta) if meta.is_dir() => Ok(()),
-                _ => Err(error),
-            }
-        }
-        Err(error) => Err(error),
-    }
 }
 
 /// Byte-exact overflow copy of one stream, created lazily at the threshold.

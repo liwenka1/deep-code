@@ -8,6 +8,8 @@ use walkdir::WalkDir;
 use crate::tool::ToolError;
 
 const CHECKPOINT_DIR: &str = ".deep-code/checkpoints";
+/// `.deep-code` and `checkpoints` inside it — the levels deep-code owns.
+const OWNED_STORAGE_DIRS: usize = 2;
 const SKIP_DIRS: &[&str] = &[".git", ".deep-code", "target", "node_modules"];
 /// Default retention: snapshots beyond this count are pruned oldest-first.
 /// Every turn creates one before-turn snapshot, so without a cap the storage
@@ -41,7 +43,10 @@ impl CheckpointStore {
             )
         })?;
         let storage_root = canonical.join(CHECKPOINT_DIR);
-        fs::create_dir_all(&storage_root).map_err(|error| {
+        // Both levels of `.deep-code/checkpoints` are ours and must be real
+        // directories: `create_dir_all` follows a symlink at either one, and
+        // every snapshot of the whole workspace is written under here.
+        crate::paths::ensure_owned_dirs(&storage_root, OWNED_STORAGE_DIRS).map_err(|error| {
             ToolError::exec_failed(
                 "checkpoint",
                 format!(
@@ -1103,6 +1108,31 @@ mod tests {
         }
         // The workspace was never cleared by a rejected restore.
         assert_eq!(fs::read_to_string(&file).unwrap(), "live");
+    }
+
+    /// Snapshots of the entire workspace are written under the storage root, so
+    /// a symlinked `.deep-code` copied the whole tree outside the workspace —
+    /// `create_dir_all` follows a link at any component. Same rule, same
+    /// helper, as the session store and the stderr log.
+    #[test]
+    fn a_symlinked_state_dir_does_not_relocate_the_store() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let state_dir = workspace.path().join(".deep-code");
+        if !crate::test_symlinks::symlink_dir_for_test(outside.path(), &state_dir) {
+            return;
+        }
+
+        let refused = CheckpointStore::new(workspace.path());
+
+        assert!(
+            refused.is_err(),
+            "a symlinked .deep-code must be refused, not followed"
+        );
+        assert!(
+            !outside.path().join("checkpoints").exists(),
+            "checkpoint storage was created outside the workspace"
+        );
     }
 
     #[test]
