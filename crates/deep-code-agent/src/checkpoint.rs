@@ -340,22 +340,32 @@ fn copy_tree(source: &Path, dest: &Path, mode: CopyMode) -> Result<(), ToolError
         }
         let target = dest.join(rel);
         let file_type = entry.file_type();
-        // Never write THROUGH a link standing where the snapshot has content.
-        // `clear` is supposed to have removed any such link already (see
-        // `clear_dir_contents`); this is the second half of the same invariant,
-        // stated where the write actually happens. `create_dir_all` and
-        // `fs::copy` both follow a reparse point, so without it a junction left
-        // in place turned `restore` into a write outside the workspace.
+        // Never write THROUGH something that is not a plain file or directory,
+        // standing where the snapshot has content. `clear` is supposed to have
+        // removed any such entry already (see `clear_dir_contents`); this is
+        // the second half of the same invariant, stated where the write
+        // actually happens.
+        //
+        // The set is [`Entry::Symlink`] and [`Entry::Uncapturable`], asked
+        // through `classify` rather than spelled again — an `is_symlink()` test
+        // here was narrower than the arm it is guarding and let the whole
+        // FIFO/socket/device family through. `create_dir_all` and `fs::copy`
+        // follow a reparse point; `fs::copy` onto a FIFO *blocks* until a
+        // reader appears and onto a socket fails, neither of which the write
+        // side has any business discovering.
         if mode == CopyMode::Restore
-            && target
-                .symlink_metadata()
-                .is_ok_and(|meta| meta.file_type().is_symlink())
+            && let Ok(meta) = target.symlink_metadata()
+            && matches!(
+                classify(&meta.file_type()),
+                Entry::Symlink | Entry::Uncapturable
+            )
         {
             return Err(checkpoint_error(
                 "restore",
                 std::io::Error::other(format!(
-                    "{} is a symlink the snapshot could not capture; refusing to \
-                     write through it. Remove it and re-run the restore.",
+                    "{} is not a plain file or directory, and the snapshot has \
+                     content for that path; refusing to write through it. \
+                     Remove it and re-run the restore.",
                     target.display()
                 )),
             ));
@@ -383,8 +393,10 @@ fn copy_tree(source: &Path, dest: &Path, mode: CopyMode) -> Result<(), ToolError
                         .map_err(|error| checkpoint_error("copy snapshot symlink", error))?;
                 }
             }
-            // Nothing recorded, so nothing may be deleted: `clear_dir_contents`
-            // keeps both of these for the same reason.
+            // Nothing recorded here, so nothing may be deleted either:
+            // `clear_dir_contents` keeps both of these under the same rule —
+            // removable only where the snapshot covers the path, because only
+            // then is there something to put back.
             Entry::Symlink | Entry::Uncapturable => {}
             Entry::Dir => {
                 fs::create_dir_all(&target)
@@ -559,7 +571,18 @@ fn clear_dir_contents(workspace: &Path, snapshot: &Path, dir: &Path) -> Result<b
         let path = entry.path();
         // Judged on the path relative to the workspace root, exactly as
         // `copy_tree` judges it — not on the bare entry name.
-        let relative = path.strip_prefix(workspace).unwrap_or(&path);
+        //
+        // Keeping is the fail-safe answer when the path cannot be judged at
+        // all. The old `unwrap_or(&path)` fell back to the ABSOLUTE path, and
+        // `Path::join` with an absolute path discards the base — so
+        // `snapshot.join(relative)` became the workspace entry itself, whose
+        // metadata always resolves, and "does the snapshot cover this?"
+        // answered yes for everything. Unreachable today, but the direction it
+        // failed in was "delete".
+        let Ok(relative) = path.strip_prefix(workspace) else {
+            kept = true;
+            continue;
+        };
         if should_skip(relative) {
             kept = true;
             continue;
@@ -589,9 +612,7 @@ fn clear_dir_contents(workspace: &Path, snapshot: &Path, dir: &Path) -> Result<b
                 // `create_dir_all`/`fs::copy` follow a reparse point, and a
                 // junction needs no privilege to create. Only a link the
                 // snapshot neither holds nor can recreate is kept.
-                if snapshot_can_capture_symlink()
-                    || snapshot.join(relative).symlink_metadata().is_ok()
-                {
+                if snapshot_can_capture_symlink() || snapshot_covers(snapshot, relative) {
                     remove_symlink(&path, &file_type)
                         .map_err(|error| checkpoint_error("clear workspace symlink", error))?;
                 } else {
@@ -612,11 +633,41 @@ fn clear_dir_contents(workspace: &Path, snapshot: &Path, dir: &Path) -> Result<b
                 fs::remove_file(&path)
                     .map_err(|error| checkpoint_error("clear workspace file", error))?;
             }
-            // No snapshot representation, so no way to put it back.
-            Entry::Uncapturable => kept = true,
+            // Exactly the link arm's rule, one file-type family over — which
+            // is the half that was missing. Nothing here was recorded, so this
+            // entry may only be removed when the snapshot holds something to
+            // put back at this very path; otherwise there is no way to restore
+            // it and it stays.
+            //
+            // Keeping it UNCONDITIONALLY was not the safe choice it looks
+            // like. A regular file captured by the snapshot, replaced in the
+            // workspace by a socket or FIFO before the restore, was then kept
+            // by `clear` and written *through* by `copy_tree`: onto a socket
+            // that fails every time (so the workspace ends up cleared, nothing
+            // restored, and the "re-run to finish it" advice is a lie), onto a
+            // FIFO with no reader it blocks forever and hangs the whole app,
+            // and onto one with a reader it injects the snapshot's bytes into
+            // a live IPC channel and reports success.
+            Entry::Uncapturable => {
+                if snapshot_covers(snapshot, relative) {
+                    fs::remove_file(&path)
+                        .map_err(|error| checkpoint_error("clear workspace special file", error))?;
+                } else {
+                    kept = true;
+                }
+            }
         }
     }
     Ok(kept)
+}
+
+/// Does the snapshot hold an entry at this workspace-relative path?
+///
+/// The one question both "may `clear` delete this?" arms ask. `symlink_metadata`
+/// so that a link recorded IN the snapshot still counts as coverage — the
+/// question is whether `copy_tree` will write something here, not what.
+fn snapshot_covers(snapshot: &Path, relative: &Path) -> bool {
+    snapshot.join(relative).symlink_metadata().is_ok()
 }
 
 /// Delete a symlink as the LINK, on either platform.
@@ -1108,6 +1159,94 @@ mod tests {
         }
         // The workspace was never cleared by a rejected restore.
         assert_eq!(fs::read_to_string(&file).unwrap(), "live");
+    }
+
+    /// `copy_tree`'s own guard, driven directly.
+    ///
+    /// It has to be driven directly to be tested at all: whenever `clear` does
+    /// its job the guard is unreachable through `restore`, so before this test
+    /// the whole block could be deleted and every checkpoint test stayed green
+    /// on both branches of `snapshot_can_capture_symlink`. That is the state
+    /// this file's own comment calls "the second half of the same invariant" —
+    /// a second half nothing was holding. It earns its place against a
+    /// concurrent writer planting an entry between the clear and the copy.
+    ///
+    /// Both members of the refusal set are exercised, because an `is_symlink()`
+    /// spelling here (what it used to be) passes the first and fails the second.
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_refuses_to_write_through_anything_that_is_not_a_plain_entry() {
+        let source = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("untouched.txt"), "VICTIM").unwrap();
+        fs::create_dir_all(source.path().join("d")).unwrap();
+        fs::write(source.path().join("d/f.txt"), "snapshot-content").unwrap();
+
+        // Asserting `is_err()` alone would be a false green for the socket:
+        // with a narrower guard the copy reaches `fs::copy`, fails on its own
+        // with EOPNOTSUPP, and returns Err anyway — the right answer for the
+        // wrong reason, and only after the write side has already blocked on
+        // the retry backoff. So both cases assert the REFUSAL, by its wording.
+        const REFUSAL: &str = "refusing to write through it";
+
+        // A directory symlink pointing out of the workspace.
+        let linked = tempfile::tempdir().unwrap();
+        crate::test_symlinks::symlink_dir_for_test(outside.path(), &linked.path().join("d"));
+        let refused = copy_tree(source.path(), linked.path(), CopyMode::Restore);
+        let message = refused.expect_err("wrote through a symlink").to_string();
+        assert!(message.contains(REFUSAL), "wrong cause: {message}");
+        assert!(!outside.path().join("f.txt").exists());
+        assert_eq!(
+            fs::read_to_string(outside.path().join("untouched.txt")).unwrap(),
+            "VICTIM"
+        );
+
+        // A socket standing where the source holds a regular file.
+        let sock_dest = tempfile::tempdir().unwrap();
+        fs::create_dir_all(sock_dest.path().join("d")).unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(sock_dest.path().join("d/f.txt")).unwrap();
+        drop(listener);
+        let refused = copy_tree(source.path(), sock_dest.path(), CopyMode::Restore);
+        let message = refused.expect_err("wrote through a socket").to_string();
+        assert!(message.contains(REFUSAL), "wrong cause: {message}");
+    }
+
+    /// The complement of `restore_keeps_entries_it_cannot_capture`: there the
+    /// FIFO pre-dates the snapshot, so nothing was recorded at that path and
+    /// keeping it is right. Here the snapshot holds a REGULAR FILE at the path
+    /// and the special file appeared afterwards — so `clear` must remove it,
+    /// because `copy_tree` is about to put the captured file back.
+    ///
+    /// Keeping it instead meant `fs::copy` ran onto a live socket: it fails
+    /// with the same error on every attempt (nothing ever removes the socket),
+    /// so the workspace stayed cleared with nothing restored while the message
+    /// promised that re-running would finish the job. A FIFO with no reader is
+    /// worse still — `fs::copy` opens it `O_WRONLY` and blocks forever, and
+    /// `restore_checkpoint` is called synchronously under `block_in_place`, so
+    /// the whole TUI hangs with no timeout. A socket is used here because it
+    /// fails fast rather than wedging the suite.
+    #[cfg(unix)]
+    #[test]
+    fn restore_removes_an_uncapturable_entry_standing_on_snapshotted_content() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        fs::write(root.join("dev.sock"), "was-a-regular-file").unwrap();
+        let store = CheckpointStore::new(root).unwrap();
+        let (id, _) = store.snapshot("before_turn").unwrap();
+
+        fs::remove_file(root.join("dev.sock")).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(root.join("dev.sock")).unwrap();
+        drop(listener);
+
+        store
+            .restore(&id)
+            .expect("a special file the snapshot covers must be cleared, not written through");
+
+        assert_eq!(
+            fs::read_to_string(root.join("dev.sock")).unwrap(),
+            "was-a-regular-file"
+        );
     }
 
     /// Snapshots of the entire workspace are written under the storage root, so
