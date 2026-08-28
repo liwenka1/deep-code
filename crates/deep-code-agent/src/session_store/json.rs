@@ -45,19 +45,29 @@ impl JsonSessionStore {
     /// touched, whatever it says — which also means *deleting* it is not a way
     /// to opt out (the next session writes it back). The file itself says so,
     /// and names the edit that does opt out.
+    ///
+    /// "Absent" is decided by the create itself, not by a prior `exists()`.
+    /// `Path::exists` FOLLOWS symlinks, so a *dangling* one answered "absent"
+    /// and the plain `fs::write` that followed then created the link's target —
+    /// anywhere on disk, from the unsandboxed parent process, triggered by
+    /// nothing more than opening a repository that ships
+    /// `.deep-code/.gitignore` as a symlink. That is the same defect
+    /// `workspace_policy::resolve_for_write` was fixed for ("a link that exists
+    /// is a link whether or not its target does"); this was its unaudited
+    /// sibling. `create_new` asks the kernel the question atomically, which
+    /// also closes the exists→write gap.
     fn write_self_ignore(state_dir: &Path) {
-        let marker = state_dir.join(".gitignore");
-        if marker.exists() {
-            return;
-        }
-        let _ = fs::write(
-            &marker,
-            "# Written by deep-code: this directory holds session transcripts and logs.\n\
+        const BODY: &str = "# Written by deep-code: this directory holds session transcripts and logs.\n\
              # Deleting this file does not opt out — deep-code writes it back next session.\n\
              # To commit this directory after all, edit this file instead (e.g. remove the\n\
              # `*` line); deep-code never touches an existing .gitignore.\n\
-             *\n",
-        );
+             *\n";
+        let marker = state_dir.join(".gitignore");
+        let _ = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, BODY.as_bytes()));
     }
 
     fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), SessionStoreError> {
@@ -401,6 +411,30 @@ mod tests {
         fs::write(&marker, "# mine\n").unwrap();
         JsonSessionStore::for_workspace(dir.path()).unwrap();
         assert_eq!(fs::read_to_string(&marker).unwrap(), "# mine\n");
+    }
+
+    /// The complement of the regular-file case above: a DANGLING symlink is an
+    /// existing directory entry too, but `Path::exists()` follows it and says
+    /// "absent", so the old `exists()`-then-`fs::write` created the link's
+    /// target instead — outside the workspace, from the unsandboxed parent
+    /// process, and reachable by nothing more than opening a repository that
+    /// ships this path as a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_marker_symlink_is_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        let state_dir = dir.path().join(".deep-code");
+        fs::create_dir_all(&state_dir).unwrap();
+        std::os::unix::fs::symlink(&victim, state_dir.join(".gitignore")).unwrap();
+
+        JsonSessionStore::for_workspace(dir.path()).unwrap();
+
+        assert!(
+            !victim.exists(),
+            "the marker write followed a dangling symlink out of the workspace"
+        );
     }
 
     #[test]
