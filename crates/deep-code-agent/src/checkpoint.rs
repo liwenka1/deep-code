@@ -774,6 +774,10 @@ mod tests {
     /// spelling genuinely differs (`remove_file` refuses it). Leaving this
     /// `#[cfg(unix)]` is how that platform-specific abort stayed invisible
     /// through the cross-platform pass in 93c4280/d84b22c.
+    ///
+    /// The link's FATE is platform-split (see `snapshot_can_capture_symlink`);
+    /// the external target surviving is not, and that is the invariant this
+    /// test is really named after.
     #[test]
     fn restore_clears_symlink_without_deleting_external_target() {
         let workspace = tempfile::tempdir().unwrap();
@@ -793,10 +797,25 @@ mod tests {
 
         store.restore(&id).unwrap();
 
-        assert!(
-            !link.exists() && link.symlink_metadata().is_err(),
-            "clear must remove the stray symlink"
-        );
+        // Clear may delete only what the snapshot could capture. On unix the
+        // link is recreatable, so it goes and the workspace really returns to
+        // the snapshot. On Windows it is not — a junction has no
+        // privilege-free creation API in `std` — so deleting it would destroy
+        // something `restore` cannot put back, and it is kept instead.
+        if snapshot_can_capture_symlink() {
+            assert!(
+                !link.exists() && link.symlink_metadata().is_err(),
+                "clear must remove a stray symlink the snapshot can recreate"
+            );
+        } else {
+            assert!(
+                link.symlink_metadata().is_ok(),
+                "a link the snapshot cannot capture must be kept, not destroyed"
+            );
+        }
+        // Platform-independent, and the real point of this test: whichever
+        // branch ran, clear must never recurse THROUGH the link into a
+        // workspace-external directory.
         assert!(
             outside.path().join("shared.txt").exists(),
             "clear must not follow the link and delete its external target"
