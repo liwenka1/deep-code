@@ -210,12 +210,25 @@ async fn grep_files_files_a_non_utf8_file_as_binary_not_unreadable() {
 /// shell-grep.
 #[tokio::test]
 async fn grep_files_does_not_invent_a_refusal_from_a_bad_ignore_glob() {
-    let tmp = tempdir().unwrap();
-    fs::write(tmp.path().join(".gitignore"), "foo{bar\n").unwrap();
-    fs::write(tmp.path().join("a.txt"), "needle one\n").unwrap();
-    fs::write(tmp.path().join("b.txt"), "needle two\n").unwrap();
+    // The bad glob has to live in an ANCESTOR of the searched directory.
+    //
+    // `ignore` reports ignore-file parse errors through two different
+    // channels, and only one of them is the walk's `Err`: for the search root
+    // and every directory below it, `add_child` attaches the error to the
+    // yielded `Ok` entry (`DirEntry::error()`), while only `add_parents` —
+    // ancestors of the root — returns `Some(Err(..))`. Writing the glob into
+    // the searched directory's own `.gitignore`, as this test first did, never
+    // reaches the arm it is named after: deleting the whole `is_io()` guard
+    // left all 573 tests green.
+    let outer = tempdir().unwrap();
+    fs::write(outer.path().join(".gitignore"), "foo{bar\n").unwrap();
+    let tmp = outer.path().join("ws");
+    fs::create_dir_all(&tmp).unwrap();
+    let tmp = tmp.as_path();
+    fs::write(tmp.join("a.txt"), "needle one\n").unwrap();
+    fs::write(tmp.join("b.txt"), "needle two\n").unwrap();
 
-    let result = run(tmp.path(), "grep_files", json!({"pattern": "needle"})).await;
+    let result = run(tmp, "grep_files", json!({"pattern": "needle"})).await;
     let output: Value = serde_json::from_str(&result.content).unwrap();
 
     assert_eq!(output["files_searched"], 2, "{output}");
@@ -227,6 +240,77 @@ async fn grep_files_does_not_invent_a_refusal_from_a_bad_ignore_glob() {
     assert!(
         output["note"].is_null(),
         "a fully-searched tree must carry no not-searched note: {output}"
+    );
+}
+
+/// The six filter rules are a contract the model plans against, and nothing
+/// read `description()` — deleting three of the clauses left all 26 grep tests
+/// green. Spelled out as independent literals here, not derived from the
+/// production string, or this would assert only that the string equals itself.
+#[test]
+fn grep_description_names_every_filter_rule() {
+    let tmp = tempdir().unwrap();
+    let description = registry(tmp.path())
+        .specs()
+        .iter()
+        .find(|spec| spec.name == "grep_files")
+        .expect("grep_files must be registered")
+        .description
+        .clone();
+    for clause in [
+        "hidden files",
+        ".gitignore",
+        ".ignore",
+        ".git/info/exclude",
+        "core.excludesFile",
+        "parent directory",
+        "skipped_oversized",
+        "skipped_binary",
+        "skipped_symlinks",
+        "skipped_unreadable",
+    ] {
+        assert!(
+            description.contains(clause),
+            "grep's contract stopped mentioning {clause:?}: {description}"
+        );
+    }
+    // The git-family rules are gated on a `.git` and stop at the nearest
+    // repository root, so "any parent directory" without that qualifier was
+    // simply false for the common case (workspace == repo root).
+    assert!(
+        description.contains("nearest repository root"),
+        "the ancestor clause must say the git rules stop at the repo root: {description}"
+    );
+}
+
+/// A refused symlink may BE a directory, and `follow_links(false)` means the
+/// walk never looked inside it — so the counts are a floor, exactly as for an
+/// unreadable directory. Only the unreadable cause carried the hedge.
+#[tokio::test]
+async fn grep_hedges_the_census_when_a_symlinked_directory_is_refused() {
+    let tmp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::write(outside.path().join("hidden-away.txt"), "needle\n").unwrap();
+    fs::write(tmp.path().join("a.txt"), "needle one\n").unwrap();
+    if !crate::test_symlinks::symlink_dir_for_test(outside.path(), &tmp.path().join("linked")) {
+        return;
+    }
+
+    let result = run(tmp.path(), "grep_files", json!({"pattern": "needle"})).await;
+    let output: Value = serde_json::from_str(&result.content).unwrap();
+
+    assert_eq!(output["skipped_symlinks"], 1, "{output}");
+    let note = output["note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("at least"),
+        "a refused directory link hides an unknown subtree, so the counts are \
+         a floor and the note must say so: {output}"
+    );
+    // And the phrase must not carry its own comma — the fragments are joined
+    // with ", ", so an internal one made three buckets read as four.
+    assert!(
+        !note.contains("symlinked path(s),"),
+        "the symlink phrase must not contain a comma: {note}"
     );
 }
 

@@ -395,6 +395,13 @@ impl GrepFilesTool {
             if file_type.is_symlink() {
                 skipped_symlinks += 1;
                 push_capped(&mut skipped_symlink_paths, self.root.relative_display(path));
+                // A refused link may BE a directory, and `follow_links(false)`
+                // means the walk never looked inside it — so, exactly as for an
+                // unreadable directory, the counts below are a floor and the
+                // note has to say so. Only the unreadable cause got that hedge.
+                if path.metadata().is_ok_and(|meta| meta.is_dir()) {
+                    subtree_lost = true;
+                }
                 continue;
             }
             if !file_type.is_file() {
@@ -530,7 +537,9 @@ impl GrepFilesTool {
                 skipped_symlinks,
                 skipped_symlink_paths,
                 "skipped_symlink_paths",
-                format!("{skipped_symlinks} symlinked path(s), refused by the workspace boundary"),
+                // No comma inside a phrase: the fragments below are joined with
+                // ", ", so an internal one made three buckets read as four.
+                format!("{skipped_symlinks} symlinked path(s) refused by the workspace boundary"),
             ),
             (
                 skipped_unreadable,
@@ -628,8 +637,14 @@ fn write_failed(tool_name: &str, path: &std::path::Path, error: &std::io::Error)
 /// The path an `ignore` walk error is about, dug out of its wrappers.
 ///
 /// `WithDepth` and `WithLineNumber` nest AROUND `WithPath`, so matching only
-/// the outermost variant misses the path on exactly the errors that carry the
-/// most context.
+/// the outermost variant would miss the path on the errors that carry the most
+/// context. The recursion is kept for that shape, but note what the only
+/// caller does before reaching here: it takes this branch solely when
+/// `is_io()` holds, and an IO walk error is built by `Error::from_walkdir` as
+/// bare `Io` or `WithPath { Io }`. `WithLineNumber` wraps only `Glob` and
+/// `WithDepth` only `Loop`, and both of those answer `is_io() == false`. So on
+/// today's call path the nested arms are unreachable — they are defence for a
+/// future caller that does not pre-filter, not something the ledger relies on.
 fn ignore_error_path(error: &ignore::Error) -> Option<&std::path::Path> {
     match error {
         ignore::Error::WithPath { path, .. } => Some(path),
@@ -689,8 +704,10 @@ impl Tool for GrepFilesTool {
     fn description(&self) -> &str {
         "Search UTF-8 workspace files with a regex. Returns structured matches with file, line \
          number, and context. NOT searched and NOT counted anywhere: hidden files, and anything \
-         excluded by .gitignore/.ignore, .git/info/exclude, the global core.excludesFile, or an \
-         ignore file in any parent directory above the workspace — use the shell tool if you \
+         excluded by .gitignore/.ignore, .git/info/exclude, the global core.excludesFile, or a \
+         .ignore file in any parent directory above the workspace (the git-specific rules need a \
+         .git and stop at the nearest repository root, so an ancestor's .gitignore does not \
+         apply inside a repo, and none of them apply outside one) — use the shell tool if you \
          need those. Files refused individually are reported with their paths in \
          skipped_oversized (over the size limit), skipped_binary (not UTF-8), skipped_symlinks \
          (refused by the workspace boundary), and skipped_unreadable (IO failure; a directory \

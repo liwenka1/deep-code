@@ -311,10 +311,14 @@ pub(crate) fn summarize_tool_result(content: &str) -> String {
 
 fn summarize_json_tool_result(value: &serde_json::Value) -> Option<String> {
     let object = value.as_object()?;
+    // Empty counts as absent: a grep of the workspace root has its root prefix
+    // stripped to "", and `unwrap_or` only catches a missing key, so the line
+    // opened with a bare colon.
     let path = object
         .get("path")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("<unknown>");
+        .filter(|path| !path.is_empty())
+        .unwrap_or(".");
 
     if let Some(entries) = object.get("entries").and_then(serde_json::Value::as_array) {
         return Some(format!("{path}: {} entries", entries.len()));
@@ -355,19 +359,39 @@ fn summarize_json_tool_result(value: &serde_json::Value) -> Option<String> {
         // split-out bucket silently stops reaching the line — which is what
         // splitting binary/symlink out of "unreadable" would otherwise have
         // done, quietly shrinking the number the human is shown.
-        let skipped = [
-            "skipped_oversized",
-            "skipped_binary",
-            "skipped_symlinks",
-            "skipped_unreadable",
+        //
+        // Broken out by cause rather than summed. The model is told which
+        // ledger each refusal landed in; collapsing them back into one integer
+        // for the human re-merged the exact distinction the split was for, and
+        // now that boundary refusals are counted too, one number mixes "grep
+        // could not read it" with "the boundary said no" — different problems
+        // with different fixes.
+        let causes = [
+            ("oversized", "skipped_oversized"),
+            ("binary", "skipped_binary"),
+            ("symlinks", "skipped_symlinks"),
+            ("unreadable", "skipped_unreadable"),
         ]
         .iter()
-        .filter_map(|key| object.get(*key).and_then(serde_json::Value::as_u64))
-        .sum::<u64>();
-        let skipped = if skipped > 0 {
-            format!(", skipped={skipped}")
-        } else {
+        .filter_map(|(label, key)| {
+            let count = object.get(*key).and_then(serde_json::Value::as_u64)?;
+            (count > 0).then(|| format!("{label}={count}"))
+        })
+        .collect::<Vec<_>>();
+        // The tool's own note carries the "at least" hedge whenever the walk
+        // did not finish; without it the human reads a floor as a census.
+        let floor = object
+            .get("note")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|note| note.contains("at least"));
+        let skipped = if causes.is_empty() {
             String::new()
+        } else {
+            format!(
+                ", skipped {}{}",
+                causes.join(" "),
+                if floor { " (at least)" } else { "" }
+            )
         };
         return Some(format!(
             "{path}: {} matches across {files_searched} files (truncated={truncated}{skipped})",
@@ -597,8 +621,10 @@ mod tests {
     /// were added to prevent — for the human this line is all there is.
     #[test]
     fn grep_summary_surfaces_skipped_files() {
-        // Every ledger the tool emits, so a bucket that stops being summed
-        // here shows up as a wrong total rather than as nothing at all.
+        // Every ledger the tool emits, each named: the model is told which
+        // bucket a refusal landed in, and one summed integer took that back
+        // — "the boundary refused it" and "grep could not read it" are
+        // different problems with different fixes.
         let with_skips = summarize_tool_result(
             r#"{"path":"logs","files_searched":5,"matches":[],"truncated":false,
                 "skipped_oversized":2,"skipped_binary":3,"skipped_symlinks":4,
@@ -606,8 +632,29 @@ mod tests {
         );
         assert_eq!(
             with_skips,
-            "logs: 0 matches across 5 files (truncated=false, skipped=10)"
+            "logs: 0 matches across 5 files (truncated=false, \
+             skipped oversized=2 binary=3 symlinks=4 unreadable=1)"
         );
+
+        // The tool's "at least" hedge has to reach the human too: without it a
+        // floor reads as a census, which is the same misread one level up.
+        let hedged = summarize_tool_result(
+            r#"{"path":"logs","files_searched":5,"matches":[],"truncated":false,
+                "skipped_unreadable":1,
+                "note":"not searched: at least 1 unreadable path(s)"}"#,
+        );
+        assert_eq!(
+            hedged,
+            "logs: 0 matches across 5 files (truncated=false, \
+             skipped unreadable=1 (at least))"
+        );
+
+        // A grep of the workspace root has its prefix stripped to "", which
+        // `unwrap_or` does not catch — the line used to open with a bare colon.
+        let rooted = summarize_tool_result(
+            r#"{"path":"","files_searched":1,"matches":[],"truncated":false}"#,
+        );
+        assert_eq!(rooted, ".: 0 matches across 1 files (truncated=false)");
         let clean = summarize_tool_result(
             r#"{"path":"src","files_searched":5,"matches":[],"truncated":false,
                 "skipped_oversized":0,"skipped_binary":0,"skipped_symlinks":0,
