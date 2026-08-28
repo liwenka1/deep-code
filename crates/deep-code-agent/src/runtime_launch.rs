@@ -847,7 +847,24 @@ mod tests {
         };
         let client = DeepSeekClient::new(config.clone()).expect("client builds without network");
 
-        for name in parent_tool_names(client, &config, dir.path()) {
+        let mut names = parent_tool_names(client, &config, dir.path());
+        assert!(
+            names.len() >= 8,
+            "an empty or truncated registry would satisfy this loop vacuously: {names:?}"
+        );
+        // `build_parent_tools` is not the whole universe: `agent` is mounted
+        // later by `attach_agent_extensions` (see the count above), so a loop
+        // over the builder alone would let `"agent" => ToolKind::SubAgent` be
+        // deleted without a single test noticing — and `agent` is exactly the
+        // kind of late-mounted name that would then be accused of matching no
+        // tool. Named explicitly rather than left to the builder.
+        names.extend(
+            crate::subagent::SUBAGENT_TOOL_NAMES
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
+
+        for name in names {
             assert_ne!(
                 crate::execution_policy::ExecPolicy::classify_tool(&name),
                 crate::execution_policy::ToolKind::Unknown,

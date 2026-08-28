@@ -415,7 +415,14 @@ impl ToolError {
     /// failed for checkpoint: …`.
     pub(crate) fn message(&self) -> &str {
         match self {
-            Self::UnknownTool { name } => name,
+            // NOT the name: `UnknownTool`'s Display is "unknown tool: {name}",
+            // which carries no `tool execution failed for …` framing to strip.
+            // Returning `name` handed the caller a bare tool name and deleted
+            // the cause, so a re-wrap would have read "checkpoint; the
+            // workspace is partially cleared…". Unreachable from today's two
+            // call sites (both build `ExecutionFailed`), but this reads as a
+            // general accessor and the next re-wrap would inherit it.
+            Self::UnknownTool { .. } => "unknown tool",
             Self::InvalidArguments { message, .. } | Self::ExecutionFailed { message, .. } => {
                 message
             }

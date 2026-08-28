@@ -370,22 +370,6 @@ impl App {
             persistent,
         )];
 
-        if !config_warnings.is_empty() {
-            history.push(HistoryCell::system(format!(
-                "{}\n{}",
-                tr(lang, TextId::ConfigWarningsHeader),
-                config_warnings.join("\n")
-            )));
-        }
-
-        // `LaunchedRuntime::warnings` documents "the consumer must surface
-        // these" — the library cannot write to stderr because raw mode owns
-        // the screen. Only `adopt_runtime` (the runtime-SWAP path: /clear,
-        // /resume, /model, /add-dir) was ever wired, so at startup — the one
-        // moment a dead `auto_allow` entry, a disabled tool group, an
-        // unavailable session store or a checkpoint failure is actually
-        // decided — every warning was dropped on the floor. Same rendering as
-        // the swap path, so a warning reads identically whenever it arrives.
         // Hydrate FIRST, then warn. `switch_session` already orders it this way
         // ("after the rebuild, so the clear above cannot erase them"); this
         // path did the opposite, so on `-c`/`-r` the warnings were pushed above
@@ -395,6 +379,20 @@ impl App {
         // staging fix exists to prevent, on the more common resume entry point.
         if let Some(record) = config.resume.as_ref() {
             history.extend(hydrate_history(record));
+        }
+
+        // Config warnings obey the same ordering, and for the same reason: they
+        // were pushed BEFORE the hydrate, so on `-c`/`-r` into a session longer
+        // than a screen `CfgGlobalKeyPerms` ("the global config holding your
+        // plaintext API key is group/world readable") opened off screen. The
+        // reorder that fixed the launch warnings left this block, twenty lines
+        // above it, behind.
+        if !config_warnings.is_empty() {
+            history.push(HistoryCell::system(format!(
+                "{}\n{}",
+                tr(lang, TextId::ConfigWarningsHeader),
+                config_warnings.join("\n")
+            )));
         }
 
         // `LaunchedRuntime::warnings` documents "the consumer must surface

@@ -541,7 +541,14 @@ mod cow {
 /// Unix: yes, as the link itself. Windows: no — a junction has no
 /// privilege-free creation API in `std` at all, and a directory symlink needs
 /// `SeCreateSymbolicLinkPrivilege` (or Developer Mode), which an ordinary
-/// account lacks, so `copy_tree`'s symlink arm is `#[cfg(unix)]`.
+/// account lacks.
+///
+/// Both halves of `restore` gate on THIS, rather than each spelling
+/// `#[cfg(unix)]` for itself, so that hard-coding it and running the suite
+/// really does exercise the other branch on both sides. `copy_tree`'s arm
+/// still needs a `#[cfg(unix)]` body for the API that does not exist
+/// elsewhere; see the compile-time assertion below for why that is not a
+/// second, driftable condition.
 ///
 /// [`clear_workspace_contents`] keys the delete side off this same answer.
 /// Snapshot and clear must agree on exactly one set of entries, or `restore`
@@ -549,6 +556,23 @@ mod cow {
 const fn snapshot_can_capture_symlink() -> bool {
     cfg!(unix)
 }
+
+/// The constant is the ONE switch both sides read, but `copy_tree`'s symlink
+/// arm still has a `#[cfg(unix)]` BODY — `std::os::unix::fs::symlink` does not
+/// exist elsewhere. That is a second condition, and the two agree today only
+/// because the constant is itself `cfg!(unix)`.
+///
+/// Flipping it true on a non-unix target would make the arm match while its
+/// body compiles away: `copy_tree` would record nothing while
+/// `clear_dir_contents` started deleting every workspace symlink — precisely
+/// the "deletes more than it stores" disagreement whose last instance was a P0.
+/// So the pairing is asserted at compile time rather than described in a
+/// comment: a Windows symlink capability has to bring a Windows body with it.
+const _: () = assert!(
+    cfg!(unix) || !snapshot_can_capture_symlink(),
+    "snapshot_can_capture_symlink() is true on a target where copy_tree's \
+     symlink arm compiles to nothing; give it a body for this platform first"
+);
 
 /// Empty the workspace of everything [`copy_tree`] put into the snapshot — and
 /// of nothing else.

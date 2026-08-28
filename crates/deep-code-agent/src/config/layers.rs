@@ -1028,16 +1028,20 @@ mod tests {
         );
 
         // Env wins, and splits on commas with surrounding space trimmed and
-        // empty entries dropped. Spelled with real tool names: matching is by
-        // exact name, so a fixture full of `read_`-style prefixes reads as an
-        // endorsed config while being exactly what launch now warns about.
+        // empty entries dropped. Spelled with real tool names that are actually
+        // GATED, matching the global fixture above: `read_file`/`grep_files`
+        // are real names but need no approval, so an entry naming them does
+        // nothing — which makes them a poor illustration of what the setting is
+        // for, and (unlike a `read_`-style prefix) is NOT what launch warns
+        // about either, since `warn_unmatched_auto_allow` deliberately stays
+        // silent for a matched-but-ungated tool.
         let env = |name: &str| {
-            (name == APPROVAL_AUTO_ALLOW_ENV).then(|| "read_file, grep_files ,,".to_string())
+            (name == APPROVAL_AUTO_ALLOW_ENV).then(|| "write_file, apply_patch ,,".to_string())
         };
         let loaded = AgentConfig::load_with(None, None, &env);
         assert_eq!(
             loaded.config.approval_auto_allow,
-            vec!["read_file".to_string(), "grep_files".to_string()]
+            vec!["write_file".to_string(), "apply_patch".to_string()]
         );
     }
 
