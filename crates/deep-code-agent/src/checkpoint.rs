@@ -135,7 +135,15 @@ impl CheckpointStore {
         warnings
     }
 
-    pub fn restore(&self, id: &CheckpointId) -> Result<(), ToolError> {
+    /// Restore, returning the workspace-relative paths `clear` deliberately
+    /// KEPT because the snapshot has no way to put them back.
+    ///
+    /// Returned rather than discarded: `restore` used to answer `Ok(())` and
+    /// the UI said "workspace restored" flat out, while three separate rules
+    /// could quietly leave things behind (a skipped directory, a link this
+    /// platform cannot recreate, an entry with no snapshot representation).
+    /// "Restored, except for these" is the true sentence.
+    pub fn restore(&self, id: &CheckpointId) -> Result<Vec<String>, ToolError> {
         validate_checkpoint_id(id)?;
         let source = self.storage_root.join(&id.0);
         // `symlink_metadata`, not `is_dir()`: the latter follows links, and
@@ -164,7 +172,8 @@ impl CheckpointStore {
         // yet — and it used to propagate raw: the user was told an unlink
         // failed and nothing told them their workspace had just been partly
         // emptied.
-        clear_workspace_contents(&self.workspace, &source).map_err(|error| {
+        let mut kept = Vec::new();
+        clear_workspace_contents(&self.workspace, &source, &mut kept).map_err(|error| {
             ToolError::exec_failed(
                 "checkpoint",
                 format!(
@@ -186,7 +195,8 @@ impl CheckpointStore {
                 ),
             )
         })?;
-        Ok(())
+        kept.sort();
+        Ok(kept)
     }
 
     pub fn list(&self) -> Result<Vec<CheckpointId>, ToolError> {
@@ -590,14 +600,23 @@ const _: () = assert!(
 ///    side judges, so the two sets are the same set by construction.
 /// 2. Windows symlinks: see the `Entry::Symlink` arm.
 /// 3. Entries with no snapshot representation at all: see [`Entry::Uncapturable`].
-fn clear_workspace_contents(workspace: &Path, snapshot: &Path) -> Result<(), ToolError> {
-    clear_dir_contents(workspace, snapshot, workspace).map(|_| ())
+fn clear_workspace_contents(
+    workspace: &Path,
+    snapshot: &Path,
+    report: &mut Vec<String>,
+) -> Result<(), ToolError> {
+    clear_dir_contents(workspace, snapshot, workspace, report).map(|_| ())
 }
 
 /// Returns whether anything under `dir` was deliberately KEPT, which is what
 /// tells the caller not to remove `dir` itself: a directory holding a skipped
 /// `.git` must survive to hold it.
-fn clear_dir_contents(workspace: &Path, snapshot: &Path, dir: &Path) -> Result<bool, ToolError> {
+fn clear_dir_contents(
+    workspace: &Path,
+    snapshot: &Path,
+    dir: &Path,
+    report: &mut Vec<String>,
+) -> Result<bool, ToolError> {
     let mut kept = false;
     for entry in fs::read_dir(dir).map_err(|error| checkpoint_error("read workspace", error))? {
         let entry = entry.map_err(|error| checkpoint_error("read workspace entry", error))?;
@@ -614,6 +633,7 @@ fn clear_dir_contents(workspace: &Path, snapshot: &Path, dir: &Path) -> Result<b
         // failed in was "delete".
         let Ok(relative) = path.strip_prefix(workspace) else {
             kept = true;
+            report.push(path.display().to_string());
             continue;
         };
         if should_skip(relative) {
@@ -650,12 +670,13 @@ fn clear_dir_contents(workspace: &Path, snapshot: &Path, dir: &Path) -> Result<b
                         .map_err(|error| checkpoint_error("clear workspace symlink", error))?;
                 } else {
                     kept = true;
+                    report.push(relative.display().to_string());
                 }
             }
             Entry::Dir => {
                 // Recurse rather than `remove_dir_all`: the subtree may hold a
                 // skipped directory, and blowing it away is bug 1 above.
-                if clear_dir_contents(workspace, snapshot, &path)? {
+                if clear_dir_contents(workspace, snapshot, &path, report)? {
                     kept = true;
                 } else {
                     fs::remove_dir(&path)
@@ -687,6 +708,7 @@ fn clear_dir_contents(workspace: &Path, snapshot: &Path, dir: &Path) -> Result<b
                         .map_err(|error| checkpoint_error("clear workspace special file", error))?;
                 } else {
                     kept = true;
+                    report.push(relative.display().to_string());
                 }
             }
         }
@@ -1138,8 +1160,16 @@ mod tests {
         let store = CheckpointStore::new(root).unwrap();
         let (id, _) = store.snapshot("before_turn").unwrap();
         fs::write(root.join("real.txt"), "v2").unwrap();
-        store.restore(&id).unwrap();
+        let kept = store.restore(&id).unwrap();
 
+        // ...and `restore` SAYS so. It used to answer a flat `Ok(())` while
+        // three separate rules could leave things behind, and the UI printed
+        // "workspace restored" on top of that.
+        assert_eq!(
+            kept,
+            vec!["dev.sock".to_string()],
+            "the entry that could not be restored must be reported, not implied"
+        );
         assert_eq!(fs::read_to_string(root.join("real.txt")).unwrap(), "v1");
         assert!(
             fifo.symlink_metadata().is_ok(),

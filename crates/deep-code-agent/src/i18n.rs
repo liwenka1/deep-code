@@ -225,6 +225,7 @@ text_ids! {
     StatusToolCallReceivingArgs,
     StatusToolRunning,
     SystemWorkspaceRestored,
+    SystemRestoreKept,
     SystemRootGranted,
     StatusRestored,
     SystemSaveFailed,

@@ -33,7 +33,10 @@ impl AgentRuntime {
     }
 
     /// Restore workspace files from a checkpoint id.
-    pub async fn restore_checkpoint(&self, id: CheckpointId) -> Result<(), ToolError> {
+    /// Restore, returning the paths `clear` deliberately kept (see
+    /// [`CheckpointStore::restore`]) so the caller can say so instead of
+    /// reporting a flat success.
+    pub async fn restore_checkpoint(&self, id: CheckpointId) -> Result<Vec<String>, ToolError> {
         let store = self.checkpoints.as_ref().ok_or_else(|| {
             ToolError::exec_failed("checkpoint", "checkpoints are not enabled on this runtime")
         })?;

@@ -99,28 +99,50 @@ impl SkillRegistry {
         let children = match fs::read_dir(dir) {
             Ok(iter) => iter,
             Err(err) => {
-                // An unreadable root is misconfiguration the user should see;
-                // unreadable nested directories are usually just noise.
-                if depth == 0 {
-                    self.note(format!(
-                        "skills root {} is unreadable: {err}",
-                        dir.display()
-                    ));
-                }
+                // Every unreadable directory is reported, at any depth. The old
+                // rule ("nested ones are usually just noise") made a whole
+                // subtree of skills vanish with nothing said — the same "a
+                // refusal the caller cannot see is a lie" that `grep_files`
+                // grew four skip ledgers for. A skill that silently fails to
+                // load looks identical to a skill that was never written.
+                self.note(if depth == 0 {
+                    format!("skills root {} is unreadable: {err}", dir.display())
+                } else {
+                    format!("skills directory {} is unreadable: {err}", dir.display())
+                });
                 return;
             }
         };
 
-        for entry in children.flatten() {
+        for entry in children {
+            // `flatten()` dropped a failed directory entry without a word.
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    self.note(format!(
+                        "skills entry under {} is unreadable: {err}",
+                        dir.display()
+                    ));
+                    continue;
+                }
+            };
             let child = entry.path();
             if is_hidden(&child) {
                 continue;
             }
-            if !fs::metadata(&child)
-                .map(|meta| meta.is_dir())
-                .unwrap_or(false)
-            {
-                continue;
+            // `metadata` FOLLOWS links on purpose here — a symlinked skill
+            // directory is a supported layout (see `claim`). Only a stat that
+            // genuinely fails is reported; a plain file is simply not a skill.
+            match fs::metadata(&child) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => continue,
+                Err(err) => {
+                    self.note(format!(
+                        "skills entry {} is unreadable: {err}",
+                        child.display()
+                    ));
+                    continue;
+                }
             }
 
             let manifest = child.join("SKILL.md");
@@ -366,6 +388,44 @@ fn clamp_line(text: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A nested unreadable directory used to vanish with nothing said: the
+    /// note was gated on `depth == 0`, so a whole subtree of skills could fail
+    /// to load and look exactly like a subtree nobody had written. Same
+    /// "a refusal the caller cannot see is a lie" rule `grep_files` keeps four
+    /// skip ledgers for.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_nested_directory_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("group");
+        std::fs::create_dir_all(nested.join("real-skill")).unwrap();
+        std::fs::write(
+            nested.join("real-skill/SKILL.md"),
+            "---\nname: real\ndescription: d\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&nested).is_ok() {
+            std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return; // running as root; the refusal cannot be produced
+        }
+
+        let registry = SkillRegistry::discover(dir.path());
+        let reported = registry
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("group") && warning.contains("unreadable"));
+
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            reported,
+            "an unreadable nested directory was skipped silently: {:?}",
+            registry.warnings()
+        );
+    }
+
     use super::*;
     use tempfile::TempDir;
 

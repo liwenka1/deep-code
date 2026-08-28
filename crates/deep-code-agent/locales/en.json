@@ -9,7 +9,6 @@
   "SessionNewPersistent": "New session · persisted",
   "SessionNewEphemeral": "New session · not persisted",
   "SessionResumed": "Resumed · {turns} turns",
-
   "ApprovalNeeded": "Approval required",
   "RiskHigh": "High risk",
   "RiskMedium": "Medium risk",
@@ -39,17 +38,14 @@
   "StatusToolResolved": "Tool {decision}, resuming...",
   "WordYes": "yes",
   "WordNo": "no",
-
   "PickerTitle": "Past sessions",
   "PickerHelpResume": "↑/↓ select · Enter resume · n/Esc cancel",
   "PickerHelpStartup": "↑/↓ select · Enter resume · n/Esc new session · Ctrl+C quit",
   "EmptySessionTitle": "(empty session)",
-
   "TimeJustNow": "just now",
   "TimeMinutesAgo": "{n} min ago",
   "TimeHoursAgo": "{n} h ago",
   "TimeDaysAgo": "{n} d ago",
-
   "ComposerPlaceholder": "Type a message, / for commands",
   "ComposerPlaceholderSteering": "Type to queue a follow-up for when this turn ends…",
   "CompletionMenuTitle": "Complete: ↑/↓ select | Tab/Enter accept | Esc close",
@@ -72,7 +68,6 @@
   "ModeStreaming": "streaming",
   "ModeReady": "ready",
   "ModeReadyResumed": "ready (resumed)",
-
   "StatusToolCallReceiving": "Receiving tool call: {tool}",
   "StatusToolCallReceivingArgs": "Receiving tool call...",
   "StatusToolRunning": "Running {tool}…",
@@ -90,7 +85,6 @@
   "SystemTurnCancelled": "Turn cancelled",
   "StatusCancelled": "Cancelled",
   "StatusReadySubagents": "{running} sub-agent(s) running",
-
   "BadgeRequired": "required",
   "BadgeApproved": "approved",
   "BadgeDenied": "denied",
@@ -98,16 +92,13 @@
   "CheckpointRestoreHint": "Restore: /restore {id}",
   "CompactionSummaryTitle": "Compaction summary",
   "CompactionSummaryTitleMeta": "Compaction summary ({meta})",
-
   "PasteChipLines": "[paste #{id} +{lines} lines]",
   "PasteChipChars": "[paste #{id} · {chars} chars]",
-
   "FindNoTranscript": "Nothing to search yet",
   "FindFound": "Found \"{query}\" (line {line}) · /find again to continue upward",
   "FindExhausted": "Reached the earliest match for \"{query}\" · /find again restarts from the bottom",
   "FindNotFound": "\"{query}\" not found",
   "UsageFind": "Usage: /find <keyword>",
-
   "BusyRelaunchConfig": "Streaming or awaiting approval; retry the config change later",
   "SessionReloadFailedRestart": "Could not reload the current session; restarted with a new one",
   "BusySwitchSession": "Streaming or awaiting approval; cannot switch sessions",
@@ -125,7 +116,6 @@
   "ConfigWarningsHeader": "Config warnings:",
   "ExtraRootsGrantedLabel": "Additional writable roots (--add-dir): {dirs}",
   "RestoreExtraRootsNotCovered": "Note: additional writable roots are not covered by checkpoints and were not rolled back; use git in those directories if needed.",
-
   "BoundaryDenialBreaker": "Turn stopped: the model tried {limit} times to write outside the granted roots; further retries cannot succeed. Grant the directory with /add-dir <dir> and resend your last message, or narrow the task.",
   "BoundaryDenialBreakerWithPath": "Turn stopped: the model repeatedly tried to write outside the granted roots (last target: {path}). Grant the directory with /add-dir and resend your last message, or narrow the task.",
   "AddDirUsage": "Usage: /add-dir <directory>",
@@ -135,7 +125,6 @@
   "AddDirAlreadyWorkspace": "{path} is the workspace itself; already writable",
   "AddDirAlreadyGranted": "{path} is already granted",
   "AddDirGranted": "Granted additional writable root: {dir}",
-
   "HintHelp": "Show help",
   "HintClear": "Start a new conversation: reset context and clear the screen (/resume recovers the old one)",
   "HintStatus": "Show runtime status",
@@ -151,7 +140,6 @@
   "HintFind": "Search the transcript for <keyword> (repeat to search upward)",
   "HintLang": "Show/switch UI language (zh|en)",
   "HintAddDir": "Grant an extra writable directory <path> (this run; saved with the session)",
-
   "UsageRestore": "Usage: /restore <checkpoint_id>",
   "ApiKeySaved": "API key saved to {path} (mode 600). Backend: {backend}",
   "StatusConnected": "Connected - {backend}",
@@ -187,16 +175,13 @@
   "CheckpointsUnavailable": "Checkpoints unavailable: {error}",
   "RestoreOutsideRuntime": "Cannot restore outside the async runtime",
   "RestoreFailed": "Restore failed: {error}",
-
   "PrefixFirstTurn": "prefix first turn",
   "PrefixStable": "prefix stable",
   "PrefixChanged": "prefix changed",
-
   "LangCurrent": "Current UI language: {lang}. Usage: /lang zh|en",
   "LangName": "English",
   "LangSwitched": "UI language set to English (written to the global config)",
   "LangUnknown": "Unknown language '{value}'. Available: zh, en",
-
   "ErrMissingApiKey": "Missing DeepSeek API key; set the DEEPSEEK_API_KEY environment variable, or get one at https://platform.deepseek.com\n1. Register and create an API key at https://platform.deepseek.com\n2. export DEEPSEEK_API_KEY=sk-...\n3. If your network to DeepSeek is unstable, try a proxy or mirror endpoint (deep-code defaults to https://api.deepseek.com/beta)",
   "ErrHttp": "HTTP request failed: {error}\nCould not reach DeepSeek — check your network, proxy settings, or the DeepSeek endpoint; configure a working proxy if your connection is unstable.",
   "ErrApiUnauthorized": "API authentication failed ({status}): confirm DEEPSEEK_API_KEY is correct and unexpired, and that the endpoint is DeepSeek-compatible. Original message: {message}",
@@ -209,7 +194,6 @@
   "ErrStreamStalled": "Stream stalled: no new data for {seconds}s\nNetwork may be stalling or the proxy dropped — retry; for genuinely long tasks raise DEEP_CODE_STREAM_CHUNK_TIMEOUT_SECS.",
   "ErrStreamDeadline": "Stream exceeded the {seconds}s total deadline\nThis turn ran too long and was terminated — split the task and retry, or raise DEEP_CODE_STREAM_TOTAL_TIMEOUT_SECS.",
   "ErrStreamOverflow": "Stream too large: content exceeded the {limit}-byte cap\nThe response was unusually huge and was truncated for safety — narrow the task, or raise DEEP_CODE_STREAM_MAX_BYTES.",
-
   "WebUrlParseError": "Cannot parse URL: {error}",
   "WebHttpStatus": "HTTP status {status}",
   "WebReadBodyError": "Failed to read response: {error}",
@@ -229,7 +213,6 @@
   "WebHostResolveError": "Cannot resolve host {host}: {error}",
   "WebHostNoAddrs": "Host {host} resolved to no addresses",
   "WebPrivateResolvedBlocked": "Refused to fetch {host} (resolves to non-public {addr}): private/loopback targets are not allowed",
-
   "CfgFileUnusable": "Config file {path} is unusable and was skipped: {detail}",
   "CfgProjectApiKeyIgnored": "provider.api_key in the project config is ignored: the key may only come from the environment or global config, to avoid leaking through the repo or being injected by a malicious one",
   "CfgProjectBaseUrlIgnored": "provider.base_url in the project config is ignored ({url}): the endpoint may only come from the environment or global config, so a malicious repo cannot redirect your API key and full context to its own server",
@@ -247,14 +230,12 @@
   "CfgWriteFailed": "Failed to write {path}: {error}",
   "CfgReplaceFailed": "Failed to replace {path}: {error}",
   "CfgTemplateHeader": "# deep-code global config (generated by the /apikey or /model command)\n# Load order: builtin defaults -> this file -> project .deep-code/config.toml -> environment\n# See config.example.toml at the repo root for the full example",
-
   "PreviewNewFile": "New file · {total} lines",
   "PreviewMoreLines": "…(+{count} more lines)",
   "PreviewFileTooBig": "(existing file exceeds {limit} MiB, skipping diff preview)",
   "PreviewReadFail": "(cannot read existing file, skipping diff preview)",
   "PreviewNoChange": "(identical to existing file, no change)",
   "PreviewNotUtf8": "(existing file is not UTF-8, skipping diff preview)",
-
   "SafetyRedirectReason": "Redirection will write to or overwrite a file",
   "SafetyRedirectSuggestion": "Confirm the target file may be overwritten",
   "SafetyPathOutsideReason": "May read/write paths outside the workspace",
@@ -269,12 +250,9 @@
   "SafetyGitRemoteSuggestion": "Confirm the remote address; avoid pushing to unknown repos",
   "SafetyInstallReason": "Installing dependencies downloads and runs third-party code",
   "SafetyInstallSuggestion": "Confirm the dependency source is trusted",
-
   "CheckpointSnapshotFailed": "Checkpoint snapshot failed ({label}): {error}",
   "TurnStepLimitReached": "This turn hit the {limit}-request limit and was stopped to avoid burning further quota. Try again with a more focused instruction.",
-
   "EchoOfflineHint": "No DeepSeek API key configured: type /apikey sk-... to connect now, or set the DEEPSEEK_API_KEY environment variable and restart.",
-
   "RouteFixedModel": "Fixed model config: {model}",
   "RouteFixedModelPassthrough": "Fixed model config: {model} (not in the catalog, used as-is)",
   "RouteCascade": "Cascade upgrade: Flash tool calls kept failing this session, handing off to Pro",
@@ -284,11 +262,11 @@
   "RouteKeywordBorderline": "Task contains \"{keyword}\" and cost-first is off, using Pro",
   "RouteFlashDefault": "Defaulting to Flash (faster, cheaper); cascade upgrades to Pro if tool calls keep failing",
   "RouteFallbackProToFlash": "DeepSeek temporarily unavailable or rate-limited; auto-downgraded Pro→Flash and retried",
-
   "PermModeDefault": "default",
   "PermModeAcceptEdits": "accept-edits",
   "PermModeAuto": "auto",
   "PermModeYolo": "YOLO",
   "PermModeSwitched": "Switched to \"{mode}\" mode",
-  "PermModeYoloArm": "⚠ Press Shift+Tab again to enter YOLO (auto-approve everything; hard denials still block); any other key cancels"
+  "PermModeYoloArm": "⚠ Press Shift+Tab again to enter YOLO (auto-approve everything; hard denials still block); any other key cancels",
+  "SystemRestoreKept": "Kept {count} entry/entries the snapshot cannot restore: {paths}"
 }

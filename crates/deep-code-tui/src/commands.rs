@@ -531,7 +531,7 @@ impl App {
             handle.block_on(runtime.restore_checkpoint(checkpoint_id.clone()))
         });
         match result {
-            Ok(()) => {
+            Ok(kept) => {
                 self.last_checkpoint = Some(id.to_string());
                 self.apply_runtime_event(RuntimeEvent::WorkspaceRestored { id: checkpoint_id });
                 // Checkpoints snapshot the primary workspace only. Restoring
@@ -541,6 +541,20 @@ impl App {
                     self.history.push(HistoryCell::system(
                         self.tr(TextId::RestoreExtraRootsNotCovered).to_string(),
                     ));
+                }
+                // "Restored" was said flat out while `clear` could deliberately
+                // leave entries behind (a skipped directory, a link this
+                // platform cannot recreate, a FIFO/socket with no snapshot
+                // representation). Naming them is the difference between
+                // "restored" and "restored, except for these".
+                if !kept.is_empty() {
+                    self.history.push(HistoryCell::system(self.tr_with(
+                        TextId::SystemRestoreKept,
+                        &[
+                            ("count", &kept.len().to_string()),
+                            ("paths", &kept.join(", ")),
+                        ],
+                    )));
                 }
             }
             Err(error) => {
