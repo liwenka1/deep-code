@@ -386,6 +386,25 @@ impl App {
         // unavailable session store or a checkpoint failure is actually
         // decided — every warning was dropped on the floor. Same rendering as
         // the swap path, so a warning reads identically whenever it arrives.
+        // Hydrate FIRST, then warn. `switch_session` already orders it this way
+        // ("after the rebuild, so the clear above cannot erase them"); this
+        // path did the opposite, so on `-c`/`-r` the warnings were pushed above
+        // a whole restored transcript. The viewport is bottom-anchored, so on
+        // any session longer than a screen the degradation notice started off
+        // screen — the same "written somewhere nobody looks" failure the
+        // staging fix exists to prevent, on the more common resume entry point.
+        if let Some(record) = config.resume.as_ref() {
+            history.extend(hydrate_history(record));
+        }
+
+        // `LaunchedRuntime::warnings` documents "the consumer must surface
+        // these" — the library cannot write to stderr because raw mode owns
+        // the screen. Only `adopt_runtime` (the runtime-SWAP path: /clear,
+        // /resume, /model, /add-dir) was ever wired, so at startup — the one
+        // moment a dead `auto_allow` entry, a disabled tool group, an
+        // unavailable session store or a checkpoint failure is actually
+        // decided — every warning was dropped on the floor. Same rendering as
+        // the swap path, so a warning reads identically whenever it arrives.
         for warning in &launch_warnings {
             history.push(HistoryCell::system(tr_with(
                 lang,
@@ -408,10 +427,6 @@ impl App {
                 TextId::ExtraRootsGrantedLabel,
                 &[("dirs", &dirs)],
             )));
-        }
-
-        if let Some(record) = config.resume.as_ref() {
-            history.extend(hydrate_history(record));
         }
 
         Self {

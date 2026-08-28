@@ -58,11 +58,23 @@ impl App {
     /// transcript. Called once per swap, at the point where the transcript is
     /// finished being rebuilt, so a startup degradation is never written
     /// somewhere a subsequent `history.clear()` will erase it.
+    /// A degradation that is still true after a swap is still the same
+    /// sentence, so it is delivered once and not once per swap. `/model`,
+    /// `/apikey`, `/logout` and `/add-dir` all relaunch WITHOUT clearing the
+    /// transcript, and a persistent cause (no session store, tool group
+    /// unavailable, checkpoints off) re-parks the identical five lines each
+    /// time — three relaunches used to leave four copies of the same block.
     pub(crate) fn flush_launch_warnings(&mut self) {
         for warning in std::mem::take(&mut self.pending_launch_warnings) {
-            self.history.push(crate::history::HistoryCell::system(
-                self.tr_with(TextId::SystemWarning, &[("message", &warning)]),
-            ));
+            let rendered = self.tr_with(TextId::SystemWarning, &[("message", &warning)]);
+            let already_said = self.history.iter().any(|cell| {
+                matches!(cell, crate::history::HistoryCell::System { text } if *text == rendered)
+            });
+            if already_said {
+                continue;
+            }
+            self.history
+                .push(crate::history::HistoryCell::system(rendered));
         }
     }
 

@@ -1710,3 +1710,70 @@ fn a_swap_that_degrades_keeps_its_warnings_after_the_transcript_is_rebuilt() {
         "the rebuilt transcript dropped the swap's warnings: {warnings:?}"
     );
 }
+
+/// The other three delivery points, which the test above only claimed.
+///
+/// Its doc named `/clear` **and** `/resume`, but the body drives `/clear`
+/// alone — so deleting the flush in `switch_session` (the `/resume` path, and
+/// the one that produces the grant-dropping warnings the doc cites) or either
+/// flush in `relaunch_runtime` (`/model`, `/apikey`, `/logout`, `/add-dir`)
+/// left all 200 tests green. Three of the four points were unguarded.
+#[test]
+fn every_swap_path_delivers_its_warnings() {
+    let blocker = tempfile::NamedTempFile::new().unwrap();
+    let workspace = blocker.path().join("workspace");
+    let degraded = |app: &App| -> bool {
+        app.history.iter().any(|cell| match cell {
+            crate::history::HistoryCell::System { text } => {
+                text.contains("workspace tools disabled")
+            }
+            _ => false,
+        })
+    };
+
+    // `/resume` — switch_session rebuilds the transcript, then flushes.
+    let mut app = App::launch(LaunchConfig {
+        workspace: Some(workspace.clone()),
+        ..LaunchConfig::default()
+    });
+    let record = deep_code_agent::SessionRecord::new(workspace.clone(), "system");
+    app.switch_session(record).ok();
+    assert!(degraded(&app), "/resume dropped the swap's warnings");
+
+    // `/model` & friends — relaunch_runtime does NOT clear the transcript.
+    let mut app = App::launch(LaunchConfig {
+        workspace: Some(workspace.clone()),
+        ..LaunchConfig::default()
+    });
+    app.history.clear();
+    app.relaunch_runtime().ok();
+    assert!(degraded(&app), "relaunch_runtime dropped its warnings");
+
+    // ...and says it once, not once per relaunch: the cause is still true
+    // after each swap, so the identical block was re-appended every time.
+    let before = app.history.len();
+    app.relaunch_runtime().ok();
+    app.relaunch_runtime().ok();
+    assert_eq!(
+        app.history.len(),
+        before,
+        "a still-true degradation was re-announced on every relaunch"
+    );
+
+    // The fourth point: relaunch_runtime's reload-failure recovery, which
+    // returns Err and so never reaches the flush at the end of the happy path.
+    let mut app = App::launch(LaunchConfig {
+        workspace: Some(workspace),
+        ..LaunchConfig::default()
+    });
+    app.history.clear();
+    app.session_id = Some("00000000-0000-0000-0000-000000000000".to_string());
+    assert!(
+        app.relaunch_runtime().is_err(),
+        "expected the reload-failure branch"
+    );
+    assert!(
+        degraded(&app),
+        "the reload-failure recovery path dropped its warnings"
+    );
+}
