@@ -594,6 +594,35 @@ mod tests {
         assert!(empty.status.contains("没有可复制"));
     }
 
+    /// Pins the WIRING, which the helper-level test below cannot.
+    ///
+    /// `copy_last_response_sanitizes_without_flattening_code` calls
+    /// `sanitize_for_clipboard` directly, so deleting the call inside
+    /// `copy_last_response` left all 200 tests green — the fix was live but
+    /// unpinned, the same species of false green this round found in three
+    /// other places.
+    ///
+    /// The observable was already there: the status line counts
+    /// `text.chars()` AFTER the shadowing `let`, so a four-char payload
+    /// carrying one stripped code point must report three.
+    #[test]
+    fn copy_last_response_actually_runs_the_text_through_the_sanitizer() {
+        let mut app = App::new();
+        app.history.push(HistoryCell::assistant("ab\u{202e}c"));
+        app.copy_last_response();
+        assert!(
+            app.status.contains('3'),
+            "expected the sanitized length 3, got status {:?}",
+            app.status
+        );
+        assert!(
+            !app.status.contains('4'),
+            "the raw length reached the status line, so nothing sanitized the \
+             text on its way to the clipboard: {:?}",
+            app.status
+        );
+    }
+
     /// The clipboard is a terminal-bound surface too: pasted `\x1b` repaints,
     /// pasted `\r` can submit. Drag-select copy was already safe because it
     /// reads the sanitized frame; `/copy` read the raw cell text, so the two

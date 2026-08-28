@@ -108,6 +108,12 @@ impl App {
                 !value.ends_with(' ')
             }
             CompletionKind::File => {
+                // Kept verbatim on purpose: this string is also what gets SENT,
+                // and an `@`-reference has to name the file that actually
+                // exists. The display side is handled where it belongs, by
+                // `neutralize_composer_text` at render — a length-preserving
+                // map, so `input_cursor` (a char index into this string) stays
+                // valid.
                 let token_start = self.trailing_token_start();
                 self.input.truncate(token_start);
                 self.input.push_str(value);

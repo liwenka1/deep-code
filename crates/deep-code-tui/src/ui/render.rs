@@ -28,8 +28,9 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     let inner_width = frame.area().width.saturating_sub(2).max(1);
     // Compute layout once — height and rendering share the same result.
+    let composer_text = neutralize_composer_text(&app.input);
     let layout = layout_input(
-        &app.input,
+        &composer_text,
         app.input_cursor,
         inner_width as usize,
         COMPOSER_MAX_VISIBLE_ROWS,
@@ -423,9 +424,12 @@ fn cell_lines(cell: &HistoryCell, width: u16, lang: Lang) -> Vec<Line<'static>> 
 /// about the columns they take.
 ///
 /// Contiguous families live in [`INVISIBLE_RANGES`] rather than here.
-const BIDI_AND_ZERO_WIDTH: [char; 15] = [
+const BIDI_AND_ZERO_WIDTH: [char; 18] = [
     '\u{00ad}',  // SHY
     '\u{061c}',  // ALM
+    '\u{06dd}',  // ARABIC END OF AYAH (prepended mark, measures 1 column)
+    '\u{070f}',  // SYRIAC ABBREVIATION MARK
+    '\u{08e2}',  // ARABIC DISPUTED END OF AYAH
     '\u{115f}',  // HANGUL CHOSEONG FILLER (invisible, measures 2 columns)
     '\u{1160}',  // HANGUL JUNGSEONG FILLER
     '\u{180e}',  // MONGOLIAN VOWEL SEPARATOR
@@ -455,17 +459,36 @@ const BIDI_AND_ZERO_WIDTH: [char; 15] = [
 ///   primitive reachable through a pipeline whose stated model is "wrapping
 ///   already consumed the real newlines".
 /// * The width-0 families (invisible operators, deprecated format controls,
-///   musical/shorthand/Egyptian format controls, U+FFA0, U+180E) were SAFE —
-///   but safe only because ratatui skips zero-width symbols, which is exactly
-///   the undocumented, one-bump-away behavior this defense was rewritten to
-///   stop leaning on. Same class, same fix: own it here.
-const INVISIBLE_RANGES: [std::ops::RangeInclusive<char>; 7] = [
+///   musical/shorthand format controls, U+FFA0, U+180E) were SAFE — but safe
+///   only because ratatui skips zero-width symbols, which is exactly the
+///   undocumented, one-bump-away behavior this defense was rewritten to stop
+///   leaning on. Same class, same fix: own it here.
+///
+/// The Egyptian block was filed under the second bullet and did not belong
+/// there: all sixteen measure ONE column and take a cell of their own, so they
+/// were a real hole like U+2028, never a lease. Nothing to change in the table,
+/// but the reason had to stop being wrong.
+///
+/// The Prepended_Concatenation_Mark family is here for the first bullet's
+/// reason. It clusters with the FOLLOWING character, and ratatui segments
+/// graphemes per span — so at a span tail, a line tail, or before a wrap, each
+/// becomes its own cluster and claims its own cell. U+0600–U+0604 and U+06DD
+/// measure 1 column; the rest measure 0 and were another lease. Half the family
+/// (the two Kaithi marks) was already stripped as individual chars, which is
+/// how the asymmetry hid: the set looked deliberate.
+const INVISIBLE_RANGES: [std::ops::RangeInclusive<char>; 11] = [
+    '\u{0600}'..='\u{0605}',   // Arabic number/year/footnote/safha signs
+    '\u{0890}'..='\u{0891}',   // Arabic pound/piastre marks
     '\u{202a}'..='\u{202e}',   // LRE RLE PDF LRO RLO
     '\u{2060}'..='\u{206f}',   // WJ, invisible operators, isolates, deprecated
-    '\u{fff9}'..='\u{fffb}',   // interlinear annotation trio
+    '\u{fff0}'..='\u{fffb}',   // reserved default-ignorables + annotation trio
     '\u{13430}'..='\u{1343f}', // Egyptian hieroglyph format controls
     '\u{1bca0}'..='\u{1bca3}', // shorthand format controls
     '\u{1d173}'..='\u{1d17a}', // musical format controls
+    // The rest of plane 14 that is default-ignorable, split around the
+    // variation selectors at E0100–E01EF, which MUST survive.
+    '\u{e0080}'..='\u{e00ff}',
+    '\u{e01f0}'..='\u{e0fff}',
     // The deprecated tag block: invisible, `Cf` (so `char::is_control` misses
     // it), and NOT dropped by ratatui — a tag attaches to the preceding
     // grapheme cluster and rides into the cell. That smuggles arbitrary hidden
@@ -788,6 +811,36 @@ pub(crate) fn neutralize_display_text(text: &str) -> String {
         neutralize_char_into(&mut out, ch);
     }
     out
+}
+
+/// The composer's own variant: same rule, but **one char in, one char out**.
+///
+/// The composer is the one surface whose string is also the thing that gets
+/// SENT, and `app.input_cursor` is a char index into it — so the buffer itself
+/// must stay verbatim (an `@`-completion has to name the file that really
+/// exists) and the sanitizing has to be length-preserving, or the cursor ends
+/// up pointing past the text it sits in. Substituting instead of deleting
+/// satisfies both: index arithmetic is untouched, and `layout_input` derives
+/// the wrapped lines AND the cursor position from this same returned string, so
+/// they cannot disagree.
+///
+/// Worth stating why the surface needed covering at all: it renders through
+/// `Buffer::set_string`, whose own filter (`!symbol.contains(char::is_control)`
+/// plus a width-0 skip) is undocumented ratatui behaviour — the very lease this
+/// module exists to stop renting — and which in any case passes U+2028, the
+/// Hangul fillers and the annotation trio straight into a cell. The completion
+/// menu drew its rows sanitized while pushing the raw directory entry in here,
+/// so what the user saw and what they inserted were different strings.
+pub(crate) fn neutralize_composer_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_control() || is_bidi_or_zero_width(ch) {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
 }
 
 /// Model-influenced text about to become an approval panel line: control
@@ -2492,7 +2545,12 @@ mod tests {
         // unaided.
         const EXPECTED: &[std::ops::RangeInclusive<u32>] = &[
             0x00ad..=0x00ad,   // SHY
+            0x0600..=0x0605,   // Arabic prepended concatenation marks
             0x061c..=0x061c,   // ALM
+            0x06dd..=0x06dd,   // ARABIC END OF AYAH
+            0x070f..=0x070f,   // SYRIAC ABBREVIATION MARK
+            0x0890..=0x0891,   // Arabic pound/piastre marks
+            0x08e2..=0x08e2,   // ARABIC DISPUTED END OF AYAH
             0x115f..=0x1160,   // Hangul choseong/jungseong fillers
             0x180e..=0x180e,   // MONGOLIAN VOWEL SEPARATOR
             0x200b..=0x200b,   // ZWSP
@@ -2503,13 +2561,15 @@ mod tests {
             0x3164..=0x3164,   // HANGUL FILLER
             0xfeff..=0xfeff,   // ZWNBSP/BOM
             0xffa0..=0xffa0,   // HALFWIDTH HANGUL FILLER
-            0xfff9..=0xfffb,   // interlinear annotation trio
+            0xfff0..=0xfffb,   // reserved default-ignorables + annotation trio
             0x110bd..=0x110bd, // KAITHI NUMBER SIGN
             0x110cd..=0x110cd, // KAITHI NUMBER SIGN ABOVE
             0x13430..=0x1343f, // Egyptian hieroglyph format controls
             0x1bca0..=0x1bca3, // shorthand format controls
             0x1d173..=0x1d17a, // musical format controls
             0xe0000..=0xe007f, // deprecated tag block
+            0xe0080..=0xe00ff, // plane 14 default-ignorable, below the VSes
+            0xe01f0..=0xe0fff, // plane 14 default-ignorable, above the VSes
         ];
         for code_point in 0u32..=0x0010_ffff {
             let Some(ch) = char::from_u32(code_point) else {
@@ -2526,9 +2586,10 @@ mod tests {
         // A representative probe per family still goes through the real
         // sanitizers, so the tables being right is not mistaken for the
         // sanitizers using them.
-        const MUST_STRIP: [char; 12] = [
-            '\u{00ad}', '\u{061c}', '\u{115f}', '\u{200b}', '\u{2028}', '\u{2029}', '\u{202e}',
-            '\u{2060}', '\u{3164}', '\u{feff}', '\u{ffa0}', '\u{fffb}',
+        const MUST_STRIP: [char; 15] = [
+            '\u{00ad}', '\u{0600}', '\u{061c}', '\u{06dd}', '\u{08e2}', '\u{115f}', '\u{200b}',
+            '\u{2028}', '\u{2029}', '\u{202e}', '\u{2060}', '\u{3164}', '\u{feff}', '\u{ffa0}',
+            '\u{fffb}',
         ];
         // Both endpoints and an interior point of the tag range.
         const MUST_STRIP_TAGS: [char; 3] = ['\u{e0000}', '\u{e0041}', '\u{e007f}'];
@@ -2546,9 +2607,30 @@ mod tests {
             assert_eq!(
                 neutralize_display_text(&probe),
                 "ab",
-                "U+{:04X} must be stripped from a panel line too — the two \
+                "U+{:04X} must be stripped from a panel line too — the \
                  sanitizers share one rule",
                 ch as u32
+            );
+            assert_eq!(
+                sanitize_for_clipboard(&probe),
+                "ab",
+                "U+{:04X} must be stripped on its way to the clipboard too — \
+                 the rule is shared by THREE entry points, not two",
+                ch as u32
+            );
+            // The composer substitutes rather than deletes (see
+            // `neutralize_composer_text`), so the invariant there is that the
+            // code point is gone and the char count is unchanged.
+            let composed = neutralize_composer_text(&probe);
+            assert!(
+                !composed.chars().any(|c| c == ch),
+                "U+{:04X} reached the composer",
+                ch as u32
+            );
+            assert_eq!(
+                composed.chars().count(),
+                probe.chars().count(),
+                "the composer map must be 1:1 or `input_cursor` desyncs"
             );
         }
         for ch in MUST_SURVIVE {
@@ -3209,6 +3291,50 @@ mod tests {
             screen.contains("hidden.txt"),
             "the row must still render, only neutralized: {screen}"
         );
+    }
+
+    /// The menu above draws sanitized rows, but accepting one pushes the RAW
+    /// directory entry into `app.input` (deliberately — that string is also
+    /// what gets sent, and an `@`-reference has to name the real file). So the
+    /// composer is the surface that has to neutralize, and it renders through
+    /// `Buffer::set_string`, which passes U+2028 and the Hangul fillers into a
+    /// cell. What the user saw and what they inserted were different strings.
+    #[test]
+    fn composer_never_lets_an_invisible_code_point_reach_a_cell() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for payload in [
+            "ev\u{2028}il.rs",
+            "ev\u{115f}il.rs",
+            "ev\u{fffb}il.rs",
+            "ev\u{0600}il.rs",
+        ] {
+            let mut app = App::new();
+            app.input = payload.to_string();
+            app.input_cursor = app.input.chars().count();
+            let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let mut screen = String::new();
+            for row in 0..buffer.area.height {
+                for col in 0..buffer.area.width {
+                    screen.push_str(buffer[(col, row)].symbol());
+                }
+            }
+            assert!(
+                !screen
+                    .chars()
+                    .any(|ch| ch.is_control() || is_bidi_or_zero_width(ch)),
+                "{payload:?} reached a cell through the composer: {screen:?}"
+            );
+            // Still legible, and the buffer the model receives is untouched.
+            assert!(
+                screen.contains("il.rs"),
+                "composer text vanished: {screen:?}"
+            );
+            assert_eq!(app.input, payload, "the sent text must stay verbatim");
+        }
     }
 
     #[test]
