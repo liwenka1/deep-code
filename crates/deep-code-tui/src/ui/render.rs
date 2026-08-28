@@ -818,7 +818,23 @@ pub(crate) fn neutralize_display_text(text: &str) -> String {
     out
 }
 
-/// The composer's own variant: same rule, but **one char in, one char out**.
+/// The composer's own variant: same rule, but **one char in, one char out**,
+/// and `'\n'` passes through.
+///
+/// The newline exemption is not a hole, it is the layout contract. `'\n'` is
+/// `is_control()`, so mapping it to a space made `wrap_input_lines`'
+/// `split('\n')` and `cursor_row_col`'s `"\n"` branch — both of which read
+/// THIS string — dead code, and a multi-line draft collapsed onto one row: the
+/// box stopped growing, and `↑`/`↓` (which navigate the raw `app.input`) moved
+/// the caret by a line model the screen no longer showed. Alt+Enter and Ctrl+J
+/// insert a literal newline and are advertised in `HelpKeys` in both locales.
+/// It still cannot reach a cell: `wrap_input_lines` consumes it before any
+/// drawing happens, and `Buffer::set_stringn` would drop it regardless.
+///
+/// The two sibling sanitizers each carry their own exemption list for the same
+/// kind of reason — [`neutralize_transcript_text`] keeps `'\t'`,
+/// [`sanitize_for_clipboard`] keeps `'\n'` and `'\t'` — so read the three
+/// together before adding a fourth.
 ///
 /// The composer is the one surface whose string is also the thing that gets
 /// SENT, and `app.input_cursor` is a char index into it — so the buffer itself
@@ -839,7 +855,9 @@ pub(crate) fn neutralize_display_text(text: &str) -> String {
 pub(crate) fn neutralize_composer_text(text: &str) -> String {
     text.chars()
         .map(|ch| {
-            if ch.is_control() || is_bidi_or_zero_width(ch) {
+            if ch == '\n' {
+                ch
+            } else if ch.is_control() || is_bidi_or_zero_width(ch) {
                 ' '
             } else {
                 ch
@@ -3353,6 +3371,55 @@ mod tests {
     /// composer is the surface that has to neutralize, and it renders through
     /// `Buffer::set_string`, which passes U+2028 and the Hangul fillers into a
     /// cell. What the user saw and what they inserted were different strings.
+    /// A multi-line draft has to render as multiple rows.
+    ///
+    /// `'\n'` is `is_control()`, so the composer sanitizer replaced it with a
+    /// space and the draft collapsed onto one row — the box no longer grew, and
+    /// `↑`/`↓` still counted lines in the raw `app.input`, so the caret moved by
+    /// a line model the screen did not show. Asserted through rendered cells,
+    /// not through the helper: the helper-level test could not see this,
+    /// because the wiring is what broke.
+    #[test]
+    fn a_multi_line_draft_renders_as_multiple_rows() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new();
+        app.input = "aaa\nbbb\nccc".to_string();
+        app.input_cursor = app.input.chars().count();
+        let mut terminal = Terminal::new(TestBackend::new(40, 14)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let mut rows_with_text = Vec::new();
+        for row in 0..buffer.area.height {
+            let mut line = String::new();
+            for col in 0..buffer.area.width {
+                line.push_str(buffer[(col, row)].symbol());
+            }
+            for marker in ["aaa", "bbb", "ccc"] {
+                if line.contains(marker) {
+                    rows_with_text.push((row, marker));
+                }
+            }
+        }
+
+        assert_eq!(
+            rows_with_text.len(),
+            3,
+            "expected one row per line, got {rows_with_text:?}"
+        );
+        let rows: Vec<_> = rows_with_text.iter().map(|(row, _)| *row).collect();
+        assert!(
+            rows[0] < rows[1] && rows[1] < rows[2],
+            "the three lines must occupy three ascending rows, got {rows_with_text:?}"
+        );
+        assert_eq!(
+            app.input, "aaa\nbbb\nccc",
+            "the sent text must stay verbatim"
+        );
+    }
+
     #[test]
     fn composer_never_lets_an_invisible_code_point_reach_a_cell() {
         use ratatui::Terminal;
