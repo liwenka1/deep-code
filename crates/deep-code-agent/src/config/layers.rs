@@ -1014,12 +1014,17 @@ mod tests {
         let global_dir = tempfile::tempdir().unwrap();
         let global = write_config(
             global_dir.path(),
-            "[approval]\nauto_allow = [\"read_file\", \" grep_files \", \"\"]\n",
+            // Gated tools, matching config.example.toml's own advice: it
+            // switched its sample away from read_file/list_dir/grep_files
+            // because those are never gated, so putting them in auto_allow is
+            // a no-op — and a fixture reads as an endorsed config even when
+            // it is only exercising the parser.
+            "[approval]\nauto_allow = [\"write_file\", \" apply_patch \", \"\"]\n",
         );
         let loaded = AgentConfig::load_with(Some(global), None, &no_env);
         assert_eq!(
             loaded.config.approval_auto_allow,
-            vec!["read_file".to_string(), "grep_files".to_string()]
+            vec!["write_file".to_string(), "apply_patch".to_string()]
         );
 
         // Env wins, and splits on commas with surrounding space trimmed and

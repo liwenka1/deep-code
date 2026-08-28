@@ -605,23 +605,33 @@ pub(crate) fn json_string(value: impl serde::Serialize) -> String {
     serde_json::to_string_pretty(&value).expect("serializing tool output should not fail")
 }
 
+/// Walk `path` yielding the accumulated prefix for every NAMED segment.
+///
+/// Prefix/RootDir are accumulated into the prefix but never yielded, because
+/// they are not stattable paths on their own: these paths are canonical, so on
+/// Windows the first component is a verbatim prefix (`\\?\C:`) whose
+/// `symlink_metadata` fails with ERROR_INVALID_FUNCTION (os error 1).
+///
+/// One function because both walkers below need that rule and both learned it
+/// separately — `first_file_segment` learned it the hard way, by shipping a
+/// diagnosis that could never fire on Windows at all, forty lines under a
+/// `contains_symlink` that already spelled the rule out. The next
+/// component-walking function should not have to learn it a third time.
+fn stattable_segments(path: &Path) -> impl Iterator<Item = (usize, PathBuf)> + '_ {
+    let mut current = PathBuf::new();
+    path.components()
+        .enumerate()
+        .filter_map(move |(index, component)| {
+            current.push(component.as_os_str());
+            matches!(component, Component::Normal(_)).then(|| (index, current.clone()))
+        })
+}
+
 /// The first ancestor segment of `path` that exists and is NOT a directory —
 /// the plain file blocking a `create_dir_all`. `None` when nothing on the path
 /// is a non-directory, which is the ordinary case for every other failure.
 fn first_file_segment(path: &Path) -> Option<PathBuf> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        // Prefix/RootDir accumulate into `current` but are never stat'd on
-        // their own — the same rule [`contains_symlink`] states below, and for
-        // the same reason: these paths are canonical, so on Windows the first
-        // component is a verbatim prefix (`\\?\C:`) that is not a stattable
-        // path by itself. Statting it fails, and reading that failure as
-        // "nothing exists from here down" abandoned the walk on component one,
-        // so the diagnosis silently never fired on Windows.
-        if !matches!(component, Component::Normal(_)) {
-            continue;
-        }
+    for (_, current) in stattable_segments(path) {
         match fs::symlink_metadata(&current) {
             Ok(meta) if !meta.is_dir() => return Some(current),
             // Missing from here down: nothing left to block anything.
@@ -649,18 +659,8 @@ pub(crate) fn contains_symlink(path: &Path, skip: &[PathBuf]) -> std::io::Result
         .map(|root| root.components().count())
         .max()
         .unwrap_or(0);
-    let mut current = PathBuf::new();
-    for (index, component) in path.components().enumerate() {
-        current.push(component.as_os_str());
+    for (index, current) in stattable_segments(path) {
         if index < start {
-            continue;
-        }
-        // Only named segments can be symlinks. Prefix/RootDir must be
-        // accumulated into `current` but not stat'd on their own: on Windows
-        // `canonicalize` yields verbatim paths (`\\?\D:\...`) whose first
-        // component is the bare disk prefix `\\?\D:`, and `symlink_metadata`
-        // on it fails with ERROR_INVALID_FUNCTION (os error 1).
-        if !matches!(component, Component::Normal(_)) {
             continue;
         }
         if fs::symlink_metadata(&current)?.file_type().is_symlink() {

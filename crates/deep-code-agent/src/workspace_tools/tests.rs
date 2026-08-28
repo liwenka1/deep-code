@@ -483,6 +483,21 @@ fn write_no_follow_refuses_a_symlinked_target() {
         "ORIGINAL\n",
         "the link's target was overwritten anyway: {error}"
     );
+
+    // ...and the refusal has to READ as the boundary, not as a loop the model
+    // built. `write_failed`'s whole reason to exist is that bare ELOOP says
+    // "Too many levels of symbolic links" for a single link, and nothing
+    // asserted the replacement text: reverting the diagnosis to "" left the
+    // suite green. Only the naming is pinned here; the tools' use of
+    // `write_failed` is covered by the two mid-write race tests below.
+    #[cfg(unix)]
+    {
+        let rendered = super::write_failed("write_file", &planted, &error).to_string();
+        assert!(
+            rendered.contains("symlink"),
+            "the ELOOP refusal must name the rule it enforced: {rendered}"
+        );
+    }
 }
 
 /// Drives one write tool against the real race and reports whether the
@@ -495,7 +510,7 @@ fn write_no_follow_refuses_a_symlinked_target() {
 /// and their results are deliberately ignored: the only question asked is
 /// whether the victim outside the boundary ever changed.
 #[cfg(unix)]
-fn victim_survives_a_planted_symlink(write: impl Fn(&Path) -> bool) -> String {
+fn victim_survives_a_planted_symlink(write: impl Fn(&Path) -> bool) -> (String, usize) {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -521,14 +536,20 @@ fn victim_survives_a_planted_symlink(write: impl Fn(&Path) -> bool) -> String {
     // Bounded: `O_NOFOLLOW` makes the victim untouchable regardless of timing,
     // so a correct implementation can never fail this no matter how the loop
     // interleaves. A regressed one escapes within a few dozen iterations.
+    // `landed` is the anti-vacuity counter. Ignoring every result means the
+    // whole loop can become a no-op — an injected `return Err(..)` at the top
+    // of `write_sync`/`patch_sync` left BOTH tests passing, three seconds
+    // faster and asserting nothing. The victim surviving is only evidence if
+    // the write was actually attempted and sometimes succeeded.
+    let mut landed = 0usize;
     for _ in 0..3000 {
-        if !write(tmp.path()) {
-            break;
+        if write(tmp.path()) {
+            landed += 1;
         }
     }
     stop.store(true, Ordering::Relaxed);
     flipper.join().unwrap();
-    fs::read_to_string(&victim).unwrap()
+    (fs::read_to_string(&victim).unwrap(), landed)
 }
 
 /// The CALL-SITE half of the `O_NOFOLLOW` guarantee, for both tools that write.
@@ -546,37 +567,45 @@ fn victim_survives_a_planted_symlink(write: impl Fn(&Path) -> bool) -> String {
 #[cfg(unix)]
 #[test]
 fn write_file_never_follows_a_symlink_planted_mid_write() {
-    let survived = victim_survives_a_planted_symlink(|root| {
+    let (survived, landed) = victim_survives_a_planted_symlink(|root| {
         let policy = WorkspacePolicy::new(root.to_path_buf()).unwrap();
         let tool = WriteFileTool::new(policy);
-        let _ = tool.write_sync(WriteFileParams {
+        tool.write_sync(WriteFileParams {
             path: "notes.txt".to_string(),
             content: "PWNED\n".to_string(),
-        });
-        true
+        })
+        .is_ok()
     });
     assert_eq!(
         survived, "ORIGINAL\n",
         "write_file followed a symlink out of the workspace"
+    );
+    assert!(
+        landed > 0,
+        "the race was never exercised: every write failed"
     );
 }
 
 #[cfg(unix)]
 #[test]
 fn apply_patch_never_follows_a_symlink_planted_mid_write() {
-    let survived = victim_survives_a_planted_symlink(|root| {
+    let (survived, landed) = victim_survives_a_planted_symlink(|root| {
         let policy = WorkspacePolicy::new(root.to_path_buf()).unwrap();
         let tool = ApplyPatchTool::new(policy);
-        let _ = tool.patch_sync(ApplyPatchParams {
+        tool.patch_sync(ApplyPatchParams {
             path: "notes.txt".to_string(),
             old: "OLD".to_string(),
             new: "PWNED".to_string(),
-        });
-        true
+        })
+        .is_ok()
     });
     assert_eq!(
         survived, "ORIGINAL\n",
         "apply_patch followed a symlink out of the workspace"
+    );
+    assert!(
+        landed > 0,
+        "the race was never exercised: every patch failed"
     );
 }
 

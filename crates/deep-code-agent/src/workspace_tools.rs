@@ -601,9 +601,17 @@ impl GrepFilesTool {
 /// `fs::write` with `O_NOFOLLOW` where the platform has it: a symlink at the
 /// final component fails the open instead of being written through.
 ///
-/// Windows has no equivalent flag, and `create_new` is not usable here because
-/// overwriting an existing file is the tool's normal job. There the guarantee
-/// is the resolve-time `symlink_metadata` check alone, as before.
+/// `create_new` is not usable here either way, because overwriting an existing
+/// file is the tool's normal job.
+///
+/// On Windows the guarantee is currently the resolve-time `symlink_metadata`
+/// check alone. Stated as the status quo rather than as an impossibility: an
+/// earlier wording claimed Windows "has no equivalent flag", which overstates
+/// it — `OpenOptionsExt::custom_flags` feeds `dwFlagsAndAttributes`, and
+/// `FILE_FLAG_OPEN_REPARSE_POINT` (0x0020_0000) does suppress reparse-point
+/// traversal. Not adopted here because the exact failure mode interacts with
+/// `FILE_FLAG_BACKUP_SEMANTICS` and nobody has run it on Windows; it is a
+/// candidate, not a closed question.
 fn write_no_follow(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 

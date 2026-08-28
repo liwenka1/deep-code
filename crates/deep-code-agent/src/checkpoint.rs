@@ -983,6 +983,53 @@ mod tests {
         );
     }
 
+    /// The recovery advice on a half-done restore is a promise to the user, and
+    /// nothing asserted either half of it: both strings appeared only in the
+    /// production `format!`. Pins the framing AND that re-running really does
+    /// finish the job — plus the absence of the doubled
+    /// `tool execution failed for checkpoint:` prefix that came from rendering
+    /// one `ToolError` inside another.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_clear_says_the_snapshot_is_intact_and_re_running_finishes_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/a.txt"), "v1").unwrap();
+
+        let store = CheckpointStore::new(root).unwrap();
+        let (id, _) = store.snapshot("before_turn").unwrap();
+        fs::write(root.join("sub/a.txt"), "v2").unwrap();
+
+        // Make the clear half fail part-way: an unreadable subdirectory.
+        fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(root.join("sub")).is_ok() {
+            fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o755)).unwrap();
+            return; // running as root; the refusal cannot be produced
+        }
+        let error = store.restore(&id).expect_err("the clear half must fail");
+        fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("partially cleared") && rendered.contains("re-run the restore"),
+            "a half-cleared workspace must say so and name the way out: {rendered}"
+        );
+        assert_eq!(
+            rendered
+                .matches("tool execution failed for checkpoint:")
+                .count(),
+            1,
+            "the wrapper stuttered its own prefix: {rendered}"
+        );
+        // And the advice is true.
+        store
+            .restore(&id)
+            .expect("re-running must finish the restore");
+        assert_eq!(fs::read_to_string(root.join("sub/a.txt")).unwrap(), "v1");
+    }
+
     /// A FIFO has no snapshot representation, so `clear` may not remove it.
     /// The copy side ended in a guarded `else if is_file()` while the clear
     /// side ended in a bare `else`, so this was captured by neither and
