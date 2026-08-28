@@ -95,8 +95,16 @@ fn random_key() -> Option<Vec<u8>> {
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
+    // Unlink-then-`create_new`, matching `config::write`'s function of the
+    // same name: `create(true).truncate(true)` follows a symlink at the final
+    // component, so a planted link would have this write the HMAC key — the
+    // trust anchor for recorded write grants — through to wherever it points.
+    // `~/.deep-code` is sandbox-denied, so this is depth rather than a live
+    // hole; two functions with one name and one purpose should not differ in
+    // strength.
+    let _ = std::fs::remove_file(path);
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

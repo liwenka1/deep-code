@@ -352,6 +352,18 @@ enum WriteError {
 /// success (re-running the command is how you upgrade), and a *generated* file
 /// that merely drifted to a new version is replaced only with `--force`.
 fn write_workflow(target: &Path, content: &str, force: bool) -> Result<WriteOutcome, WriteError> {
+    // A link that exists is a link whether or not its target does:
+    // `read_to_string` returns None for a DANGLING one, which fell through to
+    // the write below and created the link's target — anywhere on disk. Same
+    // shape as the `write_self_ignore` defect (0a5be12), and `.github/` is
+    // repo-controlled. Refuse rather than resolve: this file is generated
+    // output, never something a user meant to symlink.
+    if target
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err(WriteError::Exists);
+    }
     let existing = std::fs::read_to_string(target).ok();
     match existing {
         Some(current) if current == content => return Ok(WriteOutcome::Unchanged),
@@ -405,6 +417,39 @@ mod tests {
             Ok(WriteOutcome::Updated)
         ));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "two");
+    }
+
+    /// A DANGLING symlink at the target read as "no file here"
+    /// (`read_to_string` follows links and fails), fell through to the write,
+    /// and created the link's target — anywhere on disk, without `--force`.
+    /// `.github/` is repo-controlled, so a hostile checkout can aim it. Same
+    /// shape as the `write_self_ignore` defect: a link that exists is a link
+    /// whether or not its target does.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_target_is_refused_rather_than_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.yml");
+        let target = dir.path().join(".github/workflows/deepcode.yml");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&victim, &target).unwrap();
+
+        assert!(matches!(
+            write_workflow(&target, "one", false),
+            Err(WriteError::Exists)
+        ));
+        assert!(
+            !victim.exists(),
+            "the write followed the link out of the repository"
+        );
+        // `--force` is for replacing a generated file that drifted to a new
+        // version, not for resolving a link someone planted.
+        assert!(matches!(
+            write_workflow(&target, "one", true),
+            Err(WriteError::Exists)
+        ));
+        assert!(!victim.exists());
     }
 
     #[test]

@@ -138,7 +138,16 @@ impl CheckpointStore {
     pub fn restore(&self, id: &CheckpointId) -> Result<(), ToolError> {
         validate_checkpoint_id(id)?;
         let source = self.storage_root.join(&id.0);
-        if !source.is_dir() {
+        // `symlink_metadata`, not `is_dir()`: the latter follows links, and
+        // the storage root sits INSIDE the workspace where the model can write.
+        // A checkpoint id pointing at a symlink would have `restore` clear the
+        // workspace and then copy the link's target into it. `list()` already
+        // uses the non-following `DirEntry::file_type`, so such an entry never
+        // appears there — the two now agree.
+        if !source
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_dir())
+        {
             return Err(ToolError::exec_failed(
                 "checkpoint",
                 format!("checkpoint '{}' does not exist", id.0),
@@ -1247,6 +1256,39 @@ mod tests {
             fs::read_to_string(root.join("dev.sock")).unwrap(),
             "was-a-regular-file"
         );
+    }
+
+    /// The storage root lives inside the workspace, so the model can create
+    /// entries there. `restore` decided "is this a checkpoint?" with
+    /// `is_dir()`, which follows links — so an id naming a symlink cleared the
+    /// workspace and then copied the link's TARGET into it. `list()` has always
+    /// used the non-following `DirEntry::file_type`, so such an entry never
+    /// showed up there; the two disagreed.
+    #[test]
+    fn restore_refuses_a_checkpoint_id_that_is_a_symlink() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("planted.txt"), "FROM-OUTSIDE").unwrap();
+        let root = workspace.path();
+        fs::write(root.join("mine.txt"), "ORIGINAL").unwrap();
+        let store = CheckpointStore::new(root).unwrap();
+        let link = root.join(".deep-code/checkpoints/evil_1");
+        if !crate::test_symlinks::symlink_dir_for_test(outside.path(), &link) {
+            return;
+        }
+
+        let refused = store.restore(&CheckpointId("evil_1".to_string()));
+
+        assert!(
+            refused.is_err(),
+            "a symlinked checkpoint id must be refused"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("mine.txt")).unwrap(),
+            "ORIGINAL",
+            "the workspace must not have been cleared"
+        );
+        assert!(!root.join("planted.txt").exists());
     }
 
     /// Snapshots of the entire workspace are written under the storage root, so

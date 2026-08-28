@@ -378,8 +378,16 @@ impl WorkspacePolicy {
         // right here, which meant rendering the approval panel planted
         // directories the user then declined. Execution creates them via
         // [`Self::prepare_for_write`] after the decision.
+        // `symlink_metadata`, not `exists()`: the latter FOLLOWS links, so a
+        // dangling one answers "absent" and this walk climbs straight past the
+        // very entry `contains_symlink` below is meant to judge. That is the
+        // exact predicate, in this exact function, whose `exists()` spelling
+        // 45 lines up is documented as a past write-through — safe here today
+        // only because `create_dir_all` in `prepare_for_write` happens to
+        // re-fail with EEXIST on a dangling link, which is an accident of
+        // std's internals and nothing this file controls.
         let mut existing = parent;
-        while !existing.exists() {
+        while existing.symlink_metadata().is_err() {
             match existing.parent() {
                 Some(next) => existing = next,
                 None => break,
@@ -784,12 +792,18 @@ mod tests {
         );
     }
 
-    /// A dangling symlink posing as a missing PARENT segment gets past
-    /// resolution — `exists()` follows links, so the ancestor walk treats it
-    /// as absent — and only trips inside `create_dir_all`, as a bare "File
-    /// exists" for a directory the tool was told to create. The prepare-side
-    /// failure must name the symlink rule, or the model retries into word
-    /// salad instead of learning it.
+    /// A dangling symlink posing as a missing PARENT segment.
+    ///
+    /// It used to get past resolution entirely — the ancestor walk asked
+    /// `exists()`, which FOLLOWS links, so a dangling one read as "absent" and
+    /// the walk climbed straight past it — and trip only inside
+    /// `create_dir_all`, as a bare "File exists" for a directory the tool was
+    /// told to create. Both halves now refuse it: the walk asks
+    /// `symlink_metadata` and stops AT the link, so `contains_symlink` judges
+    /// it at resolve time, and the prepare-side diagnosis stays as the second
+    /// line of defence for a link planted after resolution. Either way the
+    /// failure names the rule, or the model retries into word salad instead of
+    /// learning it.
     #[test]
     fn prepare_for_write_names_the_symlink_when_mkdir_hits_one() {
         let (_dir, root) = canonical_tempdir();
