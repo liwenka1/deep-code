@@ -84,6 +84,17 @@ on:
         description: 'Optional GitHub App private key (PEM).'
         required: false
 
+# Least privilege by default, matching ci.yml / release.yml / release-prep.yml.
+# The one job below raises its own grant back to what the pipeline needs.
+#
+# Without a floor here, a SECOND job added to this workflow later would silently
+# inherit the caller's grant — and in this workflow that is `contents: write` +
+# `pull-requests: write` + `issues: write`, next to DEEPSEEK_API_KEY and an App
+# private key, in the workflow whose whole purpose is to run a model-driven
+# shell. The floor makes the next job state what it needs.
+permissions:
+  contents: read
+
 jobs:
   deepcode:
     # Floors first (bot / NONE), then the configurable gate. The comma

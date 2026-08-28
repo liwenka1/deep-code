@@ -24,11 +24,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A `workflow_dispatch` from a branch cannot produce a release: everything
+  # downstream reads the tag. Gating `publish` on the ref shape stops it
+  # correctly, but a SKIPPED job does not fail a run — so such a dispatch burned
+  # the whole 5-platform matrix and then reported the run GREEN with nothing
+  # published. Before that gate existed it went red, by way of
+  # softprops/action-gh-release throwing on the missing tag; trading a loud
+  # third-party failure for a silent skip of our own is the wrong direction.
+  #
+  # This job says it out loud instead, and `build` needs it, so a mis-triggered
+  # run stops in seconds rather than after half an hour of runner time.
+  guard:
+    name: Refuse a non-tag trigger
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a v* tag
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          echo "::error::release.yml must run from a v* tag; got '${GITHUB_REF}'."
+          echo "To cut a release, dispatch release-prep.yml — it writes the"
+          echo "changelog, bumps the versions, and pushes commit+tag atomically."
+          exit 1
+
   # ═══════════════════════════════════════════════
   # 阶段 1：并行编译 5 个平台
   # ═══════════════════════════════════════════════
   build:
     name: Build ${{ matrix.name }}
+    needs: guard
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

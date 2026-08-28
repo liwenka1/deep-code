@@ -122,7 +122,25 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo check --locked --workspace
+      # RUSTUP_TOOLCHAIN, not the toolchain the action made default. The action
+      # runs `rustup default 1.88.0`, and `rustup default` is the LOWEST-
+      # priority override rustup has — `rust-toolchain.toml` (pinning 1.96.0)
+      # outranks it. So a plain `cargo check` in this working tree silently
+      # downloaded and used 1.96, and the job could never go red for an MSRV
+      # reason: a permanent green with a check mark next to the one claim it
+      # exists to test. RUSTUP_TOOLCHAIN is priority 2, above the file.
+      #
+      # Verifying this by hand does not translate, which is why it slipped:
+      # `cargo +1.88 check` locally uses `+toolchain`, priority 1, which also
+      # beats the file. The floor really does pass — it was the CI spelling
+      # that was wrong, not the number. `rustc --version` is printed so the log
+      # proves which toolchain ran instead of a comment asserting it.
+      - name: Check against the declared floor
+        env:
+          RUSTUP_TOOLCHAIN: "1.88.0"
+        run: |
+          rustc --version
+          cargo check --locked --workspace
 
   # The x86_64 half of the same argument as `linux-arm` above. release.yml
   # builds and tests linux-x64 on `ubuntu-22.04` (pinned there for the glibc
@@ -144,9 +162,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Test
-        # Same demand release.yml makes of this image, made before the tag.
+        # Both variables release.yml sets on this leg, so "the same demand" is
+        # the same demand. (SYMLINKS is inert on unix — the helper panics
+        # rather than skipping there — but a leg that claims to mirror another
+        # and then sets a different environment is how the two drift apart.)
+        #
+        # What this job still does NOT cover, stated plainly: release.yml also
+        # runs `cargo build --locked --release --target ...`, and nothing in CI
+        # ever builds the release profile on any platform. `opt-level="z"` +
+        # `lto=true` + `codegen-units=1` + `panic="abort"` is a different
+        # compilation; an LTO failure is still first discovered after the tag.
+        # This job closes the "does the image exist and does its kernel have
+        # Landlock" half only.
         env:
           DEEPCODE_REQUIRE_SANDBOX: "1"
+          DEEPCODE_REQUIRE_SYMLINKS: "1"
         run: cargo test --locked --workspace
 
   # Compiles & tests the Windows-only sandbox (Job Object) code, which the
@@ -174,6 +204,12 @@ jobs:
         # taken here: libtest captures the skip message, making a skipped
         # security test indistinguishable from a passing one. Same insurance
         # as DEEPCODE_REQUIRE_SANDBOX on the unix jobs.
+        #
+        # DEEPCODE_REQUIRE_SANDBOX is inert on Windows (its only reader is
+        # `cfg(any(linux, macos))`), and it is set here for the same reason
+        # release.yml sets it on its win32 leg: harmless today, correct the day
+        # a Windows backend exists, and one fewer difference between the two.
         env:
           DEEPCODE_REQUIRE_SYMLINKS: "1"
+          DEEPCODE_REQUIRE_SANDBOX: "1"
         run: cargo test --locked --workspace
