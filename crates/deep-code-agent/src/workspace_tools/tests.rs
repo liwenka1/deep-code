@@ -247,10 +247,10 @@ async fn grep_files_does_not_invent_a_refusal_from_a_bad_ignore_glob() {
 /// agent tests, 200 TUI tests and both doc suites green, while
 /// `approval_preview` asserted in a comment that this mention was pinned.
 ///
-/// Also pins the two causes staying apart. One `map_err` used to answer a
-/// permission error with "failed to read X as UTF-8: Permission denied", and
-/// spelled the path absolutely while the guard above it used the
-/// workspace-relative form.
+/// The size guard returns BEFORE `read_to_string`, so this test says nothing
+/// about the two read causes staying apart — that is
+/// `read_file_names_the_cause_and_keeps_the_path_relative` and its
+/// unreadable-file sibling. (It used to claim otherwise here.)
 #[tokio::test]
 async fn read_file_refuses_a_file_over_the_limit() {
     let tmp = tempdir().unwrap();
@@ -269,6 +269,77 @@ async fn read_file_refuses_a_file_over_the_limit() {
     assert!(
         message.contains(&format!("{MAX_FILE_MIB} MiB")),
         "the refusal must name the limit it enforced: {message}"
+    );
+    assert!(
+        !message.contains(tmp.path().to_str().unwrap()),
+        "the absolute host path leaked to the model: {message}"
+    );
+}
+
+/// The OTHER arm of the same `if`. Only the `InvalidData` branch was
+/// exercised, so collapsing the whole thing back to the constant
+/// `"is not valid UTF-8"` — the exact bug 927eda7 set out to fix — left every
+/// test in the workspace green.
+#[cfg(unix)]
+#[tokio::test]
+async fn read_file_names_a_non_utf8_cause_separately() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("locked.txt");
+    fs::write(&path, "readable text").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_to_string(&path).is_ok() {
+        return; // running as root; the refusal cannot be produced
+    }
+
+    let call = ToolCall::new("call_1", "read_file", json!({"path": "locked.txt"}));
+    let outcome = registry(tmp.path())
+        .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await;
+    let message = match outcome {
+        Err(ToolError::ExecutionFailed { message, .. }) => message,
+        other => panic!("expected a read failure, got {other:?}"),
+    };
+
+    assert!(
+        message.contains("could not be read"),
+        "a permission failure must not be reported as bad UTF-8: {message}"
+    );
+    assert!(
+        !message.contains("is not valid UTF-8"),
+        "the two causes must stay apart: {message}"
+    );
+    assert!(
+        !message.contains(tmp.path().to_str().unwrap()),
+        "the absolute host path leaked to the model: {message}"
+    );
+}
+
+/// `apply_patch` grew the identical cause split in the same commit and had no
+/// test at all: reverting ONLY its `map_err` — restoring both the conflated
+/// cause and the absolute-path leak — kept the whole workspace green.
+#[tokio::test]
+async fn apply_patch_names_the_cause_and_keeps_the_path_relative() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("blob.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+    let call = ToolCall::new(
+        "call_1",
+        "apply_patch",
+        json!({"path": "blob.bin", "old": "a", "new": "b"}),
+    );
+    let outcome = registry(tmp.path())
+        .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await;
+    let message = match outcome {
+        Err(ToolError::ExecutionFailed { message, .. }) => message,
+        other => panic!("expected a read failure, got {other:?}"),
+    };
+
+    assert!(
+        message.contains("is not valid UTF-8"),
+        "the cause must be named: {message}"
     );
     assert!(
         !message.contains(tmp.path().to_str().unwrap()),
@@ -488,11 +559,14 @@ fn write_no_follow_refuses_a_symlinked_target() {
     // built. `write_failed`'s whole reason to exist is that bare ELOOP says
     // "Too many levels of symbolic links" for a single link, and nothing
     // asserted the replacement text: reverting the diagnosis to "" left the
-    // suite green. Only the naming is pinned here; the tools' use of
-    // `write_failed` is covered by the two mid-write race tests below.
+    // suite green. The two race tests below now depend on this wording as
+    // well — they count refusals by matching "symlink" — so the tools' USE
+    // of `write_failed` is pinned there, which this comment used to claim
+    // without it being so.
     #[cfg(unix)]
     {
-        let rendered = super::write_failed("write_file", &planted, &error).to_string();
+        let rendered =
+            super::write_failed("write_file", &planted.display().to_string(), &error).to_string();
         assert!(
             rendered.contains("symlink"),
             "the ELOOP refusal must name the rule it enforced: {rendered}"
@@ -510,7 +584,9 @@ fn write_no_follow_refuses_a_symlinked_target() {
 /// and their results are deliberately ignored: the only question asked is
 /// whether the victim outside the boundary ever changed.
 #[cfg(unix)]
-fn victim_survives_a_planted_symlink(write: impl Fn(&Path) -> bool) -> (String, usize) {
+fn victim_survives_a_planted_symlink(
+    write: impl Fn(&Path) -> Result<(), String>,
+) -> (String, usize, usize) {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -536,20 +612,39 @@ fn victim_survives_a_planted_symlink(write: impl Fn(&Path) -> bool) -> (String, 
     // Bounded: `O_NOFOLLOW` makes the victim untouchable regardless of timing,
     // so a correct implementation can never fail this no matter how the loop
     // interleaves. A regressed one escapes within a few dozen iterations.
-    // `landed` is the anti-vacuity counter. Ignoring every result means the
-    // whole loop can become a no-op — an injected `return Err(..)` at the top
-    // of `write_sync`/`patch_sync` left BOTH tests passing, three seconds
-    // faster and asserting nothing. The victim surviving is only evidence if
-    // the write was actually attempted and sometimes succeeded.
+    // Two anti-vacuity counters, because one was measuring the wrong side.
+    //
+    // `landed` counts successful writes and catches a loop that never runs at
+    // all (an injected `return Err(..)` left both tests passing, three seconds
+    // faster, asserting nothing). But it cannot see the opposite vacuity:
+    // making `write_no_follow` a no-op that returns `Ok(())` writes NOTHING,
+    // so the victim trivially survives and `landed` reaches 3000 — green while
+    // the tool is inert. Counting successes proves the loop ran; it does not
+    // prove the guard ever fired.
+    //
+    // `refused` is that missing half: the ELOOP diagnosis can only come from
+    // `O_NOFOLLOW` meeting a planted link at the final component, so a
+    // non-zero count is direct evidence that the race really was joined and
+    // that the guard — not some earlier check — did the refusing.
     let mut landed = 0usize;
+    let mut refused = 0usize;
     for _ in 0..3000 {
-        if write(tmp.path()) {
-            landed += 1;
+        match write(tmp.path()) {
+            Ok(()) => landed += 1,
+            // The ELOOP diagnosis specifically, NOT just "symlink": the
+            // resolve-time refusal ("symlinks in the destination path are not
+            // allowed") also contains that word, and counting it made this
+            // guard vacuous again — a no-op `write_no_follow` still passed,
+            // because every iteration that lost the race was refused up front
+            // by `contains_symlink` instead. Only this phrase can come from
+            // O_NOFOLLOW meeting a link at the final component.
+            Err(message) if message.contains("never written through") => refused += 1,
+            Err(_) => {}
         }
     }
     stop.store(true, Ordering::Relaxed);
     flipper.join().unwrap();
-    (fs::read_to_string(&victim).unwrap(), landed)
+    (fs::read_to_string(&victim).unwrap(), landed, refused)
 }
 
 /// The CALL-SITE half of the `O_NOFOLLOW` guarantee, for both tools that write.
@@ -567,14 +662,15 @@ fn victim_survives_a_planted_symlink(write: impl Fn(&Path) -> bool) -> (String, 
 #[cfg(unix)]
 #[test]
 fn write_file_never_follows_a_symlink_planted_mid_write() {
-    let (survived, landed) = victim_survives_a_planted_symlink(|root| {
+    let (survived, landed, refused) = victim_survives_a_planted_symlink(|root| {
         let policy = WorkspacePolicy::new(root.to_path_buf()).unwrap();
         let tool = WriteFileTool::new(policy);
         tool.write_sync(WriteFileParams {
             path: "notes.txt".to_string(),
             content: "PWNED\n".to_string(),
         })
-        .is_ok()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
     });
     assert_eq!(
         survived, "ORIGINAL\n",
@@ -584,12 +680,16 @@ fn write_file_never_follows_a_symlink_planted_mid_write() {
         landed > 0,
         "the race was never exercised: every write failed"
     );
+    assert!(
+        refused > 0,
+        "the O_NOFOLLOW guard never fired: the victim surviving proves nothing"
+    );
 }
 
 #[cfg(unix)]
 #[test]
 fn apply_patch_never_follows_a_symlink_planted_mid_write() {
-    let (survived, landed) = victim_survives_a_planted_symlink(|root| {
+    let (survived, landed, refused) = victim_survives_a_planted_symlink(|root| {
         let policy = WorkspacePolicy::new(root.to_path_buf()).unwrap();
         let tool = ApplyPatchTool::new(policy);
         tool.patch_sync(ApplyPatchParams {
@@ -597,7 +697,8 @@ fn apply_patch_never_follows_a_symlink_planted_mid_write() {
             old: "OLD".to_string(),
             new: "PWNED".to_string(),
         })
-        .is_ok()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
     });
     assert_eq!(
         survived, "ORIGINAL\n",
@@ -606,6 +707,10 @@ fn apply_patch_never_follows_a_symlink_planted_mid_write() {
     assert!(
         landed > 0,
         "the race was never exercised: every patch failed"
+    );
+    assert!(
+        refused > 0,
+        "the O_NOFOLLOW guard never fired: the victim surviving proves nothing"
     );
 }
 

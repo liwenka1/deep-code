@@ -639,7 +639,7 @@ fn write_no_follow(path: &std::path::Path, content: &[u8]) -> std::io::Result<()
 /// symlink that was there beforehand, and an intermediate loop would have
 /// failed the canonicalize before this open. So `ELOOP` here means the leaf,
 /// and it means the race — which is exactly what the caller needs told.
-fn write_failed(tool_name: &str, path: &std::path::Path, error: &std::io::Error) -> ToolError {
+fn write_failed(tool_name: &str, relative: &str, error: &std::io::Error) -> ToolError {
     #[cfg(unix)]
     let diagnosis = if error.raw_os_error() == Some(libc::ELOOP) {
         " (the final path component is a symlink; symlinks are never written through)"
@@ -650,7 +650,7 @@ fn write_failed(tool_name: &str, path: &std::path::Path, error: &std::io::Error)
     let diagnosis = "";
     ToolError::exec_failed(
         tool_name,
-        format!("failed to write {}: {error}{diagnosis}", path.display()),
+        format!("failed to write {}: {error}{diagnosis}", relative),
     )
 }
 
@@ -769,8 +769,9 @@ impl WriteFileTool {
         // It does NOT cover a directory symlink planted at an intermediate
         // segment — `O_NOFOLLOW` only inspects the last component — which
         // stays the residue described in `prepare_for_write`.
-        write_no_follow(&path, params.content.as_bytes())
-            .map_err(|error| write_failed(Self::NAME, &path, &error))?;
+        write_no_follow(&path, params.content.as_bytes()).map_err(|error| {
+            write_failed(Self::NAME, &self.root.relative_display(&path), &error)
+        })?;
         Ok(ToolOutput::text(json_string(json!({
             "path": self.root.relative_display(&path),
             "bytes_written": params.content.len()
@@ -883,8 +884,9 @@ impl ApplyPatchTool {
         // `ToolKind::WriteFile` as `write_file` and auto-approves under
         // `accept_edits`, so leaving it on the following open made the lock on
         // its twin decorative.
-        write_no_follow(&path, updated.as_bytes())
-            .map_err(|error| write_failed(Self::NAME, &path, &error))?;
+        write_no_follow(&path, updated.as_bytes()).map_err(|error| {
+            write_failed(Self::NAME, &self.root.relative_display(&path), &error)
+        })?;
         Ok(ToolOutput::text(json_string(json!({
             "path": display,
             "replacements": 1,
