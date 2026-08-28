@@ -104,6 +104,51 @@ jobs:
           DEEPCODE_REQUIRE_SANDBOX: "1"
         run: cargo test --locked --workspace
 
+  # `rust-version` in Cargo.toml was a claim nothing checked: every workflow and
+  # rust-toolchain.toml pin 1.96, so nothing anywhere compiled against the
+  # declared floor. A `cargo check` on that exact toolchain is the cheapest way
+  # to keep the manifest honest — verified to pass before this job was added, so
+  # a red here means the floor really did move and the manifest must follow.
+  msrv:
+    name: msrv · check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the declared minimum toolchain
+        # Keep in step with `rust-version` in Cargo.toml, not with
+        # rust-toolchain.toml — this job exists to test the other number.
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo check --locked --workspace
+
+  # The x86_64 half of the same argument as `linux-arm` above. release.yml
+  # builds and tests linux-x64 on `ubuntu-22.04` (pinned there for the glibc
+  # floor), and no CI job used that image: `check` runs ubuntu-latest (24.04).
+  # So the one runner image the release gate depends on was first exercised
+  # *after* the tag is pushed — and since 4e513e7 that leg also demands
+  # DEEPCODE_REQUIRE_SANDBOX, so an image whose kernel lacked Landlock would
+  # turn the discovery into a red release with a tag already in place.
+  linux-x64-release-image:
+    name: linux-x64 (22.04) · test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # Pinned to match rust-toolchain.toml; bump both together.
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        # Same demand release.yml makes of this image, made before the tag.
+        env:
+          DEEPCODE_REQUIRE_SANDBOX: "1"
+        run: cargo test --locked --workspace
+
   # Compiles & tests the Windows-only sandbox (Job Object) code, which the
   # Linux job's `cfg(windows)` gating skips.
   windows:

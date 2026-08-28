@@ -644,8 +644,11 @@ fn build_parent_tools<C: LlmClient + 'static>(
 /// (a documented opt-out this repo's own release workflow sets) and a perfectly
 /// good `fetch_url` entry was told it "matches no tool name — matching is
 /// exact", every clause of which is false. Worse, one failed workspace boundary
-/// unmounts nine tools at once and produced nine such lines on top of the real
-/// "workspace tools disabled" one.
+/// unmounts eight tools at once and produced eight such lines on top of the
+/// real "workspace tools disabled" one. (Counted, not estimated: a failed
+/// boundary loses `read_file`, `list_dir`, `grep_files`, `write_file`,
+/// `apply_patch`, `shell`, `job` and `request_write_root`; `fetch_url` and
+/// `web_search` survive it, and `agent` is mounted by the extension pass.)
 ///
 /// [`ExecPolicy::classify_tool`] is the tool-name universe (an exhaustive match
 /// on exact names), so it separates "not mounted here" from "no such tool".
@@ -824,6 +827,34 @@ mod tests {
             warnings.iter().any(|warning| warning.contains("\"read_\"")),
             "{warnings:?}"
         );
+    }
+
+    /// `warn_unmatched_auto_allow`'s doc calls `classify_tool` "the tool-name
+    /// universe", and the whole distinction between "not mounted here" and "no
+    /// such tool" rests on that. Nothing enforced it: a twelfth tool registered
+    /// without a `classify_tool` arm would make the warning tell a user with a
+    /// perfectly good entry that it "matches no tool name" — the exact false
+    /// accusation the warning was rewritten to stop making.
+    ///
+    /// (The gate itself fails safe — `ToolKind::Unknown` is `NeedsApproval` at
+    /// High — so this is about the warning telling the truth, not about access.)
+    #[test]
+    fn classify_tool_knows_every_registered_tool() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = AgentConfig {
+            api_key: Some("test-key".to_string()),
+            ..AgentConfig::builtin()
+        };
+        let client = DeepSeekClient::new(config.clone()).expect("client builds without network");
+
+        for name in parent_tool_names(client, &config, dir.path()) {
+            assert_ne!(
+                crate::execution_policy::ExecPolicy::classify_tool(&name),
+                crate::execution_policy::ToolKind::Unknown,
+                "{name} is registered but absent from classify_tool's match, so \
+                 warn_unmatched_auto_allow would call a valid entry a typo"
+            );
+        }
     }
 
     #[test]

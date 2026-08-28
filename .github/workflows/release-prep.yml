@@ -192,8 +192,13 @@ jobs:
           grep -q "^## \[${VERSION}\]" CHANGELOG.md || {
             echo "::error::CHANGELOG.md has no section for ${VERSION}"; exit 1; }
 
-      # main and the tag go in ONE push: if main advanced mid-run the push is
-      # rejected as non-fast-forward and the tag is not pushed either.
+      # main and the tag go in ONE ATOMIC push: without --atomic git updates
+      # each ref independently, so a main that advanced mid-run was rejected
+      # while the TAG still landed. That orphan tag triggers release.yml, whose
+      # version gate reads the tag's own tree and therefore passes — npm would
+      # publish a version whose chore(release) commit never reached main, with
+      # no changelog section on main and a tag the next release-prep's
+      # `git describe` cannot see. --atomic makes the whole push fail together.
       - name: Commit, tag, push
         env:
           BOT_NAME: ${{ steps.bot.outputs.name }}
@@ -204,7 +209,7 @@ jobs:
           git add CHANGELOG.md Cargo.toml Cargo.lock packages/deepcode/package.json
           git commit -m "chore(release): ${VERSION}"
           git tag "v${VERSION}"
-          git push origin "HEAD:main" "refs/tags/v${VERSION}"
+          git push --atomic origin "HEAD:main" "refs/tags/v${VERSION}"
 
       # 发布已完成；把 dispatch 输入框的提示刷成 "Current version: 刚发布的
       # 版本"，下次打开触发页时"当前版本"才是真话。刻意不进上面的原子推送：

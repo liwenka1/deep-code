@@ -17,9 +17,15 @@ case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*)
     # Neither require variable is set here, and the two have different reasons.
     #
-    # DEEPCODE_REQUIRE_SANDBOX: ci.yml's windows job does not set it either
-    # (only the three unix jobs do), and an unconditional one here hard-failed
-    # on the one platform whose CI never demands it.
+    # DEEPCODE_REQUIRE_SANDBOX: inert on Windows, so setting it would change
+    # nothing either way. It is read at exactly one place — `require_backend_
+    # or_skip` in sandbox/mod.rs — which is `cfg(all(test, any(linux, macos)))`
+    # and called only from the linux and seatbelt backends, so on a Windows
+    # target nothing ever reads it. (The earlier claim here, that an
+    # unconditional one "hard-failed on the one platform whose CI never demands
+    # it", was never true — it cannot fail what it cannot reach. And release.yml
+    # now DOES set it on every matrix leg including windows, for that same
+    # reason: harmless today, correct the day a Windows backend exists.)
     #
     # DEEPCODE_REQUIRE_SYMLINKS: ci.yml's windows job DOES set it — this is a
     # deliberate divergence, not a mirror. The hosted runner is elevated and
