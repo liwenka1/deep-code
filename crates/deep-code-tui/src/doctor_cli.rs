@@ -27,23 +27,37 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let clean = |text: &str| deep_code_agent::neutralize_display_text(text);
+
     println!("deep-code doctor");
     println!("  version: {}", report.version);
-    println!("  workspace: {}", report.workspace);
+    println!("  workspace: {}", clean(&report.workspace));
     println!(
         "  config: {} (present={})",
-        report.config_path, report.config_present
+        clean(&report.config_path),
+        report.config_present
     );
+    // Everything below that can carry repo-controlled text goes through the
+    // sanitizer: layer paths and the raw `toml::de::Error` (which echoes the
+    // offending source line), the layer warnings (which interpolate
+    // `provider.base_url` and friends), and `default_model`/`base_url`, which
+    // a project config can override. `doctor` is a real terminal like any
+    // other; it was simply outside the module that owned the rule.
     if let Some(layers) = &report.config_layers {
         for layer in &layers.layers {
             match &layer.error {
                 Some(error) => println!(
-                    "    layer {}: {} (present={}, 错误: {error})",
-                    layer.name, layer.path, layer.present
+                    "    layer {}: {} (present={}, 错误: {})",
+                    layer.name,
+                    clean(&layer.path),
+                    layer.present,
+                    clean(error)
                 ),
                 None => println!(
                     "    layer {}: {} (present={})",
-                    layer.name, layer.path, layer.present
+                    layer.name,
+                    clean(&layer.path),
+                    layer.present
                 ),
             }
         }
@@ -55,11 +69,15 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
             layers.api_key_source
         );
         for warning in &layers.warnings {
-            println!("    警告: {warning}");
+            println!("    警告: {}", clean(warning));
         }
     }
     println!("  api key: {}", report.api_key.source);
-    println!("  model: {} @ {}", report.default_model, report.base_url);
+    println!(
+        "  model: {} @ {}",
+        clean(&report.default_model),
+        clean(&report.base_url)
+    );
     println!(
         "  deepseek: auto_model={} reasoning={} currency={} beta={}",
         report.deepseek.auto_model,

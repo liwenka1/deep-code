@@ -12,6 +12,8 @@ mod workflow;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+use deep_code_agent::neutralize_display_text;
+
 use crate::cli::{GithubCommand, InstallArgs};
 use env::{GhStatus, RepoSlug};
 use workflow::{
@@ -299,7 +301,8 @@ fn status() -> i32 {
                 .find_map(|line| line.trim().strip_prefix("uses:"))
                 .map(str::trim)
                 .unwrap_or("(no `uses:` line — not a generated caller?)");
-            println!("  ✓ present, pinned at {pinned}");
+            // Read out of `.github/workflows/deepcode.yml`, a repo file.
+            println!("  ✓ present, pinned at {}", neutralize_display_text(pinned));
             if content.contains("app-private-key") {
                 println!("  ✓ GitHub App wiring present");
             } else {
@@ -313,7 +316,8 @@ fn status() -> i32 {
 
     match env::detect_repo() {
         Some(repo) => {
-            println!("repository: {}", repo.full());
+            // From `git remote get-url`, i.e. `.git/config` — repo-controlled.
+            println!("repository: {}", neutralize_display_text(&repo.full()));
             match env::gh_status() {
                 GhStatus::Ready => match env::list_secrets(&repo) {
                     Some(names) => {

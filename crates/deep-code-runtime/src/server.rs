@@ -17,7 +17,8 @@ use axum::routing::{get, post};
 use axum::{Json, middleware};
 use deep_code_agent::{
     AgentConfig, ApprovalDecision, ApprovalRequest, JsonSessionStore, LaunchedRuntime,
-    RuntimeEvent, SessionId, SessionRecord, SessionStore, TurnId, launch_runtime, now_ms,
+    RuntimeEvent, SessionId, SessionRecord, SessionStore, TurnId, launch_runtime,
+    neutralize_display_text, now_ms,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -213,8 +214,13 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
         );
     }
     let loaded = AgentConfig::load(&options.workspace);
+    // Repo-controlled: these interpolate values read out of
+    // `<workspace>/.deep-code/config.toml`. Until the sanitizer moved into the
+    // agent crate this file could not call it at all — `deep-code-runtime` does
+    // not depend on `deep-code-tui` — which is why `serve` was missed by every
+    // pass that hardened the TUI.
     for warning in &loaded.report.warnings {
-        eprintln!("config warning: {warning}");
+        eprintln!("config warning: {}", neutralize_display_text(warning));
     }
     let config = loaded.config;
     let resume = load_resume_record(&options)?;
@@ -226,8 +232,9 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
         ),
         resume,
     );
+    // Model-controlled: these interpolate paths out of the session record.
     for warning in &launched.warnings {
-        eprintln!("warning: {warning}");
+        eprintln!("warning: {}", neutralize_display_text(warning));
     }
     eprintln!(
         "deep-code runtime API listening on http://{}:{} ({})",

@@ -791,8 +791,7 @@ pub fn run_session_command(mode: RunMode) -> anyhow::Result<()> {
             let lang = Lang::from_env(&AgentConfig::load(&workspace).config.language);
             let now = now_ms();
             for record in records {
-                let preview =
-                    crate::history::truncate_chars(&record.preview().replace('\n', " "), 60);
+                let preview = session_list_preview(&record.preview());
                 println!(
                     "{}\t{}\t{} msgs\t{}",
                     record.id.as_str(),
@@ -881,9 +880,63 @@ fn print_session_usage() {
     eprintln!("  {prog} -r            # 选择历史会话");
 }
 
+/// One `session list` preview column.
+///
+/// `SessionRecord::preview()` returns the last user entry VERBATIM out of
+/// `<workspace>/.deep-code/sessions/*.json`, a file `workspace_policy` itself
+/// documents as "an ordinary `write_file` target for the model". Collapsing
+/// newlines and capping the length — all this used to do — touches neither
+/// `\x1b` nor the invisible families, so a planted session could repaint the
+/// terminal from a plain `deepcode session list`.
+///
+/// This is the third twin of the two resume pickers hardened in 806ee49 and
+/// 6a08a86, and the only one of the three with no rendered-cell test, because
+/// it prints rather than draws. Sanitize BEFORE collapsing and truncating: the
+/// cap counts characters, and dropping the invisibles first keeps that count
+/// describing what is actually shown.
+fn session_list_preview(preview: &str) -> String {
+    crate::history::truncate_chars(
+        &deep_code_agent::neutralize_display_text(preview).replace('\n', " "),
+        60,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_list_preview_neutralizes_a_planted_session() {
+        let line = session_list_preview("hi\u{1b}[2J\u{1b}[H FAKE\u{202e}x\u{2028}y");
+
+        assert!(
+            !line.chars().any(char::is_control),
+            "an escape reached stdout: {line:?}"
+        );
+        assert!(
+            !line.contains('\u{202e}') && !line.contains('\u{2028}'),
+            "an invisible code point reached stdout: {line:?}"
+        );
+        assert!(line.starts_with("hi"), "the text must survive: {line:?}");
+        assert!(line.contains('y'), "the text must survive: {line:?}");
+    }
+
+    #[test]
+    fn session_list_preview_flattens_and_caps() {
+        let line = session_list_preview(&format!("a\nb{}", "z".repeat(200)));
+
+        assert!(!line.contains('\n'), "newlines must be collapsed: {line:?}");
+        assert!(line.starts_with("a b"), "the head must survive: {line:?}");
+        assert!(
+            line.ends_with(" (truncated)"),
+            "over-long previews must say so: {line:?}"
+        );
+        assert_eq!(
+            line.chars().count(),
+            60 + " (truncated)".chars().count(),
+            "the cap counts characters of the sanitized text: {line:?}"
+        );
+    }
 
     #[test]
     fn parse_session_resume_subcommand() {

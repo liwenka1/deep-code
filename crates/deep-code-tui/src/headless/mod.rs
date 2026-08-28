@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use deep_code_agent::{
     AgentConfig, JsonSessionStore, PermissionMode, RuntimeEvent, SessionId, SessionRecord,
-    SessionStore, launch_runtime, now_ms,
+    SessionStore, launch_runtime, neutralize_display_text, now_ms,
 };
 
 use crate::cli::{PrintArgs, StartupIntent, program_name, workspace_root};
@@ -44,8 +44,14 @@ pub async fn run_print(args: PrintArgs) -> i32 {
 
     let workspace = workspace_root();
     let loaded = AgentConfig::load(&workspace);
+    // Sanitized for the same reason `trace_to_stderr` below is: under `-p`
+    // stderr is a real terminal (`redirect_stderr_to_log` runs only from
+    // `ui::run`). These interpolate `provider.base_url` and friends read out of
+    // `<workspace>/.deep-code/config.toml`, which a repository ships — and the
+    // message being concealed is the one saying a malicious repo must not
+    // redirect where your credentials go.
     for warning in &loaded.report.warnings {
-        eprintln!("config: {warning}");
+        emit("config", warning);
     }
 
     let resume = match resolve_resume_record(&args.intent, &workspace) {
@@ -58,8 +64,13 @@ pub async fn run_print(args: PrintArgs) -> i32 {
         deep_code_agent::WorkspaceRoots::new(workspace, args.add_dirs.clone()),
         resume,
     );
+    // Same surface, same reason — and the same format string as the sanitized
+    // one 190 lines below, which is how this one hid. These interpolate
+    // `record.workspace` and `record.extra_roots[i]` straight out of the
+    // session JSON, a file the model can write; the message being concealed is
+    // "dropping N write grant(s)".
     for warning in &launched.warnings {
-        eprintln!("warning: {warning}");
+        emit("warning", warning);
     }
     if launched.offline {
         eprintln!(
@@ -134,7 +145,11 @@ pub async fn run_print(args: PrintArgs) -> i32 {
 
     let (status, exit_code, error) = classify(&outcome.status, interrupted, timed_out, &args);
     if let Some(message) = &error {
-        eprintln!("error: {message}");
+        // `RuntimeEvent::Error` carries tool failures, which quote the paths
+        // and commands the model chose. `trace_to_stderr` does not handle that
+        // variant, so this is its only surfacing point — while the TUI status
+        // row sanitizes the identical value.
+        emit("error", message);
     }
 
     // The answer is read from the session, not reassembled from deltas:
@@ -225,6 +240,26 @@ fn classify(
     }
 }
 
+/// The one way this module writes a decorated line to stderr.
+///
+/// A choke point rather than four `eprintln!`s, because four `eprintln!`s is
+/// precisely what went wrong: `trace_to_stderr` was sanitized while three
+/// siblings using the *same format string* sat 190 lines above it, untouched.
+/// Under `-p` stderr is a real terminal — `redirect_stderr_to_log` runs only
+/// from `ui::run` — so every one of them could conceal the lines after it.
+///
+/// Honest about what pins this: the test below covers the sanitizing, not the
+/// wiring. Nothing stops a future caller from reaching for `eprintln!` again;
+/// what this buys is that there is now an obvious right way to do it.
+fn emit(prefix: &str, text: &str) {
+    eprintln!("{}", emit_line(prefix, text));
+}
+
+/// The pure half of [`emit`], so the sanitizing can be asserted.
+fn emit_line(prefix: &str, text: &str) -> String {
+    format!("{prefix}: {}", neutralize_display_text(text))
+}
+
 /// One stderr line per notable event. Approval denials always print — they
 /// are the honest answer to "why didn't it edit anything"; tool traffic only
 /// with `--verbose`.
@@ -240,7 +275,7 @@ fn trace_to_stderr(event: &RuntimeEvent, verbose: bool, tool_names: &mut HashMap
     // Only this decoration is filtered. `--output-format`'s payload on STDOUT
     // stays verbatim, because that is a pipe contract and the caller may be
     // parsing it; nobody pipes `→ read_file`.
-    let clean = crate::ui::render::neutralize_display_text;
+    let clean = neutralize_display_text;
     match event {
         RuntimeEvent::Warning { message } => eprintln!("warning: {}", clean(message)),
         RuntimeEvent::ApprovalRequired { request, .. } => {
@@ -325,5 +360,38 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Under `-p` stderr is a real terminal, so a `\x1b[8m` in any of these
+    /// lines conceals everything drawn after it — including the
+    /// "dropping N write grant(s)" and "a malicious repo must not redirect
+    /// where your credentials go" notices, which are exactly the lines an
+    /// attacker would want hidden. All three sources are attacker-influenced:
+    /// config values come from a repo-shipped `.deep-code/config.toml`, launch
+    /// warnings interpolate paths out of the model-writable session record,
+    /// and the error line carries the model's own tool names and paths.
+    #[test]
+    fn every_stderr_line_is_neutralized() {
+        for prefix in ["config", "warning", "error"] {
+            let line = emit_line(prefix, "a\u{1b}[8mb\u{202e}c\u{2028}d");
+            assert!(
+                !line.chars().any(|ch| ch.is_control()),
+                "{prefix}: a control character reached stderr: {line:?}"
+            );
+            assert!(
+                !line.contains('\u{202e}') && !line.contains('\u{2028}'),
+                "{prefix}: an invisible code point reached stderr: {line:?}"
+            );
+            assert!(
+                line.starts_with(prefix),
+                "the prefix must survive: {line:?}"
+            );
+            assert!(line.contains('d'), "the text must survive: {line:?}");
+        }
     }
 }

@@ -35,6 +35,7 @@ mod subagent;
 mod task_class;
 #[cfg(test)]
 mod test_symlinks;
+mod text_sanitize;
 mod text_util;
 mod tool;
 mod web_tools;
@@ -87,6 +88,11 @@ pub use session_store::{
 };
 pub use shell_tools::JobStore;
 pub use subagent::{SharedSubAgentManager, SubAgentManager, is_subagent_tool};
+// Every crate that can put text on a terminal needs this, which is why it is
+// here and not in the TUI: `deep-code-runtime` cannot depend on `deep-code-tui`
+// at all, so the `serve` warning loops were unreachable from the rule that was
+// supposed to cover them.
+pub use text_sanitize::{is_bidi_or_zero_width, neutralize_char_into, neutralize_display_text};
 pub use tool::{
     ApprovalDecision, ApprovalRequest, MockEchoTool, ToolError, ToolRegistry, ToolResult,
     ToolResultStatus,
