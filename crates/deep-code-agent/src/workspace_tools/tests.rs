@@ -243,6 +243,67 @@ async fn grep_files_does_not_invent_a_refusal_from_a_bad_ignore_glob() {
     );
 }
 
+/// The read cap had no test anywhere: deleting the whole guard left all 573
+/// agent tests, 200 TUI tests and both doc suites green, while
+/// `approval_preview` asserted in a comment that this mention was pinned.
+///
+/// Also pins the two causes staying apart. One `map_err` used to answer a
+/// permission error with "failed to read X as UTF-8: Permission denied", and
+/// spelled the path absolutely while the guard above it used the
+/// workspace-relative form.
+#[tokio::test]
+async fn read_file_refuses_a_file_over_the_limit() {
+    let tmp = tempdir().unwrap();
+    let big = vec![b'a'; (MAX_FILE_BYTES + 1) as usize];
+    fs::write(tmp.path().join("big.txt"), &big).unwrap();
+
+    let call = ToolCall::new("call_1", "read_file", json!({"path": "big.txt"}));
+    let outcome = registry(tmp.path())
+        .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await;
+    let message = match outcome {
+        Err(ToolError::ExecutionFailed { message, .. }) => message,
+        other => panic!("expected the size guard to refuse, got {other:?}"),
+    };
+
+    assert!(
+        message.contains(&format!("{MAX_FILE_MIB} MiB")),
+        "the refusal must name the limit it enforced: {message}"
+    );
+    assert!(
+        !message.contains(tmp.path().to_str().unwrap()),
+        "the absolute host path leaked to the model: {message}"
+    );
+}
+
+/// The `read_to_string` failure path, which the size guard above never reaches.
+/// One `map_err` served both causes, so a permission error was reported as
+/// "failed to read X as UTF-8: Permission denied" — and it spelled the path
+/// absolutely while every neighbouring message uses the relative form.
+#[tokio::test]
+async fn read_file_names_the_cause_and_keeps_the_path_relative() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("blob.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+    let call = ToolCall::new("call_1", "read_file", json!({"path": "blob.bin"}));
+    let outcome = registry(tmp.path())
+        .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await;
+    let message = match outcome {
+        Err(ToolError::ExecutionFailed { message, .. }) => message,
+        other => panic!("expected a read failure, got {other:?}"),
+    };
+
+    assert!(
+        message.contains("is not valid UTF-8"),
+        "the cause must be named, not folded into one phrase: {message}"
+    );
+    assert!(
+        !message.contains(tmp.path().to_str().unwrap()),
+        "the absolute host path leaked to the model: {message}"
+    );
+}
+
 /// The six filter rules are a contract the model plans against, and nothing
 /// read `description()` — deleting three of the clauses left all 26 grep tests
 /// green. Spelled out as independent literals here, not derived from the

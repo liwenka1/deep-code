@@ -191,8 +191,12 @@ mod tests {
     /// user-facing mentions derive from it and names "the approval preview's
     /// source guard" as one of them — but this one lived in the locale string
     /// as a literal "2 MiB", so a bumped cap would refuse at the new size while
-    /// telling the user the old one. The other two are pinned in
-    /// `workspace_tools::tests`; this is the third.
+    /// telling the user the old one.
+    ///
+    /// "The other two are pinned in `workspace_tools::tests`" was half true
+    /// when written: grep's note is, `read_file`'s was asserted nowhere at all
+    /// — its whole size guard could be deleted with the entire workspace green.
+    /// It has its own test now (`read_file_refuses_a_file_over_the_limit`).
     #[test]
     fn write_file_preview_reports_the_limit_from_the_constant() {
         let workspace = tempfile::tempdir().unwrap();

@@ -119,9 +119,21 @@ impl ReadFileTool {
             ));
         }
         let contents = fs::read_to_string(&path).map_err(|error| {
+            // Name the cause, and use the workspace-relative spelling. One
+            // `map_err` covered both "the bytes are not UTF-8" and every IO
+            // failure, so a permission error came back as "failed to read X as
+            // UTF-8: Permission denied" — the same two causes grep splits into
+            // separate ledgers, still conflated here. It also reached for
+            // `path.display()` while the size check nearby uses
+            // `relative_display`, leaking the absolute host path to the model.
+            let cause = if error.kind() == std::io::ErrorKind::InvalidData {
+                "is not valid UTF-8"
+            } else {
+                "could not be read"
+            };
             ToolError::exec_failed(
                 Self::NAME,
-                format!("failed to read {} as UTF-8: {error}", path.display()),
+                format!("{} {cause}: {error}", self.root.relative_display(&path)),
             )
         })?;
         let lines = contents.lines().collect::<Vec<_>>();
@@ -813,9 +825,21 @@ impl ApplyPatchTool {
         }
         let path = self.root.resolve_existing(&params.path, Self::NAME)?;
         let contents = fs::read_to_string(&path).map_err(|error| {
+            // Name the cause, and use the workspace-relative spelling. One
+            // `map_err` covered both "the bytes are not UTF-8" and every IO
+            // failure, so a permission error came back as "failed to read X as
+            // UTF-8: Permission denied" — the same two causes grep splits into
+            // separate ledgers, still conflated here. It also reached for
+            // `path.display()` while the size check nearby uses
+            // `relative_display`, leaking the absolute host path to the model.
+            let cause = if error.kind() == std::io::ErrorKind::InvalidData {
+                "is not valid UTF-8"
+            } else {
+                "could not be read"
+            };
             ToolError::exec_failed(
                 Self::NAME,
-                format!("failed to read {} as UTF-8: {error}", path.display()),
+                format!("{} {cause}: {error}", self.root.relative_display(&path)),
             )
         })?;
         let display = self.root.relative_display(&path);
