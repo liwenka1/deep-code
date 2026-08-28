@@ -92,7 +92,7 @@ impl CheckpointStore {
         // mid-snapshot and its staging dir is none of our business.
         let dest = self.storage_root.join(&id);
         let staging = self.storage_root.join(format!(".staging_{id}"));
-        if let Err(error) = copy_tree(&self.workspace, &staging, true) {
+        if let Err(error) = copy_tree(&self.workspace, &staging, CopyMode::Snapshot) {
             let _ = fs::remove_dir_all(&staging);
             return Err(error);
         }
@@ -150,22 +150,24 @@ impl CheckpointStore {
         // yet — and it used to propagate raw: the user was told an unlink
         // failed and nothing told them their workspace had just been partly
         // emptied.
-        clear_workspace_contents(&self.workspace).map_err(|error| {
+        clear_workspace_contents(&self.workspace, &source).map_err(|error| {
             ToolError::exec_failed(
                 "checkpoint",
                 format!(
-                    "{error}; the workspace is partially cleared and nothing has been restored \
+                    "{}; the workspace is partially cleared and nothing has been restored \
                      yet. Snapshot '{}' is intact — re-run the restore to finish it.",
+                    error.message(),
                     id.0
                 ),
             )
         })?;
-        copy_tree(&source, &self.workspace, false).map_err(|error| {
+        copy_tree(&source, &self.workspace, CopyMode::Restore).map_err(|error| {
             ToolError::exec_failed(
                 "checkpoint",
                 format!(
-                    "{error}; the workspace is partially restored. Snapshot '{}' is intact — \
+                    "{}; the workspace is partially restored. Snapshot '{}' is intact — \
                      re-run the restore to finish it.",
+                    error.message(),
                     id.0
                 ),
             )
@@ -254,9 +256,53 @@ fn should_skip(rel: &Path) -> bool {
     })
 }
 
-fn copy_tree(source: &Path, dest: &Path, skip_meta: bool) -> Result<(), ToolError> {
+/// What the snapshot is able to record for one directory entry.
+///
+/// Both halves of `restore` ask this one function, because the invariant that
+/// makes `restore` safe is that they classify every entry the same way: `clear`
+/// may delete only what `copy_tree` can put back.
+enum Entry {
+    Symlink,
+    Dir,
+    File,
+    /// FIFO, unix socket, device node. `copy_tree` has no representation for
+    /// these, so `clear_dir_contents` must not remove them either. The two
+    /// chains used to disagree here by accident: the copy side ended in a
+    /// guarded `else if is_file()`, the clear side in a bare `else` that
+    /// unlinked whatever was left. A dev server's socket in the workspace was
+    /// therefore never captured and always deleted, with `restore` reporting
+    /// success — the same "deletes more than it stores" shape as the nested
+    /// skip dirs, one file-type family over.
+    Uncapturable,
+}
+
+fn classify(file_type: &fs::FileType) -> Entry {
+    if file_type.is_symlink() {
+        Entry::Symlink
+    } else if file_type.is_dir() {
+        Entry::Dir
+    } else if file_type.is_file() {
+        Entry::File
+    } else {
+        Entry::Uncapturable
+    }
+}
+
+/// Which direction [`copy_tree`] is running in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopyMode {
+    /// workspace → staging. `dest` is a freshly created private directory, and
+    /// [`SKIP_DIRS`] is applied.
+    Snapshot,
+    /// snapshot → workspace. `dest` is the live workspace, which may still hold
+    /// entries `clear_workspace_contents` deliberately kept.
+    Restore,
+}
+
+fn copy_tree(source: &Path, dest: &Path, mode: CopyMode) -> Result<(), ToolError> {
     fs::create_dir_all(dest).map_err(|error| checkpoint_error("create snapshot dir", error))?;
-    for entry in WalkDir::new(source) {
+    let mut walk = WalkDir::new(source).into_iter();
+    while let Some(entry) = walk.next() {
         // A walk error must never be skipped. `filter_map(Result::ok)` dropped
         // an unreadable directory *together with its entire subtree* and still
         // returned `Ok`, so `snapshot` renamed a silently partial tree into
@@ -273,45 +319,80 @@ fn copy_tree(source: &Path, dest: &Path, skip_meta: bool) -> Result<(), ToolErro
         if rel.as_os_str().is_empty() {
             continue;
         }
-        if skip_meta && should_skip(rel) {
+        if mode == CopyMode::Snapshot && should_skip(rel) {
+            // Prune, don't just `continue`: a bare `continue` still descends.
+            // Every before-turn snapshot therefore walked all of `node_modules`,
+            // `target` and `.git` — and, because snapshots live at
+            // `.deep-code/checkpoints` INSIDE the workspace, all of the
+            // retained snapshots too, so the per-turn stat count grew with the
+            // retention window. An unreadable directory anywhere in there also
+            // failed the whole snapshot (the walk error above is deliberately
+            // fatal), every turn, over content the snapshot did not even want.
+            if entry.file_type().is_dir() {
+                walk.skip_current_dir();
+            }
             continue;
         }
         let target = dest.join(rel);
         let file_type = entry.file_type();
-        if file_type.is_symlink() {
+        // Never write THROUGH a link standing where the snapshot has content.
+        // `clear` is supposed to have removed any such link already (see
+        // `clear_dir_contents`); this is the second half of the same invariant,
+        // stated where the write actually happens. `create_dir_all` and
+        // `fs::copy` both follow a reparse point, so without it a junction left
+        // in place turned `restore` into a write outside the workspace.
+        if mode == CopyMode::Restore
+            && target
+                .symlink_metadata()
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            return Err(checkpoint_error(
+                "restore",
+                std::io::Error::other(format!(
+                    "{} is a symlink the snapshot could not capture; refusing to \
+                     write through it. Remove it and re-run the restore.",
+                    target.display()
+                )),
+            ));
+        }
+        match classify(&file_type) {
             // Preserve the link itself, not its referent: a workspace symlink
             // must survive snapshot → clear → restore instead of being
             // silently dropped.
             //
-            // Unix only — [`snapshot_can_capture_symlink`] carries the reason
-            // Windows cannot, and the delete side reads that same answer, so a
-            // link this arm fails to record is one `clear_workspace_contents`
-            // refuses to remove. (The wording here used to say Windows "keeps
-            // the old skip behavior". For a directory symlink the old behavior
-            // was an aborted restore, not a skip — and once 45d181a made the
-            // delete succeed, "skip on one side, delete on the other" was
-            // silent permanent loss.)
-            #[cfg(unix)]
-            {
+            // Gated on the same [`snapshot_can_capture_symlink`] the delete
+            // side reads, rather than on a second `#[cfg(unix)]` spelling of
+            // it. Two independent spellings of one rule cannot be made to fail
+            // together, and this pair is exactly the one whose disagreement
+            // turned a loud aborted restore into a silent permanent loss.
+            Entry::Symlink if snapshot_can_capture_symlink() => {
+                #[cfg(unix)]
+                {
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent)
+                            .map_err(|error| checkpoint_error("create snapshot parent", error))?;
+                    }
+                    let link_target = fs::read_link(entry.path())
+                        .map_err(|error| checkpoint_error("read snapshot symlink", error))?;
+                    std::os::unix::fs::symlink(&link_target, &target)
+                        .map_err(|error| checkpoint_error("copy snapshot symlink", error))?;
+                }
+            }
+            // Nothing recorded, so nothing may be deleted: `clear_dir_contents`
+            // keeps both of these for the same reason.
+            Entry::Symlink | Entry::Uncapturable => {}
+            Entry::Dir => {
+                fs::create_dir_all(&target)
+                    .map_err(|error| checkpoint_error("create snapshot subdir", error))?;
+            }
+            Entry::File => {
                 if let Some(parent) = target.parent() {
                     fs::create_dir_all(parent)
                         .map_err(|error| checkpoint_error("create snapshot parent", error))?;
                 }
-                let link_target = fs::read_link(entry.path())
-                    .map_err(|error| checkpoint_error("read snapshot symlink", error))?;
-                std::os::unix::fs::symlink(&link_target, &target)
-                    .map_err(|error| checkpoint_error("copy snapshot symlink", error))?;
+                copy_file_retrying(entry.path(), &target)
+                    .map_err(|error| checkpoint_error("copy snapshot file", error))?;
             }
-        } else if file_type.is_dir() {
-            fs::create_dir_all(&target)
-                .map_err(|error| checkpoint_error("create snapshot subdir", error))?;
-        } else if file_type.is_file() {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| checkpoint_error("create snapshot parent", error))?;
-            }
-            copy_file_retrying(entry.path(), &target)
-                .map_err(|error| checkpoint_error("copy snapshot file", error))?;
         }
     }
     Ok(())
@@ -457,15 +538,16 @@ const fn snapshot_can_capture_symlink() -> bool {
 ///    it) lost its whole history, and `restore` still reported success. The
 ///    walk below asks `should_skip` about the same relative path the snapshot
 ///    side judges, so the two sets are the same set by construction.
-/// 2. Windows symlinks: see the `is_symlink` arm.
-fn clear_workspace_contents(workspace: &Path) -> Result<(), ToolError> {
-    clear_dir_contents(workspace, workspace).map(|_| ())
+/// 2. Windows symlinks: see the `Entry::Symlink` arm.
+/// 3. Entries with no snapshot representation at all: see [`Entry::Uncapturable`].
+fn clear_workspace_contents(workspace: &Path, snapshot: &Path) -> Result<(), ToolError> {
+    clear_dir_contents(workspace, snapshot, workspace).map(|_| ())
 }
 
 /// Returns whether anything under `dir` was deliberately KEPT, which is what
 /// tells the caller not to remove `dir` itself: a directory holding a skipped
 /// `.git` must survive to hold it.
-fn clear_dir_contents(workspace: &Path, dir: &Path) -> Result<bool, ToolError> {
+fn clear_dir_contents(workspace: &Path, snapshot: &Path, dir: &Path) -> Result<bool, ToolError> {
     let mut kept = false;
     for entry in fs::read_dir(dir).map_err(|error| checkpoint_error("read workspace", error))? {
         let entry = entry.map_err(|error| checkpoint_error("read workspace entry", error))?;
@@ -483,32 +565,50 @@ fn clear_dir_contents(workspace: &Path, dir: &Path) -> Result<bool, ToolError> {
         let file_type = entry
             .file_type()
             .map_err(|error| checkpoint_error("stat workspace entry", error))?;
-        if file_type.is_symlink() {
-            // Deleted only where the snapshot can capture it. Where it cannot
-            // — Windows — removing the link destroys something `restore`
-            // provably cannot recreate, and `restore` still returns Ok, so
-            // the loss is silent and permanent. Before 45d181a the same link
-            // aborted the restore outright; the cure for a loud abort is not
-            // a quiet deletion. Kept instead, which leaves the link standing
-            // rather than the workspace short of one.
-            if snapshot_can_capture_symlink() {
-                remove_symlink(&path, &file_type)
-                    .map_err(|error| checkpoint_error("clear workspace symlink", error))?;
-            } else {
-                kept = true;
+        match classify(&file_type) {
+            Entry::Symlink => {
+                // Deletable when `restore` can put *something right* back at
+                // this path — which is true in two separate cases:
+                //
+                // * the platform records links, so the snapshot holds this one
+                //   and will recreate it; or
+                // * the snapshot holds an entry here anyway. The link post-dates
+                //   the snapshot, so it is not part of the state being restored,
+                //   and `copy_tree` is about to write the captured directory or
+                //   file over this path. Windows CAN delete a junction
+                //   (`remove_symlink` → `remove_dir`); what it cannot do is
+                //   *recreate* one, and recreating is not required here.
+                //
+                // Keeping a link that stands where the snapshot has content is
+                // what turned `restore` into a write outside the workspace:
+                // `create_dir_all`/`fs::copy` follow a reparse point, and a
+                // junction needs no privilege to create. Only a link the
+                // snapshot neither holds nor can recreate is kept.
+                if snapshot_can_capture_symlink()
+                    || snapshot.join(relative).symlink_metadata().is_ok()
+                {
+                    remove_symlink(&path, &file_type)
+                        .map_err(|error| checkpoint_error("clear workspace symlink", error))?;
+                } else {
+                    kept = true;
+                }
             }
-        } else if file_type.is_dir() {
-            // Recurse rather than `remove_dir_all`: the subtree may hold a
-            // skipped directory, and blowing it away is bug 1 above.
-            if clear_dir_contents(workspace, &path)? {
-                kept = true;
-            } else {
-                fs::remove_dir(&path)
-                    .map_err(|error| checkpoint_error("clear workspace dir", error))?;
+            Entry::Dir => {
+                // Recurse rather than `remove_dir_all`: the subtree may hold a
+                // skipped directory, and blowing it away is bug 1 above.
+                if clear_dir_contents(workspace, snapshot, &path)? {
+                    kept = true;
+                } else {
+                    fs::remove_dir(&path)
+                        .map_err(|error| checkpoint_error("clear workspace dir", error))?;
+                }
             }
-        } else {
-            fs::remove_file(&path)
-                .map_err(|error| checkpoint_error("clear workspace file", error))?;
+            Entry::File => {
+                fs::remove_file(&path)
+                    .map_err(|error| checkpoint_error("clear workspace file", error))?;
+            }
+            // No snapshot representation, so no way to put it back.
+            Entry::Uncapturable => kept = true,
         }
     }
     Ok(kept)
@@ -738,6 +838,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restore_preserves_symlinks() {
+        // Asserts a *capability*, so it is gated on the capability and not on
+        // `cfg(unix)` alone. That also keeps the "hard-code the constant and
+        // run the whole suite" check honest: now that one constant switches
+        // both halves, forcing it off must not leave a test demanding the
+        // behaviour the constant just withdrew.
+        if !snapshot_can_capture_symlink() {
+            return;
+        }
         let workspace = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("shared.txt"), "external").unwrap();
@@ -823,6 +931,112 @@ mod tests {
         assert_eq!(
             fs::read_to_string(outside.path().join("shared.txt")).unwrap(),
             "external"
+        );
+    }
+
+    /// The complement the test above does not reach: a link standing where the
+    /// snapshot DOES hold an entry.
+    ///
+    /// `restore` is clear-then-copy, and `copy_tree` writes with
+    /// `create_dir_all`/`fs::copy`, both of which follow a reparse point. So a
+    /// link kept by the clear half at a path the copy half is about to write
+    /// sent the snapshot's contents outside the workspace, with `restore`
+    /// returning `Ok`. A junction needs no privilege on Windows, which is the
+    /// platform whose keep-branch made this reachable.
+    ///
+    /// Both assertions are platform-independent by design: the link is deleted
+    /// on either platform now (the snapshot covers the path, so `restore`
+    /// rebuilds it — recreating the *link* is not required), so the workspace
+    /// really returns to the snapshot and the external target is never touched.
+    #[test]
+    fn restore_never_writes_through_a_link_standing_on_snapshotted_content() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("untouched.txt"), "VICTIM").unwrap();
+        let root = workspace.path();
+        fs::create_dir_all(root.join("d")).unwrap();
+        fs::write(root.join("d/f.txt"), "snapshot-content").unwrap();
+
+        let store = CheckpointStore::new(root).unwrap();
+        let (id, _) = store.snapshot("before_turn").unwrap();
+
+        // Swap the captured directory for a link pointing out of the workspace.
+        fs::remove_dir_all(root.join("d")).unwrap();
+        if !crate::test_symlinks::symlink_dir_for_test(outside.path(), &root.join("d")) {
+            return;
+        }
+
+        store.restore(&id).unwrap();
+
+        assert!(
+            !outside.path().join("f.txt").exists(),
+            "restore wrote through the link into a workspace-external directory"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("untouched.txt")).unwrap(),
+            "VICTIM"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("d/f.txt")).unwrap(),
+            "snapshot-content",
+            "the snapshot's own content must be restored at that path"
+        );
+    }
+
+    /// A FIFO has no snapshot representation, so `clear` may not remove it.
+    /// The copy side ended in a guarded `else if is_file()` while the clear
+    /// side ended in a bare `else`, so this was captured by neither and
+    /// deleted by one — `restore` reported success and the socket was gone.
+    #[cfg(unix)]
+    #[test]
+    fn restore_keeps_entries_it_cannot_capture() {
+        use std::os::unix::ffi::OsStrExt;
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        fs::write(root.join("real.txt"), "v1").unwrap();
+        let fifo = root.join("dev.sock");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path in a fresh tempdir.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+
+        let store = CheckpointStore::new(root).unwrap();
+        let (id, _) = store.snapshot("before_turn").unwrap();
+        fs::write(root.join("real.txt"), "v2").unwrap();
+        store.restore(&id).unwrap();
+
+        assert_eq!(fs::read_to_string(root.join("real.txt")).unwrap(), "v1");
+        assert!(
+            fifo.symlink_metadata().is_ok(),
+            "restore deleted a FIFO the snapshot never captured"
+        );
+    }
+
+    /// The walk is pruned at a skipped directory, not merely `continue`d past.
+    /// A bare `continue` still descends, so an unreadable directory inside
+    /// `node_modules` failed the whole snapshot — every turn, over content the
+    /// snapshot does not even want. (The same descent is why each before-turn
+    /// snapshot also walked every retained snapshot under `.deep-code`.)
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_does_not_descend_into_skipped_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        fs::write(root.join("main.rs"), "v1").unwrap();
+        let locked = root.join("node_modules/.cache");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("blob"), "x").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let store = CheckpointStore::new(root).unwrap();
+        let taken = store.snapshot("before_turn");
+        // Restore permissions before any assertion can panic and leak them.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            taken.is_ok(),
+            "an unreadable directory inside a skipped tree failed the snapshot: {:?}",
+            taken.err()
         );
     }
 

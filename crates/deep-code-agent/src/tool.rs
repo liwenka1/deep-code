@@ -406,6 +406,21 @@ impl ToolError {
             message: message.into(),
         }
     }
+
+    /// The payload without the `tool execution failed for <name>: ` framing.
+    ///
+    /// For re-wrapping one `ToolError` inside another: `format!("{error}")`
+    /// there would stutter the prefix, which is how `restore`'s failure advice
+    /// came out reading `tool execution failed for checkpoint: tool execution
+    /// failed for checkpoint: …`.
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::UnknownTool { name } => name,
+            Self::InvalidArguments { message, .. } | Self::ExecutionFailed { message, .. } => {
+                message
+            }
+        }
+    }
 }
 
 /// A tool with typed, schema-derived parameters.
