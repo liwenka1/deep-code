@@ -64,7 +64,7 @@ fn install(args: InstallArgs) -> i32 {
             .clone()
             .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKFLOW_PATH)),
     );
-    match write_workflow(&target, &rendered, args.force) {
+    match write_workflow(&root, &target, &rendered, args.force) {
         Ok(WriteOutcome::Created) => println!("✓ wrote {}", display(&root, &target)),
         Ok(WriteOutcome::Updated) => println!("✓ updated {}", display(&root, &target)),
         Ok(WriteOutcome::Unchanged) => {
@@ -127,7 +127,10 @@ fn configure_secrets(
     match resolve_api_key(args) {
         Some(key) => match env::set_secret(repo, API_KEY_SECRET, &key) {
             Ok(()) => {
-                println!("✓ set {API_KEY_SECRET} on {}", repo.full());
+                println!(
+                    "✓ set {API_KEY_SECRET} on {}",
+                    neutralize_display_text(&repo.full())
+                );
                 api_key_ok = true;
             }
             Err(error) => eprintln!("· could not set {API_KEY_SECRET}: {error}"),
@@ -140,7 +143,9 @@ fn configure_secrets(
             Ok(Some((app_id, private_key))) => {
                 for (name, value) in [(APP_ID_SECRET, app_id), (APP_KEY_SECRET, private_key)] {
                     match env::set_secret(repo, name, &value) {
-                        Ok(()) => println!("✓ set {name} on {}", repo.full()),
+                        Ok(()) => {
+                            println!("✓ set {name} on {}", neutralize_display_text(&repo.full()))
+                        }
                         Err(error) => eprintln!("· could not set {name}: {error}"),
                     }
                 }
@@ -351,7 +356,12 @@ enum WriteError {
 /// Write unless it would clobber someone's edits. An identical file counts as
 /// success (re-running the command is how you upgrade), and a *generated* file
 /// that merely drifted to a new version is replaced only with `--force`.
-fn write_workflow(target: &Path, content: &str, force: bool) -> Result<WriteOutcome, WriteError> {
+fn write_workflow(
+    root: &Path,
+    target: &Path,
+    content: &str,
+    force: bool,
+) -> Result<WriteOutcome, WriteError> {
     // A link that exists is a link whether or not its target does:
     // `read_to_string` returns None for a DANGLING one, which fell through to
     // the write below and created the link's target — anywhere on disk. Same
@@ -363,6 +373,27 @@ fn write_workflow(target: &Path, content: &str, force: bool) -> Result<WriteOutc
         .is_ok_and(|meta| meta.file_type().is_symlink())
     {
         return Err(WriteError::Exists);
+    }
+    // The leaf guard is not the whole escape: `create_dir_all` and `write`
+    // below both traverse a symlinked DIRECTORY component. A checkout shipping
+    // `.github` or `.github/workflows` as a link out of the repo would relocate
+    // the generated file there without `--force`, exactly the way the leaf link
+    // did. Refuse a symlink at any component we are about to create or write
+    // through, between the repo root and the leaf; at or above `root` the path
+    // is the user's own layout (a repo behind a symlinked parent is normal), so
+    // the walk stops there.
+    let mut component = target.parent();
+    while let Some(dir) = component {
+        if dir == root || !dir.starts_with(root) {
+            break;
+        }
+        if dir
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            return Err(WriteError::Exists);
+        }
+        component = dir.parent();
     }
     let existing = std::fs::read_to_string(target).ok();
     match existing {
@@ -399,21 +430,21 @@ mod tests {
         let target = dir.path().join(".github/workflows/deepcode.yml");
 
         assert!(matches!(
-            write_workflow(&target, "one", false),
+            write_workflow(dir.path(), &target, "one", false),
             Ok(WriteOutcome::Created)
         ));
         // Re-running the installer must not fail just because it already ran.
         assert!(matches!(
-            write_workflow(&target, "one", false),
+            write_workflow(dir.path(), &target, "one", false),
             Ok(WriteOutcome::Unchanged)
         ));
         // Different content without --force would silently discard edits.
         assert!(matches!(
-            write_workflow(&target, "two", false),
+            write_workflow(dir.path(), &target, "two", false),
             Err(WriteError::Exists)
         ));
         assert!(matches!(
-            write_workflow(&target, "two", true),
+            write_workflow(dir.path(), &target, "two", true),
             Ok(WriteOutcome::Updated)
         ));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "two");
@@ -436,7 +467,7 @@ mod tests {
         std::os::unix::fs::symlink(&victim, &target).unwrap();
 
         assert!(matches!(
-            write_workflow(&target, "one", false),
+            write_workflow(dir.path(), &target, "one", false),
             Err(WriteError::Exists)
         ));
         assert!(
@@ -446,10 +477,34 @@ mod tests {
         // `--force` is for replacing a generated file that drifted to a new
         // version, not for resolving a link someone planted.
         assert!(matches!(
-            write_workflow(&target, "one", true),
+            write_workflow(dir.path(), &target, "one", true),
             Err(WriteError::Exists)
         ));
         assert!(!victim.exists());
+    }
+
+    /// The leaf guard is not the whole escape: `create_dir_all(parent)` and the
+    /// write both traverse a symlinked DIRECTORY component. A hostile checkout
+    /// shipping `.github/workflows` (or `.github`) as a link out of the repo
+    /// would otherwise land the generated file outside it without `--force`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_workflow_parent_is_refused_rather_than_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".github")).unwrap();
+        // `.github/workflows` → a directory outside the repository.
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(".github/workflows")).unwrap();
+        let target = dir.path().join(".github/workflows/deepcode.yml");
+
+        assert!(matches!(
+            write_workflow(dir.path(), &target, "one", false),
+            Err(WriteError::Exists)
+        ));
+        assert!(
+            !outside.path().join("deepcode.yml").exists(),
+            "the write followed a symlinked parent out of the repository"
+        );
     }
 
     #[test]
