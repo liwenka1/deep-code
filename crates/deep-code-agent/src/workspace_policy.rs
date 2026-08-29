@@ -295,7 +295,10 @@ impl WorkspacePolicy {
         if contains_symlink(&candidate, &self.granted_roots()).map_err(|error| {
             ToolError::exec_failed(
                 tool_name,
-                format!("failed to inspect {}: {error}", candidate.display()),
+                format!(
+                    "failed to inspect {}: {error}",
+                    self.relative_display(&candidate)
+                ),
             )
         })? {
             return Err(path_error(tool_name, raw, "symlinks are not allowed"));
@@ -303,7 +306,10 @@ impl WorkspacePolicy {
         let canonical = crate::paths::canonicalize(&candidate).map_err(|error| {
             ToolError::exec_failed(
                 tool_name,
-                format!("failed to resolve {}: {error}", candidate.display()),
+                format!(
+                    "failed to resolve {}: {error}",
+                    self.relative_display(&candidate)
+                ),
             )
         })?;
         if !self.is_granted(&canonical) {
@@ -338,7 +344,10 @@ impl WorkspacePolicy {
             if contains_symlink(&candidate, &self.granted_roots()).map_err(|error| {
                 ToolError::exec_failed(
                     tool_name,
-                    format!("failed to inspect {}: {error}", candidate.display()),
+                    format!(
+                        "failed to inspect {}: {error}",
+                        self.relative_display(&candidate)
+                    ),
                 )
             })? {
                 return Err(path_error(
@@ -350,7 +359,10 @@ impl WorkspacePolicy {
             let canonical = crate::paths::canonicalize(&candidate).map_err(|error| {
                 ToolError::exec_failed(
                     tool_name,
-                    format!("failed to resolve {}: {error}", candidate.display()),
+                    format!(
+                        "failed to resolve {}: {error}",
+                        self.relative_display(&candidate)
+                    ),
                 )
             })?;
             if !self.is_granted(&canonical) {
@@ -396,7 +408,10 @@ impl WorkspacePolicy {
         if contains_symlink(existing, &self.granted_roots()).map_err(|error| {
             ToolError::exec_failed(
                 tool_name,
-                format!("failed to inspect {}: {error}", existing.display()),
+                format!(
+                    "failed to inspect {}: {error}",
+                    self.relative_display(existing)
+                ),
             )
         })? {
             return Err(path_error(
@@ -410,7 +425,7 @@ impl WorkspacePolicy {
                 tool_name,
                 format!(
                     "destination parent {} cannot be resolved: {error}",
-                    existing.display()
+                    self.relative_display(existing)
                 ),
             )
         })?;

@@ -282,7 +282,7 @@ async fn read_file_refuses_a_file_over_the_limit() {
 /// test in the workspace green.
 #[cfg(unix)]
 #[tokio::test]
-async fn read_file_names_a_non_utf8_cause_separately() {
+async fn read_file_names_an_unreadable_cause_separately() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempdir().unwrap();
@@ -340,6 +340,49 @@ async fn apply_patch_names_the_cause_and_keeps_the_path_relative() {
     assert!(
         message.contains("is not valid UTF-8"),
         "the cause must be named: {message}"
+    );
+    assert!(
+        !message.contains(tmp.path().to_str().unwrap()),
+        "the absolute host path leaked to the model: {message}"
+    );
+}
+
+/// `list_dir`'s read failure spelled the directory absolutely while every
+/// neighbouring message uses the relative form. A `chmod 000` directory still
+/// resolves (its own path stats fine) but cannot be read, so `read_dir` fails
+/// with EACCES after resolution succeeds — the one deterministic trigger for
+/// this branch.
+#[cfg(unix)]
+#[tokio::test]
+async fn list_dir_keeps_the_path_relative_when_the_read_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempdir().unwrap();
+    let locked = tmp.path().join("locked_dir");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&locked).is_ok() {
+        // Running as root; the refusal cannot be produced. Restore first so the
+        // tempdir can be cleaned up.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let call = ToolCall::new("call_1", "list_dir", json!({"path": "locked_dir"}));
+    let outcome = registry(tmp.path())
+        .run_tool_call(call, Some(ApprovalDecision::Approved))
+        .await;
+    // Restore before asserting, so a failing assertion still leaves a
+    // removable tempdir behind.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    let message = match outcome {
+        Err(ToolError::ExecutionFailed { message, .. }) => message,
+        other => panic!("expected a list failure, got {other:?}"),
+    };
+
+    assert!(
+        message.contains("locked_dir"),
+        "the relative path must be named: {message}"
     );
     assert!(
         !message.contains(tmp.path().to_str().unwrap()),

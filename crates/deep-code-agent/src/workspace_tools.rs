@@ -103,7 +103,10 @@ impl ReadFileTool {
         let metadata = fs::metadata(&path).map_err(|error| {
             ToolError::exec_failed(
                 Self::NAME,
-                format!("failed to read metadata for {}: {error}", path.display()),
+                format!(
+                    "failed to read metadata for {}: {error}",
+                    self.root.relative_display(&path)
+                ),
             )
         })?;
         if !metadata.is_file() {
@@ -214,7 +217,10 @@ impl ListDirTool {
             .map_err(|error| {
                 ToolError::exec_failed(
                     Self::NAME,
-                    format!("failed to list {}: {error}", path.display()),
+                    format!(
+                        "failed to list {}: {error}",
+                        self.root.relative_display(&path)
+                    ),
                 )
             })?
             .map(|entry| {
