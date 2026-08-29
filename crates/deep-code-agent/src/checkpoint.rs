@@ -139,10 +139,16 @@ impl CheckpointStore {
     /// KEPT because the snapshot has no way to put them back.
     ///
     /// Returned rather than discarded: `restore` used to answer `Ok(())` and
-    /// the UI said "workspace restored" flat out, while three separate rules
-    /// could quietly leave things behind (a skipped directory, a link this
-    /// platform cannot recreate, an entry with no snapshot representation).
-    /// "Restored, except for these" is the true sentence.
+    /// the UI said "workspace restored" flat out, while two surprising rules
+    /// could quietly leave things behind — a link this platform cannot recreate,
+    /// and an entry with no snapshot representation (a FIFO, socket or device
+    /// node). "Restored, except for these" is the true sentence.
+    ///
+    /// The [`SKIP_DIRS`] (`.git`, `node_modules`, `target`, `.deep-code`) are
+    /// kept too, but deliberately NOT in this list: they are never snapshotted,
+    /// so they are kept on *every* restore, and naming them each time would be
+    /// noise rather than news. The returned list is only the entries a user
+    /// would be surprised to find unrestored.
     pub fn restore(&self, id: &CheckpointId) -> Result<Vec<String>, ToolError> {
         validate_checkpoint_id(id)?;
         let source = self.storage_root.join(&id.0);
@@ -637,6 +643,10 @@ fn clear_dir_contents(
             continue;
         };
         if should_skip(relative) {
+            // Kept, but NOT pushed to `report`: SKIP_DIRS are never snapshotted,
+            // so they are kept on every restore — reporting them each time is
+            // noise. `restore`'s list is only the entries a user would be
+            // surprised to find unrestored (see its doc).
             kept = true;
             continue;
         }
