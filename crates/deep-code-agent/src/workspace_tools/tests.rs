@@ -602,10 +602,10 @@ fn write_no_follow_refuses_a_symlinked_target() {
     // built. `write_failed`'s whole reason to exist is that bare ELOOP says
     // "Too many levels of symbolic links" for a single link, and nothing
     // asserted the replacement text: reverting the diagnosis to "" left the
-    // suite green. The two race tests below now depend on this wording as
-    // well — they count refusals by matching "symlink" — so the tools' USE
-    // of `write_failed` is pinned there, which this comment used to claim
-    // without it being so.
+    // suite green. Pinned here, on the primitive, deterministically — the race
+    // tests below assert only the robust facts (the victim never escapes, the
+    // loop ran), because whether the O_NOFOLLOW leaf check is reached DURING a
+    // race depends on hitting a narrow TOCTOU window a CI scheduler may miss.
     #[cfg(unix)]
     {
         let rendered =
@@ -629,7 +629,7 @@ fn write_no_follow_refuses_a_symlinked_target() {
 #[cfg(unix)]
 fn victim_survives_a_planted_symlink(
     write: impl Fn(&Path) -> Result<(), String>,
-) -> (String, usize, usize) {
+) -> (String, usize) {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -652,42 +652,34 @@ fn victim_survives_a_planted_symlink(
         }
     });
 
-    // Bounded: `O_NOFOLLOW` makes the victim untouchable regardless of timing,
-    // so a correct implementation can never fail this no matter how the loop
-    // interleaves. A regressed one escapes within a few dozen iterations.
-    // Two anti-vacuity counters, because one was measuring the wrong side.
+    // `O_NOFOLLOW` makes the victim untouchable regardless of interleaving, so
+    // a correct implementation never lets it escape no matter how the loop
+    // races. `landed` counts successful writes: it catches a loop that never
+    // runs at all (an injected `return Err(..)` left both tests green,
+    // asserting nothing).
     //
-    // `landed` counts successful writes and catches a loop that never runs at
-    // all (an injected `return Err(..)` left both tests passing, three seconds
-    // faster, asserting nothing). But it cannot see the opposite vacuity:
-    // making `write_no_follow` a no-op that returns `Ok(())` writes NOTHING,
-    // so the victim trivially survives and `landed` reaches 3000 — green while
-    // the tool is inert. Counting successes proves the loop ran; it does not
-    // prove the guard ever fired.
-    //
-    // `refused` is that missing half: the ELOOP diagnosis can only come from
-    // `O_NOFOLLOW` meeting a planted link at the final component, so a
-    // non-zero count is direct evidence that the race really was joined and
-    // that the guard — not some earlier check — did the refusing.
+    // We deliberately do NOT assert on how many writes were refused by the
+    // O_NOFOLLOW leaf check. That count only rises when the flipper lands in
+    // the narrow TOCTOU window — the link DOWN when the tool resolves, UP by
+    // the time it opens — and whether a scheduler ever hits that window inside
+    // a bounded loop is pure timing. It is reliably hit on a fast multi-core
+    // dev box and can be missed entirely on a loaded CI runner, especially for
+    // `apply_patch`, whose read/`locate_match` step turns most "link is up"
+    // iterations into no-match errors before they ever reach the open.
+    // Requiring a non-zero count flaked the suite RED on CI while the code was
+    // correct. The guard's correctness — including that a no-op
+    // `write_no_follow` returning `Ok(())` is caught — is pinned
+    // deterministically by `write_no_follow_refuses_a_symlinked_target`, which
+    // plants the link and calls the primitive directly, no race needed.
     let mut landed = 0usize;
-    let mut refused = 0usize;
     for _ in 0..3000 {
-        match write(tmp.path()) {
-            Ok(()) => landed += 1,
-            // The ELOOP diagnosis specifically, NOT just "symlink": the
-            // resolve-time refusal ("symlinks in the destination path are not
-            // allowed") also contains that word, and counting it made this
-            // guard vacuous again — a no-op `write_no_follow` still passed,
-            // because every iteration that lost the race was refused up front
-            // by `contains_symlink` instead. Only this phrase can come from
-            // O_NOFOLLOW meeting a link at the final component.
-            Err(message) if message.contains("never written through") => refused += 1,
-            Err(_) => {}
+        if write(tmp.path()).is_ok() {
+            landed += 1;
         }
     }
     stop.store(true, Ordering::Relaxed);
     flipper.join().unwrap();
-    (fs::read_to_string(&victim).unwrap(), landed, refused)
+    (fs::read_to_string(&victim).unwrap(), landed)
 }
 
 /// The CALL-SITE half of the `O_NOFOLLOW` guarantee, for both tools that write.
@@ -705,7 +697,7 @@ fn victim_survives_a_planted_symlink(
 #[cfg(unix)]
 #[test]
 fn write_file_never_follows_a_symlink_planted_mid_write() {
-    let (survived, landed, refused) = victim_survives_a_planted_symlink(|root| {
+    let (survived, landed) = victim_survives_a_planted_symlink(|root| {
         let policy = WorkspacePolicy::new(root.to_path_buf()).unwrap();
         let tool = WriteFileTool::new(policy);
         tool.write_sync(WriteFileParams {
@@ -723,16 +715,12 @@ fn write_file_never_follows_a_symlink_planted_mid_write() {
         landed > 0,
         "the race was never exercised: every write failed"
     );
-    assert!(
-        refused > 0,
-        "the O_NOFOLLOW guard never fired: the victim surviving proves nothing"
-    );
 }
 
 #[cfg(unix)]
 #[test]
 fn apply_patch_never_follows_a_symlink_planted_mid_write() {
-    let (survived, landed, refused) = victim_survives_a_planted_symlink(|root| {
+    let (survived, landed) = victim_survives_a_planted_symlink(|root| {
         let policy = WorkspacePolicy::new(root.to_path_buf()).unwrap();
         let tool = ApplyPatchTool::new(policy);
         tool.patch_sync(ApplyPatchParams {
@@ -750,10 +738,6 @@ fn apply_patch_never_follows_a_symlink_planted_mid_write() {
     assert!(
         landed > 0,
         "the race was never exercised: every patch failed"
-    );
-    assert!(
-        refused > 0,
-        "the O_NOFOLLOW guard never fired: the victim surviving proves nothing"
     );
 }
 
