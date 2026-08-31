@@ -15,12 +15,13 @@
 # 锚点注释）。事后修正路径：main 上补 docs commit + 编辑 GitHub Release
 # 正文；tag 树里的那份历史文件不可改，是全自动的固有代价。
 #
-# 输入框提示里的 "Current version: X" 由发版流程自我维护：dispatch 的
-# description 是静态 YAML（GitHub 不支持在这里取动态值），所以发布成功后
-# 由最后一步把它刷成刚发布的版本、单独 commit 单独 push。best-effort：
-# 改的是 workflow 文件，App 需要 Workflows 写权限；缺权限或 main 恰好被
-# 推进时只告警不失败——发版本身不受影响，代价是提示停在上一个成功刷新
-# 的版本，直到下次刷新自愈。
+# 输入框提示里的 "Current version: X" 与起草器的 npm 锁版本都由发版流程
+# 自我维护：dispatch 的 description 是静态 YAML（GitHub 不支持在这里取
+# 动态值），锁版本则是供应链要求，所以发布成功后由最后一步把两者刷成刚
+# 发布的版本、单独 commit 单独 push。best-effort：改的是 workflow 文件，
+# App 需要 Workflows 写权限；缺权限或 main 恰好被推进时只告警不失败——
+# 发版本身不受影响，代价是提示与锁版本停在上一个成功刷新的版本，直到
+# 下次刷新自愈（锁版本停旧只是用旧起草器起草，无正确性影响）。
 
 name: Release Prep
 
@@ -73,7 +74,7 @@ jobs:
 
       - name: Mint app token
         id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
         with:
           app-id: ${{ secrets.DEEPCODE_APP_ID }}
           private-key: ${{ secrets.DEEPCODE_APP_PRIVATE_KEY }}
@@ -90,7 +91,7 @@ jobs:
           echo "name=${APP_SLUG}[bot]" >> "$GITHUB_OUTPUT"
           echo "email=${USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Full history + tags: the draft range is <last tag>..HEAD, and the
           # App token persists for the final push.
@@ -116,10 +117,17 @@ jobs:
 
       - name: Install Rust toolchain
         # Pinned to match rust-toolchain.toml; bump both together.
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+        with:
+          toolchain: 1.96.0
 
       - name: Install deepcode
-        run: npm i -g @liwenkai/deepcode
+        # Pinned to the last released version, and self-maintained: the
+        # refresh step at the bottom bumps this line after every release,
+        # the same way it refreshes the dispatch hint. If a release tag never
+        # actually reached npm, the next prep fails right here — loudly,
+        # which is the correct failure direction for a supply-chain pin.
+        run: npm i -g @liwenkai/deepcode@0.4.8
 
       # The drafter reads the existing CHANGELOG.md for style and turns the
       # commit subjects (stdin) into user-facing bullets. Contract is narrow
@@ -212,11 +220,12 @@ jobs:
           git push --atomic origin "HEAD:main" "refs/tags/v${VERSION}"
 
       # 发布已完成；把 dispatch 输入框的提示刷成 "Current version: 刚发布的
-      # 版本"，下次打开触发页时"当前版本"才是真话。刻意不进上面的原子推送：
-      # 这行字是纯提示，不配拥有挡住一次成功发版的能力。失败的两种已知形态
-      # （App 缺 Workflows 写权限被 GitHub 拒推、main 运行期间被推进导致
-      # 非快进）都只告警跳过。
-      - name: Refresh dispatch hint (best-effort)
+      # 版本"，并把上面 Install deepcode 的起草器锁版本刷成同一个数——下次
+      # 打开触发页时"当前版本"才是真话，下次起草用的也是最新发布的二进制。
+      # 刻意不进上面的原子推送：这些是提示与自维护,不配拥有挡住一次成功
+      # 发版的能力。失败的两种已知形态（App 缺 Workflows 写权限被 GitHub
+      # 拒推、main 运行期间被推进导致非快进）都只告警跳过。
+      - name: Refresh dispatch hint and drafter pin (best-effort)
         run: |
           NEW_HINT="Current version: ${VERSION} — enter the NEW version to release (no leading v)"
           # Anchored on the hint's own text, not on "any indented description:".
@@ -225,6 +234,13 @@ jobs:
           # overwrite that input's description with the version hint.
           sed -i -E "s|^( +description: )'Current version: .*'$|\1'${NEW_HINT}'|" \
             .github/workflows/release-prep.yml
+          # Same self-maintenance for the drafter pin in "Install deepcode":
+          # the next prep drafts with the version this run just released.
+          sed -i -E "s|^( +run: npm i -g @liwenkai/deepcode)@[0-9]+\.[0-9]+\.[0-9]+$|\1@${VERSION}|" \
+            .github/workflows/release-prep.yml
+          if ! grep -qF "deepcode@${VERSION}" .github/workflows/release-prep.yml; then
+            echo "::warning::drafter pin line not found; pin left as-is"
+          fi
           if ! grep -qF "${NEW_HINT}" .github/workflows/release-prep.yml; then
             echo "::warning::dispatch-hint description line not found; hint left as-is"
             exit 0
@@ -234,7 +250,7 @@ jobs:
             exit 0
           fi
           git add .github/workflows/release-prep.yml
-          git commit -m "docs(ci): 发版入口提示刷新为当前版本 ${VERSION}"
+          git commit -m "chore(ci): 发版提示与起草器锁版本刷新为 ${VERSION}"
           git push origin "HEAD:main" \
             || echo "::warning::hint refresh not pushed (App lacks the Workflows write permission, or main advanced mid-run); the release itself is complete — the hint self-heals on the next successful refresh."
 

@@ -156,7 +156,7 @@ jobs:
       - name: Mint app token
         id: app-token
         if: env.HAS_APP == 'true'
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
         with:
           app-id: ${{ secrets.app-id }}
           private-key: ${{ secrets.app-private-key }}
@@ -179,7 +179,7 @@ jobs:
           echo "name=${SLUG}[bot]" >> "$GITHUB_OUTPUT"
           echo "email=${USER_ID}+${SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Full history so an existing per-issue branch can be continued.
           fetch-depth: 0
@@ -222,7 +222,7 @@ jobs:
       # body, dropping the thinking block and status tail.
       - name: Build conversation context
         id: prompt
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           TRIGGER: ${{ inputs.trigger }}
         with:
@@ -548,7 +548,7 @@ jobs:
           fi
 
       - name: Post reply
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           github-token: ${{ steps.app-token.outputs.token || github.token }}
           script: |
@@ -592,7 +592,7 @@ jobs:
       # nobody is left watching a thread that silently went quiet.
       - name: Report failure
         if: failure()
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           github-token: ${{ steps.app-token.outputs.token || github.token }}
           script: |

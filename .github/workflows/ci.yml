@@ -1,7 +1,7 @@
 # CI gate for deep-code
 #
 # 触发：push 到 main、以及所有 pull request
-# 检查：rustfmt 格式、clippy(-D warnings)、全 workspace 测试
+# 检查：rustfmt 格式、clippy(-D warnings)、全 workspace 测试、release profile 编译
 
 name: CI
 
@@ -24,15 +24,16 @@ jobs:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust toolchain
         # Pinned to match rust-toolchain.toml; bump both together.
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
         with:
+          toolchain: 1.96.0
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -56,15 +57,16 @@ jobs:
     name: macos · clippy · test
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust toolchain
         # Pinned to match rust-toolchain.toml; bump both together.
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
         with:
+          toolchain: 1.96.0
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Clippy (deny warnings)
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -85,15 +87,16 @@ jobs:
     name: linux-arm · clippy · test
     runs-on: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust toolchain
         # Pinned to match rust-toolchain.toml; bump both together.
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
         with:
+          toolchain: 1.96.0
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Clippy (deny warnings)
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -113,14 +116,16 @@ jobs:
     name: msrv · check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install the declared minimum toolchain
         # Keep in step with `rust-version` in Cargo.toml, not with
         # rust-toolchain.toml — this job exists to test the other number.
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+        with:
+          toolchain: 1.88.0
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # RUSTUP_TOOLCHAIN, not the toolchain the action made default. The action
       # runs `rustup default 1.88.0`, and `rustup default` is the LOWEST-
@@ -153,13 +158,15 @@ jobs:
     name: linux-x64 (22.04) · test
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust toolchain
         # Pinned to match rust-toolchain.toml; bump both together.
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+        with:
+          toolchain: 1.96.0
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Test
         # Both variables release.yml sets on this leg, so "the same demand" is
@@ -167,17 +174,40 @@ jobs:
         # rather than skipping there — but a leg that claims to mirror another
         # and then sets a different environment is how the two drift apart.)
         #
-        # What this job still does NOT cover, stated plainly: release.yml also
-        # runs `cargo build --locked --release --target ...`, and nothing in CI
-        # ever builds the release profile on any platform. `opt-level="z"` +
-        # `lto=true` + `codegen-units=1` + `panic="abort"` is a different
-        # compilation; an LTO failure is still first discovered after the tag.
         # This job closes the "does the image exist and does its kernel have
-        # Landlock" half only.
+        # Landlock" half only; the other half — release.yml's `cargo build
+        # --locked --release`, a different compilation (`opt-level="z"` +
+        # `lto=true` + `codegen-units=1` + `panic="abort"`) — is closed by the
+        # `release-profile` job below, on this same image.
         env:
           DEEPCODE_REQUIRE_SANDBOX: "1"
           DEEPCODE_REQUIRE_SYMLINKS: "1"
         run: cargo test --locked --workspace
+
+  # `[profile.release]` (`opt-level="z"` + `lto=true` + `codegen-units=1` +
+  # `panic="abort"`) is a different compilation from every job above, and
+  # release.yml used to compile it for the first time only after the tag was
+  # pushed — an LTO or panic-strategy failure there leaves a pushed tag with no
+  # release, requiring tag surgery. This job runs the exact build command
+  # release.yml runs, for the same package, on the same runner image as the
+  # linux-x64 release leg, so that failure mode is caught on main instead.
+  # Build only: executing the artifact is release.yml's own Test step's job.
+  release-profile:
+    name: release profile · build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        # Pinned to match rust-toolchain.toml; bump both together.
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+        with:
+          toolchain: 1.96.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build (release profile, the release.yml command)
+        run: cargo build --locked --release --package deep-code-tui --target x86_64-unknown-linux-gnu
 
   # Compiles & tests the Windows-only sandbox (Job Object) code, which the
   # Linux job's `cfg(windows)` gating skips.
@@ -185,15 +215,16 @@ jobs:
     name: windows · clippy · test
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust toolchain
         # Pinned to match rust-toolchain.toml; bump both together.
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
         with:
+          toolchain: 1.96.0
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Clippy (deny warnings)
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
