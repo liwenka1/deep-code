@@ -338,9 +338,12 @@ fn refuse_gate_stays_quiet_for_overrides_and_bare_policies() {
 }
 
 /// `wrap_shell_command` must wrap and bare by the SAME gate the asserts above
-/// pin — and the bare command really is `sh -c <command>`, not a
-/// `Default::default()` husk. Inverting the gate (`delete !`) swaps both
-/// branches, so asserting the two directions separately kills the inversion.
+/// pin — and the bare command really is the platform shell (`sh -c` on unix,
+/// `cmd /C` on Windows — `bare_shell_command` has a cfg twin per platform),
+/// not a `Default::default()` husk. Inverting the gate (`delete !`) swaps
+/// both branches, so asserting the two directions separately kills the
+/// inversion. The Windows args stop at `/C`: the command itself goes through
+/// `raw_arg` (see the twin's doc for why), so only the switch is asserted.
 #[test]
 fn wrap_shell_command_bares_and_wraps_by_the_gate() {
     let cwd = std::env::temp_dir();
@@ -350,15 +353,30 @@ fn wrap_shell_command_bares_and_wraps_by_the_gate() {
         .wrap_shell_command("true", &cwd, &[], &SandboxPolicy::Unsandboxed)
         .expect("bare path cannot fail");
     let program = bare.get_program().to_string_lossy().into_owned();
-    assert!(
-        program.ends_with("sh"),
-        "an Unsandboxed policy must yield the bare shell, got {program:?}"
-    );
     let args: Vec<String> = bare
         .get_args()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    assert_eq!(args, ["-c", "true"], "bare form is `sh -c <command>`");
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            program, "cmd",
+            "an Unsandboxed policy must yield the bare cmd shell"
+        );
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("/C"),
+            "bare form is `cmd /C <command>`"
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        assert!(
+            program.ends_with("sh"),
+            "an Unsandboxed policy must yield the bare shell, got {program:?}"
+        );
+        assert_eq!(args, ["-c", "true"], "bare form is `sh -c <command>`");
+    }
 
     #[cfg(target_os = "macos")]
     {
