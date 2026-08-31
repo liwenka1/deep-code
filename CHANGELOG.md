@@ -6,6 +6,21 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [0.4.8] - 2026-08-31
+
+- **Security:** `write_file` and `apply_patch` now open with `O_NOFOLLOW`, write resolution is side-effect-free with parent directories created only at execution time, and a symlink met during execution is reported by its cause instead of being followed.
+- **Security:** four symlink-following checks across the agent and TUI now refuse to follow; the `.deep-code` writers each require the directory to be a real directory, the `.gitignore` marker is created atomically so a dangling symlink is not written through, `restore` no longer writes through a symlink outside the workspace, and `github install` refuses symlinked directory segments when writing its workflow.
+- **Security:** IO and write-failure branches no longer leak absolute host paths into the model's view.
+- **Security:** `auto_allow` now matches tools by exact full name across every reference surface, so a shared prefix no longer lets a different tool through.
+- Dead `auto_allow` entries are now called out by name at launch, and the warning says whether the tool simply wasn't mounted this time or doesn't exist at all; `/help` spells out the full-name semantics.
+- Control characters and zero-width/bidi text are now sanitized across headless stderr, the composer, `/copy`, the status line, the startup and session selectors, the completion menu, and the approval panel and transcript — all through one shared sanitizer, so an ESC in a filename no longer reaches the terminal; the zero-width defense is now the sanitizer's own rather than borrowed from ratatui's undocumented behavior. `github install` sanitizes the repository name it writes.
+- The composer's sanitizer now allows newlines, so multiline drafts are no longer collapsed onto one line.
+- `restore` now reports what it kept, no longer deletes items it could not restore back, and treats uncapturable paths by the same snapshot-overwrite deletion rule as symlinks; `skills` read failures are no longer silent.
+- On Windows, checkpoint cleanup deletes symlinks per-platform so `restore` no longer fails wholesale, and path diagnostics no longer go silent on `Prefix`/`RootDir` paths.
+- `grep` now counts skipped files truthfully instead of fabricating refusals or dropping them silently: files over 2 MiB move from a silent skip to an honest count, walker-level skips join the ledger, and the TUI summary line surfaces the skipped count.
+- `mkdir` failures now say whether a file is blocking the path or a symlink is, and `read_file` limit errors no longer conflate two distinct causes.
+- Launch warnings (including downgrades) are now staged and delivered after startup instead of being silent, buried, or clobbered by `/resume` and `/clear`; `-c`/`-r` warnings now reach the transcript.
+
 ## [0.4.7] - 2026-08-23
 
 - The model can now request additional writable roots, and the approval panel
@@ -251,3 +266,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.4.5]: https://github.com/liwenka1/deep-code/compare/v0.4.4...v0.4.5
 [0.4.6]: https://github.com/liwenka1/deep-code/compare/v0.4.5...v0.4.6
 [0.4.7]: https://github.com/liwenka1/deep-code/compare/v0.4.6...v0.4.7
+[0.4.8]: https://github.com/liwenka1/deep-code/compare/v0.4.7...v0.4.8
