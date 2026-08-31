@@ -395,3 +395,20 @@ fn wrap_shell_command_bares_and_wraps_by_the_gate() {
         );
     }
 }
+
+/// The model-facing caveat sentences, pinned by their load-bearing words.
+/// The existing coverage asserted `description.contains(gap.model_caveat())`
+/// — self-referential: mutate the sentence and both sides change together,
+/// so `-> "xyzzy"` survived. Each caveat must name its own syscall, and the
+/// ioctl one must keep saying the write boundary HOLDS — that sentence is
+/// what stops the model abandoning an intact boundary (the exact overstating/
+/// understating trade the enforcement report exists for).
+#[test]
+fn model_caveats_name_their_own_gap() {
+    let truncate = EnforcementGap::LandlockTruncate.model_caveat();
+    assert!(truncate.contains("truncate(2)"));
+    assert!(truncate.contains("outside the granted roots"));
+    let ioctl = EnforcementGap::LandlockIoctlDev.model_caveat();
+    assert!(ioctl.contains("ioctl(2)"));
+    assert!(ioctl.contains("the write boundary holds"));
+}

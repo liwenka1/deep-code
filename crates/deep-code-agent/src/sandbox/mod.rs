@@ -193,26 +193,6 @@ impl EnforcementGap {
         }
     }
 
-    /// Whether this gap weakens the *path*-write boundary — the promise that a
-    /// write aimed at a path outside the granted roots is refused.
-    ///
-    /// The distinction is not academic: it decides what the model is told, and
-    /// the two gaps differ. ABI 5 landed in Linux 6.10 (July 2024), so on every
-    /// mainstream kernel below it — Ubuntu 24.04's 6.8 included — the only gap
-    /// is [`Self::LandlockIoctlDev`]. Letting that one select a blanket "do not
-    /// treat this boundary as a safety net" told the model something false on
-    /// the majority of Linux hosts, and pushed it off a boundary that was fully
-    /// intact. Understating enforcement is a cheaper mistake than overstating
-    /// it, but it is still a wrong answer, and a warning every host shows is a
-    /// warning nobody reads.
-    #[must_use]
-    pub fn weakens_path_writes(self) -> bool {
-        match self {
-            Self::LandlockTruncate => true,
-            Self::LandlockIoctlDev => false,
-        }
-    }
-
     /// The sentence handed to the *model* for this gap. Distinct from
     /// [`Self::detail`], which is written for a human reading `doctor`: the
     /// model needs to know what to do differently, not which ABI is missing.

@@ -3551,3 +3551,46 @@ async fn unresolvable_root_grant_bounces_without_prompting() {
     );
     assert_eq!(policy.granted_roots().len(), 1, "nothing granted");
 }
+
+/// The `approval_preview` glue: the boundary-bearing runtime must hand the
+/// panel a real preview built from the call's own arguments, and only for
+/// call shapes that have one. All three collapses survived the sweep —
+/// `None` (the human approves a write they never saw), `Some("")` and
+/// `Some("xyzzy")` (a preview unrelated to the call) — because every
+/// preview test exercised `build_approval_preview` directly, never the
+/// method the runtime actually consults.
+#[tokio::test]
+async fn approval_preview_renders_through_the_live_boundary() {
+    let workspace = tempfile::tempdir().unwrap();
+    let policy =
+        crate::workspace_policy::WorkspacePolicy::new(workspace.path().to_path_buf()).unwrap();
+    let boundaryless = AgentRuntime::new(ScriptedClient::new(vec![]), ToolRegistry::default());
+    let runtime = AgentRuntime::new(ScriptedClient::new(vec![]), ToolRegistry::default())
+        .with_boundary(Some(policy));
+
+    let write = crate::tool::ToolCall {
+        id: "c1".to_string(),
+        name: "write_file".to_string(),
+        arguments: serde_json::json!({
+            "path": "notes.txt",
+            "content": "PREVIEW_TOKEN_a1b2\n",
+        }),
+    };
+    let preview = runtime
+        .approval_preview(&write)
+        .expect("a write_file against the live boundary must carry a preview");
+    assert!(
+        preview.contains("PREVIEW_TOKEN_a1b2"),
+        "the preview must show the call's own content, got: {preview}"
+    );
+
+    // No preview-able shape → no preview; the glue must not invent one.
+    let shell = crate::tool::ToolCall {
+        id: "c2".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({"command": "true"}),
+    };
+    assert_eq!(runtime.approval_preview(&shell), None);
+    // And with no boundary there is nothing to resolve against.
+    assert_eq!(boundaryless.approval_preview(&write), None);
+}
