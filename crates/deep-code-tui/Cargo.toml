@@ -13,7 +13,11 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-crossterm = { version = "0.29", features = ["event-stream"] }
+# 0.28 on purpose, matching the crossterm inside ratatui 0.29: a direct dep
+# on 0.29 shipped TWO copies of crossterm in the binary (both driving the same
+# terminal) for no API gain — the surface used here is cursor/event/execute/
+# terminal, identical in both. Bump together with ratatui, not independently.
+crossterm = { version = "0.28", features = ["event-stream"] }
 deep-code-agent = { path = "../deep-code-agent" }
 deep-code-eval = { path = "../deep-code-eval" }
 deep-code-runtime = { path = "../deep-code-runtime" }
