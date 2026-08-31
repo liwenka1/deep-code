@@ -296,3 +296,84 @@ fn windows_cmd_receives_quoted_arguments_verbatim() {
         "multiple quoted arguments were mangled: stdout={got:?}"
     );
 }
+
+/// The manager-level gate, pinned in both directions. The kernel-level
+/// seatbelt tests exercise the WRAPPER (`macos_seatbelt::wrap_shell_command`
+/// directly), so before this test a mutation collapsing
+/// `SandboxManager::should_sandbox` to `false` ran every confined command
+/// bare while all 828 tests stayed green — the exact silent regression the
+/// sandbox exists to prevent.
+#[test]
+fn manager_gate_composes_policy_veto_and_forced_override() {
+    let confined = SandboxPolicy::workspace_write();
+    let bare = SandboxPolicy::Unsandboxed;
+    let on = SandboxManager::new().force_sandbox(Some(true));
+    let off = SandboxManager::new().force_sandbox(Some(false));
+    // The policy veto is absolute: no override sandboxes an Unsandboxed run.
+    assert!(!on.should_sandbox(&bare));
+    // A confining policy sandboxes when a backend is (forced) present…
+    assert!(on.should_sandbox(&confined));
+    // …and must not claim it would when the backend is absent.
+    assert!(!off.should_sandbox(&confined));
+}
+
+/// `sandbox_unavailable_for` is the refuse-bare gate callers consult before
+/// `wrap_shell_command` hands back a bare command. A test override is
+/// authoritative EITHER WAY (see the method's doc): `force_sandbox(Some(_))`
+/// is a deliberate test state, never a missing backend, so all three shapes
+/// below are refusals that must NOT fire. The `true` row of the table needs
+/// `forced = None` on a backendless host — unreachable from a unit test on a
+/// Seatbelt machine by construction; `refuse_bare_execution` pins that row
+/// directly, and DEEPCODE_REQUIRE_SANDBOX covers the host side in CI.
+#[test]
+fn refuse_gate_stays_quiet_for_overrides_and_bare_policies() {
+    let confined = SandboxPolicy::workspace_write();
+    let bare = SandboxPolicy::Unsandboxed;
+    let off = SandboxManager::new().force_sandbox(Some(false));
+    let on = SandboxManager::new().force_sandbox(Some(true));
+    assert!(!off.sandbox_unavailable_for(&confined));
+    assert!(!on.sandbox_unavailable_for(&confined));
+    // A policy that wants no sandbox is never "unavailable".
+    assert!(!off.sandbox_unavailable_for(&bare));
+}
+
+/// `wrap_shell_command` must wrap and bare by the SAME gate the asserts above
+/// pin — and the bare command really is `sh -c <command>`, not a
+/// `Default::default()` husk. Inverting the gate (`delete !`) swaps both
+/// branches, so asserting the two directions separately kills the inversion.
+#[test]
+fn wrap_shell_command_bares_and_wraps_by_the_gate() {
+    let cwd = std::env::temp_dir();
+    let on = SandboxManager::new().force_sandbox(Some(true));
+
+    let bare = on
+        .wrap_shell_command("true", &cwd, &[], &SandboxPolicy::Unsandboxed)
+        .expect("bare path cannot fail");
+    let program = bare.get_program().to_string_lossy().into_owned();
+    assert!(
+        program.ends_with("sh"),
+        "an Unsandboxed policy must yield the bare shell, got {program:?}"
+    );
+    let args: Vec<String> = bare
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(args, ["-c", "true"], "bare form is `sh -c <command>`");
+
+    #[cfg(target_os = "macos")]
+    {
+        let wrapped = on
+            .wrap_shell_command(
+                "true",
+                &cwd,
+                std::slice::from_ref(&cwd),
+                &SandboxPolicy::workspace_write(),
+            )
+            .expect("seatbelt wrap cannot fail to build");
+        let program = wrapped.get_program().to_string_lossy().into_owned();
+        assert!(
+            program.ends_with("sandbox-exec"),
+            "a confined policy with the backend forced on must wrap, got {program:?}"
+        );
+    }
+}

@@ -89,3 +89,29 @@ impl Tool for RequestWriteRootTool {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The registry-level approval bit and the tool's stated contract. The
+    /// runtime parks this tool on its own (four independent guards), so a
+    /// mutation flipping `requires_approval` to `false` changed nothing any
+    /// existing test observed — but this bit is what registry-driven callers
+    /// and the schema read, and "the grant tool never self-approves" must
+    /// hold at every layer that states it. The description is the model's
+    /// only instruction sheet: it has to name both arguments and the
+    /// narrowest-directory rule, or the panel receives junk requests.
+    #[test]
+    fn grant_tool_requires_approval_and_description_names_its_contract() {
+        let tool = RequestWriteRootTool;
+        assert!(tool.requires_approval());
+        assert_eq!(tool.name(), REQUEST_WRITE_ROOT_TOOL);
+        for token in ["path", "justification", "narrowest"] {
+            assert!(
+                tool.description().contains(token),
+                "description must mention `{token}`"
+            );
+        }
+    }
+}

@@ -691,4 +691,99 @@ mod tests {
         // Sanity: ordinary tools stay recordable.
         assert!(session_allowable("write_file"));
     }
+
+    /// `root_grant_requested_path` feeds the panel's "requested spelling"
+    /// line and the invalid-arguments degradation: trimmed when present,
+    /// empty (never a panic) on every malformed shape a model can emit.
+    #[test]
+    fn requested_path_trims_and_degrades_to_empty() {
+        let call = |arguments: serde_json::Value| crate::tool::ToolCall {
+            id: "c1".to_string(),
+            name: crate::root_grant::REQUEST_WRITE_ROOT_TOOL.to_string(),
+            arguments,
+        };
+        assert_eq!(
+            root_grant_requested_path(&call(json!({"path": "  /tmp/x  "}))),
+            "/tmp/x"
+        );
+        assert_eq!(root_grant_requested_path(&call(json!({}))), "");
+        assert_eq!(root_grant_requested_path(&call(json!({"path": 7}))), "");
+    }
+
+    /// Classifier spend folds ADDITIVELY into the session totals — the "cost
+    /// honesty" the status line sells. Every `+=` in
+    /// `record_classifier_cost` was mutable to `-=`/`*=` with the suite
+    /// green: nothing anywhere asserted the arithmetic. Integer cache
+    /// counters are pinned exactly; the money totals are pinned as strictly
+    /// increasing across a second fold (kills `-=`, and `*=` on a
+    /// zero-initialised total stays zero). Which currency carries a nonzero
+    /// rate is the pricing table's business, so the assert accepts either —
+    /// but at least one must move, twice.
+    #[tokio::test]
+    async fn classifier_cost_folds_additively_into_the_session() {
+        struct MuteClient;
+        #[async_trait::async_trait]
+        impl crate::client::LlmClient for MuteClient {
+            fn provider_name(&self) -> &'static str {
+                "mute"
+            }
+            fn model(&self) -> &str {
+                "mute"
+            }
+            async fn stream_chat(
+                &self,
+                _request: crate::model::ChatRequest,
+            ) -> crate::error::AgentResult<crate::client::AgentEventStream> {
+                unreachable!("the classifier-cost test never talks to a model")
+            }
+        }
+
+        let runtime =
+            crate::runtime::AgentRuntime::new(MuteClient, crate::tool::ToolRegistry::default());
+        // The wrapper around `classifier_model_for`, pinned on the same
+        // runtime: builtin config routes to the Flash judge.
+        assert_eq!(runtime.classifier_model(), DEEPSEEK_V4_FLASH);
+
+        let usage = crate::model::Usage {
+            prompt_tokens: Some(100),
+            completion_tokens: Some(50),
+            total_tokens: Some(150),
+            reasoning_tokens: None,
+            prompt_cache_hit_tokens: Some(10),
+            prompt_cache_miss_tokens: Some(5),
+        };
+        runtime
+            .record_classifier_cost(DEEPSEEK_V4_FLASH, &usage)
+            .await;
+        let (cost_1, savings_1) = {
+            let state = runtime.state.lock().await;
+            assert_eq!(state.session_cache_hit_tokens, 10);
+            assert_eq!(state.session_cache_miss_tokens, 5);
+            // Per-currency, not summed: the table prices Flash in BOTH
+            // currencies, and a summed assert lets the currencies mask each
+            // other (`*=` zeroing one while `+=` still moves the other).
+            assert!(state.session_cost.usd > 0.0, "usd rate is in the table");
+            assert!(state.session_cost.cny > 0.0, "cny rate is in the table");
+            assert!(state.session_cache_savings.usd > 0.0);
+            assert!(state.session_cache_savings.cny > 0.0);
+            (state.session_cost, state.session_cache_savings)
+        };
+
+        runtime
+            .record_classifier_cost(DEEPSEEK_V4_FLASH, &usage)
+            .await;
+        let state = runtime.state.lock().await;
+        assert_eq!(state.session_cache_hit_tokens, 20);
+        assert_eq!(state.session_cache_miss_tokens, 10);
+        assert!(
+            state.session_cost.usd > cost_1.usd,
+            "usd must fold additively"
+        );
+        assert!(
+            state.session_cost.cny > cost_1.cny,
+            "cny must fold additively"
+        );
+        assert!(state.session_cache_savings.usd > savings_1.usd);
+        assert!(state.session_cache_savings.cny > savings_1.cny);
+    }
 }

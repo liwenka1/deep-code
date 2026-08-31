@@ -530,3 +530,42 @@ fn unknown_job_action_needs_approval() {
     assert!(matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }));
     assert_eq!(plan.risk_level, RiskLevel::High);
 }
+
+/// Accept-edits covers a job START whose command is a workspace fs-edit —
+/// and nothing else about jobs. The `action == "start"` guard was collapsible
+/// to `true` with every test green, which would have let `tail`/`cancel`
+/// (and any future action) ride the standing consent that was given for
+/// workspace edits specifically.
+#[test]
+fn accept_edits_covers_job_start_only() {
+    let start = json!({"action": "start", "command": "mkdir -p out"});
+    assert!(accept_edits_approvable("job", &start));
+    for action in ["tail", "cancel", "list"] {
+        let args = json!({"action": action, "command": "mkdir -p out"});
+        assert!(
+            !accept_edits_approvable("job", &args),
+            "job action `{action}` must not ride accept-edits"
+        );
+    }
+}
+
+/// Job `cancel` needs approval FOR ITS OWN REASON. Deleting the arm fell
+/// through to the unknown-action fallback — still gated, but with a generic
+/// reason, no `builtin:job_control` attribution, and High instead of Low
+/// risk: three observable differences, none pinned until now.
+#[test]
+fn job_cancel_needs_approval_for_its_stated_reason() {
+    let plan = ExecPolicy::default().evaluate_tool("job", &json!({"action": "cancel", "id": 1}));
+    assert!(plan.requires_approval);
+    match &plan.verdict {
+        PolicyVerdict::NeedsApproval { reason } => {
+            assert!(
+                reason.contains("kills its process"),
+                "cancel must state the kill consequence, got: {reason}"
+            );
+        }
+        other => panic!("expected NeedsApproval, got {other:?}"),
+    }
+    assert_eq!(plan.matched_rule.as_deref(), Some("builtin:job_control"));
+    assert_eq!(plan.risk_level, RiskLevel::Low);
+}

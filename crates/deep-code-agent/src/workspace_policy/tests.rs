@@ -553,3 +553,47 @@ fn policy_grant(primary: &Path, requested: &Path) -> RootGrantOutcome {
         .grant_extra(requested)
         .unwrap()
 }
+
+/// `first_file_segment` names the plain file blocking a `create_dir_all` —
+/// the segment that EXISTS and is NOT a directory, exactly that one. All
+/// three collapses survived the suite: returning the first existing segment
+/// (the guard widened to `true`), returning the first DIRECTORY (the `!`
+/// deleted), and returning `Some("")` (the whole body replaced) all went
+/// unnoticed because nothing pinned the diagnostic's subject.
+#[test]
+fn first_file_segment_names_the_blocking_file_exactly() {
+    // Canonical base: production callers hand this fn canonical paths, and on
+    // macOS a raw tempdir path starts with the `/var` SYMLINK — which this
+    // very function (correctly) reports as the first non-directory segment.
+    let temp = tempfile::TempDir::new().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let blocker = base.join("blocker");
+    std::fs::write(&blocker, b"plain file").unwrap();
+    let attempted = blocker.join("sub").join("dir");
+    assert_eq!(first_file_segment(&attempted), Some(blocker));
+    // A path whose existing prefix is all directories blocks nothing.
+    let clean = base.join("not-yet").join("made");
+    assert_eq!(first_file_segment(&clean), None);
+}
+
+/// A symlink DEEP in the path must be found with no skip roots in play: the
+/// fast-forward comparison (`index < start`) inverted to `>` checks only the
+/// first segment and waves the rest through — precisely the segments the
+/// caller asked to have checked.
+#[cfg(unix)]
+#[test]
+fn deep_symlink_is_found_with_no_skip_roots() {
+    // Canonical base for the same reason as above: macOS `/var` is a symlink.
+    let temp = tempfile::TempDir::new().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let real = base.join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    // The link is the DEEP segment here (everything above it is canonical),
+    // and the probe must not need to exist past it: the walk returns at the
+    // first symlink segment. The negative probe is an existing, fully
+    // canonical path — a missing segment would be a stat error, not a "no".
+    assert!(contains_symlink(&link, &[]).unwrap());
+    assert!(!contains_symlink(&real, &[]).unwrap());
+}

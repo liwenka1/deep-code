@@ -594,3 +594,17 @@ fn confined_command_writes_within_granted_root() {
     let written = std::fs::read_to_string(workspace.path().join("inside.txt")).unwrap();
     assert_eq!(written, "written-inside");
 }
+
+/// The availability probe in the direction that matters on a Seatbelt host:
+/// `-> false` (or an inverted binary check) silently reports "no backend" and
+/// downstream policy degrades — on a machine that HAS sandbox-exec that must
+/// fail loudly. The opposite direction (`-> true` on a host without Seatbelt)
+/// is unobservable here by construction; DEEPCODE_REQUIRE_SANDBOX covers that
+/// side in CI.
+#[test]
+fn seatbelt_probe_reports_available_on_a_macos_host() {
+    assert!(
+        is_available(),
+        "sandbox-exec exists on every macOS host this suite runs on"
+    );
+}

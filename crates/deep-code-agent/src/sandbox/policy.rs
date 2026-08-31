@@ -182,4 +182,21 @@ mod tests {
         );
         assert!(!SandboxPolicy::from_execution_plan(Some(&plan(true, false))).has_network_access());
     }
+
+    /// The policy bit every sandbox decision starts from, pinned in BOTH
+    /// directions. Mutation testing showed either collapse survived the whole
+    /// suite: `-> false` runs every confined command bare (the kernel-level
+    /// seatbelt tests pin the wrapper, not this decision), `-> true` wraps
+    /// trusted bare runs. Neither may regress silently again.
+    #[test]
+    fn should_sandbox_is_pinned_in_both_directions() {
+        assert!(SandboxPolicy::workspace_write().should_sandbox());
+        assert!(
+            SandboxPolicy::WorkspaceWrite {
+                network_access: true
+            }
+            .should_sandbox()
+        );
+        assert!(!SandboxPolicy::Unsandboxed.should_sandbox());
+    }
 }
