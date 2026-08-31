@@ -1,0 +1,45 @@
+# RUSTSEC advisory gate for deep-code
+#
+# 触发：依赖真正可能变化的时刻（Cargo.lock/Cargo.toml/本文件被推到 main、
+#       或出现在 PR 里）+ 每周一次定时（新披露的通告不伴随任何 push,
+#       定时是它们唯一的入场通道）+ 手动。
+#
+# 只对 vulnerability 转红；unmaintained/yanked 这类 warning 照常打印但不
+# 挡门——它们大多指向锁在上游的传递依赖（本仓库无从替换）,让 CI 永久红
+# 只会训练出「audit 红是正常的」,那是比漏报更糟的失败方向。真有可修的
+# vulnerability 时,修法是升级/替换依赖,不是绕门。
+name: Audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.lock'
+      - '**/Cargo.toml'
+      - '.github/workflows/audit.yml'
+  pull_request:
+    paths:
+      - 'Cargo.lock'
+      - '**/Cargo.toml'
+      - '.github/workflows/audit.yml'
+  schedule:
+    - cron: '0 3 * * 1' # 每周一 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+        with:
+          tool: cargo-audit
+
+      - name: Audit Cargo.lock against RUSTSEC
+        run: cargo audit
