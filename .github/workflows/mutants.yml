@@ -1,0 +1,86 @@
+# Mutation sweep on demand — the Linux half the local loop cannot reach
+#
+# 本机(macOS)的 cargo-mutants 扫不到 cfg(linux) 代码:不编译的代码变异
+# 必假 missed,所以 sandbox/linux.rs(Landlock/seccomp,~50 个变异体)在
+# 本地扫描里是刻意排除的盲区。这个 workflow 手动触发,在真有 Landlock 的
+# ubuntu runner 上补这一半;file_glob 可改,也能用来复扫任意模块。
+#
+# 结果是工作清单不是门:missed ≠ bug,而是「没有测试钉住的行为」,要人
+# 逐个定性(真缺口 / 等价变异 / 平台性)后决定钉不钉。所以 job 不因
+# missed 转红——手动触发的勘探跑,红 X 只会训练出「这个红是正常的」;
+# 结论都在 step summary 与 artifact 里。
+#
+# DEEPCODE_REQUIRE_SANDBOX=1 与 ci.yml 同款:变异若把探测/守卫弄哑,
+# 强制开关让本该跑的沙箱测试改成响亮失败 → 变异被抓,而不是静默跳过
+# → 假 caught。
+name: Mutants
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_glob:
+        description: 'cargo-mutants --file glob (relative to the package root)'
+        required: false
+        default: '**/sandbox/linux.rs'
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    name: cargo mutants (${{ inputs.file_glob }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        # Pinned to match rust-toolchain.toml; bump both together.
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+        with:
+          toolchain: 1.96.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+        with:
+          tool: cargo-mutants
+
+      - name: Run mutants
+        env:
+          DEEPCODE_REQUIRE_SANDBOX: '1'
+        run: |
+          cargo mutants -p deep-code-agent \
+            --file '${{ inputs.file_glob }}' \
+            -j 2 -o mutants-report \
+            || echo "mutants exited nonzero (missed/timeout present) — see the summary"
+
+      - name: Summarize
+        if: always()
+        run: |
+          OUT=mutants-report/mutants.out
+          {
+            echo "## cargo-mutants: ${{ inputs.file_glob }}"
+            echo
+            for kind in caught missed unviable timeout; do
+              COUNT=$(wc -l < "$OUT/$kind.txt" 2>/dev/null || echo 0)
+              echo "- **$kind**: $COUNT"
+            done
+            echo
+            if [ -s "$OUT/missed.txt" ]; then
+              echo '### Missed (the worklist — triage each: real gap / equivalent / platform)'
+              echo '```'
+              cat "$OUT/missed.txt"
+              echo '```'
+            else
+              echo 'No missed mutants.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mutants-report
+          path: mutants-report/mutants.out
