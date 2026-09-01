@@ -114,7 +114,7 @@ impl Tool for AgentTool {
         let child_ui_lang = crate::i18n::SharedLang::new(crate::i18n::Lang::from_env(
             &self.services.agent_config.language,
         ));
-        let child_tools = child_tool_registry(
+        let (child_tools, child_jobs) = child_tool_registry(
             &self.services.boundary,
             role,
             self.services.exec_policy.clone(),
@@ -213,6 +213,15 @@ impl Tool for AgentTool {
                 }
             }
         };
+
+        // Kill any background jobs the child started. They outlive the child's
+        // turn (the JobStore is not turn-scoped), so `cancel_turn` above does not
+        // reach them — and nothing else holds this store, so without an explicit
+        // shutdown its process groups only ever got `kill_on_drop`'s direct-child
+        // SIGKILL, orphaning grandchildren (a child's `job start "cargo test"`
+        // leaving test-binary subprocesses behind). Mirrors the main agent's
+        // `RuntimeHandle::shutdown`.
+        child_jobs.shutdown();
 
         // Fold the child's own request spend into the parent session totals: it
         // ran on the same API key, but its telemetry never reaches the parent

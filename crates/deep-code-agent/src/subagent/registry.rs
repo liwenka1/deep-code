@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use crate::client::LlmClient;
 use crate::config::AgentConfig;
 use crate::execution_policy::ExecPolicy;
-use crate::shell_tools::shell_tool_registry_from;
+use crate::shell_tools::{JobStore, shell_tool_registry_from};
 use crate::subagent::roles::{SubAgentRole, build_system_prompt};
 use crate::tool::ToolRegistry;
 use crate::workspace_policy::WorkspacePolicy;
@@ -108,26 +108,46 @@ pub fn attach_subagent_tools(
 /// nobody is watching its prompts, they are auto-denied. The trusted-command
 /// wall is separate and does not widen: network changes whether allow-listed
 /// commands get egress, never which commands may run.
+/// Builds the child registry AND returns its [`JobStore`], which the caller
+/// MUST `shutdown()` when the child finalizes. The store is shared with the
+/// registry's background-job tool, and its background jobs outlive the child's
+/// turn — so, unlike the main agent (whose `RuntimeHandle` shuts the store down
+/// on quit), a discarded child store never process-group-killed its jobs and
+/// orphaned their grandchildren (dev servers, build trees) until process exit.
 pub(crate) fn child_tool_registry(
     boundary: &WorkspacePolicy,
     role: SubAgentRole,
     exec_policy: ExecPolicy,
     network: bool,
     ui_lang: &crate::i18n::SharedLang,
-) -> ToolRegistry {
+) -> (ToolRegistry, JobStore) {
     let workspace_tools = workspace_tool_registry_from(boundary.clone());
     let mut registry =
         ToolRegistry::filtered_from(&workspace_tools, |name| include_workspace_tool(role, name));
     let exec_policy = if network {
         exec_policy.with_network_mode(crate::execution_policy::NetworkMode::Always)
     } else {
-        exec_policy
+        // A child dispatched WITHOUT network:true must not inherit ambient
+        // `Always` egress from a global `[sandbox] network = "always"`: that
+        // would hand its allow-listed commands egress no human approved for this
+        // child (the dispatch-approval invariant), while its system prompt tells
+        // it it has no network at all. Cap at `Prompt` so ambient egress is only
+        // reachable through a network:true dispatch — itself auto-denied for an
+        // unattended child, i.e. no egress. Never widen a stricter parent:
+        // `never` stays `never` (rank keeps the tighten-only direction).
+        use crate::execution_policy::NetworkMode;
+        let capped = if exec_policy.network_mode().rank() > NetworkMode::Prompt.rank() {
+            NetworkMode::Prompt
+        } else {
+            exec_policy.network_mode()
+        };
+        exec_policy.with_network_mode(capped)
     };
     registry.set_policy(exec_policy);
     // All roles may use the shell: child policy auto-denies anything unapproved,
     // so read-only roles effectively get only trusted read-only prefixes
     // (git status/diff/log, …).
-    let (shell_tools, _) = shell_tool_registry_from(boundary.clone());
+    let (shell_tools, job_store) = shell_tool_registry_from(boundary.clone());
     registry.extend(shell_tools);
     if network {
         // The web tools ride the same grant: in-process fetch/search behind
@@ -136,7 +156,7 @@ pub(crate) fn child_tool_registry(
         // unattended prompt could only be auto-denied anyway.
         registry.extend(crate::web_tools::web_tool_registry(ui_lang));
     }
-    registry
+    (registry, job_store)
 }
 
 fn include_workspace_tool(role: SubAgentRole, name: &str) -> bool {

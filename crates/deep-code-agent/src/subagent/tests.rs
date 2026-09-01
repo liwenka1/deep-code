@@ -760,6 +760,8 @@ None.
                 .expect("test workspace must resolve");
         let lang = crate::i18n::SharedLang::new(crate::i18n::Lang::En);
         let build = |network: bool| {
+            // The store handle is for the runtime to shut down; this test only
+            // inspects the registry.
             crate::subagent::registry::child_tool_registry(
                 &boundary,
                 SubAgentRole::Explore,
@@ -767,6 +769,7 @@ None.
                 network,
                 &lang,
             )
+            .0
         };
         let tool_names = |registry: &ToolRegistry| -> Vec<String> {
             registry
@@ -803,6 +806,54 @@ None.
         assert!(
             online.evaluate_tool(&untrusted).requires_approval,
             "the network grant must not widen which commands may run"
+        );
+    }
+
+    /// A child dispatched WITHOUT network must not inherit ambient `Always`
+    /// egress from a global `[sandbox] network = "always"`: its allow-listed
+    /// commands run offline (capped to Prompt), matching its "no network" system
+    /// prompt and keeping egress behind the network:true dispatch gate. The cap
+    /// must not widen a stricter parent — a `never` parent stays `never`.
+    #[test]
+    fn non_network_child_does_not_inherit_ambient_always_egress() {
+        use crate::execution_policy::{ExecPolicy, NetworkMode, PolicyVerdict};
+        let workspace = tempfile::tempdir().unwrap();
+        let boundary =
+            crate::workspace_policy::WorkspacePolicy::new(workspace.path().to_path_buf())
+                .expect("test workspace must resolve");
+        let lang = crate::i18n::SharedLang::new(crate::i18n::Lang::En);
+        let child = |mode: NetworkMode| {
+            crate::subagent::registry::child_tool_registry(
+                &boundary,
+                SubAgentRole::Explore,
+                ExecPolicy::default().with_network_mode(mode),
+                false, // NOT dispatched with network
+                &lang,
+            )
+            .0
+        };
+
+        // Global Always → a non-network child's trusted command runs WITHOUT
+        // egress (the old code inherited Always and set network=true here).
+        let trusted = ToolCall::new("c1", "shell", json!({"command": "cargo build"}));
+        assert!(
+            !child(NetworkMode::Always).evaluate_tool(&trusted).network,
+            "a non-network child must not get ambient egress under global Always"
+        );
+
+        // Never parent stays Never (the cap must not widen never→prompt): a
+        // network-declaring command is refused outright, not merely prompted.
+        let net_cmd = ToolCall::new(
+            "c2",
+            "shell",
+            json!({"command": "curl https://x.dev", "network": true}),
+        );
+        assert!(
+            matches!(
+                child(NetworkMode::Never).evaluate_tool(&net_cmd).verdict,
+                PolicyVerdict::Deny { .. }
+            ),
+            "a never parent must stay never for a child, not widen to prompt"
         );
     }
 
