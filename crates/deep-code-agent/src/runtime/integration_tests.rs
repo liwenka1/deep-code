@@ -530,6 +530,91 @@ async fn auto_mode_asks_when_classifier_denies() {
     );
 }
 
+/// A mock network tool that borrows the exact name `fetch_url` (the policy
+/// classifies by name). Registered so an Auto-mode call can dispatch; if the
+/// egress floor holds, it parks and this body never runs.
+#[derive(Debug, Clone, Copy)]
+struct NetworkMockTool;
+
+impl NetworkMockTool {
+    const NAME: &'static str = "fetch_url";
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct NetworkMockParams {
+    #[allow(dead_code)]
+    url: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl Tool for NetworkMockTool {
+    type Params = NetworkMockParams;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Mock network tool."
+    }
+
+    async fn run(
+        &self,
+        _params: NetworkMockParams,
+        _cx: &crate::tool::ToolCx,
+    ) -> Result<crate::tool::ToolOutput, ToolError> {
+        Ok(crate::tool::ToolOutput::text("fetched"))
+    }
+}
+
+/// The auto-mode egress floor covers the network-native tools (`fetch_url`/
+/// `web_search`), not just calls carrying a declared `network: true`. The judge
+/// is scripted to APPROVE, so the only way this parks is the floor firing
+/// *before* the judge — the bug where `fetch_url` was decided by the classifier
+/// in Auto mode and could exfiltrate over a GET query string.
+#[tokio::test]
+async fn auto_mode_floors_network_tools_above_the_judge() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta(
+                    "call_1",
+                    NetworkMockTool::NAME,
+                    r#"{"url":"http://example.com/"}"#,
+                ),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        // A judge verdict that WOULD approve — it must go unused because the
+        // floor parks the call before any judge request is made.
+        vec![
+            AgentEvent::TextDelta {
+                text: r#"{"approve": true, "reason": "looks fine"}"#.to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let mut registry = ToolRegistry::with_mock_tools();
+    registry.register(NetworkMockTool);
+    let runtime = AgentRuntime::new(client, registry)
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Auto));
+
+    let mut rx = runtime.submit_user("fetch it").await;
+    let events = drain(&mut rx).await;
+    assert!(
+        matches!(events.last(), Some(RuntimeEvent::ApprovalRequired { .. })),
+        "a network-native tool must be floored to the human in Auto mode, even with an approving judge"
+    );
+    assert!(
+        events.iter().all(|event| !matches!(
+            event,
+            RuntimeEvent::ToolCallFinished { result, .. } if result.content == "fetched"
+        )),
+        "the network tool must not have run"
+    );
+}
+
 /// Mode monotonicity: Auto sits above AcceptEdits in the cycle, so it must
 /// auto-approve everything AcceptEdits does. A bounded fs-edit (`mkdir sub`)
 /// defaults to the High risk tier, which Auto's judge floor would otherwise
