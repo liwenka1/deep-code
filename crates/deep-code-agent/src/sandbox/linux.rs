@@ -47,7 +47,7 @@ use landlock::{
     ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetCreated,
     RulesetCreatedAttr, RulesetError, path_beneath_rules,
 };
-use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
+use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch, sock_filter};
 
 use super::policy::SandboxPolicy;
 use super::{Enforcement, EnforcementGap, SandboxBackend, SandboxCapabilities};
@@ -519,8 +519,93 @@ fn enosys_rules() -> BTreeMap<i64, Vec<seccompiler::SeccompRule>> {
         .collect()
 }
 
-/// Two filters, because a `SeccompFilter` carries ONE match action and the
-/// ENOSYS set must not answer with the same errno as everything else.
+/// A standalone BPF filter that terminates any syscall issued through the x32
+/// ABI on x86_64.
+///
+/// seccompiler (like the classic seccomp cookbook) compares the *raw* syscall
+/// number against each denied entry, and an x32 call carries
+/// `__X32_SYSCALL_BIT` (`0x4000_0000`) set while still reporting
+/// `arch == AUDIT_ARCH_X86_64` — so `socket` arrives as `0x4000_0029`, matches
+/// none of the deny arms in [`seccomp_rules`], and falls through to the filter's
+/// `Allow` default. On a kernel built with `CONFIG_X86_X32_ABI` that reopens the
+/// network block AND every anti-escape denial (ptrace, mount, io_uring, …).
+/// libseccomp closes this by refusing the whole x32 number range; seccompiler
+/// does not and cannot express a range through its rule API, so this hand-built
+/// filter does it. Installed on EVERY policy: the bypass is independent of the
+/// network grant.
+///
+/// Kill, not errno: x32 is never legitimate inside this sandbox, and it mirrors
+/// how seccompiler answers a foreign architecture. aarch64 has no x32 twin — its
+/// 32-bit compat is a *different* `AUDIT_ARCH`, already killed by seccompiler's
+/// own arch gate — so the leading arch check makes this filter a no-op there.
+///
+/// The six instructions are pinned structurally by
+/// `x32_guard_kills_only_x32_syscalls`, because a wrong jump offset would
+/// silently pass x32 straight through to `Allow`.
+fn x32_guard() -> BpfProgram {
+    // Classic-BPF opcodes (`linux/filter.h`); values cross-checked against
+    // seccompiler's own `bpf_stmt`/`bpf_jump` test vectors (LD|W|ABS = 0x20,
+    // JMP|JEQ|K = 0x15).
+    const LD_W_ABS: u16 = 0x20;
+    const JEQ_K: u16 = 0x15;
+    const JSET_K: u16 = 0x45; // JMP | JSET | K
+    const RET_K: u16 = 0x06;
+    // `seccomp_data` field offsets (`linux/seccomp.h`): nr at 0, arch at 4.
+    const NR: u32 = 0;
+    const ARCH: u32 = 4;
+    const AUDIT_ARCH_X86_64: u32 = 0xC000_003E; // EM_X86_64 | __AUDIT_ARCH_64BIT | _LE
+    const X32_BIT: u32 = 0x4000_0000; // __X32_SYSCALL_BIT
+    // Jump offsets count from the instruction AFTER the jump.
+    vec![
+        // [0] A = arch
+        sock_filter {
+            code: LD_W_ABS,
+            jt: 0,
+            jf: 0,
+            k: ARCH,
+        },
+        // [1] arch == x86_64 ? fall through : jump to ALLOW ([5])
+        sock_filter {
+            code: JEQ_K,
+            jt: 0,
+            jf: 3,
+            k: AUDIT_ARCH_X86_64,
+        },
+        // [2] A = nr
+        sock_filter {
+            code: LD_W_ABS,
+            jt: 0,
+            jf: 0,
+            k: NR,
+        },
+        // [3] (nr & x32_bit) ? fall through to KILL ([4]) : jump to ALLOW ([5])
+        sock_filter {
+            code: JSET_K,
+            jt: 0,
+            jf: 1,
+            k: X32_BIT,
+        },
+        // [4] x32 syscall → terminate the process
+        sock_filter {
+            code: RET_K,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_KILL_PROCESS,
+        },
+        // [5] everything else → allow (defer to the EPERM/ENOSYS filters)
+        sock_filter {
+            code: RET_K,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
+    ]
+}
+
+/// Three filters. Two of them exist because a `SeccompFilter` carries ONE match
+/// action and the ENOSYS set must not answer with the same errno as everything
+/// else; the third is the raw [`x32_guard`], which seccompiler's rule API cannot
+/// express.
 ///
 /// EPERM on the ring was a real bug, not a cosmetic one: `write_denial_signature`
 /// classifies "Operation not permitted" from a sandboxed command as a *filesystem
@@ -555,6 +640,12 @@ fn build_seccomp(policy: &SandboxPolicy) -> Result<Vec<BpfProgram>, String> {
     };
 
     Ok(vec![
+        // Kills any x32-ABI syscall before the number-matching filters below,
+        // which are blind to the x32 bit. Order does not matter for the result
+        // (the kernel evaluates all installed filters and takes the highest-
+        // precedence action, and KILL outranks the EPERM/ENOSYS/Allow below),
+        // but it reads as the first gate.
+        x32_guard(),
         compile(seccomp_rules(policy)?, libc::EPERM, "denied")?,
         compile(enosys_rules(), libc::ENOSYS, "enosys")?,
     ])
@@ -839,7 +930,7 @@ mod tests {
     /// policies; the programs themselves are opaque BPF, which is exactly why
     /// the ingredient tests exist.
     #[test]
-    fn build_seccomp_compiles_both_filter_programs() {
+    fn build_seccomp_compiles_all_filter_programs() {
         for policy in [
             SandboxPolicy::workspace_write(),
             SandboxPolicy::WorkspaceWrite {
@@ -849,8 +940,15 @@ mod tests {
             let programs = build_seccomp(&policy).expect("seccomp must compile");
             assert_eq!(
                 programs.len(),
-                2,
-                "EPERM + ENOSYS programs under {policy:?}"
+                3,
+                "x32 guard + EPERM + ENOSYS programs under {policy:?}"
+            );
+            // The x32 guard rides first and on every policy — dropping it would
+            // reopen the number-matching bypass regardless of the network grant.
+            assert_eq!(
+                programs[0],
+                x32_guard(),
+                "x32 guard must lead under {policy:?}"
             );
             for program in &programs {
                 assert!(
@@ -859,6 +957,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The x32 guard is hand-built (seccompiler cannot range-match a syscall
+    /// number), so its exact shape is the property worth pinning: load arch,
+    /// short-circuit to ALLOW off x86_64, load nr, and KILL iff the x32 bit is
+    /// set. A wrong offset would silently pass every x32 syscall — `socket`,
+    /// `ptrace`, `io_uring_setup` — straight through to the `Allow` default,
+    /// which is exactly the bypass this filter exists to close.
+    #[test]
+    fn x32_guard_kills_only_x32_syscalls() {
+        let f = x32_guard();
+        assert_eq!(f.len(), 6);
+        // [0]/[2] load the arch then the syscall number (BPF_LD|W|ABS).
+        assert_eq!((f[0].code, f[0].k), (0x20, 4)); // arch offset
+        assert_eq!((f[2].code, f[2].k), (0x20, 0)); // nr offset
+        // [1] arch gate: not-x86_64 skips the whole check to the trailing ALLOW.
+        assert_eq!((f[1].code, f[1].k), (0x15, 0xC000_003E));
+        assert_eq!((f[1].jt, f[1].jf), (0, 3));
+        // [3] x32-bit test (BPF_JMP|JSET|K): set → fall to KILL, clear → ALLOW.
+        assert_eq!((f[3].code, f[3].k), (0x45, 0x4000_0000));
+        assert_eq!((f[3].jt, f[3].jf), (0, 1));
+        // [4] KILL_PROCESS for x32, [5] ALLOW for everything else.
+        assert_eq!((f[4].code, f[4].k), (0x06, libc::SECCOMP_RET_KILL_PROCESS));
+        assert_eq!((f[5].code, f[5].k), (0x06, libc::SECCOMP_RET_ALLOW));
     }
 
     /// The device-ioctl design note and the ioctl gap are mutually exclusive —
