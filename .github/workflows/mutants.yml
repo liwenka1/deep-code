@@ -50,18 +50,36 @@ jobs:
       - name: Run mutants
         env:
           DEEPCODE_REQUIRE_SANDBOX: '1'
+          # Dispatch inputs reach the shell via env, never by splicing into
+          # the script — the standard hygiene even though only writers can
+          # dispatch and the token is read-only.
+          FILE_GLOB: ${{ inputs.file_glob }}
         run: |
           cargo mutants -p deep-code-agent \
-            --file '${{ inputs.file_glob }}' \
+            --file "$FILE_GLOB" \
             -j 2 -o mutants-report \
             || echo "mutants exited nonzero (missed/timeout present) — see the summary"
 
       - name: Summarize
         if: always()
+        env:
+          FILE_GLOB: ${{ inputs.file_glob }}
         run: |
           OUT=mutants-report/mutants.out
+          # No report directory = the tool or the baseline build crashed
+          # before producing one. Say so; all-zero counts under the usual
+          # heading would misread as a clean sweep ("no missed mutants").
+          if [ ! -d "$OUT" ]; then
+            {
+              echo "## cargo-mutants: ${FILE_GLOB}"
+              echo
+              echo "**Run did not complete — no \`mutants.out\` was produced.**"
+              echo "See the job log; the counts that would normally sit here do not exist."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           {
-            echo "## cargo-mutants: ${{ inputs.file_glob }}"
+            echo "## cargo-mutants: ${FILE_GLOB}"
             echo
             for kind in caught missed unviable timeout; do
               COUNT=$(wc -l < "$OUT/$kind.txt" 2>/dev/null || echo 0)

@@ -716,9 +716,11 @@ mod tests {
     /// green: nothing anywhere asserted the arithmetic. Integer cache
     /// counters are pinned exactly; the money totals are pinned as strictly
     /// increasing across a second fold (kills `-=`, and `*=` on a
-    /// zero-initialised total stays zero). Which currency carries a nonzero
-    /// rate is the pricing table's business, so the assert accepts either —
-    /// but at least one must move, twice.
+    /// zero-initialised total stays zero). The table rates the judge in BOTH
+    /// currencies, and the asserts pin both on purpose — per currency, never
+    /// summed, so the currencies cannot mask each other; if the table ever
+    /// goes single-currency, this test must change with it, as a red test,
+    /// not by silently covering less.
     #[tokio::test]
     async fn classifier_cost_folds_additively_into_the_session() {
         struct MuteClient;
