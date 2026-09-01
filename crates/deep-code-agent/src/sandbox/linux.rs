@@ -769,4 +769,123 @@ mod tests {
             "write outside workspace should be blocked by Landlock"
         );
     }
+
+    /// The gap report must be exactly what the kernel answered, level by
+    /// level. Collapsing `landlock_gaps` to `Ok(vec![])` on a kernel that
+    /// does have a gap upgrades `Enforcement::Partial` to `Full` — the
+    /// overclaim the whole enforcement report exists to prevent — and
+    /// nothing pinned it. On a kernel that handles every level the empty
+    /// collapse is equivalent by construction; the membership inversion
+    /// (`delete !`) stays killable everywhere Landlock exists.
+    #[test]
+    fn gap_report_matches_what_the_kernel_answers() {
+        if crate::sandbox::require_backend_or_skip(capabilities().available, "Landlock") {
+            return;
+        }
+        let gaps = landlock_gaps().expect("gap probe must not error on a Landlock host");
+        for (abi, gap) in WRITE_RIGHT_LEVELS {
+            assert_eq!(
+                gaps.contains(gap),
+                !handles_write_rights(*abi).expect("ABI probe must not error"),
+                "report and kernel answer disagree for {gap:?}"
+            );
+        }
+    }
+
+    /// V1 write rights are Landlock's baseline: a kernel that has Landlock at
+    /// all handles them, so `handles_write_rights` collapsing to `Ok(false)`
+    /// (every level reported as a gap — enforcement understated everywhere)
+    /// must fail here. The `Ok(true)` direction is observable only on a
+    /// kernel that is missing some right (runners are < 6.10 today) and goes
+    /// unpinnable once runner kernels catch up — same bucket as the seatbelt
+    /// probe's `-> true`.
+    #[test]
+    fn baseline_write_rights_are_handled_wherever_landlock_exists() {
+        if crate::sandbox::require_backend_or_skip(capabilities().available, "Landlock") {
+            return;
+        }
+        assert_eq!(handles_write_rights(ABI::V1), Ok(true));
+    }
+
+    /// Shell redirection to /dev/null must work INSIDE the sandbox — the /dev
+    /// grants exist for exactly this, minus the ioctl bit. Kills
+    /// `device_paths -> vec![]` (nothing granted, every redirection dies) and
+    /// the `!` deletion in `build_landlock` (`access & IoctlDev` grants ONLY
+    /// the ioctl bit — the one power that line exists to withhold — and drops
+    /// the write bit this redirection needs). The ioctl-refusal half is
+    /// observable only on ABI 5+ kernels; the write half is ABI 1 and pins on
+    /// every Landlock host.
+    #[test]
+    fn dev_null_redirection_works_inside_the_sandbox() {
+        if crate::sandbox::require_backend_or_skip(capabilities().available, "Landlock") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = run(dir.path(), "echo x > /dev/null");
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The assembly, not the ingredients. `seccomp_rules`/`enosys_rules` are
+    /// pinned in detail above, but `build_seccomp` — the step that compiles
+    /// them into the BPF programs the child actually installs — could
+    /// collapse to `Ok(vec![])` with every test green: an empty program list
+    /// installs nothing, and the whole seccomp layer (io_uring, userns,
+    /// ptrace, the EPERM floor) silently vanishes while the ingredient maps
+    /// keep passing their asserts. Pinned by count and non-emptiness on both
+    /// policies; the programs themselves are opaque BPF, which is exactly why
+    /// the ingredient tests exist.
+    #[test]
+    fn build_seccomp_compiles_both_filter_programs() {
+        for policy in [
+            SandboxPolicy::workspace_write(),
+            SandboxPolicy::WorkspaceWrite {
+                network_access: true,
+            },
+        ] {
+            let programs = build_seccomp(&policy).expect("seccomp must compile");
+            assert_eq!(
+                programs.len(),
+                2,
+                "EPERM + ENOSYS programs under {policy:?}"
+            );
+            for program in &programs {
+                assert!(
+                    !program.is_empty(),
+                    "a compiled BPF program cannot be empty"
+                );
+            }
+        }
+    }
+
+    /// The device-ioctl design note and the ioctl gap are mutually exclusive —
+    /// the doc above `design_notes` has claimed a test pins this, and the
+    /// mutants run proved none did: flipping the guard (`&&` → `||`, or the
+    /// `!` deleted) told the model device ioctl is simultaneously unchecked
+    /// and refused. Two branches on the live kernel, so the pin holds on both
+    /// sides of ABI 5: where the right is governed the note must appear, and
+    /// where it is not the note must stay away. The `Vec::new()` string
+    /// collapse is equivalent on the gap branch (the true answer IS empty
+    /// there) and killable only on ABI 5+ hosts.
+    #[test]
+    fn ioctl_note_and_ioctl_gap_never_appear_together() {
+        if crate::sandbox::require_backend_or_skip(capabilities().available, "Landlock") {
+            return;
+        }
+        let has_gap = landlock_gaps()
+            .expect("gap probe must not error on a Landlock host")
+            .contains(&EnforcementGap::LandlockIoctlDev);
+        let notes = design_notes();
+        if has_gap {
+            assert!(
+                notes.is_empty(),
+                "a note claiming refusal beside a gap saying unchecked: {notes:?}"
+            );
+        } else {
+            assert_eq!(notes, [DEVICE_IOCTL_DESIGN_NOTE]);
+        }
+    }
 }
