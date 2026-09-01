@@ -24,19 +24,46 @@ use jobs::{
     job_text_snapshot, kill_process_tree, refresh_job, shell_text_output, spawn_buffer_reader,
 };
 
-/// Strip provider/runtime secrets from a tool subprocess before it is spawned.
+/// Environment variables that make the dynamic linker or the shell run code the
+/// command line never names: `LD_PRELOAD`/`LD_AUDIT` (Linux) and
+/// `DYLD_INSERT_LIBRARIES` (macOS) force-load a library into the child, and
+/// `BASH_ENV`/`ENV` name a script the shell sources before the command. An
+/// inherited value would turn a reviewed command string into a different
+/// execution, so they are dropped before the sandboxed shell starts.
 ///
-/// These live in the parent process environment because the LLM client reads
-/// the API key at startup and the HTTP server reads the auth token on bind —
-/// but no shell/job tool ever needs them. Removing them keeps an injected
+/// Defense-in-depth, deliberately narrow: on macOS SIP already strips `DYLD_*`
+/// for the platform `sandbox-exec`/`sh`, and any code that does run stays inside
+/// the sandbox. The library *search-path* vars (`LD_LIBRARY_PATH`,
+/// `DYLD_LIBRARY_PATH`, …) are intentionally left alone — legitimate builds set
+/// them and they are a search hint, not a force-load.
+const INJECTION_ENV: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "BASH_ENV",
+    "ENV",
+];
+
+/// Strip provider/runtime secrets AND linker/shell code-injection vectors from a
+/// tool subprocess before it is spawned.
+///
+/// The secrets live in the parent process environment because the LLM client
+/// reads the API key at startup and the HTTP server reads the auth token on
+/// bind — but no shell/job tool ever needs them. Removing them keeps an injected
 /// command from lifting the key straight out of its own environment
-/// (`echo $DEEPSEEK_API_KEY`, `curl -d "$DEEPSEEK_API_KEY"`).
+/// (`echo $DEEPSEEK_API_KEY`, `curl -d "$DEEPSEEK_API_KEY"`). The injection
+/// vectors (see [`INJECTION_ENV`]) are stripped for a different reason: so an
+/// inherited `LD_PRELOAD`/`DYLD_INSERT_LIBRARIES`/`BASH_ENV` cannot run code the
+/// approved command string does not show.
 ///
 /// This narrows exposure; it does not fully close it. A same-uid child can
 /// still read the parent's `/proc/<ppid>/environ` (reads are not sandboxed),
 /// which is out of scope for this hardening.
 fn scrub_secret_env(cmd: &mut tokio::process::Command) {
     for var in crate::config::SUBPROCESS_SECRET_ENV {
+        cmd.env_remove(var);
+    }
+    for var in INJECTION_ENV {
         cmd.env_remove(var);
     }
 }
@@ -588,6 +615,13 @@ impl Tool for ShellTool {
             if let Some(abort) = stderr_abort {
                 abort.abort();
             }
+            // The aborted readers never reached their own end-of-stream
+            // `finish_spill`, so release the spill file handles here — otherwise
+            // an open fd lingers in the retained JobState until the store evicts
+            // it. Safe against the winding-down reader: `finish` marks the spill
+            // finished, so a late `push` cannot re-open it.
+            stdout.finish_spill();
+            stderr.finish_spill();
         }
 
         let job = self.jobs.get(&job_id, Self::NAME)?;

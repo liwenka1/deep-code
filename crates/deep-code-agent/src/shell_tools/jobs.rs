@@ -288,7 +288,12 @@ impl SharedBuffer {
     /// Stream over: release the spill file handle. The file stays on disk —
     /// transcript references must outlive the job record — and whether it was
     /// worth writing is decided later, by [`Self::discard_unreported_spill`].
-    fn finish_spill(&self) {
+    ///
+    /// Idempotent and callable from the tool side: an aborted reader task never
+    /// reaches its own end-of-stream call, so the foreground path invokes this
+    /// after aborting to drop the handle immediately (see `finished` in
+    /// [`Spill`], which stops a still-winding-down reader from re-opening it).
+    pub(super) fn finish_spill(&self) {
         let mut ring = self.0.lock().expect("output buffer lock poisoned");
         if let Some(spill) = ring.spill.as_mut() {
             spill.finish();

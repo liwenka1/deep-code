@@ -490,7 +490,10 @@ impl WorkspacePolicy {
                     tool_name,
                     format!(
                         "failed to create destination directory {}: {error}{diagnosis}",
-                        parent.display()
+                        // Workspace-relative, like every sibling error in this
+                        // module — this one was the last to spell an absolute
+                        // host path into a model-facing message.
+                        self.relative_display(parent)
                     ),
                 )
             })?;

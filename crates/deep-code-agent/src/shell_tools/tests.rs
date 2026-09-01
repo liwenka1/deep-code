@@ -449,6 +449,34 @@ async fn scrub_secret_env_hides_key_from_child() {
     );
 }
 
+/// The same scrub drops linker/shell code-injection vectors, so an inherited
+/// `LD_PRELOAD`/`DYLD_INSERT_LIBRARIES`/`BASH_ENV`/`ENV` cannot run code the
+/// approved command line never named. Asserts each is absent from the child's
+/// environment (env absence, not shell behavior, so no bash-version dependency).
+#[cfg(unix)]
+#[tokio::test]
+async fn scrub_secret_env_strips_injection_vectors() {
+    for var in [
+        "LD_PRELOAD",
+        "LD_AUDIT",
+        "DYLD_INSERT_LIBRARIES",
+        "BASH_ENV",
+        "ENV",
+    ] {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!(r#"printf %s "${var}""#))
+            .env(var, "/tmp/evil-sentinel");
+        scrub_secret_env(&mut cmd);
+        let output = cmd.output().await.expect("spawn sh");
+        assert!(
+            output.stdout.is_empty(),
+            "{var} survived scrubbing: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
 /// The model must never be told it is confined when it is not. Both tool
 /// descriptions are picked from the host's real capability, so this asserts the
 /// two stay in agreement — on Windows (Job Object: no fs/network confinement)
