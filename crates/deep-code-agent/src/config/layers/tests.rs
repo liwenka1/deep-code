@@ -85,6 +85,30 @@ fn sandbox_network_is_tighten_only_from_the_project_layer() {
         loaded.report.warnings
     );
 
+    // …and must not widen a globally-set `never` up to `prompt` either. This is
+    // the case the old `== Always` guard missed: `prompt` is more permissive
+    // than `never` (it re-arms approval-gated egress), so a repo raising it is a
+    // widen just like `always`, and must be ignored with a warning.
+    let strict_dir = tempfile::tempdir().unwrap();
+    let global = write_config(strict_dir.path(), "[sandbox]\nnetwork = \"never\"\n");
+    let project_dir = tempfile::tempdir().unwrap();
+    let project = write_config(project_dir.path(), "[sandbox]\nnetwork = \"prompt\"\n");
+    let loaded = AgentConfig::load_with(Some(global), Some(project), &no_env);
+    assert_eq!(
+        loaded.config.sandbox_network,
+        NetworkMode::Never,
+        "project prompt must not widen a global never"
+    );
+    assert!(
+        loaded
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("sandbox.network")),
+        "widening never→prompt must be surfaced: {:?}",
+        loaded.report.warnings
+    );
+
     // Unknown values degrade to unset instead of failing the load.
     let global_dir = tempfile::tempdir().unwrap();
     let global = write_config(global_dir.path(), "[sandbox]\nnetwork = \"sometimes\"\n");

@@ -72,6 +72,29 @@ impl NetworkMode {
             _ => None,
         }
     }
+
+    /// The setting spelling, for diagnostics.
+    #[must_use]
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            Self::Prompt => "prompt",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+
+    /// Egress-permissiveness rank: `Never` < `Prompt` < `Always`. The project
+    /// config layer may only *lower* this (tighten), never raise it — comparing
+    /// against the current value is what stops a repo widening a globally-set
+    /// `never` up to `prompt`, not just rejecting the top rung `always`.
+    #[must_use]
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Never => 0,
+            Self::Prompt => 1,
+            Self::Always => 2,
+        }
+    }
 }
 
 /// Whether a shell/job call declares it needs network access (`network: true`
@@ -175,6 +198,11 @@ impl ExecPolicy {
     pub fn with_network_mode(mut self, mode: NetworkMode) -> Self {
         self.network_mode = mode;
         self
+    }
+
+    #[must_use]
+    pub fn network_mode(&self) -> NetworkMode {
+        self.network_mode
     }
 
     pub fn classify_tool(tool_name: &str) -> ToolKind {

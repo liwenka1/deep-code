@@ -472,13 +472,17 @@ fn apply_file_overlay(
     }
 
     // Network mode is tighten-only from the project layer: a repo may reduce
-    // (`prompt` → `never`) but must not re-arm ambient egress (`always`) —
-    // same reasoning as auto/yolo above. Unknown values degrade to unset.
+    // egress permissiveness (`always` → `prompt` → `never`) but never raise it.
+    // Rejecting only the top rung `always` left a hole — a globally-set `never`
+    // was widened back to `prompt` by a hostile checkout, re-arming the
+    // approval-gated egress the user turned off. Compare against the *current*
+    // value by rank, the same shape the LSP and permission-tier guards use.
+    // Unknown values degrade to unset.
     if let Some(mode) = file.sandbox.network.as_deref().and_then(NetworkMode::parse) {
-        if project && mode == NetworkMode::Always {
+        if project && mode.rank() > config.sandbox_network.rank() {
             pending.push((
                 TextId::CfgProjectFieldIgnored,
-                vec![("field", "sandbox.network=always".to_string())],
+                vec![("field", format!("sandbox.network={}", mode.as_setting()))],
             ));
         } else {
             config.sandbox_network = mode;
