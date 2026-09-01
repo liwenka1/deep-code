@@ -867,9 +867,12 @@ mod tests {
     /// `!` deleted) told the model device ioctl is simultaneously unchecked
     /// and refused. Two branches on the live kernel, so the pin holds on both
     /// sides of ABI 5: where the right is governed the note must appear, and
-    /// where it is not the note must stay away. The `Vec::new()` string
-    /// collapse is equivalent on the gap branch (the true answer IS empty
-    /// there) and killable only on ABI 5+ hosts.
+    /// where it is not the note must stay away. Which mutants this kills
+    /// depends on the side: below ABI 5 the `&&`→`||` flip and the string
+    /// collapse to a note are killable; at ABI 5+ (runners since 2026-09) the
+    /// `Vec::new()` collapse and the `!` deletion are — the `||` flip becomes
+    /// equivalent there, since `available` is true and the gap term is the
+    /// only discriminator. Verified against real runs on both kernel eras.
     #[test]
     fn ioctl_note_and_ioctl_gap_never_appear_together() {
         if crate::sandbox::require_backend_or_skip(capabilities().available, "Landlock") {
