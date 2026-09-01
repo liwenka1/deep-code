@@ -164,7 +164,15 @@ fn redirects_execution(token: &str) -> bool {
         // cargo: writes the whole build tree into a caller-named directory.
         "--target-dir",
     ];
-    let name = token.split('=').next().unwrap_or(token);
+    // `sh -c` / `cmd /C` strip shell quoting before the flag reaches the
+    // program, so `--con"fig"`, `'--config'` and (on Unix) `--config\` all run
+    // as `--config`. Match on the same de-quoted token the shell will, reusing
+    // the deny floor's stripper — the exact-string compare below otherwise
+    // missed every quoted/backslashed spelling, and an auto-trusted `cargo`/`git`
+    // executed an arbitrary program (`build.rustc-wrapper`, `--target-dir`,
+    // `git --output`) with no prompt at any permission tier.
+    let cleaned = super::shell_deny::clean_token(token);
+    let name = cleaned.split('=').next().unwrap_or(&cleaned);
     REDIRECTING.contains(&name.to_ascii_lowercase().as_str())
 }
 
@@ -276,12 +284,15 @@ pub fn rule_covers(rule: &str, command: &str) -> bool {
         || (command.starts_with(&rule) && command.as_bytes().get(rule.len()) == Some(&b' '))
 }
 
-/// A flag token without its `=value` suffix, lowercased.
+/// A flag token without its `=value` suffix, lowercased. Shell quoting is
+/// stripped first (see [`redirects_execution`]) so a rule spelling out a
+/// redirecting flag still matches its quoted command-line spelling.
 fn flag_name(token: &str) -> String {
-    token
+    let cleaned = super::shell_deny::clean_token(token);
+    cleaned
         .split('=')
         .next()
-        .unwrap_or(token)
+        .unwrap_or(&cleaned)
         .to_ascii_lowercase()
 }
 
@@ -519,5 +530,50 @@ mod tests {
             identity_of("python script.py"),
             identity_of("PYTHON -m http.server")
         );
+    }
+
+    /// A redirecting flag spelled with shell quoting or a backslash — which the
+    /// shell strips before it reaches the program — must break the trust match
+    /// exactly as its plain spelling does. Without the `clean_token` reuse in
+    /// `redirects_execution`, `cargo build --con"fig" build.rustc-wrapper=…` kept
+    /// the identity `cargo build`, matched the built-in trust list, and ran an
+    /// arbitrary program with no prompt at any tier (the quote-splice bypass).
+    #[test]
+    fn quoted_or_escaped_redirecting_flag_still_breaks_trust() {
+        assert!(!covers(
+            "cargo build",
+            "cargo build --con\"fig\" build.rustc-wrapper=/tmp/x"
+        ));
+        assert!(!covers(
+            "cargo build",
+            "cargo build --con'fig' build.rustc-wrapper=/tmp/x"
+        ));
+        assert!(!covers(
+            "cargo build",
+            "cargo build '--config' build.rustc-wrapper=/tmp/x"
+        ));
+        assert!(!covers(
+            "cargo build",
+            "cargo build --target\"-dir\" /tmp/spray"
+        ));
+        assert!(!covers("git diff", "git diff --out\"put\"=/tmp/leak"));
+        // The degraded identity must not collapse to the two-word trusted form.
+        assert_ne!(
+            identity_of("cargo build --con\"fig\" build.rustc-wrapper=/tmp/x"),
+            "cargo build"
+        );
+        // Backslash-escaped on Unix: `--config\ ` splits to a token carrying the
+        // trailing backslash, which the shell would drop. Windows keeps `\` as a
+        // path separator (cmd.exe escapes with `^`, not `\`), so it is not a
+        // bypass there and the token stays untrusted for a different reason.
+        #[cfg(not(windows))]
+        assert!(!covers(
+            "cargo build",
+            "cargo build --config\\ build.rustc-wrapper=/tmp/x"
+        ));
+        // A benign quoted *argument* (not a redirecting flag) must stay trusted,
+        // or the fix would turn ordinary quoted commands into spurious prompts.
+        assert!(covers("cargo build", "cargo build --features \"foo\""));
+        assert!(covers("git diff", "git diff \"HEAD~1\""));
     }
 }

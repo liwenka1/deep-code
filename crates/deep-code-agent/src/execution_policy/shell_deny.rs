@@ -57,7 +57,12 @@ pub(crate) fn segments(command: &str) -> Vec<&str> {
 /// check that cleaned only the program word (as an earlier version did) let
 /// quoted flags like `rm '-rf' /` and quoted paths like `cp x '/tmp/out'` slip
 /// straight past.
-fn clean_token(token: &str) -> String {
+///
+/// Shared with [`super::command_shape`]: the trust matcher must strip the same
+/// quoting this floor does, or a quoted redirecting flag (`--con"fig"`) that the
+/// shell runs as `--config` rides a trusted identity the deny floor would have
+/// cleaned. Two views of "what the shell will run" must not disagree.
+pub(super) fn clean_token(token: &str) -> String {
     let strip: &[char] = if cfg!(windows) {
         // `^` is cmd.exe's escape character — the exact Windows counterpart of
         // the `\` handled below. Without stripping it, one caret walked past
