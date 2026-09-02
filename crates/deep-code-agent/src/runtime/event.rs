@@ -59,7 +59,7 @@ impl From<&str> for ToolCallId {
 
 /// Events the agent runtime produces for UIs.
 ///
-/// These are higher level than [`AgentEvent`]: approval requests and tool
+/// These are higher level than [`AgentEvent`](crate::AgentEvent): approval requests and tool
 /// results are emitted by the runtime, never by an [`crate::client::LlmClient`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

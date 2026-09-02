@@ -240,7 +240,7 @@ impl AgentRuntime {
 
     /// Start a new turn from a user prompt. Returns a receiver that yields
     /// [`RuntimeEvent`]s until either the turn finishes or an approval is
-    /// required. After approval, call [`submit_approval`] to resume.
+    /// required. After approval, call [`Self::submit_approval`] to resume.
     pub async fn submit_user(&self, prompt: impl Into<String>) -> RuntimeEventReceiver {
         self.begin_turn(prompt).await;
         self.drive_turn().await

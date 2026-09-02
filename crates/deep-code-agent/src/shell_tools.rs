@@ -17,7 +17,6 @@ use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, ToolUpdate}
 #[cfg(test)]
 use crate::workspace_policy::WorkspaceRoots;
 use crate::workspace_policy::{WorkspacePolicy, invalid};
-#[allow(unused_imports)]
 pub use jobs::JobStore;
 use jobs::{
     ChunkFn, JobKind, JobState, JobStatus, SharedBuffer, cancel_job, job_details,
