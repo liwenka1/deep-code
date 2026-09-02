@@ -3,10 +3,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use deep_code_agent::{
-    AgentConfig, JsonSessionStore, Lang, PermissionMode, SessionId, SessionStore,
-    format_sessions_storage_note, now_ms,
-};
+use deep_code_agent::{PermissionMode, format_sessions_storage_note};
 
 use crate::headless::OutputFormat;
 
@@ -767,59 +764,6 @@ pub fn workspace_root() -> PathBuf {
     })
 }
 
-pub fn open_session_store() -> JsonSessionStore {
-    match JsonSessionStore::for_workspace(workspace_root()) {
-        Ok(store) => store,
-        Err(error) => {
-            eprintln!("session storage unavailable: {error}");
-            std::process::exit(1);
-        }
-    }
-}
-
-pub fn run_session_command(mode: RunMode) -> anyhow::Result<()> {
-    match mode {
-        RunMode::SessionList => {
-            let workspace = workspace_root();
-            let store = open_session_store();
-            println!("# {}", format_sessions_storage_note(&workspace));
-            let records = store.list()?;
-            if records.is_empty() {
-                println!("No saved sessions.");
-                return Ok(());
-            }
-            let lang = Lang::from_env(&AgentConfig::load(&workspace).config.language);
-            let now = now_ms();
-            for record in records {
-                let preview = session_list_preview(&record.preview());
-                println!(
-                    "{}\t{}\t{} msgs\t{}",
-                    record.id.as_str(),
-                    crate::startup::relative_time(now, record.updated_at_ms, lang),
-                    record.message_count(),
-                    preview
-                );
-            }
-        }
-        RunMode::SessionDelete { id } => {
-            let store = open_session_store();
-            store.delete(&SessionId::parse(&id)?)?;
-            println!("Deleted session {id}.");
-        }
-        RunMode::SessionExport { id } => {
-            let store = open_session_store();
-            println!("{}", store.export(&SessionId::parse(&id)?)?);
-        }
-        RunMode::Tui { .. }
-        | RunMode::Print(_)
-        | RunMode::Github(_)
-        | RunMode::Doctor { .. }
-        | RunMode::Serve { .. }
-        | RunMode::Eval { .. } => unreachable!("handled by caller"),
-    }
-    Ok(())
-}
-
 /// The name the user actually invoked us by.
 ///
 /// Distribution makes this necessary: the npm package installs the binary as
@@ -878,27 +822,6 @@ fn print_session_usage() {
     eprintln!("  {prog} session export <session_id>");
     eprintln!("  {prog} -c            # 续最近会话");
     eprintln!("  {prog} -r            # 选择历史会话");
-}
-
-/// One `session list` preview column.
-///
-/// `SessionRecord::preview()` returns the last user entry VERBATIM out of
-/// `<workspace>/.deep-code/sessions/*.json`, a file `workspace_policy` itself
-/// documents as "an ordinary `write_file` target for the model". Collapsing
-/// newlines and capping the length — all this used to do — touches neither
-/// `\x1b` nor the invisible families, so a planted session could repaint the
-/// terminal from a plain `deepcode session list`.
-///
-/// This is the third twin of the two resume pickers hardened in 806ee49 and
-/// 6a08a86, and the only one of the three with no rendered-cell test, because
-/// it prints rather than draws. Sanitize BEFORE collapsing and truncating: the
-/// cap counts characters, and dropping the invisibles first keeps that count
-/// describing what is actually shown.
-fn session_list_preview(preview: &str) -> String {
-    crate::history::truncate_chars(
-        &deep_code_agent::neutralize_display_text(preview).replace('\n', " "),
-        60,
-    )
 }
 
 #[cfg(test)]

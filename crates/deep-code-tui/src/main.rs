@@ -11,10 +11,11 @@ mod headless;
 mod highlight;
 mod history;
 mod markdown;
+mod session_cli;
 mod startup;
 mod ui;
 
-use cli::{CliArgs, RunMode, parse_args, run_session_command, workspace_root};
+use cli::{CliArgs, RunMode, parse_args, workspace_root};
 use deep_code_agent::JsonSessionStore;
 
 #[tokio::main]
@@ -85,6 +86,8 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
-        other => run_session_command(other),
+        RunMode::SessionList => session_cli::list(),
+        RunMode::SessionDelete { id } => session_cli::delete(id),
+        RunMode::SessionExport { id } => session_cli::export(id),
     }
 }

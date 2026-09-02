@@ -1,39 +1,6 @@
 use super::*;
 
 #[test]
-fn session_list_preview_neutralizes_a_planted_session() {
-    let line = session_list_preview("hi\u{1b}[2J\u{1b}[H FAKE\u{202e}x\u{2028}y");
-
-    assert!(
-        !line.chars().any(char::is_control),
-        "an escape reached stdout: {line:?}"
-    );
-    assert!(
-        !line.contains('\u{202e}') && !line.contains('\u{2028}'),
-        "an invisible code point reached stdout: {line:?}"
-    );
-    assert!(line.starts_with("hi"), "the text must survive: {line:?}");
-    assert!(line.contains('y'), "the text must survive: {line:?}");
-}
-
-#[test]
-fn session_list_preview_flattens_and_caps() {
-    let line = session_list_preview(&format!("a\nb{}", "z".repeat(200)));
-
-    assert!(!line.contains('\n'), "newlines must be collapsed: {line:?}");
-    assert!(line.starts_with("a b"), "the head must survive: {line:?}");
-    assert!(
-        line.ends_with(" (truncated)"),
-        "over-long previews must say so: {line:?}"
-    );
-    assert_eq!(
-        line.chars().count(),
-        60 + " (truncated)".chars().count(),
-        "the cap counts characters of the sanitized text: {line:?}"
-    );
-}
-
-#[test]
 fn parse_session_resume_subcommand() {
     let parsed = parse_session_command(vec!["resume".to_string(), "session_123_0".to_string()]);
     assert_eq!(
