@@ -293,6 +293,63 @@ fn prepare_persisted_session(
     Ok((store, record))
 }
 
+/// The shared tail of a resumed launch, for either client backend: build the
+/// parent tools, rebuild the runtime from the record, attach the workspace
+/// helpers, and assemble the `LaunchedRuntime`. The two arms of `launch_resumed`
+/// (DeepSeek and echo) differed only in the client, the label, and a hardcoded
+/// `offline` bool — now derived from the client — so they share this.
+#[allow(clippy::too_many_arguments)]
+fn finish_resumed_launch<C: LlmClient + Clone + 'static>(
+    client: C,
+    backend_label: String,
+    record: SessionRecord,
+    store: JsonSessionStore,
+    roots: WorkspaceRoots,
+    config: &AgentConfig,
+    parent_cancel: &CancellationToken,
+    ui_lang: SharedLang,
+    mut warnings: Vec<String>,
+) -> LaunchedRuntime {
+    let client = Arc::new(client);
+    let session_id = record.id.as_str().to_string();
+    let ParentTools {
+        registry: tools,
+        subagent_manager,
+        job_store,
+        shutdown,
+        boundary,
+    } = build_parent_tools(
+        Arc::clone(&client),
+        config,
+        &roots,
+        parent_cancel,
+        &mut warnings,
+        &ui_lang,
+    );
+    let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
+    let runtime = attach_workspace_helpers(
+        AgentRuntime::from_session_record((*client).clone(), tools, record, store, config.clone()),
+        &roots.primary,
+        config,
+        &mut warnings,
+    )
+    .with_boundary(boundary)
+    .with_permission_mode(permission_mode.clone())
+    .with_ui_lang(ui_lang);
+    LaunchedRuntime {
+        handle: Arc::new(runtime),
+        backend_label,
+        session_id: Some(session_id),
+        subagent_manager,
+        job_store,
+        stop_hook: shutdown,
+        offline: client.provider_name() == EchoClient::PROVIDER,
+        warnings,
+        permission_mode,
+        extra_roots: roots.extras,
+    }
+}
+
 fn launch_resumed(
     config: &AgentConfig,
     mut record: SessionRecord,
@@ -497,96 +554,32 @@ fn launch_resumed(
     if config.api_key.is_some()
         && let Ok(client) = DeepSeekClient::new(config.clone())
     {
-        let client = Arc::new(client);
         let ui_lang = SharedLang::new(Lang::from_env(&config.language));
-        let ParentTools {
-            registry: tools,
-            subagent_manager,
-            job_store,
-            shutdown,
-            boundary,
-        } = build_parent_tools(
-            Arc::clone(&client),
+        return finish_resumed_launch(
+            client,
+            format!("DeepSeek {} (resumed)", config.model),
+            record,
+            store,
+            roots,
             config,
-            &roots,
             parent_cancel,
-            &mut warnings,
-            &ui_lang,
-        );
-        let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
-        let runtime = attach_workspace_helpers(
-            AgentRuntime::from_session_record(
-                (*client).clone(),
-                tools,
-                record.clone(),
-                store,
-                config.clone(),
-            ),
-            &workspace,
-            config,
-            &mut warnings,
-        )
-        .with_boundary(boundary)
-        .with_permission_mode(permission_mode.clone())
-        .with_ui_lang(ui_lang);
-        return LaunchedRuntime {
-            handle: Arc::new(runtime),
-            backend_label: format!("DeepSeek {} (resumed)", config.model),
-            session_id: Some(record.id.as_str().to_string()),
-            subagent_manager,
-            job_store,
-            stop_hook: shutdown,
-            offline: false,
+            ui_lang,
             warnings,
-            permission_mode,
-            extra_roots: roots.extras,
-        };
+        );
     }
 
     let ui_lang = SharedLang::new(Lang::from_env(&config.language));
-    let client = Arc::new(EchoClient::new(ui_lang.clone()));
-    let ParentTools {
-        registry: tools,
-        subagent_manager,
-        job_store,
-        shutdown,
-        boundary,
-    } = build_parent_tools(
-        Arc::clone(&client),
+    finish_resumed_launch(
+        EchoClient::new(ui_lang.clone()),
+        "offline echo (resumed)".to_string(),
+        record,
+        store,
+        roots,
         config,
-        &roots,
         parent_cancel,
-        &mut warnings,
-        &ui_lang,
-    );
-    let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
-    let runtime = attach_workspace_helpers(
-        AgentRuntime::from_session_record(
-            EchoClient::new(ui_lang.clone()),
-            tools,
-            record.clone(),
-            store,
-            config.clone(),
-        ),
-        &workspace,
-        config,
-        &mut warnings,
-    )
-    .with_boundary(boundary)
-    .with_permission_mode(permission_mode.clone())
-    .with_ui_lang(ui_lang);
-    LaunchedRuntime {
-        handle: Arc::new(runtime),
-        backend_label: "offline echo (resumed)".to_string(),
-        session_id: Some(record.id.as_str().to_string()),
-        subagent_manager,
-        job_store,
-        stop_hook: shutdown,
-        offline: true,
+        ui_lang,
         warnings,
-        permission_mode,
-        extra_roots: roots.extras,
-    }
+    )
 }
 
 fn build_parent_tools<C: LlmClient + 'static>(
