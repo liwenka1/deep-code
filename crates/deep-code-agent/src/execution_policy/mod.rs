@@ -26,21 +26,29 @@
 //!    error for a plan whose [`ToolExecutionPlan::denied_reason`] is `Some`
 //!    before consulting approval at all (the sub-agent decision path in
 //!    `runtime.rs` checks the same). A hard denial therefore never reaches
-//!    consent, the mode, or the judge.
+//!    consent, the mode, or the judge. The registry then asks whenever the plan
+//!    says so *or* the tool's own spec declares `requires_approval`; every tool
+//!    that declares it (the write tools, the root grant, the mock) already gets
+//!    a `NeedsApproval` plan, so that flag is belt-and-braces, not a second
+//!    policy.
 //! 4. **Standing consent** — `runtime::approval_flow` (config `auto_allow` +
 //!    session "approve for the session", matched by command identity via
 //!    [`command_shape`]).
 //! 5. **Permission mode** — `runtime::approval_flow`, keyed on
 //!    [`PermissionMode`]: `Default` asks, `AcceptEdits` waves through in-workspace
-//!    edits ([`accept_edits_approvable`]), `Auto` consults the judge below,
-//!    `Yolo` waves through all but a root grant.
+//!    edits ([`accept_edits_approvable`]), `Auto` inherits that AcceptEdits
+//!    allowance and consults the judge below for the rest, `Yolo` waves through
+//!    all but a root grant.
 //! 6. **Auto judge** — the cheap classifier. It only ever sees a call that has
 //!    already cleared three gates it cannot override: a root grant
 //!    (`request_write_root`) asks a human in every mode, egress (a network-native
 //!    tool or a declared `network`) is decided before the judge is consulted, and
-//!    the top risk tier always asks. The judge's own fail-safes — an offline
-//!    backend cannot judge, a cancel mid-flight aborts into "ask" — are
-//!    documented on `auto_mode_approves` in `runtime::approval_flow`.
+//!    the top risk tier never reaches it: a High-tier call asks unless the
+//!    inherited AcceptEdits allowance already covers it (an untrusted `mkdir
+//!    src/x` is High by default and runs without a prompt in Auto exactly as it
+//!    does in AcceptEdits). The judge's own fail-safes — an offline backend
+//!    cannot judge, a cancel mid-flight aborts into "ask" — are documented on
+//!    `auto_mode_approves` in `runtime::approval_flow`.
 //!
 //! Only stage 1 can say an automatic hard "no" (enforced at stage 3). Every
 //! stage below can only relax a `NeedsApproval` into running — one from stage 1

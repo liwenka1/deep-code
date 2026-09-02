@@ -158,10 +158,11 @@ impl AgentRuntime {
     }
 
     /// Auto mode: a Flash classifier judges the call. Three hard floors below
-    /// the judge: the top risk tier always asks (the judge can't wave it
-    /// through), the offline echo backend can't judge, and a cancel mid-flight
-    /// aborts into "ask". Everything else the classifier decides, failing safe
-    /// to a prompt. The judge's token usage is billed to the session.
+    /// the judge: the top risk tier never reaches it (a High-tier call asks
+    /// unless the AcceptEdits allowance inherited just below already covers it),
+    /// the offline echo backend can't judge, and a cancel mid-flight aborts into
+    /// "ask". Everything else the classifier decides, failing safe to a prompt.
+    /// The judge's token usage is billed to the session.
     async fn auto_mode_approves(
         &self,
         call: &ToolCall,
