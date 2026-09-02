@@ -176,6 +176,43 @@ pub enum RuntimeEvent {
     },
 }
 
+impl RuntimeEvent {
+    /// The dotted, namespaced event kind for the wire envelope's `item.kind`
+    /// (e.g. `turn.started`). Lives on the enum so adding a variant updates the
+    /// kind here — right next to the variant — instead of in a separate match in
+    /// the runtime crate. Distinct from the serde `type` tag (snake_case), which
+    /// exists so a payload can round-trip back into this enum; the two spellings
+    /// are deliberate and both owned here.
+    ///
+    /// Stable wire contract: SSE/NDJSON consumers pin these via `.item.kind`
+    /// (see `deep-code-runtime`'s `events` module) — change a string only with
+    /// its consumers.
+    #[must_use]
+    pub fn wire_kind(&self) -> &'static str {
+        match self {
+            Self::TurnStarted { .. } => "turn.started",
+            Self::AssistantDelta { .. } => "assistant.delta",
+            Self::ReasoningDelta { .. } => "reasoning.delta",
+            Self::ToolCallStarted { .. } => "tool.started",
+            Self::ToolCallUpdated { .. } => "tool.updated",
+            Self::ToolCallProgress { .. } => "tool.progress",
+            Self::ApprovalRequired { .. } => "approval.required",
+            Self::ApprovalResolved { .. } => "approval.resolved",
+            Self::ToolCallFinished { .. } => "tool.finished",
+            Self::RootGranted { .. } => "root.granted",
+            Self::SessionUpdated { .. } => "session.updated",
+            Self::TurnFinished { .. } => "turn.completed",
+            Self::TurnCancelled { .. } => "turn.cancelled",
+            Self::CheckpointCreated { .. } => "checkpoint.created",
+            Self::WorkspaceRestored { .. } => "workspace.restored",
+            Self::DiagnosticsUpdated { .. } => "diagnostics.updated",
+            Self::CompactionApplied { .. } => "compaction.applied",
+            Self::Warning { .. } => "warning",
+            Self::Error { .. } => "error",
+        }
+    }
+}
+
 pub type RuntimeEventReceiver = mpsc::UnboundedReceiver<RuntimeEvent>;
 
 pub(super) fn emit(tx: &mpsc::UnboundedSender<RuntimeEvent>, event: RuntimeEvent) {

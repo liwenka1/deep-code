@@ -51,7 +51,7 @@ impl EnvelopeStream {
 
     pub fn event(&mut self, event: &RuntimeEvent) -> RuntimeEnvelope {
         self.wrap(
-            runtime_event_kind(event).to_string(),
+            event.wire_kind().to_string(),
             event_turn_id(event),
             event_payload(event),
         )
@@ -78,31 +78,6 @@ impl EnvelopeStream {
                 payload,
             },
         }
-    }
-}
-
-#[must_use]
-pub fn runtime_event_kind(event: &RuntimeEvent) -> &'static str {
-    match event {
-        RuntimeEvent::TurnStarted { .. } => "turn.started",
-        RuntimeEvent::AssistantDelta { .. } => "assistant.delta",
-        RuntimeEvent::ReasoningDelta { .. } => "reasoning.delta",
-        RuntimeEvent::ToolCallStarted { .. } => "tool.started",
-        RuntimeEvent::ToolCallUpdated { .. } => "tool.updated",
-        RuntimeEvent::ToolCallProgress { .. } => "tool.progress",
-        RuntimeEvent::ApprovalRequired { .. } => "approval.required",
-        RuntimeEvent::ApprovalResolved { .. } => "approval.resolved",
-        RuntimeEvent::ToolCallFinished { .. } => "tool.finished",
-        RuntimeEvent::RootGranted { .. } => "root.granted",
-        RuntimeEvent::SessionUpdated { .. } => "session.updated",
-        RuntimeEvent::TurnFinished { .. } => "turn.completed",
-        RuntimeEvent::TurnCancelled { .. } => "turn.cancelled",
-        RuntimeEvent::CheckpointCreated { .. } => "checkpoint.created",
-        RuntimeEvent::WorkspaceRestored { .. } => "workspace.restored",
-        RuntimeEvent::DiagnosticsUpdated { .. } => "diagnostics.updated",
-        RuntimeEvent::CompactionApplied { .. } => "compaction.applied",
-        RuntimeEvent::Warning { .. } => "warning",
-        RuntimeEvent::Error { .. } => "error",
     }
 }
 
