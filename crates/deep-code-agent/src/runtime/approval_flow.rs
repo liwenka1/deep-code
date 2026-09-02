@@ -72,26 +72,10 @@ pub(super) enum RootGrantPrompt {
 /// different keys, so a chained or sibling subcommand can't ride a prior
 /// consent past the gate.
 pub(super) fn session_shell_prefix(call: &ToolCall) -> Option<String> {
-    let command_bearing = match crate::execution_policy::ExecPolicy::classify_tool(&call.name) {
-        crate::execution_policy::ToolKind::Shell => true,
-        // Only `job action=start` carries a command; status/tail/cancel
-        // approvals must not record a shell prefix.
-        crate::execution_policy::ToolKind::Job => {
-            call.arguments
-                .get("action")
-                .and_then(|value| value.as_str())
-                == Some("start")
-        }
-        _ => false,
-    };
-    if !command_bearing {
-        return None;
-    }
-    let command = call
-        .arguments
-        .get("command")
-        .and_then(|value| value.as_str())?;
-    let command = command.trim();
+    // Only command-bearing calls (`shell`, or `job action=start`) record a
+    // trusted prefix; status/tail/cancel must not. `ToolCall::shell_command` is
+    // the single home for that rule.
+    let command = call.shell_command()?.trim();
     if command.is_empty() || command.contains(['&', '|', ';', '\n', '`', '<', '>', '(', ')', '$']) {
         return None;
     }

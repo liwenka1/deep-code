@@ -22,9 +22,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::execution_policy::{
-    ExecPolicy, RiskLevel, SafetyNote, ToolExecutionPlan, ToolKind, safety_notes,
-};
+use crate::execution_policy::{RiskLevel, SafetyNote, ToolExecutionPlan, safety_notes};
 use crate::model::{ChatTool, ChatToolFunction};
 use crate::sandbox::SandboxPolicy;
 
@@ -66,6 +64,15 @@ impl ToolCall {
             name: name.into(),
             arguments,
         }
+    }
+
+    /// The shell command this call would run, if it is command-bearing (the
+    /// `shell` tool, or `job` with `action=start`); `None` otherwise. Delegates
+    /// to [`crate::execution_policy::shell_command_of`] — the single home for
+    /// that rule.
+    #[must_use]
+    pub fn shell_command(&self) -> Option<&str> {
+        crate::execution_policy::shell_command_of(&self.name, &self.arguments)
     }
 }
 
@@ -357,14 +364,7 @@ pub struct ApprovalRequest {
 /// `job` with `action=start`). Empty for every other tool. Advisory only —
 /// surfaced at the approval prompt, never a gate.
 fn shell_safety_notes(call: &ToolCall) -> Vec<SafetyNote> {
-    let command = match ExecPolicy::classify_tool(&call.name) {
-        ToolKind::Shell => call.arguments.get("command").and_then(Value::as_str),
-        ToolKind::Job if call.arguments.get("action").and_then(Value::as_str) == Some("start") => {
-            call.arguments.get("command").and_then(Value::as_str)
-        }
-        _ => None,
-    };
-    command.map(safety_notes).unwrap_or_default()
+    call.shell_command().map(safety_notes).unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -561,6 +561,24 @@ pub fn evaluate_shell_command(
     }
 }
 
+/// The shell command a tool call would run, if it is command-bearing: the
+/// `command` argument for the `shell` tool, or a `job` with `action=start`.
+/// `None` for every other tool (and for job status/tail/cancel). One home for
+/// the "where does the command live" rule the gate, the safety notes, and
+/// session trust all have to agree on (see
+/// [`crate::tool::ToolCall::shell_command`], which delegates here).
+#[must_use]
+pub fn shell_command_of<'a>(tool_name: &str, arguments: &'a Value) -> Option<&'a str> {
+    let command_bearing = match ExecPolicy::classify_tool(tool_name) {
+        ToolKind::Shell => true,
+        ToolKind::Job => arguments.get("action").and_then(Value::as_str) == Some("start"),
+        _ => false,
+    };
+    command_bearing
+        .then(|| arguments.get("command").and_then(Value::as_str))
+        .flatten()
+}
+
 /// Whether a gated call is auto-approvable under `AcceptEdits` mode: a workspace
 /// file-edit tool, or an in-workspace filesystem-mutation shell/job command
 /// (cc's `acceptEdits` behavior). Everything else still prompts. Hard denials
@@ -574,20 +592,16 @@ pub fn accept_edits_approvable(tool_name: &str, arguments: &Value) -> bool {
     }
     match ExecPolicy::classify_tool(tool_name) {
         ToolKind::WriteFile => true,
-        ToolKind::Shell => arguments
-            .get("command")
-            .and_then(Value::as_str)
-            .is_some_and(shell_deny::is_workspace_fs_edit),
-        ToolKind::Job if arguments.get("action").and_then(Value::as_str) == Some("start") => {
-            arguments
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(shell_deny::is_workspace_fs_edit)
-        }
         // Spawning a writing child is standing consent to its workspace writes,
         // which is exactly what AcceptEdits already grants per-write. Only the
         // writing role ever reaches this (read-only spawns don't prompt).
         ToolKind::SubAgent => subagent_role_writes(arguments),
+        // Shell / job(start): an in-workspace filesystem-mutation command.
+        // `shell_command_of` returns None for job status/tail/cancel, so the
+        // bare `Job` arm needs no separate action guard.
+        ToolKind::Shell | ToolKind::Job => {
+            shell_command_of(tool_name, arguments).is_some_and(shell_deny::is_workspace_fs_edit)
+        }
         _ => false,
     }
 }
