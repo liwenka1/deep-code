@@ -355,7 +355,7 @@ pub struct ApprovalRequest {
     pub preview: Option<String>,
     /// Static advisory notes for shell commands as language-neutral keys (why
     /// this warrants review + a paired suggestion); the UI renders them in the
-    /// user's language. Not a dry-run — see [`crate::execution_policy::safety_notes`].
+    /// user's language. Not a dry-run — see `execution_policy::safety_notes`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub safety_notes: Vec<SafetyNote>,
 }

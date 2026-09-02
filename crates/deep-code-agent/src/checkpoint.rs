@@ -144,7 +144,7 @@ impl CheckpointStore {
     /// and an entry with no snapshot representation (a FIFO, socket or device
     /// node). "Restored, except for these" is the true sentence.
     ///
-    /// The [`SKIP_DIRS`] (`.git`, `node_modules`, `target`, `.deep-code`) are
+    /// The `SKIP_DIRS` (`.git`, `node_modules`, `target`, `.deep-code`) are
     /// kept too, but deliberately NOT in this list: they are never snapshotted,
     /// so they are kept on *every* restore, and naming them each time would be
     /// noise rather than news. The returned list is only the entries a user

@@ -207,7 +207,7 @@ impl AgentRuntime {
     }
 
     /// Shut down background resources: cancel any live turn (so its tools tear
-    /// their child processes down, see [`Self::cancel_live_turn`]), then flush
+    /// their child processes down, see `cancel_live_turn`), then flush
     /// persistence and stop spawned LSP servers.
     pub async fn shutdown(&self) {
         self.cancel_live_turn().await;

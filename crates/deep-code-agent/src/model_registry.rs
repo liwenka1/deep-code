@@ -100,7 +100,7 @@ impl ModelRegistry {
     ///
     /// * Nothing (or only whitespace) requested → the flagship default,
     ///   flagged as a fallback.
-    /// * [`AUTO_MODEL`] → passed through untouched so per-turn routing stays
+    /// * `AUTO_MODEL` → passed through untouched so per-turn routing stays
     ///   in charge.
     /// * A catalog id or alias (case/whitespace-insensitive) → its canonical id.
     /// * Anything else → trusted as-is (it may be a model newer than this

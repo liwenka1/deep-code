@@ -18,7 +18,7 @@ pub enum PrefixStatus {
 }
 
 /// One turn's telemetry snapshot: routing, token/cache counts, cost, and
-/// context-pressure readouts. Built by [`AgentRuntime::build_turn_telemetry`]
+/// context-pressure readouts. Built by `AgentRuntime::build_turn_telemetry`
 /// and surfaced on `RuntimeEvent::TurnFinished`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnTelemetry {

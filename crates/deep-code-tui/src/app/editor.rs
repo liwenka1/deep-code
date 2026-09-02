@@ -249,7 +249,7 @@ impl App {
         }
     }
 
-    /// Down arrow: mirror of [`on_up`].
+    /// Down arrow: mirror of [`Self::on_up`].
     pub fn on_down(&mut self) {
         if self.input.contains('\n') {
             self.cursor_down_logical();

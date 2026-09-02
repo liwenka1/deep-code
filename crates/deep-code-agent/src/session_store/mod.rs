@@ -109,7 +109,7 @@ pub struct SessionRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_roots: Vec<PathBuf>,
     /// Authorship tag over [`Self::extra_roots`], stamped on every save (see
-    /// [`crate::session_integrity`]). The record is a file the model can write
+    /// the `session_integrity` module). The record is a file the model can write
     /// and on resume its grants become the write boundary, so the grants must
     /// prove they came from this host rather than merely appearing in the
     /// file. A list that does not verify is dropped on resume. Absent — and
