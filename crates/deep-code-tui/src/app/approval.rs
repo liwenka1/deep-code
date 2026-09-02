@@ -133,11 +133,7 @@ impl App {
             return;
         }
 
-        let label = match decision {
-            ApprovalDecision::Approved => self.tr(TextId::DecisionApproved),
-            ApprovalDecision::ApprovedForSession => self.tr(TextId::DecisionApprovedSession),
-            ApprovalDecision::Denied => self.tr(TextId::DecisionDenied),
-        };
+        let label = self.tr(decision.text_id());
         self.approval_scroll_offset = 0;
         self.status = self.tr_with(TextId::StatusToolResolved, &[("decision", label)]);
         self.is_streaming = true;

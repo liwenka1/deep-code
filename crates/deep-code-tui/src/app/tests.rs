@@ -1333,6 +1333,49 @@ fn approval_status_line_spells_the_risk_tier_once() {
     }
 }
 
+/// The runtime's `ApprovalResolved` event names the decision through the same
+/// localized labels the y/a/n keypress uses (`ApprovalDecision::text_id`), not
+/// the Debug name of the variant — "审批结果: Approved" was English inside a
+/// Chinese status line.
+#[test]
+fn approval_resolved_status_line_is_localized() {
+    use deep_code_agent::ApprovalDecision;
+    let cases = [
+        (
+            Lang::En,
+            ApprovalDecision::Approved,
+            "Approval resolved: approved",
+        ),
+        (
+            Lang::En,
+            ApprovalDecision::ApprovedForSession,
+            "Approval resolved: approved (session)",
+        ),
+        (
+            Lang::En,
+            ApprovalDecision::Denied,
+            "Approval resolved: denied",
+        ),
+        (Lang::Zh, ApprovalDecision::Approved, "审批结果: 已批准"),
+        (
+            Lang::Zh,
+            ApprovalDecision::ApprovedForSession,
+            "审批结果: 已批准（本会话）",
+        ),
+        (Lang::Zh, ApprovalDecision::Denied, "审批结果: 已拒绝"),
+    ];
+    for (lang, decision, expected) in cases {
+        let mut app = App::new();
+        app.lang = lang;
+        app.apply_runtime_event(RuntimeEvent::ApprovalResolved {
+            turn_id: None,
+            tool_call_id: deep_code_agent::ToolCallId("call_1".to_string()),
+            decision,
+        });
+        assert_eq!(app.status, expected, "{lang:?} {decision:?}");
+    }
+}
+
 #[test]
 fn approval_events_render_pending_and_resolved_tool_metadata() {
     let mut app = App::new();

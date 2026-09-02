@@ -378,6 +378,21 @@ pub enum ApprovalDecision {
     Denied,
 }
 
+impl ApprovalDecision {
+    /// The localization key for this decision's label. On the enum, like
+    /// `RiskLevel::text_id`, so every surface that names a decision — the y/a/n
+    /// keypress and the runtime's `ApprovalResolved` event alike — renders the
+    /// same localized word instead of a `format!("{:?}")` of the variant.
+    #[must_use]
+    pub fn text_id(self) -> crate::i18n::TextId {
+        match self {
+            Self::Approved => crate::i18n::TextId::DecisionApproved,
+            Self::ApprovedForSession => crate::i18n::TextId::DecisionApprovedSession,
+            Self::Denied => crate::i18n::TextId::DecisionDenied,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolRunOutcome {

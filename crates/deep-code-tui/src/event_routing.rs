@@ -83,10 +83,8 @@ impl App {
                 if let Some(active) = self.active_turn.as_mut() {
                     active.resolve_approval(decision);
                 }
-                self.status = self.tr_with(
-                    TextId::StatusApprovalResolved,
-                    &[("decision", &format!("{decision:?}"))],
-                );
+                let label = self.tr(decision.text_id());
+                self.status = self.tr_with(TextId::StatusApprovalResolved, &[("decision", label)]);
             }
             RuntimeEvent::CheckpointCreated { id, label } => {
                 self.last_checkpoint = Some(id.0.clone());
