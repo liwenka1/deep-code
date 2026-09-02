@@ -30,7 +30,7 @@
   "ApprovalOptApprove": "Approve",
   "ApprovalOptSession": "Always allow this session",
   "ApprovalOptDeny": "Deny (Esc)",
-  "StatusApprovalPrompt": "Approve '{tool}' (risk {risk}, sandbox {sandbox})? y/a/n",
+  "StatusApprovalPrompt": "Approve '{tool}' ({risk}, sandbox {sandbox})? y/a/n",
   "StatusApprovalResolved": "Approval resolved: {decision}",
   "DecisionApproved": "approved",
   "DecisionApprovedSession": "approved (session)",

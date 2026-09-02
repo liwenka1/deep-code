@@ -30,7 +30,7 @@
   "ApprovalOptApprove": "批准",
   "ApprovalOptSession": "本会话始终允许",
   "ApprovalOptDeny": "拒绝（Esc）",
-  "StatusApprovalPrompt": "是否批准 '{tool}'（风险 {risk}，沙箱 {sandbox}）? y/a/n",
+  "StatusApprovalPrompt": "是否批准 '{tool}'（{risk}，沙箱 {sandbox}）? y/a/n",
   "StatusApprovalResolved": "审批结果: {decision}",
   "DecisionApproved": "已批准",
   "DecisionApprovedSession": "已批准（本会话）",

@@ -1295,6 +1295,46 @@ fn turn_cancelled_event_flushes_active_turn_and_resets_state() {
     )));
 }
 
+/// The status line names the tier through its localized label ("High risk" /
+/// "高风险"), so the template must not spell "risk" a second time — it once
+/// rendered "risk High risk" / "风险 高风险" when both did. Pinned per language
+/// because no other test reads this string.
+#[test]
+fn approval_status_line_spells_the_risk_tier_once() {
+    for (lang, expected) in [
+        (Lang::En, "Approve 'shell' (High risk, sandbox yes)? y/a/n"),
+        (Lang::Zh, "是否批准 'shell'（高风险，沙箱 是）? y/a/n"),
+    ] {
+        let mut app = App::new();
+        app.lang = lang;
+        let turn_id = deep_code_agent::TurnId("turn_1".to_string());
+        app.apply_runtime_event(RuntimeEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            prompt: "run the tests".to_string(),
+        });
+        app.apply_runtime_event(RuntimeEvent::ApprovalRequired {
+            turn_id: Some(turn_id),
+            tool_call_id: Some(deep_code_agent::ToolCallId("call_1".to_string())),
+            request: deep_code_agent::ApprovalRequest {
+                network: false,
+                call_id: "call_1".to_string(),
+                tool_name: "shell".to_string(),
+                description: "run cargo test".to_string(),
+                arguments: serde_json::json!({ "command": "cargo test" }),
+                risk_level: deep_code_agent::RiskLevel::High,
+                requires_sandbox: true,
+                read_only: false,
+                matched_rule: None,
+                justification: None,
+                resolved_target: None,
+                preview: None,
+                safety_notes: Vec::new(),
+            },
+        });
+        assert_eq!(app.status, expected, "{lang:?}");
+    }
+}
+
 #[test]
 fn approval_events_render_pending_and_resolved_tool_metadata() {
     let mut app = App::new();
