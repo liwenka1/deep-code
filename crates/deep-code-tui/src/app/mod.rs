@@ -293,16 +293,11 @@ fn home_relative(path: &std::path::Path) -> String {
     shown
 }
 
-/// Localized short label for a permission mode, for the status indicator.
+/// Localized short label for a permission mode, for the status indicator. The
+/// mode→key mapping lives on the enum (`PermissionMode::text_id`); the accent
+/// colour stays in `render_status`, which owns ratatui.
 pub(crate) fn perm_mode_label(lang: Lang, mode: deep_code_agent::PermissionMode) -> &'static str {
-    use deep_code_agent::PermissionMode;
-    let id = match mode {
-        PermissionMode::Default => TextId::PermModeDefault,
-        PermissionMode::AcceptEdits => TextId::PermModeAcceptEdits,
-        PermissionMode::Auto => TextId::PermModeAuto,
-        PermissionMode::Yolo => TextId::PermModeYolo,
-    };
-    tr(lang, id)
+    tr(lang, mode.text_id())
 }
 
 /// Remove the character at `char_index` (0-based). Returns true when removed.

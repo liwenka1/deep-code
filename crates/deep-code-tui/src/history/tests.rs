@@ -201,7 +201,7 @@ fn tool_call_renders_compact_single_line() {
     let gated = HistoryCell::ToolCall {
         tool_name: "write_file".to_string(),
         arguments: "{}".to_string(),
-        risk_level: Some("Medium".to_string()),
+        risk_level: Some(deep_code_agent::RiskLevel::Medium),
         requires_sandbox: Some(false),
         approval: ToolApprovalState::Approved,
         running_for_secs: None,

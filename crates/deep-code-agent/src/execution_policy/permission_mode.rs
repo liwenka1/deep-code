@@ -55,6 +55,19 @@ impl PermissionMode {
         }
     }
 
+    /// The localization key for this mode's status-chip label. On the enum so
+    /// the label mapping has one home next to the variants (the accent colour
+    /// stays in the TUI, which owns ratatui).
+    #[must_use]
+    pub fn text_id(self) -> crate::i18n::TextId {
+        match self {
+            Self::Default => crate::i18n::TextId::PermModeDefault,
+            Self::AcceptEdits => crate::i18n::TextId::PermModeAcceptEdits,
+            Self::Auto => crate::i18n::TextId::PermModeAuto,
+            Self::Yolo => crate::i18n::TextId::PermModeYolo,
+        }
+    }
+
     /// Parse a config/CLI value (tolerant of `-`/`_` and case).
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {

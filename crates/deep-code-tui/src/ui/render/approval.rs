@@ -3,16 +3,20 @@
 //! arming rule. Read `approval_lines`' doc before touching field order.
 
 use super::*;
+use deep_code_agent::RiskLevel;
 
-/// Risk tier (Debug of `RiskLevel`) → (localized tag, accent colour). Risk is
-/// shown as colour, not a `Risk: …` field. Unknown tiers fall back to amber.
-pub(super) fn risk_display(risk: &str, lang: Lang) -> (&'static str, Color) {
-    match risk {
-        "High" => (tr(lang, TextId::RiskHigh), Color::Red),
-        "Medium" => (tr(lang, TextId::RiskMedium), Color::Yellow),
-        "Low" => (tr(lang, TextId::RiskLow), Color::DarkGray),
-        _ => ("", Color::Yellow),
-    }
+/// Risk tier → (localized tag, accent colour). Risk is shown as colour, not a
+/// `Risk: …` field. Matched on the real `RiskLevel` enum (label via
+/// `text_id`), so a new variant fails to compile here instead of silently
+/// falling through to an amber default — the old `format!("{:?}")` → string
+/// match hid exactly that.
+pub(super) fn risk_display(risk: RiskLevel, lang: Lang) -> (&'static str, Color) {
+    let color = match risk {
+        RiskLevel::High => Color::Red,
+        RiskLevel::Medium => Color::Yellow,
+        RiskLevel::Low => Color::DarkGray,
+    };
+    (tr(lang, risk.text_id()), color)
 }
 
 /// The human-meaningful action behind a tool call — the shell command, the file
@@ -192,7 +196,7 @@ pub(super) fn root_grant_lines(
 /// block swallow the whole body.
 pub(super) fn approval_head_lines(
     tool_name: &str,
-    risk: &str,
+    risk: RiskLevel,
     action: &str,
     resolved_target: Option<&str>,
     arguments_json: &str,
@@ -269,7 +273,7 @@ pub(super) fn approval_head_lines(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn approval_lines(
     tool_name: &str,
-    risk: &str,
+    risk: RiskLevel,
     requires_sandbox: bool,
     network: bool,
     justification: Option<&str>,
@@ -440,7 +444,7 @@ pub(super) const APPROVAL_PANEL_MAX_ROWS: u16 = 16;
 /// [`ApprovalRequest`]: deep_code_agent::ApprovalRequest
 pub(super) struct ApprovalPanelText<'a> {
     pub(super) tool_name: &'a str,
-    pub(super) risk: String,
+    pub(super) risk: RiskLevel,
     pub(super) requires_sandbox: bool,
     pub(super) network: bool,
     pub(super) justification: Option<&'a str>,
@@ -456,7 +460,7 @@ impl<'a> ApprovalPanelText<'a> {
     pub(super) fn from_request(request: &'a deep_code_agent::ApprovalRequest) -> Self {
         Self {
             tool_name: &request.tool_name,
-            risk: format!("{:?}", request.risk_level),
+            risk: request.risk_level,
             requires_sandbox: request.requires_sandbox,
             network: request.network,
             justification: request.justification.as_deref(),
@@ -477,7 +481,7 @@ impl<'a> ApprovalPanelText<'a> {
             sanitize_panel_text(&extract_action(self.tool_name, &self.arguments_json), 240);
         approval_head_lines(
             self.tool_name,
-            &self.risk,
+            self.risk,
             &action,
             self.resolved_target,
             &self.arguments_json,
@@ -490,7 +494,7 @@ impl<'a> ApprovalPanelText<'a> {
     pub(super) fn render(&self, width: usize, lang: Lang) -> Vec<Line<'static>> {
         approval_lines(
             self.tool_name,
-            &self.risk,
+            self.risk,
             self.requires_sandbox,
             self.network,
             self.justification,

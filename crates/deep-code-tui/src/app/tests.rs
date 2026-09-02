@@ -1340,7 +1340,7 @@ fn approval_events_render_pending_and_resolved_tool_metadata() {
             requires_sandbox: Some(true),
             approval,
             ..
-        } if risk == "High" && *approval == crate::history::ToolApprovalState::Required
+        } if *risk == deep_code_agent::RiskLevel::High && *approval == crate::history::ToolApprovalState::Required
     )));
     // The approval itself is surfaced only by the dedicated panel
     // (app.pending_approval), never as a transcript cell.

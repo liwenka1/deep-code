@@ -34,6 +34,21 @@ pub enum RiskLevel {
     High,
 }
 
+impl RiskLevel {
+    /// The localization key for this tier's label. Lives on the enum so a UI
+    /// renders risk by matching the real variant instead of a `format!("{:?}")`
+    /// round-trip — a new variant then fails to compile at the render site
+    /// rather than silently falling through to a default colour.
+    #[must_use]
+    pub fn text_id(self) -> crate::i18n::TextId {
+        match self {
+            Self::Low => crate::i18n::TextId::RiskLow,
+            Self::Medium => crate::i18n::TextId::RiskMedium,
+            Self::High => crate::i18n::TextId::RiskHigh,
+        }
+    }
+}
+
 /// Policy outcome before user approval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

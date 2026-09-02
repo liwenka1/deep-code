@@ -69,11 +69,12 @@ impl App {
                 } else {
                     self.tr(TextId::WordNo)
                 };
+                let risk = self.tr(request.risk_level.text_id());
                 self.status = self.tr_with(
                     TextId::StatusApprovalPrompt,
                     &[
                         ("tool", &request.tool_name),
-                        ("risk", &format!("{:?}", request.risk_level)),
+                        ("risk", risk),
                         ("sandbox", sandbox),
                     ],
                 );

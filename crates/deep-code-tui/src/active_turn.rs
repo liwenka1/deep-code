@@ -1,4 +1,4 @@
-use deep_code_agent::{ApprovalRequest, ToolCallId, TurnId};
+use deep_code_agent::{ApprovalRequest, RiskLevel, ToolCallId, TurnId};
 
 use crate::history::{HistoryCell, ToolApprovalState};
 
@@ -39,7 +39,7 @@ pub struct ActiveToolCell {
     pub tool_call_id: ToolCallId,
     pub tool_name: String,
     pub arguments: String,
-    pub risk_level: Option<String>,
+    pub risk_level: Option<RiskLevel>,
     pub requires_sandbox: Option<bool>,
     pub approval: ToolApprovalState,
     pub live_output: LiveOutput,
@@ -136,7 +136,7 @@ impl ActiveTurn {
             .iter_mut()
             .find(|tool| tool.tool_call_id == tool_call_id)
         {
-            existing.risk_level = Some(format!("{:?}", request.risk_level));
+            existing.risk_level = Some(request.risk_level);
             existing.requires_sandbox = Some(request.requires_sandbox);
             existing.approval = ToolApprovalState::Required;
         } else {
@@ -144,7 +144,7 @@ impl ActiveTurn {
                 tool_call_id,
                 tool_name: request.tool_name.clone(),
                 arguments: request.arguments.to_string(),
-                risk_level: Some(format!("{:?}", request.risk_level)),
+                risk_level: Some(request.risk_level),
                 requires_sandbox: Some(request.requires_sandbox),
                 approval: ToolApprovalState::Required,
                 live_output: LiveOutput::default(),
@@ -230,7 +230,7 @@ impl ActiveTurn {
             cells.push(HistoryCell::ToolCall {
                 tool_name: tool.tool_name.clone(),
                 arguments: tool.arguments.clone(),
-                risk_level: tool.risk_level.clone(),
+                risk_level: tool.risk_level,
                 requires_sandbox: tool.requires_sandbox,
                 approval: tool.approval,
                 // Recomputed on every render tick, so the line reads

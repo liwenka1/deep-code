@@ -1,5 +1,6 @@
 use super::*;
 use crate::history::HistoryCell;
+use deep_code_agent::RiskLevel;
 
 fn line_width(line: &Line<'_>) -> usize {
     line.spans
@@ -110,18 +111,31 @@ fn extract_action_for_a_root_grant_ignores_a_decoy_command_key() {
 
 #[test]
 fn risk_display_maps_tier_to_colour() {
-    assert_eq!(risk_display("High", Lang::Zh), ("高风险", Color::Red));
-    assert_eq!(risk_display("Medium", Lang::Zh), ("中风险", Color::Yellow));
-    assert_eq!(risk_display("Low", Lang::Zh), ("低风险", Color::DarkGray));
-    assert_eq!(risk_display("High", Lang::En), ("High risk", Color::Red));
-    assert_eq!(risk_display("weird", Lang::Zh).0, "");
+    assert_eq!(
+        risk_display(RiskLevel::High, Lang::Zh),
+        ("高风险", Color::Red)
+    );
+    assert_eq!(
+        risk_display(RiskLevel::Medium, Lang::Zh),
+        ("中风险", Color::Yellow)
+    );
+    assert_eq!(
+        risk_display(RiskLevel::Low, Lang::Zh),
+        ("低风险", Color::DarkGray)
+    );
+    assert_eq!(
+        risk_display(RiskLevel::High, Lang::En),
+        ("High risk", Color::Red)
+    );
+    // No string fallback to test any more: a new RiskLevel variant now fails to
+    // compile in `risk_display` instead of silently rendering amber.
 }
 
 #[test]
 fn approval_lines_are_minimal_no_dump_fields() {
     let lines = approval_lines(
         "shell",
-        "Medium",
+        RiskLevel::Medium,
         false,
         false,
         None,
@@ -152,7 +166,7 @@ fn approval_lines_render_colored_diff_preview() {
     let preview = "@@ -1,2 +1,2 @@\n one\n-two\n+three";
     let lines = approval_lines(
         "write_file",
-        "Medium",
+        RiskLevel::Medium,
         false,
         false,
         None,
@@ -191,7 +205,7 @@ fn approval_lines_render_colored_diff_preview() {
 fn approval_lines_render_justification_as_a_sanitized_claim() {
     let lines = approval_lines(
         "shell",
-        "Medium",
+        RiskLevel::Medium,
         false,
         true,
         Some("need\x1b[31m crates.io\nfor deps"),
@@ -227,7 +241,7 @@ fn approval_lines_render_justification_as_a_sanitized_claim() {
 fn approval_lines_flag_a_root_grant() {
     let lines = approval_lines(
         deep_code_agent::REQUEST_WRITE_ROOT_TOOL,
-        "High",
+        RiskLevel::High,
         false,
         false,
         Some("build artifacts live there"),
@@ -263,7 +277,7 @@ fn approval_lines_flag_a_root_grant() {
 fn approval_lines_warn_when_a_root_grant_resolves_elsewhere() {
     let lines = approval_lines(
         deep_code_agent::REQUEST_WRITE_ROOT_TOOL,
-        "High",
+        RiskLevel::High,
         false,
         false,
         None,
@@ -293,7 +307,7 @@ fn approval_lines_warn_when_a_root_grant_resolves_elsewhere() {
     // target must say the prompt cannot vouch for a directory.
     let unresolved = approval_lines(
         deep_code_agent::REQUEST_WRITE_ROOT_TOOL,
-        "High",
+        RiskLevel::High,
         false,
         false,
         None,
@@ -322,7 +336,7 @@ fn approval_lines_do_not_warn_on_lexical_respellings() {
     for spelling in ["/tmp/proj-sibling/", "/tmp/./proj-sibling"] {
         let lines = approval_lines(
             deep_code_agent::REQUEST_WRITE_ROOT_TOOL,
-            "High",
+            RiskLevel::High,
             false,
             false,
             None,
@@ -355,7 +369,7 @@ fn approval_lines_do_not_warn_on_lexical_respellings() {
 fn approval_lines_sanitize_the_resolved_target_and_action() {
     let lines = approval_lines(
         deep_code_agent::REQUEST_WRITE_ROOT_TOOL,
-        "High",
+        RiskLevel::High,
         false,
         false,
         None,
@@ -425,7 +439,7 @@ fn approval_lines_sanitize_every_text_field() {
     let render = |tool: &str| -> String {
         let payload = ApprovalPanelText {
             tool_name: tool,
-            risk: format!("High{ESC}RISK"),
+            risk: deep_code_agent::RiskLevel::High,
             requires_sandbox: true,
             network: true,
             justification: Some(&justification),
@@ -462,9 +476,9 @@ fn approval_lines_sanitize_every_text_field() {
     let root_grant = render(deep_code_agent::REQUEST_WRITE_ROOT_TOOL);
 
     // Each marker must still render — proving the field was neutralised,
-    // not silently dropped. `RISK` is absent by design and deliberately
-    // not asserted: `risk_display` maps an unknown tier to a
-    // `&'static str`, so that argument cannot echo its input at all.
+    // not silently dropped. There is no `RISK` marker: `risk` is a typed
+    // `RiskLevel` enum, not free text, so that field cannot carry injection
+    // input at all — the sanitizer has nothing to do for it by construction.
     for marker in [
         "TOOLNAME",
         "JUSTIFICATION",
@@ -505,7 +519,7 @@ fn approval_lines_sanitize_every_text_field() {
 fn approval_lines_preview_keeps_diff_alignment() {
     let lines = approval_lines(
         "write_file",
-        "Medium",
+        RiskLevel::Medium,
         false,
         false,
         None,
@@ -543,7 +557,7 @@ fn approval_lines_render_safety_notes() {
     let render = |lang| {
         approval_lines(
             "shell",
-            "High",
+            RiskLevel::High,
             true,
             false,
             None,

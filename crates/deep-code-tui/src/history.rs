@@ -1,4 +1,4 @@
-use deep_code_agent::{EntryKind, SessionRecord, ToolResultStatus};
+use deep_code_agent::{EntryKind, RiskLevel, SessionRecord, ToolResultStatus};
 
 use deep_code_agent::i18n::{Lang, TextId, tr, tr_with};
 
@@ -76,7 +76,7 @@ pub enum HistoryCell {
     ToolCall {
         tool_name: String,
         arguments: String,
-        risk_level: Option<String>,
+        risk_level: Option<RiskLevel>,
         requires_sandbox: Option<bool>,
         approval: ToolApprovalState,
         /// Seconds this call has been running — `Some` only in the live
