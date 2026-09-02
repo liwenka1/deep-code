@@ -3,6 +3,7 @@ use serde_json::Value;
 
 use super::command_shape;
 use super::shell_deny;
+use super::shell_lex;
 
 /// Tool category used by the policy engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -497,13 +498,13 @@ pub fn evaluate_shell_command(
         NetworkMode::Never => false,
     };
 
-    let segments = shell_deny::segments(command);
+    let segments = shell_lex::segments(command);
     // Auto-trust only if EVERY segment is covered by a trusted rule
     // (identity-matched, so flags vary but subcommands don't) and the command
     // has no redirection/substitution/expansion — those run programs, write
     // paths, or expand content a trusted prefix doesn't cover.
     let trusted = !segments.is_empty()
-        && !shell_deny::has_shell_indirection(command)
+        && !shell_lex::has_shell_indirection(command)
         && segments.iter().all(|segment| {
             policy
                 .trusted_shell_prefixes

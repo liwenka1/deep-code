@@ -20,6 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::shell_lex::{basename_lower, clean_token, has_shell_indirection, segments};
 use crate::i18n::TextId;
 
 /// Why a command segment was denied. The string is surfaced to the user and
@@ -27,95 +28,10 @@ use crate::i18n::TextId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenyReason(pub &'static str);
 
-/// Split a command line into individually-checkable segments on the shell
-/// control operators `;`, `&&`, `||`, `|`, and newlines. Each segment is a
-/// single simple command whose program/args we can inspect.
-///
-/// This is a pragmatic tokenizer, not a full shell parser: it does not track
-/// quotes or subshells. That is a deliberate safety bias — an unparseable or
-/// exotic construct falls through to "needs approval" rather than being
-/// auto-trusted, and deny checks still run on every whitespace-split segment.
-pub(crate) fn segments(command: &str) -> Vec<&str> {
-    command
-        .split(['\n', ';', '|', '&'])
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .collect()
-}
-
-/// Remove shell quoting from a single token so a deny/bounds check inspects
-/// what `sh -c` will actually execute — not the raw, still-quoted text. Strips
-/// every `'` and `"` (the shell removes quotes anywhere in a word, so `r""m`
-/// runs as `rm` and `'-rf'` as `-rf`) and, on Unix, every `\` (a backslash
-/// escapes the next char, so `\-rf` runs as `-rf` and `\/tmp` as `/tmp`). On
-/// Windows `\` is a genuine path separator and is kept.
-///
-/// This is a deliberate safety over-approximation: dropping these characters
-/// can only *expose* a dangerous flag or path, never hide one, so it can never
-/// weaken a deny rule or a workspace-bounds check. It MUST be applied to every
-/// token a decision depends on — the program word AND its arguments — because a
-/// check that cleaned only the program word (as an earlier version did) let
-/// quoted flags like `rm '-rf' /` and quoted paths like `cp x '/tmp/out'` slip
-/// straight past.
-///
-/// Shared with [`super::command_shape`]: the trust matcher must strip the same
-/// quoting this floor does, or a quoted redirecting flag (`--con"fig"`) that the
-/// shell runs as `--config` rides a trusted identity the deny floor would have
-/// cleaned. Two views of "what the shell will run" must not disagree.
-pub(super) fn clean_token(token: &str) -> String {
-    let strip: &[char] = if cfg!(windows) {
-        // `^` is cmd.exe's escape character — the exact Windows counterpart of
-        // the `\` handled below. Without stripping it, one caret walked past
-        // every rule on this floor (`r^d /s /q C:\Windows`, `de^l /f/s/q C:\*`,
-        // `curl x | powershe^ll`) while `cmd /C` ran the real thing — and
-        // Windows is the one platform with no sandbox behind this floor.
-        &['\'', '"', '^']
-    } else {
-        &['\'', '"', '\\']
-    };
-    token.chars().filter(|ch| !strip.contains(ch)).collect()
-}
-
 /// Whether a (cleaned) token is a leading `VAR=value` environment assignment,
 /// which we skip when locating the program word.
 fn is_env_assignment(token: &str) -> bool {
     token.contains('=') && !token.starts_with('-') && !token.contains('/')
-}
-
-/// The lowercased basename of a token, with shell quoting removed first, so
-/// `/usr/bin/sudo`, `'sudo'`, and `s\udo` all resolve to `sudo`. On Windows `\`
-/// is a path separator; on Unix it was already dropped by [`clean_token`].
-fn basename_lower(token: &str) -> String {
-    let cleaned = clean_token(token);
-    let separators: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
-    let base = cleaned
-        .rsplit(separators)
-        .next()
-        .unwrap_or(cleaned.as_str())
-        .to_ascii_lowercase();
-    strip_executable_extension(&base)
-}
-
-/// Drop a Windows executable suffix so `powershell.exe` and `powershell`, or
-/// `reg.exe` and `reg`, resolve to the same program word.
-///
-/// Unconditional rather than `cfg!(windows)` for the same reason the Windows
-/// verb rules below are: it keeps the floor testable from any host, and on Unix
-/// a program genuinely named `rm.exe` is both vanishingly rare and safe to
-/// over-approximate — this floor may only ever *expose* a dangerous name, never
-/// hide one. Without it, `reg.exe delete`, `takeown.exe`, `diskpart.exe`,
-/// `format.com` and `curl x | powershell.exe` all fell through to `_ => None`,
-/// which is exactly how Windows documentation and scripts spell them.
-fn strip_executable_extension(base: &str) -> String {
-    const EXECUTABLE_SUFFIXES: &[&str] = &[".exe", ".com", ".bat", ".cmd"];
-    for suffix in EXECUTABLE_SUFFIXES {
-        if let Some(stem) = base.strip_suffix(suffix)
-            && !stem.is_empty()
-        {
-            return stem.to_string();
-        }
-    }
-    base.to_string()
 }
 
 /// The program name of a segment, reduced to its lowercased basename so that
@@ -563,19 +479,6 @@ pub fn safety_notes(command: &str) -> Vec<SafetyNote> {
         }
     }
     notes.notes
-}
-
-/// True if a command contains shell redirection, substitution, or expansion
-/// (`>`, `<`, `` ` ``, `$`). These make the visible text an unreliable
-/// description of what will run: a substitution executes an arbitrary inner
-/// program (`touch $(curl …)`), a redirection writes a path no program word
-/// mentions (`sed … > cfg`), and a `$VAR` expands to content the reviewer
-/// never saw. Any such command is excluded from every automatic pass (trust
-/// list, accept-edits) and goes to a human — which is what lets the deny floor
-/// above stay plain-form only instead of chasing obfuscations.
-#[must_use]
-pub(crate) fn has_shell_indirection(command: &str) -> bool {
-    command.contains(['>', '<', '`', '$'])
 }
 
 /// cc-style `acceptEdits` allowlist for shell/job commands: a bounded

@@ -7,6 +7,7 @@ pub mod command_shape;
 mod engine;
 mod permission_mode;
 mod shell_deny;
+mod shell_lex;
 
 pub use engine::{
     ExecPolicy, NetworkMode, PolicyVerdict, RiskLevel, ToolExecutionPlan, ToolKind,

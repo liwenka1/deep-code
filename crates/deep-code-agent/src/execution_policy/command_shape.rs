@@ -171,7 +171,7 @@ fn redirects_execution(token: &str) -> bool {
     // missed every quoted/backslashed spelling, and an auto-trusted `cargo`/`git`
     // executed an arbitrary program (`build.rustc-wrapper`, `--target-dir`,
     // `git --output`) with no prompt at any permission tier.
-    let cleaned = super::shell_deny::clean_token(token);
+    let cleaned = super::shell_lex::clean_token(token);
     let name = cleaned.split('=').next().unwrap_or(&cleaned);
     REDIRECTING.contains(&name.to_ascii_lowercase().as_str())
 }
@@ -288,7 +288,7 @@ pub fn rule_covers(rule: &str, command: &str) -> bool {
 /// stripped first (see [`redirects_execution`]) so a rule spelling out a
 /// redirecting flag still matches its quoted command-line spelling.
 fn flag_name(token: &str) -> String {
-    let cleaned = super::shell_deny::clean_token(token);
+    let cleaned = super::shell_lex::clean_token(token);
     cleaned
         .split('=')
         .next()
