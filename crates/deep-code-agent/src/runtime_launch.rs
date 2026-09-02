@@ -293,23 +293,35 @@ fn prepare_persisted_session(
     Ok((store, record))
 }
 
+/// What `launch_resumed` has settled before it picks a client backend: the
+/// vetted record, its store, the effective roots, and the warnings collected so
+/// far. One value for the shared tail below instead of four loose parameters.
+struct ResumedSession {
+    record: SessionRecord,
+    store: JsonSessionStore,
+    roots: WorkspaceRoots,
+    warnings: Vec<String>,
+}
+
 /// The shared tail of a resumed launch, for either client backend: build the
 /// parent tools, rebuild the runtime from the record, attach the workspace
 /// helpers, and assemble the `LaunchedRuntime`. The two arms of `launch_resumed`
 /// (DeepSeek and echo) differed only in the client, the label, and a hardcoded
 /// `offline` bool — now derived from the client — so they share this.
-#[allow(clippy::too_many_arguments)]
 fn finish_resumed_launch<C: LlmClient + Clone + 'static>(
     client: C,
     backend_label: String,
-    record: SessionRecord,
-    store: JsonSessionStore,
-    roots: WorkspaceRoots,
+    session: ResumedSession,
     config: &AgentConfig,
     parent_cancel: &CancellationToken,
     ui_lang: SharedLang,
-    mut warnings: Vec<String>,
 ) -> LaunchedRuntime {
+    let ResumedSession {
+        record,
+        store,
+        roots,
+        mut warnings,
+    } = session;
     let client = Arc::new(client);
     let session_id = record.id.as_str().to_string();
     let ParentTools {
@@ -551,34 +563,33 @@ fn launch_resumed(
         warnings.push(format!("failed to persist resumed session grants: {error}"));
     }
 
-    if config.api_key.is_some()
-        && let Ok(client) = DeepSeekClient::new(config.clone())
-    {
-        let ui_lang = SharedLang::new(Lang::from_env(&config.language));
-        return finish_resumed_launch(
-            client,
-            format!("DeepSeek {} (resumed)", config.model),
-            record,
-            store,
-            roots,
-            config,
-            parent_cancel,
-            ui_lang,
-            warnings,
-        );
-    }
-
-    let ui_lang = SharedLang::new(Lang::from_env(&config.language));
-    finish_resumed_launch(
-        EchoClient::new(ui_lang.clone()),
-        "offline echo (resumed)".to_string(),
+    let session = ResumedSession {
         record,
         store,
         roots,
+        warnings,
+    };
+    let ui_lang = SharedLang::new(Lang::from_env(&config.language));
+    if config.api_key.is_some()
+        && let Ok(client) = DeepSeekClient::new(config.clone())
+    {
+        return finish_resumed_launch(
+            client,
+            format!("DeepSeek {} (resumed)", config.model),
+            session,
+            config,
+            parent_cancel,
+            ui_lang,
+        );
+    }
+
+    finish_resumed_launch(
+        EchoClient::new(ui_lang.clone()),
+        "offline echo (resumed)".to_string(),
+        session,
         config,
         parent_cancel,
         ui_lang,
-        warnings,
     )
 }
 
