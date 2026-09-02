@@ -184,8 +184,6 @@ fn tool_call_renders_compact_single_line() {
     let tool = HistoryCell::ToolCall {
         tool_name: "shell".to_string(),
         arguments: "{\"command\":\n  \"grep foo\"}".to_string(),
-        risk_level: None,
-        requires_sandbox: None,
         approval: ToolApprovalState::NotRequired,
         running_for_secs: None,
     };
@@ -201,8 +199,6 @@ fn tool_call_renders_compact_single_line() {
     let gated = HistoryCell::ToolCall {
         tool_name: "write_file".to_string(),
         arguments: "{}".to_string(),
-        risk_level: Some(deep_code_agent::RiskLevel::Medium),
-        requires_sandbox: Some(false),
         approval: ToolApprovalState::Approved,
         running_for_secs: None,
     };
@@ -214,8 +210,6 @@ fn tool_call_renders_compact_single_line() {
     let running = HistoryCell::ToolCall {
         tool_name: "agent".to_string(),
         arguments: "{\"role\":\"explore\"}".to_string(),
-        risk_level: None,
-        requires_sandbox: None,
         approval: ToolApprovalState::NotRequired,
         running_for_secs: Some(47),
     };
@@ -240,8 +234,6 @@ fn tool_call_lines_truncate_long_fields() {
     let tool = HistoryCell::ToolCall {
         tool_name: "write_file".to_string(),
         arguments: long,
-        risk_level: None,
-        requires_sandbox: None,
         approval: ToolApprovalState::NotRequired,
         running_for_secs: None,
     };

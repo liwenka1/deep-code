@@ -1,4 +1,4 @@
-use deep_code_agent::{ApprovalRequest, RiskLevel, ToolCallId, TurnId};
+use deep_code_agent::{ApprovalRequest, ToolCallId, TurnId};
 
 use crate::history::{HistoryCell, ToolApprovalState};
 
@@ -39,8 +39,6 @@ pub struct ActiveToolCell {
     pub tool_call_id: ToolCallId,
     pub tool_name: String,
     pub arguments: String,
-    pub risk_level: Option<RiskLevel>,
-    pub requires_sandbox: Option<bool>,
     pub approval: ToolApprovalState,
     pub live_output: LiveOutput,
     /// When this call started running, for the "still alive, N seconds in"
@@ -120,8 +118,6 @@ impl ActiveTurn {
                 tool_call_id: tool_call_id.clone(),
                 tool_name: tool_call_id.as_str().to_string(),
                 arguments: delta.to_string(),
-                risk_level: None,
-                requires_sandbox: None,
                 approval: ToolApprovalState::NotRequired,
                 live_output: LiveOutput::default(),
                 started_at: std::time::Instant::now(),
@@ -136,16 +132,12 @@ impl ActiveTurn {
             .iter_mut()
             .find(|tool| tool.tool_call_id == tool_call_id)
         {
-            existing.risk_level = Some(request.risk_level);
-            existing.requires_sandbox = Some(request.requires_sandbox);
             existing.approval = ToolApprovalState::Required;
         } else {
             self.tools.push(ActiveToolCell {
                 tool_call_id,
                 tool_name: request.tool_name.clone(),
                 arguments: request.arguments.to_string(),
-                risk_level: Some(request.risk_level),
-                requires_sandbox: Some(request.requires_sandbox),
                 approval: ToolApprovalState::Required,
                 live_output: LiveOutput::default(),
                 started_at: std::time::Instant::now(),
@@ -201,8 +193,6 @@ impl ActiveTurn {
             cells.push(HistoryCell::ToolCall {
                 tool_name: tool.tool_name,
                 arguments: tool.arguments,
-                risk_level: tool.risk_level,
-                requires_sandbox: tool.requires_sandbox,
                 approval: tool.approval,
                 // Finished: the ToolResult line right under it says how it
                 // ended; a stale clock would just be noise.
@@ -230,8 +220,6 @@ impl ActiveTurn {
             cells.push(HistoryCell::ToolCall {
                 tool_name: tool.tool_name.clone(),
                 arguments: tool.arguments.clone(),
-                risk_level: tool.risk_level,
-                requires_sandbox: tool.requires_sandbox,
                 approval: tool.approval,
                 // Recomputed on every render tick, so the line reads
                 // "agent … · 47s" and visibly counts while the call runs.
@@ -263,8 +251,6 @@ mod tests {
             tool_call_id: ToolCallId("call_1".to_string()),
             tool_name: "mock_echo".to_string(),
             arguments: "{\"message\":\"hi\"}".to_string(),
-            risk_level: None,
-            requires_sandbox: None,
             approval: ToolApprovalState::NotRequired,
             live_output: LiveOutput::default(),
             started_at: std::time::Instant::now(),
@@ -287,8 +273,6 @@ mod tests {
             tool_call_id: id.clone(),
             tool_name: "shell".to_string(),
             arguments: "{\"command\":\"cargo build\"}".to_string(),
-            risk_level: None,
-            requires_sandbox: None,
             approval: ToolApprovalState::NotRequired,
             live_output: LiveOutput::default(),
             started_at: std::time::Instant::now(),
@@ -314,8 +298,6 @@ mod tests {
             tool_call_id: id.clone(),
             tool_name: "shell".to_string(),
             arguments: "{\"command\":\"cargo build\"}".to_string(),
-            risk_level: None,
-            requires_sandbox: None,
             approval: ToolApprovalState::NotRequired,
             live_output: LiveOutput::default(),
             started_at: std::time::Instant::now(),

@@ -1152,8 +1152,6 @@ fn every_status_row_branch_neutralizes_a_model_supplied_tool_name() {
                 tool_call_id: deep_code_agent::ToolCallId("call_1".to_string()),
                 tool_name: HOSTILE.to_string(),
                 arguments: "{}".to_string(),
-                risk_level: None,
-                requires_sandbox: None,
                 approval: crate::history::ToolApprovalState::NotRequired,
                 live_output: crate::active_turn::LiveOutput::default(),
                 started_at: std::time::Instant::now(),

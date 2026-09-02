@@ -1,4 +1,4 @@
-use deep_code_agent::{EntryKind, RiskLevel, SessionRecord, ToolResultStatus};
+use deep_code_agent::{EntryKind, SessionRecord, ToolResultStatus};
 
 use deep_code_agent::i18n::{Lang, TextId, tr, tr_with};
 
@@ -76,8 +76,6 @@ pub enum HistoryCell {
     ToolCall {
         tool_name: String,
         arguments: String,
-        risk_level: Option<RiskLevel>,
-        requires_sandbox: Option<bool>,
         approval: ToolApprovalState,
         /// Seconds this call has been running — `Some` only in the live
         /// transcript preview (re-computed each frame), `None` once flushed.
@@ -223,8 +221,6 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
                     current_turn.push(HistoryCell::ToolCall {
                         tool_name: exchange.call.function.name.clone(),
                         arguments: exchange.call.function.arguments.clone(),
-                        risk_level: None,
-                        requires_sandbox: None,
                         approval: ToolApprovalState::NotRequired,
                         running_for_secs: None,
                     });

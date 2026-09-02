@@ -1025,8 +1025,6 @@ fn streaming_activity_names_the_running_tool() {
         tool_call_id: ToolCallId("call_1".to_string()),
         tool_name: "agent".to_string(),
         arguments: "{}".to_string(),
-        risk_level: None,
-        requires_sandbox: None,
         approval: crate::history::ToolApprovalState::NotRequired,
         live_output: LiveOutput::default(),
         started_at: std::time::Instant::now(),
@@ -1372,15 +1370,13 @@ fn approval_events_render_pending_and_resolved_tool_metadata() {
         },
     });
 
+    // The transcript cell carries only what it renders: the approval badge.
+    // Risk tier and sandbox live on the request, shown by the panel below.
     let preview = app.active_turn.as_ref().unwrap().preview_cells();
     assert!(preview.iter().any(|cell| matches!(
         cell,
-        HistoryCell::ToolCall {
-            risk_level: Some(risk),
-            requires_sandbox: Some(true),
-            approval,
-            ..
-        } if *risk == deep_code_agent::RiskLevel::High && *approval == crate::history::ToolApprovalState::Required
+        HistoryCell::ToolCall { approval, .. }
+            if *approval == crate::history::ToolApprovalState::Required
     )));
     // The approval itself is surfaced only by the dedicated panel
     // (app.pending_approval), never as a transcript cell.

@@ -34,8 +34,6 @@ impl App {
                     tool_call_id,
                     tool_name: tool_name.clone(),
                     arguments: arguments.to_string(),
-                    risk_level: None,
-                    requires_sandbox: None,
                     approval: ToolApprovalState::NotRequired,
                     live_output: Default::default(),
                     started_at: std::time::Instant::now(),
