@@ -228,9 +228,10 @@ const MAX_TIMEOUT_SECS: u64 = 300;
 const MAX_OUTPUT_CHARS: usize = 20_000;
 const DEFAULT_TAIL_CHARS: u64 = 4_000;
 const MAX_TAIL_CHARS: u64 = 20_000;
-/// Cap on bytes streamed live through `cx.update` per shell call (matches the
-/// ring size; the final output still carries the tail beyond this).
-const MAX_STREAMED_BYTES: usize = 128 * 1024;
+/// Cap on bytes streamed live through `cx.update` per shell call. Derived from
+/// the ring capacity so the two cannot drift — the final output still carries
+/// the tail beyond this.
+const MAX_STREAMED_BYTES: usize = jobs::JOB_BUFFER_BYTES;
 
 #[derive(Debug, Clone)]
 pub struct ShellTools {

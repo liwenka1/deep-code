@@ -15,7 +15,11 @@ use tokio::process::Child;
 use crate::tool::ToolError;
 use crate::workspace_policy::invalid;
 
-const JOB_BUFFER_BYTES: usize = 128 * 1024;
+/// Live-output ring capacity per stream — the single source of truth for how
+/// much of a stream is held in memory. The shell tool's live-stream cap
+/// (`MAX_STREAMED_BYTES`) is derived from this so the two cannot drift; the
+/// spill-vs-inline decisions here assume they are equal.
+pub(super) const JOB_BUFFER_BYTES: usize = 128 * 1024;
 
 /// Room left for the framing the renderer adds around the two streams:
 /// `[stderr]`, the trailing `[exit N · Nms]`, the notes. Small and generous —
