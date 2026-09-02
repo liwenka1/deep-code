@@ -273,13 +273,7 @@ impl ExecPolicy {
             ToolKind::Job => match arguments.get("action").and_then(Value::as_str) {
                 // Launching a background command is exactly as risky as the
                 // command itself: same deny/trust/approve gate as `shell`.
-                Some("start") => {
-                    let command = arguments
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    evaluate_shell_command(self, command, network_requested(arguments))
-                }
+                Some("start") => self.evaluate_command_bearing(tool_name, arguments),
                 Some("status" | "tail") => ToolExecutionPlan {
                     verdict: PolicyVerdict::Allow,
                     requires_approval: false,
@@ -314,13 +308,7 @@ impl ExecPolicy {
                     network: false,
                 },
             },
-            ToolKind::Shell => {
-                let command = arguments
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                evaluate_shell_command(self, command, network_requested(arguments))
-            }
+            ToolKind::Shell => self.evaluate_command_bearing(tool_name, arguments),
             ToolKind::Mock => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {
                     reason: "mock tool requires approval for tool-loop tests".to_string(),
@@ -448,6 +436,15 @@ impl ExecPolicy {
             },
         }
     }
+
+    /// The shared tail of the `shell` and `job action=start` arms: the command
+    /// the call carries, read through [`shell_command_of`] (the one extraction
+    /// rule), through the shell gate. No `command` key gates as the empty
+    /// command.
+    fn evaluate_command_bearing(&self, tool_name: &str, arguments: &Value) -> ToolExecutionPlan {
+        let command = shell_command_of(tool_name, arguments).unwrap_or("");
+        evaluate_shell_command(self, command, network_requested(arguments))
+    }
 }
 
 pub fn evaluate_shell_command(
@@ -564,9 +561,10 @@ pub fn evaluate_shell_command(
 
 /// The shell command a tool call would run, if it is command-bearing: the
 /// `command` argument for the `shell` tool, or a `job` with `action=start`.
-/// `None` for every other tool (and for job status/tail/cancel). One home for
-/// the "where does the command live" rule the gate, the safety notes, and
-/// session trust all have to agree on (see
+/// `None` for every other tool (and for job status/tail/cancel). The one home
+/// for the "where does the command live" rule: the gate itself
+/// ([`ExecPolicy::evaluate_tool`]), accept-edits, the safety notes, and session
+/// trust all read the command through here (see
 /// [`crate::tool::ToolCall::shell_command`], which delegates here).
 #[must_use]
 pub fn shell_command_of<'a>(tool_name: &str, arguments: &'a Value) -> Option<&'a str> {

@@ -523,6 +523,52 @@ fn job_start_inherits_shell_gating() {
     ));
 }
 
+/// `shell_command_of` is the one place that knows where a call's command lives,
+/// and the gate reads through it: `shell` and `job action=start` yield their
+/// `command`; every other tool and every other job action yield nothing, even
+/// with a decoy `command` key; and the two command-bearing shapes gate
+/// identically — including when the key is missing.
+#[test]
+fn shell_command_of_is_the_single_extraction_rule() {
+    let shell = json!({"command": "cargo test"});
+    let start = json!({"action": "start", "command": "cargo test"});
+    assert_eq!(shell_command_of("shell", &shell), Some("cargo test"));
+    assert_eq!(shell_command_of("job", &start), Some("cargo test"));
+
+    for action in ["status", "tail", "cancel", "list"] {
+        let decoy = json!({"action": action, "job_id": "job_1", "command": "rm -rf /"});
+        assert_eq!(
+            shell_command_of("job", &decoy),
+            None,
+            "job action `{action}`"
+        );
+    }
+    assert_eq!(
+        shell_command_of("job", &json!({"command": "rm -rf /"})),
+        None
+    );
+    assert_eq!(
+        shell_command_of("write_file", &json!({"path": "a", "command": "x"})),
+        None
+    );
+    assert_eq!(shell_command_of("shell", &json!({"command": 42})), None);
+    assert_eq!(shell_command_of("shell", &json!({})), None);
+
+    let policy = ExecPolicy::default();
+    assert_eq!(
+        policy.evaluate_tool("job", &start),
+        policy.evaluate_tool("shell", &shell)
+    );
+    assert_eq!(
+        policy.evaluate_tool("job", &json!({"action": "start", "command": "rm -rf /"})),
+        policy.evaluate_tool("shell", &json!({"command": "rm -rf /"}))
+    );
+    assert_eq!(
+        policy.evaluate_tool("job", &json!({"action": "start"})),
+        policy.evaluate_tool("shell", &json!({}))
+    );
+}
+
 #[test]
 fn unknown_job_action_needs_approval() {
     let policy = ExecPolicy::default();
