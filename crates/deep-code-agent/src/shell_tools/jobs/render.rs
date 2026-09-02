@@ -9,7 +9,11 @@
 use super::*;
 
 /// Model-facing plain-text output for a finished foreground shell command.
-pub(crate) fn shell_text_output(job_id: &str, job: &JobState, max_chars: usize) -> String {
+pub(in crate::shell_tools) fn shell_text_output(
+    job_id: &str,
+    job: &JobState,
+    max_chars: usize,
+) -> String {
     let stdout = tail_chars(&job.stdout.text(), max_chars);
     let stderr = tail_chars(&job.stderr.text(), max_chars);
     let elapsed = format_elapsed(job.started_at.elapsed().as_millis() as u64);
@@ -183,7 +187,11 @@ fn denial_note(job: &JobState) -> Option<&'static str> {
 }
 
 /// Model-facing plain-text snapshot for job status/tail.
-pub(crate) fn job_text_snapshot(job_id: &str, job: &JobState, max_chars: usize) -> String {
+pub(in crate::shell_tools) fn job_text_snapshot(
+    job_id: &str,
+    job: &JobState,
+    max_chars: usize,
+) -> String {
     let kind = match job.kind {
         JobKind::Foreground => "foreground",
         JobKind::Background => "background",
@@ -229,7 +237,7 @@ pub(crate) fn job_text_snapshot(job_id: &str, job: &JobState, max_chars: usize) 
 }
 
 /// UI-facing structured details for any job-backed result.
-pub(crate) fn job_details(job_id: &str, job: &JobState) -> Value {
+pub(in crate::shell_tools) fn job_details(job_id: &str, job: &JobState) -> Value {
     json!({
         "job_id": job_id,
         "kind": job.kind,

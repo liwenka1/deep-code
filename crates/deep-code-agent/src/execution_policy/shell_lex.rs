@@ -22,7 +22,7 @@
 /// quotes or subshells. That is a deliberate safety bias — an unparseable or
 /// exotic construct falls through to "needs approval" rather than being
 /// auto-trusted, and deny checks still run on every whitespace-split segment.
-pub(crate) fn segments(command: &str) -> Vec<&str> {
+pub(super) fn segments(command: &str) -> Vec<&str> {
     command
         .split(['\n', ';', '|', '&'])
         .map(str::trim)
@@ -48,7 +48,7 @@ pub(crate) fn segments(command: &str) -> Vec<&str> {
 /// Shared by both sides: the trust matcher must strip the same quoting the deny
 /// floor does, or a quoted redirecting flag (`--con"fig"`) that the shell runs
 /// as `--config` rides a trusted identity the deny floor would have cleaned.
-pub(crate) fn clean_token(token: &str) -> String {
+pub(super) fn clean_token(token: &str) -> String {
     let strip: &[char] = if cfg!(windows) {
         // `^` is cmd.exe's escape character — the exact Windows counterpart of
         // the `\` handled below. Without stripping it, one caret walked past
@@ -65,7 +65,7 @@ pub(crate) fn clean_token(token: &str) -> String {
 /// The lowercased basename of a token, with shell quoting removed first, so
 /// `/usr/bin/sudo`, `'sudo'`, and `s\udo` all resolve to `sudo`. On Windows `\`
 /// is a path separator; on Unix it was already dropped by [`clean_token`].
-pub(crate) fn basename_lower(token: &str) -> String {
+pub(super) fn basename_lower(token: &str) -> String {
     let cleaned = clean_token(token);
     let separators: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
     let base = cleaned
@@ -107,7 +107,7 @@ fn strip_executable_extension(base: &str) -> String {
 /// list, accept-edits) and goes to a human — which is what lets the deny floor
 /// stay plain-form only instead of chasing obfuscations.
 #[must_use]
-pub(crate) fn has_shell_indirection(command: &str) -> bool {
+pub(super) fn has_shell_indirection(command: &str) -> bool {
     command.contains(['>', '<', '`', '$'])
 }
 
