@@ -219,7 +219,7 @@ fn collect_deepseek(config: &AgentConfig) -> DeepSeekDoctorReport {
     DeepSeekDoctorReport {
         auto_model: config.auto_model_enabled(),
         reasoning_effort: config.reasoning_effort.as_setting().to_string(),
-        cost_currency: format!("{:?}", config.cost_currency).to_ascii_lowercase(),
+        cost_currency: config.cost_currency.as_setting().to_string(),
         beta_endpoint: config.uses_beta_endpoint(),
         models,
         api_key_hint: api_key_setup_hint(crate::i18n::Lang::from_env(&config.language)),

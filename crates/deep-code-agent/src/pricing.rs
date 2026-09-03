@@ -22,6 +22,19 @@ impl CostCurrency {
         }
     }
 
+    /// Config/persistence token — the spelling `parse` accepts and `doctor`
+    /// reports. On the enum next to its variants like every other setting enum
+    /// (`PermissionMode`, `NetworkMode`, `ReasoningEffort`, `Lang`), so the
+    /// report site matches the real variant instead of lower-casing a Debug
+    /// string that a rename would silently change.
+    #[must_use]
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            Self::Cny => "cny",
+            Self::Usd => "usd",
+        }
+    }
+
     #[must_use]
     pub fn symbol(self) -> &'static str {
         match self {
@@ -123,6 +136,17 @@ fn tier_cost(tokens: u32, per_million: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::model_registry::DEEPSEEK_V4_FLASH;
+
+    /// The doctor report and the config file spell the currency the same way:
+    /// what `as_setting` emits, `parse` accepts, for every variant.
+    #[test]
+    fn as_setting_round_trips_through_parse() {
+        for currency in [CostCurrency::Cny, CostCurrency::Usd] {
+            assert_eq!(CostCurrency::parse(currency.as_setting()), Some(currency));
+        }
+        assert_eq!(CostCurrency::Cny.as_setting(), "cny");
+        assert_eq!(CostCurrency::Usd.as_setting(), "usd");
+    }
 
     #[test]
     fn cache_hit_lowers_cost() {
