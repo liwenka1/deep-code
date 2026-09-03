@@ -14,7 +14,6 @@
 
 use std::io::Read;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -27,12 +26,9 @@ use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, run_blockin
 
 mod ssrf;
 
-const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
-const MAX_REDIRECTS: usize = 5;
 const DEFAULT_MAX_FETCH_BYTES: usize = 512 * 1024;
 const DEFAULT_SEARCH_RESULTS: usize = 5;
 const MAX_SEARCH_RESULTS: usize = 10;
-const USER_AGENT: &str = concat!("deep-code/", env!("CARGO_PKG_VERSION"));
 
 /// Registry with both network tools, for [`crate::runtime_launch`]. The
 /// shared language handle keeps tool error text in step with `/lang`.

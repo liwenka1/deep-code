@@ -3,10 +3,15 @@
 //! and details JSON, and the byte/duration formatters.
 //!
 //! Split from the process/buffer machinery in the parent module — this is
-//! presentation, not job bookkeeping, and it only reads `JobState`/`SharedBuffer`
-//! accessors. `use super::*` inherits the parent's types, imports and constants.
+//! presentation, not job bookkeeping, and it reaches `JobState`/`SharedBuffer`
+//! only through their accessors. The one thing it changes on disk is the
+//! spill file a stream turned out not to need (`discard_unreported_spill`):
+//! the renderer is the first to know both streams' final sizes, so that
+//! decision has to be made here (see `shell_text_output`). `use super::*`
+//! inherits the parent's types and constants.
 
 use super::*;
+use serde_json::{Value, json};
 
 /// Model-facing plain-text output for a finished foreground shell command.
 pub(in crate::shell_tools) fn shell_text_output(

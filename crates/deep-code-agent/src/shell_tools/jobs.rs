@@ -8,7 +8,6 @@ use std::sync::{
 use std::time::Instant;
 
 use serde::Serialize;
-use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::process::Child;
 
@@ -20,8 +19,9 @@ pub(super) use render::{job_details, job_text_snapshot, shell_text_output};
 
 /// Live-output ring capacity per stream — the single source of truth for how
 /// much of a stream is held in memory. The shell tool's live-stream cap
-/// (`MAX_STREAMED_BYTES`) is derived from this so the two cannot drift; the
-/// spill-vs-inline decisions here assume they are equal.
+/// (`MAX_STREAMED_BYTES`) is derived from this so the two cannot drift. (The
+/// spill threshold below is independent of it: that one derives from the tool
+/// output budget.)
 pub(super) const JOB_BUFFER_BYTES: usize = 128 * 1024;
 
 /// Room left for the framing the renderer adds around the two streams:

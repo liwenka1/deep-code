@@ -65,7 +65,7 @@ impl App {
 
     /// How many options the approval panel offers (y/a/n, or y/n for a
     /// root-grant request).
-    pub(super) fn approval_option_count(&self) -> usize {
+    fn approval_option_count(&self) -> usize {
         if self.pending_is_root_grant() { 2 } else { 3 }
     }
 
@@ -128,7 +128,7 @@ impl App {
         self.approval_scroll_offset = usize::MAX;
     }
 
-    pub(super) fn resolve_pending_tool(&mut self, decision: ApprovalDecision) {
+    fn resolve_pending_tool(&mut self, decision: ApprovalDecision) {
         if self.pending_approval.take().is_none() {
             return;
         }

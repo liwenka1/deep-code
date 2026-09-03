@@ -9,9 +9,18 @@
 
 use super::*;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::time::Duration;
 
 use reqwest::blocking::Client;
 use reqwest::redirect::Policy;
+
+/// Transport parameters of the pinned client. They live with the fetcher
+/// because [`pinned_get`] is the only HTTP client the crate's network path
+/// builds; the tools above it only ever hand over a URL.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+/// Redirect hops followed before giving up; every hop is re-validated.
+const MAX_REDIRECTS: usize = 5;
+const USER_AGENT: &str = concat!("deep-code/", env!("CARGO_PKG_VERSION"));
 
 /// GET with manual redirect handling. Each hop's host is resolved and
 /// validated exactly once, and the connection is pinned to the validated

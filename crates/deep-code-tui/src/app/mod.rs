@@ -117,7 +117,7 @@ pub struct App {
     /// Currently highlighted approval option: 0 = y (approve), 1 = a (session),
     /// 2 = n (deny). Navigated with ↑/↓, acted on with Enter. A root grant
     /// offers only y/n and starts focused on deny — see
-    /// [`Self::set_active_approval`].
+    /// [`Self::park_approval`].
     pub approval_focus: usize,
     /// Whether the pending panel has been drawn at least once.
     ///

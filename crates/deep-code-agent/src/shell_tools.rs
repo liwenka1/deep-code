@@ -226,7 +226,10 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 300;
 const MAX_OUTPUT_CHARS: usize = 20_000;
 const DEFAULT_TAIL_CHARS: u64 = 4_000;
-const MAX_TAIL_CHARS: u64 = 20_000;
+/// The most a `job tail` may ask for — the same window the foreground result
+/// body gets, derived rather than re-spelled: the tail is the escape hatch for
+/// what that window cut from the same ring, not a wider view of it.
+const MAX_TAIL_CHARS: u64 = MAX_OUTPUT_CHARS as u64;
 /// Cap on bytes streamed live through `cx.update` per shell call. Derived from
 /// the ring capacity so the two cannot drift — the final output still carries
 /// the tail beyond this.
