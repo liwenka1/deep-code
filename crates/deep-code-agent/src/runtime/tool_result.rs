@@ -12,17 +12,6 @@ use crate::runtime::failure_class::record_failure_signals;
 use crate::runtime::state::PendingToolBatch;
 use crate::tool::{ApprovalDecision, ToolCall, ToolCx, ToolError, ToolResult, ToolRunOutcome};
 
-/// Whether a call may run concurrently inside a tool batch. Only sub-agent
-/// calls qualify: the execution policy allows them without approval, and each
-/// spawns an isolated child runtime, so a batch of them shares no mutable
-/// state and never parks the batch on a human-in-the-loop pause.
-fn is_parallel_safe(call: &ToolCall) -> bool {
-    matches!(
-        crate::execution_policy::ExecPolicy::classify_tool(&call.name),
-        crate::execution_policy::ToolKind::SubAgent
-    )
-}
-
 /// Under `Yolo`, sandboxed commands get ambient egress (unless config says
 /// `never`, which stays absolute).
 ///
@@ -147,6 +136,27 @@ impl AgentRuntime {
         self.emit_session_updated(tx).await;
     }
 
+    /// Whether a call may run concurrently inside a tool batch. Two conditions,
+    /// both required. Structurally, only sub-agent calls qualify: each spawns
+    /// an isolated child runtime, so a batch of them shares no mutable state.
+    /// And the policy must let the dispatch run outright: the concurrent path
+    /// has no approval gate — it cannot park the batch on a human-in-the-loop
+    /// pause — so a gated dispatch (a writing role, whose spawn is the write
+    /// authorization, or `network: true` under `[sandbox] network = "prompt"`)
+    /// leaves the group and takes the serial path, where standing consent, the
+    /// mode, the judge and the human all live. Read-only fan-out stays
+    /// concurrent. Before this looked at the plan, a run of two gated
+    /// dispatches failed as an error in every mode, Yolo included, while the
+    /// same dispatch issued alone ran or prompted normally.
+    fn is_parallel_safe(&self, call: &ToolCall) -> bool {
+        crate::execution_policy::ExecPolicy::classify_tool(&call.name)
+            == crate::execution_policy::ToolKind::SubAgent
+            && matches!(
+                self.tools.evaluate_tool(call).verdict,
+                crate::execution_policy::PolicyVerdict::Allow
+            )
+    }
+
     /// Run the queued tool calls of one assistant turn in order.
     ///
     /// Every call ends with a recorded tool result message — including policy
@@ -174,11 +184,19 @@ impl AgentRuntime {
             // what makes "issue several agent calls to run children in
             // parallel" true. Results are still recorded in issue order so the
             // wire transcript (and prefix cache) stays deterministic. Only
-            // sub-agent calls qualify: they never park on approval and share no
-            // mutable state, so concurrency can't race the approval machinery.
-            if is_parallel_safe(&call) && remaining.front().is_some_and(is_parallel_safe) {
+            // sub-agent calls whose plan is an outright Allow qualify (see
+            // `is_parallel_safe`): they share no mutable state and never park
+            // on approval, so concurrency can't race the approval machinery.
+            if self.is_parallel_safe(&call)
+                && remaining
+                    .front()
+                    .is_some_and(|next| self.is_parallel_safe(next))
+            {
                 let mut group = vec![call];
-                while remaining.front().is_some_and(is_parallel_safe) {
+                while remaining
+                    .front()
+                    .is_some_and(|next| self.is_parallel_safe(next))
+                {
                     group.push(remaining.pop_front().expect("front just checked"));
                 }
                 let outcomes = futures_util::future::join_all(
@@ -190,6 +208,10 @@ impl AgentRuntime {
                 for (call, outcome) in group.iter().zip(outcomes) {
                     let result = match outcome {
                         Ok(ToolRunOutcome::Result { result }) => result,
+                        // Unreachable by construction — the plan said Allow and
+                        // the registry only asks when the plan or the tool's
+                        // spec says so, which no sub-agent spec does. Kept as a
+                        // fail-closed error rather than a panic on model input.
                         Ok(ToolRunOutcome::ApprovalRequired { .. }) => ToolResult::error(
                             call,
                             "parallel sub-agent unexpectedly requested approval",

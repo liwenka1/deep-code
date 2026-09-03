@@ -753,6 +753,113 @@ async fn batch_runs_parallel_safe_agent_calls_concurrently() {
     );
 }
 
+/// A run of `agent` calls executes concurrently only while the policy lets each
+/// dispatch run outright. A gated dispatch — here a writing role, whose spawn
+/// is the write authorization — must reach the approval gate exactly as it
+/// would alone: waved through by AcceptEdits, parked for a human under
+/// Default. The concurrent path cannot park, so before the group looked at the
+/// plan it turned every gated dispatch in a run of two or more into an error,
+/// in every mode, while the same call issued alone ran or prompted normally.
+#[tokio::test]
+async fn gated_agent_dispatches_leave_the_parallel_group_and_face_the_gate() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+    use std::sync::atomic::Ordering::SeqCst;
+    let implementer = r#"{"role":"implementer","task":"land it"}"#;
+    let scripted = || {
+        ScriptedClient::new(vec![
+            vec![
+                AgentEvent::ToolCallDelta {
+                    delta: indexed_tool_call_delta(0, "call_1", "agent", implementer),
+                },
+                AgentEvent::ToolCallDelta {
+                    delta: indexed_tool_call_delta(1, "call_2", "agent", implementer),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+            vec![
+                AgentEvent::TextDelta {
+                    text: "synthesized".to_string(),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+        ])
+    };
+    let build = |mode: PermissionMode| {
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        // A size-1 barrier never blocks: on the serial path these calls run
+        // one at a time, so a size-2 barrier would be a deadlock, not a test.
+        registry.register(BarrierAgentTool {
+            barrier: Arc::new(tokio::sync::Barrier::new(1)),
+            ran: Arc::clone(&ran),
+        });
+        let runtime = AgentRuntime::new(scripted(), registry)
+            .with_permission_mode(SharedPermissionMode::new(mode));
+        (runtime, ran)
+    };
+    let parked_ids = |events: &[RuntimeEvent]| -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::ApprovalRequired { request, .. } => Some(request.call_id.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // AcceptEdits: spawning a writing child is the standing write consent that
+    // mode already grants per write, so both dispatches run, in issue order,
+    // and nobody is asked.
+    let (runtime, ran) = build(PermissionMode::AcceptEdits);
+    let mut rx = runtime.submit_user("fan out").await;
+    let events = drain(&mut rx).await;
+    assert_eq!(ran.load(SeqCst), 2, "both writing dispatches must execute");
+    assert_eq!(
+        finished_ids(&events),
+        vec!["call_1".to_string(), "call_2".to_string()]
+    );
+    assert!(
+        parked_ids(&events).is_empty(),
+        "AcceptEdits must not prompt"
+    );
+    for event in &events {
+        if let RuntimeEvent::ToolCallFinished { result, .. } = event {
+            assert_eq!(
+                result.status,
+                ToolResultStatus::Success,
+                "a gated dispatch must not degrade into an error: {}",
+                result.content
+            );
+        }
+    }
+
+    // Default: the first dispatch parks for a human and nothing runs unasked.
+    // Approving it runs that one and parks the second; approving again drains
+    // the batch — the serial gate handles the run exactly as it handles one.
+    let (runtime, ran) = build(PermissionMode::Default);
+    let mut rx = runtime.submit_user("fan out").await;
+    let events = drain(&mut rx).await;
+    assert_eq!(
+        ran.load(SeqCst),
+        0,
+        "nothing may run before the human answers"
+    );
+    assert!(finished_ids(&events).is_empty());
+    assert_eq!(parked_ids(&events), vec!["call_1".to_string()]);
+
+    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let events = drain(&mut rx).await;
+    assert_eq!(ran.load(SeqCst), 1);
+    assert_eq!(finished_ids(&events), vec!["call_1".to_string()]);
+    assert_eq!(parked_ids(&events), vec!["call_2".to_string()]);
+
+    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let events = drain(&mut rx).await;
+    assert_eq!(ran.load(SeqCst), 2);
+    assert_eq!(finished_ids(&events), vec!["call_2".to_string()]);
+    assert!(parked_ids(&events).is_empty());
+}
+
 #[tokio::test]
 async fn deny_path_records_denied_tool_message_and_continues() {
     let client = ScriptedClient::new(vec![
