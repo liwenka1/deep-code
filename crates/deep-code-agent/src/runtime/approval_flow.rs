@@ -177,7 +177,7 @@ impl AgentRuntime {
         if self.client.provider_name() == crate::echo_client::EchoClient::PROVIDER {
             return false;
         }
-        let action = crate::approval_classifier::action_summary(&call.arguments);
+        let action = crate::approval_classifier::action_summary(&call.name, &call.arguments);
         let input = crate::approval_classifier::ClassifierInput {
             tool_name: &call.name,
             action: &action,

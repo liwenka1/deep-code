@@ -224,13 +224,28 @@ fn json_object_spans(text: &str) -> Vec<&str> {
 }
 
 /// The human-meaningful action behind a gated call — the command, path, url, …
-/// — instead of the whole JSON blob. Keeps the classifier prompt focused and
-/// content-light.
+/// — instead of the whole JSON blob, collapsed onto one line. The one
+/// key-precedence table for both readers of a gated call: the approval panel's
+/// action line and this classifier's prompt (which wants it focused and
+/// content-light). Two copies had already drifted apart once.
+///
+/// `tool_name` decides which key may occupy the line, rather than letting the
+/// first familiar key win for every tool. It matters for `request_write_root`,
+/// whose subject is unambiguously `path`: the generic scan ranks `command`
+/// ahead of `path`, so an extra key would put attacker-chosen text on the
+/// action line of a boundary prompt while the grant landed on `path`. The
+/// runtime refuses such an argument set before anyone sees it; pinning the key
+/// here means neither reader depends on that refusal to show the right subject.
 #[must_use]
-pub fn action_summary(arguments: &Value) -> String {
+pub fn action_summary(tool_name: &str, arguments: &Value) -> String {
+    let keys: &[&str] = if tool_name == crate::root_grant::REQUEST_WRITE_ROOT_TOOL {
+        &["path"]
+    } else {
+        &["command", "path", "file_path", "url", "pattern", "query"]
+    };
     if let Some(object) = arguments.as_object() {
-        for key in ["command", "path", "file_path", "url", "pattern", "query"] {
-            if let Some(text) = object.get(key).and_then(Value::as_str) {
+        for key in keys {
+            if let Some(text) = object.get(*key).and_then(Value::as_str) {
                 return text.split_whitespace().collect::<Vec<_>>().join(" ");
             }
         }
@@ -280,12 +295,33 @@ mod tests {
     #[test]
     fn action_summary_prefers_meaningful_fields() {
         assert_eq!(
-            action_summary(&serde_json::json!({"command": "cargo  test"})),
+            action_summary("shell", &serde_json::json!({"command": "cargo  test"})),
             "cargo test"
         );
         assert_eq!(
-            action_summary(&serde_json::json!({"path": "src/x.rs", "content": "…"})),
+            action_summary(
+                "write_file",
+                &serde_json::json!({"path": "src/x.rs", "content": "…"})
+            ),
             "src/x.rs"
         );
+    }
+
+    /// A write-root request's action is its `path` and nothing else. The
+    /// generic key scan ranks `command` first, so without the tool-specific
+    /// list a decoy key would put text of the model's choosing on the action
+    /// line of a boundary prompt while the grant landed on `path`.
+    #[test]
+    fn action_summary_for_a_root_grant_ignores_a_decoy_command_key() {
+        let decoy = serde_json::json!({
+            "path": "/home/u/.deep-code",
+            "command": "cat CHANGELOG.md"
+        });
+        assert_eq!(
+            action_summary(crate::root_grant::REQUEST_WRITE_ROOT_TOOL, &decoy),
+            "/home/u/.deep-code"
+        );
+        // Same payload under any other tool keeps the generic precedence.
+        assert_eq!(action_summary("shell", &decoy), "cat CHANGELOG.md");
     }
 }

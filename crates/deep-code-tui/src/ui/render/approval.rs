@@ -22,29 +22,17 @@ pub(super) fn risk_display(risk: RiskLevel, lang: Lang) -> (&'static str, Color)
 /// The human-meaningful action behind a tool call — the shell command, the file
 /// path, etc. — instead of the raw JSON blob. Falls back to compact arguments.
 ///
-/// `tool_name` decides which key may occupy the line, rather than letting the
-/// first familiar key win for every tool. It matters for
-/// `request_write_root`, whose subject is unambiguously `path`: the generic
-/// scan puts `command` ahead of `path`, so an extra key would render
-/// attacker-chosen text on the action line of a boundary prompt. The runtime
-/// now refuses such an argument set outright, and pinning the key here means
-/// the panel does not depend on that refusal to show the right subject.
+/// The key that may occupy the line — `command`, `path`, … in that order, and
+/// `path` alone for `request_write_root` — is decided by the agent's
+/// [`deep_code_agent::action_summary`], the same table the auto-mode judge
+/// reads a gated call through, so the panel and the judge can never describe
+/// one call two ways. Arguments that are not JSON at all are shown as they
+/// are, collapsed onto one line.
 pub(super) fn extract_action(tool_name: &str, arguments_json: &str) -> String {
-    let keys: &[&str] = if tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL {
-        &["path"]
-    } else {
-        &["command", "path", "file_path", "url", "pattern", "query"]
-    };
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments_json)
-        && let Some(object) = value.as_object()
-    {
-        for key in keys {
-            if let Some(text) = object.get(*key).and_then(serde_json::Value::as_str) {
-                return crate::history::collapse_whitespace(text);
-            }
-        }
+    match serde_json::from_str::<serde_json::Value>(arguments_json) {
+        Ok(value) => deep_code_agent::action_summary(tool_name, &value),
+        Err(_) => crate::history::collapse_whitespace(arguments_json),
     }
-    crate::history::collapse_whitespace(arguments_json)
 }
 
 /// Model-influenced text about to become an approval panel line: control
