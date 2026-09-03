@@ -170,6 +170,7 @@ pub fn launch_runtime(
     }
 
     let prompt = runtime_system_prompt(&roots);
+    let ui_lang = SharedLang::new(Lang::from_env(&config.language));
     if config.api_key.is_some()
         && let Ok(client) = DeepSeekClient::new(config.clone())
     {
@@ -180,11 +181,10 @@ pub fn launch_runtime(
             roots,
             &prompt,
             &parent_cancel,
-            SharedLang::new(Lang::from_env(&config.language)),
+            ui_lang,
         );
     }
 
-    let ui_lang = SharedLang::new(Lang::from_env(&config.language));
     launch_fresh(
         EchoClient::new(ui_lang.clone()),
         "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string(),
@@ -208,7 +208,6 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
     ui_lang: SharedLang,
 ) -> LaunchedRuntime {
     let mut warnings = Vec::new();
-    let client = Arc::new(client);
     // Decide persistence before assembling tools: the fallback path must not
     // rebuild (and silently drop) a full extensions set, and the failure
     // reason must reach the user instead of being swallowed.
@@ -221,6 +220,63 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
             None
         }
     };
+    assemble_launch(
+        client,
+        LaunchParts {
+            backend_label,
+            roots,
+            warnings,
+            ui_lang,
+        },
+        config,
+        parent_cancel,
+        |client, tools| match persisted {
+            Some((store, record)) => {
+                let session_id = record.id.as_str().to_string();
+                (
+                    AgentRuntime::from_session_record(client, tools, record, store, config.clone()),
+                    Some(session_id),
+                )
+            }
+            None => (
+                AgentRuntime::with_system_prompt(client, tools, prompt, config.clone(), false),
+                None,
+            ),
+        },
+    )
+}
+
+/// What a launch has settled before the shared assembly runs: the label the UI
+/// shows for the backend, the roots the tools are fenced to, the warnings
+/// collected so far, and the language handle.
+struct LaunchParts {
+    backend_label: String,
+    roots: WorkspaceRoots,
+    warnings: Vec<String>,
+    ui_lang: SharedLang,
+}
+
+/// The tail every launch shares once its client and parts are settled: build
+/// the parent tools around the client, hand them to `make_runtime` — the one
+/// step that differs (a fresh launch chooses between a persisted record and an
+/// in-memory prompt; a resume always has its record) — then attach the
+/// workspace helpers and package the `LaunchedRuntime`. One body, so no arm
+/// can forget a `.with_ui_lang` or derive `offline` differently: the
+/// fresh and resumed paths used to spell these thirty lines twice.
+fn assemble_launch<C: LlmClient + Clone + 'static>(
+    client: C,
+    parts: LaunchParts,
+    config: &AgentConfig,
+    parent_cancel: &CancellationToken,
+    make_runtime: impl FnOnce(C, ToolRegistry) -> (AgentRuntime, Option<String>),
+) -> LaunchedRuntime {
+    let LaunchParts {
+        backend_label,
+        roots,
+        mut warnings,
+        ui_lang,
+    } = parts;
+    let client = Arc::new(client);
     let ParentTools {
         registry: tools,
         subagent_manager,
@@ -235,31 +291,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
         &mut warnings,
         &ui_lang,
     );
-    let (runtime, session_id) = match persisted {
-        Some((store, record)) => {
-            let session_id = record.id.as_str().to_string();
-            (
-                AgentRuntime::from_session_record(
-                    (*client).clone(),
-                    tools,
-                    record,
-                    store,
-                    config.clone(),
-                ),
-                Some(session_id),
-            )
-        }
-        None => (
-            AgentRuntime::with_system_prompt(
-                (*client).clone(),
-                tools,
-                prompt,
-                config.clone(),
-                false,
-            ),
-            None,
-        ),
-    };
+    let (runtime, session_id) = make_runtime((*client).clone(), tools);
     let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
     let runtime = attach_workspace_helpers(runtime, &roots.primary, config, &mut warnings)
         .with_boundary(boundary)
@@ -303,11 +335,11 @@ struct ResumedSession {
     warnings: Vec<String>,
 }
 
-/// The shared tail of a resumed launch, for either client backend: build the
-/// parent tools, rebuild the runtime from the record, attach the workspace
-/// helpers, and assemble the `LaunchedRuntime`. The two arms of `launch_resumed`
-/// (DeepSeek and echo) differed only in the client, the label, and a hardcoded
-/// `offline` bool — now derived from the client — so they share this.
+/// The resumed launch for either client backend: rebuild the runtime from the
+/// vetted record, then the assembly every launch shares ([`assemble_launch`]).
+/// The two arms of `launch_resumed` (DeepSeek and echo) differ only in the
+/// client and the label — `offline` is derived from the client — so they meet
+/// here, and this in turn meets `launch_fresh` in the shared tail.
 fn finish_resumed_launch<C: LlmClient + Clone + 'static>(
     client: C,
     backend_label: String,
@@ -320,46 +352,26 @@ fn finish_resumed_launch<C: LlmClient + Clone + 'static>(
         record,
         store,
         roots,
-        mut warnings,
-    } = session;
-    let client = Arc::new(client);
-    let session_id = record.id.as_str().to_string();
-    let ParentTools {
-        registry: tools,
-        subagent_manager,
-        job_store,
-        shutdown,
-        boundary,
-    } = build_parent_tools(
-        Arc::clone(&client),
-        config,
-        &roots,
-        parent_cancel,
-        &mut warnings,
-        &ui_lang,
-    );
-    let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
-    let runtime = attach_workspace_helpers(
-        AgentRuntime::from_session_record((*client).clone(), tools, record, store, config.clone()),
-        &roots.primary,
-        config,
-        &mut warnings,
-    )
-    .with_boundary(boundary)
-    .with_permission_mode(permission_mode.clone())
-    .with_ui_lang(ui_lang);
-    LaunchedRuntime {
-        handle: Arc::new(runtime),
-        backend_label,
-        session_id: Some(session_id),
-        subagent_manager,
-        job_store,
-        stop_hook: shutdown,
-        offline: client.provider_name() == EchoClient::PROVIDER,
         warnings,
-        permission_mode,
-        extra_roots: roots.extras,
-    }
+    } = session;
+    assemble_launch(
+        client,
+        LaunchParts {
+            backend_label,
+            roots,
+            warnings,
+            ui_lang,
+        },
+        config,
+        parent_cancel,
+        |client, tools| {
+            let session_id = record.id.as_str().to_string();
+            (
+                AgentRuntime::from_session_record(client, tools, record, store, config.clone()),
+                Some(session_id),
+            )
+        },
+    )
 }
 
 fn launch_resumed(
