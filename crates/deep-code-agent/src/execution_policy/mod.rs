@@ -16,7 +16,11 @@
 //!    For `shell` and `job action=start` its first step is the **deny floor**,
 //!    `shell_deny::builtin_deny` (via `shell_lex` parsing): a catastrophic shape
 //!    gets a `Deny` verdict before any trust rule is consulted, so nothing can
-//!    allow-list past it. Cannot be disabled by configuration.
+//!    allow-list past it. Cannot be disabled by configuration. The plan's one
+//!    *configuration-driven* `Deny` sits right after it: a `network: true`
+//!    declaration (shell, `job start`, or a sub-agent dispatch) under
+//!    `[sandbox] network = "never"` is refused outright rather than run
+//!    offline to fail.
 //! 2. **Yolo egress overlay** — `runtime::tool_result::yolo_ambient_network`.
 //!    The one post-hoc edit to the plan: under `Yolo`, ambient network rides a
 //!    sandboxed plan. It never touches the verdict. (`[sandbox] network =
@@ -33,7 +37,10 @@
 //!    policy.
 //! 4. **Standing consent** — `runtime::approval_flow` (config `auto_allow` +
 //!    session "approve for the session", matched by command identity via
-//!    [`command_shape`]).
+//!    [`command_shape`]). One exclusion sits *above* both consents:
+//!    `request_write_root` is never covered by `auto_allow` or session memory
+//!    (`auto_approval_granted` refuses it before consulting either), so no
+//!    standing consent can pre-approve a boundary widening.
 //! 5. **Permission mode** — `runtime::approval_flow`, keyed on
 //!    [`PermissionMode`]: `Default` asks, `AcceptEdits` waves through in-workspace
 //!    edits ([`accept_edits_approvable`]), `Auto` inherits that AcceptEdits
@@ -41,7 +48,8 @@
 //!    all but a root grant.
 //! 6. **Auto judge** — the cheap classifier. It only ever sees a call that has
 //!    already cleared three gates it cannot override: a root grant
-//!    (`request_write_root`) asks a human in every mode, egress (a network-native
+//!    (`request_write_root`) is never auto-approved in any mode — it asks a
+//!    human, or is refused before the prompt (below), egress (a network-native
 //!    tool or a declared `network`) is decided before the judge is consulted, and
 //!    the top risk tier never reaches it: a High-tier call asks unless the
 //!    inherited AcceptEdits allowance already covers it (an untrusted `mkdir
@@ -55,6 +63,14 @@
 //! may still be auto-approved by stage 4, 5 or 6 — never tighten an `Allow`.
 //! Reading one stage in isolation is therefore misleading: follow the whole
 //! chain.
+//!
+//! The one automatic refusal outside stage 1 is not a policy verdict at all:
+//! when a `request_write_root` is about to be parked, the runtime resolves its
+//! target once (`root_grant_prompt_target` in `runtime::approval_flow`) and
+//! bounces an unresolvable or categorically refused one — the filesystem root,
+//! the home directory, a credential store, a non-directory — straight back to
+//! the model without prompting, because no human answer could make that grant
+//! performable.
 
 pub mod command_shape;
 mod engine;
