@@ -8,11 +8,11 @@ use deep_code_agent::i18n::TextId;
 impl App {
     pub(crate) fn apply_runtime_event(&mut self, event: RuntimeEvent) {
         match event {
-            RuntimeEvent::TurnStarted { turn_id, .. } => {
+            RuntimeEvent::TurnStarted { .. } => {
                 // Never drop a predecessor that streamed content but missed
                 // its terminal event — flush it into history first.
                 self.flush_active_turn();
-                self.active_turn = Some(ActiveTurn::new(turn_id));
+                self.active_turn = Some(ActiveTurn::default());
                 self.status = self.tr_with(
                     TextId::StatusStreamingFrom,
                     &[("backend", &self.backend_label)],
@@ -235,7 +235,7 @@ impl App {
         if let Some(active) = self.active_turn.as_mut() {
             active.push_assistant_delta(text);
         } else {
-            let mut active = ActiveTurn::new(Default::default());
+            let mut active = ActiveTurn::default();
             active.push_assistant_delta(text);
             self.active_turn = Some(active);
         }
@@ -245,7 +245,7 @@ impl App {
         if let Some(active) = self.active_turn.as_mut() {
             active.push_reasoning_delta(text);
         } else {
-            let mut active = ActiveTurn::new(Default::default());
+            let mut active = ActiveTurn::default();
             active.push_reasoning_delta(text);
             self.active_turn = Some(active);
         }
@@ -255,7 +255,7 @@ impl App {
         if let Some(active) = self.active_turn.as_mut() {
             active.upsert_tool(cell);
         } else {
-            let mut active = ActiveTurn::new(Default::default());
+            let mut active = ActiveTurn::default();
             active.upsert_tool(cell);
             self.active_turn = Some(active);
         }
@@ -273,7 +273,7 @@ impl App {
         if let Some(active) = self.active_turn.as_mut() {
             active.append_tool_arguments(tool_call_id, delta);
         } else {
-            let mut active = ActiveTurn::new(Default::default());
+            let mut active = ActiveTurn::default();
             active.append_tool_arguments(tool_call_id, delta);
             self.active_turn = Some(active);
         }
@@ -284,7 +284,7 @@ impl App {
             active.mark_approval_required(&request);
             active.pending_approval = Some(request);
         } else {
-            let mut active = ActiveTurn::new(Default::default());
+            let mut active = ActiveTurn::default();
             active.mark_approval_required(&request);
             active.pending_approval = Some(request);
             self.active_turn = Some(active);
@@ -301,7 +301,6 @@ impl App {
     fn push_tool_result_cell(&mut self, result: &deep_code_agent::ToolResult) {
         // Exactly one ToolCallFinished per tool call — no dedup needed.
         self.history.push(HistoryCell::ToolResult {
-            tool_name: result.tool_name.clone(),
             status: result.status,
             summary: summarize_tool_result(&result.content),
         });

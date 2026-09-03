@@ -106,13 +106,8 @@ fn hydrate_history_keeps_assistant_tool_calls_and_results() {
     // Success fallback.
     assert!(matches!(
         &cells[2],
-        HistoryCell::ToolResult {
-            tool_name,
-            status,
-            summary,
-        } if tool_name == "mock_echo"
-            && *status == ToolResultStatus::Denied
-            && summary.contains("mock_echo")
+        HistoryCell::ToolResult { status, summary }
+            if *status == ToolResultStatus::Denied && summary.contains("mock_echo")
     ));
     assert!(cells.iter().any(|cell| matches!(
         cell,
@@ -219,7 +214,6 @@ fn tool_call_renders_compact_single_line() {
 #[test]
 fn tool_result_renders_compact_single_line() {
     let result = HistoryCell::ToolResult {
-        tool_name: "shell".to_string(),
         status: ToolResultStatus::Success,
         summary: "ok\nmulti\nline".to_string(),
     };

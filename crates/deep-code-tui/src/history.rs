@@ -83,8 +83,9 @@ pub enum HistoryCell {
         /// all look identically frozen.
         running_for_secs: Option<u64>,
     },
+    /// The result line renders status and summary only; the tool's name is on
+    /// the `ToolCall` cell directly above it, so it is not carried twice.
     ToolResult {
-        tool_name: String,
         status: ToolResultStatus,
         summary: String,
     },
@@ -228,7 +229,6 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
                     // the call only — no fabricated result line.
                     if let Some(result) = &exchange.result {
                         current_turn.push(HistoryCell::ToolResult {
-                            tool_name: exchange.call.function.name.clone(),
                             status: result.status,
                             summary: summarize_tool_result(&result.content),
                         });

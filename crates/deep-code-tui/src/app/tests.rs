@@ -1014,13 +1014,13 @@ fn streaming_activity_shows_only_while_streaming() {
 #[test]
 fn streaming_activity_names_the_running_tool() {
     use crate::active_turn::{ActiveToolCell, ActiveTurn, LiveOutput};
-    use deep_code_agent::{ToolCallId, TurnId};
+    use deep_code_agent::ToolCallId;
 
     let mut app = App::new();
     app.is_streaming = true;
     app.streaming_since = Some(std::time::Instant::now());
 
-    let mut turn = ActiveTurn::new(TurnId("turn_1".to_string()));
+    let mut turn = ActiveTurn::default();
     turn.upsert_tool(ActiveToolCell {
         tool_call_id: ToolCallId("call_1".to_string()),
         tool_name: "agent".to_string(),

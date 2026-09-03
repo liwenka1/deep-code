@@ -1,4 +1,4 @@
-use deep_code_agent::{ApprovalRequest, ToolCallId, TurnId};
+use deep_code_agent::{ApprovalRequest, ToolCallId};
 
 use crate::history::{HistoryCell, ToolApprovalState};
 
@@ -47,9 +47,12 @@ pub struct ActiveToolCell {
     pub started_at: std::time::Instant,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// The turn currently streaming. It carries no turn id: the TUI shows one
+/// turn at a time and attributes every event to it, so nothing ever reads the
+/// id back — a turn that arrives without a `TurnStarted` (a late delta, an
+/// approval) is started the same way as one that does.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ActiveTurn {
-    pub turn_id: TurnId,
     pub assistant_buffer: String,
     pub reasoning_buffer: String,
     pub tools: Vec<ActiveToolCell>,
@@ -58,18 +61,6 @@ pub struct ActiveTurn {
 }
 
 impl ActiveTurn {
-    #[must_use]
-    pub fn new(turn_id: TurnId) -> Self {
-        Self {
-            turn_id,
-            assistant_buffer: String::new(),
-            reasoning_buffer: String::new(),
-            tools: Vec::new(),
-            diagnostics: Vec::new(),
-            pending_approval: None,
-        }
-    }
-
     pub fn push_assistant_delta(&mut self, text: &str) {
         self.assistant_buffer.push_str(text);
     }
@@ -244,7 +235,7 @@ mod tests {
 
     #[test]
     fn preview_cells_exposes_streaming_reasoning_assistant_and_tool() {
-        let mut turn = ActiveTurn::new(TurnId("turn_1".to_string()));
+        let mut turn = ActiveTurn::default();
         turn.push_reasoning_delta("thinking");
         turn.push_assistant_delta("answer");
         turn.upsert_tool(ActiveToolCell {
@@ -267,7 +258,7 @@ mod tests {
 
     #[test]
     fn streamed_tool_output_previews_tail_and_never_reaches_history() {
-        let mut turn = ActiveTurn::new(TurnId("turn_1".to_string()));
+        let mut turn = ActiveTurn::default();
         let id = ToolCallId("call_1".to_string());
         turn.upsert_tool(ActiveToolCell {
             tool_call_id: id.clone(),

@@ -1146,8 +1146,7 @@ fn every_status_row_branch_neutralizes_a_model_supplied_tool_name() {
         if branch == "streaming_activity" {
             app.is_streaming = true;
             app.streaming_since = Some(std::time::Instant::now());
-            let mut turn =
-                crate::active_turn::ActiveTurn::new(deep_code_agent::TurnId("turn_1".to_string()));
+            let mut turn = crate::active_turn::ActiveTurn::default();
             turn.upsert_tool(crate::active_turn::ActiveToolCell {
                 tool_call_id: deep_code_agent::ToolCallId("call_1".to_string()),
                 tool_name: HOSTILE.to_string(),
