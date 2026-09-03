@@ -72,19 +72,12 @@ pub(super) enum RootGrantPrompt {
 /// different keys, so a chained or sibling subcommand can't ride a prior
 /// consent past the gate.
 pub(super) fn session_shell_prefix(call: &ToolCall) -> Option<String> {
-    // Only command-bearing calls (`shell`, or `job action=start`) record a
-    // trusted prefix; status/tail/cancel must not. `ToolCall::shell_command` is
-    // the single home for that rule.
-    let command = call.shell_command()?.trim();
-    if command.is_empty() || command.contains(['&', '|', ';', '\n', '`', '<', '>', '(', ')', '$']) {
-        return None;
-    }
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    if tokens.first().is_some_and(|token| token.contains('=')) {
-        return None; // leading `FOO=bar` env assignment, not a plain program
-    }
-    let canonical = command_shape::identity(&tokens);
-    (!canonical.is_empty()).then_some(canonical)
+    // Two rules, each with one home: `ToolCall::shell_command` says which calls
+    // carry a command at all (`shell`, or `job action=start` — status/tail/
+    // cancel must never record a prefix), and `command_shape::session_identity`
+    // says what counts as one simple command, read through the same lexer as
+    // the trust gate and the deny floor.
+    command_shape::session_identity(call.shell_command()?)
 }
 
 impl AgentRuntime {

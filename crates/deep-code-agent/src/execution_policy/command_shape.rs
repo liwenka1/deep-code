@@ -284,6 +284,40 @@ pub fn rule_covers(rule: &str, command: &str) -> bool {
         || (command.starts_with(&rule) && command.as_bytes().get(rule.len()) == Some(&b' '))
 }
 
+/// The session-consent key of a shell command: its [`identity`], but only when
+/// the command is *one simple command* — a single segment (no `;`, `&&`, `||`,
+/// `|`, newline), no redirection/substitution/expansion, no subshell parens —
+/// that does not open with an environment assignment. `None` otherwise, so a
+/// compound or indirect command can neither match nor record a standing shell
+/// consent: `cargo test && rm -rf /` must not ride a remembered `cargo test`.
+///
+/// "One simple command" is read through the same lexer the trust gate and the
+/// deny floor use ([`super::shell_lex`]), so the three sides of the gate agree
+/// on what a segment and an indirection are instead of each spelling its own
+/// separator list.
+#[must_use]
+pub fn session_identity(command: &str) -> Option<String> {
+    let command = command.trim();
+    let segments = super::shell_lex::segments(command);
+    // Exactly one segment, and it must be the whole command: `a;` and `;a`
+    // also lex to one non-empty segment, and neither is a plain command.
+    if segments.len() != 1 || segments[0] != command {
+        return None;
+    }
+    if super::shell_lex::has_shell_indirection(command) || command.contains(['(', ')']) {
+        return None;
+    }
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    // Deliberately looser than the deny floor's env-assignment test: any `=`
+    // in the first word means "not a plain program word" here, and the only
+    // cost of over-refusing is a consent that goes unrecorded.
+    if tokens.first().is_some_and(|token| token.contains('=')) {
+        return None;
+    }
+    let canonical = identity(&tokens);
+    (!canonical.is_empty()).then_some(canonical)
+}
+
 /// A flag token without its `=value` suffix, lowercased. Shell quoting is
 /// stripped first (see [`redirects_execution`]) so a rule spelling out a
 /// redirecting flag still matches its quoted command-line spelling.
@@ -321,6 +355,37 @@ mod tests {
 
     fn covers(rule: &str, command: &str) -> bool {
         rule_covers(rule, command)
+    }
+
+    /// The session key exists only for one simple command. A trailing or
+    /// leading separator lexes to a single non-empty segment, so the "whole
+    /// command is the segment" check — not the segment count — is what
+    /// refuses it; the separator, indirection and subshell cases are the
+    /// same shapes the trust gate refuses to auto-allow.
+    #[test]
+    fn session_identity_exists_only_for_one_simple_command() {
+        assert_eq!(
+            session_identity("  cargo test --all  "),
+            Some("cargo test".to_string())
+        );
+        assert_eq!(session_identity("ls -la"), Some("ls".to_string()));
+        for command in [
+            "",
+            "cargo test;",
+            ";cargo test",
+            "cargo test && rm -rf /",
+            "ls | grep foo",
+            "a\nb",
+            "echo `whoami`",
+            "echo $(id)",
+            "cat < file",
+            "echo x > y",
+            "(cd /tmp && ls)",
+            "FOO=bar cargo test",
+            "--flag",
+        ] {
+            assert_eq!(session_identity(command), None, "{command:?}");
+        }
     }
 
     #[test]
