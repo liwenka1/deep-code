@@ -25,8 +25,15 @@ pub enum PermissionMode {
     /// Auto-approve workspace file edits (and cc-style in-workspace fs commands);
     /// still prompt for shell/network/anything else.
     AcceptEdits,
-    /// A classifier model judges medium-risk gated calls (file writes, network);
-    /// high-risk calls such as shell always prompt. Unsure/hostile/error → prompt.
+    /// Everything `AcceptEdits` waves through, plus a cheap classifier model
+    /// judging the rest — behind three floors it cannot override: a root grant
+    /// and any egress (a declared `network: true`, or a network-native tool)
+    /// ask a human, and a High-tier call never reaches the judge — it asks,
+    /// unless the inherited `AcceptEdits` allowance already covers it (an
+    /// untrusted `mkdir src/x` is High by default and runs unasked here just
+    /// as it does there). Unsure/hostile/error → prompt. The order is drawn in
+    /// the `execution_policy` module docs and lives in
+    /// `runtime::approval_flow::auto_mode_approves`.
     Auto,
     /// Auto-approve everything that reaches the gate (hard denies still block).
     Yolo,
