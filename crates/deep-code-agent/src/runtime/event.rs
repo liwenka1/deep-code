@@ -184,9 +184,9 @@ impl RuntimeEvent {
     /// exists so a payload can round-trip back into this enum; the two spellings
     /// are deliberate and both owned here.
     ///
-    /// Stable wire contract: SSE/NDJSON consumers pin these via `.item.kind`
-    /// (see `deep-code-runtime`'s `events` module) — change a string only with
-    /// its consumers.
+    /// Stable wire contract: the SSE (`/v1/prompt`) and headless `stream-json`
+    /// consumers match on `item.kind`, and the test below pins every string —
+    /// change one only together with those consumers, as a deliberate red test.
     #[must_use]
     pub fn wire_kind(&self) -> &'static str {
         match self {
@@ -211,10 +211,251 @@ impl RuntimeEvent {
             Self::Error { .. } => "error",
         }
     }
+
+    /// The turn this event belongs to, for the wire envelope's `item.turn_id`.
+    /// `None` for session-level events (a save, a compaction, a checkpoint, a
+    /// warning) and for turn-scoped events whose turn was not known when they
+    /// were emitted. The second per-variant table of the envelope, kept beside
+    /// [`Self::wire_kind`] for the same reason: a new variant is placed here,
+    /// next to its definition, not in a match in the runtime crate.
+    #[must_use]
+    pub fn turn_id(&self) -> Option<&TurnId> {
+        match self {
+            Self::TurnStarted { turn_id, .. }
+            | Self::AssistantDelta { turn_id, .. }
+            | Self::ReasoningDelta { turn_id, .. }
+            | Self::ToolCallStarted { turn_id, .. }
+            | Self::ToolCallUpdated { turn_id, .. }
+            | Self::TurnFinished { turn_id, .. }
+            | Self::TurnCancelled { turn_id } => Some(turn_id),
+            Self::ApprovalRequired { turn_id, .. }
+            | Self::ApprovalResolved { turn_id, .. }
+            | Self::ToolCallProgress { turn_id, .. }
+            | Self::ToolCallFinished { turn_id, .. }
+            | Self::RootGranted { turn_id, .. }
+            | Self::Error { turn_id, .. } => turn_id.as_ref(),
+            Self::SessionUpdated { .. }
+            | Self::CompactionApplied { .. }
+            | Self::CheckpointCreated { .. }
+            | Self::WorkspaceRestored { .. }
+            | Self::DiagnosticsUpdated { .. }
+            | Self::Warning { .. } => None,
+        }
+    }
 }
 
 pub type RuntimeEventReceiver = mpsc::UnboundedReceiver<RuntimeEvent>;
 
 pub(super) fn emit(tx: &mpsc::UnboundedSender<RuntimeEvent>, event: RuntimeEvent) {
     let _ = tx.send(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution_policy::RiskLevel;
+    use crate::tool::{ApprovalDecision, ApprovalRequest, ToolResult};
+
+    /// Every variant's `item.kind` and `item.turn_id`, pinned one by one. The
+    /// envelope consumers match on these strings, so a rename must show up as
+    /// a red test here rather than as a silent wire change; before this table
+    /// only three of the nineteen kinds were asserted anywhere. The exhaustive
+    /// `match` in `wire_kind` already forces a string for a new variant — the
+    /// length check below is the nudge to pin it here too.
+    #[test]
+    fn wire_kind_and_turn_id_are_pinned_for_every_variant() {
+        let turn = TurnId("turn_1".to_string());
+        let call = ToolCallId("call_1".to_string());
+        let request = ApprovalRequest {
+            network: false,
+            call_id: "call_1".to_string(),
+            tool_name: "shell".to_string(),
+            description: "run cargo test".to_string(),
+            arguments: serde_json::json!({ "command": "cargo test" }),
+            risk_level: RiskLevel::High,
+            requires_sandbox: true,
+            read_only: false,
+            matched_rule: None,
+            justification: None,
+            resolved_target: None,
+            preview: None,
+            safety_notes: Vec::new(),
+        };
+        let result = ToolResult::success("call_1", "shell", "ok");
+        let some_turn = Some(&turn);
+        let cases: Vec<(RuntimeEvent, &str, Option<&TurnId>)> = vec![
+            (
+                RuntimeEvent::TurnStarted {
+                    turn_id: turn.clone(),
+                    prompt: "hi".to_string(),
+                },
+                "turn.started",
+                some_turn,
+            ),
+            (
+                RuntimeEvent::AssistantDelta {
+                    turn_id: turn.clone(),
+                    text: "a".to_string(),
+                },
+                "assistant.delta",
+                some_turn,
+            ),
+            (
+                RuntimeEvent::ReasoningDelta {
+                    turn_id: turn.clone(),
+                    text: "r".to_string(),
+                },
+                "reasoning.delta",
+                some_turn,
+            ),
+            (
+                RuntimeEvent::ToolCallStarted {
+                    turn_id: turn.clone(),
+                    tool_call_id: call.clone(),
+                    tool_name: "shell".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+                "tool.started",
+                some_turn,
+            ),
+            (
+                RuntimeEvent::ToolCallUpdated {
+                    turn_id: turn.clone(),
+                    tool_call_id: call.clone(),
+                    arguments_delta: None,
+                },
+                "tool.updated",
+                some_turn,
+            ),
+            (
+                RuntimeEvent::ToolCallProgress {
+                    turn_id: Some(turn.clone()),
+                    tool_call_id: call.clone(),
+                    tool_name: "shell".to_string(),
+                    update: ToolUpdate {
+                        text: "…".to_string(),
+                        details: None,
+                    },
+                },
+                "tool.progress",
+                some_turn,
+            ),
+            (
+                RuntimeEvent::ApprovalRequired {
+                    turn_id: None,
+                    tool_call_id: Some(call.clone()),
+                    request: request.clone(),
+                },
+                "approval.required",
+                None,
+            ),
+            (
+                RuntimeEvent::ApprovalResolved {
+                    turn_id: Some(turn.clone()),
+                    tool_call_id: call.clone(),
+                    decision: ApprovalDecision::Approved,
+                },
+                "approval.resolved",
+                some_turn,
+            ),
+            (
+                RuntimeEvent::ToolCallFinished {
+                    turn_id: Some(turn.clone()),
+                    tool_call_id: call.clone(),
+                    result,
+                },
+                "tool.finished",
+                some_turn,
+            ),
+            (
+                RuntimeEvent::RootGranted {
+                    turn_id: None,
+                    path: "/tmp/x".to_string(),
+                },
+                "root.granted",
+                None,
+            ),
+            (
+                RuntimeEvent::SessionUpdated {
+                    session_id: Some(SessionId("s1".to_string())),
+                    current_turn_id: Some(turn.clone()),
+                    message_count: 1,
+                    turn_count: 1,
+                    summary: None,
+                    compaction: None,
+                    save_error: None,
+                    updated_at_ms: 0,
+                },
+                "session.updated",
+                None,
+            ),
+            (
+                RuntimeEvent::TurnFinished {
+                    turn_id: turn.clone(),
+                    usage: Some(Usage::default()),
+                    telemetry: None,
+                },
+                "turn.completed",
+                some_turn,
+            ),
+            (
+                RuntimeEvent::TurnCancelled {
+                    turn_id: turn.clone(),
+                },
+                "turn.cancelled",
+                some_turn,
+            ),
+            (
+                RuntimeEvent::CheckpointCreated {
+                    id: CheckpointId("c1".to_string()),
+                    label: "before turn".to_string(),
+                },
+                "checkpoint.created",
+                None,
+            ),
+            (
+                RuntimeEvent::WorkspaceRestored {
+                    id: CheckpointId("c1".to_string()),
+                },
+                "workspace.restored",
+                None,
+            ),
+            (
+                RuntimeEvent::DiagnosticsUpdated {
+                    summary: "1 error".to_string(),
+                    rendered: "E0308".to_string(),
+                },
+                "diagnostics.updated",
+                None,
+            ),
+            (
+                RuntimeEvent::CompactionApplied {
+                    archived_count: 2,
+                    summary: "…".to_string(),
+                },
+                "compaction.applied",
+                None,
+            ),
+            (
+                RuntimeEvent::Warning {
+                    message: "w".to_string(),
+                },
+                "warning",
+                None,
+            ),
+            (
+                RuntimeEvent::Error {
+                    turn_id: Some(turn.clone()),
+                    message: "e".to_string(),
+                },
+                "error",
+                some_turn,
+            ),
+        ];
+        assert_eq!(cases.len(), 19, "a new variant must be pinned here too");
+        for (event, kind, turn_id) in &cases {
+            assert_eq!(event.wire_kind(), *kind, "{event:?}");
+            assert_eq!(event.turn_id(), *turn_id, "{event:?}");
+        }
+    }
 }

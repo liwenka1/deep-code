@@ -1,9 +1,13 @@
 //! SSE envelope construction for `/v1/prompt`.
 //!
 //! The wire shape (`RuntimeEnvelope` → `RuntimeItem` → kind/payload) is a
-//! stable contract: CI consumers extract text with jq paths like
-//! `.item.kind` / `.item.payload.text`. Change it only together with those
-//! consumers (`.github/workflows/deepcode-bot.yml`).
+//! stable contract: consumers match on `.item.kind` and read
+//! `.item.payload.*` with jq-style paths. Both per-variant tables — the kind
+//! string and the turn id — live on `RuntimeEvent` itself (`wire_kind`,
+//! `turn_id`), next to the variants, and every kind is pinned by a test there;
+//! change one only together with its consumers. (The repository's own CI bot
+//! is not one of them: it runs `--output-format json` and reads the final
+//! report, not this stream.)
 //!
 //! The headless CLI (`deep-code -p --output-format stream-json`) emits the
 //! same envelopes as NDJSON, one per line — deliberately, so a consumer's jq
@@ -52,7 +56,7 @@ impl EnvelopeStream {
     pub fn event(&mut self, event: &RuntimeEvent) -> RuntimeEnvelope {
         self.wrap(
             event.wire_kind().to_string(),
-            event_turn_id(event),
+            event.turn_id().cloned(),
             event_payload(event),
         )
     }
@@ -84,28 +88,4 @@ impl EnvelopeStream {
 #[must_use]
 pub fn event_payload(event: &RuntimeEvent) -> Value {
     serde_json::to_value(event).unwrap_or_else(|_| serde_json::json!({}))
-}
-
-fn event_turn_id(event: &RuntimeEvent) -> Option<TurnId> {
-    match event {
-        RuntimeEvent::TurnStarted { turn_id, .. }
-        | RuntimeEvent::AssistantDelta { turn_id, .. }
-        | RuntimeEvent::ReasoningDelta { turn_id, .. }
-        | RuntimeEvent::ToolCallStarted { turn_id, .. }
-        | RuntimeEvent::ToolCallUpdated { turn_id, .. }
-        | RuntimeEvent::TurnFinished { turn_id, .. }
-        | RuntimeEvent::TurnCancelled { turn_id } => Some(turn_id.clone()),
-        RuntimeEvent::ApprovalRequired { turn_id, .. }
-        | RuntimeEvent::ApprovalResolved { turn_id, .. }
-        | RuntimeEvent::ToolCallProgress { turn_id, .. }
-        | RuntimeEvent::ToolCallFinished { turn_id, .. }
-        | RuntimeEvent::RootGranted { turn_id, .. }
-        | RuntimeEvent::Error { turn_id, .. } => turn_id.clone(),
-        RuntimeEvent::SessionUpdated { .. }
-        | RuntimeEvent::CompactionApplied { .. }
-        | RuntimeEvent::CheckpointCreated { .. }
-        | RuntimeEvent::WorkspaceRestored { .. }
-        | RuntimeEvent::DiagnosticsUpdated { .. }
-        | RuntimeEvent::Warning { .. } => None,
-    }
 }
