@@ -738,3 +738,23 @@ fn granted_runs_and_plain_write_denials_keep_the_write_note() {
     assert!(rendered.contains(crate::sandbox::WRITE_DENIAL_NOTE));
     assert!(!rendered.contains(crate::sandbox::NETWORK_DENIAL_NOTE));
 }
+
+/// `as_str` hand-spells what `#[serde(rename_all = "snake_case")]` derives;
+/// the two are the same word on the wire and in the model-facing text, so pin
+/// them together rather than trusting the duplication to stay in step.
+#[test]
+fn job_status_as_str_is_its_serde_spelling() {
+    for status in [
+        JobStatus::Running,
+        JobStatus::Completed,
+        JobStatus::Failed,
+        JobStatus::TimedOut,
+        JobStatus::Cancelled,
+    ] {
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::Value::String(status.as_str().to_string()),
+            "{status:?}"
+        );
+    }
+}

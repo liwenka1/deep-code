@@ -684,8 +684,22 @@ mod tests {
             "FOO=bar cargo test",
             "",
         ] {
+            let call = shell(command);
+            // Two rules can answer None; pin which one did. A `shell` call is
+            // always command-bearing, so the refusal must come from the
+            // identity rule — a refactor that moved it between the two homes
+            // (or dropped it from one) would fail here, not just the sum.
+            assert!(
+                call.shell_command().is_some(),
+                "{command:?} is command-bearing"
+            );
             assert_eq!(
-                session_shell_prefix(&shell(command)),
+                command_shape::session_identity(command),
+                None,
+                "the identity rule must refuse {command:?}"
+            );
+            assert_eq!(
+                session_shell_prefix(&call),
                 None,
                 "must not trust: {command:?}"
             );

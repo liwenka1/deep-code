@@ -106,3 +106,26 @@ impl fmt::Display for SubAgentError {
 }
 
 impl std::error::Error for SubAgentError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `as_str` hand-spells what `#[serde(rename_all = "snake_case")]`
+    /// derives; pin the two together so the duplication cannot drift.
+    #[test]
+    fn subagent_status_as_str_is_its_serde_spelling() {
+        for status in [
+            SubAgentStatus::Running,
+            SubAgentStatus::Completed,
+            SubAgentStatus::Failed,
+            SubAgentStatus::Cancelled,
+        ] {
+            assert_eq!(
+                serde_json::to_value(status).unwrap(),
+                serde_json::Value::String(status.as_str().to_string()),
+                "{status:?}"
+            );
+        }
+    }
+}
