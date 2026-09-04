@@ -39,9 +39,9 @@ pub(super) fn session_allowable(tool_name: &str) -> bool {
 }
 
 /// Whether answering "approve for the session" at this prompt would record
-/// anything at all: either the tool is [`session_allowable`] by name, or the
+/// anything at all: either the tool is `session_allowable` by name, or the
 /// call is one simple shell command whose identity can be remembered
-/// ([`session_shell_prefix`]). `false` means "a" would silently downgrade to a
+/// (`session_shell_prefix`). `false` means "a" would silently downgrade to a
 /// one-time approve — a UI reads this to offer only the options that mean
 /// what they say, and it is the same two rules the recording path applies, so
 /// the panel and the runtime cannot disagree about what "a" does.

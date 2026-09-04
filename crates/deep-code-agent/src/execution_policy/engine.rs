@@ -67,14 +67,19 @@ pub enum PolicyVerdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NetworkMode {
     /// Default: commands run without network unless the call declares
-    /// `network: true`, and a declaration always asks the human first
-    /// ("approve for session" is remembered per command identity).
+    /// `network: true`, and a declaration asks the human first unless a
+    /// standing consent (`auto_allow`, or a shell identity remembered by
+    /// "approve for session") or `Yolo` already covers the call.
     #[default]
     Prompt,
     /// Every sandboxed command gets network without asking (the old coupled
     /// behavior, as an explicit opt-in). Only the user/global layer may set it.
     Always,
-    /// Network-declaring commands are refused outright; nothing gets egress.
+    /// Network-declaring shell/job commands and networked sub-agent dispatches
+    /// are refused outright, and no sandboxed command gets ambient egress,
+    /// `Yolo` included. The in-process web tools (`fetch_url`/`web_search`) are
+    /// outside this setting's reach — they keep their own approval gate;
+    /// unmount them with `DEEP_CODE_DISABLE_WEB`.
     Never,
 }
 
@@ -579,9 +584,11 @@ pub fn shell_command_of<'a>(tool_name: &str, arguments: &'a Value) -> Option<&'a
 }
 
 /// Whether a gated call is auto-approvable under `AcceptEdits` mode: a workspace
-/// file-edit tool, or an in-workspace filesystem-mutation shell/job command
-/// (cc's `acceptEdits` behavior). Everything else still prompts. Hard denials
-/// never reach this — they short-circuit in the registry before any decision.
+/// file-edit tool, the dispatch of a writing sub-agent, or a filesystem-shaped
+/// shell/job command ([`shell_deny::is_workspace_fs_edit`]: program name only —
+/// the sandbox bounds the paths; cc's `acceptEdits` behavior). Everything else
+/// still prompts. Hard denials never reach this — they short-circuit in the
+/// registry before any decision.
 #[must_use]
 pub fn accept_edits_approvable(tool_name: &str, arguments: &Value) -> bool {
     // A network declaration is never covered by accept-edits: that mode's

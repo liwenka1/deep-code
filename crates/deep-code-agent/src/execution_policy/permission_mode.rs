@@ -1,8 +1,9 @@
 //! Session permission mode: how far the approval gate is relaxed.
 //!
 //! A mode only ever relaxes a `NeedsApproval` verdict into an auto-run. A hard
-//! `Deny` (rm -rf, fork bomb, `curl | sh`, …) is short-circuited in the policy
-//! engine before any decision is consulted, so no mode — not even `Yolo` —
+//! `Deny` (rm -rf, fork bomb, `curl | sh`, …) is short-circuited by the tool
+//! registry (`run_tool_call_with_plan`) before any decision is consulted, so no
+//! mode — not even `Yolo` —
 //! runs a command the deny list *recognized*. Be honest about what that
 //! buys: `shell_deny` is best-effort string parsing, not a security boundary.
 //! An obfuscation it fails to parse falls through as `NeedsApproval`, which
@@ -19,11 +20,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
-    /// Prompt on every gated call. The historical default.
+    /// Prompt on every gated call that no standing consent (`auto_allow`, a
+    /// session "a") already covers. The historical default.
     #[default]
     Default,
-    /// Auto-approve workspace file edits (and cc-style in-workspace fs commands);
-    /// still prompt for shell/network/anything else.
+    /// Auto-approve workspace file edits, the dispatch of a writing sub-agent
+    /// (its spawn is the write authorization) and filesystem-shaped shell/job
+    /// commands (`mkdir`/`touch`/`mv`/`cp`/`rm`/`rmdir` by program name — the
+    /// sandbox, not this check, bounds their paths; cc's `acceptEdits`); still
+    /// prompt for other shell commands, any network declaration, and
+    /// everything else.
     AcceptEdits,
     /// Everything `AcceptEdits` waves through, plus a cheap classifier model
     /// judging the rest — behind three floors it cannot override: a root grant
@@ -35,7 +41,8 @@ pub enum PermissionMode {
     /// the `execution_policy` module docs and lives in
     /// `runtime::approval_flow::auto_mode_approves`.
     Auto,
-    /// Auto-approve everything that reaches the gate (hard denies still block).
+    /// Auto-approve everything that reaches the gate except a root grant
+    /// (`request_write_root` asks in every mode); hard denies still block.
     Yolo,
 }
 

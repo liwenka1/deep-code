@@ -11,8 +11,10 @@
 //! this map is the one place that names the stages and where each lives:
 //!
 //! 1. **Plan** — [`ExecPolicy::evaluate_tool`] → [`ToolExecutionPlan`]. A pure,
-//!    stateless function of `(tool, args)`: the verdict, risk tier, sandbox and
-//!    trust-match. Knows nothing of the session, the mode, or standing consent.
+//!    stateless function of `(tool, args)` and the policy's own configuration
+//!    (trust list, sandbox flag, network mode): the verdict, risk tier, sandbox
+//!    and trust-match. Knows nothing of the session, the mode, or standing
+//!    consent.
 //!    For `shell` and `job action=start` its first step is the **deny floor**,
 //!    `shell_deny::builtin_deny` (via `shell_lex` parsing): a catastrophic shape
 //!    gets a `Deny` verdict before any trust rule is consulted, so nothing can
@@ -35,17 +37,23 @@
 //!    that declares it (the write tools, the root grant, the mock) already gets
 //!    a `NeedsApproval` plan, so that flag is belt-and-braces, not a second
 //!    policy.
-//! 4. **Standing consent** — `runtime::approval_flow` (config `auto_allow` +
-//!    session "approve for the session", matched by command identity via
-//!    [`command_shape`]). One exclusion sits *above* both consents:
+//! 4. **Standing consent** — `runtime::approval_flow`: config `auto_allow` (the
+//!    user's explicit list, matched on the exact tool name) and session
+//!    "approve for the session". Session memory is by tool name too, except for
+//!    shell, where it is remembered at command-identity granularity
+//!    ([`command_shape::session_identity`]); a job control action, a sub-agent
+//!    dispatch or a compound command records no session consent at all
+//!    (`session_consent_recordable`). One exclusion sits *above* both consents:
 //!    `request_write_root` is never covered by `auto_allow` or session memory
 //!    (`auto_approval_granted` refuses it before consulting either), so no
 //!    standing consent can pre-approve a boundary widening.
 //! 5. **Permission mode** — `runtime::approval_flow`, keyed on
-//!    [`PermissionMode`]: `Default` asks, `AcceptEdits` waves through in-workspace
-//!    edits ([`accept_edits_approvable`]), `Auto` inherits that AcceptEdits
-//!    allowance and consults the judge below for the rest, `Yolo` waves through
-//!    all but a root grant.
+//!    [`PermissionMode`]: `Default` asks, `AcceptEdits` waves through workspace
+//!    file edits, the dispatch of a writing sub-agent and filesystem-shaped
+//!    shell commands ([`accept_edits_approvable`] — by program name; the
+//!    sandbox, not this check, bounds their paths), `Auto` inherits that
+//!    AcceptEdits allowance and consults the judge below for the rest, `Yolo`
+//!    waves through all but a root grant.
 //! 6. **Auto judge** — the cheap classifier. It only ever sees a call that has
 //!    already cleared three gates it cannot override: a root grant
 //!    (`request_write_root`) is never auto-approved in any mode — it asks a
@@ -64,7 +72,9 @@
 //! Reading one stage in isolation is therefore misleading: follow the whole
 //! chain.
 //!
-//! The one automatic refusal outside stage 1 is not a policy verdict at all:
+//! One more automatic refusal lives in the runtime and is not a policy verdict
+//! at all (consumers add their own on top — headless `-p` auto-denies every
+//! prompt, a child runtime decides its prompts in `subagent_approval_decision`):
 //! when a `request_write_root` is about to be parked, the runtime resolves its
 //! target once (`root_grant_prompt_target` in `runtime::approval_flow`) and
 //! bounces an unresolvable or categorically refused one — the filesystem root,
