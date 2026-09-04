@@ -89,8 +89,11 @@ pub struct App {
     pub is_streaming: bool,
     /// Prompts typed while a turn was streaming, queued in order. Drained and
     /// sent as one combined follow-up when the turn ends (see `submit` and the
-    /// stream-end handlers). Cleared on cancel — Esc/Ctrl+C means "changed my
-    /// mind", so nothing queued behind the cancelled turn should fire.
+    /// stream-end handlers). Cleared at the moment of cancel — Esc/Ctrl+C means
+    /// "changed my mind", so nothing queued behind the cancelled turn fires —
+    /// while a prompt typed *after* the cancel, before the runtime has
+    /// acknowledged it, is the user's next request and fires when
+    /// `TurnCancelled` lands.
     pub(crate) steering_queue: Vec<String>,
     /// Set by the turn-end handler, consumed by `drain_stream_updates` once the
     /// drain loop is finished. The flush starts a new turn, so running it inside

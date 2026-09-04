@@ -222,10 +222,15 @@ impl App {
                 self.status = self.tr(TextId::StatusCancelled).to_string();
                 self.pending_approval = None;
                 self.is_streaming = false;
-                // Cancel means "changed my mind": drop prompts queued behind
-                // the abandoned turn rather than firing them at nothing.
-                self.steering_queue.clear();
                 self.clear_stream_receiver();
+                // The cancel itself already emptied the queue, synchronously
+                // (`cancel_streaming_turn`) — "changed my mind" was honoured
+                // there. Whatever is queued *now* was typed after Esc, while
+                // the runtime was still winding the turn down: the user's next
+                // prompt, which must fire once the cancel has landed exactly as
+                // it would after `TurnFinished`. Clearing again here silently
+                // dropped it after the composer had confirmed it as queued.
+                self.pending_steering_flush = true;
             }
             RuntimeEvent::Error { message, .. } => self.record_error(message),
         }

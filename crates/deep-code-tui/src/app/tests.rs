@@ -1283,6 +1283,46 @@ fn cancel_clears_the_steering_queue_synchronously() {
     assert!(!app.pending_steering_flush);
 }
 
+/// A prompt typed after Esc — while the runtime is still winding the old turn
+/// down and `is_streaming` is therefore still set — is the user's replacement
+/// request, not a leftover behind the cancelled turn. The cancel itself already
+/// emptied the queue synchronously; `TurnCancelled` used to clear it a second
+/// time and so swallowed exactly that prompt, right after the composer had
+/// confirmed it as queued. It must fire when the cancel lands, as after
+/// `TurnFinished`.
+#[test]
+fn prompt_typed_after_cancel_fires_when_the_cancel_lands() {
+    let mut app = App::new();
+    let turn_id = deep_code_agent::TurnId("turn_1".to_string());
+    app.apply_runtime_event(RuntimeEvent::TurnStarted {
+        turn_id: turn_id.clone(),
+        prompt: "first".to_string(),
+    });
+    app.is_streaming = true;
+    app.handle_escape();
+    assert!(app.steering_queue.is_empty());
+    assert!(
+        app.is_streaming,
+        "the runtime has not acknowledged the cancel yet"
+    );
+
+    app.input = "try this instead".to_string();
+    app.submit();
+    assert_eq!(app.steering_queue, vec!["try this instead".to_string()]);
+
+    app.apply_runtime_event(RuntimeEvent::TurnCancelled { turn_id });
+    assert!(!app.is_streaming);
+    assert_eq!(
+        app.steering_queue,
+        vec!["try this instead".to_string()],
+        "the cancel landing must not swallow a prompt typed after it"
+    );
+    assert!(
+        app.pending_steering_flush,
+        "the queued prompt fires once the drain loop is done, as after TurnFinished"
+    );
+}
+
 #[test]
 fn steering_queue_is_capped_and_keeps_the_draft() {
     let mut app = App::new();
