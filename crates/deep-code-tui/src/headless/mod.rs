@@ -84,8 +84,9 @@ pub async fn run_print(args: PrintArgs) -> i32 {
         launched.permission_mode.set(mode);
         if mode == PermissionMode::Yolo {
             eprintln!(
-                "yolo: gated calls run without asking; the deny floor and the OS sandbox \
-                 (where available) are the remaining containment"
+                "yolo: gated calls run without asking (a write-root request is the one \
+                 exception, and unattended it is denied); the deny floor and the OS \
+                 sandbox (where available) are the remaining containment"
             );
         }
     }

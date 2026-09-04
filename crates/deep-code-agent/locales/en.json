@@ -267,6 +267,6 @@
   "PermModeAuto": "auto",
   "PermModeYolo": "YOLO",
   "PermModeSwitched": "Switched to \"{mode}\" mode",
-  "PermModeYoloArm": "⚠ Press Shift+Tab again to enter YOLO (auto-approve everything; hard denials still block); any other key cancels",
+  "PermModeYoloArm": "⚠ Press Shift+Tab again to enter YOLO (auto-approve everything but a write-root request; hard denials still block); any other key cancels",
   "SystemRestoreKept": "Kept {count} entry/entries the snapshot cannot restore: {paths}"
 }

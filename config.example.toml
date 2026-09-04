@@ -12,7 +12,8 @@
 # 只许收紧（tighten-only）三项：项目层可以更严、不能更松，越界即忽略并告警。
 #   - approval.default_mode：只能降档（例如 auto -> default），不能升档。
 #     注意：升档一档也不行——accept_edits 就已经自动放行全部工作区写入。
-#   - sandbox.network：只能设 prompt/never，设 always 会被忽略。
+#   - sandbox.network：只能比全局更严（always → prompt → never），放宽会被忽略——
+#     全局是 never 时，项目层写 prompt 同样忽略。
 #   - lsp.enabled：只能设 false（关掉 language server），不能替你打开。
 #
 # 项目层的 provider.api_key 一律忽略（防止随仓库泄露或被恶意仓库注入）；
@@ -90,7 +91,8 @@
 
 # 权限模式:启动时的审批档位。
 # default(每次询问)| accept_edits(自动放行工作区内编辑)| auto(AI 判断)| yolo(除写根申请外全放开)。
-# 项目配置只能设 default/accept_edits;auto/yolo 只能来自全局配置(防止恶意仓库静默解除审批门)。
+# 项目配置只能比全局更严(例如全局 auto、项目 default),升档一律忽略;auto/yolo 只能来自全局配置
+# (防止恶意仓库静默解除审批门)。
 # 注意 yolo 不是字面意义的"全放开":request_write_root 在任何档位都要弹审批。
 # yolo 下沙箱命令 egress 常开(声明制在无人在环时拦不住恶意、只坑忘声明的);
 # [sandbox] network = "never" 在 yolo 下依然绝对。

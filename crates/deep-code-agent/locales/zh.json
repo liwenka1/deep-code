@@ -267,6 +267,6 @@
   "PermModeAuto": "自动",
   "PermModeYolo": "YOLO",
   "PermModeSwitched": "已切换到「{mode}」模式",
-  "PermModeYoloArm": "⚠ 再按一次 Shift+Tab 进入 YOLO(自动放行一切，硬拒绝仍拦)；其他键取消",
+  "PermModeYoloArm": "⚠ 再按一次 Shift+Tab 进入 YOLO(自动放行一切，写根申请除外，硬拒绝仍拦)；其他键取消",
   "SystemRestoreKept": "保留了 {count} 项快照无法恢复的内容:{paths}"
 }
