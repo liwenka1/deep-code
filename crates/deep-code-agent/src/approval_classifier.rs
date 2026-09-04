@@ -236,21 +236,44 @@ fn json_object_spans(text: &str) -> Vec<&str> {
 /// action line of a boundary prompt while the grant landed on `path`. The
 /// runtime refuses such an argument set before anyone sees it; pinning the key
 /// here means neither reader depends on that refusal to show the right subject.
+/// A job control action (`status`/`tail`/`cancel`) is the other tool-specific
+/// shape: it has no command to show — a `command` key on one is a decoy the
+/// tool ignores — so its line is the action and the job it targets, which is
+/// also what the judge should be deciding about. Every other tool goes through
+/// the generic table; `task` at its end is what a sub-agent dispatch has to
+/// show, and a call matching no key falls back to its compact JSON.
 #[must_use]
 pub fn action_summary(tool_name: &str, arguments: &Value) -> String {
+    let object = arguments.as_object();
+    let field = |key: &str| {
+        object
+            .and_then(|object| object.get(key))
+            .and_then(Value::as_str)
+    };
+    if crate::execution_policy::ExecPolicy::classify_tool(tool_name)
+        == crate::execution_policy::ToolKind::Job
+        && crate::execution_policy::shell_command_of(tool_name, arguments).is_none()
+        && let Some(action) = field("action")
+    {
+        return collapse_whitespace(&match field("job_id") {
+            Some(job_id) => format!("{action} {job_id}"),
+            None => action.to_string(),
+        });
+    }
     let keys: &[&str] = if tool_name == crate::root_grant::REQUEST_WRITE_ROOT_TOOL {
         &["path"]
     } else {
-        &["command", "path", "file_path", "url", "pattern", "query"]
+        &["command", "path", "url", "pattern", "query", "task"]
     };
-    if let Some(object) = arguments.as_object() {
-        for key in keys {
-            if let Some(text) = object.get(*key).and_then(Value::as_str) {
-                return text.split_whitespace().collect::<Vec<_>>().join(" ");
-            }
-        }
+    if let Some(text) = keys.iter().find_map(|key| field(key)) {
+        return collapse_whitespace(text);
     }
-    arguments.to_string()
+    collapse_whitespace(&arguments.to_string())
+}
+
+/// One line: runs of whitespace (newlines included) become a single space.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -323,5 +346,51 @@ mod tests {
         );
         // Same payload under any other tool keeps the generic precedence.
         assert_eq!(action_summary("shell", &decoy), "cat CHANGELOG.md");
+    }
+
+    /// A job control action shows the action and its target, never a decoy
+    /// `command` the tool would ignore; `start` is command-bearing and keeps
+    /// showing its command like `shell` does.
+    #[test]
+    fn action_summary_for_job_control_shows_the_action_not_a_decoy_command() {
+        assert_eq!(
+            action_summary(
+                "job",
+                &serde_json::json!({
+                    "action": "cancel",
+                    "job_id": "job_1",
+                    "command": "cat ~/.ssh/id_rsa"
+                })
+            ),
+            "cancel job_1"
+        );
+        assert_eq!(
+            action_summary("job", &serde_json::json!({ "action": "status" })),
+            "status"
+        );
+        assert_eq!(
+            action_summary(
+                "job",
+                &serde_json::json!({ "action": "start", "command": "cargo  test" })
+            ),
+            "cargo test"
+        );
+    }
+
+    /// A sub-agent dispatch is described by its task, and a call matching no
+    /// key still comes out on one line.
+    #[test]
+    fn action_summary_shows_a_dispatch_by_its_task_and_collapses_the_fallback() {
+        assert_eq!(
+            action_summary(
+                "agent",
+                &serde_json::json!({ "role": "implementer", "task": "land\n  it" })
+            ),
+            "land it"
+        );
+        assert_eq!(
+            action_summary("mystery", &serde_json::json!({ "x": "a  b" })),
+            r#"{"x":"a b"}"#
+        );
     }
 }
