@@ -614,3 +614,41 @@ fn web_gate_defaults_on_and_respects_disable_flag() {
     // Fail-closed: an unrecognized/typo value disables rather than leaks web.
     assert!(!web_enabled_from(Some("disabel")));
 }
+
+/// With an API key both launch paths pick the online client. `offline` is
+/// derived from the client's provider name (not a per-path literal), so it
+/// must come out false here, and the label must name the provider — the
+/// resumed path tags itself as such. Every other launch test runs the echo
+/// backend, so before this neither online arm had ever executed under test.
+#[test]
+fn online_launch_names_the_provider_and_is_not_offline() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let ws = workspace.path().canonicalize().unwrap();
+    let config = AgentConfig {
+        api_key: Some("test-key".to_string()),
+        ..AgentConfig::builtin()
+    };
+
+    let fresh = launch_runtime(&config, ws.clone(), None);
+    assert!(!fresh.offline, "an API key means a working model");
+    assert_eq!(fresh.backend_label, format!("DeepSeek {}", config.model));
+
+    let record = signed(SessionRecord::new(ws.clone(), "system"));
+    let resumed = launch_runtime(&config, ws.clone(), Some(record));
+    assert!(!resumed.offline);
+    assert_eq!(
+        resumed.backend_label,
+        format!("DeepSeek {} (resumed)", config.model)
+    );
+
+    // And the derivation flips for the placeholder backend on both paths.
+    let echo_fresh = launch_runtime(&AgentConfig::builtin(), ws.clone(), None);
+    assert!(echo_fresh.offline);
+    let echo_resumed = launch_runtime(
+        &AgentConfig::builtin(),
+        ws.clone(),
+        Some(signed(SessionRecord::new(ws, "system"))),
+    );
+    assert!(echo_resumed.offline);
+    assert_eq!(echo_resumed.backend_label, "offline echo (resumed)");
+}
