@@ -45,11 +45,15 @@ fn install(args: InstallArgs) -> i32 {
     let spec = WorkflowSpec {
         workflow_ref,
         with_app: args.with_app || args.app_id.is_some(),
-        lang: args.lang.clone().unwrap_or_else(|| "zh".to_string()),
-        permission_mode: args
-            .permission_mode
+        lang: args
+            .lang
             .clone()
-            .unwrap_or_else(|| "accept_edits".to_string()),
+            .unwrap_or_else(|| deep_code_agent::Lang::Zh.as_setting().to_string()),
+        permission_mode: args.permission_mode.clone().unwrap_or_else(|| {
+            deep_code_agent::PermissionMode::AcceptEdits
+                .as_setting()
+                .to_string()
+        }),
         generator_version: env!("CARGO_PKG_VERSION").to_string(),
     };
     let rendered = workflow::render(&spec);

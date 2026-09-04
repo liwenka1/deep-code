@@ -93,7 +93,7 @@ impl App {
     /// pushed here rather than at queue time because the finished turn's own
     /// cells have only just landed in `history`; pushing earlier would render
     /// the user's message above output that was still streaming.
-    pub(crate) fn flush_steering_queue(&mut self) {
+    pub(super) fn flush_steering_queue(&mut self) {
         if self.steering_queue.is_empty() || self.is_streaming {
             return;
         }

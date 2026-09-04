@@ -88,10 +88,9 @@ pub async fn run_eval(
         deep_code_eval::report::print_summary(&report);
     }
 
-    let sb_subset = match subset.as_str() {
-        "verified" => "swe-bench_verified",
-        _ => "swe-bench_lite",
-    };
+    // sb-cli names the subset `swe-bench_<subset>`; derive it rather than map
+    // through a table whose fallthrough would call an unknown subset "lite".
+    let sb_subset = format!("swe-bench_{subset}");
     println!("已写出:");
     println!("  {}", predictions_path.display());
     println!("  {}", report_path.display());
