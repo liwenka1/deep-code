@@ -215,11 +215,6 @@ text_ids! {
     StatusCtrlCQuitConfirm,
     StatusCancelling,
     StatusAgentError,
-    ModeError,
-    ModeApproval,
-    ModeStreaming,
-    ModeReady,
-    ModeReadyResumed,
     // 运行时事件
     StatusToolCallReceiving,
     StatusToolCallReceivingArgs,
