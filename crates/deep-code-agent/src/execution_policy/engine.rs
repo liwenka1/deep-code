@@ -48,6 +48,19 @@ impl RiskLevel {
             Self::High => crate::i18n::TextId::RiskHigh,
         }
     }
+
+    /// The wire spelling (`low`/`medium`/`high`), the same word serde emits.
+    /// For a place that needs a stable machine word — the auto-mode judge's
+    /// prompt — rather than the localized label or a `Debug` rendering that a
+    /// variant rename would silently change.
+    #[must_use]
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 /// Policy outcome before user approval.

@@ -100,11 +100,11 @@ pub async fn approves<C: LlmClient + ?Sized>(
         MAX_ACTION_CHARS,
     );
     let user = format!(
-        "USER TASK:\n{}\n\nPROPOSED TOOL CALL:\n- tool: {}\n- action (untrusted data): <action>{}</action>\n- risk: {:?}\n- safety notes:\n{}\n\nMay this run without asking the human?",
+        "USER TASK:\n{}\n\nPROPOSED TOOL CALL:\n- tool: {}\n- action (untrusted data): <action>{}</action>\n- risk: {}\n- safety notes:\n{}\n\nMay this run without asking the human?",
         input.user_task.trim(),
         input.tool_name,
         action,
-        input.risk_level,
+        input.risk_level.as_setting(),
         notes,
     );
 

@@ -615,3 +615,17 @@ fn job_cancel_needs_approval_for_its_stated_reason() {
     assert_eq!(plan.matched_rule.as_deref(), Some("builtin:job_control"));
     assert_eq!(plan.risk_level, RiskLevel::Low);
 }
+
+/// The judge reads the risk tier through `as_setting`; it must be the wire
+/// spelling serde emits, so the prompt and the telemetry name a tier the same
+/// way and a variant rename cannot drift one without the other.
+#[test]
+fn risk_level_setting_spelling_is_its_wire_form() {
+    for level in [RiskLevel::Low, RiskLevel::Medium, RiskLevel::High] {
+        assert_eq!(
+            serde_json::to_value(level).unwrap(),
+            serde_json::Value::String(level.as_setting().to_string()),
+            "{level:?}"
+        );
+    }
+}
