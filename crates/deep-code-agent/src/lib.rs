@@ -80,7 +80,7 @@ pub use pricing::{CostCurrency, CostEstimate};
 pub use root_grant::REQUEST_WRITE_ROOT_TOOL;
 pub use runtime::{
     AgentRuntime, PrefixStatus, RuntimeEvent, RuntimeEventReceiver, ToolCallId, TurnId,
-    TurnTelemetry,
+    TurnTelemetry, session_consent_recordable,
 };
 pub use runtime_launch::{LaunchedRuntime, launch_runtime, web_enabled};
 pub use sandbox::{Enforcement, EnforcementGap, sandbox_available, sandbox_enforcement};

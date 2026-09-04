@@ -19,16 +19,41 @@ use crate::tool::{ApprovalDecision, ApprovalRequest, ToolCall, ToolResult, ToolR
 /// arguments, so a blanket session consent would be misleading. The `job`
 /// tool is excluded for the same reason — a session-allow granted on a
 /// `cancel` prompt must not blanket-approve future `action=start` commands.
-/// Root grants are excluded too: each request is about one specific
-/// directory, and "always widen the boundary without asking" must not be a
-/// recordable consent.
+/// Sub-agent dispatch is excluded on the same grounds: what its prompt
+/// authorizes is in the arguments — a writing role, or `network: true` — and
+/// a consent recorded on one kind of dispatch would silently cover the other.
+/// A networked child is its own approval point (see the `SubAgent` arm of
+/// `ExecPolicy::evaluate_tool`), and the Auto egress floor sits *below*
+/// standing consent, so a remembered `agent` would have skipped it. Root
+/// grants are excluded too: each request is about one specific directory,
+/// and "always widen the boundary without asking" must not be a recordable
+/// consent.
 pub(super) fn session_allowable(tool_name: &str) -> bool {
     !matches!(
         crate::execution_policy::ExecPolicy::classify_tool(tool_name),
         crate::execution_policy::ToolKind::Shell
             | crate::execution_policy::ToolKind::Job
+            | crate::execution_policy::ToolKind::SubAgent
             | crate::execution_policy::ToolKind::RootGrant
     )
+}
+
+/// Whether answering "approve for the session" at this prompt would record
+/// anything at all: either the tool is [`session_allowable`] by name, or the
+/// call is one simple shell command whose identity can be remembered
+/// ([`session_shell_prefix`]). `false` means "a" would silently downgrade to a
+/// one-time approve — a UI reads this to offer only the options that mean
+/// what they say, and it is the same two rules the recording path applies, so
+/// the panel and the runtime cannot disagree about what "a" does.
+#[must_use]
+pub fn session_consent_recordable(tool_name: &str, arguments: &serde_json::Value) -> bool {
+    session_allowable(tool_name)
+        || session_shell_prefix(&ToolCall {
+            id: String::new(),
+            name: tool_name.to_string(),
+            arguments: arguments.clone(),
+        })
+        .is_some()
 }
 
 /// Whether a call is the `request_write_root` doorbell (see
@@ -249,7 +274,9 @@ impl AgentRuntime {
             return;
         }
         // "Approve for session" is recorded here and executes as a plain
-        // approve; shell-class tools only get the one-time approval.
+        // approve; shell-class tools, sub-agent dispatch and root grants only
+        // get the one-time approval (`session_consent_recordable` is the
+        // panel-side view of these same two rules).
         let decision = if decision == ApprovalDecision::ApprovedForSession {
             if session_allowable(&current.name) {
                 self.state
@@ -683,6 +710,50 @@ mod tests {
         assert!(!session_allowable("request_write_root"));
         // Sanity: ordinary tools stay recordable.
         assert!(session_allowable("write_file"));
+    }
+
+    /// A sub-agent dispatch prompt authorizes what its arguments say (a
+    /// writing role, `network: true`), so "a" must not turn `agent` into a
+    /// standing consent: one remembered dispatch would cover the other kind
+    /// and skip the Auto egress floor, which standing consent sits above.
+    #[test]
+    fn subagent_dispatch_is_never_session_allowable() {
+        assert!(!session_allowable("agent"));
+    }
+
+    /// The panel-side predicate agrees with the recording path: it is true
+    /// exactly when "a" records something — a by-name consent, or a shell
+    /// identity — and false wherever "a" would silently become a one-time
+    /// approve (job cancel, a compound command, a dispatch, a root grant).
+    #[test]
+    fn session_consent_recordable_mirrors_the_two_recording_rules() {
+        assert!(session_consent_recordable(
+            "write_file",
+            &json!({ "path": "x", "content": "y" })
+        ));
+        assert!(session_consent_recordable(
+            "shell",
+            &json!({ "command": "cargo test --all" })
+        ));
+        assert!(session_consent_recordable(
+            "job",
+            &json!({ "action": "start", "command": "cargo test" })
+        ));
+        for (tool, arguments) in [
+            ("shell", json!({ "command": "cargo test && rm -rf /" })),
+            ("job", json!({ "action": "cancel", "job_id": "job_1" })),
+            ("agent", json!({ "role": "implementer", "task": "land it" })),
+            (
+                "agent",
+                json!({ "role": "explore", "network": true, "task": "x" }),
+            ),
+            ("request_write_root", json!({ "path": "/tmp/x" })),
+        ] {
+            assert!(
+                !session_consent_recordable(tool, &arguments),
+                "{tool} {arguments} must not offer a session consent"
+            );
+        }
     }
 
     /// `root_grant_requested_path` feeds the panel's "requested spelling"

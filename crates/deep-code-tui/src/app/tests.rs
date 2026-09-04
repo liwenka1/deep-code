@@ -169,7 +169,7 @@ fn root_grant_approval_drops_the_session_option() {
         preview: None,
         safety_notes: Vec::new(),
     });
-    assert!(app.pending_is_root_grant());
+    assert!(!app.pending_offers_session_consent());
 
     // 'a' is not an offered option, so the key must do nothing at all.
     app.approve_pending_tool_for_session();
@@ -212,8 +212,11 @@ fn a_parked_root_grant_starts_focused_on_deny() {
         preview: None,
         safety_notes: Vec::new(),
     };
+    // One simple command, so the prompt offers y/a/n (a compound command
+    // would drop "a" and change the deny index).
     let ordinary = deep_code_agent::ApprovalRequest {
         tool_name: "shell".to_string(),
+        arguments: serde_json::json!({ "command": "cargo test" }),
         risk_level: deep_code_agent::RiskLevel::Medium,
         justification: None,
         resolved_target: None,
@@ -249,6 +252,104 @@ fn a_parked_root_grant_starts_focused_on_deny() {
         app.approval_focus, 2,
         "a networked prompt must not default to approve"
     );
+}
+
+/// "a" is offered only where the runtime would actually record a consent.
+/// A sub-agent dispatch authorizes what its arguments say (a writing role,
+/// `network: true`) and a job cancel or a compound command carry their risk in
+/// the arguments too, so for all of them the runtime records nothing and "a"
+/// would silently become a one-time approve. The panel therefore renders y/n
+/// for them — the focus ring has two stops and the `a` key is inert — while a
+/// plain tool or one simple shell command keeps y/a/n.
+#[test]
+fn prompts_without_a_recordable_consent_render_without_the_session_option() {
+    let request =
+        |tool_name: &str, arguments: serde_json::Value| deep_code_agent::ApprovalRequest {
+            network: false,
+            call_id: "call_1".to_string(),
+            tool_name: tool_name.to_string(),
+            description: String::new(),
+            arguments,
+            risk_level: deep_code_agent::RiskLevel::Medium,
+            requires_sandbox: false,
+            read_only: false,
+            matched_rule: None,
+            justification: None,
+            resolved_target: None,
+            preview: None,
+            safety_notes: Vec::new(),
+        };
+    let two_options = [
+        request(
+            "agent",
+            serde_json::json!({ "role": "implementer", "task": "land it" }),
+        ),
+        request(
+            "agent",
+            serde_json::json!({ "role": "explore", "network": true, "task": "x" }),
+        ),
+        request(
+            "job",
+            serde_json::json!({ "action": "cancel", "job_id": "job_1" }),
+        ),
+        request(
+            "shell",
+            serde_json::json!({ "command": "cargo test && rm -rf /" }),
+        ),
+        request(
+            deep_code_agent::REQUEST_WRITE_ROOT_TOOL,
+            serde_json::json!({ "path": "/tmp/x" }),
+        ),
+    ];
+    for request in two_options {
+        let name = request.tool_name.clone();
+        let mut app = App::new();
+        app.park_approval(request);
+        assert!(
+            !app.pending_offers_session_consent(),
+            "{name} must not offer a session consent"
+        );
+        // y/n only: moving up from approve wraps straight onto deny.
+        app.approval_focus = 0;
+        app.approval_focus_up();
+        assert_eq!(app.approval_focus, 1, "{name}: two stops in the focus ring");
+        // The key is inert: the prompt stays parked.
+        app.approve_pending_tool_for_session();
+        assert!(
+            app.pending_approval.is_some(),
+            "{name}: `a` must not resolve a prompt whose panel hides it"
+        );
+    }
+
+    let three_options = [
+        request(
+            "write_file",
+            serde_json::json!({ "path": "x", "content": "y" }),
+        ),
+        request(
+            "shell",
+            serde_json::json!({ "command": "cargo test --all" }),
+        ),
+        request(
+            "job",
+            serde_json::json!({ "action": "start", "command": "cargo test" }),
+        ),
+    ];
+    for request in three_options {
+        let name = request.tool_name.clone();
+        let mut app = App::new();
+        app.park_approval(request);
+        assert!(
+            app.pending_offers_session_consent(),
+            "{name} offers a session consent"
+        );
+        app.approval_focus = 0;
+        app.approval_focus_up();
+        assert_eq!(
+            app.approval_focus, 2,
+            "{name}: three stops in the focus ring"
+        );
+    }
 }
 
 #[test]

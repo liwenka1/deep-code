@@ -659,15 +659,17 @@ pub(super) fn render_approval_panel(
     let dim = Style::default().fg(Color::DarkGray);
 
     let focus = app.approval_focus;
-    // A root grant offers no "approve for session": consent is per-directory
-    // by design, so the option (and its key) disappear rather than silently
-    // downgrade.
+    // "Approve for session" is offered only where the runtime would record a
+    // consent (`pending_offers_session_consent`): a root grant, a sub-agent
+    // dispatch, a job control action or a compound shell command would get a
+    // silent one-time downgrade instead, so the option (and its key)
+    // disappear rather than lie.
     let mut options: Vec<(&str, &str, Style)> = vec![
         ("  y", tr(app.lang, TextId::ApprovalOptApprove), key_y),
         ("  a", tr(app.lang, TextId::ApprovalOptSession), key_a),
         ("  n", tr(app.lang, TextId::ApprovalOptDeny), key_n),
     ];
-    if app.pending_is_root_grant() {
+    if !app.pending_offers_session_consent() {
         options.remove(1);
     }
     let options_body: Vec<Line> = options

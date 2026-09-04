@@ -10,12 +10,14 @@ impl App {
         self.resolve_pending_tool(ApprovalDecision::Approved);
     }
 
-    /// "a": approve and remember the tool for this session. The runtime
-    /// downgrades shell-class tools to a one-time approve. Ignored for a
-    /// root-grant request — that option is not offered (each grant is about
-    /// one directory), so the key must not act either.
+    /// "a": approve and remember the tool (or, for shell, the command
+    /// identity) for this session. Ignored wherever the panel does not offer
+    /// the option — a root grant, a sub-agent dispatch, a job control action,
+    /// a compound shell command — because there the runtime would record
+    /// nothing and silently downgrade to a one-time approve; an option that
+    /// is not shown must not act from its key either.
     pub fn approve_pending_tool_for_session(&mut self) {
-        if self.pending_is_root_grant() {
+        if !self.pending_offers_session_consent() {
             return;
         }
         self.resolve_pending_tool(ApprovalDecision::ApprovedForSession);
@@ -25,13 +27,18 @@ impl App {
         self.resolve_pending_tool(ApprovalDecision::Denied);
     }
 
-    /// Whether the pending approval is a `request_write_root`. Its panel
-    /// drops the "approve for session" option: a blanket "always widen the
-    /// boundary" consent must not exist, per-directory decisions only.
-    pub fn pending_is_root_grant(&self) -> bool {
-        self.pending_approval
-            .as_ref()
-            .is_some_and(|request| request.tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL)
+    /// Whether the pending approval offers "approve for session" at all. The
+    /// runtime decides ([`deep_code_agent::session_consent_recordable`], the
+    /// same two rules its recording path applies): a by-name consent for
+    /// ordinary tools, a command-identity consent for one simple shell
+    /// command. A root grant (per-directory by design), a sub-agent dispatch
+    /// (what it authorizes lives in the arguments), a job status/tail/cancel
+    /// and a compound shell command record nothing, so the option — and its
+    /// key — disappear rather than silently downgrade to a one-time approve.
+    pub fn pending_offers_session_consent(&self) -> bool {
+        self.pending_approval.as_ref().is_some_and(|request| {
+            deep_code_agent::session_consent_recordable(&request.tool_name, &request.arguments)
+        })
     }
 
     /// Park an arriving approval: reset the view, choose the starting option,
@@ -55,18 +62,22 @@ impl App {
         let deny_by_default = is_root_grant || request.network;
         self.pending_approval = Some(request);
         self.approval_scroll_offset = 0;
-        // Deny is last either way, but a root grant renders y/n (consent is
-        // per-directory, so there is no "allow for session") against y/a/n.
-        let options = if is_root_grant { 2 } else { 3 };
+        // Deny is last either way, but a prompt with no recordable consent
+        // renders y/n (see `pending_offers_session_consent`) against y/a/n.
+        let options = self.approval_option_count();
         self.approval_focus = if deny_by_default { options - 1 } else { 0 };
         self.approval_armed = false;
         self.is_streaming = false;
     }
 
-    /// How many options the approval panel offers (y/a/n, or y/n for a
-    /// root-grant request).
+    /// How many options the approval panel offers (y/a/n, or y/n when the
+    /// prompt has no recordable session consent).
     fn approval_option_count(&self) -> usize {
-        if self.pending_is_root_grant() { 2 } else { 3 }
+        if self.pending_offers_session_consent() {
+            3
+        } else {
+            2
+        }
     }
 
     /// Move the approval highlight to the previous option (wrap around).
@@ -91,7 +102,7 @@ impl App {
 
     /// Execute the currently highlighted approval action.
     pub fn execute_focused_approval(&mut self) {
-        if self.pending_is_root_grant() {
+        if !self.pending_offers_session_consent() {
             // Two options: 0 = approve, 1 = deny.
             match self.approval_focus {
                 0 => self.approve_pending_tool(),

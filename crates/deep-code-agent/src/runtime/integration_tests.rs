@@ -860,6 +860,109 @@ async fn gated_agent_dispatches_leave_the_parallel_group_and_face_the_gate() {
     assert!(parked_ids(&events).is_empty());
 }
 
+/// "Approve for the session" on a sub-agent dispatch is a one-time approve,
+/// never a standing consent. A dispatch prompt authorizes what its arguments
+/// say — here a writing role — and a remembered `agent` would have covered the
+/// *other* kind too: a later `network: true` dispatch, which is its own
+/// approval point (README, the `SubAgent` arm), ran with no prompt because the
+/// by-name consent is consulted above the Auto egress floor and above the
+/// mode. Both the networked dispatch and a second writing dispatch must park
+/// exactly as they would with no history.
+#[tokio::test]
+async fn session_consent_on_an_agent_dispatch_does_not_cover_later_dispatches() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+    use std::sync::atomic::Ordering::SeqCst;
+    let implementer = r#"{"role":"implementer","task":"land it"}"#;
+    let networked = r#"{"role":"explore","network":true,"task":"look it up"}"#;
+    let text_turn = |text: &str| {
+        vec![
+            AgentEvent::TextDelta {
+                text: text.to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ]
+    };
+    let dispatch_turn = |id: &str, arguments: &str| {
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: indexed_tool_call_delta(0, id, "agent", arguments),
+            },
+            AgentEvent::Done { usage: None },
+        ]
+    };
+    let client = ScriptedClient::new(vec![
+        dispatch_turn("call_1", implementer),
+        text_turn("ok"),
+        dispatch_turn("call_2", networked),
+        text_turn("ok"),
+        dispatch_turn("call_3", implementer),
+        text_turn("ok"),
+    ]);
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(BarrierAgentTool {
+        barrier: Arc::new(tokio::sync::Barrier::new(1)),
+        ran: Arc::clone(&ran),
+    });
+    let runtime = AgentRuntime::new(client, registry)
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Default));
+    let parked_ids = |events: &[RuntimeEvent]| -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::ApprovalRequired { request, .. } => Some(request.call_id.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // Turn 1: the writing dispatch parks; the human answers "a".
+    let mut rx = runtime.submit_user("dispatch a writer").await;
+    assert_eq!(
+        parked_ids(&drain(&mut rx).await),
+        vec!["call_1".to_string()]
+    );
+    let mut rx = runtime
+        .submit_approval(ApprovalDecision::ApprovedForSession)
+        .await;
+    let events = drain(&mut rx).await;
+    assert_eq!(
+        ran.load(SeqCst),
+        1,
+        "\"a\" still approves this one dispatch"
+    );
+    assert_eq!(finished_ids(&events), vec!["call_1".to_string()]);
+
+    // Turn 2: a networked dispatch is its own approval point — it parks.
+    let mut rx = runtime.submit_user("now go online").await;
+    let events = drain(&mut rx).await;
+    assert_eq!(
+        parked_ids(&events),
+        vec!["call_2".to_string()],
+        "a networked dispatch must prompt even after \"a\" on a writing dispatch"
+    );
+    assert_eq!(
+        ran.load(SeqCst),
+        1,
+        "nothing may run before the human answers"
+    );
+    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    assert_eq!(
+        finished_ids(&drain(&mut rx).await),
+        vec!["call_2".to_string()]
+    );
+
+    // Turn 3: even the same kind of dispatch parks again — "a" recorded nothing.
+    let mut rx = runtime.submit_user("dispatch another writer").await;
+    let events = drain(&mut rx).await;
+    assert_eq!(
+        parked_ids(&events),
+        vec!["call_3".to_string()],
+        "a sub-agent dispatch is never a standing consent"
+    );
+    assert_eq!(ran.load(SeqCst), 2);
+}
+
 #[tokio::test]
 async fn deny_path_records_denied_tool_message_and_continues() {
     let client = ScriptedClient::new(vec![
