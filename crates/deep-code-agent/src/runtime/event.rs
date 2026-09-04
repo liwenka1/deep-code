@@ -267,11 +267,8 @@ mod tests {
     /// only three of the nineteen kinds were asserted anywhere. The exhaustive
     /// `match` in `wire_kind` already forces a string for a new variant — the
     /// length check below is the nudge to pin it here too.
-    #[test]
-    fn wire_kind_and_turn_id_are_pinned_for_every_variant() {
-        let turn = TurnId("turn_1".to_string());
-        let call = ToolCallId("call_1".to_string());
-        let request = ApprovalRequest {
+    fn sample_request() -> ApprovalRequest {
+        ApprovalRequest {
             network: false,
             call_id: "call_1".to_string(),
             tool_name: "shell".to_string(),
@@ -285,7 +282,14 @@ mod tests {
             resolved_target: None,
             preview: None,
             safety_notes: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn wire_kind_and_turn_id_are_pinned_for_every_variant() {
+        let turn = TurnId("turn_1".to_string());
+        let call = ToolCallId("call_1".to_string());
+        let request = sample_request();
         let result = ToolResult::success("call_1", "shell", "ok");
         let some_turn = Some(&turn);
         let cases: Vec<(RuntimeEvent, &str, Option<&TurnId>)> = vec![
@@ -347,12 +351,12 @@ mod tests {
             ),
             (
                 RuntimeEvent::ApprovalRequired {
-                    turn_id: None,
+                    turn_id: Some(turn.clone()),
                     tool_call_id: Some(call.clone()),
                     request: request.clone(),
                 },
                 "approval.required",
-                None,
+                some_turn,
             ),
             (
                 RuntimeEvent::ApprovalResolved {
@@ -374,11 +378,11 @@ mod tests {
             ),
             (
                 RuntimeEvent::RootGranted {
-                    turn_id: None,
+                    turn_id: Some(turn.clone()),
                     path: "/tmp/x".to_string(),
                 },
                 "root.granted",
-                None,
+                some_turn,
             ),
             (
                 RuntimeEvent::SessionUpdated {
@@ -461,6 +465,52 @@ mod tests {
         for (event, kind, turn_id) in &cases {
             assert_eq!(event.wire_kind(), *kind, "{event:?}");
             assert_eq!(event.turn_id(), *turn_id, "{event:?}");
+        }
+    }
+
+    /// The variants whose turn id is optional pass `None` through as `None`.
+    /// The table above pins their `Some` side, so an arm hard-wired to either
+    /// answer fails one of the two tests — a `Some`-only table let a `=> None`
+    /// arm for `approval.required` or `root.granted` survive unnoticed.
+    #[test]
+    fn optional_turn_ids_pass_none_through() {
+        let call = ToolCallId("call_1".to_string());
+        let events = [
+            RuntimeEvent::ApprovalRequired {
+                turn_id: None,
+                tool_call_id: Some(call.clone()),
+                request: sample_request(),
+            },
+            RuntimeEvent::ApprovalResolved {
+                turn_id: None,
+                tool_call_id: call.clone(),
+                decision: ApprovalDecision::Approved,
+            },
+            RuntimeEvent::ToolCallProgress {
+                turn_id: None,
+                tool_call_id: call.clone(),
+                tool_name: "shell".to_string(),
+                update: ToolUpdate {
+                    text: "…".to_string(),
+                    details: None,
+                },
+            },
+            RuntimeEvent::ToolCallFinished {
+                turn_id: None,
+                tool_call_id: call,
+                result: ToolResult::success("call_1", "shell", "ok"),
+            },
+            RuntimeEvent::RootGranted {
+                turn_id: None,
+                path: "/tmp/x".to_string(),
+            },
+            RuntimeEvent::Error {
+                turn_id: None,
+                message: "e".to_string(),
+            },
+        ];
+        for event in &events {
+            assert_eq!(event.turn_id(), None, "{event:?}");
         }
     }
 }

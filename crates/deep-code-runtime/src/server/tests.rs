@@ -213,7 +213,8 @@ async fn prompt_sse_returns_assistant_delta_and_turn_completed() {
         body.contains("event: turn.completed"),
         "expected turn.completed SSE event, got: {body}"
     );
-    // Wire contract (the bot workflow's jq depends on all of this): first
+    // Wire contract (shared by SSE clients and the headless `stream-json`
+    // output, which render the same envelopes): first
     // envelope is the user message, seq starts at 1 and increases
     // monotonically, and assistant.delta payloads carry `.text`.
     let envelopes = envelopes_from_sse(&body);
