@@ -56,7 +56,7 @@ impl AgentRuntime {
         let store = Arc::clone(store);
         let owned_label = label.to_string();
         let outcome = tokio::task::spawn_blocking(move || store.snapshot(&owned_label)).await;
-        match outcome {
+        let failure = match outcome {
             Ok(Ok((id, prune_warnings))) => {
                 for message in prune_warnings {
                     emit(tx, RuntimeEvent::Warning { message });
@@ -69,34 +69,29 @@ impl AgentRuntime {
                         label: label.to_string(),
                     },
                 );
+                return;
             }
-            Ok(Err(error)) => {
-                emit(
-                    tx,
-                    RuntimeEvent::Error {
-                        turn_id: None,
-                        message: crate::tr_with(
-                            self.ui_lang(),
-                            crate::TextId::CheckpointSnapshotFailed,
-                            &[("label", label), ("error", &error.to_string())],
-                        ),
-                    },
-                );
-            }
-            Err(join_error) => {
-                emit(
-                    tx,
-                    RuntimeEvent::Error {
-                        turn_id: None,
-                        message: crate::tr_with(
-                            self.ui_lang(),
-                            crate::TextId::CheckpointSnapshotFailed,
-                            &[("label", label), ("error", &join_error.to_string())],
-                        ),
-                    },
-                );
-            }
-        }
+            Ok(Err(error)) => error.to_string(),
+            Err(join_error) => join_error.to_string(),
+        };
+        // The turn goes on without its restore point — `drive_turn` spawns the
+        // loop right after this call regardless — so this is a degradation to
+        // surface, not a terminal `Error`. Every consumer treats `Error` as the
+        // end of the turn (the TUI stops observing the stream, headless stops
+        // the run), and emitting it here left the loop running unobserved:
+        // tools executed and cost accrued with nothing on screen, and an
+        // approval request parked with nobody to answer it. An unreadable
+        // subtree in the workspace made that happen on every turn.
+        emit(
+            tx,
+            RuntimeEvent::Warning {
+                message: crate::tr_with(
+                    self.ui_lang(),
+                    crate::TextId::CheckpointSnapshotFailed,
+                    &[("label", label), ("error", &failure)],
+                ),
+            },
+        );
     }
 
     async fn record_checkpoint(&self, id: CheckpointId, label: &str) {

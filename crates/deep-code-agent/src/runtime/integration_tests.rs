@@ -963,6 +963,76 @@ async fn session_consent_on_an_agent_dispatch_does_not_cover_later_dispatches() 
     assert_eq!(ran.load(SeqCst), 2);
 }
 
+/// A failed before-turn snapshot is a degradation, not the end of the turn:
+/// `drive_turn` spawns the model loop right after it either way. It used to be
+/// emitted as `Error`, which every consumer treats as terminal — the TUI
+/// stopped observing without cancelling, so the turn ran on unobserved, tools
+/// executing and an approval parking with nobody to answer. Now it is a
+/// `Warning`, and the turn's own events follow it on the same channel.
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshot_failure_warns_and_the_turn_still_runs_observed() {
+    use std::os::unix::fs::PermissionsExt;
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("keep.txt"), "v1").unwrap();
+    let locked = workspace.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::write(locked.join("inner.txt"), "hidden").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::TextDelta {
+            text: "hello".to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let mut warnings = Vec::new();
+    let runtime = AgentRuntime::new(client, ToolRegistry::new())
+        .with_checkpoints(workspace.path(), &mut warnings);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let mut rx = runtime.submit_user("go").await;
+    let events = drain(&mut rx).await;
+    // Restore first so tempdir cleanup succeeds whatever the assertions say.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Root ignores the permission bits: the snapshot then simply succeeds and
+    // the failure path is not exercised on this host.
+    if events
+        .iter()
+        .any(|event| matches!(event, RuntimeEvent::CheckpointCreated { .. }))
+    {
+        let ran_as_root = unsafe { libc::geteuid() } == 0;
+        assert!(ran_as_root, "snapshot must fail on an unreadable subtree");
+        return;
+    }
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Warning { message } if message.contains("before_turn")
+        )),
+        "the failed snapshot must be surfaced as a warning: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Error { .. })),
+        "a degradation the turn survives must not be reported as terminal: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::AssistantDelta { text, .. } if text == "hello"
+        )),
+        "the model loop must still run on the observed channel: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnFinished { .. })),
+        "the turn must finish on the same channel: {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn deny_path_records_denied_tool_message_and_continues() {
     let client = ScriptedClient::new(vec![
