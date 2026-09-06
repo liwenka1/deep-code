@@ -351,6 +351,16 @@ impl AgentRuntime {
                     .await;
             }
             Ok(ToolRunOutcome::ApprovalRequired { mut request }) => {
+                // Same guard as the batch's park site (`process_tool_batch`):
+                // the tool re-requested approval after an await, and a cancel
+                // that landed during it ends the turn instead of parking a
+                // prompt nobody can answer into anything but "cancelled".
+                if cancel.is_cancelled() {
+                    let mut calls = remaining;
+                    calls.push_front(current);
+                    self.finish_cancelled_calls(calls, &turn_id, tx).await;
+                    return;
+                }
                 request.preview = self.approval_preview(&current);
                 {
                     let mut state = self.state.lock().await;

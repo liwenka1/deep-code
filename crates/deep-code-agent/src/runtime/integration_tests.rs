@@ -530,6 +530,85 @@ async fn auto_mode_asks_when_classifier_denies() {
     );
 }
 
+/// A client whose first call issues a gated tool call and whose second — the
+/// Auto judge — hangs until the test cancels the turn.
+struct HangingJudgeClient {
+    first: Mutex<Option<Vec<AgentEvent>>>,
+    judge_started: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl LlmClient for HangingJudgeClient {
+    fn provider_name(&self) -> &'static str {
+        "hanging-judge"
+    }
+
+    fn model(&self) -> &str {
+        "hanging-judge"
+    }
+
+    async fn stream_chat(&self, _request: ChatRequest) -> AgentResult<AgentEventStream> {
+        if let Some(events) = self.first.lock().unwrap().take() {
+            let stream = try_stream! {
+                for event in events {
+                    yield event;
+                }
+            };
+            return Ok(Box::pin(stream));
+        }
+        self.judge_started.notify_one();
+        let stream = try_stream! {
+            std::future::pending::<()>().await;
+            yield AgentEvent::Done { usage: None };
+        };
+        Ok(Box::pin(stream))
+    }
+}
+
+/// Cancelling while the Auto judge is mid-flight ends the turn instead of
+/// parking it. The batch loop checks the token only at call boundaries and the
+/// judge aborts into "ask" on cancel, so without the re-check right before the
+/// park site the call was parked with an already-cancelled token: nobody got a
+/// `TurnCancelled`, the turn stayed live, and any answer to the prompt could
+/// only finish it as cancelled.
+#[tokio::test]
+async fn cancel_during_the_judge_finishes_the_turn_instead_of_parking() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+    let judge_started = Arc::new(tokio::sync::Notify::new());
+    let client = HangingJudgeClient {
+        first: Mutex::new(Some(vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ])),
+        judge_started: Arc::clone(&judge_started),
+    };
+    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools())
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Auto));
+
+    let mut rx = runtime.submit_user("please echo").await;
+    judge_started.notified().await;
+    let _ = runtime.cancel_turn().await;
+    let events = drain(&mut rx).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnCancelled { .. })),
+        "the turn's own channel must carry the cancellation"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, RuntimeEvent::ApprovalRequired { .. })),
+        "a cancelled turn must not park a prompt"
+    );
+    assert!(
+        runtime.live_turn_id().await.is_none(),
+        "the turn must be over, not parked"
+    );
+}
+
 /// A mock network tool that borrows the exact name `fetch_url` (the policy
 /// classifies by name). Registered so an Auto-mode call can dispatch; if the
 /// egress floor holds, it parks and this body never runs.

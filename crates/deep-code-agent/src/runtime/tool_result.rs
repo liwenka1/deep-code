@@ -278,6 +278,18 @@ impl AgentRuntime {
                     // File I/O for a bounded diff at a human-in-the-loop
                     // pause: cheap relative to the wait, so no spawn_blocking.
                     request.preview = self.approval_preview(&call);
+                    // The loop checks the token only at call boundaries, and the
+                    // judge (or the root-grant resolution) awaited across this
+                    // one. A cancel that landed meanwhile must end the turn
+                    // here: parked, the prompt could only ever be answered into
+                    // "cancelled" (`resolve_pending_tool` checks the token
+                    // first) and no `TurnCancelled` would reach anyone until
+                    // then.
+                    if cancel.is_cancelled() {
+                        remaining.push_front(call);
+                        self.finish_cancelled_calls(remaining, turn_id, tx).await;
+                        return BatchOutcome::Cancelled;
+                    }
                     {
                         let mut state = self.state.lock().await;
                         state.pending = Some(PendingToolBatch {
