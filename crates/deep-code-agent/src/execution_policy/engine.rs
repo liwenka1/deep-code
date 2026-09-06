@@ -598,8 +598,9 @@ pub fn shell_command_of<'a>(tool_name: &str, arguments: &'a Value) -> Option<&'a
 
 /// Whether a gated call is auto-approvable under `AcceptEdits` mode: a workspace
 /// file-edit tool, the dispatch of a writing sub-agent, or a filesystem-shaped
-/// shell/job command ([`shell_deny::is_workspace_fs_edit`]: program name only —
-/// the sandbox bounds the paths; cc's `acceptEdits` behavior). Everything else
+/// shell/job command ([`shell_deny::is_workspace_fs_edit`]: a bare program name
+/// first on the line — the sandbox bounds the paths; cc's `acceptEdits`
+/// behavior). Everything else
 /// still prompts. Hard denials never reach this — they short-circuit in the
 /// registry before any decision.
 #[must_use]

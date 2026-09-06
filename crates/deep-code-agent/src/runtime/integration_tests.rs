@@ -670,6 +670,48 @@ async fn auto_mode_inherits_accept_edits_fs_grant_without_asking() {
     assert!(workspace.path().join("sub").is_dir(), "mkdir actually ran");
 }
 
+/// The AcceptEdits allowance covers a bounded fs-edit only when the program
+/// word comes first on the line. `PATH=evil mkdir sub` runs ./evil/mkdir —
+/// whatever the model put there with its auto-approved write tools — so it must
+/// park on a prompt like any other untrusted command, in AcceptEdits and, by
+/// inheritance, in Auto. Before the prefix rule, `program_of` skipped the
+/// assignment, saw a bounded `mkdir`, and this ran with no prompt at all.
+#[tokio::test]
+async fn accept_edits_does_not_cover_an_env_prefixed_fs_edit() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+    let workspace = tempfile::tempdir().unwrap();
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::ToolCallDelta {
+            delta: tool_call_delta("call_1", "shell", r#"{"command": "PATH=evil mkdir sub"}"#),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let registry = crate::shell_tools::ShellTools::new(workspace.path())
+        .unwrap()
+        .with_sandbox(crate::sandbox::SandboxManager::new().force_sandbox(Some(false)))
+        .into_registry();
+    let runtime = AgentRuntime::with_new_session(
+        client,
+        registry,
+        "system",
+        workspace.path(),
+        &crate::config::AgentConfig::builtin(),
+    )
+    .unwrap()
+    .with_permission_mode(SharedPermissionMode::new(PermissionMode::AcceptEdits));
+
+    let mut rx = runtime.submit_user("make a dir").await;
+    let events = drain(&mut rx).await;
+    assert!(
+        matches!(events.last(), Some(RuntimeEvent::ApprovalRequired { .. })),
+        "an env-prefixed edit must park on a prompt, not ride the fs-edit grant"
+    );
+    assert!(
+        !workspace.path().join("sub").exists(),
+        "nothing may run before the human answers"
+    );
+}
+
 /// A parallel-safe tool (name `agent` → `ToolKind::SubAgent`) that blocks on a
 /// shared size-2 barrier: `run` only returns once two calls are in flight at
 /// once. Sequential batch execution deadlocks on it; concurrent execution

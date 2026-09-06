@@ -10,13 +10,17 @@
 //! Trusted (allow) matching lives separately in [`super::command_shape`].
 //!
 //! Scope, honestly: this is a best-effort UX floor over PLAIN command forms,
-//! not a security boundary, and it deliberately does not chase indirection
-//! (wrappers, `sh -c` scripts, substitutions). It doesn't have to: any
-//! command containing indirection is structurally excluded from every
-//! automatic pass ([`has_shell_indirection`]) and wrapped/interpreter forms
-//! are never trusted, so those always land on a human first. What parsing
-//! misses is contained by the human at the prompt — or, under `Yolo`, by the
-//! OS sandbox (plus the per-turn checkpoint for the writable workspace).
+//! not a security boundary. It reads a segment the way `sh` does — past the
+//! `VAR=value` assignments, control-flow words and grouping the shell itself
+//! consumes ahead of the program word, and past the transparent wrappers whose
+//! whole job is to run the rest of the line (`exec`, `env`, `nohup`, …; see
+//! [`PREFIX_WORDS`]) — but it does not chase interpreters, `sh -c` scripts,
+//! substitutions or wrapper options. It doesn't have to: any command
+//! containing indirection is structurally excluded from every automatic pass
+//! ([`has_shell_indirection`]) and wrapped/interpreter forms are never
+//! trusted, so those always land on a human first. What parsing misses is
+//! contained by the human at the prompt — or, under `Yolo`, by the OS sandbox
+//! (plus the per-turn checkpoint for the writable workspace).
 
 use serde::{Deserialize, Serialize};
 
@@ -28,44 +32,94 @@ use crate::i18n::TextId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenyReason(pub &'static str);
 
-/// Whether a (cleaned) token is a leading `VAR=value` environment assignment,
-/// which we skip when locating the program word.
+/// Whether a (cleaned) token is a `NAME=value` environment assignment on the
+/// shell's own terms: the text before the first `=` is a shell identifier
+/// (`[A-Za-z_][A-Za-z0-9_]*`). The value is unconstrained — `X=/`, `PATH=/x:/y`
+/// — which is where the previous "no slash anywhere in the token" test went
+/// wrong: it left every assignment with a path value unrecognized, so the
+/// assignment was taken for the program word (basename: the empty string) and
+/// the real program (`rm`, `sudo`, `dd`, `sh`) slid into the arguments, where
+/// no rule looks.
 fn is_env_assignment(token: &str) -> bool {
-    token.contains('=') && !token.starts_with('-') && !token.contains('/')
+    let Some((name, _value)) = token.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// Words the shell consumes ahead of a segment's program word, which the floor
+/// therefore reads past exactly as `sh` does: control-flow reserved words
+/// (`if true; then rm -rf /; fi` lexes to a segment starting with `then`), the
+/// `!` negation, `time`, and the transparent wrappers whose whole job is to run
+/// the rest of the line unchanged (`exec rm -rf /`, `env X=1 rm -rf /`,
+/// `echo / | xargs rm -rf`). Wrappers that take their own options first
+/// (`nice -n 5 …`, `timeout 5 …`, `env -i …`) are not parsed: their option
+/// becomes the "program" and matches no rule — the wrapper-options arms race
+/// this floor deliberately stays out of (such a line is never trusted and never
+/// a bounded edit, so it still lands on a human).
+const PREFIX_WORDS: &[&str] = &[
+    "if", "then", "else", "elif", "while", "until", "do", "for", "case", "!", "time", "exec",
+    "command", "builtin", "env", "nohup", "nice", "busybox", "xargs",
+];
+
+/// One segment read the way the shell reads it: how many leading words the
+/// shell consumes before the program (assignments, [`PREFIX_WORDS`], grouping
+/// punctuation), the program's lowercased basename, and the cleaned arguments.
+struct SegmentWords {
+    prefixes: usize,
+    program: String,
+    args: Vec<String>,
+}
+
+/// Split a segment into [`SegmentWords`]; `None` for an empty segment or one
+/// that is nothing but prefixes (`FOO=bar`, `(`).
+fn segment_words(segment: &str) -> Option<SegmentWords> {
+    let mut tokens = segment.split_whitespace();
+    let mut prefixes = 0;
+    let program = loop {
+        let cleaned = clean_token(tokens.next()?);
+        if is_env_assignment(&cleaned)
+            || PREFIX_WORDS.contains(&cleaned.to_ascii_lowercase().as_str())
+        {
+            prefixes += 1;
+            continue;
+        }
+        // Grouping: the shell reads `(` as an operator even glued to the word,
+        // so `(rm -rf /)` runs `rm`. Peel `(`/`{` off; a bare one is a prefix
+        // word of its own.
+        let word = cleaned.trim_start_matches(['(', '{']);
+        if word.is_empty() {
+            prefixes += 1;
+            continue;
+        }
+        if word.len() != cleaned.len() {
+            prefixes += 1;
+        }
+        break basename_lower(word);
+    };
+    Some(SegmentWords {
+        prefixes,
+        program,
+        args: tokens.map(clean_token).collect(),
+    })
 }
 
 /// The program name of a segment, reduced to its lowercased basename so that
-/// `/usr/bin/sudo` and `sudo` compare equal. Returns `None` for an empty
-/// segment or a leading assignment like `FOO=bar cmd` (we skip env-prefixes).
+/// `/usr/bin/sudo` and `sudo` compare equal, read past every prefix the shell
+/// itself skips (see [`segment_words`]).
 fn program_of(segment: &str) -> Option<String> {
-    for token in segment.split_whitespace() {
-        // Skip leading `VAR=value` environment assignments.
-        if is_env_assignment(&clean_token(token)) {
-            continue;
-        }
-        return Some(basename_lower(token));
-    }
-    None
+    segment_words(segment).map(|words| words.program)
 }
 
 /// Positional/flag tokens after the program word, each with shell quoting
 /// removed (see [`clean_token`]) so a quoted flag or path is inspected exactly
 /// as the shell would run it.
 fn args_of(segment: &str) -> Vec<String> {
-    let mut seen_program = false;
-    let mut out = Vec::new();
-    for token in segment.split_whitespace() {
-        let cleaned = clean_token(token);
-        if !seen_program {
-            if is_env_assignment(&cleaned) {
-                continue; // env prefix
-            }
-            seen_program = true;
-            continue; // the program word itself
-        }
-        out.push(cleaned);
-    }
-    out
+    segment_words(segment).map_or_else(Vec::new, |words| words.args)
 }
 
 /// True if the short-flag bundles or long flags in `args` contain a flag whose
@@ -256,11 +310,12 @@ fn chmod_world_writable(arg: &str) -> bool {
 
 /// Inspect one already-split segment. Returns the deny reason if the segment is
 /// a PLAIN known-dangerous command. Program matching is basename-based with
-/// quotes stripped; it deliberately does NOT chase wrappers (`env rm …`),
-/// inline interpreters (`sh -c '…'`), or substitutions — those indirect forms
-/// can never be auto-approved (see [`has_shell_indirection`] and the untrusted
-/// default), so they always reach a human, and under `Yolo` the OS sandbox is
-/// the containment. This floor exists to stop the common destructive shapes a
+/// quotes stripped and read past the shell's own prefixes ([`segment_words`]);
+/// it deliberately does NOT chase inline interpreters (`sh -c '…'`),
+/// substitutions or wrapper options — those indirect forms can never be
+/// auto-approved (see [`has_shell_indirection`] and the untrusted default), so
+/// they always reach a human, and under `Yolo` the OS sandbox is the
+/// containment. This floor exists to stop the common destructive shapes a
 /// model emits verbatim, not to win an obfuscation arms race.
 fn deny_segment(segment: &str) -> Option<DenyReason> {
     // Fork bomb: whitespace-insensitive signature match.
@@ -334,9 +389,9 @@ fn deny_segment(segment: &str) -> Option<DenyReason> {
 /// Detect a network-fetch piped into a shell interpreter, e.g.
 /// `curl https://x | sh` or `wget -O- url | bash`. Segment splitting alone
 /// loses the pipe relationship, so this inspects the producer/consumer pair.
-/// Plain program names only (see [`deny_segment`] for why wrapped forms are
-/// out of scope); the interpreter set includes scripting languages that can
-/// `eval` piped stdin.
+/// Plain program names only (see [`deny_segment`] for what stays out of
+/// scope); the interpreter set includes scripting languages that can `eval`
+/// piped stdin.
 fn deny_pipe_to_shell(command: &str) -> Option<DenyReason> {
     if !command.contains('|') {
         return None;
@@ -374,8 +429,8 @@ fn deny_pipe_to_shell(command: &str) -> Option<DenyReason> {
 /// Evaluate a full command line against the built-in deny rules. Returns the
 /// first matching reason, or `None` if nothing is denied. A command is denied
 /// if ANY of its segments is dangerous. Plain forms only: indirect forms
-/// (wrappers, `sh -c`, substitutions) are structurally excluded from every
-/// automatic pass, so they land on a human instead of on this floor.
+/// (`sh -c`, substitutions, wrapper options) are structurally excluded from
+/// every automatic pass, so they land on a human instead of on this floor.
 #[must_use]
 pub fn builtin_deny(command: &str) -> Option<DenyReason> {
     if let Some(reason) = deny_pipe_to_shell(command) {
@@ -482,8 +537,9 @@ pub fn safety_notes(command: &str) -> Vec<SafetyNote> {
 }
 
 /// cc-style `acceptEdits` allowlist for shell/job commands: a bounded
-/// filesystem-mutation command. Every segment's program must be in the set and
-/// `rm` must not recurse. It does NOT check whether a path stays inside the
+/// filesystem-mutation command. Every segment's program must be in the set,
+/// must be the segment's first word (no assignment, wrapper or grouping ahead
+/// of it) and `rm` must not recurse. It does NOT check whether a path stays inside the
 /// workspace — the OS sandbox enforces that boundary at execution (a write
 /// outside the workspace is denied there), so an out-of-workspace edge slips to
 /// a sandboxed failure rather than needing per-token path parsing here. A hard
@@ -505,18 +561,27 @@ pub fn is_workspace_fs_edit(command: &str) -> bool {
         return false;
     }
     segs.iter().all(|segment| {
-        let Some(program) = program_of(segment) else {
+        let Some(words) = segment_words(segment) else {
             return false;
         };
-        if !FS_EDIT.contains(&program.as_str()) {
+        // Only a bare program word is a bounded edit. An assignment ahead of it
+        // redirects what actually runs — `PATH=evil mkdir x` executes
+        // ./evil/mkdir, `LD_PRELOAD=./x.so touch f` loads code into touch — and
+        // a wrapper or grouping word hides the real program from this
+        // per-segment name check. The deny floor reads past such prefixes to
+        // *deny* more; this allowance refuses them to *approve* less.
+        if words.prefixes > 0 {
             return false;
         }
-        let args = args_of(segment);
+        if !FS_EDIT.contains(&words.program.as_str()) {
+            return false;
+        }
+        let args = &words.args;
         // A recursive `rm` deletes a whole subtree — not a bounded edit, and the
         // one destruction the sandbox can't undo (the workspace itself is
         // writable). `rm <file>` and `rmdir` (empty dirs) stay auto-approvable.
-        !(program == "rm"
-            && (has_flag(&args, 'r', &["recursive"]) || has_flag(&args, 'R', &["recursive"])))
+        !(words.program == "rm"
+            && (has_flag(args, 'r', &["recursive"]) || has_flag(args, 'R', &["recursive"])))
     })
 }
 
