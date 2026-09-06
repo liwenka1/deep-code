@@ -104,7 +104,7 @@ pub fn stable_prefix_fingerprint(messages: &[Message]) -> u64 {
     let mut hasher = DefaultHasher::new();
     let end = messages.len().saturating_sub(1);
     for message in &messages[..end] {
-        format!("{:?}:{}", message.role, message.content).hash(&mut hasher);
+        format!("{}:{}", message.role.as_str(), message.content).hash(&mut hasher);
     }
     hasher.finish()
 }

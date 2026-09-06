@@ -11,6 +11,21 @@ pub enum Role {
     Tool,
 }
 
+impl Role {
+    /// The wire spelling (`rename_all = "lowercase"`), for callers that need a
+    /// stable string without a serialization round-trip — a fingerprint must
+    /// not change because a variant was renamed in Rust.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -93,6 +108,17 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn role_as_str_matches_the_serde_spelling() {
+        for role in [Role::System, Role::User, Role::Assistant, Role::Tool] {
+            assert_eq!(
+                serde_json::to_value(role).unwrap(),
+                serde_json::Value::String(role.as_str().to_string()),
+                "{role:?}"
+            );
+        }
+    }
 
     #[test]
     fn role_serializes_as_openai_compatible_lowercase() {
