@@ -123,10 +123,16 @@ impl App {
         // arrives, and the queue would be auto-sent despite the cancel.
         self.steering_queue.clear();
         self.pending_steering_flush = false;
+        self.cancel_requested = true;
         let runtime = Arc::clone(&self.runtime);
         // The streaming loop emits TurnCancelled on the live channel that the
         // bridge task is already pumping; the receiver returned here stays
-        // empty, so it can be dropped.
+        // empty, so it can be dropped. The one case where it would not be
+        // empty — the runtime had already parked the batch and finalizes the
+        // cancellation on it — is the race where its `ApprovalRequired` is
+        // still in flight towards us; `cancel_requested` turns that request
+        // into the cancellation when it lands, so nothing is lost by not
+        // pumping the second channel.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let _ = runtime.cancel_turn().await;
@@ -168,6 +174,7 @@ impl App {
     pub(super) fn start_stream(&mut self, request: StreamRequest) {
         let (tx, rx) = mpsc::unbounded_channel();
         self.ui_rx = Some(rx);
+        self.cancel_requested = false;
         self.streaming_since = Some(std::time::Instant::now());
 
         let runtime = Arc::clone(&self.runtime);
@@ -228,6 +235,7 @@ impl App {
             self.tr(TextId::ErrorPrefix)
         )));
         self.is_streaming = false;
+        self.cancel_requested = false;
         // A failed turn is not a clean hand-off: don't auto-fire queued
         // prompts into a broken state (an API-key error would just re-error
         // each). They stay in the transcript / prompt history to resend.

@@ -60,6 +60,15 @@ impl App {
                 self.append_active_tool_output(&tool_call_id, &update.text);
                 self.status = self.tr_with(TextId::StatusToolRunning, &[("tool", &tool_name)]);
             }
+            RuntimeEvent::ApprovalRequired { .. } if self.cancel_requested => {
+                // Esc landed while this request was in flight: the runtime took
+                // the parked batch out from under it and finalized the
+                // cancellation on the receiver `cancel_turn` returns, which the
+                // UI does not pump (see `cancel_streaming_turn`). The request is
+                // for a turn that no longer exists; parking it drew a panel
+                // whose every answer the runtime could only drop in silence.
+                self.finish_turn_cancelled();
+            }
             RuntimeEvent::ApprovalRequired { request, .. } => {
                 self.set_active_approval(request.clone());
                 let sandbox = if request.requires_sandbox {
@@ -210,30 +219,37 @@ impl App {
                     })
                     .unwrap_or_default();
                 self.is_streaming = false;
+                self.cancel_requested = false;
                 self.clear_stream_receiver();
                 // Fire anything the user lined up while this turn streamed —
                 // but only once the drain loop is done, see the field's doc.
                 self.pending_steering_flush = true;
             }
-            RuntimeEvent::TurnCancelled { .. } => {
-                self.flush_active_turn();
-                self.history
-                    .push(HistoryCell::system(self.tr(TextId::SystemTurnCancelled)));
-                self.status = self.tr(TextId::StatusCancelled).to_string();
-                self.pending_approval = None;
-                self.is_streaming = false;
-                self.clear_stream_receiver();
-                // The cancel itself already emptied the queue, synchronously
-                // (`cancel_streaming_turn`) — "changed my mind" was honoured
-                // there. Whatever is queued *now* was typed after Esc, while
-                // the runtime was still winding the turn down: the user's next
-                // prompt, which must fire once the cancel has landed exactly as
-                // it would after `TurnFinished`. Clearing again here silently
-                // dropped it after the composer had confirmed it as queued.
-                self.pending_steering_flush = true;
-            }
+            RuntimeEvent::TurnCancelled { .. } => self.finish_turn_cancelled(),
             RuntimeEvent::Error { message, .. } => self.record_error(message),
         }
+    }
+
+    /// The turn ended by cancellation — either the runtime said so
+    /// (`TurnCancelled`), or an `ApprovalRequired` arrived for a turn the user
+    /// had already cancelled (see `apply_runtime_event`).
+    pub(crate) fn finish_turn_cancelled(&mut self) {
+        self.flush_active_turn();
+        self.history
+            .push(HistoryCell::system(self.tr(TextId::SystemTurnCancelled)));
+        self.status = self.tr(TextId::StatusCancelled).to_string();
+        self.pending_approval = None;
+        self.cancel_requested = false;
+        self.is_streaming = false;
+        self.clear_stream_receiver();
+        // The cancel itself already emptied the queue, synchronously
+        // (`cancel_streaming_turn`) — "changed my mind" was honoured there.
+        // Whatever is queued *now* was typed after Esc, while the runtime was
+        // still winding the turn down: the user's next prompt, which must fire
+        // once the cancel has landed exactly as it would after `TurnFinished`.
+        // Clearing again here silently dropped it after the composer had
+        // confirmed it as queued.
+        self.pending_steering_flush = true;
     }
 
     fn push_assistant_delta(&mut self, text: &str) {

@@ -101,6 +101,12 @@ pub struct App {
     /// ended tear down the new turn's receiver. Deferring keeps stream start-up
     /// out of the re-entrant path entirely.
     pub(crate) pending_steering_flush: bool,
+    /// Set by `cancel_streaming_turn`, cleared when the turn's end is observed
+    /// (`TurnCancelled` / `TurnFinished` / `Error`) or a new stream starts.
+    /// While set, an `ApprovalRequired` that still arrives belongs to the
+    /// cancelled turn — the runtime already finalized that batch on a receiver
+    /// the UI does not pump — and is rendered as the cancellation, not parked.
+    pub(crate) cancel_requested: bool,
     pub pending_approval: Option<ApprovalRequest>,
     pub last_checkpoint: Option<String>,
     /// Effective `--add-dir` grants (CLI ∪ resumed record); consulted by
@@ -442,6 +448,7 @@ impl App {
             is_streaming: false,
             steering_queue: Vec::new(),
             pending_steering_flush: false,
+            cancel_requested: false,
             pending_approval: None,
             last_checkpoint: None,
             extra_roots,

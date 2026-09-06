@@ -1281,6 +1281,91 @@ fn cancel_clears_the_steering_queue_synchronously() {
 
     assert!(app.steering_queue.is_empty());
     assert!(!app.pending_steering_flush);
+
+    // The cancel lands: nothing queued before Esc may fire. The handler arms a
+    // flush (a prompt typed *after* Esc must fire), but it finds the queue
+    // empty and stays a no-op — no user cell, no new turn.
+    app.apply_runtime_event(RuntimeEvent::TurnCancelled {
+        turn_id: deep_code_agent::TurnId("turn_1".to_string()),
+    });
+    assert!(app.steering_queue.is_empty());
+    let cells = app.history.len();
+    app.flush_steering_queue();
+    assert_eq!(
+        app.history.len(),
+        cells,
+        "the pre-cancel prompt must not fire"
+    );
+    assert!(!app.is_streaming);
+}
+
+/// Esc while `ApprovalRequired` is already in flight. The runtime took the
+/// parked batch and finalized the cancellation on the receiver `cancel_turn`
+/// returns — which the UI does not pump — so the request that then lands is
+/// for a turn that no longer exists. Parking it drew a panel whose every
+/// answer the runtime could only drop in silence; the cancel must win, the
+/// transcript must say so, and a later turn's prompt must still park.
+#[test]
+fn approval_arriving_after_cancel_renders_the_cancellation_not_a_panel() {
+    let request = deep_code_agent::ApprovalRequest {
+        network: false,
+        call_id: "call_1".to_string(),
+        tool_name: "shell".to_string(),
+        description: "shell".to_string(),
+        arguments: serde_json::json!({ "command": "mkdir sub" }),
+        risk_level: deep_code_agent::RiskLevel::High,
+        requires_sandbox: true,
+        read_only: false,
+        matched_rule: None,
+        justification: None,
+        resolved_target: None,
+        preview: None,
+        safety_notes: Vec::new(),
+    };
+    let mut app = App::new();
+    let turn_id = deep_code_agent::TurnId("turn_1".to_string());
+    app.apply_runtime_event(RuntimeEvent::TurnStarted {
+        turn_id: turn_id.clone(),
+        prompt: "make a dir".to_string(),
+    });
+    app.is_streaming = true;
+    app.handle_escape();
+    assert!(app.cancel_requested);
+
+    app.apply_runtime_event(RuntimeEvent::ApprovalRequired {
+        turn_id: Some(turn_id),
+        tool_call_id: None,
+        request: request.clone(),
+    });
+    assert!(
+        app.pending_approval.is_none(),
+        "a cancelled turn's prompt must not be parked"
+    );
+    assert!(!app.is_streaming);
+    assert!(!app.cancel_requested);
+    assert_eq!(app.status, app.tr(TextId::StatusCancelled));
+    assert!(
+        app.pending_steering_flush,
+        "the cancel landed: a prompt typed after Esc fires as after TurnCancelled"
+    );
+
+    // Control: the flag does not outlive the cancelled turn — the next turn's
+    // request parks exactly as before.
+    app.pending_steering_flush = false;
+    app.apply_runtime_event(RuntimeEvent::TurnStarted {
+        turn_id: deep_code_agent::TurnId("turn_2".to_string()),
+        prompt: "again".to_string(),
+    });
+    app.is_streaming = true;
+    app.apply_runtime_event(RuntimeEvent::ApprovalRequired {
+        turn_id: Some(deep_code_agent::TurnId("turn_2".to_string())),
+        tool_call_id: None,
+        request,
+    });
+    assert!(
+        app.pending_approval.is_some(),
+        "an uncancelled turn still parks"
+    );
 }
 
 /// A prompt typed after Esc — while the runtime is still winding the old turn
