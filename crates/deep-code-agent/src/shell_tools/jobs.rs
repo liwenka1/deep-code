@@ -554,10 +554,15 @@ impl Spill {
 }
 
 /// Kill `child` and, on Unix, its whole process group (children are spawned
-/// as group leaders, see `spawn_confined`), so grandchildren spawned by the
-/// shell don't outlive the job. On non-Unix `start_kill` only reaps the direct
-/// child; killing the tree there relies on dropping the job's Windows Job
-/// Object guard (see the `job_guard = None` at each kill site).
+/// as group leaders, see `spawn_confined`), so grandchildren the shell spawned
+/// into that group don't outlive the job. A descendant that moved itself into
+/// a new session (`setsid`, a double-forking daemon) is outside the group and
+/// is not reached: it stays inside the sandbox, but not inside the job's
+/// lifetime — a `network=true` job's detached child keeps its egress after a
+/// cancel. Reaching it would take a cgroup (Linux only); this is the documented
+/// residual. On non-Unix `start_kill` only reaps the direct child; killing the
+/// tree there relies on dropping the job's Windows Job Object guard (see the
+/// `job_guard = None` at each kill site), which does contain a detached child.
 pub(super) fn kill_process_tree(child: &mut Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {

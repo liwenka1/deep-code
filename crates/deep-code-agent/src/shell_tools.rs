@@ -35,6 +35,13 @@ use jobs::{
 /// the sandbox. The library *search-path* vars (`LD_LIBRARY_PATH`,
 /// `DYLD_LIBRARY_PATH`, …) are intentionally left alone — legitimate builds set
 /// them and they are a search hint, not a force-load.
+///
+/// Proxy and agent-socket variables (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`,
+/// `SSH_AUTH_SOCK`) are kept too, deliberately: under the no-network sandbox no
+/// socket opens, so they buy an attacker nothing, and under an approved
+/// `network: true` they are what lets `git push` over ssh-agent and a
+/// corporate-proxied `cargo build` work — scrubbing them would break exactly
+/// the egress the human just approved.
 const INJECTION_ENV: &[&str] = &[
     "LD_PRELOAD",
     "LD_AUDIT",
@@ -200,7 +207,8 @@ fn spawn_confined(
             )
         })?;
     // Own process group (Unix) so timeout/cancel/shutdown can kill the whole
-    // tree via `kill_process_tree`, not just the immediate shell.
+    // group via `kill_process_tree`, not just the immediate shell (a `setsid`
+    // escapee is the documented residual there).
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

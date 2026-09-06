@@ -40,9 +40,10 @@
 //! 4. **Standing consent** — `runtime::approval_flow`: config `auto_allow` (the
 //!    user's explicit list, matched on the exact tool name) and session
 //!    "approve for the session". Session memory is by tool name too, except for
-//!    shell, where it is remembered at command-identity granularity
-//!    ([`command_shape::session_identity`]); a job control action, a sub-agent
-//!    dispatch or a compound command records no session consent at all
+//!    shell and `job action=start`, where it is remembered at command-identity
+//!    granularity in one shared set ([`command_shape::session_identity`]); a
+//!    job control action (status/tail/cancel), a sub-agent dispatch or a
+//!    compound command records no session consent at all
 //!    (`session_consent_recordable`). One exclusion sits *above* both consents:
 //!    `request_write_root` is never covered by `auto_allow` or session memory
 //!    (`auto_approval_granted` refuses it before consulting either), so no

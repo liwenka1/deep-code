@@ -157,8 +157,12 @@ impl AgentRuntime {
             PermissionMode::AcceptEdits => accept_edits_approvable(&call.name, &call.arguments),
             PermissionMode::Auto => {
                 // Egress sits above the judge: opening the network is the
-                // human's call (or `[sandbox] network = "always"`), never
-                // something a classifier waves through. `request.network` is the
+                // human's call, never something a classifier waves through.
+                // (`[sandbox] network = "always"` hands sandboxed commands
+                // ambient egress at the plan stage, with no declaration and no
+                // prompt; a call that *declares* the flag still asks here — the
+                // declaration is what puts it in front of a human.)
+                // `request.network` is the
                 // *declared* flag on shell/job/sub-agent calls; the network-
                 // native tools (fetch_url/web_search) carry no such flag, so
                 // they are floored by kind here too — otherwise an

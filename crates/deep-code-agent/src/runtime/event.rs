@@ -168,12 +168,14 @@ pub enum RuntimeEvent {
     /// exists so library code never writes to stderr while a raw-mode
     /// terminal owns the screen.
     Warning { message: String },
-    /// Runtime-level error. Terminal for the current turn: every emitter ends
-    /// the turn right after sending it, and consumers rely on that (the TUI
-    /// stops observing the stream, headless stops the run). A degradation the
-    /// loop survives — a failed checkpoint snapshot, say — is a
-    /// [`Self::Warning`], never this: an `Error` from a loop that keeps going
-    /// is a turn nobody is watching.
+    /// Runtime-level error. Terminal for the current turn: every emitter inside
+    /// a turn ends the turn right after sending it, and consumers rely on that
+    /// (the TUI stops observing the stream, headless stops the run). The one
+    /// emitter outside a turn — `submit_approval` with nothing pending —
+    /// reports a rejected request with `turn_id: None`; there is no turn for it
+    /// to end. A degradation the loop survives — a failed checkpoint snapshot,
+    /// say — is a [`Self::Warning`], never this: an `Error` from a loop that
+    /// keeps going is a turn nobody is watching.
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<TurnId>,
