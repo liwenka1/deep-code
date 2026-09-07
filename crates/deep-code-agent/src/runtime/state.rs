@@ -42,11 +42,14 @@ pub(super) struct RuntimeState {
     /// Tools the user approved for the whole session ("a" in the approval
     /// panel). In-memory only: forgotten when the runtime shuts down.
     pub(super) session_approved: HashSet<String>,
-    /// Leading programs of shell commands the user approved for the session
-    /// ("a" on a shell call) — e.g. `cargo`, `git`. Shell isn't blanket
-    /// session-approvable by tool name, so this trusts at command granularity.
-    /// In-memory only; compound commands are never matched (they keep prompting).
-    pub(super) session_trusted_shell_prefixes: HashSet<String>,
+    /// Shell commands the user approved for the session ("a" on a shell call),
+    /// keyed by command identity — e.g. `cargo test`, `git push` — paired with
+    /// whether the consent was given for a call declaring `network: true`
+    /// (`approval_flow::shell_consent_key`). Shell isn't blanket
+    /// session-approvable by tool name, so this trusts at command granularity,
+    /// and an offline consent never covers the egress variant. In-memory only;
+    /// compound commands are never matched (they keep prompting).
+    pub(super) session_trusted_shell_prefixes: HashSet<(String, bool)>,
     /// Cascade routing latch: set once Flash visibly struggles (repeated
     /// tool-call execution failures within a turn). Sticky for the rest of the
     /// session, forcing auto mode onto Pro. In-memory only.

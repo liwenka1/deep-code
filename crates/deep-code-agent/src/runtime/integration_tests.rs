@@ -1812,6 +1812,93 @@ async fn session_approval_remembers_network_command_identity() {
     ));
 }
 
+/// The converse of the test above: a consent given on an *offline* command
+/// must not cover its `network: true` variant. The consent key carries the
+/// declaration, so the networked call parks again — before, a remembered
+/// `npm test` handed egress to `npm test --coverage` with no prompt in every
+/// mode, the Auto egress floor sitting below standing consent. The same
+/// identity without the declaration stays covered.
+#[tokio::test]
+async fn session_approval_of_an_offline_command_does_not_cover_its_network_variant() {
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_1", "shell", r#"{"command":"npm test"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta(
+                    "call_2",
+                    "shell",
+                    r#"{"command":"npm test --coverage","network":true}"#,
+                ),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_3", "shell", r#"{"command":"npm test -q"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let mut registry = ToolRegistry::default();
+    registry.register(FakeShellTool);
+    let runtime = AgentRuntime::new(client, registry);
+
+    let mut rx = runtime.submit_user("test three times").await;
+    let first = drain(&mut rx).await;
+    let Some(RuntimeEvent::ApprovalRequired { request, .. }) = first.last() else {
+        panic!("the offline call must prompt: {first:?}");
+    };
+    assert!(!request.network);
+
+    let mut rx = runtime
+        .submit_approval(ApprovalDecision::ApprovedForSession)
+        .await;
+    let second = drain(&mut rx).await;
+    let Some(RuntimeEvent::ApprovalRequired { request, .. }) = second.last() else {
+        panic!(
+            "the network variant must park again despite the offline consent: {:?}",
+            second
+                .iter()
+                .map(RuntimeEvent::wire_kind)
+                .collect::<Vec<_>>()
+        );
+    };
+    assert!(
+        request.network,
+        "the second prompt is about the egress declaration"
+    );
+
+    // Approving the networked call once does not widen the offline consent —
+    // but the offline consent still covers the offline repeat.
+    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let third = drain(&mut rx).await;
+    assert!(
+        third
+            .iter()
+            .all(|event| !matches!(event, RuntimeEvent::ApprovalRequired { .. })),
+        "the offline repeat rides the offline consent: {:?}",
+        third
+            .iter()
+            .map(RuntimeEvent::wire_kind)
+            .collect::<Vec<_>>()
+    );
+    assert!(matches!(
+        third.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+}
+
 #[tokio::test]
 async fn config_auto_allow_exact_name_runs_gated_tool_without_prompt() {
     let client = ScriptedClient::new(vec![

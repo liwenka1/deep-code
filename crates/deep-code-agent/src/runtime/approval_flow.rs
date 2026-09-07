@@ -6,7 +6,9 @@
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::execution_policy::{PermissionMode, RiskLevel, accept_edits_approvable, command_shape};
+use crate::execution_policy::{
+    PermissionMode, RiskLevel, accept_edits_approvable, command_shape, network_requested,
+};
 use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_FLASH};
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
@@ -105,6 +107,19 @@ pub(super) fn session_shell_prefix(call: &ToolCall) -> Option<String> {
     command_shape::session_identity(call.shell_command()?)
 }
 
+/// What a session "a" on a shell call records, and what a later call must
+/// present to ride it: the command identity ([`session_shell_prefix`]) together
+/// with whether the call declares `network: true`. The declaration is part of
+/// the consent, not a detail beside it — a consent recorded on an offline
+/// `npm test` must not wave through `npm test` with egress, for the same reason
+/// a consent on one kind of sub-agent dispatch does not cover the other (see
+/// [`session_allowable`]): the Auto egress floor sits *below* standing consent,
+/// so a key that ignored the flag skipped that floor in every mode.
+pub(super) fn shell_consent_key(call: &ToolCall) -> Option<(String, bool)> {
+    let identity = session_shell_prefix(call)?;
+    Some((identity, network_requested(&call.arguments)))
+}
+
 impl AgentRuntime {
     /// Whether a gated call may run without asking. Two independent layers:
     /// (1) standing consent — a configured `auto_allow` name or a session
@@ -142,9 +157,10 @@ impl AgentRuntime {
                 return true;
             }
             // Shell isn't blanket session-approvable by name; trust at command
-            // granularity instead ("a" remembered `cargo`, `git`, …).
-            if let Some(prefix) = session_shell_prefix(call)
-                && state.session_trusted_shell_prefixes.contains(&prefix)
+            // granularity instead ("a" remembered `cargo test`, `git push`, …),
+            // and only for the egress the consent was given with.
+            if let Some(key) = shell_consent_key(call)
+                && state.session_trusted_shell_prefixes.contains(&key)
             {
                 return true;
             }
@@ -288,15 +304,22 @@ impl AgentRuntime {
                     .await
                     .session_approved
                     .insert(current.name.clone());
-            } else if let Some(prefix) = session_shell_prefix(&current) {
-                // Shell: remember this command's program for the session so
-                // repeated `cargo`/`git`/… stop prompting (compound commands
-                // still prompt — `session_shell_prefix` returns None for them).
-                self.state
-                    .lock()
-                    .await
+            } else if let Some((identity, network)) = shell_consent_key(&current) {
+                // Shell: remember this command's identity for the session so
+                // repeated `cargo test`/`git push`/… stop prompting (compound
+                // commands still prompt — the key is None for them). A consent
+                // given with egress also covers the same command offline, which
+                // is strictly less; one given offline covers only offline — the
+                // network variant asks again.
+                let mut state = self.state.lock().await;
+                if network {
+                    state
+                        .session_trusted_shell_prefixes
+                        .insert((identity.clone(), false));
+                }
+                state
                     .session_trusted_shell_prefixes
-                    .insert(prefix);
+                    .insert((identity, network));
             }
             ApprovalDecision::Approved
         } else {
@@ -728,6 +751,38 @@ mod tests {
             arguments: json!({ "path": "x", "content": "y" }),
         };
         assert_eq!(session_shell_prefix(&call), None);
+    }
+
+    /// The consent key carries the egress declaration: an offline consent must
+    /// not cover the network variant (the Auto egress floor sits below standing
+    /// consent, so a flag-blind key skipped it in every mode), while the
+    /// identity half still collapses flags the way `session_shell_prefix` does.
+    #[test]
+    fn shell_consent_key_carries_the_network_declaration() {
+        let networked = |command: &str| ToolCall {
+            id: "c1".to_string(),
+            name: "shell".to_string(),
+            arguments: json!({ "command": command, "network": true }),
+        };
+        assert_eq!(
+            shell_consent_key(&shell("npm test")),
+            Some(("npm test".to_string(), false))
+        );
+        assert_eq!(
+            shell_consent_key(&networked("npm test --coverage")),
+            Some(("npm test".to_string(), true))
+        );
+        assert_ne!(
+            shell_consent_key(&shell("npm test")),
+            shell_consent_key(&networked("npm test"))
+        );
+        // `job action=start` is keyed the same way; a compound command has no
+        // key at all, declared or not.
+        assert_eq!(
+            shell_consent_key(&job_start("git push origin main")),
+            Some(("git push".to_string(), false))
+        );
+        assert_eq!(shell_consent_key(&networked("npm test && curl x")), None);
     }
 
     /// "Approve for session" must not be recordable for a root grant: each
