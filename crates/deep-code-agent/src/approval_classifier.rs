@@ -25,6 +25,7 @@ use crate::execution_policy::{RiskLevel, SafetyNote};
 use crate::i18n::{Lang, tr};
 use crate::message::Message;
 use crate::model::{ChatRequest, Usage};
+use crate::text_sanitize::collapse_whitespace;
 use crate::text_util::truncate_chars;
 
 /// Fixed, English, model-facing instructions. Not UI text — never localized.
@@ -71,7 +72,7 @@ pub struct ClassifierInput<'a> {
 /// in length. The fence + system prompt make the action untrusted data rather
 /// than instructions; this keeps the fence itself intact.
 fn fenced_action(action: &str) -> String {
-    let collapsed = action.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = collapse_whitespace(action);
     truncate_chars(
         &collapsed.replace('<', "&lt;").replace('>', "&gt;"),
         MAX_ACTION_CHARS,
@@ -273,11 +274,6 @@ pub fn action_summary(tool_name: &str, arguments: &Value) -> String {
         return collapse_whitespace(text);
     }
     collapse_whitespace(&arguments.to_string())
-}
-
-/// One line: runs of whitespace (newlines included) become a single space.
-fn collapse_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]

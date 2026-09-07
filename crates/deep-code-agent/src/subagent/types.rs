@@ -68,7 +68,7 @@ impl SubAgentRecord {
         self.result
             .as_deref()
             .map(|text| {
-                let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                let flattened = crate::text_sanitize::collapse_whitespace(text);
                 if flattened.chars().count() > 120 {
                     format!("{}...", flattened.chars().take(120).collect::<String>())
                 } else {

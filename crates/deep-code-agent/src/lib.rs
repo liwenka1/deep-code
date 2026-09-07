@@ -96,7 +96,9 @@ pub use subagent::{SharedSubAgentManager, SubAgentManager, is_subagent_tool};
 // here and not in the TUI: `deep-code-runtime` cannot depend on `deep-code-tui`
 // at all, so the `serve` warning loops were unreachable from the rule that was
 // supposed to cover them.
-pub use text_sanitize::{is_bidi_or_zero_width, neutralize_char_into, neutralize_display_text};
+pub use text_sanitize::{
+    collapse_whitespace, is_bidi_or_zero_width, neutralize_char_into, neutralize_display_text,
+};
 pub use tool::{
     ApprovalDecision, ApprovalRequest, MockEchoTool, ToolError, ToolRegistry, ToolResult,
     ToolResultStatus,

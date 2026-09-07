@@ -102,7 +102,7 @@ pub(crate) fn session_title(record: &SessionRecord, lang: Lang) -> String {
         Some(content) => content,
         None => return tr(lang, TextId::EmptySessionTitle).to_string(),
     };
-    crate::history::truncate_chars(&first.split_whitespace().collect::<Vec<_>>().join(" "), 56)
+    crate::history::truncate_chars(&crate::history::collapse_whitespace(first), 56)
 }
 
 /// Human-readable age, e.g. "刚刚 / 5 分钟前" or "just now / 5 min ago". Pure.

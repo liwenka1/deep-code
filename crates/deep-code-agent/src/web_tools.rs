@@ -285,7 +285,7 @@ fn html_to_text(html: &str) -> String {
     let mut out = String::new();
     let mut blank_run = 0usize;
     for line in decoded.lines() {
-        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        let line = crate::text_sanitize::collapse_whitespace(line);
         if line.is_empty() {
             blank_run += 1;
             if blank_run > 1 {

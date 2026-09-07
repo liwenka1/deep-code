@@ -301,8 +301,7 @@ pub(crate) fn summarize_tool_result(content: &str) -> String {
         return summary;
     }
 
-    let flattened = content.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_chars(&flattened, MAX_CHARS)
+    truncate_chars(&collapse_whitespace(content), MAX_CHARS)
 }
 
 fn summarize_json_tool_result(value: &serde_json::Value) -> Option<String> {
@@ -443,10 +442,9 @@ fn summarize_json_tool_result(value: &serde_json::Value) -> Option<String> {
 }
 
 /// Collapse all runs of whitespace (incl. newlines) to single spaces so a
-/// multi-line JSON argument or tool output renders on one line.
-pub(crate) fn collapse_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
+/// multi-line JSON argument or tool output renders on one line. The agent
+/// crate's spelling, re-exported so the TUI's callers keep their short name.
+pub(crate) use deep_code_agent::collapse_whitespace;
 
 #[must_use]
 pub(crate) fn tool_result_word(status: &ToolResultStatus) -> &'static str {
