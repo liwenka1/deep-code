@@ -172,8 +172,9 @@ pub enum RuntimeEvent {
     /// a turn ends the turn right after sending it, and consumers rely on that
     /// (the TUI stops observing the stream, headless stops the run). The one
     /// emitter outside a turn — `submit_approval` with nothing pending —
-    /// reports a rejected request with `turn_id: None`; there is no turn for it
-    /// to end. A degradation the loop survives — a failed checkpoint snapshot,
+    /// reports a rejected request with `turn_id: None` on that request's own
+    /// channel; whatever turn may be live is neither named nor ended by it. A
+    /// degradation the loop survives — a failed checkpoint snapshot,
     /// say — is a [`Self::Warning`], never this: an `Error` from a loop that
     /// keeps going is a turn nobody is watching.
     Error {

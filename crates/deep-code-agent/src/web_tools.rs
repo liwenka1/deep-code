@@ -498,7 +498,7 @@ mod tests {
     /// Real-network checks; run manually with
     /// `cargo test -p deep-code-agent web_tools -- --ignored`.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network"]
     async fn fetch_url_real_network() {
         let result = ErasedTool::execute(
             &FetchUrlTool::new(SharedLang::new(Lang::Zh)),
@@ -511,7 +511,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network"]
     async fn web_search_real_network() {
         let result = ErasedTool::execute(
             &WebSearchTool::new(SharedLang::new(Lang::Zh)),
