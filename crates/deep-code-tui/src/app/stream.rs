@@ -121,8 +121,16 @@ impl App {
         // finished and its `TurnFinished` is still sitting unread in the channel,
         // `cancel_turn` is a no-op on the idle runtime, no `TurnCancelled` ever
         // arrives, and the queue would be auto-sent despite the cancel.
-        self.steering_queue.clear();
-        self.pending_steering_flush = false;
+        //
+        // Unless a cancel is already in flight: everything queued since the
+        // first Esc was typed *after* the change of mind — it is the replacement
+        // request the composer just confirmed as queued. A second Esc (or a
+        // Ctrl+C) while the status still reads "Cancelling…" must not throw it
+        // away; `TurnCancelled` landing keeps it for the same reason.
+        if !self.cancel_requested {
+            self.steering_queue.clear();
+            self.pending_steering_flush = false;
+        }
         self.cancel_requested = true;
         let runtime = Arc::clone(&self.runtime);
         // The streaming loop emits TurnCancelled on the live channel that the

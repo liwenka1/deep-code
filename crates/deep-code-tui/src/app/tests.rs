@@ -1408,6 +1408,49 @@ fn prompt_typed_after_cancel_fires_when_the_cancel_lands() {
     );
 }
 
+/// A second Esc (or Ctrl+C) while the first cancel is still winding down —
+/// status "Cancelling…", `is_streaming` still set — must not drop the prompt
+/// queued after the first Esc: that prompt is the replacement request the
+/// composer confirmed as queued. Only the *first* cancel means "changed my
+/// mind" about what was queued before it.
+#[test]
+fn a_second_escape_during_cancel_keeps_the_prompt_queued_after_the_first() {
+    let mut app = App::new();
+    let turn_id = deep_code_agent::TurnId("turn_1".to_string());
+    app.apply_runtime_event(RuntimeEvent::TurnStarted {
+        turn_id: turn_id.clone(),
+        prompt: "first".to_string(),
+    });
+    app.is_streaming = true;
+    // Control: the first cancel does drop what was queued before it.
+    app.steering_queue.push("stale follow-up".to_string());
+    app.handle_escape();
+    assert!(app.steering_queue.is_empty());
+    assert!(app.is_streaming, "the cancel has not landed yet");
+
+    app.input = "try this instead".to_string();
+    app.submit();
+    assert_eq!(app.steering_queue, vec!["try this instead".to_string()]);
+
+    app.handle_escape();
+    assert_eq!(
+        app.steering_queue,
+        vec!["try this instead".to_string()],
+        "a second Esc during the wind-down must keep the replacement prompt"
+    );
+    app.handle_ctrl_c();
+    assert_eq!(
+        app.steering_queue,
+        vec!["try this instead".to_string()],
+        "Ctrl+C during the wind-down is the same cancel, same rule"
+    );
+
+    app.apply_runtime_event(RuntimeEvent::TurnCancelled { turn_id });
+    assert!(!app.is_streaming);
+    assert_eq!(app.steering_queue, vec!["try this instead".to_string()]);
+    assert!(app.pending_steering_flush);
+}
+
 #[test]
 fn steering_queue_is_capped_and_keeps_the_draft() {
     let mut app = App::new();
