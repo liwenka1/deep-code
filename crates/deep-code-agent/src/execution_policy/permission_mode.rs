@@ -26,10 +26,11 @@ pub enum PermissionMode {
     Default,
     /// Auto-approve workspace file edits, the dispatch of a writing sub-agent
     /// (its spawn is the write authorization) and filesystem-shaped shell/job
-    /// commands (`mkdir`/`touch`/`mv`/`cp`/`rm`/`rmdir` by program name — the
-    /// sandbox, not this check, bounds their paths; cc's `acceptEdits`); still
-    /// prompt for other shell commands, any network declaration, and
-    /// everything else.
+    /// commands (`mkdir`/`touch`/`mv`/`cp`/`rm`/`rmdir` by program name, with
+    /// every operand a relative in-tree spelling — the sandbox bounds their
+    /// writes, the spelling rule bounds the reads a `cp` from outside would
+    /// make; cc's `acceptEdits`); still prompt for other shell commands, any
+    /// network declaration, and everything else.
     AcceptEdits,
     /// Everything `AcceptEdits` waves through, plus a cheap classifier model
     /// judging the rest — behind three floors it cannot override: a root grant

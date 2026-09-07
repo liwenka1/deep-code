@@ -51,8 +51,9 @@
 //! 5. **Permission mode** — `runtime::approval_flow`, keyed on
 //!    [`PermissionMode`]: `Default` asks, `AcceptEdits` waves through workspace
 //!    file edits, the dispatch of a writing sub-agent and filesystem-shaped
-//!    shell commands ([`accept_edits_approvable`] — by program name; the
-//!    sandbox, not this check, bounds their paths), `Auto` inherits that
+//!    shell commands ([`accept_edits_approvable`] — by program name, operands
+//!    spelled relative and in-tree; the sandbox bounds their writes), `Auto`
+//!    inherits that
 //!    AcceptEdits allowance and consults the judge below for the rest, `Yolo`
 //!    waves through all but a root grant.
 //! 6. **Auto judge** — the cheap classifier. It only ever sees a call that has

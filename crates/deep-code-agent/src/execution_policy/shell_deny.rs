@@ -471,10 +471,7 @@ pub fn safety_notes(command: &str) -> Vec<SafetyNote> {
             .map(|token| token.to_ascii_lowercase())
             .collect();
 
-        if positional
-            .iter()
-            .any(|arg| arg.starts_with('/') || arg.starts_with('~') || arg.contains(".."))
-        {
+        if positional.iter().any(|arg| escapes_cwd_by_spelling(arg)) {
             notes.note(
                 TextId::SafetyPathOutsideReason,
                 TextId::SafetyPathOutsideSuggestion,
@@ -517,11 +514,12 @@ pub fn safety_notes(command: &str) -> Vec<SafetyNote> {
 /// cc-style `acceptEdits` allowlist for shell/job commands: a bounded
 /// filesystem-mutation command. Every segment's program must be in the set,
 /// must be the segment's first word (no assignment, wrapper or grouping ahead
-/// of it) and `rm` must not recurse. It does NOT check whether a path stays inside the
-/// workspace — the OS sandbox enforces that boundary at execution (a write
-/// outside the workspace is denied there), so an out-of-workspace edge slips to
-/// a sandboxed failure rather than needing per-token path parsing here. A hard
-/// deny (e.g. `rm -rf`) never reaches here — `builtin_deny` short-circuits it.
+/// of it), every operand must stay under the cwd by spelling (no absolute,
+/// home-relative or `..` path — [`escapes_cwd_by_spelling`]) and `rm` must not
+/// recurse. The spelling check is not the boundary — the OS sandbox is, for
+/// writes — it covers the read side the sandbox does not bound: a `cp` *from*
+/// outside the workspace. A hard deny (e.g. `rm -rf`) never reaches here —
+/// `builtin_deny` short-circuits it.
 #[must_use]
 pub fn is_workspace_fs_edit(command: &str) -> bool {
     // `sed` is deliberately absent: its `e`/`w` script flags run commands and
@@ -555,12 +553,41 @@ pub fn is_workspace_fs_edit(command: &str) -> bool {
             return false;
         }
         let args = &words.args;
+        // Every operand must stay under the cwd by spelling. The sandbox bounds
+        // the *write* side of an out-of-workspace path — the target fails there
+        // — but not the *read* side: `cp ~/.ssh/id_rsa ./k` copied a credential
+        // into the workspace, where `read_file` then served it to the model,
+        // with no prompt in AcceptEdits or Auto (the judge never sees an
+        // accept-edits pass). So an absolute, home-relative or climbing operand
+        // is not a bounded edit; an in-workspace path spelled absolutely costs
+        // one prompt. The safety notes flag the very same spellings.
+        if args
+            .iter()
+            .filter(|arg| !arg.starts_with('-'))
+            .any(|arg| escapes_cwd_by_spelling(arg))
+        {
+            return false;
+        }
         // A recursive `rm` deletes a whole subtree — not a bounded edit, and the
         // one destruction the sandbox can't undo (the workspace itself is
         // writable). `rm <file>` and `rmdir` (empty dirs) stay auto-approvable.
         !(words.program == "rm"
             && (has_flag(args, 'r', &["recursive"]) || has_flag(args, 'R', &["recursive"])))
     })
+}
+
+/// Whether a positional token names a path that leaves the current directory
+/// by its spelling alone: absolute (`/etc/x`, `C:\x`, `\x`), home-relative
+/// (`~/.ssh`) or climbing (`../other`). Read the same way by the safety notes,
+/// which flag it for the human, and by the accept-edits allowance, which
+/// refuses to auto-approve it — so the two never disagree about what "outside"
+/// looks like. Over-approximate on purpose (`my..dir` counts): the cost is one
+/// prompt.
+fn escapes_cwd_by_spelling(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    token.starts_with(['/', '~', '\\'])
+        || token.contains("..")
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
 }
 
 #[cfg(test)]
