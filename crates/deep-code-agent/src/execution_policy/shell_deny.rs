@@ -76,10 +76,12 @@ fn segment_words(segment: &str) -> Option<SegmentWords> {
             prefixes += 1;
             continue;
         }
-        // Grouping: the shell reads `(` as an operator even glued to the word,
-        // so `(rm -rf /)` runs `rm`. Peel `(`/`{` off; a bare one is a prefix
-        // word of its own.
-        let word = cleaned.trim_start_matches(['(', '{']);
+        // Grouping: the shell reads `(` and `)` as operators even glued to the
+        // word, so `(rm -rf /)` runs `rm` and `(sh)` runs `sh`. Peel `(`/`{`
+        // off the front and `)` off the back; a bare `(`/`{` is a prefix word
+        // of its own. (`}` must be a word by itself to close a group, so a
+        // glued one is genuinely part of the name.)
+        let word = cleaned.trim_start_matches(['(', '{']).trim_end_matches(')');
         if word.is_empty() {
             prefixes += 1;
             continue;
@@ -378,18 +380,27 @@ fn deny_segment(segment: &str) -> Option<DenyReason> {
 /// `curl https://x | sh` or `wget -O- url | bash`. Segment splitting alone
 /// loses the pipe relationship, so this inspects the producer/consumer pair.
 /// Plain program names only (see [`deny_segment`] for what stays out of
-/// scope); the interpreter set includes scripting languages that can `eval`
-/// piped stdin.
+/// scope); the interpreter set ([`INTERPRETERS`]) includes scripting languages
+/// that can `eval` piped stdin.
 fn deny_pipe_to_shell(command: &str) -> Option<DenyReason> {
     if !command.contains('|') {
         return None;
     }
-    let parts: Vec<&str> = command.split('|').map(str::trim).collect();
-    let fetches = |seg: &str| matches!(program_of(seg).as_deref(), Some("curl" | "wget" | "fetch"));
+    // Split on the pipe alone, then read each side through the shared segment
+    // lexer: the producer is the last simple command before the `|`, the
+    // consumer the first one after it. Reading a whole side as one segment let
+    // text glued to the interpreter hide it — `curl x | sh; echo ok` saw the
+    // program `sh;`, `curl x | { sh; }` saw `sh;` behind the brace — and the
+    // line fell through to a plain prompt, which Yolo waves through with
+    // egress. (`(sh)` is the grouping case `segment_words` peels itself.)
+    let parts: Vec<&str> = command.split('|').collect();
+    let producer = |part: &str| segments(part).last().and_then(|seg| program_of(seg));
+    let consumer = |part: &str| segments(part).first().and_then(|seg| program_of(seg));
+    let fetches = |part: &str| matches!(producer(part).as_deref(), Some("curl" | "wget" | "fetch"));
     let is_shell =
-        |seg: &str| program_of(seg).is_some_and(|program| INTERPRETERS.contains(&program.as_str()));
-    let has_fetch = parts.iter().any(|seg| fetches(seg));
-    let feeds_shell = parts.iter().skip(1).any(|seg| is_shell(seg));
+        |part: &str| consumer(part).is_some_and(|program| INTERPRETERS.contains(&program.as_str()));
+    let has_fetch = parts.iter().any(|part| fetches(part));
+    let feeds_shell = parts.iter().skip(1).any(|part| is_shell(part));
     (has_fetch && feeds_shell).then_some(DenyReason("network fetch piped to shell"))
 }
 
