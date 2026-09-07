@@ -148,6 +148,11 @@ fn ip_is_public(ip: IpAddr) -> bool {
 fn ipv4_is_public(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     let cgnat = octets[0] == 100 && (64..=127).contains(&octets[1]);
+    // "This network" 0.0.0.0/8 (RFC 1122): only the exact `0.0.0.0` is
+    // `is_unspecified`, but the whole /8 is unroutable and some stacks treat
+    // any of it as "this host" — refuse it whole, like the other special-use
+    // ranges, instead of only its first address.
+    let this_network = octets[0] == 0;
     !(ip.is_loopback()
         || ip.is_private()
         || ip.is_link_local()
@@ -155,7 +160,8 @@ fn ipv4_is_public(ip: Ipv4Addr) -> bool {
         || ip.is_broadcast()
         || ip.is_documentation()
         || ip.is_multicast()
-        || cgnat)
+        || cgnat
+        || this_network)
 }
 
 fn ipv6_is_public(ip: Ipv6Addr) -> bool {
@@ -175,6 +181,13 @@ fn ipv6_is_public(ip: Ipv6Addr) -> bool {
     // dead, so refuse it whole rather than decode which IPv4 it would reach.
     let teredo = s[0] == 0x2001 && s[1] == 0x0000;
     let discard = s[..4] == [0x0100, 0, 0, 0]; // 100::/64 (RFC 6666)
+    // Local-use NAT64 64:ff9b:1::/48 (RFC 8215): a site's own translator
+    // prefix, whose IPv4 sits at an operator-chosen offset — refuse it whole
+    // rather than guess the layout, as with Teredo.
+    let nat64_local = s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001;
+    // Deprecated site-local fec0::/10 (RFC 3879): never globally routable, so
+    // only ever names something on the host's own network.
+    let site_local = (s[0] & 0xffc0) == 0xfec0;
     !(ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_multicast()
@@ -182,7 +195,9 @@ fn ipv6_is_public(ip: Ipv6Addr) -> bool {
         || link_local
         || documentation
         || teredo
-        || discard)
+        || discard
+        || nat64_local
+        || site_local)
 }
 
 /// The IPv4 address an IPv6 literal embeds, across every standard embedding —
@@ -245,6 +260,9 @@ mod tests {
             "http://[2001:db8::1]/",        // documentation
             "http://[2001::1]/",            // Teredo
             "http://[100::1]/",             // discard-only (RFC 6666)
+            "http://[64:ff9b:1::7f00:1]/",  // local-use NAT64 (RFC 8215)
+            "http://[fec0::1]/",            // deprecated site-local
+            "http://0.1.2.3/",              // "this network" 0.0.0.0/8
         ] {
             let parsed = Url::parse(url).unwrap();
             assert!(
