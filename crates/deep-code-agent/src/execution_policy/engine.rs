@@ -193,7 +193,6 @@ pub struct ExecPolicy {
     /// Auto-approve rules, matched by command identity (`git status` covers
     /// `git status -s` but not `git push`).
     trusted_shell_prefixes: Vec<String>,
-    enable_sandbox: bool,
     network_mode: NetworkMode,
 }
 
@@ -210,7 +209,6 @@ impl Default for ExecPolicy {
                 "printf".to_string(),
                 "echo".to_string(),
             ],
-            enable_sandbox: true,
             network_mode: NetworkMode::Prompt,
         }
     }
@@ -220,12 +218,6 @@ impl ExecPolicy {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    #[must_use]
-    pub fn with_sandbox(mut self, enabled: bool) -> Self {
-        self.enable_sandbox = enabled;
-        self
     }
 
     #[must_use]
@@ -562,7 +554,7 @@ pub fn evaluate_shell_command(
                     .to_string(),
             },
             requires_approval: true,
-            requires_sandbox: policy.enable_sandbox,
+            requires_sandbox: true,
             read_only: false,
             risk_level: if trusted {
                 RiskLevel::Medium
@@ -579,7 +571,7 @@ pub fn evaluate_shell_command(
         return ToolExecutionPlan {
             verdict: PolicyVerdict::Allow,
             requires_approval: false,
-            requires_sandbox: policy.enable_sandbox,
+            requires_sandbox: true,
             read_only: false,
             risk_level: RiskLevel::Low,
             matched_rule: Some("trust:all_segments".to_string()),
@@ -593,7 +585,7 @@ pub fn evaluate_shell_command(
             reason: "shell commands can modify workspace files or run arbitrary code".to_string(),
         },
         requires_approval: true,
-        requires_sandbox: policy.enable_sandbox,
+        requires_sandbox: true,
         read_only: false,
         risk_level: RiskLevel::High,
         matched_rule: Some("builtin:shell_default".to_string()),

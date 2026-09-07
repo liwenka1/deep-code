@@ -12,8 +12,8 @@
 //!
 //! 1. **Plan** — [`ExecPolicy::evaluate_tool`] → [`ToolExecutionPlan`]. A pure,
 //!    stateless function of `(tool, args)` and the policy's own configuration
-//!    (trust list, sandbox flag, network mode): the verdict, risk tier, sandbox
-//!    and trust-match. Knows nothing of the session, the mode, or standing
+//!    (trust list, network mode): the verdict, risk tier, sandbox and
+//!    trust-match. Knows nothing of the session, the mode, or standing
 //!    consent.
 //!    For `shell` and `job action=start` its first step is the **deny floor**,
 //!    `shell_deny::builtin_deny` (via `shell_lex` parsing): a catastrophic shape
