@@ -88,11 +88,11 @@ pub enum NetworkMode {
     /// Every sandboxed command gets network without asking (the old coupled
     /// behavior, as an explicit opt-in). Only the user/global layer may set it.
     Always,
-    /// Network-declaring shell/job commands and networked sub-agent dispatches
-    /// are refused outright, and no sandboxed command gets ambient egress,
-    /// `Yolo` included. The in-process web tools (`fetch_url`/`web_search`) are
-    /// outside this setting's reach — they keep their own approval gate;
-    /// unmount them with `DEEP_CODE_DISABLE_WEB`.
+    /// Network-declaring shell/job commands, networked sub-agent dispatches and
+    /// the in-process web tools (`fetch_url`/`web_search`) are refused
+    /// outright, and no sandboxed command gets ambient egress, `Yolo` included.
+    /// (`DEEP_CODE_DISABLE_WEB` still unmounts the web tools entirely, so the
+    /// model never sees them.)
     Never,
 }
 
