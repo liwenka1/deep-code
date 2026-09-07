@@ -120,6 +120,30 @@ pub fn select_auto_effort(is_subagent: bool, last_msg: &str) -> ReasoningEffort 
 mod tests {
     use super::*;
 
+    /// `as_setting` is the serde spelling and a `parse` fixpoint, so the config
+    /// key, the wire and the diagnostics name an effort tier the same way.
+    #[test]
+    fn effort_setting_spelling_is_the_serde_spelling_and_parses_back() {
+        for setting in [
+            ReasoningEffortSetting::Off,
+            ReasoningEffortSetting::Low,
+            ReasoningEffortSetting::Medium,
+            ReasoningEffortSetting::High,
+            ReasoningEffortSetting::Max,
+            ReasoningEffortSetting::Auto,
+        ] {
+            assert_eq!(
+                serde_json::to_value(setting).unwrap(),
+                serde_json::Value::String(setting.as_setting().to_string()),
+                "{setting:?}"
+            );
+            assert_eq!(
+                ReasoningEffortSetting::parse(setting.as_setting()),
+                Some(setting)
+            );
+        }
+    }
+
     #[test]
     fn auto_effort_keywords() {
         assert_eq!(

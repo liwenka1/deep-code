@@ -671,6 +671,20 @@ fn risk_level_setting_spelling_is_its_wire_form() {
     }
 }
 
+/// `NetworkMode` has no serde form (it is parsed from the config string), so
+/// its pin is the parse round-trip: `as_setting` must be a spelling `parse`
+/// accepts, or a diagnostic would print a value the config file rejects.
+#[test]
+fn network_mode_setting_spelling_round_trips_through_parse() {
+    for mode in [NetworkMode::Prompt, NetworkMode::Always, NetworkMode::Never] {
+        assert_eq!(
+            NetworkMode::parse(mode.as_setting()),
+            Some(mode),
+            "{mode:?}"
+        );
+    }
+}
+
 #[test]
 fn shell_prefixes_neither_dodge_the_deny_floor_nor_earn_accept_edits() {
     // The floor reads past the words the shell consumes before the program, so

@@ -153,6 +153,28 @@ mod tests {
         assert!(SubAgentRole::parse("custom").is_err());
     }
 
+    /// `as_str` is the serde spelling and a `parse` fixpoint: the prefix
+    /// fingerprint, the wire and the dispatch arguments all name a role the
+    /// same way, so a variant rename cannot drift one without the others.
+    #[test]
+    fn role_str_is_the_serde_spelling_and_parses_back() {
+        for role in [
+            SubAgentRole::General,
+            SubAgentRole::Explore,
+            SubAgentRole::Plan,
+            SubAgentRole::Review,
+            SubAgentRole::Implementer,
+            SubAgentRole::Verifier,
+        ] {
+            assert_eq!(
+                serde_json::to_value(role).unwrap(),
+                serde_json::Value::String(role.as_str().to_string()),
+                "{role:?}"
+            );
+            assert_eq!(SubAgentRole::parse(role.as_str()).unwrap(), role);
+        }
+    }
+
     /// Children run shell too and start blank, so they need the same host facts.
     #[test]
     fn child_prompt_states_the_host_shell() {

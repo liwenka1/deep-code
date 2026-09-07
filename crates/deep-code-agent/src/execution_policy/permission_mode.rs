@@ -190,6 +190,25 @@ mod tests {
         assert_eq!(PermissionMode::parse("nonsense"), None);
     }
 
+    /// `as_setting` is also the serde spelling: the config file, the wire
+    /// events and the diagnostics name a tier the same way, so a variant rename
+    /// cannot drift one without the other.
+    #[test]
+    fn setting_spelling_is_the_serde_spelling() {
+        for mode in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Auto,
+            PermissionMode::Yolo,
+        ] {
+            assert_eq!(
+                serde_json::to_value(mode).unwrap(),
+                serde_json::Value::String(mode.as_setting().to_string()),
+                "{mode:?}"
+            );
+        }
+    }
+
     #[test]
     fn shared_get_set_cycle() {
         let shared = SharedPermissionMode::new(PermissionMode::Default);
