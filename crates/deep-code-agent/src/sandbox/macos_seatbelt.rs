@@ -207,6 +207,14 @@ fn compose_profile(
             let param = profile.bind_path(&format!("KEEP_PARENT_{index}"), dir);
             profile.rule(format!("(deny file-write-unlink (literal {param}))"));
         }
+        // HOME itself is the parent of every single-component entry (`~/.ssh`,
+        // `~/.aws`, …). A writable root above it — the user typed `--add-dir
+        // /Users`, say — would let `mv ~ ~/../h` carry every credential path
+        // out from under its literal deny in one move. Same narrow rule, one
+        // more literal; renaming one's own home directory is never a build step.
+        let home = crate::paths::canonicalize(&home).unwrap_or(home);
+        let param = profile.bind_path("KEEP_HOME", home);
+        profile.rule(format!("(deny file-write-unlink (literal {param}))"));
     }
 
     // deep-code's OWN config dir holds the plaintext API key. No sandboxed

@@ -141,6 +141,28 @@ fn intermediate_credential_dirs_are_locked_against_rename() {
         );
     }
 
+    // HOME itself is locked the same way: every single-component entry is a
+    // child of it, and a writable root above HOME would otherwise let one
+    // rename carry them all out from under their literal denies.
+    let home_param = profile
+        .bindings
+        .iter()
+        .find(|(name, _)| name == "KEEP_HOME")
+        .map(|(name, _)| name.clone())
+        .expect("HOME must be bound for its unlink deny");
+    assert!(
+        text.contains(&format!(
+            "(deny file-write-unlink (literal (param \"{home_param}\")))"
+        )),
+        "renaming HOME must be refused: {text}"
+    );
+    assert!(
+        !text.contains(&format!(
+            "(deny file-write* (subpath (param \"{home_param}\")))"
+        )),
+        "HOME must not become read-only: {text}"
+    );
+
     // The specific regression: Keychains' parent is locked, not only
     // `~/.config`.
     let library = crate::paths::canonicalize(&home)
