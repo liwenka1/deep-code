@@ -379,30 +379,33 @@ impl AgentRuntime {
 
     async fn cancel_turn_inner(&self, only_if: Option<TurnId>) -> RuntimeEventReceiver {
         let (tx, rx) = mpsc::unbounded_channel();
-        let (token, pending, streaming) = {
+        let pending = {
             let mut state = self.state.lock().await;
             if let Some(want) = only_if.as_ref()
                 && state.current_turn_id.as_ref() != Some(want)
             {
                 return rx;
             }
-            let token = state.cancel.clone();
             let pending = state.pending.take();
-            let streaming = state.current_turn_id.is_some();
-            (token, pending, streaming)
+            // Flip the token under the same lock that guards `pending`. The park
+            // sites take this lock and re-check the token before parking, so a
+            // cancel either finds the batch already parked (and takes it, below)
+            // or is seen by the parker before it parks — never the interleaving
+            // where the loop passed its check, this cancel took nothing and
+            // flipped the token, and the batch then parked anyway: `pending`
+            // set, token cancelled, and no terminal event until a second Esc,
+            // the next prompt or a stale answer happened to touch the turn.
+            if pending.is_some() || state.current_turn_id.is_some() {
+                state.cancel.cancel();
+            }
+            pending
         };
 
         if let Some(pending) = pending {
-            token.cancel();
             let runtime = self.clone();
             tokio::spawn(async move {
                 runtime.finalize_cancelled_batch(pending, &tx).await;
             });
-            return rx;
-        }
-
-        if streaming {
-            token.cancel();
         }
         rx
     }

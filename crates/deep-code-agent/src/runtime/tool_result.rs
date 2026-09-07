@@ -284,20 +284,34 @@ impl AgentRuntime {
                     // here: parked, the prompt could only ever be answered into
                     // "cancelled" (`resolve_pending_tool` checks the token
                     // first) and no `TurnCancelled` would reach anyone until
-                    // then.
-                    if cancel.is_cancelled() {
-                        remaining.push_front(call);
+                    // then. The check happens under the state lock, which is
+                    // where `cancel_turn_inner` flips the token and takes
+                    // `pending`: so the cancel either sees this batch parked or
+                    // this park sees the cancel — the lock serializes the two.
+                    let batch = PendingToolBatch {
+                        current: call,
+                        remaining,
+                        turn_id: turn_id.clone(),
+                        root_grant_target,
+                    };
+                    let unparked = {
+                        let mut state = self.state.lock().await;
+                        if cancel.is_cancelled() {
+                            Some(batch)
+                        } else {
+                            state.pending = Some(batch);
+                            None
+                        }
+                    };
+                    if let Some(PendingToolBatch {
+                        current,
+                        mut remaining,
+                        ..
+                    }) = unparked
+                    {
+                        remaining.push_front(current);
                         self.finish_cancelled_calls(remaining, turn_id, tx).await;
                         return BatchOutcome::Cancelled;
-                    }
-                    {
-                        let mut state = self.state.lock().await;
-                        state.pending = Some(PendingToolBatch {
-                            current: call,
-                            remaining,
-                            turn_id: turn_id.clone(),
-                            root_grant_target,
-                        });
                     }
                     self.flush_session_update(tx).await;
                     emit(

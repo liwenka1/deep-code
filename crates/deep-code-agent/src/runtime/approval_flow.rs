@@ -381,25 +381,38 @@ impl AgentRuntime {
                 // Same guard as the batch's park site (`process_tool_batch`):
                 // the tool re-requested approval after an await, and a cancel
                 // that landed during it ends the turn instead of parking a
-                // prompt nobody can answer into anything but "cancelled".
-                if cancel.is_cancelled() {
-                    let mut calls = remaining;
-                    calls.push_front(current);
-                    self.finish_cancelled_calls(calls, &turn_id, tx).await;
-                    return;
-                }
+                // prompt nobody can answer into anything but "cancelled". The
+                // check is made under the state lock, where `cancel_turn_inner`
+                // flips the token and takes `pending`, so the two cannot
+                // interleave into a parked batch with a cancelled token.
                 request.preview = self.approval_preview(&current);
-                {
+                let batch = PendingToolBatch {
+                    current,
+                    remaining,
+                    turn_id: turn_id.clone(),
+                    // A root grant never reaches this re-prompt path (it
+                    // is intercepted above, before run_tool); None keeps
+                    // the grant fail-closed if that ever changes.
+                    root_grant_target: None,
+                };
+                let unparked = {
                     let mut state = self.state.lock().await;
-                    state.pending = Some(PendingToolBatch {
-                        current,
-                        remaining,
-                        turn_id: turn_id.clone(),
-                        // A root grant never reaches this re-prompt path (it
-                        // is intercepted above, before run_tool); None keeps
-                        // the grant fail-closed if that ever changes.
-                        root_grant_target: None,
-                    });
+                    if cancel.is_cancelled() {
+                        Some(batch)
+                    } else {
+                        state.pending = Some(batch);
+                        None
+                    }
+                };
+                if let Some(PendingToolBatch {
+                    current,
+                    mut remaining,
+                    ..
+                }) = unparked
+                {
+                    remaining.push_front(current);
+                    self.finish_cancelled_calls(remaining, &turn_id, tx).await;
+                    return;
                 }
                 emit(
                     tx,
