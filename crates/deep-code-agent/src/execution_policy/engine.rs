@@ -277,17 +277,41 @@ impl ExecPolicy {
                 matched_rule: Some("builtin:write_tool".to_string()),
                 network: false,
             },
-            ToolKind::Network => ToolExecutionPlan {
-                verdict: PolicyVerdict::NeedsApproval {
-                    reason: "network tools can send data to external hosts".to_string(),
-                },
-                requires_approval: true,
-                requires_sandbox: false,
-                read_only: true,
-                risk_level: RiskLevel::Medium,
-                matched_rule: Some("builtin:network_tool".to_string()),
-                network: false,
-            },
+            ToolKind::Network => {
+                // `[sandbox] network = "never"` means this agent opens no
+                // connection but the model's. The web tools are egress by
+                // definition, so they are refused under it exactly as a
+                // network-declaring command or a networked dispatch is —
+                // otherwise `never` held for every sandboxed command and not
+                // for the one tool whose sole purpose is reaching a host, and
+                // Yolo waved that tool through with no human in the loop.
+                if self.network_mode == NetworkMode::Never {
+                    return ToolExecutionPlan {
+                        verdict: PolicyVerdict::Deny {
+                            reason: "network access is disabled by configuration ([sandbox] \
+                                     network = \"never\"), so the web tools cannot run"
+                                .to_string(),
+                        },
+                        requires_approval: false,
+                        requires_sandbox: false,
+                        read_only: true,
+                        risk_level: RiskLevel::Medium,
+                        matched_rule: Some("deny:network_disabled".to_string()),
+                        network: false,
+                    };
+                }
+                ToolExecutionPlan {
+                    verdict: PolicyVerdict::NeedsApproval {
+                        reason: "network tools can send data to external hosts".to_string(),
+                    },
+                    requires_approval: true,
+                    requires_sandbox: false,
+                    read_only: true,
+                    risk_level: RiskLevel::Medium,
+                    matched_rule: Some("builtin:network_tool".to_string()),
+                    network: false,
+                }
+            }
             ToolKind::Job => match arguments.get("action").and_then(Value::as_str) {
                 // Launching a background command is exactly as risky as the
                 // command itself: same deny/trust/approve gate as `shell`.

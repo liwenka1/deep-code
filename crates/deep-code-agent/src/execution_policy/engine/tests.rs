@@ -456,6 +456,39 @@ fn network_never_mode_denies_declared_commands() {
     assert!(!offline.network);
 }
 
+/// `never` is the user's "no egress but the model's": the web tools are egress
+/// by definition, so they are refused under it like a declaring command or a
+/// networked dispatch. Before, the `Network` arm never read the mode, and Yolo
+/// auto-approved `fetch_url` under `never` with nobody in the loop.
+#[test]
+fn network_never_mode_denies_the_web_tools_too() {
+    let never = ExecPolicy::default().with_network_mode(NetworkMode::Never);
+    for (tool, args) in [
+        ("fetch_url", json!({"url": "https://example.com"})),
+        ("web_search", json!({"query": "deep-code"})),
+    ] {
+        let plan = never.evaluate_tool(tool, &args);
+        assert!(
+            matches!(plan.verdict, PolicyVerdict::Deny { .. }),
+            "{tool} must be refused under never, got {:?}",
+            plan.verdict
+        );
+        assert!(!plan.requires_approval);
+        assert_eq!(plan.matched_rule.as_deref(), Some("deny:network_disabled"));
+        // Under prompt and always the web tools ask, as they always did.
+        for mode in [NetworkMode::Prompt, NetworkMode::Always] {
+            let plan = ExecPolicy::default()
+                .with_network_mode(mode)
+                .evaluate_tool(tool, &args);
+            assert!(
+                matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }),
+                "{tool} under {mode:?} must ask, got {:?}",
+                plan.verdict
+            );
+        }
+    }
+}
+
 #[test]
 fn deny_still_beats_a_network_declaration() {
     let policy = ExecPolicy::default();

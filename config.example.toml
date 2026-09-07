@@ -48,10 +48,11 @@
 # 任何被自动放行的命令都可能把读到的内容外送——这就是默认 prompt 的原因。
 # 子代理派遣(agent 工具)声明 network=true 时同受本设置约束:never 直接拒,
 # always 免网络审批;获授子代理的白名单命令 egress 常开(其审批无人在环,
-# 逐条声明保护不了任何东西)。
+# 逐条声明保护不了任何东西)。联网原生工具(fetch_url / web_search)本身就是
+# egress:never 下同样直接拒,prompt / always 下照常转人工审批。
 #   prompt  声明 → 审批(默认)
 #   always  所有沙箱命令直接带网(回到旧行为,零打扰;只在全局层生效)
-#   never   声明联网的命令直接拒绝
+#   never   声明联网的命令、联网派遣、web 工具一律直接拒绝
 # network = "prompt"
 
 [cost]
