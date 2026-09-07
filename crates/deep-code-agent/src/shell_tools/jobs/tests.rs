@@ -528,6 +528,58 @@ fn plain_job(stdout: SharedBuffer) -> JobState {
     }
 }
 
+/// A child that finishes spawning after `shutdown` swept the store must not
+/// outlive it: the store is closed, so the insert kills the child the way the
+/// sweep would have and records it as cancelled. An open store, by contrast,
+/// keeps a running insert running.
+#[cfg(unix)]
+#[tokio::test]
+async fn insert_after_shutdown_kills_the_late_child() {
+    let spawn_sleep = || {
+        tokio::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    };
+    let running = |child: tokio::process::Child| JobState {
+        kind: JobKind::Background,
+        status: JobStatus::Running,
+        exit_code: None,
+        child: Some(child),
+        ..plain_job(SharedBuffer::default())
+    };
+
+    let closed = JobStore::default();
+    closed.shutdown();
+    let id = closed.reserve_id();
+    closed.insert_with_id(&id, running(spawn_sleep()));
+    let state = closed.get(&id, "job").unwrap();
+    let (status, mut child) = {
+        let mut state = state.lock().unwrap();
+        (state.status, state.child.take().unwrap())
+    };
+    assert_eq!(status, JobStatus::Cancelled);
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+    assert!(
+        exit.is_ok(),
+        "the late child must have been killed, not left to run"
+    );
+
+    let open = JobStore::default();
+    let id = open.reserve_id();
+    open.insert_with_id(&id, running(spawn_sleep()));
+    let state = open.get(&id, "job").unwrap();
+    let status = state.lock().unwrap().status;
+    assert_eq!(
+        status,
+        JobStatus::Running,
+        "control: an open store keeps the child"
+    );
+    open.shutdown();
+}
+
 #[test]
 fn truncation_note_names_the_spill_file() {
     let tmp = tempfile::tempdir().unwrap();

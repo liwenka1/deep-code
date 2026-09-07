@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Instant;
 
@@ -75,6 +75,10 @@ const MAX_RETAINED_JOBS: usize = 32;
 pub struct JobStore {
     next_id: Arc<AtomicU64>,
     jobs: Arc<Mutex<HashMap<String, Arc<Mutex<JobState>>>>>,
+    /// Set by [`Self::shutdown`], read by [`Self::insert_with_id`] under the
+    /// same map lock: a child that finishes spawning after the kill sweep is
+    /// killed on the way in instead of outliving the store.
+    closed: Arc<AtomicBool>,
 }
 
 impl JobStore {
@@ -85,6 +89,10 @@ impl JobStore {
     /// to drop.
     pub fn shutdown(&self) {
         let guard = self.jobs.lock().expect("job store lock poisoned");
+        // Under the map lock, so an `insert_with_id` racing this sweep either
+        // lands before it (and is swept) or sees the flag (and kills its own
+        // child) — never slips in between with a live process.
+        self.closed.store(true, Ordering::SeqCst);
         for state_arc in guard.values() {
             let Ok(mut state) = state_arc.lock() else {
                 continue;
@@ -110,8 +118,21 @@ impl JobStore {
         format!("job_{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
-    pub(super) fn insert_with_id(&self, id: &str, state: JobState) {
+    pub(super) fn insert_with_id(&self, id: &str, mut state: JobState) {
         let mut guard = self.jobs.lock().expect("job store lock poisoned");
+        // A child that finished spawning after `shutdown` swept the store — a
+        // sub-agent abandoned past its cancel grace while still inside
+        // `job_start`, say — would otherwise outlive the sweep with only
+        // `kill_on_drop` (the direct child, not its process group) behind it.
+        // The store is closed: kill it the way the sweep would have.
+        if self.closed.load(Ordering::SeqCst)
+            && state.status == JobStatus::Running
+            && let Some(child) = state.child.as_mut()
+        {
+            kill_process_tree(child);
+            state.job_guard = None;
+            state.status = JobStatus::Cancelled;
+        }
         guard.insert(id.to_string(), Arc::new(Mutex::new(state)));
         evict_finished_jobs(&mut guard);
     }
