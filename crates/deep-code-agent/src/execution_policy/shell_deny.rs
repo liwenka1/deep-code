@@ -42,9 +42,21 @@ pub struct DenyReason(pub &'static str);
 /// assignment was taken for the program word (basename: the empty string) and
 /// the real program (`rm`, `sudo`, `dd`, `sh`) slid into the arguments, where
 /// no rule looks.
+///
+/// Two bash spellings are read as assignments too, because the `sh` this floor
+/// fronts is bash on macOS (`/bin/sh` is bash 3.2 in POSIX mode, and it runs
+/// `X[0]=1 rm -rf /` and `X+=1 rm -rf /` as `rm`): `NAME+=value` appends and
+/// `NAME[index]=value` sets an array element. dash refuses both, so on Linux
+/// they were never a bypass — only a spelling the floor must not misread.
 fn is_env_assignment(token: &str) -> bool {
     let Some((name, _value)) = token.split_once('=') else {
         return false;
+    };
+    let name = name.strip_suffix('+').unwrap_or(name);
+    let name = match name.split_once('[') {
+        Some((base, subscript)) if subscript.ends_with(']') => base,
+        Some(_) => return false,
+        None => name,
     };
     let mut chars = name.chars();
     chars

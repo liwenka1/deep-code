@@ -113,6 +113,33 @@ fn env_assignment_with_a_path_value_is_still_a_prefix() {
     }
 }
 
+/// macOS's `/bin/sh` is bash, which also reads `NAME+=v` (append) and
+/// `NAME[i]=v` (array element) as assignment prefixes — so `X[0]=1 rm -rf /`
+/// ran `rm` while the floor, stopping at the POSIX identifier, took `x[0]=1`
+/// for the program and let `rm` slide into the arguments.
+#[test]
+fn bash_append_and_subscript_assignments_are_prefixes_too() {
+    for cmd in [
+        "X[0]=1 rm -rf /",
+        "X+=1 rm -rf /",
+        "ARR[i]+=x sudo reboot",
+        "_a[0]=/ dd if=/dev/zero of=/dev/sda",
+    ] {
+        assert!(denied(cmd), "{cmd}");
+    }
+    for assignment in ["X[0]=1", "X+=1", "ARR[i]+=x", "a[b[c]]=d"] {
+        assert!(is_env_assignment(assignment), "{assignment}");
+    }
+    // An unclosed subscript or a bare `+` is not an assignment for bash either.
+    for word in ["X[=1", "X[0=1", "+=1", "[0]=1"] {
+        assert!(!is_env_assignment(word), "{word}");
+    }
+    // The allowance side stays symmetric: an assignment ahead of an edit is a
+    // prefix there too, so it is refused rather than mistaken for the program.
+    assert!(!is_workspace_fs_edit("X[0]=1 mkdir x"));
+    assert!(!is_workspace_fs_edit("PATH+=:/evil mkdir x"));
+}
+
 #[test]
 fn grouping_and_reserved_words_do_not_hide_the_program() {
     // The shell consumes these words before the program; so does the floor.
