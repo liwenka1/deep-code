@@ -4167,3 +4167,52 @@ async fn approval_preview_renders_through_the_live_boundary() {
     // And with no boundary there is nothing to resolve against.
     assert_eq!(boundaryless.approval_preview(&write), None);
 }
+
+/// `Error` is terminal for the turn, and consumers act on the first one (the
+/// TUI stops observing, headless stops the run). A provider that follows one
+/// in-band error frame with another must therefore produce exactly one
+/// `Error`: the loop stops reading at the first instead of relaying the rest.
+#[tokio::test]
+async fn a_second_in_band_error_frame_does_not_emit_a_second_terminal_error() {
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::TextDelta {
+            text: "partial".to_string(),
+        },
+        AgentEvent::Error {
+            message: "first".to_string(),
+        },
+        AgentEvent::Error {
+            message: "second".to_string(),
+        },
+        AgentEvent::TextDelta {
+            text: "never relayed".to_string(),
+        },
+    ]]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::default());
+
+    let mut rx = runtime.submit_user("hi").await;
+    let events = drain(&mut rx).await;
+
+    let errors: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::Error { message, .. } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        errors,
+        vec!["first"],
+        "one terminal Error, the first: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::AssistantDelta { text, .. } if text == "never relayed"
+        )),
+        "nothing after the error frame is relayed: {events:?}"
+    );
+    // The partial text before the error survives, as for a single error.
+    let messages = runtime.session_messages().await;
+    assert_eq!(messages[1].content, "partial");
+}

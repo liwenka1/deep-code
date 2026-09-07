@@ -277,6 +277,13 @@ impl AgentRuntime {
                             },
                         );
                         had_error = true;
+                        // `Error` is terminal for the turn (consumers stop
+                        // observing on it), so stop reading here: a provider
+                        // that follows one error frame with another must not
+                        // produce a second terminal event. The transport-error
+                        // arm below gets the same exit from `GuardedStream`,
+                        // which fuses itself after an `Err`.
+                        break;
                     }
                     Err(error) => {
                         emit(
