@@ -353,13 +353,8 @@ impl AgentRuntime {
             };
             self.record_tool_result(&current, result, tx, turn_id.clone())
                 .await;
-            if self
-                .process_tool_batch(remaining, &turn_id, &cancel, tx)
-                .await
-                == BatchOutcome::Completed
-            {
-                self.run_loop(tx).await;
-            }
+            self.resume_after_batch(remaining, &turn_id, &cancel, tx)
+                .await;
             return;
         }
         match self
@@ -433,10 +428,27 @@ impl AgentRuntime {
 
         // Resolved call recorded; drain the rest of the batch, then resume the
         // loop to feed all tool results into the next chat turn.
+        self.resume_after_batch(remaining, &turn_id, &cancel, tx)
+            .await;
+    }
+
+    /// Drain the rest of a batch a human answer resumed, then continue the
+    /// turn — under the same exit the loop's own batches get: a batch that
+    /// pushed the turn's boundary denials past the breaker ends the turn with
+    /// guidance instead of another model round. Without this the breaker fired
+    /// one round late whenever the tripping batch was the one resumed here.
+    async fn resume_after_batch(
+        &self,
+        remaining: std::collections::VecDeque<ToolCall>,
+        turn_id: &TurnId,
+        cancel: &CancellationToken,
+        tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
         if self
-            .process_tool_batch(remaining, &turn_id, &cancel, tx)
+            .process_tool_batch(remaining, turn_id, cancel, tx)
             .await
             == BatchOutcome::Completed
+            && !self.boundary_breaker_tripped(turn_id, tx).await
         {
             self.run_loop(tx).await;
         }

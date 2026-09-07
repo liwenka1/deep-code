@@ -39,8 +39,11 @@ impl AgentRuntime {
     /// End the turn when its boundary denials crossed the breaker threshold.
     /// Mirrors the step-limit exit: a user-facing Error event with the remedy
     /// (`/add-dir`, with the denied directory when one was captured), then
-    /// `abort_turn`. Returns whether the caller should stop looping.
-    async fn boundary_breaker_tripped(
+    /// `abort_turn`. Returns whether the caller should stop looping. Consulted
+    /// after every completed batch — the loop's own and the ones
+    /// `handle_approval` resumes after a human answer — so the batch that
+    /// crosses the threshold ends the turn, not the one after it.
+    pub(super) async fn boundary_breaker_tripped(
         &self,
         turn_id: &crate::runtime::event::TurnId,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
