@@ -370,6 +370,10 @@ fn trusted_commands_lose_their_trust_when_a_flag_redirects_execution() {
         "cargo build --target-dir=/tmp/spray",
         "git diff --output=/tmp/leak",
         "git log --ext-diff",
+        // Reads, not writes, but out of the repository: the default trust list
+        // must not hand the model every readable file on the host.
+        "git diff --no-index /dev/null ~/.ssh/id_rsa",
+        "git diff --no-index ~/.aws/credentials /dev/null",
     ] {
         let plan = evaluate_shell_command(&policy, command, false);
         assert!(

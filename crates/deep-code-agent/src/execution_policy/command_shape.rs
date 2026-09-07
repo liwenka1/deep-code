@@ -144,9 +144,10 @@ static PROGRAM_SHAPES: LazyLock<HashMap<&'static str, Shape>> = LazyLock::new(||
 /// or write a caller-named path. Matched with or without an `=value` suffix, so
 /// both `--config=x` and `--config x` are caught.
 ///
-/// Deliberately narrow: only flags that change *what executes* or *what is
-/// written*, so trusting `cargo build` still covers `--release`, `--features …`
-/// and friends without a prompt.
+/// Deliberately narrow: only flags that change *what executes*, *what is
+/// written*, or *what is read from outside the repository*, so trusting
+/// `cargo build` still covers `--release`, `--features …` and friends without a
+/// prompt.
 fn redirects_execution(token: &str) -> bool {
     const REDIRECTING: &[&str] = &[
         // cargo: sets any config key, including `build.rustc-wrapper` and
@@ -163,6 +164,13 @@ fn redirects_execution(token: &str) -> bool {
         "--output-file",
         // cargo: writes the whole build tree into a caller-named directory.
         "--target-dir",
+        // git diff: lifts the repository bound and diffs two caller-named paths
+        // anywhere on disk. Every other pathspec git refuses as "outside
+        // repository", but `git diff --no-index /dev/null ~/.ssh/id_rsa`
+        // prints the whole file into the transcript — a read the file tools'
+        // workspace boundary and the shell prompt both exist to gate, riding
+        // in on the trusted `git diff` with no prompt in any tier.
+        "--no-index",
     ];
     // `sh -c` / `cmd /C` strip shell quoting before the flag reaches the
     // program, so `--con"fig"`, `'--config'` and (on Unix) `--config\` all run
@@ -548,6 +556,7 @@ mod tests {
             "git diff --output=/tmp/leak",
             "git diff --ext-diff",
             "git log --ext-diff",
+            "git diff --no-index /dev/null /etc/hosts",
         ] {
             assert_ne!(
                 identity_of(command),
@@ -564,6 +573,19 @@ mod tests {
             "cargo test --config 'build.rustc-wrapper=\"/tmp/x\"'"
         ));
         assert!(!covers("git diff", "git diff --output=/tmp/leak"));
+        // `--no-index` is a read, not a write, but it is the one diff form git
+        // lets out of the repository: through the trusted `git diff` it read
+        // any file on disk into the transcript with no prompt.
+        assert!(!covers(
+            "git diff",
+            "git diff --no-index /dev/null /etc/hosts"
+        ));
+        assert!(!covers(
+            "git diff",
+            "git diff --no-index ~/.aws/credentials /dev/null"
+        ));
+        // Inside the repository `git diff` stays trusted, pathspec or not.
+        assert!(covers("git diff", "git diff -- src/main.rs"));
         // A byte-identical rule still matches the degraded identity.
         assert!(covers("git diff --ext-diff", "git diff --ext-diff"));
     }
