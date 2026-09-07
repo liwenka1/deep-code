@@ -24,7 +24,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::shell_lex::{basename_lower, clean_token, has_shell_indirection, segments};
+use super::shell_lex::{
+    INTERPRETERS, PREFIX_WORDS, basename_lower, clean_token, has_shell_indirection, segments,
+};
 use crate::i18n::TextId;
 
 /// Why a command segment was denied. The string is surfaced to the user and
@@ -51,24 +53,10 @@ fn is_env_assignment(token: &str) -> bool {
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-/// Words the shell consumes ahead of a segment's program word, which the floor
-/// therefore reads past exactly as `sh` does: control-flow reserved words
-/// (`if true; then rm -rf /; fi` lexes to a segment starting with `then`), the
-/// `!` negation, `time`, and the transparent wrappers whose whole job is to run
-/// the rest of the line unchanged (`exec rm -rf /`, `env X=1 rm -rf /`,
-/// `echo / | xargs rm -rf`). Wrappers that take their own options first
-/// (`nice -n 5 …`, `timeout 5 …`, `env -i …`) are not parsed: their option
-/// becomes the "program" and matches no rule — the wrapper-options arms race
-/// this floor deliberately stays out of (such a line is never trusted and never
-/// a bounded edit, so it still lands on a human).
-const PREFIX_WORDS: &[&str] = &[
-    "if", "then", "else", "elif", "while", "until", "do", "for", "case", "!", "time", "exec",
-    "command", "builtin", "env", "nohup", "nice", "busybox", "xargs",
-];
-
 /// One segment read the way the shell reads it: how many leading words the
-/// shell consumes before the program (assignments, [`PREFIX_WORDS`], grouping
-/// punctuation), the program's lowercased basename, and the cleaned arguments.
+/// shell consumes before the program (assignments, the [`PREFIX_WORDS`] the
+/// floor reads past exactly as `sh` does, grouping punctuation), the program's
+/// lowercased basename, and the cleaned arguments.
 struct SegmentWords {
     prefixes: usize,
     program: String,
@@ -398,29 +386,8 @@ fn deny_pipe_to_shell(command: &str) -> Option<DenyReason> {
     }
     let parts: Vec<&str> = command.split('|').map(str::trim).collect();
     let fetches = |seg: &str| matches!(program_of(seg).as_deref(), Some("curl" | "wget" | "fetch"));
-    let is_shell = |seg: &str| {
-        matches!(
-            program_of(seg).as_deref(),
-            Some(
-                "sh" | "bash"
-                    | "zsh"
-                    | "dash"
-                    | "ksh"
-                    | "perl"
-                    | "python"
-                    | "python3"
-                    | "ruby"
-                    | "node"
-                    | "php"
-                    // Windows interpreters were missing, so `curl x | powershell`
-                    // — the standard Windows one-line installer shape — was not
-                    // denied on ANY platform.
-                    | "powershell"
-                    | "pwsh"
-                    | "cmd"
-            )
-        )
-    };
+    let is_shell =
+        |seg: &str| program_of(seg).is_some_and(|program| INTERPRETERS.contains(&program.as_str()));
     let has_fetch = parts.iter().any(|seg| fetches(seg));
     let feeds_shell = parts.iter().skip(1).any(|seg| is_shell(seg));
     (has_fetch && feeds_shell).then_some(DenyReason("network fetch piped to shell"))

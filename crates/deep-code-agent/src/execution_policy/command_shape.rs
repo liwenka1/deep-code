@@ -10,7 +10,10 @@
 //!
 //! Unknown programs collapse to their bare program word; unknown subcommands
 //! of a *known* program keep the program's base depth, so a session approval
-//! of `git frobnicate` never widens to other `git` subcommands.
+//! of `git frobnicate` never widens to other `git` subcommands. Wrappers and
+//! interpreters (`time`, `env`, `sh -c`, `python …`) are the exception to the
+//! collapse: their bare word would cover every command reachable through it,
+//! so such a line keeps its full literal text as its identity.
 //!
 //! Flags are only skipped *after* the identity is complete. A flag sitting in
 //! an identity position — `git --exec-path=/tmp/evil status` — can redirect
@@ -201,9 +204,13 @@ fn option_tokens<'a, 'b>(tokens: &'a [&'b str]) -> impl Iterator<Item = &'a &'b 
 /// Flag tokens (leading `-`) that come *after* a complete identity are
 /// skipped — they vary freely without changing what the command is. A flag
 /// *inside* the identity (between program and subcommand) degrades the
-/// identity to the full literal command line; see the module docs. One
-/// deliberate carve-out: for `python -m <module>` (and `python3`), the module
-/// named by `-m` is the operation, so the identity keeps all three words.
+/// identity to the full literal command line; see the module docs. So does a
+/// line that opens with a wrapper or an interpreter
+/// ([`super::shell_lex::runs_the_rest_of_the_line`]): `time`, `env`, `sh`,
+/// `python` … run whatever follows them, so their "identity" is the whole
+/// line. One deliberate carve-out: for `python -m <module>` (and `python3`),
+/// the module named by `-m` is the operation, so the identity keeps all three
+/// words.
 #[must_use]
 pub fn identity(tokens: &[&str]) -> String {
     let Some(first) = tokens.first() else {
@@ -219,6 +226,21 @@ pub fn identity(tokens: &[&str]) -> String {
         && let [_, "-m", module, ..] = tokens
     {
         return format!("{program} -m {}", module.to_ascii_lowercase());
+    }
+
+    // A wrapper or an interpreter names no operation of its own: what runs is
+    // whatever the rest of the line says — `time <anything>`, `env <anything>`,
+    // `sh -c '<anything>'`, `python <any script>`. Collapsing such a line to its
+    // first word would let one consent cover every command reachable through
+    // that word (a session "a" on `sh -c 'echo hi'` waving through
+    // `sh -c 'cat ~/.ssh/id_rsa'`), so the identity is the whole literal line:
+    // a rule or a remembered consent covers only the byte-identical command.
+    // The deny floor reads *past* these same words for the opposite reason —
+    // it wants the program they hand off to; this side must not pretend the
+    // word is the program. (A configured rule naming the bare interpreter
+    // still covers it through `rule_covers`' whole-word prefix branch.)
+    if super::shell_lex::runs_the_rest_of_the_line(&super::shell_lex::basename_lower(first)) {
+        return squeeze(&tokens.join(" "));
     }
 
     // Scan the whole line, not just the identity window. The loop below stops
@@ -298,6 +320,9 @@ pub fn rule_covers(rule: &str, command: &str) -> bool {
 /// that does not open with an environment assignment. `None` otherwise, so a
 /// compound or indirect command can neither match nor record a standing shell
 /// consent: `cargo test && rm -rf /` must not ride a remembered `cargo test`.
+/// A line opening with a wrapper or interpreter is recordable, but its key is
+/// the whole literal line (see [`identity`]): `sh -c 'echo hi'` remembers
+/// exactly that command, never `sh`.
 ///
 /// "One simple command" is read through the same lexer the trust gate and the
 /// deny floor use ([`super::shell_lex`]), so the three sides of the gate agree
@@ -443,6 +468,51 @@ mod tests {
         assert_eq!(identity_of("rg pattern src/"), "rg");
     }
 
+    /// A wrapper or interpreter first word hands execution to the rest of the
+    /// line, so its identity is the literal line, never the bare word: a
+    /// session "a" on `sh -c 'echo hi'` must not cover `sh -c 'cat ~/.ssh/id_rsa'`,
+    /// and one on `time cargo test` must not cover `time rm -r ~`. The deny
+    /// floor reads past the same words (`shell_lex::PREFIX_WORDS`) — the two
+    /// sides share the list and disagree, on purpose, about what to do with it.
+    #[test]
+    fn wrapper_and_interpreter_first_words_degrade_to_the_literal_line() {
+        for (command, bare) in [
+            ("time cargo test", "time"),
+            ("env cargo test", "env"),
+            ("nice cargo test", "nice"),
+            ("nohup ./server", "nohup"),
+            ("exec cargo test", "exec"),
+            ("command cargo test", "command"),
+            ("xargs rm", "xargs"),
+            ("! true", "!"),
+            ("sh -c 'echo hi'", "sh"),
+            ("bash script.sh", "bash"),
+            ("python evil.py", "python"),
+            ("node app.js", "node"),
+            // Path and quoting resolve to the same word the shell runs.
+            ("/bin/sh -c 'echo hi'", "/bin/sh"),
+            ("'sh' -c 'echo hi'", "'sh'"),
+        ] {
+            assert_eq!(identity_of(command), squeeze(command), "{command:?}");
+            assert_ne!(identity_of(command), bare, "{command:?}");
+        }
+        assert_ne!(
+            session_identity("sh -c 'echo hi'"),
+            session_identity("sh -c 'cat ~/.ssh/id_rsa'")
+        );
+        assert_eq!(
+            session_identity("time cargo test"),
+            Some("time cargo test".to_string())
+        );
+        // The module carve-out still names a bounded operation.
+        assert_eq!(identity_of("python -m pytest -q"), "python -m pytest");
+        // A configured rule naming the bare interpreter still covers it through
+        // the whole-word prefix branch, so operator trust is unchanged.
+        assert!(covers("python", "python script.py"));
+        assert!(!covers("python", "python3 script.py"));
+        assert!(covers("sh -c 'echo hi'", "sh -c 'echo hi'"));
+    }
+
     #[test]
     fn identity_of_unknown_git_subcommand_stays_specific() {
         // Approving one exotic subcommand must not widen to all of `git`.
@@ -459,7 +529,9 @@ mod tests {
             identity_of("python3 -m http.server 8000"),
             "python3 -m http.server"
         );
-        assert_eq!(identity_of("python script.py"), "python");
+        // Without `-m` the interpreter runs an arbitrary script: literal line,
+        // not the bare word (see `wrapper_and_interpreter_first_words_…`).
+        assert_eq!(identity_of("python script.py"), "python script.py");
     }
 
     #[test]

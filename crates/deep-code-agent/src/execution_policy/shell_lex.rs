@@ -30,6 +30,60 @@ pub(super) fn segments(command: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Words the shell consumes ahead of a segment's program word: control-flow
+/// reserved words (`if true; then rm -rf /; fi` lexes to a segment starting
+/// with `then`), the `!` negation, `time`, and the transparent wrappers whose
+/// whole job is to run the rest of the line unchanged (`exec rm -rf /`,
+/// `env X=1 rm -rf /`, `echo / | xargs rm -rf`).
+///
+/// The two sides read this list in opposite directions, which is why it lives
+/// here and not in either of them. The deny floor reads *past* these words to
+/// find the program they hand off to. The identity side treats a line that
+/// *opens* with one as naming no operation of its own — `time <anything>` —
+/// so it never collapses to the bare word (see
+/// [`super::command_shape::identity`]). Wrappers that take their own options
+/// first (`nice -n 5 …`, `timeout 5 …`, `env -i …`) are not parsed on the deny
+/// side: their option becomes the "program" and matches no rule — the
+/// wrapper-options arms race the floor deliberately stays out of (such a line
+/// is never trusted and never a bounded edit, so it still lands on a human).
+pub(super) const PREFIX_WORDS: &[&str] = &[
+    "if", "then", "else", "elif", "while", "until", "do", "for", "case", "!", "time", "exec",
+    "command", "builtin", "env", "nohup", "nice", "busybox", "xargs",
+];
+
+/// Interpreters that execute whatever text they are handed — a script path, a
+/// `-c` string, or piped stdin. The deny floor uses the list to refuse a
+/// network fetch piped into one; the identity side uses it the way it uses
+/// [`PREFIX_WORDS`]: `sh -c '<anything>'` and `python <any script>` name no
+/// operation of their own, so a consent on one must not cover another.
+pub(super) const INTERPRETERS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "perl",
+    "python",
+    "python3",
+    "ruby",
+    "node",
+    "php",
+    // Windows interpreters were missing, so `curl x | powershell` — the
+    // standard Windows one-line installer shape — was not denied on ANY
+    // platform.
+    "powershell",
+    "pwsh",
+    "cmd",
+];
+
+/// Whether a program word (lowercased basename) runs whatever the rest of the
+/// line names instead of an operation of its own: a [`PREFIX_WORDS`] wrapper
+/// or an [`INTERPRETERS`] entry.
+pub(super) fn runs_the_rest_of_the_line(program: &str) -> bool {
+    PREFIX_WORDS.contains(&program) || INTERPRETERS.contains(&program)
+}
+
 /// Remove shell quoting from a single token so a deny/bounds check inspects
 /// what `sh -c` will actually execute — not the raw, still-quoted text. Strips
 /// every `'` and `"` (the shell removes quotes anywhere in a word, so `r""m`
