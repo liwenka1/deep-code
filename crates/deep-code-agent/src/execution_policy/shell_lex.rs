@@ -253,6 +253,43 @@ pub(super) fn has_shell_indirection(command: &str) -> bool {
     command.contains(['>', '<', '`', '$', '{', '}', '(', ')'])
 }
 
+/// Whether a (cleaned) token names a path that leaves the current directory by
+/// its spelling alone: absolute (`/etc/x`, `\x`), home-relative (`~/.ssh`,
+/// `~user`), drive-lettered (`C:\x`) or climbing through a `..` path component
+/// (`../x`, `a/../b`, `..`). `..` counts only as a whole component: `main..HEAD`
+/// is a revision range and `my..dir` a file name, and reading the two dots
+/// anywhere in the word turned `git diff main..HEAD` into a prompt.
+///
+/// The sandbox bounds the *write* side of such a path; the *read* side it
+/// leaves open (`(allow file-read*)`), so this spelling is the read fence — for
+/// the accept-edits allowance (`cp ~/.ssh/id_rsa ./k`), for the trust gate and
+/// the session key (`git diff /dev/null ~/.ssh/id_rsa` on the default-trusted
+/// `git diff`), and for the safety notes that warn the human. One predicate, so
+/// the three never disagree about what "outside" looks like.
+pub(super) fn escapes_cwd_by_spelling(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    token.starts_with(['/', '~', '\\'])
+        || token.split(['/', '\\']).any(|component| component == "..")
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+}
+
+/// Whether an argument token (quoting already stripped) names a path outside
+/// the cwd: a positional operand judged as is, a `--flag=value` judged by its
+/// value (`--target-directory=/tmp` is a target like any other), a bare flag
+/// (`-r`, `--`) never. Judging only the words that do not start with `-` let
+/// the `=value` spelling of a target through while `-t /tmp` was refused.
+pub(super) fn operand_leaves_cwd(cleaned: &str) -> bool {
+    let operand = if cleaned.starts_with('-') {
+        match cleaned.split_once('=') {
+            Some((_, value)) => value,
+            None => return false,
+        }
+    } else {
+        cleaned
+    };
+    escapes_cwd_by_spelling(operand)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

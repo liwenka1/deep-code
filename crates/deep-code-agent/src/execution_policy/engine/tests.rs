@@ -449,13 +449,60 @@ fn trusted_commands_lose_their_trust_when_a_flag_redirects_execution() {
         "cargo build",
         "cargo test --release",
         "cargo test --features full",
-        "cargo test -- --output /tmp/handed-to-the-test-binary",
+        // Handed to the test binary, not a redirecting flag — but spelled
+        // in-tree: an absolute operand anywhere on the line costs a prompt now
+        // (see `trusted_commands_lose_their_trust_when_an_operand_leaves_the_cwd`).
+        "cargo test -- --output ./handed-to-the-test-binary",
         "git diff --stat",
         "git log --oneline -5",
     ] {
         let plan = evaluate_shell_command(&policy, command, false);
         assert_eq!(
             plan.verdict,
+            PolicyVerdict::Allow,
+            "{command:?} must stay trusted"
+        );
+    }
+}
+
+/// `--no-index` is not what lets `git diff` read outside the repository: git
+/// switches to the two-paths-on-disk form by itself whenever a path is outside
+/// the work tree, `--` or not. So the default-trusted `git diff` read any file
+/// on the host into the transcript with no prompt in Default, AcceptEdits or
+/// Auto — the plan is `Allow`, and an `Allow` has no second gate. The fence is
+/// the operand's spelling, the same predicate the accept-edits allowance reads.
+#[test]
+fn trusted_commands_lose_their_trust_when_an_operand_leaves_the_cwd() {
+    let policy = ExecPolicy::default();
+    for command in [
+        "git diff /dev/null /etc/hosts",
+        "git diff /dev/null ~/.ssh/id_rsa",
+        "git diff a.txt /etc/hosts",
+        "git diff -- /dev/null /etc/hosts",
+        "git diff ../../.ssh/id_rsa /dev/null",
+        "git log -p -- ~/.ssh/id_rsa",
+        "cargo build --manifest-path ~/evil/Cargo.toml",
+        "cargo test -- --logfile /tmp/x",
+    ] {
+        let plan = evaluate_shell_command(&policy, command, false);
+        assert!(
+            matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }),
+            "{command:?} must reach a human, got {:?}",
+            plan.verdict
+        );
+    }
+    // Revision ranges, `HEAD~n` and in-tree paths stay trusted: `..` counts
+    // only as a whole path component and `~` only at the start of a word.
+    for command in [
+        "git diff main..HEAD",
+        "git diff HEAD~1 --stat",
+        "git log HEAD~3..HEAD --oneline",
+        "git log origin/main..HEAD",
+        "git diff -- src/main.rs",
+        "cargo test -p deep-code-agent -- --nocapture",
+    ] {
+        assert_eq!(
+            evaluate_shell_command(&policy, command, false).verdict,
             PolicyVerdict::Allow,
             "{command:?} must stay trusted"
         );

@@ -20,6 +20,13 @@
 //! what actually executes, so such a command's identity degrades to its full
 //! literal text: it matches no subcommand rule and a session approval of it
 //! covers nothing but the byte-identical command.
+//!
+//! Operands are read for one property only: a token that names a path outside
+//! the cwd by spelling (`/etc/x`, `~/.ssh/id_rsa`, `../x`, `C:\x`, or the value
+//! of a `--flag=value`) breaks the trust match ([`rule_covers`]) and the
+//! session key ([`session_identity`]). The trusted programs are read-mostly and
+//! the sandbox leaves reads open, so that spelling is the only fence between a
+//! trusted `git diff` and every readable file on the host.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -171,12 +178,13 @@ fn redirects_execution(token: &str) -> bool {
         "--output-file",
         // cargo: writes the whole build tree into a caller-named directory.
         "--target-dir",
-        // git diff: lifts the repository bound and diffs two caller-named paths
-        // anywhere on disk. Every other pathspec git refuses as "outside
-        // repository", but `git diff --no-index /dev/null ~/.ssh/id_rsa`
-        // prints the whole file into the transcript — a read the file tools'
-        // workspace boundary and the shell prompt both exist to gate, riding
-        // in on the trusted `git diff` with no prompt in any tier.
+        // git diff: names the two-paths-on-disk form explicitly. git also
+        // enters that form BY ITSELF whenever a path is outside the work tree
+        // (`git diff /dev/null ~/.ssh/id_rsa`, with or without `--`), so this
+        // entry covers one spelling of that read and the operand rule in
+        // `rule_covers` covers the read itself: an out-of-cwd operand breaks
+        // the trust match. The flag stays listed because it lifts git's own
+        // repository bound whatever the operands spell.
         "--no-index",
         // find: names a program to run for each hit. This is the same "flag
         // that redirects execution" shape as the cargo/git entries above,
@@ -318,6 +326,20 @@ pub fn rule_covers(rule: &str, command: &str) -> bool {
         return false;
     }
 
+    // An operand that names a path outside the cwd by spelling breaks the
+    // match too, unless the rule spells that very operand out. The trusted
+    // programs are read-mostly and the sandbox leaves reads open, so the
+    // spelling is the only read fence: `git diff /dev/null ~/.ssh/id_rsa` — no
+    // `--no-index`; git switches to the two-paths-on-disk form by itself when
+    // a path is outside the work tree — printed any file on the host into the
+    // transcript on the default-trusted `git diff`, with no prompt in any
+    // tier. Listing `--no-index` had fixed one spelling of that read; this
+    // fixes the read. Scanned past `--` on purpose: `git diff -- /dev/null
+    // /etc/hosts` prints the file all the same.
+    if operands_outside_cwd(&tokens).any(|token| !rule_spells_out_word(&rule, token)) {
+        return false;
+    }
+
     if identity(&tokens) == rule {
         return true;
     }
@@ -362,8 +384,35 @@ pub fn session_identity(command: &str) -> Option<String> {
     if tokens.first().is_some_and(|token| token.contains('=')) {
         return None;
     }
+    // An operand outside the cwd is refused for the reason `rule_covers`
+    // refuses it: a remembered `git diff` must not cover `git diff /dev/null
+    // ~/.ssh/id_rsa`, and a consent given on that command must not be recorded
+    // as `git diff`. No key means neither.
+    if operands_outside_cwd(&tokens).next().is_some() {
+        return None;
+    }
     let canonical = identity(&tokens);
     (!canonical.is_empty()).then_some(canonical)
+}
+
+/// The argument tokens (program word excluded, everything after `--` included:
+/// git reads pathspecs there, and `git diff -- /dev/null /etc/hosts` reads the
+/// file all the same) whose de-quoted spelling names a path outside the cwd —
+/// see [`super::shell_lex::operand_leaves_cwd`].
+fn operands_outside_cwd<'a, 'b>(tokens: &'a [&'b str]) -> impl Iterator<Item = &'a &'b str> {
+    tokens
+        .iter()
+        .skip(1)
+        .filter(|token| super::shell_lex::operand_leaves_cwd(&super::shell_lex::clean_token(token)))
+}
+
+/// Whether the (already squeezed) `rule` spells `token` out as one of its own
+/// words, de-quoted and case-folded like the rule itself — so an operator who
+/// wants `ls /tmp` trusted still can, by writing it out.
+fn rule_spells_out_word(rule: &str, token: &str) -> bool {
+    let wanted = super::shell_lex::clean_token(token).to_ascii_lowercase();
+    rule.split_whitespace()
+        .any(|word| super::shell_lex::clean_token(word) == wanted)
 }
 
 /// A flag token without its `=value` suffix, lowercased. Shell quoting is
@@ -757,6 +806,66 @@ mod tests {
         assert!(covers("git diff", "git diff -- src/main.rs"));
         // A byte-identical rule still matches the degraded identity.
         assert!(covers("git diff --ext-diff", "git diff --ext-diff"));
+    }
+
+    /// An operand outside the cwd breaks the trust match and the session key.
+    /// `--no-index` was listed as the flag that lets `git diff` out of the
+    /// repository, but git leaves by itself whenever a path is outside the
+    /// work tree: `git diff /dev/null ~/.ssh/id_rsa` — and the `--` pathspec
+    /// form too — printed any file on the host on the default-trusted `git
+    /// diff`, with no prompt in any tier. The fence is the operand's spelling,
+    /// the same one the accept-edits allowance reads.
+    #[test]
+    fn operands_outside_the_cwd_break_the_trust_match_and_the_session_key() {
+        for command in [
+            "git diff /dev/null /etc/hosts",
+            "git diff /dev/null ~/.ssh/id_rsa",
+            "git diff a.txt /etc/hosts",
+            "git diff -- /dev/null /etc/hosts",
+            "git diff ../../.ssh/id_rsa /dev/null",
+            "git diff '/etc/hosts' /dev/null",
+            "git log -p -- ~/.ssh/id_rsa",
+            "cargo build --manifest-path ~/evil/Cargo.toml",
+            "cargo test --manifest-path=/tmp/evil/Cargo.toml",
+            "cargo build --features x -- /etc/hosts",
+        ] {
+            for rule in ["git diff", "git log", "cargo build", "cargo test"] {
+                assert!(
+                    !covers(rule, command),
+                    "{rule:?} must not cover {command:?}"
+                );
+            }
+            assert_eq!(
+                session_identity(command),
+                None,
+                "{command:?} must have no session key"
+            );
+        }
+        // Revision ranges and in-tree paths are not "outside": the two dots
+        // count only as a whole path component, `~` only at the start of a word.
+        for (rule, command) in [
+            ("git diff", "git diff main..HEAD"),
+            ("git diff", "git diff HEAD~1"),
+            ("git log", "git log HEAD~3..HEAD --oneline"),
+            ("git log", "git log origin/main..HEAD"),
+            ("git diff", "git diff -- src/main.rs"),
+            ("cargo test", "cargo test -p deep-code-agent"),
+            (
+                "cargo test",
+                "cargo test -- --output ./handed-to-the-test-binary",
+            ),
+        ] {
+            assert!(covers(rule, command), "{rule:?} must cover {command:?}");
+            assert_eq!(
+                session_identity(command),
+                Some(rule.to_string()),
+                "{command:?}"
+            );
+        }
+        // An operator who wants an outside path trusted spells it out.
+        assert!(covers("ls /tmp", "ls /tmp"));
+        assert!(!covers("ls /tmp", "ls /tmp/other"));
+        assert!(!covers("ls", "ls /tmp"));
     }
 
     /// `--` ends the options for every program on the redirecting list (cargo,

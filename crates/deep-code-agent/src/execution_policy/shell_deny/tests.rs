@@ -313,10 +313,17 @@ fn workspace_fs_edit_refuses_operands_that_leave_the_cwd_by_spelling() {
         "mv ../secret .",
         "cp C:/Users/me/.aws/credentials .",
         "mkdir ok; cp ~/.netrc .",
+        // A target named through a flag's `=value` is a target all the same:
+        // `-t /tmp` was refused and `--target-directory=/tmp` was not.
+        "cp --target-directory=/tmp ./x",
+        "mv --target-directory=~ ./x",
+        "cp -r --target-directory=../out src",
     ] {
         assert!(!is_workspace_fs_edit(cmd), "{cmd}");
     }
-    // Relative, in-tree spellings stay bounded edits; flags are not operands.
+    // Relative, in-tree spellings stay bounded edits; a flag without a path
+    // value is not an operand, and `..` counts only as a whole path component
+    // (`my..dir` is a file name, and the safety notes read it the same way).
     for cmd in [
         "mkdir -p src/generated",
         "cp a.txt sub/b.txt",
@@ -324,11 +331,9 @@ fn workspace_fs_edit_refuses_operands_that_leave_the_cwd_by_spelling() {
         "touch -- -weird-name",
         "rm stale.log",
         "cp --no-preserve=mode a b",
-        "mkdir my..dir-is-refused-but-this-one-is-fine",
-    ]
-    .into_iter()
-    .filter(|cmd| !cmd.contains(".."))
-    {
+        "mkdir my..dir",
+        "cp a..b c",
+    ] {
         assert!(is_workspace_fs_edit(cmd), "{cmd}");
     }
     // The same predicate feeds the safety notes, so what the allowance refuses

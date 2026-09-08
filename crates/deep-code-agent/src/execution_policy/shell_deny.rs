@@ -26,7 +26,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::shell_lex::{
-    INTERPRETERS, PREFIX_WORDS, basename_lower, clean_token, has_shell_indirection, segments,
+    INTERPRETERS, PREFIX_WORDS, basename_lower, clean_token, has_shell_indirection,
+    operand_leaves_cwd, segments,
 };
 use crate::i18n::TextId;
 
@@ -684,7 +685,7 @@ pub fn safety_notes(command: &str) -> Vec<SafetyNote> {
             .map(|token| token.to_ascii_lowercase())
             .collect();
 
-        if positional.iter().any(|arg| escapes_cwd_by_spelling(arg)) {
+        if args.iter().any(|arg| operand_leaves_cwd(arg)) {
             notes.note(
                 TextId::SafetyPathOutsideReason,
                 TextId::SafetyPathOutsideSuggestion,
@@ -727,10 +728,10 @@ pub fn safety_notes(command: &str) -> Vec<SafetyNote> {
 /// cc-style `acceptEdits` allowlist for shell/job commands: a bounded
 /// filesystem-mutation command. Every segment's program must be in the set,
 /// must be the segment's first word (no assignment, wrapper or grouping ahead
-/// of it), every operand must stay under the cwd by spelling (no absolute,
-/// home-relative or `..` path — [`escapes_cwd_by_spelling`]) and `rm` must not
-/// recurse. A hard deny (e.g. `rm -rf`) never reaches here — `builtin_deny`
-/// short-circuits it.
+/// of it), every operand — a `--flag=value`'s value included — must stay under
+/// the cwd by spelling (no absolute, home-relative or `..`-component path —
+/// `shell_lex::operand_leaves_cwd`) and `rm` must not recurse. A hard deny
+/// (e.g. `rm -rf`) never reaches here — `builtin_deny` short-circuits it.
 ///
 /// What the spelling check is and is not: writes are bounded by the OS
 /// sandbox, not by this; the spelling covers the *read* side, which the
@@ -783,12 +784,11 @@ pub fn is_workspace_fs_edit(command: &str) -> bool {
         // with no prompt in AcceptEdits or Auto (the judge never sees an
         // accept-edits pass). So an absolute, home-relative or climbing operand
         // is not a bounded edit; an in-workspace path spelled absolutely costs
-        // one prompt. The safety notes flag the very same spellings.
-        if args
-            .iter()
-            .filter(|arg| !arg.starts_with('-'))
-            .any(|arg| escapes_cwd_by_spelling(arg))
-        {
+        // one prompt. The safety notes flag the very same spellings. A flag's
+        // `=value` is judged as an operand too: `cp --target-directory=/tmp x`
+        // names its target exactly as `cp -t /tmp x` does, and only the latter
+        // was refused while the words starting with `-` were skipped wholesale.
+        if args.iter().any(|arg| operand_leaves_cwd(arg)) {
             return false;
         }
         // A recursive `rm` deletes a whole subtree — not a bounded edit, and the
@@ -797,20 +797,6 @@ pub fn is_workspace_fs_edit(command: &str) -> bool {
         !(words.program == "rm"
             && (has_flag(args, 'r', &["recursive"]) || has_flag(args, 'R', &["recursive"])))
     })
-}
-
-/// Whether a positional token names a path that leaves the current directory
-/// by its spelling alone: absolute (`/etc/x`, `C:\x`, `\x`), home-relative
-/// (`~/.ssh`) or climbing (`../other`). Read the same way by the safety notes,
-/// which flag it for the human, and by the accept-edits allowance, which
-/// refuses to auto-approve it — so the two never disagree about what "outside"
-/// looks like. Over-approximate on purpose (`my..dir` counts): the cost is one
-/// prompt.
-fn escapes_cwd_by_spelling(token: &str) -> bool {
-    let bytes = token.as_bytes();
-    token.starts_with(['/', '~', '\\'])
-        || token.contains("..")
-        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
 }
 
 #[cfg(test)]
