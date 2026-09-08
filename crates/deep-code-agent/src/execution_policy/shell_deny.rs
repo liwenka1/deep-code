@@ -723,10 +723,20 @@ pub fn safety_notes(command: &str) -> Vec<SafetyNote> {
 /// must be the segment's first word (no assignment, wrapper or grouping ahead
 /// of it), every operand must stay under the cwd by spelling (no absolute,
 /// home-relative or `..` path — [`escapes_cwd_by_spelling`]) and `rm` must not
-/// recurse. The spelling check is not the boundary — the OS sandbox is, for
-/// writes — it covers the read side the sandbox does not bound: a `cp` *from*
-/// outside the workspace. A hard deny (e.g. `rm -rf`) never reaches here —
-/// `builtin_deny` short-circuits it.
+/// recurse. A hard deny (e.g. `rm -rf`) never reaches here — `builtin_deny`
+/// short-circuits it.
+///
+/// What the spelling check is and is not: writes are bounded by the OS
+/// sandbox, not by this; the spelling covers the *read* side, which the
+/// sandbox leaves open (`(allow file-read*)`), so `cp ~/.ssh/id_rsa ./k` is
+/// refused here rather than at the kernel. It bounds the read side only as
+/// far as the spelling is what the shell resolves, which is two things:
+/// shell expansions are excluded up front (`has_shell_indirection` — brace
+/// expansion was the stage that let `cp {~/.ssh/id_rsa,./k}` past this), and
+/// a symlink inside the workspace still resolves outside it. The link is a
+/// deliberate residue: `ln` is not in `FS_EDIT`, so creating one costs a
+/// prompt, and a repository that ships an outward link is trusted the moment
+/// it is opened.
 #[must_use]
 pub fn is_workspace_fs_edit(command: &str) -> bool {
     // `sed` is deliberately absent: its `e`/`w` script flags run commands and
