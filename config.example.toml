@@ -102,10 +102,12 @@
 # 文件内容——write_file/apply_patch 的实质内容不经判官审阅(高风险档、联网
 # 声明与离线后端仍然硬性转人工)。在意这条边界就用 default/accept_edits。
 #
-# 另一条硬规则(不可配):命令文本里出现 > < ` $ 任一字符(重定向、命令替换、
-# 变量展开)就一律转人工审批,不进任何自动放行面。所以 `echo $HOME`、
-# `mkdir -p src/$MOD`、`cp a "$HOME/b"` 这类即使在 accept_edits/auto 档也会
-# 问一次——间接形态没法靠静态解析看清最终行为,交由人眼是有意的保守取舍。
+# 另一条硬规则(不可配):命令文本里出现 > < ` $ { } ( ) * ? [ ] 任一字符(重定向、
+# 命令替换、变量/花括号/glob 展开、子 shell)就一律转人工审批,不进任何自动放行面。
+# 所以 `echo $HOME`、`mkdir -p src/$MOD`、`cp a "$HOME/b"`、`rm *.log` 这类即使在
+# accept_edits/auto 档也会问一次——间接形态没法靠静态解析看清最终行为,交由人眼是
+# 有意的保守取舍。按拼写指向工作目录之外的操作数(`/…`、`~/…`、`../…`)同样不进
+# 自动放行面:`git diff /dev/null ~/.ssh/id_rsa` 会问,`git diff main..HEAD` 不会。
 # default_mode = "default"
 
 [stream]
