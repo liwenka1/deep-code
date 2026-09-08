@@ -469,6 +469,9 @@ mod tests {
     /// stripped by `clean_token`; a `~`-led operand is refused by
     /// `escapes_cwd_by_spelling`; and `#` only ever makes the shell run a
     /// *prefix* of what the gate read — the safe direction, so it needs no rule.
+    /// Unix-only like the test that reads it: on Windows the pair is dead code
+    /// and `-D warnings` refuses to compile it.
+    #[cfg(unix)]
     fn rewriting_character_is_read(c: char) -> bool {
         has_shell_indirection(&c.to_string())
             || matches!(c, ';' | '|' | '&')
