@@ -153,16 +153,38 @@ fn strip_executable_extension(base: &str) -> String {
 }
 
 /// True if a command contains shell redirection, substitution, or expansion
-/// (`>`, `<`, `` ` ``, `$`). These make the visible text an unreliable
+/// (`>`, `<`, `` ` ``, `$`, `{`/`}`). These make the visible text an unreliable
 /// description of what will run: a substitution executes an arbitrary inner
 /// program (`touch $(curl …)`), a redirection writes a path no program word
 /// mentions (`sed … > cfg`), and a `$VAR` expands to content the reviewer
 /// never saw. Any such command is excluded from every automatic pass (trust
 /// list, accept-edits) and goes to a human — which is what lets the deny floor
 /// stay plain-form only instead of chasing obfuscations.
+///
+/// Brace expansion belongs on this list for exactly the same reason and was
+/// the one word-expansion stage missing from it. Every check above this line
+/// compares the *written* token against a rule — the redirecting-flag list,
+/// the cwd-bounds spelling test, the program basename — and bash rewrites the
+/// token before any of them describes what runs. `--con{fig,fig}` reaches
+/// cargo as `--config`, so the default-trusted `cargo build` executed an
+/// arbitrary program through `build.rustc-wrapper` with no prompt at any tier;
+/// `git diff --no-index{,}` printed any file on the host into the transcript
+/// the same way; `cp {~/.ssh/id_rsa,./k}` rode the accept-edits allowance,
+/// whose operands "stay under the cwd by spelling" only while the spelling is
+/// what the shell reads. Treating the punctuation as indirection is the same
+/// over-approximation the rest of this list makes: a brace command is never
+/// auto-trusted and never a bounded edit, so it lands on a human, and no
+/// expander has to be right for the gate to be safe. (The deny floor does
+/// expand them — see `shell_deny::builtin_deny` — because under `Yolo` it is
+/// the only thing above the sandbox.)
+///
+/// Both halves of a pair are listed because bash leaves an unbalanced brace
+/// alone (`a{b` stays `a{b`): matching either character over-approximates in
+/// the safe direction rather than requiring this to parse what bash will
+/// expand.
 #[must_use]
 pub(super) fn has_shell_indirection(command: &str) -> bool {
-    command.contains(['>', '<', '`', '$'])
+    command.contains(['>', '<', '`', '$', '{', '}'])
 }
 
 #[cfg(test)]

@@ -349,6 +349,64 @@ fn variable_expansion_is_never_auto_trusted() {
     ));
 }
 
+/// Brace expansion was the one word-expansion stage the indirection gate did
+/// not model, and every check that guards the trust list reads the *written*
+/// token: `redirects_execution` compares against `--config`, so `--con{fig,fig}`
+/// — which bash hands to cargo as `--config` — kept the identity `cargo build`,
+/// matched the default trust list, and ran an arbitrary program through
+/// `build.rustc-wrapper` with no prompt at ANY permission tier. None of these
+/// contain `$`, `>`, `<` or a backtick, so nothing else caught them either.
+#[test]
+fn brace_expansion_is_never_auto_trusted() {
+    let policy = ExecPolicy::default();
+    for command in [
+        // Arbitrary program execution: bash expands this to
+        // `--config=net.offline=true --config=build.rustc-wrapper="…"`.
+        r#"cargo build --config{=net.offline=true,=build.rustc-wrapper="/tmp/wrap"}"#,
+        "cargo build --con{fig,fig} build.rustc-wrapper=/tmp/wrap",
+        // Arbitrary file read into the transcript: `{,}` duplicates the flag,
+        // and git accepts the repeat.
+        "git diff --no-index{,} /dev/null ~/.ssh/id_rsa",
+        "git diff --no-{index,index} /dev/null ~/.aws/credentials",
+        // Arbitrary path write.
+        "git diff --output{,}=/tmp/leak",
+        "cargo test --target-dir{,} /tmp/spray",
+        // The brace need not sit on a flag at all.
+        "cargo {test,build}",
+        "echo hi{,}",
+    ] {
+        let plan = evaluate_shell_command(&policy, command, false);
+        assert!(
+            matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }),
+            "{command:?} must reach a human, got {:?}",
+            plan.verdict
+        );
+    }
+    // A brace is not a bounded edit either: the accept-edits allowance bounds
+    // operands "by spelling", and the spelling is not what the shell reads —
+    // `cp {~/.ssh/id_rsa,./k}` copied a credential into the workspace with no
+    // prompt in AcceptEdits or Auto, where `read_file` then served it up.
+    for command in [
+        "cp {~/.ssh/id_rsa,./k}",
+        "cp {/etc/passwd,./k}",
+        "mv {/etc/passwd,./k}",
+        "cp -- {~/.ssh/id_rsa,./k}",
+    ] {
+        assert!(
+            !accept_edits_approvable("shell", &json!({ "command": command })),
+            "{command:?} must not ride the accept-edits allowance"
+        );
+    }
+    // The everyday brace-free forms still run unprompted.
+    for command in ["cargo build", "git diff --stat", "echo hi"] {
+        assert_eq!(
+            evaluate_shell_command(&policy, command, false).verdict,
+            PolicyVerdict::Allow,
+            "{command:?} must stay trusted"
+        );
+    }
+}
+
 #[test]
 fn every_segment_must_be_trusted_for_auto_allow() {
     let policy = ExecPolicy::default();
