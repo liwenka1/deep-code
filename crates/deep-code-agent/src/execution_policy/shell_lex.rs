@@ -210,7 +210,8 @@ fn strip_executable_extension(base: &str) -> String {
 }
 
 /// True if a command contains shell redirection, substitution, expansion or
-/// grouping (`>`, `<`, `` ` ``, `$`, `{`/`}`, `(`/`)`). These make the visible text an unreliable
+/// grouping (`>`, `<`, `` ` ``, `$`, `{`/`}`, `(`/`)`, `*`, `?`, `[`/`]`). These
+/// make the visible text an unreliable
 /// description of what will run: a substitution executes an arbitrary inner
 /// program (`touch $(curl …)`), a redirection writes a path no program word
 /// mentions (`sed … > cfg`), and a `$VAR` expands to content the reviewer
@@ -248,9 +249,20 @@ fn strip_executable_extension(base: &str) -> String {
 /// already refused these commands for unrelated reasons (a peeled `(` is a
 /// prefix word, and `(cargo` matches no rule), so folding it in changes no
 /// verdict; it changes where the next construct has to be written.
+///
+/// Pathname expansion (`*`, `?`, `[…]`) is here for the same reason as braces,
+/// and was the stage still missing after them: the pattern reaches the program
+/// as whatever file names match it in the cwd, so `cargo build --con*` reached
+/// cargo as `--config=build.rustc-wrapper=x` once a file of that name existed
+/// (and the trusted `cargo test -- --logfile ./<name>` creates a file of any
+/// name with no prompt), while `git diff --no-inde? …` reopened the `--no-index`
+/// read the flag list had closed. The cost is that `git diff -- src/*.rs` asks.
+/// Which characters belong here is no longer the author's call:
+/// `every_punctuation_the_shell_rewrites_is_accounted_for` asks the real shell
+/// which characters rewrite a word and fails naming any that no rule reads.
 #[must_use]
 pub(super) fn has_shell_indirection(command: &str) -> bool {
-    command.contains(['>', '<', '`', '$', '{', '}', '(', ')'])
+    command.contains(['>', '<', '`', '$', '{', '}', '(', ')', '*', '?', '[', ']'])
 }
 
 /// Whether a (cleaned) token names a path that leaves the current directory by
@@ -448,6 +460,91 @@ mod tests {
             "the shell hands the rest of the line to these words, but the identity side still \
              collapses such a line to the bare word — a session consent on one of them would \
              cover every command reachable through it: {missing:?}"
+        );
+    }
+
+    /// The rules that read a character the shell rewrites a word for (see the
+    /// test below): expansion, substitution, redirection and grouping are
+    /// indirection; `;`/`|`/`&` split segments; quotes and the backslash are
+    /// stripped by `clean_token`; a `~`-led operand is refused by
+    /// `escapes_cwd_by_spelling`; and `#` only ever makes the shell run a
+    /// *prefix* of what the gate read — the safe direction, so it needs no rule.
+    fn rewriting_character_is_read(c: char) -> bool {
+        has_shell_indirection(&c.to_string())
+            || matches!(c, ';' | '|' | '&')
+            || matches!(c, '\'' | '"' | '\\')
+            || c == '~'
+            || c == '#'
+    }
+
+    /// The characters the shell rewrites a word for, enumerated against the
+    /// real shell instead of remembered. For every ASCII punctuation character,
+    /// words built around it — alone, at either end, in the middle, doubled
+    /// (`` `a` ``, `'a'`, `$a$`), and closed by `}` or `]` (`a{x,y}`, `a[x,y]`,
+    /// `a{1..3}`) — are handed to `sh -c 'printf "%s\n" …'` in a directory seeded
+    /// with names a pattern can match. If what comes back is not the words as
+    /// written — expanded, split, dropped, or a failed parse — that character
+    /// rewrites text, and some rule must read it (`rewriting_character_is_read`).
+    /// Only `}` and `]` serve as closers because they are the two the shell
+    /// leaves alone when unpaired: any other closer would break the batch on
+    /// its own and charge the fault to the character under test.
+    ///
+    /// Hand-maintained, the indirection list missed one stage per review round:
+    /// quote removal, then brace expansion, then pathname expansion. The
+    /// alphabet is finite, so this is enumeration, not sampling: a
+    /// single-character trigger no rule reads cannot exist on this host without
+    /// failing here. One-directional like the wrapper test above — a listed
+    /// character the host's shell does not rewrite (dash and braces) only ever
+    /// costs a prompt.
+    #[cfg(unix)]
+    #[test]
+    fn every_punctuation_the_shell_rewrites_is_accounted_for() {
+        let dir = std::env::temp_dir().join(format!("dc-punct-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["ax", "ay", "a1", "ab"] {
+            std::fs::File::create(dir.join(name)).unwrap();
+        }
+        let punctuation: Vec<char> = (b'!'..=b'~')
+            .filter(u8::is_ascii_punctuation)
+            .map(char::from)
+            .collect();
+        let mut unaccounted = Vec::new();
+        for &c in &punctuation {
+            let mut words = vec![
+                c.to_string(),
+                format!("a{c}"),
+                format!("{c}a"),
+                format!("a{c}b"),
+                format!("{c}a{c}"),
+            ];
+            for d in ['}', ']', c] {
+                words.push(format!("a{c}x,y{d}"));
+                words.push(format!("a{c}1..3{d}"));
+            }
+            let script = format!("printf '%s\\n' {}", words.join(" "));
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .current_dir(&dir)
+                .env("HOME", &dir)
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .expect("run sh");
+            let unchanged = output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .eq(words.iter().map(String::as_str));
+            if !unchanged && !rewriting_character_is_read(c) {
+                unaccounted.push(c);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            unaccounted.is_empty(),
+            "the shell rewrites a word around these characters and no rule reads them — a \
+             trusted or accept-edits command spelled with one runs as something the gate never \
+             saw: {unaccounted:?}"
         );
     }
 }

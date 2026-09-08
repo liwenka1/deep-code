@@ -407,6 +407,51 @@ fn brace_expansion_is_never_auto_trusted() {
     }
 }
 
+/// Pathname expansion is a rewrite like brace expansion: the pattern reaches
+/// the program as whatever file names match it. With a file called
+/// `--config=build.rustc-wrapper=x` in the cwd — and the trusted
+/// `cargo test -- --logfile ./<name>` creates a file of any name with no
+/// prompt — `cargo build --con*` executed an arbitrary program through the
+/// default-trusted `cargo build`, and `git diff --no-inde? …` reopened the
+/// `--no-index` read the flag list had closed. So a pattern is never
+/// auto-trusted and never a bounded edit; it lands on a human.
+#[test]
+fn glob_patterns_are_never_auto_trusted() {
+    let policy = ExecPolicy::default();
+    for command in [
+        "cargo build --con*",
+        "cargo build --con[f]ig=x",
+        "git diff --no-inde? ./a ./b",
+        "git diff -- src/*.rs",
+        "cargo test tests::*",
+    ] {
+        let plan = evaluate_shell_command(&policy, command, false);
+        assert!(
+            matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }),
+            "{command:?} must reach a human, got {:?}",
+            plan.verdict
+        );
+    }
+    for command in ["cp ./*/x ./k", "rm *.log", "mv src/[a-c]* dst"] {
+        assert!(
+            !accept_edits_approvable("shell", &json!({ "command": command })),
+            "{command:?} must not ride the accept-edits allowance"
+        );
+    }
+    // The pattern-free forms still run unprompted.
+    for command in [
+        "cargo build --release",
+        "git diff -- src/main.rs",
+        "cargo test tests::unit",
+    ] {
+        assert_eq!(
+            evaluate_shell_command(&policy, command, false).verdict,
+            PolicyVerdict::Allow,
+            "{command:?} must stay trusted"
+        );
+    }
+}
+
 #[test]
 fn every_segment_must_be_trusted_for_auto_allow() {
     let policy = ExecPolicy::default();
