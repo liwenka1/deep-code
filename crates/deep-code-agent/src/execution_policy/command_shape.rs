@@ -273,7 +273,11 @@ pub fn identity(tokens: &[&str]) -> String {
     // program with no prompt at any tier; `git diff --output=<path>` created or
     // overwrote an arbitrary file the same way. Neither contains `$`, `>`, `<`
     // or a backtick, so the structural-indirection gate did not catch them.
-    if option_tokens(&tokens[1..]).any(|token| redirects_execution(token)) {
+    // Past the `--`, only the harness's own write flag counts (see
+    // `harness_writes_a_path`); everything else there is data to the binary.
+    if option_tokens(&tokens[1..]).any(|token| redirects_execution(token))
+        || trailing_tokens(&tokens[1..]).any(|token| harness_writes_a_path(token))
+    {
         return squeeze(&tokens.join(" "));
     }
 
@@ -322,6 +326,11 @@ pub fn rule_covers(rule: &str, command: &str) -> bool {
     // run an arbitrary program with no prompt at any permission tier.
     if option_tokens(&tokens)
         .any(|token| redirects_execution(token) && !rule_spells_out_flag(&rule, flag_name(token)))
+    {
+        return false;
+    }
+    if trailing_tokens(&tokens)
+        .any(|token| harness_writes_a_path(token) && !rule_spells_out_flag(&rule, flag_name(token)))
     {
         return false;
     }
@@ -431,6 +440,23 @@ fn flag_name(token: &str) -> String {
 /// who wants to trust a redirecting flag still can — by writing it out.
 fn rule_spells_out_flag(rule: &str, flag: String) -> bool {
     rule.split_whitespace().any(|word| flag_name(word) == flag)
+}
+
+/// The tokens after the first `--`: what `cargo test` hands to the test binary.
+fn trailing_tokens<'a, 'b>(tokens: &'a [&'b str]) -> impl Iterator<Item = &'a &'b str> {
+    tokens.iter().skip_while(|token| **token != "--").skip(1)
+}
+
+/// Whether a token past the `--` is a libtest flag that makes the test binary
+/// write a caller-named path. `option_tokens` stops at `--` for good reason (a
+/// `--config` there is data to the binary), but `--logfile <path>` is acted on:
+/// the trusted `cargo test -- --logfile ./--no-index` created that file with no
+/// prompt, in a mode where every other write asks — and a file whose name is a
+/// flag is what turns a pattern (`--no-inde?`) into a redirecting flag. The one
+/// harness flag that writes; the rest stay data.
+fn harness_writes_a_path(token: &str) -> bool {
+    const HARNESS_WRITE_FLAGS: &[&str] = &["--logfile"];
+    HARNESS_WRITE_FLAGS.contains(&flag_name(token).as_str())
 }
 
 /// Lowercase and collapse runs of whitespace to single spaces.
@@ -871,7 +897,8 @@ mod tests {
     /// `--` ends the options for every program on the redirecting list (cargo,
     /// git), so a redirecting spelling after it is data, not a flag: cargo hands
     /// it to the test binary, git reads it as pathspec. Degrading on it would
-    /// only turn harmless commands into spurious prompts.
+    /// only turn harmless commands into spurious prompts. (The test binary's
+    /// own write flag is the one exception — next test.)
     #[test]
     fn positionals_after_a_double_dash_are_not_flags() {
         assert_eq!(identity_of("cargo test -- --output /tmp/x"), "cargo test");
@@ -879,6 +906,37 @@ mod tests {
         assert!(covers("git diff", "git diff -- --output=odd-filename"));
         // Before the `--` it is still a flag and still breaks the trust.
         assert!(!covers("cargo test", "cargo test --config evil -- x"));
+    }
+
+    /// `--` hands the rest of the line to the test binary, and libtest's
+    /// `--logfile <path>` makes that binary write the path — the one flag past
+    /// `--` that writes. The trusted `cargo test -- --logfile ./--no-index`
+    /// created that file with no prompt (in-tree, so the operand rule lets it
+    /// through), and a file whose name is a flag is what turns a pattern into a
+    /// redirecting flag. The other harness flags stay data.
+    #[test]
+    fn harness_write_flags_after_the_double_dash_break_trust() {
+        for command in [
+            "cargo test -- --logfile ./--no-index",
+            "cargo test -- --logfile=./out.log",
+            "cargo test -- --nocapture --logfile ./x",
+            "cargo test -- --LOGFILE ./x",
+        ] {
+            assert!(!covers("cargo test", command), "{command:?}");
+            assert_eq!(identity_of(command), squeeze(command), "{command:?}");
+        }
+        // Spelled out in the rule, it is the operator's choice.
+        assert!(covers(
+            "cargo test -- --logfile",
+            "cargo test -- --logfile ./x"
+        ));
+        // Other harness flags remain data.
+        assert!(covers(
+            "cargo test",
+            "cargo test -- --nocapture --test-threads=1"
+        ));
+        assert!(covers("cargo test", "cargo test -- --output ./x"));
+        assert_eq!(identity_of("cargo test -- --nocapture"), "cargo test");
     }
 
     #[test]
