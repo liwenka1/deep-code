@@ -12,10 +12,11 @@
 //! Scope, honestly: this is a best-effort UX floor over PLAIN command forms,
 //! not a security boundary. It reads a segment the way `sh` does — past the
 //! `VAR=value` assignments, control-flow words and grouping the shell itself
-//! consumes ahead of the program word, and past the transparent wrappers whose
+//! consumes ahead of the program word, past the transparent wrappers whose
 //! whole job is to run the rest of the line (`exec`, `env`, `nohup`, …; see
-//! [`PREFIX_WORDS`]) — but it does not chase interpreters, `sh -c` scripts,
-//! substitutions or wrapper options. It doesn't have to: any command
+//! [`PREFIX_WORDS`]), and through brace expansion, which rewrites the program
+//! word itself (`rm{,} -rf /`) — but it does not chase interpreters, `sh -c`
+//! scripts, substitutions or wrapper options. It doesn't have to: any command
 //! containing indirection is structurally excluded from every automatic pass
 //! ([`has_shell_indirection`]) and wrapped/interpreter forms are never
 //! trusted, so those always land on a human first. What parsing misses is
@@ -423,10 +424,204 @@ fn deny_pipe_to_shell(command: &str) -> Option<DenyReason> {
 /// every automatic pass, so they land on a human instead of on this floor.
 #[must_use]
 pub fn builtin_deny(command: &str) -> Option<DenyReason> {
+    if let Some(reason) = deny_line(command) {
+        return Some(reason);
+    }
+    // Brace expansion is the one word-expansion stage that rewrites the
+    // program word itself, so the floor has to read through it or every rule
+    // here is one `{,}` away from silent: `rm{,} -rf /` presented the program
+    // `rm{,}`, `{rm,-rf,/}` presented `}`, `{sudo,ls}` presented `sudo,ls}` —
+    // none matched a rule. Every other automatic pass now refuses a brace
+    // outright (`has_shell_indirection`), so this is load-bearing only under
+    // `Yolo`, where the floor is the one thing above the sandbox — which is
+    // exactly where the iconic shapes have to keep working.
+    //
+    // Expanding cannot invent a denial the way chasing an obfuscation could:
+    // the rewritten line is the one bash will really run, so a denied
+    // expansion is a denied command. The unexpanded line is checked first, so
+    // a budget spent by a combinatorial brace can only ever degrade to the
+    // previous behavior.
+    if !command.contains('{') {
+        return None;
+    }
+    let mut budget = MAX_BRACE_WORDS;
+    let expanded = brace_expanded_line(command, &mut budget);
+    (expanded != command)
+        .then(|| deny_line(&expanded))
+        .flatten()
+}
+
+/// The deny rules for one concrete command line (no brace expansion).
+fn deny_line(command: &str) -> Option<DenyReason> {
     if let Some(reason) = deny_pipe_to_shell(command) {
         return Some(reason);
     }
     segments(command).into_iter().find_map(deny_segment)
+}
+
+/// Cap on the words one line's brace expansion may produce. A brace product is
+/// multiplicative (`{a,b}{c,d}{e,f}` is eight words from one), and this floor
+/// sits on the hot path of every shell call, so the expansion is budgeted.
+/// Exhausting it truncates the line — the unexpanded form has already been
+/// checked, so the worst case is the previous behavior, never a wrong answer.
+const MAX_BRACE_WORDS: usize = 256;
+
+/// The command line with every word's brace groups expanded, whitespace runs
+/// preserved verbatim.
+///
+/// Brace expansion happens *within a word* and yields several words on the
+/// same line — `rm{,} -rf /` runs `rm rm -rf /`, `{rm,-rf,/}` runs `rm -rf /`
+/// — which is why this rewrites the line rather than producing several of
+/// them. Preserving the original whitespace keeps the newlines and the
+/// `;`/`|`/`&` glue [`segments`] splits on, so segmentation is unchanged.
+fn brace_expanded_line(command: &str, budget: &mut usize) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut rest = command;
+    while !rest.is_empty() {
+        let gap = rest
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(rest.len());
+        out.push_str(&rest[..gap]);
+        rest = &rest[gap..];
+        if rest.is_empty() {
+            break;
+        }
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (word, tail) = rest.split_at(end);
+        rest = tail;
+        out.push_str(&expand_word(word, budget).join(" "));
+    }
+    out
+}
+
+/// The words one word expands to, in bash's own left-to-right,
+/// innermost-qualifying-first order.
+fn expand_word(word: &str, budget: &mut usize) -> Vec<String> {
+    let Some((prefix, alternatives, suffix)) = split_first_brace_group(word) else {
+        *budget = budget.saturating_sub(1);
+        return vec![word.to_string()];
+    };
+    let mut words = Vec::new();
+    for alternative in alternatives {
+        if *budget == 0 {
+            break;
+        }
+        words.extend(expand_word(
+            &format!("{prefix}{alternative}{suffix}"),
+            budget,
+        ));
+    }
+    words
+}
+
+/// The first brace group bash would expand: the text before it, its top-level
+/// alternatives, and the text after it. `None` when the word has no such group.
+///
+/// A `{` whose matching `}` holds neither a top-level comma nor a `..` range is
+/// not an expansion, so the scan moves on to the next `{` — which is how
+/// `--con{fi{g,g}}` expands its inner group and leaves the outer literal,
+/// exactly as bash does.
+///
+/// Ranges are expanded, not skipped, because a range reaches the program word
+/// just like a comma list does: `r{m..n} -rf /` runs `rm rn -rf /`, whose
+/// program really is `rm`. Skipping them would have left the floor a second
+/// brace spelling it could not read — the uncounted-sibling shape this whole
+/// fix exists to close.
+fn split_first_brace_group(word: &str) -> Option<(&str, Vec<String>, &str)> {
+    let bytes = word.as_bytes();
+    for open in 0..bytes.len() {
+        if bytes[open] != b'{' {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut commas = Vec::new();
+        for index in open..bytes.len() {
+            match bytes[index] {
+                b'{' => depth += 1,
+                b',' if depth == 1 => commas.push(index),
+                b'}' => {
+                    depth -= 1;
+                    if depth > 0 {
+                        continue;
+                    }
+                    let alternatives = if commas.is_empty() {
+                        // No top-level comma: a range, or not an expansion at
+                        // all — in which case the scan moves to the next `{`.
+                        match range_alternatives(&word[open + 1..index]) {
+                            Some(parts) => parts,
+                            None => break,
+                        }
+                    } else {
+                        let mut parts = Vec::with_capacity(commas.len() + 1);
+                        let mut start = open + 1;
+                        for &comma in &commas {
+                            parts.push(word[start..comma].to_string());
+                            start = comma + 1;
+                        }
+                        parts.push(word[start..index].to_string());
+                        parts
+                    };
+                    return Some((&word[..open], alternatives, &word[index + 1..]));
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// The words a `{A..B}` (or `{A..B..STEP}`) range expands to: an integer
+/// sequence, or a single-ASCII-character sequence. `None` when the body is not
+/// a range bash would expand, which is what tells the scan this `{` opens no
+/// expansion at all.
+///
+/// Bounded by [`MAX_BRACE_WORDS`] so `{1..100000}` costs a cap, not a hang.
+/// The step is parsed because bash 4 accepts it; bash 3.2 (macOS `/bin/sh`)
+/// leaves such a group literal, and reading one there only ever produces extra
+/// candidate words — the safe direction for a floor.
+fn range_alternatives(body: &str) -> Option<Vec<String>> {
+    let mut parts = body.split("..");
+    let from = parts.next()?;
+    let to = parts.next()?;
+    let step = match parts.next() {
+        Some(text) => text.parse::<i64>().ok().filter(|value| *value != 0)?,
+        None => 1,
+    };
+    if parts.next().is_some() || from.is_empty() || to.is_empty() {
+        return None;
+    }
+    let magnitude = i64::try_from(step.unsigned_abs().max(1)).unwrap_or(1);
+    let (Ok(start), Ok(end)) = (from.parse::<i64>(), to.parse::<i64>()) else {
+        let (from, to) = (from.as_bytes(), to.as_bytes());
+        if from.len() != 1 || to.len() != 1 || !from[0].is_ascii() || !to[0].is_ascii() {
+            return None;
+        }
+        return Some(char_range(from[0], to[0], magnitude));
+    };
+    let step = if start <= end { magnitude } else { -magnitude };
+    let mut words = Vec::new();
+    let mut value = start;
+    while words.len() < MAX_BRACE_WORDS && if step > 0 { value <= end } else { value >= end } {
+        words.push(value.to_string());
+        value += step;
+    }
+    Some(words)
+}
+
+/// The single-character words `{a..e}` expands to, in the direction the
+/// endpoints imply.
+fn char_range(from: u8, to: u8, step: i64) -> Vec<String> {
+    let step = usize::try_from(step.max(1)).unwrap_or(1);
+    let (low, high) = (from.min(to), from.max(to));
+    let mut words: Vec<String> = (low..=high)
+        .step_by(step)
+        .take(MAX_BRACE_WORDS)
+        .map(|byte| (byte as char).to_string())
+        .collect();
+    if from > to {
+        words.reverse();
+    }
+    words
 }
 
 /// Static, no-execution safety notes surfaced at the approval prompt: why a
