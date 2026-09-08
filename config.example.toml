@@ -108,6 +108,9 @@
 # accept_edits/auto 档也会问一次——间接形态没法靠静态解析看清最终行为,交由人眼是
 # 有意的保守取舍。按拼写指向工作目录之外的操作数(`/…`、`~/…`、`../…`)同样不进
 # 自动放行面:`git diff /dev/null ~/.ssh/id_rsa` 会问,`git diff main..HEAD` 不会。
+# 免审执行的命令(信任表命中、会话记住的身份、accept_edits 的文件操作)不经 shell,
+# 按策略解析出的词直接 execve;`&&`/`;`/换行由 deep-code 顺序执行,管道与后台 `&`
+# 要问人。只有人工按文本批准的命令才走 `sh -c`。
 # default_mode = "default"
 
 [stream]

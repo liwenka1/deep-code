@@ -33,6 +33,11 @@ A report is in scope when it breaks a promise one of those layers makes:
 - **Approval-gate bypass** — running a gated action without a prompt, or a
   command-identity trust confusion (a consent for `git status` waving
   through `git push`, wrapper/quote/expansion tricks).
+- **Unattended command reaching a shell** — a command that runs with no
+  prompt (a trusted identity, a remembered session consent, an accept-edits
+  file operation) being executed through `sh -c`/`cmd /C` instead of as the
+  exact argv the policy parsed, or that argv differing from the words the
+  policy judged.
 - **Workspace-boundary escape** — path traversal or symlink tricks past the
   granted roots in the built-in file tools or checkpoint restore.
 - **Credential exposure** — the tool itself leaking the API key (to
@@ -65,6 +70,52 @@ Out of scope (not vulnerabilities):
   answering a promise never made. (Job-object containment and deny-floor
   bypasses on Windows are in scope.)
 - Vulnerabilities in DeepSeek's API or other third-party services.
+
+## Invariants
+
+The promises below hold by construction, or by a test that asks the real shell
+rather than a hand-maintained list. A change that breaks one must fail the test
+named with it.
+
+1. **No shell for an unattended command.** A command that runs with no prompt
+   is executed as the argv `parse_unattended` produced, sequenced by deep-code
+   for `&&`/`;`; a command that parse cannot read is refused, never handed to a
+   shell. Human-approved text keeps shell semantics.
+   (`unattended_commands_run_without_a_shell`,
+   `execution_authority_follows_who_resolved_the_prompt`)
+2. **The unattended grammar means what `sh` means.** Quoting and the two
+   sequencing operators are the whole grammar, checked word for word against
+   the real shell. (`unattended_parse_matches_sh_word_splitting`)
+3. **Every character the shell rewrites is read by a rule.** All 32 ASCII
+   punctuation characters are run through the real shell; any that rewrites a
+   word must be indirection, a separator, stripped quoting, or the `~` operand
+   rule. (`every_punctuation_the_shell_rewrites_is_accounted_for`)
+4. **Every word the shell hands the line to is known.** Wrappers and
+   interpreters are enumerated by running the real shell, so a session consent
+   never collapses `sh -c …` or `time …` to one word.
+   (`every_word_the_shell_runs_the_tail_for_is_known`)
+5. **A trusted command names no path outside the cwd by spelling.** The
+   sandbox leaves reads open, so this spelling is the read fence; `..` counts
+   only as a whole path component.
+   (`trusted_commands_lose_their_trust_when_an_operand_leaves_the_cwd`)
+6. **`network = "never"` refuses every egress path**, counted by exhaustive
+   match over the tool kinds. (`never_refuses_every_egress_path`)
+7. **A model-requested write root is never auto-approved** by any mode, config
+   consent or session memory.
+
+Known residuals — accepted and written down rather than left for the next
+review to rediscover:
+
+- `yolo` relies on the OS sandbox alone; the deny floor there is a UX floor.
+- Windows has no filesystem or network confinement; an unattended command
+  there runs only a real `.exe`/`.com` (cmd builtins and `.cmd`/`.bat`
+  wrappers are refused, not routed through `cmd.exe`).
+- A symlink inside the workspace resolves outside it; creating one costs a
+  prompt, and a repository that ships one is trusted the moment it is opened.
+- Credential directories are readable by sandboxed commands: SSH-signed
+  commits, `npm` (`~/.npmrc`) and `codesign` (keychains) need them offline,
+  so the read fence is the operand spelling above, not the kernel.
+- A command a human approved as text keeps every shell feature the human saw.
 
 ## Disclosure
 
@@ -105,6 +156,9 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
   注册表删除等)真正执行。
 - **审批门绕过**——未经提示执行被门控的动作;命令身份信任混淆(对
   `git status` 的许可放行了 `git push`、包裹/引号/展开花招)。
+- **免审命令经过了 shell**——无提示执行的命令(信任表命中、会话记住的身份、
+  accept-edits 文件操作)经 `sh -c`/`cmd /C` 执行,而不是按策略解析出的 argv
+  直接执行;或该 argv 与策略判定的词不一致。
 - **工作区边界逃逸**——内置文件工具或 checkpoint 恢复中的路径穿越、
   symlink 花招。
 - **凭据暴露**——工具自身泄露 API key(进子进程、日志、transcript),
@@ -130,6 +184,42 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
   以其存在为前提的报告回应的是一个从未做出的承诺。(Windows 上的
   Job-object 约束和 deny floor 的绕过仍在范围内。)
 - DeepSeek API 或其他第三方服务自身的漏洞。
+
+## 不变量
+
+下面这些承诺靠构造成立,或靠一条向真 shell 提问的测试成立,而不靠手工维护的
+名单。任何打破其中一条的改动,都必须让括号里的那条测试变红。
+
+1. **免审命令不经 shell。** 无提示执行的命令按 `parse_unattended` 产出的 argv
+   直接 execve,`&&`/`;` 由 deep-code 顺序执行;解析不出的命令拒绝执行,绝不
+   交给 shell。人工按文本批准的命令保留 shell 语义。
+   (`unattended_commands_run_without_a_shell`、
+   `execution_authority_follows_who_resolved_the_prompt`)
+2. **免审语法与 `sh` 同义。** 引号与两种串接符就是全部语法,逐词对真 shell
+   差分。(`unattended_parse_matches_sh_word_splitting`)
+3. **shell 会改写的每个字符都有规则读它。** 32 个 ASCII 标点全部交给真 shell
+   跑一遍,凡会改写词的,必须属于间接名单、分段符、被剥的引号或 `~` 操作数
+   规则之一。(`every_punctuation_the_shell_rewrites_is_accounted_for`)
+4. **shell 会把后半行交出去的每个词都在表内。** wrapper 与解释器由真 shell
+   枚举,会话同意不会把 `sh -c …` 或 `time …` 塌成一个词。
+   (`every_word_the_shell_runs_the_tail_for_is_known`)
+5. **可信命令的操作数按拼写不出 cwd。** 沙箱不拦读,这个拼写就是读侧围栏;
+   `..` 只按整个路径分量计。
+   (`trusted_commands_lose_their_trust_when_an_operand_leaves_the_cwd`)
+6. **`network = "never"` 拒绝每一条出网路径**,按工具种类穷举 match 计数。
+   (`never_refuses_every_egress_path`)
+7. **模型申请的写根绝不自动放行**,任何档位、配置同意、会话记忆都不行。
+
+已知残余——写下来接受,而不是留给下一轮 review 重新发现:
+
+- `yolo` 只靠 OS 沙箱兜底,那里的 deny floor 是体验层的地板。
+- Windows 没有文件系统与网络约束;免审命令在那里只运行真正的 `.exe`/`.com`
+  (cmd 内建与 `.cmd`/`.bat` 包装拒绝执行,不回落到 `cmd.exe`)。
+- 工作区内的符号链接会解析到外面;创建它要一次提示,而自带链接的仓库在打开
+  的那一刻就已被信任。
+- 凭据目录对沙箱内命令可读:SSH 签名的 commit、`npm`(`~/.npmrc`)、`codesign`
+  (钥匙串)在离线时也需要它们,所以读侧围栏是上面的操作数拼写,不是内核。
+- 人工按文本批准的命令保留人看到的全部 shell 特性。
 
 ## 披露
 
