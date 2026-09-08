@@ -775,3 +775,91 @@ fn shell_prefixes_neither_dodge_the_deny_floor_nor_earn_accept_edits() {
         );
     }
 }
+
+/// Every way a call can reach the network must be refused under
+/// `[sandbox] network = "never"`. The check used to live in three hand-copied
+/// blocks and the `Network` arm — the one tool whose whole purpose is reaching
+/// a host — was written a release late, because nothing counted the siblings.
+///
+/// The match below is exhaustive on purpose: a new `ToolKind` cannot be added
+/// without this failing to compile, which forces the "can this egress?"
+/// question to be answered once, here, rather than remembered at three call
+/// sites.
+#[test]
+fn never_refuses_every_egress_path() {
+    fn can_egress(kind: ToolKind) -> bool {
+        match kind {
+            ToolKind::Network | ToolKind::Shell | ToolKind::Job | ToolKind::SubAgent => true,
+            ToolKind::ReadOnlyFile
+            | ToolKind::WriteFile
+            | ToolKind::Search
+            | ToolKind::Mock
+            | ToolKind::RootGrant
+            | ToolKind::Unknown => false,
+        }
+    }
+
+    let policy = ExecPolicy::new().with_network_mode(NetworkMode::Never);
+    // One call per egress-capable kind, each declaring the egress its kind
+    // expresses (the web tools declare nothing — their egress is intrinsic).
+    let egress_calls = [
+        ("fetch_url", json!({"url": "http://example.com"})),
+        ("web_search", json!({"query": "x"})),
+        (
+            "shell",
+            json!({"command": "curl http://x", "network": true}),
+        ),
+        (
+            "job",
+            json!({"action": "start", "command": "curl http://x", "network": true}),
+        ),
+        (
+            "agent",
+            json!({"role": "general", "task": "x", "network": true}),
+        ),
+    ];
+    let mut covered = Vec::new();
+    for (tool, arguments) in &egress_calls {
+        let plan = policy.evaluate_tool(tool, arguments);
+        assert!(
+            matches!(plan.verdict, PolicyVerdict::Deny { .. }),
+            "{tool} must be refused under network = \"never\", got {:?}",
+            plan.verdict
+        );
+        assert_eq!(plan.matched_rule.as_deref(), Some("deny:network_disabled"));
+        assert!(
+            !plan.requires_approval,
+            "{tool} must not ask, it must refuse"
+        );
+        covered.push(ExecPolicy::classify_tool(tool));
+    }
+    // …and the corpus above really does cover every kind the match calls
+    // egress-capable, so adding a variant cannot silently go untested.
+    for kind in [
+        ToolKind::ReadOnlyFile,
+        ToolKind::WriteFile,
+        ToolKind::Search,
+        ToolKind::Shell,
+        ToolKind::Job,
+        ToolKind::Mock,
+        ToolKind::SubAgent,
+        ToolKind::Network,
+        ToolKind::RootGrant,
+        ToolKind::Unknown,
+    ] {
+        if can_egress(kind) {
+            assert!(
+                covered.contains(&kind),
+                "{kind:?} can egress but no call in this test exercises it"
+            );
+        }
+    }
+    // The same calls without a declaration are untouched by `never`: the mode
+    // refuses egress, it does not refuse the tools.
+    assert!(matches!(
+        policy
+            .evaluate_tool("shell", &json!({"command": "cargo build"}))
+            .verdict,
+        PolicyVerdict::Allow
+    ));
+}

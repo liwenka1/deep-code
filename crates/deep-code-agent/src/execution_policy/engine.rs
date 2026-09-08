@@ -131,6 +131,36 @@ impl NetworkMode {
     }
 }
 
+/// The plan for a call `[sandbox] network = "never"` refuses outright.
+///
+/// One home for what used to be three hand-copied blocks. The copies are how
+/// the rule went missing: the `SubAgent` arm grew the check, the shell path
+/// grew the check, and the `Network` arm — the one tool whose entire purpose
+/// is reaching a host — did not, so `never` held everywhere except there, and
+/// `Yolo` waved it through. Nothing counted the siblings, so nothing noticed.
+/// `never_refuses_every_egress_path` now counts them by exhaustive match over
+/// [`ToolKind`], which means a new egress-capable tool cannot compile without
+/// someone deciding.
+///
+/// `read_only` is carried per call site because it rides into telemetry; no
+/// gate reads it on a denial (the registry short-circuits on
+/// [`ToolExecutionPlan::denied_reason`] first).
+fn network_disabled_plan(subject: &str, read_only: bool) -> ToolExecutionPlan {
+    ToolExecutionPlan {
+        verdict: PolicyVerdict::Deny {
+            reason: format!(
+                "network access is disabled by configuration ([sandbox] network = \"never\"){subject}"
+            ),
+        },
+        requires_approval: false,
+        requires_sandbox: false,
+        read_only,
+        risk_level: RiskLevel::Medium,
+        matched_rule: Some("deny:network_disabled".to_string()),
+        network: false,
+    }
+}
+
 /// Whether a shell/job call declares it needs network access (`network: true`
 /// in the arguments). The declaration comes from the model, but it can only
 /// narrow (default is no network) or route into an approval — never grant.
@@ -278,19 +308,7 @@ impl ExecPolicy {
                 // for the one tool whose sole purpose is reaching a host, and
                 // Yolo waved that tool through with no human in the loop.
                 if self.network_mode == NetworkMode::Never {
-                    return ToolExecutionPlan {
-                        verdict: PolicyVerdict::Deny {
-                            reason: "network access is disabled by configuration ([sandbox] \
-                                     network = \"never\"), so the web tools cannot run"
-                                .to_string(),
-                        },
-                        requires_approval: false,
-                        requires_sandbox: false,
-                        read_only: true,
-                        risk_level: RiskLevel::Medium,
-                        matched_rule: Some("deny:network_disabled".to_string()),
-                        network: false,
-                    };
+                    return network_disabled_plan(", so the web tools cannot run", true);
                 }
                 ToolExecutionPlan {
                     verdict: PolicyVerdict::NeedsApproval {
@@ -378,19 +396,7 @@ impl ExecPolicy {
                 // refused outright, same as a network-declaring shell command
                 // — the child would only burn a doomed attempt offline.
                 if network && self.network_mode == NetworkMode::Never {
-                    return ToolExecutionPlan {
-                        verdict: PolicyVerdict::Deny {
-                            reason: "network access is disabled by configuration ([sandbox] \
-                                     network = \"never\"), so a networked sub-agent cannot run"
-                                .to_string(),
-                        },
-                        requires_approval: false,
-                        requires_sandbox: false,
-                        read_only: false,
-                        risk_level: RiskLevel::Medium,
-                        matched_rule: Some("deny:network_disabled".to_string()),
-                        network: false,
-                    };
+                    return network_disabled_plan(", so a networked sub-agent cannot run", false);
                 }
                 // Under `always`, egress is already ambient for every sandboxed
                 // command by explicit config — a networked dispatch adds no
@@ -505,19 +511,7 @@ pub fn evaluate_shell_command(
     // 2. `[sandbox] network = "never"`: a network-declaring command is refused
     //    outright — running it offline anyway would just burn a doomed attempt.
     if network_requested && policy.network_mode == NetworkMode::Never {
-        return ToolExecutionPlan {
-            verdict: PolicyVerdict::Deny {
-                reason: "network access is disabled by configuration ([sandbox] network = \
-                         \"never\")"
-                    .to_string(),
-            },
-            requires_approval: false,
-            requires_sandbox: false,
-            read_only: false,
-            risk_level: RiskLevel::Medium,
-            matched_rule: Some("deny:network_disabled".to_string()),
-            network: false,
-        };
+        return network_disabled_plan("", false);
     }
 
     // The grant the sandbox applies once this call actually runs. Under
