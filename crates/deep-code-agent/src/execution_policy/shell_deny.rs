@@ -26,8 +26,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::shell_lex::{
-    INTERPRETERS, PREFIX_WORDS, basename_lower, clean_token, has_shell_indirection,
-    operand_leaves_cwd, segments,
+    INTERPRETERS, PREFIX_WORDS, basename_lower, clean_token, operand_leaves_cwd, parse_unattended,
+    segments,
 };
 use crate::i18n::TextId;
 
@@ -783,8 +783,12 @@ pub fn is_workspace_fs_edit(command: &str) -> bool {
     const FS_EDIT: &[&str] = &["mkdir", "touch", "mv", "cp", "rm", "rmdir"];
     // Redirection/substitution/expansion can run programs, write paths, or
     // name targets this per-segment program check never inspects, so such a
-    // command is never a bounded edit.
-    if has_shell_indirection(command) {
+    // command is never a bounded edit — nor is anything else the executor
+    // could not run without a shell (a pipe, a background `&`, an
+    // unterminated quote): an auto-approved edit runs as the argv
+    // `parse_unattended` produces, so the words judged here are the words
+    // that run.
+    if parse_unattended(command).is_none() {
         return false;
     }
     let segs = segments(command);

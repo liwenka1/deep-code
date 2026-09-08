@@ -302,6 +302,168 @@ pub(super) fn operand_leaves_cwd(cleaned: &str) -> bool {
     escapes_cwd_by_spelling(operand)
 }
 
+/// How a command in an unattended sequence is gated on the one before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunIf {
+    /// Runs regardless: the first command, or one after `;` or a newline.
+    Always,
+    /// Runs only if the previous command exited 0 (`&&`).
+    PreviousSucceeded,
+}
+
+/// One simple command of an unattended sequence: the exact argv the executor
+/// hands to `execve`, and whether it is gated on the previous command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnattendedCommand {
+    pub argv: Vec<String>,
+    pub run_if: RunIf,
+}
+
+/// The argv sequence of a command line that may run *unattended* — on the
+/// strength of the policy's own parse, with no human reading the text — or
+/// `None` when the line uses anything a shell would have to interpret.
+///
+/// This is the other half of the trust gate's promise. Every rule in this
+/// module and in `command_shape` judges the *written* words; until now the
+/// words then went to `sh -c`, which reads them by its own grammar, and every
+/// difference between the two grammars was a way to run something the gate
+/// never saw — quote splicing, brace expansion, globbing, an implicit
+/// `--no-index`: ten review rounds of them, one table entry at a time. A
+/// command that clears the gate is now executed as the argv produced here, so
+/// the words the gate judged are the words that run, by construction rather
+/// than by the completeness of any list.
+///
+/// Accepted grammar — the subset whose meaning this parser and `sh` agree on
+/// exactly (`unattended_parse_matches_sh_word_splitting` checks that against
+/// the real shell): words split on unquoted blanks; `'…'` literal; `"…"`
+/// literal except `\"` and `\\`; a backslash escapes the next character (a
+/// backslash-newline is a continuation); `#` opening a word comments out the
+/// rest of the line; commands chain by `;`, a newline, or `&&`. Everything else
+/// is `None` — `|`, `||`, a lone `&`, redirection, substitution, any expansion
+/// ([`has_shell_indirection`]), an unterminated quote, an empty command, a
+/// `~`-led word (the shell would expand it; the gate refuses such an operand
+/// anyway), a program word carrying `=` (an assignment prefix) — so the gate
+/// does not auto-approve it and the executor does not run it unattended.
+#[must_use]
+pub fn parse_unattended(command: &str) -> Option<Vec<UnattendedCommand>> {
+    if has_shell_indirection(command) {
+        return None;
+    }
+    let mut commands: Vec<UnattendedCommand> = Vec::new();
+    let mut argv: Vec<String> = Vec::new();
+    let mut word: Option<String> = None;
+    // How the command being collected is gated: set by the separator that
+    // opened it, `Always` for the first.
+    let mut gate = RunIf::Always;
+    let mut chars = command.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                // A trailing backslash is an incomplete line to the shell.
+                None => return None,
+                Some('\n') => {}
+                Some(next) => word.get_or_insert_with(String::new).push(next),
+            },
+            '\'' => {
+                let w = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next() {
+                        None => return None,
+                        Some('\'') => break,
+                        Some(ch) => w.push(ch),
+                    }
+                }
+            }
+            '"' => {
+                let w = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next() {
+                        None => return None,
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            None => return None,
+                            Some(escaped @ ('"' | '\\')) => w.push(escaped),
+                            Some('\n') => {}
+                            Some(other) => {
+                                w.push('\\');
+                                w.push(other);
+                            }
+                        },
+                        Some(ch) => w.push(ch),
+                    }
+                }
+            }
+            ' ' | '\t' => {
+                if let Some(w) = word.take() {
+                    argv.push(w);
+                }
+            }
+            '\n' | ';' => {
+                if let Some(w) = word.take() {
+                    argv.push(w);
+                }
+                if argv.is_empty() {
+                    // `;` with nothing before it is a syntax error to the
+                    // shell; a blank line is not.
+                    if c == ';' {
+                        return None;
+                    }
+                    continue;
+                }
+                commands.push(UnattendedCommand {
+                    argv: std::mem::take(&mut argv),
+                    run_if: gate,
+                });
+                gate = RunIf::Always;
+            }
+            '&' => {
+                chars.next_if_eq(&'&')?;
+                if let Some(w) = word.take() {
+                    argv.push(w);
+                }
+                if argv.is_empty() {
+                    return None;
+                }
+                commands.push(UnattendedCommand {
+                    argv: std::mem::take(&mut argv),
+                    run_if: gate,
+                });
+                gate = RunIf::PreviousSucceeded;
+            }
+            '|' => return None,
+            '#' if word.is_none() => {
+                while chars.peek().is_some_and(|next| *next != '\n') {
+                    chars.next();
+                }
+            }
+            other => word.get_or_insert_with(String::new).push(other),
+        }
+    }
+    if let Some(w) = word.take() {
+        argv.push(w);
+    }
+    if !argv.is_empty() {
+        commands.push(UnattendedCommand { argv, run_if: gate });
+    } else if gate == RunIf::PreviousSucceeded {
+        // `a &&` with nothing after it.
+        return None;
+    }
+    if commands.is_empty() {
+        return None;
+    }
+    for command in &commands {
+        let program = command.argv.first()?;
+        if program.is_empty() || program.contains('=') {
+            return None;
+        }
+        if command.argv.iter().any(|word| word.starts_with('~')) {
+            return None;
+        }
+    }
+    Some(commands)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,5 +711,183 @@ mod tests {
              trusted or accept-edits command spelled with one runs as something the gate never \
              saw: {unaccounted:?}"
         );
+    }
+
+    fn argvs(command: &str) -> Vec<Vec<String>> {
+        parse_unattended(command)
+            .expect("parses")
+            .into_iter()
+            .map(|cmd| cmd.argv)
+            .collect()
+    }
+
+    fn words(argvs: &[&[&str]]) -> Vec<Vec<String>> {
+        argvs
+            .iter()
+            .map(|argv| argv.iter().map(|word| (*word).to_string()).collect())
+            .collect()
+    }
+
+    fn gates(command: &str) -> Vec<RunIf> {
+        parse_unattended(command)
+            .expect("parses")
+            .iter()
+            .map(|cmd| cmd.run_if)
+            .collect()
+    }
+
+    #[test]
+    fn unattended_parse_splits_words_like_the_shell() {
+        assert_eq!(
+            argvs("cargo test --all"),
+            words(&[&["cargo", "test", "--all"]])
+        );
+        assert_eq!(
+            argvs("cargo test --features \"a b\" 'c d' e\\ f"),
+            words(&[&["cargo", "test", "--features", "a b", "c d", "e f"]])
+        );
+        assert_eq!(
+            argvs("git commit -m \"say \\\"hi\\\" \\\\ ok\""),
+            words(&[&["git", "commit", "-m", "say \"hi\" \\ ok"]])
+        );
+        // Quote removal glues adjacent quoted pieces into one word; a quoted
+        // empty string is a real (empty) argument.
+        assert_eq!(
+            argvs("printf a\"b\"'c' '' \"\""),
+            words(&[&["printf", "abc", "", ""]])
+        );
+        // Inside double quotes a backslash before anything but `"`/`\` stays.
+        assert_eq!(
+            argvs("printf '%s\\n' \"a\\tb\""),
+            words(&[&["printf", "%s\\n", "a\\tb"]])
+        );
+        // `#` opens a comment only at the start of a word.
+        assert_eq!(
+            argvs("cargo build # not run"),
+            words(&[&["cargo", "build"]])
+        );
+        assert_eq!(argvs("cargo build#x"), words(&[&["cargo", "build#x"]]));
+        // Backslash-newline continues the line; blank lines are nothing.
+        assert_eq!(
+            argvs("cargo build \\\n  --release\n\n"),
+            words(&[&["cargo", "build", "--release"]])
+        );
+        // Tabs and other blanks separate words too; a trailing `;` is fine.
+        assert_eq!(argvs("git\tstatus ;"), words(&[&["git", "status"]]));
+    }
+
+    #[test]
+    fn unattended_parse_chains_with_the_two_sequencing_operators() {
+        assert_eq!(
+            argvs("cargo build && cargo test; echo done\ngit status"),
+            words(&[
+                &["cargo", "build"],
+                &["cargo", "test"],
+                &["echo", "done"],
+                &["git", "status"],
+            ])
+        );
+        assert_eq!(
+            gates("cargo build && cargo test; echo done\ngit status"),
+            vec![
+                RunIf::Always,
+                RunIf::PreviousSucceeded,
+                RunIf::Always,
+                RunIf::Always
+            ]
+        );
+        // A newline after `&&` is allowed, and the gate survives it.
+        assert_eq!(
+            gates("cargo build &&\ncargo test"),
+            vec![RunIf::Always, RunIf::PreviousSucceeded]
+        );
+    }
+
+    /// Everything a shell would have to interpret beyond quoting and the two
+    /// sequencing operators is refused, so it can neither be auto-approved nor
+    /// run unattended.
+    #[test]
+    fn unattended_parse_refuses_what_only_a_shell_can_read() {
+        for command in [
+            "",
+            "   ",
+            "a | b",
+            "a || b",
+            "a &",
+            "a && b &",
+            "a &&",
+            "&& a",
+            "; a",
+            "a ;; b",
+            "a; ; b",
+            "echo \"unterminated",
+            "echo 'unterminated",
+            "echo done\\",
+            "echo $HOME",
+            "echo `id`",
+            "echo *.rs",
+            "echo a?",
+            "echo [a]",
+            "echo {a,b}",
+            "echo (a)",
+            "echo a > b",
+            "echo a < b",
+            "cd ~/x",
+            "echo ~",
+            "FOO=1 cargo test",
+            "'' cargo test",
+        ] {
+            assert_eq!(parse_unattended(command), None, "{command:?}");
+        }
+    }
+
+    /// The accepted grammar must mean to this parser exactly what it means to
+    /// `sh`, or the words the gate judged are still not the words that run —
+    /// the very gap this parser exists to close. Each spelling is run through
+    /// the real shell as arguments to `printf '%s\n'`, one line per word, and
+    /// compared with the parser's argv for the same text.
+    #[cfg(unix)]
+    #[test]
+    fn unattended_parse_matches_sh_word_splitting() {
+        for spelling in [
+            "a b c",
+            "\"a b\" c",
+            "'c d' e",
+            "e\\ f g",
+            "\"q\\\"x\" y",
+            "'it'\"'\"'s' z",
+            "\"\" '' end",
+            "a\"b\"c d",
+            "x\\\\y z",
+            "--flag=v --other=\"w x\"",
+            "a\\tb c",
+            "\"back\\\\slash\" \"quote\\\"d\" \"tab\\t\"",
+            "tab\there",
+            "line\\\ncontinued next",
+            "trailing ;",
+            "first # a comment",
+            "hash#inside word",
+            "'single \"double\" inside'",
+            "\"double 'single' inside\"",
+        ] {
+            let command = format!("printf '%s\\n' {spelling}");
+            let ours: Vec<String> = parse_unattended(&command)
+                .unwrap_or_else(|| panic!("{command:?} must parse"))
+                .into_iter()
+                .flat_map(|cmd| cmd.argv.into_iter().skip(2))
+                .collect();
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("run sh");
+            assert!(output.status.success(), "{command:?} failed in sh");
+            let theirs: Vec<&str> = std::str::from_utf8(&output.stdout)
+                .expect("utf8")
+                .lines()
+                .collect();
+            assert_eq!(ours, theirs, "{command:?} split differently from sh");
+        }
     }
 }

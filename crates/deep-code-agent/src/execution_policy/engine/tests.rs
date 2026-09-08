@@ -462,6 +462,59 @@ fn every_segment_must_be_trusted_for_auto_allow() {
     ));
 }
 
+/// A trusted command runs as the argv the gate parsed, with no shell in
+/// between — so the gate trusts only what that parse accepts: words, quotes,
+/// and `&&`/`;`/newline sequencing. A pipe or a background `&` between two
+/// trusted commands used to be trusted (each segment matched); they now ask,
+/// because only a shell could run them and a shell is exactly what an
+/// unattended command no longer gets.
+#[test]
+fn trust_covers_only_what_runs_without_a_shell() {
+    let policy = ExecPolicy::default();
+    for command in [
+        "cargo build && cargo test",
+        "cargo build; cargo test",
+        "cargo build\ncargo test",
+        "cargo test --features \"a b\"",
+        "git log --format='%h %s' -5",
+        "echo done # trailing comment",
+    ] {
+        assert_eq!(
+            evaluate_shell_command(&policy, command, false).verdict,
+            PolicyVerdict::Allow,
+            "{command:?} must stay trusted"
+        );
+    }
+    for command in [
+        "git status | git diff",
+        "echo a || echo b",
+        "echo a & echo b",
+        "cargo build &&",
+        "echo \"unterminated",
+        "echo done\\",
+    ] {
+        let plan = evaluate_shell_command(&policy, command, false);
+        assert!(
+            matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }),
+            "{command:?} must reach a human, got {:?}",
+            plan.verdict
+        );
+    }
+    // The accept-edits allowance reads the same parse.
+    assert!(accept_edits_approvable(
+        "shell",
+        &json!({ "command": "mkdir a && touch a/b" })
+    ));
+    assert!(!accept_edits_approvable(
+        "shell",
+        &json!({ "command": "mkdir a | touch b" })
+    ));
+    assert!(!accept_edits_approvable(
+        "shell",
+        &json!({ "command": "touch \"unterminated" })
+    ));
+}
+
 /// The built-in trust list covers `cargo build/test/check` and `git
 /// status/diff/log`, and matching ignored every flag after the subcommand —
 /// so a redirecting flag rode in on a trusted identity and executed an

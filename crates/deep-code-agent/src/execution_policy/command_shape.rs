@@ -383,9 +383,11 @@ pub fn session_identity(command: &str) -> Option<String> {
     if segments.len() != 1 || segments[0] != command {
         return None;
     }
-    if super::shell_lex::has_shell_indirection(command) {
-        return None;
-    }
+    // No indirection, and nothing else a shell would have to read either
+    // (`parse_unattended` refuses both): a remembered consent is executed as
+    // the argv that parse produces, so a command it cannot parse must have no
+    // key to ride.
+    super::shell_lex::parse_unattended(command)?;
     let tokens: Vec<&str> = command.split_whitespace().collect();
     // Deliberately looser than the deny floor's env-assignment test: any `=`
     // in the first word means "not a plain program word" here, and the only

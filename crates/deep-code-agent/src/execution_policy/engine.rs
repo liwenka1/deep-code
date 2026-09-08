@@ -525,11 +525,14 @@ pub fn evaluate_shell_command(
 
     let segments = shell_lex::segments(command);
     // Auto-trust only if EVERY segment is covered by a trusted rule
-    // (identity-matched, so flags vary but subcommands don't) and the command
-    // has no redirection/substitution/expansion — those run programs, write
-    // paths, or expand content a trusted prefix doesn't cover.
-    let trusted = !segments.is_empty()
-        && !shell_lex::has_shell_indirection(command)
+    // (identity-matched, so flags vary but subcommands don't) and the whole
+    // line is one the executor can run WITHOUT a shell
+    // (`shell_lex::parse_unattended`): plain words, quotes, `&&`/`;`
+    // sequencing — no redirection, substitution, expansion, pipe or
+    // background `&`. Those run programs, write paths or expand content a
+    // trusted prefix never covered; and a trusted command is executed as the
+    // argv that parse produced, so what the rules judged is what runs.
+    let trusted = shell_lex::parse_unattended(command).is_some()
         && segments.iter().all(|segment| {
             policy
                 .trusted_shell_prefixes
