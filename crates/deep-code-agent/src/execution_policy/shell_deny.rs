@@ -285,6 +285,26 @@ fn dos_delete_target_is_catastrophic(args: &[String]) -> bool {
         })
 }
 
+/// Whether a (cleaned) `rm` operand spells the filesystem root, everything
+/// directly under it, or the home directory — the targets a recursive remove
+/// must never take even without `-f`.
+fn names_root_or_home(arg: &str) -> bool {
+    matches!(
+        arg,
+        "/" | "/*"
+            | "/."
+            | "~"
+            | "~/"
+            | "~/*"
+            | "$HOME"
+            | "$HOME/"
+            | "$HOME/*"
+            | "${HOME}"
+            | "${HOME}/"
+            | "${HOME}/*"
+    )
+}
+
 /// Whether a `chmod` mode argument grants write to "other"/"all" (world-
 /// writable), covering octal (`777`, `0666`, `4777`) and symbolic (`o+w`,
 /// `a+w`, `+w`, `a=rwx`) forms. Best-effort — chmod modes have many shapes; it
@@ -337,7 +357,18 @@ fn deny_segment(segment: &str) -> Option<DenyReason> {
             let recursive =
                 has_flag(&args, 'r', &["recursive"]) || has_flag(&args, 'R', &["recursive"]);
             let force = has_flag(&args, 'f', &["force"]);
-            (recursive && force).then_some(DenyReason("recursive force remove (rm -rf)"))
+            if recursive && force {
+                return Some(DenyReason("recursive force remove (rm -rf)"));
+            }
+            // Without `-f` a recursive rm is the everyday escape (`rm -r build`)
+            // — unless it is aimed at the filesystem root or the home directory.
+            // `rm -r /` rm refuses on its own (preserve-root); `rm -r /*` walks
+            // around that guard through the glob, and `rm -r ~` has no guard at
+            // all. Spelled forms only, like every rule on this floor: `$HOME` is
+            // listed because `Yolo` runs it, not because the floor expands it.
+            (recursive && args.iter().any(|arg| names_root_or_home(arg))).then_some(DenyReason(
+                "recursive remove of the filesystem root or home directory",
+            ))
         }
         "dd" => args
             .iter()
