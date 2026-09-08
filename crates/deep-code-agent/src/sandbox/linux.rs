@@ -33,7 +33,7 @@
 //!   mistaken for a boundary denial or break every libc's fallback path.
 //!
 //! Availability is reported by [`capabilities`]; the manager only calls
-//! [`wrap_shell_command`] when Landlock is available. If the per-command ruleset
+//! [`wrap_command`] when Landlock is available. If the per-command ruleset
 //! still fails to build, that is an error — the command is refused, never run
 //! unconfined (fail-closed, matching the spawn-site guard).
 
@@ -330,13 +330,16 @@ pub(super) fn design_notes() -> &'static [&'static str] {
     }
 }
 
-pub fn wrap_shell_command(
-    command: &str,
+/// The confined command for `form` (see [`super::CommandForm`]): approved text
+/// through `sh -c`, an unattended argv directly. Landlock and seccomp are
+/// applied in the child either way, so the confinement is identical.
+pub fn wrap_command(
+    form: super::CommandForm<'_>,
     cwd: &Path,
     granted_roots: &[PathBuf],
     policy: &SandboxPolicy,
 ) -> Result<Command, String> {
-    let mut cmd = super::bare_shell_command(command, cwd);
+    let mut cmd = super::bare_command(form, cwd)?;
 
     // Fail closed. Previously this warned to stderr and returned the unconfined
     // command, which both contradicted the refuse-if-unenforceable policy and was
@@ -672,8 +675,8 @@ mod tests {
     use std::process::Stdio;
 
     fn run(workspace: &Path, command: &str) -> std::process::Output {
-        wrap_shell_command(
-            command,
+        wrap_command(
+            super::CommandForm::Text(command),
             workspace,
             &[workspace.to_path_buf()],
             &SandboxPolicy::workspace_write(),

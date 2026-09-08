@@ -456,9 +456,24 @@ fn probe_capabilities() -> SandboxCapabilities {
     }
 }
 
+/// What a launcher is asked to run.
+///
+/// Two forms because two authorities exist (`crate::tool::RunAuthority`). A
+/// human approved `Text` as written, so it goes to the platform shell and means
+/// what the human read. Nobody read an `Argv`: it is the policy's own parse of
+/// a command it matched, handed to `execve` as is — no shell reinterprets it,
+/// so the words the gate judged are the words that run.
+#[derive(Debug, Clone, Copy)]
+pub enum CommandForm<'a> {
+    /// A command line for `sh -c` / `cmd /C`.
+    Text(&'a str),
+    /// A program word and its arguments, executed directly.
+    Argv(&'a [String]),
+}
+
 /// Keeps an OS sandbox alive for a spawned child's lifetime. On Windows it owns
 /// the Job Object handle (dropping it kills the process tree); on macOS/Linux
-/// it is empty, since those confine before spawn via [`SandboxManager::wrap_shell_command`].
+/// it is empty, since those confine before spawn via [`SandboxManager::wrap_command`].
 #[derive(Debug)]
 pub struct SandboxGuard {
     #[cfg(target_os = "windows")]
@@ -520,21 +535,25 @@ impl SandboxManager {
     /// returned the *bare* command, which contradicted the refuse-if-
     /// unenforceable policy — and the warning was invisible, because the TUI
     /// redirects stderr to a log file before any command runs.
-    pub fn wrap_shell_command(
+    ///
+    /// `form` says what the launcher execs (see [`CommandForm`]): approved text
+    /// through the platform shell, an unattended argv directly. Same
+    /// confinement either way.
+    pub fn wrap_command(
         &self,
-        command: &str,
+        form: CommandForm<'_>,
         cwd: &Path,
         granted_roots: &[PathBuf],
         policy: &SandboxPolicy,
     ) -> Result<Command, String> {
         if !self.should_sandbox(policy) {
-            return Ok(bare_shell_command(command, cwd));
+            return bare_command(form, cwd);
         }
 
         #[cfg(target_os = "macos")]
         {
-            Ok(macos_seatbelt::wrap_shell_command(
-                command,
+            Ok(macos_seatbelt::wrap_command(
+                form,
                 cwd,
                 granted_roots,
                 policy,
@@ -543,13 +562,13 @@ impl SandboxManager {
 
         #[cfg(target_os = "linux")]
         {
-            linux::wrap_shell_command(command, cwd, granted_roots, policy)
+            linux::wrap_command(form, cwd, granted_roots, policy)
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = granted_roots;
-            Ok(bare_shell_command(command, cwd))
+            bare_command(form, cwd)
         }
     }
 
@@ -629,6 +648,46 @@ fn bare_shell_command(command: &str, cwd: &Path) -> Command {
     cmd.arg("-c").arg(command);
     cmd.current_dir(cwd);
     cmd
+}
+
+/// The unconfined command for `form`: approved text to the platform shell, an
+/// unattended argv to `execve` with nothing in between.
+fn bare_command(form: CommandForm<'_>, cwd: &Path) -> Result<Command, String> {
+    match form {
+        CommandForm::Text(command) => Ok(bare_shell_command(command, cwd)),
+        CommandForm::Argv(argv) => bare_argv_command(argv, cwd),
+    }
+}
+
+/// `execve` of `argv`. The program word is resolved the one way the shell would
+/// resolve a plain word — on `PATH` — and nothing else the shell does happens:
+/// no expansion, no quote removal, no redirection, no builtin. (`echo` and
+/// `printf` are the two default-trusted words the shell would have run as
+/// builtins; `/bin/echo` and `/usr/bin/printf` take their place.)
+#[cfg(not(windows))]
+fn bare_argv_command(argv: &[String], cwd: &Path) -> Result<Command, String> {
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| "an unattended command needs a program word".to_string())?;
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    cmd.current_dir(cwd);
+    Ok(cmd)
+}
+
+/// Windows: the program must resolve to a real executable image; a `.cmd`/`.bat`
+/// wrapper or a cmd.exe builtin is refused rather than routed back through
+/// `cmd /C` — see [`windows::resolve_executable`].
+#[cfg(windows)]
+fn bare_argv_command(argv: &[String], cwd: &Path) -> Result<Command, String> {
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| "an unattended command needs a program word".to_string())?;
+    let resolved = windows::resolve_executable(program)?;
+    let mut cmd = Command::new(resolved);
+    cmd.args(args);
+    cmd.current_dir(cwd);
+    Ok(cmd)
 }
 
 #[cfg(test)]

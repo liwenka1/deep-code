@@ -4216,3 +4216,130 @@ async fn a_second_in_band_error_frame_does_not_emit_a_second_terminal_error() {
     let messages = runtime.session_messages().await;
     assert_eq!(messages[1].content, "partial");
 }
+
+/// A tool named `shell` that records who let it run, in place of the real one.
+#[derive(Debug, Clone, Copy)]
+struct AuthorityProbeTool;
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AuthorityProbeParams {
+    command: String,
+}
+
+#[async_trait::async_trait]
+impl Tool for AuthorityProbeTool {
+    type Params = AuthorityProbeParams;
+
+    fn name(&self) -> &str {
+        "shell"
+    }
+
+    fn description(&self) -> &str {
+        "Records the run authority."
+    }
+
+    async fn run(
+        &self,
+        params: AuthorityProbeParams,
+        cx: &crate::tool::ToolCx,
+    ) -> Result<crate::tool::ToolOutput, ToolError> {
+        Ok(crate::tool::ToolOutput::text(format!(
+            "{}: {:?}",
+            params.command,
+            cx.authority()
+        )))
+    }
+}
+
+fn shell_script(id: &str, command: &str) -> Vec<AgentEvent> {
+    vec![
+        AgentEvent::ToolCallDelta {
+            delta: tool_call_delta(id, "shell", &format!(r#"{{"command":"{command}"}}"#)),
+        },
+        AgentEvent::Done { usage: None },
+    ]
+}
+
+fn done_script() -> Vec<AgentEvent> {
+    vec![
+        AgentEvent::TextDelta {
+            text: "done".to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]
+}
+
+fn finished_contents(events: &[RuntimeEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::ToolCallFinished { result, .. } => Some(result.content.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The executor is told WHO let a shell call run, and the answer follows the
+/// layer that resolved it: a trust-list `Allow` and a remembered session
+/// identity are the policy's own parse (`Parse` — the command runs as that
+/// parse's argv, no shell), a human's approval is text (`Approved` — the
+/// shell runs what the human read). Without this wiring every unattended
+/// run would still go through `sh -c`, and the whole class of "the shell
+/// rewrote what the gate judged" would be back.
+#[tokio::test]
+async fn execution_authority_follows_who_resolved_the_prompt() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+
+    // Default mode: trusted → Parse; human "a" → Approved; the remembered
+    // identity on the next call → Parse.
+    let client = ScriptedClient::new(vec![
+        shell_script("call_1", "echo hi"),
+        shell_script("call_2", "exit 4"),
+        shell_script("call_3", "exit 5"),
+        done_script(),
+    ]);
+    let mut registry = ToolRegistry::default();
+    registry.register(AuthorityProbeTool);
+    let runtime = AgentRuntime::new(client, registry);
+    let mut rx = runtime.submit_user("go").await;
+    let first = drain(&mut rx).await;
+    assert_eq!(finished_contents(&first), ["echo hi: Parse"]);
+    assert!(matches!(
+        first.last(),
+        Some(RuntimeEvent::ApprovalRequired { .. })
+    ));
+    let mut rx = runtime
+        .submit_approval(ApprovalDecision::ApprovedForSession)
+        .await;
+    let rest = drain(&mut rx).await;
+    assert_eq!(
+        finished_contents(&rest),
+        ["exit 4: Approved", "exit 5: Parse"],
+        "the human's text approval is `Approved`; the identity it left behind runs the next \
+         call on the policy's parse"
+    );
+
+    // AcceptEdits: the fs-edit allowance is a parse → Parse.
+    let client = ScriptedClient::new(vec![shell_script("call_1", "mkdir sub"), done_script()]);
+    let mut registry = ToolRegistry::default();
+    registry.register(AuthorityProbeTool);
+    let runtime = AgentRuntime::new(client, registry)
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::AcceptEdits));
+    let mut rx = runtime.submit_user("go").await;
+    let events = drain(&mut rx).await;
+    assert_eq!(finished_contents(&events), ["mkdir sub: Parse"]);
+
+    // Yolo waves the text through without reading it → Approved (the shell
+    // runs it, as before: nobody parsed anything).
+    let client = ScriptedClient::new(vec![
+        shell_script("call_1", "python deploy.py"),
+        done_script(),
+    ]);
+    let mut registry = ToolRegistry::default();
+    registry.register(AuthorityProbeTool);
+    let runtime = AgentRuntime::new(client, registry)
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Yolo));
+    let mut rx = runtime.submit_user("go").await;
+    let events = drain(&mut rx).await;
+    assert_eq!(finished_contents(&events), ["python deploy.py: Approved"]);
+}

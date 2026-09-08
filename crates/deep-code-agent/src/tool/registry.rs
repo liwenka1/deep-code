@@ -8,8 +8,8 @@ use crate::execution_policy::{ExecPolicy, PolicyVerdict, ToolExecutionPlan};
 use crate::model::ChatTool;
 
 use super::{
-    ApprovalDecision, ApprovalRequest, ErasedTool, MockEchoTool, Tool, ToolCall, ToolCx, ToolError,
-    ToolResult, ToolRunOutcome, ToolSpec, shell_safety_notes,
+    ApprovalDecision, ApprovalRequest, ErasedTool, MockEchoTool, RunAuthority, Tool, ToolCall,
+    ToolCx, ToolError, ToolResult, ToolRunOutcome, ToolSpec, shell_safety_notes,
 };
 
 #[derive(Clone)]
@@ -179,6 +179,17 @@ impl ToolRegistry {
             }
         }
 
+        // Whether a shell may reinterpret the command is decided by WHO let it
+        // run. No approval was needed: the plan is `Allow`, i.e. the policy's
+        // own parse of the call matched a rule, and the executor must run
+        // exactly what that parse saw. Approval was needed and given: the
+        // caller says who gave it (`ToolCx::with_authority`) — a human reading
+        // the text, or a standing rule that parsed it.
+        let cx = if needs_approval {
+            cx
+        } else {
+            cx.with_authority(RunAuthority::Parse)
+        };
         let cx = cx.with_plan(plan);
         entry
             .tool

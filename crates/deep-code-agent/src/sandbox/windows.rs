@@ -109,6 +109,66 @@ pub fn confine(process: RawHandle) -> Option<JobGuard> {
     }
 }
 
+/// The executable a program word names, searched the way `CreateProcess` would
+/// search for a bare word — the word itself when it carries a directory, else
+/// each `PATH` entry, trying `.exe` and `.com` when the word has no extension —
+/// but accepting ONLY a real executable image.
+///
+/// This is the Windows half of running an unattended command without a shell.
+/// A `.cmd`/`.bat` is a script for `cmd.exe`, and launching it hands the
+/// arguments straight back to the interpreter this path exists to keep out; a
+/// cmd builtin (`echo`, `dir`, `type`) resolves to no file at all. Both are
+/// refused: on Windows an unattended command runs a program or does not run.
+pub(super) fn resolve_executable(program: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::{Path, PathBuf};
+
+    let word = Path::new(program);
+    let has_extension = word.extension().is_some();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if program.contains(['\\', '/']) {
+        if has_extension {
+            candidates.push(word.to_path_buf());
+        } else {
+            candidates.push(word.with_extension("exe"));
+            candidates.push(word.with_extension("com"));
+        }
+    } else {
+        let names: Vec<String> = if has_extension {
+            vec![program.to_string()]
+        } else {
+            vec![format!("{program}.exe"), format!("{program}.com")]
+        };
+        if let Some(paths) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&paths) {
+                for name in &names {
+                    candidates.push(dir.join(name));
+                }
+            }
+        }
+    }
+    for candidate in candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+        let extension = candidate
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase);
+        return match extension.as_deref() {
+            Some("exe" | "com") => Ok(candidate),
+            _ => Err(format!(
+                "`{program}` resolves to {}, which is a cmd.exe script rather than an executable \
+                 image; an unattended command runs without cmd.exe, so it cannot run this way",
+                candidate.display()
+            )),
+        };
+    }
+    Err(format!(
+        "`{program}` is not an executable on PATH; an unattended command runs without cmd.exe, so \
+         a builtin or a .cmd/.bat wrapper cannot run this way"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

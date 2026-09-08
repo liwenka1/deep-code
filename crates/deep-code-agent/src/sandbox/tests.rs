@@ -350,7 +350,12 @@ fn wrap_shell_command_bares_and_wraps_by_the_gate() {
     let on = SandboxManager::new().force_sandbox(Some(true));
 
     let bare = on
-        .wrap_shell_command("true", &cwd, &[], &SandboxPolicy::Unsandboxed)
+        .wrap_command(
+            CommandForm::Text("true"),
+            &cwd,
+            &[],
+            &SandboxPolicy::Unsandboxed,
+        )
         .expect("bare path cannot fail");
     let program = bare.get_program().to_string_lossy().into_owned();
     let args: Vec<String> = bare
@@ -381,8 +386,8 @@ fn wrap_shell_command_bares_and_wraps_by_the_gate() {
     #[cfg(target_os = "macos")]
     {
         let wrapped = on
-            .wrap_shell_command(
-                "true",
+            .wrap_command(
+                CommandForm::Text("true"),
                 &cwd,
                 std::slice::from_ref(&cwd),
                 &SandboxPolicy::workspace_write(),

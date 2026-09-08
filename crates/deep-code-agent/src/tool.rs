@@ -169,6 +169,27 @@ impl ToolSpend {
     }
 }
 
+/// Who let a gated call run, as far as the executor needs to know.
+///
+/// The one fact the shell tools need beyond the plan: may a shell reinterpret
+/// the command text? A human who approved the text read it with shell semantics,
+/// so it runs that way. A command that runs because the policy's *parse* of it
+/// matched a rule — the trust list, a remembered session identity, the
+/// accept-edits allowance — was read by nobody, and the executor must run
+/// exactly the words that parse produced (`shell_lex::parse_unattended`): the
+/// two grammars, policy and `sh`, differed in ten review rounds' worth of ways,
+/// and each difference ran something the gate never saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunAuthority {
+    /// The text was approved as text: a human at the prompt, the Auto judge,
+    /// Yolo, or a config `auto_allow` naming the tool. Shell semantics.
+    #[default]
+    Approved,
+    /// Nobody read the text: the policy's parse of it matched a rule. The
+    /// executor runs that parse's argv directly; no shell.
+    Parse,
+}
+
 /// Execution context for one tool invocation.
 ///
 /// Replaces the old `tool_execution` thread-local: the sandbox plan travels
@@ -178,6 +199,7 @@ impl ToolSpend {
 pub struct ToolCx {
     cancel: CancellationToken,
     plan: Option<ToolExecutionPlan>,
+    authority: RunAuthority,
     on_update: Option<ToolUpdateFn>,
     /// Sink for spend a tool incurs out-of-band — requests the parent turn's
     /// telemetry never sees, e.g. a sub-agent's own turns on the shared key.
@@ -207,6 +229,20 @@ impl ToolCx {
     pub(crate) fn with_plan(mut self, plan: ToolExecutionPlan) -> Self {
         self.plan = Some(plan);
         self
+    }
+
+    /// Record who let this call run (see [`RunAuthority`]). The registry sets
+    /// `Parse` itself for a plan that needed no approval; a caller that
+    /// resolved an approval sets what resolved it.
+    #[must_use]
+    pub fn with_authority(mut self, authority: RunAuthority) -> Self {
+        self.authority = authority;
+        self
+    }
+
+    #[must_use]
+    pub fn authority(&self) -> RunAuthority {
+        self.authority
     }
 
     #[must_use]

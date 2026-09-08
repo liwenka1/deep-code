@@ -12,8 +12,9 @@ use serde_json::json;
 
 use std::path::{Path, PathBuf};
 
-use crate::sandbox::{Enforcement, SandboxGuard, SandboxManager, SandboxPolicy};
-use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, ToolUpdate};
+use crate::execution_policy::{RunIf, parse_unattended};
+use crate::sandbox::{CommandForm, Enforcement, SandboxGuard, SandboxManager, SandboxPolicy};
+use crate::tool::{RunAuthority, Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, ToolUpdate};
 #[cfg(test)]
 use crate::workspace_policy::WorkspaceRoots;
 use crate::workspace_policy::{WorkspacePolicy, invalid};
@@ -167,7 +168,7 @@ fn job_description() -> &'static str {
 fn spawn_confined(
     sandbox: &SandboxManager,
     granted_roots: &[PathBuf],
-    command: &str,
+    form: CommandForm<'_>,
     cwd: &Path,
     policy: &SandboxPolicy,
     tool_name: &str,
@@ -196,7 +197,7 @@ fn spawn_confined(
     // platforms the binding is moved as-is into `Command::from`.
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut std_cmd = sandbox
-        .wrap_shell_command(command, cwd, granted_roots, policy)
+        .wrap_command(form, cwd, granted_roots, policy)
         .map_err(|detail| {
             ToolError::exec_failed(
                 tool_name,
@@ -228,6 +229,111 @@ fn spawn_confined(
         .map_err(|error| ToolError::exec_failed(tool_name, format!("{error_context}: {error}")))?;
     let guard = sandbox.confine_spawned(&child, policy);
     Ok((child, guard))
+}
+
+/// One process of a shell/job call, and how it is gated on the one before it.
+struct Step {
+    form: StepForm,
+    run_if: RunIf,
+}
+
+/// The form a launcher receives for one step (see [`CommandForm`]).
+enum StepForm {
+    /// The command line, for the platform shell: the text a human approved.
+    Text(String),
+    /// A program word and its arguments, executed directly.
+    Argv(Vec<String>),
+}
+
+impl StepForm {
+    fn as_command_form(&self) -> CommandForm<'_> {
+        match self {
+            Self::Text(command) => CommandForm::Text(command),
+            Self::Argv(argv) => CommandForm::Argv(argv),
+        }
+    }
+}
+
+/// Model-facing refusal for a command cleared to run unattended whose text the
+/// unattended parser cannot read. Unreachable through the gate — trust, the
+/// accept-edits allowance and the session key all require that parse — so
+/// reaching it means a rule and the executor disagree, which is exactly the
+/// mismatch this refusal exists for. Never a fallback to the shell.
+const UNATTENDED_UNPARSABLE: &str = "this command was cleared to run without a prompt, but it \
+uses shell syntax the gate does not read (a pipe, redirection, an expansion, or an unterminated \
+quote), so it was not run: an unattended command is executed without a shell. Simplify it, or \
+the user can approve it as written.";
+
+/// What to run for `command`, decided by who let it run ([`RunAuthority`]).
+/// Approved text goes to the shell as written — one step. A command nobody
+/// read becomes the argv sequence the policy's own parse produced, one step per
+/// simple command, chained by the shell's rules for `&&` and `;`.
+fn steps_for(
+    command: &str,
+    authority: RunAuthority,
+    tool_name: &str,
+) -> Result<Vec<Step>, ToolError> {
+    match authority {
+        RunAuthority::Approved => Ok(vec![Step {
+            form: StepForm::Text(command.to_string()),
+            run_if: RunIf::Always,
+        }]),
+        RunAuthority::Parse => parse_unattended(command)
+            .map(|commands| {
+                commands
+                    .into_iter()
+                    .map(|parsed| Step {
+                        form: StepForm::Argv(parsed.argv),
+                        run_if: parsed.run_if,
+                    })
+                    .collect()
+            })
+            .ok_or_else(|| ToolError::exec_failed(tool_name, UNATTENDED_UNPARSABLE)),
+    }
+}
+
+/// Await the reader tasks so the final pipe chunks land in the buffers (a bare
+/// yield loses them under scheduler load). EOF is prompt once the child is
+/// gone; the cap guards a lingering grandchild that inherited the pipe and
+/// keeps it open past the parent's exit.
+async fn drain_readers(
+    stdout_task: Option<tokio::task::JoinHandle<()>>,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
+    stdout: &SharedBuffer,
+    stderr: &SharedBuffer,
+) {
+    let stdout_abort = stdout_task.as_ref().map(|task| task.abort_handle());
+    let stderr_abort = stderr_task.as_ref().map(|task| task.abort_handle());
+    let drain = async {
+        if let Some(task) = stdout_task {
+            let _ = task.await;
+        }
+        if let Some(task) = stderr_task {
+            let _ = task.await;
+        }
+    };
+    if tokio::time::timeout(Duration::from_millis(500), drain)
+        .await
+        .is_err()
+    {
+        // A grandchild that inherited the pipe kept it open past the cap:
+        // abort the reader tasks so they (and the pipe fds they hold) don't
+        // linger until that process finally exits (dropping the JoinHandle
+        // alone would only detach them, not stop them).
+        if let Some(abort) = stdout_abort {
+            abort.abort();
+        }
+        if let Some(abort) = stderr_abort {
+            abort.abort();
+        }
+        // The aborted readers never reached their own end-of-stream
+        // `finish_spill`, so release the spill file handles here — otherwise
+        // an open fd lingers in the retained JobState until the store evicts
+        // it. Safe against the winding-down reader: `finish` marks the spill
+        // finished, so a late `push` cannot re-open it.
+        stdout.finish_spill();
+        stderr.finish_spill();
+    }
 }
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -524,37 +630,19 @@ impl Tool for ShellTool {
                 .clamp(1, MAX_TIMEOUT_SECS),
         );
         let policy = cx.sandbox_policy();
+        let steps = steps_for(&command, cx.authority(), Self::NAME)?;
+        let granted_roots = self.root.granted_roots();
 
         let started = Instant::now();
-        let (mut child, job_guard) = spawn_confined(
-            &self.sandbox,
-            &self.root.granted_roots(),
-            &command,
-            &cwd,
-            &policy,
-            Self::NAME,
-            "failed to start command",
-        )?;
+        let deadline = started + timeout;
         let job_id = self.jobs.reserve_id();
         let (stdout, stderr) = spill_buffers(&self.spill_dir, &job_id);
         let stream_budget = Arc::new(AtomicUsize::new(0));
-        let stdout_task = child.stdout.take().map(|pipe| {
-            spawn_buffer_reader(
-                pipe,
-                stdout.clone(),
-                Some(stream_chunk_fn(cx, "stdout", Arc::clone(&stream_budget))),
-            )
-        });
-        let stderr_task = child.stderr.take().map(|pipe| {
-            spawn_buffer_reader(
-                pipe,
-                stderr.clone(),
-                Some(stream_chunk_fn(cx, "stderr", stream_budget)),
-            )
-        });
 
-        // The tool future owns the child; the store entry exposes the run to
-        // post-hoc `job action=status/tail`.
+        // The tool future owns the children; the store entry exposes the run
+        // to post-hoc `job action=status/tail`. Each step's sandbox guard
+        // (Windows Job Object) lives in the loop below for exactly that
+        // step's lifetime.
         self.jobs.insert_with_id(
             &job_id,
             JobState {
@@ -569,71 +657,89 @@ impl Tool for ShellTool {
                 stdout: stdout.clone(),
                 stderr: stderr.clone(),
                 child: None,
-                job_guard,
+                job_guard: None,
             },
         );
 
-        let (status, exit_code) = tokio::select! {
-            result = child.wait() => match result {
-                Ok(exit) => (
-                    if exit.success() { JobStatus::Completed } else { JobStatus::Failed },
-                    exit.code(),
-                ),
+        // Sequencing with the shell's own rules for `&&` and `;`: a gated
+        // step is skipped while the previous status stands, and the run's
+        // status is that of the last step that executed. One timeout covers
+        // the whole sequence.
+        let mut outcome = (JobStatus::Completed, Some(0));
+        let mut previous_succeeded = true;
+        for step in &steps {
+            if step.run_if == RunIf::PreviousSucceeded && !previous_succeeded {
+                continue;
+            }
+            let (mut child, _guard) = match spawn_confined(
+                &self.sandbox,
+                &granted_roots,
+                step.form.as_command_form(),
+                &cwd,
+                &policy,
+                Self::NAME,
+                "failed to start command",
+            ) {
+                Ok(spawned) => spawned,
+                // A lone command that cannot start is the caller's error, as
+                // before. Inside a sequence the shell would report it and
+                // carry on by the chain rules with status 127; so does this.
+                Err(error) if steps.len() == 1 => return Err(error),
                 Err(error) => {
-                    return Err(ToolError::exec_failed(
-                        Self::NAME,
-                        format!("failed to wait for command: {error}"),
-                    ));
+                    stderr.push(format!("{error}\n").as_bytes());
+                    outcome = (JobStatus::Failed, Some(127));
+                    previous_succeeded = false;
+                    continue;
                 }
-            },
-            () = cx.cancel_token().cancelled() => {
-                kill_process_tree(&mut child);
-                let _ = child.wait().await;
-                (JobStatus::Cancelled, None)
-            }
-            () = tokio::time::sleep(timeout) => {
-                kill_process_tree(&mut child);
-                let _ = child.wait().await;
-                (JobStatus::TimedOut, None)
-            }
-        };
+            };
+            let stdout_task = child.stdout.take().map(|pipe| {
+                spawn_buffer_reader(
+                    pipe,
+                    stdout.clone(),
+                    Some(stream_chunk_fn(cx, "stdout", Arc::clone(&stream_budget))),
+                )
+            });
+            let stderr_task = child.stderr.take().map(|pipe| {
+                spawn_buffer_reader(
+                    pipe,
+                    stderr.clone(),
+                    Some(stream_chunk_fn(cx, "stderr", Arc::clone(&stream_budget))),
+                )
+            });
 
-        // Await the reader tasks so the final pipe chunks land in the buffers
-        // (a bare yield loses them under scheduler load). EOF is prompt once
-        // the child is gone; the cap guards a lingering grandchild that
-        // inherited the pipe and keeps it open past the parent's exit.
-        let stdout_abort = stdout_task.as_ref().map(|task| task.abort_handle());
-        let stderr_abort = stderr_task.as_ref().map(|task| task.abort_handle());
-        let drain = async {
-            if let Some(task) = stdout_task {
-                let _ = task.await;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let (status, exit_code) = tokio::select! {
+                result = child.wait() => match result {
+                    Ok(exit) => (
+                        if exit.success() { JobStatus::Completed } else { JobStatus::Failed },
+                        exit.code(),
+                    ),
+                    Err(error) => {
+                        return Err(ToolError::exec_failed(
+                            Self::NAME,
+                            format!("failed to wait for command: {error}"),
+                        ));
+                    }
+                },
+                () = cx.cancel_token().cancelled() => {
+                    kill_process_tree(&mut child);
+                    let _ = child.wait().await;
+                    (JobStatus::Cancelled, None)
+                }
+                () = tokio::time::sleep(remaining) => {
+                    kill_process_tree(&mut child);
+                    let _ = child.wait().await;
+                    (JobStatus::TimedOut, None)
+                }
+            };
+            drain_readers(stdout_task, stderr_task, &stdout, &stderr).await;
+            outcome = (status, exit_code);
+            previous_succeeded = status == JobStatus::Completed;
+            if matches!(status, JobStatus::Cancelled | JobStatus::TimedOut) {
+                break;
             }
-            if let Some(task) = stderr_task {
-                let _ = task.await;
-            }
-        };
-        if tokio::time::timeout(Duration::from_millis(500), drain)
-            .await
-            .is_err()
-        {
-            // A grandchild that inherited the pipe kept it open past the cap:
-            // abort the reader tasks so they (and the pipe fds they hold) don't
-            // linger until that process finally exits (dropping the JoinHandle
-            // alone would only detach them, not stop them).
-            if let Some(abort) = stdout_abort {
-                abort.abort();
-            }
-            if let Some(abort) = stderr_abort {
-                abort.abort();
-            }
-            // The aborted readers never reached their own end-of-stream
-            // `finish_spill`, so release the spill file handles here — otherwise
-            // an open fd lingers in the retained JobState until the store evicts
-            // it. Safe against the winding-down reader: `finish` marks the spill
-            // finished, so a late `push` cannot re-open it.
-            stdout.finish_spill();
-            stderr.finish_spill();
         }
+        let (status, exit_code) = outcome;
 
         let job = self.jobs.get(&job_id, Self::NAME)?;
         let mut job = job.lock().expect("job lock poisoned");
@@ -684,6 +790,19 @@ impl JobTool {
         }
         let cwd = self.root.resolve_cwd(params.cwd.as_deref(), Self::NAME)?;
         let policy = cx.sandbox_policy();
+        // A background job is one process the store can own and kill. An
+        // approved text is always one step; an unattended chain would need the
+        // sequencing the foreground tool does, so it is refused here rather
+        // than handed to a shell.
+        let steps = steps_for(&command, cx.authority(), Self::NAME)?;
+        let [step] = steps.as_slice() else {
+            return Err(ToolError::exec_failed(
+                Self::NAME,
+                "an unattended background job runs exactly one command, and this line chains \
+                 several; start them as separate jobs, or run the chain in the foreground \
+                 shell tool",
+            ));
+        };
 
         // Tie the process lifetime to its stored `Child`: if the JobStore is
         // dropped (app exit) the OS process is killed rather than orphaned.
@@ -691,7 +810,7 @@ impl JobTool {
         let (mut child, job_guard) = spawn_confined(
             &self.sandbox,
             &self.root.granted_roots(),
-            &command,
+            step.form.as_command_form(),
             &cwd,
             &policy,
             Self::NAME,

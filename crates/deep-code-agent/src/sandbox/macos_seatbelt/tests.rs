@@ -1,5 +1,17 @@
 use super::*;
 
+/// The `sh -c` form under the profile — what a human-approved command gets.
+/// Every enforcement test below exercises the profile through it; the argv
+/// form differs only in what `sandbox-exec` execs, not in what it confines.
+fn wrap_shell_command(
+    command: &str,
+    cwd: &Path,
+    granted_roots: &[PathBuf],
+    policy: &SandboxPolicy,
+) -> Command {
+    wrap_command(CommandForm::Text(command), cwd, granted_roots, policy)
+}
+
 /// Single-root granted list, the shape every pre-`--add-dir` call had.
 fn single_root(ws: &Path) -> Vec<PathBuf> {
     vec![ws.to_path_buf()]

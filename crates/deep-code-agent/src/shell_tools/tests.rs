@@ -673,3 +673,298 @@ fn prune_keeps_a_run_whose_files_outdate_its_directory() {
     prune_stale_spill_runs(&home, now + Duration::from_secs(3 * 3600));
     assert!(!run.exists(), "stale dir with stale files is removed");
 }
+
+// ---------------------------------------------------------------------------
+// Unattended execution: a command nobody read runs as the policy's argv, with
+// no shell in between (`RunAuthority::Parse`). These tests are the acceptance
+// check for that promise; the sandbox is forced off because it is not what is
+// under test here.
+// ---------------------------------------------------------------------------
+
+/// A registry whose policy trusts `extra` identities on top of the defaults.
+fn registry_trusting(root: &std::path::Path, extra: &[&str]) -> ToolRegistry {
+    let mut registry = registry(root);
+    let mut policy = crate::execution_policy::ExecPolicy::default();
+    for rule in extra {
+        policy = policy.with_trusted_prefix(rule);
+    }
+    registry.set_policy(policy);
+    registry
+}
+
+/// A recorder the tests trust by absolute path: one argument per line.
+#[cfg(unix)]
+fn recorder(dir: &std::path::Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("rec");
+    std::fs::write(&path, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+async fn run_shell(
+    registry: &ToolRegistry,
+    arguments: Value,
+    decision: Option<ApprovalDecision>,
+) -> ToolResult {
+    let call = ToolCall::new("call_1", "shell", arguments);
+    match registry.run_tool_call(call, decision).await.unwrap() {
+        ToolRunOutcome::Result { result } => result,
+        ToolRunOutcome::ApprovalRequired { .. } => panic!("unexpected approval request"),
+    }
+}
+
+/// The stdout lines of a shell result: everything before the first bracketed
+/// status/stderr marker.
+fn stdout_lines(result: &ToolResult) -> Vec<String> {
+    result
+        .content
+        .lines()
+        .take_while(|line| !line.starts_with('['))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A trusted command's words reach the program exactly as the policy parsed
+/// them, quotes resolved — and they reach it with no shell in between. The
+/// second half is the part a shell could fake: `exit` exists only as a shell
+/// builtin, so a trusted `exit 3` either fails to start (no such program: the
+/// argv went straight to `execve`) or exits 3 (a shell read it). Approved as
+/// text, the same line still gets the shell, as before.
+#[cfg(unix)]
+#[tokio::test]
+async fn unattended_commands_run_without_a_shell() {
+    let tmp = tempdir().unwrap();
+    let rec = recorder(tmp.path());
+    let registry = registry_trusting(tmp.path(), &[&rec, "exit"]);
+
+    let trusted = run_shell(
+        &registry,
+        json!({"command": format!("{rec} one \"two words\" 'three' four\\ five")}),
+        None,
+    )
+    .await;
+    assert_eq!(
+        trusted.status,
+        ToolResultStatus::Success,
+        "{}",
+        trusted.content
+    );
+    assert_eq!(
+        stdout_lines(&trusted),
+        ["one", "two words", "three", "four five"]
+    );
+
+    // Nothing named `exit` exists to exec: the policy's argv was not read by a
+    // shell. (A shell would have exited 3.)
+    let call = ToolCall::new("call_2", "shell", json!({"command": "exit 3"}));
+    let error = registry
+        .run_tool_call(call, None)
+        .await
+        .expect_err("a trusted `exit 3` must fail to start rather than run in a shell");
+    assert!(
+        error.to_string().contains("failed to start command"),
+        "{error}"
+    );
+
+    // Approved as text, the shell is exactly what runs it. The quoted spelling
+    // keeps this call off the trust rule (the identity keeps the quotes), so
+    // it needs the approval — the shell strips the quotes and runs `exit 3`.
+    let call = ToolCall::new("call_3", "shell", json!({"command": "\"exit\" 3"}));
+    assert!(registry.evaluate_tool(&call).requires_approval);
+    let plan = registry.evaluate_tool(&call);
+    let ToolRunOutcome::Result { result } = registry
+        .run_tool_call_with_plan(
+            &call,
+            Some(ApprovalDecision::Approved),
+            plan,
+            crate::tool::ToolCx::new().with_authority(crate::tool::RunAuthority::Approved),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected a result");
+    };
+    assert_eq!(details(&result)["exit_code"], 3, "{}", result.content);
+}
+
+/// `&&` and `;` mean what they mean in the shell — a gated step is skipped
+/// while the previous status stands, the run's status is the last executed
+/// step's — but the steps are separate `execve`s of the policy's argv.
+#[cfg(unix)]
+#[tokio::test]
+async fn unattended_sequences_follow_the_shell_chain_rules() {
+    let tmp = tempdir().unwrap();
+    let registry = registry_trusting(tmp.path(), &["true", "false"]);
+
+    let skipped = run_shell(
+        &registry,
+        json!({"command": "false && printf second; printf third"}),
+        None,
+    )
+    .await;
+    assert_eq!(
+        skipped.status,
+        ToolResultStatus::Success,
+        "{}",
+        skipped.content
+    );
+    assert_eq!(stdout_lines(&skipped), ["third"]);
+    assert_eq!(details(&skipped)["exit_code"], 0);
+
+    let chained = run_shell(
+        &registry,
+        json!({"command": "true && printf yes\nprintf again"}),
+        None,
+    )
+    .await;
+    assert_eq!(stdout_lines(&chained), ["yesagain"]);
+
+    let failing_tail = run_shell(&registry, json!({"command": "printf a; false"}), None).await;
+    assert_eq!(details(&failing_tail)["status"], "failed");
+    assert_eq!(details(&failing_tail)["exit_code"], 1);
+    assert_eq!(stdout_lines(&failing_tail), ["a"]);
+
+    // A step that cannot start inside a sequence reports and carries on by
+    // the chain rules, as the shell would (status 127).
+    let missing = run_shell(
+        &registry,
+        json!({"command": "definitely-not-a-program-xyz && printf no; printf yes"}),
+        Some(ApprovalDecision::Approved),
+    )
+    .await;
+    // (approved as text: the shell path — the control for the next call)
+    assert!(missing.content.contains("yes") && !missing.content.contains("no\n"));
+}
+
+/// Parse authority never falls back to the shell. A command the unattended
+/// parser cannot read is refused with an explanation (a tool error, which the
+/// runtime records as the call's result) — and the identical text, approved
+/// as text, runs through the shell as before.
+#[cfg(unix)]
+#[tokio::test]
+async fn parse_authority_never_falls_back_to_the_shell() {
+    let tmp = tempdir().unwrap();
+    let registry = registry(tmp.path());
+    let piped = ToolCall::new("call_1", "shell", json!({"command": "printf a | cat"}));
+    let plan = registry.evaluate_tool(&piped);
+    assert!(plan.requires_approval, "a pipe is never trusted");
+
+    let refused = registry
+        .run_tool_call_with_plan(
+            &piped,
+            Some(ApprovalDecision::Approved),
+            plan.clone(),
+            crate::tool::ToolCx::new().with_authority(crate::tool::RunAuthority::Parse),
+        )
+        .await
+        .expect_err("parse authority must refuse what it cannot parse");
+    assert!(refused.to_string().contains("without a shell"), "{refused}");
+
+    let approved = registry
+        .run_tool_call_with_plan(
+            &piped,
+            Some(ApprovalDecision::Approved),
+            plan,
+            crate::tool::ToolCx::new(),
+        )
+        .await
+        .unwrap();
+    let ToolRunOutcome::Result { result } = approved else {
+        panic!("expected a result");
+    };
+    assert_eq!(
+        result.status,
+        ToolResultStatus::Success,
+        "{}",
+        result.content
+    );
+    assert_eq!(stdout_lines(&result), ["a"]);
+}
+
+/// A background job is one process the store can own: a trusted single
+/// command starts directly; a trusted chain is refused (a tool error) rather
+/// than handed to a shell.
+#[cfg(unix)]
+#[tokio::test]
+async fn unattended_background_jobs_run_exactly_one_command() {
+    let tmp = tempdir().unwrap();
+    let registry = registry_trusting(tmp.path(), &["sleep"]);
+    let single = ToolCall::new(
+        "call_1",
+        "job",
+        json!({"action": "start", "command": "sleep 1"}),
+    );
+    let ToolRunOutcome::Result { result } = registry.run_tool_call(single, None).await.unwrap()
+    else {
+        panic!("a trusted job must start without approval");
+    };
+    assert_eq!(
+        result.status,
+        ToolResultStatus::Success,
+        "{}",
+        result.content
+    );
+    assert_eq!(details(&result)["status"], "running");
+
+    let chain = ToolCall::new(
+        "call_2",
+        "job",
+        json!({"action": "start", "command": "sleep 1 && sleep 1"}),
+    );
+    let refused = registry
+        .run_tool_call(chain, None)
+        .await
+        .expect_err("an unattended chain must be refused, not handed to a shell");
+    assert!(
+        refused.to_string().contains("exactly one command"),
+        "{refused}"
+    );
+}
+
+/// The exec-recording check for the default trust list: every `printf` line
+/// the default policy allows delivers to the program exactly the words the
+/// unattended parser produced — one per output line — with no shell in the
+/// way to rewrite them. `printf '%s\n'` prints one argument per line, so the
+/// program itself is the recorder.
+#[cfg(unix)]
+#[tokio::test]
+async fn default_trusted_commands_deliver_the_parsed_argv_verbatim() {
+    let tmp = tempdir().unwrap();
+    let registry = registry(tmp.path());
+    for spelling in [
+        "a b c",
+        "\"a b\" c",
+        "'c d' e",
+        "e\\ f g",
+        "\"q\\\"x\" y",
+        "'it'\"'\"'s' z",
+        "\"\" '' end",
+        "a\"b\"c d",
+        "--flag=v --other=\"w x\"",
+        "hash#inside word # and a comment",
+        "\"single 'quotes' inside\" \"double \\\"quotes\\\" inside\"",
+    ] {
+        let command = format!("printf '%s\\n' {spelling}");
+        let plan =
+            registry.evaluate_tool(&ToolCall::new("c", "shell", json!({"command": command})));
+        assert!(!plan.requires_approval, "{command:?} must be trusted");
+        let expected: Vec<String> = crate::execution_policy::parse_unattended(&command)
+            .expect("trusted commands parse")
+            .into_iter()
+            .flat_map(|cmd| cmd.argv.into_iter().skip(2))
+            .collect();
+        let result = run_shell(&registry, json!({"command": command}), None).await;
+        assert_eq!(
+            result.status,
+            ToolResultStatus::Success,
+            "{}",
+            result.content
+        );
+        assert_eq!(
+            stdout_lines(&result),
+            expected,
+            "{command:?} reached printf as different words"
+        );
+    }
+}

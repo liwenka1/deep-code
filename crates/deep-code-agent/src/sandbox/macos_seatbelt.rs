@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+use super::CommandForm;
 use super::policy::SandboxPolicy;
 
 /// Launcher that applies an SBPL profile to a child process.
@@ -41,11 +42,13 @@ fn probe_seatbelt() -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Build a `Command` that runs `command` through `sh -c` under a Seatbelt
-/// profile derived from `policy`, with the granted roots (and `cwd`, when
-/// distinct) as the writable roots.
-pub fn wrap_shell_command(
-    command: &str,
+/// Build a `Command` that runs `form` under a Seatbelt profile derived from
+/// `policy`, with the granted roots (and `cwd`, when distinct) as the writable
+/// roots: approved text through `sh -c`, an unattended argv directly (see
+/// [`CommandForm`]). The profile is the same either way — the kernel confines
+/// whatever `sandbox-exec` launches and everything it spawns.
+pub fn wrap_command(
+    form: CommandForm<'_>,
     cwd: &Path,
     granted_roots: &[PathBuf],
     policy: &SandboxPolicy,
@@ -57,7 +60,15 @@ pub fn wrap_shell_command(
     for (name, path) in &profile.bindings {
         launcher.arg(format!("-D{name}={}", path.display()));
     }
-    launcher.arg("--").arg("sh").arg("-c").arg(command);
+    launcher.arg("--");
+    match form {
+        CommandForm::Text(command) => {
+            launcher.arg("sh").arg("-c").arg(command);
+        }
+        CommandForm::Argv(argv) => {
+            launcher.args(argv);
+        }
+    }
     launcher.current_dir(cwd);
     launcher
 }

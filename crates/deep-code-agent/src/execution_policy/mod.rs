@@ -96,3 +96,4 @@ pub use engine::{
 };
 pub use permission_mode::{PermissionMode, SharedPermissionMode};
 pub use shell_deny::{SafetyNote, safety_notes};
+pub use shell_lex::{RunIf, parse_unattended};

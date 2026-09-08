@@ -10,7 +10,9 @@ use crate::runtime::approval_flow::RootGrantPrompt;
 use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
 use crate::runtime::failure_class::record_failure_signals;
 use crate::runtime::state::PendingToolBatch;
-use crate::tool::{ApprovalDecision, ToolCall, ToolCx, ToolError, ToolResult, ToolRunOutcome};
+use crate::tool::{
+    ApprovalDecision, RunAuthority, ToolCall, ToolCx, ToolError, ToolResult, ToolRunOutcome,
+};
 
 /// Under `Yolo`, sandboxed commands get ambient egress (unless config says
 /// `never`, which stays absolute).
@@ -85,10 +87,15 @@ impl AgentRuntime {
     /// bridge attached. Cancellation still lands at call boundaries: the tool
     /// runs to completion so its recorded result stays paired with the
     /// assistant tool_call (tools observe the token cooperatively for now).
+    ///
+    /// `authority` says who resolved an approval this call needed (see
+    /// [`RunAuthority`]); it is read only when `decision` approves. For a call
+    /// that needs no approval the registry sets `Parse` itself.
     pub(super) async fn run_tool(
         &self,
         call: &ToolCall,
         decision: Option<ApprovalDecision>,
+        authority: RunAuthority,
         cancel: &CancellationToken,
         turn_id: &TurnId,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
@@ -100,6 +107,7 @@ impl AgentRuntime {
             std::sync::Arc::new(std::sync::Mutex::new(crate::tool::ToolSpend::default()));
         let cx = ToolCx::new()
             .with_cancel(cancel.clone())
+            .with_authority(authority)
             .with_update_fn(tool_progress_fn(tx, turn_id, call))
             .with_spend_sink(std::sync::Arc::clone(&spend_sink));
         let plan = yolo_ambient_network(
@@ -199,11 +207,9 @@ impl AgentRuntime {
                 {
                     group.push(remaining.pop_front().expect("front just checked"));
                 }
-                let outcomes = futures_util::future::join_all(
-                    group
-                        .iter()
-                        .map(|call| self.run_tool(call, None, cancel, turn_id, tx)),
-                )
+                let outcomes = futures_util::future::join_all(group.iter().map(|call| {
+                    self.run_tool(call, None, RunAuthority::Approved, cancel, turn_id, tx)
+                }))
                 .await;
                 for (call, outcome) in group.iter().zip(outcomes) {
                     let result = match outcome {
@@ -223,13 +229,19 @@ impl AgentRuntime {
                 }
                 continue;
             }
-            match self.run_tool(&call, None, cancel, turn_id, tx).await {
+            // No decision yet: the registry runs an `Allow` on its own parse
+            // authority, or asks — the authority passed here is never read.
+            match self
+                .run_tool(&call, None, RunAuthority::Approved, cancel, turn_id, tx)
+                .await
+            {
                 Ok(ToolRunOutcome::Result { result }) => {
                     self.record_tool_result(&call, result, tx, turn_id.clone())
                         .await;
                 }
                 Ok(ToolRunOutcome::ApprovalRequired { mut request }) => {
-                    if self.auto_approval_granted(&call, &request, cancel).await {
+                    if let Some(granted) = self.auto_approval_granted(&call, &request, cancel).await
+                    {
                         // Audit trail: the gate fired but a standing consent
                         // (session "a" or config auto_allow) resolved it.
                         emit(
@@ -240,8 +252,17 @@ impl AgentRuntime {
                                 decision: ApprovalDecision::Approved,
                             },
                         );
+                        // The layer that resolved the prompt decides whether a
+                        // shell may read the command (`AutoApproval::authority`).
                         let result = match self
-                            .run_tool(&call, Some(ApprovalDecision::Approved), cancel, turn_id, tx)
+                            .run_tool(
+                                &call,
+                                Some(ApprovalDecision::Approved),
+                                granted.authority(),
+                                cancel,
+                                turn_id,
+                                tx,
+                            )
                             .await
                         {
                             Ok(ToolRunOutcome::Result { result }) => result,

