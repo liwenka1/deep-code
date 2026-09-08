@@ -760,7 +760,8 @@ fn brace_expanded_commands_are_denied() {
 
 /// The expander must stay bash's own, or it invents denials for commands that
 /// never run. A group with no top-level comma and an unbalanced brace are both
-/// left alone by bash; ranges are deliberately out of scope.
+/// left alone by bash; a range expands, but only the program word it produces
+/// is judged.
 #[test]
 fn brace_expansion_does_not_invent_denials() {
     for command in [
@@ -788,6 +789,29 @@ fn brace_expansion_does_not_invent_denials() {
     }
 }
 
+/// A zero step reads as 1, as bash 4+ reads it: `r{m..m..0} -rf /` really runs
+/// `rm -rf /` wherever `sh` is bash 4+, so the floor must see `rm` there.
+/// Treating the group as "not a range" (the previous reading, matching bash
+/// 3.2) left that spelling unread on RHEL, Fedora and Arch. On bash 3.2 the
+/// group stays literal and the expansion only adds candidate words — the safe
+/// direction. Pinned here rather than in the bash differential above because
+/// no host-portable expectation exists for a step form.
+#[test]
+fn zero_step_range_reads_as_bash_4_does() {
+    let mut budget = MAX_BRACE_WORDS;
+    assert_eq!(
+        brace_expanded_line("echo {1..2..0}", &mut budget),
+        "echo 1 2"
+    );
+    assert!(denied("r{m..m..0} -rf /"));
+    // A step that is not a number is still not a range.
+    let mut budget = MAX_BRACE_WORDS;
+    assert_eq!(
+        brace_expanded_line("echo {1..2..x}", &mut budget),
+        "echo {1..2..x}"
+    );
+}
+
 /// A combinatorial brace cannot hang the gate: the budget bounds the variants,
 /// and the unexpanded line is checked first so exhausting it degrades to the
 /// previous behavior rather than to a wrong answer.
@@ -811,9 +835,13 @@ fn brace_expansion_is_budgeted() {
 /// the expansion only ever over-approximates into a denial of a command that
 /// would have failed anyway, which is the safe direction for a floor.
 ///
-/// `{A..B..STEP}` is deliberately absent: bash 4 expands it and bash 3.2
-/// (macOS) leaves it literal, so a host-portable expectation does not exist.
-/// The unit tests above pin our behavior (bash 4's) directly.
+/// `{A..B..STEP}` is deliberately absent — every spelling of it, the zero step
+/// included: bash 4 expands it and bash 3.2 (macOS) leaves it literal, so a
+/// host-portable expectation does not exist. `echo {1..2..0}` was listed here
+/// once, on the belief that a zero step is "not a range" everywhere; bash 5.1
+/// (Ubuntu 22.04) expands it to `echo 1 2`, and every Linux CI leg went red on
+/// the very test meant to keep the expander honest. `zero_step_range_reads_as_bash_4_does`
+/// pins our behavior for that shape directly.
 #[cfg(unix)]
 #[test]
 fn brace_expansion_matches_bash() {
@@ -846,7 +874,6 @@ fn brace_expansion_matches_bash() {
         "echo {5..1}",
         "echo {a..}",
         "echo {..b}",
-        "echo {1..2..0}",
         "echo pre{1..3}post",
     ] {
         let mut budget = MAX_BRACE_WORDS;

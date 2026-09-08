@@ -578,13 +578,19 @@ fn split_first_brace_group(word: &str) -> Option<(&str, Vec<String>, &str)> {
 /// Bounded by [`MAX_BRACE_WORDS`] so `{1..100000}` costs a cap, not a hang.
 /// The step is parsed because bash 4 accepts it; bash 3.2 (macOS `/bin/sh`)
 /// leaves such a group literal, and reading one there only ever produces extra
-/// candidate words — the safe direction for a floor.
+/// candidate words — the safe direction for a floor. A zero step is read as 1,
+/// which is what bash 4+ does (`{1..2..0}` → `1 2`): treating it as "not a
+/// range" left `r{m..m..0} -rf /` unread on every host whose `sh` is bash 4+
+/// (RHEL, Fedora, Arch), where it really runs `rm -rf /`.
 fn range_alternatives(body: &str) -> Option<Vec<String>> {
     let mut parts = body.split("..");
     let from = parts.next()?;
     let to = parts.next()?;
     let step = match parts.next() {
-        Some(text) => text.parse::<i64>().ok().filter(|value| *value != 0)?,
+        Some(text) => match text.parse::<i64>().ok()? {
+            0 => 1,
+            value => value,
+        },
         None => 1,
     };
     if parts.next().is_some() || from.is_empty() || to.is_empty() {
