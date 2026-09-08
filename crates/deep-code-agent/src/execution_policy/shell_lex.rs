@@ -46,9 +46,51 @@ pub(super) fn segments(command: &str) -> Vec<&str> {
 /// side: their option becomes the "program" and matches no rule — the
 /// wrapper-options arms race the floor deliberately stays out of (such a line
 /// is never trusted and never a bounded edit, so it still lands on a human).
+/// Listing such a wrapper is still worth it for the identity side, which only
+/// needs to know the line names no operation of its own.
+///
+/// Membership is not a memory exercise: `every_word_the_shell_runs_the_tail_for_is_known`
+/// asks the real shell which candidates hand off execution and fails naming
+/// the ones missing from here. That test is what found `caffeinate` and
+/// `xcrun`; the entries below them are their Linux counterparts, added
+/// pre-emptively because this list is one-directional — an entry the local
+/// shell does not treat as a wrapper costs nothing but a literal identity.
 pub(super) const PREFIX_WORDS: &[&str] = &[
-    "if", "then", "else", "elif", "while", "until", "do", "for", "case", "!", "time", "exec",
-    "command", "builtin", "env", "nohup", "nice", "busybox", "xargs",
+    "if",
+    "then",
+    "else",
+    "elif",
+    "while",
+    "until",
+    "do",
+    "for",
+    "case",
+    "!",
+    "time",
+    "exec",
+    "command",
+    "builtin",
+    "env",
+    "nohup",
+    "nice",
+    "busybox",
+    "xargs",
+    "caffeinate",
+    "xcrun",
+    "setsid",
+    "stdbuf",
+    "timeout",
+    "ionice",
+    "taskset",
+    "unshare",
+    "chroot",
+    "flock",
+    "runuser",
+    "arch",
+    "watch",
+    "script",
+    "proxychains",
+    "parallel",
 ];
 
 /// Interpreters that execute whatever text they are handed — a script path, a
@@ -56,7 +98,22 @@ pub(super) const PREFIX_WORDS: &[&str] = &[
 /// network fetch piped into one; the identity side uses it the way it uses
 /// [`PREFIX_WORDS`]: `sh -c '<anything>'` and `python <any script>` name no
 /// operation of their own, so a consent on one must not cover another.
+///
+/// Membership rule, so the next addition is not a judgement call: a runtime
+/// that executes text supplied at the call site. That is why the shell's own
+/// `eval`, `source` and `.` belong here — they were missing, so one session
+/// "a" on `source .venv/bin/activate` covered `source ./anything.sh` for the
+/// rest of the session, and in AcceptEdits the model writes that script with
+/// no prompt either. `awk`/`osascript` are here for the same reason a level
+/// down: their program text can `system()` / `do shell script` out.
 pub(super) const INTERPRETERS: &[&str] = &[
+    // The shell's own text-executing builtins.
+    "eval",
+    "source",
+    ".",
+    "awk",
+    "gawk",
+    "osascript",
     "sh",
     "bash",
     "zsh",
@@ -152,8 +209,8 @@ fn strip_executable_extension(base: &str) -> String {
     base.to_string()
 }
 
-/// True if a command contains shell redirection, substitution, or expansion
-/// (`>`, `<`, `` ` ``, `$`, `{`/`}`). These make the visible text an unreliable
+/// True if a command contains shell redirection, substitution, expansion or
+/// grouping (`>`, `<`, `` ` ``, `$`, `{`/`}`, `(`/`)`). These make the visible text an unreliable
 /// description of what will run: a substitution executes an arbitrary inner
 /// program (`touch $(curl …)`), a redirection writes a path no program word
 /// mentions (`sed … > cfg`), and a `$VAR` expands to content the reviewer
@@ -182,14 +239,90 @@ fn strip_executable_extension(base: &str) -> String {
 /// alone (`a{b` stays `a{b`): matching either character over-approximates in
 /// the safe direction rather than requiring this to parse what bash will
 /// expand.
+///
+/// Subshell parens are here rather than in one caller. `session_identity` used
+/// to spell its own `contains(['(', ')'])` beside this call, which left the
+/// module's stated "one view of the shell" invariant with a seam right at the
+/// place a new construct has to be added — and a construct added to only one
+/// of two lists is precisely how the brace hole stayed open. The other callers
+/// already refused these commands for unrelated reasons (a peeled `(` is a
+/// prefix word, and `(cargo` matches no rule), so folding it in changes no
+/// verdict; it changes where the next construct has to be written.
 #[must_use]
 pub(super) fn has_shell_indirection(command: &str) -> bool {
-    command.contains(['>', '<', '`', '$', '{', '}'])
+    command.contains(['>', '<', '`', '$', '{', '}', '(', ')'])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Candidate words that might hand execution to the rest of the line.
+    /// Deliberately broader than either list above — the point is that the
+    /// SHELL decides which of these belong, not the author.
+    ///
+    /// Absent on purpose: `sudo`/`su`/`doas` (the deny floor refuses them
+    /// outright, and a host with passwordless sudo would run the recorder),
+    /// and `ssh`/`watch`-style words are covered but bounded by the deadline
+    /// below because they never exit on their own.
+    #[cfg(unix)]
+    const WRAPPER_CANDIDATES: &[&str] = &[
+        "eval",
+        "source",
+        ".",
+        "exec",
+        "command",
+        "builtin",
+        "env",
+        "time",
+        "nohup",
+        "nice",
+        "setsid",
+        "stdbuf",
+        "timeout",
+        "ionice",
+        "taskset",
+        "unshare",
+        "chroot",
+        "flock",
+        "caffeinate",
+        "xcrun",
+        "arch",
+        "watch",
+        "script",
+        "proxychains",
+        "parallel",
+        "xargs",
+        "busybox",
+        "runuser",
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "ksh",
+        "fish",
+        "perl",
+        "python",
+        "python3",
+        "ruby",
+        "node",
+        "php",
+        "awk",
+        "gawk",
+        "osascript",
+        "tclsh",
+        "lua",
+        "julia",
+        "Rscript",
+        "deno",
+        "bun",
+        "if",
+        "then",
+        "else",
+        "while",
+        "do",
+        "!",
+    ];
 
     #[test]
     fn basename_lower_strips_paths_quotes_and_executable_suffixes() {
@@ -202,5 +335,82 @@ mod tests {
         assert_eq!(basename_lower("my.script"), "my.script");
         // A bare suffix is a real (if odd) filename, not an empty stem.
         assert_eq!(basename_lower(".exe"), ".exe");
+    }
+    /// Whether `sh` hands the rest of the line to the recorder when the line
+    /// opens with `word`. Bounded: some candidates (`watch`) never exit.
+    #[cfg(unix)]
+    fn shell_runs_the_tail(word: &str, index: usize, dir: &std::path::Path) -> bool {
+        use std::io::Write;
+        let marker = dir.join(format!("ran{index}"));
+        let recorder = dir.join(format!("rec{index}"));
+        let mut file = std::fs::File::create(&recorder).unwrap();
+        writeln!(file, "#!/bin/sh\n: > {}", marker.display()).unwrap();
+        drop(file);
+        std::fs::set_permissions(
+            &recorder,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let Ok(mut child) = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{word} {}", recorder.display()))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+            }
+        }
+        marker.exists()
+    }
+
+    /// The completeness property the two lists above exist to satisfy, checked
+    /// against the real shell instead of against the author's memory.
+    ///
+    /// If `sh` runs the rest of the line, the identity side MUST NOT collapse
+    /// that line to the bare word — otherwise one session "a" on
+    /// `source .venv/bin/activate` silently covers `source ./anything.sh` for
+    /// the rest of the session. Hand-maintained lists kept missing members of
+    /// this class one round at a time (`sh`/`time` one release, `eval`/
+    /// `source`/`.` the next); this test enumerates the class instead.
+    ///
+    /// It is one-directional on purpose: a word in the lists that this host's
+    /// shell does not treat as a wrapper is a harmless over-approximation
+    /// (`busybox` and the Windows interpreters are not installed here), so
+    /// only the unsafe direction is asserted.
+    #[cfg(unix)]
+    #[test]
+    fn every_word_the_shell_runs_the_tail_for_is_known() {
+        let dir = std::env::temp_dir().join(format!("dc-wrapper-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut missing = Vec::new();
+        for (index, word) in WRAPPER_CANDIDATES.iter().enumerate() {
+            if shell_runs_the_tail(word, index, &dir)
+                && !runs_the_rest_of_the_line(&basename_lower(word))
+            {
+                missing.push(*word);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            missing.is_empty(),
+            "the shell hands the rest of the line to these words, but the identity side still \
+             collapses such a line to the bare word — a session consent on one of them would \
+             cover every command reachable through it: {missing:?}"
+        );
     }
 }

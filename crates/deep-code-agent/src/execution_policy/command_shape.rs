@@ -136,9 +136,13 @@ static PROGRAM_SHAPES: LazyLock<HashMap<&'static str, Shape>> = LazyLock::new(||
             overrides: &[("configure", 2)],
         },
     );
-    // Build drivers where the bare program is the operation and every
-    // positional word after it is a target, not a subcommand.
-    m.insert("make", Shape::flat());
+    // `make <target>` names a repo-defined recipe that runs arbitrary shell —
+    // the same relationship `npm run <script>` has to its script, and shaped
+    // the same way for the same reason: a session consent on `make build` must
+    // not also cover `make deploy`. (It was `flat`, so it did.)
+    m.insert("make", Shape::sub());
+    // `cmake <dir>` takes a source directory, not a recipe: the operation is
+    // the bare program, so it stays flat.
     m.insert("cmake", Shape::flat());
     m
 });
@@ -174,6 +178,15 @@ fn redirects_execution(token: &str) -> bool {
         // workspace boundary and the shell prompt both exist to gate, riding
         // in on the trusted `git diff` with no prompt in any tier.
         "--no-index",
+        // find: names a program to run for each hit. This is the same "flag
+        // that redirects execution" shape as the cargo/git entries above,
+        // reached through a different program — without it `find . -name x`
+        // and `find . -exec <anything> +` collapsed to the same identity, so
+        // one session consent covered arbitrary execution.
+        "-exec",
+        "-execdir",
+        "-ok",
+        "-okdir",
     ];
     // `sh -c` / `cmd /C` strip shell quoting before the flag reaches the
     // program, so `--con"fig"`, `'--config'` and (on Unix) `--config\` all run
@@ -320,6 +333,8 @@ pub fn rule_covers(rule: &str, command: &str) -> bool {
 /// that does not open with an environment assignment. `None` otherwise, so a
 /// compound or indirect command can neither match nor record a standing shell
 /// consent: `cargo test && rm -rf /` must not ride a remembered `cargo test`.
+/// Subshell parens count as indirection like every other construct, in
+/// [`super::shell_lex::has_shell_indirection`] rather than spelled again here.
 /// A line opening with a wrapper or interpreter is recordable, but its key is
 /// the whole literal line (see [`identity`]): `sh -c 'echo hi'` remembers
 /// exactly that command, never `sh`.
@@ -337,7 +352,7 @@ pub fn session_identity(command: &str) -> Option<String> {
     if segments.len() != 1 || segments[0] != command {
         return None;
     }
-    if super::shell_lex::has_shell_indirection(command) || command.contains(['(', ')']) {
+    if super::shell_lex::has_shell_indirection(command) {
         return None;
     }
     let tokens: Vec<&str> = command.split_whitespace().collect();
@@ -388,6 +403,75 @@ mod tests {
 
     fn covers(rule: &str, command: &str) -> bool {
         rule_covers(rule, command)
+    }
+
+    /// A word that hands execution to the rest of the line names no operation
+    /// of its own, so its identity is the whole literal line — otherwise one
+    /// session "a" covers every command reachable through that word. The
+    /// shell's own text-executing builtins were the members still missing:
+    /// `source .venv/bin/activate` is an everyday command a user would approve
+    /// for the session, and it was recorded as the bare key `source`, which
+    /// then covered `source ./anything.sh` — a script AcceptEdits lets the
+    /// model write with no prompt of its own.
+    #[test]
+    fn shell_text_executing_builtins_keep_their_whole_line_as_identity() {
+        for (command, expected) in [
+            ("source .venv/bin/activate", "source .venv/bin/activate"),
+            ("source ./evil.sh", "source ./evil.sh"),
+            (". ./evil.sh", ". ./evil.sh"),
+            ("eval echo hi", "eval echo hi"),
+            ("eval rm -rf /tmp/x", "eval rm -rf /tmp/x"),
+            ("caffeinate rm -rf /tmp/x", "caffeinate rm -rf /tmp/x"),
+            ("awk BEGIN{system(\"id\")}", "awk begin{system(\"id\")}"),
+        ] {
+            assert_eq!(identity_of(command), expected, "{command:?}");
+        }
+        // Two spellings of the same class must not share a session key.
+        assert_ne!(
+            session_identity("source .venv/bin/activate"),
+            session_identity("source ./evil.sh")
+        );
+        assert_ne!(
+            session_identity("eval echo hi"),
+            session_identity("eval id")
+        );
+    }
+
+    /// `find -exec` names a program to run, which is exactly what
+    /// [`redirects_execution`] exists to catch — without it `find . -name x`
+    /// and `find . -exec <anything> +` shared the key `find`.
+    #[test]
+    fn exec_flags_degrade_the_identity_to_the_literal_line() {
+        assert_eq!(identity_of("find . -name x"), "find");
+        for command in [
+            "find . -exec rm -rf {} +",
+            "find . -execdir sh -c id +",
+            "find . -ok rm {} ;",
+            "find . -okdir rm {} ;",
+        ] {
+            assert_eq!(identity_of(command), squeeze(command), "{command:?}");
+        }
+        // Brace-free, so this really exercises the flag rather than the
+        // separate brace exclusion in `has_shell_indirection`.
+        assert_ne!(
+            session_identity("find . -name x"),
+            session_identity("find . -execdir sh -c id +")
+        );
+    }
+
+    /// `make <target>` names a repo-defined script that runs arbitrary shell,
+    /// exactly as `npm run <script>` does — the two were shaped differently,
+    /// so a session "a" on `make build` also covered `make deploy`.
+    #[test]
+    fn make_targets_are_distinct_identities_like_npm_scripts() {
+        assert_eq!(identity_of("make build"), "make build");
+        assert_eq!(identity_of("make deploy -j4"), "make deploy");
+        assert_ne!(
+            session_identity("make build"),
+            session_identity("make deploy")
+        );
+        // The bare invocation still identifies as itself.
+        assert_eq!(identity_of("make"), "make");
     }
 
     /// The session key exists only for one simple command. A trailing or
@@ -456,10 +540,23 @@ mod tests {
         assert_eq!(identity_of("aws configure list"), "aws configure");
     }
 
+    /// `cmake <dir>` takes a source directory, so its identity is the bare
+    /// program. `make` is not in that class and no longer shares it: its
+    /// positional word is a recipe. A flag ahead of that recipe degrades the
+    /// identity to the literal line, which is the point — `-f` names an
+    /// alternative makefile and `-C` a different directory, so `make -f
+    /// evil.mk target` used to ride a plain `make` consent straight to
+    /// arbitrary recipes.
     #[test]
-    fn identity_of_build_drivers_is_the_bare_program() {
-        assert_eq!(identity_of("make -j8 release"), "make");
+    fn identity_of_build_drivers() {
         assert_eq!(identity_of("cmake --build build"), "cmake");
+        assert_eq!(identity_of("make release"), "make release");
+        assert_eq!(identity_of("make release -j8"), "make release");
+        assert_eq!(identity_of("make -j8 release"), "make -j8 release");
+        assert_eq!(
+            identity_of("make -f evil.mk target"),
+            "make -f evil.mk target"
+        );
     }
 
     #[test]
