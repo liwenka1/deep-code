@@ -1037,13 +1037,32 @@ mod tests {
     /// asks.
     #[test]
     fn quoting_a_separator_does_not_hide_the_flag_behind_it() {
+        use super::super::shell_lex::executed_words;
+
+        let mut checked = 0;
         for spelling in ["--", "'--'", "\"--\"", "\\--", "-\\-"] {
             let command = format!("cargo test {spelling} --logfile ./x");
+            // Whether a spelling *is* the separator is the platform's business
+            // (a backslash escapes on Unix and is a path character on Windows),
+            // so ask the argv rather than assume. The rule under test is the
+            // implication: if the program receives a real `--`, what follows it
+            // is harness argument territory and `--logfile` writes a file.
+            let Some(words) = executed_words(&command) else {
+                continue;
+            };
+            if !words.iter().any(|word| word == "--") {
+                continue;
+            }
+            checked += 1;
             assert!(
                 !covers("cargo test", &command),
                 "{command} stayed trusted, but the program receives a real `--`"
             );
         }
+        assert!(
+            checked >= 3,
+            "the plain and quoted spellings must all be separators"
+        );
         // The rule still covers what it is meant to cover.
         assert!(covers("cargo test", "cargo test -- --nocapture"));
         assert!(covers("cargo test", "cargo test '--' --nocapture"));

@@ -491,7 +491,6 @@ fn trust_covers_only_what_runs_without_a_shell() {
         "echo a & echo b",
         "cargo build &&",
         "echo \"unterminated",
-        "echo done\\",
     ] {
         let plan = evaluate_shell_command(&policy, command, false);
         assert!(
@@ -500,6 +499,14 @@ fn trust_covers_only_what_runs_without_a_shell() {
             plan.verdict
         );
     }
+    // A trailing backslash is an unfinished line to `sh` only; on Windows it is
+    // the last character of a path, and the parser reads it as one (see
+    // `shell_lex::backslash_escapes_on_unix_and_separates_paths_on_windows`).
+    #[cfg(unix)]
+    assert!(matches!(
+        evaluate_shell_command(&policy, "echo done\\", false).verdict,
+        PolicyVerdict::NeedsApproval { .. }
+    ));
     // The accept-edits allowance reads the same parse.
     assert!(accept_edits_approvable(
         "shell",

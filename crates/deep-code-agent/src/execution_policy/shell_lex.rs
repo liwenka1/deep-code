@@ -385,7 +385,22 @@ pub struct UnattendedCommand {
 /// collapsed to `..`, which is a *different directory* than the operand fence
 /// read. [`clean_token`] splits on this same platform line, for the same
 /// reason.
+///
+/// The one Windows position where `\` is *not* an ordinary character is
+/// immediately before a quote: `CommandLineToArgvW` counts the backslash run
+/// there, so `\"` is a literal quote to the program while `\\"` is a backslash
+/// plus a real quote — and `cmd.exe` counts it differently again. This parser
+/// does not guess between them; [`backslash_hugs_a_quote`] refuses such a line,
+/// which costs a prompt and keeps the fence honest.
 const BACKSLASH_ESCAPES: bool = !cfg!(windows);
+
+/// Whether the `\` just consumed sits immediately before a quote — the one
+/// spelling whose meaning Windows argument parsers disagree about (see
+/// [`BACKSLASH_ESCAPES`]). Only ever consulted on Windows; on Unix the escape
+/// arm above has already claimed the backslash.
+fn backslash_hugs_a_quote(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    chars.peek().is_some_and(|next| matches!(next, '"' | '\''))
+}
 
 #[must_use]
 pub fn parse_unattended(command: &str) -> Option<Vec<UnattendedCommand>> {
@@ -408,6 +423,7 @@ pub fn parse_unattended(command: &str) -> Option<Vec<UnattendedCommand>> {
                 Some('\n') => {}
                 Some(next) => word.get_or_insert_with(String::new).push(next),
             },
+            '\\' if backslash_hugs_a_quote(&mut chars) => return None,
             '\'' => {
                 let w = word.get_or_insert_with(String::new);
                 loop {
@@ -433,6 +449,7 @@ pub fn parse_unattended(command: &str) -> Option<Vec<UnattendedCommand>> {
                                 w.push(other);
                             }
                         },
+                        Some('\\') if backslash_hugs_a_quote(&mut chars) => return None,
                         Some(ch) => w.push(ch),
                     }
                 }
@@ -789,29 +806,55 @@ mod tests {
     /// would have refused.
     #[test]
     fn backslash_escapes_on_unix_and_separates_paths_on_windows() {
-        let mangles = cfg!(unix);
-        assert_eq!(
-            argvs(r"git diff src\main.rs"),
-            words(&[&[
-                "git",
-                "diff",
-                if mangles {
-                    "srcmain.rs"
-                } else {
-                    r"src\main.rs"
-                }
-            ]])
-        );
-        assert_eq!(
-            argvs(r"mkdir .\."),
-            words(&[&["mkdir", if mangles { ".." } else { r".\." }]])
-        );
-        // Either way, the fence and the executor read that word the same: it
-        // is out of the cwd exactly when the word really is.
-        assert_eq!(
-            operand_leaves_cwd(if mangles { ".." } else { r".\." }),
-            mangles
-        );
+        // Both arms end at the same invariant: the word the fence judges is the
+        // word the executor opens. The platforms differ on what that word IS.
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                argvs(r"git diff src\main.rs"),
+                words(&[&["git", "diff", "srcmain.rs"]])
+            );
+            assert_eq!(argvs(r"mkdir .\."), words(&[&["mkdir", ".."]]));
+            assert!(operand_leaves_cwd(".."));
+            // A backslash escapes a blank, continues a line, and a trailing one
+            // leaves a line only a shell could finish.
+            assert_eq!(
+                argvs(r"cargo test e\ f"),
+                words(&[&["cargo", "test", "e f"]])
+            );
+            assert_eq!(
+                argvs("cargo build \\\n  --release\n\n"),
+                words(&[&["cargo", "build", "--release"]])
+            );
+            assert_eq!(parse_unattended("echo done\\"), None);
+            assert_eq!(
+                argvs("git commit -m \"say \\\"hi\\\" \\\\ ok\""),
+                words(&[&["git", "commit", "-m", "say \"hi\" \\ ok"]])
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                argvs(r"git diff src\main.rs"),
+                words(&[&["git", "diff", r"src\main.rs"]])
+            );
+            assert_eq!(argvs(r"mkdir .\."), words(&[&["mkdir", r".\."]]));
+            // `.\.` really is the current directory here, and the fence agrees.
+            assert!(!operand_leaves_cwd(r".\."));
+            // Not an escape: two words, and a trailing one is just a path.
+            assert_eq!(
+                argvs(r"cargo test e\ f"),
+                words(&[&["cargo", "test", r"e\", "f"]])
+            );
+            assert_eq!(argvs(r"mkdir src\"), words(&[&["mkdir", r"src\"]]));
+            // Hugging a quote is the one spelling Windows argument parsers
+            // disagree about, so it is refused rather than guessed at.
+            assert_eq!(
+                parse_unattended("git commit -m \"say \\\"hi\\\" ok\""),
+                None
+            );
+            assert_eq!(parse_unattended(r"echo \'x'"), None);
+        }
     }
 
     #[test]
@@ -821,13 +864,11 @@ mod tests {
             words(&[&["cargo", "test", "--all"]])
         );
         assert_eq!(
-            argvs("cargo test --features \"a b\" 'c d' e\\ f"),
-            words(&[&["cargo", "test", "--features", "a b", "c d", "e f"]])
+            argvs("cargo test --features \"a b\" 'c d'"),
+            words(&[&["cargo", "test", "--features", "a b", "c d"]])
         );
-        assert_eq!(
-            argvs("git commit -m \"say \\\"hi\\\" \\\\ ok\""),
-            words(&[&["git", "commit", "-m", "say \"hi\" \\ ok"]])
-        );
+        // Backslash spellings are platform-split; see
+        // `backslash_escapes_on_unix_and_separates_paths_on_windows`.
         // Quote removal glues adjacent quoted pieces into one word; a quoted
         // empty string is a real (empty) argument.
         assert_eq!(
@@ -845,10 +886,10 @@ mod tests {
             words(&[&["cargo", "build"]])
         );
         assert_eq!(argvs("cargo build#x"), words(&[&["cargo", "build#x"]]));
-        // Backslash-newline continues the line; blank lines are nothing.
+        // Blank lines are nothing.
         assert_eq!(
-            argvs("cargo build \\\n  --release\n\n"),
-            words(&[&["cargo", "build", "--release"]])
+            argvs("cargo build\n\n  --release\n"),
+            words(&[&["cargo", "build"], &["--release"]])
         );
         // Tabs and other blanks separate words too; a trailing `;` is fine.
         assert_eq!(argvs("git\tstatus ;"), words(&[&["git", "status"]]));
@@ -900,7 +941,6 @@ mod tests {
             "a; ; b",
             "echo \"unterminated",
             "echo 'unterminated",
-            "echo done\\",
             "echo $HOME",
             "echo `id`",
             "echo *.rs",
@@ -917,6 +957,12 @@ mod tests {
         ] {
             assert_eq!(parse_unattended(command), None, "{command:?}");
         }
+        // A trailing backslash is an unfinished line to `sh` only: on Windows
+        // it is the last character of a path. Platform-split alongside every
+        // other backslash spelling, in
+        // `backslash_escapes_on_unix_and_separates_paths_on_windows`.
+        #[cfg(unix)]
+        assert_eq!(parse_unattended("echo done\\"), None);
     }
 
     /// The accepted grammar must mean to this parser exactly what it means to
