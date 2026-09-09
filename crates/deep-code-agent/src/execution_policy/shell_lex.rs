@@ -9,6 +9,15 @@
 //! allow matcher no longer reaches into the deny module for `clean_token` (which
 //! read backwards) and the shared "one view of the shell" invariant has a home.
 //!
+//! Two readings of a word live here, and which one a rule wants is not a
+//! preference. [`clean_token`] is the *text* reading: it deletes quoting
+//! wherever it sits, over-approximating on purpose, and it is what the deny
+//! floor needs because the floor also covers text a human approved and a shell
+//! will re-read. [`executed_words`] is the *argv* reading: the words the
+//! executor really passes to `execve`. Any rule whose promise is about what the
+//! program receives — the trust fences, the session key — must read that one;
+//! the two are equal only by accident, and each accident was a bug.
+//!
 //! None of this is a full shell parser — it is a deliberate safety
 //! over-approximation. Stripping quoting can only ever *expose* a dangerous
 //! flag or path, never hide one; an exotic construct falls through to "needs
@@ -300,6 +309,28 @@ pub(super) fn operand_leaves_cwd(cleaned: &str) -> bool {
         cleaned
     };
     escapes_cwd_by_spelling(operand)
+}
+
+/// The words `command` runs as, when it is one simple command the executor
+/// could run unattended: the argv [`parse_unattended`] produced, program word
+/// first. `None` for anything else — a sequence, or a line the executor would
+/// refuse.
+///
+/// This is what every rule that judges *arguments* must read. The alternative
+/// reading, [`clean_token`] over whitespace-split tokens, is a second grammar
+/// for the same text, and the two are equal only by accident: it deletes
+/// quotes wherever they sit, so `'--'` stayed a quoted word to the rules while
+/// the executor passed a real `--` to the program, and it keeps a Windows `\`
+/// the parser eats. Both readings existed because the rules were written when
+/// the text went to `sh -c`; the executor now runs this argv, so the rules read
+/// it too.
+#[must_use]
+pub(super) fn executed_words(command: &str) -> Option<Vec<String>> {
+    let mut commands = parse_unattended(command)?;
+    if commands.len() != 1 {
+        return None;
+    }
+    Some(commands.pop()?.argv)
 }
 
 /// How a command in an unattended sequence is gated on the one before it.

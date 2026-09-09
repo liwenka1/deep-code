@@ -770,10 +770,25 @@ async fn unattended_commands_run_without_a_shell() {
         "{error}"
     );
 
-    // Approved as text, the shell is exactly what runs it. The quoted spelling
-    // keeps this call off the trust rule (the identity keeps the quotes), so
-    // it needs the approval — the shell strips the quotes and runs `exit 3`.
+    // Requoting a trusted command does not move it off the trust rule: the
+    // rules read the words the executor runs, so `"exit" 3` is the same command
+    // as `exit 3` and gets the same verdict — still no shell, still no such
+    // program.
     let call = ToolCall::new("call_3", "shell", json!({"command": "\"exit\" 3"}));
+    assert!(!registry.evaluate_tool(&call).requires_approval);
+    let error = registry
+        .run_tool_call(call, None)
+        .await
+        .expect_err("requoting must not buy a trusted command a shell");
+    assert!(
+        error.to_string().contains("failed to start command"),
+        "{error}"
+    );
+
+    // Approved as text, the shell is exactly what runs it. Arithmetic expansion
+    // is something only a shell does, and it is also why this line cannot be
+    // trusted (the gate refuses what it cannot parse), so the approval is real.
+    let call = ToolCall::new("call_4", "shell", json!({"command": "exit $((1+2))"}));
     assert!(registry.evaluate_tool(&call).requires_approval);
     let plan = registry.evaluate_tool(&call);
     let ToolRunOutcome::Result { result } = registry

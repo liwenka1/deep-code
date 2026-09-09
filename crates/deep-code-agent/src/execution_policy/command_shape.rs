@@ -21,12 +21,20 @@
 //! literal text: it matches no subcommand rule and a session approval of it
 //! covers nothing but the byte-identical command.
 //!
-//! Operands are read for one property only: a token that names a path outside
+//! Operands are read for one property only: a word that names a path outside
 //! the cwd by spelling (`/etc/x`, `~/.ssh/id_rsa`, `../x`, `C:\x`, or the value
 //! of a `--flag=value`) breaks the trust match ([`rule_covers`]) and the
 //! session key ([`session_identity`]). The trusted programs are read-mostly and
 //! the sandbox leaves reads open, so that spelling is the only fence between a
 //! trusted `git diff` and every readable file on the host.
+//!
+//! Every rule here reads the words the executor will really `execve`
+//! ([`super::shell_lex::executed_words`]), never the raw text a second time.
+//! The rules predate that executor — they were written when the text went to
+//! `sh -c` — and each place still reading tokens was a way to spell a word so
+//! that the rules and the program disagreed about it: `'--'` looked like a
+//! quoted word to the rules while the program received a real `--`, and a
+//! Windows `\` survived the cleaner but not the parser.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -316,7 +324,19 @@ pub fn rule_covers(rule: &str, command: &str) -> bool {
         return false;
     }
 
-    let tokens: Vec<&str> = command.split_whitespace().collect();
+    // Judge the words the executor will really `execve`, never a second reading
+    // of the same text: a trusted command runs as this argv, and each of the
+    // fences below is a promise about what that argv contains. Reading tokens
+    // instead let `cargo test '--' --logfile ./x` stay trusted while the
+    // program received a real `--` and wrote the file the `--logfile` rule
+    // exists to catch. A line the executor cannot run unattended is covered by
+    // no rule at all — `evaluate_shell_command` refuses trust for it upstream
+    // for the same reason, and judging words nobody will run is how the two
+    // sides drift apart.
+    let Some(words) = super::shell_lex::executed_words(command) else {
+        return false;
+    };
+    let tokens: Vec<&str> = words.iter().map(String::as_str).collect();
 
     // A redirecting flag must be spelled out in the rule itself. Degrading the
     // identity is not enough on its own, because the whole-word prefix branch
@@ -386,9 +406,10 @@ pub fn session_identity(command: &str) -> Option<String> {
     // No indirection, and nothing else a shell would have to read either
     // (`parse_unattended` refuses both): a remembered consent is executed as
     // the argv that parse produces, so a command it cannot parse must have no
-    // key to ride.
-    super::shell_lex::parse_unattended(command)?;
-    let tokens: Vec<&str> = command.split_whitespace().collect();
+    // key to ride — and the key is computed from that same argv, so the
+    // command a key is recorded for is the command it later covers.
+    let words = super::shell_lex::executed_words(command)?;
+    let tokens: Vec<&str> = words.iter().map(String::as_str).collect();
     // Deliberately looser than the deny floor's env-assignment test: any `=`
     // in the first word means "not a plain program word" here, and the only
     // cost of over-refusing is a consent that goes unrecorded.
@@ -406,15 +427,21 @@ pub fn session_identity(command: &str) -> Option<String> {
     (!canonical.is_empty()).then_some(canonical)
 }
 
-/// The argument tokens (program word excluded, everything after `--` included:
+/// The argument words (program word excluded, everything after `--` included:
 /// git reads pathspecs there, and `git diff -- /dev/null /etc/hosts` reads the
-/// file all the same) whose de-quoted spelling names a path outside the cwd —
-/// see [`super::shell_lex::operand_leaves_cwd`].
-fn operands_outside_cwd<'a, 'b>(tokens: &'a [&'b str]) -> impl Iterator<Item = &'a &'b str> {
-    tokens
+/// file all the same) that name a path outside the cwd — see
+/// [`super::shell_lex::operand_leaves_cwd`].
+///
+/// `words` are the executor's own
+/// ([`super::shell_lex::executed_words`]), already de-quoted by the parse that
+/// produced them, so nothing is stripped again here: re-cleaning a word the
+/// executor will open verbatim is what made this fence and
+/// `shell_deny::is_workspace_fs_edit` disagree about the same path.
+fn operands_outside_cwd<'a, 'b>(words: &'a [&'b str]) -> impl Iterator<Item = &'a &'b str> {
+    words
         .iter()
         .skip(1)
-        .filter(|token| super::shell_lex::operand_leaves_cwd(&super::shell_lex::clean_token(token)))
+        .filter(|word| super::shell_lex::operand_leaves_cwd(word))
 }
 
 /// Whether the (already squeezed) `rule` spells `token` out as one of its own
@@ -1000,5 +1027,73 @@ mod tests {
         // or the fix would turn ordinary quoted commands into spurious prompts.
         assert!(covers("cargo build", "cargo build --features \"foo\""));
         assert!(covers("git diff", "git diff \"HEAD~1\""));
+    }
+
+    /// Quoting a separator must not hide it from the rules. `'--'` reaches the
+    /// program as a real `--`, so `--logfile` past it is the libtest flag the
+    /// harness rule exists to catch — reading tokens instead of the executed
+    /// argv left `cargo test '--' --logfile ./x` trusted, creating an
+    /// attacker-named file with no prompt in a tier where every other write
+    /// asks.
+    #[test]
+    fn quoting_a_separator_does_not_hide_the_flag_behind_it() {
+        for spelling in ["--", "'--'", "\"--\"", "\\--", "-\\-"] {
+            let command = format!("cargo test {spelling} --logfile ./x");
+            assert!(
+                !covers("cargo test", &command),
+                "{command} stayed trusted, but the program receives a real `--`"
+            );
+        }
+        // The rule still covers what it is meant to cover.
+        assert!(covers("cargo test", "cargo test -- --nocapture"));
+        assert!(covers("cargo test", "cargo test '--' --nocapture"));
+    }
+
+    /// The invariant behind every fence in [`rule_covers`]: a rule judges the
+    /// words the executor runs, so two spellings that produce the SAME argv
+    /// must get the same verdict. Enumerated rather than sampled — each of the
+    /// gate's ten rounds of bugs was one more spelling of a word the rules read
+    /// differently than `sh` did, and a list of examples is exactly what keeps
+    /// missing the next one.
+    #[test]
+    fn requoting_a_word_never_changes_the_verdict() {
+        use super::super::shell_lex::executed_words;
+
+        const INSERTIONS: &[&str] = &[
+            "'", "\"", "\\", "\"\"", "''", "\\\\", "'\"", "\"'", "\\\"", "\\'", "\"\\\"",
+        ];
+        let lines = [
+            ("cargo test", "cargo test -- --logfile ./x"),
+            ("cargo test", "cargo test -- --nocapture"),
+            (
+                "cargo build",
+                "cargo build --config build.rustc-wrapper=/tmp/x",
+            ),
+            ("cargo build", "cargo build --release"),
+            ("git diff", "git diff /dev/null /etc/hosts"),
+            ("git diff", "git diff -- ../secret"),
+            ("git diff", "git diff main..HEAD"),
+            ("echo", "echo hi"),
+        ];
+        for (rule, base) in lines {
+            let base_argv = executed_words(base);
+            let base_verdict = covers(rule, base);
+            for (index, _) in base.char_indices() {
+                for insertion in INSERTIONS {
+                    let variant = format!("{}{}{}", &base[..index], insertion, &base[index..]);
+                    // Only a requoting of the same command is comparable: a
+                    // variant that runs different words is a different command.
+                    if executed_words(&variant) != base_argv {
+                        continue;
+                    }
+                    assert_eq!(
+                        covers(rule, &variant),
+                        base_verdict,
+                        "rule {rule:?}: {variant:?} runs the same argv as {base:?} \
+                         but was judged differently"
+                    );
+                }
+            }
+        }
     }
 }

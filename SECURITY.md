@@ -98,9 +98,15 @@ named with it.
    sandbox leaves reads open, so this spelling is the read fence; `..` counts
    only as a whole path component.
    (`trusted_commands_lose_their_trust_when_an_operand_leaves_the_cwd`)
-6. **`network = "never"` refuses every egress path**, counted by exhaustive
+6. **The rules judge the words the executor runs.** Every rule that reads a
+   command's arguments reads the argv `parse_unattended` produced, so requoting
+   a word cannot change the verdict while the program receives the same argv —
+   enumerated over quoting and escaping spellings rather than sampled, because
+   a list of examples is what kept missing the next one.
+   (`requoting_a_word_never_changes_the_verdict`)
+7. **`network = "never"` refuses every egress path**, counted by exhaustive
    match over the tool kinds. (`never_refuses_every_egress_path`)
-7. **A model-requested write root is never auto-approved** by any mode, config
+8. **A model-requested write root is never auto-approved** by any mode, config
    consent or session memory.
 
 Known residuals — accepted and written down rather than left for the next
@@ -206,9 +212,13 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
 5. **可信命令的操作数按拼写不出 cwd。** 沙箱不拦读,这个拼写就是读侧围栏;
    `..` 只按整个路径分量计。
    (`trusted_commands_lose_their_trust_when_an_operand_leaves_the_cwd`)
-6. **`network = "never"` 拒绝每一条出网路径**,按工具种类穷举 match 计数。
+6. **规则判定的是执行器真正跑的那些词。** 凡是读命令参数的规则,读的都是
+   `parse_unattended` 产出的 argv;因此只要程序收到的 argv 不变,换一种引号
+   拼法就不能改变裁决。这条按引号与转义拼法**枚举**,不是举例——举例名单正是
+   一直漏掉下一种拼法的原因。(`requoting_a_word_never_changes_the_verdict`)
+7. **`network = "never"` 拒绝每一条出网路径**,按工具种类穷举 match 计数。
    (`never_refuses_every_egress_path`)
-7. **模型申请的写根绝不自动放行**,任何档位、配置同意、会话记忆都不行。
+8. **模型申请的写根绝不自动放行**,任何档位、配置同意、会话记忆都不行。
 
 已知残余——写下来接受,而不是留给下一轮 review 重新发现:
 
