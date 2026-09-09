@@ -206,7 +206,9 @@ pub(super) struct JobState {
     /// running tool future and only their terminal state lands here.
     pub(super) child: Option<Child>,
     /// OS sandbox guard tied to the child (Windows Job Object); dropping it with
-    /// the job kills the process tree. `None` on macOS/Linux (confined pre-spawn).
+    /// the job kills the process tree. `None` on macOS/Linux (confined pre-spawn),
+    /// and `None` for a foreground run, whose tool future holds each step's
+    /// guard for exactly that step's lifetime instead.
     /// Held purely for its `Drop` — never read.
     #[allow(dead_code)]
     pub(super) job_guard: Option<crate::sandbox::SandboxGuard>,

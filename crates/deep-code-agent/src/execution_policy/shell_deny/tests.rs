@@ -207,6 +207,29 @@ fn workspace_fs_edit_requires_the_program_word_first() {
     }
 }
 
+/// The program of a bounded edit must be a bare name. The deny-side lexer
+/// reads a basename because the floor wants `/bin/rm` to be `rm`; the
+/// allowance wanted the opposite and did not have it: `./evil/mkdir x` counted
+/// as `mkdir`, and in AcceptEdits the model writes `./evil/mkdir` for free
+/// (`write_file` keeps an existing file's mode, so an in-tree executable it
+/// copied first becomes its own program).
+#[test]
+fn workspace_fs_edit_requires_a_bare_program_word() {
+    for cmd in [
+        "./evil/mkdir x",
+        "scripts/mkdir x",
+        "/bin/mkdir x",
+        "./rm x",
+        "sub/../cp a b",
+        "mkdir a && ./evil/touch b",
+    ] {
+        assert!(!is_workspace_fs_edit(cmd), "{cmd}");
+    }
+    // Case and a Windows executable suffix are spelling, not a path.
+    assert!(is_workspace_fs_edit("MKDIR x"));
+    assert!(is_workspace_fs_edit("mkdir.exe x"));
+}
+
 #[test]
 fn fetch_piped_to_scripting_interpreter_is_denied() {
     // The pipe floor covers plain scripting-language consumers that can

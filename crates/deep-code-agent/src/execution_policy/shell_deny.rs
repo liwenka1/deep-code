@@ -67,12 +67,11 @@ fn is_env_assignment(token: &str) -> bool {
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-/// One segment read the way the shell reads it: how many leading words the
+/// One segment read the way the shell reads it — past the leading words the
 /// shell consumes before the program (assignments, the [`PREFIX_WORDS`] the
-/// floor reads past exactly as `sh` does, grouping punctuation), the program's
-/// lowercased basename, and the cleaned arguments.
+/// floor reads past exactly as `sh` does, grouping punctuation): the program's
+/// lowercased basename and the cleaned arguments.
 struct SegmentWords {
-    prefixes: usize,
     program: String,
     args: Vec<String>,
 }
@@ -81,13 +80,11 @@ struct SegmentWords {
 /// that is nothing but prefixes (`FOO=bar`, `(`).
 fn segment_words(segment: &str) -> Option<SegmentWords> {
     let mut tokens = segment.split_whitespace();
-    let mut prefixes = 0;
     let program = loop {
         let cleaned = clean_token(tokens.next()?);
         if is_env_assignment(&cleaned)
             || PREFIX_WORDS.contains(&cleaned.to_ascii_lowercase().as_str())
         {
-            prefixes += 1;
             continue;
         }
         // Grouping: the shell reads `(` and `)` as operators even glued to the
@@ -97,16 +94,11 @@ fn segment_words(segment: &str) -> Option<SegmentWords> {
         // glued one is genuinely part of the name.)
         let word = cleaned.trim_start_matches(['(', '{']).trim_end_matches(')');
         if word.is_empty() {
-            prefixes += 1;
             continue;
-        }
-        if word.len() != cleaned.len() {
-            prefixes += 1;
         }
         break basename_lower(word);
     };
     Some(SegmentWords {
-        prefixes,
         program,
         args: tokens.map(clean_token).collect(),
     })
@@ -757,24 +749,26 @@ pub fn safety_notes(command: &str) -> Vec<SafetyNote> {
 }
 
 /// cc-style `acceptEdits` allowlist for shell/job commands: a bounded
-/// filesystem-mutation command. Every segment's program must be in the set,
-/// must be the segment's first word (no assignment, wrapper or grouping ahead
-/// of it), every operand — a `--flag=value`'s value included — must stay under
-/// the cwd by spelling (no absolute, home-relative or `..`-component path —
-/// `shell_lex::operand_leaves_cwd`) and `rm` must not recurse. A hard deny
-/// (e.g. `rm -rf`) never reaches here — `builtin_deny` short-circuits it.
+/// filesystem-mutation command, read from the very argv the executor will run
+/// ([`parse_unattended`]) — one tokenization, so the words judged here are the
+/// words that run. Every command's program must be a *bare* name in the set
+/// (no path component; an assignment, wrapper or grouping word ahead of it
+/// never parses as a bare program word either), every operand — a
+/// `--flag=value`'s value included — must stay under the cwd by spelling
+/// ([`operand_leaves_cwd`]), and `rm` must not recurse. A hard deny (e.g.
+/// `rm -rf`) never reaches here — `builtin_deny` short-circuits it.
 ///
 /// What the spelling check is and is not: writes are bounded by the OS
 /// sandbox, not by this; the spelling covers the *read* side, which the
 /// sandbox leaves open (`(allow file-read*)`), so `cp ~/.ssh/id_rsa ./k` is
 /// refused here rather than at the kernel. It bounds the read side only as
-/// far as the spelling is what the shell resolves, which is two things:
-/// shell expansions are excluded up front (`has_shell_indirection` — brace
-/// expansion was the stage that let `cp {~/.ssh/id_rsa,./k}` past this), and
-/// a symlink inside the workspace still resolves outside it. The link is a
-/// deliberate residue: `ln` is not in `FS_EDIT`, so creating one costs a
-/// prompt, and a repository that ships an outward link is trusted the moment
-/// it is opened.
+/// far as the spelling is what runs, which is two things: anything a shell
+/// would rewrite or that only a shell could run is excluded up front (the
+/// parse fails — brace expansion was the stage that let `cp {~/.ssh/id_rsa,./k}`
+/// past this), and a symlink inside the workspace still resolves outside it.
+/// The link is a deliberate residue: `ln` is not in `FS_EDIT`, so creating one
+/// costs a prompt, and a repository that ships an outward link is trusted the
+/// moment it is opened.
 #[must_use]
 pub fn is_workspace_fs_edit(command: &str) -> bool {
     // `sed` is deliberately absent: its `e`/`w` script flags run commands and
@@ -782,36 +776,32 @@ pub fn is_workspace_fs_edit(command: &str) -> bool {
     // bounded edit. In-workspace text edits go through the write tools.
     const FS_EDIT: &[&str] = &["mkdir", "touch", "mv", "cp", "rm", "rmdir"];
     // Redirection/substitution/expansion can run programs, write paths, or
-    // name targets this per-segment program check never inspects, so such a
-    // command is never a bounded edit — nor is anything else the executor
-    // could not run without a shell (a pipe, a background `&`, an
-    // unterminated quote): an auto-approved edit runs as the argv
-    // `parse_unattended` produces, so the words judged here are the words
-    // that run.
-    if parse_unattended(command).is_none() {
+    // name targets this per-command program check never inspects; a pipe, a
+    // background `&` or an unterminated quote only a shell could run. None of
+    // it is a bounded edit — an auto-approved edit runs as the argv produced
+    // here, with no shell to read anything else.
+    let Some(commands) = parse_unattended(command) else {
         return false;
-    }
-    let segs = segments(command);
-    if segs.is_empty() {
-        return false;
-    }
-    segs.iter().all(|segment| {
-        let Some(words) = segment_words(segment) else {
+    };
+    commands.iter().all(|parsed| {
+        let Some((program, args)) = parsed.argv.split_first() else {
             return false;
         };
-        // Only a bare program word is a bounded edit. An assignment ahead of it
-        // redirects what actually runs — `PATH=evil mkdir x` executes
-        // ./evil/mkdir, `LD_PRELOAD=./x.so touch f` loads code into touch — and
-        // a wrapper or grouping word hides the real program from this
-        // per-segment name check. The deny floor reads past such prefixes to
-        // *deny* more; this allowance refuses them to *approve* less.
-        if words.prefixes > 0 {
+        // A path spelling is not the program it is named after: `./evil/mkdir`
+        // is whatever the model wrote there (`write_file` keeps an existing
+        // file's mode, so an in-tree executable it copied first becomes its
+        // own program), and `/tmp/x/mkdir` is anything at all. The deny floor
+        // reads a basename to *deny* more (`/bin/rm` is `rm`); this allowance
+        // wants the bare word, to *approve* less. Case and a Windows `.exe`
+        // suffix are spelling, folded by `basename_lower` — safe once no
+        // separator is present.
+        if program.contains(['/', '\\']) {
             return false;
         }
-        if !FS_EDIT.contains(&words.program.as_str()) {
+        let program = basename_lower(program);
+        if !FS_EDIT.contains(&program.as_str()) {
             return false;
         }
-        let args = &words.args;
         // Every operand must stay under the cwd by spelling. The sandbox bounds
         // the *write* side of an out-of-workspace path — the target fails there
         // — but not the *read* side: `cp ~/.ssh/id_rsa ./k` copied a credential
@@ -821,15 +811,14 @@ pub fn is_workspace_fs_edit(command: &str) -> bool {
         // is not a bounded edit; an in-workspace path spelled absolutely costs
         // one prompt. The safety notes flag the very same spellings. A flag's
         // `=value` is judged as an operand too: `cp --target-directory=/tmp x`
-        // names its target exactly as `cp -t /tmp x` does, and only the latter
-        // was refused while the words starting with `-` were skipped wholesale.
+        // names its target exactly as `cp -t /tmp x` does.
         if args.iter().any(|arg| operand_leaves_cwd(arg)) {
             return false;
         }
         // A recursive `rm` deletes a whole subtree — not a bounded edit, and the
         // one destruction the sandbox can't undo (the workspace itself is
         // writable). `rm <file>` and `rmdir` (empty dirs) stay auto-approvable.
-        !(words.program == "rm"
+        !(program == "rm"
             && (has_flag(args, 'r', &["recursive"]) || has_flag(args, 'R', &["recursive"])))
     })
 }
