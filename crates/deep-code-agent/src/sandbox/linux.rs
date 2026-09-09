@@ -676,7 +676,7 @@ mod tests {
 
     fn run(workspace: &Path, command: &str) -> std::process::Output {
         wrap_command(
-            super::CommandForm::Text(command),
+            crate::sandbox::CommandForm::Text(command),
             workspace,
             &[workspace.to_path_buf()],
             &SandboxPolicy::workspace_write(),

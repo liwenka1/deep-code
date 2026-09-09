@@ -682,6 +682,7 @@ fn prune_keeps_a_run_whose_files_outdate_its_directory() {
 // ---------------------------------------------------------------------------
 
 /// A registry whose policy trusts `extra` identities on top of the defaults.
+#[cfg(unix)]
 fn registry_trusting(root: &std::path::Path, extra: &[&str]) -> ToolRegistry {
     let mut registry = registry(root);
     let mut policy = crate::execution_policy::ExecPolicy::default();
@@ -702,6 +703,7 @@ fn recorder(dir: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+#[cfg(unix)]
 async fn run_shell(
     registry: &ToolRegistry,
     arguments: Value,
@@ -716,6 +718,7 @@ async fn run_shell(
 
 /// The stdout lines of a shell result: everything before the first bracketed
 /// status/stderr marker.
+#[cfg(unix)]
 fn stdout_lines(result: &ToolResult) -> Vec<String> {
     result
         .content

@@ -261,8 +261,10 @@ impl ExecPolicy {
         self.network_mode
     }
 
-    /// Test-only: the same policy trusting one more identity.
-    #[cfg(test)]
+    /// Test-only: the same policy trusting one more identity. Unix-only like
+    /// its callers (the recorder-based shell tests), or Windows' `-D warnings`
+    /// sees dead code.
+    #[cfg(all(test, unix))]
     #[must_use]
     pub(crate) fn with_trusted_prefix(mut self, rule: &str) -> Self {
         self.trusted_shell_prefixes.push(rule.to_string());
