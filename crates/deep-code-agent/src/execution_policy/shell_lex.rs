@@ -344,6 +344,18 @@ pub struct UnattendedCommand {
 /// `~`-led word (the shell would expand it; the gate refuses such an operand
 /// anyway), a program word carrying `=` (an assignment prefix) — so the gate
 /// does not auto-approve it and the executor does not run it unattended.
+/// Whether `\` escapes the character after it.
+///
+/// It does in `sh`, and it does not on Windows, where it is the path separator
+/// and `CreateProcess` — which is what an unattended command reaches, with no
+/// `cmd.exe` in between — never had a backslash escape. Reading it as an escape
+/// there silently ate every ordinary path spelling: `git diff src\main.rs` ran
+/// as `git diff srcmain.rs` on the default-trusted `git diff`, and `.\.`
+/// collapsed to `..`, which is a *different directory* than the operand fence
+/// read. [`clean_token`] splits on this same platform line, for the same
+/// reason.
+const BACKSLASH_ESCAPES: bool = !cfg!(windows);
+
 #[must_use]
 pub fn parse_unattended(command: &str) -> Option<Vec<UnattendedCommand>> {
     if has_shell_indirection(command) {
@@ -359,7 +371,7 @@ pub fn parse_unattended(command: &str) -> Option<Vec<UnattendedCommand>> {
 
     while let Some(c) = chars.next() {
         match c {
-            '\\' => match chars.next() {
+            '\\' if BACKSLASH_ESCAPES => match chars.next() {
                 // A trailing backslash is an incomplete line to the shell.
                 None => return None,
                 Some('\n') => {}
@@ -381,7 +393,7 @@ pub fn parse_unattended(command: &str) -> Option<Vec<UnattendedCommand>> {
                     match chars.next() {
                         None => return None,
                         Some('"') => break,
-                        Some('\\') => match chars.next() {
+                        Some('\\') if BACKSLASH_ESCAPES => match chars.next() {
                             None => return None,
                             Some(escaped @ ('"' | '\\')) => w.push(escaped),
                             Some('\n') => {}
@@ -734,6 +746,41 @@ mod tests {
             .iter()
             .map(|cmd| cmd.run_if)
             .collect()
+    }
+
+    /// `\` escapes on Unix (that is what `sh` does, pinned against the real
+    /// shell by `unattended_parse_matches_sh_word_splitting`) and is an
+    /// ordinary path separator on Windows, where the word reaches
+    /// `CreateProcess` with no shell in between. Reading it as an escape there
+    /// ran `git diff src\main.rs` as `git diff srcmain.rs` on the
+    /// default-trusted `git diff`, and collapsed `.\.` — the current
+    /// directory — into `..`, its parent, which is a path the operand fence
+    /// would have refused.
+    #[test]
+    fn backslash_escapes_on_unix_and_separates_paths_on_windows() {
+        let mangles = cfg!(unix);
+        assert_eq!(
+            argvs(r"git diff src\main.rs"),
+            words(&[&[
+                "git",
+                "diff",
+                if mangles {
+                    "srcmain.rs"
+                } else {
+                    r"src\main.rs"
+                }
+            ]])
+        );
+        assert_eq!(
+            argvs(r"mkdir .\."),
+            words(&[&["mkdir", if mangles { ".." } else { r".\." }]])
+        );
+        // Either way, the fence and the executor read that word the same: it
+        // is out of the cwd exactly when the word really is.
+        assert_eq!(
+            operand_leaves_cwd(if mangles { ".." } else { r".\." }),
+            mangles
+        );
     }
 
     #[test]
