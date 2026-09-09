@@ -68,6 +68,14 @@
 //!    cannot judge, a cancel mid-flight aborts into "ask" — are documented on
 //!    `auto_mode_approves` in `runtime::approval_flow`.
 //!
+//! What runs once the chain says yes depends on WHO said it
+//! (`crate::tool::RunAuthority`): a call the policy's own parse let through —
+//! a trust-list `Allow`, a remembered session identity, the accept-edits
+//! allowance — is executed as the argv `shell_lex::parse_unattended` produced,
+//! with no shell in between; a call a human (or the judge, or Yolo) approved as
+//! text goes to `sh -c` and means what the human read. The gate therefore
+//! trusts only what that parse accepts.
+//!
 //! Only stage 1 can say an automatic hard "no" (enforced at stage 3). Every
 //! stage below can only relax a `NeedsApproval` into running — one from stage 1
 //! may still be auto-approved by stage 4, 5 or 6 — never tighten an `Allow`.

@@ -298,7 +298,7 @@ fn windows_cmd_receives_quoted_arguments_verbatim() {
 }
 
 /// The manager-level gate, pinned in both directions. The kernel-level
-/// seatbelt tests exercise the WRAPPER (`macos_seatbelt::wrap_shell_command`
+/// seatbelt tests exercise the WRAPPER (`macos_seatbelt::wrap_command`
 /// directly), so before this test a mutation collapsing
 /// `SandboxManager::should_sandbox` to `false` ran every confined command
 /// bare while all 828 tests stayed green — the exact silent regression the
@@ -318,7 +318,7 @@ fn manager_gate_composes_policy_veto_and_forced_override() {
 }
 
 /// `sandbox_unavailable_for` is the refuse-bare gate callers consult before
-/// `wrap_shell_command` hands back a bare command. A test override is
+/// `wrap_command` hands back a bare command. A test override is
 /// authoritative EITHER WAY (see the method's doc): `force_sandbox(Some(_))`
 /// is a deliberate test state, never a missing backend, so all three shapes
 /// below are refusals that must NOT fire. The `true` row of the table needs
@@ -337,7 +337,7 @@ fn refuse_gate_stays_quiet_for_overrides_and_bare_policies() {
     assert!(!off.sandbox_unavailable_for(&bare));
 }
 
-/// `wrap_shell_command` must wrap and bare by the SAME gate the asserts above
+/// `wrap_command` must wrap and bare by the SAME gate the asserts above
 /// pin — and the bare command really is the platform shell (`sh -c` on unix,
 /// `cmd /C` on Windows — `bare_shell_command` has a cfg twin per platform),
 /// not a `Default::default()` husk. Inverting the gate (`delete !`) swaps
@@ -345,7 +345,7 @@ fn refuse_gate_stays_quiet_for_overrides_and_bare_policies() {
 /// inversion. The Windows args stop at `/C`: the command itself goes through
 /// `raw_arg` (see the twin's doc for why), so only the switch is asserted.
 #[test]
-fn wrap_shell_command_bares_and_wraps_by_the_gate() {
+fn wrap_command_bares_and_wraps_by_the_gate() {
     let cwd = std::env::temp_dir();
     let on = SandboxManager::new().force_sandbox(Some(true));
 
