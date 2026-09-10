@@ -23,14 +23,21 @@
 //! flag or path, never hide one; an exotic construct falls through to "needs
 //! approval" rather than being auto-trusted.
 
-// Every item in here, private ones included, carries its own doc — and the
-// lint is what keeps it that way. Inserting a new item between a doc comment
-// and the item it describes silently re-parents the prose, which is how the
-// whole "Accepted grammar" spec — the authoritative statement of what may run
-// unattended — ended up documenting a private `const` while
-// `parse_unattended` had no doc at all. Nothing flagged it: the const was
-// private, so `missing_docs` never looked. This lint does, and CI runs clippy
-// with `-D warnings`.
+// Inserting a new item between a doc comment and the item it describes
+// silently re-parents the prose. That is how the whole "Accepted grammar"
+// spec — the authoritative statement of what may run unattended — ended up
+// documenting a private `const` while `parse_unattended` had no doc at all;
+// nothing flagged it, because the const was private and `missing_docs` only
+// looks at public API. This lint does look, and CI runs clippy with
+// `-D warnings`.
+//
+// Its reach, measured rather than assumed: it covers the items below, and it
+// does NOT cover `#[cfg(test)]` — clippy skips test items, so the same
+// re-parenting promptly happened again inside `mod tests` and this lint stayed
+// green. Test items keep their own doc adjacency by declaring helpers inside
+// the function that uses them. Crate-wide is not the answer either, or not
+// yet: at `lib.rs` this lint reports 834 items, which is a documentation
+// project, not a guard.
 #![warn(clippy::missing_docs_in_private_items)]
 
 /// Split a command line into individually-checkable segments on the shell
@@ -174,6 +181,15 @@ pub(super) fn runs_the_rest_of_the_line(program: &str) -> bool {
 /// that only ever execute on the platform they describe — every round of "green
 /// here, red on Windows CI" was a `cfg` block nobody could run.
 ///
+/// Only the parser is parameterized by this value today. [`clean_token`] and
+/// [`basename_lower`] read [`HOST`] (their `_in` twins exist for tests), so a
+/// Windows expectation must not be built by mixing them: parsing with
+/// [`WINDOWS`] and then de-quoting with the host's reading is a hybrid no
+/// platform has. What is reachable by name is the parse and the two lexical
+/// readings; `shell_deny`'s end-to-end verdicts are still pinned per platform
+/// by `#[cfg]`, so the Windows reading of `r\m -rf /` is asserted on Windows
+/// only.
+///
 /// Two things are deliberately *not* in here. Which characters quote a word:
 /// both grammars quote with `'` and `"`, which is this parser's own choice
 /// rather than a platform fact (`cmd.exe` has no `'`), and it can be, because
@@ -254,9 +270,15 @@ pub(super) const HOST: Grammar = if cfg!(windows) { WINDOWS } else { SH };
 /// floor does, or a quoted redirecting flag (`--con"fig"`) that the shell runs
 /// as `--config` rides a trusted identity the deny floor would have cleaned.
 pub(super) fn clean_token(token: &str) -> String {
+    clean_token_in(HOST, token)
+}
+
+/// [`clean_token`] under an explicit [`Grammar`], so the Windows text reading
+/// (`de^l` is `del`, and a `\` is kept) is assertable from any host.
+pub(super) fn clean_token_in(grammar: Grammar, token: &str) -> String {
     token
         .chars()
-        .filter(|ch| !HOST.quoting_to_strip.contains(ch))
+        .filter(|ch| !grammar.quoting_to_strip.contains(ch))
         .collect()
 }
 
@@ -265,9 +287,14 @@ pub(super) fn clean_token(token: &str) -> String {
 /// components is [`Grammar::path_separators`]; on Unix a `\` was already
 /// dropped by [`clean_token`].
 pub(super) fn basename_lower(token: &str) -> String {
-    let cleaned = clean_token(token);
+    basename_lower_in(HOST, token)
+}
+
+/// [`basename_lower`] under an explicit [`Grammar`] (see [`clean_token_in`]).
+pub(super) fn basename_lower_in(grammar: Grammar, token: &str) -> String {
+    let cleaned = clean_token_in(grammar, token);
     let base = cleaned
-        .rsplit(HOST.path_separators)
+        .rsplit(grammar.path_separators)
         .next()
         .unwrap_or(cleaned.as_str())
         .to_ascii_lowercase();
@@ -459,15 +486,26 @@ pub struct UnattendedCommand {
 /// the words the gate judged are the words that run, by construction rather
 /// than by the completeness of any list.
 ///
-/// Accepted grammar — the subset whose meaning this parser and the platform
-/// agree on exactly: words split on unquoted blanks; `'…'` literal; `"…"`
-/// literal except `\"` and `\\`; `#` opening a word comments out the rest of
-/// the line; commands chain by `;`, a newline, or `&&`. Everything else is
-/// `None` — `|`, `||`, a lone `&`, redirection, substitution, any expansion
-/// ([`has_shell_indirection`]), an unterminated quote, an empty command, a
-/// `~`-led word (the shell would expand it; the gate refuses such an operand
-/// anyway), a program word carrying `=` (an assignment prefix) — so the gate
-/// does not auto-approve it and the executor does not run it unattended.
+/// Accepted grammar — what this parser reads, which is also the only reading
+/// that runs (the argv it returns is what reaches the OS): words split on
+/// unquoted blanks; `'…'` literal; `"…"` literal, with `\"` and `\\` escapes
+/// where [`Grammar::backslash_escapes`] holds; `#` opening a word comments out
+/// the rest of the line; commands chain by `;`, a newline, or `&&`. Everything
+/// else is `None` — `|`, `||`, a lone `&`, redirection, substitution, any
+/// expansion ([`has_shell_indirection`]), an unterminated quote, an empty
+/// command, a `~`-led word (the shell would expand it; the gate refuses such an
+/// operand anyway), a program word carrying `=` (an assignment prefix) — so the
+/// gate does not auto-approve it and the executor does not run it unattended.
+///
+/// Under [`SH`] this subset means exactly what that shell means by it, checked
+/// against the real one by `unattended_parse_matches_sh_word_splitting`. Under
+/// [`WINDOWS`] there is no shell to agree with — `cmd.exe` is not in the path
+/// of an unattended command — and two of the rules above are this parser's own
+/// uniform choice rather than a platform fact: `'…'` quoting (`cmd.exe` has no
+/// `'`) and quote removal. That is sound because the words produced here are
+/// the argv that runs; it is *not* a claim that `CommandLineToArgvW` would read
+/// the same text the same way. Where that difference could move a word
+/// boundary, the line is refused instead ([`ambiguous_backslash_quote`]).
 ///
 /// Backslashes are the one place the two platforms read the same text
 /// differently, and which reading applies is [`Grammar::backslash_escapes`]
@@ -494,9 +532,23 @@ pub fn parse_unattended(command: &str) -> Option<Vec<UnattendedCommand>> {
 /// A property of the *line*, tested once, rather than of a parse position
 /// tested wherever a quote is consumed — and that is the whole point. The
 /// per-position version reached the top-level arm and the double-quote loop
-/// and missed the single-quote loop, so `echo 'a\'b'c'` was quietly read one
-/// of the two ways the doc said it would not choose between. A line-level test
-/// has no position for the next arm to dodge it from.
+/// and missed the single-quote loop, so the same backslash was refused outside
+/// quotes (`echo \'x'`) and read as an ordinary character inside them
+/// (`echo 'a\"b'` came out as the one word `a\"b`): the reading depended on
+/// which arm consumed it rather than on the spelling. That second line is
+/// exactly what the line-level test changed — it is refused now, like every
+/// other `\"` — and a line-level test has no position for the next arm to
+/// dodge it from.
+///
+/// `""` inside a word is deliberately *not* refused, though it is the same
+/// kind of disputed spelling: `CommandLineToArgvW` documents `""` inside a
+/// quoted block as an escaped literal quote, while this parser reads it as
+/// close-then-reopen, so `git commit -m "say ""hi"" ok"` is `say hi ok` here
+/// and `say "hi" ok` through `cmd /C`. It stays because that difference can
+/// only add or drop quote characters *inside* a word — the word count is the
+/// same, so no flag becomes an operand and no path changes — whereas `\"` can
+/// move a boundary. Pinned by
+/// `windows_reads_doubled_quotes_as_reopening_the_word`.
 ///
 /// `'` is deliberately not here, though the per-position version refused it
 /// too: it is not special to `CommandLineToArgvW`, to `CreateProcess`, or to
@@ -936,13 +988,17 @@ mod tests {
     /// default-trusted `git diff`, and collapsed `.\.` — the current
     /// directory — into `..`, its parent, a path the operand fence would have
     /// refused.
-    /// One row of the backslash table: a grammar, a line, and the argv the
-    /// executor would run under that grammar — `None` when the line is not one
-    /// this parser will run unattended at all.
-    type BackslashCase<'a> = (Grammar, &'a str, Option<&'a [&'a [&'a str]]>);
-
     #[test]
     fn backslash_reading_is_pinned_for_both_grammars() {
+        /// One row: a grammar, a line, and the argv the executor would run
+        /// under that grammar — `None` when the line is not one this parser
+        /// will run unattended at all. Declared inside the function on
+        /// purpose: an item between a doc comment and the item it describes
+        /// re-parents the prose, which is the mistake this module already made
+        /// once (see the header) and made again here, in the very commit that
+        /// added the lint against it.
+        type BackslashCase<'a> = (Grammar, &'a str, Option<&'a [&'a [&'a str]]>);
+
         let cases: &[BackslashCase<'_>] = &[
             // `sh`: a `\` escapes a path separator, a blank, a quote, itself,
             // and a newline (which continues the line); a trailing one leaves
@@ -1042,7 +1098,10 @@ mod tests {
             "echo done # note",
             "cargo build && cargo test",
         ] {
-            for (at, _) in base.char_indices() {
+            // `0..=len`, not `char_indices()`: the end of the line is a
+            // landing position too, and the only one where the inserted quote
+            // is unterminated — a different early return than the rest.
+            for at in (0..=base.len()).filter(|at| base.is_char_boundary(*at)) {
                 let line = format!("{}{}{}", &base[..at], r#"\""#, &base[at..]);
                 assert_eq!(
                     parse_unattended_in(WINDOWS, &line),
@@ -1052,6 +1111,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `""` inside a word reopens the word here, while `CommandLineToArgvW`
+    /// documents it as an escaped literal quote — a real difference between
+    /// this parser and that one, left in on purpose (see
+    /// [`ambiguous_backslash_quote`]) and therefore written down.
+    #[test]
+    fn windows_reads_doubled_quotes_as_reopening_the_word() {
+        let doubled = "git commit -m \"say \"\"hi\"\" ok\"";
+        assert_eq!(
+            executed_words_in(WINDOWS, doubled),
+            Some(vec![
+                "git".to_string(),
+                "commit".to_string(),
+                "-m".to_string(),
+                "say hi ok".to_string(),
+            ])
+        );
+        // Why it is tolerable where `\"` is not: quote characters come and go
+        // inside the word, but the word count does not move, so no flag turns
+        // into an operand and no path changes.
+        assert_eq!(
+            executed_words_in(WINDOWS, doubled).map(|words| words.len()),
+            executed_words_in(WINDOWS, "git commit -m \"say hi ok\"").map(|words| words.len())
+        );
+    }
+
+    /// The Windows *text* reading, which the deny floor uses: cmd.exe's escape
+    /// character is stripped like Unix quoting, a `\` is kept because it is a
+    /// path separator — and therefore splits a basename, which is why
+    /// `r\m -rf /` is not the `rm` the floor denies on Unix. Asserted here
+    /// from any host; the floor's end-to-end verdicts stay `#[cfg]`-split.
+    #[test]
+    fn the_windows_text_reading_is_pinned_from_any_host() {
+        assert_eq!(clean_token_in(WINDOWS, "de^l"), "del");
+        assert_eq!(clean_token_in(WINDOWS, r"r\m"), r"r\m");
+        assert_eq!(clean_token_in(SH, r"r\m"), "rm");
+        assert_eq!(basename_lower_in(WINDOWS, r"r\m"), "m");
+        assert_eq!(basename_lower_in(SH, r"r\m"), "rm");
+        assert_eq!(
+            basename_lower_in(WINDOWS, r"C:\Windows\System32\REG.EXE"),
+            "reg"
+        );
     }
 
     #[test]

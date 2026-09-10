@@ -125,8 +125,10 @@ review to rediscover:
 - On Windows a line spelling a backslash immediately before a `"` never runs
   unattended: `CommandLineToArgvW` and `cmd.exe` read that backslash run
   differently, so the parser refuses instead of choosing. The usual casualty is
-  a quoted path ending in a separator (`cd "C:\Users\me\"`), which costs a
-  prompt; the unquoted spelling runs.
+  a quoted path ending in a separator — `xcopy "src\" "dst\"` costs a prompt
+  where `xcopy src\ dst\` runs. (A quoted *absolute* path like
+  `cd "C:\Users\me\"` was never in scope: a drive letter leaves the cwd by
+  spelling, and `cd` is a cmd builtin, which no unattended command runs.)
 
 ## Disclosure
 
@@ -237,8 +239,10 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
 - 人工按文本批准的命令保留人看到的全部 shell 特性。
 - Windows 上,一行里只要出现「反斜杠紧挨 `"`」就不会免审运行:
   `CommandLineToArgvW` 与 `cmd.exe` 对那串反斜杠的读法不同,解析器拒绝而不是
-  替它选一个。代价最常见的是引号里以分隔符结尾的路径(`cd "C:\Users\me\"`)
-  ——那要一次提示;不带引号的写法照常跑。
+  替它选一个。代价最常见的是引号里以分隔符结尾的路径——`xcopy "src\" "dst\"`
+  要一次提示,而 `xcopy src\ dst\` 照常跑。(引号里的**绝对**路径如
+  `cd "C:\Users\me\"` 本来就不在讨论范围:盘符按拼写就已越界,而 `cd` 是
+  cmd 内建,免审命令从不运行它。)
 
 ## 披露
 

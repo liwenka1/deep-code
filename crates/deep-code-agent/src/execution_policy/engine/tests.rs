@@ -511,6 +511,14 @@ fn trust_covers_only_what_runs_without_a_shell() {
     // into a fallback through `cmd /C`, this line would open a shell with no
     // prompt, so the trust has to be written down where someone changing the
     // executor will trip over it.
+    //
+    // The limit of writing it this way, stated rather than hidden:
+    // `evaluate_shell_command` takes no `Grammar`, so the arm below executes
+    // on Windows CI and nowhere else — the construct this batch otherwise
+    // removed. What holds it up in the meantime is that both facts it rests on
+    // are pinned from every host in `shell_lex`: the parse
+    // (`backslash_reading_is_pinned_for_both_grammars`) and the operand fence
+    // (`!operand_leaves_cwd(r"done\")`).
     #[cfg(unix)]
     assert!(matches!(
         evaluate_shell_command(&policy, "echo done\\", false).verdict,

@@ -1030,12 +1030,20 @@ mod tests {
         // trailing backslash, which the shell would drop.
         //
         // Windows reads the same text differently and the line IS trusted
-        // there — checked by forcing `shell_lex::HOST` to `WINDOWS`, which is
-        // what the earlier "stays untrusted for a different reason" note here
-        // claimed and got wrong. What makes it harmless is one level down: the
-        // program receives `--config\`, not `--config`, so the redirecting
-        // flag never forms and cargo rejects the word. The fence that carries
-        // the weight is the argv reading, not this trust decision.
+        // there — the earlier note in this spot claimed the opposite and was
+        // wrong. What makes it harmless is one level down, and unlike the
+        // trust verdict that half is assertable from any host: the program
+        // receives `--config\`, which is not the redirecting flag, so it never
+        // forms and cargo rejects the word.
+        assert_eq!(
+            executed_words_in(WINDOWS, "cargo build --config\\ build.rustc-wrapper=/tmp/x")
+                .as_deref(),
+            Some(
+                ["cargo", "build", "--config\\", "build.rustc-wrapper=/tmp/x"]
+                    .map(String::from)
+                    .as_slice()
+            )
+        );
         #[cfg(not(windows))]
         assert!(!covers(
             "cargo build",
@@ -1069,7 +1077,8 @@ mod tests {
         // to a separator, which is the regression this test exists to catch,
         // and it would still have passed.
         for (grammar, expected) in [
-            (SH, &["--", "'--'", "\"--\"", "\\--", "-\\-"][..]),
+            // Every spelling: `sh` de-quotes and un-escapes all of them.
+            (SH, SPELLINGS),
             // A backslash is a path character there, so `\--` and `-\-` reach
             // the program with it still in the word.
             (WINDOWS, &["--", "'--'", "\"--\""][..]),
