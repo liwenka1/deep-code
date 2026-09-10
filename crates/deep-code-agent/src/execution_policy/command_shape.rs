@@ -498,11 +498,22 @@ fn squeeze(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::shell_lex::{HOST, SH, WINDOWS, executed_words, executed_words_in};
     use super::*;
 
     fn identity_of(command: &str) -> String {
         let tokens: Vec<&str> = command.split_whitespace().collect();
         identity(&tokens)
+    }
+
+    /// [`identity`] of the words the executor really runs — what
+    /// [`rule_covers`] feeds it. `identity_of` above splits raw text instead,
+    /// which is the right reading for the unquoted lines that pin subcommand
+    /// depth, but a pin about quoting has to read the parse or it guards a
+    /// shape production cannot produce.
+    fn identity_of_executed(command: &str) -> String {
+        let words = executed_words(command).expect("runs unattended");
+        identity(&words.iter().map(String::as_str).collect::<Vec<_>>())
     }
 
     fn covers(rule: &str, command: &str) -> bool {
@@ -1009,9 +1020,10 @@ mod tests {
             "cargo build --target\"-dir\" /tmp/spray"
         ));
         assert!(!covers("git diff", "git diff --out\"put\"=/tmp/leak"));
-        // The degraded identity must not collapse to the two-word trusted form.
+        // The degraded identity must not collapse to the two-word trusted
+        // form — read the way production reads it, through the parse.
         assert_ne!(
-            identity_of("cargo build --con\"fig\" build.rustc-wrapper=/tmp/x"),
+            identity_of_executed("cargo build --con\"fig\" build.rustc-wrapper=/tmp/x"),
             "cargo build"
         );
         // Backslash-escaped on Unix: `--config\ ` splits to a token carrying the
@@ -1037,32 +1049,43 @@ mod tests {
     /// asks.
     #[test]
     fn quoting_a_separator_does_not_hide_the_flag_behind_it() {
-        use super::super::shell_lex::executed_words;
+        const SPELLINGS: &[&str] = &["--", "'--'", "\"--\"", "\\--", "-\\-"];
+        let separator = |grammar, spelling: &str| {
+            executed_words_in(grammar, &format!("cargo test {spelling} --logfile ./x"))
+                .is_some_and(|words| words.iter().any(|word| word == "--"))
+        };
 
-        let mut checked = 0;
-        for spelling in ["--", "'--'", "\"--\"", "\\--", "-\\-"] {
+        // Which spellings reach the program as a real `--` is the platform's
+        // business, so it is stated per grammar and checked exactly. The
+        // previous shape counted instead — "at least three of the five" — and
+        // on Unix, where all five are separators, the three unquoted spellings
+        // satisfied that alone: both quoted ones could have stopped de-quoting
+        // to a separator, which is the regression this test exists to catch,
+        // and it would still have passed.
+        for (grammar, expected) in [
+            (SH, &["--", "'--'", "\"--\"", "\\--", "-\\-"][..]),
+            // A backslash is a path character there, so `\--` and `-\-` reach
+            // the program with it still in the word.
+            (WINDOWS, &["--", "'--'", "\"--\""][..]),
+        ] {
+            let separators: Vec<&str> = SPELLINGS
+                .iter()
+                .copied()
+                .filter(|spelling| separator(grammar, spelling))
+                .collect();
+            assert_eq!(separators, expected, "under {grammar:?}");
+        }
+
+        // The rule under test is the implication: if the program receives a
+        // real `--`, what follows it is harness argument territory and
+        // `--logfile` writes a file, so no rule may cover the line.
+        for spelling in SPELLINGS.iter().filter(|s| separator(HOST, s)) {
             let command = format!("cargo test {spelling} --logfile ./x");
-            // Whether a spelling *is* the separator is the platform's business
-            // (a backslash escapes on Unix and is a path character on Windows),
-            // so ask the argv rather than assume. The rule under test is the
-            // implication: if the program receives a real `--`, what follows it
-            // is harness argument territory and `--logfile` writes a file.
-            let Some(words) = executed_words(&command) else {
-                continue;
-            };
-            if !words.iter().any(|word| word == "--") {
-                continue;
-            }
-            checked += 1;
             assert!(
                 !covers("cargo test", &command),
                 "{command} stayed trusted, but the program receives a real `--`"
             );
         }
-        assert!(
-            checked >= 3,
-            "the plain and quoted spellings must all be separators"
-        );
         // The rule still covers what it is meant to cover.
         assert!(covers("cargo test", "cargo test -- --nocapture"));
         assert!(covers("cargo test", "cargo test '--' --nocapture"));
@@ -1076,8 +1099,6 @@ mod tests {
     /// missing the next one.
     #[test]
     fn requoting_a_word_never_changes_the_verdict() {
-        use super::super::shell_lex::executed_words;
-
         const INSERTIONS: &[&str] = &[
             "'", "\"", "\\", "\"\"", "''", "\\\\", "'\"", "\"'", "\\\"", "\\'", "\"\\\"",
         ];
