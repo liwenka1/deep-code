@@ -26,8 +26,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::shell_lex::{
-    INTERPRETERS, PREFIX_WORDS, basename_lower, clean_token, operand_leaves_cwd, parse_unattended,
-    segments,
+    Grammar, HOST, INTERPRETERS, PREFIX_WORDS, basename_lower, clean_token, operand_leaves_cwd,
+    parse_unattended, rewrites_a_word, segments,
 };
 use crate::i18n::TextId;
 
@@ -448,6 +448,44 @@ fn deny_pipe_to_shell(command: &str) -> Option<DenyReason> {
 /// every automatic pass, so they land on a human instead of on this floor.
 #[must_use]
 pub fn builtin_deny(command: &str) -> Option<DenyReason> {
+    builtin_deny_in(HOST, command)
+}
+
+/// Deny a line the platform's interpreter rewrites before the program word
+/// exists, in a way this floor cannot read.
+///
+/// `cmd.exe` expands `%VAR%`, and its substring and replace forms
+/// (`%VAR:~0,0%`, `%VAR:a=b%`), on the command line. So
+/// `de%PATH:~0,0%l /f/s/q C:\*` reached this floor as the program
+/// `de%path:~0,0%l`, matched nothing, and `cmd /C` ran `del /f/s/q C:\*` —
+/// with no sandbox behind it, because Windows has none. Two `%` in one word is
+/// the signal: `cmd` needs the pair.
+///
+/// This floor does not expand it. It cannot: the result depends on the
+/// environment, and stripping the `%` would not help either
+/// (`dePATH:~0,0l` is not `del`). The honest answer is that such a word is one
+/// nobody here can read, so the line does not run.
+///
+/// The caret was the same hole in a different spelling and was closed by
+/// stripping it ([`super::shell_lex::Grammar::quoting_to_strip`]). Listing
+/// characters is what left this one open for a round; the fact now lives with
+/// the platform's other grammar facts, as
+/// [`super::shell_lex::Grammar::rewrites_words_with`].
+fn deny_word_rewriting(grammar: Grammar, command: &str) -> Option<DenyReason> {
+    rewrites_a_word(grammar, command).then_some(DenyReason(
+        "the command interpreter would rewrite this line before running it",
+    ))
+}
+
+/// [`builtin_deny`] under an explicit [`Grammar`], so the Windows reading of
+/// the rule above is assertable from any host. Only that rule reads the
+/// grammar; the rest of the floor reads the host's, which is why its Windows
+/// verdicts are still pinned by `#[cfg]`.
+#[must_use]
+pub(super) fn builtin_deny_in(grammar: Grammar, command: &str) -> Option<DenyReason> {
+    if let Some(reason) = deny_word_rewriting(grammar, command) {
+        return Some(reason);
+    }
     if let Some(reason) = deny_line(command) {
         return Some(reason);
     }

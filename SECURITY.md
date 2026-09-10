@@ -122,6 +122,11 @@ review to rediscover:
   commits, `npm` (`~/.npmrc`) and `codesign` (keychains) need them offline,
   so the read fence is the operand spelling above, not the kernel.
 - A command a human approved as text keeps every shell feature the human saw.
+- On Windows a word carrying two `%` is denied outright and never runs
+  unattended: `cmd.exe` rewrites `%VAR%` (and `%VAR:~0,0%`, `%VAR:a=b%`) on the
+  command line, so `de%PATH:~0,0%l` is `del` by the time anything runs and no
+  rule here can read the word. A variable whose *name* contains a blank splits
+  across two words and is not covered.
 - On Windows a line spelling a backslash immediately before a `"` never runs
   unattended: `CommandLineToArgvW` and `cmd.exe` read that backslash run
   differently, so the parser refuses instead of choosing. The usual casualty is
@@ -237,6 +242,10 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
 - 凭据目录对沙箱内命令可读:SSH 签名的 commit、`npm`(`~/.npmrc`)、`codesign`
   (钥匙串)在离线时也需要它们,所以读侧围栏是上面的操作数拼写,不是内核。
 - 人工按文本批准的命令保留人看到的全部 shell 特性。
+- Windows 上,一个词里带两个 `%` 会被直接拒绝、也永不免审运行:`cmd.exe` 会在
+  命令行上展开 `%VAR%`(以及 `%VAR:~0,0%`、`%VAR:a=b%`),所以 `de%PATH:~0,0%l`
+  在真正执行时已经是 `del`,这里没有任何规则读得懂那个词。变量**名**里含空白的
+  会被拆成两个词,不在覆盖范围内。
 - Windows 上,一行里只要出现「反斜杠紧挨 `"`」就不会免审运行:
   `CommandLineToArgvW` 与 `cmd.exe` 对那串反斜杠的读法不同,解析器拒绝而不是
   替它选一个。代价最常见的是引号里以分隔符结尾的路径——`xcopy "src\" "dst\"`

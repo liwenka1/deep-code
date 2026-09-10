@@ -227,6 +227,19 @@ pub(super) struct Grammar {
     /// floor. A Windows `\` is not stripped: there it is a genuine path
     /// separator, not quoting.
     pub(super) quoting_to_strip: &'static [char],
+    /// Characters with which the platform's command interpreter rewrites a
+    /// *word* before the program word exists, beyond the ones both platforms
+    /// share (`$`, a backtick, braces, globs — all in
+    /// [`has_shell_indirection`] unconditionally).
+    ///
+    /// Empty for `sh`, whose rewriting punctuation is already on that shared
+    /// list. `%` for Windows: `cmd.exe` expands `%VAR%` and its substring and
+    /// replace forms (`%VAR:~0,0%`, `%VAR:a=b%`) on the command line, so
+    /// `de%PATH:~0,0%l /f/s/q C:\*` is `del /f/s/q C:\*` by the time anything
+    /// runs. It cannot be on the shared list: on Unix two `%` in one word is
+    /// ordinary (`date +%Y%m%d`, `git log --format=%h%s`), so refusing them
+    /// there would block real work for nothing.
+    pub(super) rewrites_words_with: &'static [char],
 }
 
 /// The grammar of `sh`, which is how an unattended command's words are read on
@@ -237,6 +250,7 @@ pub(super) const SH: Grammar = Grammar {
     backslash_escapes: true,
     path_separators: &['/'],
     quoting_to_strip: &['\'', '"', '\\'],
+    rewrites_words_with: &[],
 };
 
 /// The Windows grammar: `\` is a path separator rather than an escape, both
@@ -245,7 +259,36 @@ pub(super) const WINDOWS: Grammar = Grammar {
     backslash_escapes: false,
     path_separators: &['/', '\\'],
     quoting_to_strip: &['\'', '"', '^'],
+    rewrites_words_with: &['%'],
 };
+
+/// Whether the platform's command interpreter would rewrite a *word* of this
+/// line before the program word exists.
+///
+/// `cmd.exe` needs the pair: `%VAR%`, `%VAR:~0,0%`, `%VAR:a=b%`. A lone `%` is
+/// an ordinary character to it, which is why the test is two-in-one-word and
+/// not "contains a `%`" — `git log --format=%h -5` has to stay an ordinary
+/// command on Windows too. (A variable whose *name* contains a blank would
+/// split across two words and slip past; setting one takes a command of its
+/// own, which this floor reads on its own terms.)
+///
+/// One predicate, read by both sides of the gate: the trust and accept-edits
+/// side folds it into [`has_shell_indirection`], so such a line is never
+/// auto-approved, and the deny floor refuses it outright, because under `Yolo`
+/// on Windows that floor is the only thing above nothing. The caret — the same
+/// class, different spelling — is handled by both sides too, through
+/// [`Grammar::quoting_to_strip`]; a platform rewrite modeled on one side only
+/// is a hole with a prompt in front of it.
+#[must_use]
+pub(super) fn rewrites_a_word(grammar: Grammar, command: &str) -> bool {
+    command.split_whitespace().any(|token| {
+        token
+            .chars()
+            .filter(|ch| grammar.rewrites_words_with.contains(ch))
+            .count()
+            >= 2
+    })
+}
 
 /// The grammar of the host this build runs on — what every caller outside the
 /// tests wants. The tests reach for [`SH`] and [`WINDOWS`] by name instead, so
@@ -374,9 +417,16 @@ fn strip_executable_extension(base: &str) -> String {
 /// Which characters belong here is no longer the author's call:
 /// `every_punctuation_the_shell_rewrites_is_accounted_for` asks the real shell
 /// which characters rewrite a word and fails naming any that no rule reads.
+///
+/// Takes the [`Grammar`] rather than reading [`HOST`]: the shared list above is
+/// every platform's, and [`Grammar::rewrites_words_with`] adds the platform's
+/// own — `%` on Windows, where `cmd.exe` rewrote `de%PATH:~0,0%l` into `del`
+/// after every rule here had read the word. One function rather than a host
+/// wrapper, because no caller wants the host's reading implicitly.
 #[must_use]
-pub(super) fn has_shell_indirection(command: &str) -> bool {
+pub(super) fn has_shell_indirection(grammar: Grammar, command: &str) -> bool {
     command.contains(['>', '<', '`', '$', '{', '}', '(', ')', '*', '?', '[', ']'])
+        || rewrites_a_word(grammar, command)
 }
 
 /// Whether a (cleaned) token names a path that leaves the current directory by
@@ -571,7 +621,7 @@ pub(super) fn parse_unattended_in(
     grammar: Grammar,
     command: &str,
 ) -> Option<Vec<UnattendedCommand>> {
-    if has_shell_indirection(command) {
+    if has_shell_indirection(grammar, command) {
         return None;
     }
     if !grammar.backslash_escapes && ambiguous_backslash_quote(command) {
@@ -863,7 +913,7 @@ mod tests {
     /// and `-D warnings` refuses to compile it.
     #[cfg(unix)]
     fn rewriting_character_is_read(c: char) -> bool {
-        has_shell_indirection(&c.to_string())
+        has_shell_indirection(HOST, &c.to_string())
             || matches!(c, ';' | '|' | '&')
             || matches!(c, '\'' | '"' | '\\')
             || c == '~'
@@ -1135,6 +1185,30 @@ mod tests {
         assert_eq!(
             executed_words_in(WINDOWS, doubled).map(|words| words.len()),
             executed_words_in(WINDOWS, "git commit -m \"say hi ok\"").map(|words| words.len())
+        );
+    }
+
+    /// `%` is how `cmd.exe` rewrites a line, so it is indirection under
+    /// [`WINDOWS`] and an ordinary character under [`SH`] — where two of them
+    /// in one word is an everyday command and refusing it would buy nothing.
+    #[test]
+    fn percent_is_indirection_only_where_the_interpreter_expands_it() {
+        assert!(has_shell_indirection(WINDOWS, "echo %PATH%"));
+        // A lone `%` is not a rewrite, on either platform: cmd needs the pair,
+        // and this shape is an everyday command.
+        assert!(!has_shell_indirection(WINDOWS, "git log --format=%h -5"));
+        assert!(!has_shell_indirection(
+            WINDOWS,
+            r"git log --format='%h %s' -5"
+        ));
+        assert_eq!(
+            parse_unattended_in(WINDOWS, r"de%PATH:~0,0%l /f/s/q C:\*"),
+            None
+        );
+        assert!(!has_shell_indirection(SH, "date +%Y%m%d"));
+        assert_eq!(
+            argvs_in(SH, "git log --format=%h%s -5"),
+            Some(words(&[&["git", "log", "--format=%h%s", "-5"]]))
         );
     }
 
