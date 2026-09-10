@@ -240,6 +240,23 @@ pub(super) struct Grammar {
     /// ordinary (`date +%Y%m%d`, `git log --format=%h%s`), so refusing them
     /// there would block real work for nothing.
     pub(super) rewrites_words_with: &'static [char],
+    /// What the platform's interpreter treats as a word delimiter *besides*
+    /// blanks, and which it is therefore safe to read as one.
+    ///
+    /// Empty for `sh`, which delimits on blanks alone. `,` and `=` for
+    /// `cmd.exe`: `del,/f/s/q,C:\*` is `del` with two arguments to it there,
+    /// and one opaque word to anything that splits on blanks — which is how it
+    /// walked past every rule on the deny floor.
+    ///
+    /// `cmd` delimits on `;` too, and it is deliberately not here. This floor
+    /// reads `;` as a *segment separator* (`segments`), so normalizing it
+    /// merges two commands into one — measured, not theorized:
+    /// `curl https://x -o f; echo hi | sh` then reads as a fetch that feeds the
+    /// pipe, and the floor denied it, in every mode, wrongly. The narrow
+    /// residual is the reverse spelling (`del;/f/s/q;C:\*`, which `segments`
+    /// splits into argument-less pieces); a special case for it would cost more
+    /// than it closes.
+    pub(super) word_delimiters: &'static [char],
 }
 
 /// The grammar of `sh`, which is how an unattended command's words are read on
@@ -251,6 +268,7 @@ pub(super) const SH: Grammar = Grammar {
     path_separators: &['/'],
     quoting_to_strip: &['\'', '"', '\\'],
     rewrites_words_with: &[],
+    word_delimiters: &[],
 };
 
 /// The Windows grammar: `\` is a path separator rather than an escape, both
@@ -260,34 +278,87 @@ pub(super) const WINDOWS: Grammar = Grammar {
     path_separators: &['/', '\\'],
     quoting_to_strip: &['\'', '"', '^'],
     rewrites_words_with: &['%'],
+    word_delimiters: &[',', '='],
 };
 
-/// Whether the platform's command interpreter would rewrite a *word* of this
-/// line before the program word exists.
+/// Whether the platform's command interpreter would rewrite this line before
+/// the program word exists.
 ///
-/// `cmd.exe` needs the pair: `%VAR%`, `%VAR:~0,0%`, `%VAR:a=b%`. A lone `%` is
-/// an ordinary character to it, which is why the test is two-in-one-word and
-/// not "contains a `%`" — `git log --format=%h -5` has to stay an ordinary
-/// command on Windows too. (A variable whose *name* contains a blank would
-/// split across two words and slip past; setting one takes a command of its
-/// own, which this floor reads on its own terms.)
+/// `cmd.exe` expands `%VAR%`, and its substring and replace forms
+/// (`%VAR:~0,0%`, `%VAR:a=b%`), on the command line: `de%PATH:~0,0%l` is `del`
+/// by the time anything runs. The pair is the signal, because a lone `%` is an
+/// ordinary character to it.
 ///
-/// One predicate, read by both sides of the gate: the trust and accept-edits
-/// side folds it into [`has_shell_indirection`], so such a line is never
-/// auto-approved, and the deny floor refuses it outright, because under `Yolo`
-/// on Windows that floor is the only thing above nothing. The caret — the same
-/// class, different spelling — is handled by both sides too, through
-/// [`Grammar::quoting_to_strip`]; a platform rewrite modeled on one side only
-/// is a hole with a prompt in front of it.
+/// Counted over the whole line rather than per word, which is the difference
+/// between modeling `cmd` and modeling a guess about it: the replace form takes
+/// blanks (`%PATH:Program Files=X%` is valid), and a variable whose *name*
+/// carries a blank is settable (`setx "a b" …`, read by the next `cmd /C`), so
+/// `de%FOO BAR%l` splits into two words with one `%` each and a per-word count
+/// answers "no". The cost of the wider reading is a prompt on Windows for a
+/// line like `git log --format='%h %s'`, and only on the paths where nobody
+/// read the text.
+///
+/// Where this is load-bearing is the *text* path — a line handed to `cmd /C`
+/// by a layer that read only the text (`Yolo`, the Auto judge, a config
+/// `auto_allow`), which is why the runtime refuses to let those layers wave
+/// such a line through (`runtime::approval_flow`). On the parse path it is
+/// belt-and-braces: an argv of `["de%PATH:~0,0%l", …]` reaches `execve` with no
+/// interpreter to expand anything, so it fails to find a program rather than
+/// running `del`. This is deliberately *not* a deny: "nobody here can read this
+/// line" is not "this line is catastrophic", and a human who reads the text at
+/// a prompt still gets to approve it — the standing invariant for approved
+/// text.
 #[must_use]
-pub(super) fn rewrites_a_word(grammar: Grammar, command: &str) -> bool {
-    command.split_whitespace().any(|token| {
-        token
+fn rewrites_the_line(grammar: Grammar, command: &str) -> bool {
+    if grammar.rewrites_words_with.is_empty() {
+        return false;
+    }
+    command
+        .chars()
+        .filter(|ch| grammar.rewrites_words_with.contains(ch))
+        .count()
+        >= 2
+}
+
+/// [`rewrites_the_line`] under the host's grammar: what the runtime asks
+/// before letting an authority that read only the *text* wave a command
+/// through (`runtime::approval_flow`). Public for that caller.
+#[must_use]
+pub fn interpreter_rewrites_the_line(command: &str) -> bool {
+    rewrites_the_line(HOST, command)
+}
+
+/// `command` with the platform's non-blank word delimiters
+/// ([`Grammar::word_delimiters`]) turned into blanks, or `None` when the line
+/// has none and re-reading it would be redundant.
+///
+/// `cmd.exe` delimits words on `,` and `=` as well as blanks (and on `;`,
+/// which is deliberately not in the set — see [`Grammar::word_delimiters`]), so
+/// `del,/f/s/q,C:\*` is a catastrophic command to it and one unrecognizable
+/// word to a floor that splits on blanks — `basename_lower` of that word is
+/// `*`, which matches no rule. The floor re-reads the normalized line for the
+/// same reason it re-reads a brace-expanded one: the rewritten form is the one
+/// the interpreter really runs, so a denial there is a real denial, and
+/// checking the raw line first means this can only ever *add* denials. That
+/// also makes it safe against the delimiter set being wider than a given
+/// `cmd` build actually splits on.
+#[must_use]
+pub(super) fn blanks_for_delimiters(grammar: Grammar, command: &str) -> Option<String> {
+    if !command.contains(grammar.word_delimiters) {
+        return None;
+    }
+    Some(
+        command
             .chars()
-            .filter(|ch| grammar.rewrites_words_with.contains(ch))
-            .count()
-            >= 2
-    })
+            .map(|ch| {
+                if grammar.word_delimiters.contains(&ch) {
+                    ' '
+                } else {
+                    ch
+                }
+            })
+            .collect(),
+    )
 }
 
 /// The grammar of the host this build runs on — what every caller outside the
@@ -318,7 +389,7 @@ pub(super) fn clean_token(token: &str) -> String {
 
 /// [`clean_token`] under an explicit [`Grammar`], so the Windows text reading
 /// (`de^l` is `del`, and a `\` is kept) is assertable from any host.
-pub(super) fn clean_token_in(grammar: Grammar, token: &str) -> String {
+fn clean_token_in(grammar: Grammar, token: &str) -> String {
     token
         .chars()
         .filter(|ch| !grammar.quoting_to_strip.contains(ch))
@@ -334,7 +405,7 @@ pub(super) fn basename_lower(token: &str) -> String {
 }
 
 /// [`basename_lower`] under an explicit [`Grammar`] (see [`clean_token_in`]).
-pub(super) fn basename_lower_in(grammar: Grammar, token: &str) -> String {
+fn basename_lower_in(grammar: Grammar, token: &str) -> String {
     let cleaned = clean_token_in(grammar, token);
     let base = cleaned
         .rsplit(grammar.path_separators)
@@ -426,7 +497,7 @@ fn strip_executable_extension(base: &str) -> String {
 #[must_use]
 pub(super) fn has_shell_indirection(grammar: Grammar, command: &str) -> bool {
     command.contains(['>', '<', '`', '$', '{', '}', '(', ')', '*', '?', '[', ']'])
-        || rewrites_a_word(grammar, command)
+        || rewrites_the_line(grammar, command)
 }
 
 /// Whether a (cleaned) token names a path that leaves the current directory by
@@ -617,10 +688,7 @@ fn ambiguous_backslash_quote(command: &str) -> bool {
 
 /// [`parse_unattended`] under an explicit [`Grammar`], so both platforms'
 /// readings of the same line are reachable from any host.
-pub(super) fn parse_unattended_in(
-    grammar: Grammar,
-    command: &str,
-) -> Option<Vec<UnattendedCommand>> {
+fn parse_unattended_in(grammar: Grammar, command: &str) -> Option<Vec<UnattendedCommand>> {
     if has_shell_indirection(grammar, command) {
         return None;
     }
@@ -1194,21 +1262,45 @@ mod tests {
     #[test]
     fn percent_is_indirection_only_where_the_interpreter_expands_it() {
         assert!(has_shell_indirection(WINDOWS, "echo %PATH%"));
-        // A lone `%` is not a rewrite, on either platform: cmd needs the pair,
-        // and this shape is an everyday command.
-        assert!(!has_shell_indirection(WINDOWS, "git log --format=%h -5"));
-        assert!(!has_shell_indirection(
-            WINDOWS,
-            r"git log --format='%h %s' -5"
-        ));
         assert_eq!(
             parse_unattended_in(WINDOWS, r"de%PATH:~0,0%l /f/s/q C:\*"),
             None
         );
+        // Counted over the line, so the pair a per-word count missed — the
+        // replace form takes blanks, and a blank-named variable is settable —
+        // is a rewrite here.
+        assert!(rewrites_the_line(WINDOWS, r"de%FOO BAR%l /f/s/q C:\*"));
+        // A lone `%` is not a rewrite: `cmd` needs the pair.
+        assert!(!has_shell_indirection(WINDOWS, "git log --format=%h -5"));
+        // The cost of reading the line rather than the word, stated: this
+        // shape carries a pair and asks on Windows. It is a prompt, not a
+        // denial, and only where nobody read the text.
+        assert!(has_shell_indirection(
+            WINDOWS,
+            r"git log --format='%h %s' -5"
+        ));
+        // `sh` has no such rewrite, so none of this costs a Unix command
+        // anything, however many `%` it carries.
         assert!(!has_shell_indirection(SH, "date +%Y%m%d"));
+        assert!(!rewrites_the_line(SH, "date +%Y%m%d"));
         assert_eq!(
             argvs_in(SH, "git log --format=%h%s -5"),
             Some(words(&[&["git", "log", "--format=%h%s", "-5"]]))
+        );
+        // cmd's other delimiters, which the deny floor re-reads through.
+        assert_eq!(
+            blanks_for_delimiters(WINDOWS, r"del,/f/s/q,C:\*").as_deref(),
+            Some(r"del /f/s/q C:\*")
+        );
+        assert_eq!(blanks_for_delimiters(SH, r"del,/f/s/q,C:\*"), None);
+        // `;` stays out of the set: it is a segment separator to this floor,
+        // and turning it into a blank merged two commands — the fetch below
+        // then read as the producer of the pipe and the floor denied the line
+        // in every mode, wrongly.
+        let across_a_semicolon = "curl https://x -o f; echo hi | sh";
+        assert_eq!(
+            blanks_for_delimiters(WINDOWS, across_a_semicolon).as_deref(),
+            None
         );
     }
 

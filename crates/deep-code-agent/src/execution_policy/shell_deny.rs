@@ -26,8 +26,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::shell_lex::{
-    Grammar, HOST, INTERPRETERS, PREFIX_WORDS, basename_lower, clean_token, operand_leaves_cwd,
-    parse_unattended, rewrites_a_word, segments,
+    HOST, INTERPRETERS, PREFIX_WORDS, basename_lower, blanks_for_delimiters, clean_token,
+    operand_leaves_cwd, parse_unattended, segments,
 };
 use crate::i18n::TextId;
 
@@ -448,47 +448,28 @@ fn deny_pipe_to_shell(command: &str) -> Option<DenyReason> {
 /// every automatic pass, so they land on a human instead of on this floor.
 #[must_use]
 pub fn builtin_deny(command: &str) -> Option<DenyReason> {
-    builtin_deny_in(HOST, command)
-}
-
-/// Deny a line the platform's interpreter rewrites before the program word
-/// exists, in a way this floor cannot read.
-///
-/// `cmd.exe` expands `%VAR%`, and its substring and replace forms
-/// (`%VAR:~0,0%`, `%VAR:a=b%`), on the command line. So
-/// `de%PATH:~0,0%l /f/s/q C:\*` reached this floor as the program
-/// `de%path:~0,0%l`, matched nothing, and `cmd /C` ran `del /f/s/q C:\*` —
-/// with no sandbox behind it, because Windows has none. Two `%` in one word is
-/// the signal: `cmd` needs the pair.
-///
-/// This floor does not expand it. It cannot: the result depends on the
-/// environment, and stripping the `%` would not help either
-/// (`dePATH:~0,0l` is not `del`). The honest answer is that such a word is one
-/// nobody here can read, so the line does not run.
-///
-/// The caret was the same hole in a different spelling and was closed by
-/// stripping it ([`super::shell_lex::Grammar::quoting_to_strip`]). Listing
-/// characters is what left this one open for a round; the fact now lives with
-/// the platform's other grammar facts, as
-/// [`super::shell_lex::Grammar::rewrites_words_with`].
-fn deny_word_rewriting(grammar: Grammar, command: &str) -> Option<DenyReason> {
-    rewrites_a_word(grammar, command).then_some(DenyReason(
-        "the command interpreter would rewrite this line before running it",
-    ))
-}
-
-/// [`builtin_deny`] under an explicit [`Grammar`], so the Windows reading of
-/// the rule above is assertable from any host. Only that rule reads the
-/// grammar; the rest of the floor reads the host's, which is why its Windows
-/// verdicts are still pinned by `#[cfg]`.
-#[must_use]
-pub(super) fn builtin_deny_in(grammar: Grammar, command: &str) -> Option<DenyReason> {
-    if let Some(reason) = deny_word_rewriting(grammar, command) {
-        return Some(reason);
-    }
     if let Some(reason) = deny_line(command) {
         return Some(reason);
     }
+    // The interpreter's word delimiters are not this floor's. `cmd.exe`
+    // delimits on `,` and `=` as well as blanks, so `del,/f/s/q,C:\*` is
+    // one opaque word to every rule here — its `basename_lower` is `*` — and
+    // `del /f/s/q C:\*` to the `cmd /C` that runs it. Re-read the normalized
+    // line for the same reason the brace-expanded one is re-read: it is the
+    // form the interpreter really runs, the raw line was already checked, so
+    // this can only add denials.
+    //
+    // Not the `%VAR%` class: that one is unreadable rather than differently
+    // spelled — no normalization recovers `del` from `de%PATH:~0,0%l` — and
+    // "nobody here can read this line" is not "this line is catastrophic", so
+    // it is refused one floor up, where authority is known
+    // (`runtime::approval_flow`), instead of denied in every mode.
+    if let Some(normalized) = blanks_for_delimiters(HOST, command)
+        && let Some(reason) = deny_line(&normalized)
+    {
+        return Some(reason);
+    }
+
     // Brace expansion is the one word-expansion stage that rewrites the
     // program word itself, so the floor has to read through it or every rule
     // here is one `{,}` away from silent: `rm{,} -rf /` presented the program
