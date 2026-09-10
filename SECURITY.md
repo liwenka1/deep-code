@@ -122,18 +122,22 @@ review to rediscover:
   commits, `npm` (`~/.npmrc`) and `codesign` (keychains) need them offline,
   so the read fence is the operand spelling above, not the kernel.
 - A command a human approved as text keeps every shell feature the human saw.
-- On Windows a line carrying two `%` is not waved through by any authority that
-  read only the text (`yolo`, the Auto judge, a config `auto_allow`): `cmd.exe`
-  expands `%VAR%`, `%VAR:~0,0%` and `%VAR:a=b%` on the command line, so
+- On Windows a *program word* carrying two `%` is denied: `cmd.exe` expands
+  `%VAR%`, `%VAR:~0,0%` and `%VAR:a=b%` on the command line, so
   `de%PATH:~0,0%l` is `del` by the time anything runs and no rule here can read
-  the word. Such a line is *asked*, not denied — a human who reads the text
-  still approves it, and the parse path runs an argv no interpreter expands.
-  cmd's other delimiters (`,`, `;`, `=`) share the root and take a different
-  fix: the deny floor re-reads the line with them turned into blanks, so
-  `del,/f/s/q,C:\*` is denied like the blank-spelled form. The `sh` equivalents
-  (`$VAR`, `` `…` ``, `$(…)`, globs) are not chased by the floor at all — they
-  are never auto-approved, and under `yolo` the containment is the OS sandbox,
-  which Windows does not have.
+  the word. A `%VAR%` *operand* is not denied — it is indirection, so the line
+  is never auto-approved and never a bounded edit, a prompt exactly like `$HOME`
+  on Unix. The split matters because this floor is mode-blind: denying the
+  operand form took `echo %PATH%` away from a human who explicitly approves it,
+  in every tier. Residual: a pair split across words (`%VAR:a=b%` accepts
+  blanks, and a blank-named variable is settable) is not read as one, and
+  `cmd` leaves an *undefined* `%X%` literal, so that spelling is inert until
+  something has defined the variable. cmd's other delimiters (`,`, `=`) share
+  the root and take a different fix: the deny floor re-reads the line with them
+  turned into blanks, so `del,/f/s/q,C:\*` is denied like the blank-spelled
+  form. The `sh` equivalents (`$VAR`, `` `…` ``, `$(…)`, globs) are not chased
+  by this floor at all — they are never auto-approved, and under `yolo` the
+  containment is the OS sandbox, which Windows does not have.
 - On Windows a line spelling a backslash immediately before a `"` never runs
   unattended: `CommandLineToArgvW` and `cmd.exe` read that backslash run
   differently, so the parser refuses instead of choosing. The usual casualty is
@@ -249,15 +253,18 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
 - 凭据目录对沙箱内命令可读:SSH 签名的 commit、`npm`(`~/.npmrc`)、`codesign`
   (钥匙串)在离线时也需要它们,所以读侧围栏是上面的操作数拼写,不是内核。
 - 人工按文本批准的命令保留人看到的全部 shell 特性。
-- Windows 上,一行里带两个 `%` 就不会被「只读过文本」的授权放行(`yolo`、Auto
-  判官、配置 `auto_allow`):`cmd.exe` 会在命令行上展开 `%VAR%`、`%VAR:~0,0%`、
-  `%VAR:a=b%`,所以 `de%PATH:~0,0%l` 真正执行时已经是 `del`,这里没有任何规则
-  读得懂那个词。这类行是**去问**,不是拒绝——人读过文本仍然可以批准,而 parse
-  那条路跑的是没有解释器去展开的 argv。cmd 的其它分隔符(`,`、`;`、`=`)同根
-  但另一种修法:deny floor 把它们换成空白后重读一遍,所以 `del,/f/s/q,C:\*`
-  和用空白写的一样被拒。`sh` 那侧的对应拼法(`$VAR`、`` `…` ``、`$(…)`、通配)
-  这层楼根本不追——它们永不自动放行,而 `yolo` 下的约束是 OS 沙箱,Windows 没有
-  那层沙箱。
+- Windows 上,**程序词**里带两个 `%` 会被拒:`cmd.exe` 在命令行上展开 `%VAR%`、
+  `%VAR:~0,0%`、`%VAR:a=b%`,所以 `de%PATH:~0,0%l` 真正执行时已经是 `del`,这里
+  没有任何规则读得懂那个词。`%VAR%` 出现在**操作数**上不拒——它是 indirection,
+  所以那行永不自动放行、也永不是有界编辑,和 Unix 上的 `$HOME` 一样只是一次提示。
+  这个区分很重要,因为这层楼是模式无关的:拒操作数那一版把 `echo %PATH%` 在所有
+  档位从人手里拿走了,连他明确批准也不行。残余:跨词的一对(`%VAR:a=b%` 允许空白,
+  带空白的变量名也设得出来)不会被读成一对;而 `cmd` 对**未定义**的 `%X%` 是原样
+  保留,所以那种拼法在有人先把变量定义出来之前是惰性的。cmd 的其它分隔符
+  (`,`、`=`)同根但另一种修法:deny floor 把它们换成空白后重读一遍,所以
+  `del,/f/s/q,C:\*` 和用空白写的一样被拒。`sh` 那侧的对应拼法(`$VAR`、
+  `` `…` ``、`$(…)`、通配)这层楼根本不追——它们永不自动放行,而 `yolo` 下的
+  约束是 OS 沙箱,Windows 没有那层沙箱。
 - Windows 上,一行里只要出现「反斜杠紧挨 `"`」就不会免审运行:
   `CommandLineToArgvW` 与 `cmd.exe` 对那串反斜杠的读法不同,解析器拒绝而不是
   替它选一个。代价最常见的是引号里以分隔符结尾的路径——`xcopy "src\" "dst\"`

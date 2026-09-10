@@ -157,31 +157,6 @@ impl AutoApproval {
     }
 }
 
-/// Whether an authority that read only the *text* of `call` may wave it
-/// through, or the call has to reach a human.
-///
-/// It may not when the platform's command interpreter would rewrite the line
-/// before the program word exists. `cmd.exe` expands `%VAR%` on the command
-/// line, so `de%PATH:~0,0%l /f/s/q C:\*` reaches it as `del /f/s/q C:\*` —
-/// and `Yolo`, the Auto judge and a config `auto_allow` all hand the raw text
-/// over (`RunAuthority::Approved`), on the one platform with no sandbox behind
-/// the deny floor.
-///
-/// Asking is the whole fix, and this is the floor it belongs on. The deny floor
-/// is mode-blind, so refusing there took `echo %PATH%` away from a human who
-/// explicitly approves it — which the approved-text invariant promises them —
-/// and "nobody here can read this line" is not "this line is catastrophic"
-/// anyway. The parse-authority layers need no check of their own:
-/// `has_shell_indirection` already refuses such a line, and an argv reaches
-/// `execve` with no interpreter to expand anything.
-///
-/// A call with no command text (`read_file`, a root grant) is not this
-/// question, and passes.
-fn text_authority_may_wave_through(call: &ToolCall) -> bool {
-    call.shell_command()
-        .is_none_or(|command| !crate::execution_policy::interpreter_rewrites_the_line(command))
-}
-
 impl AgentRuntime {
     /// Whether a gated call may run without asking, and on whose authority.
     /// Two independent layers:
@@ -210,11 +185,6 @@ impl AgentRuntime {
         // even Yolo prompts — Yolo's real containment is the OS sandbox, and
         // this call is precisely a request to widen that containment.
         if is_root_grant(&call.name) {
-            return None;
-        }
-        // See [`text_authority_may_wave_through`]: the layers below that read
-        // only the text must not get a line the interpreter rewrites first.
-        if !text_authority_may_wave_through(call) {
             return None;
         }
         // Layer 1: standing consent (config auto_allow + session memory).
@@ -753,29 +723,6 @@ mod tests {
             classifier_model_for(&cfg("deepseek-v9-experimental"), &reg),
             "deepseek-v9-experimental"
         );
-    }
-
-    /// The wiring of [`text_authority_may_wave_through`], from any host: the
-    /// gate says "ask" exactly where the host's interpreter would rewrite the
-    /// line. Which lines those are is a platform fact, pinned for both
-    /// grammars by `shell_lex::rewrites_the_line`.
-    #[test]
-    fn a_line_the_interpreter_rewrites_is_not_waved_through_by_text_authority() {
-        for command in ["echo %PATH%", r"de%PATH:~0,0%l /f/s/q C:\*"] {
-            assert_eq!(
-                text_authority_may_wave_through(&shell(command)),
-                !cfg!(windows),
-                "{command:?}"
-            );
-        }
-        // An ordinary line passes on every platform, and a call carrying no
-        // command text is not this question.
-        assert!(text_authority_may_wave_through(&shell("cargo build")));
-        assert!(text_authority_may_wave_through(&ToolCall {
-            id: "c1".to_string(),
-            name: "read_file".to_string(),
-            arguments: json!({ "path": "a.rs" }),
-        }));
     }
 
     fn shell(command: &str) -> ToolCall {

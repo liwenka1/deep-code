@@ -281,51 +281,50 @@ pub(super) const WINDOWS: Grammar = Grammar {
     word_delimiters: &[',', '='],
 };
 
-/// Whether the platform's command interpreter would rewrite this line before
-/// the program word exists.
+/// Whether the platform's interpreter would rewrite this *word* before the
+/// program word exists.
 ///
 /// `cmd.exe` expands `%VAR%`, and its substring and replace forms
 /// (`%VAR:~0,0%`, `%VAR:a=b%`), on the command line: `de%PATH:~0,0%l` is `del`
 /// by the time anything runs. The pair is the signal, because a lone `%` is an
 /// ordinary character to it.
 ///
-/// Counted over the whole line rather than per word, which is the difference
-/// between modeling `cmd` and modeling a guess about it: the replace form takes
-/// blanks (`%PATH:Program Files=X%` is valid), and a variable whose *name*
-/// carries a blank is settable (`setx "a b" …`, read by the next `cmd /C`), so
-/// `de%FOO BAR%l` splits into two words with one `%` each and a per-word count
-/// answers "no". The cost of the wider reading is a prompt on Windows for a
-/// line like `git log --format='%h %s'`, and only on the paths where nobody
-/// read the text.
+/// Per word, not per line, and the difference is not academic: the line
+/// `git log --format='%h %s' -5` carries two `%` in two different words, and
+/// reading the line as a whole made that everyday command — with `git log`
+/// default-trusted — ask on every Windows run. (It also turned an unguarded
+/// assertion in `engine::tests` red under the Windows grammar, which is how the
+/// cost was measured rather than argued.)
 ///
-/// Where this is load-bearing is the *text* path — a line handed to `cmd /C`
-/// by a layer that read only the text (`Yolo`, the Auto judge, a config
-/// `auto_allow`), which is why the runtime refuses to let those layers wave
-/// such a line through (`runtime::approval_flow`). On the parse path it is
-/// belt-and-braces: an argv of `["de%PATH:~0,0%l", …]` reaches `execve` with no
-/// interpreter to expand anything, so it fails to find a program rather than
-/// running `del`. This is deliberately *not* a deny: "nobody here can read this
-/// line" is not "this line is catastrophic", and a human who reads the text at
-/// a prompt still gets to approve it — the standing invariant for approved
-/// text.
+/// The residual the per-word reading leaves is a pair split by a blank, which
+/// `cmd` reaches only through a *defined* variable: `%VAR:a=b%` accepts blanks
+/// in the pattern, and a blank-named variable is settable (`setx "a b" …`).
+/// An **undefined** `%X%` is left literal by `cmd`, so the split-pair spelling
+/// is inert until someone has run the command that defines it — a command this
+/// floor reads on its own terms.
 #[must_use]
-fn rewrites_the_line(grammar: Grammar, command: &str) -> bool {
+pub(super) fn rewrites_a_word(grammar: Grammar, word: &str) -> bool {
     if grammar.rewrites_words_with.is_empty() {
         return false;
     }
-    command
-        .chars()
+    word.chars()
         .filter(|ch| grammar.rewrites_words_with.contains(ch))
         .count()
         >= 2
 }
 
-/// [`rewrites_the_line`] under the host's grammar: what the runtime asks
-/// before letting an authority that read only the *text* wave a command
-/// through (`runtime::approval_flow`). Public for that caller.
+/// Whether any word of `command` is one [`rewrites_a_word`] describes.
+///
+/// This is the trust side's question — such a line is never auto-approved and
+/// never a bounded edit, exactly as `$VAR` and `$(…)` are not on Unix
+/// ([`has_shell_indirection`] folds it in). The deny floor asks the narrower
+/// question about the *program word* alone, because "no rule here can read this
+/// word" is a reason to refuse the line only when the word decides what runs.
 #[must_use]
-pub fn interpreter_rewrites_the_line(command: &str) -> bool {
-    rewrites_the_line(HOST, command)
+pub(super) fn rewrites_a_word_of_the_line(grammar: Grammar, command: &str) -> bool {
+    command
+        .split_whitespace()
+        .any(|word| rewrites_a_word(grammar, word))
 }
 
 /// `command` with the platform's non-blank word delimiters
@@ -497,7 +496,7 @@ fn strip_executable_extension(base: &str) -> String {
 #[must_use]
 pub(super) fn has_shell_indirection(grammar: Grammar, command: &str) -> bool {
     command.contains(['>', '<', '`', '$', '{', '}', '(', ')', '*', '?', '[', ']'])
-        || rewrites_the_line(grammar, command)
+        || rewrites_a_word_of_the_line(grammar, command)
 }
 
 /// Whether a (cleaned) token names a path that leaves the current directory by
@@ -1266,23 +1265,21 @@ mod tests {
             parse_unattended_in(WINDOWS, r"de%PATH:~0,0%l /f/s/q C:\*"),
             None
         );
-        // Counted over the line, so the pair a per-word count missed — the
-        // replace form takes blanks, and a blank-named variable is settable —
-        // is a rewrite here.
-        assert!(rewrites_the_line(WINDOWS, r"de%FOO BAR%l /f/s/q C:\*"));
-        // A lone `%` is not a rewrite: `cmd` needs the pair.
-        assert!(!has_shell_indirection(WINDOWS, "git log --format=%h -5"));
-        // The cost of reading the line rather than the word, stated: this
-        // shape carries a pair and asks on Windows. It is a prompt, not a
-        // denial, and only where nobody read the text.
-        assert!(has_shell_indirection(
+        // Per word: this everyday command carries two `%` in two words and
+        // must stay readable — reading the line as a whole made `git log`,
+        // which is default-trusted, ask on every Windows run.
+        assert!(!has_shell_indirection(
             WINDOWS,
             r"git log --format='%h %s' -5"
         ));
+        assert!(!rewrites_a_word(WINDOWS, "--format='%h"));
+        assert!(rewrites_a_word(WINDOWS, "%PATH%"));
+        // A lone `%` is not a rewrite: `cmd` needs the pair.
+        assert!(!has_shell_indirection(WINDOWS, "git log --format=%h -5"));
         // `sh` has no such rewrite, so none of this costs a Unix command
         // anything, however many `%` it carries.
         assert!(!has_shell_indirection(SH, "date +%Y%m%d"));
-        assert!(!rewrites_the_line(SH, "date +%Y%m%d"));
+        assert!(!rewrites_a_word(SH, "%Y%m%d"));
         assert_eq!(
             argvs_in(SH, "git log --format=%h%s -5"),
             Some(words(&[&["git", "log", "--format=%h%s", "-5"]]))
@@ -1293,7 +1290,7 @@ mod tests {
             Some(r"del /f/s/q C:\*")
         );
         assert_eq!(blanks_for_delimiters(SH, r"del,/f/s/q,C:\*"), None);
-        // `;` stays out of the set: it is a segment separator to this floor,
+        // `;` stays out of that set: it is a segment separator to this floor,
         // and turning it into a blank merged two commands — the fetch below
         // then read as the producer of the pipe and the floor denied the line
         // in every mode, wrongly.

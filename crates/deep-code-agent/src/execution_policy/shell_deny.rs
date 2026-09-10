@@ -26,8 +26,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::shell_lex::{
-    HOST, INTERPRETERS, PREFIX_WORDS, basename_lower, blanks_for_delimiters, clean_token,
-    operand_leaves_cwd, parse_unattended, segments,
+    Grammar, HOST, INTERPRETERS, PREFIX_WORDS, basename_lower, blanks_for_delimiters, clean_token,
+    operand_leaves_cwd, parse_unattended, rewrites_a_word, segments,
 };
 use crate::i18n::TextId;
 
@@ -448,6 +448,9 @@ fn deny_pipe_to_shell(command: &str) -> Option<DenyReason> {
 /// every automatic pass, so they land on a human instead of on this floor.
 #[must_use]
 pub fn builtin_deny(command: &str) -> Option<DenyReason> {
+    if let Some(reason) = deny_unreadable_program(HOST, command) {
+        return Some(reason);
+    }
     if let Some(reason) = deny_line(command) {
         return Some(reason);
     }
@@ -492,6 +495,36 @@ pub fn builtin_deny(command: &str) -> Option<DenyReason> {
     (expanded != command)
         .then(|| deny_line(&expanded))
         .flatten()
+}
+
+/// Deny a segment whose *program word* the interpreter would rewrite before
+/// any rule here can read it.
+///
+/// `cmd.exe` expands `%VAR%` on the command line, so
+/// `de%PATH:~0,0%l /f/s/q C:\*` reached this floor as the program
+/// `de%path:~0,0%l`, matched nothing, and `cmd /C` ran `del /f/s/q C:\*` — on
+/// the one platform with no sandbox behind this floor. No normalization
+/// recovers `del` from that word: the expansion depends on the environment.
+/// What is left is to refuse a line whose program word nobody here can read.
+///
+/// Scoped to the program word on purpose, and the scope is the whole design.
+/// An earlier version of this rule refused *any* word carrying the pair, which
+/// took `echo %PATH%` and `dir %USERPROFILE%\Desktop` away from a human who
+/// explicitly approves them — in every mode, because this floor is mode-blind —
+/// and the harness's own Windows prompt tells the model to spell variables
+/// `%VAR%`. A `%VAR%` operand is a different question with a different answer:
+/// it is indirection, so the line is never auto-approved and never a bounded
+/// edit ([`super::shell_lex::has_shell_indirection`]), exactly as `$HOME` is
+/// on Unix — a prompt, not a denial.
+fn deny_unreadable_program(grammar: Grammar, command: &str) -> Option<DenyReason> {
+    segments(command)
+        .into_iter()
+        .any(|segment| {
+            program_of(segment).is_some_and(|program| rewrites_a_word(grammar, &program))
+        })
+        .then_some(DenyReason(
+            "the command interpreter would rewrite this program word before it runs",
+        ))
 }
 
 /// The deny rules for one concrete command line (no brace expansion).
