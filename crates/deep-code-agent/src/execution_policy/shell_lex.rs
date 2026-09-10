@@ -468,18 +468,35 @@ pub fn parse_unattended(command: &str) -> Option<Vec<UnattendedCommand>> {
     parse_unattended_in(HOST, command)
 }
 
-/// Whether the `\` just consumed sits immediately before a quote — the one
-/// spelling whose meaning Windows argument parsers disagree about.
+/// Whether the line spells a backslash immediately before a `"` — the one
+/// spelling Windows argument parsers disagree about, and so the one this
+/// parser refuses to read rather than guess at.
 ///
 /// `CommandLineToArgvW` counts the backslash run before a quote, so `\"` is a
-/// literal quote to the program while `\\"` is a backslash plus a real quote —
-/// and `cmd.exe` counts it differently again. This parser does not guess
-/// between them; refusing costs a prompt and keeps the two sides of the fence
-/// reading the same word. Only ever consulted where
-/// [`Grammar::backslash_escapes`] is false: under [`SH`] the escape arm has
-/// already claimed the backslash.
-fn backslash_hugs_a_quote(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
-    chars.peek().is_some_and(|next| matches!(next, '"' | '\''))
+/// literal quote to the program while `\\"` is a backslash plus a real quote,
+/// and `cmd.exe` counts it differently again. Refusing costs a prompt and
+/// keeps both sides of the fence reading the same word.
+///
+/// A property of the *line*, tested once, rather than of a parse position
+/// tested wherever a quote is consumed — and that is the whole point. The
+/// per-position version reached the top-level arm and the double-quote loop
+/// and missed the single-quote loop, so `echo 'a\'b'c'` was quietly read one
+/// of the two ways the doc said it would not choose between. A line-level test
+/// has no position for the next arm to dodge it from.
+///
+/// `'` is deliberately not here, though the per-position version refused it
+/// too: it is not special to `CommandLineToArgvW`, to `CreateProcess`, or to
+/// `cmd.exe`, so `\'` has exactly one Windows reading and refusing it only
+/// cost a prompt on ordinary text (`git commit -m "don\'t ship"`). Quote
+/// removal is this parser's own rule, applied the same way on both platforms
+/// whether or not a backslash precedes the quote.
+///
+/// Only consulted where [`Grammar::backslash_escapes`] is false. Under [`SH`]
+/// the escape arm claims the backslash first and the real shell agrees with it
+/// (`unattended_parse_matches_sh_word_splitting`), so `printf 'a\"b'` keeps
+/// working there.
+fn ambiguous_backslash_quote(command: &str) -> bool {
+    command.contains(r#"\""#)
 }
 
 /// [`parse_unattended`] under an explicit [`Grammar`], so both platforms'
@@ -489,6 +506,9 @@ pub(super) fn parse_unattended_in(
     command: &str,
 ) -> Option<Vec<UnattendedCommand>> {
     if has_shell_indirection(command) {
+        return None;
+    }
+    if !grammar.backslash_escapes && ambiguous_backslash_quote(command) {
         return None;
     }
     let mut commands: Vec<UnattendedCommand> = Vec::new();
@@ -507,7 +527,6 @@ pub(super) fn parse_unattended_in(
                 Some('\n') => {}
                 Some(next) => word.get_or_insert_with(String::new).push(next),
             },
-            '\\' if backslash_hugs_a_quote(&mut chars) => return None,
             '\'' => {
                 let w = word.get_or_insert_with(String::new);
                 loop {
@@ -533,7 +552,6 @@ pub(super) fn parse_unattended_in(
                                 w.push(other);
                             }
                         },
-                        Some('\\') if backslash_hugs_a_quote(&mut chars) => return None,
                         Some(ch) => w.push(ch),
                     }
                 }
@@ -958,10 +976,20 @@ mod tests {
             // disagree about, so it is refused rather than guessed at.
             (WINDOWS, "git commit -m \"say \\\"hi\\\" ok\"", None),
             (WINDOWS, r#"cd "C:\Users\me\""#, None),
-            (WINDOWS, r"echo \'x'", None),
-            (WINDOWS, r#"git commit -m "don\'t ship""#, None),
+            // `\'` is not one of them: `'` is not special to any Windows
+            // argument parser, so the backslash is just a backslash and the
+            // quote is removed the same way it is everywhere else.
+            (WINDOWS, r"echo \'x'", Some(&[&["echo", r"\x"]])),
+            (
+                WINDOWS,
+                r#"git commit -m "don\'t ship""#,
+                Some(&[&["git", "commit", "-m", r"don\'t ship"]]),
+            ),
             (WINDOWS, r"echo 'a\'b'c'", Some(&[&["echo", r"a\bc"]])),
-            (WINDOWS, r#"echo 'a\"b'"#, Some(&[&["echo", r#"a\"b"#]])),
+            // Refused for the same reason as the others, from the same one
+            // test: a `\"` inside `'…'` is where the per-arm version had no
+            // check at all.
+            (WINDOWS, r#"echo 'a\"b'"#, None),
         ];
         for &(grammar, line, expected) in cases {
             assert_eq!(
@@ -985,6 +1013,31 @@ mod tests {
             parse_unattended(r"git diff src\main.rs"),
             parse_unattended_in(HOST, r"git diff src\main.rs")
         );
+    }
+
+    /// Enumerated rather than sampled: wherever a `\"` lands in a line, the
+    /// Windows reading refuses that line. Sampling is exactly what shipped the
+    /// per-arm version with the single-quote arm missing — every example anyone
+    /// wrote happened to land outside `'…'`.
+    #[test]
+    fn windows_refuses_a_backslash_before_a_quote_wherever_it_lands() {
+        for base in [
+            "cargo test --features \"a b\"",
+            "git commit -m 'msg'",
+            r"git diff src\main.rs",
+            "echo done # note",
+            "cargo build && cargo test",
+        ] {
+            for (at, _) in base.char_indices() {
+                let line = format!("{}{}{}", &base[..at], r#"\""#, &base[at..]);
+                assert_eq!(
+                    parse_unattended_in(WINDOWS, &line),
+                    None,
+                    "{line:?} spells a backslash before a quote and must not run \
+                     unattended under the Windows grammar"
+                );
+            }
+        }
     }
 
     #[test]

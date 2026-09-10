@@ -122,6 +122,11 @@ review to rediscover:
   commits, `npm` (`~/.npmrc`) and `codesign` (keychains) need them offline,
   so the read fence is the operand spelling above, not the kernel.
 - A command a human approved as text keeps every shell feature the human saw.
+- On Windows a line spelling a backslash immediately before a `"` never runs
+  unattended: `CommandLineToArgvW` and `cmd.exe` read that backslash run
+  differently, so the parser refuses instead of choosing. The usual casualty is
+  a quoted path ending in a separator (`cd "C:\Users\me\"`), which costs a
+  prompt; the unquoted spelling runs.
 
 ## Disclosure
 
@@ -230,6 +235,10 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
 - 凭据目录对沙箱内命令可读:SSH 签名的 commit、`npm`(`~/.npmrc`)、`codesign`
   (钥匙串)在离线时也需要它们,所以读侧围栏是上面的操作数拼写,不是内核。
 - 人工按文本批准的命令保留人看到的全部 shell 特性。
+- Windows 上,一行里只要出现「反斜杠紧挨 `"`」就不会免审运行:
+  `CommandLineToArgvW` 与 `cmd.exe` 对那串反斜杠的读法不同,解析器拒绝而不是
+  替它选一个。代价最常见的是引号里以分隔符结尾的路径(`cd "C:\Users\me\"`)
+  ——那要一次提示;不带引号的写法照常跑。
 
 ## 披露
 
