@@ -204,16 +204,10 @@ fn redirects_execution(token: &str) -> bool {
         "-ok",
         "-okdir",
     ];
-    // `sh -c` / `cmd /C` strip shell quoting before the flag reaches the
-    // program, so `--con"fig"`, `'--config'` and (on Unix) `--config\` all run
-    // as `--config`. Match on the same de-quoted token the shell will, reusing
-    // the deny floor's stripper — the exact-string compare below otherwise
-    // missed every quoted/backslashed spelling, and an auto-trusted `cargo`/`git`
-    // executed an arbitrary program (`build.rustc-wrapper`, `--target-dir`,
-    // `git --output`) with no prompt at any permission tier.
-    let cleaned = super::shell_lex::clean_token(token);
-    let name = cleaned.split('=').next().unwrap_or(&cleaned);
-    REDIRECTING.contains(&name.to_ascii_lowercase().as_str())
+    // Read through the same one reader as every other flag test
+    // ([`flag_name`]): two spellings of "what is this flag called" is how the
+    // quoted forms stayed trusted once already.
+    REDIRECTING.contains(&flag_name(token).as_str())
 }
 
 /// The tokens that can still be flags: everything before a literal `--`.
@@ -457,11 +451,26 @@ fn rule_spells_out_word(rule: &str, token: &str) -> bool {
 /// stripped first (see [`redirects_execution`]) so a rule spelling out a
 /// redirecting flag still matches its quoted command-line spelling.
 fn flag_name(token: &str) -> String {
+    // `sh -c` / `cmd /C` strip shell quoting before the flag reaches the
+    // program, so `--con"fig"` and `'--config'` both run as `--config`. Match
+    // on the same de-quoted token, reusing the deny floor's stripper — the
+    // exact-string compare in the callers otherwise missed every quoted
+    // spelling, and an auto-trusted `cargo`/`git` executed an arbitrary program
+    // (`build.rustc-wrapper`, `--target-dir`, `git --output`) with no prompt at
+    // any permission tier.
+    //
+    // A trailing `\` is trimmed because `clean_token` keeps it on Windows,
+    // where it is a path character: `--config\` was not `--config` to this
+    // compare, so the line stayed trusted there (measured with `HOST` forced to
+    // `WINDOWS`) and the only thing left standing between it and an arbitrary
+    // program was cargo's own opinion of the word. A flag name never ends in a
+    // separator, so the fence does not have to rest on that.
     let cleaned = super::shell_lex::clean_token(token);
     cleaned
         .split('=')
         .next()
         .unwrap_or(&cleaned)
+        .trim_end_matches('\\')
         .to_ascii_lowercase()
 }
 
@@ -1026,29 +1035,29 @@ mod tests {
             identity_of_executed("cargo build --con\"fig\" build.rustc-wrapper=/tmp/x"),
             "cargo build"
         );
-        // Backslash-escaped on Unix: `--config\ ` splits to a token carrying the
-        // trailing backslash, which the shell would drop.
-        //
-        // Windows reads the same text differently and the line IS trusted
-        // there — the earlier note in this spot claimed the opposite and was
-        // wrong. What makes it harmless is one level down, and unlike the
-        // trust verdict that half is assertable from any host: the program
-        // receives `--config\`, which is not the redirecting flag, so it never
-        // forms and cargo rejects the word.
+        // A trailing backslash: `sh` drops it, Windows keeps it as a path
+        // character, and `flag_name` trims it on both — so the redirecting flag
+        // is recognized either way and the line is refused with no cfg gate.
+        // Until that trim it was *trusted* on Windows (measured with `HOST`
+        // forced to `WINDOWS`), with nothing between it and an arbitrary
+        // program but cargo's own opinion of the word `--config\`.
+        assert!(!covers(
+            "cargo build",
+            r"cargo build --config\ build.rustc-wrapper=/tmp/x"
+        ));
+        assert_eq!(flag_name(r"--config\"), "--config");
+        assert_eq!(flag_name(r"--target-dir\=/tmp"), "--target-dir");
+        // What the program receives is unchanged and still not the flag, which
+        // is why the fence had to be the thing that reads it.
         assert_eq!(
-            executed_words_in(WINDOWS, "cargo build --config\\ build.rustc-wrapper=/tmp/x")
+            executed_words_in(WINDOWS, r"cargo build --config\ build.rustc-wrapper=/tmp/x")
                 .as_deref(),
             Some(
-                ["cargo", "build", "--config\\", "build.rustc-wrapper=/tmp/x"]
+                ["cargo", "build", r"--config\", "build.rustc-wrapper=/tmp/x"]
                     .map(String::from)
                     .as_slice()
             )
         );
-        #[cfg(not(windows))]
-        assert!(!covers(
-            "cargo build",
-            "cargo build --config\\ build.rustc-wrapper=/tmp/x"
-        ));
         // A benign quoted *argument* (not a redirecting flag) must stay trusted,
         // or the fix would turn ordinary quoted commands into spurious prompts.
         assert!(covers("cargo build", "cargo build --features \"foo\""));

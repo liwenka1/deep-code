@@ -26,7 +26,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::shell_lex::{
-    Grammar, HOST, INTERPRETERS, PREFIX_WORDS, basename_lower, blanks_for_delimiters, clean_token,
+    Grammar, HOST, INTERPRETERS, PREFIX_WORDS, basename_lower, blanks_for, clean_token,
     operand_leaves_cwd, parse_unattended, rewrites_a_word, segments,
 };
 use crate::i18n::TextId;
@@ -467,8 +467,21 @@ pub fn builtin_deny(command: &str) -> Option<DenyReason> {
     // "nobody here can read this line" is not "this line is catastrophic", so
     // it is refused one floor up, where authority is known
     // (`runtime::approval_flow`), instead of denied in every mode.
-    if let Some(normalized) = blanks_for_delimiters(HOST, command)
+    if let Some(normalized) = blanks_for(HOST.word_delimiters, command)
         && let Some(reason) = deny_line(&normalized)
+    {
+        return Some(reason);
+    }
+    // `;` is one of cmd's delimiters too, and it needs the narrower re-read:
+    // this floor reads `;` as a segment separator, so normalizing it across the
+    // whole line merges two commands and invents denials —
+    // `curl https://x -o f; echo hi | sh` read as a fetch feeding the pipe and
+    // was denied in every mode, wrongly. The per-segment rules cannot make that
+    // mistake, because they never look across a `|`, so `del;/f/s/q;C:\*` —
+    // which `segments` otherwise chopped into argument-less pieces that matched
+    // nothing — is denied without touching the pipe reading.
+    if let Some(normalized) = blanks_for(HOST.separator_delimiters, command)
+        && let Some(reason) = segments(&normalized).into_iter().find_map(deny_segment)
     {
         return Some(reason);
     }
@@ -748,6 +761,26 @@ pub fn safety_notes(command: &str) -> Vec<SafetyNote> {
             TextId::SafetyRedirectSuggestion,
         );
     }
+    note_segments_of(command, &mut notes);
+    // The interpreter's delimiters are not this function's either, and these
+    // notes are the last thing between a human and "approve":
+    // `del,/f/s/q,C:\Users\me\Documents` is one opaque word here (its
+    // basename is `documents`), so it drew no delete note and no
+    // outside-the-cwd note while `cmd /C` ran a recursive force delete of a
+    // home directory. Re-read the normalized line for the same reason the
+    // denials do — `note` dedups, so nothing doubles — and both sets, because
+    // a `;` line's segments are this function's business too.
+    for delimiters in [HOST.word_delimiters, HOST.separator_delimiters] {
+        if let Some(normalized) = blanks_for(delimiters, command) {
+            note_segments_of(&normalized, &mut notes);
+        }
+    }
+    notes.notes
+}
+
+/// The per-segment half of [`safety_notes`], so the same reading can be run
+/// over a normalized copy of the line.
+fn note_segments_of(command: &str, notes: &mut SafetyNotes) {
     for segment in segments(command) {
         let Some(program) = program_of(segment) else {
             continue;
@@ -797,7 +830,6 @@ pub fn safety_notes(command: &str) -> Vec<SafetyNote> {
             _ => {}
         }
     }
-    notes.notes
 }
 
 /// cc-style `acceptEdits` allowlist for shell/job commands: a bounded

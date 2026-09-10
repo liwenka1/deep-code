@@ -78,7 +78,82 @@ fn a_rewritten_program_word_is_denied_and_an_operand_is_not() {
     );
 }
 
-/// `cmd.exe` delimits words on `,`, `;` and `=` as well as blanks, so a
+/// `;` is one of cmd's delimiters too, so `del;/f/s/q;C:\*` is a catastrophic
+/// command to it — while `segments` chops it into argument-less pieces that
+/// match nothing. It gets the narrower re-read: only the per-segment rules,
+/// which never look across a `|`, so the pipe reading that a whole-line
+/// normalization broke (`curl https://x -o f; echo hi | sh`, denied in every
+/// mode, wrongly) stays intact.
+#[test]
+fn a_semicolon_spelled_command_is_denied_through_the_segment_rules() {
+    use super::super::shell_lex::{WINDOWS, blanks_for};
+    // `C:\*` survives the host's own reading of the rest of the line;
+    // `C:\Windows` does not (a Unix `clean_token` drops the backslash, leaving
+    // the relative `C:Windows`), so that one is asserted in the Windows arm.
+    let command = r"del;/f/s/q;C:\*";
+    let normalized = blanks_for(WINDOWS.separator_delimiters, command)
+        .expect("the line carries cmd's separator delimiter");
+    assert!(
+        segments(&normalized)
+            .into_iter()
+            .find_map(deny_segment)
+            .is_some(),
+        "{command:?} normalizes to {normalized:?}, which the segment rules must deny"
+    );
+    // The case a whole-line normalization got wrong: the fetch is not the
+    // producer of the pipe, and reading only the segment rules keeps it that
+    // way — nothing here denies it.
+    let across = "curl https://x -o f; echo hi | sh";
+    let normalized = blanks_for(WINDOWS.separator_delimiters, across).expect("carries `;`");
+    assert!(
+        segments(&normalized)
+            .into_iter()
+            .find_map(deny_segment)
+            .is_none(),
+        "the segment rules must not invent a denial for {across:?}"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn semicolon_and_comma_spellings_cannot_dodge_deny() {
+    for command in [
+        r"del;/f/s/q;C:\*",
+        r"rd;/s;/q;C:\Windows",
+        r"del,/f/s/q,C:\*",
+        r"rd,/s,/q,C:\Windows",
+        "format,C:",
+    ] {
+        assert!(denied(command), "{command:?} is a wipe to cmd.exe");
+    }
+    // And the pipe reading is intact.
+    assert!(!denied("curl https://x -o f; echo hi | sh"));
+}
+
+/// The notes are the last thing between a human and "approve", so they read
+/// what the interpreter reads: a comma-spelled `del` drew none at all — one
+/// opaque word whose basename is `documents` — while `cmd /C` ran a recursive
+/// force delete of a home directory.
+///
+/// The normalization is a platform fact (pinned for both grammars in
+/// `shell_lex`); what is pinned here is that the normalized line draws notes.
+/// `safety_notes` itself reads `HOST`, so the end-to-end arm is Windows-only.
+#[test]
+fn the_normalized_form_of_a_comma_spelled_command_draws_its_safety_notes() {
+    use super::super::shell_lex::{WINDOWS, blanks_for};
+    let spelled = r"del,/f/s/q,C:\Users\me\Documents";
+    let normalized = blanks_for(WINDOWS.word_delimiters, spelled).expect("carries `,`");
+    let mut notes = super::SafetyNotes::default();
+    super::note_segments_of(&normalized, &mut notes);
+    assert!(
+        !notes.notes.is_empty(),
+        "{normalized:?} must draw the notes the raw spelling could not"
+    );
+    #[cfg(windows)]
+    assert_eq!(super::safety_notes(spelled).len(), notes.notes.len());
+}
+
+/// `cmd.exe` delimits words on `,`, `;` and `=` as well as blanks, so a/// `cmd.exe` delimits words on `,`, `;` and `=` as well as blanks, so a
 /// catastrophic command spelled with commas was one opaque word to every rule
 /// here — `basename_lower` of `del,/f/s/q,C:\*` is `*` — and
 /// `del /f/s/q C:\*` to the `cmd /C` that ran it. The floor re-reads the
@@ -92,22 +167,22 @@ fn a_rewritten_program_word_is_denied_and_an_operand_is_not() {
 /// end-to-end arm is `#[cfg(windows)]` for that reason.
 #[test]
 fn the_normalized_form_of_a_comma_spelled_command_is_denied() {
-    use super::super::shell_lex::{WINDOWS, blanks_for_delimiters};
+    use super::super::shell_lex::{WINDOWS, blanks_for};
     // These three survive the host's own reading of the rest of the line.
     // `rd,/s,/q,C:\Windows` does not — a Unix `clean_token` drops the
     // backslash, leaving the relative `C:Windows`, which is not catastrophic —
     // so it is asserted in the Windows arm below instead of here for a reason
     // that would not hold there.
     for command in [r"del,/f/s/q,C:\*", r"del=/f/s/q,C:\*", "format,C:"] {
-        let normalized =
-            blanks_for_delimiters(WINDOWS, command).expect("the line carries cmd's delimiters");
+        let normalized = blanks_for(WINDOWS.word_delimiters, command)
+            .expect("the line carries cmd's delimiters");
         assert!(
             deny_line(&normalized).is_some(),
             "{command:?} normalizes to {normalized:?}, which the floor must deny"
         );
     }
     // A line without them is left alone rather than re-read.
-    assert!(blanks_for_delimiters(WINDOWS, r"del /f/s/q C:\*").is_none());
+    assert!(blanks_for(WINDOWS.word_delimiters, r"del /f/s/q C:\*").is_none());
 }
 
 #[test]

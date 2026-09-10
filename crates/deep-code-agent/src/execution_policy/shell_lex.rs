@@ -257,6 +257,24 @@ pub(super) struct Grammar {
     /// splits into argument-less pieces); a special case for it would cost more
     /// than it closes.
     pub(super) word_delimiters: &'static [char],
+    /// Delimiters this module reads as *segment separators* rather than word
+    /// separators, so they can only be normalized for the rules that work one
+    /// segment at a time.
+    ///
+    /// `;` for `cmd.exe`: it delimits words there, but [`segments`] splits on
+    /// it, so turning it into a blank across the whole line merges two commands
+    /// — measured, `curl https://x -o f; echo hi | sh` then read as a fetch
+    /// feeding the pipe and was denied in every mode, wrongly. The segment
+    /// rules cannot make that mistake: they never look across a `|`.
+    pub(super) separator_delimiters: &'static [char],
+    /// Whether a word opening with `#` comments out the rest of the line.
+    ///
+    /// It does in `sh`. `cmd.exe` has no comment syntax at all, and `#` is a
+    /// legal filename character there, so reading it as one silently deleted
+    /// operands from the argv the executor runs: `git log --grep #123` parsed
+    /// to `["git", "log", "--grep"]` — trusted, because `git log` is — and
+    /// `type #notes.md` to `["type"]`.
+    pub(super) comments_with_hash: bool,
 }
 
 /// The grammar of `sh`, which is how an unattended command's words are read on
@@ -269,6 +287,8 @@ pub(super) const SH: Grammar = Grammar {
     quoting_to_strip: &['\'', '"', '\\'],
     rewrites_words_with: &[],
     word_delimiters: &[],
+    separator_delimiters: &[],
+    comments_with_hash: true,
 };
 
 /// The Windows grammar: `\` is a path separator rather than an escape, both
@@ -279,6 +299,8 @@ pub(super) const WINDOWS: Grammar = Grammar {
     quoting_to_strip: &['\'', '"', '^'],
     rewrites_words_with: &['%'],
     word_delimiters: &[',', '='],
+    separator_delimiters: &[';'],
+    comments_with_hash: false,
 };
 
 /// Whether the platform's interpreter would rewrite this *word* before the
@@ -327,35 +349,31 @@ pub(super) fn rewrites_a_word_of_the_line(grammar: Grammar, command: &str) -> bo
         .any(|word| rewrites_a_word(grammar, word))
 }
 
-/// `command` with the platform's non-blank word delimiters
-/// ([`Grammar::word_delimiters`]) turned into blanks, or `None` when the line
-/// has none and re-reading it would be redundant.
+/// `command` with each of `delimiters` turned into a blank, or `None` when it
+/// carries none of them and re-reading it would be redundant.
 ///
-/// `cmd.exe` delimits words on `,` and `=` as well as blanks (and on `;`,
-/// which is deliberately not in the set — see [`Grammar::word_delimiters`]), so
+/// `cmd.exe` delimits words on `,`, `;` and `=` as well as blanks, so
 /// `del,/f/s/q,C:\*` is a catastrophic command to it and one unrecognizable
 /// word to a floor that splits on blanks — `basename_lower` of that word is
-/// `*`, which matches no rule. The floor re-reads the normalized line for the
-/// same reason it re-reads a brace-expanded one: the rewritten form is the one
-/// the interpreter really runs, so a denial there is a real denial, and
-/// checking the raw line first means this can only ever *add* denials. That
-/// also makes it safe against the delimiter set being wider than a given
-/// `cmd` build actually splits on.
+/// `*`, which matches no rule. Callers pass the set they can safely normalize:
+/// [`Grammar::word_delimiters`] for a whole-line re-read,
+/// [`Grammar::separator_delimiters`] for one that only feeds the per-segment
+/// rules.
+///
+/// A caller re-reads for the same reason the deny floor re-reads a
+/// brace-expanded line: the rewritten form is the one the interpreter really
+/// runs, the raw line has already been checked, so this can only ever *add*
+/// findings. That also makes it safe against the delimiter set being wider
+/// than a given `cmd` build actually splits on.
 #[must_use]
-pub(super) fn blanks_for_delimiters(grammar: Grammar, command: &str) -> Option<String> {
-    if !command.contains(grammar.word_delimiters) {
+pub(super) fn blanks_for(delimiters: &[char], command: &str) -> Option<String> {
+    if !command.contains(delimiters) {
         return None;
     }
     Some(
         command
             .chars()
-            .map(|ch| {
-                if grammar.word_delimiters.contains(&ch) {
-                    ' '
-                } else {
-                    ch
-                }
-            })
+            .map(|ch| if delimiters.contains(&ch) { ' ' } else { ch })
             .collect(),
     )
 }
@@ -777,7 +795,7 @@ fn parse_unattended_in(grammar: Grammar, command: &str) -> Option<Vec<Unattended
                 gate = RunIf::PreviousSucceeded;
             }
             '|' => return None,
-            '#' if word.is_none() => {
+            '#' if grammar.comments_with_hash && word.is_none() => {
                 while chars.peek().is_some_and(|next| *next != '\n') {
                     chars.next();
                 }
@@ -1255,6 +1273,39 @@ mod tests {
         );
     }
 
+    /// `#` opens a comment in `sh`. `cmd.exe` has no comment syntax and `#` is
+    /// a legal filename character there, so reading it as one deleted operands
+    /// from the argv the executor runs — on a line the gate had already
+    /// trusted, because the program word was still `git log`.
+    #[test]
+    fn hash_opens_a_comment_only_where_the_interpreter_has_comments() {
+        assert_eq!(
+            argvs_in(SH, "cargo build # not run"),
+            Some(words(&[&["cargo", "build"]]))
+        );
+        assert_eq!(
+            argvs_in(WINDOWS, "cargo build # not run"),
+            Some(words(&[&["cargo", "build", "#", "not", "run"]]))
+        );
+        assert_eq!(
+            argvs_in(WINDOWS, "git log --grep #123"),
+            Some(words(&[&["git", "log", "--grep", "#123"]]))
+        );
+        assert_eq!(
+            argvs_in(WINDOWS, "type #notes.md"),
+            Some(words(&[&["type", "#notes.md"]]))
+        );
+        // Glued to a word it is an ordinary character on both.
+        assert_eq!(
+            argvs_in(SH, "cargo build#x"),
+            Some(words(&[&["cargo", "build#x"]]))
+        );
+        assert_eq!(
+            argvs_in(WINDOWS, "cargo build#x"),
+            Some(words(&[&["cargo", "build#x"]]))
+        );
+    }
+
     /// `%` is how `cmd.exe` rewrites a line, so it is indirection under
     /// [`WINDOWS`] and an ordinary character under [`SH`] — where two of them
     /// in one word is an everyday command and refusing it would buy nothing.
@@ -1286,17 +1337,17 @@ mod tests {
         );
         // cmd's other delimiters, which the deny floor re-reads through.
         assert_eq!(
-            blanks_for_delimiters(WINDOWS, r"del,/f/s/q,C:\*").as_deref(),
+            blanks_for(WINDOWS.word_delimiters, r"del,/f/s/q,C:\*").as_deref(),
             Some(r"del /f/s/q C:\*")
         );
-        assert_eq!(blanks_for_delimiters(SH, r"del,/f/s/q,C:\*"), None);
+        assert_eq!(blanks_for(SH.word_delimiters, r"del,/f/s/q,C:\*"), None);
         // `;` stays out of that set: it is a segment separator to this floor,
         // and turning it into a blank merged two commands — the fetch below
         // then read as the producer of the pipe and the floor denied the line
         // in every mode, wrongly.
         let across_a_semicolon = "curl https://x -o f; echo hi | sh";
         assert_eq!(
-            blanks_for_delimiters(WINDOWS, across_a_semicolon).as_deref(),
+            blanks_for(WINDOWS.word_delimiters, across_a_semicolon).as_deref(),
             None
         );
     }
@@ -1342,10 +1393,12 @@ mod tests {
             argvs("printf '%s\\n' \"a\\tb\""),
             words(&[&["printf", "%s\\n", "a\\tb"]])
         );
-        // `#` opens a comment only at the start of a word.
+        // `#` opens a comment only at the start of a word — and only where the
+        // interpreter has comments at all, see
+        // `hash_opens_a_comment_only_where_the_interpreter_has_comments`.
         assert_eq!(
-            argvs("cargo build # not run"),
-            words(&[&["cargo", "build"]])
+            argvs_in(SH, "cargo build # not run"),
+            Some(words(&[&["cargo", "build"]]))
         );
         assert_eq!(argvs("cargo build#x"), words(&[&["cargo", "build#x"]]));
         // Blank lines are nothing.
