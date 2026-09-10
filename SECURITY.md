@@ -132,10 +132,12 @@ review to rediscover:
   in every tier. Residual: a pair split across words (`%VAR:a=b%` accepts
   blanks, and a blank-named variable is settable) is not read as one, and
   `cmd` leaves an *undefined* `%X%` literal, so that spelling is inert until
-  something has defined the variable. cmd's other delimiters (`,`, `=`) share
-  the root and take a different fix: the deny floor re-reads the line with them
+  something has defined the variable. cmd's other delimiters share the root and
+  take a different fix: the deny floor re-reads the line with `,` and `=`
   turned into blanks, so `del,/f/s/q,C:\*` is denied like the blank-spelled
-  form. The `sh` equivalents (`$VAR`, `` `…` ``, `$(…)`, globs) are not chased
+  form, and re-reads it once more with `;` turned into blanks through the
+  per-segment rules only — a whole-line `;` normalization merges two commands
+  and invented a denial for `curl https://x -o f; echo hi | sh`. The `sh` equivalents (`$VAR`, `` `…` ``, `$(…)`, globs) are not chased
   by this floor at all — they are never auto-approved, and under `yolo` the
   containment is the OS sandbox, which Windows does not have.
 - On Windows a line spelling a backslash immediately before a `"` never runs
@@ -260,9 +262,10 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
   这个区分很重要,因为这层楼是模式无关的:拒操作数那一版把 `echo %PATH%` 在所有
   档位从人手里拿走了,连他明确批准也不行。残余:跨词的一对(`%VAR:a=b%` 允许空白,
   带空白的变量名也设得出来)不会被读成一对;而 `cmd` 对**未定义**的 `%X%` 是原样
-  保留,所以那种拼法在有人先把变量定义出来之前是惰性的。cmd 的其它分隔符
-  (`,`、`=`)同根但另一种修法:deny floor 把它们换成空白后重读一遍,所以
-  `del,/f/s/q,C:\*` 和用空白写的一样被拒。`sh` 那侧的对应拼法(`$VAR`、
+  保留,所以那种拼法在有人先把变量定义出来之前是惰性的。cmd 的其它分隔符同根但另一种修法:deny floor
+  把 `,` 与 `=` 换成空白后重读一遍,所以 `del,/f/s/q,C:\*` 和用空白写的一样被
+  拒;`;` 再单独重读一次,但只喂 per-segment 规则——整行换掉 `;` 会把两个命令
+  合成一个,曾经让 `curl https://x -o f; echo hi | sh` 被误拒。`sh` 那侧的对应拼法(`$VAR`、
   `` `…` ``、`$(…)`、通配)这层楼根本不追——它们永不自动放行,而 `yolo` 下的
   约束是 OS 沙箱,Windows 没有那层沙箱。
 - Windows 上,一行里只要出现「反斜杠紧挨 `"`」就不会免审运行:

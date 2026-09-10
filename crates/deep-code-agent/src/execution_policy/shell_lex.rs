@@ -365,6 +365,14 @@ pub(super) fn rewrites_a_word_of_the_line(grammar: Grammar, command: &str) -> bo
 /// runs, the raw line has already been checked, so this can only ever *add*
 /// findings. That also makes it safe against the delimiter set being wider
 /// than a given `cmd` build actually splits on.
+///
+/// The cost of a re-read is one allocation and one more pass over the line,
+/// paid on any Windows line carrying a `,` or an `=` — which is most of them,
+/// `--flag=value` being what it is. It is left as is on purpose: `sh`'s set is
+/// empty, so `contains` answers `None` before allocating anything and Unix pays
+/// nothing, and on Windows the caller is about to spawn a process. Narrowing it
+/// to "a delimiter glued between two non-blanks" would not help either —
+/// `--flag=value` is exactly that shape.
 #[must_use]
 pub(super) fn blanks_for(delimiters: &[char], command: &str) -> Option<String> {
     if !command.contains(delimiters) {
@@ -1234,8 +1242,14 @@ mod tests {
             "cargo build && cargo test",
         ] {
             // `0..=len`, not `char_indices()`: the end of the line is a
-            // landing position too, and the only one where the inserted quote
-            // is unterminated — a different early return than the rest.
+            // landing position too, and `char_indices()` never yields it.
+            //
+            // What the enumeration buys is position-independence and nothing
+            // more — the check is a `contains` over the whole line, so it
+            // cannot depend on where the spelling lands, and any line-level
+            // implementation passes this. It is a guard against the *shape*
+            // the per-arm version had, not a description of the refusal set;
+            // which spellings are refused is the table above.
             for at in (0..=base.len()).filter(|at| base.is_char_boundary(*at)) {
                 let line = format!("{}{}{}", &base[..at], r#"\""#, &base[at..]);
                 assert_eq!(

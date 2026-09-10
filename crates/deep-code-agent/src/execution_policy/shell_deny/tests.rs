@@ -153,7 +153,8 @@ fn the_normalized_form_of_a_comma_spelled_command_draws_its_safety_notes() {
     assert_eq!(super::safety_notes(spelled).len(), notes.notes.len());
 }
 
-/// `cmd.exe` delimits words on `,`, `;` and `=` as well as blanks, so a/// `cmd.exe` delimits words on `,`, `;` and `=` as well as blanks, so a
+/// `cmd.exe` delimits words on `,` and `=` as well as blanks (`;` gets the
+/// narrower re-read above), so a
 /// catastrophic command spelled with commas was one opaque word to every rule
 /// here — `basename_lower` of `del,/f/s/q,C:\*` is `*` — and
 /// `del /f/s/q C:\*` to the `cmd /C` that ran it. The floor re-reads the
@@ -161,10 +162,12 @@ fn the_normalized_form_of_a_comma_spelled_command_draws_its_safety_notes() {
 ///
 /// The normalization itself is a platform fact and is pinned for both grammars
 /// in `shell_lex` (`percent_is_indirection_only_where_the_interpreter_expands_it`).
-/// What this test adds is that the floor denies the normalized form; it reads
-/// the host's grammar for everything else, so on a Unix host the *branch* that
-/// fires can differ from the Windows one while the verdict does not. The
-/// end-to-end arm is `#[cfg(windows)]` for that reason.
+/// What this test adds is that the floor denies the normalized form — and only
+/// that: `deny_line` reads the host's grammar for everything else, so on a Unix
+/// host the *branch* that fires differs from the Windows one (`C:\*` cleans to
+/// `c:*` and trips the all-wildcard rule rather than the drive-root one) while
+/// the verdict does not. That is why the cases here are the ones whose verdict
+/// survives both readings, and why the end-to-end arm is `#[cfg(windows)]`.
 #[test]
 fn the_normalized_form_of_a_comma_spelled_command_is_denied() {
     use super::super::shell_lex::{WINDOWS, blanks_for};
