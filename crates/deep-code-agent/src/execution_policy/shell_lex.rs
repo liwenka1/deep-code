@@ -150,12 +150,87 @@ pub(super) fn runs_the_rest_of_the_line(program: &str) -> bool {
     PREFIX_WORDS.contains(&program) || INTERPRETERS.contains(&program)
 }
 
+/// What this module has to know about the argument grammar of the platform an
+/// unattended command is read by: whether `\` escapes, what separates path
+/// components, and what the *text* reading deletes.
+///
+/// One value, not a `cfg!(windows)` at each site. Each platform question so far
+/// was answered locally where it came up, and the answers drifted apart: the
+/// escape question reached the top-level backslash arm and the double-quote
+/// loop but not the single-quote loop, so the one spelling the parser claims to
+/// refuse was read two different ways depending on which quote consumed it.
+/// A value is also reachable by name, so both readings are pinned by a table
+/// that runs on macOS, Linux and Windows alike instead of by `#[cfg]` blocks
+/// that only ever execute on the platform they describe — every round of "green
+/// here, red on Windows CI" was a `cfg` block nobody could run.
+///
+/// Two things are deliberately *not* in here. Which characters quote a word:
+/// both grammars quote with `'` and `"`, which is this parser's own choice
+/// rather than a platform fact (`cmd.exe` has no `'`), and it can be, because
+/// the words this parser produces *are* the argv the executor hands to the OS —
+/// its reading is the one that runs, and one reading for both platforms is what
+/// lets the fences above it be written once. And
+/// [`escapes_cwd_by_spelling`], which stays platform-blind one level up for a
+/// different reason: that fence may only ever over-refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Grammar {
+    /// Whether `\` escapes the character after it (and a `\`-newline continues
+    /// the line).
+    ///
+    /// It does in `sh`. It does not on Windows, where it is the path separator
+    /// and `CreateProcess` — which is what an unattended command reaches, with
+    /// no `cmd.exe` in between — never had a backslash escape. Reading it as an
+    /// escape there silently ate every ordinary path spelling: `git diff
+    /// src\main.rs` ran as `git diff srcmain.rs` on the default-trusted `git
+    /// diff`, and `.\.` collapsed to `..`, which is a *different directory*
+    /// than the operand fence read.
+    pub(super) backslash_escapes: bool,
+    /// What separates path components for [`basename_lower`], so `/usr/bin/sudo`,
+    /// `'sudo'` and `C:\Windows\System32\reg.exe` all resolve to the program
+    /// word a rule names.
+    pub(super) path_separators: &'static [char],
+    /// What the *text* reading ([`clean_token`]) deletes: the quote characters,
+    /// plus the platform's escape character.
+    ///
+    /// That is `\` on Unix (a backslash escapes the next char, so `\-rf` runs
+    /// as `-rf` and `\/tmp` as `/tmp`) and `^` on Windows — cmd.exe's escape
+    /// character, the exact counterpart. Without stripping the caret, one of
+    /// them walked past every rule on the deny floor (`r^d /s /q C:\Windows`,
+    /// `de^l /f/s/q C:\*`, `curl x | powershe^ll`) while `cmd /C` ran the real
+    /// thing, and Windows is the one platform with no sandbox behind that
+    /// floor. A Windows `\` is not stripped: there it is a genuine path
+    /// separator, not quoting.
+    pub(super) quoting_to_strip: &'static [char],
+}
+
+/// The grammar of `sh`, which is how an unattended command's words are read on
+/// Unix: the executor runs the argv directly, but every fence above it was
+/// written against `sh`, and `unattended_parse_matches_sh_word_splitting` holds
+/// the two together against the real shell.
+pub(super) const SH: Grammar = Grammar {
+    backslash_escapes: true,
+    path_separators: &['/'],
+    quoting_to_strip: &['\'', '"', '\\'],
+};
+
+/// The Windows grammar: `\` is a path separator rather than an escape, both
+/// separators are real, and the escape character to strip is cmd.exe's `^`.
+pub(super) const WINDOWS: Grammar = Grammar {
+    backslash_escapes: false,
+    path_separators: &['/', '\\'],
+    quoting_to_strip: &['\'', '"', '^'],
+};
+
+/// The grammar of the host this build runs on — what every caller outside the
+/// tests wants. The tests reach for [`SH`] and [`WINDOWS`] by name instead, so
+/// both readings are pinned from any host.
+pub(super) const HOST: Grammar = if cfg!(windows) { WINDOWS } else { SH };
+
 /// Remove shell quoting from a single token so a deny/bounds check inspects
 /// what `sh -c` will actually execute — not the raw, still-quoted text. Strips
 /// every `'` and `"` (the shell removes quotes anywhere in a word, so `r""m`
-/// runs as `rm` and `'-rf'` as `-rf`) and, on Unix, every `\` (a backslash
-/// escapes the next char, so `\-rf` runs as `-rf` and `\/tmp` as `/tmp`). On
-/// Windows `\` is a genuine path separator and is kept.
+/// runs as `rm` and `'-rf'` as `-rf`) plus the host's escape character; which
+/// characters those are is [`Grammar::quoting_to_strip`].
 ///
 /// This is a deliberate safety over-approximation: dropping these characters
 /// can only *expose* a dangerous flag or path, never hide one, so it can never
@@ -169,27 +244,20 @@ pub(super) fn runs_the_rest_of_the_line(program: &str) -> bool {
 /// floor does, or a quoted redirecting flag (`--con"fig"`) that the shell runs
 /// as `--config` rides a trusted identity the deny floor would have cleaned.
 pub(super) fn clean_token(token: &str) -> String {
-    let strip: &[char] = if cfg!(windows) {
-        // `^` is cmd.exe's escape character — the exact Windows counterpart of
-        // the `\` handled below. Without stripping it, one caret walked past
-        // every rule on this floor (`r^d /s /q C:\Windows`, `de^l /f/s/q C:\*`,
-        // `curl x | powershe^ll`) while `cmd /C` ran the real thing — and
-        // Windows is the one platform with no sandbox behind this floor.
-        &['\'', '"', '^']
-    } else {
-        &['\'', '"', '\\']
-    };
-    token.chars().filter(|ch| !strip.contains(ch)).collect()
+    token
+        .chars()
+        .filter(|ch| !HOST.quoting_to_strip.contains(ch))
+        .collect()
 }
 
 /// The lowercased basename of a token, with shell quoting removed first, so
-/// `/usr/bin/sudo`, `'sudo'`, and `s\udo` all resolve to `sudo`. On Windows `\`
-/// is a path separator; on Unix it was already dropped by [`clean_token`].
+/// `/usr/bin/sudo`, `'sudo'`, and `s\udo` all resolve to `sudo`. What separates
+/// components is [`Grammar::path_separators`]; on Unix a `\` was already
+/// dropped by [`clean_token`].
 pub(super) fn basename_lower(token: &str) -> String {
     let cleaned = clean_token(token);
-    let separators: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
     let base = cleaned
-        .rsplit(separators)
+        .rsplit(HOST.path_separators)
         .next()
         .unwrap_or(cleaned.as_str())
         .to_ascii_lowercase();
@@ -287,6 +355,12 @@ pub(super) fn has_shell_indirection(command: &str) -> bool {
 /// the session key (`git diff /dev/null ~/.ssh/id_rsa` on the default-trusted
 /// `git diff`), and for the safety notes that warn the human. One predicate, so
 /// the three never disagree about what "outside" looks like.
+///
+/// Deliberately platform-blind, unlike [`Grammar`]: a `\` counts as a separator
+/// and a leading one as absolute on every host. This fence may only ever
+/// over-refuse — reading a Unix file named `..\x` as a climb costs a prompt,
+/// while reading `..\secret` as an ordinary name on the platform where it *is*
+/// a climb costs the file. Do not "unify" it with the grammar above.
 pub(super) fn escapes_cwd_by_spelling(token: &str) -> bool {
     let bytes = token.as_bytes();
     token.starts_with(['/', '~', '\\'])
@@ -326,7 +400,14 @@ pub(super) fn operand_leaves_cwd(cleaned: &str) -> bool {
 /// it too.
 #[must_use]
 pub(super) fn executed_words(command: &str) -> Option<Vec<String>> {
-    let mut commands = parse_unattended(command)?;
+    executed_words_in(HOST, command)
+}
+
+/// [`executed_words`] under an explicit [`Grammar`] (see
+/// [`parse_unattended_in`]).
+#[must_use]
+pub(super) fn executed_words_in(grammar: Grammar, command: &str) -> Option<Vec<String>> {
+    let mut commands = parse_unattended_in(grammar, command)?;
     if commands.len() != 1 {
         return None;
     }
@@ -364,46 +445,49 @@ pub struct UnattendedCommand {
 /// the words the gate judged are the words that run, by construction rather
 /// than by the completeness of any list.
 ///
-/// Accepted grammar — the subset whose meaning this parser and `sh` agree on
-/// exactly (`unattended_parse_matches_sh_word_splitting` checks that against
-/// the real shell): words split on unquoted blanks; `'…'` literal; `"…"`
-/// literal except `\"` and `\\`; a backslash escapes the next character (a
-/// backslash-newline is a continuation); `#` opening a word comments out the
-/// rest of the line; commands chain by `;`, a newline, or `&&`. Everything else
-/// is `None` — `|`, `||`, a lone `&`, redirection, substitution, any expansion
+/// Accepted grammar — the subset whose meaning this parser and the platform
+/// agree on exactly: words split on unquoted blanks; `'…'` literal; `"…"`
+/// literal except `\"` and `\\`; `#` opening a word comments out the rest of
+/// the line; commands chain by `;`, a newline, or `&&`. Everything else is
+/// `None` — `|`, `||`, a lone `&`, redirection, substitution, any expansion
 /// ([`has_shell_indirection`]), an unterminated quote, an empty command, a
 /// `~`-led word (the shell would expand it; the gate refuses such an operand
 /// anyway), a program word carrying `=` (an assignment prefix) — so the gate
 /// does not auto-approve it and the executor does not run it unattended.
-/// Whether `\` escapes the character after it.
 ///
-/// It does in `sh`, and it does not on Windows, where it is the path separator
-/// and `CreateProcess` — which is what an unattended command reaches, with no
-/// `cmd.exe` in between — never had a backslash escape. Reading it as an escape
-/// there silently ate every ordinary path spelling: `git diff src\main.rs` ran
-/// as `git diff srcmain.rs` on the default-trusted `git diff`, and `.\.`
-/// collapsed to `..`, which is a *different directory* than the operand fence
-/// read. [`clean_token`] splits on this same platform line, for the same
-/// reason.
-///
-/// The one Windows position where `\` is *not* an ordinary character is
-/// immediately before a quote: `CommandLineToArgvW` counts the backslash run
-/// there, so `\"` is a literal quote to the program while `\\"` is a backslash
-/// plus a real quote — and `cmd.exe` counts it differently again. This parser
-/// does not guess between them; [`backslash_hugs_a_quote`] refuses such a line,
-/// which costs a prompt and keeps the fence honest.
-const BACKSLASH_ESCAPES: bool = !cfg!(windows);
+/// Backslashes are the one place the two platforms read the same text
+/// differently, and which reading applies is [`Grammar::backslash_escapes`]
+/// rather than a `cfg!` here: under [`SH`] a `\` escapes the next character and
+/// a `\`-newline continues the line (`unattended_parse_matches_sh_word_splitting`
+/// checks that against the real shell), while under [`WINDOWS`] it is an
+/// ordinary path character, so `git diff src\main.rs` keeps its path and `echo
+/// done\` is a finished line rather than an unfinished one. Both readings are
+/// pinned from every host by `backslash_reading_is_pinned_for_both_grammars`.
+#[must_use]
+pub fn parse_unattended(command: &str) -> Option<Vec<UnattendedCommand>> {
+    parse_unattended_in(HOST, command)
+}
 
 /// Whether the `\` just consumed sits immediately before a quote — the one
-/// spelling whose meaning Windows argument parsers disagree about (see
-/// [`BACKSLASH_ESCAPES`]). Only ever consulted on Windows; on Unix the escape
-/// arm above has already claimed the backslash.
+/// spelling whose meaning Windows argument parsers disagree about.
+///
+/// `CommandLineToArgvW` counts the backslash run before a quote, so `\"` is a
+/// literal quote to the program while `\\"` is a backslash plus a real quote —
+/// and `cmd.exe` counts it differently again. This parser does not guess
+/// between them; refusing costs a prompt and keeps the two sides of the fence
+/// reading the same word. Only ever consulted where
+/// [`Grammar::backslash_escapes`] is false: under [`SH`] the escape arm has
+/// already claimed the backslash.
 fn backslash_hugs_a_quote(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
     chars.peek().is_some_and(|next| matches!(next, '"' | '\''))
 }
 
-#[must_use]
-pub fn parse_unattended(command: &str) -> Option<Vec<UnattendedCommand>> {
+/// [`parse_unattended`] under an explicit [`Grammar`], so both platforms'
+/// readings of the same line are reachable from any host.
+pub(super) fn parse_unattended_in(
+    grammar: Grammar,
+    command: &str,
+) -> Option<Vec<UnattendedCommand>> {
     if has_shell_indirection(command) {
         return None;
     }
@@ -417,7 +501,7 @@ pub fn parse_unattended(command: &str) -> Option<Vec<UnattendedCommand>> {
 
     while let Some(c) = chars.next() {
         match c {
-            '\\' if BACKSLASH_ESCAPES => match chars.next() {
+            '\\' if grammar.backslash_escapes => match chars.next() {
                 // A trailing backslash is an incomplete line to the shell.
                 None => return None,
                 Some('\n') => {}
@@ -440,7 +524,7 @@ pub fn parse_unattended(command: &str) -> Option<Vec<UnattendedCommand>> {
                     match chars.next() {
                         None => return None,
                         Some('"') => break,
-                        Some('\\') if BACKSLASH_ESCAPES => match chars.next() {
+                        Some('\\') if grammar.backslash_escapes => match chars.next() {
                             None => return None,
                             Some(escaped @ ('"' | '\\')) => w.push(escaped),
                             Some('\n') => {}
@@ -796,65 +880,111 @@ mod tests {
             .collect()
     }
 
-    /// `\` escapes on Unix (that is what `sh` does, pinned against the real
-    /// shell by `unattended_parse_matches_sh_word_splitting`) and is an
-    /// ordinary path separator on Windows, where the word reaches
-    /// `CreateProcess` with no shell in between. Reading it as an escape there
-    /// ran `git diff src\main.rs` as `git diff srcmain.rs` on the
+    fn argvs_in(grammar: Grammar, command: &str) -> Option<Vec<Vec<String>>> {
+        parse_unattended_in(grammar, command)
+            .map(|cmds| cmds.into_iter().map(|cmd| cmd.argv).collect())
+    }
+
+    /// How a `\` reads is the one thing the two platforms do differently with
+    /// the same text, so both readings are pinned here, as a table, from every
+    /// host.
+    ///
+    /// The shape matters as much as the cases. This was two `#[cfg]` blocks,
+    /// which meant each platform's half only ever ran on that platform: the
+    /// Windows half was written blind and Windows CI was the first thing to
+    /// execute it (it was wrong, twice), and on a target that is neither the
+    /// body vanished entirely while the parser still had a reading. A table
+    /// over [`SH`] and [`WINDOWS`] runs both halves everywhere; only the
+    /// differential test against the real shell has to stay `cfg(unix)`,
+    /// because it needs a real `sh`.
+    ///
+    /// Under [`SH`] a `\` escapes, which is what that shell does. Under
+    /// [`WINDOWS`] it is an ordinary path character: reading it as an escape
+    /// there ran `git diff src\main.rs` as `git diff srcmain.rs` on the
     /// default-trusted `git diff`, and collapsed `.\.` — the current
-    /// directory — into `..`, its parent, which is a path the operand fence
-    /// would have refused.
+    /// directory — into `..`, its parent, a path the operand fence would have
+    /// refused.
+    /// One row of the backslash table: a grammar, a line, and the argv the
+    /// executor would run under that grammar — `None` when the line is not one
+    /// this parser will run unattended at all.
+    type BackslashCase<'a> = (Grammar, &'a str, Option<&'a [&'a [&'a str]]>);
+
     #[test]
-    fn backslash_escapes_on_unix_and_separates_paths_on_windows() {
-        // Both arms end at the same invariant: the word the fence judges is the
-        // word the executor opens. The platforms differ on what that word IS.
-        #[cfg(unix)]
-        {
-            assert_eq!(
-                argvs(r"git diff src\main.rs"),
-                words(&[&["git", "diff", "srcmain.rs"]])
-            );
-            assert_eq!(argvs(r"mkdir .\."), words(&[&["mkdir", ".."]]));
-            assert!(operand_leaves_cwd(".."));
-            // A backslash escapes a blank, continues a line, and a trailing one
-            // leaves a line only a shell could finish.
-            assert_eq!(
-                argvs(r"cargo test e\ f"),
-                words(&[&["cargo", "test", "e f"]])
-            );
-            assert_eq!(
-                argvs("cargo build \\\n  --release\n\n"),
-                words(&[&["cargo", "build", "--release"]])
-            );
-            assert_eq!(parse_unattended("echo done\\"), None);
-            assert_eq!(
-                argvs("git commit -m \"say \\\"hi\\\" \\\\ ok\""),
-                words(&[&["git", "commit", "-m", "say \"hi\" \\ ok"]])
-            );
-        }
-        #[cfg(windows)]
-        {
-            assert_eq!(
-                argvs(r"git diff src\main.rs"),
-                words(&[&["git", "diff", r"src\main.rs"]])
-            );
-            assert_eq!(argvs(r"mkdir .\."), words(&[&["mkdir", r".\."]]));
-            // `.\.` really is the current directory here, and the fence agrees.
-            assert!(!operand_leaves_cwd(r".\."));
-            // Not an escape: two words, and a trailing one is just a path.
-            assert_eq!(
-                argvs(r"cargo test e\ f"),
-                words(&[&["cargo", "test", r"e\", "f"]])
-            );
-            assert_eq!(argvs(r"mkdir src\"), words(&[&["mkdir", r"src\"]]));
+    fn backslash_reading_is_pinned_for_both_grammars() {
+        let cases: &[BackslashCase<'_>] = &[
+            // `sh`: a `\` escapes a path separator, a blank, a quote, itself,
+            // and a newline (which continues the line); a trailing one leaves
+            // a line only a shell could finish.
+            (
+                SH,
+                r"git diff src\main.rs",
+                Some(&[&["git", "diff", "srcmain.rs"]]),
+            ),
+            (SH, r"mkdir .\.", Some(&[&["mkdir", ".."]])),
+            (SH, r"cargo test e\ f", Some(&[&["cargo", "test", "e f"]])),
+            (
+                SH,
+                "cargo build \\\n  --release\n\n",
+                Some(&[&["cargo", "build", "--release"]]),
+            ),
+            (SH, "echo done\\", None),
+            (
+                SH,
+                "git commit -m \"say \\\"hi\\\" \\\\ ok\"",
+                Some(&[&["git", "commit", "-m", "say \"hi\" \\ ok"]]),
+            ),
+            // Inside `'…'` nothing escapes, on either platform: `sh` reads
+            // `'a\'b'c'` as the single word `a\bc`, and so does this parser.
+            (SH, r"echo 'a\'b'c'", Some(&[&["echo", r"a\bc"]])),
+            (SH, r#"echo 'a\"b'"#, Some(&[&["echo", r#"a\"b"#]])),
+            // `\'` escapes the quote, so the word after it is unterminated.
+            (SH, r"echo \'x'", None),
+            // Windows: the same backslashes are path characters, so a path
+            // keeps its spelling and a trailing one is a finished line.
+            (
+                WINDOWS,
+                r"git diff src\main.rs",
+                Some(&[&["git", "diff", r"src\main.rs"]]),
+            ),
+            (WINDOWS, r"mkdir .\.", Some(&[&["mkdir", r".\."]])),
+            (
+                WINDOWS,
+                r"cargo test e\ f",
+                Some(&[&["cargo", "test", r"e\", "f"]]),
+            ),
+            (WINDOWS, r"mkdir src\", Some(&[&["mkdir", r"src\"]])),
+            (WINDOWS, "echo done\\", Some(&[&["echo", "done\\"]])),
             // Hugging a quote is the one spelling Windows argument parsers
             // disagree about, so it is refused rather than guessed at.
+            (WINDOWS, "git commit -m \"say \\\"hi\\\" ok\"", None),
+            (WINDOWS, r#"cd "C:\Users\me\""#, None),
+            (WINDOWS, r"echo \'x'", None),
+            (WINDOWS, r#"git commit -m "don\'t ship""#, None),
+            (WINDOWS, r"echo 'a\'b'c'", Some(&[&["echo", r"a\bc"]])),
+            (WINDOWS, r#"echo 'a\"b'"#, Some(&[&["echo", r#"a\"b"#]])),
+        ];
+        for &(grammar, line, expected) in cases {
             assert_eq!(
-                parse_unattended("git commit -m \"say \\\"hi\\\" ok\""),
-                None
+                argvs_in(grammar, line),
+                expected.map(words),
+                "{line:?} under {grammar:?}"
             );
-            assert_eq!(parse_unattended(r"echo \'x'"), None);
         }
+
+        // The fence that judges those words agrees with each reading about
+        // what the word IS: `..` climbs, `.\.` is the cwd it spells, and
+        // `done\` stays put.
+        assert!(operand_leaves_cwd(".."));
+        assert!(!operand_leaves_cwd(r".\."));
+        assert!(!operand_leaves_cwd(r"done\"));
+
+        // And production reads the host's grammar — a table both halves of
+        // which pass proves nothing if the entry point reaches for neither.
+        assert_eq!(HOST, if cfg!(windows) { WINDOWS } else { SH });
+        assert_eq!(
+            parse_unattended(r"git diff src\main.rs"),
+            parse_unattended_in(HOST, r"git diff src\main.rs")
+        );
     }
 
     #[test]
@@ -868,7 +998,7 @@ mod tests {
             words(&[&["cargo", "test", "--features", "a b", "c d"]])
         );
         // Backslash spellings are platform-split; see
-        // `backslash_escapes_on_unix_and_separates_paths_on_windows`.
+        // `backslash_reading_is_pinned_for_both_grammars`.
         // Quote removal glues adjacent quoted pieces into one word; a quoted
         // empty string is a real (empty) argument.
         assert_eq!(
