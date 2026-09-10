@@ -501,11 +501,25 @@ fn trust_covers_only_what_runs_without_a_shell() {
     }
     // A trailing backslash is an unfinished line to `sh` only; on Windows it is
     // the last character of a path, and the parser reads it as one (see
-    // `shell_lex::backslash_reading_is_pinned_for_both_grammars`).
+    // `shell_lex::backslash_reading_is_pinned_for_both_grammars`, which pins
+    // both readings from any host). Both verdicts are asserted here, because
+    // the Windows one is the surprising half and was recorded nowhere: the
+    // line parses, `done\` stays inside the cwd and `echo` is default-trusted,
+    // so the POLICY trusts it — the only thing between it and a shell is the
+    // executor refusing to run a cmd builtin as a bare argv
+    // (`sandbox::windows::resolve_executable`). If that refusal ever turned
+    // into a fallback through `cmd /C`, this line would open a shell with no
+    // prompt, so the trust has to be written down where someone changing the
+    // executor will trip over it.
     #[cfg(unix)]
     assert!(matches!(
         evaluate_shell_command(&policy, "echo done\\", false).verdict,
         PolicyVerdict::NeedsApproval { .. }
+    ));
+    #[cfg(windows)]
+    assert!(matches!(
+        evaluate_shell_command(&policy, "echo done\\", false).verdict,
+        PolicyVerdict::Allow
     ));
     // The accept-edits allowance reads the same parse.
     assert!(accept_edits_approvable(

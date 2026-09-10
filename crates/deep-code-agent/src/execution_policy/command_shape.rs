@@ -1027,9 +1027,15 @@ mod tests {
             "cargo build"
         );
         // Backslash-escaped on Unix: `--config\ ` splits to a token carrying the
-        // trailing backslash, which the shell would drop. Windows keeps `\` as a
-        // path separator (cmd.exe escapes with `^`, not `\`), so it is not a
-        // bypass there and the token stays untrusted for a different reason.
+        // trailing backslash, which the shell would drop.
+        //
+        // Windows reads the same text differently and the line IS trusted
+        // there — checked by forcing `shell_lex::HOST` to `WINDOWS`, which is
+        // what the earlier "stays untrusted for a different reason" note here
+        // claimed and got wrong. What makes it harmless is one level down: the
+        // program receives `--config\`, not `--config`, so the redirecting
+        // flag never forms and cargo rejects the word. The fence that carries
+        // the weight is the argv reading, not this trust decision.
         #[cfg(not(windows))]
         assert!(!covers(
             "cargo build",

@@ -23,6 +23,16 @@
 //! flag or path, never hide one; an exotic construct falls through to "needs
 //! approval" rather than being auto-trusted.
 
+// Every item in here, private ones included, carries its own doc — and the
+// lint is what keeps it that way. Inserting a new item between a doc comment
+// and the item it describes silently re-parents the prose, which is how the
+// whole "Accepted grammar" spec — the authoritative statement of what may run
+// unattended — ended up documenting a private `const` while
+// `parse_unattended` had no doc at all. Nothing flagged it: the const was
+// private, so `missing_docs` never looked. This lint does, and CI runs clippy
+// with `-D warnings`.
+#![warn(clippy::missing_docs_in_private_items)]
+
 /// Split a command line into individually-checkable segments on the shell
 /// control operators `;`, `&&`, `||`, `|`, and newlines. Each segment is a
 /// single simple command whose program/args we can inspect.
@@ -427,7 +437,11 @@ pub enum RunIf {
 /// hands to `execve`, and whether it is gated on the previous command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnattendedCommand {
+    /// The words handed to `execve`, program word first — the argv every rule
+    /// judges (see [`executed_words`]) and the argv that runs.
     pub argv: Vec<String>,
+    /// Whether the command runs regardless or only after the previous one
+    /// succeeded.
     pub run_if: RunIf,
 }
 
@@ -1143,7 +1157,7 @@ mod tests {
         // A trailing backslash is an unfinished line to `sh` only: on Windows
         // it is the last character of a path. Platform-split alongside every
         // other backslash spelling, in
-        // `backslash_escapes_on_unix_and_separates_paths_on_windows`.
+        // `backslash_reading_is_pinned_for_both_grammars`.
         #[cfg(unix)]
         assert_eq!(parse_unattended("echo done\\"), None);
     }
