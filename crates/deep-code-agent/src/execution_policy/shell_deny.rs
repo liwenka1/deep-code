@@ -21,7 +21,11 @@
 //! ([`has_shell_indirection`]) and wrapped/interpreter forms are never
 //! trusted, so those always land on a human first. What parsing misses is
 //! contained by the human at the prompt — or, under `Yolo`, by the OS sandbox
-//! (plus the per-turn checkpoint for the writable workspace).
+//! (plus the per-turn checkpoint for the writable workspace) on the platforms
+//! that have one. Windows does not, which is why this floor reads the
+//! interpreter's own rewritings of a line ([`readings_of`]) rather than the
+//! line as typed, and why what it still cannot read there is written down in
+//! `SECURITY.md` instead of assumed contained.
 
 // Same guard as `shell_lex`, and for the same reason: an item inserted between
 // a doc comment and the item it describes re-parents the prose silently, and
