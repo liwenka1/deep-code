@@ -28,8 +28,12 @@
 // the load-bearing prose in this module is exactly the kind a reviewer reads to
 // decide whether a spelling is covered.
 //
-// It does not reach `#[cfg(test)]` — clippy skips test items — so doc
-// adjacency there is kept by declaring helpers inside the function that uses
+// What it does and does not catch is measured once, at the top of `shell_lex`.
+// The shape it misses had a live instance right here: the first paragraph of
+// `safety_notes` was documenting `SafetyNote` instead, because the item that
+// took the prose brought a doc of its own. So this is a backstop for one shape,
+// not a reason to stop reading — and `#[cfg(test)]` is outside it entirely,
+// which is why the test helpers are declared inside the functions that use
 // them.
 #![warn(clippy::missing_docs_in_private_items)]
 use std::borrow::Cow;
@@ -42,10 +46,12 @@ use super::shell_lex::{
 };
 use crate::i18n::TextId;
 
-/// Why a command segment was denied. The string is surfaced to the user and
-/// logged as the matched rule.
+/// Why a command segment was denied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DenyReason(pub &'static str);
+pub struct DenyReason(
+    /// The matched rule, surfaced to the user and logged as-is.
+    pub &'static str,
+);
 
 /// Whether a (cleaned) token is a `NAME=value` environment assignment on the
 /// shell's own terms: the text before the first `=` is a shell identifier
@@ -738,17 +744,13 @@ fn char_range(from: u8, to: u8, step: i64) -> Vec<String> {
     words
 }
 
-/// Static, no-execution safety notes surfaced at the approval prompt: why a
-/// command warrants review and how to make it safer. This does NOT dry-run or
-/// diff the command — shell side effects are impractical to preview — it
-/// classifies by program/flag/path shape, reusing the same segment split as
-/// the deny checks so notes and denials always agree on what a segment is.
-/// One advisory note as language-neutral keys: why a command warrants review
-/// (`reason`) and how to make it safer (`suggestion`). The TUI renders both in
-/// the user's language — presentation stays out of the policy layer.
+/// One advisory note as language-neutral keys. The TUI renders both in the
+/// user's language — presentation stays out of the policy layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SafetyNote {
+    /// Why the command warrants review.
     pub reason: TextId,
+    /// How to make it safer.
     pub suggestion: TextId,
 }
 
@@ -769,9 +771,15 @@ impl SafetyNotes {
     }
 }
 
-/// Advisory static analysis of a shell command for the approval prompt. Only
-/// meaningful for commands that already need approval (denied commands never
-/// reach here). Returns empty notes for a plain, low-signal command.
+/// Static, no-execution safety notes surfaced at the approval prompt: why a
+/// command warrants review and how to make it safer. Only meaningful for
+/// commands that already need approval (denied commands never reach here), and
+/// empty for a plain, low-signal one.
+///
+/// This does NOT dry-run or diff the command — shell side effects are
+/// impractical to preview — it classifies by program/flag/path shape, over the
+/// same readings and the same segment split as the deny checks, so notes and
+/// denials always agree on what a segment is.
 #[must_use]
 pub fn safety_notes(command: &str) -> Vec<SafetyNote> {
     let mut notes = SafetyNotes::default();

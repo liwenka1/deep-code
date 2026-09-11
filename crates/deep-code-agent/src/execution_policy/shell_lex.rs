@@ -31,13 +31,25 @@
 // looks at public API. This lint does look, and CI runs clippy with
 // `-D warnings`.
 //
-// Its reach, measured rather than assumed: it covers the items below, and it
-// does NOT cover `#[cfg(test)]` — clippy skips test items, so the same
-// re-parenting promptly happened again inside `mod tests` and this lint stayed
-// green. Test items keep their own doc adjacency by declaring helpers inside
-// the function that uses them. Crate-wide is not the answer either, or not
-// yet: at `lib.rs` this lint reports 834 items, which is a documentation
-// project, not a guard.
+// Its reach, measured on this module rather than assumed — it is a backstop
+// for one shape, not a reason to stop reading:
+//
+//   * Caught: the inserted item has no doc of its own (clippy names the
+//     inserter), and the item it stole the prose from is left with none
+//     (clippy names the victim). A `pub` item inside these private modules
+//     counts as private for this lint, so it is covered too.
+//   * Silent: the victim ends up with a doc of its own anyway — that is how
+//     the first paragraph of `shell_deny::safety_notes` came to document
+//     `SafetyNote`, and nothing flagged it for as long as it stood.
+//   * Silent: `#[cfg(test)]` items, which clippy skips. The same re-parenting
+//     promptly happened again inside `mod tests`; test items keep their own
+//     doc adjacency by declaring helpers inside the function that uses them.
+//   * Silent: items this lint treats as exported, and their fields either way
+//     — `shell_deny::SafetyNote`'s fields carried no doc with CI green.
+//   * Silent: plain `//` comments, which it cannot see at all.
+//
+// Crate-wide is not the answer either, or not yet: at `lib.rs` this lint
+// reports 834 items, which is a documentation project, not a guard.
 #![warn(clippy::missing_docs_in_private_items)]
 
 /// Split a command line into individually-checkable segments on the shell
