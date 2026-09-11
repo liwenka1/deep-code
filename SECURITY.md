@@ -122,24 +122,28 @@ review to rediscover:
   commits, `npm` (`~/.npmrc`) and `codesign` (keychains) need them offline,
   so the read fence is the operand spelling above, not the kernel.
 - A command a human approved as text keeps every shell feature the human saw.
-- On Windows a *program word* carrying two `%` is denied: `cmd.exe` expands
-  `%VAR%`, `%VAR:~0,0%` and `%VAR:a=b%` on the command line, so
+- On Windows a word carrying two `%` is *indirection*, not a denial: `cmd.exe`
+  expands `%VAR%`, `%VAR:~0,0%` and `%VAR:a=b%` on the command line, so
   `de%PATH:~0,0%l` is `del` by the time anything runs and no rule here can read
-  the word. A `%VAR%` *operand* is not denied — it is indirection, so the line
-  is never auto-approved and never a bounded edit, a prompt exactly like `$HOME`
-  on Unix. The split matters because this floor is mode-blind: denying the
-  operand form took `echo %PATH%` away from a human who explicitly approves it,
-  in every tier. Residual: a pair split across words (`%VAR:a=b%` accepts
-  blanks, and a blank-named variable is settable) is not read as one, and
-  `cmd` leaves an *undefined* `%X%` literal, so that spelling is inert until
-  something has defined the variable. cmd's other delimiters share the root and
-  take a different fix: the deny floor re-reads the line with `,` and `=`
-  turned into blanks, so `del,/f/s/q,C:\*` is denied like the blank-spelled
-  form, and re-reads it once more with `;` turned into blanks through the
-  per-segment rules only — a whole-line `;` normalization merges two commands
-  and invented a denial for `curl https://x -o f; echo hi | sh`. The `sh` equivalents (`$VAR`, `` `…` ``, `$(…)`, globs) are not chased
-  by this floor at all — they are never auto-approved, and under `yolo` the
-  containment is the OS sandbox, which Windows does not have.
+  the word. Such a line is therefore never trusted, never a bounded edit and
+  never a session consent — a prompt, exactly like `$(…)` and `$HOME` on Unix —
+  and under `yolo` the containment is the OS sandbox, which Windows does not
+  have. Denying it on the floor was tried and each version took ordinary
+  commands away in *every* tier, because this floor is mode-blind and cannot be
+  overridden: first `echo %PATH%` and `dir %USERPROFILE%`, then, once narrowed
+  to the program word, the launcher idiom `%PYTHON% script.py`. Residual: a
+  pair split across words is not read as one, and `cmd` leaves an *undefined*
+  `%X%` literal, so that spelling is inert until something has defined the
+  variable.
+- cmd's word delimiters are a separate problem with a real answer: `,` — and
+  `;`, which this floor reads as a segment separator — make `del,/f/s/q,C:\*`
+  one opaque word here (`basename_lower` of it is `*`) and a wipe to `cmd`. The
+  floor judges every reading of the line: raw, `,`-normalized, `;`-normalized,
+  and both, with the cross-segment pipe rule skipped on the readings that
+  merged segments (it read `curl https://x -o f; echo hi | sh` as a fetch
+  feeding a shell). `=` is in cmd's documented delimiter set and is
+  deliberately *not* normalized: it invented denials no tier could override —
+  `rm -r --exclude=/ build` read as a recursive remove of `/`.
 - On Windows a line spelling a backslash immediately before a `"` never runs
   unattended: `CommandLineToArgvW` and `cmd.exe` read that backslash run
   differently, so the parser refuses instead of choosing. The usual casualty is
@@ -255,19 +259,22 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
 - 凭据目录对沙箱内命令可读:SSH 签名的 commit、`npm`(`~/.npmrc`)、`codesign`
   (钥匙串)在离线时也需要它们,所以读侧围栏是上面的操作数拼写,不是内核。
 - 人工按文本批准的命令保留人看到的全部 shell 特性。
-- Windows 上,**程序词**里带两个 `%` 会被拒:`cmd.exe` 在命令行上展开 `%VAR%`、
-  `%VAR:~0,0%`、`%VAR:a=b%`,所以 `de%PATH:~0,0%l` 真正执行时已经是 `del`,这里
-  没有任何规则读得懂那个词。`%VAR%` 出现在**操作数**上不拒——它是 indirection,
-  所以那行永不自动放行、也永不是有界编辑,和 Unix 上的 `$HOME` 一样只是一次提示。
-  这个区分很重要,因为这层楼是模式无关的:拒操作数那一版把 `echo %PATH%` 在所有
-  档位从人手里拿走了,连他明确批准也不行。残余:跨词的一对(`%VAR:a=b%` 允许空白,
-  带空白的变量名也设得出来)不会被读成一对;而 `cmd` 对**未定义**的 `%X%` 是原样
-  保留,所以那种拼法在有人先把变量定义出来之前是惰性的。cmd 的其它分隔符同根但另一种修法:deny floor
-  把 `,` 与 `=` 换成空白后重读一遍,所以 `del,/f/s/q,C:\*` 和用空白写的一样被
-  拒;`;` 再单独重读一次,但只喂 per-segment 规则——整行换掉 `;` 会把两个命令
-  合成一个,曾经让 `curl https://x -o f; echo hi | sh` 被误拒。`sh` 那侧的对应拼法(`$VAR`、
-  `` `…` ``、`$(…)`、通配)这层楼根本不追——它们永不自动放行,而 `yolo` 下的
-  约束是 OS 沙箱,Windows 没有那层沙箱。
+- Windows 上,一个词里带两个 `%` 是 **indirection**,不是拒绝:`cmd.exe` 在命令行
+  上展开 `%VAR%`、`%VAR:~0,0%`、`%VAR:a=b%`,所以 `de%PATH:~0,0%l` 真正执行时已经
+  是 `del`,这里没有任何规则读得懂那个词。这类行因此永不可信、永不是有界编辑、
+  也拿不到会话同意——只是一次提示,和 Unix 上的 `$(…)`、`$HOME` 完全同构;`yolo`
+  下的约束是 OS 沙箱,而 Windows 没有那层沙箱。在这层楼上拒它试过,每一版都会在
+  **所有档位**拿走普通命令,因为这层楼模式无关且不可覆盖:先是 `echo %PATH%`、
+  `dir %USERPROFILE%`,收窄到程序词之后是 `%PYTHON% script.py` 这种启动器写法。
+  残余:跨词的一对不会被读成一对;而 `cmd` 对**未定义**的 `%X%` 原样保留,所以那种
+  拼法在有人先把变量定义出来之前是惰性的。
+- cmd 的词分隔符是另一个问题,而它有确切的答案:`,`——以及这层楼读作段分隔符的
+  `;`——让 `del,/f/s/q,C:\*` 在这里是一个读不懂的词(basename 是 `*`),对 `cmd`
+  却是一次清盘。这层楼现在判**每一种读法**:原文、`,` 归一化、`;` 归一化、以及两者
+  都归一化;其中合并了段的那些读法不跑跨段的管道规则(它曾把
+  `curl https://x -o f; echo hi | sh` 读成 fetch 喂给 shell)。`=` 在 cmd 的文档
+  分隔符集里,但刻意**不**归一化:它造出过任何档位都无法覆盖的误拒——
+  `rm -r --exclude=/ build` 被读成对 `/` 的递归删除。
 - Windows 上,一行里只要出现「反斜杠紧挨 `"`」就不会免审运行:
   `CommandLineToArgvW` 与 `cmd.exe` 对那串反斜杠的读法不同,解析器拒绝而不是
   替它选一个。代价最常见的是引号里以分隔符结尾的路径——`xcopy "src\" "dst\"`

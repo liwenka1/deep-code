@@ -243,10 +243,20 @@ pub(super) struct Grammar {
     /// What the platform's interpreter treats as a word delimiter *besides*
     /// blanks, and which it is therefore safe to read as one.
     ///
-    /// Empty for `sh`, which delimits on blanks alone. `,` and `=` for
-    /// `cmd.exe`: `del,/f/s/q,C:\*` is `del` with two arguments to it there,
-    /// and one opaque word to anything that splits on blanks — which is how it
-    /// walked past every rule on the deny floor.
+    /// Empty for `sh`, which delimits on blanks alone. `,` for `cmd.exe`:
+    /// `del,/f/s/q,C:\*` is `del` with two arguments to it there, and one
+    /// opaque word to anything that splits on blanks — which is how it walked
+    /// past every rule on the deny floor.
+    ///
+    /// `=` is in `cmd`'s documented delimiter set and is deliberately not here.
+    /// Normalizing it invented denials that no mode can override, measured on
+    /// ordinary lines: `rm -r --exclude=/ build` became a recursive remove of
+    /// `/`, and `format=ntfs C:` — an environment assignment to this floor —
+    /// became the `format` program with a drive operand. `--flag=value` is far
+    /// too common a shape to read as two words on a floor that cannot be
+    /// overridden, and the spellings it would catch (`del=/f/s/q …`) are not
+    /// ones anything produces. The residual is written down rather than
+    /// traded for that.
     ///
     /// `cmd` delimits on `;` too, and it is deliberately not here. This floor
     /// reads `;` as a *segment separator* (`segments`), so normalizing it
@@ -298,7 +308,7 @@ pub(super) const WINDOWS: Grammar = Grammar {
     path_separators: &['/', '\\'],
     quoting_to_strip: &['\'', '"', '^'],
     rewrites_words_with: &['%'],
-    word_delimiters: &[',', '='],
+    word_delimiters: &[','],
     separator_delimiters: &[';'],
     comments_with_hash: false,
 };

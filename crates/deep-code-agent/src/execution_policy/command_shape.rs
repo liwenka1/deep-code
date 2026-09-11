@@ -36,6 +36,13 @@
 //! quoted word to the rules while the program received a real `--`, and a
 //! Windows `\` survived the cleaner but not the parser.
 
+// Same guard as `shell_lex`, and for the same reason: an item inserted
+// between a doc comment and the item it describes re-parents the prose
+// silently, and the load-bearing prose in this module is exactly the kind
+// a reviewer reads to decide whether a spelling is covered. It does not
+// reach `#[cfg(test)]` — clippy skips test items — so doc adjacency there
+// is kept by declaring helpers inside the function that uses them.
+#![warn(clippy::missing_docs_in_private_items)]
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -46,11 +53,15 @@ use std::sync::LazyLock;
 /// deeper or shallower than the program default.
 #[derive(Debug, Clone, Copy)]
 struct Shape {
+    /// Positional words that form the operation name, the program word
+    /// included.
     base: u8,
+    /// Subcommands whose identity is deeper or shallower than `base`.
     overrides: &'static [(&'static str, u8)],
 }
 
 impl Shape {
+    /// A program whose identity is its bare name (`ls`, `cmake`).
     const fn flat() -> Self {
         Self {
             base: 1,
@@ -58,6 +69,7 @@ impl Shape {
         }
     }
 
+    /// A program whose identity is `program subcommand` (`git log`).
     const fn sub() -> Self {
         Self {
             base: 2,
@@ -65,6 +77,8 @@ impl Shape {
         }
     }
 
+    /// [`Shape::sub`], with the subcommands that read deeper or shallower
+    /// (`aws s3 sync` is three words, `aws configure` two).
     const fn sub_with(overrides: &'static [(&'static str, u8)]) -> Self {
         Self { base: 2, overrides }
     }

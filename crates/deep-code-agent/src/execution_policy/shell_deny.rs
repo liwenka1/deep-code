@@ -23,11 +23,18 @@
 //! contained by the human at the prompt — or, under `Yolo`, by the OS sandbox
 //! (plus the per-turn checkpoint for the writable workspace).
 
+// Same guard as `shell_lex`, and for the same reason: an item inserted
+// between a doc comment and the item it describes re-parents the prose
+// silently, and the load-bearing prose in this module is exactly the kind
+// a reviewer reads to decide whether a spelling is covered. It does not
+// reach `#[cfg(test)]` — clippy skips test items — so doc adjacency there
+// is kept by declaring helpers inside the function that uses them.
+#![warn(clippy::missing_docs_in_private_items)]
 use serde::{Deserialize, Serialize};
 
 use super::shell_lex::{
-    Grammar, HOST, INTERPRETERS, PREFIX_WORDS, basename_lower, blanks_for, clean_token,
-    operand_leaves_cwd, parse_unattended, rewrites_a_word, segments,
+    HOST, INTERPRETERS, PREFIX_WORDS, basename_lower, blanks_for, clean_token, operand_leaves_cwd,
+    parse_unattended, segments,
 };
 use crate::i18n::TextId;
 
@@ -72,7 +79,9 @@ fn is_env_assignment(token: &str) -> bool {
 /// floor reads past exactly as `sh` does, grouping punctuation): the program's
 /// lowercased basename and the cleaned arguments.
 struct SegmentWords {
+    /// The program's lowercased basename, quoting removed.
     program: String,
+    /// Its arguments, each with quoting removed ([`clean_token`]).
     args: Vec<String>,
 }
 
@@ -448,10 +457,7 @@ fn deny_pipe_to_shell(command: &str) -> Option<DenyReason> {
 /// every automatic pass, so they land on a human instead of on this floor.
 #[must_use]
 pub fn builtin_deny(command: &str) -> Option<DenyReason> {
-    if let Some(reason) = deny_unreadable_program(HOST, command) {
-        return Some(reason);
-    }
-    if let Some(reason) = deny_line(command) {
+    if let Some(reason) = deny_every_reading(command) {
         return Some(reason);
     }
     // The interpreter's word delimiters are not this floor's. `cmd.exe`
@@ -467,25 +473,6 @@ pub fn builtin_deny(command: &str) -> Option<DenyReason> {
     // "nobody here can read this line" is not "this line is catastrophic", so
     // it is refused one floor up, where authority is known
     // (`runtime::approval_flow`), instead of denied in every mode.
-    if let Some(normalized) = blanks_for(HOST.word_delimiters, command)
-        && let Some(reason) = deny_line(&normalized)
-    {
-        return Some(reason);
-    }
-    // `;` is one of cmd's delimiters too, and it needs the narrower re-read:
-    // this floor reads `;` as a segment separator, so normalizing it across the
-    // whole line merges two commands and invents denials —
-    // `curl https://x -o f; echo hi | sh` read as a fetch feeding the pipe and
-    // was denied in every mode, wrongly. The per-segment rules cannot make that
-    // mistake, because they never look across a `|`, so `del;/f/s/q;C:\*` —
-    // which `segments` otherwise chopped into argument-less pieces that matched
-    // nothing — is denied without touching the pipe reading.
-    if let Some(normalized) = blanks_for(HOST.separator_delimiters, command)
-        && let Some(reason) = segments(&normalized).into_iter().find_map(deny_segment)
-    {
-        return Some(reason);
-    }
-
     // Brace expansion is the one word-expansion stage that rewrites the
     // program word itself, so the floor has to read through it or every rule
     // here is one `{,}` away from silent: `rm{,} -rf /` presented the program
@@ -506,43 +493,46 @@ pub fn builtin_deny(command: &str) -> Option<DenyReason> {
     let mut budget = MAX_BRACE_WORDS;
     let expanded = brace_expanded_line(command, &mut budget);
     (expanded != command)
-        .then(|| deny_line(&expanded))
+        .then(|| deny_every_reading(&expanded))
         .flatten()
 }
 
-/// Deny a segment whose *program word* the interpreter would rewrite before
-/// any rule here can read it.
+/// Every reading of `line` the interpreter could take once its own delimiters
+/// are read as delimiters, judged by the whole floor rather than by a subset.
 ///
-/// `cmd.exe` expands `%VAR%` on the command line, so
-/// `de%PATH:~0,0%l /f/s/q C:\*` reached this floor as the program
-/// `de%path:~0,0%l`, matched nothing, and `cmd /C` ran `del /f/s/q C:\*` — on
-/// the one platform with no sandbox behind this floor. No normalization
-/// recovers `del` from that word: the expansion depends on the environment.
-/// What is left is to refuse a line whose program word nobody here can read.
+/// `cmd.exe` delimits words on `,` and `;` as well as blanks, and the two used
+/// to be re-read one at a time, by different halves of the floor. Both gaps
+/// that opened are the same shape: a spelling that mixes them
+/// (`del,/f;/s/q,C:\*` — `del /f /s /q C:\*` to `cmd`) was read by neither
+/// pass. Combinations rather than a ladder, so adding a rewriting later adds
+/// one entry instead of multiplying the missing cells.
 ///
-/// Scoped to the program word on purpose, and the scope is the whole design.
-/// An earlier version of this rule refused *any* word carrying the pair, which
-/// took `echo %PATH%` and `dir %USERPROFILE%\Desktop` away from a human who
-/// explicitly approves them — in every mode, because this floor is mode-blind —
-/// and the harness's own Windows prompt tells the model to spell variables
-/// `%VAR%`. A `%VAR%` operand is a different question with a different answer:
-/// it is indirection, so the line is never auto-approved and never a bounded
-/// edit ([`super::shell_lex::has_shell_indirection`]), exactly as `$HOME` is
-/// on Unix — a prompt, not a denial.
-fn deny_unreadable_program(grammar: Grammar, command: &str) -> Option<DenyReason> {
-    segments(command)
-        .into_iter()
-        .any(|segment| {
-            program_of(segment).is_some_and(|program| rewrites_a_word(grammar, &program))
-        })
-        .then_some(DenyReason(
-            "the command interpreter would rewrite this program word before it runs",
-        ))
+/// `merged_segments` is what the ladder was really encoding: normalizing `;`
+/// glues together what this floor reads as separate segments, so the
+/// cross-segment rule (`deny_pipe_to_shell`) must not run on that reading —
+/// it read `curl https://x -o f; echo hi | sh` as a fetch feeding the pipe and
+/// denied it, in every mode, wrongly. The per-segment rules cannot make that
+/// mistake, so they run on every reading.
+fn deny_every_reading(line: &str) -> Option<DenyReason> {
+    let words = blanks_for(HOST.word_delimiters, line);
+    let separators = blanks_for(HOST.separator_delimiters, line);
+    let both = words
+        .as_deref()
+        .and_then(|normalized| blanks_for(HOST.separator_delimiters, normalized));
+    [
+        (Some(line), false),
+        (words.as_deref(), false),
+        (separators.as_deref(), true),
+        (both.as_deref(), true),
+    ]
+    .into_iter()
+    .filter_map(|(text, merged)| Some((text?, merged)))
+    .find_map(|(text, merged)| deny_line(text, merged))
 }
 
 /// The deny rules for one concrete command line (no brace expansion).
-fn deny_line(command: &str) -> Option<DenyReason> {
-    if let Some(reason) = deny_pipe_to_shell(command) {
+fn deny_line(command: &str, merged_segments: bool) -> Option<DenyReason> {
+    if !merged_segments && let Some(reason) = deny_pipe_to_shell(command) {
         return Some(reason);
     }
     segments(command).into_iter().find_map(deny_segment)
@@ -736,6 +726,7 @@ pub struct SafetyNote {
 /// Internal builder that dedups notes as they are recorded.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SafetyNotes {
+    /// The notes recorded so far, at most one per reason.
     notes: Vec<SafetyNote>,
 }
 
@@ -805,7 +796,11 @@ fn note_segments_of(command: &str, notes: &mut SafetyNotes) {
             "curl" | "wget" | "nc" | "ncat" | "ssh" | "scp" | "rsync" | "ftp" | "telnet" => {
                 notes.note(TextId::SafetyNetworkReason, TextId::SafetyNetworkSuggestion);
             }
-            "rm" | "rmdir" | "unlink" | "shred" | "trash" => {
+            // The Windows verbs belong here for the same reason they belong
+            // in `deny_segment`: a `del`/`rd` line that is not a system root
+            // is not denied, so this note is the only thing the human reading
+            // the panel gets — and they got nothing.
+            "rm" | "rmdir" | "unlink" | "shred" | "trash" | "del" | "erase" | "rd" => {
                 notes.note(TextId::SafetyDeleteReason, TextId::SafetyDeleteSuggestion);
             }
             "chmod" | "chown" => {

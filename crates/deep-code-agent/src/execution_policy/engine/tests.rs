@@ -509,8 +509,12 @@ fn trust_covers_only_what_runs_without_a_shell() {
     // executor refusing to run a cmd builtin as a bare argv
     // (`sandbox::windows::resolve_executable`). If that refusal ever turned
     // into a fallback through `cmd /C`, this line would open a shell with no
-    // prompt, so the trust has to be written down where someone changing the
-    // executor will trip over it.
+    // prompt — and, stated plainly rather than implied: the assertion below
+    // would NOT catch that. It pins the policy's verdict, which does not
+    // change; the executor's refusal is asserted nowhere, because
+    // `resolve_executable` is `cfg(windows)` code with no test. That gap is
+    // the reason this comment exists where someone changing the executor will
+    // read it.
     //
     // The limit of writing it this way, stated rather than hidden:
     // `evaluate_shell_command` takes no `Grammar`, so the arm below executes
