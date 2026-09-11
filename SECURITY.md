@@ -135,15 +135,23 @@ review to rediscover:
   pair split across words is not read as one, and `cmd` leaves an *undefined*
   `%X%` literal, so that spelling is inert until something has defined the
   variable.
-- cmd's word delimiters are a separate problem with a real answer: `,` — and
-  `;`, which this floor reads as a segment separator — make `del,/f/s/q,C:\*`
-  one opaque word here (`basename_lower` of it is `*`) and a wipe to `cmd`. The
-  floor judges every reading of the line: raw, `,`-normalized, `;`-normalized,
-  and both, with the cross-segment pipe rule skipped on the readings that
-  merged segments (it read `curl https://x -o f; echo hi | sh` as a fetch
-  feeding a shell). `=` is in cmd's documented delimiter set and is
-  deliberately *not* normalized: it invented denials no tier could override —
-  `rm -r --exclude=/ build` read as a recursive remove of `/`.
+- cmd's word delimiters are a separate problem with a real answer: `,`, `;` and
+  `=` make `del,/f/s/q,C:\*`, `del;/f/s/q;C:\*` and `del=/f/s/q C:\*` one
+  opaque word here (`basename_lower` of the first is `*`) and a drive wipe to
+  `cmd`. The floor judges every reading of the line — as typed, brace-expanded,
+  delimiter-normalized, and every composition of those — by the whole rule set,
+  the cross-segment pipe rule included. Reading more can only add a denial: each
+  reading is one the interpreter itself would run.
+  `;` is read as a word delimiter *only* under the Windows grammar, and the
+  merge that makes of a line this floor otherwise segments is `cmd`'s own
+  reading: `curl https://x -o f; echo hi | sh` really is a fetch feeding `sh`
+  there, and is denied. On Unix the set is empty and `;` separates commands as
+  a human means it to.
+  `=` is read only *outside* a flag token, because reading it everywhere
+  invented denials no tier could override (`rm -r --exclude=/ build` as a
+  recursive remove of `/`). Residual: a delimiter spelling inside a flag's
+  value, which is the one place the floor cannot tell a value from a word
+  boundary.
 - On Windows a line spelling a backslash immediately before a `"` never runs
   unattended: `CommandLineToArgvW` and `cmd.exe` read that backslash run
   differently, so the parser refuses instead of choosing. The usual casualty is
@@ -268,13 +276,17 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
   `dir %USERPROFILE%`,收窄到程序词之后是 `%PYTHON% script.py` 这种启动器写法。
   残余:跨词的一对不会被读成一对;而 `cmd` 对**未定义**的 `%X%` 原样保留,所以那种
   拼法在有人先把变量定义出来之前是惰性的。
-- cmd 的词分隔符是另一个问题,而它有确切的答案:`,`——以及这层楼读作段分隔符的
-  `;`——让 `del,/f/s/q,C:\*` 在这里是一个读不懂的词(basename 是 `*`),对 `cmd`
-  却是一次清盘。这层楼现在判**每一种读法**:原文、`,` 归一化、`;` 归一化、以及两者
-  都归一化;其中合并了段的那些读法不跑跨段的管道规则(它曾把
-  `curl https://x -o f; echo hi | sh` 读成 fetch 喂给 shell)。`=` 在 cmd 的文档
-  分隔符集里,但刻意**不**归一化:它造出过任何档位都无法覆盖的误拒——
-  `rm -r --exclude=/ build` 被读成对 `/` 的递归删除。
+- cmd 的词分隔符是另一个问题,而它有确切的答案:`,`、`;`、`=` 让
+  `del,/f/s/q,C:\*`、`del;/f/s/q;C:\*`、`del=/f/s/q C:\*` 在这里都是读不懂的词
+  (第一个的 basename 是 `*`),对 `cmd` 却都是一次清盘。这层楼判**每一种读法**:
+  原文、花括号展开、分隔符归一化,以及它们的每一种组合——每种读法都由完整的规则集
+  判,包括跨段的管道规则。多读只会多拒:每一种读法都是解释器自己会跑的那一行。
+  `;` 只在 Windows 语法下被读作词分隔符,而它造成的「把两条命令并成一条」正是
+  `cmd` 自己的读法:`curl https://x -o f; echo hi | sh` 在那里确实是 fetch 喂给
+  `sh`,所以拒。Unix 上这个集合是空的,`;` 就是人以为的段分隔符。
+  `=` 只在**旗标之外**被读作分隔符:到处读会造出任何档位都无法覆盖的误拒
+  (`rm -r --exclude=/ build` 被读成对 `/` 的递归删除)。残余=写在旗标取值里的
+  分隔符,那是这层楼唯一分不清「取值」与「词边界」的位置。
 - Windows 上,一行里只要出现「反斜杠紧挨 `"`」就不会免审运行:
   `CommandLineToArgvW` 与 `cmd.exe` 对那串反斜杠的读法不同,解析器拒绝而不是
   替它选一个。代价最常见的是引号里以分隔符结尾的路径——`xcopy "src\" "dst\"`

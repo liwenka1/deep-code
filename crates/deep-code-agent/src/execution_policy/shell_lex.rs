@@ -241,42 +241,49 @@ pub(super) struct Grammar {
     /// there would block real work for nothing.
     pub(super) rewrites_words_with: &'static [char],
     /// What the platform's interpreter treats as a word delimiter *besides*
-    /// blanks, and which it is therefore safe to read as one.
+    /// blanks, and which it is therefore safe to read as one everywhere on the
+    /// line.
     ///
-    /// Empty for `sh`, which delimits on blanks alone. `,` for `cmd.exe`:
-    /// `del,/f/s/q,C:\*` is `del` with two arguments to it there, and one
-    /// opaque word to anything that splits on blanks — which is how it walked
-    /// past every rule on the deny floor.
+    /// Empty for `sh`, which delimits on blanks alone. `,` and `;` for
+    /// `cmd.exe`: `del,/f/s/q,C:\*` and `del;/f/s/q;C:\*` are both `del` with
+    /// three arguments there, and one opaque word to anything that splits on
+    /// blanks — which is how they walked past every rule on the deny floor.
     ///
-    /// `=` is in `cmd`'s documented delimiter set and is deliberately not here.
-    /// Normalizing it invented denials that no mode can override, measured on
-    /// ordinary lines: `rm -r --exclude=/ build` became a recursive remove of
-    /// `/`, and `format=ntfs C:` — an environment assignment to this floor —
-    /// became the `format` program with a drive operand. `--flag=value` is far
-    /// too common a shape to read as two words on a floor that cannot be
-    /// overridden, and the spellings it would catch (`del=/f/s/q …`) are not
-    /// ones anything produces. The residual is written down rather than
-    /// traded for that.
+    /// `;` was held out of this set for one release on the grounds that
+    /// normalizing it merges two commands, which made
+    /// `curl https://x -o f; echo hi | sh` read as a fetch feeding the pipe and
+    /// denied it in every mode. The measurement was real; the conclusion was
+    /// wrong. This set is non-empty only under the Windows grammar, and *there*
+    /// the merge is what `cmd` does — `;` delimits words for it while `|` still
+    /// pipes, so that line really is a fetch feeding `sh`, and denying it is the
+    /// right answer. The reading a human means by `;` is the Unix one, where
+    /// this set is empty and nothing is merged.
     ///
-    /// `cmd` delimits on `;` too, and it is deliberately not here. This floor
-    /// reads `;` as a *segment separator* (`segments`), so normalizing it
-    /// merges two commands into one — measured, not theorized:
-    /// `curl https://x -o f; echo hi | sh` then reads as a fetch that feeds the
-    /// pipe, and the floor denied it, in every mode, wrongly. The narrow
-    /// residual is the reverse spelling (`del;/f/s/q;C:\*`, which `segments`
-    /// splits into argument-less pieces); a special case for it would cost more
-    /// than it closes.
+    /// Merging can only add words to a segment, never take its program word
+    /// away, so no per-segment rule can lose a denial to it. What it could
+    /// invent is a rule that ORs over arguments seeing an argument that belonged
+    /// to the next command (`rm -r ./build; echo ~`). Every such rule needs a
+    /// shape no ordinary second command has — `rm -rf` is denied by its flags
+    /// alone, so the iconic spelling is untouched — and the cost is confined to
+    /// the one platform whose interpreter really reads the line that way.
     pub(super) word_delimiters: &'static [char],
-    /// Delimiters this module reads as *segment separators* rather than word
-    /// separators, so they can only be normalized for the rules that work one
-    /// segment at a time.
+    /// Word delimiters that may only be read as such *outside a flag token* —
+    /// a token starting with `-`.
     ///
-    /// `;` for `cmd.exe`: it delimits words there, but [`segments`] splits on
-    /// it, so turning it into a blank across the whole line merges two commands
-    /// — measured, `curl https://x -o f; echo hi | sh` then read as a fetch
-    /// feeding the pipe and was denied in every mode, wrongly. The segment
-    /// rules cannot make that mistake: they never look across a `|`.
-    pub(super) separator_delimiters: &'static [char],
+    /// `=` for `cmd.exe`, and that restriction is the whole reason it is a
+    /// field of its own. Read as a delimiter everywhere, it invented denials no
+    /// mode can override, measured on ordinary lines: `rm -r --exclude=/ build`
+    /// became a recursive remove of `/`. Read only outside flags, it still
+    /// recovers the spelling that walked past the floor — `del=/f/s/q C:\*`,
+    /// where the `=` makes the verb look like an environment assignment to
+    /// [`super::shell_deny`] and hands the program word to `C:\*`.
+    ///
+    /// `format=ntfs C:` is denied under this reading, and that is correct rather
+    /// than the false positive it was once recorded as: to `cmd`, that line *is*
+    /// the `format` program with a drive operand. Under the `sh` grammar it
+    /// stays an environment assignment, this set is empty, and nothing about it
+    /// changes.
+    pub(super) word_delimiters_outside_flags: &'static [char],
     /// Whether a word opening with `#` comments out the rest of the line.
     ///
     /// It does in `sh`. `cmd.exe` has no comment syntax at all, and `#` is a
@@ -297,7 +304,7 @@ pub(super) const SH: Grammar = Grammar {
     quoting_to_strip: &['\'', '"', '\\'],
     rewrites_words_with: &[],
     word_delimiters: &[],
-    separator_delimiters: &[],
+    word_delimiters_outside_flags: &[],
     comments_with_hash: true,
 };
 
@@ -308,8 +315,8 @@ pub(super) const WINDOWS: Grammar = Grammar {
     path_separators: &['/', '\\'],
     quoting_to_strip: &['\'', '"', '^'],
     rewrites_words_with: &['%'],
-    word_delimiters: &[','],
-    separator_delimiters: &[';'],
+    word_delimiters: &[',', ';'],
+    word_delimiters_outside_flags: &['='],
     comments_with_hash: false,
 };
 
@@ -347,11 +354,14 @@ pub(super) fn rewrites_a_word(grammar: Grammar, word: &str) -> bool {
 
 /// Whether any word of `command` is one [`rewrites_a_word`] describes.
 ///
-/// This is the trust side's question — such a line is never auto-approved and
-/// never a bounded edit, exactly as `$VAR` and `$(…)` are not on Unix
-/// ([`has_shell_indirection`] folds it in). The deny floor asks the narrower
-/// question about the *program word* alone, because "no rule here can read this
-/// word" is a reason to refuse the line only when the word decides what runs.
+/// This is the trust side's question, and the only side that asks it: such a
+/// line is never auto-approved and never a bounded edit, exactly as `$VAR` and
+/// `$(…)` are not on Unix ([`has_shell_indirection`] folds it in). The deny
+/// floor deliberately asks nothing about `%` — "no rule here can read this
+/// word" is not "this line is catastrophic", and every attempt to make the
+/// floor refuse it cost an ordinary command instead (`echo %PATH%`,
+/// `%PYTHON% script.py`, `%COMSPEC% /c …` — the launcher shapes a model is
+/// taught to write). It is an indirect form like any other.
 #[must_use]
 pub(super) fn rewrites_a_word_of_the_line(grammar: Grammar, command: &str) -> bool {
     command
@@ -362,13 +372,13 @@ pub(super) fn rewrites_a_word_of_the_line(grammar: Grammar, command: &str) -> bo
 /// `command` with each of `delimiters` turned into a blank, or `None` when it
 /// carries none of them and re-reading it would be redundant.
 ///
-/// `cmd.exe` delimits words on `,`, `;` and `=` as well as blanks, so
+/// `cmd.exe` delimits words on `,` and `;` as well as blanks, so
 /// `del,/f/s/q,C:\*` is a catastrophic command to it and one unrecognizable
 /// word to a floor that splits on blanks — `basename_lower` of that word is
-/// `*`, which matches no rule. Callers pass the set they can safely normalize:
-/// [`Grammar::word_delimiters`] for a whole-line re-read,
-/// [`Grammar::separator_delimiters`] for one that only feeds the per-segment
-/// rules.
+/// `*`, which matches no rule. Callers pass the set they may normalize
+/// everywhere ([`Grammar::word_delimiters`]);
+/// [`blanks_for_outside_flags`] is the same idea for a set that is only safe
+/// to read between operands.
 ///
 /// A caller re-reads for the same reason the deny floor re-reads a
 /// brace-expanded line: the rewritten form is the one the interpreter really
@@ -376,13 +386,10 @@ pub(super) fn rewrites_a_word_of_the_line(grammar: Grammar, command: &str) -> bo
 /// findings. That also makes it safe against the delimiter set being wider
 /// than a given `cmd` build actually splits on.
 ///
-/// The cost of a re-read is one allocation and one more pass over the line,
-/// paid on any Windows line carrying a `,` or an `=` — which is most of them,
-/// `--flag=value` being what it is. It is left as is on purpose: `sh`'s set is
-/// empty, so `contains` answers `None` before allocating anything and Unix pays
-/// nothing, and on Windows the caller is about to spawn a process. Narrowing it
-/// to "a delimiter glued between two non-blanks" would not help either —
-/// `--flag=value` is exactly that shape.
+/// The cost is one allocation and one more pass over the line, and only on a
+/// line that carries one of the characters: `sh`'s set is empty, so `contains`
+/// answers `None` before allocating and Unix pays nothing at all, while a
+/// Windows caller is about to spawn a process.
 #[must_use]
 pub(super) fn blanks_for(delimiters: &[char], command: &str) -> Option<String> {
     if !command.contains(delimiters) {
@@ -394,6 +401,49 @@ pub(super) fn blanks_for(delimiters: &[char], command: &str) -> Option<String> {
             .map(|ch| if delimiters.contains(&ch) { ' ' } else { ch })
             .collect(),
     )
+}
+
+/// `command` with each of `delimiters` turned into a blank *except* inside a
+/// flag token — one whose first character is `-` — or `None` when the line
+/// carries none of them.
+///
+/// This is [`Grammar::word_delimiters_outside_flags`]'s reading, and the carve
+/// out is what makes it usable at all: `=` is one of `cmd`'s delimiters, but
+/// `--flag=value` is far too common a shape to read as two words on a floor no
+/// mode can override (`rm -r --exclude=/ build` became a recursive remove of
+/// `/`). Outside a flag, the same character is what let `del=/f/s/q C:\*` past
+/// every rule.
+///
+/// A replaced delimiter starts a new token, so the text after it is judged on
+/// its own terms: `x=-rf` reads as `x -rf`, with `-rf` a flag token. Only `-`
+/// opens a flag, not `cmd`'s `/switch` — a switch is already a word this floor
+/// reads, and keeping the test to one character keeps the reading easy to state.
+#[must_use]
+pub(super) fn blanks_for_outside_flags(delimiters: &[char], command: &str) -> Option<String> {
+    if !command.contains(delimiters) {
+        return None;
+    }
+    let mut out = String::with_capacity(command.len());
+    let mut token_start = true;
+    let mut in_flag = false;
+    for ch in command.chars() {
+        if ch.is_whitespace() {
+            (token_start, in_flag) = (true, false);
+            out.push(ch);
+            continue;
+        }
+        if token_start {
+            in_flag = ch == '-';
+            token_start = false;
+        }
+        if !in_flag && delimiters.contains(&ch) {
+            out.push(' ');
+            token_start = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    Some(out)
 }
 
 /// The grammar of the host this build runs on — what every caller outside the
@@ -1359,19 +1409,42 @@ mod tests {
             argvs_in(SH, "git log --format=%h%s -5"),
             Some(words(&[&["git", "log", "--format=%h%s", "-5"]]))
         );
-        // cmd's other delimiters, which the deny floor re-reads through.
+        // cmd's other delimiters, which the deny floor re-reads through. `;` is
+        // one of them: it delimits words for `cmd` exactly as `,` does, and the
+        // merge that makes of a line this floor segments is `cmd`'s own reading
+        // of it.
+        for spelled in [r"del,/f/s/q,C:\*", r"del;/f/s/q;C:\*"] {
+            assert_eq!(
+                blanks_for(WINDOWS.word_delimiters, spelled).as_deref(),
+                Some(r"del /f/s/q C:\*")
+            );
+            assert_eq!(blanks_for(SH.word_delimiters, spelled), None);
+        }
+        // `=` is read only where it cannot be a flag's value. Both halves are
+        // load-bearing: the first spelling walked past every rule on the floor,
+        // and reading the second one as two words denied an everyday command in
+        // every mode with no way to say yes.
         assert_eq!(
-            blanks_for(WINDOWS.word_delimiters, r"del,/f/s/q,C:\*").as_deref(),
+            blanks_for_outside_flags(WINDOWS.word_delimiters_outside_flags, r"del=/f/s/q C:\*")
+                .as_deref(),
             Some(r"del /f/s/q C:\*")
         );
-        assert_eq!(blanks_for(SH.word_delimiters, r"del,/f/s/q,C:\*"), None);
-        // `;` stays out of that set: it is a segment separator to this floor,
-        // and turning it into a blank merged two commands — the fetch below
-        // then read as the producer of the pipe and the floor denied the line
-        // in every mode, wrongly.
-        let across_a_semicolon = "curl https://x -o f; echo hi | sh";
         assert_eq!(
-            blanks_for(WINDOWS.word_delimiters, across_a_semicolon).as_deref(),
+            blanks_for_outside_flags(
+                WINDOWS.word_delimiters_outside_flags,
+                "rm -r --exclude=/ build"
+            )
+            .as_deref(),
+            Some("rm -r --exclude=/ build")
+        );
+        // A value that begins a flag is read as one once the delimiter before
+        // it becomes a blank.
+        assert_eq!(
+            blanks_for_outside_flags(&['='], "x=-rf y=-rf").as_deref(),
+            Some("x -rf y -rf")
+        );
+        assert_eq!(
+            blanks_for_outside_flags(SH.word_delimiters_outside_flags, r"del=/f/s/q C:\*"),
             None
         );
     }

