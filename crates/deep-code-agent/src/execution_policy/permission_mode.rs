@@ -7,8 +7,9 @@
 //! runs a command the deny list *recognized*. Be honest about what that
 //! buys: `shell_deny` is best-effort string parsing, not a security boundary.
 //! An obfuscation it fails to parse falls through as `NeedsApproval`, which
-//! `Yolo` auto-approves — so under `Yolo` the real containment is the OS
-//! sandbox (where enabled), not this floor.
+//! `Yolo` auto-approves — so what holds it is not this floor, and it is not the
+//! same on every platform:
+//! [what is behind a command nobody read](super#what-is-behind-a-command-nobody-read).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};

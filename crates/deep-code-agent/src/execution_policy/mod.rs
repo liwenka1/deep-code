@@ -73,8 +73,37 @@
 //! a trust-list `Allow`, a remembered session identity, the accept-edits
 //! allowance — is executed as the argv `shell_lex::parse_unattended` produced,
 //! with no shell in between; a call a human (or the judge, or Yolo) approved as
-//! text goes to `sh -c` and means what the human read. The gate therefore
-//! trusts only what that parse accepts.
+//! text goes to a shell verbatim — `sh -c`, or `cmd /C` on Windows — and means
+//! what the human read. The gate therefore trusts only what that parse accepts.
+//!
+//! # What is behind a command nobody read
+//!
+//! Three of the channels above hand shell text to a shell with no human having
+//! read it: config `auto_allow` (stage 4), `Yolo` (stage 5) and the Auto judge
+//! (stage 6). All three resolve to `crate::tool::RunAuthority::Approved`. What
+//! stands behind such a command is platform-dependent, and this is the one
+//! place that states it — every other site should link here rather than
+//! restate it, because the short version ("the deny floor is best-effort, the
+//! sandbox is the real containment") is false on one platform:
+//!
+//! * **macOS / Linux** — [`crate::sandbox`] confines writes to the granted
+//!   roots and denies network unless the call declared egress. The deny floor
+//!   being best-effort is survivable here: the sandbox is the boundary.
+//! * **Windows** — a backend exists and reports `available: true`, so commands
+//!   are not refused for lack of one, but it is a Job Object:
+//!   `sandbox::windows` kills the process tree and caps process count, and
+//!   reports `Enforcement::None` for both filesystem and network. Nothing
+//!   bounds what such a command writes or sends, so the deny floor
+//!   (`shell_deny::builtin_deny`) is the last thing in front of it.
+//! * **Every platform** — the per-turn checkpoint snapshots the *primary*
+//!   workspace before each turn, so in-workspace damage can be rewound. It is
+//!   recovery, not containment: it skips `.git`, `target` and `node_modules`,
+//!   does not cover a write root granted later, and neither egress nor a wipe
+//!   of the drive holding it respects it.
+//!
+//! Stated the other way: `yolo` on macOS/Linux is contained by the sandbox;
+//! `yolo` on Windows is contained by the deny floor and nothing else, and
+//! `SECURITY.md` records the spellings that floor cannot read.
 //!
 //! Only stage 1 can say an automatic hard "no" (enforced at stage 3). Every
 //! stage below can only relax a `NeedsApproval` into running — one from stage 1

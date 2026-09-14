@@ -18,14 +18,20 @@
 //! word itself (`rm{,} -rf /`) — but it does not chase interpreters, `sh -c`
 //! scripts, substitutions or wrapper options. It doesn't have to: any command
 //! containing indirection is structurally excluded from every automatic pass
-//! ([`has_shell_indirection`]) and wrapped/interpreter forms are never
-//! trusted, so those always land on a human first. What parsing misses is
-//! contained by the human at the prompt — or, under `Yolo`, by the OS sandbox
-//! (plus the per-turn checkpoint for the writable workspace) on the platforms
-//! that have one. Windows does not, which is why this floor reads the
-//! interpreter's own rewritings of a line ([`readings_of`]) rather than the
-//! line as typed, and why what it still cannot read there is written down in
-//! `SECURITY.md` instead of assumed contained.
+//! ([`super::shell_lex::has_shell_indirection`]) and wrapped/interpreter forms
+//! are never trusted, so those always land on a human first. What parsing
+//! misses is contained by the human at the prompt — or, on the channels where
+//! nobody read the text, by whatever stands behind that channel, which is not
+//! the same on every platform:
+//! [what is behind a command nobody read](super#what-is-behind-a-command-nobody-read).
+//!
+//! On Windows that is this floor and nothing else, so it judges **every**
+//! reading the interpreter could take of a line ([`readings_of`]) — the line as
+//! typed always among them — and what it still cannot read there is written
+//! down in `SECURITY.md` instead of assumed contained. The readings are not a
+//! Windows accommodation: brace expansion is `sh`'s own rewriting and is read
+//! on every host, because `rm{,} -rf /` presented a program word no rule here
+//! matched.
 
 // Same guard as `shell_lex`, and for the same reason: an item inserted between
 // a doc comment and the item it describes re-parents the prose silently, and
@@ -352,10 +358,13 @@ fn chmod_world_writable(arg: &str) -> bool {
 /// quotes stripped and read past the shell's own prefixes ([`segment_words`]);
 /// it deliberately does NOT chase inline interpreters (`sh -c '…'`),
 /// substitutions or wrapper options — those indirect forms can never be
-/// auto-approved (see [`has_shell_indirection`] and the untrusted default), so
-/// they always reach a human, and under `Yolo` the OS sandbox is the
-/// containment. This floor exists to stop the common destructive shapes a
-/// model emits verbatim, not to win an obfuscation arms race.
+/// auto-approved (see [`super::shell_lex::has_shell_indirection`] and the
+/// untrusted default), so they always reach a human — except on the channels
+/// where nobody reads the text, and what stands behind those is the module
+/// map's business, not a sentence to restate here:
+/// [what is behind a command nobody read](super#what-is-behind-a-command-nobody-read).
+/// This floor exists to stop the common destructive shapes a model emits
+/// verbatim, not to win an obfuscation arms race.
 fn deny_segment(segment: &str) -> Option<DenyReason> {
     // Fork bomb: whitespace-insensitive signature match.
     let squished: String = segment.chars().filter(|c| !c.is_whitespace()).collect();

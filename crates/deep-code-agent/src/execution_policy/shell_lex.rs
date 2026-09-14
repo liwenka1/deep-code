@@ -558,8 +558,10 @@ fn strip_executable_extension(base: &str) -> String {
 /// over-approximation the rest of this list makes: a brace command is never
 /// auto-trusted and never a bounded edit, so it lands on a human, and no
 /// expander has to be right for the gate to be safe. (The deny floor does
-/// expand them — see `shell_deny::builtin_deny` — because under `Yolo` it is
-/// the only thing above the sandbox.)
+/// expand them — see `shell_deny::builtin_deny` — because on the channels that
+/// never parse a line it is the last rule that runs, and on Windows the only
+/// thing behind them at all: see the `execution_policy` module map, "what is
+/// behind a command nobody read".)
 ///
 /// Both halves of a pair are listed because bash leaves an unbalanced brace
 /// alone (`a{b` stays `a{b`): matching either character over-approximates in

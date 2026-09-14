@@ -54,11 +54,14 @@ fn quoted_program_word_cannot_dodge_deny() {
 /// by the time anything runs and nothing here can read the word. This floor
 /// deliberately does **not** chase it, for the same reason it does not chase
 /// `$(…)` or `$VAR` (`indirect_forms_fall_to_approval_not_deny`): an indirect
-/// form is made un-auto-approvable instead, so a human always sees it — and
-/// under `yolo`, where nobody does, the containment is the OS sandbox on the
-/// platforms that have one. Windows does not, so `yolo` there really does run
-/// `de%PATH:~0,0%l /f/s/q C:\*`; that residual is recorded in `SECURITY.md`
-/// rather than paid for with the ordinary commands listed below.
+/// form is made un-auto-approvable instead, so every channel that *parses* the
+/// command sends it to a human. Three channels do not parse it — config
+/// `auto_allow`, the Auto judge and `yolo` — and what stands behind those is
+/// the module map's business ("what is behind a command nobody read" in
+/// `execution_policy`). On Windows that is this floor and nothing else, so
+/// `de%PATH:~0,0%l /f/s/q C:\*` really does run there. That residual is
+/// accepted and recorded in `SECURITY.md`; closing it here would cost the
+/// ordinary commands listed below.
 ///
 /// Three rounds of trying to deny it here each took ordinary commands away in
 /// every tier, because this floor is mode-blind and cannot be overridden:
@@ -311,8 +314,11 @@ fn indirect_forms_fall_to_approval_not_deny() {
     // The collapse, stated as behavior: interpreter/substituted destructive
     // forms are NOT chased by the deny floor — they are structurally
     // un-auto-approvable instead (never trusted, never an fs-edit, see
-    // `has_shell_indirection` and the untrusted default), so a human always
-    // sees them; Yolo's containment is the OS sandbox.
+    // `has_shell_indirection` and the untrusted default), so every channel that
+    // parses the command sends it to a human. What stands behind the channels
+    // that do not parse it is the module map's business ("what is behind a
+    // command nobody read" in `execution_policy`), and it is not one sentence:
+    // on Windows there is nothing behind them but this floor.
     assert!(!denied("sh -c 'rm -rf /'"));
     assert!(!denied("echo $(rm -rf /)"));
     // …and none of them is auto-approvable anywhere:
@@ -1051,8 +1057,10 @@ fn safety_note_arms_are_pinned_each_way() {
 /// Brace expansion rewrites the program word itself, so every rule on this
 /// floor was one `{,}` away from silent: `rm{,} -rf /` presented the program
 /// `rm{,}`, `{rm,-rf,/}` presented `}`, `{sudo,ls}` presented `sudo,ls}`.
-/// Under `Yolo` this floor is the only thing above the sandbox, which is
-/// exactly where the iconic shapes have to keep working.
+/// On the channels where nobody reads the text this floor is the last rule that
+/// runs, and on Windows the only one behind them at all ("what is behind a
+/// command nobody read" in `execution_policy`) — exactly where the iconic
+/// shapes have to keep working.
 #[test]
 fn brace_expanded_commands_are_denied() {
     for command in [

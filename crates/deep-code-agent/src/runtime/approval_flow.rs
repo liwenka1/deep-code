@@ -165,7 +165,9 @@ impl AgentRuntime {
     /// the gate more broadly. Policy hard-denials are unaffected either way:
     /// they short-circuit in the registry before any decision is consulted.
     /// (That covers commands the deny parser recognized — it is best-effort,
-    /// so `Yolo`'s real containment is the OS sandbox, not the deny list.)
+    /// so what holds an obfuscation it misses is never this list. What it *is*
+    /// depends on the platform, and on Windows the answer is "nothing": see
+    /// [what is behind a command nobody read](crate::execution_policy#what-is-behind-a-command-nobody-read).)
     ///
     /// `None` means ask. `Some` names the layer that resolved it, because the
     /// executor needs to know whether that layer *parsed* the command (a
@@ -182,8 +184,9 @@ impl AgentRuntime {
         // through EVERY consent channel: above Layer 1 so a config
         // `auto_allow` entry cannot become a standing root-grant (grants
         // must stay explicit per-directory actions), and above Layer 2 so
-        // even Yolo prompts — Yolo's real containment is the OS sandbox, and
-        // this call is precisely a request to widen that containment.
+        // even Yolo prompts — this call widens the write boundary itself,
+        // which is what bounds an auto-approved command wherever anything
+        // bounds it, so no mode and no standing consent may hand it over.
         if is_root_grant(&call.name) {
             return None;
         }
