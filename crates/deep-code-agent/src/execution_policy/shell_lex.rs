@@ -430,6 +430,14 @@ pub(super) fn blanks_for(delimiters: &[char], command: &str) -> Option<String> {
 /// its own terms: `x=-rf` reads as `x -rf`, with `-rf` a flag token. Only `-`
 /// opens a flag, not `cmd`'s `/switch` — a switch is already a word this floor
 /// reads, and keeping the test to one character keeps the reading easy to state.
+///
+/// `None` also when the carve-out ate every delimiter, which is the common
+/// case: `rm -r --exclude=/ build` carries an `=` and comes back unchanged. An
+/// unchanged reading is not a reading — `shell_deny::readings_of` already holds
+/// the text this was derived from, so handing it back makes the whole floor and
+/// the approval notes judge the same bytes twice, on every `--flag=value` line
+/// Windows runs. [`blanks_for`] needs no such test: every delimiter it finds is
+/// one it replaces, so a `Some` there is always a different line.
 #[must_use]
 pub(super) fn blanks_for_outside_flags(delimiters: &[char], command: &str) -> Option<String> {
     if !command.contains(delimiters) {
@@ -455,7 +463,7 @@ pub(super) fn blanks_for_outside_flags(delimiters: &[char], command: &str) -> Op
             out.push(ch);
         }
     }
-    Some(out)
+    (out != command).then_some(out)
 }
 
 /// The grammar of the host this build runs on — what every caller outside the
@@ -1443,13 +1451,14 @@ mod tests {
                 .as_deref(),
             Some(r"del /f/s/q C:\*")
         );
+        // Nothing outside a flag, so nothing to re-read: `None`, not a
+        // byte-identical copy the floor would then judge a second time.
         assert_eq!(
             blanks_for_outside_flags(
                 WINDOWS.word_delimiters_outside_flags,
                 "rm -r --exclude=/ build"
-            )
-            .as_deref(),
-            Some("rm -r --exclude=/ build")
+            ),
+            None
         );
         // A value that begins a flag is read as one once the delimiter before
         // it becomes a blank.
