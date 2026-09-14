@@ -52,9 +52,37 @@
 // reports 834 items, which is a documentation project, not a guard.
 #![warn(clippy::missing_docs_in_private_items)]
 
-/// Split a command line into individually-checkable segments on the shell
-/// control operators `;`, `&&`, `||`, `|`, and newlines. Each segment is a
-/// single simple command whose program/args we can inspect.
+/// The characters [`segments`] cuts a line at: the shell control operators
+/// `;`, `&&`, `||`, `|` (each `&` and `|` of a pair is one cut, and the empty
+/// piece between them is dropped) and newlines. Named so that the other reader
+/// of command boundaries, [`blanks_for_outside_flags`], can be held against
+/// it: every character here ends a flag token one way or another
+/// ([`FLAG_TOKEN_BOUNDARIES`] says which way), and
+/// `flag_tokens_end_at_every_command_boundary` fails naming any that does not.
+pub(super) const SEGMENT_SEPARATORS: [char; 4] = ['\n', ';', '|', '&'];
+
+/// Where a flag token ends besides a blank, for [`blanks_for_outside_flags`]:
+/// the two command boundaries no rewriting turns into a blank. A flag glued to
+/// one of them used to carry the `=` carve-out into the next command:
+/// `echo --x=1|del=/f/s/q C:\*` is two commands to `cmd` and the second is the
+/// drive wipe, and with `|` inside the token the `=` hiding the verb was never
+/// read.
+///
+/// The other two of [`SEGMENT_SEPARATORS`] are accounted for differently. A
+/// newline is whitespace. `;` is deliberately left *inside* the token, even
+/// though [`segments`] cuts at it: under the one grammar that reads `=` at
+/// all it is a word delimiter, [`blanks_for`] blanks it, and keeping it in the
+/// token is what reads the `=` in `del;-x=/s;C:\*` — that token begins with
+/// `d`, so its `=` is not a flag's value, and the closure in
+/// `shell_deny::readings_of` takes the result on to `del -x /s C:\*`, which
+/// is what `cmd` runs. Cutting at `;` would have made `-x=/s` a flag and
+/// handed the spelling to the residual `SECURITY.md` records for a delimiter
+/// inside a flag's value. `,` is the same case without the `segments` cut.
+pub(super) const FLAG_TOKEN_BOUNDARIES: [char; 2] = ['|', '&'];
+
+/// Split a command line into individually-checkable segments on
+/// [`SEGMENT_SEPARATORS`]. Each segment is a single simple command whose
+/// program/args we can inspect.
 ///
 /// This is a pragmatic tokenizer, not a full shell parser: it does not track
 /// quotes or subshells. That is a deliberate safety bias — an unparseable or
@@ -62,7 +90,7 @@
 /// auto-trusted, and deny checks still run on every whitespace-split segment.
 pub(super) fn segments(command: &str) -> Vec<&str> {
     command
-        .split(['\n', ';', '|', '&'])
+        .split(SEGMENT_SEPARATORS)
         .map(str::trim)
         .filter(|segment| !segment.is_empty())
         .collect()
@@ -431,13 +459,16 @@ pub(super) fn blanks_for(delimiters: &[char], command: &str) -> Option<String> {
 /// opens a flag, not `cmd`'s `/switch` — a switch is already a word this floor
 /// reads, and keeping the test to one character keeps the reading easy to state.
 ///
-/// `None` also when the carve-out ate every delimiter, which is the common
-/// case: `rm -r --exclude=/ build` carries an `=` and comes back unchanged. An
-/// unchanged reading is not a reading — `shell_deny::readings_of` already holds
-/// the text this was derived from, so handing it back makes the whole floor and
-/// the approval notes judge the same bytes twice, on every `--flag=value` line
-/// Windows runs. [`blanks_for`] needs no such test: every delimiter it finds is
-/// one it replaces, so a `Some` there is always a different line.
+/// A token ends at a blank or at one of [`FLAG_TOKEN_BOUNDARIES`] — `|` and
+/// `&`, where the command ends — not at a blank alone, and deliberately not at
+/// `;` or `,`; that constant says why.
+///
+/// The result may equal `command` when every `=` sits inside a flag
+/// (`rm -r --exclude=/ build`). Whether that is worth judging again is the
+/// enumeration's call, not this function's — `shell_deny::readings_of` keeps
+/// each distinct reading once, for this rewriting and for every other — so the
+/// contract here is the same as [`blanks_for`]'s: `None` exactly when the line
+/// carries none of the delimiters.
 #[must_use]
 pub(super) fn blanks_for_outside_flags(delimiters: &[char], command: &str) -> Option<String> {
     if !command.contains(delimiters) {
@@ -447,8 +478,8 @@ pub(super) fn blanks_for_outside_flags(delimiters: &[char], command: &str) -> Op
     let mut token_start = true;
     let mut in_flag = false;
     for ch in command.chars() {
-        if ch.is_whitespace() {
-            (token_start, in_flag) = (true, false);
+        if ch.is_whitespace() || FLAG_TOKEN_BOUNDARIES.contains(&ch) {
+            token_start = true;
             out.push(ch);
             continue;
         }
@@ -463,7 +494,7 @@ pub(super) fn blanks_for_outside_flags(delimiters: &[char], command: &str) -> Op
             out.push(ch);
         }
     }
-    (out != command).then_some(out)
+    Some(out)
 }
 
 /// The grammar of the host this build runs on — what every caller outside the
@@ -1451,25 +1482,92 @@ mod tests {
                 .as_deref(),
             Some(r"del /f/s/q C:\*")
         );
-        // Nothing outside a flag, so nothing to re-read: `None`, not a
-        // byte-identical copy the floor would then judge a second time.
+        // Both in one line, one blanked and one kept: a `None` for the
+        // all-inside-a-flag line could not tell the carve-out preserving an
+        // `=` from the token model losing the delimiter.
+        assert_eq!(
+            blanks_for_outside_flags(
+                WINDOWS.word_delimiters_outside_flags,
+                "del=/f --exclude=/ x"
+            )
+            .as_deref(),
+            Some("del /f --exclude=/ x")
+        );
+        // Every `=` inside a flag: the line comes back unchanged, as `Some`.
+        // Whether an unchanged reading is worth judging again is decided once,
+        // in `shell_deny::readings_of`, for this rewriting and every other; a
+        // `None` here would be the same decision made a second time in one
+        // rewriting and not in its sibling.
         assert_eq!(
             blanks_for_outside_flags(
                 WINDOWS.word_delimiters_outside_flags,
                 "rm -r --exclude=/ build"
-            ),
-            None
+            )
+            .as_deref(),
+            Some("rm -r --exclude=/ build")
         );
         // A value that begins a flag is read as one once the delimiter before
-        // it becomes a blank.
+        // it becomes a blank — and read as a *flag*, so its own `=` is kept:
+        // `x=-rf=z` is `x -rf=z`, which is what pins the token restart after a
+        // replaced delimiter (without it, `-rf=z` is judged mid-token and its
+        // `=` is blanked too).
         assert_eq!(
-            blanks_for_outside_flags(&['='], "x=-rf y=-rf").as_deref(),
-            Some("x -rf y -rf")
+            blanks_for_outside_flags(&['='], "x=-rf=z y=-rf").as_deref(),
+            Some("x -rf=z y -rf")
         );
+        // A flag token ends where the command does, not only at a blank: a
+        // `-` word glued to `|` or `&` must not carry the carve-out into the
+        // next command, whose `=` is the one hiding the verb.
+        for (glued, read) in [
+            (r"echo --x=1|del=/f/s/q C:\*", r"echo --x=1|del /f/s/q C:\*"),
+            (r"echo --x=1&del=/f/s/q C:\*", r"echo --x=1&del /f/s/q C:\*"),
+            (r"findstr -i|del=/f/s/q C:\*", r"findstr -i|del /f/s/q C:\*"),
+        ] {
+            assert_eq!(
+                blanks_for_outside_flags(&['='], glued).as_deref(),
+                Some(read),
+                "{glued:?}: the flag must end at the command boundary"
+            );
+        }
+        // But not at `;`: it stays inside the token, so this token begins with
+        // `d` and its `=` is read. Cutting there would make `-x=/s` a flag
+        // and hand the spelling to the residual recorded for a delimiter
+        // inside a flag's value; `blanks_for` and the closure take this
+        // reading on to `del -x /s C:\*`.
+        assert_eq!(
+            blanks_for_outside_flags(&['='], r"del;-x=/s;C:\*").as_deref(),
+            Some(r"del;-x /s;C:\*")
+        );
+        // An empty set answers before allocating, which is what Unix pays.
         assert_eq!(
             blanks_for_outside_flags(SH.word_delimiters_outside_flags, r"del=/f/s/q C:\*"),
             None
         );
+    }
+
+    /// Every character `segments` cuts a command at ends a flag token one way
+    /// or another: as whitespace, as a word delimiter `blanks_for` blanks
+    /// before the closure re-reads, or as one of `FLAG_TOKEN_BOUNDARIES`. A
+    /// separator added to `segments` that is none of these is a `|`-shaped
+    /// hole reopened, and this names it.
+    #[test]
+    fn flag_tokens_end_at_every_command_boundary() {
+        for separator in SEGMENT_SEPARATORS {
+            assert!(
+                separator.is_whitespace()
+                    || WINDOWS.word_delimiters.contains(&separator)
+                    || FLAG_TOKEN_BOUNDARIES.contains(&separator),
+                "{separator:?} cuts a command but ends no flag token"
+            );
+        }
+        // And the boundaries are command boundaries — never a character a
+        // rewriting would have blanked anyway, which is what makes them the
+        // set that needs its own rule.
+        for boundary in FLAG_TOKEN_BOUNDARIES {
+            assert!(SEGMENT_SEPARATORS.contains(&boundary));
+            assert!(!WINDOWS.word_delimiters.contains(&boundary));
+            assert!(!WINDOWS.word_delimiters_outside_flags.contains(&boundary));
+        }
     }
 
     /// The Windows *text* reading, which the deny floor uses: cmd.exe's escape

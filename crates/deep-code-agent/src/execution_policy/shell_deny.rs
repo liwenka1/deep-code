@@ -489,11 +489,16 @@ pub fn builtin_deny(command: &str) -> Option<DenyReason> {
 /// program word exists: the line as written, plus each rewriting it performs,
 /// composed with every other.
 ///
-/// One enumeration, shared by the deny floor ([`builtin_deny`]) and the
-/// approval notes ([`safety_notes`]) — the two used to enumerate separately and
-/// the notes were always a stage behind. The floor read a brace-expanded line
-/// and they did not, so `cp {~/.ssh/id_rsa,./k}` drew no note whatsoever and
-/// the human approving a copy of their private key saw a bare `cp`.
+/// One definition of the readings, shared by the deny floor ([`builtin_deny`])
+/// and the approval notes ([`safety_notes`]) — the two used to enumerate
+/// separately and the notes were always a stage behind. The floor read a
+/// brace-expanded line and they did not, so `cp {~/.ssh/id_rsa,./k}` drew no
+/// note whatsoever and the human approving a copy of their private key saw a
+/// bare `cp`. One definition, not one evaluation: each caller enumerates for
+/// itself — the floor on every shell call, the notes once per approval prompt
+/// — so a line bound for a prompt is enumerated twice. That is the price of
+/// not threading the readings through the tool layer, paid once per human
+/// rather than once per command.
 ///
 /// The stages:
 ///
@@ -507,19 +512,29 @@ pub fn builtin_deny(command: &str) -> Option<DenyReason> {
 ///   `del,/f/s/q,C:\*` and `del=/f/s/q C:\*` are one opaque word to a floor
 ///   that splits on blanks, and a drive wipe to `cmd`.
 ///
-/// Composed, not laddered. The stages used to be applied one at a time by
+/// Closed, not laddered. The stages used to be applied one at a time by
 /// different halves of the floor, and every gap that opened was the same shape:
 /// a spelling that mixed two of them (`del,/f;/s/q,C:\*` — `del /f /s /q C:\*`
-/// to `cmd`) was read by neither pass. Each stage here doubles the enumeration
-/// by appending to it, so adding a rewriting later costs one entry instead of
-/// multiplying the cells nobody covers.
+/// to `cmd`) was read by neither pass. One ordered pass per stage closed that
+/// and left the mirror cell open: it produced `B(A(x))` but never `A(B(x))`,
+/// and `del,-x=/s,C:\*` needs exactly that one — until the `,` is read, the
+/// `=` sits in a token that begins with `d`, so the `,` has to be blanked
+/// *after* the `=` split for `del -x /s C:\*` to appear. So every reading, the
+/// ones produced here included, is re-read by every rewriting until nothing new
+/// appears, and each distinct reading is kept once ([`push_reading`]): the
+/// enumeration is the closure of the line, and adding a rewriting later costs
+/// one entry in the table. It terminates because a rewriting only ever turns
+/// characters into blanks and a result already in the set is dropped — the
+/// dedup is load-bearing, not tidiness: without it an unchanged rewriting
+/// re-enters the worklist forever — and it stays small because [`blanks_for`]
+/// blanks its whole set at once and [`blanks_for_outside_flags`] is idempotent.
 ///
 /// Reading more can only ever *add* a finding: every reading is one the
 /// interpreter itself would run, and the line as written is always among them,
 /// so a verdict can only get stricter. That is also what makes it safe to read
-/// a delimiter set wider than some `cmd` build really splits on. The expander's
-/// budget is capped ([`MAX_BRACE_WORDS`]) and a truncated expansion degrades to
-/// the line that was already checked.
+/// a delimiter set wider than some `cmd` build really splits on. The expander
+/// is budgeted per word ([`MAX_BRACE_WORDS`]) and a word past its budget is
+/// left as written, which the as-typed reading has already judged.
 ///
 /// Unix pays one `Vec` holding the borrowed line: `sh`'s delimiter sets are
 /// empty and a line without `{` has nothing to expand, so no reading is
@@ -540,11 +555,7 @@ fn readings_of(line: &str) -> Vec<Cow<'_, str>> {
 fn readings_of_in(grammar: Grammar, line: &str) -> Vec<Cow<'_, str>> {
     let mut readings: Vec<Cow<'_, str>> = vec![Cow::Borrowed(line)];
     if line.contains('{') {
-        let mut budget = MAX_BRACE_WORDS;
-        let expanded = brace_expanded_line(line, &mut budget);
-        if expanded != line {
-            readings.push(Cow::Owned(expanded));
-        }
+        push_reading(&mut readings, brace_expanded_line(line));
     }
     // Declared in the body on purpose: an alias between a doc comment and the
     // item it describes re-parents the prose, and this module has done that to
@@ -557,14 +568,35 @@ fn readings_of_in(grammar: Grammar, line: &str) -> Vec<Cow<'_, str>> {
             blanks_for_outside_flags,
         ),
     ];
-    for (delimiters, normalize) in normalizations {
-        let composed: Vec<Cow<'_, str>> = readings
-            .iter()
-            .filter_map(|text| normalize(delimiters, text).map(Cow::Owned))
-            .collect();
-        readings.extend(composed);
+    let mut next = 0;
+    while next < readings.len() {
+        for (delimiters, normalize) in normalizations {
+            if let Some(rewritten) = normalize(delimiters, &readings[next]) {
+                push_reading(&mut readings, rewritten);
+            }
+        }
+        next += 1;
     }
     readings
+}
+
+/// Appends `reading` to the enumeration unless it already holds those bytes.
+///
+/// One test for the whole enumeration rather than one inside each rewriting,
+/// because the collisions are between stages as much as within one: a
+/// rewriting that changes nothing hands back its input (`rm -r --exclude=/ build`
+/// under the `=` reading, where every `=` sits inside a flag), and two
+/// rewritings can converge (`git log }{,}{` brace-expands and `,`-blanks to
+/// the same `git log }{ }{`), which no rewriting can see from inside itself. A
+/// reading judged twice makes the whole floor and the notes do the same work
+/// twice for the same answer.
+fn push_reading<'a>(readings: &mut Vec<Cow<'a, str>>, reading: String) {
+    if !readings
+        .iter()
+        .any(|known| known.as_ref() == reading.as_str())
+    {
+        readings.push(Cow::Owned(reading));
+    }
 }
 
 /// The whole floor applied to one concrete reading of a command line.
@@ -586,11 +618,21 @@ fn deny_line(command: &str) -> Option<DenyReason> {
     segments(command).into_iter().find_map(deny_segment)
 }
 
-/// Cap on the words one line's brace expansion may produce. A brace product is
-/// multiplicative (`{a,b}{c,d}{e,f}` is eight words from one), and this floor
-/// sits on the hot path of every shell call, so the expansion is budgeted.
-/// Exhausting it truncates the line — the unexpanded form has already been
-/// checked, so the worst case is the previous behavior, never a wrong answer.
+/// Cap on the words one *word*'s brace expansion may produce. A brace product
+/// is multiplicative (`{a,b}{c,d}{e,f}` is eight words from one) and this floor
+/// runs on every shell call, so each word's expansion is budgeted; the number
+/// of words on the line is not, because that is the line's own length.
+///
+/// A word whose expansion would run past the budget is left exactly as written
+/// — the spelling the as-typed reading has already judged — so the worst case
+/// is the previous behavior for that one word, never a wrong answer. Both
+/// halves of that sentence were false once: exhaustion `break`-ed out of the
+/// alternatives with an empty word, so the word was *deleted* from the expanded
+/// line, and the budget was one per line rather than per word, so a wide brace
+/// ahead of the program word spent what the program word needed —
+/// `echo {a,b}…{a,b} ; rm{,} -rf /` with eight groups (exactly 256 words) came
+/// out `echo … ;  -rf /`, and the verb was gone from the one reading that could
+/// read it.
 const MAX_BRACE_WORDS: usize = 256;
 
 /// The command line with every word's brace groups expanded, whitespace runs
@@ -601,7 +643,7 @@ const MAX_BRACE_WORDS: usize = 256;
 /// — which is why this rewrites the line rather than producing several of
 /// them. Preserving the original whitespace keeps the newlines and the
 /// `;`/`|`/`&` glue [`segments`] splits on, so segmentation is unchanged.
-fn brace_expanded_line(command: &str, budget: &mut usize) -> String {
+fn brace_expanded_line(command: &str) -> String {
     let mut out = String::with_capacity(command.len());
     let mut rest = command;
     while !rest.is_empty() {
@@ -616,29 +658,40 @@ fn brace_expanded_line(command: &str, budget: &mut usize) -> String {
         let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let (word, tail) = rest.split_at(end);
         rest = tail;
-        out.push_str(&expand_word(word, budget).join(" "));
+        out.push_str(&expand_word(word).join(" "));
     }
     out
 }
 
 /// The words one word expands to, in bash's own left-to-right,
-/// innermost-qualifying-first order.
-fn expand_word(word: &str, budget: &mut usize) -> Vec<String> {
-    let Some((prefix, alternatives, suffix)) = split_first_brace_group(word) else {
-        *budget = budget.saturating_sub(1);
-        return vec![word.to_string()];
-    };
+/// innermost-qualifying-first order — or the word as written when the
+/// expansion would run past [`MAX_BRACE_WORDS`].
+fn expand_word(word: &str) -> Vec<String> {
     let mut words = Vec::new();
-    for alternative in alternatives {
-        if *budget == 0 {
-            break;
-        }
-        words.extend(expand_word(
-            &format!("{prefix}{alternative}{suffix}"),
-            budget,
-        ));
+    let mut budget = MAX_BRACE_WORDS;
+    if expand_word_within(word, &mut budget, &mut words) {
+        words
+    } else {
+        vec![word.to_string()]
     }
-    words
+}
+
+/// Appends `word`'s expansion to `words`, one unit of `budget` per word
+/// produced. `false` the moment the budget is spent — `words` is partial then,
+/// and the caller discards it for the word as written rather than keep a list
+/// that is missing some of what the shell would run.
+fn expand_word_within(word: &str, budget: &mut usize, words: &mut Vec<String>) -> bool {
+    let Some((prefix, alternatives, suffix)) = split_first_brace_group(word) else {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        words.push(word.to_string());
+        return true;
+    };
+    alternatives.iter().all(|alternative| {
+        expand_word_within(&format!("{prefix}{alternative}{suffix}"), budget, words)
+    })
 }
 
 /// The first brace group bash would expand: the text before it, its top-level
@@ -702,7 +755,10 @@ fn split_first_brace_group(word: &str) -> Option<(&str, Vec<String>, &str)> {
 /// a range bash would expand, which is what tells the scan this `{` opens no
 /// expansion at all.
 ///
-/// Bounded by [`MAX_BRACE_WORDS`] so `{1..100000}` costs a cap, not a hang.
+/// Bounded to one word past [`MAX_BRACE_WORDS`], so `{1..100000}` costs a cap
+/// rather than a hang while the word budget in [`expand_word`] — not this cap
+/// — is what then leaves the word as written: a range cut to fit the budget
+/// would have been a wrong list where a literal one was promised.
 /// The step is parsed because bash 4 accepts it; bash 3.2 (macOS `/bin/sh`)
 /// leaves such a group literal, and reading one there only ever produces extra
 /// candidate words — the safe direction for a floor. A zero step is read as 1,
@@ -734,7 +790,7 @@ fn range_alternatives(body: &str) -> Option<Vec<String>> {
     let step = if start <= end { magnitude } else { -magnitude };
     let mut words = Vec::new();
     let mut value = start;
-    while words.len() < MAX_BRACE_WORDS && if step > 0 { value <= end } else { value >= end } {
+    while words.len() <= MAX_BRACE_WORDS && if step > 0 { value <= end } else { value >= end } {
         words.push(value.to_string());
         value += step;
     }
@@ -748,7 +804,7 @@ fn char_range(from: u8, to: u8, step: i64) -> Vec<String> {
     let (low, high) = (from.min(to), from.max(to));
     let mut words: Vec<String> = (low..=high)
         .step_by(step)
-        .take(MAX_BRACE_WORDS)
+        .take(MAX_BRACE_WORDS + 1)
         .map(|byte| (byte as char).to_string())
         .collect();
     if from > to {
