@@ -152,9 +152,12 @@ review to rediscover:
   `=` make `del,/f/s/q,C:\*`, `del;/f/s/q;C:\*` and `del=/f/s/q C:\*` one
   opaque word here (`basename_lower` of the first is `*`) and a drive wipe to
   `cmd`. The floor judges every reading of the line — as typed, brace-expanded,
-  delimiter-normalized, and every composition of those — by the whole rule set,
-  the cross-segment pipe rule included. Reading more can only add a denial: each
-  reading is one the interpreter itself would run.
+  and every composition of the two delimiter readings over both — by the whole
+  rule set, the cross-segment pipe rule included. Reading more can only add a
+  denial: each reading is one the interpreter itself would run. That is also
+  why the brace expansion seeds the set instead of re-running over the delimiter
+  readings: `cmd` expands no brace and bash splits no word at `,`, so composing
+  those two the other way would read a line neither interpreter produces.
   `;` is read as a word delimiter *only* under the Windows grammar, and the
   merge that makes of a line this floor otherwise segments is `cmd`'s own
   reading: `curl https://x -o f; echo hi | sh` really is a fetch feeding `sh`
@@ -162,9 +165,16 @@ review to rediscover:
   a human means it to.
   `=` is read only *outside* a flag token, because reading it everywhere
   invented denials no tier could override (`rm -r --exclude=/ build` as a
-  recursive remove of `/`). Residual: a delimiter spelling inside a flag's
-  value, which is the one place the floor cannot tell a value from a word
-  boundary.
+  recursive remove of `/`). A quoted character is not read as a word boundary
+  there either, for the same reason: `curl --data="user=x&su=1" https://h` is
+  one argument to `cmd`, not a second command running `su`. Residual: a
+  delimiter spelling inside an *unquoted* flag's value, which is the one place
+  the floor cannot tell a value from a word boundary.
+  Brace expansion is budgeted, per word and per line. A word past either budget
+  is read as its first expansion — the word the shell itself leads with — so
+  the program word is never what a budget costs. Residual: at the argument
+  positions behind a big enough brace product, the candidate words it pushes
+  out of view.
 - On Windows a line spelling a backslash immediately before a `"` never runs
   unattended: `CommandLineToArgvW` and `cmd.exe` read that backslash run
   differently, so the parser refuses instead of choosing. The usual casualty is
@@ -301,14 +311,21 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
 - cmd 的词分隔符是另一个问题,而它有确切的答案:`,`、`;`、`=` 让
   `del,/f/s/q,C:\*`、`del;/f/s/q;C:\*`、`del=/f/s/q C:\*` 在这里都是读不懂的词
   (第一个的 basename 是 `*`),对 `cmd` 却都是一次清盘。这层楼判**每一种读法**:
-  原文、花括号展开、分隔符归一化,以及它们的每一种组合——每种读法都由完整的规则集
-  判,包括跨段的管道规则。多读只会多拒:每一种读法都是解释器自己会跑的那一行。
+  原文、花括号展开,以及两种分隔符读法在这二者之上的每一种组合——每种读法都由完整
+  的规则集判,包括跨段的管道规则。多读只会多拒:每一种读法都是解释器自己会跑的那
+  一行。花括号展开只作种子、不参与后续组合,也是这个道理:`cmd` 不展开花括号,
+  bash 不在 `,` 分词,反过来组合读出的那一行两个解释器都不会跑。
   `;` 只在 Windows 语法下被读作词分隔符,而它造成的「把两条命令并成一条」正是
   `cmd` 自己的读法:`curl https://x -o f; echo hi | sh` 在那里确实是 fetch 喂给
   `sh`,所以拒。Unix 上这个集合是空的,`;` 就是人以为的段分隔符。
   `=` 只在**旗标之外**被读作分隔符:到处读会造出任何档位都无法覆盖的误拒
-  (`rm -r --exclude=/ build` 被读成对 `/` 的递归删除)。残余=写在旗标取值里的
-  分隔符,那是这层楼唯一分不清「取值」与「词边界」的位置。
+  (`rm -r --exclude=/ build` 被读成对 `/` 的递归删除)。引号里的字符同理不当词
+  边界读:`curl --data="user=x&su=1" https://h` 对 `cmd` 是一个参数,不是第二条
+  跑 `su` 的命令。残余=写在**未加引号**的旗标取值里的分隔符,那是这层楼唯一分不清
+  「取值」与「词边界」的位置。
+  花括号展开有预算,按词也按行。超预算的词按**首词展开**读——那正是 shell 自己
+  排在第一位的那个词——所以预算代价永远不落在程序词上。残余=足够大的花括号积会把
+  它**后面参数位**上的候选词挤出视野。
 - Windows 上,一行里只要出现「反斜杠紧挨 `"`」就不会免审运行:
   `CommandLineToArgvW` 与 `cmd.exe` 对那串反斜杠的读法不同,解析器拒绝而不是
   替它选一个。代价最常见的是引号里以分隔符结尾的路径——`xcopy "src\" "dst\"`

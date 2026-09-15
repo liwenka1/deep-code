@@ -51,7 +51,7 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 
 use super::shell_lex::{
-    Grammar, HOST, INTERPRETERS, PREFIX_WORDS, basename_lower, blanks_for,
+    Grammar, HOST, INTERPRETERS, PREFIX_WORDS, SEGMENT_SEPARATORS, basename_lower, blanks_for,
     blanks_for_outside_flags, clean_token, operand_leaves_cwd, parse_unattended, segments,
 };
 use crate::i18n::TextId;
@@ -512,29 +512,43 @@ pub fn builtin_deny(command: &str) -> Option<DenyReason> {
 ///   `del,/f/s/q,C:\*` and `del=/f/s/q C:\*` are one opaque word to a floor
 ///   that splits on blanks, and a drive wipe to `cmd`.
 ///
-/// Closed, not laddered. The stages used to be applied one at a time by
-/// different halves of the floor, and every gap that opened was the same shape:
-/// a spelling that mixed two of them (`del,/f;/s/q,C:\*` — `del /f /s /q C:\*`
-/// to `cmd`) was read by neither pass. One ordered pass per stage closed that
-/// and left the mirror cell open: it produced `B(A(x))` but never `A(B(x))`,
-/// and `del,-x=/s,C:\*` needs exactly that one — until the `,` is read, the
-/// `=` sits in a token that begins with `d`, so the `,` has to be blanked
-/// *after* the `=` split for `del -x /s C:\*` to appear. So every reading, the
-/// ones produced here included, is re-read by every rewriting until nothing new
-/// appears, and each distinct reading is kept once ([`push_reading`]): the
-/// enumeration is the closure of the line, and adding a rewriting later costs
-/// one entry in the table. It terminates because a rewriting only ever turns
+/// Closed under the rewritings, seeded by the expansion. The stages used to be
+/// applied one at a time by different halves of the floor, and every gap that
+/// opened was the same shape: a spelling that mixed two of them
+/// (`del,/f;/s/q,C:\*` — `del /f /s /q C:\*` to `cmd`) was read by neither
+/// pass. One ordered pass per stage closed that and left the mirror cell open:
+/// it produced `B(A(x))` but never `A(B(x))`, and `del,-x=/s,C:\*` needs
+/// exactly that one — until the `,` is read, the `=` sits in a token that
+/// begins with `d`, so the `,` has to be blanked *after* the `=` split for
+/// `del -x /s C:\*` to appear. So every reading is re-read by *both delimiter
+/// rewritings* until nothing new appears, and each distinct reading is kept
+/// once ([`push_reading`]); adding a third delimiter rewriting later costs one
+/// entry in the table. It terminates because a rewriting only ever turns
 /// characters into blanks and a result already in the set is dropped — the
 /// dedup is load-bearing, not tidiness: without it an unchanged rewriting
 /// re-enters the worklist forever — and it stays small because [`blanks_for`]
 /// blanks its whole set at once and [`blanks_for_outside_flags`] is idempotent.
 ///
+/// Brace expansion seeds that worklist and is deliberately not one of the
+/// rewritings re-run on its results. It is bash's stage, and the delimiter
+/// rewritings are `cmd`'s; running it *after* one of them reads a line neither
+/// interpreter produces. `{1..3},{4..5}` blanks to `{1..3} {4..5}`, which would
+/// expand on to `1 2 3 4 5` — but `cmd` expands no brace, and bash splits no
+/// word at `,`, so no shell anywhere runs that line, and this floor's whole
+/// case for reading more rests on every reading being one some interpreter
+/// really runs. Seeding is safe in the other direction because blanking never
+/// *creates* a brace group: it can only blank a group's own comma, which leaves
+/// less to expand rather than more.
+///
 /// Reading more can only ever *add* a finding: every reading is one the
 /// interpreter itself would run, and the line as written is always among them,
 /// so a verdict can only get stricter. That is also what makes it safe to read
 /// a delimiter set wider than some `cmd` build really splits on. The expander
-/// is budgeted per word ([`MAX_BRACE_WORDS`]) and a word past its budget is
-/// left as written, which the as-typed reading has already judged.
+/// is budgeted per word ([`MAX_BRACE_WORDS`]) and per line
+/// ([`MAX_BRACE_LINE_BYTES`]); a word past either budget is read as its first
+/// expansion, which is a prefix of the words the shell really runs — fewer
+/// candidates than the full product, never a different one, and never one
+/// short of the program word.
 ///
 /// Unix pays one `Vec` holding the borrowed line: `sh`'s delimiter sets are
 /// empty and a line without `{` has nothing to expand, so no reading is
@@ -557,21 +571,12 @@ fn readings_of_in(grammar: Grammar, line: &str) -> Vec<Cow<'_, str>> {
     if line.contains('{') {
         push_reading(&mut readings, brace_expanded_line(line));
     }
-    // Declared in the body on purpose: an alias between a doc comment and the
-    // item it describes re-parents the prose, and this module has done that to
-    // itself once already while silencing this very lint.
-    type Normalization<'a> = (&'a [char], fn(&[char], &str) -> Option<String>);
-    let normalizations: [Normalization<'_>; 2] = [
-        (grammar.word_delimiters, blanks_for),
-        (
-            grammar.word_delimiters_outside_flags,
-            blanks_for_outside_flags,
-        ),
-    ];
+    let normalizations: [fn(Grammar, &str) -> Option<String>; 2] =
+        [blanks_for, blanks_for_outside_flags];
     let mut next = 0;
     while next < readings.len() {
-        for (delimiters, normalize) in normalizations {
-            if let Some(rewritten) = normalize(delimiters, &readings[next]) {
+        for normalize in normalizations {
+            if let Some(rewritten) = normalize(grammar, &readings[next]) {
                 push_reading(&mut readings, rewritten);
             }
         }
@@ -623,75 +628,148 @@ fn deny_line(command: &str) -> Option<DenyReason> {
 /// runs on every shell call, so each word's expansion is budgeted; the number
 /// of words on the line is not, because that is the line's own length.
 ///
-/// A word whose expansion would run past the budget is left exactly as written
-/// — the spelling the as-typed reading has already judged — so the worst case
-/// is the previous behavior for that one word, never a wrong answer. Both
-/// halves of that sentence were false once: exhaustion `break`-ed out of the
-/// alternatives with an empty word, so the word was *deleted* from the expanded
-/// line, and the budget was one per line rather than per word, so a wide brace
-/// ahead of the program word spent what the program word needed —
-/// `echo {a,b}…{a,b} ; rm{,} -rf /` with eight groups (exactly 256 words) came
-/// out `echo … ;  -rf /`, and the verb was gone from the one reading that could
-/// read it.
+/// A word past its budget is read as its **first expansion** — every group's
+/// first alternative, which is the first word bash itself produces for it. Two
+/// weaker answers were tried and each lost the verb in turn. The budget was
+/// once per *line*, so a wide brace ahead of the program word spent what the
+/// program word needed: `echo {a,b}…{a,b} ; rm{,} -rf /` with eight groups
+/// (exactly 256 words) came out `echo … ;  -rf /`. Leaving the word exactly as
+/// written instead stopped deleting it and still could not read it — `{rm,x,…}`
+/// one alternative past the cap presents the program word `{rm,x,…}`, which
+/// matches no rule, while the shell runs `rm`. The first expansion is neither:
+/// it is a prefix of the word list the shell really runs, so it can lose a
+/// finding but never invent one, and the word it leaves in the program position
+/// is exactly the one the shell leaves there.
 const MAX_BRACE_WORDS: usize = 256;
 
-/// The command line with every word's brace groups expanded, whitespace runs
-/// preserved verbatim.
+/// Cap on the bytes one line's brace expansion may produce before the rest of
+/// its words are read as their first expansion.
+///
+/// The per-word budget bounds one word's product, not their sum: 9 KB of
+/// `{1..256}` words expanded to 916 KB, and a long literal glued to each group
+/// reaches the per-word cap of 256 times its own length. This runs on every
+/// shell call and again for every approval prompt, so the sum needs a bound of
+/// its own. The cap is on the expansion's own bytes rather than on the line's
+/// length, so an ordinary long command pays nothing; a line that reaches it
+/// keeps every word already expanded and reads the rest the way an over-budget
+/// word is read — first expansion, which is where the program word lives.
+const MAX_BRACE_LINE_BYTES: usize = 1 << 18;
+
+/// Where a word ends for brace expansion: at a blank, at one of
+/// [`SEGMENT_SEPARATORS`], or at a parenthesis.
+///
+/// Blanks alone are not a word. bash lexes `true;{rm,-rf,/}` into `true`, `;`
+/// and `{rm,-rf,/}` and expands only the third; reading it as one
+/// blank-delimited word copied the `true;` into every alternative
+/// (`true;rm true;-rf true;/`), and [`segments`] then cut *that* into `true`
+/// and `rm true`, which has no `-rf` in it. The line that runs `rm -rf /` was
+/// read by no rule at all — on a floor whose whole job is the iconic shapes.
+/// Parentheses are here for the one spelling of the same gap that reaches this
+/// floor, `({rm,-rf,/})`.
+fn ends_a_word(ch: char) -> bool {
+    ch.is_whitespace() || SEGMENT_SEPARATORS.contains(&ch) || matches!(ch, '(' | ')')
+}
+
+/// The command line with every word's brace groups expanded, the text between
+/// words preserved verbatim.
 ///
 /// Brace expansion happens *within a word* and yields several words on the
 /// same line — `rm{,} -rf /` runs `rm rm -rf /`, `{rm,-rf,/}` runs `rm -rf /`
 /// — which is why this rewrites the line rather than producing several of
-/// them. Preserving the original whitespace keeps the newlines and the
-/// `;`/`|`/`&` glue [`segments`] splits on, so segmentation is unchanged.
+/// them. What separates two words is copied through unchanged, so [`segments`]
+/// cuts the expansion exactly where it cuts the line.
 fn brace_expanded_line(command: &str) -> String {
     let mut out = String::with_capacity(command.len());
     let mut rest = command;
     while !rest.is_empty() {
-        let gap = rest
-            .find(|c: char| !c.is_whitespace())
-            .unwrap_or(rest.len());
+        let gap = rest.find(|c: char| !ends_a_word(c)).unwrap_or(rest.len());
         out.push_str(&rest[..gap]);
         rest = &rest[gap..];
         if rest.is_empty() {
             break;
         }
-        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let end = rest.find(ends_a_word).unwrap_or(rest.len());
         let (word, tail) = rest.split_at(end);
         rest = tail;
-        out.push_str(&expand_word(word).join(" "));
+        let line_budget = MAX_BRACE_LINE_BYTES.saturating_sub(out.len());
+        out.push_str(&expand_word(word, line_budget).join(" "));
     }
     out
 }
 
 /// The words one word expands to, in bash's own left-to-right,
-/// innermost-qualifying-first order — or the word as written when the
-/// expansion would run past [`MAX_BRACE_WORDS`].
-fn expand_word(word: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut budget = MAX_BRACE_WORDS;
-    if expand_word_within(word, &mut budget, &mut words) {
-        words
-    } else {
-        vec![word.to_string()]
+/// innermost-qualifying-first order — or its first expansion alone when the
+/// product would run past [`MAX_BRACE_WORDS`] words or past what `line_budget`
+/// leaves of [`MAX_BRACE_LINE_BYTES`].
+///
+/// Iterative on purpose. The obvious recursion descends once per brace group in
+/// the word *before* it reaches a single leaf, so a budget that counts leaves
+/// bounds its width and nothing bounds its depth: a word of a few thousand
+/// `{a,b}` groups overflowed the worker thread's stack and took the process
+/// with it, from one tool call, before any verdict was reached. The explicit
+/// stack holds the same partially-expanded candidates on the heap where the
+/// budget can see them, and popping the last one pushed while pushing a group's
+/// alternatives in reverse is the same depth-first order bash emits.
+///
+/// The budget is read after every step, not after the expansion: a word that
+/// will be discarded should not first be expanded in full. `pending` holds
+/// candidates that each yield at least one word, so their count plus the
+/// finished ones is a lower bound on the result and is enough to stop on.
+fn expand_word(word: &str, line_budget: usize) -> Vec<String> {
+    if !word.contains('{') {
+        return vec![word.to_string()];
     }
+    let mut done: Vec<String> = Vec::new();
+    let mut pending: Vec<String> = vec![word.to_string()];
+    let mut bytes = 0usize;
+    while let Some(candidate) = pending.pop() {
+        match split_first_brace_group(&candidate) {
+            None => {
+                bytes = bytes.saturating_add(candidate.len() + 1);
+                done.push(candidate);
+            }
+            Some((prefix, alternatives, suffix)) => {
+                for alternative in alternatives.iter().rev() {
+                    pending.push(format!("{prefix}{alternative}{suffix}"));
+                }
+            }
+        }
+        if done.len() + pending.len() > MAX_BRACE_WORDS || bytes > line_budget {
+            return vec![first_expansion(word)];
+        }
+    }
+    done
 }
 
-/// Appends `word`'s expansion to `words`, one unit of `budget` per word
-/// produced. `false` the moment the budget is spent — `words` is partial then,
-/// and the caller discards it for the word as written rather than keep a list
-/// that is missing some of what the shell would run.
-fn expand_word_within(word: &str, budget: &mut usize, words: &mut Vec<String>) -> bool {
-    let Some((prefix, alternatives, suffix)) = split_first_brace_group(word) else {
-        if *budget == 0 {
-            return false;
-        }
-        *budget -= 1;
-        words.push(word.to_string());
-        return true;
-    };
-    alternatives.iter().all(|alternative| {
-        expand_word_within(&format!("{prefix}{alternative}{suffix}"), budget, words)
-    })
+/// The first word the shell produces for `word`: every brace group replaced by
+/// its first alternative, repeatedly, until none is left.
+///
+/// This is how an over-budget word is read. It is the first element of the list
+/// [`expand_word`] would have produced in full, so it is a prefix of what the
+/// shell runs; and the program word of a line is the first word of its first
+/// expansion, which is the one thing this floor cannot afford to lose.
+///
+/// Each pass replaces a group with one alternative of it, which is shorter than
+/// the group by at least its two braces and one separator, so the word shrinks
+/// every pass and the loop ends on its own. The pass count is capped anyway: a
+/// word with more groups than that is past every budget here several times
+/// over, and the line as typed is judged either way.
+fn first_expansion(word: &str) -> String {
+    let mut current = word.to_string();
+    for _ in 0..MAX_BRACE_WORDS {
+        let Some(replaced) = ({
+            match split_first_brace_group(&current) {
+                Some((prefix, alternatives, suffix)) => alternatives
+                    .first()
+                    .map(|first| format!("{prefix}{first}{suffix}")),
+                None => None,
+            }
+        }) else {
+            break;
+        };
+        current = replaced;
+    }
+    current
 }
 
 /// The first brace group bash would expand: the text before it, its top-level
@@ -702,21 +780,58 @@ fn expand_word_within(word: &str, budget: &mut usize, words: &mut Vec<String>) -
 /// `--con{fi{g,g}}` expands its inner group and leaves the outer literal,
 /// exactly as bash does.
 ///
+/// Quoted text is skipped whole, because bash expands no brace inside `'…'` or
+/// `"…"`: `"rm{,}"` is the literal word `rm{,}`, and so is `r"m{,}"`, while
+/// `"a"{b,c}` still expands the group standing outside the quotes. Reading the
+/// quotes as ordinary characters made the expander manufacture words the shell
+/// never runs — `"rm{,}" -rf /` came out `"rm" "rm" -rf /`, [`clean_token`]
+/// stripped the quotes, and the floor denied a line bash fails with "command
+/// not found", which is the one direction this module's premise says cannot
+/// happen. An escaped brace (`\{a,b\}`) is deliberately still read: `\` is a
+/// path separator under the other grammar this floor serves, and reading one
+/// brace too many only ever adds a candidate word.
+///
 /// Ranges are expanded, not skipped, because a range reaches the program word
 /// just like a comma list does: `r{m..n} -rf /` runs `rm rn -rf /`, whose
 /// program really is `rm`. Skipping them would have left the floor a second
 /// brace spelling it could not read — the uncounted-sibling shape this whole
 /// fix exists to close.
+///
+/// A `{` with nothing closing it anywhere after it ends the scan rather than
+/// restarting it at the next `{`: with no `}` left, every later `{` rescans the
+/// same tail to the same end, which made a word of unmatched braces quadratic
+/// (100 KB of them took 29 seconds here, twice over for a prompted line).
 fn split_first_brace_group(word: &str) -> Option<(&str, Vec<String>, &str)> {
     let bytes = word.as_bytes();
+    let mut quote: Option<u8> = None;
     for open in 0..bytes.len() {
-        if bytes[open] != b'{' {
-            continue;
+        match (quote, bytes[open]) {
+            (Some(active), byte) => {
+                if byte == active {
+                    quote = None;
+                }
+                continue;
+            }
+            (None, byte @ (b'\'' | b'"')) => {
+                quote = Some(byte);
+                continue;
+            }
+            (None, b'{') => {}
+            (None, _) => continue,
         }
         let mut depth = 0usize;
         let mut commas = Vec::new();
+        let mut inner_quote: Option<u8> = None;
+        let mut closed = false;
         for index in open..bytes.len() {
+            if let Some(active) = inner_quote {
+                if bytes[index] == active {
+                    inner_quote = None;
+                }
+                continue;
+            }
             match bytes[index] {
+                byte @ (b'\'' | b'"') => inner_quote = Some(byte),
                 b'{' => depth += 1,
                 b',' if depth == 1 => commas.push(index),
                 b'}' => {
@@ -724,6 +839,7 @@ fn split_first_brace_group(word: &str) -> Option<(&str, Vec<String>, &str)> {
                     if depth > 0 {
                         continue;
                     }
+                    closed = true;
                     let alternatives = if commas.is_empty() {
                         // No top-level comma: a range, or not an expansion at
                         // all — in which case the scan moves to the next `{`.
@@ -746,6 +862,9 @@ fn split_first_brace_group(word: &str) -> Option<(&str, Vec<String>, &str)> {
                 _ => {}
             }
         }
+        if !closed {
+            return None;
+        }
     }
     None
 }
@@ -755,10 +874,20 @@ fn split_first_brace_group(word: &str) -> Option<(&str, Vec<String>, &str)> {
 /// a range bash would expand, which is what tells the scan this `{` opens no
 /// expansion at all.
 ///
+/// Both endpoints must be of one kind. A mixed pair is not a range to bash —
+/// `{1..a}` stays literal in 3.2 and in 5.x — and reading one as characters
+/// walked the ASCII table between them, which put `;` and `>` in the expansion
+/// of a line that had neither: [`safety_notes`] warned about a redirect nobody
+/// wrote and [`segments`] cut the reading at a semicolon nobody typed.
+///
 /// Bounded to one word past [`MAX_BRACE_WORDS`], so `{1..100000}` costs a cap
-/// rather than a hang while the word budget in [`expand_word`] — not this cap
-/// — is what then leaves the word as written: a range cut to fit the budget
-/// would have been a wrong list where a literal one was promised.
+/// rather than a hang while the word budget in [`expand_word`] — not this cap —
+/// is what then reads the word as its first expansion: a range cut to fit the
+/// budget would have been a wrong list where a literal one was promised.
+/// The sum is checked, not assumed: a step near `i64::MAX` overflowed it, which
+/// is a panic in every profile this crate builds for a test or a `cargo run`,
+/// on the hot path of the floor itself.
+///
 /// The step is parsed because bash 4 accepts it; bash 3.2 (macOS `/bin/sh`)
 /// leaves such a group literal, and reading one there only ever produces extra
 /// candidate words — the safe direction for a floor. A zero step is read as 1,
@@ -780,35 +909,65 @@ fn range_alternatives(body: &str) -> Option<Vec<String>> {
         return None;
     }
     let magnitude = i64::try_from(step.unsigned_abs().max(1)).unwrap_or(1);
-    let (Ok(start), Ok(end)) = (from.parse::<i64>(), to.parse::<i64>()) else {
-        let (from, to) = (from.as_bytes(), to.as_bytes());
-        if from.len() != 1 || to.len() != 1 || !from[0].is_ascii() || !to[0].is_ascii() {
-            return None;
+    let (start, end) = match (from.parse::<i64>(), to.parse::<i64>()) {
+        (Ok(start), Ok(end)) => (start, end),
+        (Err(_), Err(_)) => {
+            let (from, to) = (from.as_bytes(), to.as_bytes());
+            if from.len() != 1 || to.len() != 1 || !from[0].is_ascii() || !to[0].is_ascii() {
+                return None;
+            }
+            let step = usize::try_from(magnitude).unwrap_or(1);
+            return Some(char_range(from[0], to[0], step));
         }
-        return Some(char_range(from[0], to[0], magnitude));
+        _ => return None,
     };
     let step = if start <= end { magnitude } else { -magnitude };
     let mut words = Vec::new();
     let mut value = start;
     while words.len() <= MAX_BRACE_WORDS && if step > 0 { value <= end } else { value >= end } {
         words.push(value.to_string());
-        value += step;
+        let Some(next) = value.checked_add(step) else {
+            break;
+        };
+        value = next;
     }
     Some(words)
 }
 
-/// The single-character words `{a..e}` expands to, in the direction the
-/// endpoints imply.
-fn char_range(from: u8, to: u8, step: i64) -> Vec<String> {
-    let step = usize::try_from(step.max(1)).unwrap_or(1);
-    let (low, high) = (from.min(to), from.max(to));
-    let mut words: Vec<String> = (low..=high)
-        .step_by(step)
-        .take(MAX_BRACE_WORDS + 1)
-        .map(|byte| (byte as char).to_string())
-        .collect();
-    if from > to {
-        words.reverse();
+/// The single-character words `{a..e}` expands to, walking from `from` toward
+/// `to`.
+///
+/// From the *first* endpoint, not from the lower one. With a step of 1 the
+/// difference is invisible — the list is the same one reversed — but a step
+/// that does not divide the span lands on different letters entirely: bash
+/// reads `{f..a..2}` as `f d b`, where a low-anchored walk reversed gives
+/// `e c a`. `r{m..j..2} -rf /` is the whole difference, denied under one
+/// reading and not the other, on exactly the hosts whose `sh` is bash 4+ —
+/// which is the reason step forms are read here at all.
+///
+/// The endpoints are ASCII, so the walk is bounded at 128 words and needs no
+/// cap of its own; [`MAX_BRACE_WORDS`] is a word budget and is spent one level
+/// up, in [`expand_word`].
+fn char_range(from: u8, to: u8, step: usize) -> Vec<String> {
+    let Ok(step) = u8::try_from(step.max(1)) else {
+        // Wider than the whole table: the first endpoint is the only word.
+        return vec![char::from(from).to_string()];
+    };
+    let ascending = from <= to;
+    let mut value = from;
+    let mut words = Vec::new();
+    loop {
+        words.push(char::from(value).to_string());
+        let next = if ascending {
+            value.checked_add(step)
+        } else {
+            value.checked_sub(step)
+        };
+        let Some(next) = next.filter(|next| if ascending { *next <= to } else { *next >= to })
+        else {
+            break;
+        };
+        value = next;
     }
     words
 }

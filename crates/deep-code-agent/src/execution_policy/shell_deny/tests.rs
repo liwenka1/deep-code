@@ -219,17 +219,16 @@ fn flag_values_are_not_read_as_word_delimiters() {
     // to carry the carve-out into the next command, and the `=` hiding the
     // verb there was never read — one reading, `del=/f/s/q` an assignment, the
     // program word `C:\*`, on the platform with nothing behind this floor.
-    for glued in [
-        r"echo --x=1|del=/f/s/q C:\*",
-        r"echo --x=1&del=/f/s/q C:\*",
-        r"findstr -i|del=/f/s/q C:\*",
-    ] {
+    for boundary in WINDOWS.command_separators {
+        let glued = format!(r"echo --x=1{boundary}del=/f/s/q C:\*");
         assert!(
-            denied_under(WINDOWS, glued),
+            denied_under(WINDOWS, &glued),
             "{glued:?} is two commands to `cmd`, and the second wipes the drive"
         );
-        assert!(!denied_under(SH, glued));
+        assert!(!denied_under(SH, &glued));
     }
+    // And a flag carrying no `=` of its own ends at the boundary just the same.
+    assert!(denied_under(WINDOWS, r"findstr -i|del=/f/s/q C:\*"));
     // `format=ntfs C:` was once recorded as a false positive of this reading.
     // It is not: to `cmd` that line is the `format` program with a drive
     // operand. Under `sh` it stays an assignment and is left alone.
@@ -262,7 +261,7 @@ fn the_notes_read_every_reading_the_floor_reads() {
     // The delimiter reading is a platform fact, so it is asserted per reading
     // here and end-to-end only where the host is that platform.
     let spelled = r"del,/f/s/q,C:\Users\me\Documents";
-    let normalized = blanks_for(WINDOWS.word_delimiters, spelled).expect("carries cmd's delimiter");
+    let normalized = blanks_for(WINDOWS, spelled).expect("carries cmd's delimiter");
     let mut notes = super::SafetyNotes::default();
     super::note_segments_of(&normalized, &mut notes);
     // The delete note specifically, not "some note": the only note the raw
@@ -1212,37 +1211,226 @@ fn zero_step_range_reads_as_bash_4_does() {
     assert_eq!(brace_expanded_line("echo {1..2..x}"), "echo {1..2..x}");
 }
 
-/// A combinatorial brace cannot hang the gate: the budget bounds each word's
-/// variants, and a word that would exceed it is left as written — the spelling
-/// the as-typed reading already judged — so exhaustion degrades to the previous
-/// behavior for that word, never to a wrong answer.
+/// A combinatorial brace cannot hang the gate, and the cap it costs must not
+/// be the verb: a word past the budget is read as its *first expansion*, the
+/// word bash itself puts in the program position, so exhaustion costs candidate
+/// words and never the one position every rule on this floor reads.
 #[test]
 fn brace_expansion_is_budgeted() {
     let wide = format!("echo {}", "{a,b}".repeat(12));
     assert!(!denied(&wide));
     assert!(denied(&format!("rm -rf / {}", "{a,b}".repeat(12))));
-    // As written: not the first 256 of its 4096 words, and not deleted.
-    // Exhaustion used to `break` out of the alternatives with an empty word.
-    assert_eq!(brace_expanded_line(&wide), wide);
+    // Neither deleted — exhaustion once `break`-ed out of the alternatives with
+    // an empty word — nor left as written, which presented `{a,b}…` as the
+    // program word and matched no rule at all.
+    assert_eq!(brace_expanded_line(&wide), "echo aaaaaaaaaaaa");
     // Per word, not per line. Eight groups is exactly 256 words, which was the
     // whole line's budget, so the program word after it was expanded into
     // nothing and `rm{,}` went undenied where seven groups was denied.
     let bomb = "{a,b}".repeat(8);
     let padded = format!("echo {bomb} ; rm{{,}} -rf /");
     assert!(
-        brace_expanded_line(&padded).ends_with(" ; rm rm -rf /"),
+        brace_expanded_line(&padded).ends_with("; rm rm -rf /"),
         "{padded:?} must still expand its program word"
     );
     assert!(denied(&padded), "{padded:?} runs `rm rm -rf /`");
-    // A range past the budget is left as written too, not cut to fit: a
-    // shorter list is a wrong list, and it is the word budget that decides.
+    // And the verb survives even when the over-budget word *is* the program
+    // word. One alternative past the cap, left as written, presented the whole
+    // `{rm,x,…}` to every rule while bash runs `rm`.
+    let alternatives: String = std::iter::once("rm")
+        .chain(std::iter::repeat_n("x", MAX_BRACE_WORDS))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert!(
+        denied(&format!("{{{alternatives}}} -rf ~")),
+        "a group one alternative past the cap still runs `rm`"
+    );
+    assert!(
+        denied(&format!("rm -r ~{}", "{,}".repeat(9))),
+        "512 leaves past the cap still run `rm -r ~`"
+    );
     assert_eq!(
         brace_expanded_line("echo {1..256}")
             .split_whitespace()
             .count(),
         257
     );
-    assert_eq!(brace_expanded_line("echo {1..257}"), "echo {1..257}");
+    // A range past the budget is not cut to fit — a shorter list is a wrong
+    // list — it is read as its first word, the one bash leads with.
+    assert_eq!(brace_expanded_line("echo {1..257}"), "echo 1");
+}
+
+/// The per-word budget bounds one word's product, not their sum, and nothing
+/// upstream caps a command's length: 9 KB of `{1..256}` words expanded to
+/// 916 KB, copied again by each blanking rewriting, walked by every rule, and
+/// then done over for the approval prompt. The line cap holds the expansion to
+/// its own bound — and holds it without starving the words behind it, which is
+/// the bug the per-line *word* budget was removed for.
+#[test]
+fn brace_expansion_of_a_line_is_bounded() {
+    let line = "{1..256} ".repeat(1000);
+    let expanded = brace_expanded_line(&line);
+    assert!(
+        expanded.len() < MAX_BRACE_LINE_BYTES * 2,
+        "a line's expansion must stay near its cap, got {}",
+        expanded.len()
+    );
+    // Past the cap the remaining words are still *read*, as their first
+    // expansion — so the verb behind a brace bomb is not what the cap costs.
+    let spent = format!("{line}; rm{{,}} -rf /");
+    assert!(
+        denied(&spent),
+        "the program word behind a spent line budget is still read"
+    );
+}
+
+/// The expander is iterative because the recursion it replaced descended once
+/// per brace group *before* reaching a single leaf: a budget that counts leaves
+/// bounds the width and nothing bounded the depth. A word of a few thousand
+/// sequential groups overflowed the stack — which is an abort, not a denial and
+/// not an approval, taking the process down from one tool call before any
+/// verdict existed. Pinned on a 2 MiB stack because that is what the runtime
+/// gives the worker thread `builtin_deny` runs on, not the 8 MiB this harness
+/// would otherwise lend it.
+#[test]
+fn a_deep_brace_word_does_not_recurse() {
+    let worker = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| brace_expanded_line(&format!("echo {}", "{a,b}".repeat(20_000))))
+        .expect("spawn a worker-sized thread");
+    let expanded = worker.join().expect("a deep brace word must not overflow");
+    assert!(
+        expanded.starts_with("echo aaaa"),
+        "{:?}",
+        &expanded[..expanded.len().min(24)]
+    );
+}
+
+/// A `{` with nothing left to close it ends the scan instead of restarting it
+/// at the next one. Restarting rescanned the same tail from every `{` in the
+/// word — quadratic, 29 seconds for 100 KB of them here, and a prompted line
+/// pays it twice — while producing no words at all, so no word budget ever saw
+/// it.
+#[test]
+fn unmatched_braces_do_not_rescan() {
+    let word = "{".repeat(100_000);
+    let start = std::time::Instant::now();
+    assert_eq!(brace_expanded_line(&word), word);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "unmatched braces rescanned the word: {:?}",
+        start.elapsed()
+    );
+}
+
+/// A word ends where the shell's word ends, not at blanks alone. bash lexes
+/// `true;{rm,-rf,/}` into `true`, `;` and `{rm,-rf,/}` and expands the third;
+/// reading the whole thing as one word copied the `true;` into every
+/// alternative (`true;rm true;-rf true;/`), and `segments` cut *that* into
+/// `true` and `rm true`, which carries no `-rf`. The line that runs `rm -rf /`
+/// was read by no rule on the floor.
+#[test]
+fn an_operator_glued_to_a_brace_group_is_not_part_of_the_word() {
+    for command in [
+        "true;{rm,-rf,/}",
+        "x|{rm,-rf,/}",
+        "x&&{rm,-rf,/}",
+        "({rm,-rf,/})",
+        "echo hi;r{m,x} -rf /",
+    ] {
+        assert!(denied(command), "{command:?} runs `rm -rf /`");
+    }
+    // The separators are copied through verbatim, so `segments` cuts the
+    // expansion exactly where it cuts the line.
+    assert_eq!(brace_expanded_line("true;{rm,-rf,/}"), "true;rm -rf /");
+    assert_eq!(brace_expanded_line("({rm,-rf,/})"), "(rm -rf /)");
+}
+
+/// bash expands no brace inside quotes, so neither does this. `"rm{,}"` is the
+/// literal word `rm{,}`, which bash fails with "command not found" — but
+/// reading the group produced `"rm" "rm" -rf /`, `clean_token` stripped the
+/// quotes, and the floor denied a line that never runs. That is the one
+/// direction `readings_of`'s premise says cannot happen. Quote *state* rather
+/// than skipping quoted words whole: the group outside the quotes on the same
+/// word is bash's own.
+#[test]
+fn quoted_braces_are_not_expanded() {
+    for command in [
+        r#""rm{,}" -rf /"#,
+        r#"'{rm,-rf,/}'"#,
+        r#"r"m{,}" -rf /"#,
+        r#""{rm,x}" -rf ~"#,
+    ] {
+        assert_eq!(brace_expanded_line(command), command);
+        assert!(!denied_under(SH, command), "{command:?} runs no `rm`");
+    }
+    assert_eq!(brace_expanded_line(r#"echo "a"{b,c}"#), r#"echo "a"b "a"c"#);
+    // Asserted under `sh` because brace expansion is `sh`'s stage. Under the
+    // Windows grammar the `,` blanking reads that same line again with its
+    // commas as blanks — quotes included, because `cmd` strips quotes before it
+    // splits words, which is exactly the spelling that rewriting exists for
+    // (`del","/f/s/q C:\*`). So `'{rm,-rf,/}'` is denied there, on that reading
+    // and not on the expander's. Two grammars, two answers, both deliberate.
+    assert!(denied_under(WINDOWS, r#"'{rm,-rf,/}'"#));
+    // And a quoted brace does not hide one that is really there.
+    assert!(denied(r#"echo "x" && {rm,-rf,/}"#));
+}
+
+/// A stepped range walks from the *first* endpoint toward the second, which is
+/// bash's own rule. With a step of 1 the difference is invisible — the same
+/// list reversed — but any other step lands on different letters: `{f..a..2}`
+/// is `f d b` to bash and `e c a` to a walk anchored at the low endpoint and
+/// reversed after. `r{m..j..2} -rf /` is that difference whole, `rm rk`
+/// (denied) against `rl rj` (not), on exactly the hosts whose `sh` is bash 4+
+/// — which is the reason step forms are read here at all. Pinned by rule
+/// rather than against the host bash, which is 3.2 on macOS and leaves every
+/// step form literal.
+#[test]
+fn a_stepped_range_walks_from_the_first_endpoint() {
+    assert_eq!(brace_expanded_line("echo {f..a..2}"), "echo f d b");
+    assert_eq!(brace_expanded_line("echo {m..j..2}"), "echo m k");
+    assert_eq!(brace_expanded_line("echo {a..e..2}"), "echo a c e");
+    assert_eq!(brace_expanded_line("echo {1..9..3}"), "echo 1 4 7");
+    assert_eq!(brace_expanded_line("echo {9..1..3}"), "echo 9 6 3");
+    assert!(denied("r{m..j..2} -rf /"), "bash 4 runs `rm rk -rf /`");
+}
+
+/// `{1..a}` is not a range to bash — 3.2 and 5.x both leave it literal — and
+/// reading a mixed pair as characters walked the ASCII table between the
+/// endpoints. That put `;` and `>` into the expansion of a line that had
+/// neither: `safety_notes` warned about a redirect nobody wrote, and `segments`
+/// cut the reading at a semicolon nobody typed.
+#[test]
+fn a_mixed_range_is_not_a_range() {
+    for command in ["mkdir {1..a}", "echo {0..f}", "echo {a..9}"] {
+        assert_eq!(brace_expanded_line(command), command);
+    }
+    // Both-numeric and both-character stay ranges.
+    assert_eq!(brace_expanded_line("echo {1..3}"), "echo 1 2 3");
+    assert_eq!(brace_expanded_line("echo {a..c}"), "echo a b c");
+}
+
+/// The endpoints and the step are the model's to write, and a step near
+/// `i64::MAX` overflowed the running sum — `attempt to add with overflow`, a
+/// panic in every profile this crate builds a test or a `cargo run` with, on
+/// the hot path of the floor itself and with no `catch_unwind` above it.
+#[test]
+fn a_range_near_the_integer_bounds_does_not_overflow() {
+    assert_eq!(
+        brace_expanded_line("echo {1..2..9223372036854775807}"),
+        "echo 1"
+    );
+    assert_eq!(
+        brace_expanded_line("echo {9223372036854775807..9223372036854775807}"),
+        "echo 9223372036854775807"
+    );
+    for command in [
+        "echo {-9223372036854775807..-9223372036854775808}",
+        "echo {0..9223372036854775807..9223372036854775807}",
+        "echo {9223372036854775807..-9223372036854775808..2}",
+    ] {
+        let _ = brace_expanded_line(command);
+    }
 }
 
 /// The expander has to be bash's own, not an approximation of it: a group it

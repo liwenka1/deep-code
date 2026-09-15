@@ -57,28 +57,9 @@
 /// piece between them is dropped) and newlines. Named so that the other reader
 /// of command boundaries, [`blanks_for_outside_flags`], can be held against
 /// it: every character here ends a flag token one way or another
-/// ([`FLAG_TOKEN_BOUNDARIES`] says which way), and
+/// ([`Grammar::command_separators`] says which way for each grammar), and
 /// `flag_tokens_end_at_every_command_boundary` fails naming any that does not.
 pub(super) const SEGMENT_SEPARATORS: [char; 4] = ['\n', ';', '|', '&'];
-
-/// Where a flag token ends besides a blank, for [`blanks_for_outside_flags`]:
-/// the two command boundaries no rewriting turns into a blank. A flag glued to
-/// one of them used to carry the `=` carve-out into the next command:
-/// `echo --x=1|del=/f/s/q C:\*` is two commands to `cmd` and the second is the
-/// drive wipe, and with `|` inside the token the `=` hiding the verb was never
-/// read.
-///
-/// The other two of [`SEGMENT_SEPARATORS`] are accounted for differently. A
-/// newline is whitespace. `;` is deliberately left *inside* the token, even
-/// though [`segments`] cuts at it: under the one grammar that reads `=` at
-/// all it is a word delimiter, [`blanks_for`] blanks it, and keeping it in the
-/// token is what reads the `=` in `del;-x=/s;C:\*` — that token begins with
-/// `d`, so its `=` is not a flag's value, and the closure in
-/// `shell_deny::readings_of` takes the result on to `del -x /s C:\*`, which
-/// is what `cmd` runs. Cutting at `;` would have made `-x=/s` a flag and
-/// handed the spelling to the residual `SECURITY.md` records for a delimiter
-/// inside a flag's value. `,` is the same case without the `segments` cut.
-pub(super) const FLAG_TOKEN_BOUNDARIES: [char; 2] = ['|', '&'];
 
 /// Split a command line into individually-checkable segments on
 /// [`SEGMENT_SEPARATORS`]. Each segment is a single simple command whose
@@ -324,6 +305,29 @@ pub(super) struct Grammar {
     /// stays an environment assignment, this set is empty, and nothing about it
     /// changes.
     pub(super) word_delimiters_outside_flags: &'static [char],
+    /// Where one command ends and the next begins for this interpreter, which
+    /// is where a flag token ends too ([`blanks_for_outside_flags`]).
+    ///
+    /// A flag glued to one of these used to carry the `=` carve-out into the
+    /// next command: `echo --x=1|del=/f/s/q C:\*` is two commands to `cmd` and
+    /// the second is the drive wipe, and with the `|` inside the token the `=`
+    /// hiding the verb was never read.
+    ///
+    /// `;` is the one character the two grammars disagree about, which is why
+    /// this is a field and not a constant. It ends a command in `sh`. To `cmd`
+    /// it is a *word* delimiter — it is in [`Grammar::word_delimiters`] there —
+    /// so it must stay inside the token: that is what reads the `=` in
+    /// `del;-x=/s;C:\*`, whose token begins with `d`, and the closure in
+    /// `shell_deny::readings_of` takes the result on to `del -x /s C:\*`, which
+    /// is what `cmd` runs. Cutting there would have made `-x=/s` a flag and
+    /// handed the spelling to the residual `SECURITY.md` records for a
+    /// delimiter inside a flag's value. Written as one module-wide constant,
+    /// `cmd`'s answer was simply asserted for both, and `sh` was right only
+    /// because its `=` set is empty and the function returns before ever asking.
+    ///
+    /// A newline is here for completeness and costs nothing: it is whitespace,
+    /// which ends a token anyway.
+    pub(super) command_separators: &'static [char],
     /// Whether a word opening with `#` comments out the rest of the line.
     ///
     /// It does in `sh`. `cmd.exe` has no comment syntax at all, and `#` is a
@@ -345,6 +349,7 @@ pub(super) const SH: Grammar = Grammar {
     rewrites_words_with: &[],
     word_delimiters: &[],
     word_delimiters_outside_flags: &[],
+    command_separators: &['\n', ';', '|', '&'],
     comments_with_hash: true,
 };
 
@@ -357,6 +362,7 @@ pub(super) const WINDOWS: Grammar = Grammar {
     rewrites_words_with: &['%'],
     word_delimiters: &[',', ';'],
     word_delimiters_outside_flags: &['='],
+    command_separators: &['\n', '|', '&'],
     comments_with_hash: false,
 };
 
@@ -431,7 +437,8 @@ pub(super) fn rewrites_a_word_of_the_line(grammar: Grammar, command: &str) -> bo
 /// answers `None` before allocating and Unix pays nothing at all, while a
 /// Windows caller is about to spawn a process.
 #[must_use]
-pub(super) fn blanks_for(delimiters: &[char], command: &str) -> Option<String> {
+pub(super) fn blanks_for(grammar: Grammar, command: &str) -> Option<String> {
+    let delimiters = grammar.word_delimiters;
     if !command.contains(delimiters) {
         return None;
     }
@@ -459,9 +466,22 @@ pub(super) fn blanks_for(delimiters: &[char], command: &str) -> Option<String> {
 /// opens a flag, not `cmd`'s `/switch` — a switch is already a word this floor
 /// reads, and keeping the test to one character keeps the reading easy to state.
 ///
-/// A token ends at a blank or at one of [`FLAG_TOKEN_BOUNDARIES`] — `|` and
-/// `&`, where the command ends — not at a blank alone, and deliberately not at
-/// `;` or `,`; that constant says why.
+/// A token ends at a blank or at one of this grammar's
+/// [`Grammar::command_separators`] — not at a blank alone, and under `cmd`
+/// deliberately not at `;` or `,`; that field says why.
+///
+/// None of that reads a quoted character, and the quotes themselves open no
+/// token. Both halves were bugs. A `&` inside a flag's value ended the flag
+/// token, so `curl --data="user=x&su=1" https://h` read as `…&su 1"`, which
+/// [`segments`] then cut at the `&` into a segment whose program word was `su`
+/// — a privilege-escalation denial, on a floor no mode can override, for a line
+/// `cmd` runs with the `&` as a literal. And a quote at the head of a token hid
+/// the `-` behind it, so `"--exclude=/"` was no flag, its `=` was read, and
+/// [`clean_token`] handed the rule a bare `/` operand: `rm -r "--exclude=/" build`
+/// denied as a recursive remove of the root where the unquoted spelling was
+/// fine. A delimiter *inside* the quotes is still read (`del"="/f/s/q C:\*` is
+/// still `del /f/s/q C:\*`) — `cmd` removes the quotes before it splits, and
+/// that spelling is the one this rewriting exists for.
 ///
 /// The result may equal `command` when every `=` sits inside a flag
 /// (`rm -r --exclude=/ build`). Whether that is worth judging again is the
@@ -470,20 +490,32 @@ pub(super) fn blanks_for(delimiters: &[char], command: &str) -> Option<String> {
 /// contract here is the same as [`blanks_for`]'s: `None` exactly when the line
 /// carries none of the delimiters.
 #[must_use]
-pub(super) fn blanks_for_outside_flags(delimiters: &[char], command: &str) -> Option<String> {
+pub(super) fn blanks_for_outside_flags(grammar: Grammar, command: &str) -> Option<String> {
+    let delimiters = grammar.word_delimiters_outside_flags;
     if !command.contains(delimiters) {
         return None;
     }
     let mut out = String::with_capacity(command.len());
     let mut token_start = true;
     let mut in_flag = false;
+    let mut quote: Option<char> = None;
     for ch in command.chars() {
-        if ch.is_whitespace() || FLAG_TOKEN_BOUNDARIES.contains(&ch) {
+        let quoted = quote.is_some();
+        match quote {
+            Some(active) if ch == active => quote = None,
+            None if matches!(ch, '\'' | '"') => quote = Some(ch),
+            _ => {}
+        }
+        if !quoted && (ch.is_whitespace() || grammar.command_separators.contains(&ch)) {
             token_start = true;
             out.push(ch);
             continue;
         }
         if token_start {
+            if matches!(ch, '\'' | '"') {
+                out.push(ch);
+                continue;
+            }
             in_flag = ch == '-';
             token_start = false;
         }
@@ -1120,7 +1152,7 @@ mod tests {
     #[cfg(unix)]
     fn rewriting_character_is_read(c: char) -> bool {
         has_shell_indirection(HOST, &c.to_string())
-            || matches!(c, ';' | '|' | '&')
+            || SEGMENT_SEPARATORS.contains(&c)
             || matches!(c, '\'' | '"' | '\\')
             || c == '~'
             || c == '#'
@@ -1468,29 +1500,24 @@ mod tests {
         // of it.
         for spelled in [r"del,/f/s/q,C:\*", r"del;/f/s/q;C:\*"] {
             assert_eq!(
-                blanks_for(WINDOWS.word_delimiters, spelled).as_deref(),
+                blanks_for(WINDOWS, spelled).as_deref(),
                 Some(r"del /f/s/q C:\*")
             );
-            assert_eq!(blanks_for(SH.word_delimiters, spelled), None);
+            assert_eq!(blanks_for(SH, spelled), None);
         }
         // `=` is read only where it cannot be a flag's value. Both halves are
         // load-bearing: the first spelling walked past every rule on the floor,
         // and reading the second one as two words denied an everyday command in
         // every mode with no way to say yes.
         assert_eq!(
-            blanks_for_outside_flags(WINDOWS.word_delimiters_outside_flags, r"del=/f/s/q C:\*")
-                .as_deref(),
+            blanks_for_outside_flags(WINDOWS, r"del=/f/s/q C:\*").as_deref(),
             Some(r"del /f/s/q C:\*")
         );
         // Both in one line, one blanked and one kept: a `None` for the
         // all-inside-a-flag line could not tell the carve-out preserving an
         // `=` from the token model losing the delimiter.
         assert_eq!(
-            blanks_for_outside_flags(
-                WINDOWS.word_delimiters_outside_flags,
-                "del=/f --exclude=/ x"
-            )
-            .as_deref(),
+            blanks_for_outside_flags(WINDOWS, "del=/f --exclude=/ x").as_deref(),
             Some("del /f --exclude=/ x")
         );
         // Every `=` inside a flag: the line comes back unchanged, as `Some`.
@@ -1499,11 +1526,7 @@ mod tests {
         // `None` here would be the same decision made a second time in one
         // rewriting and not in its sibling.
         assert_eq!(
-            blanks_for_outside_flags(
-                WINDOWS.word_delimiters_outside_flags,
-                "rm -r --exclude=/ build"
-            )
-            .as_deref(),
+            blanks_for_outside_flags(WINDOWS, "rm -r --exclude=/ build").as_deref(),
             Some("rm -r --exclude=/ build")
         );
         // A value that begins a flag is read as one once the delimiter before
@@ -1512,61 +1535,124 @@ mod tests {
         // replaced delimiter (without it, `-rf=z` is judged mid-token and its
         // `=` is blanked too).
         assert_eq!(
-            blanks_for_outside_flags(&['='], "x=-rf=z y=-rf").as_deref(),
+            blanks_for_outside_flags(WINDOWS, "x=-rf=z y=-rf").as_deref(),
             Some("x -rf=z y -rf")
         );
         // A flag token ends where the command does, not only at a blank: a
-        // `-` word glued to `|` or `&` must not carry the carve-out into the
-        // next command, whose `=` is the one hiding the verb.
-        for (glued, read) in [
-            (r"echo --x=1|del=/f/s/q C:\*", r"echo --x=1|del /f/s/q C:\*"),
-            (r"echo --x=1&del=/f/s/q C:\*", r"echo --x=1&del /f/s/q C:\*"),
-            (r"findstr -i|del=/f/s/q C:\*", r"findstr -i|del /f/s/q C:\*"),
-        ] {
+        // `-` word glued to a command separator must not carry the carve-out
+        // into the next command, whose `=` is the one hiding the verb. Derived
+        // from the grammar rather than copied out of it, so a separator added
+        // to the field is covered the day it is added.
+        for boundary in WINDOWS.command_separators {
+            let glued = format!(r"echo --x=1{boundary}del=/f/s/q C:\*");
+            let read = format!(r"echo --x=1{boundary}del /f/s/q C:\*");
             assert_eq!(
-                blanks_for_outside_flags(&['='], glued).as_deref(),
-                Some(read),
+                blanks_for_outside_flags(WINDOWS, &glued).as_deref(),
+                Some(read.as_str()),
                 "{glued:?}: the flag must end at the command boundary"
             );
         }
+        // A flag with no `=` of its own ends there too — the carve-out is
+        // opened by the leading `-`, not by a delimiter the token contains.
+        assert_eq!(
+            blanks_for_outside_flags(WINDOWS, r"findstr -i|del=/f/s/q C:\*").as_deref(),
+            Some(r"findstr -i|del /f/s/q C:\*")
+        );
         // But not at `;`: it stays inside the token, so this token begins with
         // `d` and its `=` is read. Cutting there would make `-x=/s` a flag
         // and hand the spelling to the residual recorded for a delimiter
         // inside a flag's value; `blanks_for` and the closure take this
         // reading on to `del -x /s C:\*`.
         assert_eq!(
-            blanks_for_outside_flags(&['='], r"del;-x=/s;C:\*").as_deref(),
+            blanks_for_outside_flags(WINDOWS, r"del;-x=/s;C:\*").as_deref(),
             Some(r"del;-x /s;C:\*")
         );
         // An empty set answers before allocating, which is what Unix pays.
-        assert_eq!(
-            blanks_for_outside_flags(SH.word_delimiters_outside_flags, r"del=/f/s/q C:\*"),
-            None
-        );
+        assert_eq!(blanks_for_outside_flags(SH, r"del=/f/s/q C:\*"), None);
+    }
+
+    /// A command boundary inside quotes is not one, and a quote at the head of
+    /// a token opens no token of its own.
+    ///
+    /// Both halves invented a denial on a floor no mode can override. The `&`
+    /// in a URL ended the flag token, so `curl --data="user=x&su=1" https://h`
+    /// read as `…&su 1"`, which `segments` cut at the `&` into a segment whose
+    /// program word is `su` — privilege escalation, for a line `cmd` runs with
+    /// that `&` as a literal character. And a quote ahead of a flag hid the `-`
+    /// behind it, so `"--exclude=/"` was no flag, its `=` was read, and
+    /// `clean_token` handed the rule a bare `/`: `rm -r "--exclude=/" build`
+    /// denied as a recursive remove of the root where the unquoted spelling
+    /// passed.
+    ///
+    /// A delimiter *inside* the quotes is still read. `cmd` removes quotes
+    /// before it splits words, so `del"="/f/s/q C:\*` really is the drive wipe,
+    /// and that spelling is the one this rewriting exists for — reading the
+    /// quotes as token boundaries rather than as quotes is what must stop, not
+    /// reading the delimiter behind them.
+    #[test]
+    fn a_quoted_command_boundary_does_not_end_a_flag_token() {
+        for (line, read) in [
+            // The boundary inside the quotes is literal to the interpreter.
+            (
+                r#"curl --data="user=x&su=1" https://h"#,
+                r#"curl --data="user=x&su=1" https://h"#,
+            ),
+            (
+                r#"curl --url="https://x/?a=1|sh=2""#,
+                r#"curl --url="https://x/?a=1|sh=2""#,
+            ),
+            // A quote ahead of the `-` leaves it a flag.
+            (
+                r#"rm -r "--exclude=/" build"#,
+                r#"rm -r "--exclude=/" build"#,
+            ),
+            (r"rm -r '--exclude=/' build", r"rm -r '--exclude=/' build"),
+            // But the delimiter behind a quote is still read, because the
+            // interpreter strips the quote before it splits.
+            (r#"del"="/f/s/q C:\*"#, r#"del" "/f/s/q C:\*"#),
+            (r#""del=/f/s/q" C:\*"#, r#""del /f/s/q" C:\*"#),
+            // And an unquoted boundary still ends the token.
+            (r"echo --x=1&del=/f/s/q C:\*", r"echo --x=1&del /f/s/q C:\*"),
+        ] {
+            assert_eq!(
+                blanks_for_outside_flags(WINDOWS, line).as_deref(),
+                Some(read),
+                "{line:?}"
+            );
+        }
     }
 
     /// Every character `segments` cuts a command at ends a flag token one way
     /// or another: as whitespace, as a word delimiter `blanks_for` blanks
-    /// before the closure re-reads, or as one of `FLAG_TOKEN_BOUNDARIES`. A
-    /// separator added to `segments` that is none of these is a `|`-shaped
-    /// hole reopened, and this names it.
+    /// before the closure re-reads, or as one of the grammar's own
+    /// `command_separators`. A separator added to `segments` that is none of
+    /// these is a `|`-shaped hole reopened, and this names it.
+    ///
+    /// Asked of *both* grammars, which is the point of the field. Written as
+    /// one module-wide constant, this asserted `cmd`'s answer for a set `sh`
+    /// disagrees about (`;` ends a command there and delimits a word here), and
+    /// `sh` passed only because its `=` set is empty and
+    /// `blanks_for_outside_flags` returns before it ever asks. Run against `sh`,
+    /// the constant failed.
     #[test]
     fn flag_tokens_end_at_every_command_boundary() {
-        for separator in SEGMENT_SEPARATORS {
-            assert!(
-                separator.is_whitespace()
-                    || WINDOWS.word_delimiters.contains(&separator)
-                    || FLAG_TOKEN_BOUNDARIES.contains(&separator),
-                "{separator:?} cuts a command but ends no flag token"
-            );
-        }
-        // And the boundaries are command boundaries — never a character a
-        // rewriting would have blanked anyway, which is what makes them the
-        // set that needs its own rule.
-        for boundary in FLAG_TOKEN_BOUNDARIES {
-            assert!(SEGMENT_SEPARATORS.contains(&boundary));
-            assert!(!WINDOWS.word_delimiters.contains(&boundary));
-            assert!(!WINDOWS.word_delimiters_outside_flags.contains(&boundary));
+        for grammar in [SH, WINDOWS] {
+            for separator in SEGMENT_SEPARATORS {
+                assert!(
+                    separator.is_whitespace()
+                        || grammar.word_delimiters.contains(&separator)
+                        || grammar.command_separators.contains(&separator),
+                    "{separator:?} cuts a command but ends no flag token"
+                );
+            }
+            // And a command separator is a command boundary — never a character
+            // a rewriting would have blanked anyway, which is what makes it a
+            // set that needs its own rule.
+            for boundary in grammar.command_separators {
+                assert!(SEGMENT_SEPARATORS.contains(boundary));
+                assert!(!grammar.word_delimiters.contains(boundary));
+                assert!(!grammar.word_delimiters_outside_flags.contains(boundary));
+            }
         }
     }
 
