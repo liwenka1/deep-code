@@ -697,20 +697,78 @@ pub(super) fn escapes_cwd_by_spelling(token: &str) -> bool {
 }
 
 /// Whether an argument token (quoting already stripped) names a path outside
-/// the cwd: a positional operand judged as is, a `--flag=value` judged by its
-/// value (`--target-directory=/tmp` is a target like any other), a bare flag
+/// the cwd: a positional operand judged as is, a flag's `=value` judged by its
+/// value (`--target-directory=/tmp` is a target like any other), a *short*
+/// flag's glued value judged by [`glued_value_leaves_cwd`], a bare flag
 /// (`-r`, `--`) never. Judging only the words that do not start with `-` let
 /// the `=value` spelling of a target through while `-t /tmp` was refused.
+///
+/// The glued reading is the half that was missing, and it was a hole in every
+/// promise built on this fence rather than a rough edge: `getopt` lets a short
+/// option carry its value with no separator at all, so `cp -t/tmp ./x` is the
+/// same command as `cp -t /tmp ./x`, and the `=`-only reading returned `false`
+/// for it. That made `mv -t/tmp src` a *bounded edit* to
+/// [`super::shell_deny::is_workspace_fs_edit`] — AcceptEdits and Auto ran it
+/// with no prompt, and `/tmp` is a sandbox write root by design, so nothing
+/// below this line stopped it either — and it let the same spelling ride any
+/// configured trust rule whose program takes such an option (`tar -C/etc …`).
+///
+/// Only a single `-` opens a glued value. A long flag spells its value after
+/// `=` or in the next word; it never glues, so reading `--exclude-from` for a
+/// value would cost prompts for nothing.
 pub(super) fn operand_leaves_cwd(cleaned: &str) -> bool {
-    let operand = if cleaned.starts_with('-') {
-        match cleaned.split_once('=') {
-            Some((_, value)) => value,
-            None => return false,
-        }
-    } else {
-        cleaned
+    let Some(flag) = cleaned.strip_prefix('-') else {
+        return escapes_cwd_by_spelling(cleaned);
     };
-    escapes_cwd_by_spelling(operand)
+    // A flag's value after `=`, judged exactly — so an in-tree target keeps
+    // its allowance (`cp --target-directory=build/out x`). The name before the
+    // `=` must not itself be a path, or a glued value that happens to carry an
+    // `=` (`-t/tmp=x`) would be read as the flag `t/tmp` with the value `x`.
+    if let Some((name, value)) = flag.split_once('=')
+        && !name.contains(['/', '\\', '~'])
+    {
+        return escapes_cwd_by_spelling(value);
+    }
+    !flag.starts_with('-') && glued_value_leaves_cwd(flag)
+}
+
+/// Whether any suffix of a short-flag bundle (the token past its single `-`)
+/// leaves the cwd by spelling — i.e. whether the value glued onto it does,
+/// wherever the program decides its option letters end.
+///
+/// Where they end is the *program's* business and this fence does not know it:
+/// `-t/tmp` is one option letter, `-rft/tmp` is three, and a bundle is free to
+/// be longer still. So every position the value could start at is judged, and
+/// the token is refused if any of them escapes.
+///
+/// Written as the three conditions rather than as a loop over suffixes,
+/// because the loop is quadratic in the token and this runs on every argument
+/// of every shell call — a model can emit a 100 KB flag token. They are the
+/// same predicate, term by term against [`escapes_cwd_by_spelling`]:
+///
+///   * a suffix starting with `/`, `~` or `\` exists exactly when the bundle
+///     holds one of those characters anywhere;
+///   * a suffix with a `..` *component* needs a separator, which the first
+///     term already caught, unless the suffix IS `..` — so, with no separator
+///     present, exactly when the bundle ends with `..`;
+///   * a drive-lettered suffix exists exactly when some letter is followed by
+///     a `:`. Byte pairs are enough: a UTF-8 continuation byte is never
+///     `is_ascii_alphabetic`, and `:` never appears inside a multi-byte
+///     sequence.
+///
+/// `every_glued_value_reading_matches_the_suffix_scan` holds the two together.
+///
+/// The cost is that an in-tree path glued to a short flag (`cp -tbuild/out x`)
+/// is refused as well: this fence cannot tell it from `-t/tmp` without knowing
+/// where the letters end, and it may only ever over-refuse. That is one
+/// prompt, on a spelling a model rarely writes.
+fn glued_value_leaves_cwd(bundle: &str) -> bool {
+    bundle.contains(['/', '\\', '~'])
+        || bundle.ends_with("..")
+        || bundle
+            .as_bytes()
+            .windows(2)
+            .any(|pair| pair[0].is_ascii_alphabetic() && pair[1] == b':')
 }
 
 /// The words `command` runs as, when it is one simple command the executor
@@ -1832,5 +1890,96 @@ mod tests {
                 .collect();
             assert_eq!(ours, theirs, "{command:?} split differently from sh");
         }
+    }
+
+    /// A short option may carry its value glued on, and the fence has to read
+    /// it: `cp -t/tmp ./x` is `cp -t /tmp ./x`, which every promise built on
+    /// this predicate is about. The `=` spelling and the bare flags are in the
+    /// same table so a future narrowing of one shows up as the other going
+    /// red — the previous version passed every `=` case while returning
+    /// `false` for the whole glued column.
+    #[test]
+    fn a_short_flags_glued_value_is_judged_like_the_operand_it_is() {
+        let cases: &[(&str, bool)] = &[
+            // Glued short-option values — the column that was unread.
+            ("-t/tmp", true),
+            ("-rft/tmp", true),
+            ("-t~/x", true),
+            ("-t../outside", true),
+            (r"-tC:\x", true),
+            (r"-t\\server\share", true),
+            ("-t/tmp=x", true),
+            // Glued, but in-tree: refused all the same, because where the
+            // option letters end is the program's business. One prompt.
+            ("-tbuild/out", true),
+            // Bare flags and bundles carry no value at all.
+            ("-r", false),
+            ("-rf", false),
+            ("--", false),
+            ("-", false),
+            ("--recursive", false),
+            ("--exclude-from", false),
+            ("-O2", false),
+            ("-j8", false),
+            // A long flag never glues: its value comes after `=` or in the
+            // next word, so reading its name for one costs prompts for
+            // nothing.
+            ("--target-directory=/tmp", true),
+            ("--target-directory=build/out", false),
+            ("--exclude=~/.ssh", true),
+            ("--exclude=/", true),
+            ("--no-index", false),
+            // Positional operands are unchanged.
+            ("./x", false),
+            ("/etc/passwd", true),
+            ("~/.ssh/id_rsa", true),
+            ("main..HEAD", false),
+            ("..", true),
+        ];
+        for &(token, expected) in cases {
+            assert_eq!(
+                operand_leaves_cwd(token),
+                expected,
+                "{token:?} read the wrong way"
+            );
+        }
+    }
+
+    /// [`glued_value_leaves_cwd`] is the suffix scan written in one pass, and
+    /// the two must stay the same predicate: the loop is what the fence means,
+    /// the three conditions are only how it affords to run on every argument
+    /// of every shell call. Enumerated over the characters that make the
+    /// difference rather than over hand-picked spellings, because a term-level
+    /// narrowing (dropping `~` from the `contains`, or `ends_with("..")`) is
+    /// exactly what a table of examples keeps passing through.
+    #[test]
+    fn every_glued_value_reading_matches_the_suffix_scan() {
+        fn by_suffix_scan(bundle: &str) -> bool {
+            (0..bundle.len())
+                .filter(|start| bundle.is_char_boundary(*start))
+                .any(|start| escapes_cwd_by_spelling(&bundle[start..]))
+        }
+        let alphabet = ['t', '/', '\\', '~', '.', ':', 'C', '=', '1'];
+        let mut checked = 0usize;
+        for a in alphabet {
+            for b in alphabet {
+                for c in alphabet {
+                    for d in alphabet {
+                        let bundle: String = [a, b, c, d].iter().collect();
+                        assert_eq!(
+                            glued_value_leaves_cwd(&bundle),
+                            by_suffix_scan(&bundle),
+                            "{bundle:?} read differently by the two forms"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, alphabet.len().pow(4));
+        // And the one-pass form stays linear: the loop it replaces is
+        // quadratic, and a model can spell a flag token this long.
+        let huge = format!("-t{}", "a".repeat(200_000));
+        assert!(!operand_leaves_cwd(&huge));
     }
 }

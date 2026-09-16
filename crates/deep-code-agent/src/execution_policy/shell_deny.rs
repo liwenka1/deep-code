@@ -1150,8 +1150,9 @@ fn note_segments_of(command: &str, notes: &mut SafetyNotes) {
 /// ([`parse_unattended`]) — one tokenization, so the words judged here are the
 /// words that run. Every command's program must be a *bare* name in the set
 /// (no path component; an assignment, wrapper or grouping word ahead of it
-/// never parses as a bare program word either), every operand — a
-/// `--flag=value`'s value included — must stay under the cwd by spelling
+/// never parses as a bare program word either), every operand — a flag's
+/// value included, spelled after an `=` or glued onto a short flag — must
+/// stay under the cwd by spelling
 /// ([`operand_leaves_cwd`]), and `rm` must not recurse. A hard deny (e.g.
 /// `rm -rf`) never reaches here — `builtin_deny` short-circuits it.
 ///
@@ -1207,8 +1208,9 @@ pub fn is_workspace_fs_edit(command: &str) -> bool {
         // accept-edits pass). So an absolute, home-relative or climbing operand
         // is not a bounded edit; an in-workspace path spelled absolutely costs
         // one prompt. The safety notes flag the very same spellings. A flag's
-        // `=value` is judged as an operand too: `cp --target-directory=/tmp x`
-        // names its target exactly as `cp -t /tmp x` does.
+        // value is judged as an operand too, in both spellings a program
+        // accepts: `cp --target-directory=/tmp x` and `cp -t/tmp x` name their
+        // target exactly as `cp -t /tmp x` does.
         if args.iter().any(|arg| operand_leaves_cwd(arg)) {
             return false;
         }

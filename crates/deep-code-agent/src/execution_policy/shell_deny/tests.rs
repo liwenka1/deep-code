@@ -654,6 +654,18 @@ fn workspace_fs_edit_refuses_operands_that_leave_the_cwd_by_spelling() {
         "cp --target-directory=/tmp ./x",
         "mv --target-directory=~ ./x",
         "cp -r --target-directory=../out src",
+        // And a target glued onto a SHORT flag is the same target again:
+        // getopt needs no separator, so `-t/tmp` IS `-t /tmp`. Reading only
+        // the `=` spelling made `mv -t/tmp src` a bounded edit — AcceptEdits
+        // and Auto moved the workspace tree to `/tmp` with no prompt, and
+        // `/tmp` is a sandbox write root by design, so nothing under this
+        // allowance stopped it either.
+        "cp -t/tmp ./x",
+        "mv -t/tmp src",
+        "cp -rft/tmp src",
+        "cp -t~/x ./a",
+        "mv -t../out src",
+        "mkdir -p../../outside",
     ] {
         assert!(!is_workspace_fs_edit(cmd), "{cmd}");
     }
@@ -669,6 +681,9 @@ fn workspace_fs_edit_refuses_operands_that_leave_the_cwd_by_spelling() {
         "cp --no-preserve=mode a b",
         "mkdir my..dir",
         "cp a..b c",
+        // A bundle that carries no path is still just flags.
+        "rm -f stale.log",
+        "touch -c a.txt",
     ] {
         assert!(is_workspace_fs_edit(cmd), "{cmd}");
     }

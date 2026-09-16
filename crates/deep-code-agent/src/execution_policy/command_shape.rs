@@ -22,8 +22,9 @@
 //! covers nothing but the byte-identical command.
 //!
 //! Operands are read for one property only: a word that names a path outside
-//! the cwd by spelling (`/etc/x`, `~/.ssh/id_rsa`, `../x`, `C:\x`, or the value
-//! of a `--flag=value`) breaks the trust match ([`rule_covers`]) and the
+//! the cwd by spelling (`/etc/x`, `~/.ssh/id_rsa`, `../x`, `C:\x`, or a flag's
+//! value — `--target-directory=/tmp` and the glued `-t/tmp` alike) breaks the
+//! trust match ([`rule_covers`]) and the
 //! session key ([`session_identity`]). The trusted programs are read-mostly and
 //! the sandbox leaves reads open, so that spelling is the only fence between a
 //! trusted `git diff` and every readable file on the host.
