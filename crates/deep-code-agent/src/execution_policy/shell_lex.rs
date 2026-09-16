@@ -66,9 +66,19 @@ pub(super) const SEGMENT_SEPARATORS: [char; 4] = ['\n', ';', '|', '&'];
 /// program/args we can inspect.
 ///
 /// This is a pragmatic tokenizer, not a full shell parser: it does not track
-/// quotes or subshells. That is a deliberate safety bias — an unparseable or
-/// exotic construct falls through to "needs approval" rather than being
-/// auto-trusted, and deny checks still run on every whitespace-split segment.
+/// quotes or subshells. On the trust side that is a safety bias — a quoted
+/// separator only ever cuts a line into *more* segments, and a segment no rule
+/// covers costs a prompt, so an exotic construct falls through to "needs
+/// approval" rather than being auto-trusted.
+///
+/// On the deny side the same blindness costs the other direction, and it is
+/// the one place this module reads a line no interpreter would run:
+/// `git commit -m "cleanup; rm -rf build"` cuts at the quoted `;` and
+/// [`super::shell_deny`] refuses the tail as a command, in every tier, on a
+/// floor no mode can override. `SECURITY.md` carries it as a written-down
+/// residual rather than a rough edge, and
+/// `a_quoted_separator_still_cuts_the_line` pins both halves so a
+/// quote-aware split has to argue with a test instead of with prose.
 pub(super) fn segments(command: &str) -> Vec<&str> {
     command
         .split(SEGMENT_SEPARATORS)

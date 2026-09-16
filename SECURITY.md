@@ -182,6 +182,18 @@ review to rediscover:
   where `xcopy src\ dst\` runs. (A quoted *absolute* path like
   `cd "C:\Users\me\"` was never in scope: a drive letter leaves the cwd by
   spelling, and `cd` is a cmd builtin, which no unattended command runs.)
+- The floor's segment split does not track quotes, so a dangerous verb written
+  *inside* a quoted argument after a `;` is read as a command of its own:
+  `git commit -m "cleanup; rm -rf build"` and `echo "a; sudo -v"` are hard
+  denials, in every tier, on a floor no mode can override. It is the one place
+  the floor reads a line no interpreter would run — everywhere else its case
+  for reading more rests on each reading being one some shell really takes.
+  The same quote-blindness is what makes the *trust* side of that split safe
+  (a quoted `;` only ever adds segments, and a segment no rule covers costs a
+  prompt), which is why one splitter serves both; teaching it quotes has to be
+  shown not to lose a denial first, on a path that also reads text a human
+  approved and a shell will re-read. Until then the cost is a respelling —
+  drop the `;`, or put the message in a file.
 
 ## Disclosure
 
@@ -332,6 +344,14 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
   要一次提示,而 `xcopy src\ dst\` 照常跑。(引号里的**绝对**路径如
   `cd "C:\Users\me\"` 本来就不在讨论范围:盘符按拼写就已越界,而 `cd` 是
   cmd 内建,免审命令从不运行它。)
+- 这层楼的分段不认引号,所以写在引号**里面**、`;` 后面的危险动词会被当成一条
+  独立命令读:`git commit -m "cleanup; rm -rf build"` 与 `echo "a; sudo -v"`
+  都是硬拒,任何档位都盖不过去。这是这层楼唯一一处读出了「没有任何解释器会跑
+  的那一行」——别处它「多读几种读法」的理由,靠的正是每一种读法都是某个 shell
+  真会跑的。同一个不认引号的性质,恰恰是这个分段在**信任**侧安全的原因(引号里的
+  `;` 只会多分出段,而没有规则覆盖的段代价是一次提示),所以两侧共用一个分段器;
+  要让它认引号,得先证明不会因此丢掉一条拒绝——而这条路径同时还要读「人已批准、
+  shell 会再读一遍」的文本。在那之前,代价是换个写法:去掉 `;`,或者把信息放进文件。
 
 ## 披露
 

@@ -1603,3 +1603,47 @@ fn brace_expansion_matches_bash() {
         );
     }
 }
+
+/// The written-down residual in `SECURITY.md`, pinned rather than described:
+/// [`segments`] does not track quotes, so a dangerous verb inside a quoted
+/// argument after a `;` is refused as if it were a command of its own — the one
+/// place this floor reads a line no interpreter would run, and a hard denial no
+/// mode can override.
+///
+/// Both halves are here on purpose. The denials are the cost, and a
+/// quote-aware split would flip them; the trust-side line is why the same
+/// splitter is safe there — a quoted separator only ever cuts the line into
+/// more segments, and a segment no rule covers is a prompt, never an
+/// allowance. Anyone teaching this split about quotes has to come through this
+/// test and show the second half still holds.
+#[test]
+fn a_quoted_separator_still_cuts_the_line() {
+    for (command, reason) in [
+        (
+            r#"git commit -m "cleanup; rm -rf build""#,
+            "recursive force remove (rm -rf)",
+        ),
+        (r#"echo "a; sudo -v""#, "privilege escalation"),
+    ] {
+        assert_eq!(
+            builtin_deny(command).map(|denied| denied.0),
+            Some(reason),
+            "{command:?} is the residual, not a verdict that changed quietly"
+        );
+    }
+    // A quoted separator with nothing dangerous behind it is not denied — the
+    // cost is confined to text that spells a verb this floor knows.
+    assert!(builtin_deny(r#"git commit -m "cleanup; tidy up""#).is_none());
+    // And the trust side of the same blindness only ever over-refuses: the
+    // extra segment is covered by no rule, so the line asks instead of running.
+    let policy = super::super::ExecPolicy::new();
+    let plan = super::super::engine::evaluate_shell_command(&policy, r#"echo "hi; there""#, false);
+    assert!(
+        matches!(
+            plan.verdict,
+            super::super::PolicyVerdict::NeedsApproval { .. }
+        ),
+        "a quoted separator must cost a prompt, never an allowance: {:?}",
+        plan.verdict
+    );
+}
