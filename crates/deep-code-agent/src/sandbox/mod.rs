@@ -516,7 +516,7 @@ impl SandboxManager {
     /// real boundary, so a command the policy wanted confined must never
     /// silently escape to the host. A policy that asks for no sandbox
     /// ([`SandboxPolicy::Unsandboxed`]) runs bare by design; a test override
-    /// ([`force_sandbox`](Self::force_sandbox)) is authoritative either way.
+    /// (`force_sandbox`, test-only) is authoritative either way.
     #[must_use]
     pub fn sandbox_unavailable_for(&self, policy: &SandboxPolicy) -> bool {
         refuse_bare_execution(
@@ -575,7 +575,7 @@ impl SandboxManager {
     /// Confine an already-spawned child where the OS sandbox must be applied
     /// post-spawn (Windows Job Object). Returns a guard to retain for the
     /// child's lifetime, or `None` when no post-spawn step is needed (macOS and
-    /// Linux confine via [`Self::wrap_shell_command`]) or sandboxing is off.
+    /// Linux confine via [`Self::wrap_command`]) or sandboxing is off.
     #[must_use]
     pub fn confine_spawned(
         &self,

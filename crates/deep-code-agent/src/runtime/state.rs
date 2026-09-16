@@ -71,7 +71,7 @@ pub(super) struct RuntimeState {
     pub(super) turn_boundary_denials: u32,
     /// The most recent boundary-denied path (from the tool call's `path`
     /// argument), when one was extractable — shell denials don't carry one.
-    /// Used to make the breaker's guidance concrete ("/add-dir <this dir>").
+    /// Used to make the breaker's guidance concrete (`/add-dir <this dir>`).
     /// Reset at the start of each turn.
     pub(super) last_boundary_denial_path: Option<String>,
 }

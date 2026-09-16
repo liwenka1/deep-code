@@ -321,7 +321,7 @@ pub fn identity(tokens: &[&str]) -> String {
 
 /// Whether the trusted-prefix `rule` covers the concrete `command`.
 ///
-/// A rule matches when it equals the command's [identity](identity) —
+/// A rule matches when it equals the command's [`identity`] —
 /// flag-insensitive, subcommand-exact — or, for rules spelled out past the
 /// identity depth, when it is a whole-word prefix of the command line
 /// (`"git log --oneline"` covers `git log --oneline -5` but `"ls"` never

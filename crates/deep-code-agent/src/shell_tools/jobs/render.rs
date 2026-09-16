@@ -112,7 +112,8 @@ fn rendered_with_pending_denial(out: &str, job: &JobState) -> (usize, Option<&'s
 /// outlives both).
 ///
 /// "Lost" is judged against the SMALLER of this rendering's own window and
-/// [`TOOL_OUTPUT_BUDGET`], the chars a tool result keeps after the runtime
+/// [`crate::runtime::tool_result::TOOL_OUTPUT_BUDGET`], the chars a tool
+/// result keeps after the runtime
 /// bounds it. Judging by the window alone made the note unreachable for the
 /// band between the two: the shell layer handed over 20k chars believing them
 /// all visible, and the runtime then elided the middle without a word.

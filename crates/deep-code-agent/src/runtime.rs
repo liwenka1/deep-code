@@ -5,7 +5,8 @@
 //! and forward approval decisions back via [`AgentRuntime::submit_approval`].
 //!
 //! Design notes
-//! - [`AgentEvent`] is intentionally kept narrow (provider-stream only). The
+//! - [`crate::AgentEvent`] is intentionally kept narrow (provider-stream
+//!   only). The
 //!   runtime synthesizes higher-level events such as approval requests and
 //!   tool results into [`RuntimeEvent`].
 //! - Multi tool-call turns run as an ordered batch: auto-approved calls

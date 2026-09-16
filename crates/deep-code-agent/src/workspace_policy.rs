@@ -67,7 +67,7 @@ pub(crate) struct WorkspacePolicy {
     extras: Arc<RwLock<Vec<PathBuf>>>,
 }
 
-/// What [`WorkspacePolicy::grant_extra`] did with an approved directory.
+/// What [`WorkspacePolicy::grant_resolved`] did with an approved directory.
 pub(crate) enum RootGrantOutcome {
     /// Appended as a new writable root.
     Granted { canonical: PathBuf },

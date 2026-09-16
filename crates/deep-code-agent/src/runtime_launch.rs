@@ -666,8 +666,8 @@ fn build_parent_tools<C: LlmClient + 'static>(
 /// `apply_patch`, `shell`, `job` and `request_write_root`; `fetch_url` and
 /// `web_search` survive it, and `agent` is mounted by the extension pass.)
 ///
-/// [`ExecPolicy::classify_tool`] is the tool-name universe (an exhaustive match
-/// on exact names), so it separates "not mounted here" from "no such tool".
+/// [`crate::execution_policy::ExecPolicy::classify_tool`] is the tool-name
+/// universe (an exhaustive match on exact names), so it separates "not mounted here" from "no such tool".
 /// Entries matching a mounted, ungated tool stay silent — harmless today,
 /// meaningful if the tool ever gains a gate.
 fn warn_unmatched_auto_allow(

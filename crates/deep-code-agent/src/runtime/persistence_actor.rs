@@ -47,9 +47,9 @@ impl PersistenceActorHandle {
     /// Spawn the actor on the current tokio runtime.
     ///
     /// If no tokio runtime is available in this context (e.g., synchronous
-    /// unit tests instantiating an [`AgentRuntime`] for state assertions),
-    /// the handle's channel is closed: [`request_save`] and [`flush`] become
-    /// no-ops. Production code always runs inside `#[tokio::main]` so the
+    /// unit tests instantiating an [`super::AgentRuntime`] for state
+    /// assertions), the handle's channel is closed: [`Self::request_save`] and
+    /// [`Self::flush`] become no-ops. Production code always runs inside `#[tokio::main]` so the
     /// actor is always spawned there.
     pub(super) fn spawn(
         store: Arc<dyn SessionStore + Send + Sync>,
