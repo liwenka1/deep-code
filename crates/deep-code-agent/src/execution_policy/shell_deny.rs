@@ -728,6 +728,15 @@ fn brace_expanded_line(command: &str) -> String {
 /// plus the finished ones is a lower bound on the result and is enough to stop
 /// on. The byte budget stays where those bytes are spent — on the finished
 /// words, after a leaf — because a candidate is not a word the line carries.
+///
+/// What that choice leaves is a transient peak of [`MAX_BRACE_WORDS`]
+/// candidates the size of the word — 34 MB for a 100 KB word here, 270 MB for a
+/// 1 MB one, linear in the line where reading the count after the push was
+/// square. Charging the in-flight bytes to `line_budget` would bound it
+/// outright, and would also change verdicts: a group whose alternatives are
+/// shorter than what they replace (`{1..1}`) makes that estimate high, and the
+/// words it would push to their first expansion are the ones
+/// [`first_expansion`] cannot finish reading in its 256 passes.
 fn expand_word(word: &str, line_budget: usize) -> Vec<String> {
     if !word.contains('{') {
         return vec![word.to_string()];
@@ -813,83 +822,106 @@ fn first_expansion(word: &str) -> String {
 /// brace spelling it could not read — the uncounted-sibling shape this whole
 /// fix exists to close.
 ///
-/// A `{` that never closes at depth 0 ends the scan rather than restarting it
-/// at the next `{`: a word of unmatched braces made every later `{` rescan the
-/// same tail to the same end — quadratic, 100 KB of them taking 29 seconds
-/// here, twice over for a prompted line. The stop is wider than the word that
-/// motivated it: `{ax{b,c}` does close an inner group and bash expands it
-/// (`{axb {axc`), while this returns `None` for the whole word. That reading is
-/// lost and nothing is lost with it — an unclosed `{` is the *first* one in the
-/// word, so it stands in the literal prefix every alternative carries, and
-/// every word the group would have produced keeps it glued to the program word
-/// (`{axb`, never `axb`), where no rule on this floor matches. The line as
-/// typed is judged either way.
+/// The scan is one left-to-right pass with a stack of the groups still open,
+/// and it answers with the *earliest-opening* group that expands. Scanning from
+/// every `{` to its own close answers the same, as far as it gets, and is
+/// quadratic in two spellings: a word of unmatched braces made every later `{`
+/// rescan the same tail to the same end (100 KB of them took 29 seconds here,
+/// twice over for a prompted line), and a balanced `{1{1{1…}}}` paid the same
+/// square in bodies instead of tails — 187 ms at 12 KB, 654 ms at 24 KB, 2.7 s
+/// at 48 KB, all of it before anything had judged the line.
+///
+/// The stop that grew against the first of those — end the scan at a `{` that
+/// never closes at depth 0 — also cost readings, which one pass does not have
+/// to give up. `{ax{b,c}` is `{axb {axc` to bash, and a reading is a finding
+/// wherever a rule reads something other than the program word: `del /s
+/// {x/{..,y}` deletes `{x/..`, which [`dos_delete_target_is_catastrophic`]
+/// refuses by path component, while the word as typed has no `..` component to
+/// read. (The program word itself was never at risk either way — an unclosed
+/// `{` stands in the literal prefix every alternative carries, so every word
+/// the group produces keeps it glued on.)
+///
+/// A body holding an unquoted group of its own is not tried as a range. That is
+/// bash's own answer — `{{..}}` is literal there, not the `{ | }` a `{`-to-`}`
+/// character range makes of it, and manufacturing words no shell runs is the
+/// one direction this floor's premise forbids — and it is also what keeps the
+/// pass linear, because only a leaf group's body is parsed and leaf bodies do
+/// not overlap.
 fn split_first_brace_group(word: &str) -> Option<(&str, Vec<String>, &str)> {
+    // One `{` still open: where it started, the commas it holds at its own top
+    // level, and whether a group opened inside it.
+    struct Frame {
+        open: usize,
+        commas: Vec<usize>,
+        nested: bool,
+    }
+
     let bytes = word.as_bytes();
+    let mut stack: Vec<Frame> = Vec::new();
+    // The winner as its own bounds rather than as its words: whichever group
+    // ends up earliest is built once, after the pass. Building on the way would
+    // pay back the square this pass exists to drop — `{a,{a,{a,…}}}` replaces
+    // its winner once per level, each time over a longer body.
+    let mut best: Option<(usize, usize, Vec<usize>)> = None;
     let mut quote: Option<u8> = None;
-    for open in 0..bytes.len() {
-        match (quote, bytes[open]) {
-            (Some(active), byte) => {
-                if byte == active {
-                    quote = None;
-                }
-                continue;
+    for index in 0..bytes.len() {
+        if let Some(active) = quote {
+            if bytes[index] == active {
+                quote = None;
             }
-            (None, byte @ (b'\'' | b'"')) => {
-                quote = Some(byte);
-                continue;
-            }
-            (None, b'{') => {}
-            (None, _) => continue,
+            continue;
         }
-        let mut depth = 0usize;
-        let mut commas = Vec::new();
-        let mut inner_quote: Option<u8> = None;
-        let mut closed = false;
-        for index in open..bytes.len() {
-            if let Some(active) = inner_quote {
-                if bytes[index] == active {
-                    inner_quote = None;
+        match bytes[index] {
+            byte @ (b'\'' | b'"') => quote = Some(byte),
+            b'{' => {
+                if let Some(parent) = stack.last_mut() {
+                    parent.nested = true;
                 }
-                continue;
+                stack.push(Frame {
+                    open: index,
+                    commas: Vec::new(),
+                    nested: false,
+                });
             }
-            match bytes[index] {
-                byte @ (b'\'' | b'"') => inner_quote = Some(byte),
-                b'{' => depth += 1,
-                b',' if depth == 1 => commas.push(index),
-                b'}' => {
-                    depth -= 1;
-                    if depth > 0 {
-                        continue;
-                    }
-                    closed = true;
-                    let alternatives = if commas.is_empty() {
-                        // No top-level comma: a range, or not an expansion at
-                        // all — in which case the scan moves to the next `{`.
-                        match range_alternatives(&word[open + 1..index]) {
-                            Some(parts) => parts,
-                            None => break,
-                        }
-                    } else {
-                        let mut parts = Vec::with_capacity(commas.len() + 1);
-                        let mut start = open + 1;
-                        for &comma in &commas {
-                            parts.push(word[start..comma].to_string());
-                            start = comma + 1;
-                        }
-                        parts.push(word[start..index].to_string());
-                        parts
-                    };
-                    return Some((&word[..open], alternatives, &word[index + 1..]));
+            b',' => {
+                if let Some(frame) = stack.last_mut() {
+                    frame.commas.push(index);
                 }
-                _ => {}
             }
-        }
-        if !closed {
-            return None;
+            // A `}` with nothing open is a literal; otherwise it closes the
+            // innermost group, the only one it can close.
+            b'}' => {
+                let Some(frame) = stack.pop() else { continue };
+                if best
+                    .as_ref()
+                    .is_some_and(|(winner, _, _)| *winner < frame.open)
+                {
+                    continue;
+                }
+                let expands = !frame.commas.is_empty()
+                    || (!frame.nested
+                        && range_alternatives(&word[frame.open + 1..index]).is_some());
+                if expands {
+                    best = Some((frame.open, index, frame.commas));
+                }
+            }
+            _ => {}
         }
     }
-    None
+    let (open, close, commas) = best?;
+    let alternatives = if commas.is_empty() {
+        range_alternatives(&word[open + 1..close])?
+    } else {
+        let mut parts = Vec::with_capacity(commas.len() + 1);
+        let mut start = open + 1;
+        for comma in commas {
+            parts.push(word[start..comma].to_string());
+            start = comma + 1;
+        }
+        parts.push(word[start..close].to_string());
+        parts
+    };
+    Some((&word[..open], alternatives, &word[close + 1..]))
 }
 
 /// The words a `{A..B}` (or `{A..B..STEP}`) range expands to: an integer

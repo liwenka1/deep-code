@@ -1339,11 +1339,13 @@ fn a_wide_brace_group_is_refused_before_it_is_built() {
     );
 }
 
-/// A `{` that never closes at depth 0 ends the scan instead of restarting it at
-/// the next one. Restarting rescanned the same tail from every `{` in the word
-/// — quadratic, 29 seconds for 100 KB of them here, and a prompted line pays it
-/// twice — while producing no words at all, so no word budget ever saw it. What
-/// that stop costs in readings is written down on `split_first_brace_group`.
+/// Neither spelling of a brace word is rescanned: the scan is one pass over the
+/// word, not one pass per `{`. Scanning from every `{` to its own close was
+/// quadratic twice over — a word of unmatched braces made each `{` walk the
+/// same tail to the same end (29 seconds for 100 KB of them here), and a
+/// balanced nest made each `{` walk its own body (2.7 s for 48 KB) — and a
+/// prompted line pays either one twice. Neither word expands to anything, so no
+/// word budget ever sees them; the shape of the scan is what bounds them.
 #[test]
 fn unmatched_braces_do_not_rescan() {
     let word = "{".repeat(100_000);
@@ -1354,6 +1356,53 @@ fn unmatched_braces_do_not_rescan() {
         "unmatched braces rescanned the word: {:?}",
         start.elapsed()
     );
+}
+
+/// The balanced half of the pair above.
+#[test]
+fn nested_braces_do_not_rescan() {
+    let word = format!("{}{}", "{1".repeat(32_000), "}".repeat(32_000));
+    let start = std::time::Instant::now();
+    assert_eq!(brace_expanded_line(&word), word);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "a balanced nest was scanned once per brace: {:?}",
+        start.elapsed()
+    );
+}
+
+/// The group that wins is built once, after the pass. A nest of groups that
+/// each qualify replaces the winner once per level, and building each one on
+/// the way copied a whole body per level — the same square the single pass
+/// exists to drop, paid in alternatives instead of in scanning. The word budget
+/// does not stand in front of this one: it bounds the words an expansion may
+/// produce, not the work of one scan.
+#[test]
+fn a_nest_of_groups_is_built_once() {
+    let word = format!("{}{}", "{a,".repeat(16_000), "}".repeat(16_000));
+    let start = std::time::Instant::now();
+    assert_eq!(brace_expanded_line(&word), "a");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "the nested groups were built on the way out: {:?}",
+        start.elapsed()
+    );
+}
+
+/// A `{` that never closes does not end the scan, because the groups behind it
+/// are the shell's own and this floor judges what the shell runs. bash is the
+/// witness for the words themselves — `brace_expansion_matches_bash` carries
+/// `{ax{b,c}` and `{x}{a{b,c}` — and what it cannot witness is what losing them
+/// costs, which lands wherever a rule reads something other than the program
+/// word. The Windows delete rule reads its target by path component:
+/// `{x/{..,y}` is `{x/.. {x/y` to bash and the first of those climbs out of the
+/// workspace, while the word as typed carries no `..` component at all.
+#[test]
+fn a_group_behind_an_unclosed_brace_is_read() {
+    assert!(denied_under(WINDOWS, "del /s {x/{..,y}"));
+    // The brace is not what denies it: the same word with nothing behind it to
+    // expand is an ordinary target.
+    assert!(!denied_under(WINDOWS, "del /s {x/y"));
 }
 
 /// A word ends where the shell's word ends, not at blanks alone. bash lexes
@@ -1507,6 +1556,10 @@ fn brace_expansion_matches_bash() {
         "cargo build --con{fig}",
         "cargo build --con{fi{g,g}}",
         "echo a{b",
+        "{ax{b,c}",
+        "{a{b,c},d}",
+        "{x}{a{b,c}",
+        "{{..}}",
         "pre{a,b}post",
         "{a,b}{c,d}",
         "a{b,c}d{e,f}g",
