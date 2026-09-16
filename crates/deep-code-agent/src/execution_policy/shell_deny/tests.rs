@@ -1306,11 +1306,44 @@ fn a_deep_brace_word_does_not_recurse() {
     );
 }
 
-/// A `{` with nothing left to close it ends the scan instead of restarting it
-/// at the next one. Restarting rescanned the same tail from every `{` in the
-/// word — quadratic, 29 seconds for 100 KB of them here, and a prompted line
-/// pays it twice — while producing no words at all, so no word budget ever saw
-/// it.
+/// A group's alternatives are counted before they are built, not after. The
+/// count budget used to be read one allocation too late: a comma group asks for
+/// as many candidates as the word has commas and each is the size of the word,
+/// so a literal glued to 25 000 alternatives built 25 000 copies of that
+/// literal before the count was looked at — 163 MB, 416 MB and 943 MB of
+/// transient allocation for a 25 KB, 50 KB and 100 KB line, growing as the
+/// square of the length — and then refused the group on a count the split had
+/// already handed it.
+///
+/// Both orders refuse the same words with the same first expansion, so no
+/// verdict can tell them apart and the resource is the whole assertion — the
+/// same shape as `a_deep_brace_word_does_not_recurse` above, which likewise
+/// pins what the expansion may spend rather than what it answers.
+#[test]
+fn a_wide_brace_group_is_refused_before_it_is_built() {
+    // The literal is what a candidate costs and the commas are how many
+    // candidates the group asks for, so the two are sized apart: building them
+    // is 2.5 GB and seconds, refusing them is one comparison on a count the
+    // split already had.
+    let word = format!("{}{{{}a}}", "x".repeat(100_000), "a,".repeat(25_000));
+    let start = std::time::Instant::now();
+    assert_eq!(
+        expand_word(&word, MAX_BRACE_LINE_BYTES),
+        vec![first_expansion(&word)],
+        "a group past the word budget is read as the word's first expansion"
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(200),
+        "the group's alternatives were built before the count refused them: {elapsed:?}"
+    );
+}
+
+/// A `{` that never closes at depth 0 ends the scan instead of restarting it at
+/// the next one. Restarting rescanned the same tail from every `{` in the word
+/// — quadratic, 29 seconds for 100 KB of them here, and a prompted line pays it
+/// twice — while producing no words at all, so no word budget ever saw it. What
+/// that stop costs in readings is written down on `split_first_brace_group`.
 #[test]
 fn unmatched_braces_do_not_rescan() {
     let word = "{".repeat(100_000);

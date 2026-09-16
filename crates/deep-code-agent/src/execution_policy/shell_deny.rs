@@ -711,10 +711,23 @@ fn brace_expanded_line(command: &str) -> String {
 /// budget can see them, and popping the last one pushed while pushing a group's
 /// alternatives in reverse is the same depth-first order bash emits.
 ///
-/// The budget is read after every step, not after the expansion: a word that
-/// will be discarded should not first be expanded in full. `pending` holds
-/// candidates that each yield at least one word, so their count plus the
-/// finished ones is a lower bound on the result and is enough to stop on.
+/// The word budget is read *before* a group is taken, never after: the count it
+/// compares is exactly the one taking the group would produce, so the verdict
+/// is the same either way and what differs is only that a refused group is
+/// never built. Reading it afterwards left one `format!` per alternative
+/// standing in `pending` first, and a comma group's alternative count is
+/// bounded by nothing but the commas in the word: 50 KB of literal glued to
+/// 25 000 alternatives built 25 000 candidates of 50 KB each — ~1 GB of
+/// transient allocation for one 100 KB line, growing as the square of its
+/// length — and then refused the group on a count it could have read first.
+/// That is the same failure the iteration above exists to prevent, the process
+/// taken down from one tool call before any verdict, reached through the heap
+/// instead of the stack.
+///
+/// `pending` holds candidates that each yield at least one word, so their count
+/// plus the finished ones is a lower bound on the result and is enough to stop
+/// on. The byte budget stays where those bytes are spent — on the finished
+/// words, after a leaf — because a candidate is not a word the line carries.
 fn expand_word(word: &str, line_budget: usize) -> Vec<String> {
     if !word.contains('{') {
         return vec![word.to_string()];
@@ -727,15 +740,18 @@ fn expand_word(word: &str, line_budget: usize) -> Vec<String> {
             None => {
                 bytes = bytes.saturating_add(candidate.len() + 1);
                 done.push(candidate);
+                if done.len() + pending.len() > MAX_BRACE_WORDS || bytes > line_budget {
+                    return vec![first_expansion(word)];
+                }
             }
             Some((prefix, alternatives, suffix)) => {
+                if done.len() + pending.len() + alternatives.len() > MAX_BRACE_WORDS {
+                    return vec![first_expansion(word)];
+                }
                 for alternative in alternatives.iter().rev() {
                     pending.push(format!("{prefix}{alternative}{suffix}"));
                 }
             }
-        }
-        if done.len() + pending.len() > MAX_BRACE_WORDS || bytes > line_budget {
-            return vec![first_expansion(word)];
         }
     }
     done
@@ -797,10 +813,17 @@ fn first_expansion(word: &str) -> String {
 /// brace spelling it could not read — the uncounted-sibling shape this whole
 /// fix exists to close.
 ///
-/// A `{` with nothing closing it anywhere after it ends the scan rather than
-/// restarting it at the next `{`: with no `}` left, every later `{` rescans the
-/// same tail to the same end, which made a word of unmatched braces quadratic
-/// (100 KB of them took 29 seconds here, twice over for a prompted line).
+/// A `{` that never closes at depth 0 ends the scan rather than restarting it
+/// at the next `{`: a word of unmatched braces made every later `{` rescan the
+/// same tail to the same end — quadratic, 100 KB of them taking 29 seconds
+/// here, twice over for a prompted line. The stop is wider than the word that
+/// motivated it: `{ax{b,c}` does close an inner group and bash expands it
+/// (`{axb {axc`), while this returns `None` for the whole word. That reading is
+/// lost and nothing is lost with it — an unclosed `{` is the *first* one in the
+/// word, so it stands in the literal prefix every alternative carries, and
+/// every word the group would have produced keeps it glued to the program word
+/// (`{axb`, never `axb`), where no rule on this floor matches. The line as
+/// typed is judged either way.
 fn split_first_brace_group(word: &str) -> Option<(&str, Vec<String>, &str)> {
     let bytes = word.as_bytes();
     let mut quote: Option<u8> = None;
