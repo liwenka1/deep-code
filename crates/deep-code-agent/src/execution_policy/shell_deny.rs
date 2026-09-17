@@ -544,8 +544,9 @@ pub fn builtin_deny(command: &str) -> Option<DenyReason> {
 /// interpreter itself would run, and the line as written is always among them,
 /// so a verdict can only get stricter. That is also what makes it safe to read
 /// a delimiter set wider than some `cmd` build really splits on. The expander
-/// is budgeted per word ([`MAX_BRACE_WORDS`]) and per line
-/// ([`MAX_BRACE_LINE_BYTES`]); a word past either budget is read as its first
+/// is budgeted per word ([`MAX_BRACE_WORDS`]), per line
+/// ([`MAX_BRACE_LINE_BYTES`]) and per word's worth of scanning
+/// ([`MAX_BRACE_SCAN_BYTES`]); a word past any budget is read as its first
 /// expansion, which is a prefix of the words the shell really runs — fewer
 /// candidates than the full product, never a different one, and never one
 /// short of the program word.
@@ -655,6 +656,46 @@ const MAX_BRACE_WORDS: usize = 256;
 /// word is read — first expansion, which is where the program word lives.
 const MAX_BRACE_LINE_BYTES: usize = 1 << 18;
 
+/// Cap on the bytes one word's expansion may *re-read* before the rest of it is
+/// read as its first expansion.
+///
+/// The two budgets above bound the words an expansion produces; neither bounds
+/// the work of producing them, and a group with exactly one alternative slips
+/// between the two. A range is the only group that can have one — a comma group
+/// has at least two by construction — and `{1..1}` yields one word, so
+/// `done.len() + pending.len()` never moves; it finishes that word only at the
+/// very end, so the byte budget is not consulted until the whole product is
+/// already built. A word of G such groups therefore takes G passes, each
+/// re-reading the whole candidate, and the cost grows as the square of the
+/// word: measured here, `echo {1..1}…` cost 0.32 s at 48 KB, 1.17 s at 96 KB,
+/// 4.7 s at 192 KB and 18.8 s at 384 KB in [`builtin_deny`], and a line bound
+/// for a prompt pays it again in [`safety_notes`] — all of it before any
+/// verdict exists, on a line that is never run. That is the same failure shape
+/// as the recursion and the build-before-count [`expand_word`] already guards
+/// against, reached through the one dimension neither of their budgets watches.
+///
+/// The value is the scanning the other two budgets already tolerate, written
+/// down rather than left implicit: a full [`MAX_BRACE_WORDS`] product re-reads
+/// about twice that many candidates the size of the word, and a word long
+/// enough for that to reach 16 MiB (32 KB) is already past
+/// [`MAX_BRACE_LINE_BYTES`] by its second finished leaf. So a product-shaped
+/// expansion meets its own budget first and this one changes nothing about it;
+/// what this one catches is the shape they cannot see, which is the point.
+///
+/// And the program word is not what it costs — the claim every budget in this
+/// module has to make, and the one that needs checking here because the
+/// fallback has a cap of its own. [`first_expansion`] is exact for a word of at
+/// most [`MAX_BRACE_WORDS`] groups and leaves the rest literal past that, so it
+/// could only lose the program word if a word carried more than 256 groups that
+/// expand to *nothing*. None can: a comma group's alternative may be empty, but
+/// a comma group has at least two alternatives and so moves the word budget
+/// instead, while a range's alternatives are integers or single characters and
+/// are never empty. A word that reaches this budget therefore expands to a word
+/// at least as long as its own group count — never `rm`, under either reading.
+/// What it can lose is what the other two lose, and no more: a candidate at an
+/// argument position behind a big enough product.
+const MAX_BRACE_SCAN_BYTES: usize = 1 << 24;
+
 /// Where a word ends for brace expansion: at a blank, at one of
 /// [`SEGMENT_SEPARATORS`], or at a parenthesis.
 ///
@@ -699,8 +740,9 @@ fn brace_expanded_line(command: &str) -> String {
 
 /// The words one word expands to, in bash's own left-to-right,
 /// innermost-qualifying-first order — or its first expansion alone when the
-/// product would run past [`MAX_BRACE_WORDS`] words or past what `line_budget`
-/// leaves of [`MAX_BRACE_LINE_BYTES`].
+/// product would run past [`MAX_BRACE_WORDS`] words, past what `line_budget`
+/// leaves of [`MAX_BRACE_LINE_BYTES`], or past the scanning
+/// [`MAX_BRACE_SCAN_BYTES`] allows.
 ///
 /// Iterative on purpose. The obvious recursion descends once per brace group in
 /// the word *before* it reaches a single leaf, so a budget that counts leaves
@@ -737,6 +779,11 @@ fn brace_expanded_line(command: &str) -> String {
 /// shorter than what they replace (`{1..1}`) makes that estimate high, and the
 /// words it would push to their first expansion are the ones
 /// [`first_expansion`] cannot finish reading in its 256 passes.
+///
+/// Both of those budgets count what the expansion *produces*, which is why a
+/// third one counts what it *reads*: see [`MAX_BRACE_SCAN_BYTES`] for the
+/// single-alternative group that moves neither of the other two and made this
+/// loop quadratic in the word.
 fn expand_word(word: &str, line_budget: usize) -> Vec<String> {
     if !word.contains('{') {
         return vec![word.to_string()];
@@ -744,7 +791,16 @@ fn expand_word(word: &str, line_budget: usize) -> Vec<String> {
     let mut done: Vec<String> = Vec::new();
     let mut pending: Vec<String> = vec![word.to_string()];
     let mut bytes = 0usize;
+    let mut scanned = 0usize;
     while let Some(candidate) = pending.pop() {
+        // Every pass re-reads the whole candidate, so this is what the
+        // expansion spends; the two budgets below bound only what it yields.
+        // Read before the split, for the same reason the word budget is: the
+        // pass being counted is the one about to be paid for.
+        scanned = scanned.saturating_add(candidate.len());
+        if scanned > MAX_BRACE_SCAN_BYTES {
+            return vec![first_expansion(word)];
+        }
         match split_first_brace_group(&candidate) {
             None => {
                 bytes = bytes.saturating_add(candidate.len() + 1);

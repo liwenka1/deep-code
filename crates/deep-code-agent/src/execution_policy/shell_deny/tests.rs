@@ -1404,6 +1404,47 @@ fn a_nest_of_groups_is_built_once() {
     );
 }
 
+/// The two budgets that bound what an expansion *produces* do not bound what it
+/// *reads*, and a single-alternative group moves neither of them: a range is
+/// the only group that can have one, `{1..1}` yields one word so the word count
+/// never grows, and it finishes that word only at the very end so the byte
+/// budget is never consulted on the way. Every pass re-read the whole
+/// candidate, so a word of G of them took G passes and the floor went quadratic
+/// in the line — 0.32 s at 48 KB, 1.17 s at 96 KB, 4.7 s at 192 KB and 18.8 s
+/// at 384 KB measured here, and a line bound for a prompt pays it twice
+/// (`builtin_deny`, then `safety_notes`), all of it before any verdict exists
+/// on a line that is never run. Same shape as the two resource pins above; a
+/// third dimension neither of their budgets watches.
+///
+/// What the cap answers is unchanged, which is what makes it safe to cap: a
+/// word of single-alternative groups has exactly one full expansion, and the
+/// budget's fallback reading is that same word's `first_expansion`.
+#[test]
+fn a_word_of_single_alternative_groups_is_not_rescanned_per_group() {
+    let word = "{1..1}".repeat(16_000);
+    let start = std::time::Instant::now();
+    assert_eq!(
+        expand_word(&word, MAX_BRACE_LINE_BYTES),
+        vec![first_expansion(&word)],
+        "a word past the scan budget is read as its first expansion"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "the word was rescanned once per group: {:?}",
+        start.elapsed()
+    );
+}
+
+/// And the verb survives the third budget the way it survives the other two: an
+/// over-budget word ahead of the program word is read as its first expansion,
+/// the text between words is copied through, so `segments` still cuts at the
+/// `;` and the floor still reads the command behind it.
+#[test]
+fn the_verb_survives_a_word_past_the_scan_budget() {
+    let line = format!("echo {} ; rm -rf /", "{1..1}".repeat(16_000));
+    assert!(denied(&line));
+}
+
 /// A `{` that never closes does not end the scan, because the groups behind it
 /// are the shell's own and this floor judges what the shell runs. bash is the
 /// witness for the words themselves — `brace_expansion_matches_bash` carries

@@ -170,11 +170,15 @@ review to rediscover:
   one argument to `cmd`, not a second command running `su`. Residual: a
   delimiter spelling inside an *unquoted* flag's value, which is the one place
   the floor cannot tell a value from a word boundary.
-  Brace expansion is budgeted, per word and per line. A word past either budget
-  is read as its first expansion — the word the shell itself leads with — so
-  the program word is never what a budget costs. Residual: at the argument
-  positions behind a big enough brace product, the candidate words it pushes
-  out of view.
+  Brace expansion is budgeted three ways: the words one word may produce, the
+  bytes one line's expansions may produce, and the bytes one word's expansion
+  may re-read. A word past any budget is read as its first expansion — the word
+  the shell itself leads with — so the program word is never what a budget
+  costs. The third budget is the one that bounds the *work* rather than the
+  product: a group with exactly one alternative (`{1..1}`) yields one word and
+  finishes it only at the end, so it moves neither of the other two, and a word
+  of them was re-read once per group. Residual: at the argument positions behind
+  a big enough brace product, the candidate words it pushes out of view.
 - On Windows a line spelling a backslash immediately before a `"` never runs
   unattended: `CommandLineToArgvW` and `cmd.exe` read that backslash run
   differently, so the parser refuses instead of choosing. The usual casualty is
@@ -335,9 +339,12 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
   边界读:`curl --data="user=x&su=1" https://h` 对 `cmd` 是一个参数,不是第二条
   跑 `su` 的命令。残余=写在**未加引号**的旗标取值里的分隔符,那是这层楼唯一分不清
   「取值」与「词边界」的位置。
-  花括号展开有预算,按词也按行。超预算的词按**首词展开**读——那正是 shell 自己
-  排在第一位的那个词——所以预算代价永远不落在程序词上。残余=足够大的花括号积会把
-  它**后面参数位**上的候选词挤出视野。
+  花括号展开有三道预算:一个词可以产出多少词、一行的展开可以产出多少字节,以及
+  一个词的展开可以**重读**多少字节。超过任一道预算的词按**首词展开**读——那正是
+  shell 自己排在第一位的那个词——所以预算代价永远不落在程序词上。第三道预算管的是
+  「花了多少功夫」而不是「产出多少」:只有一个备选的组(`{1..1}`)只产出一个词、
+  而且要到最后才落成,前两道预算都不动它,于是这样的词过去每有一个组就被整体重读
+  一遍。残余=足够大的花括号积会把它**后面参数位**上的候选词挤出视野。
 - Windows 上,一行里只要出现「反斜杠紧挨 `"`」就不会免审运行:
   `CommandLineToArgvW` 与 `cmd.exe` 对那串反斜杠的读法不同,解析器拒绝而不是
   替它选一个。代价最常见的是引号里以分隔符结尾的路径——`xcopy "src\" "dst\"`
