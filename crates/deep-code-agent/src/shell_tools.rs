@@ -296,12 +296,21 @@ fn steps_for(
 /// yield loses them under scheduler load). EOF is prompt once the child is
 /// gone; the cap guards a lingering grandchild that inherited the pipe and
 /// keeps it open past the parent's exit.
+///
+/// Returns whether the cap was reached and the readers were aborted — i.e.
+/// whether they died without reaching their own end-of-stream `finish_spill`,
+/// so the caller still owes the spill files that call. It is the caller's
+/// because it belongs to the *run*, not to one step of it: a run is a sequence
+/// now, the buffers are shared by every step, and `finish` is one-way — a late
+/// `push` cannot re-open a finished spill. Releasing the handle here therefore
+/// silently stopped spilling for every step that came after, so a `&&` chain
+/// whose first step left a grandchild on the pipe lost the full output of all
+/// the rest while the truncation hint still named the file. See the end of the
+/// step loop in `ShellTool::execute` for where it is paid.
 async fn drain_readers(
     stdout_task: Option<tokio::task::JoinHandle<()>>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
-    stdout: &SharedBuffer,
-    stderr: &SharedBuffer,
-) {
+) -> bool {
     let stdout_abort = stdout_task.as_ref().map(|task| task.abort_handle());
     let stderr_abort = stderr_task.as_ref().map(|task| task.abort_handle());
     let drain = async {
@@ -314,26 +323,21 @@ async fn drain_readers(
     };
     if tokio::time::timeout(Duration::from_millis(500), drain)
         .await
-        .is_err()
+        .is_ok()
     {
-        // A grandchild that inherited the pipe kept it open past the cap:
-        // abort the reader tasks so they (and the pipe fds they hold) don't
-        // linger until that process finally exits (dropping the JoinHandle
-        // alone would only detach them, not stop them).
-        if let Some(abort) = stdout_abort {
-            abort.abort();
-        }
-        if let Some(abort) = stderr_abort {
-            abort.abort();
-        }
-        // The aborted readers never reached their own end-of-stream
-        // `finish_spill`, so release the spill file handles here — otherwise
-        // an open fd lingers in the retained JobState until the store evicts
-        // it. Safe against the winding-down reader: `finish` marks the spill
-        // finished, so a late `push` cannot re-open it.
-        stdout.finish_spill();
-        stderr.finish_spill();
+        return false;
     }
+    // A grandchild that inherited the pipe kept it open past the cap: abort the
+    // reader tasks so they (and the pipe fds they hold) don't linger until that
+    // process finally exits (dropping the JoinHandle alone would only detach
+    // them, not stop them).
+    if let Some(abort) = stdout_abort {
+        abort.abort();
+    }
+    if let Some(abort) = stderr_abort {
+        abort.abort();
+    }
+    true
 }
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -667,6 +671,7 @@ impl Tool for ShellTool {
         // the whole sequence.
         let mut outcome = (JobStatus::Completed, Some(0));
         let mut previous_succeeded = true;
+        let mut readers_aborted = false;
         for step in &steps {
             if step.run_if == RunIf::PreviousSucceeded && !previous_succeeded {
                 continue;
@@ -732,12 +737,21 @@ impl Tool for ShellTool {
                     (JobStatus::TimedOut, None)
                 }
             };
-            drain_readers(stdout_task, stderr_task, &stdout, &stderr).await;
+            readers_aborted |= drain_readers(stdout_task, stderr_task).await;
             outcome = (status, exit_code);
             previous_succeeded = status == JobStatus::Completed;
             if matches!(status, JobStatus::Cancelled | JobStatus::TimedOut) {
                 break;
             }
+        }
+        // Owed by any step whose readers were aborted before end-of-stream (see
+        // `drain_readers`): release the spill handles now that no further step
+        // will write to these buffers, so an open fd does not linger in the
+        // retained `JobState` until the store evicts it. Idempotent against the
+        // steps that did reach their own end-of-stream.
+        if readers_aborted {
+            stdout.finish_spill();
+            stderr.finish_spill();
         }
         let (status, exit_code) = outcome;
 

@@ -172,6 +172,35 @@ async fn shell_overflow_spills_full_stream_and_result_names_the_file() {
     assert!(std::path::Path::new(&spill_path).exists());
 }
 
+/// `drain_readers` reports whether it had to abort, and finishes no spill of
+/// its own.
+///
+/// The spill handles belong to the *run*, not to one step of it. A shell call
+/// is a sequence now and every step shares one pair of buffers, while `finish`
+/// is one-way — a late `push` cannot re-open a finished spill. Releasing them
+/// inside the per-step drain therefore stopped spilling for every step after
+/// the first one whose grandchild held the pipe past the cap: a `&&` chain lost
+/// the full output of all the rest while the truncation hint still named a file
+/// missing it, silently, on the non-exceptional path. The buffers are simply
+/// not in scope in `drain_readers` any more, so the signature is the fence;
+/// what is left to pin is the answer the caller acts on.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn drain_readers_reports_whether_it_aborted() {
+    // A reader that never reaches end-of-stream — the lingering-grandchild
+    // case the 500 ms cap exists for. Virtual time, so the cap costs nothing.
+    let stuck = tokio::spawn(std::future::pending::<()>());
+    assert!(
+        drain_readers(Some(stuck), None).await,
+        "an aborted reader leaves the spill handles owed to the caller"
+    );
+    // Both readers already at end-of-stream: they finished their own spill.
+    let done = tokio::spawn(async {});
+    assert!(
+        !drain_readers(Some(done), None).await,
+        "a clean drain owes the caller nothing"
+    );
+}
+
 /// Small outputs must stay diskless: no spill file, no spill directory.
 #[tokio::test]
 async fn small_output_leaves_no_spill_dir_behind() {
