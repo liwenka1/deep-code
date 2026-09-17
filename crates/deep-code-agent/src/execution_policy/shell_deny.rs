@@ -451,18 +451,35 @@ fn deny_segment(segment: &str) -> Option<DenyReason> {
 /// Plain program names only (see [`deny_segment`] for what stays out of
 /// scope); the interpreter set ([`INTERPRETERS`]) includes scripting languages
 /// that can `eval` piped stdin.
+///
+/// The or-list is cut first, because `||` is not a pipe. Splitting the line on
+/// the `|` character alone read `curl … -o f || bash ./fallback.sh` as a
+/// pipeline whose empty middle piece changed nothing, matched the fetch on one
+/// side and the interpreter on the other, and refused an everyday "download, or
+/// else run the fallback script" line — on a floor no permission mode can
+/// override, so the user could not approve it either. Cutting `||` first is
+/// also what keeps the rule right in the other direction: in
+/// `curl x || echo y | sh` the pipe belongs to the second branch and the fetch
+/// is not on it, which is exactly what the shell does with that line.
 fn deny_pipe_to_shell(command: &str) -> Option<DenyReason> {
     if !command.contains('|') {
         return None;
     }
-    // Split on the pipe alone, then read each side through the shared segment
-    // lexer: the producer is the last simple command before the `|`, the
-    // consumer the first one after it. Reading a whole side as one segment let
-    // text glued to the interpreter hide it — `curl x | sh; echo ok` saw the
-    // program `sh;`, `curl x | { sh; }` saw `sh;` behind the brace — and the
-    // line fell through to a plain prompt, which Yolo waves through with
-    // egress. (`(sh)` is the grouping case `segment_words` peels itself.)
-    let parts: Vec<&str> = command.split('|').collect();
+    command.split("||").find_map(fetch_piped_into_shell)
+}
+
+/// [`deny_pipe_to_shell`] for one or-list branch, where every remaining `|` is
+/// a real pipe.
+///
+/// Split on the pipe, then read each side through the shared segment lexer: the
+/// producer is the last simple command before the `|`, the consumer the first
+/// one after it. Reading a whole side as one segment let text glued to the
+/// interpreter hide it — `curl x | sh; echo ok` saw the program `sh;`,
+/// `curl x | { sh; }` saw `sh;` behind the brace — and the line fell through to
+/// a plain prompt, which Yolo waves through with egress. (`(sh)` is the
+/// grouping case `segment_words` peels itself.)
+fn fetch_piped_into_shell(branch: &str) -> Option<DenyReason> {
+    let parts: Vec<&str> = branch.split('|').collect();
     let producer = |part: &str| segments(part).last().and_then(|seg| program_of(seg));
     let consumer = |part: &str| segments(part).first().and_then(|seg| program_of(seg));
     let fetches = |part: &str| matches!(producer(part).as_deref(), Some("curl" | "wget" | "fetch"));
