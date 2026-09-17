@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::execution_policy::{
     PermissionMode, RiskLevel, accept_edits_approvable, command_shape, network_requested,
+    shell_command_of,
 };
 use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_FLASH};
 use crate::runtime::AgentRuntime;
@@ -45,19 +46,32 @@ pub(super) fn session_allowable(tool_name: &str) -> bool {
 /// Whether answering "approve for the session" at this prompt would record
 /// anything at all: either the tool is `session_allowable` by name, or the
 /// call is one simple shell command whose identity can be remembered
-/// (`session_shell_prefix`). `false` means "a" would silently downgrade to a
-/// one-time approve — a UI reads this to offer only the options that mean
+/// (`shell_consent_identity`). `false` means "a" would silently downgrade to
+/// a one-time approve — a UI reads this to offer only the options that mean
 /// what they say, and it is the same two rules the recording path applies, so
 /// the panel and the runtime cannot disagree about what "a" does.
+///
+/// Takes the arguments by reference all the way down, because a UI asks this
+/// on the *render* path — the approval panel decides between `y/a/n` and `y/n`
+/// on every frame it draws. Building a throwaway `ToolCall` to ask made that
+/// a deep clone of the call's whole JSON argument object per frame, for a
+/// question that only ever reads one string out of it.
 #[must_use]
 pub fn session_consent_recordable(tool_name: &str, arguments: &serde_json::Value) -> bool {
-    session_allowable(tool_name)
-        || session_shell_prefix(&ToolCall {
-            id: String::new(),
-            name: tool_name.to_string(),
-            arguments: arguments.clone(),
-        })
-        .is_some()
+    session_allowable(tool_name) || shell_consent_identity(tool_name, arguments).is_some()
+}
+
+/// The remembered identity of a command-bearing call, from the two fields that
+/// decide it. The one body behind [`session_shell_prefix`] and
+/// [`session_consent_recordable`], so the panel's "would `a` record anything"
+/// and the runtime's "what does `a` record" cannot answer from different rules.
+fn shell_consent_identity(tool_name: &str, arguments: &serde_json::Value) -> Option<String> {
+    // Two rules, each with one home: `shell_command_of` says which calls carry
+    // a command at all (`shell`, or `job action=start` — status/tail/cancel
+    // must never record a prefix), and `command_shape::session_identity` says
+    // what counts as one simple command, read through the same lexer as the
+    // trust gate and the deny floor.
+    command_shape::session_identity(shell_command_of(tool_name, arguments)?)
 }
 
 /// Whether a call is the `request_write_root` doorbell (see
@@ -101,12 +115,7 @@ pub(super) enum RootGrantPrompt {
 /// different keys, so a chained or sibling subcommand can't ride a prior
 /// consent past the gate.
 pub(super) fn session_shell_prefix(call: &ToolCall) -> Option<String> {
-    // Two rules, each with one home: `ToolCall::shell_command` says which calls
-    // carry a command at all (`shell`, or `job action=start` — status/tail/
-    // cancel must never record a prefix), and `command_shape::session_identity`
-    // says what counts as one simple command, read through the same lexer as
-    // the trust gate and the deny floor.
-    command_shape::session_identity(call.shell_command()?)
+    shell_consent_identity(&call.name, &call.arguments)
 }
 
 /// What a session "a" on a shell call records, and what a later call must

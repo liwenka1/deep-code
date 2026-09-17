@@ -16,6 +16,18 @@ fn enforcement_label(enforcement: &Enforcement) -> &'static str {
     }
 }
 
+/// Print the report.
+///
+/// The frame is English throughout — every label here, not just most of them.
+/// Three of them used to be Chinese (`错误`, `警告`, `api key 引导`) while the
+/// twenty-odd around them were not, so an English-locale host read its own
+/// diagnostics half in a language it had not asked for. `doctor` is a
+/// diagnostic surface with no `/lang` behind it and no `TextId` anywhere in
+/// this file; the one localized thing it prints is
+/// `report.deepseek.api_key_hint`, which the agent crate resolves against the
+/// configured language because it is user-facing *guidance* rather than a label
+/// on a field. Adding a language to the labels would mean localizing all of
+/// them; matching the rest is the smaller true statement.
 pub fn run_doctor(json: bool) -> anyhow::Result<()> {
     let workspace = workspace_root();
     let loaded = AgentConfig::load(&workspace);
@@ -47,7 +59,7 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
         for layer in &layers.layers {
             match &layer.error {
                 Some(error) => println!(
-                    "    layer {}: {} (present={}, 错误: {})",
+                    "    layer {}: {} (present={}, error: {})",
                     layer.name,
                     clean(&layer.path),
                     layer.present,
@@ -69,7 +81,7 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
             layers.api_key_source
         );
         for warning in &layers.warnings {
-            println!("    警告: {}", clean(warning));
+            println!("    warning: {}", clean(warning));
         }
     }
     println!("  api key: {}", report.api_key.source);
@@ -92,7 +104,7 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
         );
     }
     if report.api_key.source == "missing" {
-        println!("  api key 引导:\n{}", report.deepseek.api_key_hint);
+        println!("  api key setup:\n{}", report.deepseek.api_key_hint);
     }
     // "available" is not the same as "enforcing": a backend can exist and still
     // confine nothing (Windows Job Object). Report what it actually does.
