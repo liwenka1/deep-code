@@ -14,7 +14,7 @@
 //!   until the decision arrives (one approval prompt at a time).
 
 mod approval_flow;
-pub use approval_flow::session_consent_recordable;
+pub use approval_flow::{is_network_tool, session_consent_recordable};
 mod checkpoints;
 mod compaction_flow;
 mod diagnostics;

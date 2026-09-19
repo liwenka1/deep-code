@@ -100,7 +100,14 @@ pub(super) fn is_root_grant(tool_name: &str) -> bool {
 /// egress is intrinsic, so they carry no `network: true` argument — the
 /// auto-mode egress floor must recognize them by kind, not by that flag, or the
 /// classifier would decide a call whose only purpose is reaching the network.
-fn is_network_tool(tool_name: &str) -> bool {
+///
+/// Exported because the approval panel needs the same answer and had been
+/// asking the wrong question: it chose its default focus from the *declared*
+/// `network` flag, which these tools never carry, so the one prompt class the
+/// panel's own doc says must open on deny opened on approve. Two spellings of
+/// "does this reach the network" cannot be kept in step; one can.
+#[must_use]
+pub fn is_network_tool(tool_name: &str) -> bool {
     crate::execution_policy::ExecPolicy::classify_tool(tool_name)
         == crate::execution_policy::ToolKind::Network
 }

