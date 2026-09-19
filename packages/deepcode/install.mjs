@@ -266,7 +266,32 @@ function sha256OfFile(file) {
 }
 
 // ── 辅助函数 ──
-function downloadFile(url, dest) {
+// GitHub release assets always 302 to a signed URL, so the redirect branch runs
+// on every install. Two things it must not do: follow forever, and throw
+// synchronously out of the response callback (an `https.get` handler is not
+// inside the promise executor, so a throw there is an uncaught exception, not a
+// rejection — the install dies with an unrelated stack).
+//
+// `MAX_DOWNLOAD_REDIRECTS` bounds the chain: each hop opens its own socket and
+// arms its own 5-minute timeout, so an unbounded chain is an unbounded hang, not
+// merely a slow one.
+const MAX_DOWNLOAD_REDIRECTS = 5;
+
+// `fs.rmSync(..., { force: true })`, never `unlinkSync`: the write stream opens
+// the file asynchronously, so on a fast response the path may not exist yet
+// (`ENOENT`), and on Windows a file with a live handle refuses to unlink
+// (`EBUSY`/`EPERM`). Both threw from inside the response callback. `force`
+// swallows the missing-file case; the try/catch covers the locked-file one.
+function discardPartial(file, dest) {
+  file.close();
+  try {
+    fs.rmSync(dest, { force: true });
+  } catch {
+    /* a locked or already-gone temp file must not mask the real error */
+  }
+}
+
+function downloadFile(url, dest, redirectsLeft = MAX_DOWNLOAD_REDIRECTS) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest, { mode: 0o755 });
 
@@ -275,18 +300,24 @@ function downloadFile(url, dest) {
       if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
         const redirectUrl = response.headers.location;
         if (!redirectUrl) {
+          discardPartial(file, dest);
           reject(new Error(`Redirect with no location from ${url}`));
           return;
         }
-        file.close();
-        fs.unlinkSync(dest);
-        downloadFile(redirectUrl, dest).then(resolve).catch(reject);
+        if (redirectsLeft <= 0) {
+          discardPartial(file, dest);
+          reject(new Error(
+            `Too many redirects (more than ${MAX_DOWNLOAD_REDIRECTS}) starting at ${url}.`
+          ));
+          return;
+        }
+        discardPartial(file, dest);
+        downloadFile(redirectUrl, dest, redirectsLeft - 1).then(resolve).catch(reject);
         return;
       }
 
       if (response.statusCode === 404) {
-        file.close();
-        fs.unlinkSync(dest);
+        discardPartial(file, dest);
         reject(new Error(
           `Binary not found for ${platform()}-${arch()} (v${VERSION}). ` +
           `Check https://github.com/${REPO}/releases for available versions.`
@@ -295,8 +326,7 @@ function downloadFile(url, dest) {
       }
 
       if (response.statusCode !== 200) {
-        file.close();
-        fs.unlinkSync(dest);
+        discardPartial(file, dest);
         reject(new Error(`HTTP ${response.statusCode} from ${url}`));
         return;
       }
