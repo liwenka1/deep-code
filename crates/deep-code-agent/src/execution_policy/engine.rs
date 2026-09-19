@@ -507,13 +507,22 @@ pub fn evaluate_shell_command(
     if let Some(reason) = shell_deny::builtin_deny(command) {
         return ToolExecutionPlan {
             verdict: PolicyVerdict::Deny {
-                reason: format!("shell command denied: {}", reason.0),
+                // The remedy rides on the MESSAGE only. `matched_rule` below
+                // stays the bare rule id: it is logged and matched on, not read
+                // as prose, and a sentence of advice in it would end up in
+                // every log line and comparison.
+                reason: match reason.remedy {
+                    Some(remedy) => {
+                        format!("shell command denied: {} — {remedy}", reason.rule)
+                    }
+                    None => format!("shell command denied: {}", reason.rule),
+                },
             },
             requires_approval: false,
             requires_sandbox: false,
             read_only: false,
             risk_level: RiskLevel::High,
-            matched_rule: Some(format!("deny:{}", reason.0)),
+            matched_rule: Some(format!("deny:{}", reason.rule)),
             network: false,
         };
     }

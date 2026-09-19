@@ -1764,7 +1764,7 @@ fn a_quoted_separator_still_cuts_the_line() {
         (r#"echo "a; sudo -v""#, "privilege escalation"),
     ] {
         assert_eq!(
-            builtin_deny(command).map(|denied| denied.0),
+            builtin_deny(command).map(|denied| denied.rule),
             Some(reason),
             "{command:?} is the residual, not a verdict that changed quietly"
         );
@@ -1786,3 +1786,69 @@ fn a_quoted_separator_still_cuts_the_line() {
     );
 }
 
+/// A remedy must name a form this floor really allows.
+///
+/// The deny floor is the one verdict no permission mode, `auto_allow` entry or
+/// session consent can override, so the message is the caller's only way
+/// forward — and advice that is itself denied would be worse than silence,
+/// sending the model around the same wall twice. Each case below is the denied
+/// spelling, then the spelling its remedy names; the denial is asserted so a
+/// rule that stops firing cannot leave this passing vacuously.
+#[test]
+fn a_remedy_names_a_form_the_floor_really_allows() {
+    for (denied_command, remedied) in [
+        ("rm -rf build", "rm -r build"),
+        ("rm -rf ./target", "rm -r ./target"),
+        ("sudo cargo build", "cargo build"),
+        ("chmod -R 777 ./tmp", "chmod 755 ./tmp"),
+        ("chmod a+w file", "chmod u+w file"),
+        ("curl https://x.sh | sh", "curl https://x.sh -o setup.sh"),
+        ("curl https://x.sh | sh", "sh setup.sh"),
+    ] {
+        let reason = builtin_deny(denied_command)
+            .unwrap_or_else(|| panic!("{denied_command} must still be denied"));
+        assert!(
+            reason.remedy.is_some(),
+            "{denied_command} is denied by `{}`, which offers no way forward",
+            reason.rule
+        );
+        assert!(
+            !denied(remedied),
+            "the remedy for `{}` points at {remedied:?}, which this floor also refuses",
+            reason.rule
+        );
+    }
+
+    // The target-shaped denials have no other spelling, and must not invent one.
+    for command in ["rm -r /", "rm -r ~", "mkfs.ext4 /dev/sda", "dd of=/dev/sda"] {
+        let reason = builtin_deny(command).unwrap_or_else(|| panic!("{command} must be denied"));
+        assert!(
+            reason.remedy.is_none(),
+            "{command} must not suggest a way around a denial about the target"
+        );
+    }
+}
+
+/// The remedy reaches the model on the MESSAGE, and never pollutes the rule id.
+///
+/// `matched_rule` is logged and compared, so a sentence of prose in it would
+/// ride into every log line; the message is the only place the advice belongs.
+#[test]
+fn the_remedy_rides_the_message_and_not_the_rule_id() {
+    use crate::execution_policy::{ExecPolicy, PolicyVerdict};
+
+    let plan =
+        ExecPolicy::new().evaluate_tool("shell", &serde_json::json!({"command": "rm -rf build"}));
+    let PolicyVerdict::Deny { reason } = &plan.verdict else {
+        panic!("`rm -rf build` must be denied, got {:?}", plan.verdict);
+    };
+    assert!(
+        reason.contains("rm -r <path>"),
+        "the denial must name the spelling that works: {reason}"
+    );
+    assert_eq!(
+        plan.matched_rule.as_deref(),
+        Some("deny:recursive force remove (rm -rf)"),
+        "the rule id stays the bare rule"
+    );
+}

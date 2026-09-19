@@ -56,12 +56,41 @@ use super::shell_lex::{
 };
 use crate::i18n::TextId;
 
-/// Why a command segment was denied.
+/// Why a command segment was denied, and — where one exists — how to spell the
+/// same intent in a form this floor does not refuse.
+///
+/// The remedy is not politeness. This floor is the one verdict no permission
+/// mode, `auto_allow` entry or session consent can override, so a caller that
+/// hits it has no way forward except a different command line. `rm -rf build`
+/// is the everyday case: refused for every target, while `rm -r build` is not
+/// refused at all — and nothing in the message, the tool description or the
+/// system prompt said so, leaving the model to retry the same shape or reach
+/// for `sudo` (also refused).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DenyReason(
+pub struct DenyReason {
     /// The matched rule, surfaced to the user and logged as-is.
-    pub &'static str,
-);
+    pub rule: &'static str,
+    /// A spelling that serves the same intent and is NOT refused, for the rules
+    /// that have one. Every remedy here is checked against the floor itself by
+    /// `a_remedy_names_a_form_the_floor_really_allows`, so this can never
+    /// advise a command that is also denied.
+    pub remedy: Option<&'static str>,
+}
+
+impl DenyReason {
+    /// A denial with no way around it: the shape itself is what is refused.
+    const fn new(rule: &'static str) -> Self {
+        Self { rule, remedy: None }
+    }
+
+    /// A denial the caller can re-spell.
+    const fn with_remedy(rule: &'static str, remedy: &'static str) -> Self {
+        Self {
+            rule,
+            remedy: Some(remedy),
+        }
+    }
+}
 
 /// Whether a (cleaned) token is a `NAME=value` environment assignment on the
 /// shell's own terms: the text before the first `=` is a shell identifier
@@ -382,20 +411,29 @@ fn deny_segment(segment: &str) -> Option<DenyReason> {
     // Fork bomb: whitespace-insensitive signature match.
     let squished: String = segment.chars().filter(|c| !c.is_whitespace()).collect();
     if squished.contains(":():{") || squished.contains(":(){") || squished.contains(":|:&") {
-        return Some(DenyReason("fork bomb pattern"));
+        return Some(DenyReason::new("fork bomb pattern"));
     }
 
     let program = program_of(segment)?;
     let args = args_of(segment);
 
     match program.as_str() {
-        "sudo" | "su" | "doas" => Some(DenyReason("privilege escalation")),
+        "sudo" | "su" | "doas" => Some(DenyReason::with_remedy(
+            "privilege escalation",
+            "run the command without the privilege wrapper; writes are bounded by \
+             the granted roots, which no escalation widens",
+        )),
         "rm" => {
             let recursive =
                 has_flag(&args, 'r', &["recursive"]) || has_flag(&args, 'R', &["recursive"]);
             let force = has_flag(&args, 'f', &["force"]);
             if recursive && force {
-                return Some(DenyReason("recursive force remove (rm -rf)"));
+                return Some(DenyReason::with_remedy(
+                    "recursive force remove (rm -rf)",
+                    "drop `-f`: `rm -r <path>` is not refused for a path inside the \
+                     workspace (`-f` is refused for every target, and `/` and `~` \
+                     are refused either way)",
+                ));
             }
             // Without `-f` a recursive rm is the everyday escape (`rm -r build`)
             // — unless it is aimed at the filesystem root or the home directory.
@@ -403,9 +441,11 @@ fn deny_segment(segment: &str) -> Option<DenyReason> {
             // around that guard through the glob, and `rm -r ~` has no guard at
             // all. Spelled forms only, like every rule on this floor: `$HOME` is
             // listed because `Yolo` runs it, not because the floor expands it.
-            (recursive && args.iter().any(|arg| names_root_or_home(arg))).then_some(DenyReason(
-                "recursive remove of the filesystem root or home directory",
-            ))
+            // No remedy: unlike the `-rf` rule above, this one is about the
+            // TARGET, so there is no other spelling of it to suggest.
+            (recursive && args.iter().any(|arg| names_root_or_home(arg))).then_some(
+                DenyReason::new("recursive remove of the filesystem root or home directory"),
+            )
         }
         "dd" => args
             .iter()
@@ -413,13 +453,18 @@ fn deny_segment(segment: &str) -> Option<DenyReason> {
                 arg.strip_prefix("of=")
                     .is_some_and(|target| target.starts_with("/dev/"))
             })
-            .then_some(DenyReason("dd write to device (of=/dev/…)")),
-        "mkfs" | "fdisk" | "parted" => Some(DenyReason("disk formatting/partitioning")),
-        _ if program.starts_with("mkfs.") => Some(DenyReason("disk formatting")),
-        "chmod" => args
-            .iter()
-            .any(|arg| chmod_world_writable(arg))
-            .then_some(DenyReason("world-writable chmod (777)")),
+            .then_some(DenyReason::new("dd write to device (of=/dev/…)")),
+        "mkfs" | "fdisk" | "parted" => Some(DenyReason::new("disk formatting/partitioning")),
+        _ if program.starts_with("mkfs.") => Some(DenyReason::new("disk formatting")),
+        "chmod" => {
+            args.iter()
+                .any(|arg| chmod_world_writable(arg))
+                .then_some(DenyReason::with_remedy(
+                    "world-writable chmod (777)",
+                    "grant no world write: `chmod 755 <path>` and `chmod u+w <path>` are \
+                 not refused",
+                ))
+        }
 
         // Windows equivalents. This floor was POSIX-only, so on Windows — where
         // the Job Object sandbox confines nothing — there was no floor at all.
@@ -434,26 +479,26 @@ fn deny_segment(segment: &str) -> Option<DenyReason> {
         // dirs and has no `/s`, so the rule cannot misfire there.)
         "del" | "erase" | "rd" | "rmdir" => (has_dos_switch(&args, 's')
             && dos_delete_target_is_catastrophic(&args))
-        .then_some(DenyReason("recursive delete of a root or system path")),
+        .then_some(DenyReason::new("recursive delete of a root or system path")),
         // `diskpart` has no benign form. `format` does collide with a repo-local
         // formatter (`./format`, `scripts/format`, a `format` bin on PATH), which
         // this floor cannot be overridden to allow — so require the shape of a
         // real disk format: a drive spec (`format C:`, `format /fs:ntfs D:`),
         // a volume GUID path, or a device path.
-        "diskpart" => Some(DenyReason("disk formatting/partitioning")),
+        "diskpart" => Some(DenyReason::new("disk formatting/partitioning")),
         "format" => args
             .iter()
             .any(|arg| is_drive_spec(arg) || is_volume_or_device_path(arg))
-            .then_some(DenyReason("disk formatting/partitioning")),
+            .then_some(DenyReason::new("disk formatting/partitioning")),
         // Registry deletion: `reg delete <key> /f`. `reg query`/`reg add` stay.
         "reg" => args
             .first()
             .is_some_and(|sub| sub.eq_ignore_ascii_case("delete"))
-            .then_some(DenyReason("registry deletion (reg delete)")),
+            .then_some(DenyReason::new("registry deletion (reg delete)")),
         // Ownership/ACL takeover of a tree — the standard prelude to wiping
         // files a normal user could not touch, and never needed inside a
         // workspace.
-        "takeown" => Some(DenyReason("ownership takeover (takeown)")),
+        "takeown" => Some(DenyReason::new("ownership takeover (takeown)")),
         _ => None,
     }
 }
@@ -519,7 +564,11 @@ fn fetch_piped_into_shell(branch: &str) -> Option<DenyReason> {
         .iter()
         .skip(first_fetch + 1)
         .any(|part| is_shell(part))
-        .then_some(DenyReason("network fetch piped to shell"))
+        .then_some(DenyReason::with_remedy(
+            "network fetch piped to shell",
+            "download and run as two steps, so the script can be read in between: \
+             `curl <url> -o setup.sh` then `sh setup.sh`",
+        ))
 }
 
 /// Evaluate a full command line against the built-in deny rules. Returns the
