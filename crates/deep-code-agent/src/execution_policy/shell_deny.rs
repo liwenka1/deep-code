@@ -111,9 +111,9 @@ fn segment_words(segment: &str) -> Option<SegmentWords> {
     let mut tokens = segment.split_whitespace();
     let program = loop {
         let cleaned = clean_token(tokens.next()?);
-        if is_env_assignment(&cleaned)
-            || PREFIX_WORDS.contains(&cleaned.to_ascii_lowercase().as_str())
-        {
+        // Assignments are tested on the raw token: the name before the first
+        // `=` is what makes it one, and a value may legitimately be a path.
+        if is_env_assignment(&cleaned) {
             continue;
         }
         // Grouping: the shell reads `(` and `)` as operators even glued to the
@@ -125,7 +125,20 @@ fn segment_words(segment: &str) -> Option<SegmentWords> {
         if word.is_empty() {
             continue;
         }
-        break basename_lower(word);
+        let base = basename_lower(word);
+        // Wrapper words are matched on the BASENAME, like every other program
+        // test in this module and like `command_shape::identity`, which already
+        // spells it `runs_the_rest_of_the_line(&basename_lower(first))`. Testing
+        // the whole token let a path spelling hide the command behind the
+        // wrapper: `/usr/bin/env rm -rf /` was read as the program `env` with
+        // arguments no rule inspects, so it escaped a floor that caught the bare
+        // `env rm -rf /` — under Yolo unprompted, and with one fewer
+        // `safety_notes` caution at the prompt everywhere else. Peeling the
+        // grouping first closes the same hole for `(env rm -rf /)`.
+        if PREFIX_WORDS.contains(&base.as_str()) {
+            continue;
+        }
+        break base;
     };
     Some(SegmentWords {
         program,
