@@ -7,8 +7,7 @@
 //! modules.
 
 use deep_code_agent::{
-    AgentConfig, JsonSessionStore, Lang, SessionId, SessionStore, format_sessions_storage_note,
-    now_ms,
+    JsonSessionStore, Lang, SessionId, SessionStore, format_sessions_storage_note, now_ms,
 };
 
 use crate::cli::workspace_root;
@@ -32,14 +31,21 @@ pub fn list() -> anyhow::Result<()> {
         println!("No saved sessions.");
         return Ok(());
     }
-    let lang = Lang::from_env(&AgentConfig::load(&workspace).config.language);
     let now = now_ms();
     for record in records {
         let preview = session_list_preview(&record.preview());
         println!(
             "{}\t{}\t{} msgs\t{}",
             record.id.as_str(),
-            crate::startup::relative_time(now, record.updated_at_ms, lang),
+            // English, like every other word this command prints and like
+            // `doctor_cli`. It used to resolve the configured UI language for
+            // this one column, so a `ui.language = "zh"` user got
+            // `session_1_0<TAB>20714 天前<TAB>2 msgs` wrapped in "No saved
+            // sessions." / "skipping unreadable session" / the storage note —
+            // one Chinese fragment in an otherwise English line, invisible to
+            // anyone reviewing in English. `relative_time` stays localized for
+            // the TUI pickers, which are localized throughout.
+            crate::startup::relative_time(now, record.updated_at_ms, Lang::En),
             record.message_count(),
             preview
         );
@@ -99,6 +105,30 @@ mod tests {
         );
         assert!(line.starts_with("hi"), "the text must survive: {line:?}");
         assert!(line.contains('y'), "the text must survive: {line:?}");
+    }
+
+    /// Every column `session list` prints is English, the age included.
+    ///
+    /// The age column used to resolve the configured UI language while the rest
+    /// of the command's text was hardcoded English, so a `ui.language = "zh"`
+    /// user saw exactly one Chinese fragment per row — and an English-speaking
+    /// reviewer saw nothing wrong. `doctor_cli` makes no `tr` call at all; this
+    /// is the same rule, asserted rather than assumed.
+    #[test]
+    fn the_age_column_is_english_like_every_other_column() {
+        let now = 1_700_000_000_000;
+        let age = crate::startup::relative_time(now, now - 7_200_000, Lang::En);
+        assert_eq!(age, "2 h ago");
+        assert!(
+            age.is_ascii(),
+            "the age column must not carry localized text: {age:?}"
+        );
+        // The localized spelling still exists — it is the TUI pickers' —
+        // so this is a call-site rule, not a lost capability.
+        assert_eq!(
+            crate::startup::relative_time(now, now - 7_200_000, Lang::Zh),
+            "2 小时前"
+        );
     }
 
     #[test]
