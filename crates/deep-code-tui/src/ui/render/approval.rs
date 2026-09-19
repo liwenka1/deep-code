@@ -498,17 +498,41 @@ impl<'a> ApprovalPanelText<'a> {
     }
 }
 
-/// The panel body for the pending approval, wrapped to `width`.
+/// The pending approval's panel text for one frame: the wrapped body, and how
+/// many of its leading rows are the pinned head.
 ///
-/// Shared by the renderer and [`approval_panel_rows`] so the height the layout
-/// reserves is measured from the very lines that will be drawn — a panel sized
-/// from a second, drifting estimate is how the resolved-target line ends up
-/// just off the bottom edge.
-pub(super) fn approval_body(app: &App, width: usize) -> Vec<Line<'static>> {
-    let Some(request) = app.pending_approval.as_ref() else {
-        return Vec::new();
-    };
-    ApprovalPanelText::from_request(request).render(width, app.lang)
+/// Built once and handed to both the layout and the draw. They used to build it
+/// each for themselves — `approval_panel_rows` once, `render_approval_panel`
+/// again, and a third `from_request` for the head count — so a panel open on
+/// screen re-serialized the call's whole argument object three times per
+/// redraw tick and rebuilt the wrapped body twice. For a `write_file` whose
+/// `content` is a few hundred KB that is the frame's dominant cost, and the
+/// redraw is on a timer: 967732c removed a clone on this path, and this is the
+/// same cost one level down.
+///
+/// Carrying `head_rows` alongside the body keeps the property the head pinning
+/// depends on — that it is a PREFIX of these very lines, not a second estimate
+/// of them.
+pub(super) struct ApprovalPanel {
+    /// The wrapped body, head included at the front.
+    pub(super) body: Vec<Line<'static>>,
+    /// How many leading rows of `body` are the non-scrolling head.
+    pub(super) head_rows: usize,
+}
+
+/// Build the frame's panel text, or `None` when no approval is pending.
+///
+/// One `ApprovalPanelText`, so the argument JSON is serialized once. The action
+/// string is still extracted twice (`render` and `head_rows` each do it),
+/// which is a parse of an already-built string rather than a re-serialization
+/// of the request — left alone deliberately rather than restructuring
+/// `approval_lines`, whose exact field order the sanitizer tests destructure.
+pub(super) fn build_approval_panel(app: &App, width: usize) -> Option<ApprovalPanel> {
+    let request = app.pending_approval.as_ref()?;
+    let text = ApprovalPanelText::from_request(request);
+    let body = text.render(width, app.lang);
+    let head_rows = text.head_rows(width, app.lang).min(body.len());
+    Some(ApprovalPanel { body, head_rows })
 }
 
 /// Rows to reserve for the approval panel, sized to its content.
@@ -528,9 +552,8 @@ pub(super) fn approval_body(app: &App, width: usize) -> Vec<Line<'static>> {
 /// negotiate when the alternative is asking the human to approve a directory
 /// the panel never named — so the only ceiling left is the frame itself
 /// (minus the status row), and [`APPROVAL_PANEL_MAX_ROWS`] on top of it.
-pub(super) fn approval_panel_rows(app: &App, area: ratatui::layout::Rect) -> u16 {
-    let width = usize::from(area.width.saturating_sub(2)).max(8);
-    let wanted = u16::try_from(approval_body(app, width).len())
+pub(super) fn approval_panel_rows(panel: &ApprovalPanel, area: ratatui::layout::Rect) -> u16 {
+    let wanted = u16::try_from(panel.body.len())
         .unwrap_or(u16::MAX)
         .saturating_add(APPROVAL_OPTION_ROWS);
     // Everything below the status row may be taken. `floor` is itself capped
@@ -545,6 +568,7 @@ pub(super) fn approval_panel_rows(app: &App, area: ratatui::layout::Rect) -> u16
 pub(super) fn render_approval_panel(
     frame: &mut Frame<'_>,
     app: &mut App,
+    panel: ApprovalPanel,
     area: ratatui::layout::Rect,
 ) {
     if app.pending_approval.is_none() {
@@ -557,26 +581,21 @@ pub(super) fn render_approval_panel(
         .constraints([Constraint::Min(1), Constraint::Length(APPROVAL_OPTION_ROWS)])
         .split(area);
 
-    let width = usize::from(chunks[0].width.saturating_sub(2)).max(8);
-    let mut body = approval_body(app, width);
+    let ApprovalPanel {
+        mut body,
+        head_rows,
+    } = panel;
 
-    // The head does not scroll, for ANY tool. It is the same lines
-    // `approval_body` already produced (drained off the front, so the two
-    // cannot drift), lifted out of the scrollable region and drawn above it:
-    // the subject of the decision must be on screen at the moment the decision
-    // keys are live. `End` — the natural keystroke for reading a long
-    // justification — otherwise clamped the body to its bottom and carried that
-    // line above the viewport, armed and with no "more above" marker; and a
-    // short terminal cut it off below. Pinning covers both, and covering every
-    // tool is what lets `approval_armed` below mean the invariant instead of
-    // approximating it.
-    let pinned_rows = app
-        .pending_approval
-        .as_ref()
-        .map(|request| ApprovalPanelText::from_request(request).head_rows(width, app.lang))
-        .unwrap_or(0)
-        .min(body.len());
-    let pinned: Vec<Line<'static>> = body.drain(..pinned_rows).collect();
+    // The head does not scroll, for ANY tool. It is the front of the very body
+    // being drawn (drained off it, so the two cannot drift), lifted out of the
+    // scrollable region and drawn above it: the subject of the decision must be
+    // on screen at the moment the decision keys are live. `End` — the natural
+    // keystroke for reading a long justification — otherwise clamped the body
+    // to its bottom and carried that line above the viewport, armed and with no
+    // "more above" marker; and a short terminal cut it off below. Pinning
+    // covers both, and covering every tool is what lets `approval_armed` below
+    // mean the invariant instead of approximating it.
+    let pinned: Vec<Line<'static>> = body.drain(..head_rows).collect();
     let (pinned_area, chunk_body) = if pinned.is_empty() {
         (None, chunks[0])
     } else {

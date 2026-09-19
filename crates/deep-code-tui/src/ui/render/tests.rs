@@ -1712,3 +1712,69 @@ fn streaming_cjk_text_wraps_by_display_width() {
         assert!(line_width(line) <= 20);
     }
 }
+
+/// The panel's text is built ONCE per frame, and the head is a prefix of the
+/// very body that gets drawn.
+///
+/// Three callers used to build it independently — the layout sizing it, the
+/// renderer drawing it, and a third construction just to count the head rows —
+/// so a `write_file` approval whose `content` is large re-serialized the whole
+/// argument object three times per redraw tick, on a timer. `approval_panel_rows`
+/// now takes a built `ApprovalPanel` rather than the `App`, so it *cannot*
+/// build a second one; this pins the two properties that made sharing safe.
+#[test]
+fn the_approval_panel_is_built_once_and_its_head_is_a_body_prefix() {
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.pending_approval = Some(root_grant_request(
+        "/tmp/workspace/build-cache",
+        "/tmp/workspace/build-cache",
+    ));
+
+    let width = 78;
+    let panel = build_approval_panel(&app, width).expect("an approval is pending");
+    assert!(
+        panel.head_rows > 0 && panel.head_rows <= panel.body.len(),
+        "the head must be a non-empty prefix of the body, got {} of {}",
+        panel.head_rows,
+        panel.body.len()
+    );
+
+    // The prefix really is the head the panel would compute on its own — the
+    // property the old code got by rebuilding, and this gets by carrying.
+    let request = app.pending_approval.as_ref().unwrap();
+    let text = ApprovalPanelText::from_request(request);
+    assert_eq!(
+        panel.head_rows,
+        text.head_rows(width, app.lang),
+        "head_rows must match what the panel text reports"
+    );
+    let head_lines: Vec<String> = panel.body[..panel.head_rows]
+        .iter()
+        .map(line_plain_text)
+        .collect();
+    let rendered: Vec<String> = text
+        .render(width, app.lang)
+        .iter()
+        .take(panel.head_rows)
+        .map(line_plain_text)
+        .collect();
+    assert_eq!(head_lines, rendered, "the head is the body's own front");
+
+    // The reserved height is measured from those same lines.
+    let area = ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 40,
+    };
+    assert_eq!(
+        approval_panel_rows(&panel, area),
+        u16::try_from(panel.body.len()).unwrap() + APPROVAL_OPTION_ROWS,
+        "the layout reserves exactly the built body plus the option rows"
+    );
+
+    // No approval pending is the only case with no panel at all.
+    app.pending_approval = None;
+    assert!(build_approval_panel(&app, width).is_none());
+}

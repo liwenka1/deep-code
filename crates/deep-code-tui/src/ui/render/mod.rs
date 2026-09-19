@@ -71,7 +71,15 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         // is left (possibly nothing). Answering an approval needs neither a
         // composer nor scrollback.
         let area = frame.area();
-        let panel_rows = approval_panel_rows(app, area);
+        // Built once for the whole frame: the layout below sizes the panel from
+        // these lines and `render_approval_panel` draws exactly them, so the
+        // reserved height cannot drift from the drawn content — and the request's
+        // argument JSON is serialized once per frame rather than three times.
+        // The width matches what the panel itself derives: this branch gives the
+        // panel a row of the full frame width, and a vertical split preserves it.
+        let panel = build_approval_panel(app, usize::from(area.width.saturating_sub(2)).max(8))
+            .expect("this branch runs only while an approval is pending");
+        let panel_rows = approval_panel_rows(&panel, area);
         let mut rest = area.height;
         let status_h = rest.min(1);
         rest -= status_h;
@@ -88,7 +96,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
             height,
         };
         let snap = render_messages(frame, app, row(0, transcript_h));
-        render_approval_panel(frame, app, row(transcript_h, panel_h));
+        render_approval_panel(frame, app, panel, row(transcript_h, panel_h));
         render_input_from_layout(frame, app, &layout, row(transcript_h + panel_h, input_h));
         render_status(frame, app, row(transcript_h + panel_h + input_h, status_h));
         snap
