@@ -340,6 +340,40 @@ async fn drain_readers(
     true
 }
 
+/// Give the run's store record a terminal status on a path that returns before
+/// the step loop's own bookkeeping runs.
+///
+/// `ShellTool::run` registers the record as `Running` before the first spawn so
+/// a `job action=status/tail` can reach the run, and assigns the real status
+/// only after the loop. The two `return Err(..)` paths in between therefore
+/// left it `Running` forever — and `evict_finished_jobs` never evicts a
+/// `Running` entry, by design, because a running background job owns the handle
+/// `JobStore::shutdown` needs.
+///
+/// The leak is the smaller half. Eviction sizes its work as
+/// `len - MAX_RETAINED_JOBS` and then takes that many from the *finished* set,
+/// so every pinned record makes it discard one more genuinely finished job:
+/// measured at 40 stuck entries against a cap of 32, one of forty real records
+/// survived. The visible symptom is a `job action=tail` on a recently completed
+/// command answering `unknown job_id`, which is why this is a correctness fix
+/// and not tidying.
+///
+/// Reachable wherever a spawn can fail, which under `RunAuthority::Parse` (the
+/// executor runs the parsed argv with no shell in between) is any program word
+/// that is not on `PATH` — a model inventing a command name is enough. The
+/// background `job action=start` path never had this: it spawns *before* it
+/// inserts.
+fn abandon_job(jobs: &JobStore, job_id: &str) {
+    let Ok(job) = jobs.get(job_id, ShellTool::NAME) else {
+        return;
+    };
+    let Ok(mut job) = job.lock() else {
+        return;
+    };
+    job.status = JobStatus::Failed;
+    job.exit_code = None;
+}
+
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 300;
 const MAX_OUTPUT_CHARS: usize = 20_000;
@@ -689,7 +723,10 @@ impl Tool for ShellTool {
                 // A lone command that cannot start is the caller's error, as
                 // before. Inside a sequence the shell would report it and
                 // carry on by the chain rules with status 127; so does this.
-                Err(error) if steps.len() == 1 => return Err(error),
+                Err(error) if steps.len() == 1 => {
+                    abandon_job(&self.jobs, &job_id);
+                    return Err(error);
+                }
                 Err(error) => {
                     stderr.push(format!("{error}\n").as_bytes());
                     outcome = (JobStatus::Failed, Some(127));
@@ -720,6 +757,7 @@ impl Tool for ShellTool {
                         exit.code(),
                     ),
                     Err(error) => {
+                        abandon_job(&self.jobs, &job_id);
                         return Err(ToolError::exec_failed(
                             Self::NAME,
                             format!("failed to wait for command: {error}"),

@@ -1023,6 +1023,88 @@ async fn default_trusted_commands_deliver_the_parsed_argv_verbatim() {
     }
 }
 
+/// A command that never starts must not pin a `Running` record in the store.
+///
+/// `ShellTool::run` inserts the record before the first spawn and assigns the
+/// real status after the loop, so the two `return Err(..)` paths in between
+/// used to leave it `Running` — which `evict_finished_jobs` refuses to evict,
+/// by design. Two consequences, and the second is the one users feel: the entry
+/// is pinned for the life of the session, AND eviction keeps sizing its work
+/// against the whole map, so each pinned entry pushes one more genuinely
+/// finished job out of the retention window.
+///
+/// Unix-only for the same reason as its neighbours: it needs a program word
+/// that reliably fails to spawn, and `RunAuthority::Parse` to reach the argv
+/// executor rather than a shell's own `command not found`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_that_never_starts_leaves_no_running_record_behind() {
+    let tmp = tempdir().unwrap();
+    let tools = ShellTools::new(tmp.path())
+        .unwrap()
+        .with_sandbox(SandboxManager::new().force_sandbox(Some(false)));
+    let jobs = tools.jobs.clone();
+    let registry = tools.into_registry();
+
+    // Awaits inside, so the borrowed `ToolCall` outlives the call it feeds.
+    async fn unattended(
+        registry: &ToolRegistry,
+        command: &str,
+    ) -> Result<ToolRunOutcome, ToolError> {
+        let call = ToolCall::new("call_1", "shell", json!({ "command": command }));
+        let plan = registry.evaluate_tool(&call);
+        registry
+            .run_tool_call_with_plan(
+                &call,
+                Some(ApprovalDecision::Approved),
+                plan,
+                crate::tool::ToolCx::new().with_authority(crate::tool::RunAuthority::Parse),
+            )
+            .await
+    }
+
+    unattended(&registry, "no-such-binary-xyz")
+        .await
+        .expect_err("a missing program is still the caller's error");
+    let state = jobs
+        .get("job_1", "shell")
+        .expect("the record is still reachable");
+    assert_ne!(
+        state.lock().unwrap().status,
+        JobStatus::Running,
+        "a spawn failure must not pin the record as Running"
+    );
+
+    // The consequence that is actually visible: real finished jobs keep their
+    // place. Well past the cap, every one of these must still be queryable —
+    // with the old behaviour the failures displaced all but one of them.
+    let mut succeeded = Vec::new();
+    for index in 0..40 {
+        let _ = unattended(&registry, &format!("no-such-binary-{index}")).await;
+        let outcome = unattended(&registry, "/bin/echo ok")
+            .await
+            .expect("echo runs");
+        let ToolRunOutcome::Result { result } = outcome else {
+            panic!("expected a result");
+        };
+        let job_id = details(&result)["job_id"]
+            .as_str()
+            .expect("a shell result names its job")
+            .to_string();
+        succeeded.push(job_id);
+    }
+
+    // The cap still bounds the store, so only the newest survive — but they
+    // survive by age, not by being crowded out by records that never ran.
+    let recent = &succeeded[succeeded.len() - 8..];
+    for job_id in recent {
+        assert!(
+            jobs.get(job_id, "shell").is_ok(),
+            "{job_id} was evicted while stuck records held the retention window"
+        );
+    }
+}
+
 /// Windows twin of `shell_trusted_command_runs_without_approval`, and the pin
 /// on the trust list being platform-aware.
 ///
