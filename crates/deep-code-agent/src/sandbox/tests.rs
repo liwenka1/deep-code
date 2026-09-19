@@ -417,3 +417,60 @@ fn model_caveats_name_their_own_gap() {
     assert!(ioctl.contains("ioctl(2)"));
     assert!(ioctl.contains("the write boundary holds"));
 }
+
+/// Every default-trusted identity must be spawnable the way a trusted command
+/// is actually run.
+///
+/// Trust and execution are decided in two different modules: the list lives in
+/// `execution_policy::engine`, and a trusted verdict is what makes
+/// `ToolRegistry::run_tool_call_with_plan` pick `RunAuthority::Parse` — argv,
+/// no shell. Nothing tied the two together, and the gap had a live instance:
+/// `echo` and `printf` were trusted on every platform while `resolve_executable`
+/// refuses a `cmd.exe` builtin by design, so on Windows the two most trivial
+/// trusted commands could not run at all, and the failure blamed the OS sandbox.
+///
+/// Windows-only because it is the only platform where resolution can fail
+/// before the spawn: `bare_argv_command` resolves there and hands `Command` a
+/// real path, while on Unix it passes the word through for `execve` to resolve.
+#[cfg(windows)]
+#[test]
+fn every_default_trusted_program_word_resolves_on_this_host() {
+    let policy = crate::execution_policy::ExecPolicy::default();
+    for rule in policy.trusted_shell_prefixes() {
+        let program = rule
+            .split_whitespace()
+            .next()
+            .expect("a trust rule names a program");
+        assert!(
+            windows::resolve_executable(program).is_ok(),
+            "trusted rule {rule:?} names {program:?}, which cannot be executed \
+             as argv on this host — a trusted command runs with no shell, so \
+             trusting it here makes every such call a spawn failure"
+        );
+    }
+}
+
+/// The Unix half of the same invariant, kept as the reason the split exists:
+/// `echo`/`printf` are trusted here precisely because they name real programs.
+#[cfg(unix)]
+#[test]
+fn the_shell_builtin_trust_rules_name_real_programs_on_unix() {
+    let policy = crate::execution_policy::ExecPolicy::default();
+    let rules: Vec<&str> = policy
+        .trusted_shell_prefixes()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for builtin in ["echo", "printf"] {
+        assert!(
+            rules.contains(&builtin),
+            "{builtin} is trusted on Unix, where it resolves on PATH"
+        );
+        assert!(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .any(|dir| dir.join(builtin).is_file()),
+            "{builtin} is trusted but names no program on PATH; a trusted \
+             command runs as argv with no shell to supply the builtin"
+        );
+    }
+}

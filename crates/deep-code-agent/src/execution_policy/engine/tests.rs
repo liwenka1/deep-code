@@ -477,6 +477,10 @@ fn trust_covers_only_what_runs_without_a_shell() {
         "cargo build\ncargo test",
         "cargo test --features \"a b\"",
         "git log --format='%h %s' -5",
+        // `echo` is trusted only where it names a real program, so this line is
+        // Unix-only (see `ExecPolicy::default`). The shapes above carry the
+        // sequencing/quoting claims on both platforms.
+        #[cfg(not(windows))]
         "echo done # trailing comment",
     ] {
         assert_eq!(
@@ -502,27 +506,23 @@ fn trust_covers_only_what_runs_without_a_shell() {
     // A trailing backslash is an unfinished line to `sh` only; on Windows it is
     // the last character of a path, and the parser reads it as one (see
     // `shell_lex::backslash_reading_is_pinned_for_both_grammars`, which pins
-    // both readings from any host). Both verdicts are asserted here, because
-    // the Windows one is the surprising half and was recorded nowhere: the
-    // line parses, `done\` stays inside the cwd and `echo` is default-trusted,
-    // so the POLICY trusts it — the only thing between it and a shell is the
-    // executor refusing to run a cmd builtin as a bare argv
-    // (`sandbox::windows::resolve_executable`). If that refusal ever turned
-    // into a fallback through `cmd /C`, this line would open a shell with no
-    // prompt — and, stated plainly rather than implied: the assertion below
-    // would NOT catch that. It pins the policy's verdict, which does not
-    // change; the executor's refusal is asserted nowhere, because
-    // `resolve_executable` is `cfg(windows)` code with no test. That gap is
-    // the reason this comment exists where someone changing the executor will
-    // read it.
+    // both readings from any host). `sh` therefore refuses to parse the line at
+    // all, and `cmd` parses it into a trusted-looking `echo`.
     //
-    // The limit of writing it this way, stated rather than hidden:
-    // `evaluate_shell_command` takes no `Grammar`, so the arm below executes
-    // on Windows CI and nowhere else — the construct this batch otherwise
-    // removed. What holds it up in the meantime is that both facts it rests on
-    // are pinned from every host in `shell_lex`: the parse
-    // (`backslash_reading_is_pinned_for_both_grammars`) and the operand fence
-    // (`!operand_leaves_cwd(r"done\")`).
+    // Both verdicts are NeedsApproval now, for two unrelated reasons, which is
+    // why they stay written out separately. On Unix the parse fails. On Windows
+    // the parse succeeds and `done\` stays inside the cwd — but `echo` is no
+    // longer default-trusted there, because a trusted command runs as argv with
+    // no shell and `echo` is a `cmd` builtin that names no program
+    // (`ExecPolicy::default`).
+    //
+    // That closes a dependency this comment used to record as unasserted: the
+    // Windows verdict was `Allow`, and the only thing between it and a shell
+    // was `sandbox::windows::resolve_executable` refusing to run a builtin as a
+    // bare argv. A refusal in the EXECUTOR cannot be the thing that keeps a
+    // line off a shell — turn it into a `cmd /C` fallback one day and the line
+    // opens a shell with no prompt. The policy refuses it now, so the executor
+    // is free to change.
     #[cfg(unix)]
     assert!(matches!(
         evaluate_shell_command(&policy, "echo done\\", false).verdict,
@@ -531,7 +531,7 @@ fn trust_covers_only_what_runs_without_a_shell() {
     #[cfg(windows)]
     assert!(matches!(
         evaluate_shell_command(&policy, "echo done\\", false).verdict,
-        PolicyVerdict::Allow
+        PolicyVerdict::NeedsApproval { .. }
     ));
     // The accept-edits allowance reads the same parse.
     assert!(accept_edits_approvable(

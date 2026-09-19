@@ -54,6 +54,13 @@ fn details(result: &ToolResult) -> &Value {
         .expect("shell results carry details")
 }
 
+/// Unix-only because the command it uses is: `echo` is a trusted prefix only
+/// where it names a real program. A trusted command runs as argv with no shell
+/// (`RunAuthority::Parse`), and on Windows `echo` is a `cmd` builtin that
+/// resolves to no file — so it is not in the default trust list there (see
+/// `ExecPolicy::default`), and `echo hello` takes the approval path instead.
+/// The Windows twin below covers the same result/details plumbing through it.
+#[cfg(unix)]
 #[tokio::test]
 async fn shell_trusted_command_runs_without_approval() {
     let tmp = tempdir().unwrap();
@@ -1014,4 +1021,46 @@ async fn default_trusted_commands_deliver_the_parsed_argv_verbatim() {
             "{command:?} reached printf as different words"
         );
     }
+}
+
+/// Windows twin of `shell_trusted_command_runs_without_approval`, and the pin
+/// on the trust list being platform-aware.
+///
+/// `echo` must NOT be auto-trusted here: a trusted command runs as the argv the
+/// gate parsed, with no shell in between, and `echo` is a `cmd.exe` builtin
+/// that resolves to no file — `sandbox::windows::resolve_executable` refuses it
+/// by design rather than routing it back through `cmd /C`. Trusting it made
+/// every `echo hi` a spawn failure whose message blamed the OS sandbox. Through
+/// the approval path it runs as approved text and works, so the same
+/// result/details plumbing is covered.
+///
+/// Whether it happens to work is not left to the machine: a Windows host with
+/// Unix tools on PATH (a CI image with Git for Windows, say) does have an
+/// `echo.exe`, so trusting it passed on the runner and failed for users. A
+/// trust decision must not depend on that.
+#[cfg(windows)]
+#[tokio::test]
+async fn echo_is_not_auto_trusted_on_windows_and_still_runs_once_approved() {
+    let tmp = tempdir().unwrap();
+    let registry = registry(tmp.path());
+    let call = ToolCall::new("call_1", "shell", json!({"command": "echo hello"}));
+
+    let plan = registry.evaluate_tool(&call);
+    assert!(
+        plan.requires_approval,
+        "`echo` names no program on Windows, so it must not be auto-trusted"
+    );
+
+    let result = approved(tmp.path(), "shell", json!({"command": "echo hello"})).await;
+    assert_eq!(
+        result.status,
+        ToolResultStatus::Success,
+        "{}",
+        result.content
+    );
+    assert!(result.content.contains("hello"), "{}", result.content);
+    let info = details(&result);
+    assert_eq!(info["status"], "completed");
+    assert_eq!(info["exit_code"], 0);
+    assert_eq!(info["kind"], "foreground");
 }

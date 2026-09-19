@@ -228,17 +228,38 @@ pub struct ExecPolicy {
 
 impl Default for ExecPolicy {
     fn default() -> Self {
+        let mut trusted_shell_prefixes = vec![
+            "git status".to_string(),
+            "git diff".to_string(),
+            "git log".to_string(),
+            "cargo test".to_string(),
+            "cargo build".to_string(),
+            "cargo check".to_string(),
+        ];
+        // `echo`/`printf` are trusted only where they name a real program.
+        //
+        // A trusted command is the one class that runs as argv with no shell
+        // (`RunAuthority::Parse`, set in `ToolRegistry::run_tool_call_with_plan`),
+        // which is what makes "the words the gate judged are the words that
+        // run" true. On Unix that costs nothing: `/bin/echo` and
+        // `/usr/bin/printf` exist, so the program word resolves on PATH the way
+        // the shell would have resolved it.
+        //
+        // On Windows both are `cmd.exe` builtins with no `.exe` anywhere on a
+        // stock PATH, and `sandbox::windows::resolve_executable` refuses a
+        // builtin by design rather than routing it back through `cmd /C` — the
+        // interpreter this path exists to keep out. Trusting them there turned
+        // every `echo hi` into a spawn failure whose message blames the OS
+        // sandbox, which on Windows is a Job Object that had nothing to do with
+        // it. Untrusted, they take the ordinary approval path, run as approved
+        // text through `cmd /C`, and work; the cost is one prompt.
+        #[cfg(not(windows))]
+        {
+            trusted_shell_prefixes.push("printf".to_string());
+            trusted_shell_prefixes.push("echo".to_string());
+        }
         Self {
-            trusted_shell_prefixes: vec![
-                "git status".to_string(),
-                "git diff".to_string(),
-                "git log".to_string(),
-                "cargo test".to_string(),
-                "cargo build".to_string(),
-                "cargo check".to_string(),
-                "printf".to_string(),
-                "echo".to_string(),
-            ],
+            trusted_shell_prefixes,
             network_mode: NetworkMode::Prompt,
         }
     }
@@ -248,6 +269,16 @@ impl ExecPolicy {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The trust list's rules, for the cross-module invariant in
+    /// `sandbox::tests`: a trusted identity runs as argv with no shell, so its
+    /// program word must be something this host can actually `execve`. That
+    /// claim spans two modules — the list lives here, the resolver lives in
+    /// `sandbox` — and it went untested in exactly the gap between them.
+    #[cfg(test)]
+    pub(crate) fn trusted_shell_prefixes(&self) -> &[String] {
+        &self.trusted_shell_prefixes
     }
 
     #[must_use]
