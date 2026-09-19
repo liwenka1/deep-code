@@ -498,9 +498,28 @@ fn fetch_piped_into_shell(branch: &str) -> Option<DenyReason> {
     let fetches = |part: &str| matches!(producer(part).as_deref(), Some("curl" | "wget" | "fetch"));
     let is_shell =
         |part: &str| consumer(part).is_some_and(|program| INTERPRETERS.contains(&program.as_str()));
-    let has_fetch = parts.iter().any(|part| fetches(part));
-    let feeds_shell = parts.iter().skip(1).any(|part| is_shell(part));
-    (has_fetch && feeds_shell).then_some(DenyReason("network fetch piped to shell"))
+    // The fetch must be UPSTREAM of the interpreter, which is the only
+    // arrangement that feeds one into the other. Asking the two questions
+    // independently — "does any part fetch" and "is any part after the first an
+    // interpreter" — matched them across a `;`/`&&` *inside* a part, where the
+    // fetch is a separate command that the pipe never reaches:
+    // `cat data.json | python3 process.py && curl -X POST https://api/upload`
+    // read as a fetch feeding the pipe and was refused on a floor no permission
+    // mode can override, so the user could not approve it either. Same shape as
+    // the `||` misread fixed in c1ee479, one level down.
+    //
+    // Position, not adjacency: the fetch may sit several hops upstream and
+    // still reach the interpreter through pass-through filters
+    // (`curl … | tee out.log | sh`), so every later part is a candidate
+    // consumer. `skip(first_fetch + 1)` also keeps the old rule that a
+    // consumer is never the first part — an interpreter there consumes
+    // nothing piped.
+    let first_fetch = parts.iter().position(|part| fetches(part))?;
+    parts
+        .iter()
+        .skip(first_fetch + 1)
+        .any(|part| is_shell(part))
+        .then_some(DenyReason("network fetch piped to shell"))
 }
 
 /// Evaluate a full command line against the built-in deny rules. Returns the
