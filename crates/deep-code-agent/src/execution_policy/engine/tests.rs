@@ -398,7 +398,16 @@ fn brace_expansion_is_never_auto_trusted() {
         );
     }
     // The everyday brace-free forms still run unprompted.
-    for command in ["cargo build", "git diff --stat", "echo hi"] {
+    for command in [
+        "cargo build",
+        "git diff --stat",
+        // `echo` is trusted only where it names a real program (see
+        // `ExecPolicy::default`), so this control is Unix-only. The two above
+        // carry the same claim — "the brace is what removed the trust, not the
+        // program" — on both platforms.
+        #[cfg(not(windows))]
+        "echo hi",
+    ] {
         assert_eq!(
             evaluate_shell_command(&policy, command, false).verdict,
             PolicyVerdict::Allow,

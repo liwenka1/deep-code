@@ -228,14 +228,6 @@ pub struct ExecPolicy {
 
 impl Default for ExecPolicy {
     fn default() -> Self {
-        let mut trusted_shell_prefixes = vec![
-            "git status".to_string(),
-            "git diff".to_string(),
-            "git log".to_string(),
-            "cargo test".to_string(),
-            "cargo build".to_string(),
-            "cargo check".to_string(),
-        ];
         // `echo`/`printf` are trusted only where they name a real program.
         //
         // A trusted command is the one class that runs as argv with no shell
@@ -253,13 +245,28 @@ impl Default for ExecPolicy {
         // sandbox, which on Windows is a Job Object that had nothing to do with
         // it. Untrusted, they take the ordinary approval path, run as approved
         // text through `cmd /C`, and work; the cost is one prompt.
-        #[cfg(not(windows))]
-        {
-            trusted_shell_prefixes.push("printf".to_string());
-            trusted_shell_prefixes.push("echo".to_string());
-        }
+        //
+        // Spelled as a `cfg`'d element rather than a conditional `push`: a
+        // `let mut` that only the non-Windows branch ever mutates is an
+        // `unused_mut` on Windows, which `-D warnings` makes a build failure —
+        // a lint that fires on one platform only is exactly what this file
+        // cannot verify locally.
         Self {
-            trusted_shell_prefixes,
+            trusted_shell_prefixes: [
+                "git status",
+                "git diff",
+                "git log",
+                "cargo test",
+                "cargo build",
+                "cargo check",
+                #[cfg(not(windows))]
+                "printf",
+                #[cfg(not(windows))]
+                "echo",
+            ]
+            .iter()
+            .map(|rule| (*rule).to_string())
+            .collect(),
             network_mode: NetworkMode::Prompt,
         }
     }

@@ -4310,8 +4310,14 @@ async fn execution_authority_follows_who_resolved_the_prompt() {
 
     // Default mode: trusted → Parse; human "a" → Approved; the remembered
     // identity on the next call → Parse.
+    // `cargo build`, not `echo hi`: this test asserts the AUTHORITY wiring, not
+    // which words are trusted, and it is not `cfg`-gated — so its trusted
+    // example has to be one that is trusted on every platform. `echo` is a
+    // `cmd` builtin on Windows and therefore not in the default trust list
+    // there (see `ExecPolicy::default`), which turned this into an approval
+    // prompt and made the authority claim untestable on that host.
     let client = ScriptedClient::new(vec![
-        shell_script("call_1", "echo hi"),
+        shell_script("call_1", "cargo build"),
         shell_script("call_2", "exit 4"),
         shell_script("call_3", "exit 5"),
         done_script(),
@@ -4321,7 +4327,7 @@ async fn execution_authority_follows_who_resolved_the_prompt() {
     let runtime = AgentRuntime::new(client, registry);
     let mut rx = runtime.submit_user("go").await;
     let first = drain(&mut rx).await;
-    assert_eq!(finished_contents(&first), ["echo hi: Parse"]);
+    assert_eq!(finished_contents(&first), ["cargo build: Parse"]);
     assert!(matches!(
         first.last(),
         Some(RuntimeEvent::ApprovalRequired { .. })
