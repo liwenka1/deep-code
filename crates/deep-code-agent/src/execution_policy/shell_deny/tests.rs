@@ -1491,15 +1491,68 @@ fn nested_braces_do_not_rescan() {
 /// produce, not the work of one scan.
 #[test]
 fn a_nest_of_groups_is_built_once() {
-    let word = format!("{}{}", "{a,".repeat(16_000), "}".repeat(16_000));
-    let start = std::time::Instant::now();
-    assert_eq!(brace_expanded_line(&word), "a");
+    let build = |levels: usize| format!("{}{}", "{a,".repeat(levels), "}".repeat(levels));
+    assert_eq!(brace_expanded_line(&build(16_000)), "a");
+    let growth = growth_over_four_times_the_work(&|levels| {
+        let word = build(levels);
+        move || {
+            let _ = brace_expanded_line(&word);
+        }
+    });
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(2),
-        "the nested groups were built on the way out: {:?}",
-        start.elapsed()
+        growth < QUADRATIC_GROWTH_FLOOR,
+        "the nested groups were built on the way out: 4x the levels cost {growth:.1}x the time"
     );
 }
+
+/// How much slower the same operation gets when its input grows 4x.
+///
+/// The two guards below pin a COMPLEXITY claim — one pass, not one pass per
+/// group — and they used to spell it as an absolute wall-clock budget (2s). A
+/// budget is a statement about the machine, not about the algorithm, and both
+/// of those guards ran ~0.4s on a dev laptop against a 2s cap. That is a 5x
+/// margin, and a shared CI runner in debug, running this CPU-bound work
+/// alongside ~700 other tests on two cores, is more than 5x slower: they came
+/// out at 2.0-2.4s and went red on every x86_64 runner while the same commit
+/// passed on macOS and aarch64. Nothing about the code had changed.
+///
+/// A ratio cannot be wrong that way: both measurements pay the same machine and
+/// the same load, so the slowdown divides out. It is also the stronger claim —
+/// the absolute form could not even distinguish linear from quadratic at this
+/// size (measured quadratic was ~1.17s against ~0.4s linear, both under the 2s
+/// cap), whereas 4x the input separates them by construction: linear costs 4x,
+/// quadratic costs 16x.
+///
+/// Both sizes must sit past [`MAX_BRACE_SCAN_BYTES`] so the two measurements
+/// exercise the same branch; 4,000 and 16,000 groups both do (the smaller is
+/// already ~48 MB of re-reads against a 16 MB budget).
+///
+/// `min` of two runs per size, because scheduling noise only ever makes a
+/// measurement slower — the fastest observed run is the closest to the work the
+/// code actually does.
+fn growth_over_four_times_the_work<F>(make: &dyn Fn(usize) -> F) -> f64
+where
+    F: Fn(),
+{
+    fn best(run: impl Fn()) -> std::time::Duration {
+        (0..2)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                run();
+                start.elapsed()
+            })
+            .min()
+            .expect("two samples")
+    }
+    let small = best(make(4_000));
+    let large = best(make(16_000));
+    large.as_secs_f64() / small.as_secs_f64().max(f64::MIN_POSITIVE)
+}
+
+/// Growth at which 4x the input is being paid for quadratically (16x) rather
+/// than linearly (4x). Halfway between them in log space, so each side has a 2x
+/// margin: measured growth is 1.8x and 4.1x for the two guards below.
+const QUADRATIC_GROWTH_FLOOR: f64 = 8.0;
 
 /// The two budgets that bound what an expansion *produces* do not bound what it
 /// *reads*, and a single-alternative group moves neither of them: a range is
@@ -1518,17 +1571,22 @@ fn a_nest_of_groups_is_built_once() {
 /// budget's fallback reading is that same word's `first_expansion`.
 #[test]
 fn a_word_of_single_alternative_groups_is_not_rescanned_per_group() {
-    let word = "{1..1}".repeat(16_000);
-    let start = std::time::Instant::now();
+    let build = |groups: usize| "{1..1}".repeat(groups);
+    let word = build(16_000);
     assert_eq!(
         expand_word(&word, MAX_BRACE_LINE_BYTES),
         vec![first_expansion(&word)],
         "a word past the scan budget is read as its first expansion"
     );
+    let growth = growth_over_four_times_the_work(&|groups| {
+        let word = build(groups);
+        move || {
+            let _ = expand_word(&word, MAX_BRACE_LINE_BYTES);
+        }
+    });
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(2),
-        "the word was rescanned once per group: {:?}",
-        start.elapsed()
+        growth < QUADRATIC_GROWTH_FLOOR,
+        "the word was rescanned once per group: 4x the groups cost {growth:.1}x the time"
     );
 }
 
