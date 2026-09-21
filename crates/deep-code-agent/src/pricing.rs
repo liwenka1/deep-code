@@ -115,8 +115,21 @@ fn calculate_with_pricing(pricing: &ModelPricingMeta, usage: &Usage) -> CostEsti
     let accounted = hit.saturating_add(miss);
     let uncategorized = input.saturating_sub(accounted);
     let miss_total = miss.saturating_add(uncategorized);
-    let reasoning = usage.reasoning_tokens.unwrap_or(0);
-    let effective_output = output.saturating_add(reasoning);
+    // Reasoning tokens are NOT added to `output`. Every OpenAI-compatible
+    // provider, DeepSeek included, counts the chain-of-thought inside
+    // `completion_tokens` and bills it at the output rate — so adding
+    // `reasoning_tokens` on top charged the same tokens twice.
+    //
+    // It survived because it could not fire: [`Usage`] models a FLAT
+    // `reasoning_tokens` key, while the wire nests the count under
+    // `completion_tokens_details`, so the field never deserializes to `Some`
+    // and no code anywhere sets it. That made this a bug waiting on a schema
+    // change rather than a live overcharge — and a silent one, because the
+    // only signal would have been a bill that did not match `/status`.
+    // `reasoning_tokens_are_already_inside_completion_tokens` pins the
+    // decision so a future provider that does send the flat key gets the right
+    // answer instead of re-opening it.
+    let effective_output = output;
 
     CostEstimate {
         usd: tier_cost(hit, pricing.input_hit_usd)
@@ -146,6 +159,30 @@ mod tests {
         }
         assert_eq!(CostCurrency::Cny.as_setting(), "cny");
         assert_eq!(CostCurrency::Usd.as_setting(), "usd");
+    }
+
+    /// The convention this module prices against: a provider's
+    /// `completion_tokens` already contains its reasoning tokens, so a usage
+    /// object that reports both must cost exactly what one reporting only
+    /// `completion_tokens` costs.
+    #[test]
+    fn reasoning_tokens_are_already_inside_completion_tokens() {
+        let with_reasoning = Usage {
+            prompt_tokens: Some(1_000),
+            completion_tokens: Some(900),
+            reasoning_tokens: Some(700),
+            ..Usage::default()
+        };
+        let without = Usage {
+            reasoning_tokens: None,
+            ..with_reasoning.clone()
+        };
+        assert_eq!(
+            calculate_turn_cost(DEEPSEEK_V4_FLASH, &with_reasoning),
+            calculate_turn_cost(DEEPSEEK_V4_FLASH, &without),
+            "reasoning tokens are part of completion_tokens; charging them again doubles the \
+             output price of every reasoning turn"
+        );
     }
 
     #[test]
