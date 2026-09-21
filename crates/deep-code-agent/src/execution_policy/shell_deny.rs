@@ -896,6 +896,8 @@ fn expand_word(word: &str, line_budget: usize) -> Vec<String> {
         // Read before the split, for the same reason the word budget is: the
         // pass being counted is the one about to be paid for.
         scanned = scanned.saturating_add(candidate.len());
+        #[cfg(test)]
+        cost::note(|spend| spend.scanned = spend.scanned.saturating_add(candidate.len()));
         if scanned > MAX_BRACE_SCAN_BYTES {
             return vec![first_expansion(word)];
         }
@@ -1063,19 +1065,101 @@ fn split_first_brace_group(word: &str) -> Option<(&str, Vec<String>, &str)> {
         }
     }
     let (open, close, commas) = best?;
-    let alternatives = if commas.is_empty() {
-        range_alternatives(&word[open + 1..close])?
-    } else {
-        let mut parts = Vec::with_capacity(commas.len() + 1);
-        let mut start = open + 1;
-        for comma in commas {
-            parts.push(word[start..comma].to_string());
-            start = comma + 1;
-        }
-        parts.push(word[start..close].to_string());
-        parts
-    };
+    let alternatives = build_alternatives(word, open, close, &commas)?;
     Some((&word[..open], alternatives, &word[close + 1..]))
+}
+
+/// The alternatives the group `word[open..=close]` holds, given the offsets of
+/// its own top-level commas.
+///
+/// Its own function because *when* it runs is the cost claim, not what it
+/// answers: the scan records its winner as bounds and calls this once, after
+/// the pass. Calling it at every `}` that wins copies a whole body per level —
+/// the square the single pass exists to drop, paid in alternatives instead of
+/// in scanning — so this is the one place a winner is ever copied out of the
+/// word, and `a_nest_of_groups_is_built_once` pins the claim by counting the
+/// bytes that pass through here. A build that moved back into the scan would
+/// still come through this function, and so would still be counted.
+fn build_alternatives(
+    word: &str,
+    open: usize,
+    close: usize,
+    commas: &[usize],
+) -> Option<Vec<String>> {
+    #[cfg(test)]
+    cost::note(|spend| spend.built = spend.built.saturating_add(close.saturating_sub(open)));
+    if commas.is_empty() {
+        return range_alternatives(&word[open + 1..close]);
+    }
+    let mut parts = Vec::with_capacity(commas.len() + 1);
+    let mut start = open + 1;
+    for comma in commas {
+        parts.push(word[start..*comma].to_string());
+        start = comma + 1;
+    }
+    parts.push(word[start..close].to_string());
+    Some(parts)
+}
+
+/// What one expansion spent, counted rather than timed.
+///
+/// The two guards that pin what an expansion *costs* rather than what it
+/// *answers* used to say it with a clock, and a clock measures the machine. An
+/// absolute budget (2 s) went red on a loaded CI runner with nothing changed.
+/// The growth ratio that replaced it separated neither side: the regression it
+/// named measures 7.4x on an idle box — under its 8.0 floor, so it shipped
+/// green 7 runs out of 7 — while healthy code under bursty load measures 10.4x,
+/// over the floor, so it went red anyway. No threshold sits between those, and
+/// none can: the regression copies bytes, which is memcpy, while the healthy
+/// pass reads them one at a time, so the two sides stay a small multiple apart
+/// at every input size instead of separating as 4x against 16x.
+///
+/// So the guards assert the integers, which need no floor and no repetition.
+/// Both are quantities this module already maintains — [`expand_word`] counts
+/// what it re-reads, and [`build_alternatives`] is the only place a winner is
+/// copied — and pinning them drops the inputs from 16,000 groups to 200.
+///
+/// A clock is still the right tool where the two sides differ by orders of
+/// magnitude rather than by a multiple, which is why the three siblings of
+/// those guards keep it: `unmatched_braces_do_not_rescan`,
+/// `nested_braces_do_not_rescan` and
+/// `a_wide_brace_group_is_refused_before_it_is_built` hold single-digit
+/// milliseconds against 29 seconds, 2.7 seconds and 2.5 GB, and no scheduler
+/// noise closes a gap that wide.
+#[cfg(test)]
+mod cost {
+    use std::cell::Cell;
+
+    /// The two resources the guards pin.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) struct Spend {
+        /// Bytes [`super::expand_word`] re-read across its passes: the
+        /// `scanned` it already keeps, which [`super::MAX_BRACE_SCAN_BYTES`]
+        /// bounds.
+        pub(super) scanned: usize,
+        /// Bytes [`super::build_alternatives`] copied out of the word.
+        pub(super) built: usize,
+    }
+
+    thread_local! {
+        static SPEND: Cell<Spend> = const { Cell::new(Spend { scanned: 0, built: 0 }) };
+    }
+
+    pub(super) fn note(add: impl FnOnce(&mut Spend)) {
+        SPEND.with(|spend| {
+            let mut current = spend.get();
+            add(&mut current);
+            spend.set(current);
+        });
+    }
+
+    /// What `run` spent. The counters are per-thread, so guards using this need
+    /// no `--test-threads=1` and are unaffected by whatever else is running.
+    pub(super) fn of(run: impl FnOnce()) -> Spend {
+        SPEND.with(|spend| spend.set(Spend::default()));
+        run();
+        SPEND.with(Cell::get)
+    }
 }
 
 /// The words a `{A..B}` (or `{A..B..STEP}`) range expands to: an integer
