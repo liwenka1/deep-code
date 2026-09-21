@@ -653,3 +653,27 @@ fn the_documented_example_config_produces_no_warnings() {
     );
 }
 
+/// The non-TUI surfaces print English; `warnings` follows `ui.language`. Both
+/// renderings must come from the one captured warning, so they cannot drift.
+#[test]
+fn warnings_render_in_the_callers_language_not_only_the_configs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(
+        dir.path(),
+        "[ui]\nlanguage = \"zh\"\n[cost]\ncurrency = \"eur\"\n",
+    );
+    let loaded = AgentConfig::load_with(Some(path), None, &no_env);
+
+    let localized = loaded.report.warnings.join("\n");
+    assert!(
+        localized.chars().any(|ch| ch as u32 > 0x4e00),
+        "the TUI keeps the configured language: {localized:?}"
+    );
+
+    let english = loaded.report.warnings_in(Lang::En).join("\n");
+    assert!(
+        english.is_ascii(),
+        "doctor/serve/-p must be able to render the same warning in English: {english:?}"
+    );
+    assert!(english.contains("cost.currency"));
+}

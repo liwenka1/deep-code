@@ -56,7 +56,11 @@ impl From<&ConfigLoadReport> for ConfigLayersDoctorReport {
             base_url_source: report.sources.base_url.label().to_string(),
             currency_source: report.sources.cost_currency.label().to_string(),
             api_key_source: report.sources.api_key.label().to_string(),
-            warnings: report.warnings.clone(),
+            // English, not `report.warnings`: every consumer of this struct
+            // (`doctor`, `serve`, headless `-p`) prints English and makes no
+            // `tr` call of its own, so inheriting `ui.language` here put
+            // localized rows inside an otherwise-English report.
+            warnings: report.warnings_in(crate::i18n::Lang::En),
         }
     }
 }

@@ -136,8 +136,36 @@ pub struct ConfigLayerStatus {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ConfigLoadReport {
     pub layers: Vec<ConfigLayerStatus>,
+    /// The warnings rendered in the language the assembled config selected —
+    /// what the TUI shows.
     pub warnings: Vec<String>,
     pub sources: ConfigSources,
+    /// The same warnings before localization, so [`Self::warnings_in`] can
+    /// render them in a language other than the config's.
+    #[serde(skip)]
+    pending: Vec<PendingWarning>,
+}
+
+impl ConfigLoadReport {
+    /// The load warnings rendered in `lang`, for a surface whose language is
+    /// its own rather than the assembled config's.
+    ///
+    /// The non-TUI surfaces (`doctor`, `serve`, headless `-p`) print English
+    /// unconditionally and make no `tr` call of their own — yet they all
+    /// printed [`Self::warnings`], which follows `ui.language`. A
+    /// `ui.language = "zh"` user therefore got an English report with Chinese
+    /// warning rows inside it: the same "one localized fragment per row" shape
+    /// that `session_cli`'s age column was fixed for, reached through the
+    /// config layer instead of through a `tr` call anyone could grep for.
+    /// Rendering on demand from one captured warning is what keeps the two
+    /// spellings from drifting.
+    #[must_use]
+    pub fn warnings_in(&self, lang: Lang) -> Vec<String> {
+        self.pending
+            .iter()
+            .map(|warning| render_warning(lang, warning))
+            .collect()
+    }
 }
 
 /// Result of [`AgentConfig::load`]: the effective config plus how it was
@@ -239,6 +267,7 @@ impl AgentConfig {
             .iter()
             .map(|warning| render_warning(lang, warning))
             .collect();
+        report.pending = pending;
         LoadedAgentConfig { config, report }
     }
 }

@@ -38,8 +38,9 @@ pub async fn run_eval(
         .is_empty()
     {
         anyhow::bail!(
-            "未配置 DeepSeek API key,评测拒绝在离线 echo 后端上运行。\
-先设置 DEEPSEEK_API_KEY 或在 ~/.deep-code/config.toml 配置。"
+            "no DeepSeek API key is configured; the benchmark refuses to run against \
+             the offline echo backend. Set DEEPSEEK_API_KEY, or configure it in \
+             ~/.deep-code/config.toml."
         );
     }
 
@@ -91,18 +92,18 @@ pub async fn run_eval(
     // sb-cli names the subset `swe-bench_<subset>`; derive it rather than map
     // through a table whose fallthrough would call an unknown subset "lite".
     let sb_subset = format!("swe-bench_{subset}");
-    println!("已写出:");
+    println!("Wrote:");
     println!("  {}", predictions_path.display());
     println!("  {}", report_path.display());
     let transcripts_dir = out_dir.join("transcripts");
     if transcripts_dir.is_dir() {
         println!(
-            "  {}/<instance_id>/  (会话记录,供复盘)",
+            "  {}/<instance_id>/  (session transcripts, for post-mortem)",
             transcripts_dir.display()
         );
     }
     println!();
-    println!("下一步(官方评分,得出真实 resolved 率):");
+    println!("Next (official grading, for the real resolved rate):");
     println!(
         "  sb-cli submit {sb_subset} {split} --predictions_path {} --run_id <run_id>",
         predictions_path.display()

@@ -219,8 +219,11 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
     // agent crate this file could not call it at all — `deep-code-runtime` does
     // not depend on `deep-code-tui` — which is why `serve` was missed by every
     // pass that hardened the TUI.
-    for warning in &loaded.report.warnings {
-        eprintln!("config warning: {}", neutralize_display_text(warning));
+    // English like every other line this binary prints: `serve` makes no `tr`
+    // call of its own, and `report.warnings` follows `ui.language`, so a
+    // `ui.language = "zh"` user got localized rows inside an English log.
+    for warning in loaded.report.warnings_in(deep_code_agent::Lang::En) {
+        eprintln!("config warning: {}", neutralize_display_text(&warning));
     }
     let config = loaded.config;
     let resume = load_resume_record(&options)?;
@@ -244,8 +247,9 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
         eprintln!("auth: bearer token required for /v1/* routes");
     } else {
         eprintln!(
-            "警告：未设置 auth token，本机任意进程都可调用 /v1/* 驱动 agent 执行工具。\
-             建议 --auth-token <TOKEN> 或设置 DEEP_CODE_RUNTIME_TOKEN。"
+            "warning: no auth token is set — any process on this machine can call \
+             /v1/* and drive the agent into running tools. Pass --auth-token <TOKEN> \
+             or set {RUNTIME_TOKEN_ENV}."
         );
     }
 

@@ -50,8 +50,10 @@ pub async fn run_print(args: PrintArgs) -> i32 {
     // `<workspace>/.deep-code/config.toml`, which a repository ships — and the
     // message being concealed is the one saying a malicious repo must not
     // redirect where your credentials go.
-    for warning in &loaded.report.warnings {
-        emit("config", warning);
+    // English: `-p` prints English throughout and makes no `tr` call, while
+    // `report.warnings` follows `ui.language` — see `ConfigLoadReport::warnings_in`.
+    for warning in loaded.report.warnings_in(deep_code_agent::Lang::En) {
+        emit("config", &warning);
     }
 
     let resume = match resolve_resume_record(&args.intent, &workspace) {

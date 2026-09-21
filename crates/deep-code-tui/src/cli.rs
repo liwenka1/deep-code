@@ -781,22 +781,32 @@ pub(crate) fn program_name() -> String {
         .unwrap_or_else(|| "deepcode".to_string())
 }
 
+/// The `--help` body.
+///
+/// English, like every other line this binary prints outside the TUI. It was
+/// the one surface that mixed: an English header over Chinese annotations,
+/// with `/lang` and `DEEP_CODE_LANG` unable to touch either — so the first
+/// thing a new user saw contradicted the rule
+/// `the_age_column_is_english_like_every_other_column` states for the rest of
+/// the CLI. The TUI stays bilingual; these are the command-line surfaces.
 fn usage_text() -> String {
     let prog = program_name();
     [
         "Commands:".to_string(),
-        format!("  {prog}                # 新会话"),
-        format!("  {prog} -c             # 续最近会话"),
-        format!("  {prog} -r             # 选择历史会话"),
+        format!("  {prog}                # new session"),
+        format!("  {prog} -c             # continue the latest session"),
+        format!("  {prog} -r             # pick a session to resume"),
         format!(
-            "  {prog} --add-dir DIR  # 额外可写目录(可重复;对 -p/serve 同样可用,随会话保存)"
+            "  {prog} --add-dir DIR  # extra writable directory (repeatable; works with -p/serve, saved with the session)"
         ),
-        format!("  {prog} -p \"PROMPT\"    # 单发无头模式;无参数则读 stdin,可与 -c/--resume 组合"),
+        format!(
+            "  {prog} -p \"PROMPT\"    # headless one-shot; reads stdin when no prompt is given, combines with -c/--resume"
+        ),
         format!(
             "  {prog} -p [PROMPT] [--output-format text|json|stream-json] [--permission-mode MODE] [--timeout SECS] [--verbose]"
         ),
-        format!("  {prog} github install [--with-app]   # 给当前仓库装上 CI bot(--print 预览)"),
-        format!("  {prog} github status                 # 查看接入状态"),
+        format!("  {prog} github install [--with-app]   # install the CI bot into this repo (--print to preview)"),
+        format!("  {prog} github status                 # show the CI bot's status"),
         format!("  {prog} doctor [--json]"),
         format!("  {prog} serve --http [--host HOST] [--port PORT]"),
         format!("  {prog} session list|resume|delete|export"),
@@ -820,8 +830,8 @@ fn print_session_usage() {
     eprintln!("  {prog} session list");
     eprintln!("  {prog} session resume <session_id>");
     eprintln!("  {prog} session export <session_id>");
-    eprintln!("  {prog} -c            # 续最近会话");
-    eprintln!("  {prog} -r            # 选择历史会话");
+    eprintln!("  {prog} -c            # continue the latest session");
+    eprintln!("  {prog} -r            # pick a session to resume");
 }
 
 #[cfg(test)]

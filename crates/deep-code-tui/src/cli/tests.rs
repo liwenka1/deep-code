@@ -262,3 +262,28 @@ fn help_is_recognized_in_any_position() {
         assert!(!wants_help(&argv(&args)), "{args:?} must not ask for help");
     }
 }
+
+/// `--help` is English, like every other line the CLI prints.
+///
+/// It was the loudest exception to the rule `session_cli`'s
+/// `the_age_column_is_english_like_every_other_column` states: an English
+/// "Commands:" header over Chinese annotations, unreachable by `/lang` or
+/// `DEEP_CODE_LANG` because it makes no `tr` call at all — so the very first
+/// screen a new user saw contradicted the convention, and the test that
+/// guarded the convention was scoped to one column of one subcommand.
+///
+/// Asserted on the whole body rather than on a phrase: a future line can only
+/// regress by being non-ASCII, which is exactly the thing being ruled out.
+/// (The TUI stays bilingual; this rule is for the command-line surfaces.)
+#[test]
+fn the_help_body_is_english_like_every_other_cli_line() {
+    let usage = usage_text();
+    assert!(
+        usage.is_ascii(),
+        "--help must not carry localized text: {usage}"
+    );
+    // Still a real help body, not an empty string that trivially passes.
+    assert!(usage.contains("Commands:"));
+    assert!(usage.contains("new session"));
+    assert!(usage.contains("--add-dir"));
+}
