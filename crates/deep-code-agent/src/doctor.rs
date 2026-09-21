@@ -98,6 +98,16 @@ pub struct SandboxReport {
     pub confines_filesystem: bool,
     pub confines_network: bool,
     pub detail: String,
+    /// The configured egress policy (`[sandbox] network`), as the setting is
+    /// spelled — what the gate will DO, beside what the backend CAN enforce.
+    ///
+    /// Every other field here describes the host; none described the
+    /// configuration, so `network = "never"` — the one switch that hard-
+    /// disables egress — could not be confirmed anywhere in the product. A
+    /// user who misspelled it saw a report identical to one where it had taken
+    /// effect. `NetworkMode::as_setting` has always been documented as being
+    /// "for diagnostics"; this is the diagnostic.
+    pub network_setting: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -178,6 +188,7 @@ impl DoctorReport {
                 filesystem: sandbox.filesystem,
                 network: sandbox.network,
                 detail: sandbox.detail,
+                network_setting: config.sandbox_network.as_setting().to_string(),
             },
             skills,
             config_layers: None,
@@ -319,6 +330,7 @@ mod tests {
             "confines_filesystem",
             "confines_network",
             "detail",
+            "network_setting",
         ] {
             assert!(object.contains_key(key), "sandbox.{key} missing from JSON");
         }

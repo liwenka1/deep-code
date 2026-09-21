@@ -377,9 +377,9 @@ text_ids! {
     CfgFileUnusable,
     CfgProjectApiKeyIgnored,
     CfgProjectBaseUrlIgnored,
-    CfgUnknownReasoning,
+    CfgUnknownValue,
     CfgProjectFieldIgnored,
-    CfgUnknownCurrency,
+    CfgUnknownKey,
     CfgProjectAutoAllowIgnored,
     CfgGlobalKeyPerms,
     // 配置写入(write.rs)

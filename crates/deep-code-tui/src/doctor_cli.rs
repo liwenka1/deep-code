@@ -127,6 +127,11 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
         }
     };
     println!("  sandbox: {} ({})", sandbox_state, report.sandbox.detail);
+    // The configured egress policy, beside what the host can enforce. Without
+    // it `[sandbox] network = "never"` was unconfirmable: a typo in the value
+    // (or in the key) produced a report identical to one where it had taken
+    // effect, on the one setting that hard-disables egress.
+    println!("    [sandbox] network = {}", report.sandbox.network_setting);
     if report.sandbox.available && !overall.is_full() {
         println!(
             "    workspace-write confinement: {}",

@@ -31,6 +31,54 @@ fn render_warning(lang: Lang, (id, args): &PendingWarning) -> String {
     tr_with(lang, *id, &refs)
 }
 
+/// Parse a setting whose value is one of a fixed set of spellings, warning
+/// when the spelling is not one of them instead of silently leaving the field
+/// at whatever the layers below it left there.
+///
+/// One helper rather than a warning written out per setting, because "written
+/// out per setting" is exactly how the gap appeared: of the five enum-shaped
+/// settings, two had a warning (`provider.reasoning_effort`, `cost.currency`)
+/// and three did not (`sandbox.network`, `approval.default_mode`,
+/// `ui.language`) — and the silent one that mattered degrades in the
+/// PERMISSIVE direction. `[sandbox] network` is the only switch that hard-
+/// disables egress, and `NetworkMode::parse` answering `None` drops it back to
+/// the builtin `Prompt`: a user who typed `"nevr"` had egress re-armed with
+/// nothing said, and under `yolo` (or headless `-p`, where nobody answers a
+/// prompt) `yolo_ambient_network` then hands every sandboxed command ambient
+/// network. A setting added later cannot repeat it without opting out of this
+/// function, and `every_enum_setting_warns_on_an_unrecognized_spelling`
+/// enumerates them.
+///
+/// `field` is the dotted name as the file spells it, so the message names the
+/// line the user has to go fix.
+fn parse_setting<T>(
+    raw: Option<&str>,
+    field: &'static str,
+    layer: ConfigLayer,
+    pending: &mut Vec<PendingWarning>,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Option<T> {
+    let value = raw?.trim();
+    // An empty value is "not set", which every caller already treated as such
+    // — warning about it would fire on a key the user is in the middle of
+    // filling in.
+    if value.is_empty() {
+        return None;
+    }
+    let parsed = parse(value);
+    if parsed.is_none() {
+        pending.push((
+            TextId::CfgUnknownValue,
+            vec![
+                ("layer", layer.label().to_string()),
+                ("field", field.to_string()),
+                ("value", value.to_string()),
+            ],
+        ));
+    }
+    parsed
+}
+
 /// Configuration layer, ordered from weakest to strongest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -160,6 +208,14 @@ impl AgentConfig {
                         present: true,
                         error: None,
                     });
+                    // Before the overlay, so a file that is one big typo says
+                    // so first rather than after the settings it failed to set.
+                    for key in file.unknown_keys() {
+                        pending.push((
+                            TextId::CfgUnknownKey,
+                            vec![("layer", layer.label().to_string()), ("field", key)],
+                        ));
+                    }
                     apply_file_overlay(&mut config, &file, layer, &mut report, &mut pending);
                     if layer == ConfigLayer::Global
                         && file
@@ -187,6 +243,46 @@ impl AgentConfig {
     }
 }
 
+/// Keys a config file carried that no field of this schema claims.
+///
+/// `#[serde(flatten)]` into a map is what collects them, and collecting is the
+/// point: `#[serde(deny_unknown_fields)]` — which this crate puts on all
+/// nineteen model-facing tool-parameter structs — fails the parse, and a
+/// failed parse here drops the WHOLE layer through `FileRead::Error`. One
+/// misspelled key would then silently disable every correctly-spelled setting
+/// beside it, which is a bigger version of the bug this exists to catch.
+/// Collecting keeps every valid setting working AND names the typo; it also
+/// reports every unknown key at once, where a strict parse stops at the first.
+///
+/// Why it is needed at all: nothing anywhere read an unknown key. A file with
+/// `netwrok = "never"`, `modle = "..."` and a whole invented section loaded
+/// with `present: true` and not one warning, so a user who believed they had
+/// turned egress off had not.
+type UnknownKeys = std::collections::BTreeMap<String, toml::Value>;
+
+/// The section names [`ConfigFile::unknown_keys`] prefixes its per-section
+/// findings with, paired with the accessor for that section's leftovers.
+///
+/// A hand-written list is a drift risk, so it is held to the user-facing
+/// schema rather than to itself: `every_documented_section_reports_its_unknown_keys`
+/// reads the `[section]` headers out of `config.example.toml`, plants a bogus
+/// key under each, and fails naming any section whose typos go unreported.
+macro_rules! sections {
+    ($file:expr) => {
+        [
+            ("provider", &$file.provider.unknown),
+            ("cost", &$file.cost.unknown),
+            ("context", &$file.context.unknown),
+            ("stream", &$file.stream.unknown),
+            ("approval", &$file.approval.unknown),
+            ("checkpoints", &$file.checkpoints.unknown),
+            ("ui", &$file.ui.unknown),
+            ("lsp", &$file.lsp.unknown),
+            ("sandbox", &$file.sandbox.unknown),
+        ]
+    };
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct ConfigFile {
@@ -199,6 +295,23 @@ struct ConfigFile {
     ui: UiSection,
     lsp: LspSection,
     sandbox: SandboxSection,
+    /// Top-level keys and whole sections no field claims.
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+impl ConfigFile {
+    /// Every key in the file that no field of the schema claims, as the dotted
+    /// path the user would go and fix. Sorted, so the warnings come out in a
+    /// stable order rather than in `BTreeMap`-per-section order.
+    fn unknown_keys(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.unknown.keys().cloned().collect();
+        for (section, unknown) in sections!(self) {
+            out.extend(unknown.keys().map(|key| format!("{section}.{key}")));
+        }
+        out.sort();
+        out
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -209,6 +322,8 @@ struct ProviderSection {
     model: Option<String>,
     reasoning_effort: Option<String>,
     timeout_secs: Option<u64>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -216,12 +331,16 @@ struct ProviderSection {
 struct CostSection {
     currency: Option<String>,
     auto_cost_saving: Option<bool>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct ContextSection {
     compaction_threshold: Option<u32>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -231,6 +350,8 @@ struct StreamSection {
     chunk_timeout_secs: Option<u64>,
     total_timeout_secs: Option<u64>,
     max_bytes: Option<u64>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -238,24 +359,32 @@ struct StreamSection {
 struct ApprovalSection {
     auto_allow: Option<Vec<String>>,
     default_mode: Option<String>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct CheckpointsSection {
     max_snapshots: Option<usize>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct UiSection {
     language: Option<String>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct LspSection {
     enabled: Option<bool>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -263,6 +392,8 @@ struct LspSection {
 struct SandboxSection {
     /// `prompt` | `always` | `never`; see [`NetworkMode`].
     network: Option<String>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 enum FileRead {
@@ -340,19 +471,15 @@ fn apply_file_overlay(
         report.sources.model = layer;
     }
 
-    if let Some(value) = file.provider.reasoning_effort.as_deref() {
-        if let Some(effort) = ReasoningEffortSetting::parse(value) {
-            config.reasoning_effort = effort;
-            report.sources.reasoning_effort = layer;
-        } else {
-            pending.push((
-                TextId::CfgUnknownReasoning,
-                vec![
-                    ("layer", layer.label().to_string()),
-                    ("value", value.to_string()),
-                ],
-            ));
-        }
+    if let Some(effort) = parse_setting(
+        file.provider.reasoning_effort.as_deref(),
+        "provider.reasoning_effort",
+        layer,
+        pending,
+        ReasoningEffortSetting::parse,
+    ) {
+        config.reasoning_effort = effort;
+        report.sources.reasoning_effort = layer;
     }
 
     if let Some(secs) = file.provider.timeout_secs {
@@ -366,19 +493,15 @@ fn apply_file_overlay(
         }
     }
 
-    if let Some(value) = file.cost.currency.as_deref() {
-        if let Some(currency) = CostCurrency::parse(value) {
-            config.cost_currency = currency;
-            report.sources.cost_currency = layer;
-        } else {
-            pending.push((
-                TextId::CfgUnknownCurrency,
-                vec![
-                    ("layer", layer.label().to_string()),
-                    ("value", value.to_string()),
-                ],
-            ));
-        }
+    if let Some(currency) = parse_setting(
+        file.cost.currency.as_deref(),
+        "cost.currency",
+        layer,
+        pending,
+        CostCurrency::parse,
+    ) {
+        config.cost_currency = currency;
+        report.sources.cost_currency = layer;
     }
     // Runtime-behavior knobs below share one rule with provider.timeout_secs:
     // not project-configurable. A repo's config must not be able to starve
@@ -444,13 +567,21 @@ fn apply_file_overlay(
 
     // UI preference: harmless from any layer, so the project file may set it
     // (a repo declaring its team's display language is fine).
-    if let Some(language) = file
-        .ui
-        .language
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        config.language = language.trim().to_string();
+    // Validated against the same rule `Lang::resolve` applies later, so an
+    // unusable spelling is named here rather than silently falling through to
+    // locale detection at render time. `auto` is a real value there, so it has
+    // to be accepted here too.
+    if let Some(language) = parse_setting(
+        file.ui.language.as_deref(),
+        "ui.language",
+        layer,
+        pending,
+        |value| {
+            (value.eq_ignore_ascii_case("auto") || Lang::from_tag(value).is_some())
+                .then(|| value.to_string())
+        },
+    ) {
+        config.language = language;
     }
 
     // Diagnostics preference, tighten-only from the project layer. Turning LSP
@@ -477,8 +608,15 @@ fn apply_file_overlay(
     // was widened back to `prompt` by a hostile checkout, re-arming the
     // approval-gated egress the user turned off. Compare against the *current*
     // value by rank, the same shape the LSP and permission-tier guards use.
-    // Unknown values degrade to unset.
-    if let Some(mode) = file.sandbox.network.as_deref().and_then(NetworkMode::parse) {
+    // An unrecognized spelling is warned about by `parse_setting` and leaves
+    // the value the layers below set — it does NOT fall back to the builtin.
+    if let Some(mode) = parse_setting(
+        file.sandbox.network.as_deref(),
+        "sandbox.network",
+        layer,
+        pending,
+        NetworkMode::parse,
+    ) {
         if project && mode.rank() > config.sandbox_network.rank() {
             pending.push((
                 TextId::CfgProjectFieldIgnored,
@@ -501,13 +639,13 @@ fn apply_file_overlay(
         }
     }
 
-    if let Some(mode) = file
-        .approval
-        .default_mode
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .and_then(PermissionMode::parse)
-    {
+    if let Some(mode) = parse_setting(
+        file.approval.default_mode.as_deref(),
+        "approval.default_mode",
+        layer,
+        pending,
+        PermissionMode::parse,
+    ) {
         // Tighten-only from the project layer: a repo may lower the tier but
         // never raise it. Rejecting only auto/yolo was not enough — a hostile
         // checkout could still raise Default → AcceptEdits and thereby

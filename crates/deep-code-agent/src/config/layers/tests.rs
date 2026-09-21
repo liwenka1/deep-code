@@ -493,3 +493,163 @@ fn world_readable_global_key_file_warns_chmod() {
             .all(|warning| !warning.contains("chmod 600"))
     );
 }
+
+/// Every setting whose value is one of a fixed set of spellings must say so
+/// when the spelling is not one of them.
+///
+/// Two of the five had a warning and three did not, and the split was
+/// invisible: each site spelled its own `and_then(X::parse)`, so "this one
+/// warns" and "this one is silent" looked identical at a glance. The one that
+/// mattered degrades PERMISSIVELY — `[sandbox] network` is the only switch
+/// that hard-disables egress, and an unrecognized value dropped it back to
+/// `prompt`. Enumerated rather than spot-checked so a sixth setting cannot
+/// join the silent side.
+#[test]
+fn every_enum_setting_warns_on_an_unrecognized_spelling() {
+    // (section, key, a spelling no parser accepts)
+    const SETTINGS: [(&str, &str, &str); 5] = [
+        ("provider", "reasoning_effort", "maximum"),
+        ("cost", "currency", "eur"),
+        ("sandbox", "network", "nevr"),
+        ("approval", "default_mode", "yoloo"),
+        ("ui", "language", "kling0n"),
+    ];
+
+    for (section, key, bad) in SETTINGS {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), &format!("[{section}]\n{key} = \"{bad}\"\n"));
+        let loaded = AgentConfig::load_with(Some(path), None, &no_env);
+        let field = format!("{section}.{key}");
+        assert!(
+            loaded
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(&field) && warning.contains(bad)),
+            "{field}='{bad}' must be reported, got {:?}",
+            loaded.report.warnings
+        );
+    }
+}
+
+/// The regression that motivated the sweep above, spelled out on its own
+/// because its consequence is not "a setting did not apply".
+///
+/// A misspelled `never` leaves `sandbox_network` at the builtin `Prompt`, and
+/// `yolo_ambient_network` hands every sandboxed command ambient egress under
+/// any mode but `Never`. With nobody at a prompt (`yolo`, headless `-p`) that
+/// is egress re-armed with nothing said.
+#[test]
+fn a_misspelled_network_never_does_not_silently_re_arm_egress() {
+    use crate::execution_policy::NetworkMode;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(dir.path(), "[sandbox]\nnetwork = \"nevr\"\n");
+    let loaded = AgentConfig::load_with(Some(path), None, &no_env);
+
+    // The value really does stay permissive — this test is about the WARNING,
+    // not about guessing what the user meant.
+    assert_eq!(loaded.config.sandbox_network, NetworkMode::Prompt);
+    assert!(
+        loaded
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("sandbox.network") && warning.contains("nevr")),
+        "the one switch that disables egress must not fail silently: {:?}",
+        loaded.report.warnings
+    );
+}
+
+/// A key no field claims is reported, at the top level and inside every
+/// documented section.
+///
+/// The section list `unknown_keys` walks is hand-written, so it is held
+/// against the user-facing schema instead of against itself: the sections come
+/// out of `config.example.toml`, which is the file the warning tells people to
+/// check. A section added to the example (or to the structs) without being
+/// wired into `sections!` fails here.
+#[test]
+fn every_documented_section_reports_its_unknown_keys() {
+    let example = include_str!("../../../../../config.example.toml");
+    let sections: Vec<&str> = example
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix('[')?.strip_suffix(']'))
+        .filter(|name| !name.starts_with('['))
+        .collect();
+    assert!(
+        sections.len() >= 9,
+        "config.example.toml should document every section, found {sections:?}"
+    );
+
+    let mut file = String::from("bogus_top_level = 1\n");
+    for section in &sections {
+        file.push_str(&format!("\n[{section}]\nbogus_key_here = 1\n"));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(dir.path(), &file);
+    let loaded = AgentConfig::load_with(Some(path), None, &no_env);
+
+    assert!(
+        loaded
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("bogus_top_level")),
+        "an unknown top-level key must be reported: {:?}",
+        loaded.report.warnings
+    );
+    for section in &sections {
+        let dotted = format!("{section}.bogus_key_here");
+        assert!(
+            loaded
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(&dotted)),
+            "{dotted} must be reported: {:?}",
+            loaded.report.warnings
+        );
+    }
+}
+
+/// A valid file warns about nothing — the unknown-key sweep must not fire on
+/// the schema it is checking against.
+///
+/// `config.example.toml` is the obvious witness: it is what the warning tells
+/// people to compare their file with, so if IT tripped the warning the advice
+/// would be self-defeating. Commented-out lines make it load as an empty file,
+/// so the keys are uncommented first.
+#[test]
+fn the_documented_example_config_produces_no_warnings() {
+    let example = include_str!("../../../../../config.example.toml");
+    let uncommented: String = example
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            match trimmed.strip_prefix("# ") {
+                // Only revive lines that look like `key = value`; prose comments
+                // stay comments.
+                Some(rest) if rest.contains(" = ") => rest.to_string(),
+                _ => line.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(dir.path(), &uncommented);
+    let loaded = AgentConfig::load_with(Some(path), None, &no_env);
+    let unexpected: Vec<&String> = loaded
+        .report
+        .warnings
+        .iter()
+        .filter(|warning| warning.contains("unknown key"))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "config.example.toml must match the schema it documents: {unexpected:?}"
+    );
+}
+
