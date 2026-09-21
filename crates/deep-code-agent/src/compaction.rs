@@ -196,22 +196,33 @@ fn summarize_archived_entries(entries: &[Arc<SessionEntry>]) -> String {
     summarize_archived(&wire)
 }
 
+/// Role labels for the summary lines, bilingual like every other model-facing
+/// string the runtime writes — `工具使用纪律 / Tool discipline`,
+/// `运行环境 / Environment`, `[会话摘要 / session summary]`. These four were the
+/// only ones that were Chinese alone, and the summary is the text that
+/// survives longest in the context window, so it is the last place the
+/// convention should lapse. (The system prompt itself is Chinese-first by
+/// design; this matches that style rather than replacing it.)
+fn role_label(role: Role) -> &'static str {
+    match role {
+        Role::User => "用户 / user",
+        Role::Assistant => "助手 / assistant",
+        Role::System => "系统 / system",
+        Role::Tool => "工具 / tool",
+    }
+}
+
 fn summarize_archived(messages: &[Message]) -> String {
     let mut lines = Vec::new();
     for message in messages {
-        let role = match message.role {
-            Role::User => "用户",
-            Role::Assistant => "助手",
-            Role::System => "系统",
-            Role::Tool => "工具",
-        };
+        let role = role_label(message.role);
         let snippet = truncate_chars(&message.content, 160);
         if !snippet.is_empty() {
             lines.push(format!("- {role}: {snippet}"));
         }
     }
     if lines.is_empty() {
-        return "（无历史内容）".to_string();
+        return "（无历史内容 / no history）".to_string();
     }
     lines.join("\n")
 }
