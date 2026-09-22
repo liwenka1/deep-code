@@ -641,6 +641,23 @@ fn the_documented_example_config_produces_no_warnings() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_config(dir.path(), &uncommented);
     let loaded = AgentConfig::load_with(Some(path), None, &no_env);
+    // The revived file has to LOAD first, or this test proves nothing: a prose
+    // comment carrying a ` = ` is revived too, the file then fails to parse,
+    // the only warning is "unusable" rather than "unknown key", and the sweep
+    // below passes without ever running. That is exactly what it did — three
+    // prose lines in the Chinese original revived into broken TOML — so the
+    // parse is asserted before the sweep, not left implied.
+    let parse_errors: Vec<&String> = loaded
+        .report
+        .layers
+        .iter()
+        .filter_map(|layer| layer.error.as_ref())
+        .collect();
+    assert!(
+        parse_errors.is_empty(),
+        "the revived example must still be valid TOML — keep ` = ` out of prose \
+         comments: {parse_errors:?}"
+    );
     let unexpected: Vec<&String> = loaded
         .report
         .warnings

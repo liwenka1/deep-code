@@ -1,137 +1,208 @@
-# deep-code 配置文件示例
+# deep-code configuration example
 #
-# 加载顺序（后者覆盖前者）：
-#   内置默认 -> 全局 ~/.deep-code/config.toml -> 项目 .deep-code/config.toml -> 环境变量 -> CLI 参数
+# English, like the CLI surface and the primary README. This file is what the
+# unknown-key warning tells you to compare your own config against, so it is the
+# one copy and it is kept in step with the schema by tests
+# (`every_documented_section_reports_its_unknown_keys` and
+# `the_documented_example_config_produces_no_warnings`).
 #
-# 项目层只允许调优字段：provider.model / provider.reasoning_effort /
-# cost.currency / ui.language。
-# 其余行为旋钮（provider.timeout_secs、stream.*、checkpoints.*、context.*、
-# cost.auto_cost_saving、approval.auto_allow）在项目层一律忽略并告警——防止恶意
-# 仓库饿死流、撑爆快照保留或静默解除审批门；请在全局配置或环境变量中设置。
+# Load order, later layers overriding earlier ones:
+#   builtin defaults -> global ~/.deep-code/config.toml
+#   -> project .deep-code/config.toml -> environment -> CLI flags
 #
-# 只许收紧（tighten-only）三项：项目层可以更严、不能更松，越界即忽略并告警。
-#   - approval.default_mode：只能降档（例如 auto -> default），不能升档。
-#     注意：升档一档也不行——accept_edits 就已经自动放行全部工作区写入。
-#   - sandbox.network：只能比全局更严（always → prompt → never），放宽会被忽略——
-#     全局是 never 时，项目层写 prompt 同样忽略。
-#   - lsp.enabled：只能设 false（关掉 language server），不能替你打开。
+# The project layer may only set tuning fields: provider.model,
+# provider.reasoning_effort, cost.currency and ui.language.
 #
-# 项目层的 provider.api_key 一律忽略（防止随仓库泄露或被恶意仓库注入）；
-# 项目层覆盖 provider.base_url 会被硬拒。
+# Every other behaviour knob (provider.timeout_secs, stream.*, checkpoints.*,
+# context.*, cost.auto_cost_saving, approval.auto_allow) is ignored there, with
+# a warning — so a hostile repository cannot starve your streams, blow up
+# snapshot retention, or quietly lift the approval gate. Set those globally or
+# in the environment.
 #
-# 拼错不会静默：本文件没有的键（如 netwrok）和识别不了的值（如
-# network = "nevr"）都会在启动和 `deepcode doctor` 里逐条点名，并说明该项仍
-# 保持下层的值——而不是让你以为设置已经生效。`deepcode doctor` 还会打印
-# 当前生效的 `[sandbox] network`，可用来确认 never 确实到位。
+# Three settings are tighten-only from the project layer: a repo may be
+# stricter than your global config, never looser, and an attempt to loosen is
+# ignored with a warning.
+#   - approval.default_mode may only step DOWN (auto to default, say), never up.
+#     Not even one step up: accept_edits already waves through every workspace
+#     write.
+#   - sandbox.network may only be stricter than the global value (always, then
+#     prompt, then never). Widening is ignored — with a global "never", a
+#     project-layer "prompt" is ignored too.
+#   - lsp.enabled may only be set false (turning the language server off). It
+#     cannot turn it on for you.
+#
+# provider.api_key in the project layer is always ignored (so a key cannot leak
+# with the repo, nor be injected by one), and a project-layer provider.base_url
+# override is refused outright.
+#
+# Typos are not silent. A key this file does not have (say "netwrok") and a
+# value that cannot be recognized (say "nevr" for the network mode) are each
+# named at startup and in `deepcode doctor`, together with the note that the
+# setting kept whatever the layer below it had — rather than letting you
+# believe it took effect. `deepcode doctor` also prints the sandbox network
+# mode currently in force, which is how you confirm that "never" really landed.
 
 [provider]
-# DeepSeek API Key。建议只放在环境变量 DEEPSEEK_API_KEY 或本全局文件中；
-# 写入本文件后请执行 chmod 600 限制权限。
+# DeepSeek API key. Prefer the DEEPSEEK_API_KEY environment variable or this
+# global file; if you do write it here, `chmod 600` the file.
 # api_key = "sk-..."
 
-# API 端点。默认 https://api.deepseek.com/beta（beta 支持 reasoning 流）。
+# API endpoint. Defaults to https://api.deepseek.com/beta (the beta endpoint is
+# the one that streams reasoning).
 # base_url = "https://api.deepseek.com/beta"
 
-# 模型：deepseek-v4-pro / deepseek-v4-flash / auto（按任务自动路由）。
+# Model: deepseek-v4-pro, deepseek-v4-flash, or auto (routed per task).
 # model = "auto"
 
-# 推理力度：off / low / medium / high / max。
+# Reasoning effort: off, low, medium, high, max.
 # reasoning_effort = "high"
 
-# 打开请求超时（秒）：连接 + 等待响应头；不限制流式响应本身（流的存活由 [stream] 超时管理）。
+# Request timeout in seconds: connect plus waiting for response headers. It does
+# not bound the streamed response itself — the [stream] timeouts below own that.
 # timeout_secs = 60
 
 [checkpoints]
-# 检查点保留上限：每轮开始前存一份工作区快照，超出上限按最旧删除（0 = 不清理）。
+# Snapshot retention. One workspace snapshot is taken before each turn; beyond
+# this count the oldest are deleted. Zero keeps every snapshot.
 # max_snapshots = 20
 
 [sandbox]
-# shell/job 命令的联网授权。命令一律在 OS 沙箱内运行,默认不带网络(含端口监听);
-# 模型认为命令需要联网时会在参数里声明 network=true,该声明强制转人工审批
-# (审批面板显示"申请联网"),"本会话记住"按命令 identity 生效(批过 git push
-# 后同形态不再问)。信任与联网是两个独立授权:沙箱内读取宽泛,若放行即联网,
-# 任何被自动放行的命令都可能把读到的内容外送——这就是默认 prompt 的原因。
-# 子代理派遣(agent 工具)声明 network=true 时同受本设置约束:never 直接拒,
-# always 免网络审批;获授子代理的白名单命令 egress 常开(其审批无人在环,
-# 逐条声明保护不了任何东西)。联网原生工具(fetch_url / web_search)本身就是
-# egress:never 下同样直接拒,prompt / always 下照常转人工审批。
-#   prompt  声明 → 审批(默认)
-#   always  所有沙箱命令直接带网(回到旧行为,零打扰;只在全局层生效)
-#   never   声明联网的命令、联网派遣、web 工具一律直接拒绝
+# Network authorization for shell/job commands. Commands always run inside the
+# OS sandbox and have no network by default (port binding included). When the
+# model judges that a command needs the network it declares network=true in the
+# arguments, and that declaration forces a human approval — the panel says the
+# command is requesting network access, and "remember for this session" is keyed
+# on the command identity, so a second `git push` of the same shape stops
+# asking.
+#
+# Trust and egress are two separate grants. Reads inside the sandbox stay broad,
+# so if auto-approval also opened the network, any auto-approved command could
+# send out whatever it had read. That is why the default is to ask.
+#
+# Sub-agent dispatches (the agent tool) declaring network=true are bound by this
+# setting too: "never" refuses them outright, "always" makes the egress prompt
+# unnecessary. An authorized child gets ambient egress for its allow-listed
+# commands — its own approvals have nobody in the loop, so a per-call
+# declaration there would protect nothing. The network-native tools (fetch_url,
+# web_search) ARE egress by definition: "never" refuses them as well, while
+# "prompt" and "always" route them through the ordinary human approval.
+#
+#   prompt  a declaration goes to a human (the default)
+#   always  every sandboxed command gets the network, no prompt (the old
+#           coupled behaviour; only the global layer may set it)
+#   never   declaring commands, networked dispatches and the web tools are all
+#           refused outright
 # network = "prompt"
 
 [cost]
-# 成本展示货币：cny / usd。
+# Display currency for costs: cny or usd.
 # currency = "cny"
 
-# auto 模式下成本优先（倾向 Flash）。
+# Prefer cheaper routing (lean towards Flash) in auto mode.
 # auto_cost_saving = false
 
 [lsp]
-# 编辑后 LSP 诊断总开关。开启时,写文件/改补丁后会拉起对应语言服务器取一次
-# 诊断并把错误随工具结果回给模型;关掉则完全不启动语言服务器(需要的语言
-# 服务器没装、或不想让它跑时用)。轮询间隔与条数上限是常量,不可配。
+# Master switch for post-edit LSP diagnostics. When on, writing a file or
+# applying a patch starts the matching language server, collects one round of
+# diagnostics, and returns the errors to the model alongside the tool result.
+# When off, no language server is ever started — useful when the server is not
+# installed, or when you would rather it did not run. The poll interval and the
+# per-round cap are constants, not settings.
 # enabled = true
 
 [context]
-# 触发压缩的 token 阈值（默认按模型上下文窗口计算，一般无需设置）。
+# Token threshold that triggers compaction. Derived from the model's context
+# window by default, so this rarely needs setting.
 # compaction_threshold = 800000
 
 [approval]
-# 预先放行的工具全名（精确匹配，不是前缀）：命中的受审批工具直接执行
-# （事件流中仍留 approval_resolved 审计记录）。策略硬拒绝不受影响。
-# 之所以不做前缀匹配：常备同意不该被拉伸——"w" 会同时盖住 write_file 与
-# web_search，未来新增的同前缀工具也会未经任何人决定就带着放行上线。
-# 安全说明：本节只在环境变量(DEEP_CODE_APPROVAL_AUTO_ALLOW，逗号分隔)
-# 或全局配置中生效；项目 .deep-code/config.toml 中的本节会被忽略并警告，
-# 防止恶意仓库静默解除审批门。
-# 注意：放行是整个工具的常备同意，连带跳过 [sandbox] network 的逐条联网
-# 审批——配了 "shell" 后，声明 network=true 的命令会直接带网执行不再询问。
-# 想要零打扰联网请用 [sandbox] network = "always"，而不是放行整个 shell。
-# 唯一的例外：request_write_root（模型申请可写根）不受本节影响，命中全名
-# 也照样弹审批——扩大写边界是一次只能由人做的决定，不存在常备同意。
-# 只对"本来就要审批"的工具有意义：read_file / list_dir / grep_files 归类为
-# 只读与检索，本就不过审批门，写进来是个 no-op（也不会有警告，因为它们确实
-# 挂载了）。下面的示例用真正受审批的工具。
+# Tool names pre-cleared from approval, matched in full (not as a prefix): a
+# gated tool named here runs straight away, and the event stream still carries
+# an approval_resolved record for the audit trail. Policy hard-denials are
+# unaffected.
+#
+# Why full names rather than prefixes: standing consent must not stretch. A rule
+# of "w" would cover write_file and web_search at once, and a tool added later
+# whose name extends an existing entry would ship pre-approved without anyone
+# deciding that.
+#
+# Security: this section only takes effect from the environment
+# (DEEP_CODE_APPROVAL_AUTO_ALLOW, comma-separated) or the global config. In a
+# project .deep-code/config.toml it is ignored with a warning, so a hostile repo
+# cannot quietly lift the approval gate.
+#
+# Note that clearing a tool is standing consent to the WHOLE tool, which
+# includes skipping the per-call network approval described under [sandbox]:
+# clear "shell" and a command declaring network=true runs with egress, unasked.
+# If what you want is undisturbed networking, set the sandbox network mode to
+# "always" instead of clearing all of shell.
+#
+# One exception: request_write_root (the model asking for a writable root) is
+# never covered here. Naming it in full still raises the prompt — widening the
+# write boundary is a decision only a human makes, and there is no standing
+# consent for it.
+#
+# Only meaningful for tools that would otherwise be gated. read_file, list_dir
+# and grep_files are read-only and never reach the approval gate, so listing
+# them is a no-op (and warns about nothing, because those tools do exist). The
+# example below uses tools that really are gated.
 # auto_allow = ["write_file", "apply_patch"]
 
-# 权限模式:启动时的审批档位。
-# default(每次询问)| accept_edits(自动放行工作区内编辑)| auto(AI 判断)| yolo(除写根申请外全放开)。
-# 项目配置只能比全局更严(例如全局 auto、项目 default),升档一律忽略;auto/yolo 只能来自全局配置
-# (防止恶意仓库静默解除审批门)。
-# 注意 yolo 不是字面意义的"全放开":request_write_root 在任何档位都要弹审批。
-# yolo 下沙箱命令 egress 常开(声明制在无人在环时拦不住恶意、只坑忘声明的);
-# [sandbox] network = "never" 在 yolo 下依然绝对。
-# 运行时按 Shift+Tab 循环切换。
-# auto 档的边界(有意取舍):AI 判官只读取命令与参数文本,不读取待写入的
-# 文件内容——write_file/apply_patch 的实质内容不经判官审阅(高风险档、联网
-# 声明与离线后端仍然硬性转人工)。在意这条边界就用 default/accept_edits。
+# Permission tier at startup:
+#   default       ask every time
+#   accept_edits  auto-approve edits inside the workspace
+#   auto          the classifier decides what is left
+#   yolo          everything except a write-root request
 #
-# 另一条硬规则(不可配):命令文本里出现 > < ` $ { } ( ) * ? [ ] 任一字符(重定向、
-# 命令替换、变量/花括号/glob 展开、子 shell)就一律转人工审批,不进任何自动放行面。
-# 所以 `echo $HOME`、`mkdir -p src/$MOD`、`cp a "$HOME/b"`、`rm *.log` 这类即使在
-# accept_edits/auto 档也会问一次——间接形态没法靠静态解析看清最终行为,交由人眼是
-# 有意的保守取舍。按拼写指向工作目录之外的操作数(`/…`、`~/…`、`../…`)同样不进
-# 自动放行面:`git diff /dev/null ~/.ssh/id_rsa` 会问,`git diff main..HEAD` 不会。
-# 免审执行的命令(信任表命中、会话记住的身份、accept_edits 的文件操作)不经 shell,
-# 按策略解析出的词直接 execve;`&&`/`;`/换行由 deep-code 顺序执行,管道与后台 `&`
-# 要问人。只有人工按文本批准的命令才走 `sh -c`。
+# A project config may only be stricter than the global one (global auto with
+# project default, say); stepping up is always ignored, and auto/yolo may come
+# only from the global config, so a hostile repo cannot lift the gate.
+#
+# "yolo" is not literally everything: request_write_root prompts at every tier.
+# Under yolo, sandboxed commands get ambient egress — with nobody in the loop, a
+# declaration-based prompt stops no attacker and only strands honest undeclared
+# commands offline. A sandbox network mode of "never" stays absolute even there.
+#
+# Shift+Tab cycles the tier at runtime.
+#
+# A deliberate limit of the auto tier: the classifier reads the command and its
+# argument text only, never the content about to be written — so what
+# write_file/apply_patch actually put on disk is not reviewed by it. (The top
+# risk tier, a network declaration and an offline backend still force a human.)
+# If that boundary matters to you, stay on default or accept_edits.
+#
+# One more rule, and it is not configurable: a command whose text carries any of
+# > < ` $ { } ( ) * ? [ ] — redirection, command substitution, variable, brace
+# or glob expansion, a subshell — always goes to a human and enters no
+# auto-approval path at all. So `echo $HOME`, `mkdir -p src/$MOD`,
+# `cp a "$HOME/b"` and `rm *.log` ask once even under accept_edits or auto:
+# an indirect form cannot be read statically for what it will finally do, and
+# handing it to a person is the deliberate conservative choice. An operand that
+# points outside the working directory by its spelling (`/...`, `~/...`,
+# `../...`) is excluded the same way: `git diff /dev/null ~/.ssh/id_rsa` asks,
+# `git diff main..HEAD` does not.
+#
+# A command that runs without a prompt (a trust-list hit, an identity remembered
+# for the session, an accept_edits file operation) never reaches a shell: the
+# words the policy parsed are execve'd directly, and `&&`, `;` and newlines are
+# sequenced by deep-code itself, while pipes and a background `&` ask. Only a
+# command a human approved as text goes through `sh -c`.
 # default_mode = "default"
 
 [stream]
-# 首内容到达前的透明重试次数。
+# Transparent retries before the first content arrives.
 # max_retries = 3
 
-# 连续无数据的卡顿超时（秒）。
+# Stall timeout in seconds with no data at all.
 # chunk_timeout_secs = 300
 
-# 单次流式响应总时长上限（秒）。
+# Total wall-clock ceiling for one streamed response, in seconds.
 # total_timeout_secs = 900
 
-# 累计内容体积上限（字节）。
+# Cumulative response body ceiling, in bytes.
 # max_bytes = 52428800
 
 [ui]
-# 界面语言：auto（跟随系统 LANG/LC_ALL）| zh | en。
-# 环境变量 DEEP_CODE_LANG 优先级最高；也可在 TUI 内用 /lang 切换并持久化。
+# Interface language: auto (follows the system LANG/LC_ALL), zh, or en.
+# DEEP_CODE_LANG outranks this; /lang switches and persists it from the TUI.
 # language = "auto"
