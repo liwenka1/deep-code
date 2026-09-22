@@ -2,13 +2,14 @@ use std::collections::{HashMap, VecDeque};
 
 use tokio::sync::mpsc;
 
-use crate::compaction::{estimate_token_count, stable_prefix_fingerprint};
+use crate::compaction::estimate_token_count;
 use crate::event::AgentEvent;
 use crate::model::{ChatRequest, Usage};
 use crate::model_registry::{DEEPSEEK_V4_PRO, context_window_for_model};
 use crate::model_route::{RouteContext, resolve_turn_route};
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, ToolCallId, emit};
+use crate::runtime::telemetry::probe_prefix;
 use crate::runtime::tool_result::{BatchOutcome, runtime_error_from_tool_error, tool_call_payload};
 use crate::tool::ToolCallAccumulator;
 
@@ -152,11 +153,15 @@ impl AgentRuntime {
                 // compaction event already emitted; continue with trimmed history
             }
 
-            let (messages, prefix_hash) = {
+            // Probed here, under the same lock that reads the transcript,
+            // because this is the only place the exact wire messages of a
+            // request exist next to what the previous turn sent. The last
+            // iteration's probe is the one the telemetry reports.
+            let (messages, prefix) = {
                 let state = self.state.lock().await;
                 let messages = state.session.wire_messages();
-                let prefix_hash = stable_prefix_fingerprint(&messages);
-                (messages, prefix_hash)
+                let prefix = probe_prefix(&messages, state.last_prefix);
+                (messages, prefix)
             };
 
             let estimated_context_tokens = estimate_token_count(&messages);
@@ -357,7 +362,7 @@ impl AgentRuntime {
                     .build_turn_telemetry(
                         &route,
                         usage.as_ref(),
-                        prefix_hash,
+                        prefix,
                         estimated_context_tokens,
                         stream_retries,
                     )

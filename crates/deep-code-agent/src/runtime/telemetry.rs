@@ -1,6 +1,10 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use serde::{Deserialize, Serialize};
 
 use crate::compaction::{context_usage_percent, effective_compaction_threshold};
+use crate::message::Message;
 use crate::model::Usage;
 use crate::model_registry::context_window_for_model;
 use crate::model_route::TurnRoute;
@@ -15,6 +19,68 @@ pub enum PrefixStatus {
     FirstTurn,
     Stable,
     Changed,
+}
+
+/// What this request's wire messages say about the prompt prefix the previous
+/// turn left in the provider's cache, and what the next turn compares against.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct PrefixProbe {
+    pub(super) status: PrefixStatus,
+    /// This request's own `(message count, fingerprint)`, carried into state so
+    /// the next turn can ask whether it is still a prefix.
+    carried: (usize, u64),
+}
+
+/// Fingerprint an exact run of wire messages.
+///
+/// Every field that reaches the provider, because the question this answers is
+/// "are these the same bytes": role, content, the reasoning replay, the tool
+/// call id, and each tool call's id/name/arguments. Hashing `role:content`
+/// alone (as this used to) gave two histories differing only in their tool
+/// calls the same fingerprint.
+fn fingerprint(messages: &[Message]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for message in messages {
+        message.role.as_str().hash(&mut hasher);
+        message.content.hash(&mut hasher);
+        message.reasoning_content.hash(&mut hasher);
+        message.tool_call_id.hash(&mut hasher);
+        for call in &message.tool_calls {
+            call.id.hash(&mut hasher);
+            call.function.name.hash(&mut hasher);
+            call.function.arguments.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+/// Whether `messages` still opens with the exact run the previous turn sent.
+///
+/// The comparison is anchored on the previous request's LENGTH, and that is the
+/// whole of the fix. The old fingerprint hashed `messages[..len - 1]` of
+/// whatever it was handed and compared those across turns — but a turn appends
+/// to the transcript, so turn N hashed `[sys, u1]` and turn N+1 hashed
+/// `[sys, u1, a1, u2]`, which can never be equal. `Stable` was therefore
+/// unreachable after the first turn and `/status` read "prefix changed" on
+/// every single turn, including the ideal append-only case the rest of this
+/// crate works hard to preserve (`appending_entries_preserves_wire_prefix`
+/// asserts exactly that invariant). Remembering how many messages went out is
+/// what turns "did it change?" into a question with a true answer.
+pub(super) fn probe_prefix(messages: &[Message], prior: Option<(usize, u64)>) -> PrefixProbe {
+    let status = match prior {
+        None => PrefixStatus::FirstTurn,
+        Some((len, hash)) if messages.len() >= len && fingerprint(&messages[..len]) == hash => {
+            PrefixStatus::Stable
+        }
+        // Includes every real prefix rewrite: a compaction (which replaces the
+        // history with a shorter, different one) reports `Changed` on its own,
+        // with no separate reset to remember to perform.
+        Some(_) => PrefixStatus::Changed,
+    };
+    PrefixProbe {
+        status,
+        carried: (messages.len(), fingerprint(messages)),
+    }
 }
 
 /// One turn's telemetry snapshot: routing, token/cache counts, cost, and
@@ -89,7 +155,7 @@ impl AgentRuntime {
         &self,
         route: &TurnRoute,
         usage: Option<&Usage>,
-        prefix_hash: u64,
+        prefix: PrefixProbe,
         estimated_context_tokens: u32,
         stream_retries: u32,
     ) -> TurnTelemetry {
@@ -98,7 +164,6 @@ impl AgentRuntime {
         // per-request accumulators filled by `accumulate_request_usage`.
         let usage = usage.cloned().unwrap_or_default();
         let (
-            prior_hash,
             turn_cost,
             turn_cache_hit_tokens,
             turn_cache_miss_tokens,
@@ -109,10 +174,8 @@ impl AgentRuntime {
             cascade_triggered,
         ) = {
             let mut state = self.state.lock().await;
-            let prior_hash = state.last_prefix_hash;
-            state.last_prefix_hash = Some(prefix_hash);
+            state.last_prefix = Some(prefix.carried);
             (
-                prior_hash,
                 state.turn_cost,
                 state.turn_cache_hit_tokens,
                 state.turn_cache_miss_tokens,
@@ -122,11 +185,6 @@ impl AgentRuntime {
                 state.session_cache_savings,
                 state.cascade_triggered_this_turn,
             )
-        };
-        let prefix_status = match prior_hash {
-            None => PrefixStatus::FirstTurn,
-            Some(previous) if previous == prefix_hash => PrefixStatus::Stable,
-            Some(_) => PrefixStatus::Changed,
         };
         let estimated_context_tokens = usage.input_tokens().max(estimated_context_tokens);
         let context_window = context_window_for_model(&route.effective_model);
@@ -150,7 +208,7 @@ impl AgentRuntime {
             session_cache_hit_tokens,
             session_cache_miss_tokens,
             session_cache_savings,
-            prefix_status,
+            prefix_status: prefix.status,
             route_reason: route.route_reason.clone(),
             route_source: route.source.label().to_string(),
             cascade_triggered,

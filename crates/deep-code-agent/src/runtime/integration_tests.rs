@@ -1612,6 +1612,101 @@ async fn checkpoint_metadata_is_capped_like_the_snapshot_store() {
     }
 }
 
+/// The prompt-prefix indicator must read "stable" in the case the rest of this
+/// crate works to guarantee: appending a turn leaves every earlier wire message
+/// byte-identical (`appending_entries_preserves_wire_prefix` pins that), so the
+/// provider's cache keeps hitting. The old fingerprint hashed
+/// `messages[..len - 1]` and compared turn N's against turn N+1's — two
+/// different-length histories, never equal — so `Stable` was unreachable and
+/// `/status` said "prefix changed" on every turn after the first.
+#[tokio::test]
+async fn an_appended_turn_reports_a_stable_prefix() {
+    let turn = || {
+        vec![
+            AgentEvent::TextDelta {
+                text: "ok".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ]
+    };
+    let client = ScriptedClient::new(vec![turn(), turn(), turn()]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::default());
+
+    let mut seen = Vec::new();
+    for prompt in ["one", "two", "three"] {
+        let mut rx = runtime.submit_user(prompt).await;
+        for event in drain(&mut rx).await {
+            if let RuntimeEvent::TurnFinished {
+                telemetry: Some(telemetry),
+                ..
+            } = event
+            {
+                seen.push(telemetry.prefix_status);
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![
+            PrefixStatus::FirstTurn,
+            PrefixStatus::Stable,
+            PrefixStatus::Stable
+        ]
+    );
+}
+
+/// And it must still say `Changed` when the prefix really is rewritten.
+/// Compaction is the one thing in the runtime that does that, and it no longer
+/// needs a reset of its own to be reported honestly.
+#[tokio::test]
+async fn a_compacted_prefix_reports_changed() {
+    let turn = || {
+        vec![
+            AgentEvent::TextDelta {
+                text: "ok".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ]
+    };
+    const TURNS: usize = 8;
+    let client = ScriptedClient::new((0..TURNS).map(|_| turn()).collect());
+    let mut config = crate::config::AgentConfig::builtin();
+    // Low enough that compaction fires as soon as there are enough entries to
+    // archive (`compact_entries` keeps a five-entry tail, so that takes a few
+    // turns however low the threshold is).
+    config.compaction_threshold = Some(1);
+    let runtime = AgentRuntime::with_config(client, ToolRegistry::default(), config);
+
+    let mut compacted_turns = 0usize;
+    for index in 0..TURNS {
+        let mut rx = runtime.submit_user(format!("prompt {index}")).await;
+        let mut compacted = false;
+        let mut status = None;
+        for event in drain(&mut rx).await {
+            match event {
+                RuntimeEvent::CompactionApplied { .. } => compacted = true,
+                RuntimeEvent::TurnFinished {
+                    telemetry: Some(telemetry),
+                    ..
+                } => status = Some(telemetry.prefix_status),
+                _ => {}
+            }
+        }
+        if compacted {
+            compacted_turns += 1;
+            assert_eq!(
+                status,
+                Some(PrefixStatus::Changed),
+                "turn {index} rewrote the prefix and must not report it as stable"
+            );
+        }
+    }
+    assert!(
+        compacted_turns > 0,
+        "the scenario never compacted, so it proves nothing"
+    );
+}
+
 #[tokio::test]
 async fn submit_approval_without_pending_emits_error() {
     let client = ScriptedClient::new(vec![]);

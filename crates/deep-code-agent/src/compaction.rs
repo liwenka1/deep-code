@@ -1,7 +1,5 @@
 //! Basic transcript compaction for long DeepSeek sessions.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::message::{Message, Role};
@@ -97,16 +95,6 @@ fn is_cjk(ch: char) -> bool {
 pub fn should_compact(model: &str, messages: &[Message], override_tokens: Option<u32>) -> bool {
     let threshold = effective_compaction_threshold(model, override_tokens);
     estimate_token_count(messages) >= threshold
-}
-
-#[must_use]
-pub fn stable_prefix_fingerprint(messages: &[Message]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    let end = messages.len().saturating_sub(1);
-    for message in &messages[..end] {
-        format!("{}:{}", message.role.as_str(), message.content).hash(&mut hasher);
-    }
-    hasher.finish()
 }
 
 /// Keep the leading system entry, summarize archived middle entries into one
@@ -408,23 +396,5 @@ mod tests {
         messages.push(Message::user("x".repeat(400)));
         assert!(!should_compact(DEEPSEEK_V4_PRO, &messages, None));
         assert!(should_compact(DEEPSEEK_V4_PRO, &messages, Some(50)));
-    }
-
-    #[test]
-    fn prefix_fingerprint_ignores_last_message() {
-        let first = vec![
-            Message::system("sys"),
-            Message::user("one"),
-            Message::user("two"),
-        ];
-        let second = vec![
-            Message::system("sys"),
-            Message::user("one"),
-            Message::user("three"),
-        ];
-        assert_eq!(
-            stable_prefix_fingerprint(&first),
-            stable_prefix_fingerprint(&second)
-        );
     }
 }

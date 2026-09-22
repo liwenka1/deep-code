@@ -19,7 +19,12 @@ pub(super) struct RuntimeState {
     pub(super) session: Session,
     pub(super) pending: Option<PendingToolBatch>,
     pub(super) current_turn: Option<TurnRecord>,
-    pub(super) last_prefix_hash: Option<u64>,
+    /// The `(message count, fingerprint)` of the last request this session
+    /// sent, so the next turn can ask whether its own wire messages still open
+    /// with that exact run — see `telemetry::probe_prefix`. The count is the
+    /// half that was missing: without it the comparison could only ever hash
+    /// two different-length histories against each other and answer "changed".
+    pub(super) last_prefix: Option<(usize, u64)>,
     pub(super) session_cost: CostEstimate,
     /// This turn's cost/cache totals, accumulated request-by-request at each
     /// stream `Done` (a multi-tool turn makes several requests; pricing only

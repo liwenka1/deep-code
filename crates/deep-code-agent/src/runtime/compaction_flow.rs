@@ -27,7 +27,11 @@ impl AgentRuntime {
         let compacted = {
             let mut state = self.state.lock().await;
             state.session.replace_entries(result.entries.clone());
-            state.last_prefix_hash = None;
+            // No prefix reset here. Compaction replaces the history with a
+            // shorter, different one, so `telemetry::probe_prefix` reports
+            // `Changed` on its own — which is also the accurate label, where
+            // the reset used to make the turn after a compaction read
+            // `FirstTurn`.
             state.session.entries().to_vec()
         };
         if let Some(persistence) = self.persistence.as_ref() {
