@@ -115,29 +115,21 @@ fn calculate_with_pricing(pricing: &ModelPricingMeta, usage: &Usage) -> CostEsti
     let accounted = hit.saturating_add(miss);
     let uncategorized = input.saturating_sub(accounted);
     let miss_total = miss.saturating_add(uncategorized);
-    // Reasoning tokens are NOT added to `output`. Every OpenAI-compatible
-    // provider, DeepSeek included, counts the chain-of-thought inside
-    // `completion_tokens` and bills it at the output rate — so adding
-    // `reasoning_tokens` on top charged the same tokens twice.
-    //
-    // It survived because it could not fire: [`Usage`] models a FLAT
-    // `reasoning_tokens` key, while the wire nests the count under
-    // `completion_tokens_details`, so the field never deserializes to `Some`
-    // and no code anywhere sets it. That made this a bug waiting on a schema
-    // change rather than a live overcharge — and a silent one, because the
-    // only signal would have been a bill that did not match `/status`.
-    // `reasoning_tokens_are_already_inside_completion_tokens` pins the
-    // decision so a future provider that does send the flat key gets the right
-    // answer instead of re-opening it.
-    let effective_output = output;
-
+    // `output` is `completion_tokens` and nothing else. Every
+    // OpenAI-compatible provider, DeepSeek included, counts the
+    // chain-of-thought INSIDE `completion_tokens` and bills it at the output
+    // rate, so adding [`Usage::reasoning_tokens`] on top — as this used to —
+    // charged the same tokens twice. The rebinding that marked the removal is
+    // gone; the decision lives in the field's own doc and in
+    // `reasoning_tokens_are_already_inside_completion_tokens`, which is what a
+    // provider that starts sending the flat key has to argue with.
     CostEstimate {
         usd: tier_cost(hit, pricing.input_hit_usd)
             + tier_cost(miss_total, pricing.input_miss_usd)
-            + tier_cost(effective_output, pricing.output_usd),
+            + tier_cost(output, pricing.output_usd),
         cny: tier_cost(hit, pricing.input_hit_cny)
             + tier_cost(miss_total, pricing.input_miss_cny)
-            + tier_cost(effective_output, pricing.output_cny),
+            + tier_cost(output, pricing.output_cny),
     }
 }
 

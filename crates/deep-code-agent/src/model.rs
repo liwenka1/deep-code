@@ -127,6 +127,14 @@ pub struct Usage {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
+    /// Reasoning tokens, as a FLAT key. Deliberately never read by the cost
+    /// math and, today, never populated: DeepSeek nests the count under
+    /// `completion_tokens_details` and already counts it inside
+    /// `completion_tokens`. The field stays as the seam a provider sending the
+    /// flat spelling would land in, and as the input
+    /// `reasoning_tokens_are_already_inside_completion_tokens` uses to pin that
+    /// such a provider must still not have it billed twice. Adding it to
+    /// `output` is the bug; leaving it unread is the fix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
