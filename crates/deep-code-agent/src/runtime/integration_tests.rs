@@ -1550,6 +1550,68 @@ async fn persistent_runtime_records_checkpoint_metadata() {
     );
 }
 
+/// The session's checkpoint metadata is capped at the same number of entries
+/// the disk store keeps. It used to grow without bound, so every session longer
+/// than the cap carried records for snapshots `prune_old_snapshots` had already
+/// deleted — and `hydrate_history` renders each of those on resume with a
+/// `/restore <id>` hint that can only fail.
+#[tokio::test]
+async fn checkpoint_metadata_is_capped_like_the_snapshot_store() {
+    let workspace = tempfile::tempdir().unwrap();
+    let turn = || {
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ]
+    };
+    let client = ScriptedClient::new(vec![turn(), turn(), turn(), turn()]);
+    let mut config = crate::config::AgentConfig::builtin();
+    config.checkpoint_max_snapshots = 2;
+    let runtime = AgentRuntime::with_new_session(
+        client,
+        ToolRegistry::default(),
+        "system",
+        workspace.path(),
+        &config,
+    )
+    .unwrap()
+    .with_checkpoints(workspace.path(), &mut Vec::new());
+    let session_id = runtime.session_id().await.expect("session id");
+
+    for prompt in ["one", "two", "three", "four"] {
+        let mut rx = runtime.submit_user(prompt).await;
+        drain(&mut rx).await;
+    }
+    runtime.shutdown().await;
+
+    let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let record = store.load(&session_id).unwrap();
+    assert_eq!(
+        record.checkpoints.len(),
+        2,
+        "metadata must track the snapshot cap, got {:?}",
+        record
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.id.0.as_str())
+            .collect::<Vec<_>>()
+    );
+    // And it kept the NEWEST two — the ones still on disk.
+    let on_disk = crate::checkpoint::CheckpointStore::new(workspace.path())
+        .unwrap()
+        .list()
+        .unwrap();
+    for checkpoint in &record.checkpoints {
+        assert!(
+            on_disk.contains(&checkpoint.id),
+            "{} is recorded but no longer on disk",
+            checkpoint.id.0
+        );
+    }
+}
+
 #[tokio::test]
 async fn submit_approval_without_pending_emits_error() {
     let client = ScriptedClient::new(vec![]);

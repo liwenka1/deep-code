@@ -189,19 +189,48 @@ impl HistoryCell {
     }
 }
 
+/// Rebuild the transcript of a resumed session.
+///
+/// Turns are identified by their user entry, and each one closes with the
+/// checkpoints taken inside it. The subtlety is which `record.turns` entry a
+/// user entry belongs to: `turns` is append-only for the life of the session
+/// while `entries` is TRIMMED by compaction, so the two line up at their END,
+/// never at their start. Counting user entries from the front — as this used to
+/// — made a compacted session render the session's OLDEST checkpoints against
+/// its NEWEST turns. The ids printed were the ones the snapshot cap had long
+/// since pruned from disk, each carrying a `/restore <id>` hint that either
+/// failed outright or, while the snapshot still existed, rewound the workspace
+/// to the start of the session instead of to the turn it was printed beside.
+/// Anchoring at the end is right whether or not a compaction ever happened.
 pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
+    let user_entries = record
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.kind, EntryKind::User { .. }))
+        .count();
+    // Saturating: a session interrupted mid-turn has one more user entry than
+    // it has finished turn records, and that trailing turn simply has no record
+    // to key off (`append_turn_checkpoints` returns early for it).
+    let turn_offset = record.turns.len().saturating_sub(user_entries);
+
     let mut cells = Vec::new();
-    let mut turn_index = 0usize;
-    let mut current_turn = Vec::new();
+    let mut current_turn: Vec<HistoryCell> = Vec::new();
+    // Which turn (0-based among the user entries present) is open, if any.
+    let mut open_turn: Option<usize> = None;
+    let mut next_turn = 0usize;
 
     for entry in &record.entries {
         match &entry.kind {
             EntryKind::User { content } => {
-                if !current_turn.is_empty() {
-                    cells.append(&mut current_turn);
-                    append_turn_checkpoints(&mut cells, record, turn_index);
-                    turn_index += 1;
+                // Close the turn this entry ends. Cells accumulated before the
+                // FIRST user entry — a compaction banner heading the retained
+                // tail — belong to no turn and are emitted without checkpoints.
+                cells.append(&mut current_turn);
+                if let Some(index) = open_turn {
+                    append_turn_checkpoints(&mut cells, record, turn_offset + index);
                 }
+                open_turn = Some(next_turn);
+                next_turn += 1;
                 current_turn.push(HistoryCell::user(content.clone()));
             }
             EntryKind::System { .. } => {}
@@ -246,9 +275,9 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
             }
         }
     }
-    if !current_turn.is_empty() {
-        cells.extend(current_turn);
-        append_turn_checkpoints(&mut cells, record, turn_index);
+    cells.append(&mut current_turn);
+    if let Some(index) = open_turn {
+        append_turn_checkpoints(&mut cells, record, turn_offset + index);
     }
 
     cells

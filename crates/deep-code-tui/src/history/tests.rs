@@ -121,6 +121,109 @@ fn hydrate_history_keeps_assistant_tool_calls_and_results() {
     )));
 }
 
+/// Compaction trims `record.entries` and leaves `record.turns` alone, so the
+/// two are aligned only at their end. Counting user entries from the front
+/// rendered the session's oldest checkpoints — the ones the 20-snapshot disk
+/// cap has already deleted — against its newest turns, each with a
+/// `/restore <id>` hint pointing at the wrong snapshot.
+#[test]
+fn hydrate_history_maps_checkpoints_to_turns_after_compaction() {
+    let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "sys");
+    // A session that ran five turns and was then compacted: only the last two
+    // turns' entries survive, behind the compaction banner.
+    record
+        .entries
+        .push(std::sync::Arc::new(SessionEntry::compaction("older", 6)));
+    for index in 3..5 {
+        record
+            .entries
+            .push(std::sync::Arc::new(SessionEntry::user(format!("u{index}"))));
+        record
+            .entries
+            .push(std::sync::Arc::new(SessionEntry::assistant(
+                format!("a{index}"),
+                None,
+                Vec::new(),
+            )));
+    }
+    for index in 0..5u64 {
+        let mut turn = deep_code_agent::TurnRecord::new();
+        turn.started_at_ms = 10 * (index + 1);
+        record.turns.push(turn);
+        let mut checkpoint = deep_code_agent::CheckpointRecord::new(
+            deep_code_agent::CheckpointId(format!("cp_{index}")),
+            "before_turn",
+        );
+        checkpoint.created_at_ms = 10 * (index + 1) + 1;
+        record.checkpoints.push(checkpoint);
+    }
+
+    let cells = hydrate_history(&record);
+    let ids: Vec<&str> = cells
+        .iter()
+        .filter_map(|cell| match cell {
+            HistoryCell::Checkpoint { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["cp_3", "cp_4"],
+        "the two retained turns must carry their own checkpoints"
+    );
+    // And they sit inside the turn they belong to, not ahead of it.
+    let position = |needle: &str| {
+        cells
+            .iter()
+            .position(|cell| match cell {
+                HistoryCell::User { text } => text == needle,
+                HistoryCell::Checkpoint { id, .. } => id == needle,
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("{needle} missing"))
+    };
+    assert!(position("u3") < position("cp_3"));
+    assert!(position("cp_3") < position("u4"));
+    assert!(position("u4") < position("cp_4"));
+}
+
+/// The uncompacted case must be unchanged by the end-anchoring: each turn
+/// still closes with the checkpoint taken inside it.
+#[test]
+fn hydrate_history_maps_checkpoints_to_turns_without_compaction() {
+    let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "sys");
+    for index in 0..3u64 {
+        record
+            .entries
+            .push(std::sync::Arc::new(SessionEntry::user(format!("u{index}"))));
+        record
+            .entries
+            .push(std::sync::Arc::new(SessionEntry::assistant(
+                format!("a{index}"),
+                None,
+                Vec::new(),
+            )));
+        let mut turn = deep_code_agent::TurnRecord::new();
+        turn.started_at_ms = 10 * (index + 1);
+        record.turns.push(turn);
+        let mut checkpoint = deep_code_agent::CheckpointRecord::new(
+            deep_code_agent::CheckpointId(format!("cp_{index}")),
+            "before_turn",
+        );
+        checkpoint.created_at_ms = 10 * (index + 1) + 1;
+        record.checkpoints.push(checkpoint);
+    }
+
+    let ids: Vec<String> = hydrate_history(&record)
+        .into_iter()
+        .filter_map(|cell| match cell {
+            HistoryCell::Checkpoint { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec!["cp_0", "cp_1", "cp_2"]);
+}
+
 #[test]
 fn hydrate_history_restores_reasoning_content() {
     let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "");

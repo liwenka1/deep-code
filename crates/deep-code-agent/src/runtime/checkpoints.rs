@@ -105,6 +105,20 @@ impl AgentRuntime {
             // that `/restore` could not list.
             let mut session = persistence.record.lock().await;
             session.checkpoints.push(record);
+            // Same cap the disk store prunes to, in the same direction.
+            // `CheckpointStore::prune_old_snapshots` deletes the oldest
+            // snapshot directories beyond `max_snapshots`; this list did not,
+            // so a session longer than the cap accumulated metadata for
+            // snapshots that no longer exist — and `hydrate_history` renders
+            // every one of them on resume with a `/restore <id>` hint that can
+            // only fail. Push-only and id-timestamped, so creation order is
+            // index order and the oldest are at the front. `0` means "keep
+            // everything" on both sides.
+            let cap = self.config.checkpoint_max_snapshots;
+            if cap > 0 && session.checkpoints.len() > cap {
+                let excess = session.checkpoints.len() - cap;
+                session.checkpoints.drain(..excess);
+            }
             session.touch();
         }
         persistence.actor.request_save();
