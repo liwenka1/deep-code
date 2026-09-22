@@ -8,7 +8,15 @@ use crate::tool::ToolResultStatus;
 /// Synthetic wire content for a tool call whose result never arrived — the
 /// session was interrupted between the assistant's `tool_calls` and the tool
 /// executing. Synthesized at wire derivation, never stored.
-pub(crate) const INTERRUPTED_TOOL_RESULT: &str = "工具调用未完成：会话在执行前被中断。";
+///
+/// Bilingual like every other model-facing string this crate writes
+/// (`[会话摘要 / session summary]`, `工具 / tool`, `运行环境 / Environment`).
+/// It was missed by the pass that fixed the compaction role labels, which is
+/// easy to do — it is the one such string with no `tr` call and no language
+/// pack entry anywhere near it, and it only ever appears in a session that was
+/// interrupted.
+pub(crate) const INTERRUPTED_TOOL_RESULT: &str = "工具调用未完成：会话在执行前被中断。/ Tool call did not complete: \
+     the session was interrupted before it ran.";
 
 /// Marker prefixing the derived compaction-summary system message. Shared
 /// with the wire→entry grouping so summaries round-trip into
@@ -249,6 +257,22 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         }
+    }
+
+    /// Every string this crate puts on the wire for the MODEL carries both
+    /// languages — the summary marker, the compaction role labels, the
+    /// cancellation note. This one is the placeholder a resumed-after-interrupt
+    /// session hands back for a tool call that never ran, and it was the last
+    /// Chinese-only one left.
+    #[test]
+    fn the_interrupted_placeholder_is_bilingual() {
+        assert!(INTERRUPTED_TOOL_RESULT.contains("工具调用未完成"));
+        assert!(
+            INTERRUPTED_TOOL_RESULT.contains("interrupted before it ran"),
+            "{INTERRUPTED_TOOL_RESULT}"
+        );
+        // The line continuation must not leave the join inside the sentence.
+        assert!(!INTERRUPTED_TOOL_RESULT.contains("  "));
     }
 
     #[test]

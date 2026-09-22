@@ -28,7 +28,10 @@ pub fn build_workspace_summary(workspace: &Path, extra_roots: &[std::path::PathB
 
 fn primary_summary(workspace: &Path) -> String {
     let Ok(read_dir) = fs::read_dir(workspace) else {
-        return format!("工作区: {} (不可读)", workspace.display());
+        return format!(
+            "工作区 / workspace: {} (不可读 / unreadable)",
+            workspace.display()
+        );
     };
 
     // Collect → filter → sort → truncate: `read_dir` order is arbitrary, and
@@ -55,7 +58,10 @@ fn primary_summary(workspace: &Path) -> String {
         .collect();
 
     if entries.is_empty() {
-        return format!("工作区: {} (空目录)", workspace.display());
+        return format!(
+            "工作区 / workspace: {} (空目录 / empty)",
+            workspace.display()
+        );
     }
 
     format!(
