@@ -764,19 +764,57 @@ pub fn workspace_root() -> PathBuf {
     })
 }
 
+/// How the JS launcher tells the binary what the user actually typed. See
+/// [`program_name`].
+pub(crate) const PROGRAM_NAME_ENV: &str = "DEEP_CODE_PROGRAM_NAME";
+
 /// The name the user actually invoked us by.
 ///
 /// Distribution makes this necessary: the npm package installs the binary as
 /// `deepcode`, while `cargo build` produces `deep-code`. Hardcoding either one
 /// tells half the users to run a command that does not exist on their machine.
+///
+/// `argv[0]` alone stopped answering the question once the npm package grew a JS
+/// launcher. npm links `deepcode` at `bin/deepcode`, and that launcher spawns
+/// the downloaded binary under the deliberately distinct name `deepcode-bin`
+/// so a download can never clobber the launcher — after which `argv[0]` is
+/// `deepcode-bin`, a command on nobody's PATH, and it went into every usage
+/// line, `--version`, and every "Try `… --help`" error. Those are the first
+/// lines a new user reads. So the launcher passes the name it was invoked as
+/// through [`PROGRAM_NAME_ENV`], and that wins over `argv[0]`; a `cargo`-built
+/// binary sets nothing and keeps reading `argv[0]` exactly as before.
+///
+/// Neither source is under this process's control and both land on a terminal,
+/// so both are neutralized and bounded — a command name is a word, not a
+/// paragraph, and not a cursor-positioning escape.
 pub(crate) fn program_name() -> String {
-    env::args_os()
-        .next()
-        .map(PathBuf::from)
-        .and_then(|path| {
+    resolve_program_name(
+        env::var(PROGRAM_NAME_ENV).ok(),
+        env::args_os().next().map(PathBuf::from).and_then(|path| {
             path.file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
+        }),
+    )
+}
+
+/// [`program_name`]'s rule, against explicit inputs — the same seam
+/// `Lang::resolve` keeps behind `Lang::from_env`, because both answers come out
+/// of the process environment and a test that sets one is a test that races
+/// every other test in the binary.
+fn resolve_program_name(override_name: Option<String>, argv0: Option<String>) -> String {
+    /// Long enough for any real command name, short enough that nothing can
+    /// spend this as a line of its own.
+    const MAX_CHARS: usize = 32;
+    override_name
+        .filter(|name| !name.trim().is_empty())
+        .or(argv0)
+        .map(|name| {
+            deep_code_agent::neutralize_display_text(name.trim())
+                .chars()
+                .take(MAX_CHARS)
+                .collect::<String>()
         })
+        .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "deepcode".to_string())
 }
@@ -825,7 +863,7 @@ fn print_usage() {
 fn print_session_usage() {
     let prog = program_name();
     let workspace = workspace_root();
-    eprintln!("{}", format_sessions_storage_note(&workspace));
+    eprintln!("{}", format_sessions_storage_note(&workspace, &prog));
     eprintln!("Examples:");
     eprintln!("  {prog} session list");
     eprintln!("  {prog} session resume <session_id>");

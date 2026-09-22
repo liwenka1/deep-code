@@ -287,3 +287,63 @@ fn the_help_body_is_english_like_every_other_cli_line() {
     assert!(usage.contains("new session"));
     assert!(usage.contains("--add-dir"));
 }
+
+/// The npm package links `deepcode` and spawns `deepcode-bin`, so argv[0] names
+/// a command that is on nobody's PATH. Every usage line, `--version` and every
+/// "Try `… --help`" error printed it — the first lines a new user reads. The
+/// launcher passes the name it was invoked as; a `cargo`-built binary sets
+/// nothing and keeps reading argv[0].
+#[test]
+fn the_launcher_name_wins_over_the_spawned_binary_name() {
+    assert_eq!(
+        resolve_program_name(
+            Some("deepcode".to_string()),
+            Some("deepcode-bin".to_string())
+        ),
+        "deepcode"
+    );
+    // No override (cargo build, or a direct invocation of the binary).
+    assert_eq!(
+        resolve_program_name(None, Some("deep-code".to_string())),
+        "deep-code"
+    );
+    // An empty or blank override is "not set", not "the empty name".
+    for blank in ["", "   "] {
+        assert_eq!(
+            resolve_program_name(Some(blank.to_string()), Some("deep-code".to_string())),
+            "deep-code"
+        );
+    }
+    // Nothing to go on at all still names the shipped command.
+    assert_eq!(resolve_program_name(None, None), "deepcode");
+}
+
+/// Both sources are outside this process's control and both are printed to a
+/// terminal, so neither may carry an escape sequence or spend more than a word.
+#[test]
+fn the_program_name_is_neutralized_and_bounded() {
+    let painted = resolve_program_name(Some("dee\u{1b}[2Kpcode\r".to_string()), None);
+    assert!(
+        !painted.chars().any(char::is_control),
+        "control characters must not survive: {painted:?}"
+    );
+    let long = resolve_program_name(Some("x".repeat(500)), None);
+    assert!(
+        long.chars().count() <= 32,
+        "got {} chars",
+        long.chars().count()
+    );
+}
+
+/// The sessions storage note is a command-line line like any other, and was the
+/// last one spelling a program name of its own (`deep-code`, which npm users do
+/// not have).
+#[test]
+fn the_sessions_storage_note_names_the_invoked_command() {
+    let note =
+        deep_code_agent::format_sessions_storage_note(std::path::Path::new("/tmp/ws"), "deepcode");
+    assert!(note.contains("run deepcode from the same cwd"), "{note}");
+    // The `.deep-code` storage directory keeps its own spelling; only the
+    // command word follows the invocation.
+    assert!(!note.contains("run deep-code"), "{note}");
+}

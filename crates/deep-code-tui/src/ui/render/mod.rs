@@ -212,6 +212,7 @@ fn render_resume_picker(frame: &mut Frame<'_>, picker: &crate::app::ResumePicker
         .map(|record| {
             neutralize_display_text(&deep_code_agent::format_sessions_storage_note(
                 &record.workspace,
+                &crate::cli::program_name(),
             ))
         })
         .unwrap_or_default();

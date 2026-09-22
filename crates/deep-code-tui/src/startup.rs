@@ -144,7 +144,12 @@ fn run_picker(sessions: &[SessionRecord], lang: Lang) -> Result<StartupChoice> {
     // owns the title above owns this line.
     let note = sessions
         .first()
-        .map(|r| neutralize_display_text(&format_sessions_storage_note(&r.workspace)))
+        .map(|r| {
+            neutralize_display_text(&format_sessions_storage_note(
+                &r.workspace,
+                &crate::cli::program_name(),
+            ))
+        })
         .unwrap_or_default();
     let now = now_ms();
     let mut selected = 0usize;

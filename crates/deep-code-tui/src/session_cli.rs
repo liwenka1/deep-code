@@ -25,7 +25,10 @@ fn open_session_store() -> JsonSessionStore {
 pub fn list() -> anyhow::Result<()> {
     let workspace = workspace_root();
     let store = open_session_store();
-    println!("# {}", format_sessions_storage_note(&workspace));
+    println!(
+        "# {}",
+        format_sessions_storage_note(&workspace, &crate::cli::program_name())
+    );
     let records = store.list()?;
     if records.is_empty() {
         println!("No saved sessions.");

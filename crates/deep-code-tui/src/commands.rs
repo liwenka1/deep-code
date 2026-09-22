@@ -447,7 +447,8 @@ impl App {
                     self.status = self.tr(TextId::NoSavedSessions).to_string();
                 }
                 Ok(records) => {
-                    let note = format_sessions_storage_note(&self.workspace);
+                    let note =
+                        format_sessions_storage_note(&self.workspace, &crate::cli::program_name());
                     self.history.push(HistoryCell::system(format!(
                         "{note}\n{}\n{}",
                         self.tr(TextId::SessionsHeader),

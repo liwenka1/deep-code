@@ -11,12 +11,21 @@
 
 const { spawnSync } = require('node:child_process');
 const { existsSync } = require('node:fs');
-const { join } = require('node:path');
+const { basename, join } = require('node:path');
 
 const binary = join(
   __dirname,
   process.platform === 'win32' ? 'deepcode.exe' : 'deepcode-bin',
 );
+
+// The binary prints its own name in `--help`, `--version`, every usage line and
+// every "Try `… --help`" error, and it reads that name from argv[0]. Spawned
+// from here, argv[0] is `deepcode-bin` — the deliberately distinct download
+// name, which is on nobody's PATH — so the first lines a new user reads told
+// them to run a command that does not exist. This launcher is the only thing
+// that knows the name npm actually linked, so it hands it over. `argv[1]` is
+// this script's own path, which IS that name.
+const invokedAs = basename(process.argv[1] || 'deepcode');
 
 if (!existsSync(binary)) {
   console.error('deepcode: native binary not found.');
@@ -25,7 +34,10 @@ if (!existsSync(binary)) {
   process.exit(1);
 }
 
-const result = spawnSync(binary, process.argv.slice(2), { stdio: 'inherit' });
+const result = spawnSync(binary, process.argv.slice(2), {
+  stdio: 'inherit',
+  env: { ...process.env, DEEP_CODE_PROGRAM_NAME: invokedAs },
+});
 
 if (result.error) {
   console.error(`deepcode: failed to launch binary: ${result.error.message}`);

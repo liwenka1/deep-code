@@ -326,9 +326,15 @@ pub fn sessions_dir_for_workspace(workspace: &Path) -> PathBuf {
 
 /// Human-readable note that sessions are scoped to a workspace directory.
 #[must_use]
-pub fn format_sessions_storage_note(workspace: &Path) -> String {
+/// Where this workspace's sessions live, and how to get back to them.
+///
+/// Takes the invoked program name rather than spelling one. `deep-code` was
+/// hardcoded here while every other command-line line resolved the name
+/// through `cli::program_name` — so this one told npm users (whose command is
+/// `deepcode`) to run something that is not on their PATH.
+pub fn format_sessions_storage_note(workspace: &Path, program: &str) -> String {
     format!(
-        "Sessions are stored under {} (one pool per workspace directory; run deep-code from the same cwd to list or resume).",
+        "Sessions are stored under {} (one pool per workspace directory; run {program} from the same cwd to list or resume).",
         sessions_dir_for_workspace(workspace).display()
     )
 }
