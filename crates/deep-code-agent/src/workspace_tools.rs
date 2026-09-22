@@ -859,7 +859,7 @@ impl ApplyPatchTool {
         })?;
         let display = self.root.relative_display(&path);
 
-        let located = locate_match(&contents, &params.old)
+        let located = locate_match(&contents, &params.old, &params.new)
             .map_err(|error| invalid(Self::NAME, error.message(&display)))?;
 
         // The model writes `new` with LF (that is how `read_file` showed it), so
@@ -970,14 +970,18 @@ fn to_crlf(s: &str) -> String {
 /// Locate `old` in `contents` through a cascade of increasingly tolerant
 /// layers — exact, then indentation-insensitive, then punctuation-normalized —
 /// each requiring a UNIQUE match. Returns the range in the original bytes.
-fn locate_match(contents: &str, old: &str) -> Result<Located, MatchError> {
+///
+/// `new` is read by one rule only ([`realign_partial_indent`]): whether an
+/// exact match that landed partway through a line's indentation may be spliced
+/// where it sits. Nothing else here looks at the replacement text.
+fn locate_match(contents: &str, old: &str, new: &str) -> Result<Located, MatchError> {
     // 1. Exact.
     match contents.matches(old).count() {
         1 => {
-            let start = contents.find(old).expect("counted one match");
+            let found = contents.find(old).expect("counted one match");
             return Ok(Located {
-                start,
-                end: start + old.len(),
+                start: realign_partial_indent(contents, found, old, new),
+                end: found + old.len(),
                 kind: MatchKind::Exact,
             });
         }
@@ -1003,10 +1007,10 @@ fn locate_match(contents: &str, old: &str) -> Result<Located, MatchError> {
         let crlf_old = to_crlf(old);
         match contents.matches(&crlf_old).count() {
             1 => {
-                let start = contents.find(&crlf_old).expect("counted one match");
+                let found = contents.find(&crlf_old).expect("counted one match");
                 return Ok(Located {
-                    start,
-                    end: start + crlf_old.len(),
+                    start: realign_partial_indent(contents, found, &crlf_old, new),
+                    end: found + crlf_old.len(),
                     kind: MatchKind::Exact,
                 });
             }
@@ -1025,7 +1029,7 @@ fn locate_match(contents: &str, old: &str) -> Result<Located, MatchError> {
     //    supply the replacement's indentation.
     let (hay_indent, indent_map) = strip_leading_ws_with_map(contents);
     let needle_indent = strip_leading_ws_with_map(old).0;
-    match unique_range(&hay_indent, &indent_map, &needle_indent) {
+    match unique_range(contents, &hay_indent, &indent_map, &needle_indent) {
         Ok((start, end)) => {
             return Ok(Located {
                 start: expand_to_line_start(contents, start),
@@ -1046,7 +1050,7 @@ fn locate_match(contents: &str, old: &str) -> Result<Located, MatchError> {
     //    ASCII on both sides, then require a unique match.
     let (hay_punct, punct_map) = normalize_punct_with_map(contents);
     let needle_punct = normalize_punct_with_map(old).0;
-    match unique_range(&hay_punct, &punct_map, &needle_punct) {
+    match unique_range(contents, &hay_punct, &punct_map, &needle_punct) {
         Ok((start, end)) => Ok(Located {
             start,
             end,
@@ -1061,10 +1065,34 @@ fn locate_match(contents: &str, old: &str) -> Result<Located, MatchError> {
 }
 
 /// Find the unique occurrence of `needle` in the normalized `hay` and map its
-/// bounds back to original byte offsets via `map` (`map[i]` = original offset of
-/// normalized byte `i`, with a terminal entry for the end). `Err(None)` means no
-/// match, `Err(Some(n))` means `n > 1` ambiguous matches.
-fn unique_range(hay: &str, map: &[usize], needle: &str) -> Result<(usize, usize), Option<usize>> {
+/// bounds back into `original` via `map` (`map[i]` = the original offset of the
+/// character behind normalized byte `i`, with a terminal entry for the end).
+/// `Err(None)` means no match, `Err(Some(n))` means `n > 1` ambiguous matches.
+///
+/// The end is deliberately NOT `map[ne]`. That is where the character *after*
+/// the match begins, and a normalization that DELETES bytes —
+/// [`strip_leading_ws_with_map`] deletes every line's indentation — leaves the
+/// deleted bytes sitting between the two. A match ending at a line break
+/// therefore reported the NEXT line's first non-blank character as its end, and
+/// splicing on it dropped that line's indentation: a line the patch never
+/// named, silently, with `status: success` on the result. In a tab-indented
+/// Python file
+///
+/// ```text
+/// def f(x):          old:  "    if x:\n        return 1\n"
+/// \tif x:            new:  "\tif x > 0:\n\t\treturn 1\n"
+/// \t\treturn 1
+/// \treturn 0         → `\treturn 0` came back as `return 0`
+/// ```
+///
+/// which moves the statement out of the function. The end of a match is one
+/// past the last character the match really consumed — [`original_char_end`].
+fn unique_range(
+    original: &str,
+    hay: &str,
+    map: &[usize],
+    needle: &str,
+) -> Result<(usize, usize), Option<usize>> {
     if needle.is_empty() {
         return Err(None);
     }
@@ -1072,11 +1100,55 @@ fn unique_range(hay: &str, map: &[usize], needle: &str) -> Result<(usize, usize)
         1 => {
             let ns = hay.find(needle).expect("counted one match");
             let ne = ns + needle.len();
-            Ok((map[ns], map[ne]))
+            Ok((map[ns], original_char_end(original, map[ne - 1])))
         }
         0 => Err(None),
         count => Err(Some(count)),
     }
+}
+
+/// One past the character that begins at `start` in `original`.
+///
+/// Both maps in this module are character-aligned — every entry is the offset
+/// of some character's FIRST byte — so the character's own length is all the
+/// end needs, and reading it back out of `original` costs one `chars().next()`
+/// instead of a second map the size of the file.
+fn original_char_end(original: &str, start: usize) -> usize {
+    start + original[start..].chars().next().map_or(0, char::len_utf8)
+}
+
+/// Realign an exact match that begins *inside* a line's leading whitespace.
+///
+/// `contents.find(old)` is a byte search with no notion of a line, so an `old`
+/// spelled with less indentation than the file carries still matches — from
+/// partway through the file's own indentation. Splicing it where it sits is
+/// right as long as `old` and `new` open with the SAME indentation: the
+/// leftover prefix then sits on both sides of the edit and the line keeps its
+/// shape (`  x` for `  x` inside a four-space file still comes out four-space,
+/// which is the common case and must not regress).
+///
+/// When the two differ, that leftover is concatenated onto `new`'s own
+/// indentation and the line ends up indented like neither — a four-space file
+/// with a two-space `old` and a four-space `new` produced six. Then the match
+/// is pulled back to the line start so `new`'s indentation is the whole of it,
+/// which is the rule the indentation-insensitive layer already applies.
+///
+/// Only when `old` itself opens with whitespace. An `old` that starts at the
+/// first non-blank character (`println!(…)` inside an indented line) is asking
+/// to replace the expression, not the line, and pulling its start back would
+/// delete an indentation `new` never carried.
+fn realign_partial_indent(contents: &str, start: usize, old: &str, new: &str) -> usize {
+    let old_indent = leading_indent(old);
+    if old_indent.is_empty() || old_indent == leading_indent(new) {
+        return start;
+    }
+    expand_to_line_start(contents, start)
+}
+
+/// The spaces and tabs opening `text`'s first line.
+fn leading_indent(text: &str) -> &str {
+    let first = text.split('\n').next().unwrap_or(text);
+    &first[..first.len() - first.trim_start_matches([' ', '\t']).len()]
 }
 
 /// If the matched region begins partway into a line preceded only by

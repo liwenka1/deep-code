@@ -838,6 +838,156 @@ async fn apply_patch_fuzzy_matches_indentation_and_uses_new_indent() {
     );
 }
 
+/// The indentation-insensitive layer must not touch a line the patch never
+/// named. `old` ending in a newline is how a model spells "these whole lines",
+/// and the file's indentation differing from `old`'s is the precondition for
+/// this layer to run at all — so the two arrive together constantly. The end
+/// of the match used to be mapped through the NEXT line's stripped
+/// indentation, which spliced that indentation away: in Python it moves a
+/// statement out of the function, with `status: success` on the result.
+///
+/// The pre-existing `..._uses_new_indent` test above could not see it: its
+/// `old` carries no trailing newline and the line after it is a flush `}`.
+#[tokio::test]
+async fn apply_patch_fuzzy_indent_keeps_the_following_line_intact() {
+    let tmp = tempdir().unwrap();
+    // Tab-indented; `old` is spelled with spaces, so only the
+    // indentation-insensitive layer can match it.
+    fs::write(
+        tmp.path().join("f.py"),
+        "def f(x):\n\tif x:\n\t\treturn 1\n\treturn 0\n",
+    )
+    .unwrap();
+
+    let result = run(
+        tmp.path(),
+        "apply_patch",
+        json!({
+            "path": "f.py",
+            "old": "    if x:\n        return 1\n",
+            "new": "\tif x > 0:\n\t\treturn 1\n",
+        }),
+    )
+    .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("f.py")).unwrap(),
+        "def f(x):\n\tif x > 0:\n\t\treturn 1\n\treturn 0\n",
+        "the untouched `return 0` must keep its indentation"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&result.content).unwrap()["match"],
+        "fuzzy-indent"
+    );
+}
+
+/// A multi-byte character at the end of the match exercises the same mapping
+/// through `char::len_utf8` rather than through a byte increment.
+#[tokio::test]
+async fn apply_patch_fuzzy_indent_end_maps_through_multibyte() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("s.rs"),
+        "fn f() {\n\tlet s = \"→\";\n\tg();\n}\n",
+    )
+    .unwrap();
+
+    let result = run(
+        tmp.path(),
+        "apply_patch",
+        json!({
+            "path": "s.rs",
+            "old": "    let s = \"→\";\n",
+            "new": "\tlet s = \"←\";\n",
+        }),
+    )
+    .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("s.rs")).unwrap(),
+        "fn f() {\n\tlet s = \"←\";\n\tg();\n}\n"
+    );
+}
+
+/// An exact match may begin partway through the file's own indentation, since
+/// `find` knows nothing about lines. Splicing it where it sits is correct while
+/// `old` and `new` open with the same indentation — and that case must keep
+/// working, because it is what a consistently under-indented model produces.
+/// When they differ, the leftover prefix lands on top of `new`'s indentation
+/// and the line comes out indented like neither (four-space file + two-space
+/// `old` + four-space `new` = six).
+#[tokio::test]
+async fn apply_patch_exact_partial_indent_does_not_stack_indentation() {
+    let source = "fn main() {\n    println!(\"a\");\n    println!(\"b\");\n}\n";
+
+    // `old` and `new` agree: spliced literally, the file keeps its shape.
+    let consistent = tempdir().unwrap();
+    fs::write(consistent.path().join("m.rs"), source).unwrap();
+    let result = run(
+        consistent.path(),
+        "apply_patch",
+        json!({
+            "path": "m.rs",
+            "old": "  println!(\"a\");\n",
+            "new": "  println!(\"A\");\n",
+        }),
+    )
+    .await;
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(
+        fs::read_to_string(consistent.path().join("m.rs")).unwrap(),
+        "fn main() {\n    println!(\"A\");\n    println!(\"b\");\n}\n",
+        "a consistently under-indented pair must still land at the file's own indent"
+    );
+
+    // `old` and `new` disagree: the match is realigned to the line start so
+    // `new`'s indentation is the whole of it, instead of being stacked on the
+    // two characters the search left behind.
+    let mismatched = tempdir().unwrap();
+    fs::write(mismatched.path().join("m.rs"), source).unwrap();
+    let result = run(
+        mismatched.path(),
+        "apply_patch",
+        json!({
+            "path": "m.rs",
+            "old": "  println!(\"a\");\n",
+            "new": "    println!(\"A\");\n",
+        }),
+    )
+    .await;
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(
+        fs::read_to_string(mismatched.path().join("m.rs")).unwrap(),
+        "fn main() {\n    println!(\"A\");\n    println!(\"b\");\n}\n",
+        "the leftover indentation must not stack onto `new`'s own"
+    );
+}
+
+/// The realignment reads `old`'s indentation, not the match position: an `old`
+/// that starts at the first non-blank character is replacing an expression, and
+/// pulling its start back to the line start would delete an indentation `new`
+/// never carried.
+#[tokio::test]
+async fn apply_patch_exact_keeps_indentation_old_never_claimed() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("m.rs"), "fn main() {\n    a();\n}\n").unwrap();
+
+    let result = run(
+        tmp.path(),
+        "apply_patch",
+        json!({"path": "m.rs", "old": "a();", "new": "b();"}),
+    )
+    .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("m.rs")).unwrap(),
+        "fn main() {\n    b();\n}\n"
+    );
+}
+
 #[tokio::test]
 async fn apply_patch_fuzzy_matches_smart_quotes() {
     let tmp = tempdir().unwrap();
