@@ -327,11 +327,27 @@ fn parse_print_args(mut args: Vec<String>) -> CliArgs {
     }
 }
 
-/// Resolve and collect one `--add-dir` grant. Canonicalized here — at the
-/// moment the human states their intent — so every later layer (session
-/// record, sandbox profile, system prompt) sees a single spelling, and a
-/// bad path refuses the launch instead of surfacing later as a mid-task
-/// tool denial the model cannot act on.
+/// Why a directory a human offered as a write grant cannot become one.
+///
+/// A typed error rather than a message, because the two entry points render
+/// it differently — the CLI flag prints English and exits, the `/add-dir`
+/// slash command sets a localized status line — while the *rule* they apply
+/// has to be one thing (see [`resolve_grant_dir`]).
+#[derive(Debug)]
+pub(crate) enum GrantDirError {
+    /// `canonicalize` failed: the path does not exist, or is unreadable.
+    Unresolvable(std::io::Error),
+    /// It resolves, but not to a directory.
+    NotADirectory,
+}
+
+/// Resolve one human-stated write grant to the single spelling every later
+/// layer compares against, or say why it cannot be one.
+///
+/// Canonicalized at the moment the human states their intent, so the session
+/// record, the sandbox profile and the system prompt all see one spelling,
+/// and a bad path is refused up front instead of surfacing later as a
+/// mid-task tool denial the model cannot act on.
 ///
 /// Through the agent crate's [`deep_code_agent::canonicalize`], not
 /// `Path::canonicalize`, because "a single spelling" is the whole claim above
@@ -344,23 +360,39 @@ fn parse_print_args(mut args: Vec<String>) -> CliArgs {
 /// longer the directory that was approved". That message exists to report a
 /// symlink planted over an approved directory; here it fired on an honest
 /// grant, and the boundary silently narrowed.
+///
+/// One body, and that is the half of the fix that lasts. There are two ways a
+/// human grants a root — this flag and `App::add_dir_command` — and the
+/// correction above landed on only this one, leaving the slash command on
+/// `Path::canonicalize` with the identical consequence. Two spellings of one
+/// rule cannot be kept in step by a comment; they can by having one.
+pub(crate) fn resolve_grant_dir(candidate: &Path) -> Result<PathBuf, GrantDirError> {
+    let canonical =
+        deep_code_agent::canonicalize(candidate).map_err(GrantDirError::Unresolvable)?;
+    if !canonical.is_dir() {
+        return Err(GrantDirError::NotADirectory);
+    }
+    Ok(canonical)
+}
+
+/// Resolve and collect one `--add-dir` grant (see [`resolve_grant_dir`]).
 fn push_add_dir(add_dirs: &mut Vec<PathBuf>, raw: &str) {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         eprintln!("--add-dir needs a directory path");
         std::process::exit(2);
     }
-    let canonical = match deep_code_agent::canonicalize(Path::new(trimmed)) {
+    let canonical = match resolve_grant_dir(Path::new(trimmed)) {
         Ok(path) => path,
-        Err(error) => {
+        Err(GrantDirError::Unresolvable(error)) => {
             eprintln!("--add-dir {trimmed} cannot be resolved: {error}");
             std::process::exit(2);
         }
+        Err(GrantDirError::NotADirectory) => {
+            eprintln!("--add-dir {trimmed} is not a directory");
+            std::process::exit(2);
+        }
     };
-    if !canonical.is_dir() {
-        eprintln!("--add-dir {trimmed} is not a directory");
-        std::process::exit(2);
-    }
     if !add_dirs.contains(&canonical) {
         add_dirs.push(canonical);
     }

@@ -161,6 +161,15 @@ impl App {
     /// session, which is the same union → persist → prompt-rebuild path that
     /// `-c --add-dir` exercises. Slash commands can only be typed at the
     /// keyboard, so this opens no model-reachable widening channel.
+    ///
+    /// "Mirrors the CLI flag" has to include WHICH `canonicalize`, and for one
+    /// release it did not: this twin resolved with `Path::canonicalize` while
+    /// the flag had already been corrected to the agent crate's reading. The
+    /// resolution now lives in one body,
+    /// [`crate::cli::resolve_grant_dir`], whose doc carries the cost of the
+    /// difference; the workspace comparison below uses the same reading for
+    /// the same reason, or under two spellings it misses and the workspace
+    /// gets recorded as its own "additional" root.
     pub(crate) fn add_dir_command(&mut self, raw: &str) {
         if self.is_streaming || self.pending_approval.is_some() {
             self.status = self.tr(TextId::BusyRelaunchConfig).to_string();
@@ -185,21 +194,21 @@ impl App {
         } else {
             self.workspace.join(candidate)
         };
-        let canonical = match absolute.canonicalize() {
+        let canonical = match crate::cli::resolve_grant_dir(&absolute) {
             Ok(path) => path,
-            Err(error) => {
+            Err(crate::cli::GrantDirError::Unresolvable(error)) => {
                 self.status = self.tr_with(
                     TextId::AddDirResolveFailed,
                     &[("path", trimmed), ("error", &error.to_string())],
                 );
                 return;
             }
+            Err(crate::cli::GrantDirError::NotADirectory) => {
+                self.status = self.tr_with(TextId::AddDirNotDirectory, &[("path", trimmed)]);
+                return;
+            }
         };
-        if !canonical.is_dir() {
-            self.status = self.tr_with(TextId::AddDirNotDirectory, &[("path", trimmed)]);
-            return;
-        }
-        if self.workspace.canonicalize().ok().as_ref() == Some(&canonical) {
+        if deep_code_agent::canonicalize(&self.workspace).ok().as_ref() == Some(&canonical) {
             self.status = self.tr_with(TextId::AddDirAlreadyWorkspace, &[("path", trimmed)]);
             return;
         }

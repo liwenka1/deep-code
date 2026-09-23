@@ -54,6 +54,52 @@ fn add_dir_is_repeatable_deduped_and_canonical() {
     }
 }
 
+/// The contract both grant entry points now share — `--add-dir` and the
+/// `/add-dir` slash command go through this one body.
+///
+/// The symlink case is the load-bearing one: a grant is recorded at its
+/// RESOLVED location, because `runtime_launch` re-resolves every recorded
+/// root on resume and drops any whose spelling no longer resolves to itself.
+/// A resolution that handed back the path as typed would therefore make every
+/// grant through a linked path self-destruct on the next `-c`.
+///
+/// What this cannot pin portably is *which* `canonicalize`: the agent crate's
+/// reading differs from `std`'s only on a macOS firmlink, which no temp
+/// directory reproduces. That half is held by there being a single body
+/// instead of two call sites — see `resolve_grant_dir`'s doc for what the
+/// second one cost.
+#[test]
+fn a_grant_dir_resolves_to_its_real_location_or_says_why_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("target");
+    std::fs::create_dir(&real).unwrap();
+
+    let resolved = resolve_grant_dir(&real).expect("a real directory resolves");
+    assert!(resolved.is_absolute());
+
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            resolve_grant_dir(&link).expect("a linked directory resolves"),
+            resolved,
+            "a grant must be recorded where it really lands, or resume drops it"
+        );
+    }
+
+    let file = dir.path().join("not-a-dir");
+    std::fs::write(&file, "x").unwrap();
+    assert!(matches!(
+        resolve_grant_dir(&file),
+        Err(GrantDirError::NotADirectory)
+    ));
+    assert!(matches!(
+        resolve_grant_dir(&dir.path().join("missing")),
+        Err(GrantDirError::Unresolvable(_))
+    ));
+}
+
 #[test]
 fn print_args_carry_add_dirs() {
     let dir = tempfile::tempdir().unwrap();
