@@ -1246,6 +1246,63 @@ async fn unattended_denial_note_replaces_the_denied_by_user_text() {
     );
 }
 
+/// The note the UNATTENDED top-level runs hand that same plumbing.
+///
+/// `-p`, `serve --approval-mode autonomous` and the eval harness all deny
+/// prompts with nobody in the loop, and all three used to submit a bare
+/// `Denied` — so the model read "Tool call denied by user.", or, for a write
+/// root, "User declined the write-root request for '<path>'. Do not request
+/// this path again." Both are statements about a human who was never there,
+/// and the sub-agent gate exists because that teaches the model the wrong
+/// next move.
+///
+/// Root grants get their own text because their recovery differs: no
+/// `auto_allow` entry and no permission mode pre-approves one (the gate
+/// refuses them in every mode, `yolo` included), so the generic advice would
+/// point at knobs that cannot help.
+#[test]
+fn the_unattended_note_tells_the_model_no_human_was_asked() {
+    let request = |tool_name: &str| ApprovalRequest {
+        call_id: "call_1".to_string(),
+        tool_name: tool_name.to_string(),
+        description: "d".to_string(),
+        arguments: serde_json::json!({}),
+        risk_level: crate::execution_policy::RiskLevel::High,
+        requires_sandbox: false,
+        network: false,
+        justification: None,
+        resolved_target: None,
+        read_only: false,
+        matched_rule: None,
+        preview: None,
+        safety_notes: Vec::new(),
+    };
+
+    let generic = unattended_denial_note(&request("shell"));
+    let root_grant = unattended_denial_note(&request(crate::root_grant::REQUEST_WRITE_ROOT_TOOL));
+
+    for note in [&generic, &root_grant] {
+        assert!(
+            note.contains("no user saw this request"),
+            "an unattended denial must not read as a human refusal: {note}"
+        );
+        assert!(
+            !note.contains("User declined"),
+            "the stock human-refusal wording must not survive: {note}"
+        );
+    }
+    // Each names the recovery that exists for it, and only that one.
+    assert!(
+        generic.contains("approval.auto_allow") && generic.contains("permission mode"),
+        "the generic note must name the knobs that grant capability: {generic}"
+    );
+    assert!(
+        root_grant.contains("--add-dir") && !root_grant.contains("approval.auto_allow"),
+        "a write root is granted by --add-dir and by nothing else: {root_grant}"
+    );
+    assert_ne!(generic, root_grant);
+}
+
 #[tokio::test]
 async fn plain_response_yields_assistant_message_and_finish() {
     let client = ScriptedClient::new(vec![vec![

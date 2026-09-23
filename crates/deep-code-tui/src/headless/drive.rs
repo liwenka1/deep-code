@@ -9,6 +9,7 @@
 
 use deep_code_agent::{
     AgentRuntime, ApprovalDecision, Message, Role, RuntimeEvent, TurnTelemetry, Usage,
+    unattended_denial_note,
 };
 
 /// How the driven turn ended.
@@ -59,11 +60,25 @@ pub(crate) async fn drive_to_completion(
             on_event(&event);
             match event {
                 RuntimeEvent::ReasoningDelta { text, .. } => outcome.reasoning.push_str(&text),
-                RuntimeEvent::ApprovalRequired { .. } => {
-                    // Deny, never park (see module docs). `submit_approval`
+                RuntimeEvent::ApprovalRequired { ref request, .. } => {
+                    // Deny, never park (see module docs). `submit_approval…`
                     // resumes the batch on a fresh channel.
+                    //
+                    // WITH the note: the stock result text is "Tool call
+                    // denied by user.", and there is no user here. The model
+                    // then plans around a refusal that never happened —
+                    // stops asking, or argues with the absent human — where
+                    // the truth ("nobody can answer; the operator grants
+                    // capability with auto_allow / --permission-mode") is
+                    // something it can act on. Same reason
+                    // `subagent_approval_decision` carries notes.
                     outcome.denied_approvals += 1;
-                    events = runtime.submit_approval(ApprovalDecision::Denied).await;
+                    events = runtime
+                        .submit_approval_with_denial_note(
+                            ApprovalDecision::Denied,
+                            Some(unattended_denial_note(request)),
+                        )
+                        .await;
                     resumed = true;
                     break;
                 }
@@ -235,6 +250,45 @@ mod tests {
         assert_eq!(outcome.status, DriveStatus::Finished);
         let messages = runtime.session_messages().await;
         assert_eq!(final_assistant_text(&messages).as_deref(), Some("done"));
+    }
+
+    /// The auto-denial the model reads must not claim a human refused it.
+    ///
+    /// `-p` denies every prompt because nobody can answer one, and it used to
+    /// submit a bare `Denied` — so the tool result the model saw was the
+    /// registry's stock "Tool call denied by user." A model that believes a
+    /// person said no plans around a decision, instead of reporting what it
+    /// needed so the operator can re-run with it granted. Same false fact the
+    /// sub-agent gate carries its own notes to avoid; this is the consumer
+    /// `runtime`'s module doc already named as adding an auto-deny on top.
+    ///
+    /// Asserted on the recorded transcript, not on the count: `denied_approvals`
+    /// was already right while the text was wrong.
+    #[tokio::test]
+    async fn the_auto_denial_tells_the_model_no_user_was_asked() {
+        let runtime = AgentRuntime::new(
+            ScriptedClient::new(vec![tool_call_events(), text_events("done", None)]),
+            ToolRegistry::with_mock_tools(),
+        );
+
+        let outcome = drive_to_completion(&runtime, "hi".to_string(), &mut |_| {}).await;
+        assert_eq!(outcome.denied_approvals, 1);
+
+        let messages = runtime.session_messages().await;
+        let denied = messages
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("the denied call keeps its paired tool message");
+        assert!(
+            denied.content.contains("no user saw this request"),
+            "the model must be told the run is unattended: {}",
+            denied.content
+        );
+        assert!(
+            !denied.content.contains("denied by user"),
+            "the stock human-refusal text must not reach the model: {}",
+            denied.content
+        );
     }
 
     #[test]

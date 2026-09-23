@@ -364,12 +364,25 @@ async fn consume_events(
                 // present. Every other unattended channel (headless `-p`,
                 // serve, sub-agents) already refuses this one; this was the
                 // only place that said yes.
-                let decision = if request.tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL {
-                    ApprovalDecision::Denied
-                } else {
-                    ApprovalDecision::Approved
-                };
-                receiver = launched.handle.submit_approval(decision).await;
+                //
+                // The denial carries the real reason for the same reason the
+                // sub-agent gate does: nobody saw this prompt, so the stock
+                // "User declined the write-root request" would teach the model
+                // a refusal that never happened — here, in a rollout whose
+                // whole output is what the model did next.
+                let (decision, denial_note) =
+                    if request.tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL {
+                        (
+                            ApprovalDecision::Denied,
+                            Some(deep_code_agent::unattended_denial_note(request)),
+                        )
+                    } else {
+                        (ApprovalDecision::Approved, None)
+                    };
+                receiver = launched
+                    .handle
+                    .submit_approval_with_denial_note(decision, denial_note)
+                    .await;
             }
             RuntimeEvent::TurnFinished { telemetry, .. } => {
                 outcome.telemetry = telemetry;

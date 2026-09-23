@@ -18,7 +18,7 @@ use axum::{Json, middleware};
 use deep_code_agent::{
     AgentConfig, ApprovalDecision, ApprovalRequest, JsonSessionStore, LaunchedRuntime,
     RuntimeEvent, SessionId, SessionRecord, SessionStore, TurnId, launch_runtime,
-    neutralize_display_text, now_ms,
+    neutralize_display_text, now_ms, unattended_denial_note,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -476,13 +476,20 @@ async fn prompt_sse(
 
                 match event {
                     RuntimeEvent::ApprovalRequired { request, .. } => {
-                        let decision = if autonomous_approvals {
+                        let (decision, denial_note) = if autonomous_approvals {
                             // Headless/unattended: no HTTP client will POST to
                             // /v1/approvals, so parking here would hang the turn
                             // until the connection dies. Deny deterministically
                             // instead — the agent records a denied result and
                             // continues (it never blocks on the callback).
-                            ApprovalDecision::Denied
+                            //
+                            // With the real reason attached: the stock result
+                            // text says a user declined, and in this mode there
+                            // is no user. See `unattended_denial_note`.
+                            (
+                                ApprovalDecision::Denied,
+                                Some(unattended_denial_note(&request)),
+                            )
                         } else {
                             let (tx, rx) = oneshot::channel();
                             let call_id = request.call_id.clone();
@@ -505,10 +512,15 @@ async fn prompt_sse(
                                 let mut slot = approval_gate.lock().await;
                                 *slot = None;
                             }
-                            decision
+                            // A human answered this one, so the stock
+                            // "denied by user" text is true for it.
+                            (decision, None)
                         };
                         let runtime = runtime.lock().await;
-                        event_stream = runtime.handle.submit_approval(decision).await;
+                        event_stream = runtime
+                            .handle
+                            .submit_approval_with_denial_note(decision, denial_note)
+                            .await;
                         resume_after_approval = true;
                         break;
                     }

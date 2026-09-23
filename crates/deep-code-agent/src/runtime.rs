@@ -632,6 +632,51 @@ const SUBAGENT_UNATTENDED_DENIAL: &str = "Denied by sub-agent policy (no user sa
 request): sub-agents run unattended, so calls that need approval are auto-denied. Work \
 within your granted tools, or state what you need in your final report.";
 
+/// The model-facing reason a prompt was refused by an UNATTENDED top-level
+/// run — headless `-p` and `serve --approval-mode autonomous`, both of which
+/// deny rather than park on a decision nobody will send.
+///
+/// Pass it as `submit_approval_with_denial_note`'s note. Without it the model
+/// reads the registry's stock `"Tool call denied by user."`, and for a
+/// write-root request the even more emphatic `"User declined the write-root
+/// request for '<path>'. Do not request this path again."` — in a run where no
+/// user existed. That is exactly the false fact
+/// [`AgentRuntime::subagent_approval_decision`] was given its own notes to
+/// avoid ("a child that believes a human refused stops asking for things the
+/// parent could in fact re-dispatch"), reached through the two consumers this
+/// module's own doc already names as adding an auto-deny on top.
+///
+/// One function in THIS crate rather than a string at each call site:
+/// `deep-code-runtime`, `deep-code-tui` and `deep-code-eval` do not depend on
+/// one another, so a note written in one is unreachable from the others — the
+/// shape [`crate::neutralize_display_text`] was moved into this crate for,
+/// which took nine one-surface-at-a-time commits to notice.
+///
+/// Root grants get their own text: the recovery differs (there is no
+/// `auto_allow` entry or permission mode that pre-approves one — the gate
+/// refuses them in every mode), so the generic advice would be wrong.
+#[must_use]
+pub fn unattended_denial_note(request: &ApprovalRequest) -> String {
+    // Through the one home for "is this the doorbell", not a name compare.
+    if approval_flow::is_root_grant(&request.tool_name) {
+        return UNATTENDED_ROOT_GRANT_DENIAL.to_string();
+    }
+    UNATTENDED_DENIAL.to_string()
+}
+
+const UNATTENDED_DENIAL: &str = "Denied by this run's approval policy (no user saw this \
+request): the session is running unattended, so there is nobody to answer a prompt and \
+every gated call is auto-denied. Retrying the same call cannot change the answer. Work \
+within the tools that run without asking, or state what you needed in your final answer so \
+the operator can re-run with it granted (`approval.auto_allow`, or a more permissive \
+permission mode).";
+
+const UNATTENDED_ROOT_GRANT_DENIAL: &str = "Denied by this run's approval policy (no user \
+saw this request): widening the write boundary always requires a human decision, and this \
+session is running unattended. Do not request a write root again. Work within the granted \
+roots, and name the directory you needed in your final answer so the operator can grant it \
+on the next run (--add-dir).";
+
 #[cfg(test)]
 #[path = "runtime/integration_tests.rs"]
 mod tests;
