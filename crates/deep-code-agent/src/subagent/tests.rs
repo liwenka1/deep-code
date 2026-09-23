@@ -747,6 +747,80 @@ None.
         );
     }
 
+    /// A granted child may actually USE the web tools its grant mounted.
+    ///
+    /// This is the half of the network grant that had no implementation.
+    /// `child_tool_registry` mounts `fetch_url`/`web_search` on a
+    /// `network: true` dispatch and `NETWORK_GRANTED_BLOCK` tells the child
+    /// "You have fetch_url and web_search" — but a network tool is
+    /// `NeedsApproval` under every network mode, a child's permission mode is
+    /// always `Default`, and `subagent_approval_decision` had no `Network`
+    /// arm, so every call fell through to the generic unattended denial. The
+    /// capability was present in the registry, the tool description, the
+    /// README and the child's own prompt, and absent from the one place that
+    /// decides.
+    ///
+    /// The sibling test below checks that the grant MOUNTS the tools; only
+    /// this one checks that a call to them survives the gate, which is why
+    /// the gap shipped.
+    #[tokio::test]
+    async fn a_granted_child_may_call_the_web_tools_it_was_given() {
+        let runtime = AgentRuntime::new(SummaryClient, ToolRegistry::new());
+        let fetch = |call_id: &str, tool_name: &str, arguments| ApprovalRequest {
+            network: false, // network-native tools carry no declaration
+            call_id: call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            description: "reach a host".to_string(),
+            arguments,
+            risk_level: crate::execution_policy::RiskLevel::Medium,
+            requires_sandbox: false,
+            read_only: true,
+            matched_rule: Some("builtin:network_tool".to_string()),
+            justification: None,
+            resolved_target: None,
+            preview: None,
+            safety_notes: Vec::new(),
+        };
+        for (tool, arguments) in [
+            ("fetch_url", json!({"url": "https://docs.rs/serde"})),
+            ("web_search", json!({"query": "serde derive"})),
+        ] {
+            let request = fetch("call_1", tool, arguments);
+            // Dispatched WITH network: the human approved egress at the
+            // dispatch prompt, so reaching execution is the consent.
+            assert_eq!(
+                runtime.subagent_approval_decision(&request, SubAgentRole::Explore, true),
+                (ApprovalDecision::Approved, None),
+                "{tool} must run in a child dispatched with network=true"
+            );
+            // Dispatched WITHOUT: unreachable today (the tools are not
+            // mounted), but the note must name the missing grant rather than
+            // the generic "calls that need approval are auto-denied".
+            let (decision, note) =
+                runtime.subagent_approval_decision(&request, SubAgentRole::Explore, false);
+            assert_eq!(decision, ApprovalDecision::Denied);
+            assert!(
+                note.as_deref()
+                    .is_some_and(|note| note.contains("network=true")),
+                "{tool} denied without a grant must name the re-dispatch path: {note:?}"
+            );
+        }
+        // The grant covers egress, not everything: a writing tool in a
+        // read-only role is still refused with network=true.
+        let write = fetch(
+            "call_2",
+            "write_file",
+            json!({"path": "a.txt", "content": "x"}),
+        );
+        assert_eq!(
+            runtime
+                .subagent_approval_decision(&write, SubAgentRole::Explore, true)
+                .0,
+            ApprovalDecision::Denied,
+            "a network grant must not widen the write posture"
+        );
+    }
+
     /// The dispatch-time network grant is what separates an online child from
     /// an offline one: a granted child gets the web tools and ambient egress
     /// for allow-listed commands; an ungranted child gets neither. The

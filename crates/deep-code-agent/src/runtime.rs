@@ -498,11 +498,15 @@ impl AgentRuntime {
     /// gated where writes prompt: the `agent` call itself requires approval
     /// for writing roles (see `ToolKind::SubAgent` in the policy engine), so
     /// this consent is granted by the human, not assumed. The network grant
-    /// works the same way at dispatch (`network: true`), but never reaches
-    /// this decision: a granted child's exec policy is `Always`, so its
-    /// allow-listed commands carry egress without prompting. Shell otherwise
-    /// still requires the policy's own allow paths (trusted prefixes /
-    /// auto_allow); hard denials are never overridden.
+    /// (`network: true`) works the same way at dispatch, and reaches this
+    /// decision through ONE of its two halves: the shell half never gets
+    /// here, because a granted child's exec policy is `Always` and its
+    /// allow-listed commands carry egress without prompting; the web half
+    /// does, because `fetch_url`/`web_search` are `NeedsApproval` under every
+    /// network mode, so the `Network` arm below is what makes the mounted
+    /// tools usable. Shell otherwise still requires the policy's own allow
+    /// paths (trusted prefixes / auto_allow); hard denials are never
+    /// overridden.
     ///
     /// Returns the decision plus, for denials, the REAL reason to record as
     /// the tool result. These prompts are resolved by policy with no human in
@@ -545,6 +549,39 @@ impl AgentRuntime {
         }
         if role.allows_writes() && kind == crate::execution_policy::ToolKind::WriteFile {
             return (ApprovalDecision::Approved, None);
+        }
+        // The network-native tools are the research half of the dispatch-time
+        // network grant, exactly as ambient egress is its shell half, and
+        // reaching execution IS the consent — the same shape as
+        // `role.allows_writes()` above. Both halves were authorized at one
+        // human-visible prompt (`ToolKind::SubAgent` in the policy engine:
+        // "anything it reads may be sent to external hosts").
+        //
+        // Without this arm the grant was half-wired and the half that was
+        // missing is the one the child is told about: `child_tool_registry`
+        // mounts `fetch_url`/`web_search` on a `network: true` dispatch, the
+        // child's system prompt says "You have fetch_url and web_search"
+        // (`NETWORK_GRANTED_BLOCK`), and then every call fell through to the
+        // unattended denial at the bottom of this function — "calls that need
+        // approval are auto-denied" — because a network tool is
+        // `NeedsApproval` under every network mode and a child's permission
+        // mode is always `Default`. The capability existed in the registry,
+        // in the tool description, in the README and in the prompt, and
+        // nowhere in the decision.
+        if kind == crate::execution_policy::ToolKind::Network {
+            return if network_granted {
+                (ApprovalDecision::Approved, None)
+            } else {
+                // Unreachable today — an ungranted child has no web tools
+                // mounted, so such a call dies as `UnknownTool` before any
+                // approval exists. Spelled out anyway, and with the note that
+                // names the missing grant rather than the generic one, so a
+                // future widening of the mount cannot land on the wrong text.
+                (
+                    ApprovalDecision::Denied,
+                    Some(SUBAGENT_NETWORK_DENIAL.to_string()),
+                )
+            };
         }
         // A network-declaring command in an UNGRANTED child: what is missing
         // is the grant, not the command — point at the re-dispatch path. (In
