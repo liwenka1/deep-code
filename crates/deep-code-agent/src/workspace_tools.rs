@@ -967,6 +967,55 @@ fn to_crlf(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
+/// Where `needle` occurs in `haystack`, counting OVERLAPPING occurrences:
+/// the number of them, and the offset of the first.
+///
+/// `str::matches` counts NON-overlapping ones, and that is the wrong question
+/// for a uniqueness check. In
+///
+/// ```text
+/// haystack: "x = x\nx = x\nx = x\n"
+/// needle:   "x = x\nx = x\n"
+/// ```
+///
+/// two positions match and `matches(..).count()` answers 1, so
+/// [`locate_match`] reported a unique `exact` hit and silently rewrote the
+/// first of the two — where the tool's own contract ("`old` must occur
+/// exactly once") and [`MatchError::NonUnique`] exist to make the caller
+/// disambiguate. Repeated line blocks are ordinary in real code (a run of
+/// identical assignments, a pair of blank lines, two `}` closers), so this is
+/// not a corner the contract can afford to lose.
+///
+/// Read by every layer, not just the exact one: the indentation and
+/// punctuation layers ask the same question of their normalized text, and a
+/// second spelling of "how many places is this" is how the two would drift.
+///
+/// Linear in `haystack` overall despite the loop: each step advances past at
+/// least one character, and the bytes a `find` scans before the next hit are
+/// bytes no later `find` re-scans.
+fn overlapping_matches(haystack: &str, needle: &str) -> (usize, Option<usize>) {
+    if needle.is_empty() {
+        return (0, None);
+    }
+    let mut count = 0usize;
+    let mut first = None;
+    let mut from = 0usize;
+    while let Some(offset) = haystack[from..].find(needle) {
+        let at = from + offset;
+        if first.is_none() {
+            first = Some(at);
+        }
+        count += 1;
+        // One CHARACTER on, not one match on: an occurrence that starts inside
+        // the previous one is exactly what this function exists to see.
+        from = at + haystack[at..].chars().next().map_or(1, char::len_utf8);
+        if from >= haystack.len() {
+            break;
+        }
+    }
+    (count, first)
+}
+
 /// Locate `old` in `contents` through a cascade of increasingly tolerant
 /// layers — exact, then indentation-insensitive, then punctuation-normalized —
 /// each requiring a UNIQUE match. Returns the range in the original bytes.
@@ -976,16 +1025,15 @@ fn to_crlf(s: &str) -> String {
 /// where it sits. Nothing else here looks at the replacement text.
 fn locate_match(contents: &str, old: &str, new: &str) -> Result<Located, MatchError> {
     // 1. Exact.
-    match contents.matches(old).count() {
-        1 => {
-            let found = contents.find(old).expect("counted one match");
+    match overlapping_matches(contents, old) {
+        (1, Some(found)) => {
             return Ok(Located {
                 start: realign_partial_indent(contents, found, old, new),
                 end: found + old.len(),
                 kind: MatchKind::Exact,
             });
         }
-        count if count > 1 => {
+        (count, _) if count > 1 => {
             return Err(MatchError::NonUnique {
                 count,
                 kind: MatchKind::Exact,
@@ -1005,16 +1053,15 @@ fn locate_match(contents: &str, old: &str, new: &str) -> Result<Located, MatchEr
     // coordinates, so the surrounding CRLF is preserved rather than normalized.
     if contents.contains("\r\n") && !old.contains('\r') && old.contains('\n') {
         let crlf_old = to_crlf(old);
-        match contents.matches(&crlf_old).count() {
-            1 => {
-                let found = contents.find(&crlf_old).expect("counted one match");
+        match overlapping_matches(contents, &crlf_old) {
+            (1, Some(found)) => {
                 return Ok(Located {
                     start: realign_partial_indent(contents, found, &crlf_old, new),
                     end: found + crlf_old.len(),
                     kind: MatchKind::Exact,
                 });
             }
-            count if count > 1 => {
+            (count, _) if count > 1 => {
                 return Err(MatchError::NonUnique {
                     count,
                     kind: MatchKind::Exact,
@@ -1096,14 +1143,13 @@ fn unique_range(
     if needle.is_empty() {
         return Err(None);
     }
-    match hay.matches(needle).count() {
-        1 => {
-            let ns = hay.find(needle).expect("counted one match");
+    match overlapping_matches(hay, needle) {
+        (1, Some(ns)) => {
             let ne = ns + needle.len();
             Ok((map[ns], original_char_end(original, map[ne - 1])))
         }
-        0 => Err(None),
-        count => Err(Some(count)),
+        (0, _) => Err(None),
+        (count, _) => Err(Some(count)),
     }
 }
 

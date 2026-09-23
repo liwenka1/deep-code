@@ -1129,6 +1129,55 @@ async fn apply_patch_rejects_non_unique_old_with_recovery_hint() {
     );
 }
 
+/// A self-overlapping `old` has more than one candidate location, and the
+/// contract ("must occur exactly once") has to see all of them.
+///
+/// `str::matches` counts non-overlapping hits, so this file answered "1" for a
+/// needle that fits at two offsets: the edit reported `exact` / `replacements:
+/// 1` and rewrote the first one, with nothing said. Repeated line blocks are
+/// ordinary code, so the shape is reachable without trying.
+#[tokio::test]
+async fn apply_patch_rejects_old_that_overlaps_itself() {
+    let tmp = tempdir().unwrap();
+    let original = "x = x\nx = x\nx = x\n";
+    fs::write(tmp.path().join("rep.rs"), original).unwrap();
+
+    let message = run_err(
+        tmp.path(),
+        "apply_patch",
+        json!({"path": "rep.rs", "old": "x = x\nx = x\n", "new": "y = y\n"}),
+    )
+    .await;
+
+    assert!(message.contains("matched 2 places"), "got: {message}");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("rep.rs")).unwrap(),
+        original,
+        "a rejected edit must leave the file untouched"
+    );
+}
+
+/// The overlap rule must not cost the ordinary unique edit: one occurrence
+/// stays one occurrence, whatever the surrounding text repeats.
+#[tokio::test]
+async fn apply_patch_still_accepts_a_genuinely_unique_old() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("once.rs"), "a = 1;\nb = 2;\na = 1;\n").unwrap();
+
+    let result = run(
+        tmp.path(),
+        "apply_patch",
+        json!({"path": "once.rs", "old": "b = 2;", "new": "b = 3;"}),
+    )
+    .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("once.rs")).unwrap(),
+        "a = 1;\nb = 3;\na = 1;\n"
+    );
+}
+
 #[tokio::test]
 async fn apply_patch_rejects_missing_old_with_recovery_hint() {
     let tmp = tempdir().unwrap();
