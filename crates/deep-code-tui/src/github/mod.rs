@@ -41,7 +41,13 @@ fn spec_for(args: &InstallArgs) -> WorkflowSpec {
             .workflow_ref
             .clone()
             .unwrap_or_else(|| DEFAULT_WORKFLOW_REF.to_string()),
-        with_app: args.with_app || args.app_id.is_some(),
+        // `--app-private-key` counts too. Deriving this from `app_id` alone
+        // made the two halves asymmetric: `--app-id` without its key reached
+        // `resolve_app_credentials` and got the "must be given together"
+        // error, while the key without its id left `with_app` false, so that
+        // check never ran — the flag was dropped on the floor and the user got
+        // a workflow with no App wiring and not one word about it.
+        with_app: args.with_app || args.app_id.is_some() || args.app_key_file.is_some(),
         // Both already parsed at the CLI boundary, so what is written into the
         // workflow is a canonical token and nothing else.
         lang: args
@@ -473,6 +479,32 @@ mod tests {
                 "{yaml}"
             );
         }
+    }
+
+    /// Either App flag alone must reach the "given together" check, so the
+    /// installer says something instead of dropping the flag.
+    #[test]
+    fn either_app_flag_alone_still_asks_for_app_wiring() {
+        let id_only = InstallArgs {
+            app_id: Some("123".to_string()),
+            ..InstallArgs::default()
+        };
+        let key_only = InstallArgs {
+            app_key_file: Some(PathBuf::from("key.pem")),
+            ..InstallArgs::default()
+        };
+        assert!(spec_for(&id_only).with_app, "--app-id alone");
+        assert!(spec_for(&key_only).with_app, "--app-private-key alone");
+        // And each is then rejected as incomplete rather than silently used.
+        for args in [&id_only, &key_only] {
+            assert!(
+                matches!(resolve_app_credentials(args), Err(message)
+                    if message.contains("must be given together")),
+                "one App flag without the other must be reported"
+            );
+        }
+        // Neither flag: no App wiring, nothing to report.
+        assert!(!spec_for(&InstallArgs::default()).with_app);
     }
 
     #[test]
