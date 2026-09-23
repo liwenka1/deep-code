@@ -32,30 +32,39 @@ pub fn run(command: GithubCommand) -> i32 {
     }
 }
 
+/// The workflow the flags describe. Pure, so what lands in the generated YAML
+/// is decided somewhere a test can reach — `install` itself needs a git
+/// checkout and the `gh` CLI.
+fn spec_for(args: &InstallArgs) -> WorkflowSpec {
+    WorkflowSpec {
+        workflow_ref: args
+            .workflow_ref
+            .clone()
+            .unwrap_or_else(|| DEFAULT_WORKFLOW_REF.to_string()),
+        with_app: args.with_app || args.app_id.is_some(),
+        // Both already parsed at the CLI boundary, so what is written into the
+        // workflow is a canonical token and nothing else.
+        lang: args
+            .lang
+            .unwrap_or(deep_code_agent::Lang::Zh)
+            .as_setting()
+            .to_string(),
+        permission_mode: args
+            .permission_mode
+            .unwrap_or(deep_code_agent::PermissionMode::AcceptEdits)
+            .as_setting()
+            .to_string(),
+        generator_version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
 fn install(args: InstallArgs) -> i32 {
     let Some(root) = env::git_root() else {
         eprintln!("not inside a git repository — run this from the repo you want the bot in");
         return EXIT_USAGE;
     };
 
-    let workflow_ref = args
-        .workflow_ref
-        .clone()
-        .unwrap_or_else(|| DEFAULT_WORKFLOW_REF.to_string());
-    let spec = WorkflowSpec {
-        workflow_ref,
-        with_app: args.with_app || args.app_id.is_some(),
-        lang: args
-            .lang
-            .clone()
-            .unwrap_or_else(|| deep_code_agent::Lang::Zh.as_setting().to_string()),
-        permission_mode: args.permission_mode.clone().unwrap_or_else(|| {
-            deep_code_agent::PermissionMode::AcceptEdits
-                .as_setting()
-                .to_string()
-        }),
-        generator_version: env!("CARGO_PKG_VERSION").to_string(),
-    };
+    let spec = spec_for(&args);
     let rendered = workflow::render(&spec);
 
     if args.print_only {
@@ -427,6 +436,44 @@ fn display(root: &Path, target: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whatever the flags say, the two values that reach the generated YAML are
+    /// canonical tokens — the enums' own `as_setting` spellings.
+    ///
+    /// They used to be raw strings carried straight from argv to an unquoted
+    /// interpolation. `--permission-mode acceptEdits` wrote a workflow whose
+    /// misconfiguration surfaced only in a later CI run, and a value carrying
+    /// YAML punctuation rewrote the file's structure. Parsing at the CLI edge
+    /// is what makes this assertion possible at all.
+    #[test]
+    fn the_generated_workflow_only_ever_carries_canonical_tokens() {
+        use deep_code_agent::{Lang, PermissionMode};
+
+        for (lang, mode, expected_lang, expected_mode) in [
+            (None, None, "zh", "accept_edits"),
+            (Some(Lang::En), Some(PermissionMode::Yolo), "en", "yolo"),
+            (
+                Some(Lang::Zh),
+                Some(PermissionMode::AcceptEdits),
+                "zh",
+                "accept_edits",
+            ),
+        ] {
+            let spec = spec_for(&InstallArgs {
+                lang,
+                permission_mode: mode,
+                ..InstallArgs::default()
+            });
+            assert_eq!(spec.lang, expected_lang);
+            assert_eq!(spec.permission_mode, expected_mode);
+            let yaml = workflow::render(&spec);
+            assert!(yaml.contains(&format!("lang: {expected_lang}\n")), "{yaml}");
+            assert!(
+                yaml.contains(&format!("permission-mode: {expected_mode}\n")),
+                "{yaml}"
+            );
+        }
+    }
 
     #[test]
     fn writing_is_idempotent_and_refuses_to_clobber() {

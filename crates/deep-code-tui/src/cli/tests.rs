@@ -347,3 +347,46 @@ fn the_sessions_storage_note_names_the_invoked_command() {
     // command word follows the invocation.
     assert!(!note.contains("run deep-code"), "{note}");
 }
+
+/// `github install`'s two enum flags are parsed at the CLI edge, like `-p`'s
+/// own `--permission-mode` and unlike the raw strings they used to be. Aliases
+/// and casing are accepted the same way every other enum setting accepts them,
+/// and what comes out is a variant — not whatever the user typed.
+#[test]
+fn github_install_parses_its_enum_flags_into_variants() {
+    fn install_args(args: &[&str]) -> InstallArgs {
+        let parsed = parse_github_command(args.iter().map(|s| (*s).to_string()).collect());
+        match parsed.mode {
+            RunMode::Github(GithubCommand::Install(install)) => install,
+            other => panic!("expected github install, got {other:?}"),
+        }
+    }
+
+    let defaults = install_args(&["install"]);
+    assert_eq!(defaults.lang, None);
+    assert_eq!(defaults.permission_mode, None);
+
+    for (flag, expected) in [
+        ("zh", Lang::Zh),
+        ("zh_CN.UTF-8", Lang::Zh),
+        ("EN", Lang::En),
+    ] {
+        let parsed = install_args(&["install", "--lang", flag]);
+        assert_eq!(parsed.lang, Some(expected), "--lang {flag}");
+    }
+
+    for (flag, expected) in [
+        ("yolo", PermissionMode::Yolo),
+        ("accept_edits", PermissionMode::AcceptEdits),
+        // The same alias set `PermissionMode::parse` accepts elsewhere.
+        ("accept-edits", PermissionMode::AcceptEdits),
+        ("Default", PermissionMode::Default),
+    ] {
+        let parsed = install_args(&["install", "--permission-mode", flag]);
+        assert_eq!(
+            parsed.permission_mode,
+            Some(expected),
+            "--permission-mode {flag}"
+        );
+    }
+}

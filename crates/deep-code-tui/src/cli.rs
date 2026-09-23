@@ -3,7 +3,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-use deep_code_agent::{PermissionMode, format_sessions_storage_note};
+use deep_code_agent::{Lang, PermissionMode, format_sessions_storage_note};
 
 use crate::headless::OutputFormat;
 
@@ -54,8 +54,14 @@ pub struct InstallArgs {
     pub app_key_file: Option<PathBuf>,
     /// Ref of the reusable pipeline. Defaults to `main`; pass a tag to pin.
     pub workflow_ref: Option<String>,
-    pub lang: Option<String>,
-    pub permission_mode: Option<String>,
+    /// Bot language. Typed, not a raw string: the value is interpolated
+    /// verbatim into the generated YAML, and only a parsed enum can promise
+    /// what lands there is one of the tokens the pipeline reads. See
+    /// [`parse_github_command`].
+    pub lang: Option<Lang>,
+    /// Permission tier the bot runs under. Typed for the same reason as
+    /// [`Self::lang`].
+    pub permission_mode: Option<PermissionMode>,
     /// Where to write, relative to the repository root.
     pub path: Option<PathBuf>,
     /// Replace an existing file whose contents differ.
@@ -665,10 +671,33 @@ fn parse_github_command(mut args: Vec<String>) -> CliArgs {
                             Some(PathBuf::from(require_value(&mut args, "--app-private-key")));
                     }
                     "--ref" => install.workflow_ref = Some(require_value(&mut args, "--ref")),
-                    "--lang" => install.lang = Some(require_value(&mut args, "--lang")),
+                    // Validated here, like `-p`'s own `--permission-mode`, and
+                    // unlike the raw strings these used to be. The value is
+                    // interpolated into the generated workflow unquoted, so an
+                    // unvalidated one had two ways to go wrong: a plain typo
+                    // (`acceptEdits`) shipped a file whose misconfiguration
+                    // only showed up in someone else's CI run, and a value
+                    // carrying `:` or a newline broke — or extended — the YAML.
+                    // Parsing to an enum here makes what reaches the file one
+                    // of a fixed set of tokens by construction, so neither is
+                    // reachable rather than merely unlikely.
+                    "--lang" => {
+                        let value = require_value(&mut args, "--lang");
+                        install.lang = Some(Lang::from_tag(&value).unwrap_or_else(|| {
+                            eprintln!("Invalid --lang '{value}'. Use 'zh' or 'en'.");
+                            std::process::exit(2);
+                        }));
+                    }
                     "--permission-mode" => {
+                        let value = require_value(&mut args, "--permission-mode");
                         install.permission_mode =
-                            Some(require_value(&mut args, "--permission-mode"));
+                            Some(PermissionMode::parse(&value).unwrap_or_else(|| {
+                                eprintln!(
+                                    "Invalid --permission-mode '{value}'. Use 'default', \
+                                     'accept_edits', 'auto', or 'yolo'."
+                                );
+                                std::process::exit(2);
+                            }));
                     }
                     "--path" => {
                         install.path = Some(PathBuf::from(require_value(&mut args, "--path")))
