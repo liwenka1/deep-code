@@ -90,8 +90,11 @@ impl LlmClient for DeepSeekClient {
         }
 
         let byte_stream = response.bytes_stream();
+        // The same budget `runtime::streaming` enforces on decoded content —
+        // see `SseDecoder::with_limit` for why the raw buffer needs it too.
+        let raw_limit = self.config.stream_max_bytes;
         let stream = try_stream! {
-            let mut decoder = SseDecoder::new();
+            let mut decoder = SseDecoder::with_limit(raw_limit);
             futures_util::pin_mut!(byte_stream);
 
             while let Some(bytes) = byte_stream.next().await {
@@ -124,19 +127,63 @@ impl LlmClient for DeepSeekClient {
 pub(crate) struct SseDecoder {
     buffer: Vec<u8>,
     data: String,
+    /// Ceiling on what may sit undispatched here — see [`Self::with_limit`].
+    limit_bytes: u64,
 }
 
 impl SseDecoder {
-    pub(crate) fn new() -> Self {
+    /// A decoder bounded by `limit_bytes` (`stream.max_bytes`).
+    ///
+    /// The guard in `runtime::streaming` counts DECODED event content, so it
+    /// bounds nothing that never becomes an event. Two things here do:
+    /// `buffer` holds bytes until a `\n` arrives, and `data` accumulates
+    /// `data:` field lines until a blank line dispatches them. A peer that
+    /// sends neither — a stuck proxy, a misbehaving endpoint, a `base_url` the
+    /// user pointed somewhere unexpected — grows both without limit, and the
+    /// liveness guards do not fire while bytes keep arriving: the chunk
+    /// timeout is reset by every chunk, so only the total deadline (default
+    /// 900s) ends it. That is fifteen minutes of unbounded allocation behind a
+    /// setting whose documented job is to stop exactly this.
+    ///
+    /// The limit is charged against the two buffers together, because they are
+    /// two halves of one undispatched event.
+    pub(crate) fn with_limit(limit_bytes: u64) -> Self {
         Self {
             buffer: Vec::new(),
             data: String::new(),
+            limit_bytes,
         }
+    }
+
+    /// A decoder with a limit no test payload reaches, so the tests below keep
+    /// asserting about framing rather than about the ceiling. The ceiling has
+    /// its own test (`an_endless_line_is_refused_instead_of_buffered`).
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self::with_limit(u64::MAX)
+    }
+
+    /// Bytes held that have not yet become an event.
+    fn buffered(&self) -> u64 {
+        self.buffer.len() as u64 + self.data.len() as u64
+    }
+
+    fn check_limit(&self) -> AgentResult<()> {
+        if self.buffered() > self.limit_bytes {
+            return Err(AgentError::StreamOverflow {
+                limit_bytes: self.limit_bytes,
+            });
+        }
+        Ok(())
     }
 
     /// Feed one network chunk; returns the events it completed.
     pub(crate) fn push(&mut self, bytes: &[u8]) -> AgentResult<Vec<AgentEvent>> {
         self.buffer.extend_from_slice(bytes);
+        // Before draining lines, not after: a chunk that carries no newline at
+        // all leaves the loop below with nothing to do, which is precisely the
+        // shape that grows without bound.
+        self.check_limit()?;
         let mut events = Vec::new();
         while let Some(newline) = self.buffer.iter().position(|&byte| byte == b'\n') {
             let line_bytes: Vec<u8> = self.buffer.drain(..=newline).collect();
@@ -175,6 +222,10 @@ impl SseDecoder {
                 self.data.push('\n');
             }
             self.data.push_str(value);
+            // A stream of `data:` lines with no blank line between them
+            // accumulates here instead of in `buffer`; same unbounded growth,
+            // reached through the other half.
+            return self.check_limit();
         }
         Ok(())
     }
@@ -321,5 +372,57 @@ mod tests {
             !text.trim().is_empty(),
             "model must stream non-empty text, got none"
         );
+    }
+
+    /// `stream.max_bytes` is documented as the stream's size guard, and the
+    /// guard in `runtime::streaming` only sees DECODED content. A peer that
+    /// never sends a newline produces no events at all, so nothing there could
+    /// ever fire; the bytes simply accumulated here.
+    #[test]
+    fn an_endless_line_is_refused_instead_of_buffered() {
+        let mut decoder = SseDecoder::with_limit(1_024);
+        let chunk = vec![b'x'; 512];
+        assert!(decoder.push(&chunk).unwrap().is_empty());
+        assert!(decoder.push(&chunk).unwrap().is_empty());
+        let error = decoder.push(&chunk).unwrap_err();
+        assert!(
+            matches!(error, AgentError::StreamOverflow { limit_bytes } if limit_bytes == 1_024),
+            "got {error:?}"
+        );
+    }
+
+    /// The other half of the same budget: `data:` lines with no blank line
+    /// between them accumulate in `data`, not in `buffer`.
+    #[test]
+    fn endless_undispatched_data_lines_are_refused() {
+        let mut decoder = SseDecoder::with_limit(1_024);
+        let line = format!("data: {}\n", "y".repeat(256));
+        let mut last = Ok(Vec::new());
+        for _ in 0..20 {
+            last = decoder.push(line.as_bytes());
+            if last.is_err() {
+                break;
+            }
+        }
+        assert!(
+            matches!(last, Err(AgentError::StreamOverflow { .. })),
+            "expected the accumulating data field to be bounded too"
+        );
+    }
+
+    /// The bound must not cost an ordinary stream: a complete event is
+    /// dispatched and its bytes stop counting against the ceiling.
+    #[test]
+    fn dispatched_events_release_their_bytes() {
+        let frame = format!("data: {CHUNK}\n\n");
+        // Room for one frame and not much more: if a dispatched event kept
+        // charging against the ceiling, the second push would already fail.
+        let mut decoder = SseDecoder::with_limit(frame.len() as u64 + 8);
+        for _ in 0..50 {
+            let events = decoder
+                .push(frame.as_bytes())
+                .expect("a dispatched frame must not accumulate");
+            assert_eq!(events, vec![text_delta("hi")]);
+        }
     }
 }
