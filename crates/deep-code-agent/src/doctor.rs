@@ -143,7 +143,21 @@ pub struct DeepSeekDoctorReport {
     pub cost_currency: String,
     pub beta_endpoint: bool,
     pub models: Vec<ModelDoctorEntry>,
-    pub api_key_hint: String,
+    /// How to obtain and set an API key — present ONLY when there is no usable
+    /// key, because that is the only state the guidance describes.
+    ///
+    /// It used to be an unconditional `String`. The text renderer gated it on
+    /// `api_key.source == "missing"` and read correctly; the JSON one
+    /// serializes the struct, so a host with a working key reported
+    /// `"api_key": {"source": "global"}` and a "missing DeepSeek API Key"
+    /// paragraph side by side. Two spellings of the same predicate, and only
+    /// one of them was applied — so the predicate moved here, where both
+    /// surfaces read the same `Option`. It is also the one localized string in
+    /// an otherwise English report (`doctor_cli` argues why: it is user
+    /// guidance, not a field label); making it conditional means it now
+    /// appears only on the host that needs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -237,16 +251,23 @@ fn collect_deepseek(config: &AgentConfig) -> DeepSeekDoctorReport {
         cost_currency: config.cost_currency.as_setting().to_string(),
         beta_endpoint: config.uses_beta_endpoint(),
         models,
-        api_key_hint: api_key_setup_hint(crate::i18n::Lang::from_env(&config.language)),
+        api_key_hint: (!has_usable_api_key(config))
+            .then(|| api_key_setup_hint(crate::i18n::Lang::from_env(&config.language))),
     }
 }
 
-fn api_key_report(config: &AgentConfig) -> ApiKeyReport {
-    let source = if config
+/// Whether the assembled config carries a key worth trying. The one predicate
+/// behind both "which layer supplied it" and "should the setup guidance be
+/// shown at all"; spelled twice, the two answered differently.
+fn has_usable_api_key(config: &AgentConfig) -> bool {
+    config
         .api_key
         .as_ref()
         .is_some_and(|key| !key.trim().is_empty())
-    {
+}
+
+fn api_key_report(config: &AgentConfig) -> ApiKeyReport {
+    let source = if has_usable_api_key(config) {
         if std::env::var(DEEPSEEK_API_KEY_ENV)
             .ok()
             .filter(|key| !key.trim().is_empty())
@@ -349,6 +370,49 @@ mod tests {
             sandbox["confines_network"],
             serde_json::Value::Bool(report.sandbox.network.is_full())
         );
+    }
+
+    /// The setup guidance describes one state, so it must appear in exactly
+    /// that state — on BOTH surfaces, since the JSON one serializes the struct
+    /// and cannot apply a renderer-side guard.
+    #[test]
+    fn the_api_key_hint_appears_only_when_no_key_is_configured() {
+        let workspace = TempDir::new().unwrap();
+
+        let without = DoctorReport::collect(
+            workspace.path(),
+            &AgentConfig {
+                api_key: None,
+                ..AgentConfig::default()
+            },
+        );
+        assert!(without.deepseek.api_key_hint.is_some());
+        let json: serde_json::Value =
+            serde_json::from_str(&without.to_json_pretty().unwrap()).unwrap();
+        assert!(json["deepseek"]["api_key_hint"].is_string());
+
+        for key in [Some("sk-live".to_string()), Some("   ".to_string())] {
+            let configured = DoctorReport::collect(
+                workspace.path(),
+                &AgentConfig {
+                    api_key: key.clone(),
+                    ..AgentConfig::default()
+                },
+            );
+            let blank = key.as_deref().is_none_or(|value| value.trim().is_empty());
+            assert_eq!(
+                configured.deepseek.api_key_hint.is_some(),
+                blank,
+                "hint presence must follow whether the key is usable ({key:?})"
+            );
+            let json: serde_json::Value =
+                serde_json::from_str(&configured.to_json_pretty().unwrap()).unwrap();
+            assert_eq!(
+                json["deepseek"].get("api_key_hint").is_some(),
+                blank,
+                "the JSON surface must agree with the struct ({key:?})"
+            );
+        }
     }
 
     #[test]

@@ -103,8 +103,13 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
             model.id, model.context_window, model.supports_reasoning, model.supports_tools
         );
     }
-    if report.api_key.source == "missing" {
-        println!("  api key setup:\n{}", report.deepseek.api_key_hint);
+    // The report decides whether guidance applies (`api_key_hint` is `Some`
+    // exactly when no usable key was assembled); this surface no longer
+    // re-derives it from `api_key.source`. Two spellings of one predicate is
+    // how the JSON surface came to print the "missing key" paragraph on a host
+    // that had one.
+    if let Some(hint) = &report.deepseek.api_key_hint {
+        println!("  api key setup:\n{hint}");
     }
     // "available" is not the same as "enforcing": a backend can exist and still
     // confine nothing (Windows Job Object). Report what it actually does.
