@@ -15,19 +15,61 @@ pub enum SubAgentRole {
     Verifier,
 }
 
+/// Every spelling [`SubAgentRole::parse`] accepts, written in the form
+/// [`normalize`] produces: lowercase, with `-` folded to `_`.
+///
+/// A table rather than match arms, because the arms could not be held to that
+/// form and drifted out of it. `normalize` rewrites `-` into `_` before the
+/// comparison, so an arm spelled `"general-purpose"` was unreachable — and
+/// unreachable in the direction that costs most: `parse` failing makes
+/// `engine::subagent_role_writes` fail closed to "this role writes", so a
+/// read-only dispatch first showed the human a *writing* sub-agent approval
+/// prompt and only then died as an invalid role. The sibling `"code-review"`
+/// was equally dead and nobody noticed, because a `"code_review"` arm beside
+/// it answered for it.
+///
+/// `every_listed_alias_parses_in_both_spellings` walks this table and fails
+/// naming any entry that is not already normalized, so the next alias cannot
+/// repeat it; `every_variant_has_an_alias` fails if a new variant is added
+/// without one.
+const ROLE_ALIASES: &[(&str, SubAgentRole)] = &[
+    ("general", SubAgentRole::General),
+    ("worker", SubAgentRole::General),
+    ("default", SubAgentRole::General),
+    ("general_purpose", SubAgentRole::General),
+    ("explore", SubAgentRole::Explore),
+    ("explorer", SubAgentRole::Explore),
+    ("exploration", SubAgentRole::Explore),
+    ("plan", SubAgentRole::Plan),
+    ("planning", SubAgentRole::Plan),
+    ("planner", SubAgentRole::Plan),
+    ("review", SubAgentRole::Review),
+    ("reviewer", SubAgentRole::Review),
+    ("code_review", SubAgentRole::Review),
+    ("implementer", SubAgentRole::Implementer),
+    ("implement", SubAgentRole::Implementer),
+    ("implementation", SubAgentRole::Implementer),
+    ("builder", SubAgentRole::Implementer),
+    ("verifier", SubAgentRole::Verifier),
+    ("verify", SubAgentRole::Verifier),
+    ("verification", SubAgentRole::Verifier),
+    ("validator", SubAgentRole::Verifier),
+    ("tester", SubAgentRole::Verifier),
+];
+
 impl SubAgentRole {
+    /// Resolve a role name written by the model (or a human) to a variant.
+    /// Case-insensitive, and `-` and `_` are interchangeable — see
+    /// [`ROLE_ALIASES`] for the accepted spellings.
     pub fn parse(value: &str) -> Result<Self, SubAgentError> {
-        match normalize(value).as_str() {
-            "general" | "worker" | "default" | "general-purpose" => Ok(Self::General),
-            "explore" | "explorer" | "exploration" => Ok(Self::Explore),
-            "plan" | "planning" | "planner" => Ok(Self::Plan),
-            "review" | "reviewer" | "code-review" | "code_review" => Ok(Self::Review),
-            "implementer" | "implement" | "implementation" | "builder" => Ok(Self::Implementer),
-            "verifier" | "verify" | "verification" | "validator" | "tester" => Ok(Self::Verifier),
-            other => Err(SubAgentError::InvalidRole {
-                value: other.to_string(),
-            }),
-        }
+        let normalized = normalize(value);
+        ROLE_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == normalized)
+            .map_or(
+                Err(SubAgentError::InvalidRole { value: normalized }),
+                |(_, role)| Ok(*role),
+            )
     }
 
     #[must_use]
@@ -151,6 +193,71 @@ mod tests {
             SubAgentRole::Review
         );
         assert!(SubAgentRole::parse("custom").is_err());
+    }
+
+    /// The table is held to the form `normalize` produces, and every entry is
+    /// checked in BOTH spellings a caller actually writes.
+    ///
+    /// Hand-written arms could not be held to either. `"general-purpose"` —
+    /// the name this module's own `GENERAL_INTRO` uses for the role, and the
+    /// one a model reaches for first — was listed and dead, because
+    /// `normalize` had already turned the caller's `-` into `_` by the time
+    /// the arm was compared. A test that spot-checks a few aliases cannot see
+    /// that; one that walks the table can only fail.
+    #[test]
+    fn every_listed_alias_parses_in_both_spellings() {
+        for (alias, role) in ROLE_ALIASES {
+            assert_eq!(
+                normalize(alias),
+                *alias,
+                "alias {alias:?} is not written in normalized form, so parse can never reach it"
+            );
+            assert_eq!(SubAgentRole::parse(alias).as_ref(), Ok(role), "{alias:?}");
+            let hyphenated = alias.replace('_', "-");
+            assert_eq!(
+                SubAgentRole::parse(&hyphenated).as_ref(),
+                Ok(role),
+                "{hyphenated:?}"
+            );
+            let shouted = alias.to_ascii_uppercase();
+            assert_eq!(
+                SubAgentRole::parse(&shouted).as_ref(),
+                Ok(role),
+                "{shouted:?}"
+            );
+        }
+    }
+
+    /// A variant with no alias is a role nothing can dispatch. Exhaustive over
+    /// the same list `role_str_is_the_serde_spelling_and_parses_back` uses.
+    #[test]
+    fn every_variant_has_an_alias() {
+        for role in [
+            SubAgentRole::General,
+            SubAgentRole::Explore,
+            SubAgentRole::Plan,
+            SubAgentRole::Review,
+            SubAgentRole::Implementer,
+            SubAgentRole::Verifier,
+        ] {
+            assert!(
+                ROLE_ALIASES.iter().any(|(_, listed)| *listed == role),
+                "{role:?} has no entry in ROLE_ALIASES"
+            );
+        }
+    }
+
+    /// The failure this table exists to prevent, pinned end to end: an
+    /// unparsable role makes `accept_edits_approvable`/`subagent_role_writes`
+    /// fail closed to "writes", so the regression was not just an error — it
+    /// was a *writing sub-agent* approval prompt for a read-only dispatch.
+    #[test]
+    fn the_general_purpose_spelling_stays_read_only() {
+        for spelling in ["general-purpose", "general_purpose", "General-Purpose"] {
+            let role = SubAgentRole::parse(spelling).expect(spelling);
+            assert_eq!(role, SubAgentRole::General);
+            assert!(!role.allows_writes(), "{spelling} must stay read-only");
+        }
     }
 
     /// `as_str` is the serde spelling and a `parse` fixpoint: the prefix
