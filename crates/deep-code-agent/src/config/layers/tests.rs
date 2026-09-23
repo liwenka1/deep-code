@@ -532,6 +532,86 @@ fn every_enum_setting_warns_on_an_unrecognized_spelling() {
     }
 }
 
+/// The environment twin of the sweep above.
+///
+/// The file layer grew `parse_setting` and this one did not, so the same typo
+/// was named in `config.toml` and swallowed in the environment — the harder
+/// place to notice it, since there is no file to re-read. Every env setting
+/// with a grammar is listed here; a new one cannot be added silently without
+/// this failing or someone deciding to leave it out.
+#[test]
+fn every_parsed_env_setting_warns_on_an_unrecognized_value() {
+    use crate::config::{
+        AUTO_COST_SAVING_ENV, CHECKPOINT_MAX_SNAPSHOTS_ENV, COMPACTION_THRESHOLD_ENV,
+        COST_CURRENCY_ENV, LANG_ENV, REASONING_EFFORT_ENV, STREAM_CHUNK_TIMEOUT_ENV,
+        STREAM_MAX_BYTES_ENV, STREAM_MAX_RETRIES_ENV, STREAM_TOTAL_TIMEOUT_ENV,
+    };
+
+    const SETTINGS: [(&str, &str); 10] = [
+        (REASONING_EFFORT_ENV, "maximum"),
+        (LANG_ENV, "kling0n"),
+        (AUTO_COST_SAVING_ENV, "affirmative"),
+        (COST_CURRENCY_ENV, "eur"),
+        (COMPACTION_THRESHOLD_ENV, "lots"),
+        (STREAM_MAX_RETRIES_ENV, "many"),
+        (STREAM_CHUNK_TIMEOUT_ENV, "5m"),
+        (STREAM_TOTAL_TIMEOUT_ENV, "-1"),
+        (STREAM_MAX_BYTES_ENV, "50MB"),
+        (CHECKPOINT_MAX_SNAPSHOTS_ENV, "twenty"),
+    ];
+
+    for (name, bad) in SETTINGS {
+        let loaded = AgentConfig::load_with(None, None, &|asked| {
+            (asked == name).then(|| bad.to_string())
+        });
+        assert!(
+            loaded
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(name) && warning.contains(bad)),
+            "{name}='{bad}' must be reported, got {:?}",
+            loaded.report.warnings
+        );
+    }
+}
+
+/// The half of the old boolean rule that failed *toward* the expensive answer:
+/// an uppercase `TRUE` meant false, silently. Both spellings now work, and an
+/// unrecognized word leaves the value alone instead of forcing it off.
+#[test]
+fn an_env_boolean_reads_case_insensitively_and_both_ways() {
+    use crate::config::AUTO_COST_SAVING_ENV;
+
+    let load = |value: &'static str| {
+        AgentConfig::load_with(None, None, &move |asked| {
+            (asked == AUTO_COST_SAVING_ENV).then(|| value.to_string())
+        })
+    };
+
+    for on in ["1", "true", "TRUE", "Yes", "ON"] {
+        assert!(load(on).config.auto_cost_saving, "{on} must read as on");
+    }
+    for off in ["0", "false", "FALSE", "no", "Off"] {
+        assert!(!load(off).config.auto_cost_saving, "{off} must read as off");
+    }
+
+    // Unrecognized: warned about, and the builtin value is left standing
+    // rather than being forced to `false` by the failed parse.
+    let loaded = load("affirmative");
+    assert_eq!(
+        loaded.config.auto_cost_saving,
+        AgentConfig::builtin().auto_cost_saving
+    );
+    assert!(
+        loaded
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("affirmative"))
+    );
+}
+
 /// The regression that motivated the sweep above, spelled out on its own
 /// because its consequence is not "a setting did not apply".
 ///

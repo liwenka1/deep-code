@@ -258,7 +258,7 @@ impl AgentConfig {
             }
         }
 
-        apply_env_overlay(&mut config, &mut report.sources, env_lookup);
+        apply_env_overlay(&mut config, &mut report.sources, &mut pending, env_lookup);
 
         // Render deferred warnings now that the final language is known.
         // Resolve through the same `env_lookup` seam so tests stay deterministic.
@@ -697,55 +697,153 @@ fn apply_file_overlay(
     }
 }
 
+/// Booleans as every other parser in this crate reads them: case-insensitively,
+/// with both directions spelled out and anything else `None`.
+///
+/// `matches!(value.trim(), "1" | "true" | "yes" | "on")` was the old rule, and
+/// it failed in two directions at once. `DEEP_CODE_AUTO_COST_SAVING=TRUE` — the
+/// spelling half of CI writes — silently meant *false*, and so did a typo, so
+/// the only way to learn the setting had not applied was to notice the bill.
+/// Returning `None` for an unrecognized word lets [`parse_setting`] say so and
+/// leaves the value the layers below set, instead of forcing it off.
+fn parse_bool_setting(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// The environment layer, applied last and therefore strongest.
+///
+/// Every setting whose value has a grammar goes through [`parse_setting`], for
+/// the reason that function documents: a value the loader cannot read is a
+/// setting the user believes they set. The file layer grew that rule and this
+/// one did not, so the same typo was reported in
+/// `<workspace>/.deep-code/config.toml` and swallowed in the environment —
+/// where it is *harder* to notice, because there is no file to re-read.
+/// `every_enum_setting_warns_on_an_unrecognized_spelling` covers the file
+/// layer; `every_parsed_env_setting_warns_on_an_unrecognized_value` covers this
+/// one, and both are enumerations rather than spot checks.
+///
+/// The free-form settings stay free-form on purpose: an API key, a model id (a
+/// model newer than this binary must still be settable — see
+/// `ResolutionKind::Passthrough`) and the `auto_allow` tool-name list have no
+/// grammar to check against, so there is nothing an unrecognized value could
+/// mean.
 pub(super) fn apply_env_overlay(
     config: &mut AgentConfig,
     sources: &mut ConfigSources,
+    pending: &mut Vec<PendingWarning>,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) {
-    if let Some(key) = lookup(DEEPSEEK_API_KEY_ENV).filter(|value| !value.trim().is_empty()) {
+    let env = |name: &'static str| lookup(name);
+    if let Some(key) = env(DEEPSEEK_API_KEY_ENV).filter(|value| !value.trim().is_empty()) {
         config.api_key = Some(key);
         sources.api_key = ConfigLayer::Env;
     }
-    if let Some(model) = lookup(MODEL_ENV).filter(|value| !value.trim().is_empty()) {
+    if let Some(model) = env(MODEL_ENV).filter(|value| !value.trim().is_empty()) {
         config.model = model;
         sources.model = ConfigLayer::Env;
     }
-    if let Some(effort) =
-        lookup(REASONING_EFFORT_ENV).and_then(|value| ReasoningEffortSetting::parse(&value))
-    {
+    if let Some(effort) = parse_setting(
+        env(REASONING_EFFORT_ENV).as_deref(),
+        REASONING_EFFORT_ENV,
+        ConfigLayer::Env,
+        pending,
+        ReasoningEffortSetting::parse,
+    ) {
         config.reasoning_effort = effort;
         sources.reasoning_effort = ConfigLayer::Env;
     }
-    if let Some(value) = lookup(LANG_ENV).filter(|value| !value.trim().is_empty()) {
-        config.language = value.trim().to_string();
+    // Validated against the same rule the `ui.language` file key uses, so the
+    // two spellings of "is this a language I can render" cannot disagree.
+    if let Some(language) = parse_setting(
+        env(LANG_ENV).as_deref(),
+        LANG_ENV,
+        ConfigLayer::Env,
+        pending,
+        |value| {
+            (value.eq_ignore_ascii_case("auto") || Lang::from_tag(value).is_some())
+                .then(|| value.to_string())
+        },
+    ) {
+        config.language = language;
     }
-    if let Some(value) = lookup(AUTO_COST_SAVING_ENV) {
-        config.auto_cost_saving = matches!(value.trim(), "1" | "true" | "yes" | "on");
+    if let Some(value) = parse_setting(
+        env(AUTO_COST_SAVING_ENV).as_deref(),
+        AUTO_COST_SAVING_ENV,
+        ConfigLayer::Env,
+        pending,
+        parse_bool_setting,
+    ) {
+        config.auto_cost_saving = value;
     }
-    if let Some(currency) = lookup(COST_CURRENCY_ENV).and_then(|value| CostCurrency::parse(&value))
-    {
+    if let Some(currency) = parse_setting(
+        env(COST_CURRENCY_ENV).as_deref(),
+        COST_CURRENCY_ENV,
+        ConfigLayer::Env,
+        pending,
+        CostCurrency::parse,
+    ) {
         config.cost_currency = currency;
         sources.cost_currency = ConfigLayer::Env;
     }
-    if let Some(value) = lookup(COMPACTION_THRESHOLD_ENV).and_then(|value| value.parse().ok()) {
+    if let Some(value) = parse_setting(
+        env(COMPACTION_THRESHOLD_ENV).as_deref(),
+        COMPACTION_THRESHOLD_ENV,
+        ConfigLayer::Env,
+        pending,
+        |value| value.parse::<u32>().ok(),
+    ) {
         config.compaction_threshold = Some(value);
     }
-    if let Some(value) = lookup(STREAM_MAX_RETRIES_ENV).and_then(|value| value.parse().ok()) {
+    if let Some(value) = parse_setting(
+        env(STREAM_MAX_RETRIES_ENV).as_deref(),
+        STREAM_MAX_RETRIES_ENV,
+        ConfigLayer::Env,
+        pending,
+        |value| value.parse::<u32>().ok(),
+    ) {
         config.stream_max_retries = value;
     }
-    if let Some(value) = lookup(STREAM_CHUNK_TIMEOUT_ENV).and_then(|value| value.parse().ok()) {
+    if let Some(value) = parse_setting(
+        env(STREAM_CHUNK_TIMEOUT_ENV).as_deref(),
+        STREAM_CHUNK_TIMEOUT_ENV,
+        ConfigLayer::Env,
+        pending,
+        |value| value.parse::<u64>().ok(),
+    ) {
         config.stream_chunk_timeout = Duration::from_secs(value);
     }
-    if let Some(value) = lookup(STREAM_TOTAL_TIMEOUT_ENV).and_then(|value| value.parse().ok()) {
+    if let Some(value) = parse_setting(
+        env(STREAM_TOTAL_TIMEOUT_ENV).as_deref(),
+        STREAM_TOTAL_TIMEOUT_ENV,
+        ConfigLayer::Env,
+        pending,
+        |value| value.parse::<u64>().ok(),
+    ) {
         config.stream_total_timeout = Duration::from_secs(value);
     }
-    if let Some(value) = lookup(STREAM_MAX_BYTES_ENV).and_then(|value| value.parse().ok()) {
+    if let Some(value) = parse_setting(
+        env(STREAM_MAX_BYTES_ENV).as_deref(),
+        STREAM_MAX_BYTES_ENV,
+        ConfigLayer::Env,
+        pending,
+        |value| value.parse::<u64>().ok(),
+    ) {
         config.stream_max_bytes = value;
     }
-    if let Some(value) = lookup(CHECKPOINT_MAX_SNAPSHOTS_ENV).and_then(|value| value.parse().ok()) {
+    if let Some(value) = parse_setting(
+        env(CHECKPOINT_MAX_SNAPSHOTS_ENV).as_deref(),
+        CHECKPOINT_MAX_SNAPSHOTS_ENV,
+        ConfigLayer::Env,
+        pending,
+        |value| value.parse::<usize>().ok(),
+    ) {
         config.checkpoint_max_snapshots = value;
     }
-    if let Some(value) = lookup(APPROVAL_AUTO_ALLOW_ENV) {
+    if let Some(value) = env(APPROVAL_AUTO_ALLOW_ENV) {
         config.approval_auto_allow = value
             .split(',')
             .map(|rule| rule.trim().to_string())

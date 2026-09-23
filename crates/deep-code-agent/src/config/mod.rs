@@ -113,7 +113,13 @@ impl Default for AgentConfig {
     fn default() -> Self {
         let mut config = Self::builtin();
         let mut sources = ConfigSources::default();
-        layers::apply_env_overlay(&mut config, &mut sources, &|name| env::var(name).ok());
+        // `default()` has no report to carry warnings on — it is the
+        // no-files constructor used by tests and by callers that only want the
+        // env overlay. `load()` is the path that surfaces them.
+        let mut discarded = Vec::new();
+        layers::apply_env_overlay(&mut config, &mut sources, &mut discarded, &|name| {
+            env::var(name).ok()
+        });
         config
     }
 }
