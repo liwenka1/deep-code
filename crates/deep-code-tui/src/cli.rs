@@ -1,7 +1,7 @@
 //! CLI argument parsing for the `deep-code` binary.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use deep_code_agent::{PermissionMode, format_sessions_storage_note};
 
@@ -326,13 +326,25 @@ fn parse_print_args(mut args: Vec<String>) -> CliArgs {
 /// record, sandbox profile, system prompt) sees a single spelling, and a
 /// bad path refuses the launch instead of surfacing later as a mid-task
 /// tool denial the model cannot act on.
+///
+/// Through the agent crate's [`deep_code_agent::canonicalize`], not
+/// `Path::canonicalize`, because "a single spelling" is the whole claim above
+/// and the two readings differ. On macOS the agent's version collapses the
+/// firmlinked `/System/Volumes/Data/...` alias onto the short spelling; this
+/// one did not, so `--add-dir /System/Volumes/Data/Users/x/repo` was *signed
+/// into the session record* in a form `runtime_launch` then re-resolved to a
+/// different string — and a grant whose recorded spelling no longer resolves
+/// to itself is dropped on resume with "it now resolves to …, so it is no
+/// longer the directory that was approved". That message exists to report a
+/// symlink planted over an approved directory; here it fired on an honest
+/// grant, and the boundary silently narrowed.
 fn push_add_dir(add_dirs: &mut Vec<PathBuf>, raw: &str) {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         eprintln!("--add-dir needs a directory path");
         std::process::exit(2);
     }
-    let canonical = match PathBuf::from(trimmed).canonicalize() {
+    let canonical = match deep_code_agent::canonicalize(Path::new(trimmed)) {
         Ok(path) => path,
         Err(error) => {
             eprintln!("--add-dir {trimmed} cannot be resolved: {error}");

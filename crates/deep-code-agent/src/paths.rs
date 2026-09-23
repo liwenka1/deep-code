@@ -37,7 +37,15 @@ const FIRMLINK_DATA_PREFIX: &str = "/System/Volumes/Data";
 /// inode, so a directory that merely happens to live under
 /// `/System/Volumes/Data` keeps its own identity. Everywhere else this is
 /// plain `canonicalize`.
-pub(crate) fn canonicalize(path: &std::path::Path) -> std::io::Result<PathBuf> {
+///
+/// Public because the boundary is decided in two crates. Anything that
+/// produces a path the write boundary will later be compared against — the
+/// TUI's `--add-dir`, most of all, whose value is *signed into the session
+/// record* — must use this reading and not `Path::canonicalize`, or the two
+/// spellings of the same directory stop being equal and a perfectly good
+/// grant is dropped on the next `-c` as "no longer the directory that was
+/// approved".
+pub fn canonicalize(path: &std::path::Path) -> std::io::Result<PathBuf> {
     let resolved = path.canonicalize()?;
     #[cfg(target_os = "macos")]
     {
