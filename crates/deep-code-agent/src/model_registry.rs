@@ -188,11 +188,28 @@ pub fn deepseek_default_models() -> Vec<ModelInfo> {
     ]
 }
 
+/// The built-in catalog, built once.
+///
+/// The free functions below — and `pricing`'s — are called per turn, per
+/// request and (through `estimate_token_count`'s callers) per rendered frame,
+/// and each one used to construct a fresh `ModelRegistry`: two `ModelInfo`
+/// values with their `Vec<String>` alias lists, allocated and dropped to
+/// answer a question about a static table. Nothing about the built-in catalog
+/// can change under a running process, so it is built once and borrowed.
+///
+/// `ModelRegistry::default()` stays as it was: callers that want an owned
+/// catalog (`runtime`, `doctor`, `/model`) keep getting one.
+pub(crate) fn builtin_registry() -> &'static ModelRegistry {
+    static REGISTRY: std::sync::LazyLock<ModelRegistry> =
+        std::sync::LazyLock::new(ModelRegistry::default);
+    &REGISTRY
+}
+
 /// Context window for `model`, falling back to the V4 family window for
 /// unknown ids (all currently supported models share it).
 #[must_use]
 pub fn context_window_for_model(model: &str) -> u32 {
-    ModelRegistry::default()
+    builtin_registry()
         .info_for(model)
         .map_or(DEEPSEEK_V4_CONTEXT_WINDOW, |entry| entry.context_window)
 }

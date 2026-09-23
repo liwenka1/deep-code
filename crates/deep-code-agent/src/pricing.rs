@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::Usage;
-use crate::model_registry::{ModelPricingMeta, ModelRegistry};
+use crate::model_registry::{ModelPricingMeta, builtin_registry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -76,10 +76,7 @@ impl CostEstimate {
 /// Spend avoided by cache hits this turn: `cache_hit_tokens × (miss − hit)` price.
 #[must_use]
 pub fn cache_savings(model: &str, cache_hit_tokens: u32) -> CostEstimate {
-    let Some(pricing) = ModelRegistry::default()
-        .info_for(model)
-        .map(|info| info.pricing.clone())
-    else {
+    let Some(pricing) = builtin_registry().info_for(model).map(|info| &info.pricing) else {
         return CostEstimate::default();
     };
     CostEstimate {
@@ -96,13 +93,10 @@ pub fn cache_savings(model: &str, cache_hit_tokens: u32) -> CostEstimate {
 
 #[must_use]
 pub fn calculate_turn_cost(model: &str, usage: &Usage) -> CostEstimate {
-    let Some(pricing) = ModelRegistry::default()
-        .info_for(model)
-        .map(|info| info.pricing.clone())
-    else {
+    let Some(pricing) = builtin_registry().info_for(model).map(|info| &info.pricing) else {
         return CostEstimate::default();
     };
-    calculate_with_pricing(&pricing, usage)
+    calculate_with_pricing(pricing, usage)
 }
 
 fn calculate_with_pricing(pricing: &ModelPricingMeta, usage: &Usage) -> CostEstimate {
