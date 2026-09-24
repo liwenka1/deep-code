@@ -20,6 +20,9 @@ use workflow::{
     API_KEY_SECRET, APP_ID_SECRET, APP_KEY_SECRET, DEFAULT_WORKFLOW_PATH, DEFAULT_WORKFLOW_REF,
     WorkflowSpec,
 };
+// The CLI validates `--ref` at its boundary, like `--lang` and
+// `--permission-mode`; the rule itself stays next to the thing that writes it.
+pub(crate) use workflow::parse_workflow_ref;
 
 const EXIT_OK: i32 = 0;
 const EXIT_FAILURE: i32 = 1;
@@ -443,14 +446,18 @@ fn display(root: &Path, target: &Path) -> String {
 mod tests {
     use super::*;
 
-    /// Whatever the flags say, the two values that reach the generated YAML are
-    /// canonical tokens — the enums' own `as_setting` spellings.
+    /// Whatever the flags say, all THREE values that reach the generated YAML
+    /// are canonical tokens — the two enums' own `as_setting` spellings, and a
+    /// ref that cleared [`workflow::parse_workflow_ref`].
     ///
     /// They used to be raw strings carried straight from argv to an unquoted
     /// interpolation. `--permission-mode acceptEdits` wrote a workflow whose
     /// misconfiguration surfaced only in a later CI run, and a value carrying
     /// YAML punctuation rewrote the file's structure. Parsing at the CLI edge
-    /// is what makes this assertion possible at all.
+    /// is what makes this assertion possible at all — and `--ref` was the one
+    /// still unparsed after the other two were fixed, which is why the count
+    /// is spelled out here: this test is where a fourth interpolated value
+    /// would have to be accounted for.
     #[test]
     fn the_generated_workflow_only_ever_carries_canonical_tokens() {
         use deep_code_agent::{Lang, PermissionMode};
@@ -478,6 +485,23 @@ mod tests {
                 yaml.contains(&format!("permission-mode: {expected_mode}\n")),
                 "{yaml}"
             );
+        }
+
+        // The third one. A ref only ever arrives through `parse_workflow_ref`,
+        // so every value that can reach the file leaves `uses:` a single line
+        // ending at the ref.
+        for raw in ["main", "v0.5.0", "release/1.x"] {
+            let workflow_ref = parse_workflow_ref(raw).expect("a plain ref is usable");
+            let spec = spec_for(&InstallArgs {
+                workflow_ref: Some(workflow_ref),
+                ..InstallArgs::default()
+            });
+            let yaml = workflow::render(&spec);
+            let line = yaml
+                .lines()
+                .find(|line| line.trim_start().starts_with("uses:"))
+                .expect("the generated file wires the reusable workflow");
+            assert!(line.trim_end().ends_with(&format!("@{raw}")), "{line}");
         }
     }
 

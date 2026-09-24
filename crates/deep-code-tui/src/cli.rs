@@ -702,7 +702,18 @@ fn parse_github_command(mut args: Vec<String>) -> CliArgs {
                         install.app_key_file =
                             Some(PathBuf::from(require_value(&mut args, "--app-private-key")));
                     }
-                    "--ref" => install.workflow_ref = Some(require_value(&mut args, "--ref")),
+                    "--ref" => {
+                        let value = require_value(&mut args, "--ref");
+                        install.workflow_ref = Some(
+                            crate::github::parse_workflow_ref(&value).unwrap_or_else(|| {
+                                eprintln!(
+                                    "Invalid --ref '{value}'. Use a branch or tag name \
+                                     (letters, digits, '.', '_', '-', '/')."
+                                );
+                                std::process::exit(2);
+                            }),
+                        );
+                    }
                     // Validated here, like `-p`'s own `--permission-mode`, and
                     // unlike the raw strings these used to be. The value is
                     // interpolated into the generated workflow unquoted, so an
