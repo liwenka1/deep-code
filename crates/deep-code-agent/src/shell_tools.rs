@@ -20,7 +20,7 @@ use crate::workspace_policy::WorkspaceRoots;
 use crate::workspace_policy::{WorkspacePolicy, invalid};
 pub use jobs::JobStore;
 use jobs::{
-    ChunkFn, JobKind, JobState, JobStatus, SharedBuffer, cancel_job, job_details,
+    ChunkFn, JobKind, JobState, JobStatus, SharedBuffer, SpillOwner, cancel_job, job_details,
     job_text_snapshot, kill_process_tree, refresh_job, shell_text_output, spawn_buffer_reader,
 };
 
@@ -297,20 +297,18 @@ fn steps_for(
 /// gone; the cap guards a lingering grandchild that inherited the pipe and
 /// keeps it open past the parent's exit.
 ///
-/// Returns whether the cap was reached and the readers were aborted — i.e.
-/// whether they died without reaching their own end-of-stream `finish_spill`,
-/// so the caller still owes the spill files that call. It is the caller's
-/// because it belongs to the *run*, not to one step of it: a run is a sequence
-/// now, the buffers are shared by every step, and `finish` is one-way — a late
-/// `push` cannot re-open a finished spill. Releasing the handle here therefore
-/// silently stopped spilling for every step that came after, so a `&&` chain
-/// whose first step left a grandchild on the pipe lost the full output of all
-/// the rest while the truncation hint still named the file. See the end of the
-/// step loop in `ShellTool::execute` for where it is paid.
+/// Says nothing about spill handles, and returns nothing, on purpose. It used
+/// to report whether it had aborted, so the caller could pay the
+/// `finish_spill` an aborted reader never reached — which made the release
+/// conditional on the *exceptional* path while the ordinary one still had each
+/// step's reader finish the run's shared buffers at its own end-of-stream.
+/// That is the same lost output, on the common path: see [`SpillOwner`], which
+/// now settles ownership once, and the single release site after the step loop
+/// in [`ShellTool::run`].
 async fn drain_readers(
     stdout_task: Option<tokio::task::JoinHandle<()>>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
-) -> bool {
+) {
     let stdout_abort = stdout_task.as_ref().map(|task| task.abort_handle());
     let stderr_abort = stderr_task.as_ref().map(|task| task.abort_handle());
     let drain = async {
@@ -325,7 +323,7 @@ async fn drain_readers(
         .await
         .is_ok()
     {
-        return false;
+        return;
     }
     // A grandchild that inherited the pipe kept it open past the cap: abort the
     // reader tasks so they (and the pipe fds they hold) don't linger until that
@@ -337,7 +335,6 @@ async fn drain_readers(
     if let Some(abort) = stderr_abort {
         abort.abort();
     }
-    true
 }
 
 /// Give the run's store record a terminal status on a path that returns before
@@ -703,95 +700,112 @@ impl Tool for ShellTool {
         // step is skipped while the previous status stands, and the run's
         // status is that of the last step that executed. One timeout covers
         // the whole sequence.
-        let mut outcome = (JobStatus::Completed, Some(0));
-        let mut previous_succeeded = true;
-        let mut readers_aborted = false;
-        for step in &steps {
-            if step.run_if == RunIf::PreviousSucceeded && !previous_succeeded {
-                continue;
-            }
-            let (mut child, _guard) = match spawn_confined(
-                &self.sandbox,
-                &granted_roots,
-                step.form.as_command_form(),
-                &cwd,
-                &policy,
-                Self::NAME,
-                "failed to start command",
-            ) {
-                Ok(spawned) => spawned,
-                // A lone command that cannot start is the caller's error, as
-                // before. Inside a sequence the shell would report it and
-                // carry on by the chain rules with status 127; so does this.
-                Err(error) if steps.len() == 1 => {
-                    abandon_job(&self.jobs, &job_id);
-                    return Err(error);
-                }
-                Err(error) => {
-                    stderr.push(format!("{error}\n").as_bytes());
-                    outcome = (JobStatus::Failed, Some(127));
-                    previous_succeeded = false;
+        //
+        // The sequence is one expression with ONE exit, rather than a loop
+        // that returns from the middle of the function, because the spill
+        // release below must happen on every way out of it — including the two
+        // spawn/wait failures. Written as three `finish_spill` calls instead,
+        // the ordinary path and the failure paths become separate spellings of
+        // one rule, which is exactly how the release came to be conditional in
+        // the first place.
+        let sequence: Result<(JobStatus, Option<i32>), ToolError> = async {
+            let mut outcome = (JobStatus::Completed, Some(0));
+            let mut previous_succeeded = true;
+            for step in &steps {
+                if step.run_if == RunIf::PreviousSucceeded && !previous_succeeded {
                     continue;
                 }
-            };
-            let stdout_task = child.stdout.take().map(|pipe| {
-                spawn_buffer_reader(
-                    pipe,
-                    stdout.clone(),
-                    Some(stream_chunk_fn(cx, "stdout", Arc::clone(&stream_budget))),
-                )
-            });
-            let stderr_task = child.stderr.take().map(|pipe| {
-                spawn_buffer_reader(
-                    pipe,
-                    stderr.clone(),
-                    Some(stream_chunk_fn(cx, "stderr", Arc::clone(&stream_budget))),
-                )
-            });
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let (status, exit_code) = tokio::select! {
-                result = child.wait() => match result {
-                    Ok(exit) => (
-                        if exit.success() { JobStatus::Completed } else { JobStatus::Failed },
-                        exit.code(),
-                    ),
+                let (mut child, _guard) = match spawn_confined(
+                    &self.sandbox,
+                    &granted_roots,
+                    step.form.as_command_form(),
+                    &cwd,
+                    &policy,
+                    Self::NAME,
+                    "failed to start command",
+                ) {
+                    Ok(spawned) => spawned,
+                    // A lone command that cannot start is the caller's error, as
+                    // before. Inside a sequence the shell would report it and
+                    // carry on by the chain rules with status 127; so does this.
+                    Err(error) if steps.len() == 1 => return Err(error),
                     Err(error) => {
-                        abandon_job(&self.jobs, &job_id);
-                        return Err(ToolError::exec_failed(
-                            Self::NAME,
-                            format!("failed to wait for command: {error}"),
-                        ));
+                        stderr.push(format!("{error}\n").as_bytes());
+                        outcome = (JobStatus::Failed, Some(127));
+                        previous_succeeded = false;
+                        continue;
                     }
-                },
-                () = cx.cancel_token().cancelled() => {
-                    kill_process_tree(&mut child);
-                    let _ = child.wait().await;
-                    (JobStatus::Cancelled, None)
+                };
+                // `SpillOwner::Caller`: these buffers are the run's, shared by
+                // every step, so no step's end-of-stream may finish them.
+                let stdout_task = child.stdout.take().map(|pipe| {
+                    spawn_buffer_reader(
+                        pipe,
+                        stdout.clone(),
+                        Some(stream_chunk_fn(cx, "stdout", Arc::clone(&stream_budget))),
+                        SpillOwner::Caller,
+                    )
+                });
+                let stderr_task = child.stderr.take().map(|pipe| {
+                    spawn_buffer_reader(
+                        pipe,
+                        stderr.clone(),
+                        Some(stream_chunk_fn(cx, "stderr", Arc::clone(&stream_budget))),
+                        SpillOwner::Caller,
+                    )
+                });
+
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let (status, exit_code) = tokio::select! {
+                    result = child.wait() => match result {
+                        Ok(exit) => (
+                            if exit.success() { JobStatus::Completed } else { JobStatus::Failed },
+                            exit.code(),
+                        ),
+                        Err(error) => {
+                            return Err(ToolError::exec_failed(
+                                Self::NAME,
+                                format!("failed to wait for command: {error}"),
+                            ));
+                        }
+                    },
+                    () = cx.cancel_token().cancelled() => {
+                        kill_process_tree(&mut child);
+                        let _ = child.wait().await;
+                        (JobStatus::Cancelled, None)
+                    }
+                    () = tokio::time::sleep(remaining) => {
+                        kill_process_tree(&mut child);
+                        let _ = child.wait().await;
+                        (JobStatus::TimedOut, None)
+                    }
+                };
+                drain_readers(stdout_task, stderr_task).await;
+                outcome = (status, exit_code);
+                previous_succeeded = status == JobStatus::Completed;
+                if matches!(status, JobStatus::Cancelled | JobStatus::TimedOut) {
+                    break;
                 }
-                () = tokio::time::sleep(remaining) => {
-                    kill_process_tree(&mut child);
-                    let _ = child.wait().await;
-                    (JobStatus::TimedOut, None)
-                }
-            };
-            readers_aborted |= drain_readers(stdout_task, stderr_task).await;
-            outcome = (status, exit_code);
-            previous_succeeded = status == JobStatus::Completed;
-            if matches!(status, JobStatus::Cancelled | JobStatus::TimedOut) {
-                break;
             }
+            Ok(outcome)
         }
-        // Owed by any step whose readers were aborted before end-of-stream (see
-        // `drain_readers`): release the spill handles now that no further step
-        // will write to these buffers, so an open fd does not linger in the
-        // retained `JobState` until the store evicts it. Idempotent against the
-        // steps that did reach their own end-of-stream.
-        if readers_aborted {
-            stdout.finish_spill();
-            stderr.finish_spill();
-        }
-        let (status, exit_code) = outcome;
+        .await;
+
+        // The run is over, so the run releases the spill handles it owns — see
+        // [`SpillOwner`] for why no reader may. Unconditional, and BEFORE the
+        // result is rendered: `shell_text_output` calls
+        // `discard_unreported_spill`, which removes the file, and removing a
+        // file with an open handle fails on Windows.
+        stdout.finish_spill();
+        stderr.finish_spill();
+
+        let (status, exit_code) = match sequence {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                abandon_job(&self.jobs, &job_id);
+                return Err(error);
+            }
+        };
 
         let job = self.jobs.get(&job_id, Self::NAME)?;
         let mut job = job.lock().expect("job lock poisoned");
@@ -870,11 +884,25 @@ impl JobTool {
         )?;
         let job_id = self.jobs.reserve_id();
         let (stdout, stderr) = spill_buffers(&self.spill_dir, &job_id);
+        // One process, one reader per stream, and nothing comes back to these
+        // buffers afterwards — the reader is the last writer, so it owns the
+        // spill handle (`SpillOwner::Reader`). A background job has no step
+        // loop to release it from, which is why the two callers differ.
         if let Some(pipe) = child.stdout.take() {
-            drop(spawn_buffer_reader(pipe, stdout.clone(), None));
+            drop(spawn_buffer_reader(
+                pipe,
+                stdout.clone(),
+                None,
+                SpillOwner::Reader,
+            ));
         }
         if let Some(pipe) = child.stderr.take() {
-            drop(spawn_buffer_reader(pipe, stderr.clone(), None));
+            drop(spawn_buffer_reader(
+                pipe,
+                stderr.clone(),
+                None,
+                SpillOwner::Reader,
+            ));
         }
 
         self.jobs.insert_with_id(

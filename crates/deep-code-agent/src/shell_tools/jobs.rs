@@ -319,10 +319,13 @@ impl SharedBuffer {
     /// transcript references must outlive the job record — and whether it was
     /// worth writing is decided later, by [`Self::discard_unreported_spill`].
     ///
-    /// Idempotent and callable from the tool side: an aborted reader task never
-    /// reaches its own end-of-stream call, so the foreground path invokes this
-    /// after aborting to drop the handle immediately (see `finished` in
-    /// [`Spill`], which stops a still-winding-down reader from re-opening it).
+    /// Call it only when no further writer remains for this buffer, because
+    /// [`Spill::finish`] is one-way. Which side that is depends on the caller
+    /// and is stated once, on [`SpillOwner`]: a background job's reader, or —
+    /// for a foreground `shell` call, whose steps share one buffer pair — the
+    /// run itself, after its last step. Idempotent, and safe against a reader
+    /// task aborted mid-flight: see `finished` in [`Spill`], which stops a
+    /// still-winding-down push from re-opening the file.
     pub(super) fn finish_spill(&self) {
         let mut ring = self.0.lock().expect("output buffer lock poisoned");
         if let Some(spill) = ring.spill.as_mut() {
@@ -598,14 +601,47 @@ pub(super) fn kill_process_tree(child: &mut Child) {
 
 pub(super) type ChunkFn = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
+/// Who releases a buffer's spill handle when a reader reaches end-of-stream.
+///
+/// The question exists because the two callers own their stream differently,
+/// and answering it the same way for both is what made a `&&` chain lose
+/// output. [`Spill::finish`] is ONE-WAY — `offer` short-circuits on `finished`
+/// forever after — so whoever calls it must be the last writer of that buffer.
+///
+/// * A background `job action=start` is one process with one reader per
+///   stream, and nothing comes back to the buffers afterwards: the reader IS
+///   the last writer, so it finishes ([`Self::Reader`]).
+/// * A foreground `shell` call is a SEQUENCE. Every step spawns its own reader
+///   but they all push into the one buffer pair the run created, so the first
+///   step's end-of-stream is not the run's. A reader that finished there
+///   stopped spilling for every step after it — silently, on the ordinary
+///   path, not just when a lingering grandchild forced an abort:
+///   `cargo build && cargo test` is two default-trusted steps, so a quiet
+///   build left `cargo test`'s log with no spill file at all, and a loud one
+///   left a file holding only the build while the truncation note called it
+///   "the complete stream". There the RUN owns the handle ([`Self::Caller`])
+///   and releases it once, after the last step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SpillOwner {
+    /// This reader is the buffer's only writer: finish at end-of-stream.
+    Reader,
+    /// Several readers share this buffer; the caller finishes it when the
+    /// whole run is over.
+    Caller,
+}
+
 /// Drain one child pipe into the ring buffer, optionally forwarding each
 /// chunk (live streaming for foreground shells; background jobs pass `None`
 /// because their parent turn has already ended). Returns the reader task so
 /// the foreground shell can await it (EOF) before reading the buffer.
+///
+/// `spill_owner` says whether reaching end-of-stream here also releases the
+/// buffer's spill handle — see [`SpillOwner`], which is not a preference.
 pub(super) fn spawn_buffer_reader<R>(
     mut pipe: R,
     buffer: SharedBuffer,
     on_chunk: Option<ChunkFn>,
+    spill_owner: SpillOwner,
 ) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -627,7 +663,9 @@ where
         // Stream over: release the spill file handle (data is already
         // written unbuffered). The file stays on disk for later reads —
         // unless it turned out to be an orphan nothing will ever name.
-        buffer.finish_spill();
+        if spill_owner == SpillOwner::Reader {
+            buffer.finish_spill();
+        }
     })
 }
 
