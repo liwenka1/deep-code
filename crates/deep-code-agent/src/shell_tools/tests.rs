@@ -179,32 +179,104 @@ async fn shell_overflow_spills_full_stream_and_result_names_the_file() {
     assert!(std::path::Path::new(&spill_path).exists());
 }
 
-/// `drain_readers` reports whether it had to abort, and finishes no spill of
-/// its own.
+/// `drain_readers` returns once the readers are done, and gives up on one that
+/// never reaches end-of-stream instead of waiting for it — the
+/// lingering-grandchild case the 500 ms cap exists for. Virtual time, so the
+/// cap costs nothing.
 ///
-/// The spill handles belong to the *run*, not to one step of it. A shell call
-/// is a sequence now and every step shares one pair of buffers, while `finish`
-/// is one-way — a late `push` cannot re-open a finished spill. Releasing them
-/// inside the per-step drain therefore stopped spilling for every step after
-/// the first one whose grandchild held the pipe past the cap: a `&&` chain lost
-/// the full output of all the rest while the truncation hint still named a file
-/// missing it, silently, on the non-exceptional path. The buffers are simply
-/// not in scope in `drain_readers` any more, so the signature is the fence;
-/// what is left to pin is the answer the caller acts on.
+/// It says nothing about spill handles any more; that ownership question is
+/// pinned end to end by `a_later_step_of_a_chain_still_spills` below.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn drain_readers_reports_whether_it_aborted() {
-    // A reader that never reaches end-of-stream — the lingering-grandchild
-    // case the 500 ms cap exists for. Virtual time, so the cap costs nothing.
+async fn drain_readers_gives_up_on_a_reader_that_never_ends() {
     let stuck = tokio::spawn(std::future::pending::<()>());
+    let handle = stuck.abort_handle();
+    drain_readers(Some(stuck), None).await;
+    // `abort` is a request; the task is dropped the next time the runtime gets
+    // to it, so give it that turn before asking.
+    tokio::task::yield_now().await;
     assert!(
-        drain_readers(Some(stuck), None).await,
-        "an aborted reader leaves the spill handles owed to the caller"
+        handle.is_finished(),
+        "a reader past the cap must be aborted, not merely detached"
     );
-    // Both readers already at end-of-stream: they finished their own spill.
+
+    // Both readers already at end-of-stream: returns without waiting the cap.
     let done = tokio::spawn(async {});
+    drain_readers(Some(done), None).await;
+}
+
+/// A shell call is a SEQUENCE, and its spill handles belong to the run rather
+/// than to one step of it.
+///
+/// Every step spawns its own reader but they all push into the one buffer pair
+/// the run created, while `Spill::finish` is one-way — so a reader that
+/// finished at its own end-of-stream stopped spilling for every step after it.
+/// Silently, and on the ORDINARY path rather than only when a lingering
+/// grandchild forced an abort, which is what the previous fix covered:
+/// `cargo build && cargo test` is two default-trusted steps, so this ran
+/// unattended with no prompt anywhere.
+///
+/// Both halves of the damage are pinned, because they fail differently. With a
+/// quiet first step no file was created at all and the result told the model to
+/// use `job action=tail` — a capped view of the ring's TAIL, so the head of the
+/// log, where the first compiler error is, was physically unrecoverable. With a
+/// loud one the file held the first step only, while the note called it "the
+/// complete stream".
+#[cfg(unix)]
+#[tokio::test]
+async fn a_later_step_of_a_chain_still_spills() {
+    let tmp = tempdir().unwrap();
+    let registry = registry_trusting(tmp.path(), &["true", "seq"]);
+
+    // Quiet first step: nothing crossed the threshold before the overflow.
+    let quiet_first = run_shell(
+        &registry,
+        json!({"command": "true && seq 1 6000"}),
+        None,
+    )
+    .await;
+    assert_eq!(quiet_first.status, ToolResultStatus::Success);
+    let path = details(&quiet_first)["stdout_spill_path"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "a step after the first must still spill: {}",
+                quiet_first.content
+            )
+        })
+        .to_string();
+    let saved = std::fs::read_to_string(&path).unwrap();
     assert!(
-        !drain_readers(Some(done), None).await,
-        "a clean drain owes the caller nothing"
+        saved.starts_with("1\n2\n") && saved.ends_with("6000\n"),
+        "the spill must hold the overflowing step whole, got {} bytes",
+        saved.len()
+    );
+    assert!(quiet_first.content.contains("complete stream saved"));
+
+    // Both steps loud: the file is the whole RUN, not the first step, and its
+    // size agrees with the bytes the run reports having produced.
+    let both_loud = run_shell(
+        &registry,
+        json!({"command": "seq 1 6000 && seq 100001 106000"}),
+        None,
+    )
+    .await;
+    let path = details(&both_loud)["stdout_spill_path"]
+        .as_str()
+        .expect("a chain whose steps both overflow must spill")
+        .to_string();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        saved.starts_with("1\n2\n"),
+        "the first step's head must survive"
+    );
+    assert!(
+        saved.ends_with("106000\n"),
+        "…and so must the last step's tail"
+    );
+    assert_eq!(
+        saved.len() as u64,
+        details(&both_loud)["stdout_len"].as_u64().unwrap(),
+        "a note that says 'complete stream' must name a file holding all of it"
     );
 }
 
