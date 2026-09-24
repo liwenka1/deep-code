@@ -435,4 +435,14 @@ fn github_install_parses_its_enum_flags_into_variants() {
             "--permission-mode {flag}"
         );
     }
+
+    // `--ref` goes through the same boundary. Only the accepting half is
+    // reachable from a test — a refused value exits the process, like its two
+    // siblings — so the shape rule itself is pinned by
+    // `github::workflow::tests::a_workflow_ref_is_a_single_yaml_inert_token`.
+    assert_eq!(install_args(&["install"]).workflow_ref, None);
+    for flag in ["main", "v0.5.0", "release/1.x"] {
+        let parsed = install_args(&["install", "--ref", flag]);
+        assert_eq!(parsed.workflow_ref.as_deref(), Some(flag), "--ref {flag}");
+    }
 }
