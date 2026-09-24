@@ -6,6 +6,24 @@ pub const DEFAULT_MAX_CONCURRENT: usize = 10;
 pub const HARD_MAX_CONCURRENT: usize = 20;
 pub const DEFAULT_MAX_STEPS: u32 = 50;
 
+/// How many sub-agent records the session ledger keeps (see
+/// [`super::manager::SubAgentManager`]), mirroring the job store's own cap.
+///
+/// Nothing ever removed one, and a record is not small: it holds the child's
+/// whole assignment AND its whole report, both of which are model-sized text.
+/// A long session that leans on delegation therefore grew the ledger by one
+/// full transcript-sized pair per `agent` call, for the life of the process,
+/// to serve a `/agents` list nobody scrolls that far back in.
+///
+/// Only TERMINAL records are evicted, so the cap can never drop a child that
+/// is still running — its record is what `finalize_*` comes back to. That is
+/// also why the number sits well above [`HARD_MAX_CONCURRENT`]: at the
+/// concurrency ceiling the ledger still has room for a useful tail of finished
+/// ones. Losing an evicted record costs nothing durable — a blocking
+/// sub-agent's report is returned into the parent transcript, which is the
+/// copy that survives the session at all.
+pub const MAX_RETAINED_AGENTS: usize = 32;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubAgentStatus {

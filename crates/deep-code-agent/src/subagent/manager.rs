@@ -1,6 +1,8 @@
 use crate::session_store::now_ms;
 use crate::subagent::output::parse_structured_report;
-use crate::subagent::types::{HARD_MAX_CONCURRENT, SubAgentError, SubAgentRecord, SubAgentStatus};
+use crate::subagent::types::{
+    HARD_MAX_CONCURRENT, MAX_RETAINED_AGENTS, SubAgentError, SubAgentRecord, SubAgentStatus,
+};
 
 /// In-memory ledger of the current session's sub-agents.
 ///
@@ -9,6 +11,11 @@ use crate::subagent::types::{HARD_MAX_CONCURRENT, SubAgentError, SubAgentRecord,
 /// what `/agents` lists and the concurrency cap. It is never persisted and
 /// starts empty each session — a fresh manager is built per runtime launch, so
 /// every record it holds belongs to the current session by construction.
+///
+/// "Working set" is now enforced rather than merely intended: the ledger is
+/// bounded by [`MAX_RETAINED_AGENTS`], oldest finished record first. It used to
+/// be the one such ledger with no cap at all while each record carried two
+/// pieces of model-sized text.
 pub struct SubAgentManager {
     max_concurrent: usize,
     agents: std::collections::HashMap<String, SubAgentRecord>,
@@ -54,7 +61,40 @@ impl SubAgentManager {
             });
         }
         self.agents.insert(record.agent_id.clone(), record);
+        self.evict_finished();
         Ok(())
+    }
+
+    /// Drop the oldest FINISHED records once the ledger exceeds
+    /// [`MAX_RETAINED_AGENTS`].
+    ///
+    /// Running ones are never evicted, for the same reason the job store never
+    /// evicts a running job: `finalize_success`/`finalize_failure` come back to
+    /// that exact record by id, and dropping it would turn a completed child
+    /// into a `NotFound` error on the parent's own tool call. The ledger can
+    /// therefore sit above the cap while many children run at once, and
+    /// converges as they finish.
+    ///
+    /// Oldest by `started_at_ms`, which is the key `list_current_session`
+    /// already orders by — so what eviction removes is exactly the tail of the
+    /// list a user sees, never a hole in the middle of it. Ties break on the
+    /// id so the choice is deterministic when several children are dispatched
+    /// in one millisecond, which one turn routinely does.
+    fn evict_finished(&mut self) {
+        if self.agents.len() <= MAX_RETAINED_AGENTS {
+            return;
+        }
+        let excess = self.agents.len() - MAX_RETAINED_AGENTS;
+        let mut finished: Vec<(u64, String)> = self
+            .agents
+            .values()
+            .filter(|agent| agent.status.is_terminal())
+            .map(|agent| (agent.started_at_ms, agent.agent_id.clone()))
+            .collect();
+        finished.sort_unstable();
+        for (_, agent_id) in finished.into_iter().take(excess) {
+            self.agents.remove(&agent_id);
+        }
     }
 
     pub fn update(
@@ -145,7 +185,7 @@ pub fn new_agent_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::subagent::types::DEFAULT_MAX_CONCURRENT;
+    use crate::subagent::types::{DEFAULT_MAX_CONCURRENT, HARD_MAX_CONCURRENT};
 
     fn record(agent_id: &str, name: &str, status: SubAgentStatus) -> SubAgentRecord {
         SubAgentRecord {
@@ -173,6 +213,55 @@ mod tests {
             manager.insert(record("a2", "second", SubAgentStatus::Running)),
             Err(SubAgentError::ConcurrencyLimit { .. })
         ));
+    }
+
+    /// The ledger is bounded, and bounded in the safe direction: finished
+    /// records age out oldest-first, a running one is never dropped (its
+    /// `finalize_*` still has to find it), and the survivors are the newest —
+    /// the top of what `/agents` shows.
+    #[test]
+    fn the_ledger_evicts_the_oldest_finished_records() {
+        let mut manager = SubAgentManager::new(DEFAULT_MAX_CONCURRENT);
+        // One long-lived child, started before everything else.
+        let mut running = record("live", "live", SubAgentStatus::Running);
+        running.started_at_ms = 0;
+        manager.insert(running).unwrap();
+
+        for index in 0..MAX_RETAINED_AGENTS + 10 {
+            let id = format!("done-{index}");
+            let mut done = record(&id, &id, SubAgentStatus::Completed);
+            done.started_at_ms = index as u64 + 1;
+            manager.insert(done).unwrap();
+        }
+
+        assert_eq!(manager.agents.len(), MAX_RETAINED_AGENTS);
+        assert!(
+            manager.get("live").is_some(),
+            "a running child must survive the cap — finalize comes back for it"
+        );
+        assert!(
+            manager.get("done-0").is_none(),
+            "the oldest finished record is the one that goes"
+        );
+        let newest = format!("done-{}", MAX_RETAINED_AGENTS + 9);
+        assert!(manager.get(&newest).is_some(), "the newest ones stay");
+    }
+
+    /// Eviction must not be able to strand a child that is still working, even
+    /// when every record in the ledger is one.
+    #[test]
+    fn a_ledger_full_of_running_agents_evicts_nothing() {
+        let mut manager = SubAgentManager::new(HARD_MAX_CONCURRENT);
+        for index in 0..HARD_MAX_CONCURRENT {
+            let id = format!("run-{index}");
+            manager
+                .insert(record(&id, &id, SubAgentStatus::Running))
+                .unwrap();
+        }
+        assert_eq!(manager.running_count(), HARD_MAX_CONCURRENT);
+        for index in 0..HARD_MAX_CONCURRENT {
+            assert!(manager.get(&format!("run-{index}")).is_some());
+        }
     }
 
     #[test]
