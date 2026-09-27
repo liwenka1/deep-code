@@ -246,6 +246,7 @@
   "SafetyInstallReason": "安装依赖会下载并执行第三方代码",
   "SafetyInstallSuggestion": "确认依赖来源可信",
   "CheckpointSnapshotFailed": "检查点快照失败（{label}）：{error}",
+  "CheckpointDisabledTooLarge": "当前工作区较大（待快照文件超过 {limit} 个），为避免每轮都全量复制，本会话已停用逐轮检查点——/restore 将不可用。需要回滚请用 git。",
   "TurnStepLimitReached": "本回合已达 {limit} 次模型请求上限，已停止以免继续消耗额度。可重新发起一条更聚焦的指令。",
   "EchoOfflineHint": "未配置 DeepSeek API key：输入 /apikey sk-... 即刻接入，或设置环境变量 DEEPSEEK_API_KEY 后重新启动。",
   "RouteFixedModel": "固定模型配置：{model}",

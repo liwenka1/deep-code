@@ -416,6 +416,7 @@ text_ids! {
     SafetyInstallSuggestion,
     // 运行时其它用户可见提示
     CheckpointSnapshotFailed,
+    CheckpointDisabledTooLarge,
     TurnStepLimitReached,
     // 离线 echo 后端提示
     EchoOfflineHint,

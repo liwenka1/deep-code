@@ -293,7 +293,10 @@ impl AgentRuntime {
         let (turn_id, prompt) = self.current_turn_context().await;
         emit(&tx, RuntimeEvent::TurnStarted { turn_id, prompt });
         self.emit_session_updated(&tx).await;
-        self.snapshot_turn("before_turn", &tx).await;
+        // The turn's cancel token, so an Esc/quit during a large before-turn
+        // snapshot aborts the copy promptly instead of after the whole tree.
+        let cancel = self.state.lock().await.cancel.clone();
+        self.snapshot_turn("before_turn", &cancel, &tx).await;
         let runtime = self.clone();
         tokio::spawn(async move {
             runtime.run_loop(&tx).await;

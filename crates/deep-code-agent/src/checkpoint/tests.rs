@@ -42,7 +42,7 @@ fn staging_and_junk_directories_are_neither_listed_nor_restorable() {
     let store = CheckpointStore::new(workspace.path()).unwrap();
     let storage = store.storage_root.clone();
 
-    let (good, _) = store.snapshot("before_turn").unwrap();
+    let (good, _) = store.snapshot_created("before_turn").unwrap();
 
     // Simulate the crash residue and some hand-dropped junk.
     fs::create_dir_all(storage.join(".staging_before_turn_123")).unwrap();
@@ -74,7 +74,7 @@ fn snapshot_publishes_atomically() {
     let store = CheckpointStore::new(workspace.path()).unwrap();
     let storage = store.storage_root.clone();
 
-    let (id, _) = store.snapshot("before_turn").unwrap();
+    let (id, _) = store.snapshot_created("before_turn").unwrap();
 
     // Published under its real id, with no staging residue left behind.
     assert!(storage.join(&id.0).is_dir());
@@ -105,7 +105,7 @@ fn unreadable_directory_fails_the_snapshot_instead_of_being_skipped() {
     fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
 
     let store = CheckpointStore::new(workspace.path()).unwrap();
-    let result = store.snapshot("before_turn");
+    let result = store.snapshot_created("before_turn");
 
     // Restore permissions first so tempdir cleanup can succeed regardless.
     fs::set_permissions(&secret, fs::Permissions::from_mode(0o755)).unwrap();
@@ -133,7 +133,7 @@ fn snapshot_and_restore_round_trip() {
     fs::write(&file, "v1").unwrap();
 
     let store = CheckpointStore::new(workspace.path()).unwrap();
-    let (id, _) = store.snapshot("before_turn").unwrap();
+    let (id, _) = store.snapshot_created("before_turn").unwrap();
 
     fs::write(&file, "v2").unwrap();
     assert_eq!(fs::read_to_string(&file).unwrap(), "v2");
@@ -162,7 +162,7 @@ fn restore_keeps_nested_skip_dirs_it_never_snapshotted() {
     fs::write(nested.join("main.rs"), "v1").unwrap();
 
     let store = CheckpointStore::new(root).unwrap();
-    let (id, _) = store.snapshot("before_turn").unwrap();
+    let (id, _) = store.snapshot_created("before_turn").unwrap();
     fs::write(nested.join("main.rs"), "v2").unwrap();
     store.restore(&id).unwrap();
 
@@ -206,7 +206,7 @@ fn restore_preserves_symlinks() {
     std::os::unix::fs::symlink(outside.path(), &link).unwrap();
 
     let store = CheckpointStore::new(workspace.path()).unwrap();
-    let (id, _) = store.snapshot("before_turn").unwrap();
+    let (id, _) = store.snapshot_created("before_turn").unwrap();
 
     fs::remove_file(&link).unwrap();
     store.restore(&id).unwrap();
@@ -246,7 +246,7 @@ fn restore_clears_symlink_without_deleting_external_target() {
     fs::write(workspace.path().join("real.txt"), "v1").unwrap();
 
     let store = CheckpointStore::new(workspace.path()).unwrap();
-    let (id, _) = store.snapshot("before_turn").unwrap();
+    let (id, _) = store.snapshot_created("before_turn").unwrap();
 
     // Introduce the external link only now, so it is live in the workspace
     // when `restore` clears it.
@@ -310,7 +310,7 @@ fn restore_never_writes_through_a_link_standing_on_snapshotted_content() {
     fs::write(root.join("d/f.txt"), "snapshot-content").unwrap();
 
     let store = CheckpointStore::new(root).unwrap();
-    let (id, _) = store.snapshot("before_turn").unwrap();
+    let (id, _) = store.snapshot_created("before_turn").unwrap();
 
     // Swap the captured directory for a link pointing out of the workspace.
     fs::remove_dir_all(root.join("d")).unwrap();
@@ -351,7 +351,7 @@ fn a_failed_clear_says_the_snapshot_is_intact_and_re_running_finishes_it() {
     fs::write(root.join("sub/a.txt"), "v1").unwrap();
 
     let store = CheckpointStore::new(root).unwrap();
-    let (id, _) = store.snapshot("before_turn").unwrap();
+    let (id, _) = store.snapshot_created("before_turn").unwrap();
     fs::write(root.join("sub/a.txt"), "v2").unwrap();
 
     // Make the clear half fail part-way: an unreadable subdirectory.
@@ -399,7 +399,7 @@ fn restore_keeps_entries_it_cannot_capture() {
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
 
     let store = CheckpointStore::new(root).unwrap();
-    let (id, _) = store.snapshot("before_turn").unwrap();
+    let (id, _) = store.snapshot_created("before_turn").unwrap();
     fs::write(root.join("real.txt"), "v2").unwrap();
     let kept = store.restore(&id).unwrap();
 
@@ -436,7 +436,7 @@ fn snapshot_does_not_descend_into_skipped_directories() {
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
 
     let store = CheckpointStore::new(root).unwrap();
-    let taken = store.snapshot("before_turn");
+    let taken = store.snapshot_created("before_turn");
     // Restore permissions before any assertion can panic and leak them.
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -496,7 +496,7 @@ fn copy_tree_refuses_to_write_through_anything_that_is_not_a_plain_entry() {
     // A directory symlink pointing out of the workspace.
     let linked = tempfile::tempdir().unwrap();
     crate::test_symlinks::symlink_dir_for_test(outside.path(), &linked.path().join("d"));
-    let refused = copy_tree(source.path(), linked.path(), CopyMode::Restore);
+    let refused = copy_tree(source.path(), linked.path(), CopyMode::Restore, None, &CancellationToken::new());
     let message = refused.expect_err("wrote through a symlink").to_string();
     assert!(message.contains(REFUSAL), "wrong cause: {message}");
     assert!(!outside.path().join("f.txt").exists());
@@ -511,7 +511,7 @@ fn copy_tree_refuses_to_write_through_anything_that_is_not_a_plain_entry() {
     let listener =
         std::os::unix::net::UnixListener::bind(sock_dest.path().join("d/f.txt")).unwrap();
     drop(listener);
-    let refused = copy_tree(source.path(), sock_dest.path(), CopyMode::Restore);
+    let refused = copy_tree(source.path(), sock_dest.path(), CopyMode::Restore, None, &CancellationToken::new());
     let message = refused.expect_err("wrote through a socket").to_string();
     assert!(message.contains(REFUSAL), "wrong cause: {message}");
 }
@@ -537,7 +537,7 @@ fn restore_removes_an_uncapturable_entry_standing_on_snapshotted_content() {
     let root = workspace.path();
     fs::write(root.join("dev.sock"), "was-a-regular-file").unwrap();
     let store = CheckpointStore::new(root).unwrap();
-    let (id, _) = store.snapshot("before_turn").unwrap();
+    let (id, _) = store.snapshot_created("before_turn").unwrap();
 
     fs::remove_file(root.join("dev.sock")).unwrap();
     let listener = std::os::unix::net::UnixListener::bind(root.join("dev.sock")).unwrap();
@@ -615,7 +615,7 @@ fn a_symlinked_state_dir_does_not_relocate_the_store() {
 fn checkpoint_storage_lives_under_deep_code_dir() {
     let workspace = tempfile::tempdir().unwrap();
     let store = CheckpointStore::new(workspace.path()).unwrap();
-    store.snapshot("probe").unwrap();
+    store.snapshot_created("probe").unwrap();
     assert!(workspace.path().join(".deep-code/checkpoints").is_dir());
 }
 
@@ -629,7 +629,7 @@ fn prunes_oldest_snapshots_beyond_cap() {
 
     let mut ids = Vec::new();
     for index in 0..5 {
-        ids.push(store.snapshot(&format!("s{index}")).unwrap().0);
+        ids.push(store.snapshot_created(&format!("s{index}")).unwrap().0);
         // Distinct millisecond timestamps so retention order is stable.
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
@@ -640,4 +640,92 @@ fn prunes_oldest_snapshots_beyond_cap() {
     assert!(!kept.contains(&ids[0]), "oldest snapshot is pruned");
     // Pruned snapshots can no longer be restored.
     assert!(store.restore(&ids[0]).is_err());
+}
+
+/// The entry budget bails the copy instead of walking the whole tree, and the
+/// cancel token aborts a copy in progress. Both surface as `Aborted`, which
+/// `snapshot` maps to `Skipped` (the turn continues without a restore point)
+/// rather than to an error.
+#[test]
+fn snapshot_copy_bails_on_budget_and_on_cancel() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path();
+    for index in 0..600 {
+        fs::write(root.join(format!("f{index}.txt")), "x").unwrap();
+    }
+    let dest = tempfile::tempdir().unwrap();
+
+    // Budget of 3 over a 600-file tree aborts almost immediately.
+    let status = copy_tree(
+        root,
+        &dest.path().join("budget"),
+        CopyMode::Snapshot,
+        Some(3),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(status, CopyStatus::Aborted, "over-budget copy must abort");
+
+    // A pre-cancelled token aborts within one check interval (600 > 512).
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let status = copy_tree(
+        root,
+        &dest.path().join("cancel"),
+        CopyMode::Snapshot,
+        None,
+        &cancelled,
+    )
+    .unwrap();
+    assert_eq!(status, CopyStatus::Aborted, "cancelled copy must abort");
+
+    // Restore never bails: same tree, Restore mode, a cancelled token — it runs
+    // to completion, because a partial restore is worse than a slow one.
+    let restore_dest = tempfile::tempdir().unwrap();
+    let status = copy_tree(
+        root,
+        restore_dest.path(),
+        CopyMode::Restore,
+        Some(3),
+        &cancelled,
+    )
+    .unwrap();
+    assert_eq!(status, CopyStatus::Done, "restore ignores budget and cancel");
+}
+
+/// A newly-skipped directory (`.venv`) is neither snapshotted nor cleared, so
+/// `/restore` leaves a hand-edit inside it untouched rather than losing it —
+/// the same snapshot/restore symmetry `target`/`node_modules` already rely on,
+/// which `should_skip` guarantees for every name in `SKIP_DIRS`.
+#[test]
+fn restore_leaves_newly_skipped_directories_untouched() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path();
+    fs::write(root.join("tracked.txt"), "v1").unwrap();
+    fs::create_dir_all(root.join(".venv/lib")).unwrap();
+    fs::write(root.join(".venv/lib/pkg.py"), "snapshot-time").unwrap();
+
+    let store = CheckpointStore::new(root).unwrap();
+    let (id, _) = store.snapshot_created("before_turn").unwrap();
+
+    // The snapshot did not capture the skipped tree.
+    let snap = root.join(".deep-code/checkpoints").join(&id.0);
+    assert!(
+        !snap.join(".venv").exists(),
+        "a SKIP_DIRS tree must not be copied into the snapshot"
+    );
+
+    // Change both the tracked file and the skipped file, then restore.
+    fs::write(root.join("tracked.txt"), "v2").unwrap();
+    fs::write(root.join(".venv/lib/pkg.py"), "post-edit").unwrap();
+    store.restore(&id).unwrap();
+
+    // The tracked file reverts; the skipped file is left exactly as it was —
+    // not reverted (never captured) and not deleted (never cleared).
+    assert_eq!(fs::read_to_string(root.join("tracked.txt")).unwrap(), "v1");
+    assert_eq!(
+        fs::read_to_string(root.join(".venv/lib/pkg.py")).unwrap(),
+        "post-edit",
+        "restore must neither revert nor delete a skipped tree"
+    );
 }

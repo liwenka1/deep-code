@@ -1,8 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
 use crate::tool::ToolError;
@@ -10,7 +13,59 @@ use crate::tool::ToolError;
 const CHECKPOINT_DIR: &str = ".deep-code/checkpoints";
 /// `.deep-code` and `checkpoints` inside it — the levels deep-code owns.
 const OWNED_STORAGE_DIRS: usize = 2;
-const SKIP_DIRS: &[&str] = &[".git", ".deep-code", "target", "node_modules"];
+/// Directories a before-turn snapshot never copies (and `restore` never
+/// clears), because they are generated, vendored or dependency trees a user
+/// does not edit by hand — copying them is what turned a 20k-source workspace
+/// with a 100k-file `.venv`/`build`/`dist` beside it into a 16-second stall per
+/// turn. Skipping is a pure function of the path name so snapshot and restore
+/// stay symmetric by construction (`should_skip` is read by both): whatever a
+/// snapshot omits, restore keeps rather than deletes, so a name that is
+/// occasionally real source (`build`, `dist`) is left untouched by `/restore`
+/// rather than lost — the same trade `target`/`node_modules` already made.
+/// A workspace whose *tracked* tree is itself enormous is bounded separately
+/// by [`MAX_SNAPSHOT_ENTRIES`].
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".deep-code",
+    "target",
+    "node_modules",
+    // Python
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    // JS/TS build output
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".output",
+    // JVM / mobile / other toolchains
+    ".gradle",
+    ".terraform",
+    ".dart_tool",
+    "DerivedData",
+    "Pods",
+    // Editor / tooling caches
+    ".idea",
+];
+/// Ceiling on entries one before-turn snapshot copies. Past it the snapshot is
+/// abandoned and per-turn checkpoints are disabled for the session (one
+/// warning, then silent) rather than paying a multi-second copy every turn.
+/// The count is of entries actually visited — [`SKIP_DIRS`] are pruned before
+/// they count — so this bounds the real copy work, not the tree's raw size.
+/// A workspace above it keeps every other safety layer (git, the sandbox); it
+/// only loses the copy-based rewind, which at that size was never fast enough
+/// to run each turn anyway.
+pub(crate) const MAX_SNAPSHOT_ENTRIES: usize = 20_000;
+/// How often the copy loop checks the turn's cancellation token, so an Esc or a
+/// quit during a large snapshot aborts promptly instead of after the whole
+/// tree is copied.
+const CANCEL_CHECK_INTERVAL: usize = 512;
 /// Default retention: snapshots beyond this count are pruned oldest-first.
 /// Every turn creates one before-turn snapshot, so without a cap the storage
 /// grows by one workspace copy per turn. On CoW filesystems (APFS, btrfs/XFS)
@@ -22,12 +77,40 @@ pub const DEFAULT_MAX_SNAPSHOTS: usize = 20;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CheckpointId(pub String);
 
+/// Why a before-turn snapshot produced no checkpoint. Distinct from an error:
+/// the turn goes on regardless, and neither reason is a failure to surface as
+/// one — a cancel is what the user asked for, and an over-budget workspace is a
+/// deliberate, one-time downgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotSkip {
+    /// The turn was cancelled (Esc / quit) mid-copy.
+    Cancelled,
+    /// The workspace exceeded [`MAX_SNAPSHOT_ENTRIES`]. `first` is true only on
+    /// the turn that tripped it, so the runtime warns once and stays quiet after.
+    TooLarge { first: bool },
+}
+
+/// What a before-turn snapshot did: created a checkpoint, or skipped with a
+/// reason the turn can continue past.
+#[derive(Debug, Clone)]
+pub enum SnapshotOutcome {
+    Created {
+        id: CheckpointId,
+        prune_warnings: Vec<String>,
+    },
+    Skipped(SnapshotSkip),
+}
+
 /// Side-storage workspace snapshots (taken before each turn).
 #[derive(Debug, Clone)]
 pub struct CheckpointStore {
     workspace: PathBuf,
     storage_root: PathBuf,
     max_snapshots: usize,
+    /// Latched once a snapshot exceeds [`MAX_SNAPSHOT_ENTRIES`], so later turns
+    /// skip the walk entirely instead of re-scanning a too-large tree every
+    /// time. Shared across clones (the runtime holds the store behind an `Arc`).
+    oversized: Arc<AtomicBool>,
 }
 
 impl CheckpointStore {
@@ -59,6 +142,7 @@ impl CheckpointStore {
             workspace: canonical,
             storage_root,
             max_snapshots: DEFAULT_MAX_SNAPSHOTS,
+            oversized: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -75,9 +159,25 @@ impl CheckpointStore {
     }
 
     /// Capture a full workspace snapshot under side storage, then prune the
-    /// oldest snapshots beyond the retention cap. Returns the id plus any
-    /// non-fatal prune warnings for the caller to surface.
-    pub fn snapshot(&self, label: &str) -> Result<(CheckpointId, Vec<String>), ToolError> {
+    /// oldest snapshots beyond the retention cap.
+    ///
+    /// `cancel` aborts a large copy promptly (the before-turn snapshot must not
+    /// hold Esc/quit hostage for the length of a full-tree copy), and the copy
+    /// is bounded by [`MAX_SNAPSHOT_ENTRIES`]: a workspace above it disables
+    /// per-turn checkpoints for the session rather than paying the copy every
+    /// turn. Both come back as [`SnapshotOutcome::Skipped`] — the turn continues
+    /// either way — while a real I/O failure is still an `Err`.
+    pub fn snapshot(
+        &self,
+        label: &str,
+        cancel: &CancellationToken,
+    ) -> Result<SnapshotOutcome, ToolError> {
+        // Already found too large earlier this session: skip the walk entirely.
+        if self.oversized.load(Ordering::Relaxed) {
+            return Ok(SnapshotOutcome::Skipped(SnapshotSkip::TooLarge {
+                first: false,
+            }));
+        }
         let id = format!(
             "{}_{}",
             sanitize_label(label),
@@ -97,16 +197,38 @@ impl CheckpointStore {
         // mid-snapshot and its staging dir is none of our business.
         let dest = self.storage_root.join(&id);
         let staging = self.storage_root.join(format!(".staging_{id}"));
-        if let Err(error) = copy_tree(&self.workspace, &staging, CopyMode::Snapshot) {
-            let _ = fs::remove_dir_all(&staging);
-            return Err(error);
+        match copy_tree(
+            &self.workspace,
+            &staging,
+            CopyMode::Snapshot,
+            Some(MAX_SNAPSHOT_ENTRIES),
+            cancel,
+        ) {
+            Ok(CopyStatus::Done) => {}
+            Ok(CopyStatus::Aborted) => {
+                // Cancel vs. budget: the token is the only other abort cause, so
+                // if it is not set the copy hit the entry ceiling.
+                let _ = fs::remove_dir_all(&staging);
+                if cancel.is_cancelled() {
+                    return Ok(SnapshotOutcome::Skipped(SnapshotSkip::Cancelled));
+                }
+                let first = !self.oversized.swap(true, Ordering::Relaxed);
+                return Ok(SnapshotOutcome::Skipped(SnapshotSkip::TooLarge { first }));
+            }
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
         }
         if let Err(error) = fs::rename(&staging, &dest) {
             let _ = fs::remove_dir_all(&staging);
             return Err(checkpoint_error("publish snapshot", error));
         }
         let prune_warnings = self.prune_old_snapshots();
-        Ok((CheckpointId(id), prune_warnings))
+        Ok(SnapshotOutcome::Created {
+            id: CheckpointId(id),
+            prune_warnings,
+        })
     }
 
     /// Best-effort retention: delete the oldest snapshot directories (by the
@@ -190,7 +312,16 @@ impl CheckpointStore {
                 ),
             )
         })?;
-        copy_tree(&source, &self.workspace, CopyMode::Restore).map_err(|error| {
+        // Restore is never budgeted or cancelled — a partial restore is worse
+        // than a slow one — so pass no budget and a token that never fires.
+        copy_tree(
+            &source,
+            &self.workspace,
+            CopyMode::Restore,
+            None,
+            &CancellationToken::new(),
+        )
+        .map_err(|error| {
             ToolError::exec_failed(
                 "checkpoint",
                 format!(
@@ -329,9 +460,19 @@ enum CopyMode {
     Restore,
 }
 
-fn copy_tree(source: &Path, dest: &Path, mode: CopyMode) -> Result<(), ToolError> {
+fn copy_tree(
+    source: &Path,
+    dest: &Path,
+    mode: CopyMode,
+    budget: Option<usize>,
+    cancel: &CancellationToken,
+) -> Result<CopyStatus, ToolError> {
     fs::create_dir_all(dest).map_err(|error| checkpoint_error("create snapshot dir", error))?;
     let mut walk = WalkDir::new(source).into_iter();
+    // Entries actually copied (skipped dirs do not count), for the snapshot
+    // budget and the periodic cancel check. Restore never bounds or aborts —
+    // a partial restore is worse than a slow one.
+    let mut copied = 0usize;
     while let Some(entry) = walk.next() {
         // A walk error must never be skipped. `filter_map(Result::ok)` dropped
         // an unreadable directory *together with its entire subtree* and still
@@ -362,6 +503,16 @@ fn copy_tree(source: &Path, dest: &Path, mode: CopyMode) -> Result<(), ToolError
                 walk.skip_current_dir();
             }
             continue;
+        }
+        if mode == CopyMode::Snapshot {
+            copied += 1;
+            // Budget first: an over-budget tree must not also pay a full copy.
+            if budget.is_some_and(|limit| copied > limit) {
+                return Ok(CopyStatus::Aborted);
+            }
+            if copied.is_multiple_of(CANCEL_CHECK_INTERVAL) && cancel.is_cancelled() {
+                return Ok(CopyStatus::Aborted);
+            }
         }
         let target = dest.join(rel);
         let file_type = entry.file_type();
@@ -437,7 +588,14 @@ fn copy_tree(source: &Path, dest: &Path, mode: CopyMode) -> Result<(), ToolError
             }
         }
     }
-    Ok(())
+    Ok(CopyStatus::Done)
+}
+
+/// Whether [`copy_tree`] finished or bailed early (snapshot budget or cancel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyStatus {
+    Done,
+    Aborted,
 }
 
 /// Copy a file, preferring a copy-on-write clone where the filesystem supports
@@ -763,6 +921,28 @@ fn remove_symlink(path: &Path, file_type: &fs::FileType) -> std::io::Result<()> 
 
 fn checkpoint_error(action: &str, error: std::io::Error) -> ToolError {
     ToolError::exec_failed("checkpoint", format!("{action}: {error}"))
+}
+
+#[cfg(test)]
+impl CheckpointStore {
+    /// Test convenience: a snapshot that must have been created, in the old
+    /// `(id, warnings)` shape. Tests never run with a cancelled token or an
+    /// over-budget workspace, so a skip is a test bug rather than an outcome to
+    /// handle.
+    pub(crate) fn snapshot_created(
+        &self,
+        label: &str,
+    ) -> Result<(CheckpointId, Vec<String>), ToolError> {
+        match self.snapshot(label, &CancellationToken::new())? {
+            SnapshotOutcome::Created {
+                id,
+                prune_warnings,
+            } => Ok((id, prune_warnings)),
+            SnapshotOutcome::Skipped(skip) => {
+                panic!("test snapshot unexpectedly skipped: {skip:?}")
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -2,8 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
-use crate::checkpoint::{CheckpointId, CheckpointStore};
+use crate::checkpoint::{CheckpointId, CheckpointStore, SnapshotOutcome, SnapshotSkip};
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, emit};
 use crate::session_store::CheckpointRecord;
@@ -46,18 +47,26 @@ impl AgentRuntime {
     pub(super) async fn snapshot_turn(
         &self,
         label: &str,
+        cancel: &CancellationToken,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
         let Some(store) = self.checkpoints.as_ref() else {
             return;
         };
         // Full workspace copy: run it on the blocking pool so a large repo
-        // can't stall the async executor for the duration of the copy.
+        // can't stall the async executor for the duration of the copy. The
+        // token lets Esc/quit abort the copy promptly (see `CheckpointStore::
+        // snapshot`) rather than after the whole tree has been copied.
         let store = Arc::clone(store);
         let owned_label = label.to_string();
-        let outcome = tokio::task::spawn_blocking(move || store.snapshot(&owned_label)).await;
+        let cancel = cancel.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || store.snapshot(&owned_label, &cancel)).await;
         let failure = match outcome {
-            Ok(Ok((id, prune_warnings))) => {
+            Ok(Ok(SnapshotOutcome::Created {
+                id,
+                prune_warnings,
+            })) => {
                 for message in prune_warnings {
                     emit(tx, RuntimeEvent::Warning { message });
                 }
@@ -69,6 +78,28 @@ impl AgentRuntime {
                         label: label.to_string(),
                     },
                 );
+                return;
+            }
+            // Cancelled: the turn is being torn down anyway, so say nothing.
+            Ok(Ok(SnapshotOutcome::Skipped(SnapshotSkip::Cancelled))) => return,
+            // Over the entry budget: warn once (the turn it trips), then the
+            // session latch keeps every later turn silent.
+            Ok(Ok(SnapshotOutcome::Skipped(SnapshotSkip::TooLarge { first }))) => {
+                if first {
+                    emit(
+                        tx,
+                        RuntimeEvent::Warning {
+                            message: crate::tr_with(
+                                self.ui_lang(),
+                                crate::TextId::CheckpointDisabledTooLarge,
+                                &[(
+                                    "limit",
+                                    &crate::checkpoint::MAX_SNAPSHOT_ENTRIES.to_string(),
+                                )],
+                            ),
+                        },
+                    );
+                }
                 return;
             }
             Ok(Err(error)) => error.to_string(),
