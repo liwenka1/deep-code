@@ -126,6 +126,17 @@ review to rediscover:
 - Credential directories are readable by sandboxed commands: SSH-signed
   commits, `npm` (`~/.npmrc`) and `codesign` (keychains) need them offline,
   so the read fence is the operand spelling above, not the kernel.
+- On Linux the write boundary does not cover file *metadata*. Landlock has no
+  access right for `chmod`/`chown`/`utimes` — its rights are data- and
+  traversal-class — and seccomp does not filter those syscalls, so a sandboxed
+  command can change the mode, owner or timestamps of any file its Unix
+  permissions already allow, including files *outside* the writable roots (e.g.
+  `chmod` something under `$HOME`). Their *contents* stay unwritable (that needs
+  the write right Landlock does deny), and `chown` to another user still needs
+  privilege. macOS has no such gap — Seatbelt's `(deny file-write* …)` outside
+  the roots already covers `file-write-mode`/`-owner`/`-times` — and no current
+  Landlock ABI closes it, unlike the kernel-version gaps in the sandbox's
+  `EnforcementGap`.
 - A command a human approved as text keeps every shell feature the human saw.
 - The post-edit language server (`[lsp] enabled`, on by default) runs *outside*
   the OS sandbox — it is not a model shell command. It is configured not to
@@ -316,6 +327,14 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
   的那一刻就已被信任。
 - 凭据目录对沙箱内命令可读:SSH 签名的 commit、`npm`(`~/.npmrc`)、`codesign`
   (钥匙串)在离线时也需要它们,所以读侧围栏是上面的操作数拼写,不是内核。
+- Linux 上写边界不覆盖文件**元数据**:Landlock 没有管 `chmod`/`chown`/`utimes`
+  的访问权(它的权限都是数据类与目录遍历类),seccomp 也不过滤这些系统调用,
+  所以沙箱内命令可以修改任何 Unix 权限本就允许的文件的 mode、owner、时间戳,
+  包括写根**之外**的文件(比如 `chmod` 一个 `$HOME` 下的文件)。这些文件的**内容**
+  仍然不可写(那需要 Landlock 确实拒绝的写权限),`chown` 给别的用户也仍需特权。
+  macOS 没有这个洞——写根外的 `(deny file-write* …)` 已经覆盖
+  `file-write-mode`/`-owner`/`-times`;而且当前任何 Landlock ABI 都关不掉它,
+  这一点不同于沙箱 `EnforcementGap` 里那些随内核版本存在的缺口。
 - 人工按文本批准的命令保留人看到的全部 shell 特性。
 - 编辑后诊断用的语言服务器(`[lsp] enabled`,默认开)运行在 OS 沙箱**之外**——
   它不是模型的 shell 命令。已在 initialize 握手里关掉执行仓库代码的开关

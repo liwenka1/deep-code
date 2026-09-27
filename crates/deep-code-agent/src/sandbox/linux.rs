@@ -14,7 +14,13 @@
 //!   confined, so no surface claims a boundary the host is not holding — and
 //!   because the two gaps are not the same gap, each carries its own wording
 //!   rather than one blanket "this boundary is not a safety net" (see
-//!   [`EnforcementGap`]).
+//!   [`EnforcementGap`]). File *metadata* is a separate, PERMANENT gap, not an
+//!   [`EnforcementGap`]: Landlock has no access right for `chmod`/`chown`/
+//!   `utimes`, so a confined command can change mode/owner/timestamps on any
+//!   DAC-permitted file, in or out of the roots, on every kernel. No ABI closes
+//!   it, so nothing reports it; it is a documented residual (SECURITY.md). The
+//!   file *contents* outside the roots stay unwritable — that needs the write
+//!   right Landlock does deny. macOS's `(deny file-write* …)` covers metadata.
 //! - **Network is blocked** (seccomp `socket`/`connect` → EPERM) unless the
 //!   policy allows it. When the policy DOES allow network (approved/trusted
 //!   writable commands), the broad reads above become an exfiltration surface:
