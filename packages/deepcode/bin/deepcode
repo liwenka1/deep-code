@@ -9,9 +9,10 @@
 // instead of leaving a command pointing at nothing.
 'use strict';
 
-const { spawnSync } = require('node:child_process');
+const { spawn } = require('node:child_process');
 const { existsSync } = require('node:fs');
 const { basename, join } = require('node:path');
+const os = require('node:os');
 
 const binary = join(
   __dirname,
@@ -34,15 +35,40 @@ if (!existsSync(binary)) {
   process.exit(1);
 }
 
-const result = spawnSync(binary, process.argv.slice(2), {
+// `spawn`, not `spawnSync`: a supervisor (or `timeout`, or a closed shell) that
+// sends SIGTERM/SIGHUP to THIS launcher would, with spawnSync, kill only Node —
+// the native binary is reparented to init and keeps running, orphaning its job
+// process groups (dev servers, watchers). Async spawn lets us forward those
+// signals so the binary runs its own graceful shutdown. (SIGINT/Ctrl-C already
+// reaches the whole foreground group; forwarding it too is harmless — the binary
+// guards against a double interrupt — and covers a supervisor that signals only
+// this pid.)
+const child = spawn(binary, process.argv.slice(2), {
   stdio: 'inherit',
   env: { ...process.env, DEEP_CODE_PROGRAM_NAME: invokedAs },
 });
 
-if (result.error) {
-  console.error(`deepcode: failed to launch binary: ${result.error.message}`);
-  process.exit(1);
+const forward = (signal) => {
+  try {
+    child.kill(signal);
+  } catch {
+    /* child already gone — nothing to forward to */
+  }
+};
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => forward(signal));
 }
 
-// Mirror the child's exit; a signal-terminated child reports null status.
-process.exit(result.status === null ? 1 : result.status);
+child.on('error', (error) => {
+  console.error(`deepcode: failed to launch binary: ${error.message}`);
+  process.exit(1);
+});
+
+child.on('exit', (code, signal) => {
+  // Mirror the child's fate. A signal exit becomes the shell convention 128+n so
+  // the parent sees the real cause; a normal exit passes its code through.
+  if (signal) {
+    process.exit(128 + (os.constants.signals[signal] || 0));
+  }
+  process.exit(code === null ? 1 : code);
+});

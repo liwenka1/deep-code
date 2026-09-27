@@ -6,6 +6,8 @@ mod input;
 pub(crate) mod render;
 
 use std::io::{self, Stdout, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -39,7 +41,21 @@ pub async fn run(config: LaunchConfig) -> Result<()> {
     install_panic_hook();
     let mut terminal = setup_terminal()?;
     let mut app = App::launch(config);
-    let result = run_loop(&mut terminal, &mut app);
+    // SIGTERM/SIGHUP (a supervisor, or the terminal window being closed) must
+    // run the same cleanup path as a quit — restore the terminal, flush the
+    // session, kill job process trees and LSP children — instead of the default
+    // action killing the process and orphaning them. The sync render loop cannot
+    // await a signal, so a task flips a flag the loop checks each tick (Ctrl-C is
+    // already delivered as a key event in raw mode, so SIGINT needs no arm here).
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            crate::headless::terminate_signal().await;
+            shutdown.store(true, Ordering::SeqCst);
+        });
+    }
+    let result = run_loop(&mut terminal, &mut app, &shutdown);
     // Nothing may `?` past `shutdown_runtime`: an early return here skips the
     // final persist/flush and leaks job process trees and LSP children. The
     // loop result used to take that exit, and after that was fixed the
@@ -227,12 +243,16 @@ fn redirect_stderr_to_log() {
 #[cfg(not(any(unix, windows)))]
 fn redirect_stderr_to_log() {}
 
-fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
+fn run_loop(
+    terminal: &mut AppTerminal,
+    app: &mut App,
+    shutdown: &AtomicBool,
+) -> Result<()> {
     let mut needs_redraw = true;
     let mut last_draw: Option<Instant> = None;
     let mut was_streaming = app.is_streaming;
 
-    while !app.should_quit {
+    while !app.should_quit && !shutdown.load(Ordering::SeqCst) {
         if app.drain_stream_updates() {
             needs_redraw = true;
         }

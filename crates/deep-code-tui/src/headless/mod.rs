@@ -123,6 +123,11 @@ pub async fn run_print(args: PrintArgs) -> i32 {
             .map(|secs| tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
         let drive = drive::drive_to_completion(&handle, prompt.clone(), &mut on_event);
         tokio::pin!(drive);
+        // Registered once and reused, so a SIGTERM/SIGHUP arriving between loop
+        // turns is not missed. The `if !interrupted` guard disables the arm
+        // after the first hit.
+        let terminated = terminate_signal();
+        tokio::pin!(terminated);
         loop {
             tokio::select! {
                 outcome = &mut drive => break outcome,
@@ -132,6 +137,16 @@ pub async fn run_print(args: PrintArgs) -> i32 {
                 _ = tokio::signal::ctrl_c(), if !interrupted => {
                     interrupted = true;
                     eprintln!("interrupted: cancelling the turn…");
+                    canceller.cancel_turn().await;
+                }
+                // SIGTERM/SIGHUP (a supervisor, `timeout`, a closed shell) must
+                // drain like Ctrl-C, not kill the process before cleanup: the
+                // cancel tears down tool process groups, and the post-loop
+                // `shutdown()` kills background jobs. Without this a `kill` left
+                // dev servers/watchers orphaned and the session tail unpersisted.
+                () = &mut terminated, if !interrupted => {
+                    interrupted = true;
+                    eprintln!("terminated: cancelling the turn…");
                     canceller.cancel_turn().await;
                 }
                 () = sleep_until(deadline), if deadline.is_some() && !timed_out && !interrupted => {
@@ -355,6 +370,35 @@ fn open_store(workspace: &std::path::Path) -> Result<JsonSessionStore, i32> {
         eprintln!("session storage unavailable: {error}");
         EXIT_FAILURE
     })
+}
+
+/// Resolves on the first SIGTERM or SIGHUP (unix); pends forever elsewhere.
+/// Ctrl-C (SIGINT) is handled separately via [`tokio::signal::ctrl_c`]. Shared
+/// with the TUI (`ui::run`) so both entry points drain on the same signals.
+pub(crate) async fn terminate_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match (signal(SignalKind::terminate()), signal(SignalKind::hangup())) {
+            (Ok(mut term), Ok(mut hup)) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = hup.recv() => {}
+                }
+            }
+            (Ok(mut term), Err(_)) => {
+                term.recv().await;
+            }
+            (Err(_), Ok(mut hup)) => {
+                hup.recv().await;
+            }
+            (Err(_), Err(_)) => std::future::pending::<()>().await,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::future::pending::<()>().await;
+    }
 }
 
 /// Total future for the optional wall-clock deadline; pends forever when no
