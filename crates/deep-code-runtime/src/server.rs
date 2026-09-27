@@ -200,6 +200,27 @@ mod host_tests {
         assert!(!host_is_loopback("192.168.1.9"));
         assert!(!host_is_loopback("example.com"));
     }
+
+    #[test]
+    fn host_header_loopback_strips_port_and_brackets() {
+        use super::host_header_is_loopback;
+        use axum::http::{HeaderMap, HeaderValue, header::HOST};
+        let with = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(HOST, HeaderValue::from_str(value).unwrap());
+            host_header_is_loopback(&headers)
+        };
+        assert!(with("127.0.0.1:8787"));
+        assert!(with("localhost:8787"));
+        assert!(with("[::1]:8787"));
+        assert!(with("127.0.0.1"));
+        // A DNS-rebinding page carries the attacker's own hostname, even when it
+        // resolves to 127.0.0.1.
+        assert!(!with("attacker.example.com:8787"));
+        assert!(!with("192.168.1.9:8787"));
+        // No Host at all fails closed.
+        assert!(!host_header_is_loopback(&HeaderMap::new()));
+    }
 }
 
 pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
@@ -388,18 +409,58 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 }
 
 async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    if let Some(expected) = &state.auth_token
-        && !token_matches(expected, request.headers())
-    {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "missing or invalid runtime token"
-            })),
-        )
-            .into_response();
+    match &state.auth_token {
+        Some(expected) => {
+            if !token_matches(expected, request.headers()) {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "missing or invalid runtime token"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+        // No token: the bind is loopback-only (enforced at startup), but a web
+        // page that DNS-rebinds its own hostname to 127.0.0.1 is same-origin, so
+        // neither the absence of CORS nor the JSON content-type check stops it —
+        // and it could read the SSE stream and POST to /v1/prompt|/v1/approvals.
+        // Require a loopback `Host`, which such a page cannot forge (the browser
+        // sends the attacker's hostname). A token, when set, IS the boundary and
+        // also permits non-loopback binds, so this only guards the no-token mode.
+        None => {
+            if !host_header_is_loopback(request.headers()) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "request Host is not loopback; refused (set --auth-token to \
+                                  allow non-loopback access)"
+                    })),
+                )
+                    .into_response();
+            }
+        }
     }
     next.run(request).await
+}
+
+/// Whether the request's `Host` header names a loopback address (so a
+/// DNS-rebinding page, which arrives with the attacker's own hostname in `Host`,
+/// is refused). A missing or unparseable Host fails closed.
+fn host_header_is_loopback(headers: &axum::http::HeaderMap) -> bool {
+    let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    // Strip the optional port, and the brackets around an IPv6 literal.
+    let hostname = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host.rsplit_once(':').map_or(host, |(name, _)| name)
+    };
+    host_is_loopback(hostname)
 }
 
 #[derive(Deserialize)]
