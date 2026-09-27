@@ -221,6 +221,19 @@ impl AgentRuntime {
         if is_root_grant(&call.name) {
             return None;
         }
+        // Inside a sub-agent NONE of the channels below apply: a child's gated
+        // calls are decided solely by `subagent_approval_decision` (role-based
+        // writes, the dispatch-time network grant), consulted when the call
+        // parks. Config `auto_allow` and session memory are the human's own
+        // session authority — letting them short-circuit here escalated a child
+        // past its dispatch. Concretely, a parent `auto_allow = ["shell"]` would
+        // hand a child dispatched WITHOUT network full egress (it declares
+        // `network: true` and the config waves it through, below the egress
+        // floor), and let a read-only-role child run arbitrary shell. Force
+        // every gated child call to the sub-agent decider instead.
+        if self.is_subagent {
+            return None;
+        }
         // Layer 1: standing consent (config auto_allow + session memory).
         // Exact name match, not a prefix: standing consent must not stretch.
         // A prefix `"s"` would have covered every s-tool at once, and a tool

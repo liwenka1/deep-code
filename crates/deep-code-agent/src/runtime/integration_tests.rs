@@ -2182,6 +2182,50 @@ async fn config_auto_allow_exact_name_runs_gated_tool_without_prompt() {
     ));
 }
 
+/// The same `auto_allow` that pre-approves in a parent must NOT short-circuit
+/// inside a sub-agent: a child's gated calls belong to
+/// `subagent_approval_decision`, not to the human's session-level consent.
+/// Otherwise a parent `auto_allow = ["shell"]` would silently hand a child
+/// egress and arbitrary shell past its dispatch. Here the same config that made
+/// the test above run without a prompt instead PARKS the call in a sub-agent
+/// runtime (`is_subagent = true`).
+#[tokio::test]
+async fn config_auto_allow_does_not_apply_inside_a_subagent() {
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::ToolCallDelta {
+            delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let config = AgentConfig {
+        approval_auto_allow: vec![MockEchoTool::NAME.to_string()],
+        ..AgentConfig::builtin()
+    };
+    // Last arg: is_subagent = true.
+    let runtime =
+        AgentRuntime::with_system_prompt(client, ToolRegistry::with_mock_tools(), "system", config, true);
+
+    let mut rx = runtime.submit_user("echo").await;
+    let events = drain(&mut rx).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::ApprovalRequired { .. })),
+        "auto_allow must not pre-approve a gated call inside a sub-agent; it must park"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ApprovalResolved {
+                decision: ApprovalDecision::Approved,
+                ..
+            }
+        )),
+        "no channel may auto-approve a child's gated call"
+    );
+}
+
 /// The complement: an entry that is merely a PREFIX of the tool's name grants
 /// nothing. Standing consent is an exact-name match — `"mock_"` (or `"s"`)
 /// must not stretch over whatever tools happen to share the spelling, so the

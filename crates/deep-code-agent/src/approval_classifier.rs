@@ -10,14 +10,17 @@
 //! - It sees a **structured summary** (task, tool, action, risk, safety notes)
 //!   rather than the whole tool payload. The tool name, risk, and notes are
 //!   non-injectable (enum keys, not free text). The other two fields are not:
-//!   `action` is model-chosen content (a command/path/url), and `user_task`
-//!   is only the human's own words in the PARENT session — inside a sub-agent
-//!   it is the task brief the parent model wrote, and a child inherits the
-//!   parent's permission mode, so `auto` puts model-authored text in the judge
-//!   prompt. Both are therefore fenced with delimiters and named as untrusted
-//!   data in the system prompt. That instruction shrinks, but does not
-//!   eliminate, the prompt-injection surface — which is why the high-risk
-//!   floor keeps arbitrary shell out of the judge's reach entirely.
+//!   `action` is model-chosen content (a command/path/url), and `user_task` is
+//!   the human's own words. The judge only ever runs in the PARENT session
+//!   (a sub-agent's gated calls are decided by `subagent_approval_decision`, not
+//!   by this classifier — `auto_approval_granted` returns before the Auto layer
+//!   for a child), so `user_task` here is the human's task rather than
+//!   model-authored text. Both fields are still fenced with delimiters and named
+//!   as untrusted data in the system prompt — defense in depth, and it keeps the
+//!   fence honest if the judge is ever reached with model-written text. That
+//!   instruction shrinks, but does not eliminate, the prompt-injection surface —
+//!   which is why the high-risk floor keeps arbitrary shell out of the judge's
+//!   reach entirely.
 
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -381,10 +384,10 @@ mod tests {
     ///
     /// The task used to be interpolated raw, one line above a fenced action —
     /// which made the escaping below it decorative: a task carrying
-    /// `</action>` re-opened the same hole from the block printed first. It is
-    /// the human's own words in a parent session, but a sub-agent's "task" is
-    /// the brief the PARENT MODEL wrote, and a child inherits the parent's
-    /// permission mode, so `auto` really does put model-authored text here.
+    /// `</action>` re-opened the same hole from the block printed first. The
+    /// judge only runs in the parent session (a sub-agent's calls never reach
+    /// it), so the task is the human's own words; the fence is defense in depth,
+    /// applied to every untrusted field uniformly rather than argued case by case.
     #[test]
     fn the_task_is_fenced_like_the_action() {
         let input = ClassifierInput {

@@ -159,10 +159,17 @@ impl AgentRuntime {
         let mut backoff = INITIAL_BACKOFF;
 
         let inner = loop {
-            // Refresh the model on every attempt: a fallback in a prior
-            // attempt mutates the route and must stick for retries.
+            // Refresh the model AND the effort on every attempt: a fallback in a
+            // prior attempt mutated the route (Pro→Flash), and Flash rejects
+            // `max`. Re-deriving the effort from the route's current model keeps
+            // the two coherent, so a retry after a fallback never re-sends the
+            // original unclamped effort to the fallen-back model.
             let mut attempt = request.clone();
             attempt.model = route.effective_model.clone();
+            attempt.reasoning_effort =
+                clamp_effort_to_model(&route.effective_model, route.effective_effort)
+                    .as_api_value()
+                    .map(str::to_string);
             match self.stream_with_fallback(route, attempt).await {
                 Ok(stream) => break stream,
                 Err(error) if retries_left > 0 && open_error_retriable(&error) => {
@@ -176,9 +183,14 @@ impl AgentRuntime {
         };
 
         // Mid-stream re-opens stay on the route's final model: the fallback
-        // decision was already taken (and surfaced) at open time.
+        // decision was already taken (and surfaced) at open time. The effort
+        // rides the same model, so a reopen after a Pro→Flash fallback does not
+        // re-send `max` to Flash.
         let mut request = request;
         request.model = route.effective_model.clone();
+        request.reasoning_effort = clamp_effort_to_model(&route.effective_model, route.effective_effort)
+            .as_api_value()
+            .map(str::to_string);
 
         Ok(GuardedStream {
             client: Arc::clone(&self.client),

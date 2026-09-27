@@ -116,7 +116,20 @@ pub fn compact_entries(entries: &[Arc<SessionEntry>]) -> CompactionResult {
         .first()
         .filter(|entry| matches!(entry.kind, EntryKind::System { .. }))
         .cloned();
-    let tail_start = entries.len().saturating_sub(RECENT_TAIL_ENTRIES);
+    let mut tail_start = entries.len().saturating_sub(RECENT_TAIL_ENTRIES);
+    // Never archive the newest user message. A turn that runs many tool steps
+    // (>= RECENT_TAIL_ENTRIES) before compaction fires would otherwise push the
+    // current request out of the retained tail and fold it into the summary —
+    // and the next request then carries NO user message at all, so the model
+    // loses its task (or the provider rejects a user-less request). Extend the
+    // tail back to include the last user entry when it sits before the window;
+    // this keeps the active turn intact and only archives history before it.
+    if let Some(last_user) = entries
+        .iter()
+        .rposition(|entry| matches!(entry.kind, EntryKind::User { .. }))
+    {
+        tail_start = tail_start.min(last_user);
+    }
     let head_offset = usize::from(system.is_some());
     if tail_start <= head_offset {
         return unchanged();
@@ -253,6 +266,55 @@ mod tests {
         assert!(
             wire.iter()
                 .any(|message| message.content.contains("会话摘要"))
+        );
+    }
+
+    /// A turn that runs many tool steps before compaction fires must not lose
+    /// its user request. Reproduces the drop: [system, user(TASK), then more
+    /// than RECENT_TAIL_ENTRIES assistant/tool entries]. The task must survive
+    /// as a real user message, or the next request has none.
+    #[test]
+    fn compaction_never_archives_the_active_user_request() {
+        let mut entries = vec![Arc::new(SessionEntry::system("sys"))];
+        // Older turns BEFORE the active task, so there is history to archive.
+        for turn in 0..3 {
+            entries.push(Arc::new(SessionEntry::user(format!("old task {turn}"))));
+            entries.push(Arc::new(SessionEntry::assistant(
+                format!("old answer {turn}"),
+                None,
+                Vec::new(),
+            )));
+        }
+        // The active request, then enough tool steps that it would fall outside
+        // the recent tail under the old `len - RECENT_TAIL_ENTRIES` rule.
+        entries.push(Arc::new(SessionEntry::user("FIX THE LOGIN BUG")));
+        for index in 0..RECENT_TAIL_ENTRIES + 3 {
+            entries.push(Arc::new(SessionEntry::assistant(
+                format!("step {index}"),
+                None,
+                Vec::new(),
+            )));
+        }
+        let result = compact_entries(&entries);
+        assert!(result.archived_count > 0, "history before the task is archived");
+        assert!(
+            result.entries.iter().any(|entry| matches!(
+                &entry.kind,
+                EntryKind::User { content } if content == "FIX THE LOGIN BUG"
+            )),
+            "the active user request must survive compaction as a user message"
+        );
+        // And it survives on the WIRE (not only as an entry), so the next
+        // request carries a real user turn.
+        let wire: Vec<Message> = result
+            .entries
+            .iter()
+            .flat_map(|entry| entry_wire_messages(entry))
+            .collect();
+        assert!(
+            wire.iter()
+                .any(|m| m.role == Role::User && m.content == "FIX THE LOGIN BUG"),
+            "the task must reach the wire as a user message"
         );
     }
 
