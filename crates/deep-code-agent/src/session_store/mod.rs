@@ -295,7 +295,13 @@ pub trait SessionStore: Send + Sync {
 pub fn new_session_id() -> SessionId {
     static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
     let seq = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    SessionId(format!("session_{}_{seq}", now_ms()))
+    // The `_seq` counter is per-process and starts at 0, so two separate
+    // processes creating a session in the same millisecond (parallel `deepcode`
+    // / scripted `-p` in one workspace) both minted `session_<ms>_0` and
+    // clobbered each other's file via the atomic rename. The pid disambiguates
+    // cross-process; the atomic seq disambiguates within a process. Both stay
+    // inside the `[A-Za-z0-9_-]` id charset `validate_session_id` enforces.
+    SessionId(format!("session_{}_{}_{seq}", now_ms(), std::process::id()))
 }
 
 /// Reject path components and other unsafe filename characters in session ids.

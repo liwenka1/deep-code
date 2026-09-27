@@ -179,6 +179,20 @@ fn write_denial_signature_matches_backend_denial_texts() {
     // Ordinary failures don't match.
     assert!(!write_denial_signature(Some(1), "error: expected `;`"));
     assert!(!write_denial_signature(Some(2), ""));
+
+    // Exec-failure conventions are not write denials, even though the shell
+    // prints "Permission denied": 126 is a script without its +x bit (chmod IS
+    // the fix, the opposite of the note), 127 is not-found.
+    assert!(!write_denial_signature(
+        Some(126),
+        "sh: ./run.sh: Permission denied"
+    ));
+    assert!(!write_denial_signature(Some(127), "sh: foo: command not found"));
+    // ssh auth failure carries the substring but is a credential problem.
+    assert!(!write_denial_signature(
+        Some(255),
+        "git@github.com: Permission denied (publickey)."
+    ));
 }
 
 /// Every stderr below was captured under the real no-network Seatbelt

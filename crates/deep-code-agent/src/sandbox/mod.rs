@@ -49,6 +49,19 @@ pub(crate) fn write_denial_signature(exit_code: Option<i32>, stderr: &str) -> bo
     if exit_code == Some(0) {
         return false;
     }
+    // 126 (found but not executable) and 127 (not found) are shell exec-failure
+    // conventions, not write denials: 126 in particular prints "Permission
+    // denied" for a script missing its +x bit, where chmod IS the fix — the exact
+    // opposite of this note's "no retry/chmod can succeed". Excluding them keeps
+    // those out of the write-boundary breaker.
+    if matches!(exit_code, Some(126) | Some(127)) {
+        return false;
+    }
+    // ssh authentication failure ("Permission denied (publickey).") also carries
+    // the substring but is a credential problem, not the granted-roots fence.
+    if stderr.contains("Permission denied (publickey") {
+        return false;
+    }
     [
         "Operation not permitted",
         "Permission denied",

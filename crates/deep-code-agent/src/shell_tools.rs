@@ -446,6 +446,18 @@ static SPILL_PRUNE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 /// spill home itself is never created here, and every failure is ignored:
 /// retention is disk hygiene, not correctness.
 fn prune_stale_spill_runs(spill_home: &Path, cutoff: std::time::SystemTime) {
+    // Refuse to enumerate or delete through a symlinked `.deep-code` or `spill`.
+    // A repository can ship either as a link (an ordinary permitted write inside
+    // a granted root, refused by no sandbox), and `read_dir` follows the final
+    // component while `remove_dir_all` resolves the prefix — so a link here would
+    // have this unsandboxed launch delete `run-*` dirs OUTSIDE the workspace. The
+    // write side (`create_spill_file` → `ensure_owned_dirs`) already guards this;
+    // this is its missing sibling on the prune side. `symlink_metadata` (not
+    // `metadata`) so the check does not itself follow the link.
+    let real_dir = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir());
+    if !real_dir(spill_home) || spill_home.parent().is_some_and(|parent| !real_dir(parent)) {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(spill_home) else {
         return;
     };

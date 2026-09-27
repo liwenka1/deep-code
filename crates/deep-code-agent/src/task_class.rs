@@ -90,8 +90,16 @@ const KEYWORDS: &[(&str, TaskWeight)] = &[
 #[must_use]
 pub(crate) fn classify_keyword(prompt: &str) -> Option<(TaskWeight, &'static str)> {
     let lower = prompt.to_lowercase();
+    // Split ASCII runs on any non-ASCII-alphanumeric char, so a CJK character
+    // ADJACENT to an English keyword also ends the token: `帮我debug一下` and
+    // `请review一下` are one alphanumeric run under `is_alphanumeric` (CJK counts
+    // as alphanumeric), so the token was `帮我debug一下` and `token.starts_with
+    // ("debug")` missed — Chinese users writing mixed prompts got routed to Flash.
+    // CJK keywords still match by substring over `lower` below, so this only
+    // affects the ASCII word-boundary pass. `research`→`search` stays excluded:
+    // `research` is still one run and does not start with `search`.
     let tokens: Vec<&str> = lower
-        .split(|ch: char| !ch.is_alphanumeric())
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
         .collect();
 
@@ -158,5 +166,24 @@ mod tests {
     #[test]
     fn no_keyword_is_none() {
         assert_eq!(classify_keyword("how are you today"), None);
+    }
+
+    /// An English keyword pressed against CJK with no space still classifies —
+    /// mixed prompts are how Chinese users actually write ("帮我debug一下",
+    /// "请review这段代码"). Before, the whole thing was one alphanumeric token and
+    /// the ASCII prefix match missed, routing to Flash.
+    #[test]
+    fn ascii_keyword_adjacent_to_cjk_is_found() {
+        assert_eq!(
+            classify_keyword("\u{5e2e}\u{6211}debug\u{4e00}\u{4e0b}").map(|hit| hit.0),
+            Some(TaskWeight::Deep)
+        );
+        assert_eq!(
+            classify_keyword("\u{8bf7}review\u{8fd9}\u{6bb5}\u{4ee3}\u{7801}").map(|hit| hit.0),
+            Some(TaskWeight::Heavy)
+        );
+        // The substring guard still holds across the boundary: `研究`(research
+        // sense) plus an English word must not trip `search`.
+        assert_eq!(classify_keyword("\u{7814}\u{7a76}research"), None);
     }
 }
