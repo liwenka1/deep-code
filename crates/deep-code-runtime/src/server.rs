@@ -274,6 +274,9 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
         );
     }
 
+    // Captured before `options.auth_token` moves into `AppState`, for the
+    // resolved-address loopback re-check at bind time below.
+    let no_auth_token = options.auth_token.is_none();
     let state = AppState {
         version: env!("CARGO_PKG_VERSION").to_string(),
         auth_token: options.auth_token,
@@ -310,6 +313,23 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
         .with_context(|| format!("cannot resolve listen host '{}'", options.host))?
         .next()
         .with_context(|| format!("no address resolved for listen host '{}'", options.host))?;
+    // Defence in depth for the no-token exemption above: that gate classified
+    // the *unresolved* host string, but `lookup_host` runs it through the system
+    // resolver, so a hostile `/etc/hosts`/resolver mapping a trusted name
+    // (`localhost`) to a routable address could bind the agent to the network
+    // with no token. `parse::<SocketAddr>()` could not lie this way — it rejected
+    // names outright. Re-check the RESOLVED address and fail closed if the
+    // exemption no longer holds. (IP literals resolve to themselves, so this only
+    // ever catches a name whose resolution disagrees with the string gate.)
+    if no_auth_token && !addr.ip().is_loopback() {
+        anyhow::bail!(
+            "host '{}' resolved to non-loopback {} but no auth token is set: refusing to bind. \
+             Pass --auth-token <TOKEN>, set {}, or bind 127.0.0.1.",
+            options.host,
+            addr.ip(),
+            RUNTIME_TOKEN_ENV
+        );
+    }
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind {addr}"))?;
