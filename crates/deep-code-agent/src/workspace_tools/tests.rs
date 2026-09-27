@@ -102,6 +102,40 @@ async fn list_dir_returns_structured_entries() {
     assert_eq!(output["path"], "src");
     assert_eq!(output["entries"][0]["name"], "lib.rs");
     assert_eq!(output["entries"][0]["kind"], "file");
+    assert!(
+        output.get("truncated").is_none(),
+        "a small directory carries no truncation marker"
+    );
+}
+
+/// A directory with more than `MAX_LIST_ENTRIES` children is capped: the window
+/// is the first `MAX_LIST_ENTRIES` names, and the result reports the true total
+/// so the caller knows to narrow — without paying a `metadata()` per entry or
+/// serialising tens of thousands of rows into the model's context.
+#[tokio::test]
+async fn list_dir_caps_a_huge_directory_and_reports_the_total() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path().join("many");
+    fs::create_dir(&dir).unwrap();
+    let total = MAX_LIST_ENTRIES + 3;
+    for index in 0..total {
+        // Zero-padded so the alphabetical window is deterministic.
+        fs::write(dir.join(format!("f{index:05}.txt")), "x").unwrap();
+    }
+
+    let result = run(tmp.path(), "list_dir", json!({"path": "many"})).await;
+    let output: Value = serde_json::from_str(&result.content).unwrap();
+
+    assert_eq!(
+        output["entries"].as_array().unwrap().len(),
+        MAX_LIST_ENTRIES
+    );
+    assert_eq!(output["total_entries"], total);
+    assert_eq!(output["truncated"], true);
+    assert_eq!(
+        output["entries"][0]["name"], "f00000.txt",
+        "the retained window is alphabetical from the start"
+    );
 }
 
 #[tokio::test]
@@ -121,6 +155,31 @@ async fn grep_files_returns_matches_with_context() {
     assert_eq!(output["matches"][0]["line_number"], 2);
     assert_eq!(output["matches"][0]["context_before"][0]["text"], "alpha");
     assert_eq!(output["matches"][0]["context_after"][0]["text"], "omega");
+}
+
+/// grep runs on a `spawn_blocking` thread tokio cannot abort, so it checks the
+/// turn's cancel token once per walked entry and stops. A token cancelled before
+/// the walk begins means nothing is searched at all — the guarantee that a huge
+/// or no-match grep frees its pool thread promptly after the user presses Esc.
+#[tokio::test]
+async fn grep_stops_when_the_turn_is_cancelled() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("a.rs"), "needle\n").unwrap();
+    fs::write(tmp.path().join("b.rs"), "needle\n").unwrap();
+
+    let tool =
+        GrepFilesTool::new(WorkspacePolicy::new(WorkspaceRoots::from(tmp.path())).unwrap());
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let params: GrepFilesParams = serde_json::from_value(json!({"pattern": "needle"})).unwrap();
+
+    let output: Value =
+        serde_json::from_str(&tool.grep_sync(params, &cancel).unwrap().content).unwrap();
+    assert_eq!(
+        output["files_searched"], 0,
+        "a pre-cancelled grep searches nothing"
+    );
+    assert!(output["matches"].as_array().unwrap().is_empty());
 }
 
 /// Files over the size limit are refused by the walk — but refused OUT LOUD

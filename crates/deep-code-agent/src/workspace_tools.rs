@@ -6,6 +6,7 @@ use regex::RegexBuilder;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, run_blocking};
 #[cfg(test)]
@@ -25,6 +26,12 @@ const DEFAULT_CONTEXT_LINES: usize = 2;
 /// Cap on each skipped-path list in grep results: enough to act on, small
 /// enough that a tree full of oversized artifacts cannot flood the output.
 const SKIPPED_PATHS_LISTED: usize = 10;
+/// Cap on entries returned by `list_dir`. A directory with tens of thousands of
+/// direct children (a flat cache, a `node_modules/.bin`, a data dump) would
+/// otherwise cost one `metadata()` stat per entry and bury the model's context
+/// under a JSON array it cannot use. The window is alphabetical and the result
+/// says how many were elided so the caller can narrow the path.
+const MAX_LIST_ENTRIES: usize = 1000;
 
 /// The size cap in MiB, for prose. The compile-time assert keeps the division
 /// exact: a cap that stops being a MiB multiple would otherwise truncate into
@@ -213,7 +220,11 @@ impl ListDirTool {
         if !path.is_dir() {
             return Err(invalid(Self::NAME, "path is not a directory"));
         }
-        let mut entries = fs::read_dir(&path)
+        // Collect the raw entries first: a readdir yields names without a stat,
+        // so a directory with a huge number of children is capped BEFORE paying
+        // one `metadata()` per entry and before serialising a JSON array large
+        // enough to bury the model's context.
+        let mut raw = fs::read_dir(&path)
             .map_err(|error| {
                 ToolError::exec_failed(
                     Self::NAME,
@@ -223,13 +234,22 @@ impl ListDirTool {
                     ),
                 )
             })?
+            .collect::<Result<Vec<fs::DirEntry>, _>>()
+            .map_err(|error| {
+                ToolError::exec_failed(
+                    Self::NAME,
+                    format!("failed to read directory entry: {error}"),
+                )
+            })?;
+        let total = raw.len();
+        // Sort by name so the retained window is stable and alphabetical; within
+        // one directory name order equals the path order the output used before.
+        raw.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+        let truncated = total > MAX_LIST_ENTRIES;
+        raw.truncate(MAX_LIST_ENTRIES);
+        let entries = raw
+            .iter()
             .map(|entry| {
-                let entry = entry.map_err(|error| {
-                    ToolError::exec_failed(
-                        Self::NAME,
-                        format!("failed to read directory entry: {error}"),
-                    )
-                })?;
                 let file_type = entry.file_type().map_err(|error| {
                     ToolError::exec_failed(
                         Self::NAME,
@@ -254,11 +274,19 @@ impl ListDirTool {
                 }))
             })
             .collect::<Result<Vec<_>, ToolError>>()?;
-        entries.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
-        Ok(ToolOutput::text(json_string(json!({
+        let mut result = json!({
             "path": self.root.relative_display(&path),
-            "entries": entries
-        }))))
+            "entries": entries,
+        });
+        if truncated {
+            result["total_entries"] = json!(total);
+            result["truncated"] = json!(true);
+            result["note"] = json!(format!(
+                "directory has {total} entries; showing the first {MAX_LIST_ENTRIES} by name — \
+                 narrow with a subdirectory path or grep_files"
+            ));
+        }
+        Ok(ToolOutput::text(json_string(result)))
     }
 }
 
@@ -278,7 +306,9 @@ impl Tool for ListDirTool {
     }
 
     fn description(&self) -> &str {
-        "List a workspace directory with structured entries."
+        "List a workspace directory (non-recursive) with structured entries. At most 1000 entries \
+         are returned, alphabetically; if the directory holds more, the result carries \
+         total_entries and truncated:true — narrow with a subdirectory path or grep_files."
     }
 
     async fn run(&self, params: ListDirParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
@@ -299,7 +329,11 @@ impl GrepFilesTool {
         Self { root }
     }
 
-    fn grep_sync(&self, params: GrepFilesParams) -> Result<ToolOutput, ToolError> {
+    fn grep_sync(
+        &self,
+        params: GrepFilesParams,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
         let pattern = params.pattern.as_str();
         let path_arg = params.path.as_deref().unwrap_or(".");
         let context_lines = params.context_lines.unwrap_or(DEFAULT_CONTEXT_LINES);
@@ -359,6 +393,16 @@ impl GrepFilesTool {
             .follow_links(false)
             .build()
         {
+            // Cooperative cancellation. This runs on a `spawn_blocking` thread
+            // that tokio cannot abort, so without a check a walk over a huge
+            // tree — or one whose pattern matches nothing and therefore reads
+            // every file to the end — kept a pool thread pinned long after the
+            // user pressed Esc. An atomic load per entry is free beside the
+            // readdir and file read it guards; on cancel we stop and return the
+            // matches gathered so far (the turn is being torn down anyway).
+            if cancel.is_cancelled() {
+                break;
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 // A DIRECTORY the walk could not read (EACCES, a subtree that
@@ -740,9 +784,10 @@ impl Tool for GrepFilesTool {
          that cannot be opened hides its whole subtree)."
     }
 
-    async fn run(&self, params: GrepFilesParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+    async fn run(&self, params: GrepFilesParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {
         let this = self.clone();
-        run_blocking(Self::NAME, move || this.grep_sync(params)).await
+        let cancel = cx.cancel_token().clone();
+        run_blocking(Self::NAME, move || this.grep_sync(params, &cancel)).await
     }
 }
 
