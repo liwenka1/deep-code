@@ -207,6 +207,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     if app.pending_approval.is_some() {
+        // A decision fires only on an UNMODIFIED key (Shift allowed, for `Y`/`N`).
+        // The approval keys `y`/`a`/`n` collide with composer chords —
+        // Ctrl+A is cursor-home, Alt+Enter is newline, Ctrl+Y approves — and a
+        // reflexive chord must never be read as "approve for the session"
+        // against a security prompt. Navigation/scrolling stay live under any
+        // modifier; they resolve nothing.
+        let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.handle_ctrl_c();
@@ -218,13 +225,14 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             // once; navigation and scrolling stay live, because neither of them
             // resolves anything.
             KeyCode::Char('y' | 'Y' | 'a' | 'A' | 'n' | 'N') | KeyCode::Enter | KeyCode::Esc
-                if !app.approval_armed => {}
-            KeyCode::Char('y') | KeyCode::Char('Y') => app.approve_pending_tool(),
-            KeyCode::Char('a') | KeyCode::Char('A') => app.approve_pending_tool_for_session(),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.deny_pending_tool(),
+                if plain && !app.approval_armed => {}
+            KeyCode::Char('y' | 'Y') if plain => app.approve_pending_tool(),
+            KeyCode::Char('a' | 'A') if plain => app.approve_pending_tool_for_session(),
+            KeyCode::Char('n' | 'N') if plain => app.deny_pending_tool(),
+            KeyCode::Esc if plain => app.deny_pending_tool(),
             KeyCode::Up => app.approval_focus_up(),
             KeyCode::Down => app.approval_focus_down(),
-            KeyCode::Enter => app.execute_focused_approval(),
+            KeyCode::Enter if plain => app.execute_focused_approval(),
             KeyCode::PageUp => app.scroll_approval_up(),
             KeyCode::PageDown => app.scroll_approval_down(),
             KeyCode::Home => app.scroll_approval_to_top(),
@@ -256,7 +264,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 let _ = app.accept_completion();
                 return;
             }
-            KeyCode::Enter => {
+            // Plain Enter accepts+submits; Alt+Enter is a newline, so let it
+            // fall through to the composer handler below instead of submitting.
+            KeyCode::Enter if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
                 if app.accept_completion() {
                     app.submit();
                 }
@@ -331,7 +341,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         // Plain ↑↓ serve the composer (cursor between lines, else history).
         KeyCode::Up => app.on_up(),
         KeyCode::Down => app.on_down(),
-        KeyCode::Char(value) => app.push_char(value),
+        // Only an unmodified (or Shift-only) character is composer input. An
+        // unbound chord — Ctrl+L, Ctrl+R, Alt+d — otherwise fell through here
+        // and inserted its bare letter into the prompt.
+        KeyCode::Char(value) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
+            app.push_char(value)
+        }
         _ => {}
     }
 }
@@ -445,6 +460,57 @@ mod tests {
             app.pending_approval.is_none(),
             "once the panel has been drawn, y must approve as before"
         );
+    }
+
+    /// A modified key never resolves an armed approval panel. Ctrl+A is the
+    /// composer's cursor-home, Alt+Enter its newline, Ctrl+Y a stray chord — a
+    /// reflex on any of them used to record "approve for the session" / approve
+    /// against a security prompt.
+    #[tokio::test]
+    async fn a_modified_key_never_resolves_an_armed_approval() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let park = |app: &mut App| {
+            app.park_approval(deep_code_agent::ApprovalRequest {
+                network: false,
+                call_id: "call_1".to_string(),
+                tool_name: "mock_echo".to_string(),
+                description: "echo".to_string(),
+                arguments: serde_json::json!({}),
+                risk_level: deep_code_agent::RiskLevel::Low,
+                requires_sandbox: false,
+                read_only: true,
+                matched_rule: None,
+                justification: None,
+                resolved_target: None,
+                preview: None,
+                safety_notes: Vec::new(),
+            });
+            app.approval_armed = true;
+        };
+
+        for (code, modifiers) in [
+            (KeyCode::Char('a'), KeyModifiers::CONTROL),
+            (KeyCode::Char('y'), KeyModifiers::CONTROL),
+            (KeyCode::Char('n'), KeyModifiers::ALT),
+            (KeyCode::Char('a'), KeyModifiers::SUPER),
+            (KeyCode::Enter, KeyModifiers::ALT),
+            (KeyCode::Esc, KeyModifiers::CONTROL),
+        ] {
+            let mut app = App::new();
+            park(&mut app);
+            handle_key(&mut app, KeyEvent::new(code, modifiers));
+            assert!(
+                app.pending_approval.is_some(),
+                "{code:?}+{modifiers:?} resolved a security prompt"
+            );
+        }
+
+        // The unmodified (and Shift-only) keys still decide.
+        let mut app = App::new();
+        park(&mut app);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.pending_approval.is_none(), "plain `a` still approves");
     }
 
     /// End-to-end steering guard at the layer that actually shipped broken:

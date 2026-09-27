@@ -174,6 +174,50 @@ fn approval_lines_are_minimal_no_dump_fields() {
     assert!(!text.contains("沙箱") && !text.contains("规则"));
 }
 
+/// A multi-line shell command must render as multiple faithful lines, not be
+/// collapsed onto one — `git status\ngit reset --hard HEAD~5` runs as two
+/// commands through `sh -c`, and the panel is the only place the human sees it.
+#[test]
+fn approval_lines_show_a_multiline_command_faithfully() {
+    let lines = approval_lines(
+        "shell",
+        RiskLevel::High,
+        true,
+        false,
+        None,
+        None,
+        None,
+        "运行 shell 命令",
+        r#"{"command":"git status\ngit reset --hard HEAD~5"}"#,
+        None,
+        &[],
+        60,
+        Lang::Zh,
+    );
+    let rows: Vec<String> = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        })
+        .collect();
+    // The reset lives on its own row, not merged into the status line.
+    assert!(
+        rows.iter().any(|r| r.contains("git status") && !r.contains("reset")),
+        "the first command must be on its own row: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("git reset --hard HEAD~5")),
+        "the second command must be shown verbatim on its own row: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("git status git reset")),
+        "the two commands must never be collapsed onto one line: {rows:?}"
+    );
+}
+
 #[test]
 fn approval_lines_render_colored_diff_preview() {
     let preview = "@@ -1,2 +1,2 @@\n one\n-two\n+three";

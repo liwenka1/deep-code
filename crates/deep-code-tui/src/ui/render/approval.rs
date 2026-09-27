@@ -239,6 +239,13 @@ pub(super) fn approval_head_lines(
             width,
             lang,
         ));
+    } else if let Some(command) = raw_command(tool_name, arguments_json) {
+        // A shell/job command runs verbatim through `sh -c`, so the panel must
+        // show it verbatim. The compact `action` line collapses newlines and
+        // truncates at 240 columns, which made `git status\ngit reset --hard`
+        // read as one line and hid the tail of a long command entirely — the
+        // human then approves something other than what runs.
+        lines.extend(command_head_lines(&command, width, lang));
     } else {
         lines.extend(wrap_prefixed(
             "  ",
@@ -249,6 +256,55 @@ pub(super) fn approval_head_lines(
         ));
     }
     lines
+}
+
+/// Cap on command rows shown in the pinned head. Beyond it the panel adds a
+/// "+N more" marker; a command long enough to blow the whole panel then fails
+/// the arm check (the head is pinned), so it cannot be blind-approved — the same
+/// fail-safe a giant root-grant spelling already relies on.
+const MAX_COMMAND_ROWS: usize = 12;
+
+/// The raw command a command-bearing call would run (`shell`, or `job` with
+/// `action=start`), read through the same rule the policy uses so the panel and
+/// the executor cannot disagree about which calls carry a command.
+fn raw_command(tool_name: &str, arguments_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(arguments_json).ok()?;
+    deep_code_agent::shell_command_of(tool_name, &value).map(str::to_string)
+}
+
+/// Render a command faithfully in the pinned head: each source line kept as its
+/// own line (never collapsed onto one), sanitized and wrapped to the panel
+/// width, bounded to [`MAX_COMMAND_ROWS`] rows with a warning marker when it
+/// does not fit.
+fn command_head_lines(command: &str, width: usize, lang: Lang) -> Vec<Line<'static>> {
+    let style = Style::default().fg(Color::Cyan);
+    // Sanitize per source line (control chars → space, invisibles removed,
+    // combining marks clamped) WITHOUT collapsing the newline structure — that
+    // structure is what the shell runs, so it is what the human must see. A big
+    // per-line column cap only bounds a pathological single line; ordinary lines
+    // pass through and `wrap_prefixed` wraps them to the real width.
+    let cleaned = command
+        .split('\n')
+        .map(|line| sanitize_panel_text(line, 4000))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut rows = wrap_prefixed("  ", &cleaned, width, style, style);
+    if rows.len() > MAX_COMMAND_ROWS {
+        let hidden = rows.len() - MAX_COMMAND_ROWS;
+        rows.truncate(MAX_COMMAND_ROWS);
+        rows.push(Line::from(Span::styled(
+            format!(
+                "  {}",
+                tr_with(
+                    lang,
+                    TextId::ApprovalCommandMoreRows,
+                    &[("count", &hidden.to_string())],
+                )
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    rows
 }
 
 /// Minimal, borderless approval block matching the welcome/picker style: a

@@ -61,7 +61,7 @@ pub use doctor::{DoctorReport, default_config_path};
 pub use error::AgentResult;
 pub use event::AgentEvent;
 pub use execution_policy::{
-    NetworkMode, PermissionMode, RiskLevel, SafetyNote, SharedPermissionMode,
+    NetworkMode, PermissionMode, RiskLevel, SafetyNote, SharedPermissionMode, shell_command_of,
 };
 pub use i18n::{Lang, TextId, tr, tr_with};
 // Already reachable through `AgentRuntime::session_messages`'s signature;

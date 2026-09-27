@@ -417,6 +417,7 @@ text_ids! {
     // 运行时其它用户可见提示
     CheckpointSnapshotFailed,
     CheckpointDisabledTooLarge,
+    ApprovalCommandMoreRows,
     TurnStepLimitReached,
     // 离线 echo 后端提示
     EchoOfflineHint,
