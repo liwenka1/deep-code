@@ -127,6 +127,14 @@ review to rediscover:
   commits, `npm` (`~/.npmrc`) and `codesign` (keychains) need them offline,
   so the read fence is the operand spelling above, not the kernel.
 - A command a human approved as text keeps every shell feature the human saw.
+- The post-edit language server (`[lsp] enabled`, on by default) runs *outside*
+  the OS sandbox — it is not a model shell command. It is configured not to
+  execute repository code (rust-analyzer's build scripts, proc-macros and
+  on-save `cargo check` are disabled in the `initialize` handshake), so opening
+  a repository does not run its code; what remains is that the server reads the
+  workspace to analyze it. Turning it off (`[lsp] enabled = false`) removes even
+  that. Running the server inside the sandbox would restore full analysis
+  accuracy at trusted-`cargo build` risk, and is a possible future option.
 - On Windows a word carrying two `%` is *indirection*, not a denial: `cmd.exe`
   expands `%VAR%`, `%VAR:~0,0%` and `%VAR:a=b%` on the command line, so
   `de%PATH:~0,0%l` is `del` by the time anything runs and no rule here can read
@@ -309,6 +317,12 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
 - 凭据目录对沙箱内命令可读:SSH 签名的 commit、`npm`(`~/.npmrc`)、`codesign`
   (钥匙串)在离线时也需要它们,所以读侧围栏是上面的操作数拼写,不是内核。
 - 人工按文本批准的命令保留人看到的全部 shell 特性。
+- 编辑后诊断用的语言服务器(`[lsp] enabled`,默认开)运行在 OS 沙箱**之外**——
+  它不是模型的 shell 命令。已在 initialize 握手里关掉执行仓库代码的开关
+  (rust-analyzer 的 build script、proc-macro、保存时 `cargo check` 全部禁用),
+  所以打开一个仓库不会跑它的代码,剩下的只是服务器为分析而读取工作区。设
+  `[lsp] enabled = false` 连这一点也去掉。把服务器放进沙箱可恢复完整分析精度,
+  代价是等同"可信 `cargo build`"的风险,是后续可选项。
 - Windows 上,一个词里带两个 `%` 是 **indirection**,不是拒绝:`cmd.exe` 在命令行
   上展开 `%VAR%`、`%VAR:~0,0%`、`%VAR:a=b%`,所以 `de%PATH:~0,0%l` 真正执行时已经
   是 `del`,这里没有任何规则读得懂那个词。这类行因此永不可信、永不是有界编辑、

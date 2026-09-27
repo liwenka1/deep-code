@@ -148,6 +148,7 @@ impl StdioLspTransport {
                 "params": {
                     "processId": std::process::id(),
                     "rootUri": root,
+                    "initializationOptions": initialization_options(language),
                     "capabilities": {
                         "textDocument": {
                             "publishDiagnostics": { "relatedInformation": false }
@@ -481,6 +482,42 @@ fn code_text(raw: &Value) -> Option<String> {
 /// spaces or non-ASCII path segments make servers echo an escaped URI that
 /// never matches ours, and their diagnostics are silently dropped.
 /// Unix-oriented: Windows drive letters are out of scope for now.
+/// Server-specific `initialize` options that keep a language server from
+/// executing repository-controlled code during analysis.
+///
+/// rust-analyzer, on its defaults, runs the project's `build.rs` build scripts,
+/// compiles and runs its proc-macros, and runs `cargo check` on save — all as
+/// this unsandboxed parent process, triggered by the first edit of a `.rs`
+/// file. Opening a hostile repository would therefore execute its code with the
+/// user's full privileges, with no prompt and no sandbox (the OS sandbox only
+/// wraps the model's shell commands, not the language server). Disable the three
+/// code-execution surfaces here.
+///
+/// The cost is accuracy, not function: rust-analyzer's native syntax/type
+/// analysis — which is what post-edit diagnostics mostly surface — still runs
+/// without any of these. What is lost is knowledge of build-script-generated
+/// code and proc-macro expansions, so a few "unresolved" items may show up on
+/// heavily generated crates. That is the safe direction for a tool that opens
+/// arbitrary repositories; a future option is to run the server inside the OS
+/// sandbox instead, which would restore accuracy at trusted-`cargo build` risk.
+///
+/// typescript-language-server does not run project build steps and does not load
+/// workspace ts-plugins unless explicitly allow-listed, so it needs no options
+/// here; `null` leaves every other server on its defaults.
+fn initialization_options(language: Language) -> Value {
+    match language {
+        Language::Rust => json!({
+            "cargo": { "buildScripts": { "enable": false } },
+            "procMacro": { "enable": false },
+            "checkOnSave": false,
+            // Older rust-analyzer spelled the save-check switch differently;
+            // unknown keys are ignored, so setting both covers either version.
+            "check": { "enable": false },
+        }),
+        _ => Value::Null,
+    }
+}
+
 fn file_uri(path: &Path) -> String {
     let resolved = normalize_path(path);
     let bytes = path_to_bytes(&resolved);

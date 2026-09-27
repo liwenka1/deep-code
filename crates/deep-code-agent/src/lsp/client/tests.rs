@@ -4,6 +4,19 @@ fn frame(body: &str) -> Vec<u8> {
     format!("Content-Length: {}\r\n\r\n{body}", body.len()).into_bytes()
 }
 
+/// The `initialize` handshake must tell rust-analyzer NOT to run the project's
+/// build scripts, proc-macros, or on-save `cargo check` — each executes
+/// repository code as this unsandboxed process. A regression here silently
+/// re-opens "open a hostile repo, edit a .rs file, run its code".
+#[test]
+fn rust_initialization_options_disable_code_execution() {
+    let options = initialization_options(Language::Rust);
+    assert_eq!(options["cargo"]["buildScripts"]["enable"], serde_json::json!(false));
+    assert_eq!(options["procMacro"]["enable"], serde_json::json!(false));
+    assert_eq!(options["checkOnSave"], serde_json::json!(false));
+    assert_eq!(options["check"]["enable"], serde_json::json!(false));
+}
+
 #[test]
 fn decoder_yields_a_complete_frame() {
     let mut decoder = FrameDecoder::default();
