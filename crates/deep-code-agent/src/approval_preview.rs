@@ -108,8 +108,21 @@ fn write_file_preview(path: &Path, content: &str, lang: Lang) -> String {
     }
 }
 
+/// Cap on the diff algorithm's runtime. This preview is built *synchronously*
+/// inside the async approval flow (see `approval_flow::approval_preview`), so a
+/// slow diff blocks the executor — and the cancel with it. `similar`'s line
+/// diff is Myers, whose worst case is O((N+M)·D): two large, wholly-dissimilar
+/// files (e.g. the model rewriting a big generated file, `existing` up to
+/// `MAX_SOURCE_BYTES` against an equally large `content`) drove it into a
+/// tens-of-seconds freeze. The output is clamped to 40 lines anyway, so an
+/// optimal diff is not needed; on timeout `similar` returns a coarser but valid
+/// diff, which previews just as well.
+const DIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
 fn unified_diff(old: &str, new: &str) -> String {
-    TextDiff::from_lines(old, new)
+    TextDiff::configure()
+        .timeout(DIFF_TIMEOUT)
+        .diff_lines(old, new)
         .unified_diff()
         .context_radius(2)
         .to_string()

@@ -31,7 +31,13 @@ pub(super) fn render_messages(
 
     let max_scroll = lines.len().saturating_sub(viewport);
     let scroll = app.scroll_offset.min(max_scroll);
-    let scroll_top = max_scroll - scroll;
+    // ratatui's Paragraph scroll offset is a u16, so a transcript taller than
+    // u16::MAX rows can't be addressed. Clamp rather than `as u16`, which WRAPS
+    // (scroll_top mod 65536) and snaps the view to a garbage line once history
+    // crosses 65_535 rendered rows. The clamped value is reused for the
+    // selection overlay and the snapshot below, so mouse→line mapping stays
+    // consistent with what is actually drawn.
+    let scroll_top = (max_scroll - scroll).min(u16::MAX as usize);
 
     let plain: Vec<String> = lines.iter().map(line_plain_text).collect();
 
