@@ -180,6 +180,20 @@ async fn grep_stops_when_the_turn_is_cancelled() {
         "a pre-cancelled grep searches nothing"
     );
     assert!(output["matches"].as_array().unwrap().is_empty());
+    // Crucially, the partial result must NOT read as a complete search: the
+    // batch loop records it before acting on the cancel, so a later turn would
+    // otherwise trust "searched everything, found nothing".
+    assert_eq!(
+        output["cancelled"], true,
+        "a cancelled walk must be marked incomplete"
+    );
+    assert!(
+        output["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cancelled"),
+        "the note must say the search was interrupted: {output}"
+    );
 }
 
 /// Files over the size limit are refused by the walk — but refused OUT LOUD

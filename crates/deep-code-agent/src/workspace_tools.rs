@@ -388,6 +388,14 @@ impl GrepFilesTool {
         // beneath it, so every count above becomes a floor rather than a
         // census — the same caveat truncation carries, from a different cause.
         let mut subtree_lost = false;
+        // Set if the walk stopped on the turn's cancel token. Without it a
+        // cancelled grep returns a partial result that `truncated: false` reads
+        // as a complete search — and the batch loop records that result before
+        // it acts on the cancel (see `tool_result::process_tool_batch`), so a
+        // later turn reading it from the session would trust "searched
+        // everything, found only these". This is the same census lie the
+        // skipped_* ledgers above exist to prevent, so it gets the same honesty.
+        let mut cancelled = false;
         let mut matches = Vec::new();
         // Boundary snapshot taken once: `granted_roots()` locks and clones per
         // call, and this loop visits every file in the tree — per-file calls
@@ -406,8 +414,9 @@ impl GrepFilesTool {
             // every file to the end — kept a pool thread pinned long after the
             // user pressed Esc. An atomic load per entry is free beside the
             // readdir and file read it guards; on cancel we stop and return the
-            // matches gathered so far (the turn is being torn down anyway).
+            // matches gathered so far, MARKED incomplete (see `cancelled` above).
             if cancel.is_cancelled() {
+                cancelled = true;
                 break;
             }
             let entry = match entry {
@@ -586,6 +595,7 @@ impl GrepFilesTool {
             "skipped_symlinks": skipped_symlinks,
             "skipped_unreadable": skipped_unreadable,
             "truncated": truncated,
+            "cancelled": cancelled,
             "matches": matches
         });
         let mut parts = Vec::new();
@@ -628,7 +638,21 @@ impl GrepFilesTool {
                 phrase
             });
         }
-        if !parts.is_empty() {
+        if cancelled {
+            // A cancelled walk needs its own note even when nothing was
+            // skipped: with empty `parts` the branch below stays silent, and the
+            // result would otherwise look like a clean, complete search. Say
+            // plainly that it stopped early so a later turn does not trust it.
+            let tail = if parts.is_empty() {
+                String::new()
+            } else {
+                format!("; not searched so far: at least {}", parts.join(", "))
+            };
+            result["note"] = json!(format!(
+                "search cancelled before completion — matches are partial and may miss \
+                 files not yet reached{tail}"
+            ));
+        } else if !parts.is_empty() {
             // What was counted is a floor, not a census, whenever the walk did
             // not finish. TWO causes, not one: truncation stops it mid-tree,
             // and a directory it could not open hides an unknown number of
