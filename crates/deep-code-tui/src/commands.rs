@@ -68,7 +68,13 @@ impl App {
                 self.set_model(arg);
                 true
             }
-            _ if prompt == "/apikey" || prompt.starts_with("/apikey ") => {
+            // `starts_with("/apikey")`, not `"/apikey "`: pasting the key right
+            // after the command with no space (`/apikeysk-…`) — or an IME
+            // full-width space — otherwise fell through to the model and was
+            // persisted in the session transcript. `trim()` handles the
+            // full-width space too (it strips all Unicode whitespace). No other
+            // command shares this prefix, so nothing legitimate is captured.
+            _ if prompt.starts_with("/apikey") => {
                 let arg = prompt.strip_prefix("/apikey").unwrap_or_default().trim();
                 self.set_api_key(arg);
                 true

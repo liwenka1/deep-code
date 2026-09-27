@@ -300,9 +300,16 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
         .merge(protected)
         .with_state(state);
 
-    let addr: SocketAddr = format!("{}:{}", options.host, options.port)
-        .parse()
-        .context("invalid listen address")?;
+    // Resolve rather than `parse::<SocketAddr>()`: the latter only accepts a
+    // bare IP:port, so `--host localhost` / `--host ::1` (both classified as
+    // loopback above, so accepted without a token) failed with "invalid listen
+    // address" instead of binding. `lookup_host` turns a hostname or an IPv6
+    // literal into an address.
+    let addr: SocketAddr = tokio::net::lookup_host((options.host.as_str(), options.port))
+        .await
+        .with_context(|| format!("cannot resolve listen host '{}'", options.host))?
+        .next()
+        .with_context(|| format!("no address resolved for listen host '{}'", options.host))?;
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind {addr}"))?;

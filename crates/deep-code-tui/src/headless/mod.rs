@@ -118,9 +118,14 @@ pub async fn run_print(args: PrintArgs) -> i32 {
             trace_to_stderr(event, verbose, &mut tool_names);
         };
 
-        let deadline = args
-            .timeout_secs
-            .map(|secs| tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
+        // `checked_add`, not `+`: a large-but-valid `--timeout` (or the bot's
+        // `agent-timeout`) would otherwise overflow the Instant and panic
+        // (exit 101), which is neither the documented `2 usage` nor `124 timeout`.
+        // An un-representable deadline degrades to "no deadline" — a timeout that
+        // far out never meaningfully fires anyway.
+        let deadline = args.timeout_secs.and_then(|secs| {
+            tokio::time::Instant::now().checked_add(std::time::Duration::from_secs(secs))
+        });
         let drive = drive::drive_to_completion(&handle, prompt.clone(), &mut on_event);
         tokio::pin!(drive);
         // Registered once and reused, so a SIGTERM/SIGHUP arriving between loop

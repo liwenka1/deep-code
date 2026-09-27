@@ -45,9 +45,15 @@ pub fn choose_startup(
     intent: StartupIntent,
     workspace: &Path,
 ) -> Result<Option<SessionRecord>> {
-    // A specific id is loaded directly (and surfaces a clear "not found").
-    if let StartupIntent::ResumeId(id) = &intent {
-        return Ok(Some(store.load(&SessionId::parse(id)?)?));
+    match &intent {
+        // A specific id is loaded directly (and surfaces a clear "not found").
+        StartupIntent::ResumeId(id) => return Ok(Some(store.load(&SessionId::parse(id)?)?)),
+        // A fresh session needs no listing. `store.list()` fully deserializes
+        // every session file on disk; on a long-lived workspace with hundreds
+        // of sessions that added a visible stall to the most common launch
+        // (bare `deep-code`), all to compute a result we already know is `New`.
+        StartupIntent::New => return Ok(None),
+        StartupIntent::ContinueLatest | StartupIntent::ResumePicker => {}
     }
 
     let sessions = store.list()?; // newest-first
