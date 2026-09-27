@@ -223,8 +223,11 @@ impl ListDirTool {
         // Collect the raw entries first: a readdir yields names without a stat,
         // so a directory with a huge number of children is capped BEFORE paying
         // one `metadata()` per entry and before serialising a JSON array large
-        // enough to bury the model's context.
-        let mut raw = fs::read_dir(&path)
+        // enough to bury the model's context. Each entry is paired with its name
+        // ONCE here, so the sort compares precomputed keys instead of cloning the
+        // name twice per comparison — the difference between O(n) and O(n·log n)
+        // allocations on a directory whose size is the whole reason for the cap.
+        let raw = fs::read_dir(&path)
             .map_err(|error| {
                 ToolError::exec_failed(
                     Self::NAME,
@@ -244,12 +247,16 @@ impl ListDirTool {
         let total = raw.len();
         // Sort by name so the retained window is stable and alphabetical; within
         // one directory name order equals the path order the output used before.
-        raw.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+        let mut keyed: Vec<(std::ffi::OsString, fs::DirEntry)> = raw
+            .into_iter()
+            .map(|entry| (entry.file_name(), entry))
+            .collect();
+        keyed.sort_by(|(left, _), (right, _)| left.cmp(right));
         let truncated = total > MAX_LIST_ENTRIES;
-        raw.truncate(MAX_LIST_ENTRIES);
-        let entries = raw
+        keyed.truncate(MAX_LIST_ENTRIES);
+        let entries = keyed
             .iter()
-            .map(|entry| {
+            .map(|(_, entry)| {
                 let file_type = entry.file_type().map_err(|error| {
                     ToolError::exec_failed(
                         Self::NAME,
