@@ -199,7 +199,19 @@ jobs:
           BRANCH_PREFIX: ${{ inputs.branch-prefix }}
         run: |
           if [ -n "$IS_PR" ]; then
-            BRANCH=$(gh pr view "$ISSUE_NUMBER" --json headRefName -q .headRefName)
+            # A fork PR's head branch lives in the FORK, not in origin. The
+            # push at the end targets origin/<branch>, so a fork PR whose head
+            # is named like a base branch (e.g. `main` — the common case, since
+            # many contributors open PRs from their fork's default branch) would
+            # be checked out from origin, edited, and pushed straight onto that
+            # base branch, with no PR gate. Refuse cross-repository PRs: the
+            # push model only makes sense for a branch that lives in this repo.
+            PR_JSON=$(gh pr view "$ISSUE_NUMBER" --json headRefName,isCrossRepository)
+            if [ "$(printf '%s' "$PR_JSON" | jq -r .isCrossRepository)" = "true" ]; then
+              echo "::error::deep-code will not act on a pull request from a fork: its head branch lives in the fork, so pushing the result would land on this repository's own same-named branch with no PR. Reopen the change as a branch in this repository, or run the bot from an issue instead."
+              exit 1
+            fi
+            BRANCH=$(printf '%s' "$PR_JSON" | jq -r .headRefName)
             echo "continuing PR #$ISSUE_NUMBER on $BRANCH"
             git fetch origin "$BRANCH"
             git checkout -B "$BRANCH" "origin/$BRANCH"
@@ -215,6 +227,14 @@ jobs:
             fi
           fi
           echo "DC_BRANCH=$BRANCH" >> "$GITHUB_ENV"
+
+          # Remove actions/checkout's write token from .git/config BEFORE the
+          # untrusted agent runs, so an injected command in an issue/PR comment
+          # cannot read it out of the repo (`cat .git/config`) and exfiltrate it
+          # (the default auto-allow grants `shell` and `fetch_url`). The
+          # fetch/checkout above already used it; the push at the end sets up a
+          # tokened remote of its own, after the agent has finished.
+          git config --local --unset-all "http.https://github.com/.extraheader" 2>/dev/null || true
 
       # Rebuild the conversation from the thread every run — that thread, plus
       # the branch, is the entire persistent state (no agent session is kept).
@@ -396,6 +416,21 @@ jobs:
           fi
           exit "$EXIT"
 
+      # The agent step ran untrusted repository content and shell, and could
+      # have written .git/config, git hooks, or core.fsmonitor to run code
+      # inside the unsandboxed git steps that follow (status/add/commit/push).
+      # Force off the two command-execution surfaces before any of them touches
+      # the repo — the very first is `git status` in "Check diff" below, which
+      # itself runs a configured core.fsmonitor command. No `|| true`: if this
+      # cannot disable them, failing here (so the git steps are skipped) is the
+      # safe direction. Residual: an in-tree .gitattributes clean filter still
+      # runs on `git add`, so the trigger set (allowed-associations) must stay
+      # trusted; there is no per-invocation switch to disable in-tree filters.
+      - name: Neutralize repo-controlled git config
+        run: |
+          git config core.hooksPath /dev/null
+          git config core.fsmonitor false
+
       - name: Check diff
         id: diff
         run: |
@@ -535,7 +570,15 @@ jobs:
           iconv -c -f utf-8 -t utf-8 \
             < /tmp/deepcode-pr-body-raw.md > /tmp/deepcode-pr-body.md || true
 
-          git commit -m "$MESSAGE"
+          # --no-verify: belt-and-braces with the hooksPath override above, so
+          # a commit hook the agent may have dropped never runs here.
+          git commit --no-verify -m "$MESSAGE"
+          # Re-establish a tokened remote only now, after the agent has run and
+          # cannot read it (the checkout token was scrubbed before the agent).
+          # $GH_TOKEN is masked in logs; $GITHUB_REPOSITORY is the built-in
+          # owner/repo. The push model targets this repository's own branch,
+          # which the fork guard in "Prepare working branch" enforces.
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push origin "$DC_BRANCH"
 
           EXISTING=$(gh pr list --head "$DC_BRANCH" --state open --json number -q '.[0].number')
