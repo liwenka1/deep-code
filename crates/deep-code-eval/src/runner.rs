@@ -3,15 +3,16 @@
 //! a non-empty patch is not "resolved"; submit the predictions to the official
 //! SWE-bench harness (sb-cli) for the real resolved rate.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deep_code_agent::{
     AgentConfig, ApprovalDecision, LaunchedRuntime, RuntimeEvent, RuntimeEventReceiver,
     TurnTelemetry, launch_runtime,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use tokio::time::timeout;
 
 use crate::bench::{BenchmarkInstance, BenchmarkSet};
@@ -122,11 +123,20 @@ pub async fn run_bench(
     // Eval blind-approves every tool call over untrusted checkouts; without an
     // OS sandbox that means model-generated commands run bare on this machine.
     // Refuse instead of silently degrading.
+    // `sandbox_available()` alone is not enough: Windows reports a backend
+    // (the Job Object) as available while it confines neither writes nor
+    // network, so the refusal that promises "run inside a container" never
+    // fired there and eval ran model commands unconfined. Require the sandbox
+    // to actually ENFORCE something — `is_enforced()` accepts a Partial Linux
+    // kernel (writes still bounded) but rejects Windows' `None`.
     anyhow::ensure!(
-        deep_code_agent::sandbox_available(),
-        "refusing to run eval without an OS sandbox: eval auto-approves model \
-         commands on untrusted repos, and this machine has no usable sandbox \
-         backend. Run inside a container, or on macOS/Linux with sandbox support."
+        deep_code_agent::sandbox_available()
+            && deep_code_agent::sandbox_enforcement().is_enforced(),
+        "refusing to run eval without an enforcing OS sandbox: eval auto-approves \
+         model commands on untrusted repos, and this machine's sandbox confines \
+         nothing (no backend, or a Windows Job Object that restricts neither \
+         writes nor network). Run inside a container, or on macOS/Linux with \
+         sandbox support."
     );
     let started_at = utc_now_iso();
     let start = Instant::now();
@@ -252,8 +262,18 @@ async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> I
         Ok(dir) => dir,
         Err(e) => return error_result(format!("failed to create temp dir: {e}"), &start),
     };
-    if let Err(e) = checkout_repo(instance.repo(), instance.base_commit(), workspace.path()).await {
-        return error_result(format!("checkout failed: {e}"), &start);
+    // Bound the checkout too, not just the turn: a stalled clone/fetch (git has
+    // no timeout of its own) would otherwise hold this parallelism slot forever
+    // and write nothing until every other instance finished.
+    match timeout(
+        config.instance_timeout,
+        checkout_repo(instance.repo(), instance.base_commit(), workspace.path()),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return error_result(format!("checkout failed: {e}"), &start),
+        Err(_) => return error_result("checkout timed out".to_string(), &start),
     }
 
     let launched = launch_runtime(&config.agent_config, workspace.path().to_path_buf(), None);
@@ -273,6 +293,12 @@ async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> I
             (true, TurnOutcome::default())
         }
     };
+    // Read the accumulated session spend BEFORE shutting the runtime down: on a
+    // timeout the turn carries no telemetry (`TurnOutcome::default()`), so cost
+    // fell to 0 for exactly the instances that usually cost the most, and the
+    // report's total ran systematically low. `session_spend` holds the real
+    // accumulated cost however the turn ended.
+    let session_spend = launched.handle.session_spend().await;
     // Fully stop the runtime before extracting the diff.
     launched.shutdown().await;
 
@@ -311,7 +337,9 @@ async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> I
             Some(t.route_source.clone()),
             t.cascade_triggered,
         ),
-        None => (0.0, None, None, false),
+        // No telemetry (timeout/cancel/error): fall back to the accumulated
+        // session spend so a timed-out instance still reports its real cost.
+        None => (session_spend.cost.cny, None, None, false),
     };
     println!(
         "  ✓ {instance_id}: {status:?} ({}s, patch={}b, ¥{cost_cny:.4})",
@@ -423,6 +451,14 @@ async fn save_transcript(
     let mut entries = tokio::fs::read_dir(&sessions).await?;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
+        // Only real files. `DirEntry::file_type` does NOT follow symlinks, so a
+        // `sessions/x.json` symlink the agent planted (an ordinary workspace
+        // write) is skipped rather than having `tokio::fs::copy` — which DOES
+        // follow symlinks — copy its target (e.g. ~/.deep-code/config.toml, the
+        // API key) out into eval-out, from this unsandboxed harness.
+        if !entry.file_type().await.is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
         if path.extension().is_some_and(|ext| ext == "json")
             && let Some(name) = path.file_name()
         {
@@ -476,12 +512,36 @@ async fn git(args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One lock per repo id, so parallel instances of the same repo serialize their
+/// use of the shared bare cache instead of racing `if !cache.exists() { clone }`
+/// (three concurrent `clone --bare` into one path fail with exit 128, and an
+/// instance that sees the dir mid-clone gets an empty repo and a failed
+/// checkout). Cross-repo checkouts still run in parallel.
+fn repo_lock_for(repo: &str) -> Arc<TokioMutex<()>> {
+    static LOCKS: LazyLock<StdMutex<HashMap<String, Arc<TokioMutex<()>>>>> =
+        LazyLock::new(|| StdMutex::new(HashMap::new()));
+    LOCKS
+        .lock()
+        .expect("repo-lock map poisoned")
+        .entry(repo.to_string())
+        .or_default()
+        .clone()
+}
+
 /// Check out `repo` at `commit` into `dest`, going through the bare cache.
 async fn checkout_repo(repo: &str, commit: &str, dest: &Path) -> anyhow::Result<()> {
     let cache = cache_dir().join(repo.replace('/', "__"));
     let cache_str = cache.to_string_lossy().into_owned();
     let dest_str = dest.to_string_lossy().into_owned();
     let url = format!("https://github.com/{repo}.git");
+
+    // The whole checkout is serialized per repo: the `clone --shared` workdir
+    // borrows objects from the cache, so a concurrent `fetch` into that cache
+    // (the retry path below) could pull the alternates out from under it. The
+    // agent turn dominates an instance's runtime, so serializing checkouts of
+    // the same repo costs little; different repos still overlap.
+    let lock = repo_lock_for(repo);
+    let _guard = lock.lock().await;
 
     if !cache.exists() {
         if let Some(parent) = cache.parent() {
@@ -517,11 +577,43 @@ async fn checkout_repo(repo: &str, commit: &str, dest: &Path) -> anyhow::Result<
 /// exclude it so agent bookkeeping never leaks into the model patch.
 async fn extract_git_diff(workspace: &Path) -> anyhow::Result<String> {
     let ws = workspace.to_string_lossy().into_owned();
-    git(&["-C", &ws, "add", "-A", "--", ".", ":(exclude).deep-code"]).await?;
-    let output = tokio::process::Command::new("git")
-        .args(["-C", &ws, "diff", "--cached"])
-        .output()
-        .await?;
+    // The agent just ran over an UNTRUSTED benchmark repo and may have written
+    // .git/config, hooks, core.fsmonitor, or a .gitattributes ext-diff/textconv
+    // driver to run code inside these unsandboxed git commands. Override the
+    // execution surfaces we can: no system config, hooks disabled, fsmonitor
+    // off, and the diff drivers suppressed. Residual: an in-tree .gitattributes
+    // clean filter still runs on `git add` (there is no per-invocation switch to
+    // disable in-tree filters); the dataset repos are the official SWE-bench set.
+    let base: &[&str] = &[
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-C",
+        &ws,
+    ];
+    let run = |extra: &[&str]| {
+        let args: Vec<String> = base
+            .iter()
+            .chain(extra.iter())
+            .map(|s| (*s).to_string())
+            .collect();
+        async move {
+            tokio::process::Command::new("git")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(&args)
+                .output()
+                .await
+        }
+    };
+    let add = run(&["add", "-A", "--", ".", ":(exclude).deep-code"]).await?;
+    if !add.status.success() {
+        anyhow::bail!(
+            "git add failed: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        );
+    }
+    let output = run(&["diff", "--cached", "--no-ext-diff", "--no-textconv"]).await?;
     if !output.status.success() {
         anyhow::bail!("git diff --cached failed");
     }
@@ -589,6 +681,42 @@ mod tests {
         // copying them would mean gigabytes across a 300-instance split.
         assert!(!dest.join("ckpt_1").exists());
         assert!(!dest.join("big.bin").exists());
+    }
+
+    /// A `.json` entry in sessions/ that is actually a SYMLINK (an ordinary
+    /// workspace write the agent can make) must not be followed: the unsandboxed
+    /// harness would otherwise copy the link's target — e.g. a credential file —
+    /// into eval-out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transcript_copy_skips_symlinked_session_files() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = workspace.path().join(".deep-code").join("sessions");
+        tokio::fs::create_dir_all(&sessions).await.unwrap();
+
+        // A real session file, and a secret sitting outside the workspace.
+        tokio::fs::write(sessions.join("real.json"), b"{}")
+            .await
+            .unwrap();
+        let secret = tempfile::tempdir().unwrap();
+        tokio::fs::write(secret.path().join("id_rsa"), b"PRIVATE KEY")
+            .await
+            .unwrap();
+        // A .json-named symlink pointing at the secret.
+        std::os::unix::fs::symlink(secret.path().join("id_rsa"), sessions.join("stolen.json"))
+            .unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        save_transcript(workspace.path(), out.path(), "repo__repo-1")
+            .await
+            .unwrap();
+
+        let dest = out.path().join("repo__repo-1");
+        assert!(dest.join("real.json").is_file(), "real sessions still travel");
+        assert!(
+            !dest.join("stolen.json").exists(),
+            "a symlinked session file must not be followed and copied out"
+        );
     }
 
     #[tokio::test]
