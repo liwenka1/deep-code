@@ -5,6 +5,12 @@
 
 use super::*;
 
+/// Minimum time an approval panel must be on screen before a decision key is
+/// accepted. Short enough not to slow a deliberate answer, long enough that a
+/// keystroke burst already in flight when the panel pops (mid-steering-message
+/// typing) lands during the swallow window instead of resolving the prompt.
+pub(crate) const APPROVAL_ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(350);
+
 impl App {
     pub fn approve_pending_tool(&mut self) {
         self.resolve_pending_tool(ApprovalDecision::Approved);
@@ -76,6 +82,7 @@ impl App {
         let options = self.approval_option_count();
         self.approval_focus = if deny_by_default { options - 1 } else { 0 };
         self.approval_armed = false;
+        self.approval_shown_at = Some(std::time::Instant::now());
         self.is_streaming = false;
     }
 

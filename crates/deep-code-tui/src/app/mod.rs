@@ -24,6 +24,7 @@ use crate::history::{HistoryCell, hydrate_history};
 use deep_code_agent::i18n::{Lang, TextId, tr, tr_with};
 
 mod approval;
+pub(crate) use approval::APPROVAL_ARM_DELAY;
 mod completion;
 mod editor;
 mod selection;
@@ -138,6 +139,12 @@ pub struct App {
     /// had never seen. Decision keys are ignored until the panel has actually
     /// been on screen for a frame; scrolling and Ctrl-C are not gated.
     pub(crate) approval_armed: bool,
+    /// When the current approval panel first appeared. A decision is accepted
+    /// only after the panel has been on screen for [`APPROVAL_ARM_DELAY`], so a
+    /// keystroke already in flight when the prompt pops (a `y`/`a`/`n` mid-way
+    /// through a steering message) cannot resolve a panel the user has not had
+    /// time to register. `None` when no approval is pending.
+    pub(crate) approval_shown_at: Option<std::time::Instant>,
     pub(crate) runtime: Arc<AgentRuntime>,
     pub(crate) backend_label: String,
     pub(crate) backend_offline: bool,
@@ -460,6 +467,7 @@ impl App {
             approval_scroll_offset: 0,
             approval_focus: 0,
             approval_armed: false,
+            approval_shown_at: None,
             runtime,
             backend_label,
             backend_offline,

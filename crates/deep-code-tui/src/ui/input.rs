@@ -214,18 +214,23 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         // against a security prompt. Navigation/scrolling stay live under any
         // modifier; they resolve nothing.
         let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+        // A decision needs a panel the user has actually seen AND had a moment
+        // to register: drawn at least once (`approval_armed`), and on screen for
+        // `APPROVAL_ARM_DELAY`. A key already in flight when the prompt pops —
+        // the `y` in a steering message being typed as a tool call parks — lands
+        // inside that window and is swallowed rather than resolving the prompt.
+        let ready = app.approval_armed
+            && app
+                .approval_shown_at
+                .is_some_and(|at| at.elapsed() >= crate::app::APPROVAL_ARM_DELAY);
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.handle_ctrl_c();
             }
-            // A decision needs a panel the user has actually seen. The run loop
-            // can apply the approval event, skip the frame, and then read a key
-            // that was already queued — typed before the prompt existed, so it
-            // is not an answer to it. Swallowed until the panel has been drawn
-            // once; navigation and scrolling stay live, because neither of them
-            // resolves anything.
+            // Swallowed until the panel is ready; navigation and scrolling stay
+            // live, because neither of them resolves anything.
             KeyCode::Char('y' | 'Y' | 'a' | 'A' | 'n' | 'N') | KeyCode::Enter | KeyCode::Esc
-                if plain && !app.approval_armed => {}
+                if plain && !ready => {}
             KeyCode::Char('y' | 'Y') if plain => app.approve_pending_tool(),
             KeyCode::Char('a' | 'A') if plain => app.approve_pending_tool_for_session(),
             KeyCode::Char('n' | 'N') if plain => app.deny_pending_tool(),
@@ -453,12 +458,15 @@ mod tests {
         handle_key(&mut app, plain(KeyCode::Home));
         assert_eq!(app.approval_scroll_offset, 0);
 
-        // Drawing the panel is what arms it (see `render_approval_panel`).
+        // Drawing the panel is what arms it (see `render_approval_panel`), and a
+        // decision is accepted only after it has been on screen for the arm
+        // delay — simulate that here so the panel is fully ready.
         app.approval_armed = true;
+        app.approval_shown_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
         handle_key(&mut app, plain(KeyCode::Char('y')));
         assert!(
             app.pending_approval.is_none(),
-            "once the panel has been drawn, y must approve as before"
+            "once the panel has been drawn and settled, y must approve as before"
         );
     }
 
@@ -487,6 +495,10 @@ mod tests {
                 safety_notes: Vec::new(),
             });
             app.approval_armed = true;
+            // Simulate the panel having been on screen past the arm delay, so
+            // this test isolates the modifier gate, not the settle timer.
+            app.approval_shown_at =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
         };
 
         for (code, modifiers) in [
@@ -511,6 +523,37 @@ mod tests {
         park(&mut app);
         handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         assert!(app.pending_approval.is_none(), "plain `a` still approves");
+    }
+
+    /// A decision key is swallowed while the panel is armed but has NOT been on
+    /// screen for the arm delay yet — the burst-arrives-as-the-panel-pops case.
+    #[test]
+    fn a_decision_key_is_swallowed_until_the_panel_settles() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new();
+        app.park_approval(deep_code_agent::ApprovalRequest {
+            network: false,
+            call_id: "call_1".to_string(),
+            tool_name: "mock_echo".to_string(),
+            description: "echo".to_string(),
+            arguments: serde_json::json!({}),
+            risk_level: deep_code_agent::RiskLevel::Low,
+            requires_sandbox: false,
+            read_only: true,
+            matched_rule: None,
+            justification: None,
+            resolved_target: None,
+            preview: None,
+            safety_notes: Vec::new(),
+        });
+        // Drawn, but just now — inside the arm delay.
+        app.approval_armed = true;
+        app.approval_shown_at = Some(std::time::Instant::now());
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(
+            app.pending_approval.is_some(),
+            "a key within the arm delay must not resolve the panel"
+        );
     }
 
     /// End-to-end steering guard at the layer that actually shipped broken:
