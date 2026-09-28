@@ -1008,16 +1008,28 @@ fn zero_width_code_points_cannot_reorder_or_pad_the_frame() {
     );
 
     // The joiners ride instead of being stripped. Adjacency IS the pad
-    // check: a joiner that got a cell of its own would push 'Y' or 'Z'
-    // one column right and fail below.
-    let rider_cells = cells_for("X\u{200c}Y\u{200d}Z");
-    // Selected by ALL THREE letters, not the first 'X': UI chrome (status
-    // hints and the like) can legally contain a stray capital letter, and
-    // which chrome shows varies with unrelated test order on the thread.
+    // check: a joiner that got a cell of its own would push the second or
+    // third letter one column right and fail below.
+    //
+    // The row is found by searching the WHOLE frame, whose chrome this test
+    // does not control — so the rider letters must be ones no chrome can
+    // spell. They were ASCII X/Y/Z, and "selected by all three letters" was
+    // not enough: the welcome card's `Dir` row shows the test workspace path,
+    // whose tail is `tempfile`'s random 6-alphanumeric suffix, and a suffix
+    // like `.tmpZkYX…` put all three on a row ABOVE the rider. Windows CI drew
+    // one: the path was measured instead of the payload (X@54 Y@53 Z@51).
+    // Greek capitals cannot come from an ASCII-alphanumeric suffix, a CI temp
+    // path, or this UI's English/Chinese copy, so the first row holding all
+    // three is the rider's. Any base letter tests the same invariant.
+    const RIDER: [char; 3] = ['Ξ', 'Ψ', 'Ω'];
+    let rider_cells = cells_for(&format!(
+        "{}\u{200c}{}\u{200d}{}",
+        RIDER[0], RIDER[1], RIDER[2]
+    ));
     let letter_row = rider_cells
         .iter()
         .find(|row| {
-            ['X', 'Y', 'Z']
+            RIDER
                 .iter()
                 .all(|letter| row.iter().any(|cell| cell.contains(*letter)))
         })
@@ -1028,11 +1040,18 @@ fn zero_width_code_points_cannot_reorder_or_pad_the_frame() {
             .position(|cell| cell.contains(letter))
             .unwrap_or_else(|| panic!("letter {letter:?} missing from the frame"))
     };
-    let (x, y, z) = (column_of('X'), column_of('Y'), column_of('Z'));
+    let (first, second, third) = (
+        column_of(RIDER[0]),
+        column_of(RIDER[1]),
+        column_of(RIDER[2]),
+    );
     assert!(
-        y == x + 1 && z == y + 1,
+        second == first + 1 && third == second + 1,
         "letters around joiners must occupy adjacent columns, got \
-             X@{x} Y@{y} Z@{z}"
+             {}@{first} {}@{second} {}@{third}",
+        RIDER[0],
+        RIDER[1],
+        RIDER[2]
     );
 }
 
