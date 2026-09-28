@@ -237,8 +237,24 @@ async function checksumMatches(assetName, binPath) {
     const expected = parseChecksum(fs.readFileSync(sumsPath, 'utf8'), assetName);
     if (!expected) return !checksumRequired();
     return (await sha256OfFile(binPath)) === expected;
-  } catch {
-    return !checksumRequired();
+  } catch (error) {
+    // Distinguish "the server answered no" from "could not reach the server".
+    // A 404 / HTTP status means this VERSION's manifest or asset is genuinely
+    // absent (a wrong version left on disk), so fall through to re-download as
+    // before. But a connection failure/timeout is transient — offline
+    // `npm rebuild`, a blocked request — and the binary on disk was already
+    // verified at install time (download → verifyChecksum → rename), so deleting
+    // it and then failing the offline re-download is worse than keeping it.
+    const message = String(error?.message ?? error);
+    const serverRejected = message.includes('Binary not found') || message.startsWith('HTTP ');
+    if (serverRejected) {
+      return !checksumRequired();
+    }
+    console.warn(
+      '⚠️  deepcode: could not reach SHA256SUMS to re-verify the installed binary ' +
+      '(offline?); keeping the existing, install-time-verified binary.',
+    );
+    return true;
   } finally {
     fs.rmSync(sumsPath, { force: true });
   }

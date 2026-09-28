@@ -126,7 +126,20 @@ impl Tool for AgentTool {
         // the parent's configured model. See `SubAgentRole::model_override`.
         let mut child_config = self.services.agent_config.clone();
         if let Some(model) = role.model_override() {
-            child_config.model = model.to_string();
+            // Only substitute the built-in flash id when the parent is on a model
+            // this build actually knows (a catalog id, or the `auto` sentinel).
+            // On a custom `base_url` with a passthrough model id, `deepseek-v4-flash`
+            // does not exist upstream and every recon child would 404 — there,
+            // inherit the parent's model instead. Mirrors `classifier_model_for`.
+            let configured = child_config.model.trim();
+            let known = configured.is_empty()
+                || configured.eq_ignore_ascii_case(crate::model_registry::AUTO_MODEL)
+                || crate::model_registry::ModelRegistry::default()
+                    .info_for(configured)
+                    .is_some();
+            if known {
+                child_config.model = model.to_string();
+            }
         }
         let runtime = AgentRuntime::with_system_prompt_shared(
             std::sync::Arc::clone(&self.services.client),
