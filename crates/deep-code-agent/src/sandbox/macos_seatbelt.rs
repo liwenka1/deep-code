@@ -153,6 +153,25 @@ fn compose_profile(
          (vnode-type CHARACTER-DEVICE)))",
     );
 
+    // Re-opening the process's own standard streams by PATH. `echo x >&2` dups
+    // an already-open fd (always allowed), but `echo x > /dev/stderr` re-opens
+    // `/dev/fd/2` and needs write to that path — a deny-default profile refused
+    // it, so an everyday redirect failed with "Operation not permitted" that
+    // then read as a write-boundary denial. These paths are the command's own
+    // descriptors (our pipes, or its terminal); writing to them escapes nothing.
+    profile.rule("(allow file-write-data (regex #\"^/dev/fd/[0-9]+$\"))");
+    profile.rule("(allow file-write-data (literal \"/dev/stdout\"))");
+    profile.rule("(allow file-write-data (literal \"/dev/stderr\"))");
+    profile.rule("(allow file-write-data (literal \"/dev/tty\"))");
+
+    // User/group identity lookups go through opendirectoryd's `libinfo` mach
+    // service: `getpwuid(3)` (any tool resolving the current user), ssh reading
+    // its config, `ssh-keygen`. A deny-default profile without it makes ssh print
+    // "No user exists for uid N" and breaks SSH commit signing and `git push`
+    // over SSH even with the network grant. Identity lookup only — this is not
+    // the keychain (that is `SecurityServer`, gated on the network grant below).
+    profile.rule("(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))");
+
     // Reads are broad: deep-code's own read tools already expose the filesystem
     // to the model, and toolchains (dyld, locale data, SSH keys for `git push`)
     // need it. When network is granted, this broad read is a real exfiltration
@@ -169,6 +188,15 @@ fn compose_profile(
         profile.rule("(allow network-outbound)");
         profile.rule("(allow network-inbound)");
         profile.rule("(allow system-socket)");
+        // macOS's default git credential helper (`git-credential-osxkeychain`)
+        // reads the keychain through the SecurityServer mach service, so a
+        // `git push` over HTTPS needs it. Deliberately gated on the network
+        // grant the push already required: the keychain is reachable only for a
+        // command the user approved egress for. This DOES widen what a networked
+        // command can read (keychain items), a trade-off noted alongside the
+        // broad `file-read*` above; SSH pushes need only `libinfo`, granted
+        // unconditionally, not this.
+        profile.rule("(allow mach-lookup (global-name \"com.apple.SecurityServer\"))");
     }
 
     // Grant writes only under the roots the policy hands out (the granted

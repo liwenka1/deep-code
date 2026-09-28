@@ -105,6 +105,19 @@ impl SandboxPolicy {
                         roots.push(tmp);
                     }
                 }
+                // Linux POSIX shared memory is files under `/dev/shm` (a tmpfs):
+                // Python multiprocessing (Pool/Queue/Lock/ProcessPoolExecutor),
+                // PyTorch DataLoader workers and headless Chromium all create
+                // objects there, and without the grant Landlock refuses the write
+                // with EACCES and those everyday workloads fail. macOS covers the
+                // equivalent through `ipc-posix-sem`. Linux-only: `/dev/shm` does
+                // not exist on macOS, where it would be a dead (or rejected) root.
+                if cfg!(target_os = "linux") {
+                    let shm = PathBuf::from("/dev/shm");
+                    if !roots.contains(&shm) {
+                        roots.push(shm);
+                    }
+                }
                 roots
             }
         }
@@ -150,6 +163,19 @@ mod tests {
                 .filter(|root| *root == &PathBuf::from("/tmp"))
                 .count(),
             1
+        );
+    }
+
+    /// Linux POSIX shared memory needs `/dev/shm` writable, or multiprocessing
+    /// and DataLoader workloads fail with EACCES under Landlock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dev_shm_is_a_writable_root_on_linux() {
+        let ws = Path::new("/w");
+        let roots = SandboxPolicy::workspace_write().writable_roots(&[ws.to_path_buf()], ws);
+        assert!(
+            roots.contains(&PathBuf::from("/dev/shm")),
+            "linux roots must include /dev/shm: {roots:?}"
         );
     }
 

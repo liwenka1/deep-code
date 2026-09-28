@@ -57,18 +57,25 @@ pub(crate) fn write_denial_signature(exit_code: Option<i32>, stderr: &str) -> bo
     if matches!(exit_code, Some(126) | Some(127)) {
         return false;
     }
+    // Case-insensitive: the two OS backends print the errno text capitalized
+    // ("Operation not permitted" / "Permission denied"), but Node/npm and other
+    // runtimes print the libc string lowercased ("EPERM: operation not
+    // permitted, …"). Matching only the capitalized form missed `npm install`'s
+    // EPERM on its cache dir — a write outside the roots — so the model got no
+    // write-boundary note and never learned it could request that dir.
+    let lower = stderr.to_ascii_lowercase();
     // ssh authentication failure ("Permission denied (publickey).") also carries
     // the substring but is a credential problem, not the granted-roots fence.
-    if stderr.contains("Permission denied (publickey") {
+    if lower.contains("permission denied (publickey") {
         return false;
     }
     [
-        "Operation not permitted",
-        "Permission denied",
-        "Read-only file system",
+        "operation not permitted",
+        "permission denied",
+        "read-only file system",
     ]
     .iter()
-    .any(|signature| stderr.contains(signature))
+    .any(|signature| lower.contains(signature))
 }
 
 /// Model-facing note for a failed sandboxed command that ran WITHOUT the
@@ -127,11 +134,22 @@ pub(crate) fn network_denial_signature(exit_code: Option<i32>, stderr: &str) -> 
         "operation not permitted",
         "Permission denied",
     ];
+    // Whole words, not substrings: matching `contains("port")` fired on an
+    // ordinary `import`/`report`/`support` in a Python traceback, and
+    // `contains("connect")` on `connection`, so a genuine WRITE denial whose
+    // output merely mentioned one of those was mislabelled a network denial and
+    // pointed the model at `network=true` instead of the write boundary.
     const NETWORK_WORDS: [&str; 5] = ["bind", "listen", "socket", "connect", "port"];
     PERMISSION
         .iter()
         .any(|signature| stderr.contains(signature))
-        && NETWORK_WORDS.iter().any(|word| stderr.contains(word))
+        && stderr
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|token| {
+                NETWORK_WORDS
+                    .iter()
+                    .any(|word| token.eq_ignore_ascii_case(word))
+            })
 }
 
 /// Detected sandbox backend for the current platform.

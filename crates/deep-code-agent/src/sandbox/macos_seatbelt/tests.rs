@@ -489,6 +489,52 @@ fn confined_command_writes_into_a_root_granted_mid_session() {
     );
 }
 
+/// Everyday commands that a deny-default profile silently broke: writing to the
+/// process's own `/dev/stderr` by path, and any tool that resolves the current
+/// user via `getpwuid` (here `id -un`). Both failed with "Operation not
+/// permitted" before the `/dev/fd` write rule and the `libinfo` mach-lookup were
+/// added, and the former was then misread as a write-boundary denial.
+#[cfg(target_os = "macos")]
+#[test]
+fn confined_command_writes_dev_stderr_and_resolves_the_user() {
+    if crate::sandbox::require_backend_or_skip(is_available(), "Seatbelt") {
+        return;
+    }
+    let workspace = tempfile::tempdir().unwrap();
+
+    let stderr_redirect = wrap_shell_command(
+        "echo hi > /dev/stderr",
+        workspace.path(),
+        &single_root(workspace.path()),
+        &SandboxPolicy::workspace_write(),
+    )
+    .output()
+    .expect("sandbox-exec should launch");
+    assert!(
+        stderr_redirect.status.success(),
+        "`> /dev/stderr` must work inside the sandbox: {}",
+        String::from_utf8_lossy(&stderr_redirect.stderr)
+    );
+
+    let whoami = wrap_shell_command(
+        "id -un",
+        workspace.path(),
+        &single_root(workspace.path()),
+        &SandboxPolicy::workspace_write(),
+    )
+    .output()
+    .expect("sandbox-exec should launch");
+    assert!(
+        whoami.status.success(),
+        "getpwuid (id -un) must resolve inside the sandbox: {}",
+        String::from_utf8_lossy(&whoami.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&whoami.stdout).trim().is_empty(),
+        "id -un printed nothing — libinfo lookup was refused"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn confined_command_reads_the_workspace_spill_dir() {

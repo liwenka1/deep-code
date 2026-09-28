@@ -170,6 +170,18 @@ fn write_denial_signature_matches_backend_denial_texts() {
     assert!(write_denial_signature(Some(1), "Read-only file system"));
     // A killed child reports no exit code; the stderr text still decides.
     assert!(write_denial_signature(None, "Operation not permitted"));
+    // Node/npm lowercase the libc string: `npm install`'s EPERM on its cache dir
+    // (a write outside the roots) must be recognized so the model gets the write
+    // note and can request that directory.
+    assert!(write_denial_signature(
+        Some(1),
+        "npm error code EPERM\nnpm error syscall mkdir\nnpm error errno -1\n\
+         npm error EPERM: operation not permitted, mkdir '/Users/me/.npm/_cacache/tmp'"
+    ));
+    assert!(write_denial_signature(
+        Some(1),
+        "Error: EACCES: permission denied, open '/Users/me/.cache/x'"
+    ));
 
     // A successful command is never a denial, whatever stderr says.
     assert!(!write_denial_signature(
@@ -249,6 +261,24 @@ fn network_denial_signature_matches_offline_sandbox_texts() {
     assert!(!network_denial_signature(
         Some(1),
         "nc: 127.0.0.1 8080: Connection refused"
+    ));
+    // A WRITE denial whose output merely mentions `import`/`report`/`connection`
+    // must NOT be read as a network denial: the network words are matched whole,
+    // not as substrings, so these do not borrow `port`/`connect`.
+    for stderr in [
+        "Traceback:\n  import os\nPermissionError: Operation not permitted: /etc/x",
+        "failed to write report.txt: Operation not permitted",
+        "database connection cache: Permission denied writing /var/lib/x",
+    ] {
+        assert!(
+            !network_denial_signature(Some(1), stderr),
+            "a write denial mentioning a non-network word matched: {stderr:?}"
+        );
+    }
+    // But the real whole words still match next to a permission error.
+    assert!(network_denial_signature(
+        Some(1),
+        "socket: Operation not permitted"
     ));
 }
 
