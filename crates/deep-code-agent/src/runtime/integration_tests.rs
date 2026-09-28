@@ -2106,7 +2106,11 @@ async fn session_approval_of_an_offline_command_does_not_cover_its_network_varia
     let client = ScriptedClient::new(vec![
         vec![
             AgentEvent::ToolCallDelta {
-                delta: tool_call_delta("call_1", "shell", r#"{"command":"cargo clippy --version"}"#),
+                delta: tool_call_delta(
+                    "call_1",
+                    "shell",
+                    r#"{"command":"cargo clippy --version"}"#,
+                ),
             },
             AgentEvent::Done { usage: None },
         ],
