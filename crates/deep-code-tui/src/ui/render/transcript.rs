@@ -31,19 +31,25 @@ pub(super) fn render_messages(
 
     let max_scroll = lines.len().saturating_sub(viewport);
     let scroll = app.scroll_offset.min(max_scroll);
-    // ratatui's Paragraph scroll offset is a u16, so a transcript taller than
-    // u16::MAX rows can't be addressed. Clamp rather than `as u16`, which WRAPS
-    // (scroll_top mod 65536) and snaps the view to a garbage line once history
-    // crosses 65_535 rendered rows. The clamped value is reused for the
-    // selection overlay and the snapshot below, so mouse→line mapping stays
-    // consistent with what is actually drawn.
-    let scroll_top = (max_scroll - scroll).min(u16::MAX as usize);
+    // Absolute top row, NOT clamped to u16. ratatui's `Paragraph::scroll` offset
+    // is a u16, so `scroll_top as u16` WRAPPED (mod 65536) once history crossed
+    // 65_535 rendered rows, and clamping to u16::MAX instead pinned the view to
+    // row 65_535 — either way the newest output, at the bottom of a taller
+    // transcript, became unreachable. Instead of scrolling the Paragraph, window
+    // the lines: render from `scroll_top` down with the Paragraph's own offset at
+    // 0, so any height is addressable. `plain` and `scroll_top` stay absolute for
+    // the selection overlay and the snapshot, so mouse→line mapping is unchanged.
+    let scroll_top = max_scroll - scroll;
 
     let plain: Vec<String> = lines.iter().map(line_plain_text).collect();
 
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().padding(Padding::new(1, 0, 0, 0)))
-        .scroll((scroll_top as u16, 0));
+    let visible: Vec<Line<'static>> = if scroll_top < lines.len() {
+        lines.split_off(scroll_top)
+    } else {
+        Vec::new()
+    };
+    let paragraph =
+        Paragraph::new(visible).block(Block::default().padding(Padding::new(1, 0, 0, 0)));
     frame.render_widget(paragraph, area);
 
     if let Some(sel) = app.selection {

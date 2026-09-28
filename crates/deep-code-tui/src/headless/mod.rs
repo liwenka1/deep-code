@@ -32,9 +32,14 @@ const EXIT_TIMEOUT: i32 = 124;
 const EXIT_INTERRUPT: i32 = 130;
 
 pub async fn run_print(args: PrintArgs) -> i32 {
-    let Some(prompt) =
-        input::compose_prompt(args.prompt.as_deref(), input::read_piped_stdin().as_deref())
-    else {
+    let has_positional = args
+        .prompt
+        .as_deref()
+        .is_some_and(|text| !text.trim().is_empty());
+    let Some(prompt) = input::compose_prompt(
+        args.prompt.as_deref(),
+        input::read_piped_stdin(has_positional).as_deref(),
+    ) else {
         eprintln!(
             "nothing to run: pass a prompt (`{} -p \"…\"`) or pipe one on stdin",
             program_name()
@@ -377,30 +382,56 @@ fn open_store(workspace: &std::path::Path) -> Result<JsonSessionStore, i32> {
     })
 }
 
+/// Whether `signum`'s disposition is currently `SIG_IGN`.
+///
+/// `nohup` sets `SIGHUP` to `SIG_IGN` so a job survives the terminal closing.
+/// Installing a tokio signal handler REPLACES that disposition, so a
+/// `nohup deepcode -p … &` started catching SIGHUP and cancelling on terminal
+/// close — the exact thing nohup exists to prevent (a 4e117e1 regression). We
+/// query the disposition first and leave an ignored signal alone.
+#[cfg(unix)]
+fn signal_is_ignored(signum: libc::c_int) -> bool {
+    // SAFETY: querying the current disposition with a null new-action is the
+    // documented read-only form of sigaction(2); `old` is fully written by it.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(signum, std::ptr::null(), &mut old) != 0 {
+            return false;
+        }
+        old.sa_sigaction == libc::SIG_IGN
+    }
+}
+
 /// Resolves on the first SIGTERM or SIGHUP (unix); pends forever elsewhere.
 /// Ctrl-C (SIGINT) is handled separately via [`tokio::signal::ctrl_c`]. Shared
 /// with the TUI (`ui::run`) so both entry points drain on the same signals.
+///
+/// SIGHUP is watched only when it is not already ignored: a `nohup`'d process
+/// must keep ignoring it (see [`signal_is_ignored`]) so it survives the terminal
+/// closing, rather than have this handler turn a hang-up into a shutdown.
 pub(crate) async fn terminate_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        match (
-            signal(SignalKind::terminate()),
-            signal(SignalKind::hangup()),
-        ) {
-            (Ok(mut term), Ok(mut hup)) => {
+        let hup = if signal_is_ignored(libc::SIGHUP) {
+            None
+        } else {
+            signal(SignalKind::hangup()).ok()
+        };
+        match (signal(SignalKind::terminate()), hup) {
+            (Ok(mut term), Some(mut hup)) => {
                 tokio::select! {
                     _ = term.recv() => {}
                     _ = hup.recv() => {}
                 }
             }
-            (Ok(mut term), Err(_)) => {
+            (Ok(mut term), None) => {
                 term.recv().await;
             }
-            (Err(_), Ok(mut hup)) => {
+            (Err(_), Some(mut hup)) => {
                 hup.recv().await;
             }
-            (Err(_), Err(_)) => std::future::pending::<()>().await,
+            (Err(_), None) => std::future::pending::<()>().await,
         }
     }
     #[cfg(not(unix))]
@@ -421,6 +452,25 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `signal_is_ignored` must report an ignored disposition truthfully, so a
+    /// `nohup`'d run leaves SIGHUP alone. Set → assert → restore synchronously
+    /// (no other test in this binary sends itself SIGHUP).
+    #[cfg(unix)]
+    #[test]
+    fn detects_an_ignored_sighup() {
+        assert!(
+            !signal_is_ignored(libc::SIGHUP),
+            "precondition: SIGHUP is not ignored by default under the test harness"
+        );
+        // SAFETY: standard signal(2) set/restore around a single assertion.
+        unsafe {
+            let previous = libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            let observed = signal_is_ignored(libc::SIGHUP);
+            libc::signal(libc::SIGHUP, previous);
+            assert!(observed, "an ignored SIGHUP must be detected");
+        }
+    }
 
     /// Under `-p` stderr is a real terminal, so a `\x1b[8m` in any of these
     /// lines conceals everything drawn after it — including the

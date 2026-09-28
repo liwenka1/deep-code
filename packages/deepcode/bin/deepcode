@@ -55,7 +55,15 @@ const forward = (signal) => {
     /* child already gone — nothing to forward to */
   }
 };
-for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+// SIGINT is deliberately NOT forwarded on Windows: the child receives its own
+// CTRL_C_EVENT from the console directly, and Node's `child.kill('SIGINT')`
+// there is a forced TerminateProcess — it would win the race and abort the
+// binary before its graceful Ctrl-C cancel (drain, JSON report, session tail)
+// could run. On unix SIGINT already reaches the whole foreground group; the
+// forward only additionally covers a supervisor signalling this pid alone.
+const forwarded =
+  process.platform === 'win32' ? ['SIGTERM', 'SIGHUP'] : ['SIGINT', 'SIGTERM', 'SIGHUP'];
+for (const signal of forwarded) {
   process.on(signal, () => forward(signal));
 }
 

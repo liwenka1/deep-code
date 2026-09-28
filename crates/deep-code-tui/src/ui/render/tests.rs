@@ -1351,6 +1351,38 @@ fn a_panel_with_no_room_to_draw_does_not_arm_the_decision_keys() {
 /// deny and Esc included, was swallowed, and the only way out was quitting. The
 /// counterpart the arming invariant never had: not just "armed ⇒ subject
 /// visible", but "a real prompt can still be answered".
+/// A transcript taller than u16::MAX rows must still show its bottom (the newest
+/// output). `Paragraph::scroll` is a u16, so the old `scroll_top as u16` wrapped
+/// past 65_535 rows and clamping pinned the view to row 65_535 — either way the
+/// latest turn was unreachable. Windowing the rendered lines fixes it.
+#[test]
+fn transcript_past_u16_rows_still_shows_the_bottom() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    // One cell that wraps to well over u16::MAX rows.
+    let body = (0..70_000)
+        .map(|i| format!("row{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.history.push(HistoryCell::Assistant { text: body });
+    app.scroll_offset = 0; // bottom-anchored: showing the newest content
+
+    let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let painted: String = (0..buffer.area.height)
+        .flat_map(|row| (0..buffer.area.width).map(move |col| (col, row)))
+        .map(|(col, row)| buffer[(col, row)].symbol().to_string())
+        .collect();
+    assert!(
+        painted.contains("row69999"),
+        "the newest line must be reachable past 65k rendered rows"
+    );
+}
+
 #[test]
 fn a_long_shell_command_can_still_be_answered() {
     use ratatui::Terminal;
