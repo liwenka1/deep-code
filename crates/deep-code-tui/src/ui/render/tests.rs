@@ -1344,6 +1344,61 @@ fn a_panel_with_no_room_to_draw_does_not_arm_the_decision_keys() {
     }
 }
 
+/// A shell approval must stay answerable no matter how long the command is.
+///
+/// Regression: pinning the whole command as the head filled the body, left no
+/// content row, and `approval_armed` stayed false forever — every decision key,
+/// deny and Esc included, was swallowed, and the only way out was quitting. The
+/// counterpart the arming invariant never had: not just "armed ⇒ subject
+/// visible", but "a real prompt can still be answered".
+#[test]
+fn a_long_shell_command_can_still_be_answered() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    for lines in [1usize, 8, 11, 12, 13, 20, 40] {
+        let command = (0..lines)
+            .map(|i| format!("echo line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = App::new();
+        app.lang = Lang::En;
+        app.pending_approval = Some(deep_code_agent::ApprovalRequest {
+            call_id: "call_sh".to_string(),
+            tool_name: "shell".to_string(),
+            description: "shell commands can modify workspace files or run arbitrary code"
+                .to_string(),
+            arguments: serde_json::json!({ "command": command }),
+            risk_level: RiskLevel::High,
+            requires_sandbox: true,
+            network: false,
+            justification: None,
+            resolved_target: None,
+            read_only: false,
+            matched_rule: Some("builtin:shell_default".to_string()),
+            preview: None,
+            safety_notes: Vec::new(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(
+            app.approval_armed,
+            "a {lines}-line shell command left the panel unanswerable at 80x24"
+        );
+        // The choices must actually be painted — arming without them drawn is
+        // the same deadlock one layer up.
+        let buffer = terminal.backend().buffer().clone();
+        let painted: String = (0..buffer.area.height)
+            .flat_map(|row| (0..buffer.area.width).map(move |col| (col, row)))
+            .map(|(col, row)| buffer[(col, row)].symbol().to_string())
+            .collect();
+        assert!(
+            painted.contains(tr(Lang::En, TextId::ApprovalOptDeny)),
+            "the deny choice must be visible for a {lines}-line command"
+        );
+    }
+}
+
 #[test]
 fn root_grant_panel_shows_the_resolved_target_on_screen() {
     let target = "/home/u/.config/private-keys";

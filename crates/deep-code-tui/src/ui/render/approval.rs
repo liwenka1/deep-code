@@ -239,13 +239,17 @@ pub(super) fn approval_head_lines(
             width,
             lang,
         ));
-    } else if let Some(command) = raw_command(tool_name, arguments_json) {
-        // A shell/job command runs verbatim through `sh -c`, so the panel must
-        // show it verbatim. The compact `action` line collapses newlines and
-        // truncates at 240 columns, which made `git status\ngit reset --hard`
-        // read as one line and hid the tail of a long command entirely — the
-        // human then approves something other than what runs.
-        lines.extend(command_head_lines(&command, width, lang));
+    } else if raw_command(tool_name, arguments_json).is_some() {
+        // A shell/job command is shown verbatim, but NOT here in the pinned
+        // head: a command of many wrapped rows would fill the whole panel body,
+        // leave no scrollable content row, and `approval_armed` — which requires
+        // one — stayed false forever, so every decision key (deny and Esc
+        // included) was swallowed with no way out but quitting. The verbatim
+        // command instead leads the SCROLLABLE body (see `approval_lines`), so
+        // it is the first thing shown, scrolls with the overflow marker when it
+        // is long, and the header alone is pinned. The command is still shown
+        // in full, line by line — the reason it left the collapsed one-line
+        // `action` in the first place.
     } else {
         lines.extend(wrap_prefixed(
             "  ",
@@ -341,6 +345,15 @@ pub(super) fn approval_lines(
         width,
         lang,
     );
+
+    // A shell/job command leads the scrollable body, verbatim and line by line.
+    // It is deliberately NOT part of the pinned head above: pinning a long
+    // command filled the panel and deadlocked the decision keys (see
+    // `approval_head_lines`). As the first body line it is still the first thing
+    // the user sees, and it scrolls (with the "more below" marker) when long.
+    if let Some(command) = raw_command(tool_name, arguments_json) {
+        lines.extend(command_head_lines(&command, width, lang));
+    }
 
     // Neutralised but not capped: tool descriptions run past any line cap, and
     // they are written by this crate, not the model — the filter is uniformity
@@ -651,6 +664,7 @@ pub(super) fn render_approval_panel(
     // "more above" marker; and a short terminal cut it off below. Pinning
     // covers both, and covering every tool is what lets `approval_armed` below
     // mean the invariant instead of approximating it.
+    //
     let pinned: Vec<Line<'static>> = body.drain(..head_rows).collect();
     let (pinned_area, chunk_body) = if pinned.is_empty() {
         (None, chunks[0])
