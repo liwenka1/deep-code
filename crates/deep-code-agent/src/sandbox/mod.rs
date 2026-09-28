@@ -721,8 +721,8 @@ fn bare_argv_command(argv: &[String], cwd: &Path) -> Result<Command, String> {
     Ok(cmd)
 }
 
-/// Whether `program` (a bare program word, argv[0]) can be executed directly as
-/// argv — with no shell — on this host.
+/// Whether `program` (a bare program word, `argv[0]`) can be executed directly
+/// as argv — with no shell — on this host.
 ///
 /// A command runs unattended (a trusted identity, a remembered session consent,
 /// an accept-edits file op) as the exact argv the policy parsed, never through a
