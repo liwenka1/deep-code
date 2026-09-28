@@ -275,3 +275,26 @@ jobs:
           DEEPCODE_REQUIRE_SYMLINKS: "1"
           DEEPCODE_REQUIRE_SANDBOX: "1"
         run: cargo test --locked --workspace
+
+  # The packaging contract — two ways this repo can break every install at once,
+  # and both are invisible to the Rust test suite: install.mjs's ASSET_MAP
+  # drifting from release.yml's build matrix (every install on the affected
+  # platform 404s), and the npm tarball containing or omitting the wrong files
+  # (a downloaded platform binary shipped to every user; or a missing launcher).
+  #
+  # release.yml's `verify-install` job catches both as well, but only once a tag
+  # has been pushed. This costs seconds, needs no Rust toolchain, and catches
+  # them on the PR that introduces them instead — which is the difference
+  # between a review comment and a bad release.
+  packaging:
+    name: packaging · contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
+      - name: Check the asset map and the npm tarball
+        run: bash scripts/check-packaging.sh
