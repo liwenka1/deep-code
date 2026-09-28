@@ -15,6 +15,10 @@ use crate::workspace_policy::{WorkspacePolicy, contains_symlink, invalid, json_s
 
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 500;
+/// Chars held back from [`crate::runtime::tool_result::TOOL_OUTPUT_BUDGET`] for
+/// `read_file`'s wrapper fields (path, counts, flags) so the line array plus the
+/// wrapper together stay under the budget the runtime enforces on every result.
+const READ_WRAPPER_RESERVE: usize = 256;
 /// Size cap for reading/searching a single file. `pub(crate)` so every
 /// user-facing mention of the limit (read_file's error, grep's note, the
 /// approval preview's source guard) derives from this one number instead of
@@ -149,27 +153,54 @@ impl ReadFileTool {
         let lines = contents.lines().collect::<Vec<_>>();
         let total_lines = lines.len();
         let start_index = start_line.saturating_sub(1);
-        let selected = lines
-            .iter()
-            .enumerate()
-            .skip(start_index)
-            .take(max_lines)
-            .map(|(index, line)| json!({"line": index + 1, "text": line}))
-            .collect::<Vec<_>>();
-        let next_start_line = if start_index + selected.len() < total_lines {
-            Some(start_index + selected.len() + 1)
+        // Size the returned slice to the runtime's per-result budget, not just to
+        // `max_lines`. The result used to be up to 500 pretty-printed
+        // `{"line","text"}` objects (~49 chars of overhead each), so an ordinary
+        // 200-line read ran to 16-20k chars and the runtime's 12k truncation
+        // silently dropped the MIDDLE — while `next_start_line` pointed past the
+        // hole, so the model "continued" over unseen lines. Emit compact JSON and
+        // stop adding lines once the budget is reached, reporting the real
+        // continuation point.
+        let line_budget =
+            crate::runtime::tool_result::TOOL_OUTPUT_BUDGET.saturating_sub(READ_WRAPPER_RESERVE);
+        let mut selected: Vec<serde_json::Value> = Vec::new();
+        let mut used = 0usize;
+        for (index, line) in lines.iter().enumerate().skip(start_index).take(max_lines) {
+            let element = json!({"line": index + 1, "text": line});
+            // Compact size of this element plus its separating comma, in chars —
+            // the same unit the budget's truncation counts in.
+            let cost = serde_json::to_string(&element).map_or(0, |text| text.chars().count()) + 1;
+            // Always take at least one line: a single line wider than the whole
+            // budget still gets returned (the runtime trims its ends) rather than
+            // an empty result that strands the read.
+            if !selected.is_empty() && used + cost > line_budget {
+                break;
+            }
+            used += cost;
+            selected.push(element);
+        }
+        let returned = selected.len();
+        let next_start_line = if start_index + returned < total_lines {
+            Some(start_index + returned + 1)
         } else {
             None
         };
-        Ok(ToolOutput::text(json_string(json!({
-            "path": self.root.relative_display(&path),
-            "total_lines": total_lines,
-            "start_line": start_line,
-            "max_lines": max_lines,
-            "truncated": next_start_line.is_some(),
-            "next_start_line": next_start_line,
-            "lines": selected
-        }))))
+        // Compact, not pretty: the pretty overhead is exactly what this budget
+        // accounting is measuring, so the emitted bytes must match what was
+        // counted (and be as small as what fits).
+        Ok(ToolOutput::text(
+            serde_json::to_string(&json!({
+                "path": self.root.relative_display(&path),
+                "total_lines": total_lines,
+                "start_line": start_line,
+                "max_lines": max_lines,
+                "returned_lines": returned,
+                "truncated": next_start_line.is_some(),
+                "next_start_line": next_start_line,
+                "lines": selected
+            }))
+            .unwrap_or_else(|_| "{}".to_string()),
+        ))
     }
 }
 
@@ -693,6 +724,34 @@ impl GrepFilesTool {
 /// traversal. Not adopted here because the exact failure mode interacts with
 /// `FILE_FLAG_BACKUP_SEMANTICS` and nobody has run it on Windows; it is a
 /// candidate, not a closed question.
+/// Refuse a destination that exists but is not a regular file or a symlink — a
+/// directory, FIFO, socket or device node.
+///
+/// Opening a FIFO for read or write BLOCKS until the other end is opened, so a
+/// `write_file`/`apply_patch` at a FIFO path would hang the blocking-pool thread
+/// (and the turn) forever with no timeout. `read_file` already guards this; the
+/// write tools did not. A symlink is deliberately left to the caller's own
+/// `O_NOFOLLOW` / symlink handling, which reports it precisely.
+fn refuse_non_regular_file(
+    tool_name: &str,
+    relative: &str,
+    path: &std::path::Path,
+) -> Result<(), ToolError> {
+    if let Ok(meta) = path.symlink_metadata() {
+        let kind = meta.file_type();
+        if !kind.is_file() && !kind.is_symlink() {
+            return Err(invalid(
+                tool_name,
+                format!(
+                    "{relative} exists but is not a regular file (a directory, FIFO, socket \
+                     or device); refusing to touch it"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn write_no_follow(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -839,6 +898,9 @@ impl WriteFileTool {
         // create missing parent directories — preview/approval resolve the
         // same path side-effect-free.
         let path = self.root.prepare_for_write(&params.path, Self::NAME)?;
+        // Refuse a FIFO/socket/device/dir destination before opening it: writing
+        // to a FIFO blocks the thread until a reader appears, hanging the turn.
+        refuse_non_regular_file(Self::NAME, &self.root.relative_display(&path), &path)?;
         // `fs::write` opens `O_CREAT|O_WRONLY|O_TRUNC` and FOLLOWS a symlink at
         // the final component. Resolution rejects a symlink that is already
         // there, but it cannot rule out one planted in the window between that
@@ -915,6 +977,10 @@ impl ApplyPatchTool {
             ));
         }
         let path = self.root.resolve_existing(&params.path, Self::NAME)?;
+        // Reading a FIFO blocks until a writer appears; refuse a non-regular
+        // target before `read_to_string` can hang the turn (see
+        // `refuse_non_regular_file`). `resolve_existing` guarantees it exists.
+        refuse_non_regular_file(Self::NAME, &self.root.relative_display(&path), &path)?;
         let contents = fs::read_to_string(&path).map_err(|error| {
             // Name the cause, and use the workspace-relative spelling. One
             // `map_err` covered both "the bytes are not UTF-8" and every IO
@@ -938,14 +1004,19 @@ impl ApplyPatchTool {
         let located = locate_match(&contents, &params.old, &params.new)
             .map_err(|error| invalid(Self::NAME, error.message(&display)))?;
 
+        // The effective replacement text. The indentation-insensitive layer may
+        // rewrite `new`'s own indentation to match the file it landed in (see
+        // `locate_match`); every other layer replaces `new` verbatim.
+        let new_text = located.new_override.as_deref().unwrap_or(&params.new);
+
         // The model writes `new` with LF (that is how `read_file` showed it), so
         // in a CRLF file splice in the file's own convention — otherwise a
         // successful patch leaves a block of LF-only lines in an otherwise CRLF
         // file and every later diff shows the whole region as changed.
-        let replacement = if contents.contains("\r\n") && !params.new.contains('\r') {
-            to_crlf(&params.new)
+        let replacement = if contents.contains("\r\n") && !new_text.contains('\r') {
+            to_crlf(new_text)
         } else {
-            params.new.clone()
+            new_text.to_string()
         };
 
         // Splice the matched *original* byte range out and drop `new` in: every
@@ -1014,6 +1085,11 @@ struct Located {
     start: usize,
     end: usize,
     kind: MatchKind,
+    /// A rewritten replacement text, when the matching layer had to adjust
+    /// `new` before splicing — today only the indentation-insensitive layer,
+    /// which re-indents `new` to the file's own indentation. `None` means splice
+    /// `new` verbatim.
+    new_override: Option<String>,
 }
 
 enum MatchError {
@@ -1107,6 +1183,7 @@ fn locate_match(contents: &str, old: &str, new: &str) -> Result<Located, MatchEr
                 start: realign_partial_indent(contents, found, old, new),
                 end: found + old.len(),
                 kind: MatchKind::Exact,
+                new_override: None,
             });
         }
         (count, _) if count > 1 => {
@@ -1135,6 +1212,7 @@ fn locate_match(contents: &str, old: &str, new: &str) -> Result<Located, MatchEr
                     start: realign_partial_indent(contents, found, &crlf_old, new),
                     end: found + crlf_old.len(),
                     kind: MatchKind::Exact,
+                    new_override: None,
                 });
             }
             (count, _) if count > 1 => {
@@ -1148,16 +1226,35 @@ fn locate_match(contents: &str, old: &str, new: &str) -> Result<Located, MatchEr
     }
 
     // 2. Indentation-insensitive: strip each line's leading whitespace on both
-    //    sides, then require a unique match; the line-start expansion lets `new`
-    //    supply the replacement's indentation.
+    //    sides, then require a unique match. The matched region is only accepted
+    //    when the file is `old` shifted right by ONE consistent whitespace prefix
+    //    (see `uniform_indent_shift`); `new` is then re-indented by that same
+    //    prefix so it adopts the file's indentation. Splicing `new` verbatim
+    //    instead — the old behaviour — silently mis-indented code and reported
+    //    success: a tab-indented file patched with a space-indented `old`/`new`
+    //    came out with the block dedented (TabError), and a stepped `old` against
+    //    a flat file moved statements across scope. Those are exactly the cases
+    //    with no single consistent shift, so they now fall through to a NotFound
+    //    the model can recover from, rather than a corrupt file.
     let (hay_indent, indent_map) = strip_leading_ws_with_map(contents);
     let needle_indent = strip_leading_ws_with_map(old).0;
     match unique_range(contents, &hay_indent, &indent_map, &needle_indent) {
         Ok((start, end)) => {
+            let region_start = expand_to_line_start(contents, start);
             return Ok(Located {
-                start: expand_to_line_start(contents, start),
+                start: region_start,
                 end,
                 kind: MatchKind::Indent,
+                // Anchor `new` to the file's indentation at the match site rather
+                // than splicing it verbatim. `new` verbatim discarded the file's
+                // indentation and used its own, which — when they differ in width
+                // OR in tabs-vs-spaces — dedented the block relative to its
+                // unchanged neighbours: in Python it moved a statement out of the
+                // enclosing block (TabError / wrong scope), reported as success.
+                new_override: Some(reindent_to_file(
+                    new,
+                    leading_indent(&contents[region_start..end]),
+                )),
             });
         }
         Err(Some(count)) => {
@@ -1178,6 +1275,7 @@ fn locate_match(contents: &str, old: &str, new: &str) -> Result<Located, MatchEr
             start,
             end,
             kind: MatchKind::Punct,
+            new_override: None,
         }),
         Err(Some(count)) => Err(MatchError::NonUnique {
             count,
@@ -1185,6 +1283,35 @@ fn locate_match(contents: &str, old: &str, new: &str) -> Result<Located, MatchEr
         }),
         Err(None) => Err(MatchError::NotFound),
     }
+}
+
+/// Re-indent `new` so its block sits at the file's indentation `file_base`,
+/// preserving `new`'s own internal structure.
+///
+/// The block is anchored on `new`'s FIRST non-blank line: that line adopts
+/// `file_base`, and every other line keeps its indentation *relative* to that
+/// first line. So a `new` written with less (or differently-styled) indentation
+/// than the file lands at the file's level instead of dedenting the block out of
+/// its enclosing scope, while a genuine indent step inside `new` is kept. Blank
+/// lines stay blank; a line less-indented than the anchor (a dedent below
+/// `new`'s own first line) is left untouched rather than guessed at.
+fn reindent_to_file(new: &str, file_base: &str) -> String {
+    let new_base = leading_indent(new);
+    if new_base == file_base {
+        return new.to_string();
+    }
+    new.split('\n')
+        .map(|line| {
+            if line.trim().is_empty() {
+                line.to_string()
+            } else if let Some(rest) = line.strip_prefix(new_base) {
+                format!("{file_base}{rest}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Find the unique occurrence of `needle` in the normalized `hay` and map its

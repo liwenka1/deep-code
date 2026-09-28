@@ -43,6 +43,87 @@ async fn read_file_returns_structured_lines() {
     assert_eq!(output["truncated"], true);
 }
 
+/// A read of a large file must fit the runtime's per-result budget, and its
+/// `next_start_line` must point at the FIRST line it did not return — no gap.
+/// The old fixed 200/500-line window overran the 12k budget, the runtime cut the
+/// middle, and `next_start_line` pointed past the hole, so the model "continued"
+/// over lines it never saw.
+#[tokio::test]
+async fn read_file_fits_the_result_budget_and_paginates_without_a_gap() {
+    let tmp = tempdir().unwrap();
+    // 400 lines of ~90 chars — far past the budget at the default window.
+    let body = (1..=400)
+        .map(|i| format!("line {i}: {}", "x".repeat(80)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(tmp.path().join("big.txt"), &body).unwrap();
+
+    let result = run(tmp.path(), "read_file", json!({"path": "big.txt"})).await;
+    let out: Value = serde_json::from_str(&result.content).unwrap();
+
+    let budget = crate::runtime::tool_result::TOOL_OUTPUT_BUDGET;
+    assert!(
+        result.content.chars().count() <= budget,
+        "read result must fit the {budget}-char budget, got {}",
+        result.content.chars().count()
+    );
+    let returned = out["returned_lines"].as_u64().unwrap() as usize;
+    assert!(
+        returned > 0 && returned < 400,
+        "budget must cap the window below the whole file, returned {returned}"
+    );
+    assert_eq!(out["truncated"], true);
+    // The last returned line and the continuation point are contiguous.
+    let last = out["lines"].as_array().unwrap().last().unwrap()["line"]
+        .as_u64()
+        .unwrap() as usize;
+    assert_eq!(last, returned, "lines are 1..=returned from the start");
+    assert_eq!(
+        out["next_start_line"].as_u64().unwrap() as usize,
+        last + 1,
+        "continuation must resume at the first unreturned line, no gap"
+    );
+}
+
+/// write_file and apply_patch must refuse a FIFO (or other non-regular file)
+/// instead of blocking forever on open — a FIFO waits for the other end, which
+/// would hang the blocking-pool thread and the whole turn with no timeout.
+/// read_file already guarded this; the write tools did not.
+#[cfg(unix)]
+#[tokio::test]
+async fn write_and_patch_refuse_a_fifo_instead_of_hanging() {
+    use std::ffi::CString;
+    let tmp = tempdir().unwrap();
+    let fifo = tmp.path().join("pipe");
+    let c_path = CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(
+        unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) },
+        0,
+        "mkfifo must succeed to set up the test"
+    );
+
+    for (tool, args) in [
+        ("write_file", json!({"path": "pipe", "content": "x"})),
+        (
+            "apply_patch",
+            json!({"path": "pipe", "old": "a", "new": "b"}),
+        ),
+    ] {
+        let call = ToolCall::new("call_1", tool, args);
+        let outcome = registry(tmp.path())
+            .run_tool_call(call, Some(ApprovalDecision::Approved))
+            .await;
+        let message = match outcome {
+            Err(ToolError::InvalidArguments { message, .. }) => message,
+            other => panic!("{tool} on a FIFO must error (not hang or succeed): {other:?}"),
+        };
+        assert!(
+            message.contains("not a regular file"),
+            "{tool} on a FIFO: {message}"
+        );
+    }
+}
+
 /// Behavioral contract for shell-output spill files (which live under the
 /// workspace's `.deep-code/spill/`): the default walk must NOT surface them —
 /// logs polluting code searches would be worse than no spill at all — while
@@ -880,7 +961,7 @@ async fn run_err(root: &Path, name: &str, arguments: Value) -> String {
 }
 
 #[tokio::test]
-async fn apply_patch_fuzzy_matches_indentation_and_uses_new_indent() {
+async fn apply_patch_fuzzy_matches_indentation_and_adopts_the_files_indent() {
     let tmp = tempdir().unwrap();
     // Middle line is tab-indented; `old` carries a 4-space indent, so there is
     // no exact substring — only the indentation-insensitive layer can match.
@@ -898,15 +979,50 @@ async fn apply_patch_fuzzy_matches_indentation_and_uses_new_indent() {
     .await;
 
     assert_eq!(result.status, ToolResultStatus::Success);
-    // The original tab indent is replaced by `new`'s indentation; surrounding
-    // lines are untouched.
+    // `new`'s 4-space indent is a fuzzy-match artifact, not intent: the block is
+    // re-anchored to the file's own tab indentation so it stays consistent with
+    // the surrounding lines (splicing `new`'s spaces verbatim next to tab-
+    // indented neighbours is what caused TabError / out-of-scope corruption).
     assert_eq!(
         fs::read_to_string(tmp.path().join("lib.rs")).unwrap(),
-        "fn f() {\n    let y = 42;\n}\n"
+        "fn f() {\n\tlet y = 42;\n}\n"
     );
     assert_eq!(
         serde_json::from_str::<Value>(&result.content).unwrap()["match"],
         "fuzzy-indent"
+    );
+}
+
+/// The corruption the re-anchoring prevents: a `new` less-indented than the file
+/// must not dedent the block out of its enclosing scope. Splicing `new` verbatim
+/// put `a = 10` at column 0 — outside the function — with `status: success`.
+#[tokio::test]
+async fn apply_patch_fuzzy_indent_keeps_the_block_in_scope() {
+    let tmp = tempdir().unwrap();
+    // Both statements sit at 8 spaces inside the function body.
+    fs::write(
+        tmp.path().join("m.py"),
+        "def f():\n        a = 1\n        b = 2\n        return a + b\n",
+    )
+    .unwrap();
+
+    let result = run(
+        tmp.path(),
+        "apply_patch",
+        json!({"path": "m.py", "old": "a = 1\n    b = 2", "new": "a = 10\n    b = 20"}),
+    )
+    .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    let after = fs::read_to_string(tmp.path().join("m.py")).unwrap();
+    // `a = 10` stays inside the function (8-space anchor), never at column 0.
+    assert!(
+        after.contains("\n        a = 10\n"),
+        "the block must stay at the function's indentation, got:\n{after}"
+    );
+    assert!(
+        !after.contains("\na = 10\n"),
+        "a = 10 must not land at column 0 (out of the function):\n{after}"
     );
 }
 
