@@ -101,9 +101,32 @@ impl StdioLspTransport {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         // A language server has no business reading the agent's credentials:
-        // scrub provider/runtime secrets from the environment it inherits.
+        // scrub provider/runtime secrets from the environment it inherits, plus
+        // the linker/shell code-injection vectors an inherited value could use to
+        // run code in this UNSANDBOXED process (the LSP is not a model shell
+        // command; it runs with the user's full rights).
         for name in crate::config::SUBPROCESS_SECRET_ENV {
             launch.env_remove(name);
+        }
+        for name in crate::config::SUBPROCESS_INJECTION_ENV {
+            launch.env_remove(name);
+        }
+        // rust-analyzer runs `cargo metadata` to load the project, and cargo
+        // honours the repository's own `.cargo/config.toml` `[build]
+        // rustc-wrapper` / `rustc-workspace-wrapper` — running `<wrapper> rustc
+        // -vV`. A hostile (or `cargo build`-planted) config would thus execute
+        // arbitrary code in this unsandboxed process the moment a `.rs` file is
+        // edited, which the `initialize` build-script/proc-macro/check disabling
+        // does NOT cover. Override the wrappers with a pass-through (`env` just
+        // execs the real rustc) so the repo's cannot run; the env value beats the
+        // config file (verified). Unix-only: this is where `/usr/bin/env` is a
+        // stable pass-through, and on Windows nothing is sandboxed regardless.
+        // The cost is that a user's legitimate wrapper (sccache) is bypassed for
+        // the LSP's own metadata/checks, which do not need it.
+        #[cfg(unix)]
+        if language == Language::Rust && std::path::Path::new("/usr/bin/env").exists() {
+            launch.env("RUSTC_WRAPPER", "/usr/bin/env");
+            launch.env("RUSTC_WORKSPACE_WRAPPER", "/usr/bin/env");
         }
 
         let mut server = launch
@@ -493,6 +516,13 @@ fn code_text(raw: &Value) -> Option<String> {
 /// wraps the model's shell commands, not the language server). Disable the three
 /// code-execution surfaces here.
 ///
+/// One more surface is NOT closed here but in `spawn`: `cargo metadata` (which
+/// rust-analyzer always runs, before any of the above) honours the repo's
+/// `.cargo/config.toml` `rustc-wrapper`, so that ran repo code too. `spawn`
+/// overrides the wrapper env with a pass-through on unix, which beats the config
+/// file. Kept there, not here, because it is an environment override on the
+/// process, not an `initialize` option.
+///
 /// The cost is accuracy, not function: rust-analyzer's native syntax/type
 /// analysis — which is what post-edit diagnostics mostly surface — still runs
 /// without any of these. What is lost is knowledge of build-script-generated
@@ -501,9 +531,12 @@ fn code_text(raw: &Value) -> Option<String> {
 /// arbitrary repositories; a future option is to run the server inside the OS
 /// sandbox instead, which would restore accuracy at trusted-`cargo build` risk.
 ///
-/// typescript-language-server does not run project build steps and does not load
-/// workspace ts-plugins unless explicitly allow-listed, so it needs no options
-/// here; `null` leaves every other server on its defaults.
+/// typescript-language-server does not run project build steps, but it DOES
+/// prefer the workspace's own `node_modules/typescript/lib/tsserver.js` over any
+/// bundled copy — repo-controlled code this process would then run. That one is
+/// a known residual (there is no bundled tsserver to point it at), documented in
+/// `SECURITY.md` rather than claimed closed; `null` leaves every other server on
+/// its defaults.
 fn initialization_options(language: Language) -> Value {
     match language {
         Language::Rust => json!({

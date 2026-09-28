@@ -24,33 +24,6 @@ use jobs::{
     job_text_snapshot, kill_process_tree, refresh_job, shell_text_output, spawn_buffer_reader,
 };
 
-/// Environment variables that make the dynamic linker or the shell run code the
-/// command line never names: `LD_PRELOAD`/`LD_AUDIT` (Linux) and
-/// `DYLD_INSERT_LIBRARIES` (macOS) force-load a library into the child, and
-/// `BASH_ENV`/`ENV` name a script the shell sources before the command. An
-/// inherited value would turn a reviewed command string into a different
-/// execution, so they are dropped before the sandboxed shell starts.
-///
-/// Defense-in-depth, deliberately narrow: on macOS SIP already strips `DYLD_*`
-/// for the platform `sandbox-exec`/`sh`, and any code that does run stays inside
-/// the sandbox. The library *search-path* vars (`LD_LIBRARY_PATH`,
-/// `DYLD_LIBRARY_PATH`, …) are intentionally left alone — legitimate builds set
-/// them and they are a search hint, not a force-load.
-///
-/// Proxy and agent-socket variables (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`,
-/// `SSH_AUTH_SOCK`) are kept too, deliberately: under the no-network sandbox no
-/// socket opens, so they buy an attacker nothing, and under an approved
-/// `network: true` they are what lets `git push` over ssh-agent and a
-/// corporate-proxied `cargo build` work — scrubbing them would break exactly
-/// the egress the human just approved.
-const INJECTION_ENV: &[&str] = &[
-    "LD_PRELOAD",
-    "LD_AUDIT",
-    "DYLD_INSERT_LIBRARIES",
-    "BASH_ENV",
-    "ENV",
-];
-
 /// Strip provider/runtime secrets AND linker/shell code-injection vectors from a
 /// tool subprocess before it is spawned.
 ///
@@ -59,9 +32,9 @@ const INJECTION_ENV: &[&str] = &[
 /// bind — but no shell/job tool ever needs them. Removing them keeps an injected
 /// command from lifting the key straight out of its own environment
 /// (`echo $DEEPSEEK_API_KEY`, `curl -d "$DEEPSEEK_API_KEY"`). The injection
-/// vectors (see [`INJECTION_ENV`]) are stripped for a different reason: so an
-/// inherited `LD_PRELOAD`/`DYLD_INSERT_LIBRARIES`/`BASH_ENV` cannot run code the
-/// approved command string does not show.
+/// vectors ([`crate::config::SUBPROCESS_INJECTION_ENV`]) are stripped for a
+/// different reason: so an inherited `LD_PRELOAD`/`DYLD_INSERT_LIBRARIES`/
+/// `BASH_ENV` cannot run code the approved command string does not show.
 ///
 /// This narrows exposure; it does not fully close it. A same-uid child can
 /// still read the parent's `/proc/<ppid>/environ` (reads are not sandboxed),
@@ -70,7 +43,7 @@ fn scrub_secret_env(cmd: &mut tokio::process::Command) {
     for var in crate::config::SUBPROCESS_SECRET_ENV {
         cmd.env_remove(var);
     }
-    for var in INJECTION_ENV {
+    for var in crate::config::SUBPROCESS_INJECTION_ENV {
         cmd.env_remove(var);
     }
 }

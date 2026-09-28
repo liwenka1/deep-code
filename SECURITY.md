@@ -140,12 +140,20 @@ review to rediscover:
 - A command a human approved as text keeps every shell feature the human saw.
 - The post-edit language server (`[lsp] enabled`, on by default) runs *outside*
   the OS sandbox — it is not a model shell command. It is configured not to
-  execute repository code (rust-analyzer's build scripts, proc-macros and
-  on-save `cargo check` are disabled in the `initialize` handshake), so opening
-  a repository does not run its code; what remains is that the server reads the
-  workspace to analyze it. Turning it off (`[lsp] enabled = false`) removes even
-  that. Running the server inside the sandbox would restore full analysis
-  accuracy at trusted-`cargo build` risk, and is a possible future option.
+  execute repository code: rust-analyzer's build scripts, proc-macros and
+  on-save `cargo check` are disabled in the `initialize` handshake, and its
+  `cargo metadata` step — which honours the repo's `.cargo/config.toml`
+  `rustc-wrapper`/`rustc-workspace-wrapper` — is neutralized by overriding those
+  wrappers with a pass-through in the server's environment (unix; the env value
+  beats the config file). So opening a repository does not run its code; what
+  remains is that the server reads the workspace to analyze it. **One residual:**
+  `typescript-language-server` prefers the workspace's own
+  `node_modules/typescript/lib/tsserver.js` over any bundled copy, so a hostile
+  TS/JS repo can still get repo-controlled code run by the server on the first
+  edit of a `.ts`/`.js` file. Until a bundled tsserver is pinned, set
+  `[lsp] enabled = false` when opening untrusted TS/JS repositories. Turning the
+  server off removes the read too. Running it inside the sandbox would close all
+  of this at trusted-`cargo build` risk, and is a possible future option.
 - On Windows a word carrying two `%` is *indirection*, not a denial: `cmd.exe`
   expands `%VAR%`, `%VAR:~0,0%` and `%VAR:a=b%` on the command line, so
   `de%PATH:~0,0%l` is `del` by the time anything runs and no rule here can read

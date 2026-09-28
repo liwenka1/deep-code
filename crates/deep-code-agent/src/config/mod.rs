@@ -30,6 +30,23 @@ pub const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 /// one, so the constant can't be imported here — keep the two in sync.
 pub const SUBPROCESS_SECRET_ENV: &[&str] = &[DEEPSEEK_API_KEY_ENV, "DEEP_CODE_RUNTIME_TOKEN"];
 
+/// Environment variables that make the dynamic linker or the shell run code the
+/// command line never names: `LD_PRELOAD`/`LD_AUDIT` (Linux) and
+/// `DYLD_INSERT_LIBRARIES` (macOS) force-load a library into the child, and
+/// `BASH_ENV`/`ENV` name a script the shell sources before it. An inherited
+/// value would turn a reviewed command — or an out-of-sandbox helper like the
+/// language server — into a different execution, so they are dropped before such
+/// a subprocess starts. Shared by the shell/job tools and the LSP spawn so the
+/// one list cannot drift between them (the library *search-path* vars are
+/// deliberately left alone — a search hint, not a force-load).
+pub const SUBPROCESS_INJECTION_ENV: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "BASH_ENV",
+    "ENV",
+];
+
 pub const MODEL_ENV: &str = "DEEP_CODE_MODEL";
 pub const LANG_ENV: &str = "DEEP_CODE_LANG";
 pub const REASONING_EFFORT_ENV: &str = "DEEP_CODE_REASONING_EFFORT";
