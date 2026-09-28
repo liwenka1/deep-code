@@ -703,5 +703,36 @@ fn bare_argv_command(argv: &[String], cwd: &Path) -> Result<Command, String> {
     Ok(cmd)
 }
 
+/// Whether `program` (a bare program word, argv[0]) can be executed directly as
+/// argv — with no shell — on this host.
+///
+/// A command runs unattended (a trusted identity, a remembered session consent,
+/// an accept-edits file op) as the exact argv the policy parsed, never through a
+/// shell. On Unix any program `execve` would find on `PATH` qualifies, and a
+/// name that resolves nowhere fails the same way it would through a shell, so
+/// this is always true and nothing changes. On Windows only a real `.exe`/`.com`
+/// runs that way: a cmd builtin (`mkdir`) or a `.cmd`/`.bat` shim (`npm`, `npx`,
+/// `yarn`, `pnpm`) is deliberately refused rather than routed through `cmd.exe`.
+///
+/// The consent/accept-edits layer consults this before it hands such a command
+/// [`crate::tool::RunAuthority::Parse`]: a command that cannot run as argv here
+/// must keep PROMPTING (each approval runs it as text through `cmd /C`, which a
+/// human reads) instead of being auto-approved as an argv that then fails to
+/// spawn for the rest of the session — the `26cbaf1` regression. It mirrors the
+/// default-trust list's own `echo`/`printf` carve-out from `308f740`, which
+/// fixed only that one class.
+#[must_use]
+#[cfg(not(windows))]
+pub(crate) fn program_runs_as_argv(_program: &str) -> bool {
+    true
+}
+
+/// See the non-Windows twin: on Windows this is the real check.
+#[must_use]
+#[cfg(windows)]
+pub(crate) fn program_runs_as_argv(program: &str) -> bool {
+    windows::resolve_executable(program).is_ok()
+}
+
 #[cfg(test)]
 mod tests;

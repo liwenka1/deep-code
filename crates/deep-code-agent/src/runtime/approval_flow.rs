@@ -89,6 +89,35 @@ fn shell_consent_identity(tool_name: &str, arguments: &serde_json::Value) -> Opt
     command_shape::session_identity(shell_command_of(tool_name, arguments)?)
 }
 
+/// Whether a command-bearing call could actually run unattended (as argv, no
+/// shell) on this host. Only Windows ever answers `false`: a cmd builtin
+/// (`mkdir`) or a `.cmd`/`.bat` shim (`npm`, `npx`, `yarn`, `pnpm`) does not
+/// resolve to a real `.exe`/`.com`, so the executor refuses to run it as argv
+/// and will not route it through `cmd.exe`. Such a command must keep PROMPTING —
+/// each approval runs it as text through `cmd /C`, which a human reads — instead
+/// of being auto-approved as argv (a session consent, or accept-edits) and then
+/// failing to spawn for the rest of the session (the `26cbaf1` regression).
+///
+/// Non-command calls (`write_file`, a sub-agent dispatch) and, on Unix, every
+/// command answer `true`, so this is a no-op everywhere but Windows. A compound
+/// command must have EVERY segment runnable, since each runs as its own argv. An
+/// unparsable line answers `true` and is left to the executor, which refuses it
+/// with the unattended-unparsable note rather than through this gate.
+fn command_runnable_unattended(call: &ToolCall) -> bool {
+    let Some(command) = shell_command_of(&call.name, &call.arguments) else {
+        return true; // not command-bearing
+    };
+    match crate::execution_policy::parse_unattended(command) {
+        Some(commands) => commands.iter().all(|parsed| {
+            parsed
+                .argv
+                .first()
+                .is_some_and(|program| crate::sandbox::program_runs_as_argv(program))
+        }),
+        None => true,
+    }
+}
+
 /// Whether a call is the `request_write_root` doorbell (see
 /// [`crate::execution_policy::ToolKind::RootGrant`]).
 pub(super) fn is_root_grant(tool_name: &str) -> bool {
@@ -249,9 +278,15 @@ impl AgentRuntime {
             }
             // Shell isn't blanket session-approvable by name; trust at command
             // granularity instead ("a" remembered `cargo test`, `git push`, …),
-            // and only for the egress the consent was given with.
+            // and only for the egress the consent was given with. A remembered
+            // command that cannot run as argv on this host (a Windows `.cmd`
+            // shim or cmd builtin) is NOT auto-approved here: `SessionShell`
+            // authority runs it as argv, which fails to spawn. It falls through
+            // to the mode below — Yolo runs it as text via `cmd /C`, every other
+            // mode prompts — so `npm test` keeps working instead of dying.
             if let Some(key) = shell_consent_key(call)
                 && state.session_trusted_shell_prefixes.contains(&key)
+                && command_runnable_unattended(call)
             {
                 return Some(AutoApproval::SessionShell);
             }
@@ -261,8 +296,9 @@ impl AgentRuntime {
         // Layer 2: session permission mode.
         match self.permission_mode() {
             PermissionMode::Default => None,
-            PermissionMode::AcceptEdits => accept_edits_approvable(&call.name, &call.arguments)
-                .then_some(AutoApproval::AcceptEdits),
+            PermissionMode::AcceptEdits => (accept_edits_approvable(&call.name, &call.arguments)
+                && command_runnable_unattended(call))
+            .then_some(AutoApproval::AcceptEdits),
             PermissionMode::Auto => {
                 // Egress sits above the judge: opening the network is the
                 // human's call, never something a classifier waves through.
@@ -305,8 +341,12 @@ impl AgentRuntime {
         // mode cycle), so inherit its bounded fs-edit allowances first. Without
         // this, a "more permissive" mode would ask for a plain `mkdir src/x`
         // that the stricter AcceptEdits waves through — shell defaults to the
-        // High risk tier, which the judge floor below always prompts on.
-        if accept_edits_approvable(&call.name, &call.arguments) {
+        // High risk tier, which the judge floor below always prompts on. The
+        // same argv-runnable gate as AcceptEdits above: a Windows `.cmd`/builtin
+        // is not auto-approved as argv (it would fail to spawn); it falls to the
+        // judge/prompt path, which runs it as text.
+        if accept_edits_approvable(&call.name, &call.arguments) && command_runnable_unattended(call)
+        {
             return Some(AutoApproval::AcceptEdits);
         }
         if request.risk_level == RiskLevel::High {
@@ -908,6 +948,50 @@ mod tests {
             Some(("git push".to_string(), false))
         );
         assert_eq!(shell_consent_key(&networked("npm test && curl x")), None);
+    }
+
+    /// The argv-runnable gate: a command auto-approved by a session consent or
+    /// accept-edits runs as argv, so a program word that cannot run that way on
+    /// this host must not be auto-approved (it would fail to spawn every time).
+    /// Non-command calls bypass it, and on Unix every command passes.
+    #[test]
+    fn command_runnable_gate_bypasses_non_command_calls() {
+        let write = ToolCall {
+            id: "c1".to_string(),
+            name: "write_file".to_string(),
+            arguments: json!({ "path": "a.rs", "content": "x" }),
+        };
+        assert!(command_runnable_unattended(&write));
+        let dispatch = ToolCall {
+            id: "c1".to_string(),
+            name: "agent".to_string(),
+            arguments: json!({ "role": "implementer", "task": "x" }),
+        };
+        assert!(command_runnable_unattended(&dispatch));
+    }
+
+    /// On Unix the gate is a no-op: `execve` resolves any command word, or fails
+    /// the same way a shell would, so nothing is withheld from Parse authority.
+    #[cfg(unix)]
+    #[test]
+    fn unix_runs_every_command_as_argv() {
+        assert!(command_runnable_unattended(&shell("npm test")));
+        assert!(command_runnable_unattended(&shell(
+            "mkdir foo && touch foo/x"
+        )));
+    }
+
+    /// On Windows a program word with no real `.exe`/`.com` cannot run as argv,
+    /// so the gate withholds Parse authority and the command keeps prompting
+    /// (running as text through `cmd /C`) instead of failing to spawn forever —
+    /// the `26cbaf1` regression. `cmd.exe` is a real image and still passes.
+    #[cfg(windows)]
+    #[test]
+    fn windows_withholds_argv_from_unresolvable_programs() {
+        assert!(!command_runnable_unattended(&shell(
+            "__no_such_program_xyz__ --flag"
+        )));
+        assert!(command_runnable_unattended(&shell("cmd /c echo hi")));
     }
 
     /// "Approve for session" must not be recordable for a root grant: each
