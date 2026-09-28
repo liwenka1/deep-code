@@ -41,6 +41,23 @@ impl AgentRuntime {
         let store = self.checkpoints.as_ref().ok_or_else(|| {
             ToolError::exec_failed("checkpoint", "checkpoints are not enabled on this runtime")
         })?;
+        // Refuse while a turn is live or parked on an approval. Restore clears
+        // and re-copies the whole workspace; a turn running concurrently keeps
+        // writing files (its tool calls run on other tasks) on top of — or into
+        // a directory being cleared by — the restore, so the workspace ends up a
+        // mix of the rewound tree and the live turn's later writes, with the
+        // model unaware and a "restored" report either way. Cancel the turn
+        // first (Esc), then restore.
+        {
+            let state = self.state.lock().await;
+            if state.current_turn_id.is_some() || state.pending.is_some() {
+                return Err(ToolError::exec_failed(
+                    "checkpoint",
+                    "a turn is in progress — cancel it (Esc) before restoring, so the rollback \
+                     is not overwritten by the turn's remaining file writes",
+                ));
+            }
+        }
         store.restore(&id)
     }
 

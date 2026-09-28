@@ -255,6 +255,7 @@ text_ids! {
     BusyRelaunchConfig,
     SessionReloadFailedRestart,
     BusySwitchSession,
+    BusyRestore,
     SessionsReadFailed,
     NoResumableSessions,
     StatusPickSession,

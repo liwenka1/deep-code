@@ -525,6 +525,15 @@ impl App {
     }
 
     fn restore_checkpoint(&mut self, id: &str) {
+        // Same busy guard as the other state-changing commands: restoring while
+        // a turn streams (or is parked on approval) rewinds the workspace under
+        // the live turn, which keeps writing on top of it. The runtime refuses
+        // it too, but stopping here keeps the transcript honest (no "restored"
+        // cell above still-streaming output).
+        if self.is_streaming || self.pending_approval.is_some() {
+            self.status = self.tr(TextId::BusyRestore).to_string();
+            return;
+        }
         // Route through the runtime handle (the one place that owns the
         // configured checkpoint store) instead of keeping a second
         // CheckpointStore construction here.

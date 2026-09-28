@@ -97,6 +97,7 @@
   "BusyRelaunchConfig": "正在流式输出或等待审批，请稍后再切换配置",
   "SessionReloadFailedRestart": "无法读取当前会话记录，已重启为新会话",
   "BusySwitchSession": "正在流式输出或等待审批，无法切换会话",
+  "BusyRestore": "正在流式输出或等待审批，请先取消本轮（Esc）再回退",
   "SessionsReadFailed": "无法读取历史会话: {error}",
   "NoResumableSessions": "没有可恢复的历史会话",
   "StatusPickSession": "选择要恢复的历史会话 (↑/↓ · Enter · Esc 取消)",

@@ -19,11 +19,15 @@ const OWNED_STORAGE_DIRS: usize = 2;
 /// with a 100k-file `.venv`/`build`/`dist` beside it into a 16-second stall per
 /// turn. Skipping is a pure function of the path name so snapshot and restore
 /// stay symmetric by construction (`should_skip` is read by both): whatever a
-/// snapshot omits, restore keeps rather than deletes, so a name that is
-/// occasionally real source (`build`, `dist`) is left untouched by `/restore`
-/// rather than lost — the same trade `target`/`node_modules` already made.
-/// A workspace whose *tracked* tree is itself enormous is bounded separately
-/// by [`MAX_SNAPSHOT_ENTRIES`].
+/// snapshot omits, restore keeps rather than deletes.
+///
+/// These names are unambiguous — a `.venv`, `__pycache__` or `node_modules` at
+/// ANY depth is generated — so they are matched on every path component. The
+/// genuinely ambiguous names (`build`, `dist`) live in [`SKIP_DIRS_TOP_LEVEL`]
+/// instead and match only at the workspace root, so a hand-edited
+/// `scripts/build/release.sh` or `docs/dist/` is snapshotted and rolled back
+/// rather than silently left behind. A workspace whose *tracked* tree is itself
+/// enormous is bounded separately by [`MAX_SNAPSHOT_ENTRIES`].
 const SKIP_DIRS: &[&str] = &[
     ".git",
     ".deep-code",
@@ -38,8 +42,6 @@ const SKIP_DIRS: &[&str] = &[
     ".ruff_cache",
     ".tox",
     // JS/TS build output
-    "dist",
-    "build",
     ".next",
     ".nuxt",
     ".svelte-kit",
@@ -53,6 +55,15 @@ const SKIP_DIRS: &[&str] = &[
     // Editor / tooling caches
     ".idea",
 ];
+
+/// Generated-directory names common enough to skip but ambiguous enough to be
+/// real hand-edited source under a subdirectory — so they are skipped only when
+/// they sit at the workspace ROOT. `<ws>/build` and `<ws>/dist` (the usual
+/// generated output) are omitted from the snapshot; `<ws>/scripts/build/x`,
+/// `<ws>/docs/dist/`, a Go `build/package/` are kept, snapshotted and restored.
+/// Matching these at any depth (the `c2371bf` behavior) silently dropped such
+/// files from `/restore` with a "restored" report.
+const SKIP_DIRS_TOP_LEVEL: &[&str] = &["build", "dist"];
 /// Ceiling on entries one before-turn snapshot copies. Past it the snapshot is
 /// abandoned and per-turn checkpoints are disabled for the session (one
 /// warning, then silent) rather than paying a multi-second copy every turn.
@@ -467,12 +478,26 @@ fn sanitize_label(label: &str) -> String {
 }
 
 fn should_skip(rel: &Path) -> bool {
-    rel.components().any(|component| {
+    // Unambiguous generated names at any depth.
+    let any_depth = rel.components().any(|component| {
         component
             .as_os_str()
             .to_str()
             .is_some_and(|part| SKIP_DIRS.contains(&part))
-    })
+    });
+    if any_depth {
+        return true;
+    }
+    // Ambiguous names (`build`, `dist`) only at the workspace root: `rel` is
+    // relative to the workspace, so "top level" is a single-component path whose
+    // one component is in the list.
+    let mut components = rel.components();
+    let (first, rest) = (components.next(), components.next());
+    matches!(
+        (first, rest),
+        (Some(std::path::Component::Normal(name)), None)
+            if name.to_str().is_some_and(|part| SKIP_DIRS_TOP_LEVEL.contains(&part))
+    )
 }
 
 /// What the snapshot is able to record for one directory entry.
@@ -813,13 +838,14 @@ const _: () = assert!(
 /// delete only what `restore` is able to write back. It used to break that
 /// twice, in both directions.
 ///
-/// 1. `should_skip` excludes [`SKIP_DIRS`] at **any** depth, while this loop
-///    compared only the top-level entry name. So `sub/.git` never entered the
-///    snapshot and `fs::remove_dir_all(sub)` deleted it regardless — a
-///    vendored git clone (normally gitignored, so `git` itself cannot recover
-///    it) lost its whole history, and `restore` still reported success. The
-///    walk below asks `should_skip` about the same relative path the snapshot
-///    side judges, so the two sets are the same set by construction.
+/// 1. `should_skip` excludes [`SKIP_DIRS`] at **any** depth (and
+///    [`SKIP_DIRS_TOP_LEVEL`] at the root only), while this loop compared only
+///    the top-level entry name. So `sub/.git` never entered the snapshot and
+///    `fs::remove_dir_all(sub)` deleted it regardless — a vendored git clone
+///    (normally gitignored, so `git` itself cannot recover it) lost its whole
+///    history, and `restore` still reported success. The walk below asks
+///    `should_skip` about the same relative path the snapshot side judges, so the
+///    two sets are the same set by construction.
 /// 2. Windows symlinks: see the `Entry::Symlink` arm.
 /// 3. Entries with no snapshot representation at all: see [`Entry::Uncapturable`].
 fn clear_workspace_contents(

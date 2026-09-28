@@ -821,3 +821,43 @@ fn list_ignores_directories_that_are_not_snapshots() {
         );
     }
 }
+
+/// The `build`/`dist` ambiguity: a top-level generated `build/` is skipped (the
+/// perf win), but a hand-edited `scripts/build/release.sh` deeper in the tree is
+/// snapshotted and rolled back — matching those names at ANY depth (the c2371bf
+/// regression) silently dropped such files from `/restore`.
+#[test]
+fn ambiguous_generated_names_are_skipped_only_at_the_workspace_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("scripts/build")).unwrap();
+    fs::write(root.join("scripts/build/release.sh"), "v1").unwrap();
+    fs::create_dir_all(root.join("build")).unwrap();
+    fs::write(root.join("build/artifact.o"), "obj-v1").unwrap();
+
+    let store = CheckpointStore::new(root).unwrap();
+    let (id, _) = store.snapshot_created("before_turn").unwrap();
+    let snap = root.join(".deep-code/checkpoints").join(&id.0);
+    assert!(
+        snap.join("scripts/build/release.sh").exists(),
+        "a nested build/ dir must be snapshotted"
+    );
+    assert!(
+        !snap.join("build").exists(),
+        "a top-level build/ dir must be skipped"
+    );
+
+    fs::write(root.join("scripts/build/release.sh"), "v2").unwrap();
+    fs::write(root.join("build/artifact.o"), "obj-v2").unwrap();
+    store.restore(&id).unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("scripts/build/release.sh")).unwrap(),
+        "v1",
+        "the nested build/ file must be rolled back"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("build/artifact.o")).unwrap(),
+        "obj-v2",
+        "the top-level build/ (never snapshotted) is left untouched, not deleted"
+    );
+}

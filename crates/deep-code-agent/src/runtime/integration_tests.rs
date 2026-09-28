@@ -1607,6 +1607,56 @@ async fn persistent_runtime_records_checkpoint_metadata() {
     );
 }
 
+/// Restore must refuse while a turn is in flight: rewinding the workspace under
+/// a live turn lets its remaining tool writes land on top of the rollback.
+#[tokio::test]
+async fn restore_refuses_while_a_turn_is_in_progress() {
+    let workspace = tempfile::tempdir().unwrap();
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::TextDelta {
+            text: "done".to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = AgentRuntime::with_new_session(
+        client,
+        ToolRegistry::default(),
+        "system",
+        workspace.path(),
+        &crate::config::AgentConfig::builtin(),
+    )
+    .unwrap()
+    .with_checkpoints(workspace.path(), &mut Vec::new());
+
+    let (id, _) = runtime
+        .checkpoints
+        .as_ref()
+        .unwrap()
+        .snapshot_created("before_turn")
+        .unwrap();
+
+    // Restore is fine before any turn starts.
+    assert!(
+        runtime.restore_checkpoint(id.clone()).await.is_ok(),
+        "restore must work when no turn is live"
+    );
+
+    // A turn is now live (bookkeeping started, loop not driven).
+    runtime.begin_turn("do a thing").await;
+    let refused = runtime.restore_checkpoint(id).await;
+    assert!(
+        refused.is_err(),
+        "restore must refuse while a turn is in progress"
+    );
+    assert!(
+        refused
+            .unwrap_err()
+            .to_string()
+            .contains("turn is in progress"),
+        "the refusal must name the reason"
+    );
+}
+
 /// The session's checkpoint metadata is capped at the same number of entries
 /// the disk store keeps. It used to grow without bound, so every session longer
 /// than the cap carried records for snapshots `prune_old_snapshots` had already

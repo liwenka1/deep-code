@@ -97,6 +97,7 @@
   "BusyRelaunchConfig": "Streaming or awaiting approval; retry the config change later",
   "SessionReloadFailedRestart": "Could not reload the current session; restarted with a new one",
   "BusySwitchSession": "Streaming or awaiting approval; cannot switch sessions",
+  "BusyRestore": "Streaming or awaiting approval; cancel the turn (Esc) before restoring",
   "SessionsReadFailed": "Could not read past sessions: {error}",
   "NoResumableSessions": "No resumable sessions",
   "StatusPickSession": "Pick a session to resume (↑/↓ · Enter · Esc cancel)",
