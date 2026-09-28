@@ -154,6 +154,17 @@ review to rediscover:
   `[lsp] enabled = false` when opening untrusted TS/JS repositories. Turning the
   server off removes the read too. Running it inside the sandbox would close all
   of this at trusted-`cargo build` risk, and is a possible future option.
+- The CI bot's model prompt carries the issue title, body and every comment, and
+  those authors can be anyone even when only trusted associations may *trigger*
+  the bot. That thread text is wrapped in an `<untrusted-thread>` envelope and
+  the system rules tell the model to treat it as data, never as instructions
+  (only the triggering maintainer's instruction is authoritative) — but an LLM
+  following that framing is best-effort, not a hard boundary. So the real fence
+  stays the trigger gate (`allowed-associations`) plus what the run is allowed to
+  do: on a **public** repo, keep `shell`/`job`/`fetch_url`/`web_search` out of
+  the bot's `auto-allow` (the default includes them) so injected text cannot run
+  arbitrary commands or reach the network next to your secrets. PRs never
+  auto-merge, which is the third leg.
 - On Windows a word carrying two `%` is *indirection*, not a denial: `cmd.exe`
   expands `%VAR%`, `%VAR:~0,0%` and `%VAR:a=b%` on the command line, so
   `de%PATH:~0,0%l` is `del` by the time anything runs and no rule here can read
