@@ -127,6 +127,15 @@ impl AgentRuntime {
             // `record_classifier_cost` folds them: the session hit-rate and
             // savings must cover every request billed to the session.
             let mut state = self.state.lock().await;
+            // Turn totals too, not only session: a sub-agent's spend is incurred
+            // during THIS turn, so the turn's `cost` (what headless `-p` and the
+            // CI bot print, and `/status` shows) must include it. Folding only
+            // into the session left the per-turn number low by the child's whole
+            // spend on any turn that dispatched an `agent`.
+            state.turn_cost.usd += reported.cost.usd;
+            state.turn_cost.cny += reported.cost.cny;
+            state.turn_cache_hit_tokens += reported.cache_hit_tokens;
+            state.turn_cache_miss_tokens += reported.cache_miss_tokens;
             state.session_cost.usd += reported.cost.usd;
             state.session_cost.cny += reported.cost.cny;
             state.session_cache_hit_tokens += reported.cache_hit_tokens;

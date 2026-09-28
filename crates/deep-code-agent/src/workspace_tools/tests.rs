@@ -85,6 +85,43 @@ async fn read_file_fits_the_result_budget_and_paginates_without_a_gap() {
     );
 }
 
+/// grep must cap its matches to the runtime's per-result budget and say so,
+/// instead of returning 100 matches with context (~50k chars) that the runtime
+/// silently trims to ~14 while `truncated` claims a complete search.
+#[tokio::test]
+async fn grep_results_are_capped_to_the_output_budget() {
+    let tmp = tempdir().unwrap();
+    let body = (0..300)
+        .map(|i| format!("NEEDLE {i} {}", "y".repeat(120)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(tmp.path().join("big.txt"), &body).unwrap();
+
+    let result = run(tmp.path(), "grep_files", json!({"pattern": "NEEDLE"})).await;
+    let out: Value = serde_json::from_str(&result.content).unwrap();
+
+    let budget = crate::runtime::tool_result::TOOL_OUTPUT_BUDGET;
+    assert!(
+        result.content.chars().count() <= budget,
+        "grep result must fit the {budget}-char budget, got {}",
+        result.content.chars().count()
+    );
+    assert_eq!(out["truncated"], true);
+    let returned = out["matches"].as_array().unwrap().len();
+    assert!(
+        returned > 0 && returned < 300,
+        "the size cap must return some but not all matches, got {returned}"
+    );
+    assert!(
+        out["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("truncated"),
+        "a truncated result must carry an explanatory note: {}",
+        out["note"]
+    );
+}
+
 /// write_file and apply_patch must refuse a FIFO (or other non-regular file)
 /// instead of blocking forever on open — a FIFO waits for the other end, which
 /// would hang the blocking-pool thread and the whole turn with no timeout.

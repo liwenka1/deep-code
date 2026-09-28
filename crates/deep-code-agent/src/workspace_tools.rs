@@ -19,6 +19,10 @@ const MAX_READ_LINES: usize = 500;
 /// `read_file`'s wrapper fields (path, counts, flags) so the line array plus the
 /// wrapper together stay under the budget the runtime enforces on every result.
 const READ_WRAPPER_RESERVE: usize = 256;
+/// Same idea for `grep_files`, whose wrapper is larger: the pattern, four skipped
+/// counts, up to four capped skipped-path lists and a note ride alongside the
+/// matches, so more is reserved than for a plain read.
+const GREP_WRAPPER_RESERVE: usize = 2_048;
 /// Size cap for reading/searching a single file. `pub(crate)` so every
 /// user-facing mention of the limit (read_file's error, grep's note, the
 /// approval preview's source guard) derives from this one number instead of
@@ -428,6 +432,17 @@ impl GrepFilesTool {
         // skipped_* ledgers above exist to prevent, so it gets the same honesty.
         let mut cancelled = false;
         let mut matches = Vec::new();
+        // Bytes the serialized `matches` array has spent so far, against a budget
+        // derived from the runtime's per-result ceiling. 100 matches with context
+        // ran to ~50k chars, which the runtime cut to 12k — so the model saw ~14
+        // of them while `truncated` (keyed only on `max_results`) claimed a
+        // complete search. Cap by size too, and set `truncated` when the cap
+        // stops the walk. `GREP_WRAPPER_RESERVE` leaves room for the counts,
+        // skipped-path lists and note that ride alongside.
+        let match_budget =
+            crate::runtime::tool_result::TOOL_OUTPUT_BUDGET.saturating_sub(GREP_WRAPPER_RESERVE);
+        let mut matches_bytes = 0usize;
+        let mut size_capped = false;
         // Boundary snapshot taken once: `granted_roots()` locks and clones per
         // call, and this loop visits every file in the tree — per-file calls
         // would be thousands of lock+clone rounds for a boundary that cannot
@@ -596,7 +611,7 @@ impl GrepFilesTool {
                 }
                 let before_start = index.saturating_sub(context_lines);
                 let after_end = (index + context_lines + 1).min(lines.len());
-                matches.push(json!({
+                let entry = json!({
                     "path": self.root.relative_display(path),
                     "line_number": index + 1,
                     "line": line,
@@ -606,17 +621,27 @@ impl GrepFilesTool {
                     "context_after": ((index + 1)..after_end)
                         .map(|line_index| json!({"line": line_index + 1, "text": lines[line_index]}))
                         .collect::<Vec<_>>(),
-                }));
+                });
+                let cost = serde_json::to_string(&entry).map_or(0, |text| text.chars().count()) + 1;
+                // Always keep at least one match (the runtime trims a single huge
+                // one), but past the budget stop and report it as truncated rather
+                // than let the runtime silently drop the tail.
+                if !matches.is_empty() && matches_bytes + cost > match_budget {
+                    size_capped = true;
+                    break;
+                }
+                matches_bytes += cost;
+                matches.push(entry);
                 if matches.len() >= max_results {
                     break;
                 }
             }
-            if matches.len() >= max_results {
+            if size_capped || matches.len() >= max_results {
                 break;
             }
         }
 
-        let truncated = matches.len() >= max_results;
+        let truncated = size_capped || matches.len() >= max_results;
         let mut result = json!({
             "pattern": pattern,
             "path": self.root.relative_display(&search_path),
@@ -705,8 +730,21 @@ impl GrepFilesTool {
                  grep the non-symlinked ones where approval allows",
                 parts.join(", ")
             ));
+        } else if truncated {
+            // Truncated but nothing was skipped and it was not cancelled: the
+            // match set itself hit the count or size cap. There is no pagination,
+            // so tell the model to narrow rather than let `truncated: true` sit
+            // unexplained.
+            result["note"] = json!(
+                "results truncated (hit the match count or output-size cap) — narrow the \
+                 pattern or search a subdirectory to see the rest"
+            );
         }
-        Ok(ToolOutput::text(json_string(result)))
+        // Compact, not pretty: the size budget above is measured in compact
+        // chars, so the emitted result must be compact to stay within it.
+        Ok(ToolOutput::text(
+            serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string()),
+        ))
     }
 }
 

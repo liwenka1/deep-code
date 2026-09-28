@@ -382,16 +382,23 @@ impl AgentRuntime {
         classifier_model_for(&self.config, &self.registry)
     }
 
-    /// Fold a classifier call's token cost into the running session total. The
-    /// judge runs on a separate (cheap) model from the turn, so its usage never
-    /// flows through the turn telemetry; without this the session cost silently
-    /// under-counts every auto-mode gated call.
+    /// Fold a classifier call's token cost into the running turn and session
+    /// totals. The judge runs on a separate (cheap) model from the turn, so its
+    /// usage never flows through the turn telemetry; without this the reported
+    /// cost silently under-counts every auto-mode gated call.
     async fn record_classifier_cost(&self, model: &str, usage: &crate::model::Usage) {
         let cost = crate::pricing::calculate_turn_cost(model, usage);
         let cache_hit = usage.prompt_cache_hit_tokens.unwrap_or(0);
         let cache_miss = usage.prompt_cache_miss_tokens.unwrap_or(0);
         let savings = crate::pricing::cache_savings(model, cache_hit);
         let mut state = self.state.lock().await;
+        // Turn totals too: the judge fires during this turn's approval gate, so
+        // the turn `cost` (headless/bot output, `/status`) must include it — not
+        // only the session total.
+        state.turn_cost.usd += cost.usd;
+        state.turn_cost.cny += cost.cny;
+        state.turn_cache_hit_tokens += u64::from(cache_hit);
+        state.turn_cache_miss_tokens += u64::from(cache_miss);
         state.session_cost.usd += cost.usd;
         state.session_cost.cny += cost.cny;
         // Fold cache tokens too, so the session cache-hit rate/savings read
@@ -1157,6 +1164,13 @@ mod tests {
             assert!(state.session_cost.cny > 0.0, "cny rate is in the table");
             assert!(state.session_cache_savings.usd > 0.0);
             assert!(state.session_cache_savings.cny > 0.0);
+            // The judge fires during a turn, so its spend folds into the TURN
+            // totals too — the number headless/bot report. Under-counting it
+            // there was the bug this half of the fold fixes.
+            assert_eq!(state.turn_cache_hit_tokens, 10);
+            assert_eq!(state.turn_cache_miss_tokens, 5);
+            assert!(state.turn_cost.usd > 0.0, "turn usd must include the judge");
+            assert!(state.turn_cost.cny > 0.0, "turn cny must include the judge");
             (state.session_cost, state.session_cache_savings)
         };
 
