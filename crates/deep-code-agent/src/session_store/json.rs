@@ -209,7 +209,14 @@ impl SessionStore for JsonSessionStore {
     }
 
     fn load(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError> {
-        self.read_file(&self.path_for(id)?)
+        let mut record = self.read_file(&self.path_for(id)?)?;
+        // The FILENAME is authoritative for the id, not the record's stored one.
+        // A session file copied to a new name (a "fork") keeps the original's id
+        // inside it; without this, the resumed runtime would save back under that
+        // original id and silently clobber the source session. Binding the id to
+        // the file it was loaded from makes a fork write to itself.
+        record.id = id.clone();
+        Ok(record)
     }
 
     fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError> {
@@ -226,13 +233,21 @@ impl SessionStore for JsonSessionStore {
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            if let Some(stem) = path.file_stem().and_then(|value| value.to_str())
-                && validate_session_id(stem).is_err()
-            {
+            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if validate_session_id(stem).is_err() {
                 continue;
             }
             match self.read_file(&path) {
-                Ok(record) => records.push(record),
+                Ok(mut record) => {
+                    // Bind the id to the filename, as `load` does and for the same
+                    // reason: the picker and any resume off this list must target
+                    // the file that actually holds the session, not an id copied
+                    // inside it.
+                    record.id = SessionId(stem.to_string());
+                    records.push(record);
+                }
                 Err(SessionStoreError::UnsupportedSchema { .. }) => {
                     eprintln!("skipping unsupported session file {}", path.display());
                 }

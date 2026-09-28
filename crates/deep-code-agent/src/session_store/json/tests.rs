@@ -36,6 +36,37 @@ fn json_store_round_trips_session() {
     ));
 }
 
+/// A session file copied to a new name (a "fork") must load under the NEW id and
+/// save back to its own file — never to the id stored inside it, which would
+/// clobber the original session.
+#[test]
+fn a_copied_session_file_does_not_write_back_to_the_original() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    let mut original = SessionRecord::new(dir.path().to_path_buf(), "system");
+    store.save(&mut original).unwrap();
+
+    // Copy original.json -> fork.json (the file still holds original's id).
+    let original_path = dir
+        .path()
+        .join(".deep-code/sessions")
+        .join(format!("{}.json", original.id.as_str()));
+    let fork_id = SessionId("session_fork_copy".to_string());
+    let fork_path = dir
+        .path()
+        .join(".deep-code/sessions")
+        .join(format!("{}.json", fork_id.as_str()));
+    std::fs::copy(&original_path, &fork_path).unwrap();
+
+    // Loading the fork yields the fork's id, not the one baked into the file.
+    let loaded = store.load(&fork_id).unwrap();
+    assert_eq!(
+        loaded.id, fork_id,
+        "a copied session must adopt its filename's id"
+    );
+    assert_ne!(loaded.id, original.id);
+}
+
 #[test]
 fn json_store_round_trips_extra_roots_and_defaults_them_on_old_files() {
     let dir = tempfile::tempdir().unwrap();

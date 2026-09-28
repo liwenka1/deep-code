@@ -12,6 +12,7 @@ fn api_error(status: StatusCode) -> AgentError {
 fn retriable_statuses_include_rate_limit_and_gateway_errors() {
     for status in [
         StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::INTERNAL_SERVER_ERROR,
         StatusCode::BAD_GATEWAY,
         StatusCode::SERVICE_UNAVAILABLE,
         StatusCode::GATEWAY_TIMEOUT,

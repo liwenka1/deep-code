@@ -256,7 +256,11 @@ fn event_content_len(event: &AgentEvent) -> usize {
 
 fn api_error_retriable(error: &AgentError) -> bool {
     match error {
-        AgentError::Api { status, .. } => matches!(status.as_u16(), 429 | 502 | 503 | 504),
+        // 500 included: DeepSeek documents it as "Server Error — retry after a
+        // brief wait", and the request did not complete, so a retry is safe. It
+        // was the one 5xx missing here, so a transient 500 killed the turn
+        // outright instead of falling back Pro→Flash / retrying like 502/503/504.
+        AgentError::Api { status, .. } => matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504),
         _ => false,
     }
 }
