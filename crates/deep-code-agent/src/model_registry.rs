@@ -163,7 +163,12 @@ pub fn deepseek_default_models() -> Vec<ModelInfo> {
     vec![
         v4_entry(
             DEEPSEEK_V4_PRO,
-            &[],
+            // `pro` is the short name the README and the CI bot advertise
+            // (`provider.model = pro`, `model: pro`). Without it the value went
+            // through as a `Passthrough` id the API does not know, so EVERY
+            // request 400'd and the auto judge fell back to asking. The TUI's
+            // `/model pro` mapped it by hand; config, env and the bot did not.
+            &["pro"],
             ModelPricingMeta {
                 input_miss_usd: 0.435,
                 input_hit_usd: 0.003625,
@@ -175,7 +180,9 @@ pub fn deepseek_default_models() -> Vec<ModelInfo> {
         ),
         v4_entry(
             DEEPSEEK_V4_FLASH,
-            &["deepseek-chat", "deepseek-reasoner"],
+            // `flash` is the advertised short name (see the `pro` note above);
+            // the two legacy ids keep older configs working.
+            &["flash", "deepseek-chat", "deepseek-reasoner"],
             ModelPricingMeta {
                 input_miss_usd: 0.14,
                 input_hit_usd: 0.0028,
@@ -250,6 +257,29 @@ mod tests {
         let resolution = ModelRegistry::default().resolve(Some("Auto"));
         assert_eq!(resolution.resolved_id, AUTO_MODEL);
         assert_eq!(resolution.kind, ResolutionKind::Resolved);
+    }
+
+    /// The short names the README, config docs and the CI bot advertise
+    /// (`provider.model = pro|flash`) must resolve to real ids, not pass through
+    /// as unknown ones the API 400s on. This is the one place they were NOT
+    /// mapped — the TUI's `/model` did it by hand, config/env/bot did not.
+    #[test]
+    fn pro_and_flash_short_names_resolve() {
+        let registry = ModelRegistry::default();
+        for (name, expected) in [
+            ("pro", DEEPSEEK_V4_PRO),
+            ("PRO", DEEPSEEK_V4_PRO),
+            ("flash", DEEPSEEK_V4_FLASH),
+            ("  Flash ", DEEPSEEK_V4_FLASH),
+        ] {
+            let resolution = registry.resolve(Some(name));
+            assert_eq!(resolution.resolved_id, expected, "for {name:?}");
+            assert_eq!(
+                resolution.kind,
+                ResolutionKind::Resolved,
+                "{name:?} must not pass through as an unknown id"
+            );
+        }
     }
 
     #[test]

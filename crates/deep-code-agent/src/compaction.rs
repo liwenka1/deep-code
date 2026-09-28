@@ -136,6 +136,21 @@ pub fn compact_entries(entries: &[Arc<SessionEntry>]) -> CompactionResult {
     }
 
     let archived = &entries[head_offset..tail_start];
+    // Nothing new to archive: the only entry in range is the compaction summary
+    // already produced by the last pass. Folding it just reproduces the same
+    // entry, but with `archived_count = 1` — and the caller (`maybe_compact`)
+    // treats any nonzero count as real work, so it rewrites the session, emits
+    // `CompactionApplied` and pushes an ~8k-char compaction cell into the
+    // transcript on EVERY step. Once a single turn's own tail exceeds the
+    // threshold (routine at a lowered `context.compaction_threshold`), that
+    // fires every model round while the context never actually shrinks. Report
+    // a no-op so the caller bails. (A range that also holds fresh entries —
+    // `[C, user, …]` — is real progress and falls through.)
+    if let [only] = archived
+        && matches!(only.kind, EntryKind::Compaction { .. })
+    {
+        return unchanged();
+    }
     // Cache-aware summary fold. DeepSeek prompt caching is automatic longest-
     // prefix matching, so a byte-stable `[system, summary…]` prefix lets the
     // cache warmed right after one compaction survive the NEXT compaction
@@ -267,6 +282,34 @@ mod tests {
             wire.iter()
                 .any(|message| message.content.contains("会话摘要"))
         );
+    }
+
+    /// Re-compacting when the only archivable entry is the previous compaction
+    /// summary is a no-op, and must report `archived_count == 0` so the caller
+    /// does not rewrite the session and push a compaction cell every step. This
+    /// is the shape a single over-threshold turn produces: [system, compaction,
+    /// user, tail…], where the tail clamp pulls `tail_start` to the user entry
+    /// and leaves the lone compaction entry as the "archived" range.
+    #[test]
+    fn recompacting_only_the_prior_summary_is_a_noop() {
+        let mut entries = vec![
+            Arc::new(SessionEntry::system("sys")),
+            Arc::new(SessionEntry::compaction("prior summary".to_string(), 7)),
+            Arc::new(SessionEntry::user("the current, huge task")),
+        ];
+        for step in 0..8 {
+            entries.push(Arc::new(SessionEntry::assistant(
+                format!("step {step}"),
+                None,
+                Vec::new(),
+            )));
+        }
+        let result = compact_entries(&entries);
+        assert_eq!(
+            result.archived_count, 0,
+            "re-folding the lone prior summary must be reported as no work"
+        );
+        assert_eq!(result.entries.len(), entries.len(), "nothing was archived");
     }
 
     /// A turn that runs many tool steps before compaction fires must not lose
