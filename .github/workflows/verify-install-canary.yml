@@ -1,0 +1,125 @@
+# Verify Install (canary) — 对**已发布**的版本跑一遍 scripts/verify-install.sh。
+#
+# 它不改动任何东西：不发布、不写 registry，只从公开的 GitHub Release 下载。
+#
+# 两个用途，都是手动触发，**故意不加定时**：
+#
+#   1. 演练。release.yml 的 `verify-install` 是决定一个版本能否进 npm 的闸门；
+#      这个 workflow 让你在拿一次真实发版去赌之前，先证明那道闸门本身是好的。
+#      对当前已发布的版本（如 0.4.8）dispatch 一次，看 5 条 leg 全绿即可。
+#      不作定时任务：一个因为 runner 或网络抖动而变红的定时 job 会训练你去忽略
+#      它，那个代价比它提前几天报信的价值更高。
+#
+#   2. 诊断。用户报"装不上"时，用他的版本 dispatch 一次，变红的那条 leg 直接
+#      点名是哪个平台坏了。
+#
+# 它与真闸门共用 scripts/verify-install.sh，这是刻意的：两份"同一个"检查会漂移，
+# 而一个已经不再等于它所演练的闸门的演练，比没有更糟——它制造的是虚假的信心。
+
+name: Verify Install (canary)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Already-published version to verify, no leading v (e.g. 0.4.8)'
+        required: true
+
+# 只读。这个 job 只安装和运行，不发布任何东西。
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # 这里最可能犯的错是版本号打错，没有这道闸门它会表现为 5 条 leg 各自 checkout
+  # 失败——5 条看不懂的错误，而不是一句"没有这个版本"。
+  guard:
+    name: Check the version is published
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a published GitHub Release for that version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must be MAJOR.MINOR.PATCH without a leading v (got: $VERSION)"
+            exit 1
+          fi
+          # 检查的是 Release 而不只是 tag：install.mjs 下载的是 Release 的资产，
+          # 一个被转成 draft 的 Release 会让每次安装 404，而 tag 依然在。
+          if ! gh release view "v${VERSION}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::error::no published GitHub Release v${VERSION} in ${{ github.repository }} — install.mjs downloads its assets, so there is nothing to verify"
+            exit 1
+          fi
+
+  verify:
+    name: Verify install · ${{ matrix.name }}
+    needs: guard
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Same pins and same reasoning as release.yml's `verify-install` matrix —
+      # including the absence of a `darwin-x64` leg, which on an arm64 runner
+      # would verify the arm64 asset while its name claimed otherwise. The
+      # rehearsal has to cover the same platform set as the gate it rehearses,
+      # or it is proving something about a different pipeline.
+      matrix:
+        include:
+          - name: darwin-arm64
+            os: macos-latest
+            expect: darwin-arm64
+          - name: linux-x64
+            os: ubuntu-22.04
+            expect: linux-x64
+          - name: linux-arm64
+            os: ubuntu-22.04-arm
+            expect: linux-arm64
+          - name: win32-x64
+            os: windows-latest
+            expect: win32-x64
+    steps:
+      # Two checkouts, and both the split and their ORDER matter.
+      #
+      # This first one is the CHECKER: it must come from the ref this workflow was
+      # dispatched from, not from the released tag — a tag older than this change
+      # (v0.4.8, for instance) contains no scripts/verify-install.sh, so running
+      # the script out of the released tree would fail with "No such file" on all
+      # five legs. That is a red run that says nothing about the release, which is
+      # exactly the kind of false signal this whole design exists to avoid.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # This one is the SUBJECT: the tagged tree, because install.mjs reads its
+      # own package.json version to build the download URL and verify-install.sh
+      # packs that same tree. Rehearsing against the current main would be
+      # rehearsing something else.
+      #
+      # Order: `actions/checkout` runs `git clean` on its target directory, so a
+      # checkout into the workspace root AFTER this one would delete `released/`.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: v${{ inputs.version }}
+          path: released
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
+      # Same assertion as release.yml's gate, for the same reason: `install.mjs`
+      # chooses its asset from the HOST, so a leg whose runner contradicts its
+      # name verifies a different platform's artifact and passes. A rehearsal
+      # that can be fooled that way is worse than none.
+      - name: Assert the runner is the platform this leg claims
+        run: |
+          ACTUAL="$(node -p 'process.platform + "-" + process.arch')"
+          echo "runner platform = ${ACTUAL}   (leg claims ${{ matrix.expect }})"
+          if [ "$ACTUAL" != "${{ matrix.expect }}" ]; then
+            echo "::error::leg '${{ matrix.name }}' runs on '${ACTUAL}' but claims '${{ matrix.expect }}'. install.mjs selects the asset from the host, so this leg would verify the WRONG artifact and pass anyway."
+            exit 1
+          fi
+
+      - name: Install from the local tarball and run it
+        run: bash scripts/verify-install.sh "${{ inputs.version }}" released/packages/deepcode

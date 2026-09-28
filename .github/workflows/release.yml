@@ -130,6 +130,61 @@ jobs:
             chmod +x "deep-code-${TARGET}"
           fi
 
+      # ── Execute the artifact before it can be published ──────────────────
+      #
+      # Everything above this line exercises the DEV profile library. The release
+      # profile binary (opt-level=z, lto, codegen-units=1, strip, panic=abort) is
+      # a different artifact, and until this step existed nothing in the pipeline
+      # ever ran it: it went from `cp` to `upload-artifact` to the GitHub Release
+      # to `npm publish` untouched.
+      #
+      # It is also the regression test for the incident recorded in the matrix
+      # comment above. The linux-x64 leg builds AND runs on ubuntu-22.04, so a
+      # binary that quietly raised its glibc floor — which once made every run
+      # die with `GLIBC_2.3x not found` on most of the installed base, after
+      # `npm i -g` had already reported success — cannot pass here.
+      - name: Smoke the artifact
+        shell: bash
+        run: |
+          EXPECTED="${GITHUB_REF_NAME#v}"
+          BIN="deep-code-${{ matrix.target }}"
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            BIN="${BIN}.exe"
+          fi
+
+          # darwin-x64 is cross-compiled on an arm64 runner, and executing an
+          # x86_64 binary there would need Rosetta, which the runner does not
+          # have. Skip LOUDLY: this gate's entire value is that a silent skip is
+          # indistinguishable from a pass — the same argument the
+          # DEEPCODE_REQUIRE_* comments on the Test step above make.
+          #
+          # Stated cost, in full: this is the ONE artifact CI never executes.
+          # `verify-install` does not cover it either, and cannot — there is no
+          # x86_64 macOS runner here to install it on, and a macOS leg cannot
+          # stand in for one (it would fetch the arm64 asset instead). Say so
+          # here rather than let a green board imply otherwise.
+          if [[ "${{ matrix.target }}" == "x86_64-apple-darwin" ]]; then
+            echo "::warning::$BIN is NOT executed anywhere in CI: it is cross-compiled on an arm64 runner with no Rosetta, and no x86_64 macOS runner exists to install it on. This is the one artifact that ships unexecuted."
+            exit 0
+          fi
+
+          # GitHub's bash shell runs with `-e -o pipefail`, so a binary that dies
+          # on startup already fails the step; the `||` branch only says so with
+          # a better message.
+          OUT="$(./"$BIN" --version | tr -d '\r')" || {
+            echo "::error::$BIN failed to execute — see the exit status above"
+            exit 1
+          }
+          echo "$BIN --version  ->  $OUT"
+
+          # cli.rs prints "<program name> <CARGO_PKG_VERSION>" and exits 0. Here
+          # the program name is the artifact's own filename, which is not what we
+          # care about, so assert on the tail only.
+          if [[ "$OUT" != *" $EXPECTED" ]]; then
+            echo "::error::$BIN --version printed \"$OUT\", which does not end in \" $EXPECTED\""
+            exit 1
+          fi
+
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -137,10 +192,10 @@ jobs:
           path: deep-code-${{ matrix.target }}*
 
   # ═══════════════════════════════════════════════
-  # 阶段 2：GitHub Release + npm publish
+  # 阶段 2：GitHub Release（资产 + SHA256SUMS）
   # ═══════════════════════════════════════════════
-  publish:
-    name: Release & Publish
+  release:
+    name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
     # Gate the JOB, not the step. `workflow_dispatch` is an allowed trigger, and
@@ -150,9 +205,11 @@ jobs:
     # an unverified tree was softprops/action-gh-release throwing on a missing
     # tag: a third-party action's internal check, not a gate of ours.
     if: startsWith(github.ref, 'refs/tags/v')
+    # `contents: write` is for the GitHub Release only. npm publishing now lives
+    # in the `publish` job, which holds the OIDC grant — this job never touches
+    # npm, so it no longer needs (or gets) `id-token: write`.
     permissions:
       contents: write
-      id-token: write # OIDC trusted publishing to npm (no token, no OTP)
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -200,12 +257,126 @@ jobs:
           echo "=== SHA256SUMS ==="
           cat SHA256SUMS
 
+      # The file every install is verified against, checked before it becomes the
+      # verification root. install.mjs refuses to install an asset whose hash is
+      # missing from SHA256SUMS, so a truncated or malformed file here breaks
+      # every platform at once — and, since it is what the installer *trusts*,
+      # a wrong entry is worse than a missing one.
+      - name: Verify SHA256SUMS
+        working-directory: release-assets
+        run: |
+          sha256sum -c SHA256SUMS
+          ASSETS=$(find . -maxdepth 1 -type f ! -name SHA256SUMS | wc -l)
+          ENTRIES=$(grep -c . SHA256SUMS)
+          echo "assets=$ASSETS  sums_entries=$ENTRIES"
+          if [ "$ASSETS" -ne "$ENTRIES" ]; then
+            echo "::error::SHA256SUMS has $ENTRIES entries for $ASSETS assets — an install on the uncovered platform would be refused by install.mjs"
+            exit 1
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: release-assets/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  # ═══════════════════════════════════════════════
+  # 阶段 3：安装验证 —— 在 npm publish 之前
+  # ═══════════════════════════════════════════════
+  #
+  # This runs BEFORE `npm publish`, not after, and that ordering is the whole
+  # design. `scripts/verify-install.sh` installs the LOCAL tarball, so it does
+  # not need the version to be on npm — while `install.mjs` inside it still
+  # fetches the platform binary and its SHA256SUMS from the GitHub Release the
+  # `release` job just created. Pre-publish verification is therefore equivalent
+  # to post-publish verification, with one decisive difference: a version that
+  # cannot be installed never reaches npm `latest`, so nobody has to promote or
+  # roll back a dist-tag.
+  #
+  # That matters because an automatic post-publish promotion is not available to
+  # us: npm's OIDC trusted publishing only covers `npm publish`, so a workflow
+  # cannot run `npm dist-tag add` without a long-lived token (npm/cli#8547, still
+  # open). This ordering sidesteps the question instead of answering it.
+  verify-install:
+    name: Verify install · ${{ matrix.name }}
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Same OS pins as `build` where the platform is real, on purpose: the linux
+      # legs re-confirm the glibc floor on the oldest supported runner by
+      # actually installing and running the published asset there.
+      #
+      # There is deliberately NO `darwin-x64` leg. `install.mjs` picks its asset
+      # from the HOST (`process.platform`-`process.arch`), so a `darwin-x64` leg
+      # on `macos-latest` (arm64) would download and run the arm64 asset and go
+      # green — a leg that proves nothing about the platform in its name, while
+      # reading as coverage. `darwin-x64` was exactly that until this comment
+      # existed. The honest position: the x86_64-apple-darwin asset is the one
+      # artifact CI never executes (see the `expect` assertion below, and
+      # RELEASING.md's residual list).
+      matrix:
+        include:
+          - name: darwin-arm64
+            os: macos-latest
+            expect: darwin-arm64
+          - name: linux-x64
+            os: ubuntu-22.04
+            expect: linux-x64
+          - name: linux-arm64
+            os: ubuntu-22.04-arm
+            expect: linux-arm64
+          - name: win32-x64
+            os: windows-latest
+            expect: win32-x64
+    steps:
+      # The tag, so the tree whose package.json version and install.mjs the
+      # tarball is built from is exactly the tree that was released.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
+      # Assert this leg IS the platform it claims. See the matrix comment: the
+      # asset is chosen from the host, so nothing else in this job ties the leg's
+      # name to what it actually verified. Without this, adding a leg for a
+      # platform no runner here provides would silently duplicate another leg's
+      # work and report success.
+      #
+      # After setup-node, not before: `process.arch` must be read from the Node
+      # this job pinned, not from whatever the runner image happens to ship.
+      - name: Assert the runner is the platform this leg claims
+        shell: bash
+        run: |
+          ACTUAL="$(node -p 'process.platform + "-" + process.arch')"
+          echo "runner platform = ${ACTUAL}   (leg claims ${{ matrix.expect }})"
+          if [ "$ACTUAL" != "${{ matrix.expect }}" ]; then
+            echo "::error::leg '${{ matrix.name }}' runs on '${ACTUAL}' but claims '${{ matrix.expect }}'. install.mjs selects the asset from the host, so this leg would verify the WRONG artifact and pass anyway."
+            exit 1
+          fi
+
+      # `shell: bash` is required, not cosmetic: the default shell on a Windows
+      # runner is pwsh, where `${GITHUB_REF_NAME#v}` is a parse error.
+      - name: Install from the local tarball and run it
+        shell: bash
+        run: bash scripts/verify-install.sh "${GITHUB_REF_NAME#v}"
+
+  # ═══════════════════════════════════════════════
+  # 阶段 4：npm publish
+  # ═══════════════════════════════════════════════
+  publish:
+    name: Publish to npm
+    needs: verify-install
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC trusted publishing to npm (no token, no OTP)
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Node 24 ships with npm >= 11.5.1, meeting the OIDC trusted publishing
       # requirement without a separate upgrade step that can break module paths.
@@ -218,4 +389,35 @@ jobs:
         working-directory: packages/deepcode
         # No NODE_AUTH_TOKEN: auth comes from GitHub OIDC via the package's
         # configured trusted publisher, so it bypasses 2FA/OTP entirely.
-        run: npm publish --access public
+        #
+        # Idempotent on purpose. A run that failed somewhere above is fixed by
+        # "Re-run failed jobs", and by then the version may already be on the
+        # registry — `npm publish` would fail with E403 and paint a successful
+        # release red for no reason.
+        run: |
+          EXPECTED="${GITHUB_REF_NAME#v}"
+          OUT="$(npm view "@liwenkai/deepcode@${EXPECTED}" version 2>&1)" && {
+            echo "@liwenkai/deepcode@${EXPECTED} is already on the registry — nothing to publish."
+            exit 0
+          }
+          # "The registry says this version does not exist" and "I could not ask
+          # the registry" are different answers, and only the first one licenses
+          # a publish. Treating a network blip or a 5xx as "not published" would
+          # fall through to `npm publish`, which then fails with E403 — painting
+          # a release that actually succeeded red, with the real cause buried in
+          # stderr that this guard had discarded. So only a not-found answer
+          # proceeds; anything else stops and shows what the registry said.
+          if ! printf '%s' "$OUT" | grep -qE 'E404|ETARGET'; then
+            echo "::error::could not determine whether @liwenkai/deepcode@${EXPECTED} is published — refusing to guess:"
+            printf '%s\n' "$OUT"
+            exit 1
+          fi
+          npm publish --access public
+
+      - name: Record dist-tags
+        # Printed, never asserted. Past this point the release is live and a red
+        # job cannot undo it, so a stale-by-a-second registry read must not
+        # manufacture a failure on a publish that actually succeeded. Without
+        # `--tag`, `npm publish` always moves `latest`, so there is nothing to
+        # gate on in the first place.
+        run: npm view @liwenkai/deepcode dist-tags --json || true
