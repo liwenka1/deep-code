@@ -11,7 +11,10 @@ fn frame(body: &str) -> Vec<u8> {
 #[test]
 fn rust_initialization_options_disable_code_execution() {
     let options = initialization_options(Language::Rust);
-    assert_eq!(options["cargo"]["buildScripts"]["enable"], serde_json::json!(false));
+    assert_eq!(
+        options["cargo"]["buildScripts"]["enable"],
+        serde_json::json!(false)
+    );
     assert_eq!(options["procMacro"]["enable"], serde_json::json!(false));
     assert_eq!(options["checkOnSave"], serde_json::json!(false));
     assert_eq!(options["check"]["enable"], serde_json::json!(false));

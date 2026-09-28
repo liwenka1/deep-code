@@ -296,7 +296,10 @@ mod tests {
             )));
         }
         let result = compact_entries(&entries);
-        assert!(result.archived_count > 0, "history before the task is archived");
+        assert!(
+            result.archived_count > 0,
+            "history before the task is archived"
+        );
         assert!(
             result.entries.iter().any(|entry| matches!(
                 &entry.kind,

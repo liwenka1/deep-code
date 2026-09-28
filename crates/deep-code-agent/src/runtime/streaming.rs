@@ -188,9 +188,10 @@ impl AgentRuntime {
         // re-send `max` to Flash.
         let mut request = request;
         request.model = route.effective_model.clone();
-        request.reasoning_effort = clamp_effort_to_model(&route.effective_model, route.effective_effort)
-            .as_api_value()
-            .map(str::to_string);
+        request.reasoning_effort =
+            clamp_effort_to_model(&route.effective_model, route.effective_effort)
+                .as_api_value()
+                .map(str::to_string);
 
         Ok(GuardedStream {
             client: Arc::clone(&self.client),

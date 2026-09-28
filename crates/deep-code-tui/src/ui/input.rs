@@ -521,7 +521,10 @@ mod tests {
         // The unmodified (and Shift-only) keys still decide.
         let mut app = App::new();
         park(&mut app);
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
         assert!(app.pending_approval.is_none(), "plain `a` still approves");
     }
 
@@ -549,7 +552,10 @@ mod tests {
         // Drawn, but just now — inside the arm delay.
         app.approval_armed = true;
         app.approval_shown_at = Some(std::time::Instant::now());
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
         assert!(
             app.pending_approval.is_some(),
             "a key within the arm delay must not resolve the panel"

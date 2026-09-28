@@ -496,7 +496,13 @@ fn copy_tree_refuses_to_write_through_anything_that_is_not_a_plain_entry() {
     // A directory symlink pointing out of the workspace.
     let linked = tempfile::tempdir().unwrap();
     crate::test_symlinks::symlink_dir_for_test(outside.path(), &linked.path().join("d"));
-    let refused = copy_tree(source.path(), linked.path(), CopyMode::Restore, None, &CancellationToken::new());
+    let refused = copy_tree(
+        source.path(),
+        linked.path(),
+        CopyMode::Restore,
+        None,
+        &CancellationToken::new(),
+    );
     let message = refused.expect_err("wrote through a symlink").to_string();
     assert!(message.contains(REFUSAL), "wrong cause: {message}");
     assert!(!outside.path().join("f.txt").exists());
@@ -511,7 +517,13 @@ fn copy_tree_refuses_to_write_through_anything_that_is_not_a_plain_entry() {
     let listener =
         std::os::unix::net::UnixListener::bind(sock_dest.path().join("d/f.txt")).unwrap();
     drop(listener);
-    let refused = copy_tree(source.path(), sock_dest.path(), CopyMode::Restore, None, &CancellationToken::new());
+    let refused = copy_tree(
+        source.path(),
+        sock_dest.path(),
+        CopyMode::Restore,
+        None,
+        &CancellationToken::new(),
+    );
     let message = refused.expect_err("wrote through a socket").to_string();
     assert!(message.contains(REFUSAL), "wrong cause: {message}");
 }
@@ -690,7 +702,11 @@ fn snapshot_copy_bails_on_budget_and_on_cancel() {
         &cancelled,
     )
     .unwrap();
-    assert_eq!(status, CopyStatus::Done, "restore ignores budget and cancel");
+    assert_eq!(
+        status,
+        CopyStatus::Done,
+        "restore ignores budget and cancel"
+    );
 }
 
 /// A newly-skipped directory (`.venv`) is neither snapshotted nor cleared, so

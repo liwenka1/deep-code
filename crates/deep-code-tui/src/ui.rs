@@ -243,11 +243,7 @@ fn redirect_stderr_to_log() {
 #[cfg(not(any(unix, windows)))]
 fn redirect_stderr_to_log() {}
 
-fn run_loop(
-    terminal: &mut AppTerminal,
-    app: &mut App,
-    shutdown: &AtomicBool,
-) -> Result<()> {
+fn run_loop(terminal: &mut AppTerminal, app: &mut App, shutdown: &AtomicBool) -> Result<()> {
     let mut needs_redraw = true;
     let mut last_draw: Option<Instant> = None;
     let mut was_streaming = app.is_streaming;

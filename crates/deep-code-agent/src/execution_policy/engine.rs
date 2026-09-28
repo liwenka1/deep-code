@@ -651,9 +651,11 @@ pub fn evaluate_shell_command(
 /// `command` argument for the `shell` tool, or a `job` with `action=start`.
 /// `None` for every other tool (and for job status/tail/cancel). The one home
 /// for the "where does the command live" rule: the gate itself
-/// ([`ExecPolicy::evaluate_tool`]), accept-edits, the safety notes, and session
-/// trust all read the command through here (see
-/// [`crate::tool::ToolCall::shell_command`], which delegates here).
+/// (`ExecPolicy::evaluate_tool`), accept-edits, the safety notes, and session
+/// trust all read the command through here (see `ToolCall::shell_command`,
+/// which delegates here). Plain code spans, not links: this function is
+/// re-exported for the TUI's approval panel, and both of those are
+/// crate-private, so a link would dangle in the public docs.
 #[must_use]
 pub fn shell_command_of<'a>(tool_name: &str, arguments: &'a Value) -> Option<&'a str> {
     let command_bearing = match ExecPolicy::classify_tool(tool_name) {

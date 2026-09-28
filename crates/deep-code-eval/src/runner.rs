@@ -712,7 +712,10 @@ mod tests {
             .unwrap();
 
         let dest = out.path().join("repo__repo-1");
-        assert!(dest.join("real.json").is_file(), "real sessions still travel");
+        assert!(
+            dest.join("real.json").is_file(),
+            "real sessions still travel"
+        );
         assert!(
             !dest.join("stolen.json").exists(),
             "a symlinked session file must not be followed and copied out"

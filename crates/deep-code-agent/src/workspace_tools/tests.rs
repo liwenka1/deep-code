@@ -167,8 +167,7 @@ async fn grep_stops_when_the_turn_is_cancelled() {
     fs::write(tmp.path().join("a.rs"), "needle\n").unwrap();
     fs::write(tmp.path().join("b.rs"), "needle\n").unwrap();
 
-    let tool =
-        GrepFilesTool::new(WorkspacePolicy::new(WorkspaceRoots::from(tmp.path())).unwrap());
+    let tool = GrepFilesTool::new(WorkspacePolicy::new(WorkspaceRoots::from(tmp.path())).unwrap());
     let cancel = CancellationToken::new();
     cancel.cancel();
     let params: GrepFilesParams = serde_json::from_value(json!({"pattern": "needle"})).unwrap();

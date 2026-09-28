@@ -384,7 +384,10 @@ pub(crate) async fn terminate_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        match (signal(SignalKind::terminate()), signal(SignalKind::hangup())) {
+        match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) {
             (Ok(mut term), Ok(mut hup)) => {
                 tokio::select! {
                     _ = term.recv() => {}

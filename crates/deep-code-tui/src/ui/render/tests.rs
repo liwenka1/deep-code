@@ -205,7 +205,8 @@ fn approval_lines_show_a_multiline_command_faithfully() {
         .collect();
     // The reset lives on its own row, not merged into the status line.
     assert!(
-        rows.iter().any(|r| r.contains("git status") && !r.contains("reset")),
+        rows.iter()
+            .any(|r| r.contains("git status") && !r.contains("reset")),
         "the first command must be on its own row: {rows:?}"
     );
     assert!(

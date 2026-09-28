@@ -167,7 +167,12 @@ impl CheckpointStore {
     /// per-turn checkpoints for the session rather than paying the copy every
     /// turn. Both come back as [`SnapshotOutcome::Skipped`] — the turn continues
     /// either way — while a real I/O failure is still an `Err`.
-    pub fn snapshot(
+    ///
+    /// Crate-private: its only caller is the runtime's before-turn hook, and it
+    /// returns [`SnapshotOutcome`], which is not re-exported — as a `pub` method
+    /// on the re-exported [`CheckpointStore`] it offered outside callers a
+    /// result they could not name, let alone match on.
+    pub(crate) fn snapshot(
         &self,
         label: &str,
         cancel: &CancellationToken,
@@ -934,10 +939,7 @@ impl CheckpointStore {
         label: &str,
     ) -> Result<(CheckpointId, Vec<String>), ToolError> {
         match self.snapshot(label, &CancellationToken::new())? {
-            SnapshotOutcome::Created {
-                id,
-                prune_warnings,
-            } => Ok((id, prune_warnings)),
+            SnapshotOutcome::Created { id, prune_warnings } => Ok((id, prune_warnings)),
             SnapshotOutcome::Skipped(skip) => {
                 panic!("test snapshot unexpectedly skipped: {skip:?}")
             }

@@ -2202,8 +2202,13 @@ async fn config_auto_allow_does_not_apply_inside_a_subagent() {
         ..AgentConfig::builtin()
     };
     // Last arg: is_subagent = true.
-    let runtime =
-        AgentRuntime::with_system_prompt(client, ToolRegistry::with_mock_tools(), "system", config, true);
+    let runtime = AgentRuntime::with_system_prompt(
+        client,
+        ToolRegistry::with_mock_tools(),
+        "system",
+        config,
+        true,
+    );
 
     let mut rx = runtime.submit_user("echo").await;
     let events = drain(&mut rx).await;

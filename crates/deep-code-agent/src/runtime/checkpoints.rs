@@ -63,10 +63,7 @@ impl AgentRuntime {
         let outcome =
             tokio::task::spawn_blocking(move || store.snapshot(&owned_label, &cancel)).await;
         let failure = match outcome {
-            Ok(Ok(SnapshotOutcome::Created {
-                id,
-                prune_warnings,
-            })) => {
+            Ok(Ok(SnapshotOutcome::Created { id, prune_warnings })) => {
                 for message in prune_warnings {
                     emit(tx, RuntimeEvent::Warning { message });
                 }

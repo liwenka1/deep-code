@@ -187,7 +187,10 @@ fn write_denial_signature_matches_backend_denial_texts() {
         Some(126),
         "sh: ./run.sh: Permission denied"
     ));
-    assert!(!write_denial_signature(Some(127), "sh: foo: command not found"));
+    assert!(!write_denial_signature(
+        Some(127),
+        "sh: foo: command not found"
+    ));
     // ssh auth failure carries the substring but is a credential problem.
     assert!(!write_denial_signature(
         Some(255),
