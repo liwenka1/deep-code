@@ -535,6 +535,84 @@ fn confined_command_writes_dev_stderr_and_resolves_the_user() {
     );
 }
 
+/// Smoke net for the Seatbelt profile: a batch of everyday, no-network
+/// toolchain commands must all succeed under the real profile. Every sandbox
+/// regression this round (git identity lookup, `/dev/stderr`, spill reads) was
+/// an ordinary command the profile silently broke — the kind a handful of live
+/// commands in CI catches before a release, which per-rule unit tests do not.
+/// Network commands (git push, npm install) need egress/credentials and are not
+/// hermetic, so they stay out of this list; the network-grant rules are pinned
+/// structurally by `network_grant_opens_the_expected_profile_rules`.
+#[cfg(target_os = "macos")]
+#[test]
+fn everyday_commands_run_under_the_sandbox() {
+    if crate::sandbox::require_backend_or_skip(is_available(), "Seatbelt") {
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(ws.path().join("a.txt"), "hello\nworld\n").unwrap();
+
+    // Each must exit 0 under the workspace-write, no-network profile.
+    let commands = [
+        "git init -q . && git -c user.email=t@t -c user.name=t add -A && git status --porcelain",
+        "mkdir -p sub/dir && touch sub/dir/f && rm -r sub",
+        "cat a.txt",
+        "grep world a.txt",
+        "printf 'x' > out.txt && cat out.txt",
+        "echo to-stderr > /dev/stderr",
+        "id -un",
+    ];
+    for command in commands {
+        let output = wrap_shell_command(
+            command,
+            ws.path(),
+            &single_root(ws.path()),
+            &SandboxPolicy::workspace_write(),
+        )
+        .output()
+        .expect("sandbox-exec should launch");
+        assert!(
+            output.status.success(),
+            "everyday command failed under the sandbox: `{command}`\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// The network grant opens exactly the rules `git push` over HTTPS/SSH needs —
+/// pinned on the rendered profile so a future edit that drops one is caught
+/// without a live push. libinfo is unconditional; SecurityServer and egress ride
+/// the network grant only.
+#[cfg(target_os = "macos")]
+#[test]
+fn network_grant_opens_the_expected_profile_rules() {
+    let ws = std::path::Path::new("/tmp/ws");
+    let offline =
+        compose_profile(&SandboxPolicy::workspace_write(), &[ws.to_path_buf()], ws).render();
+    let online = compose_profile(
+        &SandboxPolicy::WorkspaceWrite {
+            network_access: true,
+        },
+        &[ws.to_path_buf()],
+        ws,
+    )
+    .render();
+
+    // Identity lookup and stdio redirection are always available.
+    for rule in ["opendirectoryd.libinfo", "/dev/stderr"] {
+        assert!(offline.contains(rule), "offline profile must grant {rule}");
+        assert!(online.contains(rule), "online profile must grant {rule}");
+    }
+    // Egress and the keychain service ride the network grant only.
+    for rule in ["network-outbound", "com.apple.SecurityServer"] {
+        assert!(online.contains(rule), "networked profile must grant {rule}");
+        assert!(
+            !offline.contains(rule),
+            "offline profile must NOT grant {rule}"
+        );
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn confined_command_reads_the_workspace_spill_dir() {

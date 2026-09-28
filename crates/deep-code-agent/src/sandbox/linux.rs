@@ -848,6 +848,36 @@ mod tests {
         assert!(dir.path().join("inside.txt").exists());
     }
 
+    /// Smoke net for the Landlock+seccomp profile: everyday no-network toolchain
+    /// commands must all succeed under it. This is the Linux twin of the Seatbelt
+    /// smoke test; it also covers `/dev/shm` (POSIX shared memory), which
+    /// multiprocessing/DataLoader workloads need and which Landlock refused
+    /// before it was added to the writable roots.
+    #[test]
+    fn everyday_commands_run_under_the_sandbox() {
+        if crate::sandbox::require_backend_or_skip(capabilities().available, "Landlock") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
+        let commands = [
+            "mkdir -p sub/dir && touch sub/dir/f && rm -r sub",
+            "cat a.txt",
+            "grep world a.txt",
+            "printf 'x' > out.txt && cat out.txt",
+            // POSIX shared memory: create and remove a file under /dev/shm.
+            "touch /dev/shm/deepcode-smoke-$$ && rm -f /dev/shm/deepcode-smoke-$$",
+        ];
+        for command in commands {
+            let out = run(dir.path(), command);
+            assert!(
+                out.status.success(),
+                "everyday command failed under the sandbox: `{command}`\nstderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
     #[test]
     fn write_outside_workspace_is_blocked() {
         if crate::sandbox::require_backend_or_skip(capabilities().available, "Landlock") {
