@@ -745,3 +745,79 @@ fn restore_leaves_newly_skipped_directories_untouched() {
         "restore must neither revert nor delete a skipped tree"
     );
 }
+
+/// A storage root swapped for a symlink AFTER construction must not let the
+/// unsandboxed snapshot/prune write or delete through it. The startup check is a
+/// snapshot in time; the storage root sits inside a tree a sandboxed command can
+/// write, so every operation re-validates.
+#[cfg(unix)]
+#[test]
+fn snapshot_refuses_a_symlinked_storage_root_planted_after_construction() {
+    let base = tempfile::tempdir().unwrap();
+    let ws = base.path().join("ws");
+    let victim = base.path().join("victim");
+    fs::create_dir_all(ws.join("src")).unwrap();
+    fs::write(ws.join("src/main.rs"), "fn main() {}").unwrap();
+    for i in 0..25 {
+        let repo = victim.join(format!("repo{i:02}"));
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("README"), "precious").unwrap();
+    }
+    let store = CheckpointStore::new(&ws).unwrap();
+    // What a repo's build.rs (run by a default-trusted `cargo check`) can do
+    // inside the sandbox: an ordinary permitted write inside the workspace.
+    let storage = ws.join(".deep-code").join("checkpoints");
+    fs::remove_dir_all(&storage).unwrap();
+    std::os::unix::fs::symlink(&victim, &storage).unwrap();
+
+    let before: Vec<_> = fs::read_dir(&victim).unwrap().flatten().collect();
+    assert!(
+        store
+            .snapshot("before_turn", &CancellationToken::new())
+            .is_err(),
+        "snapshot must refuse a symlinked storage root"
+    );
+    assert!(store.list().is_err(), "list must refuse it too");
+    assert!(
+        store
+            .restore(&CheckpointId("before_turn_1".to_string()))
+            .is_err(),
+        "restore must refuse it too"
+    );
+
+    // Nothing under the victim was deleted, and no snapshot was written through
+    // the link.
+    let after: Vec<_> = fs::read_dir(&victim).unwrap().flatten().collect();
+    assert_eq!(before.len(), after.len(), "no victim entry may be deleted");
+    for i in 0..25 {
+        assert!(
+            victim.join(format!("repo{i:02}")).join("README").exists(),
+            "repo{i:02} was deleted through the symlink"
+        );
+    }
+}
+
+/// A directory whose name is not a `{label}_{millis}` snapshot (an ordinary
+/// repo name) is neither listed nor eligible for prune-deletion, so a lost
+/// TOCTOU race cannot turn retention into deletion of the user's folders.
+#[test]
+fn list_ignores_directories_that_are_not_snapshots() {
+    let base = tempfile::tempdir().unwrap();
+    let ws = base.path();
+    fs::write(ws.join("f.txt"), "x").unwrap();
+    let store = CheckpointStore::new(ws).unwrap();
+    let (real, _) = store.snapshot_created("before_turn").unwrap();
+    // Junk directories that pass the character check but are not snapshots.
+    let storage = ws.join(".deep-code").join("checkpoints");
+    for name in ["repo00", "my-project", "node_modules"] {
+        fs::create_dir_all(storage.join(name)).unwrap();
+    }
+    let listed = store.list().unwrap();
+    assert!(listed.contains(&real), "the real snapshot must be listed");
+    for name in ["repo00", "my-project", "node_modules"] {
+        assert!(
+            !listed.iter().any(|id| id.0 == name),
+            "{name} must not count as a checkpoint"
+        );
+    }
+}

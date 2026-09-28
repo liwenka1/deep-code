@@ -146,6 +146,24 @@ impl CheckpointStore {
         })
     }
 
+    /// Re-assert that both levels of `.deep-code/checkpoints` are real
+    /// directories, not symlinks planted since construction. Every operation
+    /// that reads, writes or deletes under the storage root calls this first:
+    /// the check at `new` is a snapshot in time, and the storage root sits
+    /// inside a tree the model can write while this process runs unsandboxed.
+    fn ensure_owned_storage(&self) -> Result<(), ToolError> {
+        crate::paths::ensure_owned_dirs(&self.storage_root, OWNED_STORAGE_DIRS).map_err(|error| {
+            ToolError::exec_failed(
+                "checkpoint",
+                format!(
+                    "checkpoint storage {} is not a real directory (a symlink was planted \
+                     where deep-code owns a directory); refusing to touch it: {error}",
+                    self.storage_root.display()
+                ),
+            )
+        })
+    }
+
     /// Override the retention cap (0 disables pruning).
     #[must_use]
     pub fn with_max_snapshots(mut self, max_snapshots: usize) -> Self {
@@ -177,6 +195,16 @@ impl CheckpointStore {
         label: &str,
         cancel: &CancellationToken,
     ) -> Result<SnapshotOutcome, ToolError> {
+        // The storage root was validated once, at construction. Between then and
+        // now a sandboxed command (a repo's build.rs run by a default-trusted
+        // `cargo check`, say) can swap `.deep-code/checkpoints` for a symlink —
+        // an ordinary permitted write inside the workspace — and this copy runs
+        // in the UNSANDBOXED parent. Re-validate every time, or the snapshot
+        // writes the whole workspace THROUGH the link, outside every granted
+        // root, and the prune below then `remove_dir_all`s the "old checkpoints"
+        // it finds there — the user's own directories. Same check the spill
+        // prune already re-runs; the checkpoint sibling was missed.
+        self.ensure_owned_storage()?;
         // Already found too large earlier this session: skip the walk entirely.
         if self.oversized.load(Ordering::Relaxed) {
             return Ok(SnapshotOutcome::Skipped(SnapshotSkip::TooLarge {
@@ -278,6 +306,10 @@ impl CheckpointStore {
     /// would be surprised to find unrestored.
     pub fn restore(&self, id: &CheckpointId) -> Result<Vec<String>, ToolError> {
         validate_checkpoint_id(id)?;
+        // Restore CLEARS the workspace before copying, so a storage root swapped
+        // for a symlink would clear the tree and then copy the link target into
+        // it. Re-validate before touching anything (see `ensure_owned_storage`).
+        self.ensure_owned_storage()?;
         let source = self.storage_root.join(&id.0);
         // `symlink_metadata`, not `is_dir()`: the latter follows links, and
         // the storage root sits INSIDE the workspace where the model can write.
@@ -342,6 +374,11 @@ impl CheckpointStore {
     }
 
     pub fn list(&self) -> Result<Vec<CheckpointId>, ToolError> {
+        // Both the `/checkpoints` list and `prune_old_snapshots` (which
+        // `remove_dir_all`s what this returns) flow through here, so a symlinked
+        // storage root must be refused before `read_dir` follows it. Same reason
+        // as `snapshot`/`restore`.
+        self.ensure_owned_storage()?;
         let mut ids = Vec::new();
         let entries = fs::read_dir(&self.storage_root).map_err(|error| {
             ToolError::exec_failed("checkpoint", format!("failed to list checkpoints: {error}"))
@@ -355,11 +392,17 @@ impl CheckpointStore {
             })?;
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let candidate = CheckpointId(entry.file_name().to_string_lossy().into_owned());
-                // Only report directories that are actually restorable. This
-                // filters in-progress `.staging_*` copies (see `snapshot`) and
-                // any hand-dropped junk, so nothing unrestorable reaches the
-                // `/checkpoints` list or the retention accounting.
-                if validate_checkpoint_id(&candidate).is_ok() {
+                // Only report directories `snapshot()` itself produced — a
+                // `{label}_{millis}` name whose trailing component is all digits.
+                // `validate_checkpoint_id` alone is far too wide: it admits any
+                // `[A-Za-z0-9_-]+`, so an ordinary directory name (`repo00`,
+                // `my-project`) counted as a checkpoint. That is the blast radius
+                // of the symlink escape above — should the re-check ever lose a
+                // TOCTOU race to a background job, prune would `remove_dir_all`
+                // the user's own directories it found through the link. Requiring
+                // the timestamp shape bounds deletion to names deep-code minted.
+                // (`.staging_*` copies are excluded by the leading dot too.)
+                if is_snapshot_name(&candidate.0) {
                     ids.push(candidate);
                 }
             }
@@ -367,6 +410,16 @@ impl CheckpointStore {
         ids.sort();
         Ok(ids)
     }
+}
+
+/// Whether `name` is a directory name `snapshot()` produced: a
+/// `{label}_{millis}` whose final `_`-separated component is a non-empty run of
+/// ASCII digits, and which is otherwise a valid single-component id.
+fn is_snapshot_name(name: &str) -> bool {
+    validate_checkpoint_id(&CheckpointId(name.to_string())).is_ok()
+        && name
+            .rsplit_once('_')
+            .is_some_and(|(_, tail)| !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Trailing `_{ms}` component of a snapshot directory name; unparseable names
