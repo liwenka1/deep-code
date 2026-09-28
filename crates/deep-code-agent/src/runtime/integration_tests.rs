@@ -2097,15 +2097,16 @@ async fn session_approval_remembers_network_command_identity() {
 /// The converse of the test above: a consent given on an *offline* command
 /// must not cover its `network: true` variant. The consent key carries the
 /// declaration, so the networked call parks again — before, a remembered
-/// `npm test` handed egress to `npm test --coverage` with no prompt in every
-/// mode, the Auto egress floor sitting below standing consent. The same
-/// identity without the declaration stays covered.
+/// `cargo clippy --version` handed egress to `cargo clippy --help` with
+/// `network: true` and no prompt in every mode, the Auto egress floor sitting
+/// below standing consent. The same identity without the declaration stays
+/// covered.
 #[tokio::test]
 async fn session_approval_of_an_offline_command_does_not_cover_its_network_variant() {
     let client = ScriptedClient::new(vec![
         vec![
             AgentEvent::ToolCallDelta {
-                delta: tool_call_delta("call_1", "shell", r#"{"command":"npm test"}"#),
+                delta: tool_call_delta("call_1", "shell", r#"{"command":"cargo clippy --version"}"#),
             },
             AgentEvent::Done { usage: None },
         ],
@@ -2114,14 +2115,14 @@ async fn session_approval_of_an_offline_command_does_not_cover_its_network_varia
                 delta: tool_call_delta(
                     "call_2",
                     "shell",
-                    r#"{"command":"npm test --coverage","network":true}"#,
+                    r#"{"command":"cargo clippy --help","network":true}"#,
                 ),
             },
             AgentEvent::Done { usage: None },
         ],
         vec![
             AgentEvent::ToolCallDelta {
-                delta: tool_call_delta("call_3", "shell", r#"{"command":"npm test -q"}"#),
+                delta: tool_call_delta("call_3", "shell", r#"{"command":"cargo clippy -q"}"#),
             },
             AgentEvent::Done { usage: None },
         ],
@@ -4623,16 +4624,21 @@ async fn execution_authority_follows_who_resolved_the_prompt() {
 
     // Default mode: trusted → Parse; human "a" → Approved; the remembered
     // identity on the next call → Parse.
-    // `cargo build`, not `echo hi`: this test asserts the AUTHORITY wiring, not
-    // which words are trusted, and it is not `cfg`-gated — so its trusted
-    // example has to be one that is trusted on every platform. `echo` is a
-    // `cmd` builtin on Windows and therefore not in the default trust list
-    // there (see `ExecPolicy::default`), which turned this into an approval
-    // prompt and made the authority claim untestable on that host.
+    // `cargo build`, not `echo hi`, and `cargo clippy --version`/`--help`, not
+    // `exit 4`/`exit 5`: this test asserts the AUTHORITY wiring, not which words
+    // are trusted, and it is not `cfg`-gated — so every example has to behave the
+    // same on every platform. `echo` is a `cmd` builtin on Windows and therefore
+    // not in the default trust list there (see `ExecPolicy::default`), which
+    // turned the trusted example into an approval prompt; `exit` is likewise a
+    // `cmd` builtin, so a remembered `exit` identity cannot run as argv on
+    // Windows (`command_runnable_unattended` refuses it) and would keep
+    // prompting instead of reaching the `Parse` assertion. `cargo clippy` is not
+    // trusted (so it prompts for the human approval) and its program word is
+    // `cargo`, a real executable on every host.
     let client = ScriptedClient::new(vec![
         shell_script("call_1", "cargo build"),
-        shell_script("call_2", "exit 4"),
-        shell_script("call_3", "exit 5"),
+        shell_script("call_2", "cargo clippy --version"),
+        shell_script("call_3", "cargo clippy --help"),
         done_script(),
     ]);
     let mut registry = ToolRegistry::default();
@@ -4651,7 +4657,10 @@ async fn execution_authority_follows_who_resolved_the_prompt() {
     let rest = drain(&mut rx).await;
     assert_eq!(
         finished_contents(&rest),
-        ["exit 4: Approved", "exit 5: Parse"],
+        [
+            "cargo clippy --version: Approved",
+            "cargo clippy --help: Parse",
+        ],
         "the human's text approval is `Approved`; the identity it left behind runs the next \
          call on the policy's parse"
     );
