@@ -131,8 +131,22 @@ if grep -qE "$FORBIDDEN" <<<"$PACKED"; then
   grep -E "$FORBIDDEN" <<<"$PACKED" | sed 's/^/    /' || true
 fi
 
+# ── 3. the launcher must hand the linked name over ──
+# `bin/deepcode` sets DEEP_CODE_PROGRAM_NAME so that `--version` and `--help`
+# name the command the user actually ran. Without it the binary reports
+# `deepcode-bin` on unix — a name on nobody's PATH — which is f514302.
+#
+# scripts/verify-install.sh stays lenient about this at release time, because it
+# also has to diagnose releases cut before that handoff existed. THIS is the
+# check that keeps that leniency from hiding a regression in our own tree.
+if grep -q 'DEEP_CODE_PROGRAM_NAME' packages/deepcode/bin/deepcode; then
+  info "OK  bin/deepcode hands DEEP_CODE_PROGRAM_NAME over to the binary"
+else
+  bad "bin/deepcode no longer sets DEEP_CODE_PROGRAM_NAME — 'deepcode --version' would report 'deepcode-bin' on unix, a command on nobody's PATH (f514302)"
+fi
+
 if [ "$fail" -eq 0 ]; then
-  info "OK  npm tarball contains the launcher + installer and no downloaded binary"
+  info "OK  packaging contract holds (asset map, tarball contents, launcher handoff)"
 fi
 
 exit "$fail"

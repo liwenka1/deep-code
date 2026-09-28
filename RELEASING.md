@@ -104,8 +104,9 @@ Actions → Verify Install (canary) → 输入 0.4.8 → Run
 
 1. **发版前演练**。拿一次真实发版去赌一道从未运行过的闸门是不划算的。而对
    0.4.8 演练是**有意义的**：0.4.8 在 npm 和 GitHub Release 上都真实存在，所以这次
-   演练是端到端的。演练通过之后，下一次发版的 `verify-install` 是**已被证明过的
-   流程**，而不是第一次运行。
+   演练是端到端的。   演练通过之后，下一次发版的 `verify-install` 是**已被证明过的
+   流程**，而不是第一次运行。（v0.4.8 的演练实测结果见下一节 —— 它同时证明了
+   安装路径可用，以及为什么对旧版本演练时程序名断言不适用。）
 2. **故障诊断**。用户报"装不上"，用他的版本跑一次，变红的那条 leg 直接点名平台。
 
 **为什么它 checkout 两棵树**：主体是发布过的 tag（`released/`，`install.mjs` 要从它
@@ -119,6 +120,43 @@ checkout 的**顺序**不能反 —— 先工作区、后 `released/`。
 
 **故意不加定时任务**：一个因 runner 或网络抖动而变红的定时 job 会训练你去忽略它，
 那个代价高于它提前几天报信的价值。
+
+---
+
+## 首次演练记录 —— v0.4.8（2026-09-28）
+
+**结论：安装路径 4/4 平台通过；程序名断言自 v0.4.9 起才成立。**
+
+对 v0.4.8 演练时，unix 三条 leg 报 `deepcode-bin 0.4.8` 而不是 `deepcode 0.4.8`，
+Windows 通过。这**不是流水线故障**，而是演练对象比断言所假设的行为更早：
+
+- v0.4.8 的 `bin/deepcode` 只有 1366 字节，是 `spawnSync(binary, ...)`、**不传任何
+  env**，所以二进制退回 argv[0] 自报名字。unix 上二进制叫 `deepcode-bin`（刻意的
+  下载名，不在任何人的 PATH 上）→ 自报 `deepcode-bin`；Windows 上叫 `deepcode.exe`，
+  词干本来就是 `deepcode` → 自报 `deepcode`。**这就是只有 Windows 绿的原因。**
+- 那个修复是 `f514302 fix(cli): npm 装出来的命令自报 deepcode-bin`，它落在
+  `v0.4.8..HEAD` 里 —— 即 v0.4.8 之后才发。演练的报错文字与那个提交标题一字不差。
+
+所以 `scripts/verify-install.sh` 现在按**演练对象**决定断言强度：版本号永远断言；
+程序名只在该 release 的启动器确实做了交接时才断言，否则以 `::warning::` 出声。
+「当前树必须有交接」这一点由 `check-packaging.sh` 独立把关，因此发布时的宽松
+不会掩盖我们自己树里的回归。
+
+**这次演练同时排除的未知**：Windows 上 `npm i -g` 之后 `deepcode` 确实在 PATH 上、
+Git Bash 的相对路径 tarball 传参可用 —— 二进制真的被执行并打印了版本号。
+
+**这次演练同时发现的新风险**：npm 输出
+
+```
+npm warn install-scripts 1 package has install scripts not yet covered by allowScripts:
+npm warn install-scripts   @liwenkai/deepcode@0.4.8 (postinstall: node install.mjs)
+```
+
+本次脚本仍然执行了（安装 31 秒，且二进制真的跑起来）。但 npm 正朝「默认门禁 install
+scripts」演进，而 `install.mjs` 的整个机制依赖 postinstall 运行。**闸门天然覆盖它**：
+脚本一旦被真的拦住，二进制就不存在，`bin/deepcode` 会打印 "native binary not found"
+并以 1 退出，`verify-install` 当场变红 —— 即 npm 真改语义时，发版会被挡住，而不是
+静默发出一个装不上的版本。
 
 ---
 
@@ -168,6 +206,6 @@ bash scripts/verify-install.sh 0.4.8
 | **`deep-code-x86_64-apple-darwin` 从未在 CI 里被执行过** | 它是唯一一个"没被执行就发出去"的产物。若它启动即死，只有 Intel Mac 用户会先发现 | 没有 x86_64 macOS runner 可用（`macos-13` 稀缺且在退役，见 `release.yml` 的 matrix 注释），arm64 runner 上执行需 Rosetta 而 runner 没有。S1 与 `verify-install` 都**显式出声**声明这一点，不静默；`verify-install` 的每条 leg 还断言宿主平台，杜绝"名字覆盖了、实际没有" |
 | `release` job 里新建的校验和自检，演练覆盖不到 | 首次发版时这一步是第一次运行 | 它是"照搬的已有代码 + 一个自检"，且失败会停在 npm publish 之前 |
 | 闸门失败时 GitHub Release 已公开 | 会留下"有 Release、npm 上没有"的孤儿版本 | 用户不受影响（`latest` 没动）。修好代码后发下一个 patch；若是验证脚本自身的问题，"Re-run failed jobs" 可以走通（建 Release 是幂等更新） |
-| Windows leg 上 `npm i -g` 后 `deepcode` 能否被找到，未经实证 | 若全局 bin 目录不在 Git Bash 的 PATH 上，`windows-latest` leg 会假红并挡住 publish | **这正是 canary 存在的理由**：先对 0.4.8 dispatch 一次，所有平台的真假红灯都会在真发版之前暴露 |
+| npm 可能改为默认门禁 install scripts | 若被拦住，`npm i -g deepcode` 会"安装成功"但二进制不存在，**所有新装用户全坏** | 闸门天然覆盖：二进制不存在时 `verify-install` 当场变红。v0.4.8 演练里 npm 只告警未拦截（见上一节），但这是要盯的演进方向 |
 | 逻辑错误、安全边界绕过、UI 异常 | 闸门**不覆盖** | 机器只能判"能不能用"，判不了"用得对不对"。这一类靠 PR 时的 CI 与人工评审 |
 | CHANGELOG 内容无人过目 | 文案质量与准确性 | 见上一节；知情选择 |

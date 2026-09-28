@@ -83,23 +83,54 @@ npm i -g "$TARBALL"
 # launcher as "command not found" on a perfectly good install.
 hash -r
 
-# `cli.rs` prints "<program name> <CARGO_PKG_VERSION>" then exits 0. Through the
-# launcher the program name is `deepcode`, because bin/deepcode hands over the
-# name npm actually linked via DEEP_CODE_PROGRAM_NAME — that handoff exists
-# because argv[0] would otherwise be `deepcode-bin`, a name on nobody's PATH, so
-# the first line a new user read told them to run a command that does not exist.
-# Requiring an exact match therefore covers the launcher, the handoff, the
-# binary's ability to execute, and the version, all at once.
+# `cli.rs` prints "<program name> <CARGO_PKG_VERSION>" then exits 0. There are
+# TWO assertions here, and the second one depends on the subject.
+#
+# 1. The VERSION is always asserted. Every release must report its own version,
+#    and that is what ties the artifact that ran to the release being verified.
+#
+# 2. The PROGRAM NAME is asserted only when this release's launcher hands it
+#    over. `bin/deepcode` sets DEEP_CODE_PROGRAM_NAME to the name npm actually
+#    linked; without that handoff the binary falls back to argv[0], which on unix
+#    is `deepcode-bin` — the deliberately distinct download name, on nobody's
+#    PATH. That is f514302 ("npm 装出来的命令自报 deepcode-bin"), and it first
+#    shipped AFTER v0.4.8. Windows is unaffected either way: the binary there is
+#    `deepcode.exe`, whose stem is already `deepcode` — which is exactly why a
+#    rehearsal against v0.4.8 reports `deepcode-bin 0.4.8` on unix and passes on
+#    Windows.
+#
+#    This check has to work against ANY published version, so the SUBJECT decides
+#    which assertion applies. Asserting the current tree's behaviour against an
+#    older release fails for a reason that has nothing to do with that release,
+#    and that is what the first rehearsal run did.
+#
+#    The lenient branch is NOT a silent skip — it announces itself with
+#    ::warning::, and check-packaging.sh independently requires the handoff to be
+#    present in the current tree. So this leniency cannot hide a regression in the
+#    tree we are about to ship; it only declines to assert something about a
+#    release that never had it.
 #
 # `tr -d '\r'` is not paranoia: on Windows the value arrives through a pipe, and
 # a stray CR would fail an exact comparison for a reason that has nothing to do
 # with the release.
 VERSION_OUT="$(deepcode --version | tr -d '\r')"
 printf 'deepcode --version  ->  %s\n' "$VERSION_OUT"
-if [ "$VERSION_OUT" != "deepcode ${EXPECTED}" ]; then
-  printf '::error::"deepcode --version" printed "%s", expected "deepcode %s"\n' \
+
+if [[ "$VERSION_OUT" != *" ${EXPECTED}" ]]; then
+  printf '::error::"deepcode --version" printed "%s", which does not end in " %s"\n' \
     "$VERSION_OUT" "$EXPECTED"
   exit 1
+fi
+
+if grep -q 'DEEP_CODE_PROGRAM_NAME' bin/deepcode; then
+  if [ "$VERSION_OUT" != "deepcode ${EXPECTED}" ]; then
+    printf '::error::"deepcode --version" printed "%s", expected exactly "deepcode %s" — this launcher DOES hand the linked name over, so the program name is part of the assertion\n' \
+      "$VERSION_OUT" "$EXPECTED"
+    exit 1
+  fi
+  printf 'OK   program name is "deepcode" — the handoff is present in this launcher\n'
+else
+  printf '::warning::bin/deepcode in this release has no DEEP_CODE_PROGRAM_NAME handoff (f514302, first shipped after v0.4.8) — the version is asserted, the PROGRAM NAME is not. On unix this release reports "deepcode-bin".\n'
 fi
 
 # `--help` is the other early-exit path a new user hits first, and it carries its
