@@ -71,16 +71,34 @@ pub(crate) struct LayoutResult {
 
 /// Layout the text, wrapping at `width`, scrolling to keep the cursor
 /// visible, and returning only the `max_visible_rows` subset.
+///
+/// Guarantee: the row the cursor is on always EXISTS in `visible_lines` (and is
+/// counted by `total_rows`). A caret at the right edge of an exactly-filled line
+/// belongs to the row that starts there, so this materializes that row — without
+/// it the renderer's `min(inner_height - 1)` clamp silently rewrote the caret to
+/// row 0, which is the "cursor snaps back to the first line when the text is
+/// exactly one line long" bug.
 pub(crate) fn layout_input(
     input: &str,
     cursor_chars: usize,
     width: usize,
     max_visible_rows: usize,
 ) -> LayoutResult {
-    let lines = wrap_input_lines(input, width);
-    let total_rows = lines.len().max(1);
+    let mut lines = wrap_input_lines(input, width);
     let max_visible = max_visible_rows.max(1);
     let (cursor_row, cursor_col) = cursor_row_col(input, cursor_chars, width.max(1));
+
+    // Two callers depend on this row existing. `total_rows` sizes the composer,
+    // so the box grows by the row the caret needs; and
+    // `render_input_from_layout` clamps the caret row with `min(inner_height - 1)`,
+    // which without this resolves to 0 and puts the caret back at the start of the
+    // first line — the reported symptom, and a silent one, because a caret on a
+    // row that was never rendered is indistinguishable from a caret that belongs
+    // at column 0.
+    while lines.len() <= cursor_row {
+        lines.push(String::new());
+    }
+    let total_rows = lines.len().max(1);
 
     // Scroll to keep the cursor visible.
     let mut start = 0usize;
@@ -103,6 +121,29 @@ pub(crate) fn layout_input(
 
 /// Compute the visual row and column of a character position in a
 /// grapheme-cluster-aware way.
+///
+/// The row this returns for an exactly-filled line was ALREADY right when the
+/// boundary bug was reported: a caret at the right edge of a full line does
+/// belong on the row that follows it. What was wrong is that no such row existed
+/// — the layout never materialized it, so `render_input_from_layout`'s
+/// `min(inner_height - 1)` clamp rewrote the caret onto the only row there was,
+/// which placed it exactly on the first character of the line the user had just
+/// filled. `layout_input` materializes that row now; this function's job is to
+/// keep naming the same row it always did.
+///
+/// The wrap is DEFERRED rather than taken the instant `col` reaches `width`, and
+/// that is what keeps the name correct in the one case where taking it eagerly
+/// double-counts: a newline at the boundary. `col == width` is a pending state —
+/// "the caret sits at the right edge and whatever comes next opens a new row" —
+/// consumed when the next grapheme arrives, or after the loop for a caret that
+/// ends up there. A `\n` is therefore handled BEFORE that consumption: it moves to
+/// the row the caret was already pending on instead of opening a second one.
+///
+/// That ordering is invisible while the clamp masks everything, and turns into a
+/// visible extra blank line the moment the row count becomes honest — which is why
+/// it is written down rather than left for the next reader to rediscover. It is
+/// pinned by
+/// `a_newline_at_an_exactly_filled_line_does_not_add_a_second_row`.
 pub(super) fn cursor_row_col(input: &str, cursor_chars: usize, width: usize) -> (usize, usize) {
     let mut row = 0usize;
     let mut col = 0usize;
@@ -117,6 +158,7 @@ pub(super) fn cursor_row_col(input: &str, cursor_chars: usize, width: usize) -> 
         let cursor_inside = cursor_chars < next_char_idx;
 
         if grapheme == "\n" {
+            // Deliberately ahead of the pending-wrap consumption below.
             row += 1;
             col = 0;
             char_idx = next_char_idx;
@@ -126,20 +168,31 @@ pub(super) fn cursor_row_col(input: &str, cursor_chars: usize, width: usize) -> 
             continue;
         }
 
+        // A line that was filled exactly: the caret is at its right edge, so this
+        // grapheme opens the next row.
+        if col >= width {
+            row += 1;
+            col = 0;
+        }
+
         let gw = grapheme.width();
         if col + gw > width && col != 0 {
             row += 1;
             col = 0;
         }
         col += gw;
-        if col >= width {
-            row += 1;
-            col = 0;
-        }
         if cursor_inside {
             break;
         }
         char_idx = next_char_idx;
+    }
+
+    // A caret resting at the right edge of a full line belongs to the row that
+    // starts there. `layout_input` materializes that row so the renderer has
+    // somewhere to put the caret instead of clamping it back to the first line.
+    if col >= width {
+        row += 1;
+        col = 0;
     }
 
     (row, col)

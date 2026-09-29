@@ -1929,3 +1929,224 @@ fn the_approval_panel_is_built_once_and_its_head_is_a_body_prefix() {
     app.pending_approval = None;
     assert!(build_approval_panel(&app, width).is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Composer wrapping and the caret at a line boundary
+// ---------------------------------------------------------------------------
+//
+// `cursor_row_col`, `layout_input` and `wrap_input_lines` had no tests at all,
+// which is how the row the caret named and the rows the layout actually produced
+// came to disagree for as long as they did. The bug: typing until the text filled
+// the line to its last cell snapped the caret to the START OF THE FIRST LINE
+// instead of wrapping.
+
+/// Render the whole app and read back both the screen and the caret the backend
+/// was actually given. The caret is the observable a human reports, so it is what
+/// these tests assert — not the intermediate layout fields.
+fn draw_composer(width: u16, height: u16, input: &str) -> (Vec<String>, (u16, u16)) {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.input = input.to_string();
+    app.input_cursor = app.input.chars().count();
+
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+    let buffer = terminal.backend().buffer().clone();
+    let mut rows = Vec::new();
+    for row in 0..buffer.area.height {
+        let mut line = String::new();
+        for col in 0..buffer.area.width {
+            line.push_str(buffer[(col, row)].symbol());
+        }
+        rows.push(line);
+    }
+    let pos = terminal.get_cursor_position().unwrap();
+    (rows, (pos.x, pos.y))
+}
+
+/// Pins the caret arithmetic at the wrap boundary — the boundary a human reaches
+/// by simply typing, and one that had no test at all before.
+///
+/// These expectations are CHARACTERIZATION, not a regression guard: every one of
+/// them already held before the fix, because `cursor_row_col` was naming the right
+/// row all along. The bug was the missing row in the layout plus the renderer's
+/// clamp, which `composer_caret_wraps_*` below asserts where a human sees it. What
+/// this test protects is the arithmetic itself, and the fact that the deferred
+/// wrap did not disturb it.
+#[test]
+fn cursor_row_col_places_the_caret_at_the_wrap_boundary() {
+    let w = 10;
+    // (input, cursor char index, expected row, expected column)
+    let cases: &[(&str, usize, usize, usize)] = &[
+        ("", 0, 0, 0),
+        ("aaaaaaaaa", 9, 0, 9),             // one short of the edge
+        ("aaaaaaaaaa", 10, 1, 0),           // exactly one full line
+        ("aaaaaaaaaaa", 11, 1, 1),          // fill + 1
+        ("aaaaaaaaaaaaaaaaaaaa", 20, 2, 0), // exactly two full lines
+        ("aaaaaaaaaaaaaaaaaaaa", 10, 1, 0), // caret sitting on the boundary itself
+        ("中中中中中", 5, 1, 0),            // 5 x 2 columns = exactly 10
+        ("中中中中中中", 6, 1, 2),          // fill + 1 wide glyph
+        ("aaaaaaaaa中", 10, 1, 2),          // a wide glyph that does not fit the rest
+    ];
+    for (input, cursor, want_row, want_col) in cases {
+        assert_eq!(
+            cursor_row_col(input, *cursor, w),
+            (*want_row, *want_col),
+            "input={input:?} cursor={cursor}"
+        );
+    }
+}
+
+/// A newline landing on an exactly-filled boundary must NOT add a second row.
+///
+/// This is the half of the fix that was invisible before: the old code advanced
+/// the row when the line filled AND again for the `\n`, so the caret row was one
+/// past the truth — but the clamp rewrote it back onto the only existing row, and
+/// the result happened to look right. `layout_input` materializes the caret's row,
+/// so that accident stops working the moment the row count becomes honest: these
+/// two cases are what keeps the `\n` branch ordered ahead of the pending wrap.
+#[test]
+fn a_newline_at_an_exactly_filled_line_does_not_add_a_second_row() {
+    let w = 10;
+    let full = "a".repeat(10);
+    // The caret is after the newline, on the one empty row it opened.
+    assert_eq!(cursor_row_col(&format!("{full}\n"), 11, w), (1, 0));
+    // Not at a boundary: unchanged, and worth pinning so the fix cannot be
+    // "simplified" into skipping the newline's own row.
+    assert_eq!(cursor_row_col("abc\n", 4, w), (1, 0));
+    assert_eq!(cursor_row_col("abc\ndef", 7, w), (1, 3));
+    assert_eq!(cursor_row_col("\n", 1, w), (1, 0));
+}
+
+/// `layout_input` guarantees the caret has a row: it is counted by `total_rows`
+/// (so the composer grows into it) and it is present in `visible_lines`.
+#[test]
+fn layout_input_materializes_the_row_the_caret_needs() {
+    let w = 10;
+    let max_vis = 6;
+
+    let short = layout_input("aaaaaaaaa", 9, w, max_vis);
+    assert_eq!((short.total_rows, short.cursor_visible_row), (1, 0));
+
+    let exact = layout_input("aaaaaaaaaa", 10, w, max_vis);
+    assert_eq!(
+        (exact.total_rows, exact.cursor_visible_row),
+        (2, 1),
+        "an exactly-filled line needs a second row for the caret"
+    );
+
+    // Same row count as `exact` on purpose: the newline opened the row the caret
+    // was already pending on, so this must not become three rows.
+    let exact_nl = layout_input(&format!("{}\n", "a".repeat(10)), 11, w, max_vis);
+    assert_eq!((exact_nl.total_rows, exact_nl.cursor_visible_row), (2, 1));
+
+    // Seven full rows plus the caret's row, scrolled to keep the caret visible.
+    let scrolled = layout_input(&"a".repeat(70), 70, w, max_vis);
+    assert_eq!((scrolled.total_rows, scrolled.cursor_visible_row), (8, 5));
+    assert_eq!(scrolled.visible_lines.len(), max_vis);
+}
+
+/// The reported symptom, asserted where a human sees it: the caret the terminal
+/// is handed.
+///
+/// Geometry at 40x12: `inner_width = 40 - 2 = 38`, so 38 characters fill the text
+/// area exactly. The composer then occupies rows 7-10 (transcript 0-6, status 11),
+/// its top border on row 7, so the text rows are 8 and 9 and the caret belongs on
+/// the blank row 9.
+///
+/// Before the fix the composer was one row SHORTER and therefore sat one row
+/// lower — rows 8-10 — with its border on row 8 and all 38 characters on row 9.
+/// The caret's screen coordinate came out the same, which is precisely why this
+/// bug survived inspection: it landed on (2, 9) too, but there row 9 was the LINE
+/// OF TEXT, so the caret sat on its first character. Typing the 38th character
+/// moved it from the end of the line to the start of it — the "cursor jumps back
+/// to the first line" a human reports. The two row assertions below are what
+/// separate those two worlds; the coordinate alone cannot.
+#[test]
+fn composer_caret_wraps_to_a_new_line_when_the_text_fills_the_line_exactly() {
+    let (rows, caret) = draw_composer(40, 12, &"a".repeat(38));
+    let screen = rows.join("\n");
+
+    assert!(
+        rows[8].contains("aaaa"),
+        "the filled line must be on row 8:\n{screen}"
+    );
+    assert!(
+        rows[9].trim().is_empty(),
+        "row 9 must be the caret's new, empty line:\n{screen}"
+    );
+    assert_eq!(
+        caret,
+        (2, 9),
+        "the caret must wrap onto the row after the filled line:\n{screen}"
+    );
+}
+
+/// The same boundary for CJK input, where the wrap point is a display width and
+/// `中` is two columns: 19 of them fill 38 cells exactly. This is the case a
+/// Chinese-language user hits while typing normally, so it is pinned separately
+/// rather than assumed to follow from the ASCII case.
+#[test]
+fn composer_caret_wraps_for_a_cjk_line_filled_exactly() {
+    let (rows, caret) = draw_composer(40, 12, &"中".repeat(19));
+    let screen = rows.join("\n");
+
+    assert!(
+        rows[8].contains("中"),
+        "the filled line is on row 8:\n{screen}"
+    );
+    assert!(
+        rows[9].trim().is_empty(),
+        "row 9 must be the caret's new, empty line:\n{screen}"
+    );
+    assert_eq!(
+        caret,
+        (2, 9),
+        "caret must wrap for width-2 glyphs too:\n{screen}"
+    );
+}
+
+/// Wrapped past the visible window the caret must still land on a rendered row —
+/// the scrolled path uses the same layout, and `min(inner_height - 1)` there is
+/// backed by `start` rather than by the padding fix.
+#[test]
+fn composer_caret_lands_on_a_visible_row_when_the_input_scrolls() {
+    // 266 = 7 rows of 38; the caret's own row makes 8, of which 6 are visible.
+    let (rows, caret) = draw_composer(40, 24, &"a".repeat(266));
+    let screen = rows.join("\n");
+    let (_, cy) = caret;
+
+    assert_eq!(
+        rows[cy as usize].trim(),
+        "",
+        "the caret's row is the blank last row:\n{screen}"
+    );
+    assert!(
+        rows[cy as usize - 1].contains("aaaa"),
+        "and it sits directly under the text:\n{screen}"
+    );
+}
+
+/// The one case the fix does NOT change, pinned so it is a known limitation
+/// rather than a surprise: a terminal too short to show the caret's row.
+///
+/// At 40x12 an 8-row composer cannot fit (`Constraint::Min(5)` on the transcript
+/// leaves 6), so it is drawn 4 rows tall and the caret is clamped onto the last
+/// VISIBLE text row. Before the fix the same clamp applied here and landed on the
+/// same row — this is a "nowhere to draw" case, not the boundary bug, and the
+/// distinction only holds if someone keeps the two apart on purpose.
+#[test]
+fn composer_caret_is_clamped_when_the_terminal_cannot_show_its_row() {
+    let (rows, caret) = draw_composer(40, 12, &"a".repeat(266));
+    let screen = rows.join("\n");
+    let (_, cy) = caret;
+
+    assert!(
+        rows[cy as usize].contains("aaaa"),
+        "with no free row the caret stays on a text row:\n{screen}"
+    );
+}
