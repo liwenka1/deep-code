@@ -2271,3 +2271,34 @@ fn a_long_context_listing_keeps_the_head_and_the_tail() {
     assert!(lines[3].contains("17"), "{}", lines[3]);
     assert!(lines.last().unwrap().contains("m29"), "{:?}", lines.last());
 }
+
+/// `/status` after a session switch (`/resume` and `/clear` share the path).
+///
+/// The switch drops `last_telemetry` — correctly, since that telemetry
+/// described the session being left — and the session-scoped totals used to live
+/// inside the same block, so a resumed conversation reported nothing at all.
+/// They come from the runtime's own totals now, which the session record
+/// restores.
+///
+/// This pins that the block is PRESENT; that the values survive a resume is the
+/// record round-trip's business, not this test's.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_still_reports_session_totals_after_a_session_switch() {
+    let mut app = App::new();
+    assert!(app.handle_slash_command("/clear"));
+    assert!(
+        app.last_telemetry.is_none(),
+        "the switch must clear the previous session's telemetry"
+    );
+
+    assert!(app.handle_slash_command("/status"));
+
+    let Some(HistoryCell::System { text }) = app.history.last() else {
+        panic!("expected a system cell, got {:?}", app.history.last());
+    };
+    // The per-turn fields are legitimately absent...
+    assert!(text.contains("last_turn=none"), "{text}");
+    // ...but the session's own totals are not.
+    assert!(text.contains("session_cost="), "{text}");
+    assert!(text.contains("cache_hit="), "{text}");
+}

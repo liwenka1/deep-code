@@ -1,6 +1,6 @@
 use deep_code_agent::{
-    CheckpointId, CheckpointStore, JsonSessionStore, Message, PrefixStatus, RuntimeEvent,
-    SessionStore, estimate_token_count, format_sessions_storage_note, web_enabled,
+    CheckpointId, CheckpointStore, CostEstimate, JsonSessionStore, Message, PrefixStatus,
+    RuntimeEvent, SessionStore, estimate_token_count, format_sessions_storage_note, web_enabled,
 };
 
 use crate::app::App;
@@ -472,10 +472,8 @@ impl App {
         } else {
             "ready"
         };
-        let telemetry = self
-            .last_telemetry
-            .as_ref()
-            .map(|telemetry| {
+        let telemetry = match self.last_telemetry.as_ref() {
+            Some(telemetry) => {
                 let fallback = telemetry
                     .fallback_reason
                     .as_deref()
@@ -491,25 +489,12 @@ impl App {
                     telemetry.session_cache_miss_tokens,
                 )
                 .map_or_else(|| "—".to_string(), |pct| format!("{pct}%"));
-                let cache_line = self.tr_with(
-                    TextId::StatusCacheHitLine,
-                    &[
-                        ("turn", &turn_cache),
-                        ("session", &session_cache),
-                        // The session's raw counts, matching `saved`'s scope:
-                        // a percentage alone hides where the money went — at a
-                        // 99% hit rate the remaining 1% is still about a third
-                        // of the input bill, because the price gap is 50–120x.
-                        ("hit", &compact_token_count(telemetry.session_cache_hit_tokens)),
-                        (
-                            "miss",
-                            &compact_token_count(telemetry.session_cache_miss_tokens),
-                        ),
-                        (
-                            "saved",
-                            &telemetry.session_cache_savings.format(self.cost_currency),
-                        ),
-                    ],
+                let cache_line = self.cache_hit_line(
+                    &turn_cache,
+                    &session_cache,
+                    telemetry.session_cache_hit_tokens,
+                    telemetry.session_cache_miss_tokens,
+                    telemetry.session_cache_savings,
                 );
                 format!(
                     "\neffective_model={}\nroute={}\nroute_source={}\nprefix={}\ncascade_triggered={}\nreasoning={}\nauto_reason={}\nturn_cost={}\nsession_cost={}\n{cache_line}\ncontext={}/{} ({}%)\ncompaction_near={}\nstream_retries={}{}",
@@ -529,8 +514,16 @@ impl App {
                     telemetry.stream_retries,
                     fallback
                 )
-            })
-            .unwrap_or_else(|| "\nlast_turn=none".to_string());
+            }
+            // No turn has run in THIS session yet: a fresh launch, or just after
+            // `/resume`, which clears `last_telemetry` because that telemetry
+            // described the session being left. The per-turn fields have nothing
+            // to report — but the session's own totals do, and those survive the
+            // resume (the record carries them). Leaving them in the `Some` arm
+            // alone made a resumed conversation read as if it had never spent
+            // anything.
+            None => format!("\nlast_turn=none{}", self.session_spend_lines()),
+        };
         let trimmed = if self.trimmed_cells > 0 {
             self.tr_with(
                 TextId::StatusTrimmedSuffix,
@@ -549,6 +542,61 @@ impl App {
             telemetry
         )));
         self.status = self.tr(TextId::StatusShown).to_string();
+    }
+
+    /// The session-scoped half of `/status`, for a session where no turn has run
+    /// yet.
+    ///
+    /// Everything here comes from the runtime's own session totals, which are
+    /// restored from the session record — so a `/resume`d conversation reports
+    /// the money it has already spent. The per-turn fields (`turn_cost`,
+    /// `route`, `context`, …) genuinely have nothing to say without a turn, and
+    /// stay absent.
+    fn session_spend_lines(&self) -> String {
+        // Outside a runtime (tests) there is nothing to read; the block simply
+        // does not appear, which is the pre-existing shape.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return String::new();
+        };
+        let runtime = std::sync::Arc::clone(&self.runtime);
+        let spend = tokio::task::block_in_place(|| handle.block_on(runtime.session_spend()));
+        let hit = u32::try_from(spend.cache_hit_tokens).unwrap_or(u32::MAX);
+        let miss = u32::try_from(spend.cache_miss_tokens).unwrap_or(u32::MAX);
+        let session_cache =
+            cache_hit_percent(hit, miss).map_or_else(|| "—".to_string(), |pct| format!("{pct}%"));
+        let cache_line = self.cache_hit_line("—", &session_cache, hit, miss, spend.cache_savings);
+        format!(
+            "\nsession_cost={}\n{cache_line}",
+            spend.cost.format(self.cost_currency)
+        )
+    }
+
+    /// One shape for the `/status` cache row, whoever holds the numbers: the
+    /// per-turn block (both rates) and the no-turn fallback (session only, with
+    /// `turn` reading `—`). Sharing it is what keeps the two from drifting into
+    /// differently-worded lines describing the same three facts.
+    fn cache_hit_line(
+        &self,
+        turn: &str,
+        session: &str,
+        hit: u32,
+        miss: u32,
+        saved: CostEstimate,
+    ) -> String {
+        self.tr_with(
+            TextId::StatusCacheHitLine,
+            &[
+                ("turn", turn),
+                ("session", session),
+                // The raw counts, matching `saved`'s scope: a percentage alone
+                // hides where the money went — at a 99% hit rate the remaining
+                // 1% is still about a third of the input bill, because the
+                // price gap is 50–120x.
+                ("hit", &compact_token_count(hit)),
+                ("miss", &compact_token_count(miss)),
+                ("saved", &saved.format(self.cost_currency)),
+            ],
+        )
     }
 
     fn list_subagents(&mut self) {
