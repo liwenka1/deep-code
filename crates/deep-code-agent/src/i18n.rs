@@ -210,6 +210,8 @@ text_ids! {
     StatusStreamingFrom,
     StatusSteeringQueued,
     StatusSteeringQueueFull,
+    // 转录里"这条追问还在排队"那行标签。
+    PendingSteerLabel,
     StatusInputClearedEsc,
     StatusInputClearedCtrlC,
     StatusCtrlCQuitConfirm,

@@ -8,7 +8,7 @@ use crate::model::{ChatRequest, Usage};
 use crate::model_registry::{DEEPSEEK_V4_PRO, context_window_for_model};
 use crate::model_route::{RouteContext, resolve_turn_route};
 use crate::runtime::AgentRuntime;
-use crate::runtime::event::{RuntimeEvent, ToolCallId, emit};
+use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
 use crate::runtime::telemetry::probe_prefix;
 use crate::runtime::tool_result::{BatchOutcome, runtime_error_from_tool_error, tool_call_payload};
 use crate::tool::ToolCallAccumulator;
@@ -152,6 +152,17 @@ impl AgentRuntime {
             if self.maybe_compact(&route.effective_model, tx).await {
                 // compaction event already emitted; continue with trimmed history
             }
+
+            // Mid-turn steering lands here. The iteration above ran to its
+            // `continue`, i.e. a tool batch finished, so the session now ends on
+            // `tool` results — appending a `user` entry cannot split a
+            // `tool_calls`/`tool` pair, which is exactly why a batch boundary is
+            // the only safe point to inject at. Draining *before* the wire
+            // messages are derived below is what makes this very request carry
+            // the steered prompt; draining *after* `maybe_compact` keeps a
+            // message the user just typed out of that pass's archive window (it
+            // is the newest thing in the transcript, not history).
+            self.drain_steering(&turn_id, tx).await;
 
             // Probed here, under the same lock that reads the transcript,
             // because this is the only place the exact wire messages of a
@@ -421,6 +432,37 @@ impl AgentRuntime {
                 }
                 BatchOutcome::AwaitingApproval | BatchOutcome::Cancelled => return,
             }
+        }
+    }
+
+    /// Record any steered prompts in the session and tell the UI they landed.
+    ///
+    /// One lock scope for the whole batch: a `steer()` racing this drain lands
+    /// wholly in this batch or wholly in the next, never half in each. Persist
+    /// and the announcements happen after the lock is released, and the events
+    /// go out in arrival order — the UI pops its own pending list FIFO, so that
+    /// order is part of the contract.
+    async fn drain_steering(&self, turn_id: &TurnId, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
+        let drained: Vec<String> = {
+            let mut state = self.state.lock().await;
+            let drained: Vec<String> = std::mem::take(&mut state.steering).into();
+            for text in &drained {
+                state.session.push_user(text);
+            }
+            drained
+        };
+        if drained.is_empty() {
+            return;
+        }
+        self.persist().await;
+        for text in drained {
+            emit(
+                tx,
+                RuntimeEvent::UserMessageInjected {
+                    turn_id: turn_id.clone(),
+                    text,
+                },
+            );
         }
     }
 }

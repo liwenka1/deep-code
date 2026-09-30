@@ -2168,3 +2168,29 @@ fn every_swap_path_delivers_its_warnings() {
         "the reload-failure recovery path dropped its warnings"
     );
 }
+
+#[test]
+fn an_injected_mid_turn_prompt_retires_its_pending_entry() {
+    let mut app = App::new();
+    app.is_streaming = true;
+    app.active_turn = Some(ActiveTurn::default());
+    app.steering_queue.push("skip the tests".to_string());
+
+    app.apply_runtime_event(RuntimeEvent::UserMessageInjected {
+        turn_id: deep_code_agent::TurnId("turn_1".to_string()),
+        text: "skip the tests".to_string(),
+    });
+
+    // Retired, not merely hidden: the pending promise became an ordinary user
+    // cell, which is also what stops the turn-end fallback re-sending it.
+    assert!(
+        app.steering_queue.is_empty(),
+        "the injected prompt must leave the pending queue"
+    );
+    assert!(matches!(
+        app.history.last(),
+        Some(HistoryCell::User { text }) if text == "skip the tests"
+    ));
+    // Injection continues the same turn — it does not end it.
+    assert!(app.is_streaming, "injecting a prompt must not end the turn");
+}

@@ -2150,3 +2150,53 @@ fn composer_caret_is_clamped_when_the_terminal_cannot_show_its_row() {
         "with no free row the caret stays on a text row:\n{screen}"
     );
 }
+
+/// A queued (steered) prompt has to be VISIBLE while it waits — the whole point
+/// of the feature is that the user can see their follow-up is not lost. Drawn
+/// under the live stream, above the composer, and gone the moment the queue
+/// drains.
+#[test]
+fn a_queued_steer_is_visible_as_a_pending_row() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let screen = |queue: Vec<String>| -> String {
+        let mut app = App::new();
+        app.lang = Lang::En;
+        app.is_streaming = true;
+        app.streaming_since = Some(std::time::Instant::now());
+        app.history.push(HistoryCell::user("do the thing"));
+        app.steering_queue = queue;
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut rows = Vec::new();
+        for row in 0..buffer.area.height {
+            let mut line = String::new();
+            for col in 0..buffer.area.width {
+                line.push_str(buffer[(col, row)].symbol());
+            }
+            rows.push(line);
+        }
+        rows.join("\n")
+    };
+
+    // Nothing queued: no pending band at all (`◷` marks it and nothing else).
+    let empty = screen(Vec::new());
+    assert!(
+        !empty.contains('◷'),
+        "nothing queued, nothing to show:\n{empty}"
+    );
+
+    // One queued follow-up: the marker and the text itself are both on screen.
+    let one = screen(vec!["skip the tests".to_string()]);
+    assert!(
+        one.contains('◷'),
+        "the pending marker must be visible:\n{one}"
+    );
+    assert!(
+        one.contains("skip the tests"),
+        "the queued prompt itself must be readable:\n{one}"
+    );
+}

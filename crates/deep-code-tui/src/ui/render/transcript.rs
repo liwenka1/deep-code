@@ -29,6 +29,22 @@ pub(super) fn render_messages(
         lines.extend(cell_lines(cell, content_width, app.lang));
     }
 
+    // Prompts the user steered while this turn streams, drawn under the live
+    // preview and above the composer — exactly where each one lands when it is
+    // sent. A preview only: these lines never enter `app.history`, so a queued
+    // prompt disappears the moment its `UserMessageInjected` retires it.
+    // Dimmed and marked, so a promise is never taken for a message already
+    // sent.
+    if !app.steering_queue.is_empty() {
+        lines.push(Line::from(Span::styled(
+            tr(app.lang, TextId::PendingSteerLabel),
+            Style::default().fg(Color::Yellow),
+        )));
+        for text in &app.steering_queue {
+            lines.extend(pending_steer_lines(text, content_width));
+        }
+    }
+
     let max_scroll = lines.len().saturating_sub(viewport);
     let scroll = app.scroll_offset.min(max_scroll);
     // Absolute top row, NOT clamped to u16. ratatui's `Paragraph::scroll` offset
@@ -218,6 +234,20 @@ pub(super) fn neutralize_transcript_text(text: &str) -> String {
         }
     }
     out
+}
+
+/// One queued (steered) prompt: rendered like a user cell but dimmed, with a
+/// queue marker instead of the sent `›` — it is a promise, not a message.
+fn pending_steer_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    let mut lines = wrap_prefixed(
+        "◷ ",
+        text,
+        width as usize,
+        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::Yellow),
+    );
+    lines.push(Line::default());
+    lines
 }
 
 pub(super) fn cell_lines_unsanitized(

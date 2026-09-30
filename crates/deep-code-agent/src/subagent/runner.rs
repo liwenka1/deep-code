@@ -97,12 +97,15 @@ pub async fn run_subagent(
             | RuntimeEvent::ApprovalResolved { .. }
             | RuntimeEvent::SessionUpdated { .. } => {}
             // RootGranted cannot fire in a child (root grants are auto-denied
-            // for sub-agents); listed for exhaustiveness.
+            // for sub-agents), and UserMessageInjected cannot either: a child
+            // turn is driven unattended, so nobody is there to steer it. Both
+            // listed for exhaustiveness.
             RuntimeEvent::CheckpointCreated { .. }
             | RuntimeEvent::WorkspaceRestored { .. }
             | RuntimeEvent::DiagnosticsUpdated { .. }
             | RuntimeEvent::CompactionApplied { .. }
             | RuntimeEvent::RootGranted { .. }
+            | RuntimeEvent::UserMessageInjected { .. }
             | RuntimeEvent::Warning { .. } => {}
         }
     }

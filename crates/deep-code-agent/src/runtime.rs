@@ -283,6 +283,11 @@ impl AgentRuntime {
             state.turn_cost = Default::default();
             state.turn_cache_hit_tokens = 0;
             state.turn_cache_miss_tokens = 0;
+            // A steer that never found a tool-batch boundary to land on must
+            // not survive into this turn: it was aimed at the *previous* turn
+            // (the TUI's own queue is what re-sends it, as a fresh prompt), and
+            // re-injecting a stale copy here would duplicate the user's words.
+            state.steering.clear();
         }
         self.persist().await;
     }
@@ -302,6 +307,28 @@ impl AgentRuntime {
             runtime.run_loop(&tx).await;
         });
         rx
+    }
+
+    /// Hand the runtime a prompt the user typed while a turn was streaming, to
+    /// be injected into **that** turn rather than queued behind it (mid-turn
+    /// steering).
+    ///
+    /// Returns whether the text was accepted. `false` means no turn is in
+    /// flight — there is nothing to steer — and the caller should submit it
+    /// normally instead. This is a best-effort hand-off, not a delivery
+    /// guarantee: the text waits in the runtime's steering queue until the loop
+    /// reaches a tool-batch boundary, so a turn that never runs another batch (a
+    /// single long answer, or one tool that outlives the user's patience) ends
+    /// with the text still queued. `begin_turn` clears it then, and the caller
+    /// is expected to fall back to sending it as the next prompt — which is
+    /// exactly what the TUI's own queue does.
+    pub async fn steer(&self, text: impl Into<String>) -> bool {
+        let mut state = self.state.lock().await;
+        if state.current_turn_id.is_none() {
+            return false;
+        }
+        state.steering.push_back(text.into());
+        true
     }
 
     /// Resolve a pending tool approval and resume the loop.
@@ -402,6 +429,13 @@ impl AgentRuntime {
             if pending.is_some() || state.current_turn_id.is_some() {
                 state.cancel.cancel();
             }
+            // Esc/Ctrl-C means "changed my mind", so a steer still waiting for a
+            // tool-batch boundary is dropped with the turn it was aimed at — the
+            // same call the TUI makes on its own queue at the moment of cancel.
+            // Clearing it here (rather than only in `begin_turn`) closes the
+            // window where the loop still runs long enough to drain it after the
+            // user has already changed their mind.
+            state.steering.clear();
             pending
         };
 

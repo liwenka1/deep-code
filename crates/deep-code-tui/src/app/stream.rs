@@ -57,7 +57,21 @@ impl App {
                 );
                 return;
             }
-            self.steering_queue.push(sent);
+            self.steering_queue.push(sent.clone());
+            // Also hand the text to the runtime, so it can steer it into the
+            // *live* turn at the next tool-batch boundary rather than making the
+            // user wait for the whole turn. The queue above stays the source of
+            // truth for what the user typed: it is what the pending UI renders,
+            // and what fires as a new turn when the turn ends before any
+            // boundary arrives. No double-send — `begin_turn` clears the
+            // runtime's copy, so the fallback path below can never race the
+            // injected one.
+            let runtime = Arc::clone(&self.runtime);
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = runtime.steer(sent).await;
+                });
+            }
             self.clear_input();
             self.status = self.tr_with(
                 TextId::StatusSteeringQueued,

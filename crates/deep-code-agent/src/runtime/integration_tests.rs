@@ -4693,3 +4693,122 @@ async fn execution_authority_follows_who_resolved_the_prompt() {
     let events = drain(&mut rx).await;
     assert_eq!(finished_contents(&events), ["python deploy.py: Approved"]);
 }
+
+/// Blocks until the test releases it, so a steer can be issued while the tool —
+/// and with it the turn — is genuinely in flight. The turn's next model request
+/// only happens after `run` returns, which is exactly the tool-batch boundary
+/// mid-turn steering injects at.
+#[derive(Debug)]
+struct BlockingEchoTool {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct BlockingEchoParams {
+    message: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl Tool for BlockingEchoTool {
+    type Params = BlockingEchoParams;
+
+    // The exact whitelisted read-only name, so the policy auto-approves the
+    // call: the turn must reach the batch boundary without parking on an
+    // approval panel nobody is there to answer.
+    fn name(&self) -> &str {
+        AutoEchoTool::NAME
+    }
+
+    fn description(&self) -> &str {
+        "Echoes a message once the test releases it."
+    }
+
+    async fn run(
+        &self,
+        params: BlockingEchoParams,
+        _cx: &crate::tool::ToolCx,
+    ) -> Result<crate::tool::ToolOutput, ToolError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(crate::tool::ToolOutput::text(format!(
+            "read_file: {}",
+            params.message.unwrap_or_default()
+        )))
+    }
+}
+
+/// A prompt typed mid-turn is injected at the next tool-batch boundary — not
+/// queued behind the whole turn, and not appended after it.
+#[tokio::test]
+async fn a_steered_prompt_is_injected_at_the_next_tool_boundary() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_1", AutoEchoTool::NAME, r#"{"message":"hi"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let mut registry = ToolRegistry::with_mock_tools();
+    registry.register(BlockingEchoTool {
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    });
+    let runtime = AgentRuntime::new(client, registry);
+
+    let mut rx = runtime.submit_user("please echo").await;
+    started.notified().await;
+    // The tool is running, so the turn is genuinely mid-flight — the window a
+    // user types into.
+    assert!(
+        runtime.steer("skip the echo").await,
+        "a live turn must accept a steer"
+    );
+    release.notify_one();
+
+    let events = drain(&mut rx).await;
+
+    let injected = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                RuntimeEvent::UserMessageInjected { text, .. } if text == "skip the echo"
+            )
+        })
+        .expect("the injected prompt must be announced on the turn's own stream");
+
+    // At the batch boundary: after the tool's result landed, before the model's
+    // next request answered. That ordering is the whole feature — an injection
+    // that arrived after the answer would be the turn-end fallback instead.
+    let tool_result = events
+        .iter()
+        .position(|event| matches!(event, RuntimeEvent::ToolCallFinished { .. }))
+        .expect("the tool must have finished");
+    let next_answer = events
+        .iter()
+        .position(|event| matches!(event, RuntimeEvent::AssistantDelta { .. }))
+        .expect("the model must answer after the batch");
+    assert!(tool_result < injected, "{events:?}");
+    assert!(injected < next_answer, "{events:?}");
+
+    // And it is in the session before that request is built, which is what makes
+    // the request carry it.
+    let messages = runtime.session_messages().await;
+    assert!(
+        messages.iter().any(|message| {
+            matches!(message.role, crate::message::Role::User) && message.content == "skip the echo"
+        }),
+        "the steered prompt must be in the wire: {messages:?}"
+    );
+}

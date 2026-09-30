@@ -42,6 +42,16 @@ pub(super) struct RuntimeState {
     pub(super) session_cache_savings: CostEstimate,
     pub(super) current_prompt: Option<String>,
     pub(super) current_turn_id: Option<TurnId>,
+    /// Prompts the user steered into the in-flight turn (mid-turn steering), in
+    /// arrival order. Drained at the top of each `run_loop` iteration — i.e. at
+    /// a tool-batch boundary, the only point where appending a `user` entry
+    /// cannot split the wire's `tool_calls`/`tool` pairing — and only then
+    /// recorded in the session.
+    ///
+    /// Cleared by `begin_turn` (a steer that was never drained must not leak
+    /// into the next turn) and by `cancel_turn` (Esc means "changed my mind",
+    /// matching the TUI's own queue).
+    pub(super) steering: VecDeque<String>,
     /// Cancellation token for the in-flight turn; rotated by `begin_turn`.
     pub(super) cancel: CancellationToken,
     /// Tools the user approved for the whole session ("a" in the approval

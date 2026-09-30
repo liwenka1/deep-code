@@ -261,18 +261,23 @@ pub(super) fn render_input_from_layout(
 
     // Faint placeholder when the composer is empty and accepting input. While a
     // turn streams the composer is still live (mid-turn steering), so it gets a
-    // placeholder too — a different one, since the text will be queued rather
-    // than sent immediately. Without this the feature is invisible.
+    // different placeholder too — the text will be steered into the live turn
+    // rather than sent as its own, and once something is already queued the
+    // hint says how many are waiting. Without this the feature is invisible.
     if app.input.is_empty() && app.pending_approval.is_none() {
         let hint = if app.is_streaming {
-            TextId::ComposerPlaceholderSteering
+            tr_with(
+                app.lang,
+                TextId::ComposerPlaceholderSteering,
+                &[("count", &app.steering_queue.len().to_string())],
+            )
         } else {
-            TextId::ComposerPlaceholder
+            tr(app.lang, TextId::ComposerPlaceholder).to_string()
         };
         frame.buffer_mut().set_string(
             text_x,
             inner_area.y,
-            tr(app.lang, hint),
+            &hint,
             Style::default().fg(Color::DarkGray),
         );
     }

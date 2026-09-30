@@ -18,6 +18,26 @@ impl App {
                     &[("backend", &self.backend_label)],
                 );
             }
+            RuntimeEvent::UserMessageInjected { text, .. } => {
+                // The steered prompt is already in the session (the runtime
+                // recorded it before emitting), so this arm is the UI catching
+                // up. Flush what the turn streamed so far into history first:
+                // without it the user's cell would render ABOVE output that
+                // preceded it. The reply genuinely was split in two by the
+                // user's message, and this is what makes the transcript say so.
+                self.flush_active_turn();
+                self.history.push(HistoryCell::user(text));
+                // Drop the matching pending entry. FIFO, the same order the
+                // runtime drained in — the message is an ordinary user cell now,
+                // no longer a promise the composer is showing.
+                if !self.steering_queue.is_empty() {
+                    self.steering_queue.remove(0);
+                }
+                self.status = self.tr_with(
+                    TextId::StatusStreamingFrom,
+                    &[("backend", &self.backend_label)],
+                );
+            }
             RuntimeEvent::AssistantDelta { text, .. } => {
                 self.push_assistant_delta(&text);
             }

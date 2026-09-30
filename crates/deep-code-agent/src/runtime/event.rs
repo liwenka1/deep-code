@@ -66,6 +66,17 @@ impl From<&str> for ToolCallId {
 pub enum RuntimeEvent {
     /// A user-visible turn has started.
     TurnStarted { turn_id: TurnId, prompt: String },
+    /// A prompt the user typed while this turn was already streaming was taken
+    /// into the live turn instead of waiting for it to end (mid-turn
+    /// steering). By the time this is emitted the text is already in the
+    /// session, so a UI renders it as an ordinary user message. No new turn id
+    /// is introduced — this belongs to the turn it steered.
+    ///
+    /// Only emitted at a tool-batch boundary, the one point where appending a
+    /// `user` entry cannot split the wire's `tool_calls`/`tool` pairing. That
+    /// is a fact only the runtime knows, which is why the decision lives there
+    /// and the UI merely reports it.
+    UserMessageInjected { turn_id: TurnId, text: String },
     /// Assistant text suitable for transcript rendering.
     AssistantDelta { turn_id: TurnId, text: String },
     /// Reasoning text suitable for transcript rendering.
@@ -199,6 +210,7 @@ impl RuntimeEvent {
     pub fn wire_kind(&self) -> &'static str {
         match self {
             Self::TurnStarted { .. } => "turn.started",
+            Self::UserMessageInjected { .. } => "user.injected",
             Self::AssistantDelta { .. } => "assistant.delta",
             Self::ReasoningDelta { .. } => "reasoning.delta",
             Self::ToolCallStarted { .. } => "tool.started",
@@ -230,6 +242,7 @@ impl RuntimeEvent {
     pub fn turn_id(&self) -> Option<&TurnId> {
         match self {
             Self::TurnStarted { turn_id, .. }
+            | Self::UserMessageInjected { turn_id, .. }
             | Self::AssistantDelta { turn_id, .. }
             | Self::ReasoningDelta { turn_id, .. }
             | Self::ToolCallStarted { turn_id, .. }
@@ -267,7 +280,7 @@ mod tests {
     /// Every variant's `item.kind` and `item.turn_id`, pinned one by one. The
     /// envelope consumers match on these strings, so a rename must show up as
     /// a red test here rather than as a silent wire change; before this table
-    /// only three of the nineteen kinds were asserted anywhere. The exhaustive
+    /// only three of the twenty kinds were asserted anywhere. The exhaustive
     /// `match` in `wire_kind` already forces a string for a new variant — the
     /// length check below is the nudge to pin it here too.
     fn sample_request() -> ApprovalRequest {
@@ -302,6 +315,14 @@ mod tests {
                     prompt: "hi".to_string(),
                 },
                 "turn.started",
+                some_turn,
+            ),
+            (
+                RuntimeEvent::UserMessageInjected {
+                    turn_id: turn.clone(),
+                    text: "actually, skip the tests".to_string(),
+                },
+                "user.injected",
                 some_turn,
             ),
             (
@@ -464,7 +485,7 @@ mod tests {
                 some_turn,
             ),
         ];
-        assert_eq!(cases.len(), 19, "a new variant must be pinned here too");
+        assert_eq!(cases.len(), 20, "a new variant must be pinned here too");
         for (event, kind, turn_id) in &cases {
             assert_eq!(event.wire_kind(), *kind, "{event:?}");
             assert_eq!(event.turn_id(), *turn_id, "{event:?}");
