@@ -24,6 +24,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, TextId, bool)] = &[
     ("/sessions", TextId::HintSessions, false),
     ("/agents", TextId::HintAgents, false),
     ("/find", TextId::HintFind, true),
+    ("/compact", TextId::HintCompact, false),
     ("/lang", TextId::HintLang, true),
     ("/add-dir", TextId::HintAddDir, true),
 ];
@@ -107,12 +108,62 @@ impl App {
                 }
                 true
             }
+            "/compact" => {
+                self.compact_now_command();
+                true
+            }
             _ if prompt == "/lang" || prompt.starts_with("/lang ") => {
                 let arg = prompt.strip_prefix("/lang").unwrap_or_default().trim();
                 self.set_lang_command(arg);
                 true
             }
             _ => false,
+        }
+    }
+
+    /// `/compact`: fold old history into a summary now, whether or not the
+    /// automatic threshold has been reached.
+    ///
+    /// The threshold is a token count, but the user often knows something it
+    /// does not — that the last twenty turns were a dead-end exploration, or
+    /// that a big task is about to start and the window should be cleared
+    /// first. Compaction is not otherwise reachable by hand.
+    fn compact_now_command(&mut self) {
+        // Same busy guard as the other state-changing commands: a compaction
+        // swaps the session's entry list under the running turn, and the
+        // summary cell would then land above output that already streamed.
+        // (The runtime keeps the in-flight request alive either way —
+        // `compact_entries` never archives the newest user entry — so this is
+        // about keeping what is on screen true, not about safety.)
+        if self.is_streaming || self.pending_approval.is_some() {
+            self.status = self.tr(TextId::BusyCompact).to_string();
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.status = self.tr(TextId::CompactOutsideRuntime).to_string();
+            return;
+        };
+        let runtime = std::sync::Arc::clone(&self.runtime);
+        let result = tokio::task::block_in_place(|| handle.block_on(runtime.compact_now()));
+        match result {
+            Some((archived_count, summary)) => {
+                self.history.push(HistoryCell::Compaction {
+                    metadata: Some(format!("archived={archived_count}")),
+                    summary,
+                });
+                self.status = self.tr_with(
+                    TextId::StatusCompacted,
+                    &[("count", &archived_count.to_string())],
+                );
+            }
+            // Not a failure. A short transcript has nothing to fold, and
+            // `compact_entries` deliberately refuses to archive its own
+            // summary — so "nothing to do" is the correct answer, and saying it
+            // is the difference between a command that worked and one that
+            // looks broken.
+            None => {
+                self.status = self.tr(TextId::CompactedNothing).to_string();
+            }
         }
     }
 

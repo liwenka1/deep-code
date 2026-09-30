@@ -4992,3 +4992,61 @@ async fn a_400_that_does_not_name_the_context_window_is_not_retried() {
     );
     assert_eq!(client.calls(), 1, "and must not be retried");
 }
+
+/// `/compact`'s runtime half: fold now, and answer honestly when there is
+/// nothing to fold.
+#[tokio::test]
+async fn compact_now_folds_history_and_reports_a_short_one_as_a_no_op() {
+    let workspace = tempfile::tempdir().unwrap();
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::TextDelta {
+                text: "one".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "two".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "three".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::with_new_session(
+        client,
+        ToolRegistry::default(),
+        "system",
+        workspace.path(),
+        &crate::config::AgentConfig::builtin(),
+    )
+    .unwrap();
+
+    // A transcript too short to archive answers so, rather than pretending.
+    assert!(
+        runtime.compact_now().await.is_none(),
+        "a fresh session has nothing worth folding"
+    );
+
+    for prompt in ["one", "two", "three"] {
+        let mut rx = runtime.submit_user(prompt).await;
+        drain(&mut rx).await;
+    }
+
+    let (archived, summary) = runtime.compact_now().await.expect("history to fold");
+    assert!(archived > 0);
+    assert!(
+        !summary.is_empty(),
+        "the caller renders this text, so it cannot be empty"
+    );
+
+    // The second call has nothing left to do: the only entry in the archivable
+    // range is the summary the first call just wrote, and folding that would
+    // report work on every call while the context never actually shrinks.
+    assert!(runtime.compact_now().await.is_none());
+}

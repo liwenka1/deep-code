@@ -2194,3 +2194,38 @@ fn an_injected_mid_turn_prompt_retires_its_pending_entry() {
     // Injection continues the same turn — it does not end it.
     assert!(app.is_streaming, "injecting a prompt must not end the turn");
 }
+
+#[test]
+fn compact_is_refused_while_a_turn_streams() {
+    let mut app = App::new();
+    app.is_streaming = true;
+    let before = app.history.len();
+
+    assert!(app.handle_slash_command("/compact"));
+
+    assert_eq!(app.status, tr(app.lang, TextId::BusyCompact).to_string());
+    assert_eq!(
+        app.history.len(),
+        before,
+        "a refused compaction must not touch the transcript"
+    );
+}
+
+/// `/compact` on a session with nothing to fold reaches the runtime and reports
+/// the no-op — the wiring, not the folding (that is the runtime's own test).
+///
+/// `multi_thread` because the command blocks on the runtime handle exactly as
+/// `/restore` does, which a current-thread runtime cannot do.
+#[tokio::test(flavor = "multi_thread")]
+async fn compact_on_a_short_session_reports_nothing_to_do() {
+    let mut app = App::new();
+    let before = app.history.len();
+
+    assert!(app.handle_slash_command("/compact"));
+
+    assert_eq!(
+        app.status,
+        tr(app.lang, TextId::CompactedNothing).to_string()
+    );
+    assert_eq!(app.history.len(), before, "nothing folded, no cell");
+}

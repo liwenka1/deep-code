@@ -231,6 +231,8 @@ text_ids! {
     StatusSessionUpdated,
     StatusDiagnostics,
     StatusCompacted,
+    // `/compact` 无事可做时要说出来,而不是静默:短会话打它就是没有可归档的历史。
+    CompactedNothing,
     SystemWarning,
     // 请求被服务端以"超出上下文窗口"拒绝、已强制压缩并重试时的提示。
     ContextOverflowRescued,
@@ -260,6 +262,7 @@ text_ids! {
     SessionReloadFailedRestart,
     BusySwitchSession,
     BusyRestore,
+    BusyCompact,
     SessionsReadFailed,
     NoResumableSessions,
     StatusPickSession,
@@ -298,6 +301,7 @@ text_ids! {
     HintSessions,
     HintAgents,
     HintFind,
+    HintCompact,
     HintLang,
     HintAddDir,
     // 命令输出
@@ -335,6 +339,7 @@ text_ids! {
     CheckpointsCount,
     CheckpointsUnavailable,
     RestoreOutsideRuntime,
+    CompactOutsideRuntime,
     RestoreFailed,
     // 遥测
     PrefixFirstTurn,
