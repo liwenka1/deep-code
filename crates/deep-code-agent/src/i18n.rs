@@ -232,6 +232,8 @@ text_ids! {
     StatusDiagnostics,
     StatusCompacted,
     SystemWarning,
+    // 请求被服务端以"超出上下文窗口"拒绝、已强制压缩并重试时的提示。
+    ContextOverflowRescued,
     StatusRollbackHint,
     SystemTurnCancelled,
     StatusCancelled,
@@ -350,6 +352,8 @@ text_ids! {
     ErrApiRateLimited,
     ErrApiServer,
     ErrApiGeneric,
+    // 上下文超长且已无法再压缩时的错误:必须给出路,而不是只报数字。
+    ErrContextOverflow,
     ErrParse,
     ErrSerde,
     ErrRequestTimeout,

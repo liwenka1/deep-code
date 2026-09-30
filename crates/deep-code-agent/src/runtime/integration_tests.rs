@@ -4812,3 +4812,183 @@ async fn a_steered_prompt_is_injected_at_the_next_tool_boundary() {
         "the steered prompt must be in the wire: {messages:?}"
     );
 }
+
+/// Serves ordinary text turns, except that the `refuse_at_call`-th request is
+/// rejected with `refusal_message` — the only way to drive the context-overflow
+/// rescue without building a genuinely oversized context. Records each
+/// request's message count, which is how a test proves the retry really did
+/// carry less.
+#[derive(Clone)]
+struct RefusingClient {
+    inner: Arc<RefusingInner>,
+}
+
+struct RefusingInner {
+    refuse_at_call: usize,
+    refusal_message: String,
+    calls: Mutex<usize>,
+    message_counts: Mutex<Vec<usize>>,
+}
+
+impl RefusingClient {
+    fn new(refuse_at_call: usize, refusal_message: &str) -> Self {
+        Self {
+            inner: Arc::new(RefusingInner {
+                refuse_at_call,
+                refusal_message: refusal_message.to_string(),
+                calls: Mutex::new(0),
+                message_counts: Mutex::new(Vec::new()),
+            }),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        *self.inner.calls.lock().unwrap()
+    }
+
+    fn message_counts(&self) -> Vec<usize> {
+        self.inner.message_counts.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmClient for RefusingClient {
+    fn provider_name(&self) -> &'static str {
+        "refusing"
+    }
+
+    fn model(&self) -> &str {
+        "refusing"
+    }
+
+    async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
+        let call = {
+            let mut calls = self.inner.calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        self.inner
+            .message_counts
+            .lock()
+            .unwrap()
+            .push(request.messages.len());
+        if call == self.inner.refuse_at_call {
+            return Err(AgentError::Api {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                message: self.inner.refusal_message.clone(),
+            });
+        }
+        let text = format!("reply {call}");
+        let stream = try_stream! {
+            yield AgentEvent::TextDelta { text };
+            yield AgentEvent::Done { usage: None };
+        };
+        let stream: Pin<Box<dyn Stream<Item = AgentResult<AgentEvent>> + Send>> = Box::pin(stream);
+        Ok(stream)
+    }
+}
+
+/// A 400 the provider blames on the context window is recovered from by
+/// compacting history and retrying the same request — instead of ending the
+/// turn with an error the user can neither read nor act on.
+#[tokio::test]
+async fn a_context_overflow_refusal_compacts_and_retries() {
+    let workspace = tempfile::tempdir().unwrap();
+    let client = RefusingClient::new(
+        4,
+        r#"{"error":{"message":"This model's maximum context length is 131072 tokens.","code":"context_length_exceeded"}}"#,
+    );
+    let runtime = AgentRuntime::with_new_session(
+        client.clone(),
+        ToolRegistry::default(),
+        "system",
+        workspace.path(),
+        &crate::config::AgentConfig::builtin(),
+    )
+    .unwrap();
+
+    // Three turns first, so there is a middle to fold away: `compact_entries`
+    // keeps the system head plus the last five entries, and needs something
+    // between them to archive.
+    for prompt in ["one", "two", "three"] {
+        let mut rx = runtime.submit_user(prompt).await;
+        drain(&mut rx).await;
+    }
+
+    // The fourth turn's request is refused.
+    let mut rx = runtime.submit_user("four").await;
+    let events = drain(&mut rx).await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Error { .. })),
+        "the refusal must be recovered, not surfaced: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::CompactionApplied { archived_count, .. } if *archived_count > 0
+        )),
+        "the rescue must actually fold history: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Warning { .. })),
+        "the user must be told why the turn paused: {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(RuntimeEvent::TurnFinished { .. })),
+        "the recovered turn still finishes normally: {events:?}"
+    );
+
+    // The proof it helped: the retry carried strictly fewer messages than the
+    // request that was refused. Without this the test would pass on a rescue
+    // that compacted and then re-sent the identical context.
+    let counts = client.message_counts();
+    assert_eq!(
+        counts.len(),
+        5,
+        "one refused attempt, one retry: {counts:?}"
+    );
+    let (refused, retried) = (counts[3], counts[4]);
+    assert!(
+        retried < refused,
+        "the retry must carry a smaller context: refused={refused} retried={retried} ({counts:?})"
+    );
+}
+
+/// The other half of the contract: a 400 naming something else must NOT be
+/// re-read as an overflow. Compacting there would cost a rewrite and a request
+/// before finally reporting the real problem.
+#[tokio::test]
+async fn a_400_that_does_not_name_the_context_window_is_not_retried() {
+    let workspace = tempfile::tempdir().unwrap();
+    let client = RefusingClient::new(1, r#"{"error":{"message":"invalid tool schema"}}"#);
+    let runtime = AgentRuntime::with_new_session(
+        client.clone(),
+        ToolRegistry::default(),
+        "system",
+        workspace.path(),
+        &crate::config::AgentConfig::builtin(),
+    )
+    .unwrap();
+
+    let mut rx = runtime.submit_user("hi").await;
+    let events = drain(&mut rx).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Error { .. })),
+        "an unrelated 400 is the user's to see: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::CompactionApplied { .. })),
+        "and must not cost a compaction: {events:?}"
+    );
+    assert_eq!(client.calls(), 1, "and must not be retried");
+}

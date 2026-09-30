@@ -41,7 +41,47 @@ pub enum AgentError {
     StreamOverflow { limit_bytes: u64 },
 }
 
+/// Provider phrases that name the context window in a rejected request's body.
+///
+/// Both spellings are OpenAI-compatible: the code half
+/// (`context_length_exceeded`) and the human half ("This model's maximum
+/// context length is N tokens"). The list is a list precisely because the body
+/// belongs to the provider, not to us — a third spelling costs one more entry
+/// and nothing else.
+///
+/// Matched against the RAW body rather than a parsed field: the code appears
+/// verbatim in the JSON, so parsing would add a failure mode (a proxy returning
+/// a non-JSON page) without adding any reach.
+const CONTEXT_WINDOW_HINTS: &[&str] = &["context_length_exceeded", "context length"];
+
 impl AgentError {
+    /// Does this look like the provider refusing the request because it
+    /// exceeded the model's context window?
+    ///
+    /// Only answers for a `400`; a `429`/`5xx` is the retry path's business, and
+    /// the two must not be confused — one retries the same request, the other
+    /// has to shrink it first.
+    ///
+    /// Asymmetric on purpose. `false` is always safe: the caller falls back to
+    /// reporting the error exactly as it did before. A wrong `true` costs one
+    /// wasted request. That is why the caller pairs this with its own token
+    /// estimate rather than trusting the provider's wording alone, and why the
+    /// match is on a couple of distinctive phrases rather than anything looser
+    /// ("too long" would catch unrelated 400s).
+    #[must_use]
+    pub fn blames_context_window(&self) -> bool {
+        let Self::Api { status, message } = self else {
+            return false;
+        };
+        if status.as_u16() != 400 {
+            return false;
+        }
+        let lowered = message.to_ascii_lowercase();
+        CONTEXT_WINDOW_HINTS
+            .iter()
+            .any(|hint| lowered.contains(hint))
+    }
+
     /// The localized, guidance-carrying message shown to the user (status line
     /// + error cell). `Display` remains the English log form.
     #[must_use]
@@ -129,5 +169,44 @@ mod tests {
                 .user_message(Lang::En)
                 .contains("authentication failed")
         );
+    }
+
+    #[test]
+    fn only_a_400_mentioning_the_context_window_blames_it() {
+        let api = |status: u16, message: &str| AgentError::Api {
+            status: reqwest::StatusCode::from_u16(status).unwrap(),
+            message: message.to_string(),
+        };
+
+        // Both spellings the provider may use for the same refusal.
+        assert!(
+            api(
+                400,
+                r#"{"error":{"message":"This model's maximum context length is 131072 tokens.","code":"context_length_exceeded"}}"#
+            )
+            .blames_context_window()
+        );
+        assert!(
+            api(
+                400,
+                r#"{"error":{"message":"This model's maximum context length is 131072 tokens."}}"#
+            )
+            .blames_context_window()
+        );
+
+        // A 400 naming something else must not reach the compaction path: it
+        // would burn a compaction and a request before reporting the real
+        // problem.
+        assert!(
+            !api(400, r#"{"error":{"message":"invalid tool schema"}}"#).blames_context_window()
+        );
+        // ...and neither must a context-flavoured message that is NOT a 400 —
+        // a 429 is the retry path's, and must keep retrying the same request.
+        assert!(
+            !api(429, "context length exceeded, slow down").blames_context_window(),
+            "a retriable status must never be re-read as an overflow"
+        );
+        // Non-API variants have no body to read.
+        assert!(!AgentError::RequestTimeout { seconds: 30 }.blames_context_window());
     }
 }

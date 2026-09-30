@@ -3,6 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 
 use crate::compaction::estimate_token_count;
+use crate::error::AgentError;
 use crate::event::AgentEvent;
 use crate::model::{ChatRequest, Usage};
 use crate::model_registry::{DEEPSEEK_V4_PRO, context_window_for_model};
@@ -114,6 +115,11 @@ impl AgentRuntime {
 
         let mut stream_retries = 0u32;
         let mut steps = 0u32;
+        // One forced-compaction rescue per turn at most (see the `Some(Err)`
+        // arm below). A second overflow means the oversized part is this turn's
+        // own retained tail, which compaction structurally cannot reach —
+        // retrying again would only re-bill the same rejected request.
+        let mut overflow_rescued = false;
 
         loop {
             // Bound the model/tool ping-pong. Every iteration is one API request
@@ -149,7 +155,7 @@ impl AgentRuntime {
             // turn grew the context without ever re-checking the threshold — the
             // exact shape that overflows the window, and a context-overflow 400
             // is not retriable and has no recovery path.
-            if self.maybe_compact(&route.effective_model, tx).await {
+            if self.maybe_compact(&route.effective_model, tx, false).await {
                 // compaction event already emitted; continue with trimmed history
             }
 
@@ -176,6 +182,12 @@ impl AgentRuntime {
             };
 
             let estimated_context_tokens = estimate_token_count(&messages);
+            // Our own read on how close this request is to the window, used only
+            // for the overflow rescue below. The provider's error wording is not
+            // ours to rely on across versions; this number is, so the rescue has
+            // a signal that does not depend on it.
+            let near_window = estimated_context_tokens
+                >= context_window_for_model(&route.effective_model).saturating_mul(95) / 100;
 
             let mut request = ChatRequest::streaming(route.effective_model.clone(), messages)
                 .with_tools(self.tools.chat_tools());
@@ -188,12 +200,66 @@ impl AgentRuntime {
                 () = cancel.cancelled() => None,
                 opened = self.open_turn_stream(&mut route, request) => Some(opened),
             };
+            // A 400 the provider blames on the context window, OR any 400 at a
+            // context we ourselves read as within 5% of it. Two independent
+            // signals on purpose: the phrase match is the provider's wording,
+            // `near_window` is our own estimate and survives a rewording.
+            let overflow_refusal = |error: &AgentError| {
+                error.blames_context_window()
+                    || (near_window
+                        && matches!(error, AgentError::Api { status, .. } if status.as_u16() == 400))
+            };
+
             let mut stream = match opened {
                 None => {
                     self.finish_turn_cancelled(&turn_id, tx).await;
                     return;
                 }
                 Some(Ok(stream)) => stream,
+                Some(Err(error)) if !overflow_rescued && overflow_refusal(&error) => {
+                    // The provider refused the request for being over the model's
+                    // window. Shrinking history is the only recovery there is,
+                    // and it has to be FORCED: the estimate that normally gates
+                    // compaction is the very number that just proved too
+                    // optimistic.
+                    //
+                    // The loop simply continues — the retry is the same request
+                    // over a now-shorter history, so a UI must not read it as a
+                    // new turn. Hence a warning rather than an error, and no
+                    // TurnStarted.
+                    overflow_rescued = true;
+                    if self.compact_session(Some(tx)).await.is_none() {
+                        // Nothing left to archive: the oversized part is this
+                        // turn's own retained tail — a single huge tool result,
+                        // say — which the retention rule keeps by design and
+                        // compaction can never reach. Report that instead of
+                        // re-raising the raw 400, and name the way out.
+                        emit(
+                            tx,
+                            RuntimeEvent::Error {
+                                turn_id: Some(turn_id.clone()),
+                                message: crate::tr_with(
+                                    self.ui_lang(),
+                                    crate::TextId::ErrContextOverflow,
+                                    &[("estimate", &estimated_context_tokens.to_string())],
+                                ),
+                            },
+                        );
+                        self.abort_turn(&turn_id).await;
+                        return;
+                    }
+                    emit(
+                        tx,
+                        RuntimeEvent::Warning {
+                            message: crate::tr(
+                                self.ui_lang(),
+                                crate::TextId::ContextOverflowRescued,
+                            )
+                            .to_string(),
+                        },
+                    );
+                    continue;
+                }
                 Some(Err(error)) => {
                     emit(
                         tx,

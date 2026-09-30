@@ -1,28 +1,56 @@
+use std::sync::Arc;
+
 use tokio::sync::mpsc;
 
 use crate::compaction::{compact_entries, should_compact};
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, emit};
+use crate::session_entry::SessionEntry;
 
 impl AgentRuntime {
+    /// Compact when the threshold says so, or unconditionally when `force`.
     pub(super) async fn maybe_compact(
         &self,
         model: &str,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        force: bool,
     ) -> bool {
-        let (wire, entries) = {
-            let state = self.state.lock().await;
-            (
-                state.session.wire_messages(),
-                state.session.entries().to_vec(),
-            )
-        };
-        if !should_compact(model, &wire, self.config.compaction_threshold) {
-            return false;
+        if !force {
+            let wire = self.state.lock().await.session.wire_messages();
+            if !should_compact(model, &wire, self.config.compaction_threshold) {
+                return false;
+            }
         }
+        self.compact_session(Some(tx)).await.is_some()
+    }
+
+    /// Compact now, threshold or not — for a caller that knows something the
+    /// estimate does not (a provider that already refused the request).
+    ///
+    /// `None` means there was nothing to archive: the transcript is already
+    /// short. That is a normal answer to a hand-issued `/compact`, and a dead
+    /// end for the rescue path — so it is reported rather than swallowed.
+    pub async fn compact_now(&self) -> Option<(usize, String)> {
+        self.compact_session(None).await
+    }
+
+    /// Fold history and report what happened as `(archived_entries, summary)`,
+    /// or `None` when nothing could be archived.
+    ///
+    /// `tx` is `None` for a compaction no turn is running (`/compact`): its
+    /// event has no turn stream to ride, so the caller renders the result
+    /// itself rather than a `CompactionApplied` nobody is listening for.
+    pub(super) async fn compact_session(
+        &self,
+        tx: Option<&mpsc::UnboundedSender<RuntimeEvent>>,
+    ) -> Option<(usize, String)> {
+        let entries: Vec<Arc<SessionEntry>> = {
+            let state = self.state.lock().await;
+            state.session.entries().to_vec()
+        };
         let result = compact_entries(&entries);
         if result.archived_count == 0 {
-            return false;
+            return None;
         }
         let compacted = {
             let mut state = self.state.lock().await;
@@ -44,13 +72,15 @@ impl AgentRuntime {
             }
             persistence.actor.request_save();
         }
-        emit(
-            tx,
-            RuntimeEvent::CompactionApplied {
-                archived_count: result.archived_count,
-                summary: result.summary.clone(),
-            },
-        );
-        true
+        if let Some(tx) = tx {
+            emit(
+                tx,
+                RuntimeEvent::CompactionApplied {
+                    archived_count: result.archived_count,
+                    summary: result.summary.clone(),
+                },
+            );
+        }
+        Some((result.archived_count, result.summary))
     }
 }
