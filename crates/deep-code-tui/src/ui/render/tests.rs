@@ -2200,3 +2200,60 @@ fn a_queued_steer_is_visible_as_a_pending_row() {
         "the queued prompt itself must be readable:\n{one}"
     );
 }
+
+/// The transcript memo must be invisible: a warm frame has to be identical to a
+/// cold one, and neither an edited cell nor a shifted index may be served from
+/// it.
+///
+/// The index key is only safe because the entry carries its own cell — a
+/// front-drain (what `enforce_history_cap` does at the cap) moves every cell
+/// down one index, and without that comparison the memo would happily draw the
+/// old occupant's lines at the new occupant's index.
+#[test]
+fn the_transcript_memo_never_changes_what_is_drawn() {
+    use crate::history::HistoryCell;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.history = vec![
+        HistoryCell::user("first question"),
+        HistoryCell::assistant("# Heading\n\nbody **text** here"),
+        HistoryCell::system("note"),
+    ];
+    let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    let screen = |terminal: &mut Terminal<TestBackend>, app: &mut App| {
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|row| {
+                (0..buffer.area.width)
+                    .map(|col| buffer[(col, row)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let _ = screen(&mut terminal, &mut app);
+    let warm = screen(&mut terminal, &mut app);
+    app.cell_lines.clear();
+    let cold = screen(&mut terminal, &mut app);
+    assert_eq!(warm, cold, "a warm memo drew a different frame");
+
+    // A cell replaced in place must not be served from the memo.
+    app.history[1] = HistoryCell::assistant("replaced body");
+    let after_edit = screen(&mut terminal, &mut app);
+    assert!(after_edit.contains("replaced body"), "{after_edit}");
+    assert!(!after_edit.contains("body **text**"), "{after_edit}");
+
+    // A front-drain shifts every index — the case the content comparison exists
+    // for.
+    app.history.remove(0);
+    let after_shift = screen(&mut terminal, &mut app);
+    assert!(!after_shift.contains("first question"), "{after_shift}");
+    assert!(after_shift.contains("replaced body"), "{after_shift}");
+}

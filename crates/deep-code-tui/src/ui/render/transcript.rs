@@ -3,9 +3,11 @@
 
 use super::*;
 
+use crate::app::CachedCellLines;
+
 pub(super) fn render_messages(
     frame: &mut Frame<'_>,
-    app: &App,
+    app: &mut App,
     area: ratatui::layout::Rect,
 ) -> TranscriptSnapshot {
     // No transcript border/title — a 1-col left gutter and the input box
@@ -16,9 +18,35 @@ pub(super) fn render_messages(
     // Render the WHOLE transcript into a stable line buffer: a fixed
     // coordinate space is what lets mouse drag-selection map cleanly, and
     // bottom-anchored scroll then just windows it.
+    //
+    // Each cell's lines come from the memo when they are still valid — the
+    // transcript is re-rendered every frame, and re-parsing markdown for the
+    // whole history measured ~41ms/frame on a 1.7MB session (see
+    // `App::cell_lines`). Rendering is per-cell, so the cost is now paid once
+    // per cell instead of once per cell per frame.
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for cell in &app.history {
-        lines.extend(cell_lines(cell, content_width, app.lang));
+    for index in 0..app.history.len() {
+        let stale = !app
+            .cell_lines
+            .get(&index)
+            .is_some_and(|cached| cached.matches(&app.history[index], content_width, app.lang));
+        if stale {
+            let cell = app.history[index].clone();
+            let rendered = cell_lines(&cell, content_width, app.lang);
+            app.cell_lines.insert(
+                index,
+                CachedCellLines::new(cell, content_width, app.lang, rendered),
+            );
+        }
+        lines.extend(app.cell_lines[&index].lines().iter().cloned());
+    }
+    // A session switch or `/clear` leaves the memo holding cells that are no
+    // longer in `history`. They cost nothing to keep re-validating, but they do
+    // hold the old transcript in memory, so drop the ones past the end once the
+    // two disagree.
+    if app.cell_lines.len() > app.history.len() {
+        let live = app.history.len();
+        app.cell_lines.retain(|index, _| *index < live);
     }
     let preview = app
         .active_turn

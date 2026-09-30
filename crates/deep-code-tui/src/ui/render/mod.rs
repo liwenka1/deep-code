@@ -100,7 +100,10 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_input_from_layout(frame, app, &layout, row(transcript_h + panel_h, input_h));
         render_status(frame, app, row(transcript_h + panel_h + input_h, status_h));
         snap
-    } else if let Some(menu) = &app.completion {
+    } else if let Some(menu) = app.completion.clone() {
+        // Cloned for the frame: `render_messages` now takes `&mut App` (it
+        // memoizes each cell's rendered lines), so nothing may hold a borrow
+        // into `app` across it. The menu is a handful of short rows.
         let menu_height = (menu.items.len() as u16).min(COMPLETION_VISIBLE_ROWS as u16) + 2;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -112,7 +115,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
             ])
             .split(frame.area());
         let snap = render_messages(frame, app, chunks[0]);
-        render_completion_menu(frame, menu, chunks[1], app.lang);
+        render_completion_menu(frame, &menu, chunks[1], app.lang);
         render_input_from_layout(frame, app, &layout, chunks[2]);
         render_status(frame, app, chunks[3]);
         snap

@@ -18,6 +18,8 @@ use deep_code_agent::{
 };
 use tokio::sync::mpsc;
 
+use ratatui::text::Line;
+
 use crate::active_turn::ActiveTurn;
 use crate::cli::workspace_root;
 use crate::history::{HistoryCell, hydrate_history};
@@ -80,6 +82,21 @@ pub struct App {
     pub(crate) input_cursor: usize,
     pub input: String,
     pub history: Vec<HistoryCell>,
+    /// Rendered lines per history cell, keyed by index in `history`.
+    ///
+    /// `render_messages` used to re-render the WHOLE transcript every frame, and
+    /// markdown parsing plus wrapping a few thousand cells costs tens of
+    /// milliseconds — measured at ~41ms/frame on a 1.7MB session, i.e. one
+    /// stalled frame per keystroke or scroll. A history cell is immutable once
+    /// pushed (nothing in the app edits one in place; verified by auditing every
+    /// write to `history`), so the rendering is worth keeping.
+    ///
+    /// Validated by comparing the cell, not merely the key: `history` is only
+    /// ever appended to, cleared, or drained from the FRONT, and a front-drain
+    /// shifts every index. Without the comparison a stale entry would render the
+    /// wrong text under a key that still looked right. With it, a shift costs
+    /// one re-render and then settles — never a wrong frame.
+    pub(crate) cell_lines: std::collections::HashMap<usize, CachedCellLines>,
     pub active_turn: Option<ActiveTurn>,
     pub status: String,
     pub error: Option<String>,
@@ -210,6 +227,49 @@ pub(crate) struct ResumePicker {
 /// A position in the transcript line buffer: absolute line index + display
 /// column (CJK counts as 2).
 pub(crate) type TextPos = (usize, usize);
+
+/// One history cell's rendered lines, memoized across frames.
+///
+/// Lives next to [`TranscriptSnapshot`] rather than in the render module
+/// because the `App` owns it: the cache has to outlive a frame, and the type
+/// that mirrors `history` belongs beside `history`.
+pub(crate) struct CachedCellLines {
+    /// The cell these lines were rendered from — see [`App::cell_lines`] for why
+    /// the cell itself, and not just the key, decides whether an entry is still
+    /// good.
+    cell: HistoryCell,
+    /// The wrap width and language the lines were produced for. Either changing
+    /// reflows every cell, so they are part of the key.
+    width: u16,
+    lang: Lang,
+    lines: Vec<Line<'static>>,
+}
+
+impl CachedCellLines {
+    pub(crate) fn new(
+        cell: HistoryCell,
+        width: u16,
+        lang: Lang,
+        lines: Vec<Line<'static>>,
+    ) -> Self {
+        Self {
+            cell,
+            width,
+            lang,
+            lines,
+        }
+    }
+
+    /// Whether these lines are still the ones `cell` would render to.
+    #[must_use]
+    pub(crate) fn matches(&self, cell: &HistoryCell, width: u16, lang: Lang) -> bool {
+        self.width == width && self.lang == lang && self.cell == *cell
+    }
+
+    pub(crate) fn lines(&self) -> &[Line<'static>] {
+        &self.lines
+    }
+}
 
 /// What the transcript looked like at the last render — used to translate a
 /// mouse `(col, row)` into a `(line, display_col)` position.
@@ -444,6 +504,7 @@ impl App {
             input_cursor: 0,
             input: String::new(),
             history,
+            cell_lines: std::collections::HashMap::new(),
             active_turn: None,
             // Transient note only — `status_line()` owns the mode/backend/
             // session/telemetry frame, so seeding any of that here would show
