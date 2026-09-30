@@ -1,6 +1,6 @@
 use deep_code_agent::{
-    CheckpointId, CheckpointStore, JsonSessionStore, PrefixStatus, RuntimeEvent, SessionStore,
-    format_sessions_storage_note, web_enabled,
+    CheckpointId, CheckpointStore, JsonSessionStore, Message, PrefixStatus, RuntimeEvent,
+    SessionStore, estimate_token_count, format_sessions_storage_note, web_enabled,
 };
 
 use crate::app::App;
@@ -25,6 +25,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, TextId, bool)] = &[
     ("/agents", TextId::HintAgents, false),
     ("/find", TextId::HintFind, true),
     ("/compact", TextId::HintCompact, false),
+    ("/context", TextId::HintContext, false),
     ("/lang", TextId::HintLang, true),
     ("/add-dir", TextId::HintAddDir, true),
 ];
@@ -112,6 +113,10 @@ impl App {
                 self.compact_now_command();
                 true
             }
+            "/context" => {
+                self.context_command();
+                true
+            }
             _ if prompt == "/lang" || prompt.starts_with("/lang ") => {
                 let arg = prompt.strip_prefix("/lang").unwrap_or_default().trim();
                 self.set_lang_command(arg);
@@ -166,6 +171,100 @@ impl App {
                 self.status = self.tr(TextId::CompactedNothing).to_string();
             }
         }
+    }
+
+    /// `/context`: dump what the model's context actually holds right now.
+    ///
+    /// The transcript on screen is NOT it. Compaction trims the session while
+    /// leaving every cell above intact, so from the first compaction onward the
+    /// two diverge — and there was no way to see the side the model actually
+    /// reads. That is the gap `/compact` opens and this closes.
+    fn context_command(&mut self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.status = self.tr(TextId::ContextUnavailable).to_string();
+            return;
+        };
+        let runtime = std::sync::Arc::clone(&self.runtime);
+        // The wire messages ARE the context (the provider sees nothing else), so
+        // this lists them rather than the entries or the transcript.
+        let (messages, tokens) = tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let messages = runtime.session_messages().await;
+                let tokens = estimate_token_count(&messages);
+                (messages, tokens)
+            })
+        });
+        let header = self.tr_with(
+            TextId::ContextHeader,
+            &[
+                ("messages", &messages.len().to_string()),
+                ("tokens", &tokens.to_string()),
+            ],
+        );
+        let mut body = vec![header.clone()];
+        body.extend(self.context_list_lines(&messages));
+        self.history.push(HistoryCell::system(body.join("\n")));
+        self.status = header;
+    }
+
+    /// The `/context` listing: the first few wire messages, an elision marker,
+    /// the last few.
+    ///
+    /// Head *and* tail, because that is the shape a compacted context has — the
+    /// folded summary sits at the front and the retained tail at the back, and
+    /// seeing exactly that is the point of the command.
+    pub(crate) fn context_list_lines(&self, messages: &[Message]) -> Vec<String> {
+        const HEAD: usize = 3;
+        const TAIL: usize = 10;
+        const LINE_CHARS: usize = 120;
+
+        let line = |index: usize, message: &Message| {
+            // Newlines would break the one-line-per-message shape this listing
+            // exists to provide.
+            let head =
+                crate::history::truncate_chars(&message.content.replace('\n', " "), LINE_CHARS);
+            // The wire role (`system`/`user`/`assistant`/`tool`), not a
+            // translation: this is a dump of the wire, and the reason to read it
+            // is to compare it against the transcript above.
+            let calls = if message.tool_calls.is_empty() {
+                String::new()
+            } else {
+                format!(" (+{} tool call(s))", message.tool_calls.len())
+            };
+            let role = message.role.as_str();
+            if head.is_empty() {
+                format!("{index:>3}. {role}{calls}")
+            } else {
+                format!("{index:>3}. {role}{calls}: {head}")
+            }
+        };
+
+        if messages.len() <= HEAD + TAIL {
+            return messages
+                .iter()
+                .enumerate()
+                .map(|(index, message)| line(index + 1, message))
+                .collect();
+        }
+        let mut lines: Vec<String> = messages
+            .iter()
+            .take(HEAD)
+            .enumerate()
+            .map(|(index, message)| line(index + 1, message))
+            .collect();
+        lines.push(self.tr_with(
+            TextId::ContextElided,
+            &[("count", &(messages.len() - HEAD - TAIL).to_string())],
+        ));
+        let start = messages.len() - TAIL;
+        lines.extend(
+            messages
+                .iter()
+                .skip(start)
+                .enumerate()
+                .map(|(offset, message)| line(start + offset + 1, message)),
+        );
+        lines
     }
 
     /// `/lang`: show the current UI language; `/lang zh|en` switches it live

@@ -304,6 +304,7 @@ text_ids! {
     HintAgents,
     HintFind,
     HintCompact,
+    HintContext,
     HintLang,
     HintAddDir,
     // 命令输出
@@ -342,6 +343,10 @@ text_ids! {
     CheckpointsUnavailable,
     RestoreOutsideRuntime,
     CompactOutsideRuntime,
+    // `/context`:把模型此刻实际拥有的上下文列出来。
+    ContextHeader,
+    ContextElided,
+    ContextUnavailable,
     RestoreFailed,
     // 遥测
     PrefixFirstTurn,

@@ -53,6 +53,10 @@ mod workspace_tools;
 pub use approval_classifier::action_summary;
 pub use checkpoint::{CheckpointId, CheckpointStore};
 pub use client::{AgentEventStream, LlmClient};
+// The model-visible context is only inspectable if its size is: `/context`
+// renders the session's wire messages, and a count of messages says nothing
+// about how close the request is to the window.
+pub use compaction::estimate_token_count;
 pub use config::{
     AgentConfig, ConfigLoadReport, ConfigSources, GlobalConfigUpdate, LoadedAgentConfig,
     validate_api_key, write_global_config_update,

@@ -2229,3 +2229,45 @@ async fn compact_on_a_short_session_reports_nothing_to_do() {
     );
     assert_eq!(app.history.len(), before, "nothing folded, no cell");
 }
+
+/// `/context` exists because the transcript and the model's context diverge: it
+/// lists the wire messages, not the cells above them.
+#[tokio::test(flavor = "multi_thread")]
+async fn context_lists_the_wire_messages_not_the_transcript() {
+    let mut app = App::new();
+    let before = app.history.len();
+
+    assert!(app.handle_slash_command("/context"));
+
+    assert_eq!(app.history.len(), before + 1);
+    let Some(HistoryCell::System { text }) = app.history.last() else {
+        panic!("expected a system cell, got {:?}", app.history.last());
+    };
+    assert!(text.contains("模型当前上下文"), "{text}");
+    // The system prompt is on the wire from the start, so it is message 1 — and
+    // `1. system` is also the assertion that the lines carry wire roles.
+    assert!(text.contains("1. system"), "{text}");
+}
+
+/// A context longer than the listing window keeps BOTH ends: the folded summary
+/// lives at the front of a compacted context and the retained tail at the back,
+/// so eliding only the middle is the shape that shows the reader what changed.
+#[test]
+fn a_long_context_listing_keeps_the_head_and_the_tail() {
+    use deep_code_agent::Message;
+
+    let app = App::new();
+    let messages: Vec<Message> = (0..30)
+        .map(|index| Message::user(format!("m{index}")))
+        .collect();
+
+    let lines = app.context_list_lines(&messages);
+
+    assert_eq!(lines.len(), 3 + 1 + 10, "{lines:?}");
+    assert!(lines[0].contains("m0"), "{}", lines[0]);
+    assert!(lines[2].contains("m2"), "{}", lines[2]);
+    assert!(lines[3].contains("省略"), "{}", lines[3]);
+    // 30 messages, 3 + 10 shown → 17 elided.
+    assert!(lines[3].contains("17"), "{}", lines[3]);
+    assert!(lines.last().unwrap().contains("m29"), "{:?}", lines.last());
+}
