@@ -246,8 +246,10 @@ text_ids! {
     BadgeDenied,
     CheckpointLabel,
     CheckpointRestoreHint,
-    CompactionSummaryTitle,
-    CompactionSummaryTitleMeta,
+    // 压缩 cell:标题说清"折叠了几条",中行说清"下面这段就是模型现在看到的历史"。
+    CompactionTitle,
+    CompactionTitleMeasured,
+    CompactionWhatModelSees,
     // 粘贴 chip
     PasteChipLines,
     PasteChipChars,

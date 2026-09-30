@@ -103,8 +103,20 @@ pub enum HistoryCell {
         id: String,
         label: String,
     },
+    /// A compaction summary, as rendered.
+    ///
+    /// Typed rather than a preformatted `metadata: String`, which is exactly how
+    /// this cell came to print a raw `archived=2` into a Chinese UI — no unit,
+    /// and nothing the renderer could localize.
     Compaction {
-        metadata: Option<String>,
+        /// SessionEntries folded into the summary. Not messages: one assistant
+        /// entry carries a whole tool batch, so the two counts diverge precisely
+        /// on the sessions where compaction fires.
+        archived_entries: usize,
+        /// Estimated context tokens either side of the fold. `None` when the
+        /// compaction did not measure itself (a cell replayed from a session
+        /// record cannot — the record stores no token counts).
+        context_tokens: Option<(u32, u32)>,
         summary: String,
     },
 }
@@ -178,12 +190,34 @@ impl HistoryCell {
                 format!("ID: {id}"),
                 tr_with(lang, TextId::CheckpointRestoreHint, &[("id", id)]),
             ],
-            Self::Compaction { metadata, summary } => {
-                let title = metadata.as_deref().map_or_else(
-                    || tr(lang, TextId::CompactionSummaryTitle).to_string(),
-                    |value| tr_with(lang, TextId::CompactionSummaryTitleMeta, &[("meta", value)]),
-                );
-                vec![title, summary.clone()]
+            Self::Compaction {
+                archived_entries,
+                context_tokens,
+                summary,
+            } => {
+                let count = archived_entries.to_string();
+                let title = match context_tokens {
+                    Some((before, after)) => tr_with(
+                        lang,
+                        TextId::CompactionTitleMeasured,
+                        &[
+                            ("count", &count),
+                            ("before", &before.to_string()),
+                            ("after", &after.to_string()),
+                        ],
+                    ),
+                    None => tr_with(lang, TextId::CompactionTitle, &[("count", &count)]),
+                };
+                // The middle line is the point of the whole cell. The transcript
+                // above still shows the originals, so without it this block reads
+                // as "the conversation was rewritten into the text below" — which
+                // is not what happened. What happened is that the model stopped
+                // seeing them, and only this line says so.
+                vec![
+                    title,
+                    tr(lang, TextId::CompactionWhatModelSees).to_string(),
+                    summary.clone(),
+                ]
             }
         }
     }
@@ -269,7 +303,10 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
                 archived_count,
             } => {
                 current_turn.push(HistoryCell::Compaction {
-                    metadata: Some(format!("archived={archived_count}")),
+                    archived_entries: *archived_count,
+                    // The record carries no token counts, so a replayed cell can
+                    // say what was folded but not what it bought.
+                    context_tokens: None,
                     summary: summary.clone(),
                 });
             }

@@ -111,14 +111,59 @@ fn hydrate_history_keeps_assistant_tool_calls_and_results() {
     ));
     assert!(cells.iter().any(|cell| matches!(
         cell,
-        HistoryCell::Compaction { metadata, summary }
-            if metadata.as_deref() == Some("archived=2")
-                && summary == "older conversation summary"
+        // A replayed cell can say what was folded but not what it bought: the
+        // session record stores no token counts.
+        HistoryCell::Compaction {
+            archived_entries: 2,
+            context_tokens: None,
+            summary,
+        } if summary == "older conversation summary"
     )));
     assert!(cells.iter().any(|cell| matches!(
         cell,
         HistoryCell::Checkpoint { id, .. } if id == "checkpoint_1"
     )));
+}
+
+/// The two things the compaction cell has to answer: what got folded, and — the
+/// question that had no answer before — what the model is looking at now.
+#[test]
+fn a_compaction_cell_says_what_was_folded_and_what_the_model_now_sees() {
+    let measured = HistoryCell::Compaction {
+        archived_entries: 3,
+        context_tokens: Some((120_000, 45_000)),
+        summary: "- 用户 / user: 做点事".to_string(),
+    };
+    let lines = measured.lines(Lang::Zh);
+
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    // The count is entries and says so; the delta is what tells the user the
+    // fold actually bought something.
+    assert!(lines[0].contains("3 条记录"), "{}", lines[0]);
+    assert!(
+        lines[0].contains("120000") && lines[0].contains("45000"),
+        "{}",
+        lines[0]
+    );
+    // The line that resolves the confusion: the block BELOW is the model's
+    // context, and the originals are still above it in the transcript.
+    assert!(lines[1].contains("模型当前看到"), "{}", lines[1]);
+    assert_eq!(lines[2], "- 用户 / user: 做点事");
+
+    // A cell replayed from a session record carries no token counts, so it
+    // states what it knows and no more.
+    let replayed = HistoryCell::Compaction {
+        archived_entries: 2,
+        context_tokens: None,
+        summary: "…".to_string(),
+    };
+    let lines = replayed.lines(Lang::En);
+    assert!(lines[0].contains("2 record"), "{}", lines[0]);
+    assert!(
+        !lines[0].contains("tokens"),
+        "no numbers, no token delta: {}",
+        lines[0]
+    );
 }
 
 /// Compaction trims `record.entries` and leaves `record.turns` alone, so the

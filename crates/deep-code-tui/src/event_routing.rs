@@ -210,7 +210,11 @@ impl App {
                 summary,
             } => {
                 self.history.push(HistoryCell::Compaction {
-                    metadata: Some(format!("archived={archived_count}")),
+                    archived_entries: archived_count,
+                    // The automatic path fires on a threshold, so "did it buy
+                    // anything" is not in question — and `CompactionApplied`
+                    // carries no token counts to answer it with anyway.
+                    context_tokens: None,
                     summary: summary.clone(),
                 });
                 self.status = self.tr_with(

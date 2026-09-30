@@ -4998,26 +4998,19 @@ async fn a_400_that_does_not_name_the_context_window_is_not_retried() {
 #[tokio::test]
 async fn compact_now_folds_history_and_reports_a_short_one_as_a_no_op() {
     let workspace = tempfile::tempdir().unwrap();
-    let client = ScriptedClient::new(vec![
+    // Long enough that the excerpt (a 160-char cap) is a real reduction. Short
+    // messages are the case where folding does NOT shrink anything — see
+    // `compacting_only_short_messages_reports_a_context_that_grew`.
+    let prompt = |tag: &str| format!("{tag}: {}", "detail ".repeat(120));
+    let reply = |text: &str| {
         vec![
             AgentEvent::TextDelta {
-                text: "one".to_string(),
+                text: text.to_string(),
             },
             AgentEvent::Done { usage: None },
-        ],
-        vec![
-            AgentEvent::TextDelta {
-                text: "two".to_string(),
-            },
-            AgentEvent::Done { usage: None },
-        ],
-        vec![
-            AgentEvent::TextDelta {
-                text: "three".to_string(),
-            },
-            AgentEvent::Done { usage: None },
-        ],
-    ]);
+        ]
+    };
+    let client = ScriptedClient::new(vec![reply("one"), reply("two"), reply("three")]);
     let runtime = AgentRuntime::with_new_session(
         client,
         ToolRegistry::default(),
@@ -5033,20 +5026,70 @@ async fn compact_now_folds_history_and_reports_a_short_one_as_a_no_op() {
         "a fresh session has nothing worth folding"
     );
 
-    for prompt in ["one", "two", "three"] {
-        let mut rx = runtime.submit_user(prompt).await;
+    for tag in ["one", "two", "three"] {
+        let mut rx = runtime.submit_user(prompt(tag)).await;
         drain(&mut rx).await;
     }
 
-    let (archived, summary) = runtime.compact_now().await.expect("history to fold");
-    assert!(archived > 0);
+    let report = runtime.compact_now().await.expect("history to fold");
+    assert!(report.archived_entries > 0);
     assert!(
-        !summary.is_empty(),
+        !report.summary.is_empty(),
         "the caller renders this text, so it cannot be empty"
+    );
+    // The measurement the cell reports has to move in the helpful direction on
+    // a history like this one, or showing it would be noise.
+    assert!(
+        report.tokens_after < report.tokens_before,
+        "folding long messages must shrink the context: {report:?}"
     );
 
     // The second call has nothing left to do: the only entry in the archivable
     // range is the summary the first call just wrote, and folding that would
     // report work on every call while the context never actually shrinks.
     assert!(runtime.compact_now().await.is_none());
+}
+
+/// Folding is NOT automatically a win, and `archived_entries > 0` cannot say
+/// whether it was one.
+///
+/// A summary line costs `min(len, 160)` chars **plus** a `- 角色 / role: `
+/// label, so a history whose messages are all short comes out *longer* than it
+/// went in. That is the shape a plain chat session has — and the exact case
+/// where a user reaches for `/compact` and then cannot tell whether it did
+/// anything. The report carries both numbers so the UI can say so.
+#[tokio::test]
+async fn compacting_only_short_messages_reports_a_context_that_grew() {
+    let workspace = tempfile::tempdir().unwrap();
+    // Deliberately tiny: `one`, `two`, `three` are short enough that the
+    // excerpt label outweighs them.
+    let reply = |text: &str| {
+        vec![
+            AgentEvent::TextDelta {
+                text: text.to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ]
+    };
+    let client = ScriptedClient::new(vec![reply("a"), reply("b"), reply("c")]);
+    let runtime = AgentRuntime::with_new_session(
+        client,
+        ToolRegistry::default(),
+        "system",
+        workspace.path(),
+        &crate::config::AgentConfig::builtin(),
+    )
+    .unwrap();
+
+    for tag in ["one", "two", "three"] {
+        let mut rx = runtime.submit_user(tag).await;
+        drain(&mut rx).await;
+    }
+
+    let report = runtime.compact_now().await.expect("history to fold");
+    assert!(report.archived_entries > 0);
+    assert!(
+        report.tokens_after > report.tokens_before,
+        "the inversion this test exists to pin: {report:?}"
+    );
 }

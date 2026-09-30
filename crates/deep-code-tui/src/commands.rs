@@ -146,14 +146,15 @@ impl App {
         let runtime = std::sync::Arc::clone(&self.runtime);
         let result = tokio::task::block_in_place(|| handle.block_on(runtime.compact_now()));
         match result {
-            Some((archived_count, summary)) => {
+            Some(report) => {
                 self.history.push(HistoryCell::Compaction {
-                    metadata: Some(format!("archived={archived_count}")),
-                    summary,
+                    archived_entries: report.archived_entries,
+                    context_tokens: Some((report.tokens_before, report.tokens_after)),
+                    summary: report.summary,
                 });
                 self.status = self.tr_with(
                     TextId::StatusCompacted,
-                    &[("count", &archived_count.to_string())],
+                    &[("count", &report.archived_entries.to_string())],
                 );
             }
             // Not a failure. A short transcript has nothing to fold, and

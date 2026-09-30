@@ -93,6 +93,26 @@ pub struct AgentRuntime {
     ui_lang: crate::i18n::SharedLang,
 }
 
+/// What a compaction actually did, for a caller that has to show it.
+///
+/// [`crate::compaction::CompactionResult`] carries the rebuilt entry list, which
+/// never leaves the runtime; this is the slice of it a UI needs. `archived_entries`
+/// counts SessionEntries, not messages — one assistant entry carries a whole tool
+/// batch, and the two counts diverge exactly on the sessions where compaction
+/// fires.
+///
+/// The token estimates are here for the same reason the count alone is not
+/// enough: folding one short message preserves it verbatim (the excerpt cap is
+/// 160 chars), so `archived_entries > 0` does not imply the context shrank.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionReport {
+    pub archived_entries: usize,
+    pub summary: String,
+    /// Estimated model-visible context tokens either side of the fold.
+    pub tokens_before: u32,
+    pub tokens_after: u32,
+}
+
 impl AgentRuntime {
     pub fn new<C: LlmClient + 'static>(client: C, tools: ToolRegistry) -> Self {
         Self::with_config(client, tools, AgentConfig::default())
