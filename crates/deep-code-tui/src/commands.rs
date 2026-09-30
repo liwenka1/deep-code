@@ -496,6 +496,15 @@ impl App {
                     &[
                         ("turn", &turn_cache),
                         ("session", &session_cache),
+                        // The session's raw counts, matching `saved`'s scope:
+                        // a percentage alone hides where the money went — at a
+                        // 99% hit rate the remaining 1% is still about a third
+                        // of the input bill, because the price gap is 50–120x.
+                        ("hit", &compact_token_count(telemetry.session_cache_hit_tokens)),
+                        (
+                            "miss",
+                            &compact_token_count(telemetry.session_cache_miss_tokens),
+                        ),
                         (
                             "saved",
                             &telemetry.session_cache_savings.format(self.cost_currency),
@@ -739,6 +748,22 @@ pub(crate) fn cache_hit_percent(hit: u32, miss: u32) -> Option<u8> {
         .map(|percent| percent as u8)
 }
 
+/// A token count in the compact form the status line needs: `47.6M`, `820k`,
+/// `912`.
+///
+/// Raw counts run to eight digits on a cached session and would push the cost —
+/// the reason the line exists — off the right edge. The exact figures stay
+/// re-derivable from the two rates, so this row is a readout, not an audit.
+pub(crate) fn compact_token_count(tokens: u32) -> String {
+    if tokens < 10_000 {
+        tokens.to_string()
+    } else if tokens < 1_000_000 {
+        format!("{:.0}k", f64::from(tokens) / 1_000.0)
+    } else {
+        format!("{:.1}M", f64::from(tokens) / 1_000_000.0)
+    }
+}
+
 /// The user-facing tag for the prompt-prefix cache status. Presentation
 /// lives here, not in the agent crate — telemetry stays language-neutral.
 fn prefix_status_label(status: PrefixStatus, lang: Lang) -> &'static str {
@@ -759,6 +784,21 @@ mod tests {
         assert_eq!(cache_hit_percent(80, 20), Some(80));
         assert_eq!(cache_hit_percent(1, 2), Some(33));
         assert_eq!(cache_hit_percent(100, 0), Some(100));
+    }
+
+    /// The status row has to stay one line, and a cached session's counts reach
+    /// eight digits.
+    #[test]
+    fn compact_token_count_keeps_the_row_one_line() {
+        assert_eq!(compact_token_count(0), "0");
+        assert_eq!(compact_token_count(912), "912");
+        assert_eq!(compact_token_count(9_999), "9999");
+        assert_eq!(compact_token_count(10_000), "10k");
+        assert_eq!(compact_token_count(820_400), "820k");
+        assert_eq!(compact_token_count(1_000_000), "1.0M");
+        // The count that made this necessary: `已省 ¥46.69` was the whole row
+        // before, and 47_637_857 alone is longer than everything else on it.
+        assert_eq!(compact_token_count(47_637_857), "47.6M");
     }
 
     #[test]

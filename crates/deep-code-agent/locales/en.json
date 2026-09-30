@@ -164,7 +164,7 @@
   "HelpNoteCancel": "Note: cancellation takes effect at tool boundaries — a synchronous tool that is already running finishes first. 'a' allows shell by program name for this session (e.g. cargo/git; compound commands still prompt each time).",
   "HelpNoteAutoAllow": "Config [approval] auto_allow pre-approves tools by EXACT name, never by prefix (env or global config only; the project file is ignored).",
   "StatusHelpShown": "Help displayed",
-  "StatusCacheHitLine": "cache_hit=turn {turn} · session {session} (saved {saved})",
+  "StatusCacheHitLine": "cache_hit=turn {turn} · session {session} ({hit} hit / {miss} miss, saved {saved})",
   "StatusTrimmedSuffix": " (oldest {count} cells folded)",
   "StatusShown": "Status displayed",
   "SubagentsUnavailable": "Sub-agents unavailable: {error}",

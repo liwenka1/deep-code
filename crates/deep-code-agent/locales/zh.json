@@ -164,7 +164,7 @@
   "HelpNoteCancel": "注意: 取消在工具边界生效，正在执行中的同步工具会先跑完；a 对 shell 按命令程序名在本会话放行（如 cargo/git，复合命令仍逐次询问）。",
   "HelpNoteAutoAllow": "配置 [approval] auto_allow 可按工具全名预先放行，精确匹配、不是前缀（仅 env 或全局配置，项目配置无效）。",
   "StatusHelpShown": "已显示帮助",
-  "StatusCacheHitLine": "cache_hit=本轮 {turn} · 会话 {session}（已省 {saved}）",
+  "StatusCacheHitLine": "cache_hit=本轮 {turn} · 会话 {session}（{hit} 命中 / {miss} 未命中，已省 {saved}）",
   "StatusTrimmedSuffix": "（已折叠最早 {count} 条）",
   "StatusShown": "已显示状态",
   "SubagentsUnavailable": "子代理不可用: {error}",
