@@ -95,11 +95,11 @@ pub struct AgentRuntime {
 
 /// What a compaction actually did, for a caller that has to show it.
 ///
-/// [`crate::compaction::CompactionResult`] carries the rebuilt entry list, which
-/// never leaves the runtime; this is the slice of it a UI needs. `archived_entries`
-/// counts SessionEntries, not messages — one assistant entry carries a whole tool
-/// batch, and the two counts diverge exactly on the sessions where compaction
-/// fires.
+/// `CompactionResult` (in the private `compaction` module) carries the rebuilt
+/// entry list, which never leaves the runtime; this is the slice of it a UI
+/// needs. `archived_entries` counts SessionEntries, not messages — one assistant
+/// entry carries a whole tool batch, and the two counts diverge exactly on the
+/// sessions where compaction fires.
 ///
 /// The token estimates are here for the same reason the count alone is not
 /// enough: folding one short message preserves it verbatim (the excerpt cap is
