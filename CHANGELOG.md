@@ -6,6 +6,15 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [0.4.10] - 2026-10-01
+
+- A new `/context` command lists the context the model actually holds at that moment, and a new `/compact` command lets you compact history manually at any time; compaction cells now spell out what was folded, what the model now sees, and the before/after token counts.
+- `/status` no longer drops the session's cumulative cost and cache after `/resume` (it had collapsed to `last_turn=none`), and its cache line now reports the raw hit/miss token counts.
+- When the context is rejected as over-length, the runtime now forces one compaction and retries instead of failing the turn.
+- Follow-up questions are now injected at the tool-batch boundary within the same turn, so queued content is visible in the transcript.
+- Transcript cells render per-cell from cache, so a long session's per-frame time drops from 42 ms to 3.9 ms.
+- Filling the input box to exactly one line no longer jumps the cursor back to the start of the line; the cursor's line is now tracked correctly.
+
 ## [0.4.9] - 2026-09-28
 
 - **Security:** Pre-approved commands no longer run through the shell — a new argv tokenizer lets the trust table, `accept_edits`, and session-consent keys cover only commands that can execute shell-less, which are then `execve`d directly from the policy-sliced argv (the program word must be a bare name).
@@ -297,3 +306,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.4.7]: https://github.com/liwenka1/deep-code/compare/v0.4.6...v0.4.7
 [0.4.8]: https://github.com/liwenka1/deep-code/compare/v0.4.7...v0.4.8
 [0.4.9]: https://github.com/liwenka1/deep-code/compare/v0.4.8...v0.4.9
+[0.4.10]: https://github.com/liwenka1/deep-code/compare/v0.4.9...v0.4.10
