@@ -33,7 +33,7 @@ fn streaming_plain_assistant_wraps_to_width() {
 fn welcome_text(offline: bool, lang: Lang) -> String {
     let cell = HistoryCell::Welcome {
         version: "0.1.0".to_string(),
-        model: "deepseek-chat".to_string(),
+        model: "deepseek-flash".to_string(),
         reasoning: "medium".to_string(),
         offline,
         workspace: "~/code/deep-code".to_string(),
@@ -50,7 +50,7 @@ fn welcome_text(offline: bool, lang: Lang) -> String {
 fn welcome_cell_shows_model_dir_session_when_online() {
     let text = welcome_text(false, Lang::Zh);
     assert!(text.contains("deep-code") && text.contains("v0.1.0"));
-    assert!(text.contains("模型") && text.contains("deepseek-chat"));
+    assert!(text.contains("模型") && text.contains("deepseek-flash"));
     assert!(text.contains("目录") && text.contains("新会话 · 已持久化"));
     assert!(
         !text.contains("/apikey"),
@@ -63,7 +63,7 @@ fn welcome_cell_prompts_apikey_when_offline() {
     let text = welcome_text(true, Lang::Zh);
     assert!(text.contains("离线模式") && text.contains("/apikey"));
     assert!(
-        !text.contains("deepseek-chat"),
+        !text.contains("deepseek-flash"),
         "offline hides the model line"
     );
 }
@@ -71,7 +71,7 @@ fn welcome_cell_prompts_apikey_when_offline() {
 #[test]
 fn welcome_cell_renders_english_pack() {
     let text = welcome_text(false, Lang::En);
-    assert!(text.contains("Model") && text.contains("deepseek-chat"));
+    assert!(text.contains("Model") && text.contains("deepseek-flash"));
     assert!(text.contains("New session · persisted"));
     assert!(!text.contains("模型"), "no Chinese leaks into en: {text}");
 }

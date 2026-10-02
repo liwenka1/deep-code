@@ -134,7 +134,7 @@ fn tier_cost(tokens: u32, per_million: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_registry::DEEPSEEK_V4_FLASH;
+    use crate::model_registry::DEEPSEEK_FLASH;
 
     /// The doctor report and the config file spell the currency the same way:
     /// what `as_setting` emits, `parse` accepts, for every variant.
@@ -164,8 +164,8 @@ mod tests {
             ..with_reasoning.clone()
         };
         assert_eq!(
-            calculate_turn_cost(DEEPSEEK_V4_FLASH, &with_reasoning),
-            calculate_turn_cost(DEEPSEEK_V4_FLASH, &without),
+            calculate_turn_cost(DEEPSEEK_FLASH, &with_reasoning),
+            calculate_turn_cost(DEEPSEEK_FLASH, &without),
             "reasoning tokens are part of completion_tokens; charging them again doubles the \
              output price of every reasoning turn"
         );
@@ -185,8 +185,8 @@ mod tests {
             completion_tokens: Some(100),
             ..Usage::default()
         };
-        let hit_cost = calculate_turn_cost(DEEPSEEK_V4_FLASH, &usage);
-        let miss_cost = calculate_turn_cost(DEEPSEEK_V4_FLASH, &full_miss);
+        let hit_cost = calculate_turn_cost(DEEPSEEK_FLASH, &usage);
+        let miss_cost = calculate_turn_cost(DEEPSEEK_FLASH, &full_miss);
         assert!(hit_cost.cny < miss_cost.cny);
     }
 }

@@ -317,7 +317,7 @@ None.
         assert_eq!(models.len(), 2, "one child request per call: {models:?}");
         assert_eq!(
             models[0],
-            crate::model_registry::DEEPSEEK_V4_FLASH,
+            crate::model_registry::DEEPSEEK_FLASH,
             "explore child must run on the flash tier"
         );
         assert_eq!(

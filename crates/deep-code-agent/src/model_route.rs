@@ -3,7 +3,7 @@
 use crate::config::AgentConfig;
 use crate::i18n::{Lang, TextId, tr, tr_with};
 use crate::model_registry::{
-    AUTO_MODEL, DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO, ModelRegistry, ResolutionKind,
+    AUTO_MODEL, DEEPSEEK_FLASH, DEEPSEEK_V4_PRO, ModelRegistry, ResolutionKind,
 };
 use crate::reasoning::{ReasoningEffort, ReasoningEffortSetting};
 use crate::task_class::{TaskWeight, classify_keyword};
@@ -105,7 +105,7 @@ impl TurnRoute {
 /// `max` to Flash.
 #[must_use]
 pub fn clamp_effort_to_model(model: &str, effort: ReasoningEffort) -> ReasoningEffort {
-    if model == DEEPSEEK_V4_FLASH && effort == ReasoningEffort::Max {
+    if model == DEEPSEEK_FLASH && effort == ReasoningEffort::Max {
         ReasoningEffort::High
     } else {
         effort
@@ -119,7 +119,7 @@ pub fn api_fallback_model(route: &TurnRoute) -> Option<&'static str> {
         return None;
     }
     if route.auto_model && route.effective_model == DEEPSEEK_V4_PRO {
-        Some(DEEPSEEK_V4_FLASH)
+        Some(DEEPSEEK_FLASH)
     } else {
         None
     }
@@ -252,7 +252,7 @@ pub(crate) fn classify_model(
         // Everything else (Light keywords, Borderline under cost-saving, no
         // keyword) starts on Flash; cascade upgrades it if Flash struggles.
         _ => (
-            DEEPSEEK_V4_FLASH.to_string(),
+            DEEPSEEK_FLASH.to_string(),
             tr(lang, TextId::RouteFlashDefault).to_string(),
             RouteSource::Heuristic,
         ),

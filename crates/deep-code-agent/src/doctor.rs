@@ -131,9 +131,21 @@ pub struct SkillsDoctorReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelDoctorEntry {
     pub id: String,
+    pub version: String,
     pub context_window: u32,
+    pub max_output: u32,
     pub supports_reasoning: bool,
+    pub supports_json_output: bool,
     pub supports_tools: bool,
+    pub supports_responses_api: bool,
+    pub supports_anthropic_api: bool,
+    pub supports_prefix_completion: bool,
+    /// `unsupported` / `supported` / `non_thinking_only` — the token
+    /// [`crate::model_registry::Capability::as_setting`] emits, so the report
+    /// and the data file spell the state the same way.
+    pub fim_completion: String,
+    pub supports_vision: bool,
+    pub concurrency_limit: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -239,9 +251,18 @@ fn collect_deepseek(config: &AgentConfig) -> DeepSeekDoctorReport {
         .iter()
         .map(|model| ModelDoctorEntry {
             id: model.id.clone(),
+            version: model.version.clone(),
             context_window: model.context_window,
+            max_output: model.max_output,
             supports_reasoning: model.supports_reasoning,
+            supports_json_output: model.supports_json_output,
             supports_tools: model.supports_tools,
+            supports_responses_api: model.supports_responses_api,
+            supports_anthropic_api: model.supports_anthropic_api,
+            supports_prefix_completion: model.supports_prefix_completion,
+            fim_completion: model.fim_completion.as_setting().to_string(),
+            supports_vision: model.supports_vision,
+            concurrency_limit: model.concurrency_limit,
         })
         .collect();
 

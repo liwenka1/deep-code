@@ -349,7 +349,7 @@ impl App {
                 .iter()
                 .map(|model| model.id.clone())
                 .collect();
-            ids.push("auto".to_string());
+            ids.push(deep_code_agent::AUTO_MODEL.to_string());
             ids.join(", ")
         };
         if arg.is_empty() {
@@ -363,11 +363,20 @@ impl App {
             self.status = self.tr(TextId::StatusModelInfoShown).to_string();
             return;
         }
-        let resolved = match arg.to_ascii_lowercase().as_str() {
-            "auto" => "auto".to_string(),
-            "pro" => deep_code_agent::DEEPSEEK_V4_PRO.to_string(),
-            "flash" => deep_code_agent::DEEPSEEK_V4_FLASH.to_string(),
-            _ => match registry.info_for(arg) {
+        // `auto` is the one name here that is NOT a model: it is a sentinel the
+        // turn router answers, so the catalog has no entry for it. Every real
+        // name — canonical id or alias, including the `pro` / `flash` short
+        // names the README advertises — is looked up in the catalog, so `/model`
+        // and `provider.model` cannot disagree about which spellings exist.
+        //
+        // This used to carry its own `pro` / `flash` arms, which is precisely
+        // how the two came to disagree: the arms shadowed the alias table, so
+        // removing an alias there left `/model` still accepting a name that
+        // config, env and the bot had stopped resolving.
+        let resolved = if arg.eq_ignore_ascii_case(deep_code_agent::AUTO_MODEL) {
+            deep_code_agent::AUTO_MODEL.to_string()
+        } else {
+            match registry.info_for(arg) {
                 Some(info) => info.id.clone(),
                 None => {
                     self.status = self.tr_with(
@@ -376,7 +385,7 @@ impl App {
                     );
                     return;
                 }
-            },
+            }
         };
         let update = deep_code_agent::GlobalConfigUpdate::Model(resolved.clone());
         match deep_code_agent::write_global_config_update(

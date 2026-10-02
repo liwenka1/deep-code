@@ -43,7 +43,7 @@ A DeepSeek-powered terminal coding agent, written in Rust. One small binary: str
 
 **Model routing**
 
-- `auto` picks between `deepseek-v4-pro` and `deepseek-v4-flash` (and the reasoning effort) per task, and falls back with retry on rate limits or upstream failures. Pin with `/model` or `provider.model`.
+- `auto` picks between `deepseek-v4-pro` and `deepseek-flash` (and the reasoning effort) per task, and falls back with retry on rate limits or upstream failures. Pin with `/model` or `provider.model`.
 
 ## Install
 

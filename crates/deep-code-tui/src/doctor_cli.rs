@@ -98,9 +98,40 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
         report.deepseek.beta_endpoint
     );
     for model in &report.deepseek.models {
+        // What the model CAN do, as names. A row of `vision=false` flags is
+        // read by comparing lines, and the comparison that matters — Flash
+        // accepts an image, Pro does not — is exactly what a name list makes
+        // visible. `fim` is kept separate because its third state is not a flag,
+        // and a model with no capabilities prints `-` rather than an empty value
+        // that reads like a formatting bug.
+        let capabilities = [
+            (model.supports_reasoning, "reasoning"),
+            (model.supports_json_output, "json-output"),
+            (model.supports_tools, "tools"),
+            (model.supports_responses_api, "responses-api"),
+            (model.supports_anthropic_api, "anthropic-api"),
+            (model.supports_prefix_completion, "prefix-completion"),
+            (model.supports_vision, "vision"),
+        ]
+        .into_iter()
+        .filter_map(|(present, name)| present.then_some(name))
+        .collect::<Vec<&str>>();
+        let capabilities = if capabilities.is_empty() {
+            "-".to_string()
+        } else {
+            capabilities.join(",")
+        };
+        // `version` and `concurrency_limit` are printed because they are the two
+        // fields nothing consumes yet, and an unread field is one that rots.
         println!(
-            "    - {} ctx={} reasoning={} tools={}",
-            model.id, model.context_window, model.supports_reasoning, model.supports_tools
+            "    - {} v={} ctx={} max_out={} conc={} caps={} fim={}",
+            model.id,
+            model.version,
+            model.context_window,
+            model.max_output,
+            model.concurrency_limit,
+            capabilities,
+            model.fim_completion
         );
     }
     // The report decides whether guidance applies (`api_key_hint` is `Some`

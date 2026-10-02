@@ -243,7 +243,7 @@ mod tests {
 
         write_global_config_update(
             &path,
-            &GlobalConfigUpdate::Model("deepseek-v4-flash".to_string()),
+            &GlobalConfigUpdate::Model("deepseek-flash".to_string()),
             Lang::Zh,
         )
         .unwrap();
@@ -251,7 +251,7 @@ mod tests {
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("# 用户自己的注释"), "comments survive");
         assert!(contents.contains("api_key = \"sk-oldoldoldoldold\""));
-        assert!(contents.contains("model = \"deepseek-v4-flash\""));
+        assert!(contents.contains("model = \"deepseek-flash\""));
         assert!(contents.contains("currency = \"usd\""));
     }
 

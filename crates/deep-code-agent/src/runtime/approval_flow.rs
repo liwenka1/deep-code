@@ -10,7 +10,7 @@ use crate::execution_policy::{
     PermissionMode, RiskLevel, accept_edits_approvable, command_shape, network_requested,
     shell_command_of,
 };
-use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_FLASH};
+use crate::model_registry::{AUTO_MODEL, DEEPSEEK_FLASH};
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
 use crate::runtime::state::PendingToolBatch;
@@ -784,7 +784,7 @@ fn classifier_model_for(
         || configured.eq_ignore_ascii_case(AUTO_MODEL)
         || registry.info_for(configured).is_some()
     {
-        return DEEPSEEK_V4_FLASH.to_string();
+        return DEEPSEEK_FLASH.to_string();
     }
     configured.to_string()
 }
@@ -804,11 +804,11 @@ mod tests {
             ..AgentConfig::builtin()
         };
         // DeepSeek sentinels and catalog models → the cheap Flash judge.
-        assert_eq!(classifier_model_for(&cfg("auto"), &reg), DEEPSEEK_V4_FLASH);
-        assert_eq!(classifier_model_for(&cfg(""), &reg), DEEPSEEK_V4_FLASH);
+        assert_eq!(classifier_model_for(&cfg("auto"), &reg), DEEPSEEK_FLASH);
+        assert_eq!(classifier_model_for(&cfg(""), &reg), DEEPSEEK_FLASH);
         assert_eq!(
             classifier_model_for(&cfg("deepseek-v4-pro"), &reg),
-            DEEPSEEK_V4_FLASH
+            DEEPSEEK_FLASH
         );
         // A passthrough id the catalog doesn't know (e.g. a newer DeepSeek model
         // the registry hasn't caught up to) is judged on itself — and the raw
@@ -1140,7 +1140,7 @@ mod tests {
             crate::runtime::AgentRuntime::new(MuteClient, crate::tool::ToolRegistry::default());
         // The wrapper around `classifier_model_for`, pinned on the same
         // runtime: builtin config routes to the Flash judge.
-        assert_eq!(runtime.classifier_model(), DEEPSEEK_V4_FLASH);
+        assert_eq!(runtime.classifier_model(), DEEPSEEK_FLASH);
 
         let usage = crate::model::Usage {
             prompt_tokens: Some(100),
@@ -1150,9 +1150,7 @@ mod tests {
             prompt_cache_hit_tokens: Some(10),
             prompt_cache_miss_tokens: Some(5),
         };
-        runtime
-            .record_classifier_cost(DEEPSEEK_V4_FLASH, &usage)
-            .await;
+        runtime.record_classifier_cost(DEEPSEEK_FLASH, &usage).await;
         let (cost_1, savings_1) = {
             let state = runtime.state.lock().await;
             assert_eq!(state.session_cache_hit_tokens, 10);
@@ -1174,9 +1172,7 @@ mod tests {
             (state.session_cost, state.session_cache_savings)
         };
 
-        runtime
-            .record_classifier_cost(DEEPSEEK_V4_FLASH, &usage)
-            .await;
+        runtime.record_classifier_cost(DEEPSEEK_FLASH, &usage).await;
         let state = runtime.state.lock().await;
         assert_eq!(state.session_cache_hit_tokens, 20);
         assert_eq!(state.session_cache_miss_tokens, 10);

@@ -1,0 +1,126 @@
+# DeepSeek model catalog: which models exist, what they are called, what they
+# can do, and what they cost. Compiled into the binary with `include_str!` and
+# parsed once by `model_registry::builtin_registry()`.
+#
+# This file is the source of truth for DATA. `model_registry.rs` owns the
+# LOGIC (id/alias resolution, window lookups, the shape of an entry);
+# `pricing.rs` owns the arithmetic. Repricing a model, teaching this build
+# about a new capability, or adding a model is therefore an edit here and
+# nowhere else — no Rust change.
+#
+# `include_str!` embeds the file at build time, so this is not something the
+# program reads from disk: editing an installed copy changes nothing, and a
+# release re-embeds whatever is here. The structs that parse it deny unknown
+# keys, so a typo or a retired key fails the parse instead of sitting in the
+# file as a line that quietly means nothing.
+#
+# ---------------------------------------------------------------------------
+# WHERE THE NUMBERS COME FROM
+#
+#   https://api-docs.deepseek.com/quick_start/pricing/          (USD)
+#   https://api-docs.deepseek.com/zh-cn/quick_start/pricing/    (CNY)
+#
+# Both pages carry the same "Model Details" table, and this file mirrors it row
+# for row: the model version, the capability flags, the context window, the
+# maximum output and the prices all come from that one table. Keys are written
+# in the order the table prints them, so re-syncing is read top to bottom —
+# with one forced exception noted below.
+#
+# The exception is `[model.pricing]`. TOML requires a sub-table to follow the
+# scalar keys of its parent, so it sits at the end of each entry even though the
+# table prints prices before the concurrency limit.
+#
+# We record rows this build has no consumer for yet (the Anthropic API shape and
+# the concurrency limit, for instance). That is deliberate: the point of the
+# file is to mirror the official table, and a row that is already here costs
+# nothing while a row missing is a re-read of the page later. Nothing here is
+# write-only — `doctor` reports every field, which is what keeps a wrong value
+# from sitting unnoticed.
+#
+# Prices are per MILLION tokens. The table lists two rows per figure — off-peak
+# (空闲时段) and peak (高峰时段) — and off-peak is a discount: exactly half the
+# peak rate. We store the PEAK row, the list price the discount is defined
+# against. It is also the conservative choice: an estimate is never LOWER than
+# what was actually billed. The cost is the mirror image — a session run
+# entirely off-peak (any hour outside Beijing time Mon-Fri 09:00-12:00 and
+# 14:00-18:00: all evenings, nights, weekends and Chinese public holidays)
+# reports up to 2x what it spent.
+#
+# Take USD from the English page and CNY from the Chinese one. Do NOT convert
+# one from the other at an exchange rate: the two pages are priced
+# independently, and a converted figure silently drifts (the values this file
+# replaced were CNY-derived at a stale rate, and were wrong in both currencies).
+#
+# Token counts are written 1000-based, matching the table's own units: "1M"
+# context is 1000000 here, so "384K" of output is 384000.
+#
+# This file has exactly one failure mode: going stale. Record when it was last
+# checked against the pages above.
+#
+#   last reviewed: 2026-10-03
+# ---------------------------------------------------------------------------
+
+[[model]]
+id = "deepseek-v4-pro"
+# `pro` is the short name the README and the CI bot advertise
+# (`provider.model = pro`, `model: pro`). Without an alias it went through as a
+# `Passthrough` id the API does not know, so EVERY request 400'd and the auto
+# judge fell back to asking: the TUI's `/model pro` mapped it by hand, config,
+# env and the bot did not.
+aliases = ["pro"]
+version = "DeepSeek-V4-Pro-0813"
+
+# Capabilities, in the order of the official table's "Model Details" block.
+# `supports_reasoning` is the "thinking mode" row above that block.
+supports_reasoning = true
+context_window = 1000000
+max_output = 384000
+supports_json_output = true
+supports_tools = true
+supports_responses_api = true
+supports_anthropic_api = true
+supports_prefix_completion = true
+# FIM completion is the one row the table does not answer with a plain yes/no.
+fim_completion = "non_thinking_only"
+# Pro is the model WITHOUT image input. Anything that accepts a pasted image
+# has to read this flag rather than assume the flagship can do everything.
+supports_vision = false
+concurrency_limit = 500
+
+[model.pricing]
+input_hit_usd = 0.044
+input_miss_usd = 1.32
+output_usd = 3.96
+input_hit_cny = 0.3
+input_miss_cny = 9.0
+output_cny = 27.0
+
+[[model]]
+id = "deepseek-flash"
+# `flash` is the advertised short name (see the `pro` note above).
+#
+# `deepseek-v4-flash` is the name releases up to 0.4.10 wrote into
+# `provider.model`, and the API still accepts it for this model (billing it at
+# the Flash rate), so a config carrying it has to keep resolving.
+aliases = ["flash", "deepseek-v4-flash"]
+version = "DeepSeek-V4.1-Flash"
+
+supports_reasoning = true
+context_window = 1000000
+max_output = 384000
+supports_json_output = true
+supports_tools = true
+supports_responses_api = true
+supports_anthropic_api = true
+supports_prefix_completion = true
+fim_completion = "non_thinking_only"
+supports_vision = true
+concurrency_limit = 2500
+
+[model.pricing]
+input_hit_usd = 0.006
+input_miss_usd = 0.3
+output_usd = 1.2
+input_hit_cny = 0.04
+input_miss_cny = 2.0
+output_cny = 8.0

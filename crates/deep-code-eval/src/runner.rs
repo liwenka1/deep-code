@@ -69,7 +69,7 @@ pub struct InstanceResult {
     pub duration_ms: u64,
     /// Session cost in CNY (from turn telemetry; 0 if unavailable).
     pub cost_cny: f64,
-    /// Effective model of the turn (e.g. deepseek-v4-flash), if reported.
+    /// Effective model of the turn (e.g. deepseek-flash), if reported.
     pub model: Option<String>,
     /// What decided the route (heuristic / hard-rule / cascade).
     pub route_source: Option<String>,

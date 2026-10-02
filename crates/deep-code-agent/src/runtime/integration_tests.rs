@@ -2795,7 +2795,7 @@ impl LlmClient for FallbackTestClient {
 
 #[tokio::test]
 async fn auto_pro_retries_with_flash_after_retriable_api_error() {
-    use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO};
+    use crate::model_registry::{AUTO_MODEL, DEEPSEEK_FLASH, DEEPSEEK_V4_PRO};
 
     let client = FallbackTestClient::new();
     // Pin zh so the localized fallback-reason assertion is deterministic.
@@ -2817,7 +2817,7 @@ async fn auto_pro_retries_with_flash_after_retriable_api_error() {
 
     assert_eq!(
         client.models_used(),
-        vec![DEEPSEEK_V4_PRO.to_string(), DEEPSEEK_V4_FLASH.to_string()]
+        vec![DEEPSEEK_V4_PRO.to_string(), DEEPSEEK_FLASH.to_string()]
     );
     let telemetry = events.iter().find_map(|event| match event {
         RuntimeEvent::TurnFinished { telemetry, .. } => telemetry.as_ref(),
@@ -2825,7 +2825,7 @@ async fn auto_pro_retries_with_flash_after_retriable_api_error() {
     });
     let telemetry = telemetry.expect("turn finished with telemetry");
     assert!(telemetry.used_model_fallback);
-    assert_eq!(telemetry.effective_model, DEEPSEEK_V4_FLASH);
+    assert_eq!(telemetry.effective_model, DEEPSEEK_FLASH);
     assert!(telemetry.route_label.contains("fallback→flash"));
     assert!(telemetry.route_reason.contains("debug"));
     assert!(
@@ -3519,7 +3519,7 @@ async fn cancel_during_open_backoff_finalizes_as_cancelled() {
 
 #[tokio::test(start_paused = true)]
 async fn open_retry_runs_after_fallback_exhausted_and_is_counted() {
-    use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO};
+    use crate::model_registry::{AUTO_MODEL, DEEPSEEK_FLASH, DEEPSEEK_V4_PRO};
 
     let client = AttemptScriptClient::new(vec![
         AttemptBehavior::ConnectFail(503),
@@ -3547,8 +3547,8 @@ async fn open_retry_runs_after_fallback_exhausted_and_is_counted() {
         client.models_used(),
         vec![
             DEEPSEEK_V4_PRO.to_string(),
-            DEEPSEEK_V4_FLASH.to_string(),
-            DEEPSEEK_V4_FLASH.to_string()
+            DEEPSEEK_FLASH.to_string(),
+            DEEPSEEK_FLASH.to_string()
         ]
     );
     let telemetry = turn_finished_telemetry(&events).expect("telemetry");

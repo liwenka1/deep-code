@@ -49,7 +49,7 @@ pub enum HistoryCell {
     /// it in the new language on the next frame.
     Welcome {
         version: String,
-        /// Raw model id, e.g. "deepseek-chat".
+        /// Raw model id, e.g. "deepseek-flash".
         model: String,
         /// Raw reasoning setting, e.g. "medium".
         reasoning: String,

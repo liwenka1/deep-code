@@ -74,7 +74,7 @@ pub use message::{Message, Role};
 pub use model::{
     ChatRequest, FunctionCallDelta, ToolCallDelta, ToolCallFunctionPayload, ToolCallPayload, Usage,
 };
-pub use model_registry::{DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO, ModelRegistry};
+pub use model_registry::{AUTO_MODEL, DEEPSEEK_FLASH, DEEPSEEK_V4_PRO, ModelRegistry};
 // The TUI writes into `<workspace>/.deep-code` too (the stderr log), and every
 // writer of that directory has to enforce the same "we own it, so it must be a
 // real directory" rule. Exported rather than re-spelled: two independent

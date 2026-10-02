@@ -7,7 +7,7 @@ fn auto_model(input: &str) -> String {
 
 #[test]
 fn short_prompt_routes_to_flash() {
-    assert_eq!(auto_model("hello"), DEEPSEEK_V4_FLASH);
+    assert_eq!(auto_model("hello"), DEEPSEEK_FLASH);
 }
 
 #[test]
@@ -107,12 +107,12 @@ fn resolve_subagent_uses_low_effort_in_auto_mode() {
 #[test]
 fn flash_never_requests_max_effort() {
     assert_eq!(
-        clamp_effort_to_model(DEEPSEEK_V4_FLASH, ReasoningEffort::Max),
+        clamp_effort_to_model(DEEPSEEK_FLASH, ReasoningEffort::Max),
         ReasoningEffort::High
     );
     // High and below pass through; Pro keeps Max.
     assert_eq!(
-        clamp_effort_to_model(DEEPSEEK_V4_FLASH, ReasoningEffort::High),
+        clamp_effort_to_model(DEEPSEEK_FLASH, ReasoningEffort::High),
         ReasoningEffort::High
     );
     assert_eq!(
@@ -126,7 +126,7 @@ fn fixed_flash_clamps_explicit_max_effort_to_high() {
     // A fixed Flash model with an explicit Max effort must be clamped: Flash
     // never accepts Max.
     let config = AgentConfig {
-        model: DEEPSEEK_V4_FLASH.to_string(),
+        model: DEEPSEEK_FLASH.to_string(),
         reasoning_effort: ReasoningEffortSetting::Max,
         ..AgentConfig::default()
     };
@@ -138,7 +138,7 @@ fn fixed_flash_clamps_explicit_max_effort_to_high() {
         RouteContext::default(),
         Lang::Zh,
     );
-    assert_eq!(route.effective_model, DEEPSEEK_V4_FLASH);
+    assert_eq!(route.effective_model, DEEPSEEK_FLASH);
     assert_eq!(route.effective_effort, ReasoningEffort::High);
 }
 
@@ -227,7 +227,7 @@ fn api_fallback_only_for_auto_pro() {
         fallback_reason: None,
         source: RouteSource::Heuristic,
     };
-    assert_eq!(api_fallback_model(&route), Some(DEEPSEEK_V4_FLASH));
+    assert_eq!(api_fallback_model(&route), Some(DEEPSEEK_FLASH));
 }
 
 #[test]
@@ -242,7 +242,7 @@ fn auto_model_returns_human_readable_reason() {
     assert!(reason.contains("debug"));
 
     let (model, reason, _) = classify_model("hi", &RouteContext::default(), false, Lang::Zh);
-    assert_eq!(model, DEEPSEEK_V4_FLASH);
+    assert_eq!(model, DEEPSEEK_FLASH);
     assert!(reason.contains("Flash"));
 }
 

@@ -6,6 +6,8 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+- The model catalog — ids, aliases, context windows and per-token prices — now lives in a data file compiled into the binary instead of Rust literals, so repricing a model or adding a new one is a one-file data edit. Three things it carries are user-visible: the shipped prices had gone stale and are refreshed; they are now the list (peak) rate, so an off-peak session's estimate is an upper bound rather than an under-count (off-peak hours are billed at half); and the Flash model's canonical id is `deepseek-flash`, the API's current name, with `deepseek-v4-flash` — the id releases up to 0.4.10 persisted — still resolving. Note that resolution happens before the request is built, so a config pinning the old spelling now sends `deepseek-flash` upstream: the official API accepts both names, but a third-party `base_url` that knows only the old one no longer will. The retired `deepseek-chat` / `deepseek-reasoner` names were dropped, as was a write-only capability field. Code that names the Flash model by constant must move from `DEEPSEEK_V4_FLASH` to `DEEPSEEK_FLASH`; the crates are not published, so this reaches source builds only.
+
 ## [0.4.10] - 2026-10-01
 
 - A new `/context` command lists the context the model actually holds at that moment, and a new `/compact` command lets you compact history manually at any time; compaction cells now spell out what was folded, what the model now sees, and the before/after token counts.

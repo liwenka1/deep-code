@@ -117,7 +117,7 @@ impl SubAgentRole {
     pub fn model_override(self) -> Option<&'static str> {
         match self {
             Self::Explore | Self::Review | Self::Verifier => {
-                Some(crate::model_registry::DEEPSEEK_V4_FLASH)
+                Some(crate::model_registry::DEEPSEEK_FLASH)
             }
             Self::General | Self::Plan | Self::Implementer => None,
         }

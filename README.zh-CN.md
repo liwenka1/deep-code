@@ -43,7 +43,7 @@
 
 **模型路由**
 
-- `auto` 按任务在 `deepseek-v4-pro` / `deepseek-v4-flash` 间选择模型与 reasoning effort;限流或上游故障时自动降级重试。可用 `/model` 或 `provider.model` 固定。
+- `auto` 按任务在 `deepseek-v4-pro` / `deepseek-flash` 间选择模型与 reasoning effort;限流或上游故障时自动降级重试。可用 `/model` 或 `provider.model` 固定。
 
 ## 安装
 

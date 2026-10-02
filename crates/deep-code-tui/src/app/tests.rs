@@ -431,8 +431,8 @@ fn approval_scroll_helpers_adjust_panel_offset() {
 fn status_includes_deepseek_native_telemetry() {
     let mut app = App::new();
     app.last_telemetry = Some(TurnTelemetry {
-        route_label: "auto→deepseek-v4-flash (high)".to_string(),
-        effective_model: "deepseek-v4-flash".to_string(),
+        route_label: "auto→deepseek-flash (high)".to_string(),
+        effective_model: "deepseek-flash".to_string(),
         reasoning_effort: "high".to_string(),
         prompt_tokens: 100,
         completion_tokens: 20,
@@ -466,7 +466,7 @@ fn status_includes_deepseek_native_telemetry() {
     assert!(matches!(
         app.history.last(),
         Some(HistoryCell::System { text })
-            if text.contains("effective_model=deepseek-v4-flash")
+            if text.contains("effective_model=deepseek-flash")
                 && text.contains("auto_reason=短提示优先使用 Flash")
                 && text.contains("session_cost=¥0.0020")
                 && text.contains("stream_retries=2")
@@ -705,13 +705,35 @@ fn model_command_resolves_aliases_persists_and_keeps_session() {
     );
 
     assert!(app.handle_slash_command("/model flash"));
-    assert_eq!(app.configured_model, deep_code_agent::DEEPSEEK_V4_FLASH);
+    assert_eq!(app.configured_model, deep_code_agent::DEEPSEEK_FLASH);
     let contents = std::fs::read_to_string(&app.global_config_path).unwrap();
-    assert!(contents.contains("deepseek-v4-flash"));
+    // The CANONICAL id is what gets persisted, not the alias that was typed —
+    // so the assertion is written against the constant rather than a literal,
+    // and a future rename has to come here and mean it.
+    assert!(
+        contents.contains(deep_code_agent::DEEPSEEK_FLASH),
+        "a resolved alias must persist the canonical id, got: {contents}"
+    );
     assert_eq!(
         app.session_id, original_session,
         "config switch must resume the same session"
     );
+
+    // A FORMER id the API still accepts resolves to that same canonical id, so
+    // configs written before the rename keep working and keep rewriting
+    // themselves forward. This is the compatibility promise of the rename —
+    // and the string below is a LITERAL on purpose: what is under test is that
+    // the old SPELLING still resolves, which the constant cannot express.
+    //
+    // Start on a DIFFERENT model first. `set_model` returns early on a name it
+    // cannot resolve, leaving `configured_model` untouched, so asserting from
+    // the value the previous step already left there would pass whether the
+    // alias resolved or was rejected.
+    assert!(app.handle_slash_command("/model pro"));
+    assert_eq!(app.configured_model, deep_code_agent::DEEPSEEK_V4_PRO);
+
+    assert!(app.handle_slash_command("/model deepseek-v4-flash"));
+    assert_eq!(app.configured_model, deep_code_agent::DEEPSEEK_FLASH);
 
     assert!(app.handle_slash_command("/model nope"));
     assert!(app.status.contains("未知模型"));
@@ -1826,8 +1848,8 @@ fn status_line_is_minimal_model_and_context() {
     app.session_id = Some("session_1".to_string());
     app.last_checkpoint = Some("checkpoint_1".to_string());
     app.last_telemetry = Some(TurnTelemetry {
-        route_label: "auto->deepseek-v4-flash (high)".to_string(),
-        effective_model: "deepseek-v4-flash".to_string(),
+        route_label: "auto->deepseek-flash (high)".to_string(),
+        effective_model: "deepseek-flash".to_string(),
         reasoning_effort: "high".to_string(),
         prompt_tokens: 100,
         completion_tokens: 20,
@@ -1859,7 +1881,7 @@ fn status_line_is_minimal_model_and_context() {
 
     let status = app.status_line();
     // The effective model in use, plus context headroom — nothing else.
-    assert!(status.contains("deepseek-v4-flash"), "{status}");
+    assert!(status.contains("deepseek-flash"), "{status}");
     assert!(status.contains("ctx 1%"), "{status}");
     // Cost, session id, checkpoint, and the verbose route label are gone.
     assert!(!status.contains("session"), "{status}");

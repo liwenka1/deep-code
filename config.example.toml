@@ -51,7 +51,8 @@
 # the one that streams reasoning).
 # base_url = "https://api.deepseek.com/beta"
 
-# Model: deepseek-v4-pro, deepseek-v4-flash, or auto (routed per task).
+# Model: deepseek-v4-pro, deepseek-flash, or auto (routed per task).
+# The former name deepseek-v4-flash still resolves.
 # model = "auto"
 
 # Reasoning effort: off, low, medium, high, max.

@@ -128,7 +128,7 @@ impl Tool for AgentTool {
         if let Some(model) = role.model_override() {
             // Only substitute the built-in flash id when the parent is on a model
             // this build actually knows (a catalog id, or the `auto` sentinel).
-            // On a custom `base_url` with a passthrough model id, `deepseek-v4-flash`
+            // On a custom `base_url` with a passthrough model id, `deepseek-flash`
             // does not exist upstream and every recon child would 404 — there,
             // inherit the parent's model instead. Mirrors `classifier_model_for`.
             let configured = child_config.model.trim();
