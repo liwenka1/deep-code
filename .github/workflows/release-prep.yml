@@ -29,7 +29,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Current version: 0.4.10 — enter the NEW version to release (no leading v)'
+        description: 'Current version: 0.4.11 — enter the NEW version to release (no leading v)'
         required: true
 
 # 同一时刻只允许一次发版准备在跑，杜绝并发双开互相踩 tag。
@@ -127,7 +127,7 @@ jobs:
         # the same way it refreshes the dispatch hint. If a release tag never
         # actually reached npm, the next prep fails right here — loudly,
         # which is the correct failure direction for a supply-chain pin.
-        run: npm i -g @liwenkai/deepcode@0.4.10
+        run: npm i -g @liwenkai/deepcode@0.4.11
 
       # The drafter reads the existing CHANGELOG.md for style and turns the
       # commit subjects (stdin) into user-facing bullets. Contract is narrow
