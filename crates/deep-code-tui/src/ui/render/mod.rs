@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Widget};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, TranscriptSnapshot};
+use crate::app::{App, FoldTarget, TranscriptSnapshot};
 use crate::history::HistoryCell;
 use crate::markdown::render_markdown;
 use deep_code_agent::SafetyNote;

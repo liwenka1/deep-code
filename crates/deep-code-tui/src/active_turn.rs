@@ -1,6 +1,6 @@
 use deep_code_agent::{ApprovalRequest, ToolCallId};
 
-use crate::history::{HistoryCell, ToolApprovalState};
+use crate::history::{HistoryCell, ToolApprovalState, quiet_while_running};
 
 /// Bound on the buffered live-output tail per running tool (display only —
 /// the agent-side ring buffer keeps the full 128 KiB).
@@ -47,6 +47,19 @@ pub struct ActiveToolCell {
     pub started_at: std::time::Instant,
 }
 
+/// What one finished tool call flushes into the transcript, in the order the
+/// cells must be pushed: the prose that streamed before it, the call itself,
+/// then any diagnostics that arrived for it.
+///
+/// Split out rather than returned as one `Vec` because the call is the only
+/// part whose fate depends on its result — see [`ActiveTurn::take_finished_tool`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FinishedTool {
+    pub prose: Vec<HistoryCell>,
+    pub call: Option<HistoryCell>,
+    pub diagnostics: Vec<HistoryCell>,
+}
+
 /// The turn currently streaming. It carries no turn id: the TUI shows one
 /// turn at a time and attributes every event to it, so nothing ever reads the
 /// id back — a turn that arrives without a `TurnStarted` (a late delta, an
@@ -55,6 +68,13 @@ pub struct ActiveToolCell {
 pub struct ActiveTurn {
     pub assistant_buffer: String,
     pub reasoning_buffer: String,
+    /// Whether THIS turn's reasoning block is expanded. It starts folded — the
+    /// whole point — and is carried into the cell when the buffered text is
+    /// flushed, because a block that snapped shut mid-read the moment a tool
+    /// call landed would be worse than one that never opened. The flush resets
+    /// it, so the NEXT block of the same turn starts folded again: expanding
+    /// is a per-block act, never a sticky mode.
+    pub reasoning_expanded: bool,
     pub tools: Vec<ActiveToolCell>,
     pub diagnostics: Vec<HistoryCell>,
     pub pending_approval: Option<ApprovalRequest>,
@@ -98,21 +118,24 @@ impl ActiveTurn {
     }
 
     pub fn append_tool_arguments(&mut self, tool_call_id: &ToolCallId, delta: &str) {
+        // Nothing to append to, and that is the point.
+        //
+        // A provider streams a call's arguments BEFORE the runtime knows which
+        // tool they belong to: `ToolCallUpdated` fires per delta while the model
+        // is still talking, and `ToolCallStarted` — which carries the tool's
+        // real name and the whole argument string — only follows once that
+        // stream ends. Creating a provisional cell here would paint a row naming
+        // the call by its id, and then, when the real name arrived and turned
+        // out to be a quiet tool, that row would vanish. Nothing to show yet is
+        // the right thing to show: the deltas are lost nothing, because
+        // `upsert_tool` replaces the arguments wholesale when the identity
+        // lands.
         if let Some(existing) = self
             .tools
             .iter_mut()
             .find(|tool| &tool.tool_call_id == tool_call_id)
         {
             existing.arguments.push_str(delta);
-        } else {
-            self.tools.push(ActiveToolCell {
-                tool_call_id: tool_call_id.clone(),
-                tool_name: tool_call_id.as_str().to_string(),
-                arguments: delta.to_string(),
-                approval: ToolApprovalState::NotRequired,
-                live_output: LiveOutput::default(),
-                started_at: std::time::Instant::now(),
-            });
         }
     }
 
@@ -163,15 +186,25 @@ impl ActiveTurn {
     /// Flush only what belongs to one finished tool call: the streamed
     /// text/reasoning so far (once), that tool's cell, and accumulated
     /// diagnostics. Other still-running tool cells stay in the active turn.
-    pub fn take_finished_tool_cells(&mut self, tool_call_id: &ToolCallId) -> Vec<HistoryCell> {
-        let mut cells = Vec::new();
+    ///
+    /// The call's own cell comes back **separately** from the rest because only
+    /// the caller knows its result — and therefore whether it can join a folded
+    /// batch (see `App::push_finished_tool`). Returning it inside the vector
+    /// would force the caller to pick it back out of a list whose order it
+    /// would then have to know.
+    pub fn take_finished_tool(&mut self, tool_call_id: &ToolCallId) -> FinishedTool {
+        let mut finished = FinishedTool::default();
         if !self.reasoning_buffer.is_empty() {
-            cells.push(HistoryCell::Reasoning {
+            finished.prose.push(HistoryCell::Reasoning {
                 text: std::mem::take(&mut self.reasoning_buffer),
+                expanded: self.reasoning_expanded,
             });
+            // The block that just left for history keeps what the user chose;
+            // the next block of this turn starts folded again.
+            self.reasoning_expanded = false;
         }
         if !self.assistant_buffer.is_empty() {
-            cells.push(HistoryCell::Assistant {
+            finished.prose.push(HistoryCell::Assistant {
                 text: std::mem::take(&mut self.assistant_buffer),
             });
         }
@@ -181,7 +214,7 @@ impl ActiveTurn {
             .position(|tool| &tool.tool_call_id == tool_call_id)
         {
             let tool = self.tools.remove(position);
-            cells.push(HistoryCell::ToolCall {
+            finished.call = Some(HistoryCell::ToolCall {
                 tool_name: tool.tool_name,
                 arguments: tool.arguments,
                 approval: tool.approval,
@@ -190,16 +223,47 @@ impl ActiveTurn {
                 running_for_secs: None,
             });
         }
-        cells.append(&mut self.diagnostics);
-        cells
+        finished.diagnostics = std::mem::take(&mut self.diagnostics);
+        finished
     }
 
+    /// What the live preview draws for the turn in flight.
+    ///
+    /// A quiet call (`quiet_while_running`) contributes **nothing** — neither
+    /// its command nor its streamed output. Anything drawn here and then
+    /// swallowed when the call lands is a flicker, and because the transcript is
+    /// bottom-anchored every one of them also drags the rows below it up and
+    /// down, so a burst of commands reads as a stutter.
+    ///
+    /// What the call produced is not lost: it is in the run's result, one click
+    /// away once the call lands, and the status line keeps its clock ticking
+    /// meanwhile. A call a human has to answer, or one that writes, is never
+    /// quiet and keeps both its row and its output.
     #[must_use]
     pub fn preview_cells(&self) -> Vec<HistoryCell> {
+        self.cells(true)
+    }
+
+    /// What an abandoned turn leaves behind.
+    ///
+    /// Every tool still in flight gets its row, quiet ones included: a call
+    /// whose outcome never arrived is exactly what a reader needs to see, and
+    /// the fold policy — which is a verdict on *finished* calls — has nothing
+    /// to say about it.
+    #[must_use]
+    pub fn flushed_cells(&self) -> Vec<HistoryCell> {
+        self.cells(false)
+    }
+
+    fn cells(&self, hide_quiet_calls: bool) -> Vec<HistoryCell> {
         let mut cells = Vec::new();
         if !self.reasoning_buffer.is_empty() {
             cells.push(HistoryCell::Reasoning {
                 text: self.reasoning_buffer.clone(),
+                // Read here AND by `flush_active_turn`, which drains the turn
+                // through this very type — so the turn-end flush inherits the
+                // user's choice with no second code path to keep in step.
+                expanded: self.reasoning_expanded,
             });
         }
         if !self.assistant_buffer.is_empty() {
@@ -208,6 +272,16 @@ impl ActiveTurn {
             });
         }
         for tool in &self.tools {
+            // A quiet call has no footprint at all — neither its command nor
+            // its output. A line that appears and is then swallowed is the same
+            // flicker as a command that appears and is then swallowed, and
+            // because the transcript is bottom-anchored every one of them also
+            // shifts everything below it. What the call produced is in the
+            // run's result, one click away, and the status line keeps its clock
+            // ticking in the meantime.
+            if hide_quiet_calls && quiet_while_running(&tool.tool_name, tool.approval) {
+                continue;
+            }
             cells.push(HistoryCell::ToolCall {
                 tool_name: tool.tool_name.clone(),
                 arguments: tool.arguments.clone(),
@@ -256,18 +330,25 @@ mod tests {
         ));
     }
 
+    /// The live-output preview cap, exercised through a tool the preview
+    /// actually draws.
+    ///
+    /// `job` rather than `shell`: a shell call nobody had to approve is a quiet
+    /// call, and the preview draws no part of one — not its row, not its
+    /// output (see `a_quiet_running_call_draws_nothing_but_a_watched_one_draws_both`).
     #[test]
     fn streamed_tool_output_previews_tail_and_never_reaches_history() {
         let mut turn = ActiveTurn::default();
         let id = ToolCallId("call_1".to_string());
-        turn.upsert_tool(ActiveToolCell {
+        let cell = || ActiveToolCell {
             tool_call_id: id.clone(),
-            tool_name: "shell".to_string(),
-            arguments: "{\"command\":\"cargo build\"}".to_string(),
+            tool_name: "job".to_string(),
+            arguments: "{\"action\":\"start\"}".to_string(),
             approval: ToolApprovalState::NotRequired,
             live_output: LiveOutput::default(),
             started_at: std::time::Instant::now(),
-        });
+        };
+        turn.upsert_tool(cell());
 
         for line in 0..10 {
             turn.append_tool_output(&id, &format!("line-{line}\n"));
@@ -285,24 +366,86 @@ mod tests {
         assert!(!text.contains("line-0"));
 
         // A duplicate upsert must not wipe streamed output.
-        turn.upsert_tool(ActiveToolCell {
-            tool_call_id: id.clone(),
-            tool_name: "shell".to_string(),
-            arguments: "{\"command\":\"cargo build\"}".to_string(),
-            approval: ToolApprovalState::NotRequired,
-            live_output: LiveOutput::default(),
-            started_at: std::time::Instant::now(),
-        });
+        turn.upsert_tool(cell());
         assert!(!turn.tools[0].live_output.is_empty());
 
         // The finished-tool flush drops live output: the final ToolResult
         // summary replaces it in history.
-        let flushed = turn.take_finished_tool_cells(&id);
+        let finished = turn.take_finished_tool(&id);
         assert!(
-            flushed
-                .iter()
-                .all(|cell| !matches!(cell, HistoryCell::ToolStream { .. }))
+            finished
+                .call
+                .is_some_and(|cell| matches!(cell, HistoryCell::ToolCall { .. })),
+            "the flush hands back the call, not its live-output tail"
         );
+        assert!(
+            finished
+                .prose
+                .iter()
+                .all(|cell| !matches!(cell, HistoryCell::ToolStream { .. })),
+            "no live output leaks into the flushed prose"
+        );
+    }
+
+    #[test]
+    fn preview_cells_carry_the_live_expansion_choice() {
+        let mut turn = ActiveTurn::default();
+        turn.push_reasoning_delta("thinking");
+
+        assert!(matches!(
+            turn.preview_cells()[0],
+            HistoryCell::Reasoning {
+                expanded: false,
+                ..
+            }
+        ));
+        turn.reasoning_expanded = true;
+        assert!(matches!(
+            turn.preview_cells()[0],
+            HistoryCell::Reasoning { expanded: true, .. }
+        ));
+    }
+
+    /// Opening a block and then watching a tool call land must not fold it shut
+    /// mid-read — but the choice is per-block, so the block that starts after
+    /// the flush opens folded like every other.
+    #[test]
+    fn flushing_an_open_block_keeps_it_open_and_the_next_one_starts_folded() {
+        let mut turn = ActiveTurn::default();
+        let id = ToolCallId("call_1".to_string());
+        turn.upsert_tool(ActiveToolCell {
+            tool_call_id: id.clone(),
+            tool_name: "shell".to_string(),
+            arguments: "{}".to_string(),
+            approval: ToolApprovalState::NotRequired,
+            live_output: LiveOutput::default(),
+            started_at: std::time::Instant::now(),
+        });
+        turn.push_reasoning_delta("first");
+        turn.reasoning_expanded = true;
+
+        let finished = turn.take_finished_tool(&id);
+        assert!(
+            matches!(
+                finished.prose[0],
+                HistoryCell::Reasoning { expanded: true, .. }
+            ),
+            "the block the user opened must stay open once flushed"
+        );
+        assert!(
+            !turn.reasoning_expanded,
+            "the next reasoning block of this turn starts folded"
+        );
+
+        turn.push_reasoning_delta("second");
+        let finished = turn.take_finished_tool(&id);
+        assert!(matches!(
+            finished.prose[0],
+            HistoryCell::Reasoning {
+                expanded: false,
+                ..
+            }
+        ));
     }
 
     #[test]

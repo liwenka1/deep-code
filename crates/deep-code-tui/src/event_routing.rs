@@ -2,7 +2,7 @@ use deep_code_agent::{RuntimeEvent, ToolCallId};
 
 use crate::active_turn::{ActiveToolCell, ActiveTurn};
 use crate::app::App;
-use crate::history::{HistoryCell, ToolApprovalState, summarize_tool_result};
+use crate::history::{HistoryCell, ToolApprovalState, folded_entry, summarize_tool_result};
 use deep_code_agent::i18n::TextId;
 
 impl App {
@@ -148,11 +148,50 @@ impl App {
             } => {
                 // Flush only the finished tool so cells of other calls in the
                 // same multi-tool batch keep streaming in the active turn.
-                if let Some(active) = self.active_turn.as_mut() {
-                    let cells = active.take_finished_tool_cells(&tool_call_id);
-                    self.history.extend(cells);
+                let finished = self
+                    .active_turn
+                    .as_mut()
+                    .map(|active| active.take_finished_tool(&tool_call_id))
+                    .unwrap_or_default();
+                self.history.extend(finished.prose);
+                // Computed once, for the two consumers below: summarising scans
+                // the whole tool content, so doing it per-decision would pay it
+                // twice on every call.
+                let summary = summarize_tool_result(&result.content);
+                // A call that brought diagnostics along is shown in full: today
+                // their cell is pushed BETWEEN the call and its result, so
+                // folding the call would either reorder them or drop them
+                // outright — and silently dropping a reader's only copy of a
+                // type error is not a thing this may ever do.
+                //
+                // They are in hand only because the runtime drains them with
+                // whichever call finishes next, which is not necessarily the
+                // edit they describe — so this is a real case, not a
+                // theoretical one.
+                let entry = if finished.diagnostics.is_empty() {
+                    finished
+                        .call
+                        .as_ref()
+                        .and_then(|call| foldable_call(call, &result.status, &summary))
+                } else {
+                    None
+                };
+                match (finished.call, entry) {
+                    (Some(_), Some(entry)) => match self.history.last_mut() {
+                        Some(HistoryCell::ToolBatch { entries, .. }) => entries.push(entry),
+                        _ => self.history.push(HistoryCell::ToolBatch {
+                            entries: vec![entry],
+                            expanded: false,
+                        }),
+                    },
+                    (call, _) => {
+                        if let Some(call) = call {
+                            self.history.push(call);
+                        }
+                        self.history.extend(finished.diagnostics);
+                        self.push_tool_result_cell(&result, summary);
+                    }
                 }
-                self.push_tool_result_cell(&result);
             }
             RuntimeEvent::SessionUpdated {
                 session_id,
@@ -340,17 +379,39 @@ impl App {
         let Some(active) = self.active_turn.take() else {
             return;
         };
-        self.history.extend(active.preview_cells());
+        self.history.extend(active.flushed_cells());
     }
 
-    fn push_tool_result_cell(&mut self, result: &deep_code_agent::ToolResult) {
+    fn push_tool_result_cell(&mut self, result: &deep_code_agent::ToolResult, summary: String) {
         // Exactly one ToolCallFinished per tool call — no dedup needed.
         self.history.push(HistoryCell::ToolResult {
             status: result.status,
-            summary: summarize_tool_result(&result.content),
+            summary,
         });
         if deep_code_agent::is_subagent_tool(&result.tool_name) {
             self.refresh_subagent_status();
         }
     }
+}
+
+/// The batch entry a finished call would contribute, or `None` when the call
+/// has to be shown in full.
+///
+/// Thin adapter over [`folded_entry`], so the policy itself has exactly one
+/// home and both the live path and the resume path read it from there.
+fn foldable_call(
+    call: &HistoryCell,
+    status: &deep_code_agent::ToolResultStatus,
+    summary: &str,
+) -> Option<crate::history::ToolBatchEntry> {
+    let HistoryCell::ToolCall {
+        tool_name,
+        arguments,
+        approval,
+        ..
+    } = call
+    else {
+        return None;
+    };
+    folded_entry(tool_name, arguments, *approval, status, summary)
 }

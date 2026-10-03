@@ -204,6 +204,9 @@ pub struct App {
     /// Active mouse selection over the transcript: `(anchor, head)` as
     /// `(line, display_col)` into [`TranscriptSnapshot::lines`].
     pub(crate) selection: Option<(TextPos, TextPos)>,
+    /// Where the pending left-button press landed, what it controlled, and how
+    /// many cells the scrollback cap had already dropped.
+    pub(crate) mouse_down: Option<ClickPress>,
     /// Open `/resume` modal: rendered as an in-app overlay (no alt-screen
     /// churn, so switching sessions doesn't flicker) over the live TUI.
     pub(crate) resume_picker: Option<ResumePicker>,
@@ -227,6 +230,29 @@ pub(crate) struct ResumePicker {
 /// A position in the transcript line buffer: absolute line index + display
 /// column (CJK counts as 2).
 pub(crate) type TextPos = (usize, usize);
+
+/// A left-button press: where it landed, what it controlled, and how many cells
+/// the scrollback cap had already dropped at that moment.
+///
+/// A press only becomes a click when the release is in the same cell, and the
+/// target is resolved at PRESS time on purpose: the transcript scrolls under a
+/// streaming turn, so the row under the cursor can change between press and
+/// release, and what the user aimed at is what they saw when they pressed.
+///
+/// The cap's count is what keeps the stored history index honest across that
+/// gap. A `ToolCallFinished` landing in between can push the transcript past
+/// `MAX_HISTORY_CELLS`, and the drain that follows moves every index down by
+/// however many cells went — so an index recorded before it now names a
+/// different cell. The counter is monotonic (nothing resets it), which makes the
+/// difference exactly the shift, and a press whose own cell was dropped answers
+/// "nothing" rather than folding a neighbour.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClickPress {
+    pub col: u16,
+    pub row: u16,
+    pub target: Option<FoldTarget>,
+    pub trimmed_cells: usize,
+}
 
 /// One history cell's rendered lines, memoized across frames.
 ///
@@ -281,6 +307,29 @@ pub(crate) struct TranscriptSnapshot {
     pub height: u16,
     pub scroll_top: usize,
     pub lines: Vec<String>,
+    /// Absolute line index of each foldable block's header row, with what that
+    /// row controls.
+    ///
+    /// A click target is the header **row**, not the `▸` glyph at its start: the
+    /// whole row is the block's announcement, and a terminal has no hover to
+    /// make a one-cell target discoverable. Only the header is listed: a click
+    /// inside an expanded body has to stay an ordinary click, or starting a text
+    /// selection in it would fold the block shut.
+    pub fold_headers: Vec<(usize, FoldTarget)>,
+}
+
+/// What a click on a foldable block's header acts on.
+///
+/// A block is either folded into the scrollback (`History*`, by index) or still
+/// streaming in the live preview (`LiveReasoning`), and those live in different
+/// places on `App` — hence one variant per thing that can actually be toggled,
+/// rather than a generic "path" into a state tree two of whose members do not
+/// exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FoldTarget {
+    HistoryReasoning(usize),
+    HistoryToolBatch(usize),
+    LiveReasoning,
 }
 
 const PROMPT_HISTORY_CAP: usize = 100;
@@ -552,6 +601,7 @@ impl App {
             pasted_blocks: Vec::new(),
             transcript: None,
             selection: None,
+            mouse_down: None,
             resume_picker: None,
             lang,
             permission_mode,

@@ -1,12 +1,479 @@
 use super::*;
-use crate::history::HistoryCell;
-use deep_code_agent::RiskLevel;
+use crate::history::{HistoryCell, ToolApprovalState, ToolBatchEntry};
+use deep_code_agent::{RiskLevel, ToolResultStatus};
 
 fn line_width(line: &Line<'_>) -> usize {
     line.spans
         .iter()
         .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
         .sum()
+}
+
+/// A folded reasoning block is ONE row — that is the whole point: a long chain
+/// of thought must not push the answer it produced off the screen.
+#[test]
+fn folded_reasoning_renders_one_row_and_hides_the_text() {
+    let cell = HistoryCell::Reasoning {
+        text: "first step\nsecond step\nthird step".to_string(),
+        expanded: false,
+    };
+    let lines = cell_lines(&cell, 40, Lang::Zh);
+    let header: String = lines[0]
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert!(
+        header.contains('▸') && header.contains("3 行"),
+        "the folded header must carry the fold marker and the hidden line count: {header:?}"
+    );
+    assert!(
+        !header.contains("first step"),
+        "the folded header must not carry the body: {header:?}"
+    );
+    // Header + the cell's trailing blank, nothing else.
+    assert_eq!(lines.len(), 2, "folded reasoning is one row: {lines:?}");
+
+    // And it stays one row when narrow: the header is never wrapped, so a
+    // reflow can never turn a folded block back into a block of rows.
+    assert_eq!(cell_lines(&cell, 12, Lang::Zh).len(), 2);
+}
+
+/// Expanding puts the text back under the SAME header row, so the row a click
+/// folds the block with is still there to fold it again.
+#[test]
+fn expanded_reasoning_shows_the_text_behind_the_same_header() {
+    let cell = HistoryCell::Reasoning {
+        text: "first step\nsecond step\nthird step".to_string(),
+        expanded: true,
+    };
+    let lines = cell_lines(&cell, 40, Lang::Zh);
+    let all: String = lines
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        all.contains('▾') && all.contains("3 行"),
+        "the expanded header keeps its marker and count, pointing down: {all:?}"
+    );
+    for fragment in ["first step", "second step", "third step"] {
+        assert!(
+            all.contains(fragment),
+            "expanded reasoning must show {fragment:?}: {all:?}"
+        );
+    }
+    // Header + three body rows + the trailing blank.
+    assert_eq!(lines.len(), 5, "{lines:?}");
+}
+
+/// The click mapping is only as good as the row number the renderer recorded,
+/// so this drives a real frame and clicks where the snapshot says the header
+/// is — proving the recorded row and the drawn row are the same one, and that
+/// the click lands on that block and nothing else.
+#[test]
+fn clicking_the_row_the_renderer_registered_unfolds_that_block() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.history.push(HistoryCell::Reasoning {
+        text: "hidden body one\nhidden body two".to_string(),
+        expanded: false,
+    });
+    // Off the end: `App::new()` already opens the transcript with a welcome
+    // cell, which is exactly the offset this test exists to catch.
+    let index = app.history.len() - 1;
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    let mut screen = |app: &mut App| {
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .flat_map(|row| (0..buffer.area.width).map(move |col| (col, row)))
+            .map(|(col, row)| buffer[(col, row)].symbol().to_string())
+            .collect::<String>()
+    };
+
+    let folded = screen(&mut app);
+    assert!(
+        folded.contains("Thinking · 2 line(s)"),
+        "precondition: the folded header is on screen:\n{folded}"
+    );
+    assert!(
+        !folded.contains("hidden body"),
+        "the body must be folded away:\n{folded}"
+    );
+
+    let snapshot = app.transcript.clone().expect("render records a snapshot");
+    let (line, _) = snapshot
+        .fold_headers
+        .iter()
+        .find(|(_, target)| *target == FoldTarget::HistoryReasoning(index))
+        .copied()
+        .expect("the reasoning block must be registered as clickable");
+    assert!(
+        snapshot.lines[line].contains("Thinking"),
+        "the registered row must be the header, got {:?}",
+        snapshot.lines[line]
+    );
+
+    // Click at the screen coordinates that row maps to.
+    let row = snapshot.y + (line - snapshot.scroll_top) as u16;
+    app.mouse_press(snapshot.x + 1, row);
+    app.mouse_release(snapshot.x + 1, row);
+
+    assert!(
+        matches!(&app.history[index], HistoryCell::Reasoning { expanded, .. } if *expanded),
+        "the click must reach the block the header belongs to"
+    );
+    let unfolded = screen(&mut app);
+    assert!(
+        unfolded.contains("hidden body one") && unfolded.contains("hidden body two"),
+        "the unfolded block must paint its text:\n{unfolded}"
+    );
+}
+
+/// A folded run is ONE row that says how much it is hiding and of what — that
+/// is the whole point of the change.
+#[test]
+fn a_folded_batch_is_one_summary_row_counting_each_tool() {
+    let batch = HistoryCell::ToolBatch {
+        entries: vec![
+            batch_entry("read_file", "{\"path\":\"a.rs\"}"),
+            batch_entry("read_file", "{\"path\":\"b.rs\"}"),
+            batch_entry("shell", "{\"command\":\"cargo test\"}"),
+        ],
+        expanded: false,
+    };
+
+    let lines = cell_lines(&batch, 60, Lang::En);
+    // The summary row, then the cell's trailing blank.
+    assert_eq!(lines.len(), 2, "a folded run must be one row: {lines:?}");
+    let header: String = lines[0]
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert!(
+        header.contains('▸')
+            && header.contains("2 file(s) read")
+            && header.contains("1 command(s) run"),
+        "the row must count each tool by its own verb: {header:?}"
+    );
+    // The verb order follows the run, so the row reads as the order the work
+    // happened rather than as a fixed schema.
+    assert!(
+        header.find("file(s)").unwrap() < header.find("command(s)").unwrap(),
+        "the summaries must keep the run's own order: {header:?}"
+    );
+    // And it stays one row when narrow: a header is never wrapped, so a reflow
+    // can never turn a folded run back into a block of rows.
+    assert_eq!(cell_lines(&batch, 12, Lang::En).len(), 2);
+}
+
+/// Expanding is not a second rendering path: it is the same rows the transcript
+/// would have shown before batching existed, behind the one header.
+#[test]
+fn an_expanded_batch_is_the_same_rows_as_the_unbatched_calls() {
+    let entries = vec![
+        batch_entry("read_file", "{\"path\":\"a.rs\"}"),
+        batch_entry("shell", "{\"command\":\"cargo test\"}"),
+    ];
+    let batch = cell_lines(
+        &HistoryCell::ToolBatch {
+            entries: entries.clone(),
+            expanded: true,
+        },
+        60,
+        Lang::En,
+    );
+
+    let mut unbatched = Vec::new();
+    for entry in &entries {
+        unbatched.extend(cell_lines(
+            &HistoryCell::ToolCall {
+                tool_name: entry.tool_name.clone(),
+                arguments: entry.arguments.clone(),
+                approval: ToolApprovalState::NotRequired,
+                running_for_secs: None,
+            },
+            60,
+            Lang::En,
+        ));
+        unbatched.extend(cell_lines(
+            &HistoryCell::ToolResult {
+                status: ToolResultStatus::Success,
+                summary: entry.summary.clone(),
+            },
+            60,
+            Lang::En,
+        ));
+    }
+
+    let plain = |lines: &[Line<'_>]| -> Vec<String> { lines.iter().map(line_plain_text).collect() };
+    // Everything after the header — row for row, in order.
+    assert_eq!(
+        plain(&batch)[1..],
+        plain(&unbatched)[..],
+        "an expanded batch must be exactly the unbatched rows"
+    );
+}
+
+/// End to end through the real layout: the row the renderer registered for a
+/// folded run has to be the row it drew, and a click there has to open that run
+/// and nothing else.
+#[test]
+fn clicking_the_row_a_batch_registered_unfolds_that_run() {
+    use deep_code_agent::{RuntimeEvent, ToolCallId, ToolResult, ToolResultStatus, TurnId};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    let turn = TurnId("turn_1".to_string());
+    for (id, tool) in [("c1", "read_file"), ("c2", "shell")] {
+        app.apply_runtime_event(RuntimeEvent::ToolCallStarted {
+            turn_id: turn.clone(),
+            tool_call_id: ToolCallId(id.to_string()),
+            tool_name: tool.to_string(),
+            arguments: serde_json::json!({ "path": "hidden/secret.rs" }),
+        });
+        app.apply_runtime_event(RuntimeEvent::ToolCallFinished {
+            turn_id: Some(turn.clone()),
+            tool_call_id: ToolCallId(id.to_string()),
+            result: ToolResult {
+                call_id: id.to_string(),
+                tool_name: tool.to_string(),
+                status: ToolResultStatus::Success,
+                content: format!("{tool} body"),
+                details: None,
+            },
+        });
+    }
+    let index = app.history.len() - 1;
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    let mut screen = |app: &mut App| {
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .flat_map(|row| (0..buffer.area.width).map(move |col| (col, row)))
+            .map(|(col, row)| buffer[(col, row)].symbol().to_string())
+            .collect::<String>()
+    };
+
+    let folded = screen(&mut app);
+    assert!(
+        folded.contains("1 file(s) read") && folded.contains("1 command(s) run"),
+        "precondition: the folded run is on screen:\n{folded}"
+    );
+    assert!(
+        !folded.contains("hidden/secret.rs"),
+        "a folded run must not paint its calls:\n{folded}"
+    );
+
+    let snapshot = app.transcript.clone().expect("render records a snapshot");
+    let (line, _) = snapshot
+        .fold_headers
+        .iter()
+        .find(|(_, target)| *target == FoldTarget::HistoryToolBatch(index))
+        .copied()
+        .expect("the run must be registered as clickable");
+    assert!(
+        snapshot.lines[line].contains("file(s) read"),
+        "the registered row must be the summary, got {:?}",
+        snapshot.lines[line]
+    );
+
+    let row = snapshot.y + (line - snapshot.scroll_top) as u16;
+    app.mouse_press(snapshot.x + 1, row);
+    app.mouse_release(snapshot.x + 1, row);
+
+    assert!(
+        matches!(&app.history[index], HistoryCell::ToolBatch { expanded, .. } if *expanded),
+        "the click must reach the run the summary belongs to"
+    );
+    let opened = screen(&mut app);
+    assert!(
+        opened.contains("hidden/secret.rs") && opened.contains("read_file"),
+        "the opened run must paint its calls:\n{opened}"
+    );
+}
+
+/// Render one frame and flatten it to text, for tests that care about what the
+/// frame as a whole says.
+fn frame(app: &mut App, width: u16, height: u16) -> String {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| render(frame, app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    (0..buffer.area.height)
+        .flat_map(|row| (0..buffer.area.width).map(move |col| (col, row)))
+        .map(|(col, row)| buffer[(col, row)].symbol().to_string())
+        .collect()
+}
+
+/// Drive one quiet call through the event stream.
+fn quiet_call(app: &mut App, turn: &deep_code_agent::TurnId, id: &str, path: &str) {
+    use deep_code_agent::{RuntimeEvent, ToolCallId, ToolResult, ToolResultStatus};
+
+    app.apply_runtime_event(RuntimeEvent::ToolCallStarted {
+        turn_id: turn.clone(),
+        tool_call_id: ToolCallId(id.to_string()),
+        tool_name: "read_file".to_string(),
+        arguments: serde_json::json!({ "path": path }),
+    });
+    app.apply_runtime_event(RuntimeEvent::ToolCallFinished {
+        turn_id: Some(turn.clone()),
+        tool_call_id: ToolCallId(id.to_string()),
+        result: ToolResult {
+            call_id: id.to_string(),
+            tool_name: "read_file".to_string(),
+            status: ToolResultStatus::Success,
+            content: "12 lines".to_string(),
+            details: None,
+        },
+    });
+}
+
+/// A quiet call never shows its command — not while it runs, not after. So
+/// there is no row to watch appear and then condense away: the only thing that
+/// ever changes is the count.
+#[test]
+fn a_quiet_call_shows_only_its_count_while_the_turn_runs() {
+    use deep_code_agent::{RuntimeEvent, ToolCallId, TurnId};
+    use serde_json::json;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.is_streaming = true;
+    let turn = TurnId("turn_1".to_string());
+
+    // Started but not finished: the run draws nothing at all.
+    app.apply_runtime_event(RuntimeEvent::ToolCallStarted {
+        turn_id: turn.clone(),
+        tool_call_id: ToolCallId("c1".to_string()),
+        tool_name: "read_file".to_string(),
+        arguments: json!({ "path": "src/router.rs" }),
+    });
+    let running = frame(&mut app, 72, 24);
+    assert!(
+        !running.contains("src/router.rs"),
+        "a quiet call must draw no row of its own:\n{running}"
+    );
+
+    // It lands: one row, counting it.
+    quiet_call(&mut app, &turn, "c1", "src/router.rs");
+    let landed = frame(&mut app, 72, 24);
+    assert!(landed.contains("1 file(s) read"), "{landed}");
+    assert!(
+        !landed.contains("src/router.rs"),
+        "the command is never painted:\n{landed}"
+    );
+
+    // The turn ending changes nothing about it.
+    app.is_streaming = false;
+    let ended = frame(&mut app, 72, 24);
+    assert!(ended.contains("1 file(s) read"), "{ended}");
+    assert!(!ended.contains("src/router.rs"), "{ended}");
+}
+
+/// Expanding is the escape hatch: the commands a folded run hides are one click
+/// away, results and all.
+#[test]
+fn expanding_a_run_brings_back_the_commands_it_hides() {
+    use deep_code_agent::TurnId;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    let turn = TurnId("turn_1".to_string());
+    quiet_call(&mut app, &turn, "c1", "src/router.rs");
+    let index = app.history.len() - 1;
+
+    let folded = frame(&mut app, 72, 24);
+    assert!(folded.contains("1 file(s) read"), "{folded}");
+    assert!(!folded.contains("src/router.rs"), "{folded}");
+
+    let snapshot = app.transcript.clone().expect("snapshot");
+    let (line, _) = snapshot
+        .fold_headers
+        .iter()
+        .find(|(_, target)| *target == FoldTarget::HistoryToolBatch(index))
+        .copied()
+        .expect("the run is clickable");
+    let row = snapshot.y + (line - snapshot.scroll_top) as u16;
+    app.mouse_press(snapshot.x + 1, row);
+    app.mouse_release(snapshot.x + 1, row);
+
+    let opened = frame(&mut app, 72, 24);
+    assert!(
+        opened.contains("src/router.rs") && opened.contains("read_file"),
+        "expanding must bring the command back:\n{opened}"
+    );
+}
+
+/// A tool's arguments stream in BEFORE the runtime knows which tool they belong
+/// to — `ToolCallStarted`, which carries the real name and the whole argument
+/// string, only follows the end of the model's stream. Drawing a provisional
+/// row in that window named the call by its id, and the row vanished the moment
+/// the name arrived and turned out to be a quiet tool. That was the flicker.
+#[test]
+fn arguments_streaming_in_before_the_tool_is_known_draw_nothing() {
+    use deep_code_agent::{RuntimeEvent, ToolCallId, TurnId};
+    use serde_json::json;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.is_streaming = true;
+    let turn = TurnId("turn_1".to_string());
+    app.apply_runtime_event(RuntimeEvent::ToolCallUpdated {
+        turn_id: turn.clone(),
+        tool_call_id: ToolCallId("call_1".to_string()),
+        arguments_delta: Some("{\"path\":\"src/router".to_string()),
+    });
+
+    let streaming = frame(&mut app, 72, 24);
+    assert!(
+        !streaming.contains("src/router"),
+        "the raw arguments of an unidentified call must never be painted:\n{streaming}"
+    );
+
+    // The identity lands, and the call is quiet: still nothing — and therefore
+    // nothing that could be taken away later.
+    app.apply_runtime_event(RuntimeEvent::ToolCallStarted {
+        turn_id: turn.clone(),
+        tool_call_id: ToolCallId("call_1".to_string()),
+        tool_name: "read_file".to_string(),
+        arguments: json!({ "path": "src/router.rs" }),
+    });
+    let named = frame(&mut app, 72, 24);
+    assert!(!named.contains("src/router.rs"), "{named}");
+
+    // A tool a reader watches announces itself here instead — in full, once,
+    // and it stays.
+    app.apply_runtime_event(RuntimeEvent::ToolCallStarted {
+        turn_id: turn,
+        tool_call_id: ToolCallId("call_2".to_string()),
+        tool_name: "write_file".to_string(),
+        arguments: json!({ "path": "src/auth.rs" }),
+    });
+    let watched = frame(&mut app, 72, 24);
+    assert!(
+        watched.contains("write_file") && watched.contains("src/auth.rs"),
+        "a watched call announces itself once, in full:\n{watched}"
+    );
+}
+
+fn batch_entry(tool_name: &str, arguments: &str) -> ToolBatchEntry {
+    ToolBatchEntry {
+        tool_name: tool_name.to_string(),
+        arguments: arguments.to_string(),
+        summary: format!("{tool_name} ok"),
+    }
 }
 
 #[test]

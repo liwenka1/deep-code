@@ -1,4 +1,5 @@
 use super::*;
+use crate::app::ClickPress;
 
 impl App {
     /// Record what the transcript render produced, for mouse → text mapping.
@@ -86,6 +87,93 @@ impl App {
         }
     }
 
+    /// Left button down: start a selection and remember what the press landed
+    /// on, so the release can tell a click from a drag.
+    pub(crate) fn mouse_press(&mut self, col: u16, row: u16) {
+        let target = self.fold_target_at(col, row);
+        self.mouse_down = Some(ClickPress {
+            col,
+            row,
+            target,
+            trimmed_cells: self.trimmed_cells,
+        });
+        self.selection_begin(col, row);
+    }
+
+    /// Left button up: the dragged text to copy, or `None` when nothing was
+    /// dragged — in which case a press/release pair on a foldable header folds
+    /// or unfolds that block.
+    pub(crate) fn mouse_release(&mut self, col: u16, row: u16) -> Option<String> {
+        let click = self.take_click(col, row);
+        let copied = self.selection_finish();
+        if copied.is_none()
+            && let Some(target) = click
+        {
+            self.toggle_fold(target);
+        }
+        copied
+    }
+
+    /// Consume the pending press. `Some(target)` only when the release landed in
+    /// the same cell the press did — a drag that started on a header must select
+    /// text, never fold the block.
+    fn take_click(&mut self, col: u16, row: u16) -> Option<FoldTarget> {
+        let press = self.mouse_down.take()?;
+        if (press.col, press.row) != (col, row) {
+            return None;
+        }
+        // `enforce_history_cap` drains from the FRONT, so a history index
+        // recorded before such a drain now names a cell that many places
+        // earlier. Without this correction the click would fold whichever block
+        // happens to sit at the stale index — same cell variant, wrong block.
+        // (`checked_sub` answers `None` when the pressed cell was itself one of
+        // the dropped ones, which is the honest outcome.)
+        let dropped = self.trimmed_cells.saturating_sub(press.trimmed_cells);
+        match press.target? {
+            FoldTarget::HistoryReasoning(index) => {
+                index.checked_sub(dropped).map(FoldTarget::HistoryReasoning)
+            }
+            FoldTarget::HistoryToolBatch(index) => {
+                index.checked_sub(dropped).map(FoldTarget::HistoryToolBatch)
+            }
+            live @ FoldTarget::LiveReasoning => Some(live),
+        }
+    }
+
+    /// What the foldable header at an absolute mouse position controls, if the
+    /// position is on one. Resolved against the last render's snapshot, which is
+    /// exactly what the user is looking at.
+    fn fold_target_at(&self, col: u16, row: u16) -> Option<FoldTarget> {
+        let snapshot = self.transcript.as_ref()?;
+        let (line, _) = self.mouse_to_text(col, row)?;
+        snapshot
+            .fold_headers
+            .iter()
+            .find(|(at, _)| *at == line)
+            .map(|(_, target)| *target)
+    }
+
+    /// Fold or unfold one block, wherever it lives.
+    fn toggle_fold(&mut self, target: FoldTarget) {
+        match target {
+            FoldTarget::HistoryReasoning(index) => {
+                if let Some(HistoryCell::Reasoning { expanded, .. }) = self.history.get_mut(index) {
+                    *expanded = !*expanded;
+                }
+            }
+            FoldTarget::HistoryToolBatch(index) => {
+                if let Some(HistoryCell::ToolBatch { expanded, .. }) = self.history.get_mut(index) {
+                    *expanded = !*expanded;
+                }
+            }
+            FoldTarget::LiveReasoning => {
+                if let Some(active) = self.active_turn.as_mut() {
+                    active.reasoning_expanded = !active.reasoning_expanded;
+                }
+            }
+        }
+    }
+
     /// Extend the in-progress selection (left button drag).
     pub(crate) fn selection_update(&mut self, col: u16, row: u16) {
         if let (Some((anchor, _)), Some(pos)) = (self.selection, self.mouse_to_text(col, row)) {
@@ -104,8 +192,17 @@ impl App {
         self.selected_text()
     }
 
+    /// Forget the pointer's whole gesture over the transcript.
+    ///
+    /// Both halves are coordinates into the transcript a caller replaces when it
+    /// calls this: the selection, and the press that may still be waiting for its
+    /// release. Dropping only the first leaves a release to be matched against
+    /// the same index in a *different* history — `/clear` and `/resume` swap the
+    /// transcript wholesale without touching the cap counter the release uses to
+    /// correct for a trim, so the index would name whatever block now sits there.
     pub(crate) fn clear_selection(&mut self) {
         self.selection = None;
+        self.mouse_down = None;
     }
 
     /// Extract the currently selected transcript text.

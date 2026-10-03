@@ -124,6 +124,7 @@ fn find_in_transcript_jumps_and_continues_upward() {
         height: 10,
         scroll_top: 0,
         lines,
+        fold_headers: Vec::new(),
     });
 
     // First /find: nearest-to-bottom match (line 30, case-insensitive).
@@ -1040,6 +1041,7 @@ fn snapshot(lines: &[&str]) -> TranscriptSnapshot {
         height: 10,
         scroll_top: 0,
         lines: lines.iter().map(|s| (*s).to_string()).collect(),
+        fold_headers: Vec::new(),
     }
 }
 
@@ -1081,6 +1083,546 @@ fn mouse_outside_transcript_clears_selection() {
     app.set_transcript_snapshot(snapshot(&["abc"]));
     app.selection_begin(200, 200); // outside
     assert!(app.selection.is_none());
+}
+
+/// A click on a folded reasoning header unfolds exactly that block, and a
+/// second click folds it back. The row is a header, so nothing is copied.
+#[test]
+fn a_click_on_a_reasoning_header_folds_and_unfolds_that_block() {
+    let mut app = App::new();
+    app.history.push(HistoryCell::user("hi"));
+    app.history.push(HistoryCell::Reasoning {
+        text: "deep thought".to_string(),
+        expanded: false,
+    });
+    // Indexed off the end: the transcript already opens with a welcome cell.
+    let index = app.history.len() - 1;
+    app.set_transcript_snapshot(TranscriptSnapshot {
+        fold_headers: vec![(1, FoldTarget::HistoryReasoning(index))],
+        ..snapshot(&["› hi", "▸ ✻ 思考 · 1 行"])
+    });
+
+    app.mouse_press(1, 1);
+    assert!(
+        app.mouse_release(1, 1).is_none(),
+        "a click on a header copies nothing"
+    );
+    assert!(
+        matches!(&app.history[index], HistoryCell::Reasoning { expanded, .. } if *expanded),
+        "the clicked block must have unfolded"
+    );
+
+    app.mouse_press(1, 1);
+    app.mouse_release(1, 1);
+    assert!(
+        matches!(&app.history[index], HistoryCell::Reasoning { expanded, .. } if !*expanded),
+        "a second click must fold it back"
+    );
+}
+
+/// A drag that STARTS on a header is a selection, not a fold: the header is a
+/// perfectly ordinary place to begin selecting from, and folding the block
+/// under the cursor mid-drag would be a trap.
+#[test]
+fn a_drag_from_a_reasoning_header_selects_instead_of_folding() {
+    let mut app = App::new();
+    app.history.push(HistoryCell::Reasoning {
+        text: "deep thought".to_string(),
+        expanded: false,
+    });
+    let index = app.history.len() - 1;
+    app.set_transcript_snapshot(TranscriptSnapshot {
+        fold_headers: vec![(0, FoldTarget::HistoryReasoning(index))],
+        ..snapshot(&["▸ ✻ 思考 · 1 行", "more text"])
+    });
+
+    app.mouse_press(1, 0);
+    app.selection_update(1 + 4, 1);
+    let copied = app.mouse_release(1 + 4, 1);
+    assert!(copied.is_some(), "a drag copies its selection");
+    assert!(
+        matches!(&app.history[index], HistoryCell::Reasoning { expanded, .. } if !*expanded),
+        "dragging from a header must not fold the block"
+    );
+}
+
+/// The streaming block is not in `history` yet, so its header has to reach the
+/// live turn instead — otherwise the block the user most wants to open (the one
+/// currently growing) would be the one row that cannot be clicked.
+#[test]
+fn a_click_on_the_live_reasoning_header_expands_the_streaming_block() {
+    use crate::active_turn::ActiveTurn;
+
+    let mut app = App::new();
+    let mut turn = ActiveTurn::default();
+    turn.push_reasoning_delta("thinking");
+    app.active_turn = Some(turn);
+    app.set_transcript_snapshot(TranscriptSnapshot {
+        fold_headers: vec![(0, FoldTarget::LiveReasoning)],
+        ..snapshot(&["▸ ✻ 思考 · 1 行"])
+    });
+
+    app.mouse_press(1, 0);
+    app.mouse_release(1, 0);
+    assert!(
+        app.active_turn.as_ref().unwrap().reasoning_expanded,
+        "the live block must have unfolded"
+    );
+}
+
+/// Only a header row is clickable. Clicking the body of an EXPANDED block must
+/// stay a plain click — a user reading it will click in the text, and folding
+/// the block shut under them would be the same trap as the drag case.
+#[test]
+fn a_click_inside_the_body_of_an_expanded_block_does_nothing() {
+    let mut app = App::new();
+    app.history.push(HistoryCell::Reasoning {
+        text: "deep thought".to_string(),
+        expanded: true,
+    });
+    let index = app.history.len() - 1;
+    // Header on row 0; the body occupies row 1 and is deliberately absent from
+    // `reasoning_headers`.
+    app.set_transcript_snapshot(TranscriptSnapshot {
+        fold_headers: vec![(0, FoldTarget::HistoryReasoning(index))],
+        ..snapshot(&["▾ ✻ 思考 · 1 行", "deep thought"])
+    });
+
+    app.mouse_press(1, 1);
+    app.mouse_release(1, 1);
+    assert!(
+        matches!(&app.history[index], HistoryCell::Reasoning { expanded, .. } if *expanded),
+        "a click in the body must leave the block open"
+    );
+}
+
+/// Drive one tool call through the event stream exactly the way the runtime
+/// does: started, then finished with a result.
+fn finish_tool(
+    app: &mut App,
+    turn: &deep_code_agent::TurnId,
+    id: &str,
+    tool: &str,
+    status: deep_code_agent::ToolResultStatus,
+) {
+    app.apply_runtime_event(RuntimeEvent::ToolCallStarted {
+        turn_id: turn.clone(),
+        tool_call_id: deep_code_agent::ToolCallId(id.to_string()),
+        tool_name: tool.to_string(),
+        arguments: serde_json::json!({ "path": "src/lib.rs" }),
+    });
+    app.apply_runtime_event(RuntimeEvent::ToolCallFinished {
+        turn_id: Some(turn.clone()),
+        tool_call_id: deep_code_agent::ToolCallId(id.to_string()),
+        result: deep_code_agent::ToolResult {
+            call_id: id.to_string(),
+            tool_name: tool.to_string(),
+            status,
+            content: format!("{tool} output"),
+            details: None,
+        },
+    });
+}
+
+/// The sizes of every folded run in the transcript, in order.
+fn batch_sizes(app: &App) -> Vec<usize> {
+    app.history
+        .iter()
+        .filter_map(|cell| match cell {
+            HistoryCell::ToolBatch { entries, .. } => Some(entries.len()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Several quiet calls in one run become ONE cell, so the transcript carries a
+/// single summary row for them instead of a call line and a result line each.
+#[test]
+fn consecutive_quiet_calls_fold_into_one_batch() {
+    use deep_code_agent::ToolResultStatus::Success;
+
+    let mut app = App::new();
+    let turn = deep_code_agent::TurnId("turn_1".to_string());
+    finish_tool(&mut app, &turn, "call_1", "read_file", Success);
+    finish_tool(&mut app, &turn, "call_2", "read_file", Success);
+    finish_tool(&mut app, &turn, "call_3", "shell", Success);
+
+    assert_eq!(batch_sizes(&app), vec![3]);
+    assert!(
+        app.history
+            .iter()
+            .all(|cell| !matches!(cell, HistoryCell::ToolCall { .. })),
+        "every folded call must leave no standalone cell behind: {:?}",
+        app.history
+    );
+    let folded = app.history.iter().find_map(|cell| match cell {
+        HistoryCell::ToolBatch { entries, expanded } => Some((entries, expanded)),
+        _ => None,
+    });
+    let (entries, expanded) = folded.expect("one batch");
+    assert!(!expanded, "a run arrives folded");
+    assert_eq!(entries[0].tool_name, "read_file");
+    assert_eq!(entries[2].tool_name, "shell");
+}
+
+/// A failure is the thing a reader most needs, so it is never counted into a
+/// summary — and because it is pushed as an ordinary cell it also ends the run,
+/// leaving the calls either side as their own honest nodes.
+#[test]
+fn a_failed_call_stays_visible_and_splits_the_run() {
+    use deep_code_agent::ToolResultStatus::{Error, Success};
+
+    let mut app = App::new();
+    let turn = deep_code_agent::TurnId("turn_1".to_string());
+    finish_tool(&mut app, &turn, "call_1", "read_file", Success);
+    finish_tool(&mut app, &turn, "call_2", "read_file", Error);
+    finish_tool(&mut app, &turn, "call_3", "read_file", Success);
+
+    assert_eq!(batch_sizes(&app), vec![1, 1]);
+    assert!(
+        app.history.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::ToolResult {
+                status: deep_code_agent::ToolResultStatus::Error,
+                ..
+            }
+        )),
+        "the failure must have a visible cell of its own: {:?}",
+        app.history
+    );
+}
+
+/// A tool that writes, a sub-agent, a background job, and anything nobody
+/// classified: all of them stay visible, and all of them end the run they land
+/// in rather than being averaged into a summary around them.
+#[test]
+fn state_changing_and_watched_tools_never_fold_and_break_the_run() {
+    use deep_code_agent::ToolResultStatus::Success;
+
+    for tool in [
+        "write_file",
+        "apply_patch",
+        "job",
+        "agent",
+        "brand_new_tool",
+    ] {
+        let mut app = App::new();
+        let turn = deep_code_agent::TurnId("turn_1".to_string());
+        finish_tool(&mut app, &turn, "call_1", "read_file", Success);
+        finish_tool(&mut app, &turn, "call_2", tool, Success);
+        finish_tool(&mut app, &turn, "call_3", "read_file", Success);
+
+        assert_eq!(batch_sizes(&app), vec![1, 1], "{tool} must split the run");
+        assert!(
+            !app.history.iter().any(|cell| matches!(
+                cell,
+                HistoryCell::ToolBatch { entries, .. }
+                    if entries.iter().any(|entry| entry.tool_name == tool)
+            )),
+            "{tool} must never be folded into a summary"
+        );
+        assert!(
+            app.history.iter().any(|cell| matches!(
+                cell,
+                HistoryCell::ToolCall { tool_name, .. } if tool_name == tool
+            )),
+            "{tool} must keep its own cell"
+        );
+    }
+}
+
+/// A click on a batch's summary row opens it, and a second click folds it back
+/// — the same mechanism as the reasoning block.
+#[test]
+fn a_click_on_a_tool_batch_header_folds_and_unfolds_it() {
+    use deep_code_agent::ToolResultStatus::Success;
+
+    let mut app = App::new();
+    let turn = deep_code_agent::TurnId("turn_1".to_string());
+    finish_tool(&mut app, &turn, "call_1", "read_file", Success);
+    let index = app.history.len() - 1;
+    app.set_transcript_snapshot(TranscriptSnapshot {
+        fold_headers: vec![(0, FoldTarget::HistoryToolBatch(index))],
+        ..snapshot(&["▸ ⏺ 1 file(s) read"])
+    });
+
+    app.mouse_press(1, 0);
+    app.mouse_release(1, 0);
+    assert!(
+        matches!(&app.history[index], HistoryCell::ToolBatch { expanded, .. } if *expanded),
+        "the clicked run must have opened"
+    );
+
+    app.mouse_press(1, 0);
+    app.mouse_release(1, 0);
+    assert!(
+        matches!(&app.history[index], HistoryCell::ToolBatch { expanded, .. } if !*expanded),
+        "a second click must fold it back"
+    );
+}
+
+/// A quiet call draws no row of its own while it runs — so there is nothing for
+/// the reader to watch appear and then blink into a summary. A call that writes,
+/// or one a human has to answer, keeps its row (and its clock) as before.
+///
+/// Its **output** stays out too, for the same reason: a line that appears and is
+/// then swallowed churns exactly as a command does, and because the transcript
+/// is bottom-anchored it also drags everything below it up and down.
+#[test]
+fn a_quiet_running_call_draws_nothing_but_a_watched_one_draws_both() {
+    use deep_code_agent::{ToolCallId, TurnId};
+    use serde_json::json;
+
+    let mut app = App::new();
+    let turn = TurnId("turn_1".to_string());
+    app.is_streaming = true;
+    let quiet = ToolCallId("call_1".to_string());
+    app.apply_runtime_event(RuntimeEvent::ToolCallStarted {
+        turn_id: turn.clone(),
+        tool_call_id: quiet.clone(),
+        tool_name: "read_file".to_string(),
+        arguments: json!({ "path": "src/lib.rs" }),
+    });
+    let emit_output = |app: &mut App, id: &ToolCallId, text: &str| {
+        let mut turn = app.active_turn.take().expect("turn");
+        turn.append_tool_output(id, text);
+        app.active_turn = Some(turn);
+    };
+    emit_output(&mut app, &quiet, "compiling deep-code\n");
+
+    let preview = app.active_turn.as_ref().expect("turn").preview_cells();
+    assert!(
+        preview.is_empty(),
+        "a quiet call draws nothing at all: {preview:?}"
+    );
+
+    // A write is exactly what a reader watches, so it keeps its row and the
+    // output under it.
+    let watched = ToolCallId("call_2".to_string());
+    app.apply_runtime_event(RuntimeEvent::ToolCallStarted {
+        turn_id: turn,
+        tool_call_id: watched.clone(),
+        tool_name: "write_file".to_string(),
+        arguments: json!({ "path": "src/lib.rs" }),
+    });
+    emit_output(&mut app, &watched, "patching src/lib.rs\n");
+
+    let preview = app.active_turn.as_ref().expect("turn").preview_cells();
+    assert!(
+        preview.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::ToolCall {
+                tool_name,
+                running_for_secs: Some(_),
+                ..
+            } if tool_name == "write_file"
+        )),
+        "a watched call keeps its clock: {preview:?}"
+    );
+    assert!(
+        preview.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::ToolStream { text } if text.contains("patching")
+        )),
+        "a watched call keeps its output: {preview:?}"
+    );
+}
+
+/// …but an abandoned turn still shows what was in flight. A call whose outcome
+/// never arrived is exactly what a reader needs to see, and the fold policy — a
+/// verdict on *finished* calls — has nothing to say about it. This is the
+/// invariant that keeps `flushed_cells` separate from `preview_cells`.
+#[test]
+fn an_abandoned_quiet_call_still_gets_its_row() {
+    use deep_code_agent::{ToolCallId, TurnId};
+    use serde_json::json;
+
+    let mut app = App::new();
+    app.apply_runtime_event(RuntimeEvent::ToolCallStarted {
+        turn_id: TurnId("turn_1".to_string()),
+        tool_call_id: ToolCallId("call_1".to_string()),
+        tool_name: "read_file".to_string(),
+        arguments: json!({ "path": "src/lib.rs" }),
+    });
+
+    let preview = app.active_turn.as_ref().expect("turn").preview_cells();
+    assert!(preview.is_empty(), "the live preview hides it: {preview:?}");
+
+    let flushed = app.active_turn.as_ref().expect("turn").flushed_cells();
+    assert!(
+        flushed.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::ToolCall { tool_name, .. } if tool_name == "read_file"
+        )),
+        "an interrupted call must not vanish with the turn: {flushed:?}"
+    );
+}
+
+/// A call that brought diagnostics along must not fold.
+///
+/// The runtime hands diagnostics to whichever call finishes next, which is not
+/// necessarily the edit they describe, so a quiet read can be carrying a type
+/// error from an earlier write. Folding that call would reorder the diagnostic
+/// around it — or drop it.
+#[test]
+fn a_call_carrying_a_diagnostic_stays_visible_and_keeps_it() {
+    use deep_code_agent::ToolResultStatus::Success;
+
+    let mut app = App::new();
+    let turn = deep_code_agent::TurnId("turn_1".to_string());
+    // The edit that produced them is itself never foldable.
+    finish_tool(&mut app, &turn, "call_1", "write_file", Success);
+    // The diagnostics land while the next call is still in flight, and are
+    // drained by THAT call's flush.
+    app.apply_runtime_event(RuntimeEvent::DiagnosticsUpdated {
+        summary: "1 error".to_string(),
+        rendered: "src/lib.rs:1:1: error: nope".to_string(),
+    });
+    finish_tool(&mut app, &turn, "call_2", "read_file", Success);
+
+    assert!(
+        app.history.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::Diagnostics { summary, .. } if summary == "1 error"
+        )),
+        "the diagnostic must survive: {:?}",
+        app.history
+    );
+    assert!(
+        batch_sizes(&app).is_empty(),
+        "a call carrying a diagnostic stays visible: {:?}",
+        app.history
+    );
+}
+
+/// A press and a release that straddle a scrollback trim must still fold the
+/// block the user pressed on.
+///
+/// `enforce_history_cap` drains cells from the FRONT, so it moves every history
+/// index down by however many it dropped. A `ToolCallFinished` landing between
+/// the press and the release can trigger that drain (the cap is checked once per
+/// frame), and the stored index then names a different cell — same variant, wrong
+/// block. The press records the cap's counter so the release can correct for it.
+#[test]
+fn a_click_survives_a_trim_between_press_and_release() {
+    let mut app = App::new();
+    app.history.push(HistoryCell::user("first"));
+    app.history.push(HistoryCell::Reasoning {
+        text: "thinking".to_string(),
+        expanded: false,
+    });
+    let pressed_on = app.history.len() - 1;
+    app.set_transcript_snapshot(TranscriptSnapshot {
+        fold_headers: vec![(1, FoldTarget::HistoryReasoning(pressed_on))],
+        ..snapshot(&["› first", "▸ ✻ 思考 · 1 行"])
+    });
+
+    app.mouse_press(1, 1);
+    // Exactly what `enforce_history_cap` does when the transcript overflows:
+    // drop the oldest cell and count it.
+    app.history.remove(0);
+    app.trimmed_cells += 1;
+    app.mouse_release(1, 1);
+
+    assert!(
+        matches!(
+            &app.history[pressed_on - 1],
+            HistoryCell::Reasoning { expanded, .. } if *expanded
+        ),
+        "the block the user pressed on must be the one that folds: {:?}",
+        app.history
+    );
+}
+
+/// And when the trim dropped the pressed cell itself, nothing folds — folding a
+/// neighbour would be worse than doing nothing, because the user never asked for
+/// it.
+#[test]
+fn a_click_on_a_cell_the_trim_dropped_folds_nothing() {
+    let mut app = App::new();
+    app.history.push(HistoryCell::user("first"));
+    app.history.push(HistoryCell::Reasoning {
+        text: "thinking".to_string(),
+        expanded: false,
+    });
+    let pressed_on = app.history.len() - 1;
+    app.set_transcript_snapshot(TranscriptSnapshot {
+        fold_headers: vec![(1, FoldTarget::HistoryReasoning(pressed_on))],
+        ..snapshot(&["› first", "▸ ✻ 思考 · 1 行"])
+    });
+
+    app.mouse_press(1, 1);
+    // The pressed cell is the one that went.
+    app.history.remove(pressed_on);
+    app.trimmed_cells += 1;
+    app.mouse_release(1, 1);
+
+    assert!(
+        app.history
+            .iter()
+            .all(|cell| !matches!(cell, HistoryCell::Reasoning { expanded: true, .. })),
+        "nothing may be folded on behalf of a cell that is gone: {:?}",
+        app.history
+    );
+}
+
+/// A press whose transcript is replaced before the release must fold nothing.
+///
+/// `/clear` and `/resume` swap the transcript wholesale and do not touch the cap
+/// counter the release uses to correct for a trim, so a stale `FoldTarget` index
+/// names whatever block now sits at that position — same variant, a block the
+/// user never pressed on. The guard is `clear_selection` dropping the pending
+/// press along with the selection, and it is what those two paths call.
+///
+/// The replacement here is deliberately hostile — a same-variant cell AT the
+/// stale index. Driving the real command instead would not prove the guard:
+/// `/clear` leaves a lone welcome cell, the stale index lands past the end, and
+/// nothing folds whether the guard is there or not.
+#[test]
+fn a_press_whose_transcript_is_replaced_folds_nothing_on_release() {
+    let mut app = App::new();
+    app.history.push(HistoryCell::user("first"));
+    app.history.push(HistoryCell::user("second"));
+    app.history.push(HistoryCell::Reasoning {
+        text: "thinking".to_string(),
+        expanded: false,
+    });
+    // The app already opens with a welcome cell, so this is 3, not 2 — and the
+    // replacement below has to be long enough for that index to exist at all,
+    // or the guard would go untested (a stale index past the end folds nothing
+    // whether the guard is there or not; that false green is what this comment
+    // is here to prevent).
+    let pressed_on = app.history.len() - 1;
+    app.set_transcript_snapshot(TranscriptSnapshot {
+        fold_headers: vec![(1, FoldTarget::HistoryReasoning(pressed_on))],
+        ..snapshot(&["› first", "› second", "▸ ✻ 思考 · 1 行", "▸ ✻ 思考 · 1 行"])
+    });
+
+    app.mouse_press(1, 1);
+    // What `/clear` and `/resume` do: a different transcript, index for index —
+    // built to the same length from the app's ACTUAL history, because that is
+    // what makes the stale index land on a live cell. Guessing the length (or
+    // where the welcome cell sits) is how this test passed while broken: an index
+    // past the end folds nothing whether the guard is there or not.
+    app.history.clear();
+    for index in 0..pressed_on {
+        app.history
+            .push(HistoryCell::user(format!("other {index}")));
+    }
+    app.history.push(HistoryCell::Reasoning {
+        text: "a block the user never pressed on".to_string(),
+        expanded: false,
+    });
+    app.clear_selection();
+    app.mouse_release(1, 1);
+
+    assert!(
+        app.history
+            .iter()
+            .all(|cell| !matches!(cell, HistoryCell::Reasoning { expanded: true, .. })),
+        "nothing may be folded on behalf of a transcript that is gone: {:?}",
+        app.history
+    );
 }
 
 #[test]

@@ -244,6 +244,15 @@ text_ids! {
     BadgeRequired,
     BadgeApproved,
     BadgeDenied,
+    // 思考 cell 的那一行 header(折叠与展开两态都用它)。展开/收起是点击行为(见 `HelpKeys`)。
+    ThinkingHeader,
+    // 工具批折叠后的摘要行:每个可折工具一个动词,`{count}` 是本批出现次数。
+    ToolLogReadFiles,
+    ToolLogListDirs,
+    ToolLogSearches,
+    ToolLogCommands,
+    ToolLogWebSearches,
+    ToolLogFetches,
     CheckpointLabel,
     CheckpointRestoreHint,
     // 压缩 cell:标题说清"折叠了几条",中行说清"下面这段就是模型现在看到的历史"。

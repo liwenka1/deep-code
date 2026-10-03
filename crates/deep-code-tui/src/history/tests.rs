@@ -286,7 +286,7 @@ fn hydrate_history_restores_reasoning_content() {
     let cells = hydrate_history(&record);
     assert!(matches!(
         &cells[1],
-        HistoryCell::Reasoning { text } if text == "thinking"
+        HistoryCell::Reasoning { text, expanded } if text == "thinking" && !expanded
     ));
     assert!(matches!(
         &cells[2],
@@ -320,6 +320,218 @@ fn hydrate_history_renders_pending_exchange_as_call_only() {
             .iter()
             .any(|cell| matches!(cell, HistoryCell::ToolResult { .. }))
     );
+}
+
+/// The whole "what may be hidden" policy, in one table.
+///
+/// The interesting cases are the refusals: a failure, a call a human answered,
+/// and every tool that writes or that a user watches. The last row is the one
+/// that matters most — a tool nobody classified must default to VISIBLE, so
+/// adding a tool to the registry can never silently hide its calls.
+#[test]
+fn only_quiet_successful_calls_with_a_verb_may_fold() {
+    use ToolApprovalState::{Approved, NotRequired, Required};
+    use deep_code_agent::ToolResultStatus::{Denied, Error, Success};
+
+    let folds =
+        |tool: &str, approval, status| folded_entry(tool, "{}", approval, &status, "ok").is_some();
+
+    for tool in [
+        "read_file",
+        "list_dir",
+        "grep_files",
+        "shell",
+        "web_search",
+        "fetch_url",
+    ] {
+        assert!(
+            folds(tool, NotRequired, Success),
+            "{tool} is noise and should fold"
+        );
+    }
+
+    assert!(
+        !folds("read_file", NotRequired, Error),
+        "a failure must stay visible"
+    );
+    assert!(!folds("read_file", NotRequired, Denied));
+    assert!(
+        !folds("read_file", Approved, Success),
+        "a human's decision is not noise"
+    );
+    assert!(!folds("read_file", Required, Success));
+
+    for tool in [
+        // Change the workspace: the transcript is the audit trail for exactly
+        // these.
+        "write_file",
+        "apply_patch",
+        "request_write_root",
+        // Long-lived things a reader watches.
+        "job",
+        "agent",
+        // Test doubles and — above all — anything nobody classified yet.
+        "mock_echo",
+        "brand_new_tool",
+    ] {
+        assert!(
+            !folds(tool, NotRequired, Success),
+            "{tool} must never be folded into a summary"
+        );
+    }
+}
+
+/// Nothing that folds may be something the live preview draws.
+///
+/// `folded_entry` is defined as `quiet_while_running` *minus the outcome test*,
+/// which is a relationship two functions can drift out of in silence: widening
+/// `quiet_while_running` to admit, say, a call a human answered would leave both
+/// compiled and both plausible while a run hid a decision. So assert the
+/// implication over the whole cross-product rather than trusting the comment.
+///
+/// Scope, so nobody trusts it further than it goes: this is a guardrail against
+/// a *refactor* of those two functions, not independent verification of the
+/// policy — `folded_entry` calls `quiet_while_running`, so the implication holds
+/// by construction until someone changes that. The policy itself is pinned from
+/// the outside by the agent-side records (`the_record_says_when_a_human_was_asked`)
+/// and the render tests. And the tool list below is hand-written, so a tool
+/// newly added to `tool_log_label` is not covered here until it is listed.
+#[test]
+fn nothing_that_folds_is_something_the_preview_draws() {
+    use ToolApprovalState::{Approved, Denied as Refused, NotRequired, Required};
+    use deep_code_agent::ToolResultStatus::{Denied, Error, Success};
+
+    let tools = [
+        // Foldable verbs, plus tools that must never fold at all.
+        "read_file",
+        "list_dir",
+        "grep_files",
+        "shell",
+        "web_search",
+        "fetch_url",
+        "write_file",
+        "apply_patch",
+        "job",
+        "agent",
+        "request_write_root",
+        "mock_echo",
+        "brand_new_tool",
+    ];
+    for tool in tools {
+        for approval in [NotRequired, Required, Approved, Refused] {
+            for status in [Success, Error, Denied] {
+                if folded_entry(tool, "{}", approval, &status, "ok").is_some() {
+                    assert!(
+                        quiet_while_running(tool, approval),
+                        "{tool}/{approval:?}/{status:?} folds, so the live preview must \
+                         have drawn nothing for it"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Resume rebuilds the same runs the live path builds, from the same predicate.
+#[test]
+fn hydrate_folds_a_run_of_quiet_calls_and_keeps_the_rest_visible() {
+    let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "");
+    record
+        .entries
+        .push(std::sync::Arc::new(SessionEntry::user("go")));
+    let done = |content: &str| {
+        Some(ExchangeResult {
+            content: content.to_string(),
+            status: deep_code_agent::ToolResultStatus::Success,
+        })
+    };
+    record
+        .entries
+        .push(std::sync::Arc::new(SessionEntry::assistant(
+            "done",
+            None,
+            vec![
+                ToolExchange {
+                    call: call("c1", "read_file"),
+                    result: done("a"),
+                },
+                ToolExchange {
+                    call: call("c2", "read_file"),
+                    result: done("b"),
+                },
+                // A write ends the run: it is never folded, and the reads
+                // either side of it become two nodes rather than one that
+                // would have to mention a call it is not showing.
+                ToolExchange {
+                    call: call("c3", "write_file"),
+                    result: done("w"),
+                },
+                // A `shell` can be gated, and the record does not say whether
+                // this one was: resume may not hide it behind a count.
+                ToolExchange {
+                    call: call("c3b", "shell"),
+                    result: done("ran"),
+                },
+                ToolExchange {
+                    call: call("c4", "read_file"),
+                    result: done("c"),
+                },
+                // Interrupted before a result: no outcome to summarise.
+                ToolExchange {
+                    call: call("c5", "read_file"),
+                    result: None,
+                },
+            ],
+        )));
+
+    let cells = hydrate_history(&record);
+    let batches: Vec<usize> = cells
+        .iter()
+        .filter_map(|cell| match cell {
+            HistoryCell::ToolBatch { entries, expanded } => {
+                assert!(!expanded, "a resumed batch starts folded");
+                Some(entries.len())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(batches, vec![2, 1], "got {cells:?}");
+    assert!(
+        cells.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::ToolCall { tool_name, .. } if tool_name == "shell"
+        )),
+        "a call that COULD have been gated stays visible on resume: {cells:?}"
+    );
+    assert!(
+        cells
+            .iter()
+            .any(|cell| matches!(cell, HistoryCell::ToolCall { tool_name, .. } if tool_name == "write_file")),
+        "the write keeps its own visible cell"
+    );
+    assert!(
+        cells
+            .iter()
+            .any(|cell| matches!(cell, HistoryCell::ToolCall { tool_name, .. } if tool_name == "read_file")),
+        "a call with no result stays visible rather than being summarised"
+    );
+}
+
+/// `/copy` hands over what ran, not the folded summary — the same rule as
+/// reasoning.
+#[test]
+fn copying_a_batch_yields_its_calls_and_results_not_its_summary() {
+    let batch = HistoryCell::ToolBatch {
+        entries: vec![ToolBatchEntry {
+            tool_name: "read_file".to_string(),
+            arguments: "{\"path\":\"a.rs\"}".to_string(),
+            summary: "a.rs (12 lines)".to_string(),
+        }],
+        expanded: false,
+    };
+    let text = batch.lines(Lang::Zh).join("\n");
+    assert!(text.contains("read_file"), "{text}");
+    assert!(text.contains("a.rs (12 lines)"), "{text}");
 }
 
 #[test]

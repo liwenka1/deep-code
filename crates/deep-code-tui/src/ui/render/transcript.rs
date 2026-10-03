@@ -4,6 +4,8 @@
 use super::*;
 
 use crate::app::CachedCellLines;
+use crate::history::{ToolApprovalState, ToolBatchEntry, tool_log_label};
+use deep_code_agent::ToolResultStatus;
 
 pub(super) fn render_messages(
     frame: &mut Frame<'_>,
@@ -25,6 +27,11 @@ pub(super) fn render_messages(
     // `App::cell_lines`). Rendering is per-cell, so the cost is now paid once
     // per cell instead of once per cell per frame.
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // Absolute row of every foldable block's header, and what it controls.
+    // Recorded here because this is the only place a cell's first rendered row
+    // is known; the snapshot turns a click's `(col, row)` back into one of
+    // these.
+    let mut fold_headers: Vec<(usize, FoldTarget)> = Vec::new();
     for index in 0..app.history.len() {
         let stale = !app
             .cell_lines
@@ -37,6 +44,15 @@ pub(super) fn render_messages(
                 index,
                 CachedCellLines::new(cell, content_width, app.lang, rendered),
             );
+        }
+        match app.history[index] {
+            HistoryCell::Reasoning { .. } => {
+                fold_headers.push((lines.len(), FoldTarget::HistoryReasoning(index)));
+            }
+            HistoryCell::ToolBatch { .. } => {
+                fold_headers.push((lines.len(), FoldTarget::HistoryToolBatch(index)));
+            }
+            _ => {}
         }
         lines.extend(app.cell_lines[&index].lines().iter().cloned());
     }
@@ -54,6 +70,11 @@ pub(super) fn render_messages(
         .map(|active| active.preview_cells())
         .unwrap_or_default();
     for cell in &preview {
+        // The preview's reasoning block is never in `history` yet, so it gets
+        // its own target — toggling it must reach the live turn, not a cell.
+        if matches!(cell, HistoryCell::Reasoning { .. }) {
+            fold_headers.push((lines.len(), FoldTarget::LiveReasoning));
+        }
         lines.extend(cell_lines(cell, content_width, app.lang));
     }
 
@@ -107,6 +128,7 @@ pub(super) fn render_messages(
         height: area.height,
         scroll_top,
         lines: plain,
+        fold_headers,
     }
 }
 
@@ -278,6 +300,127 @@ fn pending_steer_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
+/// The `⏺ name  args` row for one call.
+///
+/// Built through the standalone cell's own formatter on purpose: one call must
+/// not be described two ways depending on whether it happens to sit inside a
+/// folded batch. A batch passes `None` for the clock — it only ever holds
+/// finished calls.
+fn tool_call_lines(
+    tool_name: &str,
+    arguments: &str,
+    approval: ToolApprovalState,
+    running_for_secs: Option<u64>,
+    lang: Lang,
+) -> Vec<Line<'static>> {
+    let text = HistoryCell::ToolCall {
+        tool_name: tool_name.to_string(),
+        arguments: arguments.to_string(),
+        approval,
+        running_for_secs,
+    }
+    .lines(lang)
+    .join(" ");
+    vec![Line::from(vec![
+        Span::styled("⏺ ", Style::default().fg(Color::Green)),
+        Span::raw(text),
+    ])]
+}
+
+/// One call and its result, as the transcript shows them.
+///
+/// Shared by a batch's expanded body and by a run that is still being worked on,
+/// so a call's row is the same either way. The entries are quiet successes by
+/// construction (see [`crate::history::folded_entry`]), so the call carries no
+/// badge and the result is always the successful one.
+fn batch_entry_lines(entry: &ToolBatchEntry, width: usize, lang: Lang) -> Vec<Line<'static>> {
+    let mut lines = tool_call_lines(
+        &entry.tool_name,
+        &entry.arguments,
+        ToolApprovalState::NotRequired,
+        // Flushed calls never carry a clock.
+        None,
+        lang,
+    );
+    lines.extend(tool_result_lines(
+        &ToolResultStatus::Success,
+        &entry.summary,
+        width,
+    ));
+    lines
+}
+
+/// The `  ⎿ <word> summary` rows under a call, trailing blank included.
+fn tool_result_lines(status: &ToolResultStatus, summary: &str, width: usize) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let body = match status {
+        ToolResultStatus::Success => dim,
+        ToolResultStatus::Denied => Style::default().fg(Color::Yellow),
+        ToolResultStatus::Error => Style::default().fg(Color::Red),
+    };
+    let mut lines = wrap_prefixed("  ⎿ ", summary, width, body, dim);
+    lines.push(Line::default());
+    lines
+}
+
+/// The one row a folded run of calls shrinks to — and the row a click lands on
+/// to open it.
+///
+/// Each tool is counted once, in the order the run first met it, so the row
+/// reads as the order the work happened rather than as a fixed schema:
+/// `read 3 file(s) · 2 command(s) run`. The verbs come from
+/// [`tool_log_label`], which is the same table that decides *what may fold at
+/// all* — so the two cannot drift, since a tool with no verb can never be in
+/// a batch to be labelled.
+fn tool_batch_header(entries: &[ToolBatchEntry], expanded: bool, lang: Lang) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for entry in entries {
+        match counts.iter_mut().find(|(name, _)| *name == entry.tool_name) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((entry.tool_name.as_str(), 1)),
+        }
+    }
+    let labels: Vec<String> = counts
+        .iter()
+        .filter_map(|(name, count)| {
+            tool_log_label(name).map(|id| tr_with(lang, id, &[("count", &count.to_string())]))
+        })
+        .collect();
+    let marker = if expanded { "▾" } else { "▸" };
+    Line::from(vec![
+        Span::styled(format!("{marker} ⏺ "), dim),
+        Span::styled(labels.join(" · "), dim),
+    ])
+}
+
+/// The single row a reasoning block folds down to — and the row a click lands
+/// on to unfold it.
+///
+/// A header is drawn in BOTH states rather than only when folded. Expanded, it
+/// is the stable target that folds the block back up; folded, its `▸` marker is
+/// the only affordance saying the row can be clicked at all, since this
+/// terminal has no hover.
+///
+/// The line count is the block's own — its newlines, not the rows it would
+/// occupy wrapped. Counting display rows would mean wrapping the text purely to
+/// measure it, which is the cost folding exists to avoid; a fold that says
+/// "42 lines" while hiding rather more of them is the accepted trade. The count
+/// costs a scan of the text, which the per-cell memo pays once per cell rather
+/// than once per frame.
+fn reasoning_header(text: &str, expanded: bool, lang: Lang) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let marker = if expanded { "▾" } else { "▸" };
+    let count = text.lines().count().to_string();
+    Line::from(vec![
+        Span::styled(format!("{marker} ✻ "), dim),
+        Span::styled(
+            tr_with(lang, TextId::ThinkingHeader, &[("lines", &count)]),
+            dim,
+        ),
+    ])
+}
+
 pub(super) fn cell_lines_unsanitized(
     cell: &HistoryCell,
     width: u16,
@@ -363,30 +506,43 @@ pub(super) fn cell_lines_unsanitized(
             lines.push(Line::default());
             lines
         }
-        HistoryCell::Reasoning { text } => {
-            let mut lines = wrap_styled(text, width, dim);
+        HistoryCell::Reasoning { text, expanded } => {
+            // Folded, the whole block is this one row: `wrap_styled` never runs,
+            // so a long reasoning stream no longer re-wraps itself on every
+            // frame it arrives in either.
+            let mut lines = vec![reasoning_header(text, *expanded, lang)];
+            if *expanded {
+                lines.extend(wrap_styled(text, width, dim));
+            }
             lines.push(Line::default());
             lines
         }
         // Tool call + result form a tight group: a green dot for the call,
         // a dim ⎿ connector for the result. No blank between them.
-        HistoryCell::ToolCall { .. } => {
-            let text = cell.lines(lang).join(" ");
-            vec![Line::from(vec![
-                Span::styled("⏺ ", Style::default().fg(Color::Green)),
-                Span::raw(text),
-            ])]
-        }
+        HistoryCell::ToolCall {
+            tool_name,
+            arguments,
+            approval,
+            running_for_secs,
+        } => tool_call_lines(tool_name, arguments, *approval, *running_for_secs, lang),
         HistoryCell::ToolResult {
             status, summary, ..
-        } => {
-            let body = match status {
-                deep_code_agent::ToolResultStatus::Success => dim,
-                deep_code_agent::ToolResultStatus::Denied => Style::default().fg(Color::Yellow),
-                deep_code_agent::ToolResultStatus::Error => Style::default().fg(Color::Red),
-            };
-            let mut lines = wrap_prefixed("  ⎿ ", summary, width, body, dim);
-            lines.push(Line::default());
+        } => tool_result_lines(status, summary, width),
+        // A folded run: one summary row, or the whole run behind the same row.
+        //
+        // The row is drawn in BOTH states for the same reason the reasoning
+        // header is — expanded, it is the target that folds the run back up,
+        // and its marker is the only thing saying the row can be clicked,
+        // since this terminal has no hover.
+        HistoryCell::ToolBatch { entries, expanded } => {
+            let mut lines = vec![tool_batch_header(entries, *expanded, lang)];
+            if *expanded {
+                for entry in entries {
+                    lines.extend(batch_entry_lines(entry, width, lang));
+                }
+            } else {
+                lines.push(Line::default());
+            }
             lines
         }
         // Live output of a running tool: dim, indented under the call line,

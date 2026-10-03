@@ -68,13 +68,13 @@ pub(super) fn dispatch_terminal_event(
                 MouseEventKind::ScrollUp => app.scroll_up(),
                 MouseEventKind::ScrollDown => app.scroll_down(),
                 MouseEventKind::Down(MouseButton::Left) => {
-                    app.selection_begin(mouse.column, mouse.row);
+                    app.mouse_press(mouse.column, mouse.row);
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
                     app.selection_update(mouse.column, mouse.row);
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
-                    if let Some(text) = app.selection_finish() {
+                    if let Some(text) = app.mouse_release(mouse.column, mouse.row) {
                         crate::clipboard::copy(&text);
                         // The clipboard helper (clip.exe / pbcopy / xclip)
                         // is a child process that can reset the console

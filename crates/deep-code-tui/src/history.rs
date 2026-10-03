@@ -41,6 +41,134 @@ pub(crate) fn session_summary(
     }
 }
 
+/// One completed call inside a [`HistoryCell::ToolBatch`].
+///
+/// Deliberately carries no approval state and no result status: a batch only
+/// ever admits calls that were neither gated by a human nor failed, so both
+/// would be constants. `folded_entry` is the only constructor, which is what
+/// keeps that true — relax the policy there and this struct grows the field it
+/// then needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolBatchEntry {
+    pub tool_name: String,
+    pub arguments: String,
+    pub summary: String,
+}
+
+/// Whether a call that is *still running* draws no row of its own.
+///
+/// The same test as [`folded_entry`] minus the outcome, which is not known yet:
+/// a call that turns out to have failed shows its args — and its failure — the
+/// moment it does, because it is then no longer quiet.
+///
+/// Used by the live preview, which is why it must stay separate from the
+/// outcome-dependent half: showing a command and then condensing it away is the
+/// flicker this whole policy exists to avoid, so a quiet call never gets a row
+/// *to* flicker.
+#[must_use]
+pub(crate) fn quiet_while_running(tool_name: &str, approval: ToolApprovalState) -> bool {
+    approval == ToolApprovalState::NotRequired && tool_log_label(tool_name).is_some()
+}
+
+/// The folded-batch entry a finished call contributes, or `None` when the call
+/// must stay visible in full.
+///
+/// This is the entire "what may be hidden from the transcript" policy, and it
+/// is deliberately a whitelist:
+///
+/// * **only a success** — a failure is the thing a reader most needs to see,
+///   and it is never folded away;
+/// * **only an un-gated call** — a call a human answered is that human's
+///   decision, part of the record of what was authorised, not noise;
+/// * **only a tool with a verb of its own** — see [`tool_log_label`], which
+///   excludes everything that writes or that a user watches.
+///
+/// A call that fails the test is not merely left unfolded: it is pushed as an
+/// ordinary cell, which ends the run it interrupted, so the calls before and
+/// after it fold into two honest nodes instead of one that would have to
+/// mention a call it is hiding.
+#[must_use]
+pub(crate) fn folded_entry(
+    tool_name: &str,
+    arguments: &str,
+    approval: ToolApprovalState,
+    status: &ToolResultStatus,
+    summary: &str,
+) -> Option<ToolBatchEntry> {
+    (quiet_while_running(tool_name, approval) && *status == ToolResultStatus::Success).then(|| {
+        ToolBatchEntry {
+            tool_name: tool_name.to_string(),
+            arguments: arguments.to_string(),
+            summary: summary.to_string(),
+        }
+    })
+}
+
+/// Tools the policy engine can never ask a human about.
+///
+/// A resumed transcript has no approval state to read — `ExchangeResult` records
+/// content and status only — so it may hide calls only when it knows,
+/// independently of the record, that no human was ever asked.
+///
+/// These three are the ones `execution_policy::evaluate_tool` hardcodes
+/// `requires_approval: false` for, and the `Tool` trait's default is `false`
+/// with overrides only on the editing and dispatch tools — so no rule, mode or
+/// standing consent can ever put one of them in front of a human. Everything
+/// else in [`tool_log_label`] (`shell`, `web_search`, `fetch_url`) can be, and so
+/// never folds on resume: the only direction that cannot hide a decision, at the
+/// cost of a resumed transcript that is more verbose than the live one.
+///
+/// A whitelist, deliberately: a tool nobody listed simply does not fold, so a
+/// stale list costs a noisier transcript rather than a hidden approval.
+#[must_use]
+fn never_gated(tool_name: &str) -> bool {
+    matches!(tool_name, "read_file" | "list_dir" | "grep_files")
+}
+
+/// The one-line verb a folded batch counts a tool by, or `None` for a tool that
+/// must stay visible.
+///
+/// Narrower than the tool registry on purpose. `job` and `agent` are
+/// long-lived things a reader watches rather than noise; `write_file`,
+/// `apply_patch` and `request_write_root` change the workspace, and the
+/// transcript is the audit trail for exactly that.
+///
+/// A tool that is not listed — **including one added to the registry later** —
+/// has no verb, so it cannot fold and stays visible. The failure mode of
+/// forgetting to update this list is a noisier transcript, never a silent one.
+///
+/// Listing `shell` here is narrower than it looks, and the direction is worth
+/// stating because the opposite is easy to assume: **nothing about the gate
+/// makes a call visible.**
+///
+/// A standing consent — `auto_allow`, a session-remembered command (`a`),
+/// AcceptEdits, Auto, Yolo — resolves the gate *before* anything is put in front
+/// of a human: the runtime emits `ApprovalResolved` and never `ApprovalRequired`
+/// (see `auto_approval_granted` and its caller), and both the UI's badge and the
+/// call's visibility are driven by the latter. So under those modes every
+/// successful `shell` folds, and draws nothing at all while it runs — the normal
+/// case there, not an exception.
+///
+/// That is the intended reading, and it is what `ExchangeResult::asked` records
+/// as `false`, so a resumed transcript agrees: the consent was the human's
+/// decision, taken earlier and once ("stop asking me"), and re-showing every
+/// command it covers is the noise those modes exist to remove.
+///
+/// In an ordinary session this list removes reads and searches. Under Yolo it
+/// removes most of the transcript.
+#[must_use]
+pub(crate) fn tool_log_label(tool_name: &str) -> Option<TextId> {
+    Some(match tool_name {
+        "read_file" => TextId::ToolLogReadFiles,
+        "list_dir" => TextId::ToolLogListDirs,
+        "grep_files" => TextId::ToolLogSearches,
+        "shell" => TextId::ToolLogCommands,
+        "web_search" => TextId::ToolLogWebSearches,
+        "fetch_url" => TextId::ToolLogFetches,
+        _ => return None,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryCell {
     /// The startup header: a compact, styled welcome card (rendered specially
@@ -70,8 +198,16 @@ pub enum HistoryCell {
     Assistant {
         text: String,
     },
+    /// 模型思考过程。默认折叠成一行 header:流式时它有用,写完就基本没用,而
+    /// 全文会把真正的回答顶出屏幕。
+    ///
+    /// `expanded` 是用户对这一块的独立选择(点击 header 切换),它放在 **cell
+    /// 里**而不是旁边一张索引表,因为 `enforce_history_cap` 会从头部 `drain`
+    /// 掉旧 cell —— 任何按下标记录的展开状态一裁剪就指向了别的 cell。放在 cell
+    /// 里还顺带让 `CachedCellLines::matches`(比较 cell 全值)自动失效缓存。
     Reasoning {
         text: String,
+        expanded: bool,
     },
     ToolCall {
         tool_name: String,
@@ -94,6 +230,29 @@ pub enum HistoryCell {
     /// ToolResult summary replaces it.
     ToolStream {
         text: String,
+    },
+    /// A run of quiet, successful calls, folded to one summary row.
+    ///
+    /// A batch is "a maximal run of tool calls between two pieces of prose",
+    /// and the transcript already yields that for free: the merge rule is
+    /// *`history`'s last cell is a `ToolBatch`*, so anything else pushed in
+    /// between — prose, reasoning, a diagnostic, another tool's call, or a call
+    /// that did not qualify — closes the run by construction. No boundaries are
+    /// recorded anywhere, and none can drift from the transcript's real order.
+    ///
+    /// Every entry is a complete call+result pair decided together at
+    /// `ToolCallFinished` (the result is in hand at that point), so there is no
+    /// half-known entry and no call-id pairing to get wrong. And because only
+    /// qualifying calls ever get in, the entries are all quiet successes by
+    /// construction — see [`folded_entry`] for what qualifies, which is where
+    /// the whole "what may be hidden" policy lives.
+    ToolBatch {
+        entries: Vec<ToolBatchEntry>,
+        /// The reader's choice, per batch — the same rule as `Reasoning`, and
+        /// for the same two reasons: it survives the scrollback cap (which
+        /// drops cells from the front and would slide any index-keyed state),
+        /// and it invalidates the render memo by simply being part of the cell.
+        expanded: bool,
     },
     Diagnostics {
         summary: String,
@@ -144,10 +303,13 @@ impl HistoryCell {
             // the styled header/rule/intro), so its plain-text form is never
             // requested — no duplicate formatting kept here.
             Self::Welcome { .. } => Vec::new(),
-            Self::System { text }
-            | Self::User { text }
-            | Self::Assistant { text }
-            | Self::Reasoning { text } => vec![text.clone()],
+            Self::System { text } | Self::User { text } | Self::Assistant { text } => {
+                vec![text.clone()]
+            }
+            // `/copy` hands over what the model actually produced — the whole
+            // reasoning, not the one-line header the transcript happens to be
+            // showing. Folding is a display choice, not a data one.
+            Self::Reasoning { text, .. } => vec![text.clone()],
             // Compact single line: detailed risk/sandbox/rule live in the
             // approval panel; here we only show name + args, plus an approval
             // badge when the call was actually gated.
@@ -178,6 +340,26 @@ impl HistoryCell {
                 )]
             }
             Self::ToolStream { text } => text.lines().map(str::to_string).collect(),
+            // `/copy` gets what the model actually ran, not the folded summary
+            // — the same rule as reasoning. The entries are rendered through
+            // the standalone variants' own formatters so the two can never
+            // describe one call two ways.
+            Self::ToolBatch { entries, .. } => entries
+                .iter()
+                .flat_map(|entry| {
+                    let call = Self::ToolCall {
+                        tool_name: entry.tool_name.clone(),
+                        arguments: entry.arguments.clone(),
+                        approval: ToolApprovalState::NotRequired,
+                        running_for_secs: None,
+                    };
+                    let result = Self::ToolResult {
+                        status: ToolResultStatus::Success,
+                        summary: entry.summary.clone(),
+                    };
+                    call.lines(lang).into_iter().chain(result.lines(lang))
+                })
+                .collect(),
             Self::Diagnostics { summary, rendered } => {
                 if rendered.is_empty() {
                     vec![summary.clone()]
@@ -274,14 +456,55 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
                 exchanges,
             } => {
                 if let Some(reasoning) = reasoning.as_ref().filter(|text| !text.is_empty()) {
+                    // A resumed session starts folded, like a live one: the
+                    // expansion is a reading choice, not part of the record.
                     current_turn.push(HistoryCell::Reasoning {
                         text: reasoning.clone(),
+                        expanded: false,
                     });
                 }
                 if !content.is_empty() {
                     current_turn.push(HistoryCell::assistant(content.clone()));
                 }
                 for exchange in exchanges {
+                    // Resume rebuilds the same batches the live path builds,
+                    // from the same predicate: one assistant entry's exchanges
+                    // already ARE one batch, so this needs no segmentation of
+                    // its own — a non-qualifying exchange simply breaks the run
+                    // by being pushed between the qualifying ones.
+                    let summary = exchange
+                        .result
+                        .as_ref()
+                        .map(|result| summarize_tool_result(&result.content));
+                    // …and only a tool the policy engine can NEVER ask a human
+                    // about. The record keeps no approval state (see
+                    // `never_gated`), so folding anything else here would turn a
+                    // call a human answered into an anonymous count — the one way
+                    // this whole policy could hide a decision.
+                    let folded = match (&exchange.result, &summary) {
+                        (Some(result), Some(summary))
+                            if never_gated(&exchange.call.function.name) =>
+                        {
+                            folded_entry(
+                                &exchange.call.function.name,
+                                &exchange.call.function.arguments,
+                                ToolApprovalState::NotRequired,
+                                &result.status,
+                                summary,
+                            )
+                        }
+                        _ => None,
+                    };
+                    if let Some(entry) = folded {
+                        match current_turn.last_mut() {
+                            Some(HistoryCell::ToolBatch { entries, .. }) => entries.push(entry),
+                            _ => current_turn.push(HistoryCell::ToolBatch {
+                                entries: vec![entry],
+                                expanded: false,
+                            }),
+                        }
+                        continue;
+                    }
                     current_turn.push(HistoryCell::ToolCall {
                         tool_name: exchange.call.function.name.clone(),
                         arguments: exchange.call.function.arguments.clone(),
@@ -290,10 +513,10 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
                     });
                     // Pending exchanges (interrupted before a result) render
                     // the call only — no fabricated result line.
-                    if let Some(result) = &exchange.result {
+                    if let (Some(result), Some(summary)) = (&exchange.result, summary) {
                         current_turn.push(HistoryCell::ToolResult {
                             status: result.status,
-                            summary: summarize_tool_result(&result.content),
+                            summary,
                         });
                     }
                 }
