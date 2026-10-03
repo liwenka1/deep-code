@@ -89,7 +89,7 @@ pub use runtime::{
 pub use runtime_launch::{LaunchedRuntime, launch_runtime, web_enabled};
 pub use sandbox::{Enforcement, EnforcementGap, sandbox_available, sandbox_enforcement};
 pub use session::Session;
-pub use session_entry::{EntryKind, ExchangeResult, SessionEntry, ToolExchange};
+pub use session_entry::{Ask, EntryKind, ExchangeResult, SessionEntry, ToolExchange};
 pub use session_store::{
     CheckpointRecord, JsonSessionStore, SessionId, SessionRecord, SessionStore, SessionStoreError,
     TurnRecord, format_sessions_storage_note, now_ms,

@@ -15,6 +15,7 @@ use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
 use crate::runtime::state::PendingToolBatch;
 use crate::runtime::tool_result::BatchOutcome;
+use crate::session_entry::Ask;
 use crate::tool::{
     ApprovalDecision, ApprovalRequest, RunAuthority, ToolCall, ToolResult, ToolRunOutcome,
 };
@@ -465,6 +466,19 @@ impl AgentRuntime {
         } else {
             decision
         };
+        // What goes into the record. Every path that reaches this function is
+        // resolving a PARKED call — one that was put in front of whoever answers
+        // for this runtime, which is what the live view badges it for — so the
+        // record says so whatever the answer was. The answer itself, refusals
+        // above all, is carried by `status`, so it needs no flag of its own.
+        //
+        // Inside a sub-agent, "whoever answers" is the child's role decider, not
+        // a human. That exchange lands in the child's in-memory session
+        // (`with_system_prompt_shared` builds a bare `Session` — no store, no
+        // id) and is never resumed, so it reaches no transcript a badge could
+        // mislead in. Give a child persistence and this needs revisiting: `asked`
+        // would then mark a call the human never saw.
+        let ask = Ask::Asked;
         // `request_write_root` never executes as a registry tool: granting is
         // a runtime state transition (widen the shared boundary, persist,
         // notify UIs), performed here — the single point every decision path
@@ -491,7 +505,7 @@ impl AgentRuntime {
                         .await
                 }
             };
-            self.record_tool_result(&current, result, tx, turn_id.clone())
+            self.record_tool_result(&current, result, ask, tx, turn_id.clone())
                 .await;
             self.resume_after_batch(remaining, &turn_id, &cancel, tx)
                 .await;
@@ -516,7 +530,7 @@ impl AgentRuntime {
                 {
                     result.content = note;
                 }
-                self.record_tool_result(&current, result, tx, turn_id.clone())
+                self.record_tool_result(&current, result, ask, tx, turn_id.clone())
                     .await;
             }
             Ok(ToolRunOutcome::ApprovalRequired { mut request }) => {
@@ -568,7 +582,7 @@ impl AgentRuntime {
             }
             Err(error) => {
                 let result = ToolResult::error(&current, error.to_string());
-                self.record_tool_result(&current, result, tx, turn_id.clone())
+                self.record_tool_result(&current, result, ask, tx, turn_id.clone())
                     .await;
             }
         }

@@ -178,6 +178,22 @@ impl ActiveTurn {
         }
     }
 
+    /// Give up on any request nobody answered, when the turn ends without one.
+    ///
+    /// A badge means a human answered, so a call left waiting when its turn is
+    /// cancelled must not keep the `pending` badge: nobody is going to answer it
+    /// now, and the transcript would assert a decision that never happened. It
+    /// becomes `Unknown` — "no answer was recorded" — which is also what a
+    /// resumed transcript reports for the same call, since the runtime records
+    /// the cancel as an unasked call (`tool_result.rs::finish_cancelled_calls`).
+    pub fn abandon_unanswered_approvals(&mut self) {
+        for tool in &mut self.tools {
+            if tool.approval == ToolApprovalState::Required {
+                tool.approval = ToolApprovalState::Unknown;
+            }
+        }
+    }
+
     pub fn push_diagnostics(&mut self, summary: String, rendered: String) {
         self.diagnostics
             .push(HistoryCell::Diagnostics { summary, rendered });
@@ -446,6 +462,94 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// An `ApprovalResolved` with no parked request must change nothing.
+    ///
+    /// This is the hinge the whole `asked` record rests on. A standing consent
+    /// (`auto_allow`, a remembered command, AcceptEdits, Auto, Yolo) resolves the
+    /// gate without ever emitting `ApprovalRequired`, so this event arrives with
+    /// `pending_approval` already `None` — and it must leave the cell alone. If
+    /// it marked the call `Approved` instead, the live view would show a badge
+    /// and keep the row for a call nobody was asked about, while the record (and
+    /// therefore `/resume`) says `asked: false` and folds it.
+    #[test]
+    fn an_approval_that_was_never_asked_leaves_the_call_quiet() {
+        let mut turn = ActiveTurn::default();
+        let id = ToolCallId("call_1".to_string());
+        turn.upsert_tool(ActiveToolCell {
+            tool_call_id: id.clone(),
+            tool_name: "shell".to_string(),
+            arguments: "{\"command\":\"cargo test\"}".to_string(),
+            approval: ToolApprovalState::NotRequired,
+            live_output: LiveOutput::default(),
+            started_at: std::time::Instant::now(),
+        });
+
+        turn.resolve_approval(deep_code_agent::ApprovalDecision::Approved);
+
+        assert_eq!(
+            turn.tools[0].approval,
+            ToolApprovalState::NotRequired,
+            "nobody was asked, so nothing was answered"
+        );
+        assert!(
+            quiet_while_running("shell", turn.tools[0].approval),
+            "and the call stays quiet, exactly as the record says"
+        );
+    }
+
+    /// The minimum a `mark_approval_required` / `resolve_approval` pair needs.
+    fn gated_shell_request() -> deep_code_agent::ApprovalRequest {
+        deep_code_agent::ApprovalRequest {
+            call_id: "call_1".to_string(),
+            tool_name: "shell".to_string(),
+            description: "runs a command".to_string(),
+            arguments: serde_json::json!({ "command": "cargo test" }),
+            risk_level: deep_code_agent::RiskLevel::Medium,
+            requires_sandbox: true,
+            network: false,
+            justification: None,
+            resolved_target: None,
+            read_only: false,
+            matched_rule: None,
+            preview: None,
+            safety_notes: Vec::new(),
+        }
+    }
+
+    /// The parked path still resolves, or the fix above would have broken it.
+    #[test]
+    fn an_approval_with_a_parked_request_still_resolves() {
+        let mut turn = ActiveTurn::default();
+        let request = gated_shell_request();
+        turn.mark_approval_required(&request);
+        turn.pending_approval = Some(request);
+
+        turn.resolve_approval(deep_code_agent::ApprovalDecision::Approved);
+
+        assert_eq!(turn.tools[0].approval, ToolApprovalState::Approved);
+        assert!(!quiet_while_running("shell", turn.tools[0].approval));
+    }
+
+    /// A run that was still waiting when its turn was cancelled must not keep
+    /// the `pending` badge: nobody will answer it now.
+    #[test]
+    fn a_cancelled_turn_gives_up_on_an_unanswered_request() {
+        let mut turn = ActiveTurn::default();
+        let request = gated_shell_request();
+        turn.mark_approval_required(&request);
+        assert_eq!(turn.tools[0].approval, ToolApprovalState::Required);
+
+        turn.abandon_unanswered_approvals();
+
+        assert_eq!(turn.tools[0].approval, ToolApprovalState::Unknown);
+        assert_eq!(
+            turn.tools[0]
+                .approval
+                .label(deep_code_agent::i18n::Lang::Zh),
+            ""
+        );
     }
 
     #[test]

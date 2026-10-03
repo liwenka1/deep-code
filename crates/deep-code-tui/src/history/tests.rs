@@ -77,6 +77,7 @@ fn hydrate_history_keeps_assistant_tool_calls_and_results() {
                 result: Some(ExchangeResult {
                     content: "mock_echo: hi".to_string(),
                     status: ToolResultStatus::Denied,
+                    asked: Some(false),
                 }),
             }],
         )));
@@ -398,7 +399,7 @@ fn only_quiet_successful_calls_with_a_verb_may_fold() {
 /// newly added to `tool_log_label` is not covered here until it is listed.
 #[test]
 fn nothing_that_folds_is_something_the_preview_draws() {
-    use ToolApprovalState::{Approved, Denied as Refused, NotRequired, Required};
+    use ToolApprovalState::{Approved, Denied as Refused, NotRequired, Required, Unknown};
     use deep_code_agent::ToolResultStatus::{Denied, Error, Success};
 
     let tools = [
@@ -418,7 +419,7 @@ fn nothing_that_folds_is_something_the_preview_draws() {
         "brand_new_tool",
     ];
     for tool in tools {
-        for approval in [NotRequired, Required, Approved, Refused] {
+        for approval in [NotRequired, Required, Approved, Refused, Unknown] {
             for status in [Success, Error, Denied] {
                 if folded_entry(tool, "{}", approval, &status, "ok").is_some() {
                     assert!(
@@ -443,6 +444,7 @@ fn hydrate_folds_a_run_of_quiet_calls_and_keeps_the_rest_visible() {
         Some(ExchangeResult {
             content: content.to_string(),
             status: deep_code_agent::ToolResultStatus::Success,
+            asked: Some(false),
         })
     };
     record
@@ -495,14 +497,9 @@ fn hydrate_folds_a_run_of_quiet_calls_and_keeps_the_rest_visible() {
             _ => None,
         })
         .collect();
-    assert_eq!(batches, vec![2, 1], "got {cells:?}");
-    assert!(
-        cells.iter().any(|cell| matches!(
-            cell,
-            HistoryCell::ToolCall { tool_name, .. } if tool_name == "shell"
-        )),
-        "a call that COULD have been gated stays visible on resume: {cells:?}"
-    );
+    // `Some(false)` on every record: nothing was granted, so the shell folds
+    // exactly as it did live — which is the whole point of recording it.
+    assert_eq!(batches, vec![2, 2], "got {cells:?}");
     assert!(
         cells
             .iter()
@@ -515,6 +512,199 @@ fn hydrate_folds_a_run_of_quiet_calls_and_keeps_the_rest_visible() {
             .any(|cell| matches!(cell, HistoryCell::ToolCall { tool_name, .. } if tool_name == "read_file")),
         "a call with no result stays visible rather than being summarised"
     );
+    assert!(
+        !cells.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::ToolCall { tool_name, .. } if tool_name == "shell"
+        )),
+        "an un-granted shell folds on resume because it folded live: {cells:?}"
+    );
+}
+
+/// A record written before the session carried an approval must not be read as
+/// "never asked": the transcript cannot vouch for it, so it shows the call in
+/// full and carries no badge.
+#[test]
+fn hydrate_treats_a_record_without_an_approval_as_unknown() {
+    let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "");
+    let unrecorded = |content: &str| {
+        Some(ExchangeResult {
+            content: content.to_string(),
+            status: deep_code_agent::ToolResultStatus::Success,
+            asked: None,
+        })
+    };
+    record
+        .entries
+        .push(std::sync::Arc::new(SessionEntry::user("go")));
+    record
+        .entries
+        .push(std::sync::Arc::new(SessionEntry::assistant(
+            "done",
+            None,
+            vec![
+                // Provably never gated, so an unknown record may still fold it.
+                ToolExchange {
+                    call: call("c1", "read_file"),
+                    result: unrecorded("a"),
+                },
+                // Could have been gated: it must not fold, and must not claim
+                // either outcome.
+                ToolExchange {
+                    call: call("c2", "shell"),
+                    result: unrecorded("ran"),
+                },
+            ],
+        )));
+
+    let cells = hydrate_history(&record);
+    let batch_sizes: Vec<usize> = cells
+        .iter()
+        .filter_map(|cell| match cell {
+            HistoryCell::ToolBatch { entries, .. } => Some(entries.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(batch_sizes, vec![1], "only the read may fold: {cells:?}");
+    let shell = cells
+        .iter()
+        .find_map(|cell| match cell {
+            HistoryCell::ToolCall {
+                tool_name,
+                approval,
+                ..
+            } if tool_name == "shell" => Some(*approval),
+            _ => None,
+        })
+        .expect("the shell keeps a cell of its own");
+    assert_eq!(
+        shell,
+        ToolApprovalState::Unknown,
+        "an unknowable approval must not be badged as anything"
+    );
+    assert_eq!(shell.label(Lang::Zh), "", "and it must render no badge");
+}
+
+/// …while a record that DOES carry the answer comes back exactly as it was
+/// lived: the badge is restored, a call a human was asked about stays out of a
+/// folded run, and a call nobody was asked about folds as it did live — which is
+/// the standing-consent case (`auto_allow`, Yolo, a remembered command).
+#[test]
+fn hydrate_restores_what_the_record_kept() {
+    let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "");
+    let result = |content: &str, asked: bool| {
+        Some(ExchangeResult {
+            content: content.to_string(),
+            status: deep_code_agent::ToolResultStatus::Success,
+            asked: Some(asked),
+        })
+    };
+    record
+        .entries
+        .push(std::sync::Arc::new(SessionEntry::user("go")));
+    record
+        .entries
+        .push(std::sync::Arc::new(SessionEntry::assistant(
+            "done",
+            None,
+            vec![
+                // A human answered this one: it never folds, and it says so.
+                ToolExchange {
+                    call: call("c1", "shell"),
+                    result: result("ran", true),
+                },
+                // Nobody was asked — a standing consent resolved the gate, or
+                // the policy never raised it. The live view folds it, so this
+                // does too.
+                ToolExchange {
+                    call: call("c2", "shell"),
+                    result: result("ran", false),
+                },
+            ],
+        )));
+
+    let cells = hydrate_history(&record);
+    let approved = cells
+        .iter()
+        .find_map(|cell| match cell {
+            HistoryCell::ToolCall {
+                tool_name,
+                approval,
+                ..
+            } if tool_name == "shell" => Some(*approval),
+            _ => None,
+        })
+        .expect("the answered call keeps a visible cell");
+    assert_eq!(approved, ToolApprovalState::Approved);
+    assert_eq!(
+        approved.label(Lang::En),
+        tr(Lang::En, TextId::BadgeApproved),
+        "the badge the live view showed comes back"
+    );
+    let batch_sizes: Vec<usize> = cells
+        .iter()
+        .filter_map(|cell| match cell {
+            HistoryCell::ToolBatch { entries, .. } => Some(entries.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        batch_sizes,
+        vec![1],
+        "the un-asked shell folds; the answered one does not: {cells:?}"
+    );
+}
+
+/// A refusal a human made comes back as a badge; a refusal the policy made
+/// without asking anyone does not — because the live view never badged it, and
+/// the record now distinguishes the two.
+///
+/// `PolicyVerdict::Deny` refuses outright and deliberately never reaches a mode
+/// or a consent, so a hard denial never puts anything in front of a human; a
+/// parked refusal does. Both record `Denied`, so `asked` is what tells them
+/// apart — which is why it, and not the status alone, drives this.
+#[test]
+fn hydrate_badges_a_refusal_only_when_a_human_made_it() {
+    let exchange = |asked: bool| ToolExchange {
+        call: call("c1", "shell"),
+        result: Some(ExchangeResult {
+            content: "declined".to_string(),
+            status: deep_code_agent::ToolResultStatus::Denied,
+            asked: Some(asked),
+        }),
+    };
+    let badge_for = |asked: bool| {
+        let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "");
+        record
+            .entries
+            .push(std::sync::Arc::new(SessionEntry::user("go")));
+        record
+            .entries
+            .push(std::sync::Arc::new(SessionEntry::assistant(
+                "done",
+                None,
+                vec![exchange(asked)],
+            )));
+        hydrate_history(&record)
+            .iter()
+            .find_map(|cell| match cell {
+                HistoryCell::ToolCall { approval, .. } => Some(*approval),
+                _ => None,
+            })
+            .expect("a denied call stays visible")
+    };
+
+    let human = badge_for(true);
+    assert_eq!(human, ToolApprovalState::Denied);
+    assert_eq!(human.label(Lang::Zh), tr(Lang::Zh, TextId::BadgeDenied));
+
+    let hard = badge_for(false);
+    assert_eq!(
+        hard,
+        ToolApprovalState::NotRequired,
+        "the policy refused without asking, so there is no decision to badge"
+    );
+    assert_eq!(hard.label(Lang::Zh), "", "and it renders no badge");
 }
 
 /// `/copy` hands over what ran, not the folded summary — the same rule as

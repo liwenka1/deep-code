@@ -297,6 +297,12 @@ impl App {
     /// (`TurnCancelled`), or an `ApprovalRequired` arrived for a turn the user
     /// had already cancelled (see `apply_runtime_event`).
     pub(crate) fn finish_turn_cancelled(&mut self) {
+        // Before the flush, not after: the request this turn was parked on will
+        // never be answered, and the flush is what carries its cell into the
+        // transcript — with a `pending` badge that would outlive the question.
+        if let Some(active) = self.active_turn.as_mut() {
+            active.abandon_unanswered_approvals();
+        }
         self.flush_active_turn();
         self.history
             .push(HistoryCell::system(self.tr(TextId::SystemTurnCancelled)));

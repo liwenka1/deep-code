@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::message::{Message, Role};
 use crate::model::ToolCallPayload;
-use crate::session_entry::{EntryKind, ExchangeResult, SessionEntry, ToolExchange};
+use crate::session_entry::{Ask, EntryKind, ExchangeResult, SessionEntry, ToolExchange};
 use crate::tool::ToolResultStatus;
 
 /// Synthetic wire content for a tool call whose result never arrived — the
@@ -93,11 +93,17 @@ impl Session {
     /// pending exchange. Calls always belong to the latest assistant entry
     /// (the runtime pushes the entry immediately before executing its batch).
     /// Returns false when no pending exchange matches.
+    ///
+    /// `ask` is whether the approval gate put this call in front of a human —
+    /// see [`ExchangeResult::asked`]. The caller always knows (it is the layer
+    /// that ran the gate), so this is unambiguous on the way in and only the
+    /// *reader* has to cope with records that predate the field.
     pub fn record_tool_result(
         &mut self,
         call_id: &str,
         content: String,
         status: ToolResultStatus,
+        ask: Ask,
     ) -> bool {
         // Find the newest assistant entry first, and only `make_mut` (which
         // clones the entry while the persistence record also holds it) once a
@@ -128,7 +134,11 @@ impl Session {
         else {
             unreachable!("presence checked above");
         };
-        exchange.result = Some(ExchangeResult { content, status });
+        exchange.result = Some(ExchangeResult {
+            content,
+            status,
+            asked: Some(ask == Ask::Asked),
+        });
         true
     }
 
@@ -189,10 +199,13 @@ impl Session {
                     if let Some(exchange) = slot {
                         // Wire messages carry no status; the schema-v2
                         // migration recovers it from TurnRecord. In-memory
-                        // resume only needs the content for wire round-trips.
+                        // resume only needs the content for wire round-trips —
+                        // and it has no approval state either, so whether a
+                        // human was asked is left unknown rather than guessed.
                         exchange.result = Some(ExchangeResult {
                             content: message.content.clone(),
                             status: ToolResultStatus::Success,
+                            asked: None,
                         });
                     }
                     // Orphan tool messages (no matching call) were already
@@ -348,9 +361,15 @@ mod tests {
         assert!(session.record_tool_result(
             "c1",
             "content-1".to_string(),
-            ToolResultStatus::Success
+            ToolResultStatus::Success,
+            Ask::Unasked
         ));
-        assert!(session.record_tool_result("c2", "content-2".to_string(), ToolResultStatus::Error));
+        assert!(session.record_tool_result(
+            "c2",
+            "content-2".to_string(),
+            ToolResultStatus::Error,
+            Ask::Unasked
+        ));
         session.push_assistant("改好了", "", Vec::new());
         session.push_user("thanks");
 
@@ -381,11 +400,31 @@ mod tests {
 
         // Unknown id → false; id from an OLDER entry → also false (results
         // always belong to the newest batch).
-        assert!(!session.record_tool_result("nope", String::new(), ToolResultStatus::Success));
-        assert!(!session.record_tool_result("c1", String::new(), ToolResultStatus::Success));
-        assert!(session.record_tool_result("c9", "ok".to_string(), ToolResultStatus::Success));
+        assert!(!session.record_tool_result(
+            "nope",
+            String::new(),
+            ToolResultStatus::Success,
+            Ask::Unasked
+        ));
+        assert!(!session.record_tool_result(
+            "c1",
+            String::new(),
+            ToolResultStatus::Success,
+            Ask::Unasked
+        ));
+        assert!(session.record_tool_result(
+            "c9",
+            "ok".to_string(),
+            ToolResultStatus::Success,
+            Ask::Unasked
+        ));
         // Double-record of the same call is rejected.
-        assert!(!session.record_tool_result("c9", "again".to_string(), ToolResultStatus::Success));
+        assert!(!session.record_tool_result(
+            "c9",
+            "again".to_string(),
+            ToolResultStatus::Success,
+            Ask::Unasked
+        ));
     }
 
     #[test]

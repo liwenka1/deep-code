@@ -96,6 +96,22 @@ pub enum EntryKind {
     },
 }
 
+/// Whether the approval gate put a call in front of a human.
+///
+/// A type rather than a bare `bool` because `record_tool_result` takes it
+/// positionally at ten-odd call sites, and "is this one `true`?" is exactly the
+/// question that gets answered wrong in silence — the two channels differ by one
+/// word in the middle of an argument list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ask {
+    /// The request was shown to a human (or to whoever answers on their behalf
+    /// for this runtime) and they answered it.
+    Asked,
+    /// Nobody was asked: the policy never raised the gate, a standing consent
+    /// resolved it before anyone was shown anything, or it was refused outright.
+    Unasked,
+}
+
 /// One tool call and (once recorded) its model-facing result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolExchange {
@@ -121,4 +137,39 @@ pub struct ExchangeResult {
     /// recovered in full from a session file or `session export`.
     pub content: String,
     pub status: ToolResultStatus,
+    /// Whether the approval gate ever put this call in front of a human.
+    ///
+    /// This is the predicate the live view badges on and the only thing that
+    /// keeps a call out of a folded run, so recording it is what lets a resumed
+    /// transcript be the transcript the session actually had.
+    ///
+    /// **A standing consent is not an ask.** `auto_allow`, a session-remembered
+    /// command (`a`), AcceptEdits, Auto and Yolo all resolve the gate *before*
+    /// anyone is shown anything — the runtime emits `ApprovalResolved` without
+    /// ever emitting `ApprovalRequired`, and the UI's badge is driven by the
+    /// latter. So those calls record `false`, and they fold exactly as they did
+    /// live. Treating them as asks would un-fold every command under the
+    /// permission modes chosen precisely to stop asking.
+    ///
+    /// Three states, and the third is the point:
+    ///
+    /// * `Some(true)` — a human was shown the request; their answer is in
+    ///   `status` (`Success` = granted, `Denied` = refused);
+    /// * `Some(false)` — nobody was asked: the policy never raised the gate, a
+    ///   standing consent resolved it, it was refused outright without asking
+    ///   (a hard `PolicyVerdict::Deny`), or the wait was cancelled;
+    /// * `None` — recorded before this field existed. **Unknown**, which is not
+    ///   the same as "nobody asked", and a reader must not treat it as such.
+    ///
+    /// The writer spells the same thing as [`Ask::Asked`] / [`Ask::Unasked`]:
+    /// `Some(true)` is exactly `Ask::Asked`, because a bare `true` in the middle
+    /// of `record_tool_result`'s argument list is the sort of thing that gets
+    /// flipped without anyone noticing. Only the *reader* sees the `Option`,
+    /// where the third state is what a resumed transcript has to cope with.
+    ///
+    /// Additive and defaulted: a session written by this build is still read by
+    /// an older one (which ignores the field) and an older session reads back as
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked: Option<bool>,
 }

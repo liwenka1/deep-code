@@ -10,6 +10,7 @@ use crate::runtime::approval_flow::RootGrantPrompt;
 use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
 use crate::runtime::failure_class::record_failure_signals;
 use crate::runtime::state::PendingToolBatch;
+use crate::session_entry::Ask;
 use crate::tool::{
     ApprovalDecision, RunAuthority, ToolCall, ToolCx, ToolError, ToolResult, ToolRunOutcome,
 };
@@ -233,7 +234,9 @@ impl AgentRuntime {
                         ),
                         Err(error) => ToolResult::error(call, error.to_string()),
                     };
-                    self.record_tool_result(call, result, tx, turn_id.clone())
+                    // Outright-Allow sub-agent plans: they never reach the gate
+                    // (see `is_parallel_safe`), so nobody is asked.
+                    self.record_tool_result(call, result, Ask::Unasked, tx, turn_id.clone())
                         .await;
                 }
                 continue;
@@ -245,7 +248,7 @@ impl AgentRuntime {
                 .await
             {
                 Ok(ToolRunOutcome::Result { result }) => {
-                    self.record_tool_result(&call, result, tx, turn_id.clone())
+                    self.record_tool_result(&call, result, Ask::Unasked, tx, turn_id.clone())
                         .await;
                 }
                 Ok(ToolRunOutcome::ApprovalRequired { mut request }) => {
@@ -281,7 +284,12 @@ impl AgentRuntime {
                             ),
                             Err(error) => ToolResult::error(&call, error.to_string()),
                         };
-                        self.record_tool_result(&call, result, tx, turn_id.clone())
+                        // A standing consent resolved the gate WITHOUT putting
+                        // it in front of anyone: the `ApprovalResolved` above is
+                        // the only event a UI sees (no `ApprovalRequired`), so
+                        // the live view leaves this call quiet — no badge, folded
+                        // with the rest — and the record says the same.
+                        self.record_tool_result(&call, result, Ask::Unasked, tx, turn_id.clone())
                             .await;
                         continue;
                     }
@@ -297,8 +305,16 @@ impl AgentRuntime {
                         RootGrantPrompt::Resolved(canonical) => Some(canonical),
                         RootGrantPrompt::Refused(reason) => {
                             let result = ToolResult::error(&call, reason);
-                            self.record_tool_result(&call, result, tx, turn_id.clone())
-                                .await;
+                            // Bounced before the human was involved: the gate
+                            // was raised, but nobody was ever shown it.
+                            self.record_tool_result(
+                                &call,
+                                result,
+                                Ask::Unasked,
+                                tx,
+                                turn_id.clone(),
+                            )
+                            .await;
                             continue;
                         }
                     };
@@ -356,7 +372,7 @@ impl AgentRuntime {
                 }
                 Err(error) => {
                     let result = ToolResult::error(&call, error.to_string());
-                    self.record_tool_result(&call, result, tx, turn_id.clone())
+                    self.record_tool_result(&call, result, Ask::Unasked, tx, turn_id.clone())
                         .await;
                 }
             }
@@ -393,7 +409,10 @@ impl AgentRuntime {
     ) {
         for call in calls {
             let result = ToolResult::error(&call, CANCELLED_TOOL_RESULT);
-            self.record_tool_result(&call, result, tx, turn_id.clone())
+            // The wait was resolved by the cancel, not by an answer — so no
+            // badge, which is more accurate than the stale pending one the
+            // live view keeps for these.
+            self.record_tool_result(&call, result, Ask::Unasked, tx, turn_id.clone())
                 .await;
         }
         self.flush_session_update(tx).await;
@@ -417,10 +436,17 @@ impl AgentRuntime {
         );
     }
 
+    /// `ask` is whether the approval gate put this call in front of a human,
+    /// carried into the session record so a resumed transcript badges and folds
+    /// exactly as the live one did. See `ExchangeResult::asked`. **Every** record
+    /// from this file passes `Ask::Unasked`: none of them is reached through a
+    /// parked request — that path lives in `approval_flow`, which is the only
+    /// caller that has seen a human.
     pub(super) async fn record_tool_result(
         &self,
         call: &ToolCall,
         mut result: ToolResult,
+        ask: Ask,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
         turn_id: TurnId,
     ) {
@@ -435,7 +461,7 @@ impl AgentRuntime {
             let trimmed = truncate_tool_output(&result.content);
             if !state
                 .session
-                .record_tool_result(&result.call_id, trimmed, result.status)
+                .record_tool_result(&result.call_id, trimmed, result.status, ask)
             {
                 // Should be unreachable: the assistant entry carrying this
                 // call was pushed before the batch ran.

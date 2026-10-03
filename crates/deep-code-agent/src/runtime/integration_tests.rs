@@ -1938,6 +1938,93 @@ async fn session_approval_skips_future_prompts_for_same_tool() {
     );
 }
 
+/// The writer-side contract for `ExchangeResult::asked`, which is what a resumed
+/// transcript reads to badge and fold exactly as the live one did.
+///
+/// Two gated calls of the same tool in one session, resolved two different ways:
+/// the first is parked and answered by a human, the second is resolved by the
+/// standing consent that answer created — WITHOUT a prompt, which is the whole
+/// point of the consent. A UI never sees an `ApprovalRequired` for the second,
+/// so it never badges it and folds it with the rest; the record has to say the
+/// same thing, or `/resume` shows a session that never happened.
+///
+/// Nothing asserted this before, which is how the two could drift.
+#[tokio::test]
+async fn the_record_says_when_a_human_was_asked() {
+    let workspace = tempfile::tempdir().unwrap();
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"one"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_2", MockEchoTool::NAME, r#"{"message":"two"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![
+            AgentEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+    ]);
+    let runtime = AgentRuntime::with_new_session(
+        client,
+        ToolRegistry::with_mock_tools(),
+        "system",
+        workspace.path(),
+        &crate::config::AgentConfig::builtin(),
+    )
+    .unwrap();
+    let session_id = runtime.session_id().await.expect("session id");
+
+    let mut rx = runtime.submit_user("echo twice").await;
+    let parked = drain(&mut rx).await;
+    assert!(
+        matches!(parked.last(), Some(RuntimeEvent::ApprovalRequired { .. })),
+        "precondition: the first call parks"
+    );
+    // "Yes, and stop asking" — so the second call never reaches a human.
+    let mut rx = runtime
+        .submit_approval(ApprovalDecision::ApprovedForSession)
+        .await;
+    let resumed = drain(&mut rx).await;
+    assert!(
+        resumed
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::ApprovalResolved { .. })),
+        "precondition: the standing consent leaves an audit event"
+    );
+    runtime.shutdown().await;
+
+    let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let record = store.load(&session_id).unwrap();
+    // One assistant entry per model round, so each call is its own exchange.
+    let exchanges: Vec<_> = record
+        .entries
+        .iter()
+        .flat_map(|entry| match &entry.kind {
+            crate::session_entry::EntryKind::Assistant { exchanges, .. } => exchanges.as_slice(),
+            _ => &[],
+        })
+        .collect();
+    assert_eq!(exchanges.len(), 2, "both calls were recorded");
+    assert_eq!(
+        exchanges[0].result.as_ref().expect("result").asked,
+        Some(true),
+        "the call a human answered says so — it must not be folded away on resume"
+    );
+    assert_eq!(
+        exchanges[1].result.as_ref().expect("result").asked,
+        Some(false),
+        "the standing consent answered before anyone was asked, so this is quiet"
+    );
+}
+
 /// Auto mode must park a network declaration for the human WITHOUT consulting
 /// the judge: the scripted judge slot (which would approve) stays unconsumed,
 /// so the turn ends at ApprovalRequired carrying the network badge.

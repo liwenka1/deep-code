@@ -8,13 +8,21 @@ pub enum ToolApprovalState {
     Required,
     Approved,
     Denied,
+    /// The call was recorded before the session format carried an approval, so
+    /// this transcript does not know whether the gate ever asked.
+    ///
+    /// Distinct from [`Self::NotRequired`] on purpose: "never asked" is a fact
+    /// that lets a call fold, while "unknown" is not — a resumed transcript must
+    /// not hide a call a human may have authorised. It carries no badge, because
+    /// a badge would be a claim this transcript cannot make.
+    Unknown,
 }
 
 impl ToolApprovalState {
     #[must_use]
     pub fn label(self, lang: Lang) -> &'static str {
         match self {
-            Self::NotRequired => "",
+            Self::NotRequired | Self::Unknown => "",
             Self::Required => tr(lang, TextId::BadgeRequired),
             Self::Approved => tr(lang, TextId::BadgeApproved),
             Self::Denied => tr(lang, TextId::BadgeDenied),
@@ -106,17 +114,19 @@ pub(crate) fn folded_entry(
 
 /// Tools the policy engine can never ask a human about.
 ///
-/// A resumed transcript has no approval state to read — `ExchangeResult` records
-/// content and status only — so it may hide calls only when it knows,
-/// independently of the record, that no human was ever asked.
+/// Only consulted for exchanges whose record predates
+/// `ExchangeResult::asked` (in the agent crate): for those, `Unknown` is the
+/// honest reading, and this is what keeps a resumed old session from either
+/// hiding a call a human answered or badging one it cannot vouch for. Newer
+/// records answer from the record itself and never reach this list.
 ///
 /// These three are the ones `execution_policy::evaluate_tool` hardcodes
 /// `requires_approval: false` for, and the `Tool` trait's default is `false`
 /// with overrides only on the editing and dispatch tools — so no rule, mode or
 /// standing consent can ever put one of them in front of a human. Everything
 /// else in [`tool_log_label`] (`shell`, `web_search`, `fetch_url`) can be, and so
-/// never folds on resume: the only direction that cannot hide a decision, at the
-/// cost of a resumed transcript that is more verbose than the live one.
+/// never folds on an unknown record: the only direction that cannot hide a
+/// decision.
 ///
 /// A whitelist, deliberately: a tool nobody listed simply does not fold, so a
 /// stale list costs a noisier transcript rather than a hidden approval.
@@ -322,7 +332,9 @@ impl HistoryCell {
             } => {
                 let args = truncate_chars(&collapse_whitespace(arguments), 72);
                 let badge = match approval {
-                    ToolApprovalState::NotRequired => String::new(),
+                    // `Unknown` carries no badge: this transcript does not know
+                    // whether the gate ever asked, and a badge is a claim.
+                    ToolApprovalState::NotRequired | ToolApprovalState::Unknown => String::new(),
                     other => format!(" [{}]", other.label(lang)),
                 };
                 let clock = running_for_secs
@@ -476,23 +488,46 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
                         .result
                         .as_ref()
                         .map(|result| summarize_tool_result(&result.content));
-                    // …and only a tool the policy engine can NEVER ask a human
-                    // about. The record keeps no approval state (see
-                    // `never_gated`), so folding anything else here would turn a
-                    // call a human answered into an anonymous count — the one way
-                    // this whole policy could hide a decision.
-                    let folded = match (&exchange.result, &summary) {
-                        (Some(result), Some(summary))
-                            if never_gated(&exchange.call.function.name) =>
-                        {
-                            folded_entry(
-                                &exchange.call.function.name,
-                                &exchange.call.function.arguments,
-                                ToolApprovalState::NotRequired,
-                                &result.status,
-                                summary,
-                            )
+                    // The approval the record kept, mapped back onto what the
+                    // live view showed. `asked` is that predicate exactly — the
+                    // live badge appears iff the request was put in front of a
+                    // human — so this reproduces the session instead of
+                    // approximating it.
+                    let approval = match &exchange.result {
+                        // `asked == Some(true)`: a human answered, and the
+                        // status carries which way (a refusal is the one
+                        // outcome it records).
+                        Some(result) if result.asked == Some(true) => {
+                            if result.status == ToolResultStatus::Denied {
+                                ToolApprovalState::Denied
+                            } else {
+                                ToolApprovalState::Approved
+                            }
                         }
+                        // Nobody was asked: the policy never raised the gate, a
+                        // standing consent resolved it, it was refused outright
+                        // (a hard `PolicyVerdict::Deny` never reaches a human —
+                        // so no badge, exactly as live), or the wait was
+                        // cancelled. All quiet, all folded like live.
+                        Some(result) if result.asked == Some(false) => {
+                            ToolApprovalState::NotRequired
+                        }
+                        // Recorded before the field existed: unknown, and
+                        // unknown is NOT "nobody asked", so only what the policy
+                        // can never ask about may still fold (see `never_gated`).
+                        Some(_) if never_gated(&exchange.call.function.name) => {
+                            ToolApprovalState::NotRequired
+                        }
+                        _ => ToolApprovalState::Unknown,
+                    };
+                    let folded = match (&exchange.result, &summary) {
+                        (Some(result), Some(summary)) => folded_entry(
+                            &exchange.call.function.name,
+                            &exchange.call.function.arguments,
+                            approval,
+                            &result.status,
+                            summary,
+                        ),
                         _ => None,
                     };
                     if let Some(entry) = folded {
@@ -508,7 +543,7 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
                     current_turn.push(HistoryCell::ToolCall {
                         tool_name: exchange.call.function.name.clone(),
                         arguments: exchange.call.function.arguments.clone(),
-                        approval: ToolApprovalState::NotRequired,
+                        approval,
                         running_for_secs: None,
                     });
                     // Pending exchanges (interrupted before a result) render
