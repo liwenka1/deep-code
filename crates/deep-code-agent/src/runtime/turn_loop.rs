@@ -87,13 +87,15 @@ impl AgentRuntime {
         let (user_prompt, cancel, route_ctx) = {
             let state = self.state.lock().await;
             let context_tokens = estimate_token_count(&state.session.wire_messages());
+            let prompt = state.current_prompt.clone().unwrap_or_default();
             (
-                state.current_prompt.clone().unwrap_or_default(),
+                prompt.text.clone(),
                 state.cancel.clone(),
                 RouteContext {
                     context_tokens,
                     context_window: context_window_for_model(DEEPSEEK_V4_PRO),
                     escalated: state.cascade_escalated,
+                    has_images: prompt.has_images(),
                 },
             )
         };
@@ -170,16 +172,39 @@ impl AgentRuntime {
             // is the newest thing in the transcript, not history).
             self.drain_steering(&turn_id, tx).await;
 
-            // Probed here, under the same lock that reads the transcript,
-            // because this is the only place the exact wire messages of a
-            // request exist next to what the previous turn sent. The last
-            // iteration's probe is the one the telemetry reports.
-            let (messages, prefix) = {
+            // The transcript and the previous prefix are read under one lock:
+            // this is the only place a request's exact messages exist next to
+            // what the last turn sent, and the last iteration's probe is the one
+            // telemetry reports.
+            let (messages, prior_prefix) = {
                 let state = self.state.lock().await;
-                let messages = state.session.wire_messages();
-                let prefix = probe_prefix(&messages, state.last_prefix);
-                (messages, prefix)
+                (state.session.wire_messages(), state.last_prefix)
             };
+            // Resolving an image reads a file, so it happens outside the lock.
+            //
+            // Capability-aware, and that is what makes the session usable after a
+            // model switch: a transcript that already contains an image must stay
+            // sendable on a model without vision, so `hydrate` replaces those
+            // images with a note instead of the request being refused. Refusing
+            // here would wedge the session for good — the image is in the history,
+            // every later turn re-derives it, so *every* turn including the
+            // text-only ones would be refused, with advice ("remove the images")
+            // the user cannot act on because the images left the draft at submit.
+            // An id the registry does not know is treated as accepting (`map_or`),
+            // so a self-hosted or newer model is the server's call rather than
+            // ours.
+            let accepts_images = self
+                .registry
+                .info_for(&route.effective_model)
+                .is_none_or(|entry| entry.supports_vision);
+            let messages = crate::image::hydrate_for(
+                messages,
+                Some(self.config.vision_detail),
+                accepts_images,
+                crate::image::MAX_TOTAL_BYTES,
+            );
+
+            let prefix = probe_prefix(&messages, prior_prefix);
 
             let estimated_context_tokens = estimate_token_count(&messages);
             // Our own read on how close this request is to the window, used only
@@ -509,11 +534,13 @@ impl AgentRuntime {
     /// go out in arrival order — the UI pops its own pending list FIFO, so that
     /// order is part of the contract.
     async fn drain_steering(&self, turn_id: &TurnId, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
-        let drained: Vec<String> = {
+        let drained: Vec<crate::runtime::UserTurn> = {
             let mut state = self.state.lock().await;
-            let drained: Vec<String> = std::mem::take(&mut state.steering).into();
-            for text in &drained {
-                state.session.push_user(text);
+            let drained: Vec<crate::runtime::UserTurn> = std::mem::take(&mut state.steering).into();
+            for prompt in &drained {
+                state
+                    .session
+                    .push_user_with_images(&prompt.text, prompt.images.clone());
             }
             drained
         };
@@ -521,12 +548,12 @@ impl AgentRuntime {
             return;
         }
         self.persist().await;
-        for text in drained {
+        for prompt in drained {
             emit(
                 tx,
                 RuntimeEvent::UserMessageInjected {
                     turn_id: turn_id.clone(),
-                    text,
+                    text: prompt.text,
                 },
             );
         }

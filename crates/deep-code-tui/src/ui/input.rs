@@ -297,7 +297,15 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         // so it would fall through to push_char('v') and corrupt the input.
         // Ignore it — the terminal handles paste via its own mechanism
         // (right-click / menu) and injects characters directly.
-        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Deliberately not a no-op. A terminal that handles the paste itself
+            // never sends us this key — we get an `Event::Paste` instead — so a
+            // Ctrl+V that *does* arrive is a terminal asking us to read the
+            // clipboard, and an image is the only thing bracketed paste cannot
+            // carry. With no image on the clipboard this does nothing, which
+            // keeps the key transparent for terminals that forward it for text.
+            app.paste_clipboard_image();
+        }
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => app.push_newline(),
         KeyCode::Enter => app.submit(),
         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => app.push_newline(),

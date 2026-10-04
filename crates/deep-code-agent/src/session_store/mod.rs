@@ -15,6 +15,12 @@ use serde::{Deserialize, Serialize};
 
 pub use json::JsonSessionStore;
 
+/// Make sure `<state_dir>/.gitignore` excludes everything, for every writer of
+/// `<workspace>/.deep-code` — not just whichever one happens to run first.
+pub(crate) fn write_self_ignore(state_dir: &Path) {
+    JsonSessionStore::write_self_ignore(state_dir);
+}
+
 use crate::checkpoint::CheckpointId;
 use crate::pricing::CostEstimate;
 use crate::session_entry::{EntryKind, SessionEntry};
@@ -211,7 +217,7 @@ impl SessionRecord {
             .iter()
             .rev()
             .find_map(|entry| match &entry.kind {
-                EntryKind::User { content } => Some(content.clone()),
+                EntryKind::User { content, .. } => Some(content.clone()),
                 _ => None,
             })
             .unwrap_or_else(|| "(empty session)".to_string())

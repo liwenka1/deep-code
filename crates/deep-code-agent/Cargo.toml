@@ -32,6 +32,7 @@ toml = "0.8"
 toml_edit = "0.20"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
+base64 = "0.22"
 
 # Process-group kill for shell/job children (killpg on timeout/cancel).
 [target.'cfg(unix)'.dependencies]

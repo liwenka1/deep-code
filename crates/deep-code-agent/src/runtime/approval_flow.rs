@@ -291,7 +291,7 @@ impl AgentRuntime {
             {
                 return Some(AutoApproval::SessionShell);
             }
-            state.current_prompt.clone().unwrap_or_default()
+            state.current_prompt.clone().unwrap_or_default().text
         }; // release the state lock before any mode logic (Auto awaits a judge)
 
         // Layer 2: session permission mode.

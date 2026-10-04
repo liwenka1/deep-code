@@ -32,6 +32,10 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+arboard = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
+percent-encoding = "2"
 
 # Redirect stderr to the log file on Windows (SetStdHandle), mirroring the
 # unix `dup2` path so stray writes can't paint over the alternate-screen TUI.

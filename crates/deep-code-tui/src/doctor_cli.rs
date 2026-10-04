@@ -91,11 +91,12 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
         clean(&report.base_url)
     );
     println!(
-        "  deepseek: auto_model={} reasoning={} currency={} beta={}",
+        "  deepseek: auto_model={} reasoning={} currency={} beta={} vision_detail={}",
         report.deepseek.auto_model,
         report.deepseek.reasoning_effort,
         report.deepseek.cost_currency,
-        report.deepseek.beta_endpoint
+        report.deepseek.beta_endpoint,
+        report.deepseek.vision_detail
     );
     for model in &report.deepseek.models {
         // What the model CAN do, as names. A row of `vision=false` flags is

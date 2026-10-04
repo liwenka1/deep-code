@@ -45,6 +45,13 @@ pub struct RouteContext {
     /// Cascade escalation latch: Flash already struggled (repeated tool-call
     /// failures) earlier this session, so force Pro for the rest of it.
     pub escalated: bool,
+    /// This turn carries images.
+    ///
+    /// The one input only Flash accepts, so it outranks every other signal here
+    /// — all of which exist to move work *onto* Pro. Sending an image to Pro is
+    /// a 400, so a turn carrying one runs on the model that can take it or not
+    /// at all.
+    pub has_images: bool,
 }
 
 impl RouteContext {
@@ -172,8 +179,19 @@ pub fn resolve_turn_route(
         };
     }
 
-    let (effective_model, route_reason, source) =
+    let (mut effective_model, mut route_reason, mut source) =
         classify_model(user_prompt, &ctx, config.auto_cost_saving, lang);
+
+    // Images are the one input Pro cannot take, so they outrank every rule
+    // `classify_model` applies: cascade escalation, context pressure and the
+    // difficulty keywords all move work onto Pro on purpose, and every one of
+    // them would turn a turn with an image into a 400. Decision and reason are
+    // replaced together so telemetry never reports one without the other.
+    if ctx.has_images && effective_model != DEEPSEEK_FLASH {
+        effective_model = DEEPSEEK_FLASH.to_string();
+        route_reason = tr(lang, TextId::RouteImagesForceFlash).to_string();
+        source = RouteSource::HardRule;
+    }
 
     // Effort and model both derive from `task_class`, so they stay coherent.
     let effort = config.reasoning_effort.resolve(is_subagent, user_prompt);

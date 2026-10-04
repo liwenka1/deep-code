@@ -1,5 +1,6 @@
 use super::*;
 use crate::pricing::CostCurrency;
+use crate::supports_vision_for_model;
 
 fn auto_model(input: &str) -> String {
     classify_model(input, &RouteContext::default(), false, Lang::Zh).0
@@ -174,6 +175,7 @@ fn context_pressure_forces_pro_without_keywords() {
         context_tokens: 800_000,
         context_window: 1_000_000,
         escalated: false,
+        has_images: false,
     };
     let route = resolve_turn_route(
         &config,
@@ -185,6 +187,95 @@ fn context_pressure_forces_pro_without_keywords() {
     );
     assert_eq!(route.effective_model, DEEPSEEK_V4_PRO);
     assert_eq!(route.source, RouteSource::HardRule);
+}
+
+/// Every rule `classify_model` has exists to move work onto Pro, and a turn
+/// carrying an image cannot go there — so images have to outrank all of them at
+/// once. This pins the override against the whole set rather than against the
+/// easy case, because the bug it prevents (a 400 the user pays for) only appears
+/// on the turns where a Pro rule already fired.
+#[test]
+fn images_outrank_every_rule_that_would_force_pro() {
+    let config = AgentConfig {
+        model: AUTO_MODEL.to_string(),
+        reasoning_effort: ReasoningEffortSetting::Auto,
+        ..AgentConfig::default()
+    };
+    // Cascade latched, context at pressure, difficulty keyword, and a
+    // borderline task with cost-first off: four independent reasons to pick Pro.
+    let ctx = RouteContext {
+        context_tokens: 800_000,
+        context_window: 1_000_000,
+        escalated: true,
+        has_images: true,
+    };
+    let route = resolve_turn_route(
+        &config,
+        &ModelRegistry::default(),
+        "please debug this error in the refactor",
+        false,
+        ctx,
+        Lang::Zh,
+    );
+
+    assert_eq!(route.effective_model, DEEPSEEK_FLASH);
+    assert_eq!(route.source, RouteSource::HardRule);
+    // The reason has to travel with the decision, or the status line and the
+    // telemetry will explain the route with a rule that did not choose it.
+    assert_eq!(
+        route.route_reason,
+        tr(Lang::Zh, TextId::RouteImagesForceFlash)
+    );
+}
+
+/// Whether the model the image rule forces onto a turn is the one the catalog
+/// says accepts images.
+///
+/// The two halves live in different modules — `model_route` names
+/// `DEEPSEEK_FLASH` as a constant, and `turn_loop`'s guard asks the registry's
+/// `supports_vision` — so nothing but this assertion stops `assets/models.toml`
+/// from turning every image turn into one that is forced onto Flash and then
+/// refused for being there.
+#[test]
+fn the_model_images_are_forced_onto_is_the_one_that_takes_them() {
+    assert_eq!(
+        supports_vision_for_model(DEEPSEEK_FLASH),
+        Some(true),
+        "image turns are forced onto Flash, so Flash must be the model that accepts them"
+    );
+    assert_eq!(
+        supports_vision_for_model(DEEPSEEK_V4_PRO),
+        Some(false),
+        "Pro is the model the image gate exists to keep images away from"
+    );
+}
+
+/// Images do not silently overrule a model the user pinned. The catalog's
+/// `supports_vision = false` is a claim the *caller* acts on — the TUI refuses
+/// at submit and the turn loop refuses before the request — but the router's job
+/// is to honour `provider.model`, and quietly sending the turn somewhere else
+/// would make the setting a lie.
+#[test]
+fn images_leave_a_pinned_model_alone() {
+    let config = AgentConfig {
+        model: DEEPSEEK_V4_PRO.to_string(),
+        ..AgentConfig::default()
+    };
+    let ctx = RouteContext {
+        has_images: true,
+        ..RouteContext::default()
+    };
+    let route = resolve_turn_route(
+        &config,
+        &ModelRegistry::default(),
+        "hi",
+        false,
+        ctx,
+        Lang::Zh,
+    );
+
+    assert_eq!(route.effective_model, DEEPSEEK_V4_PRO);
+    assert!(!route.auto_model);
 }
 
 #[test]

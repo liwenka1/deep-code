@@ -59,8 +59,17 @@ pub fn estimate_token_count(messages: &[Message]) -> u32 {
             }
         }
     };
+    let mut total_tokens = 0u32;
     for message in messages {
         tally(&message.content);
+        // An image is not text: the guide bounds one at 1024 tokens however
+        // large it is, and the *bytes* on the wire (a base64 data URL, tens of
+        // megabytes) are not what the model is billed for. Tallying the URL —
+        // or letting it reach `content` — would report one screenshot as tens
+        // of thousands of tokens and trip compaction on nothing.
+        for _ in &message.images {
+            total_tokens = total_tokens.saturating_add(crate::image::MAX_TOKENS_PER_IMAGE);
+        }
         // Tool-call arguments and reasoning replay ride the same wire and can
         // dominate a turn (patch bodies are routinely multi-KB); skipping them
         // systematically underestimates context and trips compaction late.
@@ -72,8 +81,12 @@ pub fn estimate_token_count(messages: &[Message]) -> u32 {
             tally(&call.function.arguments);
         }
     }
-    // CJK ≈ 1 token/char; other text ≈ 4 chars/token.
-    (cjk + other / 4).max(1) as u32
+    // CJK ≈ 1 token/char; other text ≈ 4 chars/token. Saturating like the
+    // per-image accumulation above: the sum cannot overflow in practice (a
+    // million tokens of text needs a 4 GB transcript), but this function is the
+    // one that decides whether to compact, and a wrap there would be a
+    // compaction that never fires.
+    ((cjk + other / 4).max(1) as u32).saturating_add(total_tokens)
 }
 
 /// Whether a character is CJK-ish (Chinese/Japanese/Korean script or wide
@@ -232,7 +245,20 @@ fn summarize_archived(messages: &[Message]) -> String {
     let mut lines = Vec::new();
     for message in messages {
         let role = role_label(message.role);
-        let snippet = truncate_chars(&message.content, 160);
+        let mut snippet = truncate_chars(&message.content, 160);
+        // An archived image is dropped — the wire derivation elides it exactly
+        // as it elides a tool result — but the summary has to SAY so, or the
+        // model reads a turn whose text refers to a picture and concludes the
+        // picture never existed.
+        if !message.images.is_empty() {
+            if !snippet.is_empty() {
+                snippet.push(' ');
+            }
+            snippet.push_str(&format!(
+                "[图片 {count} 张已省略 / {count} image(s) omitted]",
+                count = message.images.len()
+            ));
+        }
         if !snippet.is_empty() {
             lines.push(format!("- {role}: {snippet}"));
         }
@@ -346,7 +372,7 @@ mod tests {
         assert!(
             result.entries.iter().any(|entry| matches!(
                 &entry.kind,
-                EntryKind::User { content } if content == "FIX THE LOGIN BUG"
+                EntryKind::User { content, .. } if content == "FIX THE LOGIN BUG"
             )),
             "the active user request must survive compaction as a user message"
         );

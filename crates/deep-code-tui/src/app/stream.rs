@@ -27,9 +27,36 @@ impl App {
             return;
         }
         let sent = self.expand_pasted(&display);
+        // Collected before anything clears the composer: this is what the turn
+        // will actually carry.
+        let images = self.attached_image_paths();
         // Never let the API key into the recallable prompt history.
+        //
+        // Remembered *before* the vision refusal below, so a prompt that was never
+        // sent still lands in `↑`. That is deliberate and follows the rule the
+        // tests pin (`/help` is remembered too): the history is what the user
+        // typed, not what went out. It also keeps the recovery path available —
+        // the refusal leaves the draft in place, so the common fix is `/model
+        // flash` and Enter, but a user who cleared the draft first gets their
+        // images back with one `↑` instead of retyping.
         if !display.starts_with("/apikey") {
             self.remember_prompt(&sent);
+        }
+
+        // `/image` edits the *draft*, not the session, so it cannot go through
+        // the branch below: that branch clears the composer after a command
+        // runs, which would wipe the very chip this command just inserted. The
+        // typed line is cleared first so what is left is only the chip (bare
+        // `/image` inserts nothing, and clears the line the same way).
+        if display == "/image" || display.starts_with("/image ") {
+            let arg = display
+                .strip_prefix("/image")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            self.clear_input();
+            self.handle_image_command(&arg);
+            return;
         }
 
         // Slash commands are interactive directives, not conversation — they
@@ -37,6 +64,31 @@ impl App {
         // stream, in both idle and streaming states.
         if display.starts_with('/') && self.handle_slash_command(&display) {
             self.clear_input();
+            return;
+        }
+
+        // The one place we can refuse an image without costing the user their
+        // draft. Auto mode is routed onto Flash (the only model that takes an
+        // image), so this fires only when `provider.model` pinned a model the
+        // catalog says cannot — and the alternative is a request that 400s
+        // after the turn has started and the images are gone. An id the catalog
+        // does not know is left to the server, matching the runtime's rule.
+        //
+        // After the slash branch on purpose: `/image` is how you inspect and fix
+        // what is attached, and it has to run whatever model is configured.
+        //
+        // Stricter than the runtime, and deliberately so. The runtime *degrades*
+        // an image the model cannot take into a sentence, because it has no draft
+        // to keep and refusing there would wedge the session (see
+        // `image::not_accepted_note`). Here the picture is still in front of the
+        // user, so the honest thing is to stop and let them choose: switch the
+        // model, or take the image out. Both are one keystroke, and neither
+        // silently drops what they attached.
+        if !images.is_empty() && supports_vision_for_model(&self.configured_model) == Some(false) {
+            self.status = self.tr_with(
+                TextId::TurnImagesUnsupportedModel,
+                &[("model", &self.configured_model)],
+            );
             return;
         }
 
@@ -48,6 +100,18 @@ impl App {
         // user cell pushed now would render ABOVE it. The cell is added when
         // the queue flushes, after the current turn's cells land.
         if self.is_streaming {
+            // An image cannot ride the live turn. The model for a turn is chosen
+            // before it starts, and there is no way to hand a picture to one
+            // picked without knowing about it — so a steered image would go to
+            // whatever this turn is running on, up to and including Pro, which
+            // answers 400. It cannot simply be queued either: the steering queue
+            // pairs each entry with the runtime's copy by FIFO position, and an
+            // entry that is never injected breaks that pairing for every entry
+            // behind it. So: refuse, and keep the draft.
+            if !images.is_empty() {
+                self.status = self.tr(TextId::ImageWhileStreaming).to_string();
+                return;
+            }
             if self.steering_queue.len() >= STEERING_QUEUE_CAP {
                 // Leave the draft in the composer — losing it is worse than
                 // refusing to take more.
@@ -96,7 +160,7 @@ impl App {
 
         self.history.push(HistoryCell::user(sent.clone()));
 
-        self.start_stream(StreamRequest::User(sent));
+        self.start_stream(StreamRequest::User(UserTurn::with_images(sent, images)));
     }
 
     /// Send any prompts queued (steered) while the just-finished turn was
@@ -125,7 +189,10 @@ impl App {
         // Added now (not at queue time): the just-finished turn's cells have
         // landed in `history`, so this renders after them, in order.
         self.history.push(HistoryCell::user(combined.clone()));
-        self.start_stream(StreamRequest::User(combined));
+        // Text only: reaching the queue at all requires passing the
+        // `ImageWhileStreaming` refusal in `submit`, so every entry here is a
+        // prompt the runtime was steered with.
+        self.start_stream(StreamRequest::User(UserTurn::new(combined)));
     }
 
     pub(super) fn cancel_streaming_turn(&mut self) {

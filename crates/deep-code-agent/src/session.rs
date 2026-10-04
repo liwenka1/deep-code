@@ -1,5 +1,7 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::image::ImageRef;
 use crate::message::{Message, Role};
 use crate::model::ToolCallPayload;
 use crate::session_entry::{Ask, EntryKind, ExchangeResult, SessionEntry, ToolExchange};
@@ -69,7 +71,16 @@ impl Session {
     }
 
     pub fn push_user(&mut self, content: impl Into<String>) {
-        self.push_entry(SessionEntry::user(content));
+        self.push_user_with_images(content, Vec::new());
+    }
+
+    /// Append a user turn that carries images.
+    ///
+    /// Separate from `push_user` rather than folded into it: the images are
+    /// local paths (see [`SessionEntry::user_with_images`]), and a call site
+    /// that has none should not have to spell an empty `Vec` to say so.
+    pub fn push_user_with_images(&mut self, content: impl Into<String>, images: Vec<PathBuf>) {
+        self.push_entry(SessionEntry::user_with_images(content, images));
     }
 
     /// Append an assistant turn; `calls` become pending exchanges whose
@@ -225,7 +236,10 @@ impl Session {
 pub(crate) fn entry_wire_messages(entry: &SessionEntry) -> Vec<Message> {
     match &entry.kind {
         EntryKind::System { content } => vec![Message::system(content.clone())],
-        EntryKind::User { content } => vec![Message::user(content.clone())],
+        EntryKind::User { content, images } => vec![Message::user_with_images(
+            content.clone(),
+            images.iter().cloned().map(ImageRef::Path).collect(),
+        )],
         EntryKind::Compaction { summary, .. } => vec![Message::system(format!(
             "{COMPACTION_SUMMARY_PREFIX}{summary}"
         ))],

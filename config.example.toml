@@ -207,3 +207,20 @@
 # Interface language: auto (follows the system LANG/LC_ALL), zh, or en.
 # DEEP_CODE_LANG outranks this; /lang switches and persists it from the TUI.
 # language = "auto"
+
+[vision]
+# How attached images are handed to the model. Only `deepseek-flash` accepts
+# image input (see `supports_vision` in the model catalog); a turn carrying an
+# image is routed to it, and pinning `provider.model` to a model that cannot
+# take one makes the turn stop instead of sending a request that would 400.
+#
+#   low       downscales to 512x512 first - faster and cheaper, and the wrong
+#             choice when you are attaching a screenshot to read text off
+#   high      the original image (same as `original`)
+#   original  the original image
+#   auto      let the API decide; currently the same as `original`
+#
+# Unlike the permission fields, this one has no project-layer guard: it changes
+# the quality and cost of images you chose to attach, and can widen nothing.
+# default: auto
+# detail = "auto"

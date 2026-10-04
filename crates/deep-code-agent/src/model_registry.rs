@@ -294,6 +294,21 @@ pub fn context_window_for_model(model: &str) -> u32 {
         .map_or(DEFAULT_CONTEXT_WINDOW, |entry| entry.context_window)
 }
 
+/// Whether `model` accepts images in the prompt.
+///
+/// `None` means the catalog has no row for this id — a self-hosted proxy name, a
+/// name from a newer table, or a hand-written `provider.model`. Unknown is
+/// deliberately not `false`: refusing to send an image to a model we merely have
+/// no row for would break the setups that cannot be tested here, and the
+/// server's verdict is authoritative anyway. `Some(false)` is a claim we can act
+/// on, because it comes from the table.
+#[must_use]
+pub fn supports_vision_for_model(model: &str) -> Option<bool> {
+    builtin_registry()
+        .info_for(model)
+        .map(|entry| entry.supports_vision)
+}
+
 /// Token count at which history compaction should kick in: 80% of the model's
 /// window, leaving headroom for the reply and compaction overhead.
 #[must_use]

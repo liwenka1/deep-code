@@ -101,7 +101,7 @@ pub(crate) fn has_user_message(record: &SessionRecord) -> bool {
 /// First user prompt, single-lined and truncated — the list title.
 pub(crate) fn session_title(record: &SessionRecord, lang: Lang) -> String {
     let first = record.entries.iter().find_map(|entry| match &entry.kind {
-        deep_code_agent::EntryKind::User { content } => Some(content.as_str()),
+        deep_code_agent::EntryKind::User { content, .. } => Some(content.as_str()),
         _ => None,
     });
     let first = match first {

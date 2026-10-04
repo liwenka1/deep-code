@@ -449,7 +449,7 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
 
     for entry in &record.entries {
         match &entry.kind {
-            EntryKind::User { content } => {
+            EntryKind::User { content, .. } => {
                 // Close the turn this entry ends. Cells accumulated before the
                 // FIRST user entry — a compaction banner heading the retained
                 // tail — belong to no turn and are emitted without checkpoints.

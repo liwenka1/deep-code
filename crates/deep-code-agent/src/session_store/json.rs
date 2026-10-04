@@ -69,7 +69,7 @@ impl JsonSessionStore {
     /// is a link whether or not its target does"); this was its unaudited
     /// sibling. `create_new` asks the kernel the question atomically, which
     /// also closes the exists→write gap.
-    fn write_self_ignore(state_dir: &Path) {
+    pub(crate) fn write_self_ignore(state_dir: &Path) {
         const BODY: &str = "# Written by deep-code: this directory holds session transcripts and logs.\n\
              # Deleting this file does not opt out — deep-code writes it back next session.\n\
              # To commit this directory after all, edit this file instead (e.g. remove the\n\

@@ -614,8 +614,11 @@ fn prompt_history_navigates_and_preserves_draft() {
     app.remember_prompt("second");
     app.remember_prompt("second");
     assert_eq!(
-        app.prompt_history,
-        vec!["first".to_string(), "second".to_string()],
+        app.prompt_history
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second"],
         "consecutive duplicates collapse"
     );
 
@@ -637,7 +640,7 @@ fn prompt_history_navigates_and_preserves_draft() {
     assert_eq!(app.input, "second");
     app.push_char('!');
     assert_eq!(app.input, "second!");
-    assert_eq!(app.prompt_history[1], "second");
+    assert_eq!(app.prompt_history[1].text, "second");
     app.history_prev();
     assert_eq!(
         app.input, "second",
@@ -652,8 +655,8 @@ fn prompt_history_caps_at_limit() {
         app.remember_prompt(&format!("prompt-{index}"));
     }
     assert_eq!(app.prompt_history.len(), 100);
-    assert_eq!(app.prompt_history[0], "prompt-50");
-    assert_eq!(app.prompt_history[99], "prompt-149");
+    assert_eq!(app.prompt_history[0].text, "prompt-50");
+    assert_eq!(app.prompt_history[99].text, "prompt-149");
 }
 
 #[test]
@@ -691,7 +694,13 @@ fn apikey_command_validates_writes_and_stays_out_of_history() {
     // Ordinary slash commands ARE remembered (contrast).
     app.input = "/help".to_string();
     app.submit();
-    assert_eq!(app.prompt_history, vec!["/help".to_string()]);
+    assert_eq!(
+        app.prompt_history
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/help"]
+    );
 }
 
 #[test]
@@ -2865,4 +2874,280 @@ async fn status_still_reports_session_totals_after_a_session_switch() {
     // ...but the session's own totals are not.
     assert!(text.contains("session_cost="), "{text}");
     assert!(text.contains("cache_hit="), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// images
+// ---------------------------------------------------------------------------
+
+/// A real PNG header on disk. Only the first eight bytes matter to
+/// `ImageFormat::sniff`; the rest is there so the file is not a lie.
+fn write_test_png(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::write(
+        &path,
+        [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3],
+    )
+    .unwrap();
+    path
+}
+
+/// `/image <path>` has to survive its own command.
+///
+/// The generic slash branch clears the composer after a command runs, and this
+/// one *writes to* the composer — so the order is load-bearing: clear the typed
+/// line, then attach. Reversed, the chip is inserted and then immediately wiped,
+/// and the user watches an attach succeed and vanish.
+#[test]
+fn image_command_attaches_without_wiping_the_chip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_png(dir.path(), "shot.png");
+    let mut app = App::new();
+    app.input = format!("/image {}", path.display());
+
+    app.submit();
+
+    assert_eq!(app.attached_images.len(), 1, "the command must attach it");
+    assert_eq!(
+        app.input, app.attached_images[0].chip,
+        "the chip is all that should be left of the command"
+    );
+    assert!(app.pasted_blocks.is_empty());
+}
+
+/// The command line itself must not survive into the sent prompt.
+#[test]
+fn image_command_does_not_send_the_typed_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_png(dir.path(), "shot.png");
+    let mut app = App::new();
+    app.input = format!("/image {}", path.display());
+
+    app.submit();
+
+    assert!(
+        !app.input.contains("/image"),
+        "the chip replaced the command: {:?}",
+        app.input
+    );
+    assert!(app.attached_image_paths() == vec![path]);
+}
+
+/// The refusal has to leave the draft intact — that is the entire reason the
+/// check lives at submit rather than being left to the API's 400.
+#[test]
+fn a_model_that_cannot_take_images_refuses_and_keeps_the_draft() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_png(dir.path(), "shot.png");
+    let mut app = App::new();
+    // Type first, then attach — the order a user does it in, and the order that
+    // leaves the chip and the attachment agreeing. Assigning to `input` *after*
+    // attaching would strip the chip while keeping the attachment, which is the
+    // state `sync_images` exists to prevent; a test that builds it by hand only
+    // passes while `attached_image_paths` is willing to send a chip-less image.
+    app.input = "look at this ".to_string();
+    app.cursor_to_end();
+    assert!(app.attach_image(path));
+    app.configured_model = deep_code_agent::DEEPSEEK_V4_PRO.to_string();
+
+    app.submit();
+
+    assert!(!app.is_streaming, "the turn must not have started");
+    assert!(
+        app.input.contains("look at this"),
+        "the draft is kept: {:?}",
+        app.input
+    );
+    assert_eq!(app.attached_image_paths().len(), 1, "the image is kept");
+    assert!(
+        app.status.contains(deep_code_agent::DEEPSEEK_V4_PRO),
+        "the refusal names the model to switch away from: {}",
+        app.status
+    );
+}
+
+/// Auto mode is not a refusal: the model is chosen per turn, and the one it
+/// chooses can take an image. `/model`'s own gate would otherwise turn the
+/// default configuration into a dead end.
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_mode_does_not_refuse_an_image_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_png(dir.path(), "shot.png");
+    let mut app = App::new();
+    app.configured_model = deep_code_agent::AUTO_MODEL.to_string();
+    app.input = "look at this ".to_string();
+    app.cursor_to_end();
+    assert!(app.attach_image(path));
+
+    app.submit();
+
+    // Asserted on the turn's own state rather than by scanning the status text
+    // for a phrase: a locale substring is only as strong as the wording, and a
+    // reworded refusal would leave this test green while the behaviour broke.
+    assert!(
+        app.is_streaming,
+        "auto mode must accept an image turn, status was: {}",
+        app.status
+    );
+    assert!(app.input.is_empty(), "an accepted turn clears the draft");
+    assert!(app.attached_images.is_empty());
+}
+
+/// Backspacing into a chip takes the whole thing, and the attachment with it.
+/// Character-by-character deletion would leave a half-eaten label and a picture
+/// that vanished without a gesture which looks like it removed it.
+#[test]
+fn backspace_takes_a_whole_chip_and_its_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_png(dir.path(), "shot.png");
+    let mut app = App::new();
+    assert!(app.attach_image(path));
+    let chip_chars = app.input.chars().count();
+    assert_eq!(app.attached_images.len(), 1);
+    app.cursor_to_end();
+
+    app.backspace();
+
+    assert_eq!(app.input, "", "the whole chip went in one keypress");
+    assert!(app.attached_images.is_empty(), "and the image with it");
+    assert!(chip_chars > 1, "sanity: a chip is not a single character");
+}
+
+/// An attachment whose chip is gone must not be sent. This is what makes every
+/// other deletion route (`Ctrl+W`, `Ctrl+U`, a selection overwrite) safe without
+/// teaching each of them about chips.
+#[test]
+fn an_attachment_whose_chip_was_cut_away_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_png(dir.path(), "shot.png");
+    let mut app = App::new();
+    assert!(app.attach_image(path));
+    app.input.push_str(" trailing words");
+    app.cursor_to_end();
+
+    // Cut back through the chip and the words after it, leaving neither.
+    app.kill_to_line_start();
+
+    assert!(app.input.is_empty());
+    assert!(
+        app.attached_images.is_empty(),
+        "an image the draft no longer mentions must not be sent"
+    );
+}
+
+/// Recall restores the pictures, not just the text that mentions them — the
+/// failure mode being a recalled `[image #1 PNG]` with nothing behind it.
+#[test]
+fn recalling_a_prompt_restores_its_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_png(dir.path(), "shot.png");
+    let mut app = App::new();
+    assert!(app.attach_image(path.clone()));
+    let chip = app.input.clone();
+    app.input.push_str(" look here");
+    app.remember_prompt(&app.input.clone());
+    app.clear_input();
+
+    app.history_prev();
+
+    assert_eq!(app.input, format!("{chip} look here"));
+    assert_eq!(app.attached_images.len(), 1);
+    assert_eq!(app.attached_image_paths(), vec![path]);
+}
+
+/// A dragged-in path attaches; ordinary text still pastes as text. The
+/// all-or-nothing rule is what keeps a log excerpt mentioning a `.png` from
+/// being eaten.
+#[test]
+fn a_pasted_image_path_attaches_and_plain_text_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_png(dir.path(), "shot.png");
+    let mut app = App::new();
+
+    app.paste_str(format!("{}\n", path.display()));
+    assert_eq!(app.attached_images.len(), 1);
+
+    app.paste_str("just some words".to_string());
+    assert_eq!(app.attached_images.len(), 1, "text is text");
+    assert!(app.input.contains("just some words"));
+}
+
+#[test]
+fn the_per_message_cap_refuses_before_the_draft_is_committed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new();
+    for index in 0..deep_code_agent::MAX_IMAGES_PER_MESSAGE {
+        let path = write_test_png(dir.path(), &format!("shot-{index}.png"));
+        assert!(app.attach_image(path), "image {index} should attach");
+    }
+    let extra = write_test_png(dir.path(), "one-too-many.png");
+
+    assert!(!app.attach_image(extra));
+
+    assert_eq!(
+        app.attached_images.len(),
+        deep_code_agent::MAX_IMAGES_PER_MESSAGE
+    );
+    assert!(
+        app.status
+            .contains(&deep_code_agent::MAX_IMAGES_PER_MESSAGE.to_string())
+    );
+}
+
+/// The `@` menu hands back a *workspace-relative* path, and the token before it
+/// can be multi-byte — `图 @shot` puts the token's byte index and its char index
+/// four bytes apart. Both had to be right for the reference to become a chip
+/// instead of a mangled draft.
+#[test]
+fn an_at_referenced_image_becomes_a_chip_even_behind_multibyte_text() {
+    let mut app = App::new();
+    // A workspace-relative name, which is exactly what the menu offers.
+    let name = "cjk-prefix-shot.png";
+    let path = app.workspace.join(name);
+    std::fs::write(&path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1]).unwrap();
+    app.workspace_files.push(name.to_string());
+
+    app.input = format!("图 @{name}");
+    app.cursor_to_end();
+    app.refresh_completion();
+    assert!(
+        app.completion_open(),
+        "the file menu should offer the image"
+    );
+
+    app.accept_completion();
+
+    assert_eq!(app.attached_images.len(), 1);
+    assert_eq!(app.attached_image_paths(), vec![path]);
+    assert!(
+        !app.input.contains(name),
+        "the path is replaced by the chip: {:?}",
+        app.input
+    );
+    assert_eq!(
+        app.input,
+        format!("图 {}", app.attached_images[0].chip),
+        "the prefix survives intact — no `@s` left behind"
+    );
+}
+
+/// `/image` accepts the same quoted and backslash-escaped spellings a dropped
+/// file arrives in, because a path with a space is the case that needs it.
+#[test]
+fn image_command_accepts_a_quoted_or_escaped_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let spaced = dir.path().join("my shots");
+    std::fs::create_dir(&spaced).unwrap();
+    let path = write_test_png(&spaced, "screen shot.png");
+    let display = path.to_string_lossy().into_owned();
+
+    for spelling in [format!("'{display}'"), display.replace(' ', "\\ ")] {
+        let mut app = App::new();
+        app.input = format!("/image {spelling}");
+
+        app.submit();
+
+        assert_eq!(app.attached_images.len(), 1, "failed to attach {spelling}");
+        assert_eq!(app.attached_image_paths(), vec![path.clone()]);
+    }
 }

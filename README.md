@@ -45,6 +45,12 @@ A DeepSeek-powered terminal coding agent, written in Rust. One small binary: str
 
 - `auto` picks between `deepseek-v4-pro` and `deepseek-flash` (and the reasoning effort) per task, and falls back with retry on rate limits or upstream failures. Pin with `/model` or `provider.model`.
 
+**Image understanding**
+
+- **Attach an image by pasting it, dropping a file in, typing `@` in the file menu, or `/image <path>`.** `Ctrl+V` reads the system clipboard and attaches whatever image it carries — a screenshot, a file copied in Finder, a picture copied out of another application — storing it under `<workspace>/.deep-code/images/`, content-addressed so pasting the same shot twice is one file. The terminal's **own** paste key can attach an image too, by two separate routes, and which one applies depends on whether the clipboard carries any text at all: for a file copied in Finder it does (the file's *name*), so a paste that is exactly an image name we cannot open sends us to the clipboard for the file itself; for a screenshot or a picture copied from an application the clipboard is pixels alone, leaving the terminal nothing to send — and a terminal that forwards the empty paste anyway is telling us a paste was requested, which is the second route. A terminal that stays silent in that case leaves `Ctrl+V` as the only key that works, so that is the one to reach for when you want certainty. Dragging a file in works as it always did, because a terminal hands a dropped file over as its path. The composer shows a `[图片 #N PNG]` chip where the image sits, and `/image` with no argument lists what is attached and where it lives.
+- **Only `deepseek-flash` accepts images**, so a turn carrying one is routed there whatever the difficulty keywords, context pressure or cascade latch would otherwise say — the alternative is a request the API refuses. Pinning a model the catalog says cannot take an image behaves differently by surface, and the difference is deliberate: in the TUI the turn stops *before* it starts and your draft is kept, so the picture is still in front of you and one keystroke fixes it (`/model flash`, or take the image out); over `-p`/headless there is no draft to keep, so the image becomes a sentence in that turn's text (`[图片未发送 / image not sent, …]`) and the request still goes — refusing *there* would wedge the session, because a turn's images are recorded in the transcript and every later turn re-derives them, so a pinned model without vision would refuse every request after it, text-only ones included. The same mechanism is why switching to such a model mid-session keeps working: the images already in the history are sent as sentences rather than turning the session into a dead end. `[vision] detail` in the config picks how the image is processed (`low` downscales to 512×512 first; `original`/`auto` send it whole).
+- **An image that cannot be sent never costs you the message.** A file that has been moved or deleted since the turn was recorded, one that is not really an image (the format is read from the file's own bytes, not its extension), or one past the size and count caps becomes a sentence in that turn's text naming the file — the model is told what it is missing instead of being silently shown less. Pasted images are stored under `<workspace>/.deep-code/images/` (already git-ignored) and **are not cleaned up automatically** — delete the directory by hand if you would rather they were gone.
+
 ## Install
 
 ```sh
@@ -85,7 +91,7 @@ deepcode eval            # SWE-bench rollout (see below)
 deepcode session list|resume|delete|export
 ```
 
-Common slash commands: `/help` `/model` `/apikey` `/lang` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy` `/add-dir` (`/help` lists everything plus keybindings).
+Common slash commands: `/help` `/model` `/apikey` `/lang` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy` `/add-dir` `/image` (`/help` lists everything plus keybindings).
 
 ### Working across sibling repos (`--add-dir`)
 

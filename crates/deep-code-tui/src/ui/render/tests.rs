@@ -2151,6 +2151,7 @@ fn resume_picker_neutralizes_every_model_reachable_field() {
         .push(std::sync::Arc::new(deep_code_agent::SessionEntry::new(
             deep_code_agent::EntryKind::User {
                 content: "sess\u{1b}[8m\u{202e}ion".to_string(),
+                images: Vec::new(),
             },
         )));
     let picker = crate::app::ResumePicker {

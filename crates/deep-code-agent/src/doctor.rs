@@ -153,6 +153,11 @@ pub struct DeepSeekDoctorReport {
     pub auto_model: bool,
     pub reasoning_effort: String,
     pub cost_currency: String,
+    /// `[vision] detail`: how an attached image is offered to the model. Here
+    /// rather than in the sandbox report because it is a model-facing setting,
+    /// and here at all because an unread config field is one that rots — the
+    /// rule the capability flags in `ModelDoctorEntry` already follow.
+    pub vision_detail: String,
     pub beta_endpoint: bool,
     pub models: Vec<ModelDoctorEntry>,
     /// How to obtain and set an API key — present ONLY when there is no usable
@@ -270,6 +275,7 @@ fn collect_deepseek(config: &AgentConfig) -> DeepSeekDoctorReport {
         auto_model: config.auto_model_enabled(),
         reasoning_effort: config.reasoning_effort.as_setting().to_string(),
         cost_currency: config.cost_currency.as_setting().to_string(),
+        vision_detail: config.vision_detail.as_str().to_string(),
         beta_endpoint: config.uses_beta_endpoint(),
         models,
         api_key_hint: (!has_usable_api_key(config))

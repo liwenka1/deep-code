@@ -43,6 +43,12 @@ fn fingerprint(messages: &[Message]) -> u64 {
     for message in messages {
         message.role.as_str().hash(&mut hasher);
         message.content.hash(&mut hasher);
+        // Images reach the provider, so they belong in the fingerprint: two
+        // histories differing only in the picture attached are not the same
+        // prefix. Hashing the data URL rather than the file is deliberate — it
+        // is what is actually sent, and it is already in memory here, so a file
+        // edited in place under a stable path still registers as a change.
+        message.images.hash(&mut hasher);
         message.reasoning_content.hash(&mut hasher);
         message.tool_call_id.hash(&mut hasher);
         for call in &message.tool_calls {

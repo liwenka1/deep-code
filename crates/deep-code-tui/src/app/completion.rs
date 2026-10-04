@@ -13,6 +13,11 @@ impl App {
     /// Recompute the menu from the current input: `/command` prefix while no
     /// whitespace was typed, or a trailing `@file` token.
     pub(crate) fn refresh_completion(&mut self) {
+        // The draft is the only thing that says which attachments still exist,
+        // and every edit funnels through here, so this is where the list is
+        // brought back in line with the text — rather than at each of the ten
+        // mutation sites that would each have to remember to do it.
+        self.sync_images();
         self.completion = self.compute_completion();
     }
 
@@ -70,7 +75,7 @@ impl App {
     }
 
     /// Byte index where the trailing whitespace-delimited token begins.
-    fn trailing_token_start(&self) -> usize {
+    pub(crate) fn trailing_token_start(&self) -> usize {
         self.input
             .char_indices()
             .rev()
@@ -108,6 +113,13 @@ impl App {
                 !value.ends_with(' ')
             }
             CompletionKind::File => {
+                // An `@`-reference to an image becomes an attachment instead of
+                // a path: the model cannot open a path, and the user picked an
+                // image deliberately. `attach_if_image_path` takes back the
+                // token being completed and puts a chip where it was.
+                if self.attach_if_image_path(std::path::Path::new(value)) {
+                    return false;
+                }
                 // Kept verbatim on purpose: this string is also what gets SENT,
                 // and an `@`-reference has to name the file that actually
                 // exists. The display side is handled where it belongs, by

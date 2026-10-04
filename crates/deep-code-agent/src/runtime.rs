@@ -48,6 +48,58 @@ use crate::session_store::{TurnRecord, now_ms};
 use crate::tool::{ApprovalDecision, ApprovalRequest, ToolCall, ToolRegistry};
 use event::emit;
 pub use event::{RuntimeEvent, RuntimeEventReceiver, ToolCallId, TurnId};
+
+/// One user turn: its text plus the local image files attached to it.
+///
+/// The runtime's whole public prompt surface takes `impl Into<UserTurn>`, and
+/// the two `From` impls below are why: every call site written before images
+/// existed keeps compiling unchanged, and a text-only turn keeps one obvious
+/// spelling rather than growing a second constructor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserTurn {
+    pub text: String,
+    /// Local image files, in the order the user attached them.
+    ///
+    /// Paths rather than bytes: [`crate::image::hydrate`] reads them when a
+    /// request is assembled and the session stores these same paths, so an image
+    /// is never copied into the transcript or into the session file.
+    pub images: Vec<PathBuf>,
+}
+
+impl UserTurn {
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_images(text: impl Into<String>, images: Vec<PathBuf>) -> Self {
+        Self {
+            text: text.into(),
+            images,
+        }
+    }
+
+    #[must_use]
+    pub fn has_images(&self) -> bool {
+        !self.images.is_empty()
+    }
+}
+
+impl From<String> for UserTurn {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+impl From<&str> for UserTurn {
+    fn from(text: &str) -> Self {
+        Self::new(text)
+    }
+}
 use state::{Persistence, RuntimeState};
 pub use telemetry::{PrefixStatus, TurnTelemetry};
 
@@ -263,13 +315,13 @@ impl AgentRuntime {
     /// Start a new turn from a user prompt. Returns a receiver that yields
     /// [`RuntimeEvent`]s until either the turn finishes or an approval is
     /// required. After approval, call [`Self::submit_approval`] to resume.
-    pub async fn submit_user(&self, prompt: impl Into<String>) -> RuntimeEventReceiver {
+    pub async fn submit_user(&self, prompt: impl Into<UserTurn>) -> RuntimeEventReceiver {
         self.begin_turn(prompt).await;
         self.drive_turn().await
     }
 
     /// Record a user prompt and start turn bookkeeping without spawning the loop.
-    pub async fn begin_turn(&self, prompt: impl Into<String>) {
+    pub async fn begin_turn(&self, prompt: impl Into<UserTurn>) {
         // A previous turn may still be live (e.g. the HTTP client disconnected
         // mid-turn and a new prompt arrived): cancel its loop so it stops
         // streaming. The turn-id guard in `finish_turn` keeps that loop's late
@@ -287,7 +339,9 @@ impl AgentRuntime {
             let mut state = self.state.lock().await;
             // Interrupted tool calls need no repair here: pending exchanges
             // synthesize their placeholder at wire derivation.
-            state.session.push_user(&prompt);
+            state
+                .session
+                .push_user_with_images(&prompt.text, prompt.images.clone());
             state.pending = None;
             state.current_turn = Some(TurnRecord::new());
             state.current_prompt = Some(prompt);
@@ -342,7 +396,7 @@ impl AgentRuntime {
     /// with the text still queued. `begin_turn` clears it then, and the caller
     /// is expected to fall back to sending it as the next prompt — which is
     /// exactly what the TUI's own queue does.
-    pub async fn steer(&self, text: impl Into<String>) -> bool {
+    pub async fn steer(&self, text: impl Into<UserTurn>) -> bool {
         let mut state = self.state.lock().await;
         if state.current_turn_id.is_none() {
             return false;
@@ -507,7 +561,7 @@ impl AgentRuntime {
         let state = self.state.lock().await;
         (
             state.current_turn_id.clone().unwrap_or_else(TurnId::new),
-            state.current_prompt.clone().unwrap_or_default(),
+            state.current_prompt.clone().unwrap_or_default().text,
         )
     }
 

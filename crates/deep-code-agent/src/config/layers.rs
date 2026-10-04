@@ -17,6 +17,7 @@ use super::{
 };
 use crate::execution_policy::{NetworkMode, PermissionMode};
 use crate::i18n::{Lang, TextId, tr_with};
+use crate::image::ImageDetail;
 use crate::paths::home_dir;
 use crate::pricing::CostCurrency;
 use crate::reasoning::ReasoningEffortSetting;
@@ -308,6 +309,7 @@ macro_rules! sections {
             ("ui", &$file.ui.unknown),
             ("lsp", &$file.lsp.unknown),
             ("sandbox", &$file.sandbox.unknown),
+            ("vision", &$file.vision.unknown),
         ]
     };
 }
@@ -324,6 +326,7 @@ struct ConfigFile {
     ui: UiSection,
     lsp: LspSection,
     sandbox: SandboxSection,
+    vision: VisionSection,
     /// Top-level keys and whole sections no field claims.
     #[serde(flatten)]
     unknown: UnknownKeys,
@@ -421,6 +424,15 @@ struct LspSection {
 struct SandboxSection {
     /// `prompt` | `always` | `never`; see [`NetworkMode`].
     network: Option<String>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct VisionSection {
+    /// `low` | `high` | `original` | `auto`; see [`ImageDetail`].
+    detail: Option<String>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -694,6 +706,19 @@ fn apply_file_overlay(
         } else {
             config.default_permission_mode = mode;
         }
+    }
+
+    // How attached images are handed to the model. Unlike the permission
+    // fields above this needs no project-layer guard: it changes the quality
+    // and the cost of images the user chose to attach, and can widen nothing.
+    if let Some(detail) = parse_setting(
+        file.vision.detail.as_deref(),
+        "vision.detail",
+        layer,
+        pending,
+        ImageDetail::parse,
+    ) {
+        config.vision_detail = detail;
     }
 }
 

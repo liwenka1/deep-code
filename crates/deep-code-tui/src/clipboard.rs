@@ -1,12 +1,96 @@
-//! Clipboard copy. Locally we shell out to the OS clipboard tool (pbcopy /
-//! wl-copy / xclip / clip), which is UTF-8 safe and reliable on macOS/Linux.
-//! On Windows, clip.exe uses the system ANSI code page (e.g. GBK on Chinese
-//! Windows), which corrupts any non-ASCII text, so we use the Win32 clipboard
-//! API (CF_UNICODETEXT) instead.
+//! Clipboard access. Locally we shell out to the OS clipboard tool for
+//! *copying* (pbcopy / wl-copy / xclip / clip), which is UTF-8 safe and reliable
+//! on macOS/Linux. On Windows, clip.exe uses the system ANSI code page (e.g.
+//! GBK on Chinese Windows), which corrupts any non-ASCII text, so we use the
+//! Win32 clipboard API (CF_UNICODETEXT) instead.
 //! Over SSH — where no local clipboard tool is reachable — we fall back to
 //! the OSC 52 escape sequence so the *local* terminal still receives the copy.
+//!
+//! *Reading* is a different problem, and an image is the only reason to do it.
+//! A terminal delivers a paste as text, so a screenshot on the clipboard is
+//! invisible unless we go and ask the OS for it; `arboard` is that ask, and it
+//! is why this module has a dependency the copy path never needed.
 
 use std::io::Write;
+
+/// An image from the system clipboard.
+///
+/// Three outcomes, and the middle one is not a failure:
+///
+/// * `None` — there is nothing to read: the clipboard holds no image, or this
+///   host has no readable clipboard at all (a bare container, no X11/Wayland), or
+///   we are over SSH. All three mean "`Ctrl+V` is not the image channel here",
+///   which is not something to tell the user about on every keypress. `Ctrl+V`
+///   reaches us only in terminals that forward the key rather than pasting
+///   themselves, and those users are usually copying text.
+/// * `Some(Err(_))` — there is genuinely something to say: an image was found
+///   and could not be encoded.
+/// * `Some(Ok(bytes))` — image bytes, in one of the four formats
+///   [`deep_code_agent::ImageFormat`] accepts. **Not necessarily PNG**: copying
+///   a file in Finder puts the file itself on the clipboard, and re-encoding it
+///   would only lose quality.
+///
+/// A **non-image file** on the clipboard is not a fourth outcome, and that is a
+/// decision rather than an oversight: it reads as `None`. The alternative —
+/// putting the copied path into the composer — was considered and dropped,
+/// because `Ctrl+V` means "here is something to look at", and answering it with
+/// sixty characters of path for a file the model still cannot open is a worse
+/// surprise than silence. Dropping a file onto the terminal, or naming it with
+/// `@`, is how a path gets into a prompt.
+pub(crate) fn read_image() -> Option<Result<Vec<u8>, String>> {
+    // Over SSH there is no *local* clipboard to read: the terminal's own paste is
+    // how text gets in, and `arboard` would either fail or hand back the remote
+    // host's clipboard — which is not what the user just copied. Reading is the
+    // one direction OSC 52 cannot help with, so there is no fallback here; the
+    // choice is between silence and a wrong answer, and silence wins.
+    if is_ssh() {
+        return None;
+    }
+
+    // A host with no clipboard at all is a fact about the machine, not a failure
+    // of this paste. Reporting it would put a status line under every `Ctrl+V`,
+    // which is the noise `None` exists to avoid.
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+
+    // A file copied in Finder (or Explorer) is a file LIST, not pixels, and the
+    // file is already where we want it — so prefer it, and hand back its bytes
+    // untouched.
+    if let Ok(files) = clipboard.get().file_list() {
+        for file in files {
+            // `inspect` before `read`: it is a metadata check plus a 16-byte
+            // header sniff, so a file we would refuse anyway — too big, not an
+            // image, already gone — costs nothing. Reading first would pull a
+            // multi-gigabyte file into memory to find out.
+            if deep_code_agent::inspect(&file).is_err() {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(&file) {
+                return Some(Ok(bytes));
+            }
+        }
+    }
+
+    // Otherwise it is pixels — from a screenshot, or an image copied out of a
+    // browser — and those arrive as raw RGBA, which has to be encoded before it
+    // can be sent anywhere.
+    match clipboard.get_image() {
+        Ok(image) => Some(encode_png(image)),
+        Err(_) => None,
+    }
+}
+
+/// Encode raw clipboard pixels as PNG.
+fn encode_png(image: arboard::ImageData<'_>) -> Result<Vec<u8>, String> {
+    let width = u32::try_from(image.width).map_err(|_| "image is impossibly wide".to_string())?;
+    let height = u32::try_from(image.height).map_err(|_| "image is impossibly tall".to_string())?;
+    let rgba = image::RgbaImage::from_raw(width, height, image.bytes.into_owned())
+        .ok_or_else(|| "clipboard image buffer does not match its dimensions".to_string())?;
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|error| format!("could not encode the clipboard image: {error}"))?;
+    Ok(png)
+}
 
 /// Copy `text` to the system clipboard.
 pub(crate) fn copy(text: &str) {
@@ -127,50 +211,46 @@ fn write_to_command(command: &str, args: &[&str], text: &str) -> bool {
 }
 
 /// Fallback: write the clipboard via the OSC 52 escape sequence.
+///
+/// The **standard** alphabet, not the URL-safe one: OSC 52 carries the payload
+/// in a control sequence, and terminals decode it against RFC 4648 `base64`.
+/// Swapping in the URL-safe engine would silently mangle every `+` and `/` in
+/// the copied text, which is why the test below pins the vectors rather than
+/// trusting the engine's name.
 fn copy_osc52(text: &str) {
-    let seq = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    use base64::Engine as _;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let seq = format!("\x1b]52;c;{encoded}\x07");
     let mut out = std::io::stdout();
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
-}
-
-/// Minimal standard-alphabet base64 (avoids a crate just for OSC 52).
-pub(crate) fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((n >> 18) & 63) as usize] as char);
-        out.push(TABLE[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[((n >> 6) & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The OSC 52 payload has to be RFC 4648 standard base64 — the URL-safe
+    /// alphabet mangles `+` and `/`, and a terminal decoding against the
+    /// standard one would render the copied text wrong with no error anywhere.
+    /// Vectors rather than the engine's name, because the name is not what the
+    /// terminal reads.
     #[test]
-    fn base64_matches_known_vectors() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode("你好".as_bytes()), "5L2g5aW9");
+    fn osc52_payload_is_standard_base64() {
+        use base64::Engine as _;
+
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+        assert_eq!(encode(b""), "");
+        assert_eq!(encode(b"f"), "Zg==");
+        assert_eq!(encode(b"fo"), "Zm8=");
+        assert_eq!(encode(b"foo"), "Zm9v");
+        assert_eq!(encode(b"foob"), "Zm9vYg==");
+        assert_eq!(encode("你好".as_bytes()), "5L2g5aW9");
+        // The two bytes that separate the standard alphabet from the URL-safe
+        // one, which is the whole point of pinning this.
+        assert_eq!(encode(&[0xfb, 0xff]), "+/8=");
     }
 
     #[test]

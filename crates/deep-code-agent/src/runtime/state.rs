@@ -40,7 +40,7 @@ pub(super) struct RuntimeState {
     pub(super) session_cache_miss_tokens: u64,
     /// Cumulative spend avoided by cache hits this session (vs all-miss).
     pub(super) session_cache_savings: CostEstimate,
-    pub(super) current_prompt: Option<String>,
+    pub(super) current_prompt: Option<crate::runtime::UserTurn>,
     pub(super) current_turn_id: Option<TurnId>,
     /// Prompts the user steered into the in-flight turn (mid-turn steering), in
     /// arrival order. Drained at the top of each `run_loop` iteration — i.e. at
@@ -51,7 +51,7 @@ pub(super) struct RuntimeState {
     /// Cleared by `begin_turn` (a steer that was never drained must not leak
     /// into the next turn) and by `cancel_turn` (Esc means "changed my mind",
     /// matching the TUI's own queue).
-    pub(super) steering: VecDeque<String>,
+    pub(super) steering: VecDeque<crate::runtime::UserTurn>,
     /// Cancellation token for the in-flight turn; rotated by `begin_turn`.
     pub(super) cancel: CancellationToken,
     /// Tools the user approved for the whole session ("a" in the approval

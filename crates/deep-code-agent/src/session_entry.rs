@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::path::PathBuf;
+
 use crate::model::ToolCallPayload;
 use crate::tool::ToolResultStatus;
 
@@ -46,8 +48,21 @@ impl SessionEntry {
 
     #[must_use]
     pub fn user(content: impl Into<String>) -> Self {
+        Self::user_with_images(content, Vec::new())
+    }
+
+    /// A user turn that carries images.
+    ///
+    /// `images` are local paths, not bytes and not URLs. Bytes would put
+    /// megabytes into every session file *and* into every save — the persistence
+    /// actor rewrites the whole record — while a URL would be a second copy of
+    /// data we already have on disk. [`crate::image::hydrate`] reads them when a
+    /// request is assembled.
+    #[must_use]
+    pub fn user_with_images(content: impl Into<String>, images: Vec<PathBuf>) -> Self {
         Self::new(EntryKind::User {
             content: content.into(),
+            images,
         })
     }
 
@@ -81,6 +96,14 @@ pub enum EntryKind {
     },
     User {
         content: String,
+        /// Local image files attached to this turn, in the order the user
+        /// attached them.
+        ///
+        /// Additive and defaulted, so a session written by this build is still
+        /// read by one that predates the field, and an older session reads back
+        /// as a turn without images.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<PathBuf>,
     },
     Assistant {
         content: String,

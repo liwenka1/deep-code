@@ -28,6 +28,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, TextId, bool)] = &[
     ("/context", TextId::HintContext, false),
     ("/lang", TextId::HintLang, true),
     ("/add-dir", TextId::HintAddDir, true),
+    ("/image", TextId::HintImage, true),
 ];
 
 impl App {
@@ -231,11 +232,30 @@ impl App {
             } else {
                 format!(" (+{} tool call(s))", message.tool_calls.len())
             };
+            // Images are part of the wire too, and they are the one thing a
+            // reader of this listing cannot see in the text: the content shows a
+            // `[图片 #1 PNG]` chip where the picture sits, and the tokens those
+            // pictures cost (up to 1024 each) would otherwise appear from
+            // nowhere. Counted, not shown — a data URL is megabytes of base64
+            // and would defeat the one-line-per-message shape.
+            //
+            // Counted before hydration, so this is what the *transcript* holds
+            // rather than what the request will carry: an image the request had
+            // to leave out (over the budget, or a model that cannot take one) is
+            // still counted here and shows up as a sentence in `content` that
+            // this listing has already truncated past. The listing answers "what
+            // is in the sessions's history", and `/status` plus the per-turn
+            // telemetry are where the request's own size is read.
+            let images = if message.images.is_empty() {
+                String::new()
+            } else {
+                format!(" (+{} image(s))", message.images.len())
+            };
             let role = message.role.as_str();
             if head.is_empty() {
-                format!("{index:>3}. {role}{calls}")
+                format!("{index:>3}. {role}{calls}{images}")
             } else {
-                format!("{index:>3}. {role}{calls}: {head}")
+                format!("{index:>3}. {role}{calls}{images}: {head}")
             }
         };
 

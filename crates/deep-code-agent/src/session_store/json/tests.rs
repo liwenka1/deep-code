@@ -32,7 +32,7 @@ fn json_store_round_trips_session() {
     assert_eq!(loaded.entries.len(), 2);
     assert!(matches!(
         &loaded.entries[1].kind,
-        crate::session_entry::EntryKind::User { content } if content == "hello"
+        crate::session_entry::EntryKind::User { content, .. } if content == "hello"
     ));
 }
 

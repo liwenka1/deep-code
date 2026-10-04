@@ -9,6 +9,7 @@ use crate::client::AgentEventStream;
 use crate::error::{AgentError, AgentResult};
 use crate::event::AgentEvent;
 use crate::model::{ChatRequest, FunctionCallDelta, ToolCallDelta};
+use crate::model_registry::{DEEPSEEK_FLASH, DEEPSEEK_V4_PRO};
 use crate::runtime::diagnostics::append_diagnostics;
 use crate::session_store::SessionStore;
 use crate::tool::{MockEchoTool, Tool, ToolError, ToolRegistry, ToolResultStatus};
@@ -3894,7 +3895,13 @@ async fn begin_turn_supersedes_live_turn_without_clobbering() {
         state.current_turn.is_some(),
         "stale finalization must not consume the new turn's record"
     );
-    assert_eq!(state.current_prompt.as_deref(), Some("second"));
+    assert_eq!(
+        state
+            .current_prompt
+            .as_ref()
+            .map(|prompt| prompt.text.as_str()),
+        Some("second")
+    );
     assert!(state.current_turn_id.is_some());
 }
 
@@ -3926,7 +3933,13 @@ async fn cancel_turn_if_only_cancels_the_named_turn() {
         "a stale turn's lease must not cancel the successor"
     );
     assert_eq!(
-        runtime.state.lock().await.current_prompt.as_deref(),
+        runtime
+            .state
+            .lock()
+            .await
+            .current_prompt
+            .as_ref()
+            .map(|prompt| prompt.text.as_str()),
         Some("second"),
         "the successor turn stays live"
     );
@@ -5178,5 +5191,87 @@ async fn compacting_only_short_messages_reports_a_context_that_grew() {
     assert!(
         report.tokens_after > report.tokens_before,
         "the inversion this test exists to pin: {report:?}"
+    );
+}
+
+/// A model that cannot take images degrades the image; it does not wedge the
+/// session.
+///
+/// The failure this pins, and why it is not merely a nicer error: the user's
+/// images are recorded in the session *before* the turn runs, and every turn
+/// re-derives the whole transcript, so a refusal here re-fires on every later
+/// turn — including text-only ones — for as long as the transcript holds that
+/// image. The advice it would carry ("remove the images") is unactionable
+/// because the images left the draft at submit. So the image becomes a sentence
+/// in the text and the turn still goes; what the request actually contained is
+/// `image::tests`, which can inspect it.
+#[tokio::test]
+async fn a_model_that_cannot_take_images_keeps_the_session_usable() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("shot.png");
+    std::fs::write(&image, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1]).unwrap();
+
+    // Two turns, so an exhausted script cannot be mistaken for a refusal.
+    let client = ScriptedClient::new(vec![
+        vec![AgentEvent::Done { usage: None }],
+        vec![AgentEvent::Done { usage: None }],
+    ]);
+    let config = AgentConfig {
+        model: DEEPSEEK_V4_PRO.to_string(),
+        ..AgentConfig::builtin()
+    };
+    let runtime =
+        AgentRuntime::with_system_prompt(client, ToolRegistry::default(), "system", config, false);
+
+    let mut rx = runtime
+        .submit_user(UserTurn::with_images("look at this", vec![image]))
+        .await;
+    let events = drain(&mut rx).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Error { .. })),
+        "the turn must run, with the image degraded: {events:?}"
+    );
+
+    // The turn after it must not be refused for the picture still in the
+    // history — that is the wedge.
+    let mut rx = runtime.submit_user("and now a plain question").await;
+    let events = drain(&mut rx).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Error { .. })),
+        "a text-only turn must not inherit the history's images: {events:?}"
+    );
+}
+
+/// The same turn on Flash goes through. Paired with the test above so the
+/// refusal is pinned to the model's capability rather than to the presence of an
+/// image.
+#[tokio::test]
+async fn the_same_image_turn_is_accepted_on_flash() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("shot.png");
+    std::fs::write(&image, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1]).unwrap();
+
+    let client = ScriptedClient::new(vec![vec![AgentEvent::Done { usage: None }]]);
+    let config = AgentConfig {
+        model: DEEPSEEK_FLASH.to_string(),
+        ..AgentConfig::builtin()
+    };
+    let runtime =
+        AgentRuntime::with_system_prompt(client, ToolRegistry::default(), "system", config, false);
+
+    let mut rx = runtime
+        .submit_user(UserTurn::with_images("look at this", vec![image]))
+        .await;
+    let events = drain(&mut rx).await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Error { .. })),
+        "Flash accepts images, so the turn must run: {events:?}"
     );
 }

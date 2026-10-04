@@ -14,7 +14,8 @@ use std::path::PathBuf;
 use deep_code_agent::{
     AgentConfig, AgentRuntime, ApprovalDecision, ApprovalRequest, CostCurrency, JobStore,
     JsonSessionStore, LaunchedRuntime, RuntimeEvent, SessionRecord, SessionStore,
-    SharedSubAgentManager, TurnTelemetry, default_config_path, launch_runtime,
+    SharedSubAgentManager, TurnTelemetry, UserTurn, default_config_path, launch_runtime,
+    supports_vision_for_model,
 };
 use tokio::sync::mpsc;
 
@@ -29,6 +30,7 @@ mod approval;
 pub(crate) use approval::APPROVAL_ARM_DELAY;
 mod completion;
 mod editor;
+mod images;
 mod selection;
 mod session;
 mod stream;
@@ -55,7 +57,7 @@ enum UiUpdate {
 }
 
 enum StreamRequest {
-    User(String),
+    User(UserTurn),
     Approval(ApprovalDecision),
 }
 
@@ -177,9 +179,12 @@ pub struct App {
     pub(crate) configured_model: String,
     pub(crate) configured_reasoning: String,
     pub(crate) last_telemetry: Option<TurnTelemetry>,
-    pub(crate) prompt_history: Vec<String>,
+    pub(crate) prompt_history: Vec<HistoryPrompt>,
     history_cursor: Option<usize>,
-    history_draft: String,
+    /// The draft `↑` replaced, put back by `↓`. Carries its images too, or
+    /// walking the history would silently strip the pictures out of a draft the
+    /// user was in the middle of writing.
+    history_draft: HistoryPrompt,
     pub(crate) completion: Option<CompletionMenu>,
     pub(crate) workspace_files: Vec<String>,
     /// Resolved once at launch; every runtime swap and store access must
@@ -198,6 +203,15 @@ pub struct App {
     /// show a compact `[粘贴 #N …]` chip in the composer; the real content is
     /// expanded back in on submit. Reset once a turn is sent or input cleared.
     pub(crate) pasted_blocks: Vec<(String, String)>,
+    /// Images attached to the draft, in the order they were attached.
+    ///
+    /// The chips live in `input` as ordinary text and this is the list they
+    /// address — see [`images`] for why the split is worth it. Cleared with the
+    /// input, pruned by [`App::sync_images`] whenever the draft loses a chip.
+    pub(crate) attached_images: Vec<images::AttachedImage>,
+    /// Monotonic source of chip numbers. Never reused, so recalling an old
+    /// prompt cannot make its `#3` mean a different picture than it did.
+    pub(crate) next_image_id: usize,
     /// Geometry + plain text of the last transcript render, so mouse events
     /// can be mapped to a text position for drag-selection.
     pub(crate) transcript: Option<TranscriptSnapshot>,
@@ -333,6 +347,27 @@ pub(crate) enum FoldTarget {
 }
 
 const PROMPT_HISTORY_CAP: usize = 100;
+
+/// One recalled prompt: the text plus the images that were attached to it.
+///
+/// The attachments are kept whole (chips included) rather than as bare paths,
+/// so a recall restores the same `[图片 #2 PNG]` the text refers to — a
+/// re-attach would number them afresh and leave the recalled text pointing at
+/// pictures that no longer exist under those names.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HistoryPrompt {
+    pub(crate) text: String,
+    pub(crate) images: Vec<images::AttachedImage>,
+}
+
+impl HistoryPrompt {
+    /// What `↑` puts back into the composer.
+    fn restore(&self, app: &mut App) {
+        app.input = self.text.clone();
+        app.attached_images = self.images.clone();
+        app.cursor_to_end();
+    }
+}
 /// Cap on prompts queued behind one streaming turn. Reaching it keeps the text
 /// in the composer rather than dropping either end of the queue — the whole
 /// point of steering is that nothing typed gets silently discarded.
@@ -591,7 +626,7 @@ impl App {
             last_telemetry: None,
             prompt_history: Vec::new(),
             history_cursor: None,
-            history_draft: String::new(),
+            history_draft: HistoryPrompt::default(),
             completion: None,
             workspace_files,
             workspace,
@@ -599,6 +634,8 @@ impl App {
             streaming_since: None,
             pending_launch_warnings: Vec::new(),
             pasted_blocks: Vec::new(),
+            attached_images: Vec::new(),
+            next_image_id: 0,
             transcript: None,
             selection: None,
             mouse_down: None,
@@ -736,6 +773,11 @@ impl App {
         self.input.clear();
         self.input_cursor = 0;
         self.pasted_blocks.clear();
+        // The chips went with the text, so the attachments have to go too —
+        // `sync_images` would drop them on the next edit anyway, but a cleared
+        // composer that still holds images would count against the per-message
+        // cap for no visible reason.
+        self.attached_images.clear();
     }
 
     /// Esc cancel stack: close completion menu > deny approval (handled by

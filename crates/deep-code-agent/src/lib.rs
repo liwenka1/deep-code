@@ -13,6 +13,7 @@ mod event;
 mod execution_policy;
 mod extensions;
 pub mod i18n;
+mod image;
 mod lsp;
 mod message;
 mod model;
@@ -68,13 +69,24 @@ pub use execution_policy::{
     NetworkMode, PermissionMode, RiskLevel, SafetyNote, SharedPermissionMode, shell_command_of,
 };
 pub use i18n::{Lang, TextId, tr, tr_with};
+// The TUI reads the clipboard and writes the bytes, the runtime reads them back
+// and builds the URL, and compaction charges them against the window. All three
+// sides come through here so there is exactly one definition of what an
+// acceptable image is.
+pub use image::{
+    Attachment, ImageDetail, ImageError, ImageFormat, ImageRef, MAX_IMAGE_BYTES,
+    MAX_IMAGES_PER_MESSAGE, MAX_TOKENS_PER_IMAGE, MAX_TOTAL_BYTES, StoreError, data_url, hydrate,
+    inspect, store,
+};
 // Already reachable through `AgentRuntime::session_messages`'s signature;
 // exported so consumers (the headless driver) can actually name them.
 pub use message::{Message, Role};
 pub use model::{
     ChatRequest, FunctionCallDelta, ToolCallDelta, ToolCallFunctionPayload, ToolCallPayload, Usage,
 };
-pub use model_registry::{AUTO_MODEL, DEEPSEEK_FLASH, DEEPSEEK_V4_PRO, ModelRegistry};
+pub use model_registry::{
+    AUTO_MODEL, DEEPSEEK_FLASH, DEEPSEEK_V4_PRO, ModelRegistry, supports_vision_for_model,
+};
 // The TUI writes into `<workspace>/.deep-code` too (the stderr log), and every
 // writer of that directory has to enforce the same "we own it, so it must be a
 // real directory" rule. Exported rather than re-spelled: two independent
@@ -84,7 +96,8 @@ pub use pricing::{CostCurrency, CostEstimate};
 pub use root_grant::REQUEST_WRITE_ROOT_TOOL;
 pub use runtime::{
     AgentRuntime, CompactionReport, PrefixStatus, RuntimeEvent, RuntimeEventReceiver, ToolCallId,
-    TurnId, TurnTelemetry, is_network_tool, session_consent_recordable, unattended_denial_note,
+    TurnId, TurnTelemetry, UserTurn, is_network_tool, session_consent_recordable,
+    unattended_denial_note,
 };
 pub use runtime_launch::{LaunchedRuntime, launch_runtime, web_enabled};
 pub use sandbox::{Enforcement, EnforcementGap, sandbox_available, sandbox_enforcement};

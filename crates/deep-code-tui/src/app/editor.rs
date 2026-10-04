@@ -24,6 +24,17 @@ impl App {
         if self.input_cursor == 0 {
             return;
         }
+        // A chip is one thing to the user, so it is one thing to Backspace.
+        // Stepping into `[图片 #1 PNG]` a character at a time is never what
+        // someone means, and it would leave a half-eaten chip for
+        // `sync_images` to throw away — the picture vanishing with no gesture
+        // that looks like it removed it.
+        if let Some(index) = self.chip_ending_at_cursor() {
+            let cursor = self.input_cursor.min(char_count(&self.input));
+            let start = cursor.saturating_sub(char_count(&self.attached_images[index].chip));
+            self.cut_chip(start, cursor);
+            return;
+        }
         let target = self.input_cursor.saturating_sub(1);
         if remove_char_at(&mut self.input, target) {
             self.input_cursor = target;
@@ -47,8 +58,33 @@ impl App {
         if self.input_cursor >= char_count(&self.input) {
             return;
         }
+        // Mirror of Backspace: a chip in front of the cursor goes as a unit.
+        if let Some(index) = self.chip_starting_at_cursor() {
+            let start = self.input_cursor;
+            let end = start + char_count(&self.attached_images[index].chip);
+            self.cut_chip(start, end);
+            return;
+        }
         remove_char_at(&mut self.input, self.input_cursor);
         // cursor stays — next char slides left into its place.
+        self.history_cursor = None;
+        self.refresh_completion();
+    }
+
+    /// Remove one attachment chip as a unit.
+    ///
+    /// `start`/`end` are char indices into `input`: Backspace deletes a chip that
+    /// ends at the cursor, Delete deletes one that starts there, and both land
+    /// here so the two paths cannot drift on the other bookkeeping.
+    ///
+    /// The attachment itself is *not* removed here — `sync_images`, reached
+    /// through `refresh_completion`, drops it only once no copy of its chip is
+    /// left in the draft. That is what makes a chip the user copied and pasted a
+    /// second time behave: deleting one copy keeps the image, because the other
+    /// copy is still addressing it, and deleting the last one takes it away.
+    fn cut_chip(&mut self, start: usize, end: usize) {
+        self.drain_chars(start, end);
+        self.input_cursor = start;
         self.history_cursor = None;
         self.refresh_completion();
     }
@@ -90,7 +126,7 @@ impl App {
         self.input_cursor = char_count(&self.input);
     }
 
-    fn insert_str_at_cursor(&mut self, text: &str) {
+    pub(crate) fn insert_str_at_cursor(&mut self, text: &str) {
         let cursor = self.input_cursor.min(char_count(&self.input));
         let byte = byte_idx(&self.input, cursor);
         self.input.insert_str(byte, text);
@@ -106,6 +142,20 @@ impl App {
     pub fn paste_str(&mut self, text: String) {
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         if normalized.is_empty() {
+            // An empty paste is a signal, not a no-op. A pasteboard carrying
+            // pixels and no text — a screenshot — leaves some terminals with
+            // nothing to send, and those that send the empty paste anyway are
+            // telling us a paste was requested. Nothing else an empty paste could
+            // mean, and the clipboard read is the only way to find out.
+            self.attach_clipboard_image_quietly();
+            return;
+        }
+        // A drag-and-drop arrives as the file's path, so this is the only thing
+        // between "drag an image in" and reading a `/Users/…` path back off your
+        // own screen. All-or-nothing: a paste that merely mentions a path is
+        // text, which is what `@` and `/image` are for. The clipboard fallback
+        // for a bare *name* a terminal handed over lives in there too.
+        if self.attach_pasted_images(&normalized) {
             return;
         }
         let multiline = normalized.contains('\n');
@@ -213,7 +263,7 @@ impl App {
         self.input_cursor = i;
     }
 
-    fn drain_chars(&mut self, start: usize, end: usize) {
+    pub(crate) fn drain_chars(&mut self, start: usize, end: usize) {
         if start >= end {
             return;
         }
@@ -333,15 +383,20 @@ impl App {
         }
         let cursor = match self.history_cursor {
             None => {
-                self.history_draft = std::mem::take(&mut self.input);
+                // Park the in-progress draft, images and all, so `↓` puts back
+                // what the user was actually writing.
+                self.history_draft = HistoryPrompt {
+                    text: std::mem::take(&mut self.input),
+                    images: std::mem::take(&mut self.attached_images),
+                };
                 self.prompt_history.len() - 1
             }
             Some(0) => 0,
             Some(index) => index - 1,
         };
         self.history_cursor = Some(cursor);
-        self.input = self.prompt_history[cursor].clone();
-        self.cursor_to_end();
+        let recalled = self.prompt_history[cursor].clone();
+        recalled.restore(self);
     }
 
     /// Walk back toward the draft (Ctrl+N).
@@ -350,25 +405,31 @@ impl App {
             None => {}
             Some(index) if index + 1 < self.prompt_history.len() => {
                 self.history_cursor = Some(index + 1);
-                self.input = self.prompt_history[index + 1].clone();
-                self.cursor_to_end();
+                let recalled = self.prompt_history[index + 1].clone();
+                recalled.restore(self);
             }
             Some(_) => {
                 self.history_cursor = None;
-                self.input = std::mem::take(&mut self.history_draft);
-                self.cursor_to_end();
+                let draft = std::mem::take(&mut self.history_draft);
+                draft.restore(self);
             }
         }
     }
 
     pub(crate) fn remember_prompt(&mut self, prompt: &str) {
-        if self.prompt_history.last().map(String::as_str) != Some(prompt) {
-            self.prompt_history.push(prompt.to_string());
+        if self.prompt_history.last().map(|entry| entry.text.as_str()) != Some(prompt) {
+            // The attachments ride along, so recalling this prompt restores its
+            // pictures rather than text that talks about a `[图片 #1 PNG]` the
+            // composer no longer has.
+            self.prompt_history.push(HistoryPrompt {
+                text: prompt.to_string(),
+                images: self.attached_images.clone(),
+            });
             if self.prompt_history.len() > PROMPT_HISTORY_CAP {
                 self.prompt_history.remove(0);
             }
         }
         self.history_cursor = None;
-        self.history_draft.clear();
+        self.history_draft = HistoryPrompt::default();
     }
 }
