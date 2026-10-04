@@ -6,6 +6,10 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [0.4.12] - 2026-10-04
+
+- Image understanding arrives in the agent and TUI: an image can be attached in four ways, it is sent only to a model that accepts images, and when it cannot be sent the attachment degrades to a one-line note instead.
+
 ## [0.4.11] - 2026-10-03
 
 - A session record now captures whether each tool call was actually put in front of a human, and `/resume` replays that state instead of inferring it: a resumed transcript badges and folds every call exactly as the live session did — a call you answered returns with its `[approved]` / `[denied]` badge, and a call a standing consent resolved without asking folds just as it did live — rather than claiming a badge the record cannot support or un-folding a call that never needed you.
@@ -321,3 +325,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.4.9]: https://github.com/liwenka1/deep-code/compare/v0.4.8...v0.4.9
 [0.4.10]: https://github.com/liwenka1/deep-code/compare/v0.4.9...v0.4.10
 [0.4.11]: https://github.com/liwenka1/deep-code/compare/v0.4.10...v0.4.11
+[0.4.12]: https://github.com/liwenka1/deep-code/compare/v0.4.11...v0.4.12
