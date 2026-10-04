@@ -30,10 +30,10 @@ impl Role {
 
 /// One turn on the wire.
 ///
-/// Serialization is hand-written (see [`ContentField`]) rather than derived,
-/// because one field — `content` — has two legal shapes and which one we emit
-/// depends on a *different* field. Everything else matches what the derive used
-/// to emit, byte for byte.
+/// Serialization is hand-written (see `ContentField`, private) rather than
+/// derived, because one field — `content` — has two legal shapes and which one we
+/// emit depends on a *different* field. Everything else matches what the derive
+/// used to emit, byte for byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub role: Role,

@@ -42,7 +42,8 @@ pub const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 /// The guide's rule: an image below roughly 544×544 is scaled *up*, anything
 /// larger is scaled down to about a 1300×1300 pixel count, and the result is
 /// bounded by 1024 tokens. So this is a ceiling, not an estimate, which is what
-/// makes it safe to charge per image in [`crate::compaction`].
+/// makes it safe to charge per image in `compaction`'s token estimate — that
+/// module is private, so this names it rather than linking to it.
 pub const MAX_TOKENS_PER_IMAGE: u32 = 1024;
 /// Images allowed on one message.
 ///
@@ -405,7 +406,7 @@ fn data_url_of(path: &Path) -> Result<String, ImageError> {
 /// dominant cost is the body itself, which the request has to carry either way,
 /// so this is not where a cache would pay. What it does NOT do is pay twice for
 /// the same file: the inspection below is reused rather than repeated inside
-/// [`data_url_of`].
+/// `data_url_of` (private).
 ///
 /// Nothing here fails a turn. Four things can go wrong with one image — the file
 /// is gone, it is not an image, it is too big, or the chosen model cannot take
@@ -413,7 +414,7 @@ fn data_url_of(path: &Path) -> Result<String, ImageError> {
 /// the model is told what it is missing instead of being silently shown less and
 /// the user keeps their turn. A transcript that already contains an image must
 /// stay sendable after a switch to a model without vision; refusing the request
-/// instead would wedge the session for good (see [`not_accepted_note`]).
+/// instead would wedge the session for good (see `not_accepted_note`, private).
 ///
 /// The caps are applied here too, for the same reason. `MAX_TOTAL_BYTES` is
 /// charged across the *whole request* — a session that has accumulated images
