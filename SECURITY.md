@@ -129,15 +129,31 @@ review to rediscover:
   commands over untrusted repositories.
 - The irreversible-outward floor (publishing a package, force-pushing over
   someone's commits, merging a PR, applying infrastructure, deleting a bucket)
-  is a **consent** gate, not a containment boundary. Its promise is narrow and
-  stated as such: no routine spelling of those commands runs unless the user
-  authorized that class of command. It reads the argv, it is liftable by one
+  is a **consent** gate, not a containment boundary, and it is enforced by
+  refusing every automatic path rather than by refusing the human: it asks in
+  every interactive tier (yolo included), is auto-denied where nobody can answer
+  (headless, a sub-agent — neither a dispatch-level `allow_commands` nor the
+  network grant lifts it), and stops asking only for a class the user authorized
+  with `[sandbox] allow_irreversible`. Its promise is narrow and stated as such:
+  no routine spelling of those commands runs unless the user authorized that
+  class of command. It reads the argv, it is liftable by one
   configuration entry the user writes, and an obfuscation it cannot read walks
   past it. So does a leading global option that takes a value — `kubectl -n prod
   delete pod api` is not refused, `kubectl delete -n prod pod api` is — because
   reading that correctly means modelling each program's option arity, which is a
   parser rather than a floor. The class is kept short on purpose: a floor that
   strands legitimate work is a floor someone turns off.
+- A sub-agent can be given commands outside its built-in trust list by
+  `allow_commands` on the dispatch, and that is a widening a human approves once
+  (the dispatch prompt names the commands). It is scoped to that one child: it
+  cannot reach the parent's own policy, cannot be raised by a child for its own
+  children, and cannot lift the irreversible floor. Its approval follows the
+  session like any other dispatch — under `yolo` a dispatch is auto-approved, so
+  the model can widen a child's reach without anyone reading it, which is the
+  same thing yolo already lets it do in the parent. So does a config
+  `auto_allow` entry naming `agent`: a standing consent to a TOOL covers every
+  dispatch of it, including one carrying `allow_commands` or `network: true` —
+  the entry list is a per-tool decision, and these are arguments of that tool.
 - Windows has no filesystem or network confinement; an unattended command
   there runs only a real `.exe`/`.com` (cmd builtins and `.cmd`/`.bat`
   wrappers are refused, not routed through `cmd.exe`).
@@ -374,12 +390,22 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
   `deepcode doctor`、状态栏常驻标记、以及 eval 侧的硬拒绝(eval 会在不受信仓库上
   自动批准模型命令)。
 - "不可逆对外"地板(发布包、强推覆盖他人提交、合并 PR、apply 基础设施、删对象
-  存储)是**同意**门,不是约束边界。它的承诺是窄的,而且就按窄的写:这些命令的常规
+  存储)是**同意**门,不是约束边界;它的执行方式是"拒绝一切自动通道",而不是"拒绝人":
+  它在**每个**交互档位都问人(yolo 也一样),在没人能回答的地方自动拒绝(无头运行、子代理
+  ——派遣时的 `allow_commands` 和网络授权都掀不动它),只有在你用 `[sandbox]
+  allow_irreversible` 授权了该类命令之后才不再问。它的承诺是窄的,而且就按窄的写:这些命令的常规
   拼写一旦未经用户对该类命令的授权,就不运行。它读的是 argv,可以由用户写一条配置
   解除,而它读不懂的混淆写法会绕过去;会绕过去的还有"带值的前置全局选项"——
   `kubectl -n prod delete pod api` 不会被拒,`kubectl delete -n prod pod api` 会,
   因为要正确读出前者就得给每个程序建选项元数模型,那是解析器而不是地板。这一类刻意
   保持很短——把正当工作搞死的地板,下场是被人关掉。
+- 子代理可以通过派遣时的 `allow_commands` 获得白名单之外的具体命令,这是一次由人批准的
+  放宽(派遣提示会列出命令名)。它只作用于那一个孩子:碰不到父会话自己的策略,不能由孩子
+  再下传给孙代理,也掀不动不可逆地板。它的批准和别的派遣一样跟随会话档位——yolo 下派遣本身
+  是自动批准的,所以模型可以在没人读的情况下放宽孩子的能力,这与 yolo 已经允许它在父会话里
+  做的事是同一件。配置里的 `auto_allow` 条目写了 `agent` 也一样:对某个**工具**的常设同意
+  覆盖它的每一次派遣,包括带 `allow_commands` 或 `network: true` 的那种——那张表是按工具做的
+  决定,而这些是那个工具的参数。
 - Windows 没有文件系统与网络约束;免审命令在那里只运行真正的 `.exe`/`.com`
   (cmd 内建与 `.cmd`/`.bat` 包装拒绝执行,不回落到 `cmd.exe`)。
 - 工作区内的符号链接会解析到外面;创建它要一次提示,而自带链接的仓库在打开

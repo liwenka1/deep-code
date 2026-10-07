@@ -255,6 +255,62 @@ fn a_parked_root_grant_starts_focused_on_deny() {
     );
 }
 
+/// An irreversible command joins the deny-by-default set — and must not offer
+/// "a" either.
+///
+/// Both halves follow from the floor becoming a parked decision instead of a
+/// refusal: the panel now SEES these prompts for the first time, so every
+/// behavior keyed on "what kind of prompt is this" had to be taught about them.
+/// A default of approve would put the reflex `Enter` on publishing a package or
+/// applying infrastructure, and an "a" would print an option whose real effect is
+/// one-time — the gate refuses `needs-human` above session memory, so a recorded
+/// identity could never be read.
+#[test]
+fn a_parked_irreversible_command_starts_focused_on_deny_without_a_session_option() {
+    let irreversible = deep_code_agent::ApprovalRequest {
+        network: false,
+        call_id: "call_publish".to_string(),
+        tool_name: "shell".to_string(),
+        description: "publish".to_string(),
+        arguments: serde_json::json!({ "command": "npm publish" }),
+        risk_level: deep_code_agent::RiskLevel::High,
+        requires_sandbox: true,
+        read_only: false,
+        matched_rule: Some("needs-human:irreversible:npm publish".to_string()),
+        justification: None,
+        resolved_target: None,
+        preview: None,
+        safety_notes: Vec::new(),
+    };
+
+    let mut app = App::new();
+    app.park_approval(irreversible.clone());
+    assert!(
+        !app.pending_offers_session_consent(),
+        "an irreversible command records nothing, so the panel must not offer \"a\""
+    );
+    assert_eq!(
+        app.approval_focus, 1,
+        "the prompt renders y/n, so index 1 is deny — a reflex Enter must not publish"
+    );
+
+    // The same shape WITHOUT the floor keeps the ordinary default and keeps
+    // offering "a", so both assertions above are about the rule id rather than
+    // about shell commands in general.
+    let ordinary = deep_code_agent::ApprovalRequest {
+        matched_rule: None,
+        arguments: serde_json::json!({ "command": "npm run test:e2e" }),
+        risk_level: deep_code_agent::RiskLevel::Medium,
+        ..irreversible
+    };
+    app.park_approval(ordinary);
+    assert!(
+        app.pending_offers_session_consent(),
+        "an ordinary command still offers a session consent"
+    );
+    assert_eq!(app.approval_focus, 0, "and keeps the approve default");
+}
+
 /// The network-native tools reach the network without declaring it, so the
 /// deny-by-default rule must recognize them by KIND.
 ///

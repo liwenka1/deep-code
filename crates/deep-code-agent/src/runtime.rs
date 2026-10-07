@@ -707,6 +707,21 @@ impl AgentRuntime {
                 Some(SUBAGENT_NETWORK_DENIAL.to_string()),
             );
         }
+        // Before the shell wall, because the remedies differ: this one is
+        // "authorize that class of command", not "work within the allow-list" —
+        // and `allow_commands` cannot lift it either (the floor is checked before
+        // trust, so a declared `git push` still cannot force-push for a child).
+        //
+        // Read off the plan this function just derived, NOT off
+        // `request.matched_rule`: that field is filled in by the registry for the
+        // panel's benefit, and a decision this consequential must not depend on
+        // whether the caller populated a display field.
+        if crate::execution_policy::is_needs_human_rule(plan.matched_rule.as_deref()) {
+            return (
+                ApprovalDecision::Denied,
+                Some(SUBAGENT_NEEDS_HUMAN_DENIAL.to_string()),
+            );
+        }
         if matches!(
             kind,
             crate::execution_policy::ToolKind::Shell | crate::execution_policy::ToolKind::Job
@@ -741,6 +756,13 @@ sub-agents run unattended, so shell commands outside the trusted allow-list (git
 status/diff/log, cargo build/test/check, …) are auto-denied. Work within read tools and \
 allow-listed commands, or state what you need in your final report.";
 
+const SUBAGENT_NEEDS_HUMAN_DENIAL: &str = "Denied by sub-agent policy (no user saw this \
+request): this command is irreversible and outward-facing (publishing, force-pushing, merging, \
+applying infrastructure), and only a person can authorize that — a child's prompts are \
+auto-denied, so there is nobody to ask here. A dispatch-level `allow_commands` does not lift \
+this, and neither does the network grant. Do not retry it; state the need in your final report \
+so the parent can run it (or the user can add it to [sandbox] allow_irreversible).";
+
 const SUBAGENT_UNATTENDED_DENIAL: &str = "Denied by sub-agent policy (no user saw this \
 request): sub-agents run unattended, so calls that need approval are auto-denied. Work \
 within your granted tools, or state what you need in your final report.";
@@ -774,6 +796,13 @@ pub fn unattended_denial_note(request: &ApprovalRequest) -> String {
     if approval_flow::is_root_grant(&request.tool_name) {
         return UNATTENDED_ROOT_GRANT_DENIAL.to_string();
     }
+    // The irreversible floor parks a decision, and this is the run where nobody
+    // can answer it. Without this arm the model would read the generic "nobody is
+    // here" text and retry a command whose remedy is a different sentence
+    // entirely.
+    if crate::execution_policy::is_needs_human_rule(request.matched_rule.as_deref()) {
+        return UNATTENDED_NEEDS_HUMAN_DENIAL.to_string();
+    }
     UNATTENDED_DENIAL.to_string()
 }
 
@@ -783,6 +812,13 @@ every gated call is auto-denied. Retrying the same call cannot change the answer
 within the tools that run without asking, or state what you needed in your final answer so \
 the operator can re-run with it granted (`approval.auto_allow`, or a more permissive \
 permission mode).";
+
+const UNATTENDED_NEEDS_HUMAN_DENIAL: &str = "Denied by this run's approval policy (no user \
+saw this request): this command is irreversible and outward-facing (publishing, force-pushing, \
+merging, applying infrastructure), and only a person can authorize it — this session is running \
+unattended, so there is nobody to ask. Retrying cannot change the answer. State the need in \
+your final answer, and the operator can authorize that class of command for good with \
+`[sandbox] allow_irreversible`.";
 
 const UNATTENDED_ROOT_GRANT_DENIAL: &str = "Denied by this run's approval policy (no user \
 saw this request): widening the write boundary always requires a human decision, and this \

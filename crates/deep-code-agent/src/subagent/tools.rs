@@ -76,6 +76,23 @@ pub struct AgentParams {
     network: Option<bool>,
     /// Optional display name (shown by /agents).
     name: Option<String>,
+    /// Command identities this child may run unattended (`"git push"`,
+    /// `"npm run test:e2e"`). Each entry is a command identity — the same
+    /// vocabulary as the trusted list: a program word plus, when it has one, its
+    /// subcommand. `"git push"` covers `git push origin main`; a bare program
+    /// name covers that program entirely, so write the longest run you mean.
+    ///
+    /// This grants reach, NOT egress: a command that needs the network still
+    /// needs `network: true` as well, and an ungranted child's push will fail on
+    /// the connection rather than being refused.
+    ///
+    /// Use it only when the task genuinely needs to run such a command itself: a
+    /// child's own prompts are auto-denied (nobody watches them), so without this
+    /// its shell reach stops at the built-in trusted list, in every mode — and
+    /// this dispatch is the one place a human can still be asked. Declaring it
+    /// raises an approval prompt naming the commands; the alternative, for work
+    /// the parent can do itself, is not to dispatch at all.
+    allow_commands: Option<Vec<String>>,
 }
 
 #[async_trait]
@@ -92,7 +109,9 @@ impl Tool for AgentTool {
          investigations or delegated changes whose conclusion is much smaller than the work — \
          the child burns its own context, the parent only receives the report. Children have no \
          network unless dispatched with network=true (goes through user approval): a granted \
-         child gets fetch_url/web_search and its allow-listed commands run with egress."
+         child gets fetch_url/web_search and its allow-listed commands run with egress. A \
+         child's shell reach otherwise stops at the built-in trusted list; allow_commands adds \
+         specific command identities and is its own approval point."
     }
 
     async fn run(&self, params: AgentParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {
@@ -156,11 +175,18 @@ impl Tool for AgentTool {
         let child_ui_lang = crate::i18n::SharedLang::new(crate::i18n::Lang::from_env(
             &self.services.agent_config.language,
         ));
+        // Normalized with the SAME helper the policy engine used to decide
+        // whether this dispatch needed approval: the panel must have authorized
+        // exactly the set the child receives, no more and no less.
+        let allow_commands = crate::execution_policy::normalize_allow_commands(
+            &params.allow_commands.unwrap_or_default(),
+        );
         let (child_tools, child_jobs) = child_tool_registry(
             &self.services.boundary,
             role,
             self.services.exec_policy.clone(),
             network,
+            &allow_commands,
             &child_ui_lang,
         );
         // Reconnaissance roles run pinned to the flash tier (a fixed model id

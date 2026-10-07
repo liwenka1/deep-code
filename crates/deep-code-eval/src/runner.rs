@@ -282,6 +282,32 @@ Requirements:\n\
     )
 }
 
+/// What this harness answers on the model's behalf, since a rollout has no user.
+///
+/// It approves what it can — that is the point of an unattended rollout — and
+/// denies exactly the prompts whose answer is a decision only a person makes.
+/// There are two now, and the second is easy to miss: the irreversible-outward
+/// floor used to be a hard `Deny` no consumer could override, and it is a parked
+/// decision instead, so its enforcement moved HERE. A harness that approved
+/// everything but a root grant would have gone on approving force-pushes and
+/// publishes.
+///
+/// Extracted from the event loop so the predicate is testable without a rollout.
+fn unattended_decision(
+    request: &deep_code_agent::ApprovalRequest,
+) -> (ApprovalDecision, Option<String>) {
+    let needs_a_person = request.tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL
+        || deep_code_agent::is_needs_human_rule(request.matched_rule.as_deref());
+    if needs_a_person {
+        (
+            ApprovalDecision::Denied,
+            Some(deep_code_agent::unattended_denial_note(request)),
+        )
+    } else {
+        (ApprovalDecision::Approved, None)
+    }
+}
+
 /// Run the agent on a single benchmark instance.
 async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> InstanceResult {
     let instance_id = instance.instance_id().to_string();
@@ -467,15 +493,7 @@ async fn consume_events(
                 // "User declined the write-root request" would teach the model
                 // a refusal that never happened — here, in a rollout whose
                 // whole output is what the model did next.
-                let (decision, denial_note) =
-                    if request.tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL {
-                        (
-                            ApprovalDecision::Denied,
-                            Some(deep_code_agent::unattended_denial_note(request)),
-                        )
-                    } else {
-                        (ApprovalDecision::Approved, None)
-                    };
+                let (decision, denial_note) = unattended_decision(request);
                 receiver = launched
                     .handle
                     .submit_approval_with_denial_note(decision, denial_note)
@@ -865,5 +883,64 @@ mod tests {
         assert!(prompt.contains("git checkout of x/x"));
         assert!(prompt.contains("<issue>\nSomething is broken\n</issue>"));
         assert!(prompt.contains("Do NOT modify any test files"));
+    }
+
+    fn approval_request(
+        tool: &str,
+        matched_rule: Option<&str>,
+    ) -> deep_code_agent::ApprovalRequest {
+        deep_code_agent::ApprovalRequest {
+            network: false,
+            call_id: "c1".to_string(),
+            tool_name: tool.to_string(),
+            description: "run".to_string(),
+            arguments: serde_json::json!({"command": "git push --force"}),
+            risk_level: deep_code_agent::RiskLevel::High,
+            requires_sandbox: true,
+            read_only: false,
+            matched_rule: matched_rule.map(str::to_string),
+            justification: None,
+            resolved_target: None,
+            preview: None,
+            safety_notes: Vec::new(),
+        }
+    }
+
+    /// The harness approves what it can, and the two classes nobody may decide
+    /// for the model are refused WITH the reason — a rollout's whole output is
+    /// what the model did next, so a stock "user declined" would teach it a
+    /// refusal that never happened.
+    #[test]
+    fn the_harness_denies_only_what_needs_a_person() {
+        let (decision, note) = unattended_decision(&approval_request(
+            "shell",
+            Some("needs-human:irreversible:git push --force"),
+        ));
+        assert_eq!(decision, ApprovalDecision::Denied);
+        assert!(
+            note.as_deref()
+                .is_some_and(|note| note.contains("allow_irreversible")),
+            "the floor's remedy must reach the model: {note:?}"
+        );
+
+        let (decision, note) = unattended_decision(&approval_request(
+            deep_code_agent::REQUEST_WRITE_ROOT_TOOL,
+            None,
+        ));
+        assert_eq!(decision, ApprovalDecision::Denied);
+        assert!(
+            note.as_deref()
+                .is_some_and(|note| note.contains("--add-dir"))
+        );
+
+        // Everything else is approved, or a rollout could not run at all.
+        assert_eq!(
+            unattended_decision(&approval_request("shell", Some("builtin:untrusted_shell"))),
+            (ApprovalDecision::Approved, None)
+        );
+        assert_eq!(
+            unattended_decision(&approval_request("write_file", None)),
+            (ApprovalDecision::Approved, None)
+        );
     }
 }

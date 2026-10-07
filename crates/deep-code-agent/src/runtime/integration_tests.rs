@@ -5399,3 +5399,106 @@ async fn the_hard_end_of_the_budget_still_stops_the_turn() {
         "the stop names the ceiling that was hit: {error}"
     );
 }
+
+/// Yolo auto-approves everything that REACHES it, and the irreversible floor's
+/// whole claim is that an unauthorized irreversible command does not reach it.
+/// Same shape as the root-grant test above: the strongest automatic path there is
+/// must still leave a human decision.
+#[tokio::test]
+async fn yolo_mode_still_parks_an_irreversible_command() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+
+    let workspace = tempfile::tempdir().unwrap();
+    let (registry, _jobs) = crate::shell_tools::shell_tool_registry(workspace.path()).unwrap();
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::ToolCallDelta {
+            delta: tool_call_delta(
+                "call_force",
+                "shell",
+                r#"{"command":"git push --force origin main","network":true}"#,
+            ),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let runtime = AgentRuntime::new(client, registry)
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Yolo));
+
+    let mut rx = runtime.submit_user("push it").await;
+    let events = drain(&mut rx).await;
+    assert!(
+        matches!(events.last(), Some(RuntimeEvent::ApprovalRequired { .. })),
+        "an unauthorized irreversible command must park even under Yolo: {events:?}"
+    );
+}
+
+/// …and neither does the other standing-consent channel. `auto_allow` is consent
+/// to run a TOOL; this decision is about a command nobody has decided about, so
+/// the strongest thing config can say (`shell`, in full) still leaves it parked.
+#[tokio::test]
+async fn standing_consents_never_cover_an_irreversible_command() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (registry, _jobs) = crate::shell_tools::shell_tool_registry(workspace.path()).unwrap();
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::ToolCallDelta {
+            delta: tool_call_delta("call_publish", "shell", r#"{"command":"npm publish"}"#),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let config = crate::config::AgentConfig {
+        approval_auto_allow: vec!["shell".to_string()],
+        ..crate::config::AgentConfig::builtin()
+    };
+    let runtime = AgentRuntime::with_config(client, registry, config);
+
+    let mut rx = runtime.submit_user("publish it").await;
+    let events = drain(&mut rx).await;
+    assert!(
+        matches!(events.last(), Some(RuntimeEvent::ApprovalRequired { .. })),
+        "an irreversible command must park even with `shell` in auto_allow: {events:?}"
+    );
+}
+
+/// The headless denial notes have to name the real remedy: all four unattended
+/// consumers (headless `-p`, `serve --approval-mode autonomous`, the eval harness
+/// and this crate's own tests) reach the model through this one function, and a
+/// generic "nobody is here" would send it looking for a spelling that gets around
+/// something the operator has to authorize instead.
+#[test]
+fn the_unattended_denial_note_names_the_floor_it_hit() {
+    let request = |tool: &str, matched: Option<&str>| crate::tool::ApprovalRequest {
+        network: false,
+        call_id: "c1".to_string(),
+        tool_name: tool.to_string(),
+        description: "run".to_string(),
+        arguments: serde_json::json!({ "command": "git push --force" }),
+        risk_level: crate::execution_policy::RiskLevel::High,
+        requires_sandbox: true,
+        read_only: false,
+        matched_rule: matched.map(str::to_string),
+        justification: None,
+        resolved_target: None,
+        preview: None,
+        safety_notes: Vec::new(),
+    };
+
+    let floor = crate::unattended_denial_note(&request(
+        "shell",
+        Some("needs-human:irreversible:git push --force"),
+    ));
+    assert!(
+        floor.contains("allow_irreversible"),
+        "the floor's remedy is a config entry, and the note must say so: {floor}"
+    );
+    assert!(
+        !floor.contains("auto_allow"),
+        "and must not send the model after a consent no mode may give: {floor}"
+    );
+
+    // A root grant keeps its own note, and an ordinary gated call keeps the
+    // generic one — so the new arm is not swallowing either.
+    assert!(
+        crate::unattended_denial_note(&request("request_write_root", None)).contains("--add-dir")
+    );
+    let generic = crate::unattended_denial_note(&request("shell", Some("builtin:untrusted_shell")));
+    assert!(generic.contains("auto_allow"), "{generic}");
+}

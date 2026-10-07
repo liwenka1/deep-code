@@ -671,6 +671,23 @@ None.
             ),
             (ApprovalDecision::Approved, None)
         );
+
+        // An IRREVERSIBLE command gets its own denial, not the wall's: the two
+        // remedies differ ("authorize that class of command" against "work within
+        // the allow-list"), and a dispatch-level `allow_commands` lifts the wall
+        // but not this. Checked here rather than in the floor's own tests because
+        // what is being pinned is which NOTE a child receives.
+        let (decision, note) = runtime.subagent_approval_decision(
+            &request("git push --force origin main", true),
+            SubAgentRole::Implementer,
+            true,
+        );
+        assert_eq!(decision, ApprovalDecision::Denied);
+        assert!(
+            note.as_deref()
+                .is_some_and(|note| note.contains("allow_irreversible")),
+            "the note must name the floor's remedy, not the allow-list: {note:?}"
+        );
     }
 
     #[tokio::test]
@@ -902,6 +919,7 @@ None.
                 SubAgentRole::Explore,
                 crate::execution_policy::ExecPolicy::default(),
                 network,
+                &[],
                 &lang,
             )
             .0
@@ -963,6 +981,7 @@ None.
                 SubAgentRole::Explore,
                 ExecPolicy::default().with_network_mode(mode),
                 false, // NOT dispatched with network
+                &[],   // and no allow_commands
                 &lang,
             )
             .0
@@ -1064,5 +1083,104 @@ None.
                 _ => None,
             }
         }
+    }
+
+    /// The half of `allow_commands` that matters: the command is then actually
+    /// APPROVED for the child, not merely asked about at dispatch. Pinned here
+    /// because the dispatch-side test only proves a prompt appears — a feature
+    /// that asks and then denies anyway would pass that one.
+    ///
+    /// Three boundaries ride along, each a claim made elsewhere in comments:
+    /// the match is a command IDENTITY (the sibling subcommand is not covered),
+    /// the floor outranks the declaration (checked before trust, so a declared
+    /// `git push` still cannot force-push), and a declaration grants REACH, not
+    /// egress (a network-declaring command in an ungranted child is still denied).
+    #[tokio::test]
+    async fn allow_commands_grants_that_identity_and_nothing_more() {
+        use crate::execution_policy::ExecPolicy;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let boundary =
+            crate::workspace_policy::WorkspacePolicy::new(workspace.path().to_path_buf())
+                .expect("test workspace must resolve");
+        let lang = crate::i18n::SharedLang::new(crate::i18n::Lang::En);
+        let (registry, _jobs) = crate::subagent::registry::child_tool_registry(
+            &boundary,
+            SubAgentRole::General,
+            ExecPolicy::default(),
+            false, // no network grant
+            &["git push".to_string()],
+            &lang,
+        );
+        let runtime = AgentRuntime::new(SummaryClient, registry);
+        let request = |command: &str, network: bool| ApprovalRequest {
+            network,
+            call_id: "call_1".to_string(),
+            tool_name: "shell".to_string(),
+            description: "run".to_string(),
+            arguments: json!({ "command": command, "network": network }),
+            risk_level: crate::execution_policy::RiskLevel::Medium,
+            requires_sandbox: true,
+            read_only: false,
+            matched_rule: None,
+            justification: None,
+            resolved_target: None,
+            preview: None,
+            safety_notes: Vec::new(),
+        };
+
+        // Declared identity → approved without asking anyone.
+        assert_eq!(
+            runtime.subagent_approval_decision(
+                &request("git push origin main", false),
+                SubAgentRole::General,
+                false
+            ),
+            (ApprovalDecision::Approved, None),
+            "a declared identity must actually run"
+        );
+
+        // Identity, not prefix: the neighbouring subcommand is not covered.
+        let (decision, note) = runtime.subagent_approval_decision(
+            &request("git commit -m x", false),
+            SubAgentRole::General,
+            false,
+        );
+        assert_eq!(decision, ApprovalDecision::Denied);
+        assert!(
+            note.as_deref()
+                .is_some_and(|note| note.contains("allow-list")),
+            "the sibling command faces the ordinary wall: {note:?}"
+        );
+
+        // The floor outranks the declaration.
+        let (decision, note) = runtime.subagent_approval_decision(
+            &request("git push --force origin main", false),
+            SubAgentRole::General,
+            false,
+        );
+        assert_eq!(
+            decision,
+            ApprovalDecision::Denied,
+            "a declared identity must not carry the force flag through"
+        );
+        assert!(
+            note.as_deref()
+                .is_some_and(|note| note.contains("allow_irreversible")),
+            "and it is the floor that stopped it: {note:?}"
+        );
+
+        // Reach is not egress.
+        let (decision, note) = runtime.subagent_approval_decision(
+            &request("git push origin main", true),
+            SubAgentRole::General,
+            false,
+        );
+        assert_eq!(decision, ApprovalDecision::Denied, "no network grant");
+        assert!(
+            note.as_deref()
+                .is_some_and(|note| note.contains("network=true")),
+            "the note points at the missing grant: {note:?}"
+        );
     }
 }

@@ -19,18 +19,23 @@
 //!    `shell_deny::builtin_deny` (via `shell_lex` parsing): a catastrophic shape
 //!    gets a `Deny` verdict before any trust rule is consulted, so nothing can
 //!    allow-list past it. Cannot be disabled by configuration. The plan's one
-//!    *configuration-driven* `Deny`s sit right after it, and there are three:
-//!    a `network: true` declaration (shell, `job start`, or a sub-agent
-//!    dispatch) under `[sandbox] network = "never"` is refused outright rather
-//!    than run offline to fail; a **networked sub-agent dispatch** under the
-//!    same setting (the child would only burn a doomed attempt); and an
-//!    **irreversible-outward command** — publishing, force-pushing, merging a
-//!    PR, applying infrastructure — that no `[sandbox] allow_irreversible`
-//!    entry authorizes. That last floor is a *consent* gate rather than a
-//!    containment boundary, and it is refused rather than prompted on purpose:
-//!    under `Yolo` a prompt is precisely what is missing, so a floor a mode can
-//!    auto-approve would not be a floor. Its promise is narrow and stated as
-//!    such — see `SECURITY.md`.
+//!    *configuration-driven* `Deny`s sit right after it, and there are two: a
+//!    `network: true` declaration (shell, `job start`, or a sub-agent dispatch)
+//!    under `[sandbox] network = "never"` is refused outright rather than run
+//!    offline to fail, and a **networked sub-agent dispatch** under the same
+//!    setting (the child would only burn a doomed attempt).
+//!
+//!    The third floor is not a `Deny` but a park: an **irreversible-outward
+//!    command** — publishing, force-pushing, merging a PR, applying
+//!    infrastructure — that no `[sandbox] allow_irreversible` entry authorizes
+//!    comes back as `NeedsApproval` carrying the `needs-human` rule id. That id
+//!    is what makes it a floor: every automatic path refuses it (stages 4, 5 and
+//!    6 all consult it, so `auto_allow`, session memory, every mode including
+//!    `Yolo`, and the judge are out), while a person can still authorize one run
+//!    — the root grant's shape, and for the same reason. Where nobody can answer
+//!    (a headless run, a child) the unanswered park becomes a denial whose note
+//!    names the remedy. Its promise is narrow and stated as such — see
+//!    `SECURITY.md`.
 //! 2. **Yolo egress overlay** — `runtime::tool_result::yolo_ambient_network`.
 //!    The one post-hoc edit to the plan: under `Yolo`, ambient network rides a
 //!    sandboxed plan. It never touches the verdict. (`[sandbox] network =
@@ -52,10 +57,12 @@
 //!    granularity in one shared set ([`command_shape::session_identity`]); a
 //!    job control action (status/tail/cancel), a sub-agent dispatch or a
 //!    compound command records no session consent at all
-//!    (`session_consent_recordable`). One exclusion sits *above* both consents:
-//!    `request_write_root` is never covered by `auto_allow` or session memory
-//!    (`auto_approval_granted` refuses it before consulting either), so no
-//!    standing consent can pre-approve a boundary widening.
+//!    (`session_consent_recordable`, which also refuses an irreversible command:
+//!    a recorded identity for one could never be read). Two exclusions sit
+//!    *above* both consents: `request_write_root` and a `needs-human` plan are
+//!    never covered by `auto_allow` or session memory (`auto_approval_granted`
+//!    refuses them before consulting either), so no standing consent can
+//!    pre-approve a boundary widening or an irreversible command.
 //! 5. **Permission mode** — `runtime::approval_flow`, keyed on
 //!    [`PermissionMode`]: `Default` asks, `AcceptEdits` waves through workspace
 //!    file edits, the dispatch of a writing sub-agent and filesystem-shaped
@@ -63,11 +70,12 @@
 //!    spelled relative and in-tree; the sandbox bounds their writes), `Auto`
 //!    inherits that
 //!    AcceptEdits allowance and consults the judge below for the rest, `Yolo`
-//!    waves through all but a root grant.
+//!    waves through all but a root grant and a `needs-human` call.
 //! 6. **Auto judge** — the cheap classifier. It only ever sees a call that has
 //!    already cleared three gates it cannot override: a root grant
-//!    (`request_write_root`) is never auto-approved in any mode — it asks a
-//!    human, or is refused before the prompt (below), egress (a network-native
+//!    (`request_write_root`) — and a `needs-human` call, an unauthorized
+//!    irreversible command — is never auto-approved in any mode; it asks a human,
+//!    or is refused before the prompt (below), egress (a network-native
 //!    tool or a declared `network`) is decided before the judge is consulted, and
 //!    the top risk tier never reaches it: a High-tier call asks unless the
 //!    inherited AcceptEdits allowance already covers it (an untrusted `mkdir
@@ -142,7 +150,8 @@ mod shell_lex;
 
 pub use engine::{
     ExecPolicy, NetworkMode, PolicyVerdict, RiskLevel, SandboxMode, ToolExecutionPlan, ToolKind,
-    accept_edits_approvable, justification_claimed, network_requested, shell_command_of,
+    accept_edits_approvable, is_needs_human_rule, justification_claimed, network_requested,
+    normalize_allow_commands, shell_command_of,
 };
 pub use permission_mode::{PermissionMode, SharedPermissionMode};
 pub use shell_deny::{SafetyNote, safety_notes};

@@ -62,10 +62,19 @@ pub(super) fn session_allowable(tool_name: &str) -> bool {
 /// Whether answering "approve for the session" at this prompt would record
 /// anything at all: either the tool is `session_allowable` by name, or the
 /// call is one simple shell command whose identity can be remembered
-/// (`shell_consent_identity`). `false` means "a" would silently downgrade to
-/// a one-time approve — a UI reads this to offer only the options that mean
-/// what they say, and it is the same two rules the recording path applies, so
-/// the panel and the runtime cannot disagree about what "a" does.
+/// (`shell_consent_identity`) — and in neither case is it a `needs-human` call.
+/// `false` means "a" would silently downgrade to a one-time approve: a UI reads
+/// this to offer only the options that mean what they say, and it is the same
+/// rules the recording path applies, so the panel and the runtime cannot
+/// disagree about what "a" does.
+///
+/// `needs-human` is the third rule and the reason this takes the rule id: an
+/// irreversible command is refused to every automatic path ABOVE this question
+/// (`auto_approval_granted` returns before consulting session memory), so a
+/// recorded identity for it would never be read. Offering "a" would print an
+/// option whose effect is "this once" — and, worse here than elsewhere, the
+/// identity a shell consent records drops the flags, so "I approved that force
+/// push for the session" would have been remembered as plain `git push`.
 ///
 /// Takes the arguments by reference all the way down, because a UI asks this
 /// on the *render* path — the approval panel decides between `y/a/n` and `y/n`
@@ -73,7 +82,14 @@ pub(super) fn session_allowable(tool_name: &str) -> bool {
 /// a deep clone of the call's whole JSON argument object per frame, for a
 /// question that only ever reads one string out of it.
 #[must_use]
-pub fn session_consent_recordable(tool_name: &str, arguments: &serde_json::Value) -> bool {
+pub fn session_consent_recordable(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    matched_rule: Option<&str>,
+) -> bool {
+    if crate::execution_policy::is_needs_human_rule(matched_rule) {
+        return false;
+    }
     session_allowable(tool_name) || shell_consent_identity(tool_name, arguments).is_some()
 }
 
@@ -249,6 +265,26 @@ impl AgentRuntime {
         // which is what bounds an auto-approved command wherever anything
         // bounds it, so no mode and no standing consent may hand it over.
         if is_root_grant(&call.name) {
+            return None;
+        }
+        // A plan marked `needs-human` (today: an irreversible-outward command)
+        // joins the root grant at this height — ABOVE config `auto_allow`, above
+        // session memory, above every permission mode and above the judge — for
+        // the same reason: it is a decision only a person makes, and no standing
+        // consent was ever collected for it. It sits above `is_subagent` too, so
+        // the ordering cannot be read as "a child skips this check".
+        //
+        // The two differ in what the human gets, and that difference is the whole
+        // point: a root grant is a boundary widening nobody may pre-approve,
+        // while an irreversible command IS something a person can authorize for
+        // one run. So this one parks a decision instead of being refused, and the
+        // unattended consumers (`subagent_approval_decision`,
+        // `unattended_denial_note`) turn that unanswered park into a denial with
+        // a note naming the floor.
+        //
+        // Yolo included: it auto-approves everything that reaches it, and the
+        // point of this check is that this call does not reach it.
+        if crate::execution_policy::is_needs_human_rule(request.matched_rule.as_deref()) {
             return None;
         }
         // Inside a sub-agent NONE of the channels below apply: a child's gated
@@ -439,7 +475,20 @@ impl AgentRuntime {
         // get the one-time approval (`session_consent_recordable` is the
         // panel-side view of these same two rules).
         let decision = if decision == ApprovalDecision::ApprovedForSession {
-            if session_allowable(&current.name) {
+            // A `needs-human` call records NOTHING, and this is the enforcement
+            // half of `session_consent_recordable`'s contract (the panel's
+            // option list is the other). Re-derived from the registry rather than
+            // carried in the parked batch, matching how the two rules beside it
+            // already work (`session_allowable` by name, `shell_consent_key` from
+            // the call): `evaluate_tool` is a pure function of the call and the
+            // policy, so this is the same plan the panel was shown.
+            let needs_human = crate::execution_policy::is_needs_human_rule(
+                self.tools.evaluate_tool(&current).matched_rule.as_deref(),
+            );
+            if needs_human {
+                // Fall through to a plain one-time approve: the human said yes,
+                // and the only thing refused here is remembering it.
+            } else if session_allowable(&current.name) {
                 self.state
                     .lock()
                     .await
@@ -1037,20 +1086,31 @@ mod tests {
     /// The panel-side predicate agrees with the recording path: it is true
     /// exactly when "a" records something — a by-name consent, or a shell
     /// identity — and false wherever "a" would silently become a one-time
-    /// approve (job cancel, a compound command, a dispatch, a root grant).
+    /// approve (job cancel, a compound command, a dispatch, a root grant, an
+    /// irreversible command).
     #[test]
-    fn session_consent_recordable_mirrors_the_two_recording_rules() {
+    fn session_consent_recordable_mirrors_the_recording_rules() {
         assert!(session_consent_recordable(
             "write_file",
-            &json!({ "path": "x", "content": "y" })
+            &json!({ "path": "x", "content": "y" }),
+            None
         ));
         assert!(session_consent_recordable(
             "shell",
-            &json!({ "command": "cargo test --all" })
+            &json!({ "command": "cargo test --all" }),
+            None
         ));
         assert!(session_consent_recordable(
             "job",
-            &json!({ "action": "start", "command": "cargo test" })
+            &json!({ "action": "start", "command": "cargo test" }),
+            None
+        ));
+        // A declared networked command still records its identity: egress is a
+        // separate grant, remembered with its flag.
+        assert!(session_consent_recordable(
+            "shell",
+            &json!({ "command": "git push origin main", "network": true }),
+            None
         ));
         for (tool, arguments) in [
             ("shell", json!({ "command": "cargo test && rm -rf /" })),
@@ -1063,10 +1123,64 @@ mod tests {
             ("request_write_root", json!({ "path": "/tmp/x" })),
         ] {
             assert!(
-                !session_consent_recordable(tool, &arguments),
+                !session_consent_recordable(tool, &arguments, None),
                 "{tool} {arguments} must not offer a session consent"
             );
         }
+    }
+
+    /// An irreversible command offers no session consent, and the reason is not
+    /// theoretical: the gate refuses `needs-human` ABOVE session memory
+    /// (`auto_approval_granted` returns before consulting it), so a recorded
+    /// identity could never be read — "a" would print an option meaning "this
+    /// once". The identity a shell consent records also drops flags, so a
+    /// remembered force-push would have surfaced as plain `git push`.
+    ///
+    /// Pinned on the predicate the panel prints its options from AND on the
+    /// decision the recording path makes: "the panel offered y/n" and "nothing
+    /// was recorded" have to stay the same answer.
+    #[tokio::test]
+    async fn an_irreversible_command_records_no_session_consent() {
+        const RULE: Option<&str> = Some("needs-human:irreversible:git push --force");
+        assert!(!session_consent_recordable(
+            "shell",
+            &json!({ "command": "git push --force origin main" }),
+            RULE
+        ));
+        // The same command without the floor IS recordable, so the assertion
+        // above is about the rule id rather than the command's shape.
+        assert!(session_consent_recordable(
+            "shell",
+            &json!({ "command": "git push origin main" }),
+            None
+        ));
+
+        // …and the recording path refuses even when a caller sends
+        // `ApprovedForSession` for a floor call (a programmatic consumer can).
+        let runtime = AgentRuntime::new(
+            crate::echo_client::EchoClient::new(crate::i18n::SharedLang::default()),
+            crate::tool::ToolRegistry::new(),
+        );
+        let pending = PendingToolBatch {
+            current: crate::tool::ToolCall::new(
+                "c1",
+                "shell",
+                json!({ "command": "git push --force origin main" }),
+            ),
+            remaining: std::collections::VecDeque::new(),
+            turn_id: crate::runtime::event::TurnId("turn_1".to_string()),
+            root_grant_target: None,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime
+            .handle_approval(pending, ApprovalDecision::ApprovedForSession, None, &tx)
+            .await;
+        let state = runtime.state.lock().await;
+        assert!(
+            state.session_trusted_shell_prefixes.is_empty(),
+            "a floor call must record nothing: {:?}",
+            state.session_trusted_shell_prefixes
+        );
     }
 
     /// The network-native tools take no standing consent by name.
@@ -1089,7 +1203,7 @@ mod tests {
                 "{tool} must not be session-allowable by name"
             );
             assert!(
-                !session_consent_recordable(tool, &arguments),
+                !session_consent_recordable(tool, &arguments, None),
                 "{tool} must not offer a session consent"
             );
         }

@@ -136,6 +136,7 @@ pub(crate) fn child_tool_registry(
     role: SubAgentRole,
     exec_policy: ExecPolicy,
     network: bool,
+    allow_commands: &[String],
     ui_lang: &crate::i18n::SharedLang,
 ) -> (ToolRegistry, JobStore) {
     let workspace_tools = workspace_tool_registry_from(boundary.clone());
@@ -160,14 +161,30 @@ pub(crate) fn child_tool_registry(
         };
         exec_policy.with_network_mode(capped)
     };
+    // `allow_commands`: the identities this dispatch declared, added to THIS
+    // child's trust list and nowhere else. It is the one channel that gives a
+    // child a command outside the built-in list, because it is the one place a
+    // human can still be asked — the child's own prompts are auto-denied, so no
+    // mode can authorize them (see the `needs_human`/shell-wall tests). The
+    // built-in list itself is untouched: this widens one child by exactly what
+    // was approved at dispatch.
+    //
+    // Applied AFTER the network cap: the two are independent grants, and a
+    // command's reach must not depend on which one was processed first.
+    let exec_policy = allow_commands
+        .iter()
+        .fold(exec_policy, |policy, rule| policy.with_trusted_prefix(rule));
     // Read before the move: the shell registry's own description and manager
     // have to agree with the policy that gates the calls, and this is the last
     // point where both are in hand.
     let unconfined = exec_policy.sandbox_off();
     registry.set_policy(exec_policy);
     // All roles may use the shell: child policy auto-denies anything unapproved,
-    // so read-only roles effectively get only trusted read-only prefixes
-    // (git status/diff/log, …).
+    // so a read-only role effectively gets only the trusted prefixes
+    // (git status/diff/log, …) plus whatever `allow_commands` declared. Note that
+    // a declaration is deliberately NOT filtered by role: the human approving it
+    // is naming commands, and silently dropping one because the role happens to
+    // be `explore` would make the panel a lie.
     let (shell_tools, job_store) = shell_tool_registry_from(boundary.clone(), unconfined);
     registry.extend(shell_tools);
     if network {

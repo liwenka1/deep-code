@@ -1051,12 +1051,29 @@ fn never_refuses_every_egress_path() {
     ));
 }
 
-/// The irreversible-outward floor. Each of these is one command that reaches
-/// the world and cannot be undone by the next command, and none of them may run
-/// on a declaration the user never made — under `yolo` nobody reads a prompt, so
-/// "ask" would silently become "allow".
+/// Whether the irreversible-outward floor gated this call — `NeedsApproval` AND
+/// the `needs-human` rule that no automatic path may approve.
+///
+/// Both halves matter now that the floor asks instead of refusing: the ordinary
+/// gate also yields `NeedsApproval`, so that alone cannot tell "only a human may
+/// decide this" from "a human may decide this like any other command". Every
+/// assertion in this file's floor tests reads through here — positive AND
+/// negative — because the negative form written against the old `Deny` would now
+/// pass vacuously.
+fn floor_gated(policy: &ExecPolicy, command: &str) -> bool {
+    let plan = evaluate_shell_command(policy, command, false);
+    matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. })
+        && crate::execution_policy::is_needs_human_rule(plan.matched_rule.as_deref())
+}
+
+/// The irreversible-outward floor. Each of these is one command that reaches the
+/// world and cannot be undone by the next command, and none of them runs without
+/// the user having authorized that class — the floor parks a prompt for a human
+/// in every tier, and NO automatic path may answer it (that is what
+/// `floor_gated` asserts, and what the yolo/`auto_allow` tests pin from the other
+/// side).
 #[test]
-fn irreversible_outward_commands_are_refused_without_a_declaration() {
+fn irreversible_outward_commands_need_a_human_without_a_declaration() {
     let policy = ExecPolicy::default();
     for command in [
         "npm publish",
@@ -1075,10 +1092,9 @@ fn irreversible_outward_commands_are_refused_without_a_declaration() {
         "helm uninstall release",
         "aws s3 rm s3://bucket/key",
     ] {
-        let plan = evaluate_shell_command(&policy, command, false);
         assert!(
-            matches!(plan.verdict, PolicyVerdict::Deny { .. }),
-            "{command} must be refused by default: {plan:?}"
+            floor_gated(&policy, command),
+            "{command} must reach a human under the floor"
         );
     }
 }
@@ -1101,10 +1117,9 @@ fn reversible_commands_including_an_ordinary_push_still_run() {
         "docker build -t x .",
         "aws s3 ls",
     ] {
-        let plan = evaluate_shell_command(&policy, command, false);
         assert!(
-            !matches!(plan.verdict, PolicyVerdict::Deny { .. }),
-            "{command} must stay available: {plan:?}"
+            !floor_gated(&policy, command),
+            "{command} must stay available"
         );
     }
 }
@@ -1121,14 +1136,12 @@ fn a_declared_exemption_lifts_exactly_what_it_names() {
     let policy = ExecPolicy::default().with_allow_irreversible(vec!["npm publish".to_string()]);
     let lifted = evaluate_shell_command(&policy, "npm publish --tag next", false);
     assert!(
-        matches!(lifted.verdict, PolicyVerdict::NeedsApproval { .. }),
-        "a declared command rejoins the ordinary gate: {lifted:?}"
+        matches!(lifted.verdict, PolicyVerdict::NeedsApproval { .. })
+            && !crate::execution_policy::is_needs_human_rule(lifted.matched_rule.as_deref()),
+        "a declared command rejoins the ordinary gate, not the floor: {lifted:?}"
     );
     assert!(
-        matches!(
-            evaluate_shell_command(&policy, "docker push registry.example/x:1", false).verdict,
-            PolicyVerdict::Deny { .. }
-        ),
+        floor_gated(&policy, "docker push registry.example/x:1"),
         "an exemption is not a blanket"
     );
 }
@@ -1140,10 +1153,9 @@ fn a_declared_exemption_lifts_exactly_what_it_names() {
 #[test]
 fn a_shorter_entry_deliberately_covers_the_wider_command() {
     let policy = ExecPolicy::default().with_allow_irreversible(vec!["git push".to_string()]);
-    let plan = evaluate_shell_command(&policy, "git push origin main --force", false);
     assert!(
-        !matches!(plan.verdict, PolicyVerdict::Deny { .. }),
-        "the entry covered it, so the floor no longer applies: {plan:?}"
+        !floor_gated(&policy, "git push origin main --force"),
+        "the entry covered it, so the floor no longer applies"
     );
 }
 
@@ -1151,12 +1163,11 @@ fn a_shorter_entry_deliberately_covers_the_wider_command() {
 /// redirect, a pipe) cannot be matched token-by-token, so the floor falls back
 /// to splitting words rather than letting the obvious spelling walk through.
 #[test]
-fn a_redirected_publish_is_still_refused() {
+fn a_redirected_publish_still_needs_a_human() {
     let policy = ExecPolicy::default();
-    let plan = evaluate_shell_command(&policy, "npm publish > /tmp/log 2>&1", false);
     assert!(
-        matches!(plan.verdict, PolicyVerdict::Deny { .. }),
-        "the fallback reading must still catch it: {plan:?}"
+        floor_gated(&policy, "npm publish > /tmp/log 2>&1"),
+        "the fallback reading must still catch it"
     );
 }
 
@@ -1179,34 +1190,34 @@ fn sandbox_mode_parses_and_ranks() {
 /// walked straight through the floor. The first two cases go through the
 /// unattended parser (it reads `&&`/`;`), the last only through the fallback.
 #[test]
-fn a_chained_or_redirected_irreversible_command_is_still_refused() {
+fn a_chained_or_redirected_irreversible_command_still_needs_a_human() {
     let policy = ExecPolicy::default();
     for command in [
         "echo starting && npm publish",
         "cargo test; git push --force origin main",
         "echo starting && npm publish > /tmp/log 2>&1",
     ] {
-        let plan = evaluate_shell_command(&policy, command, false);
         assert!(
-            matches!(plan.verdict, PolicyVerdict::Deny { .. }),
-            "{command} must be refused: {plan:?}"
+            floor_gated(&policy, command),
+            "{command} must reach a human"
         );
     }
     // …and a chain of reversible commands stays available, so the segmentation
-    // has not simply turned every compound line into a denial.
-    assert!(!matches!(
-        evaluate_shell_command(&policy, "echo starting && npm install > /tmp/log", false).verdict,
-        PolicyVerdict::Deny { .. }
+    // has not simply turned every compound line into a floor hit.
+    assert!(!floor_gated(
+        &policy,
+        "echo starting && npm install > /tmp/log"
     ));
 }
 
-/// Routine force-push spellings. `git -C <path> push -f`, a `+<refspec>` force
-/// and a bundled short flag are all ordinary ways to spell it, and the first
+/// Routine force-push spellings that must all reach a human. `git -C <path>
+/// push -f`, a `+<refspec>` force and a bundled short flag are ordinary ways to
+/// spell it, and the first
 /// version of this rule read "push is the second word" and "the flag is `-f`" —
 /// so it missed every one of them, which is precisely the difference between a
 /// consent gate over routine spellings and one over a spelling nobody types.
 #[test]
-fn routine_force_push_spellings_are_refused() {
+fn routine_force_push_spellings_still_need_a_human() {
     let policy = ExecPolicy::default();
     for command in [
         "git -C /repo push --force",
@@ -1216,10 +1227,9 @@ fn routine_force_push_spellings_are_refused() {
         "git push origin +refs/heads/main:refs/heads/main",
         "git push --force-with-lease=main origin main",
     ] {
-        let plan = evaluate_shell_command(&policy, command, false);
         assert!(
-            matches!(plan.verdict, PolicyVerdict::Deny { .. }),
-            "{command} must be refused: {plan:?}"
+            floor_gated(&policy, command),
+            "{command} must reach a human"
         );
     }
 }
@@ -1240,10 +1250,9 @@ fn dry_runs_and_passive_flags_are_not_refused() {
         "npm run publish",
         "gh pr view 12",
     ] {
-        let plan = evaluate_shell_command(&policy, command, false);
         assert!(
-            !matches!(plan.verdict, PolicyVerdict::Deny { .. }),
-            "{command} must stay available: {plan:?}"
+            !floor_gated(&policy, command),
+            "{command} must stay available"
         );
     }
 }
@@ -1280,10 +1289,7 @@ fn an_exemption_matches_words_in_order_across_programs() {
     // Order still binds: the same words reversed authorize nothing.
     let reversed = ExecPolicy::default().with_allow_irreversible(vec!["push git".to_string()]);
     assert!(
-        matches!(
-            evaluate_shell_command(&reversed, "git push -f origin main", false).verdict,
-            PolicyVerdict::Deny { .. }
-        ),
+        floor_gated(&reversed, "git push -f origin main"),
         "reordering must not stretch an entry"
     );
 }
@@ -1304,10 +1310,7 @@ fn a_leading_option_that_takes_a_value_is_a_known_miss() {
     );
     // The same command with the option after the verb IS covered, so the miss is
     // about position and not about `kubectl delete` being absent from the list.
-    assert!(matches!(
-        evaluate_shell_command(&policy, "kubectl delete -n prod pod api", false).verdict,
-        PolicyVerdict::Deny { .. }
-    ));
+    assert!(floor_gated(&policy, "kubectl delete -n prod pod api"));
 }
 
 /// The interactive modes reach a push and a test suite the same way: a human
@@ -1341,6 +1344,142 @@ fn a_push_or_a_suite_is_gated_by_approval_and_keeps_its_egress() {
             plan.network,
             "{command} keeps its egress once approved — without this the approval \
              would buy nothing"
+        );
+    }
+}
+
+/// The two properties the floor's plan must carry now that it RUNS once
+/// approved. Neither is visible from the verdict, and each was a wrong shape
+/// earlier in this change's life:
+///
+/// - `requires_sandbox`: the refusal version could leave it false, because a
+///   denied plan never executes. A command that then ran unconfined because of it
+///   would be the worst bug in this file.
+/// - `network`: the egress the ordinary path computed. Without it an approved
+///   `git push` would fail on a connection error and make the approval look
+///   broken.
+#[test]
+fn an_approved_floor_command_is_still_sandboxed_and_keeps_its_egress() {
+    let declared = evaluate_shell_command(&ExecPolicy::default(), "git push --force", true);
+    assert!(
+        crate::execution_policy::is_needs_human_rule(declared.matched_rule.as_deref()),
+        "precondition: the floor is what gated it"
+    );
+    assert!(
+        declared.requires_sandbox,
+        "an approved irreversible command is still a shell command"
+    );
+    assert!(
+        declared.network,
+        "and it keeps the egress the declaration asked for"
+    );
+
+    // Under `network = "never"` the declaration is refused before the floor is
+    // reached, so this ordering cannot hand out egress.
+    let never = ExecPolicy::default().with_network_mode(NetworkMode::Never);
+    let plan = evaluate_shell_command(&never, "git push --force", true);
+    assert_eq!(plan.matched_rule.as_deref(), Some("deny:network_disabled"));
+    assert!(!plan.network);
+}
+
+/// `allow_commands` is its own approval point, and the reason has to NAME the
+/// commands: the decision a human is making is "this child may run THESE without
+/// anyone watching its prompts", which "3 commands" does not describe.
+///
+/// The malformed shapes matter as much as the happy one: an empty or unparsable
+/// list must not raise a prompt, because there is no authority to ask about —
+/// and the child gets nothing either way, since the same normalized list is what
+/// reaches it.
+#[test]
+fn a_dispatch_that_declares_allow_commands_asks_a_human() {
+    let policy = ExecPolicy::default();
+
+    let bare = policy.evaluate_tool("agent", &json!({"role": "explore", "task": "x"}));
+    assert_eq!(
+        bare.verdict,
+        PolicyVerdict::Allow,
+        "a read-only dispatch with no declarations still needs no prompt"
+    );
+
+    let declared = policy.evaluate_tool(
+        "agent",
+        &json!({"role": "explore", "task": "x", "allow_commands": ["git push"]}),
+    );
+    assert!(
+        matches!(declared.verdict, PolicyVerdict::NeedsApproval { .. }),
+        "declaring commands must be an approval point: {declared:?}"
+    );
+    assert_eq!(
+        declared.matched_rule.as_deref(),
+        Some("builtin:subagent_allow_commands")
+    );
+    let PolicyVerdict::NeedsApproval { reason } = &declared.verdict else {
+        unreachable!("asserted above")
+    };
+    // Pinned in FULL for this shape, not by `contains`: a dispatch with only
+    // `allow_commands` has neither a write nor a network grant to name, and the
+    // clause is appended to whatever base sentence that leaves — so the base has
+    // to BE a sentence. `contains("git push")` passed while the panel read
+    // "dispatching a sub-agent It also authorizes it to run git push …".
+    assert_eq!(
+        reason,
+        concat!(
+            "dispatching a sub-agent. It also authorizes it to run git push without anyone ",
+            "watching its prompts — anything those commands reach may be read, written or sent"
+        ),
+        "the panel's text for an allow_commands-only dispatch"
+    );
+
+    // A combined dispatch keeps BOTH sentences, in order: each authorization is
+    // a separate grant, and the generic clause must not swallow the specific one.
+    let combined = policy.evaluate_tool(
+        "agent",
+        &json!({
+            "role": "implementer",
+            "task": "x",
+            "allow_commands": ["git push"],
+            "network": true,
+        }),
+    );
+    let PolicyVerdict::NeedsApproval { reason } = &combined.verdict else {
+        panic!("expected a prompt: {combined:?}")
+    };
+    assert!(
+        reason.starts_with(
+            "dispatching a writing sub-agent with network access authorizes its workspace \
+             writes and its egress — anything it reads may be sent to external hosts. \
+             It also authorizes it to run git push"
+        ),
+        "both grants are named, in order: {reason}"
+    );
+
+    // Long lists are truncated with a count, so the panel stays readable without
+    // looking complete.
+    let many: Vec<String> = (0..8).map(|index| format!("cmd{index}")).collect();
+    let long = policy.evaluate_tool(
+        "agent",
+        &json!({"role": "explore", "task": "x", "allow_commands": many}),
+    );
+    let PolicyVerdict::NeedsApproval { reason } = &long.verdict else {
+        panic!("expected a prompt: {long:?}")
+    };
+    assert!(reason.contains("and 3 more"), "{reason}");
+
+    // Nothing to authorize, nothing to ask.
+    for value in [
+        json!([]),
+        json!(["   ", ""]),
+        json!("git push"),
+        json!([1, 2]),
+    ] {
+        let plan = policy.evaluate_tool(
+            "agent",
+            &json!({"role": "explore", "task": "x", "allow_commands": value}),
+        );
+        assert_eq!(
+            plan.verdict,
+            PolicyVerdict::Allow,
+            "{value} carries no authority, so it must not prompt"
         );
     }
 }

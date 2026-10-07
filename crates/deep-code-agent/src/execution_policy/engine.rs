@@ -564,10 +564,17 @@ impl ExecPolicy {
         })
     }
 
-    /// Test-only: the same policy trusting one more identity. Unix-only like
-    /// its callers (the recorder-based shell tests), or Windows' `-D warnings`
-    /// sees dead code.
-    #[cfg(all(test, unix))]
+    /// The same policy trusting one more identity.
+    ///
+    /// Production use is `allow_commands`: the identities a dispatch declared,
+    /// added to the CHILD's policy alone (see `child_tool_registry`). The global
+    /// trust list stays hardcoded — this widens one child's reach by exactly what
+    /// a human approved at dispatch, and never the running session's own.
+    ///
+    /// `pub(crate)`, not `pub`: the only production caller is the child registry
+    /// builder, and this widens a session-wide GATE. Exposing it would invite
+    /// reuse as a general capability, on a signature that does not say it only
+    /// means anything for the shell trust table.
     #[must_use]
     pub(crate) fn with_trusted_prefix(mut self, rule: &str) -> Self {
         self.trusted_shell_prefixes.push(rule.to_string());
@@ -705,6 +712,14 @@ impl ExecPolicy {
             ToolKind::SubAgent => {
                 let writes = subagent_role_writes(arguments);
                 let network = network_requested(arguments);
+                // Commands the dispatcher asks the child to be able to run
+                // unattended. This is `allow_commands`' whole reason to be an
+                // approval point: a child's own prompts are auto-denied (nobody
+                // is watching them), so a command outside the built-in trust list
+                // is otherwise unreachable for a child in EVERY mode — the gap
+                // `an_inherited_mode_does_not_lift_the_childs_shell_wall` pins.
+                // Declaring it here moves the decision to where a human still is.
+                let allow_commands = subagent_allow_commands(arguments);
                 // `[sandbox] network = "never"`: a networked dispatch is
                 // refused outright, same as a network-declaring shell command
                 // — the child would only burn a doomed attempt offline.
@@ -715,19 +730,62 @@ impl ExecPolicy {
                 // command by explicit config — a networked dispatch adds no
                 // consent question. The write authorization still does.
                 let network_gated = network && self.network_mode == NetworkMode::Prompt;
-                if writes || network_gated {
-                    let reason = match (writes, network_gated) {
+                if writes || network_gated || !allow_commands.is_empty() {
+                    let mut reason = match (writes, network_gated) {
                         (true, true) => {
                             "dispatching a writing sub-agent with network access authorizes \
                              its workspace writes and its egress — anything it reads may be \
-                             sent to external hosts"
+                             sent to external hosts."
                         }
                         (false, true) => {
                             "dispatching a networked sub-agent authorizes its egress — \
-                             anything it reads may be sent to external hosts"
+                             anything it reads may be sent to external hosts."
                         }
-                        _ => "dispatching a writing sub-agent authorizes its workspace writes",
-                    };
+                        (true, false) => {
+                            "dispatching a writing sub-agent authorizes its workspace writes."
+                        }
+                        // Only `allow_commands`: the role may be read-only, so
+                        // the sentence must not claim a write authorization — and
+                        // it still has to be a sentence, because the clause below
+                        // is appended to it.
+                        (false, false) => "dispatching a sub-agent.",
+                    }
+                    .to_string();
+                    if !allow_commands.is_empty() {
+                        // Named in full rather than counted: the human is deciding
+                        // that this child may run THESE commands without anyone
+                        // watching, and "3 commands" is not a decision anyone can
+                        // make. Capped so a long list cannot push the rest of the
+                        // panel off the screen — the count says the rest exists.
+                        let shown: Vec<&str> = allow_commands
+                            .iter()
+                            .take(MAX_NAMED_ALLOW_COMMANDS)
+                            .map(String::as_str)
+                            .collect();
+                        let extra = allow_commands.len().saturating_sub(shown.len());
+                        // APPENDED, not substituted: a dispatch can be all three
+                        // things at once, and the sentences above exist because
+                        // each authorization is a different grant a human is being
+                        // asked about. Replacing them with the generic one hid
+                        // "authorizes its workspace writes" and "anything it reads
+                        // may be sent to external hosts" behind "those commands
+                        // may be read, written or sent".
+                        //
+                        // Joined as a second sentence, so the base has to end in a
+                        // full stop — without one the panel read "…its workspace
+                        // writes It also authorizes it to run git push …".
+                        reason.push_str(&format!(
+                            " It also authorizes it to run {} without anyone watching its \
+                             prompts{} — anything those commands reach may be read, written \
+                             or sent",
+                            shown.join(", "),
+                            if extra > 0 {
+                                format!(" (and {extra} more)")
+                            } else {
+                                String::new()
+                            }
+                        ));
+                    }
                     ToolExecutionPlan {
                         verdict: PolicyVerdict::NeedsApproval {
                             reason: reason.to_string(),
@@ -737,7 +795,9 @@ impl ExecPolicy {
                         read_only: !writes,
                         risk_level: RiskLevel::Medium,
                         matched_rule: Some(
-                            if network_gated {
+                            if !allow_commands.is_empty() {
+                                "builtin:subagent_allow_commands"
+                            } else if network_gated {
                                 "builtin:subagent_network_dispatch"
                             } else {
                                 "builtin:subagent_writing_role"
@@ -830,46 +890,6 @@ pub fn evaluate_shell_command(
         };
     }
 
-    // 1b. Irreversible-outward floor.
-    //
-    //     Not local catastrophes (that is `shell_deny`, which cannot be lifted)
-    //     and not ordinary egress (a human approves that per call): these are
-    //     single commands that reach the world and cannot be undone by the next
-    //     command — publishing a package, force-pushing over someone's commits,
-    //     merging a PR, applying infrastructure, deleting a bucket.
-    //
-    //     Under `Yolo` nobody sees the approval prompt, so the decision has to
-    //     be taken *before* the session, in configuration the user wrote: an
-    //     entry in `[sandbox] allow_irreversible` is matched as words in order.
-    //     Refused rather than prompted, deliberately: a prompt is exactly what
-    //     yolo removes, and a floor that a mode can auto-approve is not a floor.
-    //     (The interactive "ask me each time" shape lives in the root grant,
-    //     where a human is guaranteed to be present by construction; this floor
-    //     exists for the runs where nobody is.)
-    if let Some(matched) = policy
-        .irreversible_outward(command)
-        .filter(|matched| !policy.irreversible_allowed(matched))
-    {
-        return ToolExecutionPlan {
-            verdict: PolicyVerdict::Deny {
-                reason: format!(
-                    "shell command denied: '{matched}' is irreversible and outward-facing — it \
-                     reaches the world and the next command cannot undo it, and this session has \
-                     no standing consent for it. If it is genuinely intended, the user can \
-                     authorize it once by adding it to [sandbox] allow_irreversible in the global \
-                     config. Do not look for a spelling that gets around this: report the need \
-                     in your answer and let the human decide."
-                ),
-            },
-            requires_approval: false,
-            requires_sandbox: false,
-            read_only: false,
-            risk_level: RiskLevel::High,
-            matched_rule: Some(format!("irreversible:{matched}")),
-            network: false,
-        };
-    }
-
     // 2. `[sandbox] network = "never"`: a network-declaring command is refused
     //    outright — running it offline anyway would just burn a doomed attempt.
     if network_requested && policy.network_mode == NetworkMode::Never {
@@ -884,6 +904,56 @@ pub fn evaluate_shell_command(
         NetworkMode::Prompt => network_requested,
         NetworkMode::Never => false,
     };
+
+    // The irreversible-outward floor.
+    //
+    // Not local catastrophes (that is `shell_deny`, which cannot be lifted) and
+    // not ordinary egress (a human approves that per call): these are single
+    // commands that reach the world and cannot be undone by the next command —
+    // publishing a package, force-pushing over someone's commits, merging a PR,
+    // applying infrastructure, deleting a bucket.
+    //
+    // A `NeedsApproval` marked `needs-human`, which is the root grant's shape and
+    // not a denial: the property that makes this a floor is that NO automatic
+    // path may approve it (see `is_needs_human_rule` and its readers) — not that
+    // a person is forbidden to. Asked rather than refused, because refusing also
+    // refused the interactive case, where a human is right there: under `default`
+    // a one-off force push had no way to be authorized short of editing global
+    // config and restarting, which is a worse answer than a question.
+    //
+    // What is unchanged: yolo cannot auto-approve it (the reader below refuses
+    // before the mode is consulted), a child gets a denial with a note naming the
+    // floor, and an unattended run auto-denies. `[sandbox] allow_irreversible`
+    // remains the "stop asking" path for a class of command the user has decided
+    // about once.
+    if let Some(matched) = policy
+        .irreversible_outward(command)
+        .filter(|matched| !policy.irreversible_allowed(matched))
+    {
+        return ToolExecutionPlan {
+            verdict: PolicyVerdict::NeedsApproval {
+                reason: format!(
+                    "'{matched}' is irreversible and outward-facing: it reaches the world and \
+                     the next command cannot undo it. Approve it for this run, or add it to \
+                     [sandbox] allow_irreversible in the global config to authorize that class \
+                     of command for good."
+                ),
+            },
+            requires_approval: true,
+            // It RUNS once approved, so it is sandboxed like any other shell
+            // command: the Deny version could leave this false because a denied
+            // plan never executes, and a plan that runs unconfined because of it
+            // would be the worst bug in this file.
+            requires_sandbox: true,
+            read_only: false,
+            risk_level: RiskLevel::High,
+            matched_rule: Some(format!("{NEEDS_HUMAN_RULE_PREFIX}irreversible:{matched}")),
+            // The egress it was granted, exactly as the ordinary path computes
+            // it: an approved force push that then failed on a connection error
+            // would make the approval look broken.
+            network,
+        };
+    }
 
     let segments = shell_lex::segments(command);
     // Auto-trust only if EVERY segment is covered by a trusted rule
@@ -1007,6 +1077,71 @@ pub fn accept_edits_approvable(tool_name: &str, arguments: &Value) -> bool {
 /// (see [`crate::subagent::SubAgentRole::allows_writes`]). Absent role means
 /// `general` (read-only); an unparsable role fails closed to "writes" — the
 /// tool itself will reject it, but if that ever drifts, prompt rather than pass.
+/// The `matched_rule` prefix on a plan no automatic path may approve.
+///
+/// It rides `matched_rule` rather than a new plan field on purpose: that field is
+/// documented as the machine-readable half ("logged and matched on, not read as
+/// prose"), the same role `deny:` and `builtin:` already play, and the plan
+/// struct has thirty-odd construction sites that a new field would have to touch.
+/// `is_needs_human_rule` is the only reader; keep the prefix here.
+pub const NEEDS_HUMAN_RULE_PREFIX: &str = "needs-human:";
+
+/// Whether a rule id marks a call that only a person may authorize.
+///
+/// Read by `runtime::approval_flow` (above `auto_allow`, session memory, every
+/// permission mode and the judge, so nothing automatic can approve it),
+/// by `subagent_approval_decision` (which denies it with a note naming the floor
+/// rather than the shell wall) and by `unattended_denial_note` (headless runs).
+#[must_use]
+pub fn is_needs_human_rule(rule: Option<&str>) -> bool {
+    rule.is_some_and(|rule| rule.starts_with(NEEDS_HUMAN_RULE_PREFIX))
+}
+
+/// How many `allow_commands` entries the approval reason names before it says
+/// "(and N more)". The panel has to stay readable; the count keeps the list from
+/// silently looking complete.
+const MAX_NAMED_ALLOW_COMMANDS: usize = 5;
+
+/// The command identities a dispatch declares for its child, trimmed, empty
+/// entries dropped. Unparsable shapes yield an empty list rather than an error:
+/// the argument is model-written, and a malformed one should cost the child its
+/// extra reach (and, by making the list empty, not raise an approval prompt for
+/// authority nobody is getting).
+fn subagent_allow_commands(arguments: &Value) -> Vec<String> {
+    let entries: Vec<String> = arguments
+        .get("allow_commands")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    normalize_allow_commands(&entries)
+}
+
+/// Trim, drop empties, drop duplicates.
+///
+/// ONE rule, shared by the policy engine (which reads the raw arguments to decide
+/// whether the dispatch needs approval at all) and the `agent` tool (which hands
+/// the list to the child). If the two ever disagreed, the panel could authorize a
+/// set the child does not get, or worse: the child could receive a reach the
+/// human was never shown.
+#[must_use]
+pub fn normalize_allow_commands(entries: &[String]) -> Vec<String> {
+    let mut normalized: Vec<String> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let entry = entry.trim();
+        if entry.is_empty() || normalized.iter().any(|known| known == entry) {
+            continue;
+        }
+        normalized.push(entry.to_string());
+    }
+    normalized
+}
+
 fn subagent_role_writes(arguments: &Value) -> bool {
     let role = arguments
         .get("role")

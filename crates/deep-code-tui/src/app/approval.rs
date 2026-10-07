@@ -19,9 +19,9 @@ impl App {
     /// "a": approve and remember the tool (or, for shell, the command
     /// identity) for this session. Ignored wherever the panel does not offer
     /// the option — a root grant, a sub-agent dispatch, a job control action,
-    /// a compound shell command — because there the runtime would record
-    /// nothing and silently downgrade to a one-time approve; an option that
-    /// is not shown must not act from its key either.
+    /// a compound shell command, an irreversible command — because there the
+    /// runtime would record nothing and silently downgrade to a one-time
+    /// approve; an option that is not shown must not act from its key either.
     pub fn approve_pending_tool_for_session(&mut self) {
         if !self.pending_offers_session_consent() {
             return;
@@ -35,34 +35,53 @@ impl App {
 
     /// Whether the pending approval offers "approve for session" at all. The
     /// runtime decides ([`deep_code_agent::session_consent_recordable`], the
-    /// same two rules its recording path applies): a by-name consent for
-    /// ordinary tools, a command-identity consent for one simple shell
-    /// command. A root grant (per-directory by design), a sub-agent dispatch
-    /// (what it authorizes lives in the arguments), a job status/tail/cancel
-    /// and a compound shell command record nothing, so the option — and its
-    /// key — disappear rather than silently downgrade to a one-time approve.
+    /// same rules its recording path applies): a by-name consent for ordinary
+    /// tools, a command-identity consent for one simple shell command. A root
+    /// grant (per-directory by design), a sub-agent dispatch (what it authorizes
+    /// lives in the arguments), a job status/tail/cancel, a compound shell
+    /// command and an irreversible command (`needs-human`: no automatic path may
+    /// ever read a recorded consent for it) record nothing, so the OPTION
+    /// disappears from the rendered list rather than advertising a consent that
+    /// would silently downgrade to a one-time approve.
+    ///
+    /// The KEY follows the option, which is the contract one screen up:
+    /// `approve_pending_tool_for_session` returns early when the panel does not
+    /// offer it, so on a y/n prompt `a` is a NO-OP and not a hidden alias for
+    /// `y`. That distinction matters most for this class: the panel shows y/n for
+    /// an irreversible command, and a key that is not shown must not be able to
+    /// approve a publish or a force push. (An earlier version of this comment
+    /// claimed the opposite — that `a` approved once there — which would have
+    /// been the invariant to break rather than the behavior to match.)
     pub fn pending_offers_session_consent(&self) -> bool {
         self.pending_approval.as_ref().is_some_and(|request| {
-            deep_code_agent::session_consent_recordable(&request.tool_name, &request.arguments)
+            deep_code_agent::session_consent_recordable(
+                &request.tool_name,
+                &request.arguments,
+                request.matched_rule.as_deref(),
+            )
         })
     }
 
     /// Park an arriving approval: reset the view, choose the starting option,
     /// and disarm the decision keys until the panel has been drawn.
     ///
-    /// The reflex `Enter` belongs to the reversible answer, so two classes
+    /// The reflex `Enter` belongs to the reversible answer, so three classes
     /// start focused on **deny**: a root grant, which widens the session's
-    /// write boundary for good rather than authorizing one action; and
-    /// anything reaching the network, where a mis-keyed yes costs whatever the
-    /// far end sends back or receives — `curl … | sh` is one keystroke either
-    /// way. The user still approves with `y` or by moving the highlight;
-    /// nothing became harder to reach, the default just changed side.
+    /// write boundary for good rather than authorizing one action; anything
+    /// reaching the network, where a mis-keyed yes costs whatever the far end
+    /// sends back or receives — `curl … | sh` is one keystroke either way; and
+    /// an irreversible command (`needs-human`), which is the one class where a
+    /// mis-keyed yes cannot be walked back at all — the whole reason that floor
+    /// parks a prompt instead of refusing outright is that a person may
+    /// authorize one run, and a default that approves it is not a decision. The
+    /// user still approves with `y` or by moving the highlight; nothing became
+    /// harder to reach, the default just changed side.
     ///
     /// A *local* High-risk action deliberately keeps approve as its default.
-    /// The genuinely unrecoverable ones are hard-refused by the deny floor
-    /// before a prompt exists at all, and flipping the whole tier would train
-    /// the user to reach for `y` reflexively instead — which is the habit this
-    /// is here to protect.
+    /// Flipping the whole tier would train the user to reach for `y`
+    /// reflexively instead — which is the habit this is here to protect — and
+    /// the genuinely unrecoverable local shapes are refused by the deny floor
+    /// before a prompt exists at all.
     pub(crate) fn park_approval(&mut self, request: ApprovalRequest) {
         let is_root_grant = request.tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL;
         // Two ways to reach the network, and the doc above means both.
@@ -74,7 +93,11 @@ impl App {
         // predicate the runtime's egress floor reads, so the two cannot drift.
         let reaches_network =
             request.network || deep_code_agent::is_network_tool(&request.tool_name);
-        let deny_by_default = is_root_grant || reaches_network;
+        // Read off `matched_rule`, the same field the runtime's own refusal reads
+        // (`approval_flow::auto_approval_granted`), so the panel's default and
+        // the gate's answer cannot disagree about which prompts these are.
+        let irreversible = deep_code_agent::is_needs_human_rule(request.matched_rule.as_deref());
+        let deny_by_default = is_root_grant || reaches_network || irreversible;
         self.pending_approval = Some(request);
         self.approval_scroll_offset = 0;
         // Deny is last either way, but a prompt with no recordable consent

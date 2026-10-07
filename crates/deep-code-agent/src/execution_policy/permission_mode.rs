@@ -44,8 +44,10 @@ pub enum PermissionMode {
     /// the `execution_policy` module docs and lives in
     /// `runtime::approval_flow::auto_mode_approves`.
     Auto,
-    /// Auto-approve everything that reaches the gate except a root grant
-    /// (`request_write_root` asks in every mode); hard denies still block.
+    /// Auto-approve everything that reaches the gate except two calls, both of
+    /// which ask in every mode: a root grant (`request_write_root`) and a
+    /// `needs-human` plan (today: an unauthorized irreversible-outward command).
+    /// Hard denies still block, and the deny floor still runs first.
     Yolo,
 }
 

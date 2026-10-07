@@ -116,13 +116,14 @@
 # line carries a permanent `[unsandboxed]` chip while it is not `os`.
 # mode = "os"
 #
-# Commands that are irreversible AND outward-facing are refused unless the user
-# authorized them here. Being refused is deliberate rather than an inconvenience
-# to work around: it is a decision only a human makes, and there is no standing
-# consent for publishing a package, force-pushing over someone's commits,
-# merging a PR, applying infrastructure or deleting a bucket. Under `yolo`
-# nobody sees a prompt, so the authorization has to be given in advance — which
-# is what this key is.
+# Commands that are irreversible AND outward-facing — publishing a package,
+# force-pushing over someone's commits, merging a PR, applying infrastructure,
+# deleting a bucket — are a decision only a human makes, so no automatic path may
+# approve them: not `yolo`, not an `auto_allow` entry, not the classifier, not a
+# remembered session approval. In an interactive tier they ASK (approve once, or
+# say no); where nobody can answer — a headless run, a sub-agent — they are
+# auto-denied. Listing one here is how you stop being asked: it authorizes that
+# class of command for good, which is the point of the key.
 #
 # Entries match the words the executor would run, IN ORDER, so a flag cannot
 # hide from them: `npm publish --tag next` is matched by "npm publish", and
@@ -219,7 +220,8 @@
 #   default       ask every time
 #   accept_edits  auto-approve edits inside the workspace
 #   auto          the classifier decides what is left
-#   yolo          everything except a write-root request
+#   yolo          everything except a write-root request and an unauthorized
+#                 irreversible command (see [sandbox] allow_irreversible)
 #
 # A project config may only be stricter than the global one (global auto with
 # project default, say); stepping up is always ignored, and auto/yolo may come

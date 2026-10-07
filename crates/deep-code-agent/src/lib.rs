@@ -67,7 +67,7 @@ pub use error::AgentResult;
 pub use event::AgentEvent;
 pub use execution_policy::{
     NetworkMode, PermissionMode, RiskLevel, SafetyNote, SandboxMode, SharedPermissionMode,
-    shell_command_of,
+    is_needs_human_rule, shell_command_of,
 };
 pub use i18n::{Lang, TextId, tr, tr_with};
 // The TUI reads the clipboard and writes the bytes, the runtime reads them back
