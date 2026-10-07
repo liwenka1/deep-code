@@ -270,6 +270,8 @@
   "CheckpointDisabledTooLarge": "This workspace is large (over {limit} files to snapshot), so per-turn checkpoints are disabled for this session to avoid a copy on every turn — /restore will not be available. Use git to roll back if needed.",
   "ApprovalCommandMoreRows": "… +{count} more line(s) — full command not shown; deny if unsure",
   "TurnStepLimitReached": "This turn hit the {limit}-request limit and was stopped to avoid burning further quota. Try again with a more focused instruction.",
+  "TurnBudgetWrapUp": "[runtime] This turn has used {used}/{limit} model requests. Exhausting the budget ends the turn outright and loses work in flight, so start converging now: finish the edit or investigation in hand, then hand over — what is done, what remains, and the next concrete step — instead of opening new work.",
+  "SubagentBudgetWrapUp": "[runtime] Your tool-call budget is at {used}/{limit}. Exhausting it terminates you with no report at all, so start converging now: finish the step in hand, then write your conclusions per the output contract — what you found, what remains, and the next step.",
   "EchoOfflineHint": "No DeepSeek API key configured: type /apikey sk-... to connect now, or set the DEEPSEEK_API_KEY environment variable and restart.",
   "RouteFixedModel": "Fixed model config: {model}",
   "RouteFixedModelPassthrough": "Fixed model config: {model} (not in the catalog, used as-is)",

@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::LlmClient;
 use crate::config::AgentConfig;
-use crate::execution_policy::ExecPolicy;
+use crate::execution_policy::{ExecPolicy, SharedPermissionMode};
 use crate::shell_tools::{JobStore, shell_tool_registry_from};
 use crate::subagent::roles::{SubAgentRole, build_system_prompt};
 use crate::tool::ToolRegistry;
@@ -35,6 +35,20 @@ pub struct SubAgentServices {
     /// like it reaches the parent's own tools.
     pub(crate) boundary: WorkspacePolicy,
     pub parent_cancel: CancellationToken,
+    /// The parent's live permission mode, shared rather than snapshotted: a
+    /// child's gate then follows the session exactly as the parent's own tools
+    /// do, so Shift+Tab mid-session reaches a child that is already running.
+    ///
+    /// A child inherits rather than being pinned to `Default`. The old pin was
+    /// argued from "a child runs unattended, so its prompts can only be
+    /// auto-decided" — which is true, and is exactly why pinning it stricter
+    /// than its dispatcher strands work instead of protecting anything: a child
+    /// could not run a command outside the trust list by any route, not even a
+    /// `git push` with egress granted, because no approval path existed for it
+    /// to take. Inheritance keeps the dispatcher's decision as the decision
+    /// point (that is where the human saw the request) and lets the child act
+    /// on it.
+    pub permission_mode: SharedPermissionMode,
     pub exec_policy: ExecPolicy,
 }
 
@@ -44,6 +58,7 @@ impl SubAgentServices {
         agent_config: AgentConfig,
         boundary: WorkspacePolicy,
         parent_cancel: CancellationToken,
+        permission_mode: SharedPermissionMode,
         max_concurrent: usize,
         exec_policy: ExecPolicy,
     ) -> Self {
@@ -54,6 +69,7 @@ impl SubAgentServices {
             agent_config,
             boundary,
             parent_cancel,
+            permission_mode,
             exec_policy,
         }
     }
@@ -90,6 +106,7 @@ pub fn attach_subagent_tools(
             agent_config,
             boundary,
             parent_cancel,
+            SharedPermissionMode::default(),
         )
         .subagent,
     )
@@ -143,11 +160,15 @@ pub(crate) fn child_tool_registry(
         };
         exec_policy.with_network_mode(capped)
     };
+    // Read before the move: the shell registry's own description and manager
+    // have to agree with the policy that gates the calls, and this is the last
+    // point where both are in hand.
+    let unconfined = exec_policy.sandbox_off();
     registry.set_policy(exec_policy);
     // All roles may use the shell: child policy auto-denies anything unapproved,
     // so read-only roles effectively get only trusted read-only prefixes
     // (git status/diff/log, …).
-    let (shell_tools, job_store) = shell_tool_registry_from(boundary.clone());
+    let (shell_tools, job_store) = shell_tool_registry_from(boundary.clone(), unconfined);
     registry.extend(shell_tools);
     if network {
         // The web tools ride the same grant: in-process fetch/search behind

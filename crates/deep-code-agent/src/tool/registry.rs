@@ -140,6 +140,23 @@ impl ToolRegistry {
             });
         }
 
+        // `[sandbox] mode = "off"`: nothing will confine this call, so the plan
+        // must not claim otherwise — and this has to happen BEFORE the approval
+        // request is built from it. `requires_sandbox` is what the panel renders
+        // as "sandboxed execution", so with the mode off that sentence would tell
+        // the user they are protected while they approve a command that will run
+        // bare: the one surface where the field is a promise rather than a
+        // diagnostic. The session-level warning is the status line's permanent
+        // marker; per call, the honest answer is "no sandbox".
+        let plan = if self.policy.sandbox_off() {
+            crate::execution_policy::ToolExecutionPlan {
+                requires_sandbox: false,
+                ..plan
+            }
+        } else {
+            plan
+        };
+
         let needs_approval = plan.requires_approval || spec.requires_approval;
         if needs_approval {
             let description = match &plan.verdict {

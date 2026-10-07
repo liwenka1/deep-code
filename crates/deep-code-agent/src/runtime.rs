@@ -29,6 +29,8 @@ mod telemetry;
 /// have to be keyed to the same ceiling this module enforces on tool results.
 pub(crate) mod tool_result;
 mod turn_loop;
+pub use turn_loop::MAX_TURN_STEPS;
+pub(crate) use turn_loop::budget_wrap_up_due;
 
 use std::path::PathBuf;
 use std::sync::Arc;

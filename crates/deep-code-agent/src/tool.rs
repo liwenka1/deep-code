@@ -781,4 +781,61 @@ mod tests {
             );
         }
     }
+
+    /// `[sandbox] mode = "off"` is reported honestly to the approval gate.
+    /// `requires_sandbox` is what the panel renders as "sandboxed execution", so
+    /// a session that is not applying the sandbox must not hand the human a plan
+    /// claiming it will — the session-level warning is the status line's
+    /// permanent marker, and per call the truthful answer is "no sandbox".
+    #[tokio::test]
+    async fn sandbox_off_clears_requires_sandbox_before_the_approval_panel() {
+        use crate::execution_policy::{ExecPolicy, SandboxMode};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut registry, _) = crate::shell_tools::shell_tool_registry(workspace.path()).unwrap();
+        // Untrusted, so it parks; a trusted command (`cargo build`) would run
+        // without ever reaching the panel and prove nothing about it.
+        let call = ToolCall::new(
+            "call_off",
+            "shell",
+            json!({"command": "git push origin main"}),
+        );
+
+        // Confined (the default): the panel is told a sandbox applies.
+        let plan = registry.evaluate_tool(&call);
+        assert!(
+            plan.requires_sandbox,
+            "the default plan asks for confinement"
+        );
+        let confined = registry
+            .run_tool_call_with_plan(&call, None, plan, ToolCx::new())
+            .await
+            .unwrap();
+        let ToolRunOutcome::ApprovalRequired { request } = confined else {
+            panic!("a gated shell command parks for approval");
+        };
+        assert!(
+            request.requires_sandbox,
+            "a confined session still reports the sandbox"
+        );
+
+        // `mode = "off"`: the plan must stop claiming it.
+        registry.set_policy(ExecPolicy::default().with_sandbox_mode(SandboxMode::Off));
+        let plan = registry.evaluate_tool(&call);
+        assert!(
+            plan.requires_sandbox,
+            "the policy still asks; the registry is what knows the mode"
+        );
+        let bare = registry
+            .run_tool_call_with_plan(&call, None, plan, ToolCx::new())
+            .await
+            .unwrap();
+        let ToolRunOutcome::ApprovalRequired { request } = bare else {
+            panic!("a gated shell command parks for approval");
+        };
+        assert!(
+            !request.requires_sandbox,
+            "with the sandbox off, the panel must not promise confinement"
+        );
+    }
 }

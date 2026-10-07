@@ -270,6 +270,8 @@
   "CheckpointDisabledTooLarge": "当前工作区较大（待快照文件超过 {limit} 个），为避免每轮都全量复制，本会话已停用逐轮检查点——/restore 将不可用。需要回滚请用 git。",
   "ApprovalCommandMoreRows": "… 还有 {count} 行未显示——命令未完整展示，拿不准就拒绝",
   "TurnStepLimitReached": "本回合已达 {limit} 次模型请求上限，已停止以免继续消耗额度。可重新发起一条更聚焦的指令。",
+  "TurnBudgetWrapUp": "[runtime] 本回合已用 {used}/{limit} 次模型请求。预算用尽会直接结束本回合并丢掉进行中的工作，所以现在开始收敛：先完成手上的编辑或调查，然后给出交接摘要——已完成什么、还剩什么、下一步具体做什么——不要再开新战线。",
+  "SubagentBudgetWrapUp": "[runtime] 你的工具调用预算已到 {used}/{limit}。预算用尽会让你在完全没有报告的情况下被终止，所以现在开始收敛：先收尾手上这一步，然后按输出契约写出结论——发现了什么、还剩什么、下一步。",
   "EchoOfflineHint": "未配置 DeepSeek API key：输入 /apikey sk-... 即刻接入，或设置环境变量 DEEPSEEK_API_KEY 后重新启动。",
   "RouteFixedModel": "固定模型配置：{model}",
   "RouteFixedModelPassthrough": "固定模型配置：{model}（不在目录中，按原样使用）",

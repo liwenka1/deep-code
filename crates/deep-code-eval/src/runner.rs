@@ -9,7 +9,7 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deep_code_agent::{
-    AgentConfig, ApprovalDecision, LaunchedRuntime, RuntimeEvent, RuntimeEventReceiver,
+    AgentConfig, ApprovalDecision, LaunchedRuntime, Role, RuntimeEvent, RuntimeEventReceiver,
     TurnTelemetry, launch_runtime,
 };
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
@@ -67,6 +67,32 @@ pub struct InstanceResult {
     pub patch: String,
     /// Wall-clock duration in milliseconds.
     pub duration_ms: u64,
+    /// Model requests this turn made — the agent loop's own step unit, one per
+    /// API round.
+    ///
+    /// Counted off the session transcript rather than read from telemetry, and
+    /// deliberately so: the abort paths (the step cap, a cancel, a timeout) emit
+    /// no telemetry, and those are exactly the turns this column exists to
+    /// explain. Reading the transcript instead means an abnormally-ended
+    /// instance still reports a real number rather than a zero standing in for
+    /// "unknown".
+    #[serde(default)]
+    pub api_rounds: u32,
+    /// Tool calls across the turn's assistant messages. Not `api_rounds`: one
+    /// round can carry several calls in parallel, so this is the count that
+    /// shows how hard the turn actually worked.
+    #[serde(default)]
+    pub tool_calls: u32,
+    /// The turn's request ceiling **as it applied to this instance**, so the
+    /// column below answers about the cap that was actually in force rather than
+    /// about a constant this crate also happens to know. `0` means the run was
+    /// unlimited by configuration.
+    #[serde(default)]
+    pub max_turn_steps: u32,
+    /// True when `api_rounds` reached [`Self::max_turn_steps`], i.e. the turn was
+    /// cut by the cap rather than by the model deciding it was done.
+    #[serde(default)]
+    pub step_limit_hit: bool,
     /// Session cost in CNY (from turn telemetry; 0 if unavailable).
     pub cost_cny: f64,
     /// Effective model of the turn (e.g. deepseek-flash), if reported.
@@ -129,6 +155,18 @@ pub async fn run_bench(
     // fired there and eval ran model commands unconfined. Require the sandbox
     // to actually ENFORCE something — `is_enforced()` accepts a Partial Linux
     // kernel (writes still bounded) but rejects Windows' `None`.
+    // Configuration can turn the sandbox off; eval must not accept that. The
+    // host check below proves a backend exists, and this one proves the run is
+    // actually using it — else a `sandbox_mode = "off"` in a config file would
+    // silently turn every rollout into unconfined model commands on this
+    // machine, which is the exact scenario the refusal exists for.
+    anyhow::ensure!(
+        config.agent_config.sandbox_mode.is_os(),
+        "refusing to run eval with [sandbox] mode = \"off\": eval auto-approves model \
+         commands on untrusted repositories, so the OS sandbox is the only boundary between \
+         a generated command and this machine. Remove the setting (or set mode = \"os\") for \
+         the rollout."
+    );
     anyhow::ensure!(
         deep_code_agent::sandbox_available()
             && deep_code_agent::sandbox_enforcement().is_enforced(),
@@ -176,6 +214,10 @@ pub async fn run_bench(
                     status: InstanceStatus::Error,
                     patch: String::new(),
                     duration_ms: 0,
+                    api_rounds: 0,
+                    tool_calls: 0,
+                    max_turn_steps: 0,
+                    step_limit_hit: false,
                     cost_cny: 0.0,
                     model: None,
                     route_source: None,
@@ -251,6 +293,10 @@ async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> I
         status: InstanceStatus::Error,
         patch: String::new(),
         duration_ms: start.elapsed().as_millis() as u64,
+        api_rounds: 0,
+        tool_calls: 0,
+        max_turn_steps: 0,
+        step_limit_hit: false,
         cost_cny: 0.0,
         model: None,
         route_source: None,
@@ -299,6 +345,25 @@ async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> I
     // report's total ran systematically low. `session_spend` holds the real
     // accumulated cost however the turn ended.
     let session_spend = launched.handle.session_spend().await;
+    // The turn's shape, read here for the same reason the spend is: this is the
+    // last moment the transcript is reachable, and the instances that need
+    // explaining are the ones that ended abnormally (hence no telemetry).
+    // Rounds and calls are counted, never guessed.
+    let (api_rounds, tool_calls) = {
+        let messages = launched.handle.session_messages().await;
+        let mut rounds = 0u32;
+        let mut calls = 0u32;
+        for message in &messages {
+            if message.role == Role::Assistant {
+                rounds = rounds.saturating_add(1);
+                calls = calls
+                    .saturating_add(u32::try_from(message.tool_calls.len()).unwrap_or(u32::MAX));
+            }
+        }
+        (rounds, calls)
+    };
+    let max_turn_steps = config.agent_config.turn_steps;
+    let step_limit_hit = max_turn_steps > 0 && api_rounds >= max_turn_steps;
     // Fully stop the runtime before extracting the diff.
     launched.shutdown().await;
 
@@ -351,6 +416,10 @@ async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> I
         status,
         patch,
         duration_ms,
+        api_rounds,
+        tool_calls,
+        max_turn_steps,
+        step_limit_hit,
         cost_cny,
         model,
         route_source,

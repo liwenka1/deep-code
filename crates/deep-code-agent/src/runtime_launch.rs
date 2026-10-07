@@ -42,6 +42,11 @@ pub struct LaunchedRuntime {
     /// gate. The TUI reads it for the status indicator and flips it on
     /// Shift+Tab; both sides see the same value.
     pub permission_mode: SharedPermissionMode,
+    /// True when `[sandbox] mode = "off"` is in force: shell/job commands run
+    /// bare. Exposed because every guarantee this product makes about writes and
+    /// egress is conditional on it being false, so a UI that cannot see it
+    /// cannot warn the user that they are on a different footing than usual.
+    pub sandbox_off: bool,
     /// Effective extra writable roots this runtime was granted (`--add-dir`,
     /// unioned with a resumed record's own grants). Exposed so consumers can
     /// show the user the real boundary without re-deriving the union.
@@ -74,15 +79,21 @@ impl LaunchedRuntime {
 #[must_use]
 pub fn build_tool_registry(
     roots: &WorkspaceRoots,
-    network: crate::execution_policy::NetworkMode,
+    config: &AgentConfig,
     warnings: &mut Vec<String>,
     ui_lang: &SharedLang,
 ) -> (ToolRegistry, JobStore, Option<WorkspacePolicy>) {
     let mut registry = ToolRegistry::new();
     // The exec policy set here is the one the runtime consults for every call,
     // and the one sub-agent registries clone — the single place config-driven
-    // gating (network mode) enters.
-    registry.set_policy(crate::execution_policy::ExecPolicy::default().with_network_mode(network));
+    // gating enters: the network mode, the OS-sandbox switch, and the
+    // irreversible-outward exemptions.
+    registry.set_policy(
+        crate::execution_policy::ExecPolicy::default()
+            .with_network_mode(config.sandbox_network)
+            .with_sandbox_mode(config.sandbox_mode)
+            .with_allow_irreversible(config.sandbox_allow_irreversible.clone()),
+    );
     let mut job_store = JobStore::default();
     let boundary = match WorkspacePolicy::new(roots.clone()) {
         Ok(policy) => Some(policy),
@@ -94,7 +105,8 @@ pub fn build_tool_registry(
     };
     if let Some(policy) = &boundary {
         registry.extend(workspace_tool_registry_from(policy.clone()));
-        let (shell_tools, shell_jobs) = shell_tool_registry_from(policy.clone());
+        let (shell_tools, shell_jobs) =
+            shell_tool_registry_from(policy.clone(), !config.sandbox_mode.is_os());
         registry.extend(shell_tools);
         job_store = shell_jobs;
         registry.register(crate::root_grant::RequestWriteRootTool);
@@ -277,6 +289,12 @@ fn assemble_launch<C: LlmClient + Clone + 'static>(
         ui_lang,
     } = parts;
     let client = Arc::new(client);
+    // Built here rather than after the tools, because the child runtimes
+    // constructed inside `build_parent_tools` share THIS handle: one atomic, so
+    // Shift+Tab reaches a running child's gate exactly as it reaches the
+    // parent's own tools. A second instance for the children would freeze them
+    // at whatever the mode was at spawn.
+    let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
     let ParentTools {
         registry: tools,
         subagent_manager,
@@ -288,17 +306,18 @@ fn assemble_launch<C: LlmClient + Clone + 'static>(
         config,
         &roots,
         parent_cancel,
+        &permission_mode,
         &mut warnings,
         &ui_lang,
     );
     let (runtime, session_id) = make_runtime((*client).clone(), tools);
-    let permission_mode = SharedPermissionMode::new(config.default_permission_mode);
     let runtime = attach_workspace_helpers(runtime, &roots.primary, config, &mut warnings)
         .with_boundary(boundary)
         .with_permission_mode(permission_mode.clone())
         .with_ui_lang(ui_lang);
     LaunchedRuntime {
         handle: Arc::new(runtime),
+        sandbox_off: !config.sandbox_mode.is_os(),
         backend_label,
         session_id,
         subagent_manager,
@@ -610,11 +629,11 @@ fn build_parent_tools<C: LlmClient + 'static>(
     config: &AgentConfig,
     roots: &WorkspaceRoots,
     parent_cancel: &CancellationToken,
+    permission_mode: &SharedPermissionMode,
     warnings: &mut Vec<String>,
     ui_lang: &SharedLang,
 ) -> ParentTools {
-    let (mut registry, job_store, boundary) =
-        build_tool_registry(roots, config.sandbox_network, warnings, ui_lang);
+    let (mut registry, job_store, boundary) = build_tool_registry(roots, config, warnings, ui_lang);
     // Sub-agents inherit the parent's live boundary; without one (workspace
     // unresolvable — the fs tool groups are disabled too) there is nothing a
     // child could correctly work inside, so the dispatch tool stays unmounted.
@@ -626,6 +645,7 @@ fn build_parent_tools<C: LlmClient + 'static>(
                 config.clone(),
                 policy.clone(),
                 parent_cancel.clone(),
+                permission_mode.clone(),
             );
             let shutdown: Box<dyn Fn() + Send + Sync> = Box::new({
                 let extensions = Arc::clone(&extensions);

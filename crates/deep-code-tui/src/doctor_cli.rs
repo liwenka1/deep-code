@@ -169,6 +169,10 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
     // (or in the key) produced a report identical to one where it had taken
     // effect, on the one setting that hard-disables egress.
     println!("    [sandbox] network = {}", report.sandbox.network_setting);
+    // …and the sandbox switch, for the same reason one line up: it is a
+    // configuration value that decides what the gate DOES, and `off` removes the
+    // confinement every other line of this report describes.
+    println!("    [sandbox] mode = {}", report.sandbox.mode_setting);
     if report.sandbox.available && !overall.is_full() {
         println!(
             "    workspace-write confinement: {}",

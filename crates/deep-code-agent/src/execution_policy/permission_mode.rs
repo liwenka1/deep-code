@@ -1,7 +1,8 @@
 //! Session permission mode: how far the approval gate is relaxed.
 //!
 //! A mode only ever relaxes a `NeedsApproval` verdict into an auto-run. A hard
-//! `Deny` (rm -rf, fork bomb, `curl | sh`, …) is short-circuited by the tool
+//! `Deny` (rm -rf, fork bomb, `curl | sh`, an unauthorized `npm publish`, …) is
+//! short-circuited by the tool
 //! registry (`run_tool_call_with_plan`) before any decision is consulted, so no
 //! mode — not even `Yolo` —
 //! runs a command the deny list *recognized*. Be honest about what that

@@ -1,6 +1,6 @@
 //! Shared filesystem locations.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The user's home directory, if the environment names one.
 ///
@@ -207,6 +207,105 @@ pub(crate) const CREDENTIAL_ENTRIES: &[&str] = &[
     "Library/Keychains",
 ];
 
+/// Ecosystem cache directories a sandboxed command legitimately needs to
+/// WRITE, and that nothing else grants.
+///
+/// The same argument that puts the temp dir in `SandboxPolicy::writable_roots`
+/// applies here and only here: these are directories the user's own toolchain
+/// writes unconditionally, so a profile without them does not *confine*
+/// `npm install` or a cold `cargo build` — it makes them fail (the EPERM-on-its-
+/// own-cache case `sandbox::write_denial_signature` was taught to recognize).
+///
+/// **Subpaths, never the tool's home.** `$CARGO_HOME/config.toml` selects a
+/// source replacement (code execution at the next build) and `~/.npmrc` carries
+/// a registry token — both stay out, and `~/.npmrc` is in
+/// [`CREDENTIAL_ENTRIES`] besides. Granting the cache is not granting the tool.
+///
+/// **Paths must exist to be granted**, and a missing one is therefore *created*
+/// — not silently dropped, and never by granting a parent instead.
+///
+/// Landlock has no way to express a rule for an absent path (adding one errors
+/// and the whole per-command ruleset fails with it), and an unresolvable
+/// Seatbelt rule is a rule the kernel never matches. Dropping the entry is what
+/// this used to do, and the case it dropped is the common one: a fresh machine,
+/// a fresh CI container, a first `npm install`. `~/.npm/_cacache` does not exist
+/// yet, the tool cannot create it because `~/.npm` is not writable either, and
+/// the run dies on the very EPERM these roots were added to prevent — in the
+/// default configuration, on a host where nothing was misconfigured.
+///
+/// So the leaf is created here when its **parent already exists**. Creating it
+/// is what the toolchain would do on first use, and it is strictly narrower than
+/// the alternative (granting `~/.npm`, or `$CARGO_HOME` — which would expose
+/// `config.toml`, the source-replacement channel, which is exactly why a parent
+/// grant is never an option here). A parent that does not exist means this
+/// machine never used that toolchain, and then nothing is created and nothing is
+/// granted: an agent must not bring `~/.npm` into being for a user who has never
+/// run npm.
+pub(crate) fn tool_cache_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".cargo")));
+    if let Some(cargo_home) = cargo_home {
+        roots.push((cargo_home.join("registry"), CacheLeaf::Directory));
+        // A file, not a directory: cargo's advisory lock. `create_dir_all` here
+        // would leave a *directory* where cargo expects a file, so the kind
+        // travels with the path.
+        roots.push((cargo_home.join(".package-cache"), CacheLeaf::File));
+    }
+    if let Some(home) = home_dir() {
+        roots.push((home.join(".npm").join("_cacache"), CacheLeaf::Directory));
+        // The browser download root, where the platform actually puts it.
+        #[cfg(target_os = "macos")]
+        roots.push((
+            home.join("Library").join("Caches").join("ms-playwright"),
+            CacheLeaf::Directory,
+        ));
+        #[cfg(not(target_os = "macos"))]
+        roots.push((
+            home.join(".cache").join("ms-playwright"),
+            CacheLeaf::Directory,
+        ));
+    }
+
+    roots
+        .into_iter()
+        .filter_map(|(path, leaf)| leaf.ensure(path))
+        .collect()
+}
+
+/// Whether one cache path is a directory or a file, which decides how it is
+/// created. Only cargo's lock is a file today; the distinction is carried rather
+/// than guessed because guessing wrong turns a lock file into a directory.
+#[derive(Clone, Copy)]
+enum CacheLeaf {
+    Directory,
+    File,
+}
+
+impl CacheLeaf {
+    /// The path, once it exists — creating it when the parent is there to hold
+    /// it, and giving up when it is not.
+    fn ensure(self, path: PathBuf) -> Option<PathBuf> {
+        if path.exists() {
+            return Some(path);
+        }
+        if !path.parent().is_some_and(Path::exists) {
+            return None;
+        }
+        let created = match self {
+            Self::Directory => std::fs::create_dir_all(&path).is_ok(),
+            Self::File => std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .is_ok(),
+        };
+        created.then_some(path)
+    }
+}
+
 /// Absolute paths that a model-requested write grant must never reach: the
 /// [`CREDENTIAL_ENTRIES`] plus deep-code's own [`DEEP_CODE_DIR`].
 ///
@@ -247,4 +346,78 @@ pub(crate) fn sensitive_paths() -> Vec<PathBuf> {
         paths.push(joined);
     }
     paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Subpaths of the tools' homes, never the homes themselves:
+    /// `$CARGO_HOME/config.toml` selects a source replacement (code execution at
+    /// the next build) and `~/.npmrc` carries a registry token — and `~/.npmrc`
+    /// is in [`CREDENTIAL_ENTRIES`] besides. Granting the cache must not grant
+    /// the tool.
+    #[test]
+    fn tool_cache_roots_never_grant_a_tool_config_or_home() {
+        for root in tool_cache_roots() {
+            let name = root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            assert_ne!(
+                name, "config.toml",
+                "{root:?} would select a source replacement"
+            );
+            assert_ne!(name, ".npmrc", "{root:?} would carry a registry token");
+            // `Path::ends_with` compares whole components, so this is the home
+            // itself and not merely a path containing `.cargo`.
+            for tool_home in [".cargo", ".npm"] {
+                assert!(
+                    !root.ends_with(tool_home),
+                    "{root:?} is the tool home itself"
+                );
+            }
+        }
+    }
+
+    /// Only paths that exist. Landlock cannot express a rule for an absent path
+    /// (adding one fails the whole per-command ruleset, taking every other
+    /// margin with it), and a Seatbelt rule whose path does not resolve is a rule
+    /// the kernel never matches — so a missing entry is dropped, not bound.
+    #[test]
+    fn tool_cache_roots_only_returns_paths_that_exist() {
+        assert!(tool_cache_roots().iter().all(|root| root.exists()));
+    }
+
+    /// The fresh-machine case, which is the one that used to fail: an absent
+    /// cache leaf is created when — and only when — its parent is already there.
+    /// Dropping it instead meant the FIRST `npm install` on a new machine died
+    /// on the EPERM these roots exist to prevent, in the default configuration,
+    /// with nothing misconfigured.
+    #[test]
+    fn a_missing_cache_leaf_is_created_only_where_its_parent_exists() {
+        let parent = tempfile::tempdir().unwrap();
+
+        let leaf = parent.path().join("_cacache");
+        assert_eq!(
+            CacheLeaf::Directory.ensure(leaf.clone()),
+            Some(leaf.clone())
+        );
+        assert!(leaf.is_dir(), "the directory kind makes a directory");
+
+        // …and the file kind must NOT: `create_dir_all` on cargo's advisory lock
+        // would leave a directory where cargo expects a file.
+        let lock = parent.path().join(".package-cache");
+        assert_eq!(CacheLeaf::File.ensure(lock.clone()), Some(lock.clone()));
+        assert!(lock.is_file(), "the file kind makes a file");
+
+        // Already present: handed back untouched.
+        assert_eq!(CacheLeaf::Directory.ensure(leaf.clone()), Some(leaf));
+
+        // Parent absent: nothing created, nothing granted. An agent must not
+        // bring `~/.npm` into being for a user who has never run npm.
+        let deep = parent.path().join("missing").join("_cacache");
+        assert_eq!(CacheLeaf::Directory.ensure(deep.clone()), None);
+        assert!(!deep.exists());
+    }
 }

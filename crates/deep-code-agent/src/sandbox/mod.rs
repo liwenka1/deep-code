@@ -152,6 +152,69 @@ pub(crate) fn network_denial_signature(exit_code: Option<i32>, stderr: &str) -> 
             })
 }
 
+/// Model-facing note for a failed sandboxed command whose output looks like a
+/// credential failure — a class neither existing note covers.
+///
+/// The gap was real: an SSH push whose key is unreachable, or an HTTPS push
+/// whose credential helper cannot reach the keychain, fails with
+/// `Permission denied (publickey)`, and [`write_denial_signature`] deliberately
+/// excludes that text (a `chmod` is not the fix). So the one failure class no
+/// retry can repair arrived with no note at all: the model retried, or reached
+/// for `/add-dir`, neither of which can help. The recovery is a human action
+/// outside the sandbox (agent/keychain setup) or a different transport.
+///
+/// Sited after the network check on purpose. A credential failure happens
+/// *after* connecting, so on an offline run the connection error is still the
+/// root cause and the network note is the honest one; this check is what
+/// catches the case where egress was granted and auth is what broke.
+///
+/// It is also the one denial class judged for a run that was NOT sandboxed:
+/// unlike the other two, the failure is about *who* the command is rather than
+/// about a fence the sandbox erects, and the remedy does not change with
+/// confinement. `[sandbox] mode = "off"` would otherwise lose this diagnosis
+/// entirely, on a host where credential problems are if anything more likely to
+/// be hit.
+pub(crate) const CREDENTIAL_DENIAL_NOTE: &str = "[note] this command looks like it failed on \
+CREDENTIALS, not on the workspace boundary and not on egress: retrying it unmodified cannot \
+succeed. If it is an SSH push, the agent is not reachable, the key needs a passphrase, or the \
+host is not in known_hosts; if it is HTTPS, the credential helper is not usable from here (a \
+sandboxed command reaches the keychain only with the network grant). The fix is outside the \
+command: configure ssh-agent / the credential helper for this user, or switch the remote to a \
+transport that works non-interactively.";
+
+/// Heuristic: does a failed *sandboxed* command's output look like an
+/// authentication/credential failure?
+///
+/// Matched on provider-agnostic wordings rather than one vendor's: ssh's
+/// `Permission denied (publickey)` and `sign_and_send_pubkey: signing failed`
+/// (the macOS keychain/passphrase form), git's `Authentication failed` and
+/// `could not read Username/Password` plus `terminal prompts disabled` (what a
+/// non-interactive helper prints when it wanted to ask), and ssh's
+/// `Host key verification failed` (which is `~/.ssh/known_hosts` being
+/// unwritable or unknown-host in a run that cannot answer).
+///
+/// Callers must additionally know the run was sandboxed and failed; this
+/// function only inspects the text.
+#[must_use]
+pub(crate) fn credential_denial_signature(exit_code: Option<i32>, stderr: &str) -> bool {
+    if exit_code == Some(0) {
+        return false;
+    }
+    // Case-insensitive for the same reason `write_denial_signature` is: ssh
+    // capitalizes, runtimes and wrappers do not.
+    let lower = stderr.to_ascii_lowercase();
+    const SIGNATURES: [&str; 7] = [
+        "permission denied (publickey",
+        "sign_and_send_pubkey",
+        "authentication failed",
+        "could not read username",
+        "could not read password",
+        "terminal prompts disabled",
+        "host key verification failed",
+    ];
+    SIGNATURES.iter().any(|signature| lower.contains(signature))
+}
+
 /// Detected sandbox backend for the current platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SandboxBackend {
@@ -529,6 +592,33 @@ impl SandboxManager {
     pub fn force_sandbox(mut self, enabled: Option<bool>) -> Self {
         self.forced = enabled;
         self
+    }
+
+    /// `[sandbox] mode = "off"`: run every command bare, because the boundary is
+    /// provided by something larger than this process (a container, a micro-VM,
+    /// a disposable runner).
+    ///
+    /// Implemented through the same override the tests use, on purpose: it is
+    /// the one place that answers "should this command be confined", and
+    /// `wrap_command` plus `sandbox_unavailable_for` both already consult it.
+    /// A second path would be a second answer.
+    ///
+    /// Note what this is NOT: it is not the no-backend case. A host whose probe
+    /// fails has `forced: None`, so `sandbox_unavailable_for` refuses to run the
+    /// command at all — the deliberate "never silently run bare" behaviour. This
+    /// is the opposite: a user saying "run bare, I know what is outside".
+    #[must_use]
+    pub fn without_confinement() -> Self {
+        Self {
+            forced: Some(false),
+        }
+    }
+
+    /// Whether confinement is off by configuration, rather than by a host with
+    /// no backend. Callers use it to describe themselves honestly to the model.
+    #[must_use]
+    pub fn confinement_disabled(&self) -> bool {
+        self.forced == Some(false)
     }
 
     pub fn should_sandbox(&self, policy: &SandboxPolicy) -> bool {

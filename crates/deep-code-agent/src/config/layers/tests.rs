@@ -774,3 +774,66 @@ fn warnings_render_in_the_callers_language_not_only_the_configs() {
     );
     assert!(english.contains("cost.currency"));
 }
+
+/// The turn budget: a global knob with a project layer that may only tighten it,
+/// where "tighten" means spending LESS. `0` is the loosest value rather than the
+/// smallest — it removes the ceiling — so a project reaching for it is widening,
+/// exactly like one reaching for a huge finite number.
+#[test]
+fn turn_budget_defaults_and_is_only_lowered_from_the_project_layer() {
+    assert_eq!(
+        AgentConfig::builtin().turn_steps,
+        crate::runtime::MAX_TURN_STEPS,
+        "the builtin budget is the shipped ceiling"
+    );
+
+    // The global layer may set any value, including the unlimited one.
+    let global_dir = tempfile::tempdir().unwrap();
+    let global = write_config(global_dir.path(), "[budget]\nturn_steps = 40\n");
+    let loaded = AgentConfig::load_with(Some(global.clone()), None, &no_env);
+    assert_eq!(loaded.config.turn_steps, 40);
+
+    // A project may lower it further…
+    let project_dir = tempfile::tempdir().unwrap();
+    let project = write_config(project_dir.path(), "[budget]\nturn_steps = 10\n");
+    let loaded = AgentConfig::load_with(Some(global.clone()), Some(project), &no_env);
+    assert_eq!(loaded.config.turn_steps, 10);
+
+    // …but never raise it, and never unlock it with `0`.
+    for value in ["900", "0"] {
+        let project_dir = tempfile::tempdir().unwrap();
+        let project = write_config(
+            project_dir.path(),
+            &format!("[budget]\nturn_steps = {value}\n"),
+        );
+        let loaded = AgentConfig::load_with(Some(global.clone()), Some(project), &no_env);
+        assert_eq!(
+            loaded.config.turn_steps, 40,
+            "project value {value} must not widen the budget"
+        );
+        assert!(
+            loaded
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("budget.turn_steps")),
+            "ignoring a repo's budget must be surfaced: {:?}",
+            loaded.report.warnings
+        );
+    }
+
+    // Against a global `0` (the user's own decision), a finite project value is
+    // a tightening and is accepted.
+    let unlimited_dir = tempfile::tempdir().unwrap();
+    let unlimited = write_config(unlimited_dir.path(), "[budget]\nturn_steps = 0\n");
+    let loaded = AgentConfig::load_with(Some(unlimited), None, &no_env);
+    assert_eq!(loaded.config.turn_steps, 0, "0 is an accepted global value");
+    let project_dir = tempfile::tempdir().unwrap();
+    let project = write_config(project_dir.path(), "[budget]\nturn_steps = 25\n");
+    let loaded = AgentConfig::load_with(
+        Some(global_dir.path().join("config.toml")),
+        Some(project),
+        &no_env,
+    );
+    assert_eq!(loaded.config.turn_steps, 25);
+}

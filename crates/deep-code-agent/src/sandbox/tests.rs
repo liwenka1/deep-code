@@ -521,3 +521,71 @@ fn the_shell_builtin_trust_rules_name_real_programs_on_unix() {
         );
     }
 }
+
+/// A credential failure is a class of its own, and the gap it left was real:
+/// `write_denial_signature` excludes `Permission denied (publickey)` on purpose
+/// (a `chmod` is not the fix), so before this the one failure no retry can
+/// repair arrived with no note at all.
+#[test]
+fn credential_denial_is_recognized_and_never_masquerades_as_a_write_denial() {
+    // ssh, key unreachable.
+    assert!(credential_denial_signature(
+        Some(128),
+        "git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository."
+    ));
+    // macOS keychain / passphrase form.
+    assert!(credential_denial_signature(
+        Some(1),
+        "sign_and_send_pubkey: signing failed for RSA \"/Users/x/.ssh/id_rsa\": Operation not permitted"
+    ));
+    // https helper with no way to ask.
+    assert!(credential_denial_signature(
+        Some(1),
+        "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+    ));
+    assert!(credential_denial_signature(
+        Some(1),
+        "fatal: Authentication failed for 'https://github.com/x/y.git/'"
+    ));
+    // Not a credential failure: this is the granted-roots fence, and the write
+    // note is the honest one to hand the model.
+    assert!(!credential_denial_signature(
+        Some(1),
+        "npm ERR! EPERM: operation not permitted, mkdir '/Users/x/.npm'"
+    ));
+    // And a successful run never carries a failure note.
+    assert!(!credential_denial_signature(
+        Some(0),
+        "Permission denied (publickey)."
+    ));
+}
+
+/// Three failure classes, three notes. They are matched by `contains`, so two
+/// notes sharing a phrase would let the weaker remedy win the earlier check.
+#[test]
+fn the_three_denial_notes_are_distinct() {
+    assert_ne!(WRITE_DENIAL_NOTE, NETWORK_DENIAL_NOTE);
+    assert_ne!(WRITE_DENIAL_NOTE, CREDENTIAL_DENIAL_NOTE);
+    assert_ne!(NETWORK_DENIAL_NOTE, CREDENTIAL_DENIAL_NOTE);
+}
+
+/// `[sandbox] mode = "off"` runs bare and does NOT refuse — the exact opposite
+/// of the no-backend case, where `refuse_bare_execution` stops the command. Both
+/// go through the same override, so this pins that they stay distinguishable.
+#[test]
+fn without_confinement_runs_bare_instead_of_refusing() {
+    let manager = SandboxManager::without_confinement();
+    assert!(manager.confinement_disabled());
+    let policy = SandboxPolicy::WorkspaceWrite {
+        network_access: false,
+    };
+    assert!(!manager.should_sandbox(&policy), "off means no confinement");
+    assert!(
+        !manager.sandbox_unavailable_for(&policy),
+        "a deliberately bare run must not be refused for lack of a backend"
+    );
+    assert!(
+        !SandboxManager::new().confinement_disabled(),
+        "the default manager confines"
+    );
+}

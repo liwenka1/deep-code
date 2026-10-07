@@ -66,7 +66,8 @@ pub use doctor::{DoctorReport, default_config_path};
 pub use error::AgentResult;
 pub use event::AgentEvent;
 pub use execution_policy::{
-    NetworkMode, PermissionMode, RiskLevel, SafetyNote, SharedPermissionMode, shell_command_of,
+    NetworkMode, PermissionMode, RiskLevel, SafetyNote, SandboxMode, SharedPermissionMode,
+    shell_command_of,
 };
 pub use i18n::{Lang, TextId, tr, tr_with};
 // The TUI reads the clipboard and writes the bytes, the runtime reads them back
@@ -95,9 +96,9 @@ pub use paths::{canonicalize, ensure_owned_dirs};
 pub use pricing::{CostCurrency, CostEstimate};
 pub use root_grant::REQUEST_WRITE_ROOT_TOOL;
 pub use runtime::{
-    AgentRuntime, CompactionReport, PrefixStatus, RuntimeEvent, RuntimeEventReceiver, ToolCallId,
-    TurnId, TurnTelemetry, UserTurn, is_network_tool, session_consent_recordable,
-    unattended_denial_note,
+    AgentRuntime, CompactionReport, MAX_TURN_STEPS, PrefixStatus, RuntimeEvent,
+    RuntimeEventReceiver, ToolCallId, TurnId, TurnTelemetry, UserTurn, is_network_tool,
+    session_consent_recordable, unattended_denial_note,
 };
 pub use runtime_launch::{LaunchedRuntime, launch_runtime, web_enabled};
 pub use sandbox::{Enforcement, EnforcementGap, sandbox_available, sandbox_enforcement};

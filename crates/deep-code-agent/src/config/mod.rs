@@ -130,6 +130,22 @@ pub struct AgentConfig {
     /// to `always` — a repo must not silently re-arm ambient egress (enforced
     /// in the layered loader).
     pub sandbox_network: NetworkMode,
+    /// Whether the OS sandbox runs at all (`[sandbox] mode`): `os` (the
+    /// default) or `off`. Only the global layer may set `off` — a repository
+    /// must not be able to turn its own confinement off (enforced in the
+    /// layered loader).
+    pub sandbox_mode: crate::execution_policy::SandboxMode,
+    /// Commands that would otherwise hit the irreversible-outward floor
+    /// (`[sandbox] allow_irreversible`), matched by command identity exactly as
+    /// `approval.auto_allow` matches tool names. Empty by default: publishing,
+    /// force-pushing and merging are decisions only a human makes, and there is
+    /// no standing consent for them.
+    pub sandbox_allow_irreversible: Vec<String>,
+    /// Model requests allowed in one turn (`[budget] turn_steps`). `0` means no
+    /// ceiling at all — the user's own choice, and the one setting whose absence
+    /// removes the only backstop a runaway loop has. Only the global layer may
+    /// raise it (a project may lower it), because it is a spend knob.
+    pub turn_steps: u32,
 }
 
 impl Default for AgentConfig {
@@ -173,6 +189,9 @@ impl AgentConfig {
             lsp_enabled: true,
             vision_detail: ImageDetail::Auto,
             sandbox_network: NetworkMode::Prompt,
+            sandbox_mode: crate::execution_policy::SandboxMode::Os,
+            sandbox_allow_irreversible: Vec::new(),
+            turn_steps: crate::runtime::MAX_TURN_STEPS,
         }
     }
 

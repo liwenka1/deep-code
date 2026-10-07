@@ -1,5 +1,6 @@
 use crate::session_store::now_ms;
 use crate::subagent::output::parse_structured_report;
+use crate::subagent::roles::SubAgentRole;
 use crate::subagent::types::{
     HARD_MAX_CONCURRENT, MAX_RETAINED_AGENTS, SubAgentError, SubAgentRecord, SubAgentStatus,
 };
@@ -42,6 +43,22 @@ impl SubAgentManager {
         self.agents
             .values()
             .filter(|agent| agent.status == SubAgentStatus::Running)
+            .count()
+    }
+
+    /// Running children whose role may write the workspace.
+    ///
+    /// The concurrency cap is a count of children, which is the wrong unit for
+    /// this question: ten readers on one workspace are a throughput choice, and
+    /// two writers on one workspace are a corruption class (two `apply_patch`s
+    /// on one file, two package installs on one `node_modules`, one rebasing
+    /// while the other pushes). Checkpoints do not cover it either — they are
+    /// recovery, not containment.
+    pub fn running_writers(&self) -> usize {
+        self.agents
+            .values()
+            .filter(|agent| agent.status == SubAgentStatus::Running)
+            .filter(|agent| SubAgentRole::parse(&agent.role).is_ok_and(|role| role.allows_writes()))
             .count()
     }
 
@@ -214,6 +231,41 @@ mod tests {
             manager.insert(record("a2", "second", SubAgentStatus::Running)),
             Err(SubAgentError::ConcurrencyLimit { .. })
         ));
+    }
+
+    /// Writers are counted on their own axis. The concurrency cap answers "how
+    /// many children at once"; this answers "may another writer start", which is
+    /// a question about one workspace, not about throughput.
+    #[test]
+    fn running_writers_counts_only_running_writing_roles() {
+        let mut manager = SubAgentManager::new(DEFAULT_MAX_CONCURRENT);
+        assert_eq!(
+            manager.running_writers(),
+            0,
+            "an empty ledger has no writer"
+        );
+
+        // A reader never counts, however many are in flight.
+        manager
+            .insert(record("reader", "reader", SubAgentStatus::Running))
+            .unwrap();
+        assert_eq!(manager.running_writers(), 0, "`explore` never writes");
+
+        let mut writer = record("writer", "writer", SubAgentStatus::Running);
+        writer.role = "implementer".to_string();
+        manager.insert(writer).unwrap();
+        assert_eq!(manager.running_writers(), 1);
+
+        // A finished writer stops blocking: that is what makes the
+        // serialization a queue rather than a one-shot.
+        manager
+            .finalize_success("writer", "done".to_string(), 3)
+            .unwrap();
+        assert_eq!(
+            manager.running_writers(),
+            0,
+            "a finished writer frees the slot"
+        );
     }
 
     /// The ledger is bounded, and bounded in the safe direction: finished

@@ -4,7 +4,16 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_MAX_CONCURRENT: usize = 10;
 pub const HARD_MAX_CONCURRENT: usize = 20;
-pub const DEFAULT_MAX_STEPS: u32 = 50;
+/// Tool-call budget for one child run.
+///
+/// Counted in **finished tool calls**, not in model requests like the parent
+/// loop's `MAX_TURN_STEPS` — a unit mismatch, and one that charges a child N
+/// for a batch of N parallel calls while the parent is charged 1 for the same
+/// batch. The number is raised anyway (from 50) because 50 was below the real
+/// work: a whole SWE-bench instance spends 25–38 calls, so 50 could not cover
+/// a delegated *chunk* of one. Unifying the unit is tracked in
+/// `docs/agent-grants-and-budget-plan.md`; until then, read this as calls.
+pub const DEFAULT_MAX_STEPS: u32 = 200;
 
 /// How many sub-agent records the session ledger keeps (see
 /// [`super::manager::SubAgentManager`]), mirroring the job store's own cap.

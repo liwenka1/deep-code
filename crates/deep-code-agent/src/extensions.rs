@@ -5,6 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::LlmClient;
 use crate::config::AgentConfig;
+use crate::execution_policy::SharedPermissionMode;
 use crate::skills::build_system_prompt;
 use crate::subagent::{DEFAULT_MAX_CONCURRENT, SubAgentServices, register_subagent_tools};
 use crate::tool::ToolRegistry;
@@ -90,6 +91,7 @@ pub fn attach_agent_extensions(
     agent_config: AgentConfig,
     boundary: WorkspacePolicy,
     parent_cancel: CancellationToken,
+    permission_mode: SharedPermissionMode,
 ) -> Arc<AgentExtensions> {
     let exec_policy = registry.policy().clone();
     let subagent = Arc::new(SubAgentServices::new(
@@ -97,6 +99,7 @@ pub fn attach_agent_extensions(
         agent_config,
         boundary,
         parent_cancel,
+        permission_mode,
         DEFAULT_MAX_CONCURRENT,
         exec_policy,
     ));

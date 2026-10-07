@@ -810,3 +810,31 @@ fn job_status_as_str_is_its_serde_spelling() {
         );
     }
 }
+
+/// Credentials are the one denial class judged with AND without the sandbox:
+/// `mode = "off"` runs bare, and a failing push there needs the same diagnosis
+/// as a sandboxed one. The neighbouring promise is pinned too — an unsandboxed
+/// `Operation not permitted` is an ordinary permission error and must stay
+/// silent, or every bare-mode EPERM would be read as a boundary denial.
+#[test]
+fn credential_denial_is_noted_with_or_without_a_sandbox() {
+    const SSH_FAILURE: &str = "git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.";
+    let sandboxed = finished_job(JobStatus::Failed, true, SSH_FAILURE);
+    assert!(
+        shell_text_output("job_1", &sandboxed, 4096)
+            .contains(crate::sandbox::CREDENTIAL_DENIAL_NOTE)
+    );
+    let bare = finished_job(JobStatus::Failed, false, SSH_FAILURE);
+    assert!(
+        shell_text_output("job_2", &bare, 4096).contains(crate::sandbox::CREDENTIAL_DENIAL_NOTE),
+        "an unsandboxed credential failure needs the note as much as a sandboxed one"
+    );
+
+    let bare_eperm = finished_job(JobStatus::Failed, false, "sh: Operation not permitted");
+    let text = shell_text_output("job_3", &bare_eperm, 4096);
+    assert!(
+        !text.contains(crate::sandbox::CREDENTIAL_DENIAL_NOTE)
+            && !text.contains(crate::sandbox::WRITE_DENIAL_NOTE),
+        "an unsandboxed permission error is neither note: {text}"
+    );
+}

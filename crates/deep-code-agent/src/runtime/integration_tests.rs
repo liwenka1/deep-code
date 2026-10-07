@@ -5275,3 +5275,127 @@ async fn the_same_image_turn_is_accepted_on_flash() {
         "Flash accepts images, so the turn must run: {events:?}"
     );
 }
+
+/// The soft end of the budget, end to end: past four fifths of the cap the model
+/// is asked to converge and hand over, and the turn is still allowed to finish.
+/// Before this the only signal was the hard stop, which cannot ask for anything.
+#[tokio::test]
+async fn a_turn_past_four_fifths_of_its_budget_is_asked_to_hand_over() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+
+    // Four requests: three tool rounds then a final answer. The notice is due at
+    // step 3 (four fifths of 4), which is exactly one round before the end, so
+    // the test also pins that the warning itself does not end the turn.
+    let config = crate::config::AgentConfig {
+        turn_steps: 4,
+        ..Default::default()
+    };
+
+    let mut scripts: Vec<Vec<AgentEvent>> = (0..3)
+        .map(|index| {
+            vec![
+                AgentEvent::ToolCallDelta {
+                    delta: tool_call_delta(
+                        &format!("call_{index}"),
+                        MockEchoTool::NAME,
+                        r#"{"message":"hi"}"#,
+                    ),
+                },
+                AgentEvent::Done { usage: None },
+            ]
+        })
+        .collect();
+    scripts.push(vec![
+        AgentEvent::TextDelta {
+            text: "handing over".to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]);
+
+    let runtime = AgentRuntime::with_system_prompt(
+        ScriptedClient::new(scripts),
+        ToolRegistry::with_mock_tools(),
+        "",
+        config,
+        false,
+    )
+    .with_permission_mode(SharedPermissionMode::new(PermissionMode::Yolo));
+
+    let mut rx = runtime.submit_user("work").await;
+    let events = drain(&mut rx).await;
+
+    let notice = events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::UserMessageInjected { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("the budget notice must reach the model before the cap");
+    assert!(
+        notice.contains("3/4"),
+        "the notice names the budget it is about: {notice}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Error { .. })),
+        "the soft end is a warning, not a stop: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnFinished { .. })),
+        "the turn still finishes on the model's own terms"
+    );
+}
+
+/// …and the hard end still stops, so raising the cap did not remove the backstop.
+#[tokio::test]
+async fn the_hard_end_of_the_budget_still_stops_the_turn() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+
+    let config = crate::config::AgentConfig {
+        turn_steps: 2,
+        ..Default::default()
+    };
+
+    // Three tool rounds against a budget of two: the third iteration is over it.
+    let scripts: Vec<Vec<AgentEvent>> = (0..3)
+        .map(|index| {
+            vec![
+                AgentEvent::ToolCallDelta {
+                    delta: tool_call_delta(
+                        &format!("call_{index}"),
+                        MockEchoTool::NAME,
+                        r#"{"message":"hi"}"#,
+                    ),
+                },
+                AgentEvent::Done { usage: None },
+            ]
+        })
+        .collect();
+
+    let runtime = AgentRuntime::with_system_prompt(
+        ScriptedClient::new(scripts),
+        ToolRegistry::with_mock_tools(),
+        "",
+        config,
+        false,
+    )
+    .with_permission_mode(SharedPermissionMode::new(PermissionMode::Yolo));
+
+    let mut rx = runtime.submit_user("work").await;
+    let events = drain(&mut rx).await;
+
+    let error = events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("exceeding the cap must stop the turn");
+    assert!(
+        error.contains("2"),
+        "the stop names the ceiling that was hit: {error}"
+    );
+}

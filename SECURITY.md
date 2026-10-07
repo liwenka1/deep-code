@@ -118,11 +118,38 @@ review to rediscover:
   floor is the only rule in front of it — the entry below says what that leaves
   open. Config `auto_allow` and the `auto` judge approve text the same way, with
   nobody reading it.
+- `[sandbox] mode = "off"` removes the OS sandbox on **every** platform. What is
+  left in front of a command is then the deny floor and the irreversible-outward
+  floor — two best-effort readings of the text — on macOS and Linux just as much
+  as on Windows. It is the user's own global-layer decision (a project may ask
+  for `os` but never for `off`), it is meant for runs where something larger
+  already fences the process (a container, a micro-VM, a disposable runner), and
+  it is made loud everywhere it applies: `deepcode doctor`, a permanent status
+  marker, and an outright refusal in the eval harness, which auto-approves model
+  commands over untrusted repositories.
+- The irreversible-outward floor (publishing a package, force-pushing over
+  someone's commits, merging a PR, applying infrastructure, deleting a bucket)
+  is a **consent** gate, not a containment boundary. Its promise is narrow and
+  stated as such: no routine spelling of those commands runs unless the user
+  authorized that class of command. It reads the argv, it is liftable by one
+  configuration entry the user writes, and an obfuscation it cannot read walks
+  past it. So does a leading global option that takes a value — `kubectl -n prod
+  delete pod api` is not refused, `kubectl delete -n prod pod api` is — because
+  reading that correctly means modelling each program's option arity, which is a
+  parser rather than a floor. The class is kept short on purpose: a floor that
+  strands legitimate work is a floor someone turns off.
 - Windows has no filesystem or network confinement; an unattended command
   there runs only a real `.exe`/`.com` (cmd builtins and `.cmd`/`.bat`
   wrappers are refused, not routed through `cmd.exe`).
 - A symlink inside the workspace resolves outside it; creating one costs a
   prompt, and a repository that ships one is trusted the moment it is opened.
+- The ecosystem cache directories are a writable persistence surface, not only a
+  convenience: `$CARGO_HOME/registry` holds the index *and* the downloaded
+  sources, so a command that holds egress can plant a crate a later build trusts,
+  and `~/.npm/_cacache` is the same shape. The subpath rule keeps the tool's
+  *configuration* out (`config.toml` selects a source replacement; `.npmrc` is in
+  `CREDENTIAL_ENTRIES`), which is what stops the grant from becoming code
+  execution — it does not make the cache read-only.
 - Credential directories are readable by sandboxed commands: SSH-signed
   commits, `npm` (`~/.npmrc`) and `codesign` (keychains) need them offline,
   so the read fence is the operand spelling above, not the kernel.
@@ -340,10 +367,28 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
   Linux 上是 OS 沙箱,那里的 deny floor 确实只是体验层的地板;Windows 上没有任何
   东西约束它,deny floor 就是它前面唯一的一条规则——下一条写明那留下了什么。
   配置的 `auto_allow` 与 `auto` 判官同样是没有人读过文本的通道。
+- `[sandbox] mode = "off"` 在**每个**平台都移除 OS 沙箱。此时命令前面剩下的只有
+  deny floor 与"不可逆对外"地板——两次尽力而为的文本判读——macOS 与 Linux 上同样
+  如此。它是用户自己在全局层的决定(项目层可以要求 `os`,永远不能要求 `off`),
+  面向的是外层已有围栏的场景(容器、micro-VM、一次性 runner),并且处处显式:
+  `deepcode doctor`、状态栏常驻标记、以及 eval 侧的硬拒绝(eval 会在不受信仓库上
+  自动批准模型命令)。
+- "不可逆对外"地板(发布包、强推覆盖他人提交、合并 PR、apply 基础设施、删对象
+  存储)是**同意**门,不是约束边界。它的承诺是窄的,而且就按窄的写:这些命令的常规
+  拼写一旦未经用户对该类命令的授权,就不运行。它读的是 argv,可以由用户写一条配置
+  解除,而它读不懂的混淆写法会绕过去;会绕过去的还有"带值的前置全局选项"——
+  `kubectl -n prod delete pod api` 不会被拒,`kubectl delete -n prod pod api` 会,
+  因为要正确读出前者就得给每个程序建选项元数模型,那是解析器而不是地板。这一类刻意
+  保持很短——把正当工作搞死的地板,下场是被人关掉。
 - Windows 没有文件系统与网络约束;免审命令在那里只运行真正的 `.exe`/`.com`
   (cmd 内建与 `.cmd`/`.bat` 包装拒绝执行,不回落到 `cmd.exe`)。
 - 工作区内的符号链接会解析到外面;创建它要一次提示,而自带链接的仓库在打开
   的那一刻就已被信任。
+- 生态缓存目录是一个**可写的持久化面**,而不只是方便:`$CARGO_HOME/registry` 里既
+  有 index 也有下载下来的源码,所以持有 egress 的命令可以在里面种一个后续构建会信任
+  的 crate,`~/.npm/_cacache` 同理。子路径规则挡住的是工具**配置**(`config.toml` 会
+  选 source replacement;`.npmrc` 已在 `CREDENTIAL_ENTRIES`),这挡住的是"授权变成代码
+  执行",并不等于让缓存只读。
 - 凭据目录对沙箱内命令可读:SSH 签名的 commit、`npm`(`~/.npmrc`)、`codesign`
   (钥匙串)在离线时也需要它们,所以读侧围栏是上面的操作数拼写,不是内核。
 - Linux 上写边界不覆盖文件**元数据**:Landlock 没有管 `chmod`/`chown`/`utimes`

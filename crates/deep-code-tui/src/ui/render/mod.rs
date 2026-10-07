@@ -357,6 +357,16 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) 
         format!("[{}] ", crate::app::perm_mode_label(app.lang, mode)),
         chip_style,
     )];
+    // Unsandboxed shouts louder than any permission mode: `[sandbox] mode =
+    // "off"` removes the boundary every other sentence in the status line and
+    // every approval panel is predicated on, so a session running bare must be
+    // unmistakable at a glance.
+    if app.sandbox_off {
+        spans.push(Span::styled(
+            "[unsandboxed] ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
 
     if let Some(error) = &app.error {
         spans.push(Span::styled(

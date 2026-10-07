@@ -19,7 +19,7 @@
 # snapshot retention, or quietly lift the approval gate. Set those globally or
 # in the environment.
 #
-# Three settings are tighten-only from the project layer: a repo may be
+# Five settings are tighten-only from the project layer: a repo may be
 # stricter than your global config, never looser, and an attempt to loosen is
 # ignored with a warning.
 #   - approval.default_mode may only step DOWN (auto to default, say), never up.
@@ -28,6 +28,11 @@
 #   - sandbox.network may only be stricter than the global value (always, then
 #     prompt, then never). Widening is ignored — with a global "never", a
 #     project-layer "prompt" is ignored too.
+#   - sandbox.mode may only be stricter than the global value (off, then os).
+#     A repository may ask for `os`; it can never turn its own confinement off.
+#   - budget.turn_steps may only be LOWERED, and may not be set to 0: 0 is the
+#     loosest value (no ceiling), not the smallest, so a repo reaching for it is
+#     widening exactly like one reaching for a huge number.
 #   - lsp.enabled may only be set false (turning the language server off). It
 #     cannot turn it on for you.
 #
@@ -94,6 +99,63 @@
 #   never   declaring commands, networked dispatches and the web tools are all
 #           refused outright
 # network = "prompt"
+#
+# Whether the OS sandbox runs at all.
+#
+#   os   the default. Everything this section describes — writes bounded to the
+#        granted roots, no egress without a grant — is what you get.
+#   off  every shell/job command runs bare, because the boundary is provided by
+#        something larger than this process: a container, a micro-VM, a
+#        disposable CI runner. Commands are not refused for lack of a backend
+#        either, so this is also the answer on a host whose probe fails.
+#
+# Read this as "I am already inside a fence": it removes the write and network
+# confinement outright, and the commands this agent runs inherit your whole user
+# account. It is global-layer only (a repository may tighten to `os` but never
+# loosen to `off`), `deepcode doctor` reports the value in force, and the status
+# line carries a permanent `[unsandboxed]` chip while it is not `os`.
+# mode = "os"
+#
+# Commands that are irreversible AND outward-facing are refused unless the user
+# authorized them here. Being refused is deliberate rather than an inconvenience
+# to work around: it is a decision only a human makes, and there is no standing
+# consent for publishing a package, force-pushing over someone's commits,
+# merging a PR, applying infrastructure or deleting a bucket. Under `yolo`
+# nobody sees a prompt, so the authorization has to be given in advance — which
+# is what this key is.
+#
+# Entries match the words the executor would run, IN ORDER, so a flag cannot
+# hide from them: `npm publish --tag next` is matched by "npm publish", and
+# `git push origin main --force` needs the force flag spelled out. A dry run is
+# never refused — `npm publish --dry-run` and `kubectl delete --dry-run=client`
+# publish and delete nothing.
+#
+# The entry does not have to name every word, and that is the part to read twice.
+# A shorter entry authorizes the wider thing on purpose: an entry for `git push`
+# also authorizes a force push, and an entry for the single word `push` also
+# authorizes `docker push` — the match is over words IN ORDER, not over programs.
+# Write the longest run you actually mean.
+#
+# Global layer only, the same class as approval.auto_allow: an exemption written
+# by a checked-out repository would be a repository granting itself the right to
+# publish on your behalf.
+# allow_irreversible = ["npm publish"]
+
+[budget]
+# Model requests allowed in one turn. A turn is one user message and everything
+# the model does before it stops; every iteration is one API request whose
+# context is larger than the last, and the only other exits are your cancel key,
+# a stream error, an empty tool batch or an approval park — so this is the one
+# backstop a runaway loop has.
+#
+# 0 means no ceiling at all. That is a real option, and the config says what it
+# costs rather than hiding it: with nobody at the keyboard (yolo, a sub-agent, a
+# headless run) nothing stops a model that keeps calling tools except the
+# stream's own timeouts. Prefer a large finite number to 0.
+#
+# A project config may only LOWER this (it spends less of your money), and never
+# raise it nor set 0 — a repository must not be able to unlock your budget.
+# turn_steps = 500
 
 [cost]
 # Display currency for costs: cny or usd.
@@ -131,6 +193,10 @@
 # (DEEP_CODE_APPROVAL_AUTO_ALLOW, comma-separated) or the global config. In a
 # project .deep-code/config.toml it is ignored with a warning, so a hostile repo
 # cannot quietly lift the approval gate.
+#
+# sandbox.allow_irreversible is global-layer for the same reason (see [sandbox]):
+# an exemption written by a checkout would be that checkout granting itself the
+# right to publish on your behalf.
 #
 # Note that clearing a tool is standing consent to the WHOLE tool, which
 # includes skipping the per-call network approval described under [sandbox]:

@@ -309,6 +309,7 @@ macro_rules! sections {
             ("ui", &$file.ui.unknown),
             ("lsp", &$file.lsp.unknown),
             ("sandbox", &$file.sandbox.unknown),
+            ("budget", &$file.budget.unknown),
             ("vision", &$file.vision.unknown),
         ]
     };
@@ -326,6 +327,7 @@ struct ConfigFile {
     ui: UiSection,
     lsp: LspSection,
     sandbox: SandboxSection,
+    budget: BudgetSection,
     vision: VisionSection,
     /// Top-level keys and whole sections no field claims.
     #[serde(flatten)]
@@ -424,6 +426,19 @@ struct LspSection {
 struct SandboxSection {
     /// `prompt` | `always` | `never`; see [`NetworkMode`].
     network: Option<String>,
+    /// `os` | `off`; see [`crate::execution_policy::SandboxMode`].
+    mode: Option<String>,
+    /// Command identities exempt from the irreversible-outward floor.
+    allow_irreversible: Option<Vec<String>>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct BudgetSection {
+    /// Model requests allowed in one turn; `0` = no ceiling.
+    turn_steps: Option<u32>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -665,6 +680,71 @@ fn apply_file_overlay(
             ));
         } else {
             config.sandbox_network = mode;
+        }
+    }
+
+    // Whether the OS sandbox runs at all. Tighten-only from the project layer in
+    // the same direction as `sandbox.network`: a repo may ask for `os` (the
+    // strict value) but never `off`, because turning confinement off is exactly
+    // the "hostile checkout widens its own gate" case the layered loader exists
+    // to stop. An unrecognized spelling is warned about and leaves the value the
+    // layers below set.
+    if let Some(mode) = parse_setting(
+        file.sandbox.mode.as_deref(),
+        "sandbox.mode",
+        layer,
+        pending,
+        crate::execution_policy::SandboxMode::parse,
+    ) {
+        if project && mode.rank() > config.sandbox_mode.rank() {
+            pending.push((
+                TextId::CfgProjectFieldIgnored,
+                vec![("field", format!("sandbox.mode={}", mode.as_setting()))],
+            ));
+        } else {
+            config.sandbox_mode = mode;
+        }
+    }
+
+    // Exemptions from the irreversible-outward floor. Global-only, the same
+    // class as `approval.auto_allow` and for the same reason: an exemption set
+    // by a checked-out repository would be a repository granting itself the
+    // right to publish, force-push and merge on the user's behalf.
+    // The turn budget is numeric, and tighten-only in the direction that spends
+    // LESS: a repository may lower it, never raise it. `0` is the loosest value
+    // rather than the smallest — it means "no ceiling at all" — so a project
+    // reaching for 0 is widening just like a project reaching for 10_000, and
+    // both are ignored with a warning. Against a global `0` (the user's own
+    // choice) any finite number is a tightening and is accepted.
+    if let Some(steps) = file.budget.turn_steps {
+        let global_unlimited = config.turn_steps == 0;
+        let widening = if global_unlimited {
+            false
+        } else {
+            steps == 0 || steps > config.turn_steps
+        };
+        if project && widening {
+            pending.push((
+                TextId::CfgProjectFieldIgnored,
+                vec![("field", format!("budget.turn_steps={steps}"))],
+            ));
+        } else {
+            config.turn_steps = steps;
+        }
+    }
+
+    if let Some(rules) = &file.sandbox.allow_irreversible {
+        if project {
+            pending.push((
+                TextId::CfgProjectFieldIgnored,
+                vec![("field", "sandbox.allow_irreversible".to_string())],
+            ));
+        } else {
+            config.sandbox_allow_irreversible = rules
+                .iter()
+                .map(|rule| rule.trim().to_string())
+                .filter(|rule| !rule.is_empty())
+                .collect();
         }
     }
 

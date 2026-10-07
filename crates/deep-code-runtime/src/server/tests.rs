@@ -322,6 +322,7 @@ fn tool_calling_state(autonomous_approvals: bool) -> AppState {
         offline: false,
         warnings: Vec::new(),
         permission_mode: deep_code_agent::SharedPermissionMode::default(),
+        sandbox_off: false,
         extra_roots: Vec::new(),
     };
     AppState {

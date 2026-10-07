@@ -21,10 +21,25 @@ pub async fn run_subagent(
     role: SubAgentRole,
     network: bool,
     on_progress: impl Fn(String),
-) -> Result<(String, u32), (u32, String)> {
+) -> Result<(String, u32), (u32, String, Option<String>)> {
     let started = std::time::Instant::now();
     let mut steps = 0u32;
+    let mut budget_notice_sent = false;
     let mut rx = runtime.drive_turn().await;
+
+    /// The child's own last words, for a run that ends before the report
+    /// contract was reached. `None` when it never said anything, so the caller
+    /// can tell "nothing to hand over" from "an empty message".
+    async fn partial_report(runtime: &AgentRuntime) -> Option<String> {
+        runtime
+            .session_messages()
+            .await
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, crate::message::Role::Assistant))
+            .map(|message| message.content.trim().to_string())
+            .filter(|text| !text.is_empty())
+    }
 
     loop {
         if steps >= max_steps {
@@ -34,16 +49,36 @@ pub async fn run_subagent(
             // after the parent had already reported the failure and folded its
             // spend. The timeout arm in the `agent` tool cancels for exactly this
             // reason; this arm did not.
+            let partial = partial_report(&runtime).await;
             let _ = runtime.cancel_turn().await;
-            return Err((steps, format!("max steps exceeded ({max_steps})")));
+            return Err((steps, format!("max steps exceeded ({max_steps})"), partial));
+        }
+
+        // Same soft end as the parent loop, in this loop's own unit (tool
+        // calls): a child cut off at the cap returns a failure with whatever its
+        // last message happened to be, and the only way it can hand over
+        // properly is to be asked while it still has budget to answer.
+        if crate::runtime::budget_wrap_up_due(steps, max_steps, budget_notice_sent) {
+            budget_notice_sent = true;
+            let text = crate::tr_with(
+                runtime.ui_lang(),
+                crate::TextId::SubagentBudgetWrapUp,
+                &[
+                    ("used", &steps.to_string()),
+                    ("limit", &max_steps.to_string()),
+                ],
+            );
+            let _ = runtime.steer(text).await;
         }
 
         let Some(event) = rx.recv().await else {
             // Same reasoning: an ended stream does not stop the loop task.
+            let partial = partial_report(&runtime).await;
             let _ = runtime.cancel_turn().await;
             return Err((
                 steps,
                 "sub-agent event stream ended unexpectedly".to_string(),
+                partial,
             ));
         };
 
@@ -60,7 +95,11 @@ pub async fn run_subagent(
                     // The turn ended without an assistant report (e.g. the model
                     // stopped on a tool call). Surface it as a failure rather
                     // than handing the parent an empty "success".
-                    return Err((steps, "sub-agent finished without a report".to_string()));
+                    return Err((
+                        steps,
+                        "sub-agent finished without a report".to_string(),
+                        None,
+                    ));
                 }
                 return Ok((text, steps));
             }
@@ -71,8 +110,13 @@ pub async fn run_subagent(
                     .submit_approval_with_denial_note(decision, denial_note)
                     .await;
             }
-            RuntimeEvent::TurnCancelled { .. } => return Err((steps, "cancelled".to_string())),
-            RuntimeEvent::Error { message, .. } => return Err((steps, message)),
+            RuntimeEvent::TurnCancelled { .. } => {
+                return Err((steps, "cancelled".to_string(), None));
+            }
+            RuntimeEvent::Error { message, .. } => {
+                let partial = partial_report(&runtime).await;
+                return Err((steps, message, partial));
+            }
             RuntimeEvent::ToolCallStarted { tool_name, .. } => {
                 // The upcoming step: `steps` counts finished calls. Each line
                 // carries the role, elapsed wall clock and the step budget, so

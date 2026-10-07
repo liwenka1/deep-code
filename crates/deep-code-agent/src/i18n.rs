@@ -447,6 +447,8 @@ text_ids! {
     CheckpointDisabledTooLarge,
     ApprovalCommandMoreRows,
     TurnStepLimitReached,
+    TurnBudgetWrapUp,
+    SubagentBudgetWrapUp,
     // 离线 echo 后端提示
     EchoOfflineHint,
     // 路由遥测原因(auto_mode / streaming),显示在状态栏

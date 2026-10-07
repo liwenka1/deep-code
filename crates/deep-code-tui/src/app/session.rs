@@ -17,6 +17,7 @@ impl App {
             offline,
             warnings,
             permission_mode,
+            sandbox_off,
             extra_roots,
         } = launched;
         // Parked, not pushed. Two of the three callers rebuild the transcript
@@ -51,6 +52,11 @@ impl App {
         // silently reset it.
         let previous_mode = self.permission_mode.get();
         self.permission_mode = permission_mode;
+        // Adopted, not inherited from the previous session: `/resume` and
+        // `switch_session` can cross between a config that had `mode = "off"`
+        // and one that did not, and a stale chip would either hide a real
+        // removal of confinement or cry wolf about one that is gone.
+        self.sandbox_off = sandbox_off;
         self.permission_mode.set(previous_mode);
     }
 

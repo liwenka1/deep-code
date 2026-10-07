@@ -16,7 +16,35 @@ use crate::tool::ToolCallAccumulator;
 
 /// Maximum model requests in a single turn. Generous enough that no legitimate
 /// agentic turn hits it, low enough that a runaway loop is bounded.
-const MAX_TURN_STEPS: u32 = 100;
+///
+/// Raised from 100, which the session record shows was the wrong side of the
+/// distribution's tail: across 263 recorded turns the median is 4 requests and
+/// p95 is 45, but three turns sat at exactly 100 — the cap, not the model
+/// stopping, and each of them in one of the session's largest (most valuable)
+/// runs. A bound that fires at all should fire where nothing legitimate lives,
+/// and those three observations are censored: how much longer they would have
+/// run is unknowable, which is the other reason to move the bound out of the
+/// way before drawing conclusions from the distribution.
+///
+/// Public because it is a measurement key and not only a bound: the eval
+/// report derives "did this instance hit the cap?" from its own round count
+/// compared against this value, and a private copy there would drift the
+/// moment this number moves. Exported for that comparison — the loop itself
+/// remains the only thing that enforces it.
+pub const MAX_TURN_STEPS: u32 = 500;
+
+/// Whether the wrap-up instruction is due: once, at four fifths of whatever
+/// budget the caller is counting against.
+///
+/// Shared by the parent loop (counting model requests) and the sub-agent runner
+/// (counting tool calls) so the two cannot drift into "one of them warns and the
+/// other is cut off mid-sentence". Four fifths, not "one step before the end":
+/// the point is to leave room for the model to FINISH and report, and a single
+/// request of warning is not enough room for a turn that still has to write the
+/// summary.
+pub(crate) fn budget_wrap_up_due(used: u32, limit: u32, already_sent: bool) -> bool {
+    !already_sent && limit > 0 && used >= limit.saturating_mul(4) / 5
+}
 
 /// Boundary denials tolerated in one turn before the loop stops feeding them
 /// back to the model. A denial is deterministic — the kernel/policy refuses
@@ -34,7 +62,10 @@ impl AgentRuntime {
     /// TUI flips on `/lang` via the runtime handle, so a switch is picked up by
     /// the next rendered string without a relaunch or a per-call approval-mode
     /// env re-parse.
-    pub(super) fn ui_lang(&self) -> crate::i18n::Lang {
+    /// Crate-wide rather than `pub(super)`: the sub-agent runner renders the
+    /// child's own budget notice and must use the child's language, and the
+    /// child runtime is the thing that knows it.
+    pub(crate) fn ui_lang(&self) -> crate::i18n::Lang {
         self.ui_lang.get()
     }
 
@@ -122,6 +153,8 @@ impl AgentRuntime {
         // own retained tail, which compaction structurally cannot reach —
         // retrying again would only re-bill the same rejected request.
         let mut overflow_rescued = false;
+        // One wrap-up instruction per turn (see `budget_wrap_up_due`).
+        let mut budget_notice_sent = false;
 
         loop {
             // Bound the model/tool ping-pong. Every iteration is one API request
@@ -132,7 +165,13 @@ impl AgentRuntime {
             // press Esc. Sub-agents have had a step cap all along; the parent
             // loop, which is the one holding the key, had none.
             steps += 1;
-            if steps > MAX_TURN_STEPS {
+            // `0` is the user's explicit "no ceiling": the loop then has no
+            // step stop at all, and the only exits left are cancel, a stream
+            // error, an empty tool batch or an approval park. That is a real
+            // choice with a real cost, which is why it is global-layer only and
+            // why the config documents it as removing the backstop.
+            let cap = self.config.turn_steps;
+            if cap > 0 && steps > cap {
                 emit(
                     tx,
                     RuntimeEvent::Error {
@@ -140,7 +179,7 @@ impl AgentRuntime {
                         message: crate::tr_with(
                             self.ui_lang(),
                             crate::TextId::TurnStepLimitReached,
-                            &[("limit", &MAX_TURN_STEPS.to_string())],
+                            &[("limit", &cap.to_string())],
                         ),
                     },
                 );
@@ -150,6 +189,26 @@ impl AgentRuntime {
             if cancel.is_cancelled() {
                 self.finish_turn_cancelled(&turn_id, tx).await;
                 return;
+            }
+
+            // The soft end of the budget, ahead of the hard one: past four
+            // fifths of the cap the model is told to converge and hand over,
+            // because the hard stop cannot ask for anything — it just ends the
+            // turn. Steered rather than pushed into the transcript directly, so
+            // it lands at a tool-batch boundary where appending a `user` entry
+            // cannot split a `tool_calls`/`tool` pair.
+            //
+            // The cost is one prefix break for the rest of the turn, which is
+            // the price of saying anything mid-turn at all. Worth it: the
+            // alternative is a turn that dies mid-edit with nothing said.
+            if budget_wrap_up_due(steps, cap, budget_notice_sent) {
+                budget_notice_sent = true;
+                let text = crate::tr_with(
+                    self.ui_lang(),
+                    crate::TextId::TurnBudgetWrapUp,
+                    &[("used", &steps.to_string()), ("limit", &cap.to_string())],
+                );
+                let _ = self.steer(text).await;
             }
 
             // Inside the loop, not once before it. Every iteration appends an
@@ -557,5 +616,33 @@ impl AgentRuntime {
                 },
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::budget_wrap_up_due;
+
+    /// The wrap-up fires once, at four fifths of whatever budget is in force,
+    /// and never when there is no budget. Pinned as a truth table because the
+    /// shipped cap (500) is far above any reachable turn, so the threshold
+    /// cannot be exercised end-to-end at its real value.
+    #[test]
+    fn wrap_up_is_due_once_at_four_fifths() {
+        assert!(!budget_wrap_up_due(0, 500, false));
+        assert!(!budget_wrap_up_due(399, 500, false));
+        assert!(budget_wrap_up_due(400, 500, false));
+        assert!(budget_wrap_up_due(500, 500, false));
+        assert!(
+            !budget_wrap_up_due(400, 500, true),
+            "asked once per turn, not on every step past the threshold"
+        );
+        assert!(
+            !budget_wrap_up_due(10, 0, false),
+            "an unlimited budget has no four fifths"
+        );
+        // The sub-agent counts tool calls instead of requests; same fraction.
+        assert!(budget_wrap_up_due(160, 200, false));
+        assert!(!budget_wrap_up_due(159, 200, false));
     }
 }

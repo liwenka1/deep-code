@@ -65,6 +65,18 @@ const SHELL_DESC_UNCONFINED: &str = "Run a foreground shell command in the works
 /// Job tool description, confined host.
 const JOB_DESC_CONFINED: &str = "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it. Jobs run sandboxed without network; a dev server that binds a port needs network=true on start. Writes are confined to the granted roots (workspace and --add-dir directories); a denied write cannot be fixed by retrying — request the directory with the request_write_root tool instead (the user decides).";
 
+/// Shell tool description for `[sandbox] mode = "off"`.
+///
+/// A third text, not `SHELL_DESC_UNCONFINED`: that one says "this host has NO OS
+/// sandbox", which is true on Windows or where the probe fails and false here —
+/// the host has one, this session turned it off. The difference is not cosmetic,
+/// because the recovery differs: an unconfined host has nothing to configure,
+/// while this one is one config edit away from being confined again.
+const SHELL_DESC_DISABLED: &str = "Run a foreground shell command in the workspace; output streams live and the process is killed at the timeout. Use it for git, builds, and tests; start long-running processes (dev servers) with the job tool instead. [sandbox] mode = \"off\" is in force for this session, so NOTHING confines these commands: they have this user's network access and can write anywhere this user can. Keep writes inside the workspace yourself and avoid destructive commands. Still set network=true for a command that needs the network, so the user is asked first (the declaration is what routes it through approval).";
+
+/// Job tool description for `[sandbox] mode = "off"`.
+const JOB_DESC_DISABLED: &str = "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it. [sandbox] mode = \"off\" is in force for this session, so jobs are not confined at all: they have this user's network access and can write anywhere this user can. Keep writes inside the workspace yourself. Still set network=true when starting something that binds a port or needs the network, so the user is asked first.";
+
 /// Job tool description, unconfined host.
 const JOB_DESC_UNCONFINED: &str = "Manage background shell jobs: action=start launches a command in the background, status/tail inspect it, cancel kills it. This host has NO OS sandbox confinement: jobs are not restricted to the workspace and do have network access. Still set network=true when starting something that binds a port or needs the network, so the user is asked first.";
 
@@ -84,19 +96,59 @@ const JOB_DESC_UNCONFINED: &str = "Manage background shell jobs: action=start la
 /// reason a gap must: its failure text ("Permission denied") reads exactly like
 /// a write-boundary denial, and a model that cannot tell them apart chases
 /// `/add-dir` over a failure no grant can fix.
-fn describe(
+/// The three bodies one tool can describe itself with, carried together so a
+/// call site cannot transpose them.
+///
+/// Transposing two of these is the worst bug this file can have: it compiles,
+/// the shape of the sentence is right, and the model is told the opposite of the
+/// truth about its own confinement — which is exactly what shipped once, when
+/// `[sandbox] mode = "off"` was wired to a cache slot while `describe` was still
+/// handed the host's verdict.
+#[derive(Clone, Copy)]
+struct ConfinementBodies {
+    /// The ordinary case: the host confines what it says it confines.
     confined: &'static str,
+    /// This host has no backend that enforces anything (Windows' Job Object, or
+    /// a probe that failed).
     unconfined: &'static str,
+    /// `[sandbox] mode = "off"`: the host has one, this session is not using it.
+    disabled: &'static str,
+}
+
+const SHELL_BODIES: ConfinementBodies = ConfinementBodies {
+    confined: SHELL_DESC_CONFINED,
+    unconfined: SHELL_DESC_UNCONFINED,
+    disabled: SHELL_DESC_DISABLED,
+};
+
+const JOB_BODIES: ConfinementBodies = ConfinementBodies {
+    confined: JOB_DESC_CONFINED,
+    unconfined: JOB_DESC_UNCONFINED,
+    disabled: JOB_DESC_DISABLED,
+};
+
+fn describe(
+    bodies: ConfinementBodies,
+    disabled: bool,
     enforcement: &Enforcement,
     notes: &[&str],
 ) -> String {
+    // `disabled` is checked first and does not consult the probe at all: the
+    // probe answers what this HOST can enforce, and `[sandbox] mode = "off"` is
+    // a decision that overrides it. Reading the probe here was a real bug — the
+    // unconfined slot was selected but `describe` was still handed the host's
+    // verdict, so a normal macOS/Linux machine got the confined text while the
+    // commands ran bare.
+    if disabled {
+        return format!("{}{SPILL_DESC}", bodies.disabled);
+    }
     if !enforcement.is_enforced() {
-        return format!("{unconfined}{SPILL_DESC}");
+        return format!("{}{SPILL_DESC}", bodies.unconfined);
     }
     // Spill is tool behavior, not a sandbox property: it joins the body on
     // both branches, BEFORE the enforcement caveats — design notes keep the
     // last word about what the sandbox refuses.
-    let mut text = format!("{confined}{SPILL_DESC}");
+    let mut text = format!("{}{SPILL_DESC}", bodies.confined);
     for gap in enforcement.gaps() {
         text.push(' ');
         text.push_str(gap.model_caveat());
@@ -108,36 +160,88 @@ fn describe(
     text
 }
 
+/// The sentence the model reads about its own confinement.
+///
+/// `disabled` is `[sandbox] mode = "off"` for this registry, and it must reach
+/// `describe` rather than only selecting a cache slot — see the branch there.
+///
 /// Memoized: `description()` is called for every tool-registry build (each
-/// subagent gets one) and the answer cannot change under a running process.
-fn shell_description() -> &'static str {
-    static DESC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    DESC.get_or_init(|| {
+/// subagent gets one) and the answer cannot change under a running process. Two
+/// slots, not one, because the two answers are different texts.
+fn shell_description(disabled: bool) -> &'static str {
+    static LIVE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static OFF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let slot = if disabled { &OFF } else { &LIVE };
+    slot.get_or_init(|| {
         describe(
-            SHELL_DESC_CONFINED,
-            SHELL_DESC_UNCONFINED,
+            SHELL_BODIES,
+            disabled,
             crate::sandbox::sandbox_enforcement(),
             crate::sandbox::sandbox_design_notes(),
         )
     })
 }
 
-fn job_description() -> &'static str {
-    static DESC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    DESC.get_or_init(|| {
+/// Same two-slot shape as [`shell_description`].
+fn job_description(disabled: bool) -> &'static str {
+    static LIVE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static OFF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let slot = if disabled { &OFF } else { &LIVE };
+    slot.get_or_init(|| {
         describe(
-            JOB_DESC_CONFINED,
-            JOB_DESC_UNCONFINED,
+            JOB_BODIES,
+            disabled,
             crate::sandbox::sandbox_enforcement(),
             crate::sandbox::sandbox_design_notes(),
         )
     })
+}
+
+/// The sandbox manager a registry is built on: the real one, or the
+/// not-confining one `[sandbox] mode = "off"` asks for.
+fn sandbox_manager(unconfined: bool) -> SandboxManager {
+    if unconfined {
+        SandboxManager::without_confinement()
+    } else {
+        SandboxManager::new()
+    }
 }
 
 /// Build, secret-scrub, sandbox-wrap and spawn one shell subprocess, then
 /// confine it. Shared by the foreground and background job paths so both apply
 /// the identical env-scrub + sandbox treatment; they differ only afterwards in
 /// how they read output and whether they retain the child handle.
+/// The roots a sandboxed command may write: the workspace boundary, plus the
+/// ecosystem cache directories **when this call holds egress**.
+///
+/// Keyed on the call's egress rather than on the session's mode, and that is the
+/// point: the cache grant exists so a package manager can write its own cache
+/// while it downloads — one capability, not two. Keying it on "yolo or
+/// `network = always`" meant the canonical case, `npm install` with a declared
+/// `network: true` the user approved under the default `network = "prompt"`,
+/// still died on EPERM in `~/.npm/_cacache` — the very failure these roots were
+/// added for. A granted child had it worse: egress from its own `Always` policy
+/// and no cache, because the check read the global config instead of the policy
+/// in force.
+///
+/// Egress is still never implied by trust (reads stay broad, so an auto-allowed
+/// command must not be able to send what it read): this asks only whether the
+/// sandbox will let THIS call reach the network.
+///
+/// One function for both the foreground shell and the background job, so the
+/// grant cannot reach one path and not the other.
+fn sandbox_roots(root: &WorkspacePolicy, cx: &ToolCx) -> Vec<PathBuf> {
+    let mut roots = root.granted_roots();
+    if cx.sandbox_policy().has_network_access() {
+        for cache in crate::paths::tool_cache_roots() {
+            if !roots.contains(&cache) {
+                roots.push(cache);
+            }
+        }
+    }
+    roots
+}
+
 fn spawn_confined(
     sandbox: &SandboxManager,
     granted_roots: &[PathBuf],
@@ -344,8 +448,23 @@ fn abandon_job(jobs: &JobStore, job_id: &str) {
     job.exit_code = None;
 }
 
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
-const MAX_TIMEOUT_SECS: u64 = 300;
+/// Foreground `shell` deadline, in seconds.
+///
+/// Raised from 30 because the old default sat below the floor of the work the
+/// tool exists for: a cold `cargo build`, an `npm install`, and any real e2e
+/// suite all exceed it, and a deadline kill reaches the model as a failure of
+/// the command rather than as "ask for more time" — so it retried, or reached
+/// for the write/network note, neither of which was the problem. Long-running
+/// *processes* still belong in `job` (which has no deadline and survives the
+/// turn); this bounds one foreground call, not the work.
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// Ceiling a caller may ask for.
+///
+/// 1800s is the honest upper bound for the "run the suite" class of foreground
+/// command. Anything longer than that should be `job start`, which has no
+/// deadline at all — so the ceiling is not the tool's limit, it is the point
+/// past which sitting in the foreground stops being the right shape.
+const MAX_TIMEOUT_SECS: u64 = 1800;
 const MAX_OUTPUT_CHARS: usize = 20_000;
 const DEFAULT_TAIL_CHARS: u64 = 4_000;
 /// The most a `job tail` may ask for — the same window the foreground result
@@ -469,14 +588,14 @@ impl ShellTools {
     /// ONE shared policy and use [`Self::with_policy`].
     #[cfg(test)]
     pub fn new(roots: impl Into<WorkspaceRoots>) -> Result<Self, ToolError> {
-        Ok(Self::with_policy(WorkspacePolicy::new(roots)?))
+        Ok(Self::with_policy(WorkspacePolicy::new(roots)?, false))
     }
 
     /// Build on an existing (shared) boundary policy instead of constructing
     /// one. This is how a launch threads ONE policy through every tool group,
     /// so a mid-session `request_write_root` grant reaches shell commands and
     /// file tools alike without rebuilding any registry.
-    pub(crate) fn with_policy(root: WorkspacePolicy) -> Self {
+    pub(crate) fn with_policy(root: WorkspacePolicy, unconfined: bool) -> Self {
         // Construction is the retention hook, detached: removing a stale spill
         // tree can be hundreds of MB of I/O, which must not stall the launch.
         // Racing this instance's own run dir is harmless — a freshly created
@@ -495,7 +614,7 @@ impl ShellTools {
         Self {
             root,
             jobs: JobStore::default(),
-            sandbox: SandboxManager::new(),
+            sandbox: sandbox_manager(unconfined),
             spill_dir,
         }
     }
@@ -535,12 +654,18 @@ impl ShellTools {
 pub fn shell_tool_registry(
     roots: impl Into<WorkspaceRoots>,
 ) -> Result<(ToolRegistry, JobStore), ToolError> {
-    Ok(shell_tool_registry_from(WorkspacePolicy::new(roots)?))
+    Ok(shell_tool_registry_from(
+        WorkspacePolicy::new(roots)?,
+        false,
+    ))
 }
 
 /// Registry from a shared boundary policy (see [`ShellTools::with_policy`]).
-pub(crate) fn shell_tool_registry_from(policy: WorkspacePolicy) -> (ToolRegistry, JobStore) {
-    let shell = ShellTools::with_policy(policy);
+pub(crate) fn shell_tool_registry_from(
+    policy: WorkspacePolicy,
+    unconfined: bool,
+) -> (ToolRegistry, JobStore) {
+    let shell = ShellTools::with_policy(policy, unconfined);
     let jobs = shell.job_store();
     (shell.into_registry(), jobs)
 }
@@ -589,7 +714,7 @@ struct ShellParams {
     command: String,
     /// Optional workspace-relative working directory (absolute allowed only inside a granted root)
     cwd: Option<String>,
-    /// Timeout in seconds, default 30, max 300; the command is killed at the deadline
+    /// Timeout in seconds, default 120, max 1800; the command is killed at the deadline. For long runs (test suites, installs, dev servers) prefer the job tool, which has no deadline
     timeout_secs: Option<u64>,
     /// Set true when the command needs network access (downloads/installs, git push/pull/fetch/clone, curl). The sandbox blocks all network by default; a declaration routes through user approval.
     #[allow(dead_code)] // consumed by the execution policy from the raw arguments
@@ -623,18 +748,19 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        // The confinement sentence must match reality per host. Telling the model
+        // The confinement sentence must match reality. Telling the model
         // "sandboxed without network" where nothing enforces it (the Windows Job
         // Object confines neither writes nor egress) teaches it a false model of
         // its own environment: it would skip declaring network it silently
         // already has, and assume out-of-workspace writes get refused for it.
         //
-        // Keyed on `sandbox_enforcement` — the weaker of both dimensions —
-        // and not on the network one alone: a description that promises write
-        // confinement must be chosen by what confines writes. The two can now
-        // differ in level, and the model is the thing that actually issues the
-        // write, so it is the last surface that may round a gap away.
-        shell_description()
+        // Keyed on `sandbox_enforcement` — the weaker of both dimensions — plus
+        // this registry's own manager, which answers the same question for the
+        // `mode = "off"` case the host probe cannot see. A description that
+        // promises write confinement must be chosen by what confines writes, and
+        // the model is the thing that actually issues the write, so this is the
+        // last surface that may round a gap away.
+        shell_description(self.sandbox.confinement_disabled())
     }
 
     async fn run(&self, params: ShellParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {
@@ -651,7 +777,7 @@ impl Tool for ShellTool {
         );
         let policy = cx.sandbox_policy();
         let steps = steps_for(&command, cx.authority(), Self::NAME)?;
-        let granted_roots = self.root.granted_roots();
+        let granted_roots = sandbox_roots(&self.root, cx);
 
         let started = Instant::now();
         let deadline = started + timeout;
@@ -860,7 +986,7 @@ impl JobTool {
         // `JobStore::shutdown` makes this deterministic on cancel/quit.
         let (mut child, job_guard) = spawn_confined(
             &self.sandbox,
-            &self.root.granted_roots(),
+            &sandbox_roots(&self.root, cx),
             step.form.as_command_form(),
             &cwd,
             &policy,
@@ -990,7 +1116,7 @@ impl Tool for JobTool {
     }
 
     fn description(&self) -> &str {
-        job_description()
+        job_description(self.sandbox.confinement_disabled())
     }
 
     async fn run(&self, params: JobParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {

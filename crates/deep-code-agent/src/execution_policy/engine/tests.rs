@@ -1050,3 +1050,262 @@ fn never_refuses_every_egress_path() {
         PolicyVerdict::Allow
     ));
 }
+
+/// The irreversible-outward floor. Each of these is one command that reaches
+/// the world and cannot be undone by the next command, and none of them may run
+/// on a declaration the user never made — under `yolo` nobody reads a prompt, so
+/// "ask" would silently become "allow".
+#[test]
+fn irreversible_outward_commands_are_refused_without_a_declaration() {
+    let policy = ExecPolicy::default();
+    for command in [
+        "npm publish",
+        "yarn publish --tag next",
+        "pnpm publish",
+        "git push origin main --force",
+        "git push -f",
+        "git push --mirror origin",
+        "git push --force-with-lease origin main",
+        "gh pr merge 12 --squash",
+        "gh release create v1.0.0",
+        "terraform apply -auto-approve",
+        "terraform destroy",
+        "kubectl delete namespace staging",
+        "docker push registry.example/x:1",
+        "helm uninstall release",
+        "aws s3 rm s3://bucket/key",
+    ] {
+        let plan = evaluate_shell_command(&policy, command, false);
+        assert!(
+            matches!(plan.verdict, PolicyVerdict::Deny { .. }),
+            "{command} must be refused by default: {plan:?}"
+        );
+    }
+}
+
+/// …and the capability the floor must NOT take away. An ordinary push is
+/// exactly what egress was granted for, and a rule that could not tell it from a
+/// force-push would have re-broken the thing this work exists to fix.
+#[test]
+fn reversible_commands_including_an_ordinary_push_still_run() {
+    let policy = ExecPolicy::default();
+    for command in [
+        "git push origin main",
+        "git push --set-upstream origin feature",
+        "git fetch --all",
+        "npm install",
+        "npm run test:e2e",
+        "gh pr view 12",
+        "terraform plan",
+        "kubectl get pods",
+        "docker build -t x .",
+        "aws s3 ls",
+    ] {
+        let plan = evaluate_shell_command(&policy, command, false);
+        assert!(
+            !matches!(plan.verdict, PolicyVerdict::Deny { .. }),
+            "{command} must stay available: {plan:?}"
+        );
+    }
+}
+
+/// A declaration lifts what it names and nothing else.
+///
+/// "Lifts" means the command rejoins the ORDINARY gate rather than becoming
+/// pre-approved: `npm publish` is not on the trust list, so the plan is
+/// `NeedsApproval` — the human (or `yolo`) decides as it would for any other
+/// command. A floor that turned into an auto-allow would have replaced one
+/// kind of standing consent with another.
+#[test]
+fn a_declared_exemption_lifts_exactly_what_it_names() {
+    let policy = ExecPolicy::default().with_allow_irreversible(vec!["npm publish".to_string()]);
+    let lifted = evaluate_shell_command(&policy, "npm publish --tag next", false);
+    assert!(
+        matches!(lifted.verdict, PolicyVerdict::NeedsApproval { .. }),
+        "a declared command rejoins the ordinary gate: {lifted:?}"
+    );
+    assert!(
+        matches!(
+            evaluate_shell_command(&policy, "docker push registry.example/x:1", false).verdict,
+            PolicyVerdict::Deny { .. }
+        ),
+        "an exemption is not a blanket"
+    );
+}
+
+/// An entry naming a shorter run of words authorizes the wider thing — on
+/// purpose. Pinned so it cannot quietly become the opposite: the user writing
+/// `git push` in `allow_irreversible` is authorizing pushes, and the note in
+/// `config.example.toml` says so.
+#[test]
+fn a_shorter_entry_deliberately_covers_the_wider_command() {
+    let policy = ExecPolicy::default().with_allow_irreversible(vec!["git push".to_string()]);
+    let plan = evaluate_shell_command(&policy, "git push origin main --force", false);
+    assert!(
+        !matches!(plan.verdict, PolicyVerdict::Deny { .. }),
+        "the entry covered it, so the floor no longer applies: {plan:?}"
+    );
+}
+
+/// Best-effort, but not absent. A line the unattended parser refuses (a
+/// redirect, a pipe) cannot be matched token-by-token, so the floor falls back
+/// to splitting words rather than letting the obvious spelling walk through.
+#[test]
+fn a_redirected_publish_is_still_refused() {
+    let policy = ExecPolicy::default();
+    let plan = evaluate_shell_command(&policy, "npm publish > /tmp/log 2>&1", false);
+    assert!(
+        matches!(plan.verdict, PolicyVerdict::Deny { .. }),
+        "the fallback reading must still catch it: {plan:?}"
+    );
+}
+
+/// `[sandbox] mode` round-trips, and ranks in the direction the layered loader
+/// compares (a project may raise it to `os`, never lower it to `off`).
+#[test]
+fn sandbox_mode_parses_and_ranks() {
+    assert_eq!(SandboxMode::parse("os"), Some(SandboxMode::Os));
+    assert_eq!(SandboxMode::parse(" OFF "), Some(SandboxMode::Off));
+    assert_eq!(SandboxMode::parse("none"), Some(SandboxMode::Off));
+    assert_eq!(SandboxMode::parse("nonsense"), None);
+    assert!(SandboxMode::default().is_os(), "the default confines");
+    assert!(SandboxMode::Os.rank() > SandboxMode::Off.rank());
+    assert!(!SandboxMode::Off.is_os());
+}
+
+/// The fallback keeps the line's segmentation, which is the half that was easy
+/// to get wrong: splitting the whole line into one word list made the matcher
+/// read the first word as the program, and `echo starting && npm publish`
+/// walked straight through the floor. The first two cases go through the
+/// unattended parser (it reads `&&`/`;`), the last only through the fallback.
+#[test]
+fn a_chained_or_redirected_irreversible_command_is_still_refused() {
+    let policy = ExecPolicy::default();
+    for command in [
+        "echo starting && npm publish",
+        "cargo test; git push --force origin main",
+        "echo starting && npm publish > /tmp/log 2>&1",
+    ] {
+        let plan = evaluate_shell_command(&policy, command, false);
+        assert!(
+            matches!(plan.verdict, PolicyVerdict::Deny { .. }),
+            "{command} must be refused: {plan:?}"
+        );
+    }
+    // …and a chain of reversible commands stays available, so the segmentation
+    // has not simply turned every compound line into a denial.
+    assert!(!matches!(
+        evaluate_shell_command(&policy, "echo starting && npm install > /tmp/log", false).verdict,
+        PolicyVerdict::Deny { .. }
+    ));
+}
+
+/// Routine force-push spellings. `git -C <path> push -f`, a `+<refspec>` force
+/// and a bundled short flag are all ordinary ways to spell it, and the first
+/// version of this rule read "push is the second word" and "the flag is `-f`" —
+/// so it missed every one of them, which is precisely the difference between a
+/// consent gate over routine spellings and one over a spelling nobody types.
+#[test]
+fn routine_force_push_spellings_are_refused() {
+    let policy = ExecPolicy::default();
+    for command in [
+        "git -C /repo push --force",
+        "git --no-pager push -f origin main",
+        "git push origin +main",
+        "git push -fu origin main",
+        "git push origin +refs/heads/main:refs/heads/main",
+        "git push --force-with-lease=main origin main",
+    ] {
+        let plan = evaluate_shell_command(&policy, command, false);
+        assert!(
+            matches!(plan.verdict, PolicyVerdict::Deny { .. }),
+            "{command} must be refused: {plan:?}"
+        );
+    }
+}
+
+/// …and the spellings that only look like the real thing must not be. A dry run
+/// publishes and deletes nothing, and `--force-if-includes` is a modifier for
+/// `--force-with-lease` that does nothing on its own: refusing either would
+/// block the way people check their own work, and an over-eager floor is a floor
+/// someone turns off.
+#[test]
+fn dry_runs_and_passive_flags_are_not_refused() {
+    let policy = ExecPolicy::default();
+    for command in [
+        "npm publish --dry-run",
+        "kubectl delete pod scratch --dry-run=client",
+        "git push --force-if-includes",
+        "git push origin main",
+        "npm run publish",
+        "gh pr view 12",
+    ] {
+        let plan = evaluate_shell_command(&policy, command, false);
+        assert!(
+            !matches!(plan.verdict, PolicyVerdict::Deny { .. }),
+            "{command} must stay available: {plan:?}"
+        );
+    }
+}
+
+/// The exemption is a subsequence of words, not a prefix of the line, and the
+/// two consequences that follow from that are pinned here rather than left to be
+/// rediscovered: a shorter entry authorizes the wider command, and a one-word
+/// entry crosses programs because the match is over words and not tools.
+#[test]
+fn an_exemption_matches_words_in_order_across_programs() {
+    let force_full = ExecPolicy::default().with_allow_irreversible(vec!["git push".to_string()]);
+    assert!(
+        !matches!(
+            evaluate_shell_command(&force_full, "git push origin main --force", false).verdict,
+            PolicyVerdict::Deny { .. }
+        ),
+        "a shorter entry covers the wider command on purpose"
+    );
+
+    let single_word = ExecPolicy::default().with_allow_irreversible(vec!["push".to_string()]);
+    for command in [
+        "docker push registry.example/x:1",
+        "git push -f origin main",
+    ] {
+        assert!(
+            !matches!(
+                evaluate_shell_command(&single_word, command, false).verdict,
+                PolicyVerdict::Deny { .. }
+            ),
+            "{command} is authorized by the one word, as documented"
+        );
+    }
+
+    // Order still binds: the same words reversed authorize nothing.
+    let reversed = ExecPolicy::default().with_allow_irreversible(vec!["push git".to_string()]);
+    assert!(
+        matches!(
+            evaluate_shell_command(&reversed, "git push -f origin main", false).verdict,
+            PolicyVerdict::Deny { .. }
+        ),
+        "reordering must not stretch an entry"
+    );
+}
+
+/// Known miss, accepted and pinned so it is a stated boundary rather than an
+/// assumed coverage: a leading global option that takes a value moves the verb
+/// out of the position the rule reads. Modelling each program's option arity is
+/// a parser, not a floor, and `SECURITY.md` says this in as many words.
+#[test]
+fn a_leading_option_that_takes_a_value_is_a_known_miss() {
+    let policy = ExecPolicy::default();
+    assert!(
+        !matches!(
+            evaluate_shell_command(&policy, "kubectl -n prod delete pod api", false).verdict,
+            PolicyVerdict::Deny { .. }
+        ),
+        "the verb is out of position: documented, not covered"
+    );
+    // The same command with the option after the verb IS covered, so the miss is
+    // about position and not about `kubectl delete` being absent from the list.
+    assert!(matches!(
+        evaluate_shell_command(&policy, "kubectl delete -n prod pod api", false).verdict,
+        PolicyVerdict::Deny { .. }
+    ));
+}

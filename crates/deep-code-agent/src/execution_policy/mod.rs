@@ -19,10 +19,18 @@
 //!    `shell_deny::builtin_deny` (via `shell_lex` parsing): a catastrophic shape
 //!    gets a `Deny` verdict before any trust rule is consulted, so nothing can
 //!    allow-list past it. Cannot be disabled by configuration. The plan's one
-//!    *configuration-driven* `Deny` sits right after it: a `network: true`
-//!    declaration (shell, `job start`, or a sub-agent dispatch) under
-//!    `[sandbox] network = "never"` is refused outright rather than run
-//!    offline to fail.
+//!    *configuration-driven* `Deny`s sit right after it, and there are three:
+//!    a `network: true` declaration (shell, `job start`, or a sub-agent
+//!    dispatch) under `[sandbox] network = "never"` is refused outright rather
+//!    than run offline to fail; a **networked sub-agent dispatch** under the
+//!    same setting (the child would only burn a doomed attempt); and an
+//!    **irreversible-outward command** — publishing, force-pushing, merging a
+//!    PR, applying infrastructure — that no `[sandbox] allow_irreversible`
+//!    entry authorizes. That last floor is a *consent* gate rather than a
+//!    containment boundary, and it is refused rather than prompted on purpose:
+//!    under `Yolo` a prompt is precisely what is missing, so a floor a mode can
+//!    auto-approve would not be a floor. Its promise is narrow and stated as
+//!    such — see `SECURITY.md`.
 //! 2. **Yolo egress overlay** — `runtime::tool_result::yolo_ambient_network`.
 //!    The one post-hoc edit to the plan: under `Yolo`, ambient network rides a
 //!    sandboxed plan. It never touches the verdict. (`[sandbox] network =
@@ -88,7 +96,12 @@
 //!
 //! * **macOS / Linux** — [`crate::sandbox`] confines writes to the granted
 //!   roots and denies network unless the call declared egress. The deny floor
-//!   being best-effort is survivable here: the sandbox is the boundary.
+//!   being best-effort is survivable here: the sandbox is the boundary. Except
+//!   under `[sandbox] mode = "off"`, which removes that boundary on every
+//!   platform: this bullet then reads exactly like the Windows one below, and
+//!   the deny and irreversible floors are what is left. The mode is a
+//!   global-layer-only decision, reported by `doctor`, marked in the status
+//!   line, and refused by the eval harness.
 //! * **Windows** — a backend exists and reports `available: true`, so commands
 //!   are not refused for lack of one, but it is a Job Object:
 //!   `sandbox::windows` kills the process tree and caps process count, and
@@ -128,7 +141,7 @@ mod shell_deny;
 mod shell_lex;
 
 pub use engine::{
-    ExecPolicy, NetworkMode, PolicyVerdict, RiskLevel, ToolExecutionPlan, ToolKind,
+    ExecPolicy, NetworkMode, PolicyVerdict, RiskLevel, SandboxMode, ToolExecutionPlan, ToolKind,
     accept_edits_approvable, justification_claimed, network_requested, shell_command_of,
 };
 pub use permission_mode::{PermissionMode, SharedPermissionMode};

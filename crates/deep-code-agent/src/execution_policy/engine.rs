@@ -5,6 +5,121 @@ use super::command_shape;
 use super::shell_deny;
 use super::shell_lex;
 
+/// Whether every word of `needle` appears in `haystack`, in order.
+fn words_in_order(needle: &[&str], haystack: &[&str]) -> bool {
+    let mut rest = haystack.iter();
+    needle
+        .iter()
+        .all(|word| rest.any(|candidate| candidate == word))
+}
+
+/// The irreversible-outward rule one argv hits, as the words that matched.
+///
+/// Token-level rather than command-identity, and that distinction is
+/// load-bearing: identity drops flags — `session_identity("git push origin
+/// main")` is `git push` — so an identity-based rule could not separate a
+/// force-push from the ordinary push an agent is *supposed* to be able to run
+/// once egress is granted. Denying `git push` outright would undo the capability
+/// this floor exists alongside.
+///
+/// The set is deliberately short and made of commands whose whole purpose is the
+/// irreversible act. What keeps it short is the *shape* of the test, not a
+/// judgement about consequences: a rule has to be readable off the words alone
+/// ("is this invocation publishing / force-pushing / applying?"), and anything
+/// needing a call about whether THIS one matters ("is that namespace a scratch
+/// one?") stays out — the floor refuses the whole class and the user authorizes
+/// the class once. An over-eager floor strands legitimate work, which is the
+/// failure mode this codebase keeps choosing against.
+///
+/// Known misses, accepted: a verb in a position this rule does not read is not
+/// refused, and a leading option is the usual reason — `kubectl -n prod delete
+/// pod api` passes where `kubectl delete -n prod pod api` is refused, and
+/// `npm -s publish` / `yarn --silent publish` pass where `npm publish` is
+/// refused (that arm still reads the subcommand at position 1). Chasing it means
+/// modelling each program's option arity, which is a parser, not a floor; the
+/// honest boundary is that this is a consent gate over the routine spellings
+/// (`SECURITY.md` says so in those words, the known misses included), and
+/// containment is the sandbox's job rather than this list's.
+fn irreversible_outward_argv(argv: &[String]) -> Option<String> {
+    let program = argv
+        .first()?
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(".exe")
+        .to_string();
+    let words: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let args = &words[1..];
+    let second = args.first().copied();
+
+    // `--dry-run` (and aws's `--dryrun`) is the one routine spelling that makes
+    // these commands harmless: it reports what would happen and does nothing.
+    // Refusing it would strand the way people check their own work — and a floor
+    // that blocks `npm publish --dry-run` is a floor someone turns off.
+    if args
+        .iter()
+        .any(|word| matches!(*word, "--dry-run" | "--dryrun") || word.starts_with("--dry-run="))
+    {
+        return None;
+    }
+
+    match program.as_str() {
+        "git" => {
+            // `push` is not always the first argument: `git -C <path> push -f`,
+            // `git --no-pager push`, `git -c key=value push`. Anchoring on
+            // position 1 missed every one of those, and they are routine
+            // spellings rather than obfuscations.
+            let push_at = args.iter().position(|word| *word == "push")?;
+            let rest = &args[push_at + 1..];
+            let forcing = rest.iter().copied().find(|word| {
+                matches!(
+                    *word,
+                    "--force" | "--force-with-lease" | "--mirror" | "--delete"
+                ) || word.starts_with("--force-with-lease=")
+                    // `+<refspec>` IS a force push, spelled without any flag.
+                    || (*word != "+" && word.starts_with('+'))
+                    // A short-flag cluster: `-fu` forces, `-u` does not. Long
+                    // options are excluded so `--force-if-includes` — a modifier
+                    // that does nothing on its own — is not read as a force.
+                    || (word.starts_with('-')
+                        && !word.starts_with("--")
+                        && word.len() > 1
+                        && word[1..].contains('f'))
+            })?;
+            Some(format!("git push {forcing}"))
+        }
+        "npm" | "yarn" | "pnpm" | "bun" if second == Some("publish") => {
+            Some(format!("{program} publish"))
+        }
+        "gh" if matches!(
+            (words.get(1), words.get(2)),
+            (Some(&"pr"), Some(&"merge")) | (Some(&"release"), Some(&"create"))
+        ) =>
+        {
+            Some(format!("gh {} {}", words[1], words[2]))
+        }
+        "terraform" if matches!(second, Some("apply" | "destroy")) => {
+            Some(format!("terraform {}", second.unwrap_or_default()))
+        }
+        "kubectl" if matches!(second, Some("delete" | "drain")) => {
+            Some(format!("kubectl {}", second.unwrap_or_default()))
+        }
+        "docker" if second == Some("push") => Some("docker push".to_string()),
+        "helm" if matches!(second, Some("uninstall" | "delete")) => {
+            Some(format!("helm {}", second.unwrap_or_default()))
+        }
+        "aws"
+            if matches!(
+                (words.get(1), words.get(2)),
+                (Some(&"s3"), Some(&"rm")) | (Some(&"s3api"), Some(&"delete-object"))
+            ) =>
+        {
+            Some(format!("aws {} {}", words[1], words[2]))
+        }
+        _ => None,
+    }
+}
+
 /// Tool category used by the policy engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolKind {
@@ -131,6 +246,65 @@ impl NetworkMode {
     }
 }
 
+/// Whether the OS sandbox is applied to shell/job commands at all
+/// (`[sandbox] mode`).
+///
+/// `Os` is the default and the product's entire containment story: writes are
+/// bounded to the granted roots and egress is a separate, explicit grant. `Off`
+/// exists for the one case where that boundary is already provided by something
+/// larger — a container, a micro-VM, a disposable CI runner — and the in-process
+/// sandbox is redundant work that also breaks tools needing kernel features the
+/// outer sandbox already constrains.
+///
+/// It is a *loosening* switch, so the project layer may only set `os` (see the
+/// layered loader): a repository must never be able to turn its own confinement
+/// off. And it is loud wherever it applies — `doctor`, the approval panel and a
+/// standing UI marker — because everything the sandbox docs promise is
+/// conditional on this being `Os`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxMode {
+    #[default]
+    Os,
+    Off,
+}
+
+impl SandboxMode {
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "os" => Some(Self::Os),
+            "off" | "none" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// The setting spelling, for diagnostics.
+    #[must_use]
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            Self::Os => "os",
+            Self::Off => "off",
+        }
+    }
+
+    /// Strictness rank, the direction the layered loader compares in:
+    /// `Off` < `Os`. A project file may move this up (to `os`), never down.
+    #[must_use]
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Os => 1,
+        }
+    }
+
+    /// Whether the OS sandbox is applied. The one accessor callers should use,
+    /// so a future third mode cannot be mistaken for one of these two.
+    #[must_use]
+    pub fn is_os(self) -> bool {
+        matches!(self, Self::Os)
+    }
+}
+
 /// The plan for a call `[sandbox] network = "never"` refuses outright.
 ///
 /// One home for what used to be three hand-copied blocks. The copies are how
@@ -224,6 +398,14 @@ pub struct ExecPolicy {
     /// `git status -s` but not `git push`).
     trusted_shell_prefixes: Vec<String>,
     network_mode: NetworkMode,
+    /// `[sandbox] mode = "off"`: run commands bare because the boundary is
+    /// outside this process. Read by the shell layer to pick the honest tool
+    /// description and by `build_tool_registry` to build an unconfined
+    /// `SandboxManager`.
+    sandbox_off: bool,
+    /// `[sandbox] allow_irreversible`: the words that authorize an
+    /// irreversible-outward command (see [`irreversible_outward_argv`]).
+    allow_irreversible: Vec<String>,
 }
 
 impl Default for ExecPolicy {
@@ -268,6 +450,8 @@ impl Default for ExecPolicy {
             .map(|rule| (*rule).to_string())
             .collect(),
             network_mode: NetworkMode::Prompt,
+            sandbox_off: false,
+            allow_irreversible: Vec::new(),
         }
     }
 }
@@ -297,6 +481,87 @@ impl ExecPolicy {
     #[must_use]
     pub fn network_mode(&self) -> NetworkMode {
         self.network_mode
+    }
+
+    /// Attach the OS-sandbox switch (`[sandbox] mode`). Kept beside
+    /// `network_mode` because both are the same kind of thing: a config-driven
+    /// gate that the runtime consults per call rather than a per-call decision.
+    #[must_use]
+    pub fn with_sandbox_mode(mut self, mode: crate::execution_policy::SandboxMode) -> Self {
+        self.sandbox_off = !mode.is_os();
+        self
+    }
+
+    #[must_use]
+    pub fn sandbox_off(&self) -> bool {
+        self.sandbox_off
+    }
+
+    /// Attach the irreversible-outward exemptions (`[sandbox]
+    /// allow_irreversible`).
+    #[must_use]
+    pub fn with_allow_irreversible(mut self, allow: Vec<String>) -> Self {
+        self.allow_irreversible = allow;
+        self
+    }
+
+    /// The irreversible-outward rule a command line hits, if any, as the words
+    /// that matched — used for both the denial message and the exemption
+    /// comparison, so the two can never name different things.
+    ///
+    /// Best-effort by construction, like the deny floor: a line the unattended
+    /// parser refuses is re-read by whitespace splitting, which an obfuscation
+    /// can defeat. That is acceptable *here* and nowhere else, because this
+    /// floor is a "did a human mean to authorize this" gate over a short list of
+    /// everyday commands, not a containment boundary — containment is the
+    /// sandbox's job, and the deny floor already handles the catastrophes.
+    #[must_use]
+    pub fn irreversible_outward(&self, command: &str) -> Option<String> {
+        if let Some(segments) = shell_lex::parse_unattended(command) {
+            return segments
+                .iter()
+                .find_map(|segment| irreversible_outward_argv(&segment.argv));
+        }
+        // Segment first, then words. Splitting the whole line into words would
+        // run the matcher once against an "argv" starting with whatever the line
+        // began with, so `echo x && npm publish` matched nothing at all — the
+        // fallback has to keep the segmentation the parser would have given it.
+        command.split([';', '&', '|']).find_map(|segment| {
+            let words: Vec<String> = segment
+                .split_whitespace()
+                .map(|word| word.to_string())
+                .collect();
+            irreversible_outward_argv(&words)
+        })
+    }
+
+    /// Whether an `[sandbox] allow_irreversible` entry authorizes the words a
+    /// rule matched.
+    ///
+    /// The entry's words must appear among the matched rule's words **in order**
+    /// — a subsequence, not a prefix. Order is enforced so a reordering cannot
+    /// stretch an entry (`"push git"` authorizes nothing); length is not, so an
+    /// entry naming fewer words than the rule is the user deliberately
+    /// authorizing the wider thing: `"git push"` covers a force-push.
+    ///
+    /// Two consequences worth stating, because neither is obvious from the
+    /// spelling of an entry:
+    ///
+    /// - A match is over words, not programs, so a one-word entry crosses
+    ///   programs: `"push"` authorizes `docker push` as well as
+    ///   `git push --force`. That is the user's choice to write, and the example
+    ///   config says so.
+    /// - Words need not be adjacent, so `"git --mirror"` authorizes
+    ///   `git push --mirror` — and also `git --mirror push`, which is not a real
+    ///   command. Over-covering a spelling nobody can type costs nothing;
+    ///   under-covering a real one would strand it.
+    #[must_use]
+    pub fn irreversible_allowed(&self, matched: &str) -> bool {
+        let wanted: Vec<&str> = matched.split_whitespace().collect();
+        self.allow_irreversible.iter().any(|entry| {
+            let entry: Vec<&str> = entry.split_whitespace().collect();
+            !entry.is_empty() && words_in_order(&entry, &wanted)
+        })
     }
 
     /// Test-only: the same policy trusting one more identity. Unix-only like
@@ -561,6 +826,46 @@ pub fn evaluate_shell_command(
             read_only: false,
             risk_level: RiskLevel::High,
             matched_rule: Some(format!("deny:{}", reason.rule)),
+            network: false,
+        };
+    }
+
+    // 1b. Irreversible-outward floor.
+    //
+    //     Not local catastrophes (that is `shell_deny`, which cannot be lifted)
+    //     and not ordinary egress (a human approves that per call): these are
+    //     single commands that reach the world and cannot be undone by the next
+    //     command — publishing a package, force-pushing over someone's commits,
+    //     merging a PR, applying infrastructure, deleting a bucket.
+    //
+    //     Under `Yolo` nobody sees the approval prompt, so the decision has to
+    //     be taken *before* the session, in configuration the user wrote: an
+    //     entry in `[sandbox] allow_irreversible` is matched as words in order.
+    //     Refused rather than prompted, deliberately: a prompt is exactly what
+    //     yolo removes, and a floor that a mode can auto-approve is not a floor.
+    //     (The interactive "ask me each time" shape lives in the root grant,
+    //     where a human is guaranteed to be present by construction; this floor
+    //     exists for the runs where nobody is.)
+    if let Some(matched) = policy
+        .irreversible_outward(command)
+        .filter(|matched| !policy.irreversible_allowed(matched))
+    {
+        return ToolExecutionPlan {
+            verdict: PolicyVerdict::Deny {
+                reason: format!(
+                    "shell command denied: '{matched}' is irreversible and outward-facing — it \
+                     reaches the world and the next command cannot undo it, and this session has \
+                     no standing consent for it. If it is genuinely intended, the user can \
+                     authorize it once by adding it to [sandbox] allow_irreversible in the global \
+                     config. Do not look for a spelling that gets around this: report the need \
+                     in your answer and let the human decide."
+                ),
+            },
+            requires_approval: false,
+            requires_sandbox: false,
+            read_only: false,
+            risk_level: RiskLevel::High,
+            matched_rule: Some(format!("irreversible:{matched}")),
             network: false,
         };
     }

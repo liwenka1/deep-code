@@ -229,6 +229,11 @@ pub struct App {
     /// Session permission mode, shared (lock-free) with the runtime's approval
     /// gate. Shift+Tab cycles it; the status line shows it.
     pub(crate) permission_mode: deep_code_agent::SharedPermissionMode,
+    /// `[sandbox] mode = "off"`: shell/job commands run bare. Shown as a
+    /// permanent chip, because it changes what every other safety sentence on
+    /// screen means — a user who forgot they set it must not be able to read the
+    /// status line as an ordinary session.
+    pub(crate) sandbox_off: bool,
     /// One-shot latch: a first Shift+Tab that would enter Yolo arms this and
     /// shows a confirm; the next Shift+Tab confirms. Any other key disarms.
     pub(crate) yolo_armed: bool,
@@ -506,6 +511,7 @@ impl App {
             offline: backend_offline,
             warnings: launch_warnings,
             permission_mode,
+            sandbox_off,
             extra_roots,
         } = launched;
         let subagent_shutdown = Some(stop_hook);
@@ -642,6 +648,7 @@ impl App {
             resume_picker: None,
             lang,
             permission_mode,
+            sandbox_off,
             yolo_armed: false,
         }
     }

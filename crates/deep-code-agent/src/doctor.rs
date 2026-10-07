@@ -112,6 +112,11 @@ pub struct SandboxReport {
     /// effect. `NetworkMode::as_setting` has always been documented as being
     /// "for diagnostics"; this is the diagnostic.
     pub network_setting: String,
+    /// The configured OS-sandbox switch (`[sandbox] mode`). Reported beside the
+    /// network setting and for the same reason: it is a configuration value that
+    /// decides what the gate DOES, not what the host CAN do, and `off` silently
+    /// removes the confinement every other field here describes.
+    pub mode_setting: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -224,6 +229,7 @@ impl DoctorReport {
                 network: sandbox.network,
                 detail: sandbox.detail,
                 network_setting: config.sandbox_network.as_setting().to_string(),
+                mode_setting: config.sandbox_mode.as_setting().to_string(),
             },
             skills,
             config_layers: None,
@@ -383,6 +389,7 @@ mod tests {
             "confines_network",
             "detail",
             "network_setting",
+            "mode_setting",
         ] {
             assert!(object.contains_key(key), "sandbox.{key} missing from JSON");
         }

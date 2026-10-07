@@ -685,19 +685,14 @@ fn describe_appends_gap_caveats_then_design_notes() {
     const NOTE: &str = "DESIGN-NOTE-SENTINEL.";
 
     // Full host with a designed refusal: body intact, note appended.
-    let full = describe(
-        SHELL_DESC_CONFINED,
-        SHELL_DESC_UNCONFINED,
-        &Enforcement::Full,
-        &[NOTE],
-    );
+    let full = describe(SHELL_BODIES, false, &Enforcement::Full, &[NOTE]);
     assert!(full.starts_with(SHELL_DESC_CONFINED));
     assert!(full.ends_with(NOTE));
 
     // Partial host: its gap caveat comes first, the note still lands.
     let partial = describe(
-        SHELL_DESC_CONFINED,
-        SHELL_DESC_UNCONFINED,
+        SHELL_BODIES,
+        false,
         &Enforcement::from_gaps(vec![EnforcementGap::LandlockTruncate]),
         &[NOTE],
     );
@@ -706,13 +701,14 @@ fn describe_appends_gap_caveats_then_design_notes() {
 
     // Unconfined host: no sandbox note lands on a body that promises no
     // sandbox — only the sandbox-independent spill sentence joins the body.
-    let none = describe(
-        SHELL_DESC_CONFINED,
-        SHELL_DESC_UNCONFINED,
-        &Enforcement::None,
-        &[NOTE],
-    );
+    let none = describe(SHELL_BODIES, false, &Enforcement::None, &[NOTE]);
     assert_eq!(none, format!("{SHELL_DESC_UNCONFINED}{SPILL_DESC}"));
+
+    // A session that turned the sandbox off says so, and neither the gap
+    // caveats nor the design notes belong on that body: they describe a sandbox
+    // this registry is not applying.
+    let disabled = describe(SHELL_BODIES, true, &Enforcement::Full, &[NOTE]);
+    assert_eq!(disabled, format!("{SHELL_DESC_DISABLED}{SPILL_DESC}"));
 }
 
 /// Retention contract for spill runs: stale `run-*` directories are removed,
@@ -1212,4 +1208,101 @@ async fn echo_is_not_auto_trusted_on_windows_and_still_runs_once_approved() {
     assert_eq!(info["status"], "completed");
     assert_eq!(info["exit_code"], 0);
     assert_eq!(info["kind"], "foreground");
+}
+
+/// The confinement sentence follows the EFFECTIVE enforcement, which has two
+/// sources: the host probe and `[sandbox] mode = "off"`. Pinned on the pure
+/// function so the host-dependent half does not flake, plus the one assertion
+/// that must hold on every host: `mode = "off"` wins over a perfectly capable
+/// probe. That last one is the regression — the disabled slot was once selected
+/// while `describe` was still handed the host's verdict, so the model read the
+/// confined text ("writes are limited to the granted roots") while commands ran
+/// bare with ambient network.
+#[test]
+fn describe_picks_the_body_that_matches_enforcement() {
+    /// Sentinels, so the assertion names the branch rather than repeating the
+    /// production text.
+    const BODIES: ConfinementBodies = ConfinementBodies {
+        confined: "CONFINED",
+        unconfined: "UNCONFINED",
+        disabled: "DISABLED",
+    };
+
+    let unconfined = describe(BODIES, false, &crate::sandbox::Enforcement::None, &[]);
+    assert!(unconfined.starts_with("UNCONFINED"), "{unconfined}");
+    let full = describe(BODIES, false, &crate::sandbox::Enforcement::Full, &[]);
+    assert!(full.starts_with("CONFINED"), "{full}");
+    // The host probe is not consulted at all when the session turned the sandbox
+    // off: a Full-enforcement host still gets the disabled text.
+    let off = describe(BODIES, true, &crate::sandbox::Enforcement::Full, &[]);
+    assert!(off.starts_with("DISABLED"), "{off}");
+}
+
+/// The wiring, not just the branch: a registry built with `mode = "off"` must
+/// describe itself as unconfined even on a host whose probe succeeds, and it must
+/// say which of the two situations it is in.
+#[test]
+fn an_off_registry_describes_itself_as_unconfined() {
+    let disabled = shell_description(true);
+    assert!(
+        disabled.starts_with(SHELL_DESC_DISABLED),
+        "the model must be told nothing confines these commands: {disabled}"
+    );
+    assert!(
+        !disabled.contains("writes are confined"),
+        "and must not be told the granted-roots fence is holding: {disabled}"
+    );
+    assert!(
+        job_description(true).starts_with(JOB_DESC_DISABLED),
+        "the job tool must agree with the shell tool"
+    );
+}
+
+/// The cache grant rides the CALL's egress, not the session's mode. The
+/// canonical failure these roots exist for — `npm install` with a declared
+/// `network: true` that the user approved under the default `network =
+/// "prompt"` — must get them, and a call that holds no egress must not.
+#[test]
+fn cache_roots_ride_the_calls_egress() {
+    let caches = crate::paths::tool_cache_roots();
+    if caches.is_empty() {
+        // No ecosystem cache on this host: nothing to grant, nothing to assert.
+        return;
+    }
+
+    let workspace = tempfile::tempdir().unwrap();
+    let policy = WorkspacePolicy::new(workspace.path()).unwrap();
+    let evaluate = |network: bool| {
+        crate::execution_policy::ExecPolicy::default().evaluate_tool(
+            "shell",
+            &json!({"command": "npm install", "network": network}),
+        )
+    };
+
+    let declared = evaluate(true);
+    assert!(
+        declared.network,
+        "precondition: the declaration is on the plan"
+    );
+    let with_egress = sandbox_roots(&policy, &ToolCx::new().with_plan(declared));
+    assert!(
+        caches.iter().all(|cache| with_egress.contains(cache)),
+        "a call holding egress may write its package caches: {with_egress:?}"
+    );
+
+    let offline = sandbox_roots(&policy, &ToolCx::new().with_plan(evaluate(false)));
+    assert!(
+        !caches.iter().any(|cache| offline.contains(cache)),
+        "a call without egress gets none of them: {offline:?}"
+    );
+    // The workspace boundary is on both, which is what makes the difference the
+    // cache roots rather than the whole list. Compared canonically: granted roots
+    // are canonicalized before they reach the sandbox (on macOS a tempdir is a
+    // symlink into /private), so the raw spelling would fail on a healthy build.
+    let canonical = crate::paths::canonicalize(workspace.path())
+        .unwrap_or_else(|_| workspace.path().to_path_buf());
+    assert!(
+        offline.contains(&canonical),
+        "the workspace is a root either way: {offline:?}"
+    );
 }

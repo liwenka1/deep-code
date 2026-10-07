@@ -13,6 +13,7 @@ fn parent_tool_names<C: LlmClient + Clone + 'static>(
         config,
         &WorkspaceRoots::from(workspace),
         &cancel,
+        &SharedPermissionMode::default(),
         &mut Vec::new(),
         &SharedLang::default(),
     );
@@ -82,6 +83,7 @@ fn launch_assembly_warns_about_dead_auto_allow_entries() {
         &config,
         &WorkspaceRoots::from(dir.path()),
         &cancel,
+        &SharedPermissionMode::default(),
         &mut warnings,
         &ui_lang,
     );

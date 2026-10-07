@@ -181,12 +181,30 @@ fn truncation_note(
 /// the grant never gets the network note: its EPERM can only be the write
 /// fence, so it falls through to the write check unchanged.
 fn denial_note(job: &JobState) -> Option<&'static str> {
-    if job.status != JobStatus::Failed || !job.sandboxed {
+    if job.status != JobStatus::Failed {
         return None;
     }
     let stderr = job.stderr.text();
+    if !job.sandboxed {
+        // No fence produced this failure, so only the class that is not about a
+        // fence applies. An unsandboxed `Operation not permitted` stays silent —
+        // that is an ordinary permission problem, not the granted-roots fence —
+        // while an authentication failure is the same diagnosis either way, and
+        // `[sandbox] mode = "off"` is the configuration most likely to run into
+        // it.
+        return crate::sandbox::credential_denial_signature(job.exit_code, &stderr)
+            .then_some(crate::sandbox::CREDENTIAL_DENIAL_NOTE);
+    }
     if !job.network && crate::sandbox::network_denial_signature(job.exit_code, &stderr) {
         return Some(crate::sandbox::NETWORK_DENIAL_NOTE);
+    }
+    // Credentials come before the write fence: both notes share `Permission
+    // denied`, and a push that failed on auth would otherwise be handed the
+    // granted-roots advice, which is exactly wrong. Ungated by `job.network` —
+    // this failure happens after connecting, so it is equally possible with and
+    // without the grant.
+    if crate::sandbox::credential_denial_signature(job.exit_code, &stderr) {
+        return Some(crate::sandbox::CREDENTIAL_DENIAL_NOTE);
     }
     crate::sandbox::write_denial_signature(job.exit_code, &stderr)
         .then_some(crate::sandbox::WRITE_DENIAL_NOTE)

@@ -61,10 +61,12 @@ pub struct AgentParams {
     /// Defaults to general.
     role: Option<String>,
     /// Set true when the child task needs network access (fetching docs/URLs,
-    /// installing dependencies). Routes the dispatch through user approval; an
-    /// approved networked child gets the web tools (fetch_url, web_search) and
-    /// its allow-listed sandboxed commands run with egress. Children without
-    /// this grant have no network at all.
+    /// installing dependencies, `git push`). Routes the dispatch through user
+    /// approval; an approved networked child gets the web tools (fetch_url,
+    /// web_search) and its allow-listed sandboxed commands run with egress.
+    /// Children without this grant have no network at all. Note that the child
+    /// also inherits this session's permission mode, so under yolo a child's
+    /// gated calls are auto-approved exactly as the parent's are.
     network: Option<bool>,
     /// Optional display name (shown by /agents).
     name: Option<String>,
@@ -101,6 +103,40 @@ impl Tool for AgentTool {
         // standing auto_allow). Under `network = "never"` the policy denies
         // the dispatch before this point.
         let network = params.network.unwrap_or(false);
+
+        // Writing children are serialized to one. The manager's cap counts
+        // children, which is the wrong unit: readers on one workspace are a
+        // throughput choice, writers on one workspace are a corruption class.
+        // Refused as a soft error rather than a hard one — nothing is wrong with
+        // the call, it is just early, and the parent can retry after the running
+        // writer finishes.
+        //
+        // The check-then-insert below is not itself atomic, and it does not need
+        // to be, for a reason that lives in the policy engine: dispatching a
+        // writing child always resolves to `NeedsApproval`, so it is never
+        // `is_parallel_safe` and two of them cannot be in flight in one batch.
+        // That is a real dependency on an invariant stated elsewhere — if a
+        // future change let a writing dispatch be `Allow`, two writers in one
+        // batch would both pass this check before either inserted.
+        if role.allows_writes() {
+            let running_writers = {
+                let manager = self
+                    .services
+                    .manager
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                manager.running_writers()
+            };
+            if running_writers > 0 {
+                return Ok(ToolOutput::soft_error(
+                    "a writing sub-agent is already running, and writing children are \
+                     serialized so two of them cannot fight over one workspace file, one \
+                     package cache or one git index. Re-dispatch this task once it finishes \
+                     (its record in /agents shows when)."
+                        .to_string(),
+                ));
+            }
+        }
 
         let agent_id = new_agent_id();
         let name = params
@@ -147,7 +183,11 @@ impl Tool for AgentTool {
             child_system_prompt(role, network),
             child_config,
             true,
-        );
+        )
+        // The child shares the parent's mode handle (see
+        // `SubAgentServices::permission_mode`). This is the one line that makes
+        // "yolo" mean the same thing inside a dispatch as outside it.
+        .with_permission_mode(self.services.permission_mode.clone());
 
         {
             let mut manager = self
@@ -220,9 +260,9 @@ impl Tool for AgentTool {
                 match tokio::time::timeout(CANCEL_GRACE, &mut run).await {
                     Ok(joined) => match unwrap_panic(joined) {
                         Ok(success) => Ok(success),
-                        Err(_) => Err((0, reason)),
+                        Err(_) => Err((0, reason, None)),
                     },
-                    Err(_) => Err((0, reason)),
+                    Err(_) => Err((0, reason, None)),
                 }
             }
         };
@@ -266,25 +306,67 @@ impl Tool for AgentTool {
                 }));
                 Ok(output)
             }
-            Err((_, message)) if message == "cancelled" => {
+            Err((_, message, _)) if message == "cancelled" => {
                 let _ = manager.mark_cancelled(&agent_id);
                 Ok(ToolOutput::soft_error("sub-agent cancelled"))
             }
-            Err((steps, message)) => {
+            Err((steps, message, partial)) => {
                 let _ = manager.finalize_failure(&agent_id, message.clone(), steps);
                 Ok(ToolOutput::soft_error(format!(
-                    "sub-agent failed: {message}"
+                    "sub-agent failed: {message}{}",
+                    partial_report_suffix(partial.as_deref())
                 )))
             }
         }
     }
 }
 
-/// A finished child run: `Ok(report, steps)` or `Err(steps, message)`.
-type ChildOutcome = Result<(String, u32), (u32, String)>;
+/// Append whatever the child had already worked out, so an interrupted run is
+/// something to continue from rather than something to redo.
+///
+/// The cap used to end a child with a one-line error and nothing else: the
+/// parent's only sane response was re-dispatching the same task, which walked
+/// the same steps again. The child's own last message is cheap to keep, and it
+/// is labelled unverified because it never reached the `SUMMARY` contract.
+fn partial_report_suffix(partial: Option<&str>) -> String {
+    match partial {
+        Some(text) => format!(
+            "\n\nPartial report from the child (it stopped before it could report; this is its \
+             last message, unverified, not a substitute for the output contract):\n{text}"
+        ),
+        None => String::new(),
+    }
+}
+
+/// A finished child run: `Ok(report, steps)` or `Err(steps, message, partial)`.
+type ChildOutcome = Result<(String, u32), (u32, String, Option<String>)>;
 
 /// Flatten `catch_unwind`'s join result: a panic in the child run becomes a
 /// failure with no steps recorded.
 fn unwrap_panic(joined: Result<ChildOutcome, Box<dyn std::any::Any + Send>>) -> ChildOutcome {
-    joined.unwrap_or_else(|_| Err((0, "sub-agent panicked".to_string())))
+    joined.unwrap_or_else(|_| Err((0, "sub-agent panicked".to_string(), None)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::partial_report_suffix;
+
+    /// An interrupted child has to hand something back. A one-line failure is
+    /// what made the parent's only sane move a full re-dispatch of a task that
+    /// had already been half done.
+    #[test]
+    fn a_failure_carries_the_childs_partial_report() {
+        let suffix = partial_report_suffix(Some("the parser lives at src/x.rs:40"));
+        assert!(suffix.contains("src/x.rs:40"));
+        assert!(
+            suffix.contains("unverified"),
+            "the label must not oversell an unreviewed message: {suffix}"
+        );
+    }
+
+    /// "Nothing to hand over" must not read as an empty report.
+    #[test]
+    fn no_partial_report_adds_nothing() {
+        assert!(partial_report_suffix(None).is_empty());
+    }
 }

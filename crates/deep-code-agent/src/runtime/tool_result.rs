@@ -29,15 +29,32 @@ use crate::tool::{
 /// Sited in `run_tool` rather than the policy engine so it reads the LIVE
 /// mode per call (Shift+Tab mid-session applies immediately, in both
 /// directions) and covers every execution path — direct runs and the
-/// approved re-run — in one place. Sub-agents are untouched: a child runtime
-/// never has yolo (children do not inherit the parent's mode), and a granted
-/// child's egress rides its own `Always` policy instead.
+/// approved re-run — in one place.
+///
+/// `is_subagent` is why this cannot be a pure function of the mode. Children DO
+/// inherit the session's permission mode (that is what makes a dispatch usable
+/// at all — see `SubAgentServices::permission_mode`), but the ambient-egress half
+/// of `Yolo` must not follow it into a child dispatched WITHOUT the network
+/// grant:
+///
+/// - that child's registry caps its network mode at `Prompt`, not `Never`
+///   (`child_tool_registry`), so a `!= Never` test alone would let it through;
+/// - its system prompt says, in as many words, that it has no network;
+/// - and the dispatch prompt — "anything the child reads may be sent to external
+///   hosts" — is the consent that grant exists to collect. Egress handed over
+///   here would be a capability nobody approved, under a prompt denying it.
+///
+/// A granted child needs no overlay: its own policy is already `Always`.
 fn yolo_ambient_network(
     plan: crate::execution_policy::ToolExecutionPlan,
     mode: crate::execution_policy::PermissionMode,
     network_mode: crate::execution_policy::NetworkMode,
+    is_subagent: bool,
 ) -> crate::execution_policy::ToolExecutionPlan {
+    let ambient_granted =
+        !is_subagent || network_mode == crate::execution_policy::NetworkMode::Always;
     if mode == crate::execution_policy::PermissionMode::Yolo
+        && ambient_granted
         && network_mode != crate::execution_policy::NetworkMode::Never
         && plan.requires_sandbox
     {
@@ -111,10 +128,18 @@ impl AgentRuntime {
             .with_authority(authority)
             .with_update_fn(tool_progress_fn(tx, turn_id, call))
             .with_spend_sink(std::sync::Arc::clone(&spend_sink));
+        // The network mode that will actually gate this call comes from the
+        // registry's own policy, not from the config the registry was built
+        // from: a child registry overrides it (capped down without a grant,
+        // raised to `Always` with one), so reading `self.config` here made the
+        // egress overlay — and the cache grant that rides it — disagree with the
+        // gate that decides. One source of truth: the policy about to run.
+        let network_mode = self.tools.policy().network_mode();
         let plan = yolo_ambient_network(
             self.tools.evaluate_tool(call),
             self.permission_mode(),
-            self.config.sandbox_network,
+            network_mode,
+            self.is_subagent,
         );
         let outcome = self
             .tools
@@ -558,14 +583,17 @@ mod tests {
         for command in ["cargo build", "git push origin main", "npm install"] {
             let plan = undeclared_shell_plan(command);
             assert!(plan.requires_sandbox && !plan.network, "precondition");
-            let yolo = yolo_ambient_network(plan, PermissionMode::Yolo, NetworkMode::Prompt);
+            let yolo = yolo_ambient_network(plan, PermissionMode::Yolo, NetworkMode::Prompt, false);
             assert!(yolo.network, "{command} must get egress under yolo");
         }
         // A declared command keeps its grant — the override is idempotent.
         let declared = ExecPolicy::default()
             .evaluate_tool("shell", &json!({"command": "git push", "network": true}));
         assert!(declared.network, "precondition");
-        assert!(yolo_ambient_network(declared, PermissionMode::Yolo, NetworkMode::Prompt).network);
+        assert!(
+            yolo_ambient_network(declared, PermissionMode::Yolo, NetworkMode::Prompt, false)
+                .network
+        );
     }
 
     /// `never` is the user's absolute refusal and yolo must not override it;
@@ -576,7 +604,13 @@ mod tests {
     fn ambient_egress_stops_at_never_other_modes_and_unsandboxed_plans() {
         let plan = undeclared_shell_plan("git push origin main");
         assert!(
-            !yolo_ambient_network(plan.clone(), PermissionMode::Yolo, NetworkMode::Never).network,
+            !yolo_ambient_network(
+                plan.clone(),
+                PermissionMode::Yolo,
+                NetworkMode::Never,
+                false
+            )
+            .network,
             "never stays absolute"
         );
         for mode in [
@@ -585,13 +619,64 @@ mod tests {
             PermissionMode::Auto,
         ] {
             assert!(
-                !yolo_ambient_network(plan.clone(), mode, NetworkMode::Prompt).network,
+                !yolo_ambient_network(plan.clone(), mode, NetworkMode::Prompt, false).network,
                 "{mode:?} must keep the human-gated behavior"
             );
         }
         let write = ExecPolicy::default()
             .evaluate_tool("write_file", &json!({"path": "a.rs", "content": "x"}));
         assert!(!write.requires_sandbox, "precondition");
-        assert!(!yolo_ambient_network(write, PermissionMode::Yolo, NetworkMode::Prompt).network);
+        assert!(
+            !yolo_ambient_network(write, PermissionMode::Yolo, NetworkMode::Prompt, false).network
+        );
+    }
+
+    /// A child dispatched WITHOUT the network grant must not ride the parent's
+    /// yolo egress. Its registry caps the mode at `Prompt` rather than `Never`
+    /// (that is what makes the cap a cap: a declared command there would ask a
+    /// human who is not there), so the `!= Never` test alone let ambient egress
+    /// through — into a child whose system prompt said it had none, and whose
+    /// dispatch never collected the "anything it reads may be sent to external
+    /// hosts" consent.
+    #[test]
+    fn yolo_egress_does_not_reach_a_child_without_the_dispatch_grant() {
+        let plan = undeclared_shell_plan("npm install");
+
+        // The parent: unchanged.
+        assert!(
+            yolo_ambient_network(
+                plan.clone(),
+                PermissionMode::Yolo,
+                NetworkMode::Prompt,
+                false
+            )
+            .network
+        );
+        // The ungranted child: capped at `Prompt`, and left offline.
+        assert!(
+            !yolo_ambient_network(
+                plan.clone(),
+                PermissionMode::Yolo,
+                NetworkMode::Prompt,
+                true
+            )
+            .network,
+            "an ungranted child's commands stay offline under yolo"
+        );
+        // A granted child runs on `Always` and needs no overlay — it already has
+        // ambient egress, so the overlay is a no-op rather than a second grant.
+        assert!(
+            yolo_ambient_network(
+                plan.clone(),
+                PermissionMode::Yolo,
+                NetworkMode::Always,
+                true
+            )
+            .network
+        );
+        // And the `never` floor still outranks every combination.
+        assert!(
+            !yolo_ambient_network(plan, PermissionMode::Yolo, NetworkMode::Never, true).network
+        );
     }
 }
