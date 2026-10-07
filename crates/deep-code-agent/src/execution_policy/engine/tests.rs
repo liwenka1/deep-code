@@ -1309,3 +1309,38 @@ fn a_leading_option_that_takes_a_value_is_a_known_miss() {
         PolicyVerdict::Deny { .. }
     ));
 }
+
+/// The interactive modes reach a push and a test suite the same way: a human
+/// approves the call, and the approval is worth something because the plan keeps
+/// the egress it was granted for. Neither half is optional — the failure this
+/// pins is the reverse one, a mode waving the call through as if it were a
+/// workspace edit, which would turn "approve egress" into "no decision at all".
+///
+/// (The unrelated half of the story lives elsewhere: on the *unattended* side a
+/// child's shell wall refuses these in every mode, test
+/// `an_inherited_mode_does_not_lift_the_childs_shell_wall`.)
+#[test]
+fn a_push_or_a_suite_is_gated_by_approval_and_keeps_its_egress() {
+    for command in [
+        "git push origin main",
+        "npm run test:e2e",
+        "npx playwright test",
+        "npm install",
+    ] {
+        let declared = json!({"command": command, "network": true});
+        assert!(
+            !accept_edits_approvable("shell", &declared),
+            "accept_edits must not wave {command} through as a workspace edit"
+        );
+        let plan = evaluate_shell_command(&ExecPolicy::default(), command, true);
+        assert!(
+            matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }),
+            "{command} reaches a human, who can say yes: {plan:?}"
+        );
+        assert!(
+            plan.network,
+            "{command} keeps its egress once approved — without this the approval \
+             would buy nothing"
+        );
+    }
+}

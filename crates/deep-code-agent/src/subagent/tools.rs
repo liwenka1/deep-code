@@ -61,12 +61,18 @@ pub struct AgentParams {
     /// Defaults to general.
     role: Option<String>,
     /// Set true when the child task needs network access (fetching docs/URLs,
-    /// installing dependencies, `git push`). Routes the dispatch through user
-    /// approval; an approved networked child gets the web tools (fetch_url,
-    /// web_search) and its allow-listed sandboxed commands run with egress.
-    /// Children without this grant have no network at all. Note that the child
-    /// also inherits this session's permission mode, so under yolo a child's
-    /// gated calls are auto-approved exactly as the parent's are.
+    /// installing dependencies). Routes the dispatch through user approval; an
+    /// approved networked child gets the web tools (fetch_url, web_search) and
+    /// its allow-listed sandboxed commands run with egress. Children without
+    /// this grant have no network at all.
+    ///
+    /// A child inherits this session's permission mode, but that is NOT a way to
+    /// give it the parent's reach. Its own gated calls are decided by the
+    /// unattended sub-agent policy, which never consults the mode, so a shell
+    /// command outside the trusted list — `git push`, `npm run …`, anything with
+    /// a network declaration — is denied in EVERY mode, `yolo` included. Run
+    /// that kind of command in the parent, or have the child report the need so
+    /// the parent can.
     network: Option<bool>,
     /// Optional display name (shown by /agents).
     name: Option<String>,

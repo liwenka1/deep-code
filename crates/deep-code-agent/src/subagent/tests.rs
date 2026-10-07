@@ -612,6 +612,67 @@ None.
         );
     }
 
+    /// Inheriting the session's mode is not inheriting its capability.
+    ///
+    /// A child's gated calls are decided by the unattended policy, which never
+    /// reads the mode, and its shell wall admits no approval path in any mode. So
+    /// `yolo` makes the PARENT able to `git push` while a dispatched child still
+    /// cannot — the recovery stays what the denial note says (report the need;
+    /// the parent, which has the human, runs it). Pinned because the README and
+    /// the model-facing parameter docs both claimed the opposite, and because
+    /// "children inherit the mode" is exactly the kind of sentence that gets
+    /// re-read as "children inherit what the mode grants".
+    #[tokio::test]
+    async fn an_inherited_mode_does_not_lift_the_childs_shell_wall() {
+        use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+
+        let runtime = AgentRuntime::new(SummaryClient, ToolRegistry::new())
+            .with_permission_mode(SharedPermissionMode::new(PermissionMode::Yolo));
+        let request = |command: &str, network: bool| ApprovalRequest {
+            network,
+            call_id: "call_1".to_string(),
+            tool_name: "shell".to_string(),
+            description: "run".to_string(),
+            arguments: json!({ "command": command, "network": network }),
+            risk_level: crate::execution_policy::RiskLevel::High,
+            requires_sandbox: true,
+            read_only: false,
+            matched_rule: None,
+            justification: None,
+            resolved_target: None,
+            preview: None,
+            safety_notes: Vec::new(),
+        };
+
+        // The network grant AND an inherited yolo, and it is still refused.
+        let (decision, note) = runtime.subagent_approval_decision(
+            &request("git push origin main", true),
+            SubAgentRole::Implementer,
+            true,
+        );
+        assert_eq!(
+            decision,
+            ApprovalDecision::Denied,
+            "an inherited yolo must not make a child able to push"
+        );
+        assert!(
+            note.as_deref()
+                .is_some_and(|note| note.contains("allow-list")),
+            "the denial must name the wall rather than the missing grant: {note:?}"
+        );
+
+        // …while the same runtime still approves what the wall admits, so the
+        // assertion above is about the wall and not about a dead runtime.
+        assert_eq!(
+            runtime.subagent_approval_decision(
+                &request("cargo build", false),
+                SubAgentRole::Implementer,
+                false
+            ),
+            (ApprovalDecision::Approved, None)
+        );
+    }
+
     #[tokio::test]
     async fn approval_posture_allows_writes_only_for_writing_roles() {
         let runtime = AgentRuntime::new(SummaryClient, ToolRegistry::new());
