@@ -6,6 +6,13 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [0.4.13] - 2026-10-08
+
+- A sub-agent dispatch can now carry an `allow_commands` list — the command identities the child may run beyond its built-in trust list. A child's own prompts are auto-denied (nobody is watching them), so a shell command outside that list was unreachable in every mode, `yolo` included; naming it here moves the decision to the one place a human still is, and the dispatch prompt lists the commands and asks once. The grant is scoped to that one child: it cannot reach the parent's own policy, a child cannot pass it on to its own children, and it cannot lift the irreversible floor.
+- **Security:** The irreversible floor now asks a human rather than refusing. A command that is irreversible and outward-facing — publishing a package, force-pushing over someone's commits, merging a PR, applying infrastructure, deleting a bucket — prompts in every interactive tier, `yolo` included, and is auto-denied only where nobody can answer (a headless run, a sub-agent); `[sandbox] allow_irreversible` remains the way to stop the asking for a class of command you have already decided about.
+- Under `yolo`, sandboxed commands now get ambient egress unless `[sandbox] network = "never"` overrides it, so networked commands — `git push`, `npm install`, an e2e suite, a trusted build fetching crates — run instead of failing offline with a raw connection error nobody is around to interpret. `yolo` already removed the human from the loop, so the per-call network gate stopped no attacker there and only stranded honest commands that forgot to declare `network: true`.
+- A sub-agent's tool-call budget is raised from 50 to 200 and now ends in a hand-off rather than a wall: the child is nudged to wrap up at four-fifths of its budget, and one that still runs out returns its partial report alongside the failure, so the parent continues from real progress instead of re-dispatching from scratch.
+
 ## [0.4.12] - 2026-10-04
 
 - Image understanding arrives in the agent and TUI: an image can be attached in four ways, it is sent only to a model that accepts images, and when it cannot be sent the attachment degrades to a one-line note instead.
@@ -326,3 +333,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.4.10]: https://github.com/liwenka1/deep-code/compare/v0.4.9...v0.4.10
 [0.4.11]: https://github.com/liwenka1/deep-code/compare/v0.4.10...v0.4.11
 [0.4.12]: https://github.com/liwenka1/deep-code/compare/v0.4.11...v0.4.12
+[0.4.13]: https://github.com/liwenka1/deep-code/compare/v0.4.12...v0.4.13
