@@ -7,8 +7,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::execution_policy::{
-    PermissionMode, RiskLevel, accept_edits_approvable, command_shape, network_requested,
-    shell_command_of,
+    PermissionMode, RiskLevel, accept_edits_approvable, command_shape,
+    dispatch_declares_allow_commands, network_requested, shell_command_of,
 };
 use crate::model_registry::{AUTO_MODEL, DEEPSEEK_FLASH};
 use crate::runtime::AgentRuntime;
@@ -351,6 +351,15 @@ impl AgentRuntime {
                 // the Flash judge, a soft and injectable backstop, in Auto mode.
                 // Short-circuits before the judge spends a request.
                 if request.network || is_network_tool(&call.name) {
+                    return None;
+                }
+                // A dispatch carrying `allow_commands` is its own approval point
+                // for the same reason, and it sits above the judge too: the
+                // judge reads only the dispatch's `task` text, which never
+                // mentions the authorized commands, so a read-only-role dispatch
+                // (not covered by the accept-edits inherit below) would otherwise
+                // have `bash` waved through by the classifier.
+                if dispatch_declares_allow_commands(&call.name, &call.arguments) {
                     return None;
                 }
                 self.auto_mode_approves(call, request, &user_task, cancel)

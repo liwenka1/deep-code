@@ -169,6 +169,56 @@ fn spawning_a_writing_subagent_needs_approval_like_a_write() {
     ));
 }
 
+/// `allow_commands` is its own consent point: it authorizes the child to run
+/// those commands unattended, which only a person decides by seeing them named.
+/// So a dispatch carrying it must not be waved through by AcceptEdits (even for
+/// a writing role, whose plain workspace writes that mode would grant) nor by
+/// the Auto judge (which reads only the `task` text) — `dispatch_declares_allow_commands`
+/// is the predicate both consult, mirroring `network_requested`.
+#[test]
+fn an_allow_commands_dispatch_is_its_own_consent_point() {
+    // A writing role is accept-edits-approvable on its own…
+    assert!(accept_edits_approvable(
+        "agent",
+        &json!({"task": "fix", "role": "implementer"})
+    ));
+    // …but NOT once it also carries allow_commands.
+    assert!(!accept_edits_approvable(
+        "agent",
+        &json!({"task": "fix", "role": "implementer", "allow_commands": ["bash", "python3"]})
+    ));
+    // A read-only role with allow_commands is the Auto-mode case: not
+    // accept-edits-approvable (read-only), and flagged so the Auto flow floors
+    // it before the judge.
+    assert!(!accept_edits_approvable(
+        "agent",
+        &json!({"task": "look", "role": "explore", "allow_commands": ["bash"]})
+    ));
+    assert!(dispatch_declares_allow_commands(
+        "agent",
+        &json!({"task": "look", "role": "explore", "allow_commands": ["bash"]})
+    ));
+    assert!(dispatch_declares_allow_commands(
+        "agent",
+        &json!({"task": "fix", "role": "implementer", "allow_commands": ["bash"]})
+    ));
+    // No allow_commands (or an empty list) is not flagged — the plain dispatch
+    // consent paths still apply.
+    assert!(!dispatch_declares_allow_commands(
+        "agent",
+        &json!({"task": "fix", "role": "implementer"})
+    ));
+    assert!(!dispatch_declares_allow_commands(
+        "agent",
+        &json!({"task": "fix", "role": "implementer", "allow_commands": []})
+    ));
+    // It is specific to the dispatch tool: the key on another tool is not it.
+    assert!(!dispatch_declares_allow_commands(
+        "shell",
+        &json!({"command": "ls", "allow_commands": ["bash"]})
+    ));
+}
+
 /// A `network: true` dispatch is the child's egress consent, collected at
 /// the only prompt a human ever sees (the child's own prompts are
 /// auto-denied unattended) — so it must ask even for read-only roles.
@@ -1567,17 +1617,21 @@ fn a_dispatch_that_declares_allow_commands_asks_a_human() {
         "both grants are named, in order: {reason}"
     );
 
-    // Long lists are truncated with a count, so the panel stays readable without
-    // looking complete.
+    // Long lists name EVERY entry — no truncation. Each command is a distinct
+    // capability the human is authorizing, so a count ("and 3 more") would hide
+    // one and grant it sight-unseen; a long prompt is the honest signal instead.
     let many: Vec<String> = (0..8).map(|index| format!("cmd{index}")).collect();
     let long = policy.evaluate_tool(
         "agent",
-        &json!({"role": "explore", "task": "x", "allow_commands": many}),
+        &json!({"role": "explore", "task": "x", "allow_commands": many.clone()}),
     );
     let PolicyVerdict::NeedsApproval { reason } = &long.verdict else {
         panic!("expected a prompt: {long:?}")
     };
-    assert!(reason.contains("and 3 more"), "{reason}");
+    for command in &many {
+        assert!(reason.contains(command.as_str()), "{command} must be named: {reason}");
+    }
+    assert!(!reason.contains("more)"), "no entry may be hidden behind a count: {reason}");
 
     // Nothing to authorize, nothing to ask.
     for value in [

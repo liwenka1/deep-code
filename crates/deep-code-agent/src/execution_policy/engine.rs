@@ -379,6 +379,20 @@ pub fn network_requested(arguments: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether an `agent` dispatch declares a non-empty `allow_commands`.
+///
+/// `allow_commands` is its own approval point — it authorizes the child to run
+/// those commands (`bash`, `git push`, …) unattended, which a person decides by
+/// seeing them named at the prompt. So no permission mode and no Auto judge may
+/// auto-approve such a dispatch; it mirrors [`network_requested`], the other
+/// grant a dispatch carries that standing consent must not cover. Read by the
+/// approval flow (Auto) and folded into [`accept_edits_approvable`].
+#[must_use]
+pub fn dispatch_declares_allow_commands(tool_name: &str, arguments: &Value) -> bool {
+    matches!(ExecPolicy::classify_tool(tool_name), ToolKind::SubAgent)
+        && !subagent_allow_commands(arguments).is_empty()
+}
+
 /// The model's stated reason for a gated call (`justification` in the
 /// arguments), for the human at the approval prompt. Advisory text only: it
 /// is the model's own claim, never fed back to the auto-mode judge (a
@@ -806,17 +820,15 @@ impl ExecPolicy {
                     }
                     .to_string();
                     if !allow_commands.is_empty() {
-                        // Named in full rather than counted: the human is deciding
-                        // that this child may run THESE commands without anyone
-                        // watching, and "3 commands" is not a decision anyone can
-                        // make. Capped so a long list cannot push the rest of the
-                        // panel off the screen — the count says the rest exists.
-                        let shown: Vec<&str> = allow_commands
-                            .iter()
-                            .take(MAX_NAMED_ALLOW_COMMANDS)
-                            .map(String::as_str)
-                            .collect();
-                        let extra = allow_commands.len().saturating_sub(shown.len());
+                        // Named in full — EVERY entry, not a capped prefix. The
+                        // human is deciding that this child may run THESE commands
+                        // without anyone watching, and each entry is a distinct
+                        // capability: a cap that showed "cargo clippy (and 1 more)"
+                        // hid `bash` behind the count and granted it sight-unseen.
+                        // A long list makes a long prompt, which is the honest
+                        // signal that the dispatch is asking for a lot; a dispatch
+                        // a person actually wrote names a handful.
+                        //
                         // APPENDED, not substituted: a dispatch can be all three
                         // things at once, and the sentences above exist because
                         // each authorization is a different grant a human is being
@@ -830,14 +842,9 @@ impl ExecPolicy {
                         // writes It also authorizes it to run git push …".
                         reason.push_str(&format!(
                             " It also authorizes it to run {} without anyone watching its \
-                             prompts{} — anything those commands reach may be read, written \
+                             prompts — anything those commands reach may be read, written \
                              or sent",
-                            shown.join(", "),
-                            if extra > 0 {
-                                format!(" (and {extra} more)")
-                            } else {
-                                String::new()
-                            }
+                            allow_commands.join(", "),
                         ));
                     }
                     ToolExecutionPlan {
@@ -1115,7 +1122,16 @@ pub fn accept_edits_approvable(tool_name: &str, arguments: &Value) -> bool {
         // Spawning a writing child is standing consent to its workspace writes,
         // which is exactly what AcceptEdits already grants per-write. Only the
         // writing role ever reaches this (read-only spawns don't prompt).
-        ToolKind::SubAgent => subagent_role_writes(arguments),
+        //
+        // But a dispatch carrying `allow_commands` is NOT just workspace writes:
+        // it authorizes the child to run those commands unattended (`bash`,
+        // `git push`, …), its own approval point that a person names at the
+        // prompt — the same reason `network` is excluded above. AcceptEdits's
+        // standing consent does not reach it, so a writing-role dispatch that
+        // also carries `allow_commands` must still ask.
+        ToolKind::SubAgent => {
+            subagent_role_writes(arguments) && subagent_allow_commands(arguments).is_empty()
+        }
         // Shell / job(start): an in-workspace filesystem-mutation command.
         // `shell_command_of` returns None for job status/tail/cancel, so the
         // bare `Job` arm needs no separate action guard.
@@ -1149,11 +1165,6 @@ pub const NEEDS_HUMAN_RULE_PREFIX: &str = "needs-human:";
 pub fn is_needs_human_rule(rule: Option<&str>) -> bool {
     rule.is_some_and(|rule| rule.starts_with(NEEDS_HUMAN_RULE_PREFIX))
 }
-
-/// How many `allow_commands` entries the approval reason names before it says
-/// "(and N more)". The panel has to stay readable; the count keeps the list from
-/// silently looking complete.
-const MAX_NAMED_ALLOW_COMMANDS: usize = 5;
 
 /// The command identities a dispatch declares for its child, trimmed, empty
 /// entries dropped. Unparsable shapes yield an empty list rather than an error:

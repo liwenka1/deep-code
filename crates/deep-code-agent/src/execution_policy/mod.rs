@@ -150,8 +150,8 @@ mod shell_lex;
 
 pub use engine::{
     ExecPolicy, NetworkMode, PolicyVerdict, RiskLevel, SandboxMode, ToolExecutionPlan, ToolKind,
-    accept_edits_approvable, is_needs_human_rule, justification_claimed, network_requested,
-    normalize_allow_commands, shell_command_of,
+    accept_edits_approvable, dispatch_declares_allow_commands, is_needs_human_rule,
+    justification_claimed, network_requested, normalize_allow_commands, shell_command_of,
 };
 pub use permission_mode::{PermissionMode, SharedPermissionMode};
 pub use shell_deny::{SafetyNote, safety_notes};
