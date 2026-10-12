@@ -210,9 +210,31 @@ fn compose_profile(
             granted.push(resolved);
         }
     }
-    for (index, root) in granted.into_iter().enumerate() {
-        let param = profile.bind_path(&format!("WRITE_ROOT_{index}"), root);
+    for (index, root) in granted.iter().enumerate() {
+        let param = profile.bind_path(&format!("WRITE_ROOT_{index}"), root.clone());
         profile.rule(format!("(allow file-write* (subpath {param}))"));
+    }
+
+    // A `subpath` grant also covers the granted directory's OWN entry, so a
+    // sandboxed command can rename or remove a writable root and drop a symlink
+    // in its place (`mv ws /tmp/x && ln -s ~ ws`). This profile is rebuilt per
+    // spawn and the roots are re-resolved above, so the NEXT command's grant
+    // would follow that symlink and bake its target — `$HOME`, say — into a
+    // `subpath` write grant, escaping the fence with no root-grant prompt. On
+    // Linux the same move needs write on the root's parent, which Landlock does
+    // not grant, so this is macOS-specific.
+    //
+    // Deny renaming/unlinking each root's own entry — a `literal`, so only that
+    // directory's own rename is refused while the ordinary writes beneath it a
+    // working tool needs stay allowed. Exactly the technique the
+    // credential-parent denials below use against `mv ~/Library …`, and it must
+    // likewise follow the write grants so last-match-wins keeps it. Renaming the
+    // workspace root, the temp dir or a cache root out from under the sandbox is
+    // never a build step; a tool that tried would get a recoverable EPERM, not a
+    // silent escape.
+    for (index, root) in granted.iter().enumerate() {
+        let param = profile.bind_path(&format!("KEEP_ROOT_{index}"), root.clone());
+        profile.rule(format!("(deny file-write-unlink (literal {param}))"));
     }
 
     // Credential stores must never be *modified* by a sandboxed command, even

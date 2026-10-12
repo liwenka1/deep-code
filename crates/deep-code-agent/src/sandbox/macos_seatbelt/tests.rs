@@ -187,6 +187,107 @@ fn intermediate_credential_dirs_are_locked_against_rename() {
     );
 }
 
+/// Every writable root must have its OWN entry locked against rename/unlink,
+/// the same way the credential parents are. Without it a `subpath` grant also
+/// covers the root's directory entry, so a sandboxed command can swap the root
+/// for a symlink that the next spawn resolves into a wider write grant. Only
+/// unlink is denied, so ordinary writes beneath the root stay allowed.
+#[test]
+fn every_write_root_entry_is_locked_against_rename() {
+    let ws = Path::new("/tmp/dc-ws");
+    let profile = compose_profile(&SandboxPolicy::workspace_write(), &single_root(ws), ws);
+    let text = profile.render();
+
+    // Find every bound WRITE_ROOT_i and assert a matching KEEP_ROOT_i unlink
+    // deny for the same path, after the grant. There is at least one (the
+    // workspace), plus the temp dir(s).
+    let write_roots: Vec<(String, PathBuf)> = profile
+        .bindings
+        .iter()
+        .filter(|(name, _)| name.starts_with("WRITE_ROOT_"))
+        .cloned()
+        .collect();
+    assert!(
+        !write_roots.is_empty(),
+        "there must be at least one write root: {:?}",
+        profile.bindings
+    );
+    for (write_name, path) in write_roots {
+        let index = write_name
+            .strip_prefix("WRITE_ROOT_")
+            .expect("name starts with WRITE_ROOT_");
+        let keep_name = format!("KEEP_ROOT_{index}");
+        let keep_path = profile
+            .bindings
+            .iter()
+            .find(|(name, _)| *name == keep_name)
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| panic!("{keep_name} must be bound next to {write_name}"));
+        assert_eq!(
+            keep_path, path,
+            "{keep_name} must lock the same path {write_name} granted"
+        );
+        assert!(
+            text.contains(&format!(
+                "(deny file-write-unlink (literal (param \"{keep_name}\")))"
+            )),
+            "the write root bound to {keep_name} must have its own entry locked: {text}"
+        );
+        // Last match wins, so the deny must come AFTER the grant it narrows.
+        let grant_at = text
+            .find(&format!("(allow file-write* (subpath (param \"{write_name}\")))"))
+            .expect("the grant is present");
+        let deny_at = text
+            .find(&format!(
+                "(deny file-write-unlink (literal (param \"{keep_name}\")))"
+            ))
+            .expect("the deny is present");
+        assert!(
+            deny_at > grant_at,
+            "the entry-lock deny must follow its write grant"
+        );
+        // Only unlink — the root does not become read-only.
+        assert!(
+            !text.contains(&format!("(deny file-write* (subpath (param \"{keep_name}\")))")),
+            "the write root must not become read-only: {text}"
+        );
+    }
+}
+
+/// End-to-end: a sandboxed command cannot rename a granted root's own entry,
+/// which is step one of swapping it for a symlink the next spawn would resolve
+/// into a wider grant (the write-fence escape). Writes *inside* the root stay
+/// allowed — pinned by the mid-session-grant test above.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_granted_root_cannot_be_renamed_out_from_under_the_sandbox() {
+    if crate::sandbox::require_backend_or_skip(is_available(), "Seatbelt") {
+        return;
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let ws = workspace.path().canonicalize().unwrap();
+    let parked = ws.with_extension("parked");
+    let _ = std::fs::remove_dir_all(&parked);
+
+    let status = wrap_shell_command(
+        &format!("mv {} {}", ws.display(), parked.display()),
+        &ws,
+        &single_root(&ws),
+        &SandboxPolicy::workspace_write(),
+    )
+    .status()
+    .expect("sandbox-exec should launch");
+
+    let moved = parked.exists();
+    // Restore before asserting, so a regression does not strand the tempdir.
+    let _ = std::fs::rename(&parked, &ws);
+    let _ = std::fs::remove_dir_all(&parked);
+    assert!(
+        !status.success() && !moved,
+        "renaming the workspace root's own entry must be denied"
+    );
+}
+
 #[test]
 fn network_rules_appear_only_when_policy_grants_network() {
     let ws = Path::new("/tmp/dc-ws");
