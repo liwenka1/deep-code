@@ -26,11 +26,12 @@ use crate::tool::ToolCallAccumulator;
 /// run is unknowable, which is the other reason to move the bound out of the
 /// way before drawing conclusions from the distribution.
 ///
-/// Public because it is a measurement key and not only a bound: the eval
-/// report derives "did this instance hit the cap?" from its own round count
-/// compared against this value, and a private copy there would drift the
-/// moment this number moves. Exported for that comparison — the loop itself
-/// remains the only thing that enforces it.
+/// Public because it is the documented DEFAULT for `[budget] turn_steps`
+/// (`AgentConfig` seeds that field with it), not only a bound. The eval report
+/// derives "did this instance hit the cap?" from its round count compared
+/// against the *configured* `turn_steps` in force for the run — which is this
+/// value only when nothing overrode it — not against the constant directly.
+/// The loop itself remains the only thing that enforces the cap.
 pub const MAX_TURN_STEPS: u32 = 500;
 
 /// Whether the wrap-up instruction is due: once, at four fifths of whatever

@@ -80,10 +80,10 @@ pub struct AgentParams {
     /// A child inherits this session's permission mode, but that is NOT a way to
     /// give it the parent's reach. Its own gated calls are decided by the
     /// unattended sub-agent policy, which never consults the mode, so a shell
-    /// command outside the trusted list — `git push`, `npm run …`, anything with
-    /// a network declaration — is denied in EVERY mode, `yolo` included. Run
-    /// that kind of command in the parent, or have the child report the need so
-    /// the parent can.
+    /// command outside the trusted list — `git push`, `npm run …` — is denied in
+    /// EVERY mode, `yolo` included, UNLESS the dispatch named it in
+    /// `allow_commands` (below). Without that, run such a command in the parent,
+    /// or have the child report the need so the parent can.
     network: Option<bool>,
     /// Optional display name (shown by /agents).
     name: Option<String>,

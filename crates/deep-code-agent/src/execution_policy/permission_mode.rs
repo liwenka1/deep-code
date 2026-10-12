@@ -1,11 +1,13 @@
 //! Session permission mode: how far the approval gate is relaxed.
 //!
 //! A mode only ever relaxes a `NeedsApproval` verdict into an auto-run. A hard
-//! `Deny` (rm -rf, fork bomb, `curl | sh`, an unauthorized `npm publish`, …) is
-//! short-circuited by the tool
+//! `Deny` (rm -rf, fork bomb, `curl | sh`, …) is short-circuited by the tool
 //! registry (`run_tool_call_with_plan`) before any decision is consulted, so no
 //! mode — not even `Yolo` —
-//! runs a command the deny list *recognized*. Be honest about what that
+//! runs a command the deny list *recognized*. (An unauthorized `npm publish` is
+//! a different gate: the irreversible-outward floor parks it as a `NeedsApproval`
+//! no automatic path may answer — see `is_needs_human_rule` — rather than a hard
+//! `Deny`, so an interactive user can still authorize it once.) Be honest about what that
 //! buys: `shell_deny` is best-effort string parsing, not a security boundary.
 //! An obfuscation it fails to parse falls through as `NeedsApproval`, which
 //! `Yolo` auto-approves — so what holds it is not this floor, and it is not the

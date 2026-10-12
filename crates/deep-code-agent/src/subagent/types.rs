@@ -11,8 +11,8 @@ pub const HARD_MAX_CONCURRENT: usize = 20;
 /// for a batch of N parallel calls while the parent is charged 1 for the same
 /// batch. The number is raised anyway (from 50) because 50 was below the real
 /// work: a whole SWE-bench instance spends 25–38 calls, so 50 could not cover
-/// a delegated *chunk* of one. Unifying the unit is tracked in
-/// `docs/agent-grants-and-budget-plan.md`; until then, read this as calls.
+/// a delegated *chunk* of one. Unifying the unit with the parent loop's is still
+/// open; until then, read this as calls.
 pub const DEFAULT_MAX_STEPS: u32 = 200;
 
 /// How many sub-agent records the session ledger keeps (see
