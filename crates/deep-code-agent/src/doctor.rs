@@ -207,6 +207,33 @@ impl DoctorReport {
         let skills = collect_skills(workspace);
         let deepseek = collect_deepseek(config);
 
+        // `[sandbox] mode = "off"` means the OS sandbox does not run at all, so
+        // what the host CAN enforce is not what this configuration WILL enforce.
+        // Fold the switch into every enforcement dimension here, at the one place
+        // the report is built, so the booleans, the levels and the text headline
+        // all tell the truth together. Before this they came straight from the
+        // host probe, and `doctor --json` reported `confines_network = true`
+        // (the documented `jq -e '.sandbox.confines_network'` supervisor gate
+        // passing) while every command actually ran unconfined.
+        let mode_off = !config.sandbox_mode.is_os();
+        let (filesystem, network, detail) = if mode_off {
+            (
+                Enforcement::None,
+                Enforcement::None,
+                format!(
+                    "OS sandbox disabled by [sandbox] mode = \"off\"; shell/job commands run \
+                     unconfined (host backend: {})",
+                    if sandbox.available {
+                        sandbox.backend.id()
+                    } else {
+                        "none"
+                    }
+                ),
+            )
+        } else {
+            (sandbox.filesystem, sandbox.network, sandbox.detail)
+        };
+
         Self {
             version: env!("CARGO_PKG_VERSION").to_string(),
             config_path: config_path.display().to_string(),
@@ -223,11 +250,11 @@ impl DoctorReport {
                 } else {
                     None
                 },
-                confines_filesystem: sandbox.filesystem.is_full(),
-                confines_network: sandbox.network.is_full(),
-                filesystem: sandbox.filesystem,
-                network: sandbox.network,
-                detail: sandbox.detail,
+                confines_filesystem: filesystem.is_full(),
+                confines_network: network.is_full(),
+                filesystem,
+                network,
+                detail,
                 network_setting: config.sandbox_network.as_setting().to_string(),
                 mode_setting: config.sandbox_mode.as_setting().to_string(),
             },
@@ -404,6 +431,43 @@ mod tests {
             sandbox["confines_network"],
             serde_json::Value::Bool(report.sandbox.network.is_full())
         );
+    }
+
+    /// `[sandbox] mode = "off"` turns the OS sandbox off, so the report must say
+    /// so on the booleans and the levels too — not only in `mode_setting`. The
+    /// documented `jq -e '.sandbox.confines_network'` supervisor gate reads the
+    /// boolean, and it must fail when nothing is confined.
+    #[test]
+    fn mode_off_reports_no_confinement_everywhere_not_only_in_the_setting() {
+        let workspace = TempDir::new().unwrap();
+        let report = DoctorReport::collect(
+            workspace.path(),
+            &AgentConfig {
+                sandbox_mode: crate::execution_policy::SandboxMode::Off,
+                ..AgentConfig::default()
+            },
+        );
+        assert!(
+            !report.sandbox.confines_filesystem,
+            "mode=off must not claim filesystem confinement"
+        );
+        assert!(
+            !report.sandbox.confines_network,
+            "mode=off must not claim network confinement"
+        );
+        assert_eq!(report.sandbox.filesystem, Enforcement::None);
+        assert_eq!(report.sandbox.network, Enforcement::None);
+        assert_eq!(report.sandbox.mode_setting, "off");
+        assert!(
+            report.sandbox.detail.contains("mode = \"off\""),
+            "the detail must name the switch that turned it off: {}",
+            report.sandbox.detail
+        );
+        // The JSON booleans (the supervisor contract) agree.
+        let value: serde_json::Value =
+            serde_json::from_str(&report.to_json_pretty().unwrap()).unwrap();
+        assert_eq!(value["sandbox"]["confines_network"], serde_json::Value::Bool(false));
+        assert_eq!(value["sandbox"]["confines_filesystem"], serde_json::Value::Bool(false));
     }
 
     /// The setup guidance describes one state, so it must appear in exactly

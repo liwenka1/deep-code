@@ -90,11 +90,24 @@ pub async fn run_print(args: PrintArgs) -> i32 {
     if let Some(mode) = args.permission_mode {
         launched.permission_mode.set(mode);
         if mode == PermissionMode::Yolo {
-            eprintln!(
-                "yolo: gated calls run without asking (a write-root request is the one \
-                 exception, and unattended it is denied); the deny floor and the OS \
-                 sandbox (where available) are the remaining containment"
-            );
+            // The remaining containment depends on whether the OS sandbox is
+            // actually in force: under `[sandbox] mode = "off"` it is NOT, so
+            // naming it would promise a boundary that is not there — the deny
+            // floor is then all that is left.
+            if launched.sandbox_off {
+                eprintln!(
+                    "yolo: gated calls run without asking (a write-root request is the one \
+                     exception, and unattended it is denied); [sandbox] mode = \"off\", so the \
+                     OS sandbox is NOT running — the deny floor is the only remaining \
+                     containment and shell/job commands otherwise run unconfined"
+                );
+            } else {
+                eprintln!(
+                    "yolo: gated calls run without asking (a write-root request is the one \
+                     exception, and unattended it is denied); the deny floor and the OS \
+                     sandbox (where available) are the remaining containment"
+                );
+            }
         }
     }
 
