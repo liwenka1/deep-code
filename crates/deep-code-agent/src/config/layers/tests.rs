@@ -877,18 +877,19 @@ fn turn_budget_defaults_and_is_only_lowered_from_the_project_layer() {
         );
     }
 
-    // Against a global `0` (the user's own decision), a finite project value is
-    // a tightening and is accepted.
+    // Against a global `0` (the user's own decision — no ceiling), a finite
+    // project value is a tightening and is accepted. The global here must be the
+    // UNLIMITED file just written, not `global_dir` (turn_steps = 40): loading 40
+    // tested a 40→25 tightening, never the 0→25 case the comment claims.
     let unlimited_dir = tempfile::tempdir().unwrap();
     let unlimited = write_config(unlimited_dir.path(), "[budget]\nturn_steps = 0\n");
-    let loaded = AgentConfig::load_with(Some(unlimited), None, &no_env);
+    let loaded = AgentConfig::load_with(Some(unlimited.clone()), None, &no_env);
     assert_eq!(loaded.config.turn_steps, 0, "0 is an accepted global value");
     let project_dir = tempfile::tempdir().unwrap();
     let project = write_config(project_dir.path(), "[budget]\nturn_steps = 25\n");
-    let loaded = AgentConfig::load_with(
-        Some(global_dir.path().join("config.toml")),
-        Some(project),
-        &no_env,
+    let loaded = AgentConfig::load_with(Some(unlimited), Some(project), &no_env);
+    assert_eq!(
+        loaded.config.turn_steps, 25,
+        "a finite project value tightens a global 0 (no ceiling)"
     );
-    assert_eq!(loaded.config.turn_steps, 25);
 }

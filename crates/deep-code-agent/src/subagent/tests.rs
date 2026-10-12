@@ -628,6 +628,14 @@ None.
 
         let runtime = AgentRuntime::new(SummaryClient, ToolRegistry::new())
             .with_permission_mode(SharedPermissionMode::new(PermissionMode::Yolo));
+        // The same decider under the strictest mode, so the assertions below pin
+        // that the child's wall is INDEPENDENT of the parent mode — not merely
+        // that one decision happened under yolo. `subagent_approval_decision`
+        // must return the same verdict for both, or an inherited mode is leaking
+        // into a child's gate (the regression this test's name claims to catch,
+        // which a single-mode call could never fail on).
+        let default_runtime = AgentRuntime::new(SummaryClient, ToolRegistry::new())
+            .with_permission_mode(SharedPermissionMode::new(PermissionMode::Default));
         let request = |command: &str, network: bool| ApprovalRequest {
             network,
             call_id: "call_1".to_string(),
@@ -659,6 +667,17 @@ None.
             note.as_deref()
                 .is_some_and(|note| note.contains("allow-list")),
             "the denial must name the wall rather than the missing grant: {note:?}"
+        );
+        // The strict-mode runtime reaches the identical verdict: the wall does
+        // not read the inherited mode, so yolo cannot lift it.
+        assert_eq!(
+            default_runtime.subagent_approval_decision(
+                &request("git push origin main", true),
+                SubAgentRole::Implementer,
+                true,
+            ),
+            (decision, note),
+            "the child's wall must be independent of the parent mode"
         );
 
         // …while the same runtime still approves what the wall admits, so the

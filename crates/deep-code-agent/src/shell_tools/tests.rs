@@ -1249,7 +1249,11 @@ fn an_off_registry_describes_itself_as_unconfined() {
         "the model must be told nothing confines these commands: {disabled}"
     );
     assert!(
-        !disabled.contains("writes are confined"),
+        // The real confined claim is "Writes are confined to the granted roots"
+        // (capital W) — the lowercase spelling never appeared, so this check was
+        // vacuous and also would not have caught the confined body being appended
+        // to the disabled description.
+        !disabled.contains("Writes are confined"),
         "and must not be told the granted-roots fence is holding: {disabled}"
     );
     assert!(
