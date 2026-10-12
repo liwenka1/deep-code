@@ -203,12 +203,22 @@ pub(crate) fn credential_denial_signature(exit_code: Option<i32>, stderr: &str) 
     // Case-insensitive for the same reason `write_denial_signature` is: ssh
     // capitalizes, runtimes and wrappers do not.
     let lower = stderr.to_ascii_lowercase();
+    // Each signature is a tool-specific diagnostic, not a bare English phrase:
+    // the note steers the model away from retrying ("fix your credentials, not
+    // your code"), so a false positive on ordinary program output is a real
+    // cost. `"authentication failed"` on its own matched a test suite printing
+    // `Authentication failed for user bob`; git's own message quotes the remote
+    // (`Authentication failed for 'https://…'`), and the quote is what tells the
+    // two apart — likewise `could not read Username/Password for '…'`. The
+    // prompts-disabled and host-key lines are already whole git/ssh sentences an
+    // application does not emit by accident, and `(publickey` / `sign_and_send_pubkey`
+    // are ssh internals.
     const SIGNATURES: [&str; 7] = [
         "permission denied (publickey",
         "sign_and_send_pubkey",
-        "authentication failed",
-        "could not read username",
-        "could not read password",
+        "authentication failed for '",
+        "could not read username for '",
+        "could not read password for '",
         "terminal prompts disabled",
         "host key verification failed",
     ];

@@ -558,6 +558,26 @@ fn credential_denial_is_recognized_and_never_masquerades_as_a_write_denial() {
         Some(0),
         "Permission denied (publickey)."
     ));
+    // Ordinary program/test output that merely mentions auth must NOT be
+    // relabelled a credential failure: the signatures are git/ssh diagnostics,
+    // not bare English. git quotes the remote; a test printing a username does
+    // not. Before this, these steered the model away from fixing its own code.
+    for benign in [
+        "FAIL auth.test.ts\n  ✕ rejects bad creds\n    Authentication failed for user bob",
+        "assert_eq failed: expected \"Authentication failed\" got \"ok\"",
+        "Error: could not read password from stdin (interactive mode off)",
+        "log: host key verification step skipped in CI",
+    ] {
+        assert!(
+            !credential_denial_signature(Some(1), benign),
+            "benign output must not be a credential denial: {benign:?}"
+        );
+    }
+    // The real git HTTPS/SSH diagnostics still match (quoted remote, publickey).
+    assert!(credential_denial_signature(
+        Some(1),
+        "fatal: could not read Password for 'https://user@github.com': terminal prompts disabled"
+    ));
 }
 
 /// Three failure classes, three notes. They are matched by `contains`, so two
