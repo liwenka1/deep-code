@@ -715,11 +715,12 @@ impl AgentRuntime {
         // child's system prompt says "You have fetch_url and web_search"
         // (`NETWORK_GRANTED_BLOCK`), and then every call fell through to the
         // unattended denial at the bottom of this function — "calls that need
-        // approval are auto-denied" — because a network tool is
-        // `NeedsApproval` under every network mode and a child's permission
-        // mode is always `Default`. The capability existed in the registry,
-        // in the tool description, in the README and in the prompt, and
-        // nowhere in the decision.
+        // approval are auto-denied" — because a network tool is `NeedsApproval`
+        // under every network mode and this decider never consults the
+        // permission mode (a child inherits the parent's mode, but its gated
+        // calls are settled here, above the mode, not by it). The capability
+        // existed in the registry, in the tool description, in the README and in
+        // the prompt, and nowhere in the decision.
         if kind == crate::execution_policy::ToolKind::Network {
             return if network_granted {
                 (ApprovalDecision::Approved, None)
@@ -735,21 +736,15 @@ impl AgentRuntime {
                 )
             };
         }
-        // A network-declaring command in an UNGRANTED child: what is missing
-        // is the grant, not the command — point at the re-dispatch path. (In
-        // a granted child egress is ambient, so a network-declaring prompt
-        // can only mean the command itself is outside the allow-list; the
-        // allow-list note below is then the honest one.)
-        if request.network && !network_granted {
-            return (
-                ApprovalDecision::Denied,
-                Some(SUBAGENT_NETWORK_DENIAL.to_string()),
-            );
-        }
-        // Before the shell wall, because the remedies differ: this one is
-        // "authorize that class of command", not "work within the allow-list" —
-        // and `allow_commands` cannot lift it either (the floor is checked before
-        // trust, so a declared `git push` still cannot force-push for a child).
+        // Before the network-grant note AND the shell wall, because the remedies
+        // differ and this one overrides both: an irreversible-outward command is
+        // "authorize that class of command", not "re-dispatch with network" (a
+        // networked re-dispatch still hits this floor) and not "work within the
+        // allow-list" (`allow_commands` cannot lift it either — the floor is
+        // checked before trust, so a declared `git push` still cannot force-push
+        // for a child). A `git push --force` with `network: true` in an ungranted
+        // child would otherwise be told to re-dispatch with network, which can
+        // never work.
         //
         // Read off the plan this function just derived, NOT off
         // `request.matched_rule`: that field is filled in by the registry for the
@@ -759,6 +754,17 @@ impl AgentRuntime {
             return (
                 ApprovalDecision::Denied,
                 Some(SUBAGENT_NEEDS_HUMAN_DENIAL.to_string()),
+            );
+        }
+        // A network-declaring command in an UNGRANTED child: what is missing
+        // is the grant, not the command — point at the re-dispatch path. (In
+        // a granted child egress is ambient, so a network-declaring prompt
+        // can only mean the command itself is outside the allow-list; the
+        // allow-list note below is then the honest one.)
+        if request.network && !network_granted {
+            return (
+                ApprovalDecision::Denied,
+                Some(SUBAGENT_NETWORK_DENIAL.to_string()),
             );
         }
         if matches!(

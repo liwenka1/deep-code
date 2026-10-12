@@ -707,6 +707,23 @@ None.
                 .is_some_and(|note| note.contains("allow_irreversible")),
             "the note must name the floor's remedy, not the allow-list: {note:?}"
         );
+
+        // And in an UNGRANTED child the floor note still wins over the
+        // network-grant note: a networked re-dispatch cannot authorize an
+        // irreversible command, so telling the child to re-dispatch with network
+        // would be a remedy that can never work.
+        let (decision, note) = runtime.subagent_approval_decision(
+            &request("git push --force origin main", true),
+            SubAgentRole::Implementer,
+            false,
+        );
+        assert_eq!(decision, ApprovalDecision::Denied);
+        assert!(
+            note.as_deref()
+                .is_some_and(|note| note.contains("allow_irreversible")),
+            "an ungranted irreversible command must get the floor note, not \
+             re-dispatch-with-network: {note:?}"
+        );
     }
 
     #[tokio::test]
