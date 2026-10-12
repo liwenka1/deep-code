@@ -706,16 +706,26 @@ impl SandboxManager {
     /// Confine an already-spawned child where the OS sandbox must be applied
     /// post-spawn (Windows Job Object). Returns a guard to retain for the
     /// child's lifetime, or `None` when no post-spawn step is needed (macOS and
-    /// Linux confine via [`Self::wrap_command`]) or sandboxing is off.
+    /// Linux confine via [`Self::wrap_command`]).
+    ///
+    /// On Windows the Job Object is created on EVERY spawn, independent of
+    /// `should_sandbox`. It is process-tree management — kill-on-close plus the
+    /// 512-process cap — not filesystem/network confinement, of which Windows
+    /// has none. Gating it on `should_sandbox` meant `[sandbox] mode = "off"`
+    /// (which builds a `without_confinement` manager, so `should_sandbox` is
+    /// false) dropped the Job Object entirely: cancel, a shell timeout, `job
+    /// cancel` and quit then killed only the direct `cmd.exe`, leaving the
+    /// node/test-runner/dev-server tree it spawned alive — holding ports and
+    /// file locks that broke the next build — and lost the process cap. mode=off
+    /// removes confinement Windows never had; it must not also remove process
+    /// management.
     #[must_use]
     pub fn confine_spawned(
         &self,
         child: &tokio::process::Child,
         policy: &SandboxPolicy,
     ) -> Option<SandboxGuard> {
-        if !self.should_sandbox(policy) {
-            return None;
-        }
+        let _ = policy;
         #[cfg(target_os = "windows")]
         {
             // `raw_handle()` is `None` once the child has already exited — the
