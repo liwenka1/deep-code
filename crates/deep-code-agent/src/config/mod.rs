@@ -136,10 +136,13 @@ pub struct AgentConfig {
     /// layered loader).
     pub sandbox_mode: crate::execution_policy::SandboxMode,
     /// Commands that would otherwise hit the irreversible-outward floor
-    /// (`[sandbox] allow_irreversible`), matched by command identity exactly as
-    /// `approval.auto_allow` matches tool names. Empty by default: publishing,
-    /// force-pushing and merging are decisions only a human makes, and there is
-    /// no standing consent for them.
+    /// (`[sandbox] allow_irreversible`). Each entry authorizes the commands
+    /// whose executed words contain the entry's words IN ORDER (a subsequence,
+    /// not an identity match — see `ExecPolicy::irreversible_allowed`), so
+    /// `"git push"` covers a force push and `"git push origin main --force"`
+    /// names exactly that command. Empty by default: publishing, force-pushing
+    /// and merging are decisions only a human makes, and there is no standing
+    /// consent for them.
     pub sandbox_allow_irreversible: Vec<String>,
     /// Model requests allowed in one turn (`[budget] turn_steps`). `0` means no
     /// ceiling at all — the user's own choice, and the one setting whose absence

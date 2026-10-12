@@ -143,7 +143,7 @@ pub struct BenchReport {
 
 /// Run a benchmark rollout: produce patches for every instance.
 pub async fn run_bench(
-    config: EvalConfig,
+    mut config: EvalConfig,
     bench_set: &BenchmarkSet<impl BenchmarkInstance + Clone + Send + Sync + 'static>,
 ) -> anyhow::Result<BenchReport> {
     // Eval blind-approves every tool call over untrusted checkouts; without an
@@ -176,6 +176,7 @@ pub async fn run_bench(
          writes nor network). Run inside a container, or on macOS/Linux with \
          sandbox support."
     );
+    harden_config_for_rollout(&mut config);
     let started_at = utc_now_iso();
     let start = Instant::now();
 
@@ -280,6 +281,22 @@ Requirements:\n\
         repo = instance.repo(),
         issue = instance.problem_statement(),
     )
+}
+
+/// Config the harness neutralizes before any rollout, because it blind-approves
+/// tool calls over untrusted checkouts.
+///
+/// `[sandbox] mode = "off"` is *refused* above (the OS sandbox is the only
+/// boundary left when every call is approved). The irreversible-outward
+/// exemptions are *cleared* instead of refused: an interactive
+/// `allow_irreversible` is the user's own standing consent for their own
+/// machine, not consent for a model steered by issue or repo text into a
+/// publish, force-push or bucket deletion. Honoring it would auto-approve
+/// exactly those — the same hole the mode refusal exists for, one layer up.
+/// With the list empty the floor parks, and [`unattended_decision`] denies the
+/// park with the floor's own note.
+fn harden_config_for_rollout(config: &mut EvalConfig) {
+    config.agent_config.sandbox_allow_irreversible.clear();
 }
 
 /// What this harness answers on the model's behalf, since a rollout has no user.
@@ -904,6 +921,23 @@ mod tests {
             preview: None,
             safety_notes: Vec::new(),
         }
+    }
+
+    /// Eval must not honor the user's interactive `allow_irreversible`: it
+    /// blind-approves over untrusted repos, so an exempted class would be
+    /// auto-approved for a model steered by repo text. The exemptions are
+    /// cleared before the rollout, which leaves the floor to park and
+    /// [`unattended_decision`] to deny.
+    #[test]
+    fn a_rollout_clears_the_irreversible_exemptions() {
+        let mut config = EvalConfig::default();
+        config.agent_config.sandbox_allow_irreversible =
+            vec!["npm publish".to_string(), "git push".to_string()];
+        harden_config_for_rollout(&mut config);
+        assert!(
+            config.agent_config.sandbox_allow_irreversible.is_empty(),
+            "eval must drop interactive irreversible exemptions over untrusted repos"
+        );
     }
 
     /// The harness approves what it can, and the two classes nobody may decide
