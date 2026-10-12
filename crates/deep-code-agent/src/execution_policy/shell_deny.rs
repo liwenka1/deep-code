@@ -182,6 +182,18 @@ fn program_of(segment: &str) -> Option<String> {
     segment_words(segment).map(|words| words.program)
 }
 
+/// A segment's program word (lowercased basename) and its cleaned arguments,
+/// read the way the shell reads them: past `NAME=value` assignments, the
+/// [`PREFIX_WORDS`] wrappers and grouping punctuation (see [`segment_words`]).
+///
+/// Shared with the irreversible-outward floor in `engine.rs` so it reads a
+/// segment exactly as this deny floor does — same assignment/wrapper skipping,
+/// same basename lowercasing — rather than its own raw-argv reading, which
+/// `env npm publish` and `FOO=1 NPM publish` walked straight through.
+pub(super) fn program_and_args(segment: &str) -> Option<(String, Vec<String>)> {
+    segment_words(segment).map(|words| (words.program, words.args))
+}
+
 /// Positional/flag tokens after the program word, each with shell quoting
 /// removed (see [`clean_token`]) so a quoted flag or path is inspected exactly
 /// as the shell would run it.

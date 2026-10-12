@@ -1184,11 +1184,10 @@ fn sandbox_mode_parses_and_ranks() {
     assert!(!SandboxMode::Off.is_os());
 }
 
-/// The fallback keeps the line's segmentation, which is the half that was easy
-/// to get wrong: splitting the whole line into one word list made the matcher
-/// read the first word as the program, and `echo starting && npm publish`
-/// walked straight through the floor. The first two cases go through the
-/// unattended parser (it reads `&&`/`;`), the last only through the fallback.
+/// Segmentation is read off `shell_lex::segments` (`\n`, `;`, `|`, `&`), so an
+/// irreversible command anywhere on a compound line reaches a human, not only
+/// the first word of the line — `echo starting && npm publish` and a redirected
+/// or newline-separated form all park.
 #[test]
 fn a_chained_or_redirected_irreversible_command_still_needs_a_human() {
     let policy = ExecPolicy::default();
@@ -1196,6 +1195,7 @@ fn a_chained_or_redirected_irreversible_command_still_needs_a_human() {
         "echo starting && npm publish",
         "cargo test; git push --force origin main",
         "echo starting && npm publish > /tmp/log 2>&1",
+        "echo starting\nnpm publish",
     ] {
         assert!(
             floor_gated(&policy, command),
@@ -1208,6 +1208,129 @@ fn a_chained_or_redirected_irreversible_command_still_needs_a_human() {
         &policy,
         "echo starting && npm install > /tmp/log"
     ));
+}
+
+/// Routine spellings that wrap or prefix an irreversible command must still
+/// reach a human: a leading `NAME=value` assignment, a transparent wrapper
+/// (`env`, `time`, `command`), a path/case/suffix spelling of the program, and
+/// a newline-separated script line. The old reading scanned a raw argv, so each
+/// of these presented a "program word" (`FOO=1`, `env`, `echo`) that matched no
+/// rule and walked straight through the floor.
+#[test]
+fn wrapped_and_prefixed_irreversible_spellings_still_need_a_human() {
+    let policy = ExecPolicy::default();
+    for command in [
+        "FOO=1 npm publish",
+        "NODE_AUTH_TOKEN=x npm publish",
+        "env npm publish",
+        "time npm publish",
+        "command git push --force origin main",
+        "NPM publish",
+        "Git push -f origin main",
+        "git.EXE push -f origin main",
+        "npm.cmd publish",
+        "VERSION=$(jq -r .version package.json)\nnpm publish",
+    ] {
+        assert!(floor_gated(&policy, command), "{command} must reach a human");
+    }
+}
+
+/// The package-publish class covers the publishers the docs name, not just the
+/// node family: `cargo publish` (this tool's own ecosystem, whose build/test
+/// are default-trusted), Yarn Berry's `yarn npm publish`, and twine/poetry/gem.
+#[test]
+fn every_named_package_publisher_needs_a_human() {
+    let policy = ExecPolicy::default();
+    for command in [
+        "cargo publish",
+        "yarn npm publish",
+        "twine upload dist/*",
+        "poetry publish",
+        "gem push pkg.gem",
+    ] {
+        assert!(floor_gated(&policy, command), "{command} must reach a human");
+    }
+}
+
+/// A `--dry-run` turned back OFF by its value is not a dry run: `npm publish
+/// --dry-run=false` really publishes and `kubectl delete --dry-run=none` really
+/// deletes, so the off-spellings must not exempt the command — while a dry run
+/// that is actually on (`--dry-run`, `--dry-run=client`) stays exempt.
+#[test]
+fn a_dry_run_turned_off_by_its_value_is_not_exempt() {
+    let policy = ExecPolicy::default();
+    for command in [
+        "npm publish --dry-run=false",
+        "kubectl delete ns prod --dry-run=none",
+        "git push --dry-run=0 --force origin main",
+    ] {
+        assert!(floor_gated(&policy, command), "{command} must reach a human");
+    }
+    for command in [
+        "npm publish --dry-run",
+        "npm publish --dry-run=true",
+        "kubectl delete pod scratch --dry-run=client",
+    ] {
+        assert!(!floor_gated(&policy, command), "{command} is a real dry run");
+    }
+}
+
+/// A remote-branch deletion is irreversible and outward the same way a force
+/// push is, in every spelling: `--delete`, the short `-d`, and the empty-source
+/// refspec `:branch`. A whole-bucket deletion (`aws s3 rb`, the `s3api`
+/// spellings) is the same class.
+#[test]
+fn remote_deletions_still_need_a_human() {
+    let policy = ExecPolicy::default();
+    for command in [
+        "git push origin --delete release",
+        "git push -d origin release",
+        "git push origin :release",
+        "aws s3 rb s3://prod-assets --force",
+        "aws s3api delete-bucket --bucket prod-assets",
+        "aws s3api delete-objects --bucket prod-assets --delete file://d.json",
+    ] {
+        assert!(floor_gated(&policy, command), "{command} must reach a human");
+    }
+}
+
+/// The exemption is checked per segment against the real words the executor
+/// runs. Two properties the old code got wrong, pinned here:
+///
+/// - An authorized first command does NOT exempt a later unauthorized one on
+///   the same line (the old floor reported only the first match and the call
+///   site filtered that single string).
+/// - An entry written the way the example config advises — the longest run you
+///   actually mean, flags spelled out — authorizes that exact command, because
+///   the match is against the command words and not the short rule string.
+#[test]
+fn the_exemption_is_per_segment_and_reads_the_real_words() {
+    let allow_publish =
+        ExecPolicy::default().with_allow_irreversible(vec!["npm publish".to_string()]);
+    assert!(
+        floor_gated(&allow_publish, "npm publish && git push --force origin main"),
+        "authorizing npm publish must not exempt a force push beside it"
+    );
+    assert!(
+        floor_gated(&allow_publish, "npm publish; terraform apply -auto-approve"),
+        "authorizing npm publish must not exempt terraform apply beside it"
+    );
+    assert!(
+        !floor_gated(&allow_publish, "npm publish --tag next"),
+        "the authorized command itself stays available"
+    );
+
+    let full = ExecPolicy::default()
+        .with_allow_irreversible(vec!["git push origin main --force".to_string()]);
+    assert!(
+        !floor_gated(&full, "git push origin main --force"),
+        "an entry naming the full command authorizes exactly that command"
+    );
+    // The same entry does not stretch to a command it does not name in order.
+    assert!(
+        floor_gated(&full, "git push origin other --force"),
+        "a different branch is not the authorized command"
+    );
 }
 
 /// Routine force-push spellings that must all reach a human. `git -C <path>
@@ -1265,10 +1388,7 @@ fn dry_runs_and_passive_flags_are_not_refused() {
 fn an_exemption_matches_words_in_order_across_programs() {
     let force_full = ExecPolicy::default().with_allow_irreversible(vec!["git push".to_string()]);
     assert!(
-        !matches!(
-            evaluate_shell_command(&force_full, "git push origin main --force", false).verdict,
-            PolicyVerdict::Deny { .. }
-        ),
+        !floor_gated(&force_full, "git push origin main --force"),
         "a shorter entry covers the wider command on purpose"
     );
 
@@ -1278,10 +1398,7 @@ fn an_exemption_matches_words_in_order_across_programs() {
         "git push -f origin main",
     ] {
         assert!(
-            !matches!(
-                evaluate_shell_command(&single_word, command, false).verdict,
-                PolicyVerdict::Deny { .. }
-            ),
+            !floor_gated(&single_word, command),
             "{command} is authorized by the one word, as documented"
         );
     }
@@ -1302,10 +1419,7 @@ fn an_exemption_matches_words_in_order_across_programs() {
 fn a_leading_option_that_takes_a_value_is_a_known_miss() {
     let policy = ExecPolicy::default();
     assert!(
-        !matches!(
-            evaluate_shell_command(&policy, "kubectl -n prod delete pod api", false).verdict,
-            PolicyVerdict::Deny { .. }
-        ),
+        !floor_gated(&policy, "kubectl -n prod delete pod api"),
         "the verb is out of position: documented, not covered"
     );
     // The same command with the option after the verb IS covered, so the miss is

@@ -13,7 +13,35 @@ fn words_in_order(needle: &[&str], haystack: &[&str]) -> bool {
         .all(|word| rest.any(|candidate| candidate == word))
 }
 
-/// The irreversible-outward rule one argv hits, as the words that matched.
+/// Whether a token is a `--dry-run` that is actually ON, so the command only
+/// reports and is exempt. A bare `--dry-run`/`--dryrun` is on; a
+/// `--dry-run=VALUE` is on unless VALUE turns it back OFF — `npm publish
+/// --dry-run=false` really publishes and `kubectl delete --dry-run=none` really
+/// deletes, so those off-spellings must not exempt the command.
+fn is_dry_run_on(word: &str) -> bool {
+    if matches!(word, "--dry-run" | "--dryrun") {
+        return true;
+    }
+    for prefix in ["--dry-run=", "--dryrun="] {
+        if let Some(value) = word.strip_prefix(prefix) {
+            return !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "false" | "none" | "no" | "off" | "0" | ""
+            );
+        }
+    }
+    false
+}
+
+/// The irreversible-outward rule the words of one segment hit, as the short
+/// canonical string that names the class — used for the denial message and the
+/// rule id, never for the exemption comparison (that reads the segment's real
+/// words; see [`ExecPolicy::irreversible_outward`]).
+///
+/// `program` is the lowercased basename and `args` are quoting-stripped, both
+/// produced by [`shell_deny::program_and_args`], so this reads the same words
+/// the executor runs: `FOO=1 /usr/bin/env NPM publish` reaches the same arm as
+/// `npm publish`.
 ///
 /// Token-level rather than command-identity, and that distinction is
 /// load-bearing: identity drops flags — `session_identity("git push origin
@@ -34,36 +62,21 @@ fn words_in_order(needle: &[&str], haystack: &[&str]) -> bool {
 /// Known misses, accepted: a verb in a position this rule does not read is not
 /// refused, and a leading option is the usual reason — `kubectl -n prod delete
 /// pod api` passes where `kubectl delete -n prod pod api` is refused, and
-/// `npm -s publish` / `yarn --silent publish` pass where `npm publish` is
-/// refused (that arm still reads the subcommand at position 1). Chasing it means
+/// `pnpm -r publish` / `npm -s publish` pass where `pnpm publish` is refused
+/// (that arm still reads the subcommand at position 1). Chasing it means
 /// modelling each program's option arity, which is a parser, not a floor; the
 /// honest boundary is that this is a consent gate over the routine spellings
 /// (`SECURITY.md` says so in those words, the known misses included), and
 /// containment is the sandbox's job rather than this list's.
-fn irreversible_outward_argv(argv: &[String]) -> Option<String> {
-    let program = argv
-        .first()?
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches(".exe")
-        .to_string();
-    let words: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let args = &words[1..];
+fn irreversible_outward_words(program: &str, args: &[&str]) -> Option<String> {
     let second = args.first().copied();
 
-    // `--dry-run` (and aws's `--dryrun`) is the one routine spelling that makes
-    // these commands harmless: it reports what would happen and does nothing.
-    // Refusing it would strand the way people check their own work — and a floor
-    // that blocks `npm publish --dry-run` is a floor someone turns off.
-    if args
-        .iter()
-        .any(|word| matches!(*word, "--dry-run" | "--dryrun") || word.starts_with("--dry-run="))
-    {
+    // The dry-run exemption, read past off-spellings (`--dry-run=false`).
+    if args.iter().any(|word| is_dry_run_on(word)) {
         return None;
     }
 
-    match program.as_str() {
+    match program {
         "git" => {
             // `push` is not always the first argument: `git -C <path> push -f`,
             // `git --no-pager push`, `git -c key=value push`. Anchoring on
@@ -71,32 +84,50 @@ fn irreversible_outward_argv(argv: &[String]) -> Option<String> {
             // spellings rather than obfuscations.
             let push_at = args.iter().position(|word| *word == "push")?;
             let rest = &args[push_at + 1..];
-            let forcing = rest.iter().copied().find(|word| {
+            let matched = rest.iter().copied().find(|word| {
                 matches!(
                     *word,
                     "--force" | "--force-with-lease" | "--mirror" | "--delete"
                 ) || word.starts_with("--force-with-lease=")
                     // `+<refspec>` IS a force push, spelled without any flag.
                     || (*word != "+" && word.starts_with('+'))
-                    // A short-flag cluster: `-fu` forces, `-u` does not. Long
-                    // options are excluded so `--force-if-includes` — a modifier
-                    // that does nothing on its own — is not read as a force.
+                    // `:<refspec>` with an empty source side DELETES the remote
+                    // ref — `git push origin :release` is `--delete release`
+                    // spelled as a refspec, equally irreversible and outward.
+                    || (*word != ":" && word.starts_with(':'))
+                    // A short-flag cluster: `-fu` forces, `-d`/`-fd` deletes,
+                    // `-u` does neither. Long options are excluded so
+                    // `--force-if-includes` — a modifier that does nothing on
+                    // its own — is not read as a force.
                     || (word.starts_with('-')
                         && !word.starts_with("--")
                         && word.len() > 1
-                        && word[1..].contains('f'))
+                        && (word[1..].contains('f') || word[1..].contains('d')))
             })?;
-            Some(format!("git push {forcing}"))
+            Some(format!("git push {matched}"))
+        }
+        // Yarn Berry publishes with `yarn npm publish`; the bare-`publish` arm
+        // below never sees it because its subcommand is `npm`.
+        "yarn" if matches!((second, args.get(1).copied()), (Some("npm"), Some("publish"))) => {
+            Some("yarn npm publish".to_string())
         }
         "npm" | "yarn" | "pnpm" | "bun" if second == Some("publish") => {
             Some(format!("{program} publish"))
         }
+        // `cargo publish` is this tool's own home ecosystem, and its build/test
+        // are default-trusted — the one publish spelling most likely to run
+        // beside trusted commands. `twine`/`poetry`/`gem` round out the package
+        // publishers the docs already name.
+        "cargo" if second == Some("publish") => Some("cargo publish".to_string()),
+        "twine" if second == Some("upload") => Some("twine upload".to_string()),
+        "poetry" if second == Some("publish") => Some("poetry publish".to_string()),
+        "gem" if second == Some("push") => Some("gem push".to_string()),
         "gh" if matches!(
-            (words.get(1), words.get(2)),
-            (Some(&"pr"), Some(&"merge")) | (Some(&"release"), Some(&"create"))
+            (args.first().copied(), args.get(1).copied()),
+            (Some("pr"), Some("merge")) | (Some("release"), Some("create"))
         ) =>
         {
-            Some(format!("gh {} {}", words[1], words[2]))
+            Some(format!("gh {} {}", args[0], args[1]))
         }
         "terraform" if matches!(second, Some("apply" | "destroy")) => {
             Some(format!("terraform {}", second.unwrap_or_default()))
@@ -108,14 +139,16 @@ fn irreversible_outward_argv(argv: &[String]) -> Option<String> {
         "helm" if matches!(second, Some("uninstall" | "delete")) => {
             Some(format!("helm {}", second.unwrap_or_default()))
         }
-        "aws"
-            if matches!(
-                (words.get(1), words.get(2)),
-                (Some(&"s3"), Some(&"rm")) | (Some(&"s3api"), Some(&"delete-object"))
-            ) =>
-        {
-            Some(format!("aws {} {}", words[1], words[2]))
-        }
+        "aws" => match (args.first().copied(), args.get(1).copied()) {
+            (Some("s3"), Some("rm")) => Some("aws s3 rm".to_string()),
+            // `s3 rb` removes a whole bucket (`--force` empties it first); the
+            // `s3api` verbs are the lower-level spellings of the same deletions.
+            (Some("s3"), Some("rb")) => Some("aws s3 rb".to_string()),
+            (Some("s3api"), Some("delete-object")) => Some("aws s3api delete-object".to_string()),
+            (Some("s3api"), Some("delete-objects")) => Some("aws s3api delete-objects".to_string()),
+            (Some("s3api"), Some("delete-bucket")) => Some("aws s3api delete-bucket".to_string()),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -505,43 +538,60 @@ impl ExecPolicy {
         self
     }
 
-    /// The irreversible-outward rule a command line hits, if any, as the words
-    /// that matched — used for both the denial message and the exemption
-    /// comparison, so the two can never name different things.
+    /// The first *unauthorized* irreversible-outward command on a line, as the
+    /// short canonical string that names its class (the denial message and rule
+    /// id). `None` when no segment is irreversible, or every irreversible one is
+    /// covered by an `[sandbox] allow_irreversible` entry.
     ///
-    /// Best-effort by construction, like the deny floor: a line the unattended
-    /// parser refuses is re-read by whitespace splitting, which an obfuscation
-    /// can defeat. That is acceptable *here* and nowhere else, because this
-    /// floor is a "did a human mean to authorize this" gate over a short list of
-    /// everyday commands, not a containment boundary — containment is the
-    /// sandbox's job, and the deny floor already handles the catastrophes.
+    /// Each segment is read exactly as the deny floor reads it —
+    /// [`shell_lex::segments`] (which splits on `\n` as well as `;`/`|`/`&`) then
+    /// [`shell_deny::program_and_args`] (past `NAME=value` assignments and the
+    /// `env`/`time`/`command` wrappers, basename-lowercased). The old reading
+    /// scanned a raw argv, so `FOO=1 npm publish`, `env npm publish`, a
+    /// newline-separated script and `NPM publish` all walked straight through.
+    ///
+    /// The exemption is checked HERE, per segment, so an authorized first
+    /// command cannot exempt a later unauthorized one: `npm publish && git push
+    /// --force` with `allow_irreversible = ["npm publish"]` still reports the
+    /// force push. It is compared against the segment's REAL words (program plus
+    /// cleaned args), not the short `matched` string — that is what the example
+    /// config means by "entries match the words the executor would run", and it
+    /// is why `["git push origin main --force"]` authorizes that exact command
+    /// instead of nothing.
+    ///
+    /// Best-effort by construction, like the deny floor: [`shell_lex::segments`]
+    /// does not track quotes, so a quoted separator cuts a line into more
+    /// segments and may ask about a command inside a string. That is acceptable
+    /// *here* and nowhere else, because this floor is a "did a human mean to
+    /// authorize this" gate over a short list of everyday commands, not a
+    /// containment boundary — containment is the sandbox's job, and the deny
+    /// floor already handles the catastrophes.
     #[must_use]
     pub fn irreversible_outward(&self, command: &str) -> Option<String> {
-        if let Some(segments) = shell_lex::parse_unattended(command) {
-            return segments
-                .iter()
-                .find_map(|segment| irreversible_outward_argv(&segment.argv));
-        }
-        // Segment first, then words. Splitting the whole line into words would
-        // run the matcher once against an "argv" starting with whatever the line
-        // began with, so `echo x && npm publish` matched nothing at all — the
-        // fallback has to keep the segmentation the parser would have given it.
-        command.split([';', '&', '|']).find_map(|segment| {
-            let words: Vec<String> = segment
-                .split_whitespace()
-                .map(|word| word.to_string())
-                .collect();
-            irreversible_outward_argv(&words)
+        shell_lex::segments(command).into_iter().find_map(|segment| {
+            let (program, args) = shell_deny::program_and_args(segment)?;
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let matched = irreversible_outward_words(&program, &arg_refs)?;
+            // Authorized segments keep the scan going (return None); only an
+            // unauthorized one is reported.
+            let mut words = Vec::with_capacity(1 + arg_refs.len());
+            words.push(program.as_str());
+            words.extend_from_slice(&arg_refs);
+            if self.irreversible_allowed(&words) {
+                return None;
+            }
+            Some(matched)
         })
     }
 
-    /// Whether an `[sandbox] allow_irreversible` entry authorizes the words a
-    /// rule matched.
+    /// Whether an `[sandbox] allow_irreversible` entry authorizes the real words
+    /// the executor would run for a segment (program word first, then cleaned
+    /// args — see [`Self::irreversible_outward`]).
     ///
-    /// The entry's words must appear among the matched rule's words **in order**
-    /// — a subsequence, not a prefix. Order is enforced so a reordering cannot
+    /// The entry's words must appear among those words **in order** — a
+    /// subsequence, not a prefix. Order is enforced so a reordering cannot
     /// stretch an entry (`"push git"` authorizes nothing); length is not, so an
-    /// entry naming fewer words than the rule is the user deliberately
+    /// entry naming fewer words than the command is the user deliberately
     /// authorizing the wider thing: `"git push"` covers a force-push.
     ///
     /// Two consequences worth stating, because neither is obvious from the
@@ -555,12 +605,16 @@ impl ExecPolicy {
     ///   `git push --mirror` — and also `git --mirror push`, which is not a real
     ///   command. Over-covering a spelling nobody can type costs nothing;
     ///   under-covering a real one would strand it.
+    ///
+    /// Comparing against the command's real words (rather than the short
+    /// `matched` string the old code used) is what lets an entry written the way
+    /// the example config advises — `"git push origin main --force"`, the
+    /// longest run you actually mean — authorize that command instead of nothing.
     #[must_use]
-    pub fn irreversible_allowed(&self, matched: &str) -> bool {
-        let wanted: Vec<&str> = matched.split_whitespace().collect();
+    pub fn irreversible_allowed(&self, words: &[&str]) -> bool {
         self.allow_irreversible.iter().any(|entry| {
             let entry: Vec<&str> = entry.split_whitespace().collect();
-            !entry.is_empty() && words_in_order(&entry, &wanted)
+            !entry.is_empty() && words_in_order(&entry, words)
         })
     }
 
@@ -926,10 +980,9 @@ pub fn evaluate_shell_command(
     // floor, and an unattended run auto-denies. `[sandbox] allow_irreversible`
     // remains the "stop asking" path for a class of command the user has decided
     // about once.
-    if let Some(matched) = policy
-        .irreversible_outward(command)
-        .filter(|matched| !policy.irreversible_allowed(matched))
-    {
+    // `irreversible_outward` already skips exempted segments, so what it returns
+    // is the first command the user has NOT authorized.
+    if let Some(matched) = policy.irreversible_outward(command) {
         return ToolExecutionPlan {
             verdict: PolicyVerdict::NeedsApproval {
                 reason: format!(
