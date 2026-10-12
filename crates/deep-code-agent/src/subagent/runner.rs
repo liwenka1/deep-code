@@ -77,7 +77,10 @@ pub async fn run_subagent(
                     ("limit", &max_steps.to_string()),
                 ],
             );
-            let _ = runtime.steer(text).await;
+            // A runtime notice, not user input (see `steer_notice`): the child's
+            // own turn loop records it as a System entry, so it cannot pull the
+            // child's compaction anchor off its task the way a user entry would.
+            let _ = runtime.steer_notice(text).await;
         }
 
         let Some(event) = rx.recv().await else {

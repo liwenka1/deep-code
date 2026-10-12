@@ -390,6 +390,48 @@ mod tests {
         );
     }
 
+    /// The budget wrap-up is injected as a System entry, not a user one, for
+    /// exactly this reason: a user entry at the tail becomes the newest user
+    /// message, pulls the anchor off the task and archives it. With the wrap-up
+    /// as a System entry the task is still the newest user message, so it
+    /// survives — the end-to-end property the `steer_notice` plumbing exists for.
+    #[test]
+    fn a_system_wrap_up_notice_does_not_displace_the_task_anchor() {
+        let mut entries = vec![Arc::new(SessionEntry::system("sys"))];
+        for turn in 0..3 {
+            entries.push(Arc::new(SessionEntry::user(format!("old task {turn}"))));
+            entries.push(Arc::new(SessionEntry::assistant(
+                format!("old answer {turn}"),
+                None,
+                Vec::new(),
+            )));
+        }
+        entries.push(Arc::new(SessionEntry::user("FIX THE LOGIN BUG")));
+        for index in 0..RECENT_TAIL_ENTRIES + 3 {
+            entries.push(Arc::new(SessionEntry::assistant(
+                format!("step {index}"),
+                None,
+                Vec::new(),
+            )));
+        }
+        // The runtime's budget wrap-up, recorded as a System entry at the very
+        // tail (newer than the task). If this were a User entry it would be the
+        // newest user message and the task would archive; as System it must not.
+        entries.push(Arc::new(SessionEntry::system(
+            "You are at 4/5 of the step budget — converge and hand over.",
+        )));
+
+        let result = compact_entries(&entries);
+        assert!(result.archived_count > 0, "history before the task is archived");
+        assert!(
+            result.entries.iter().any(|entry| matches!(
+                &entry.kind,
+                EntryKind::User { content, .. } if content == "FIX THE LOGIN BUG"
+            )),
+            "the task must survive even with a System wrap-up notice after it"
+        );
+    }
+
     #[test]
     fn appending_entries_preserves_wire_prefix() {
         // The invariant DeepSeek's automatic prefix cache depends on: appending

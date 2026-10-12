@@ -194,9 +194,11 @@ impl AgentRuntime {
             // The soft end of the budget, ahead of the hard one: past four
             // fifths of the cap the model is told to converge and hand over,
             // because the hard stop cannot ask for anything — it just ends the
-            // turn. Steered rather than pushed into the transcript directly, so
-            // it lands at a tool-batch boundary where appending a `user` entry
-            // cannot split a `tool_calls`/`tool` pair.
+            // turn. Steered so it lands at a tool-batch boundary where appending
+            // an entry cannot split a `tool_calls`/`tool` pair — but as a runtime
+            // NOTICE, not a user turn: `steer_notice` records a System entry and
+            // raises no user-injection event, so it cannot move compaction's
+            // task anchor or masquerade as the user's own message.
             //
             // The cost is one prefix break for the rest of the turn, which is
             // the price of saying anything mid-turn at all. Worth it: the
@@ -208,7 +210,7 @@ impl AgentRuntime {
                     crate::TextId::TurnBudgetWrapUp,
                     &[("used", &steps.to_string()), ("limit", &cap.to_string())],
                 );
-                let _ = self.steer(text).await;
+                let _ = self.steer_notice(text).await;
             }
 
             // Inside the loop, not once before it. Every iteration appends an
@@ -597,9 +599,20 @@ impl AgentRuntime {
             let mut state = self.state.lock().await;
             let drained: Vec<crate::runtime::UserTurn> = std::mem::take(&mut state.steering).into();
             for prompt in &drained {
-                state
-                    .session
-                    .push_user_with_images(&prompt.text, prompt.images.clone());
+                if prompt.is_runtime_notice {
+                    // A runtime nudge (the budget wrap-up): recorded as a System
+                    // entry, never a user one. As a user entry it would become
+                    // the newest user message and pull compaction's anchor off
+                    // the real task — archiving the task into a summary line that
+                    // is then persisted. System entries are not the anchor, so
+                    // the task survives (and a mid-stream System notice is itself
+                    // archivable once the turn moves on).
+                    state.session.push_system(&prompt.text);
+                } else {
+                    state
+                        .session
+                        .push_user_with_images(&prompt.text, prompt.images.clone());
+                }
             }
             drained
         };
@@ -608,6 +621,13 @@ impl AgentRuntime {
         }
         self.persist().await;
         for prompt in drained {
+            // Runtime notices raise no user-injection event: the TUI renders
+            // `UserMessageInjected` as the user's own message and retires a
+            // pending user steer against it, neither of which is true of a
+            // runtime nudge. It stays an internal instruction to the model.
+            if prompt.is_runtime_notice {
+                continue;
+            }
             emit(
                 tx,
                 RuntimeEvent::UserMessageInjected {

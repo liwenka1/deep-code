@@ -5324,16 +5324,25 @@ async fn a_turn_past_four_fifths_of_its_budget_is_asked_to_hand_over() {
     let mut rx = runtime.submit_user("work").await;
     let events = drain(&mut rx).await;
 
-    let notice = events
-        .iter()
-        .find_map(|event| match event {
-            RuntimeEvent::UserMessageInjected { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .expect("the budget notice must reach the model before the cap");
+    // The notice reaches the MODEL as a System entry, not as a user turn: a user
+    // turn here would become the newest user message and pull compaction's task
+    // anchor off the real request. So it must be in the session as a System
+    // message naming the budget…
+    let messages = runtime.session_messages().await;
     assert!(
-        notice.contains("3/4"),
-        "the notice names the budget it is about: {notice}"
+        messages.iter().any(|message| {
+            message.role == crate::message::Role::System && message.content.contains("3/4")
+        }),
+        "the budget notice must reach the model as a System message: {messages:?}"
+    );
+    // …and it must NOT be delivered as a user-injection event, which the TUI
+    // renders as the user's own message and which retires a pending user steer.
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::UserMessageInjected { text, .. } if text.contains("3/4")
+        )),
+        "the runtime nudge must not masquerade as a user message: {events:?}"
     );
     assert!(
         !events
@@ -5501,4 +5510,19 @@ fn the_unattended_denial_note_names_the_floor_it_hit() {
     );
     let generic = crate::unattended_denial_note(&request("shell", Some("builtin:untrusted_shell")));
     assert!(generic.contains("auto_allow"), "{generic}");
+}
+
+/// A runtime notice (`steer_notice` → the budget wrap-up) is flagged distinctly
+/// from a user steer, which is what drives `drain_steering` to record it as a
+/// System entry and raise no user-injection event. The ordinary constructors
+/// (and the `From` impls every pre-existing steer call site uses) stay user
+/// input.
+#[test]
+fn a_runtime_notice_user_turn_is_flagged_distinctly_from_user_input() {
+    use crate::runtime::UserTurn;
+    assert!(UserTurn::notice("wrap up").is_runtime_notice);
+    assert!(!UserTurn::new("do the thing").is_runtime_notice);
+    assert!(!UserTurn::with_images("look", Vec::new()).is_runtime_notice);
+    assert!(!UserTurn::from("typed steer").is_runtime_notice);
+    assert!(!UserTurn::from("typed steer".to_string()).is_runtime_notice);
 }
