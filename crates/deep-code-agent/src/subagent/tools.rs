@@ -25,10 +25,21 @@ use crate::workspace_policy::invalid;
 
 const AGENT_TOOL: &str = "agent";
 
-/// Wall-clock ceiling for one child run. The step budget bounds work, not
-/// time — without this, one child stuck on a slow model call would hang the
-/// parent turn indefinitely.
-const AGENT_WALL_CLOCK_TIMEOUT: Duration = Duration::from_secs(600);
+/// Wall-clock ceiling for one child run — a backstop against a child that stops
+/// making progress (a slow model call that never returns), not a bound on
+/// legitimate work, which the step budget covers.
+///
+/// It must exceed the foreground shell ceiling (`shell_tools::MAX_TIMEOUT_SECS`,
+/// 1800s): at 600s any child command with `timeout_secs > ~600` was killed by
+/// this wall-clock before its own deadline, so a child could never run the long
+/// suite the shell tool explicitly allows, and a child doing ordinary
+/// builds/tests hit 600s long before spending its 200-step budget. Set to one
+/// full-ceiling command (1800s) plus comparable headroom for the surrounding
+/// steps; a child whose work genuinely outruns this should use the `job` tool,
+/// which has no deadline. When it does fire, the partial report is now handed
+/// back (see the timeout arm), so a timeout salvages the child's findings
+/// instead of discarding them.
+const AGENT_WALL_CLOCK_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// After cancelling a child, how long to wait for it to unwind through its
 /// own cancel check before abandoning the await.
@@ -288,13 +299,36 @@ impl Tool for AgentTool {
                 cancel_handle.cancel_turn().await;
                 // Honor a child that genuinely finished inside the grace window
                 // (raced the deadline and won); otherwise the cancel/timeout
-                // reason governs.
+                // reason governs — but hand back whatever the child managed to
+                // say. Discarding the partial report (the old `None`) threw away
+                // findings the child had already written, exactly when the parent
+                // most needs them; `cancel_handle` still shares the child's
+                // session, so its messages are readable here.
                 match tokio::time::timeout(CANCEL_GRACE, &mut run).await {
                     Ok(joined) => match unwrap_panic(joined) {
                         Ok(success) => Ok(success),
-                        Err(_) => Err((0, reason, None)),
+                        // The child unwound and produced its own (steps, reason,
+                        // partial); keep its step count and report, falling back
+                        // to its session messages if it carried none.
+                        Err((steps, _inner_reason, partial)) => {
+                            let partial = match partial {
+                                Some(report) => Some(report),
+                                None => crate::subagent::runner::partial_report_from(
+                                    &cancel_handle.session_messages().await,
+                                ),
+                            };
+                            Err((steps, reason, partial))
+                        }
                     },
-                    Err(_) => Err((0, reason, None)),
+                    // Grace window elapsed: no (steps, …) from the child, so
+                    // recover the partial report from its session messages.
+                    Err(_) => Err((
+                        0,
+                        reason,
+                        crate::subagent::runner::partial_report_from(
+                            &cancel_handle.session_messages().await,
+                        ),
+                    )),
                 }
             }
         };

@@ -1,5 +1,24 @@
+use crate::message::{Message, Role};
 use crate::runtime::{AgentRuntime, RuntimeEvent};
 use crate::subagent::roles::SubAgentRole;
+
+/// The child's last substantive words, for a run that ends before the report
+/// contract was reached (step cap, wall-clock timeout, cancel).
+///
+/// Finds the last NON-EMPTY assistant message, not merely the last assistant
+/// message: at the step cap the final assistant turn is the empty content
+/// carrier for the tool call that tripped the cap, so filtering emptiness only
+/// *after* taking the last message returned `None` and threw away the findings
+/// the child had written one or two turns earlier. This is the lookup
+/// `headless::drive::final_assistant_text` already does correctly; shared so the
+/// step-cap arm here and the wall-clock arm in `subagent::tools` agree.
+pub(super) fn partial_report_from(messages: &[Message]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::Assistant && !message.content.trim().is_empty())
+        .map(|message| message.content.trim().to_string())
+}
 
 /// Drive a child runtime's turn loop to completion and return its final
 /// report. Cancellation is *not* observed here via a side token — the caller
@@ -27,18 +46,8 @@ pub async fn run_subagent(
     let mut budget_notice_sent = false;
     let mut rx = runtime.drive_turn().await;
 
-    /// The child's own last words, for a run that ends before the report
-    /// contract was reached. `None` when it never said anything, so the caller
-    /// can tell "nothing to hand over" from "an empty message".
     async fn partial_report(runtime: &AgentRuntime) -> Option<String> {
-        runtime
-            .session_messages()
-            .await
-            .iter()
-            .rev()
-            .find(|message| matches!(message.role, crate::message::Role::Assistant))
-            .map(|message| message.content.trim().to_string())
-            .filter(|text| !text.is_empty())
+        partial_report_from(&runtime.session_messages().await)
     }
 
     loop {
@@ -152,5 +161,58 @@ pub async fn run_subagent(
             | RuntimeEvent::UserMessageInjected { .. }
             | RuntimeEvent::Warning { .. } => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Message;
+    use crate::model::{ToolCallFunctionPayload, ToolCallPayload};
+
+    /// At the step cap the child's final assistant turn is the empty content
+    /// carrier for the tool call that tripped the cap, so the hand-off must look
+    /// PAST it to the last turn that actually said something. Taking the last
+    /// assistant message and only then filtering emptiness returned `None` and
+    /// discarded the findings written a turn or two earlier.
+    #[test]
+    fn partial_report_skips_the_empty_tool_call_carrier() {
+        let messages = vec![
+            Message::user("find the bug"),
+            Message::assistant_turn("Here is what I found: the race is in foo.rs.", "", vec![]),
+            // The carrier for the final tool call: empty content, tool_calls set.
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCallPayload {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: ToolCallFunctionPayload {
+                        name: "shell".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }],
+            ),
+            Message::tool("call_1", "some output"),
+        ];
+        assert_eq!(
+            partial_report_from(&messages).as_deref(),
+            Some("Here is what I found: the race is in foo.rs."),
+            "the last non-empty assistant turn is the hand-off, not the empty carrier"
+        );
+    }
+
+    /// A whitespace-only final turn is also skipped, and a run that never
+    /// produced assistant text yields `None` so the caller can tell "nothing to
+    /// hand over" from an empty string.
+    #[test]
+    fn partial_report_is_none_when_nothing_was_said() {
+        assert_eq!(partial_report_from(&[]), None);
+        let only_user = vec![Message::user("x"), Message::tool("c", "out")];
+        assert_eq!(partial_report_from(&only_user), None);
+        let blank_tail = vec![
+            Message::assistant_turn("real findings", "", vec![]),
+            Message::assistant_turn("   \n  ", "", vec![]),
+        ];
+        assert_eq!(partial_report_from(&blank_tail).as_deref(), Some("real findings"));
     }
 }
