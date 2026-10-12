@@ -216,6 +216,9 @@ mod tests {
             Message::assistant_turn("real findings", "", vec![]),
             Message::assistant_turn("   \n  ", "", vec![]),
         ];
-        assert_eq!(partial_report_from(&blank_tail).as_deref(), Some("real findings"));
+        assert_eq!(
+            partial_report_from(&blank_tail).as_deref(),
+            Some("real findings")
+        );
     }
 }

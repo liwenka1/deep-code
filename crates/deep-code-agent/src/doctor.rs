@@ -466,8 +466,14 @@ mod tests {
         // The JSON booleans (the supervisor contract) agree.
         let value: serde_json::Value =
             serde_json::from_str(&report.to_json_pretty().unwrap()).unwrap();
-        assert_eq!(value["sandbox"]["confines_network"], serde_json::Value::Bool(false));
-        assert_eq!(value["sandbox"]["confines_filesystem"], serde_json::Value::Bool(false));
+        assert_eq!(
+            value["sandbox"]["confines_network"],
+            serde_json::Value::Bool(false)
+        );
+        assert_eq!(
+            value["sandbox"]["confines_filesystem"],
+            serde_json::Value::Bool(false)
+        );
     }
 
     /// The setup guidance describes one state, so it must appear in exactly

@@ -108,7 +108,12 @@ fn irreversible_outward_words(program: &str, args: &[&str]) -> Option<String> {
         }
         // Yarn Berry publishes with `yarn npm publish`; the bare-`publish` arm
         // below never sees it because its subcommand is `npm`.
-        "yarn" if matches!((second, args.get(1).copied()), (Some("npm"), Some("publish"))) => {
+        "yarn"
+            if matches!(
+                (second, args.get(1).copied()),
+                (Some("npm"), Some("publish"))
+            ) =>
+        {
             Some("yarn npm publish".to_string())
         }
         "npm" | "yarn" | "pnpm" | "bun" if second == Some("publish") => {
@@ -582,20 +587,22 @@ impl ExecPolicy {
     /// floor already handles the catastrophes.
     #[must_use]
     pub fn irreversible_outward(&self, command: &str) -> Option<String> {
-        shell_lex::segments(command).into_iter().find_map(|segment| {
-            let (program, args) = shell_deny::program_and_args(segment)?;
-            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let matched = irreversible_outward_words(&program, &arg_refs)?;
-            // Authorized segments keep the scan going (return None); only an
-            // unauthorized one is reported.
-            let mut words = Vec::with_capacity(1 + arg_refs.len());
-            words.push(program.as_str());
-            words.extend_from_slice(&arg_refs);
-            if self.irreversible_allowed(&words) {
-                return None;
-            }
-            Some(matched)
-        })
+        shell_lex::segments(command)
+            .into_iter()
+            .find_map(|segment| {
+                let (program, args) = shell_deny::program_and_args(segment)?;
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                let matched = irreversible_outward_words(&program, &arg_refs)?;
+                // Authorized segments keep the scan going (return None); only an
+                // unauthorized one is reported.
+                let mut words = Vec::with_capacity(1 + arg_refs.len());
+                words.push(program.as_str());
+                words.extend_from_slice(&arg_refs);
+                if self.irreversible_allowed(&words) {
+                    return None;
+                }
+                Some(matched)
+            })
     }
 
     /// Whether an `[sandbox] allow_irreversible` entry authorizes the real words

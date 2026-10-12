@@ -1281,7 +1281,10 @@ fn wrapped_and_prefixed_irreversible_spellings_still_need_a_human() {
         "npm.cmd publish",
         "VERSION=$(jq -r .version package.json)\nnpm publish",
     ] {
-        assert!(floor_gated(&policy, command), "{command} must reach a human");
+        assert!(
+            floor_gated(&policy, command),
+            "{command} must reach a human"
+        );
     }
 }
 
@@ -1298,7 +1301,10 @@ fn every_named_package_publisher_needs_a_human() {
         "poetry publish",
         "gem push pkg.gem",
     ] {
-        assert!(floor_gated(&policy, command), "{command} must reach a human");
+        assert!(
+            floor_gated(&policy, command),
+            "{command} must reach a human"
+        );
     }
 }
 
@@ -1314,14 +1320,20 @@ fn a_dry_run_turned_off_by_its_value_is_not_exempt() {
         "kubectl delete ns prod --dry-run=none",
         "git push --dry-run=0 --force origin main",
     ] {
-        assert!(floor_gated(&policy, command), "{command} must reach a human");
+        assert!(
+            floor_gated(&policy, command),
+            "{command} must reach a human"
+        );
     }
     for command in [
         "npm publish --dry-run",
         "npm publish --dry-run=true",
         "kubectl delete pod scratch --dry-run=client",
     ] {
-        assert!(!floor_gated(&policy, command), "{command} is a real dry run");
+        assert!(
+            !floor_gated(&policy, command),
+            "{command} is a real dry run"
+        );
     }
 }
 
@@ -1340,7 +1352,10 @@ fn remote_deletions_still_need_a_human() {
         "aws s3api delete-bucket --bucket prod-assets",
         "aws s3api delete-objects --bucket prod-assets --delete file://d.json",
     ] {
-        assert!(floor_gated(&policy, command), "{command} must reach a human");
+        assert!(
+            floor_gated(&policy, command),
+            "{command} must reach a human"
+        );
     }
 }
 
@@ -1358,7 +1373,10 @@ fn the_exemption_is_per_segment_and_reads_the_real_words() {
     let allow_publish =
         ExecPolicy::default().with_allow_irreversible(vec!["npm publish".to_string()]);
     assert!(
-        floor_gated(&allow_publish, "npm publish && git push --force origin main"),
+        floor_gated(
+            &allow_publish,
+            "npm publish && git push --force origin main"
+        ),
         "authorizing npm publish must not exempt a force push beside it"
     );
     assert!(
@@ -1629,9 +1647,15 @@ fn a_dispatch_that_declares_allow_commands_asks_a_human() {
         panic!("expected a prompt: {long:?}")
     };
     for command in &many {
-        assert!(reason.contains(command.as_str()), "{command} must be named: {reason}");
+        assert!(
+            reason.contains(command.as_str()),
+            "{command} must be named: {reason}"
+        );
     }
-    assert!(!reason.contains("more)"), "no entry may be hidden behind a count: {reason}");
+    assert!(
+        !reason.contains("more)"),
+        "no entry may be hidden behind a count: {reason}"
+    );
 
     // Nothing to authorize, nothing to ask.
     for value in [

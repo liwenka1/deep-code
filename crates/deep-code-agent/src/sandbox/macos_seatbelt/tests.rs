@@ -235,7 +235,9 @@ fn every_write_root_entry_is_locked_against_rename() {
         );
         // Last match wins, so the deny must come AFTER the grant it narrows.
         let grant_at = text
-            .find(&format!("(allow file-write* (subpath (param \"{write_name}\")))"))
+            .find(&format!(
+                "(allow file-write* (subpath (param \"{write_name}\")))"
+            ))
             .expect("the grant is present");
         let deny_at = text
             .find(&format!(
@@ -248,7 +250,9 @@ fn every_write_root_entry_is_locked_against_rename() {
         );
         // Only unlink — the root does not become read-only.
         assert!(
-            !text.contains(&format!("(deny file-write* (subpath (param \"{keep_name}\")))")),
+            !text.contains(&format!(
+                "(deny file-write* (subpath (param \"{keep_name}\")))"
+            )),
             "the write root must not become read-only: {text}"
         );
     }
