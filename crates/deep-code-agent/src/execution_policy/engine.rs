@@ -456,7 +456,7 @@ pub struct ExecPolicy {
     /// `SandboxManager`.
     sandbox_off: bool,
     /// `[sandbox] allow_irreversible`: the words that authorize an
-    /// irreversible-outward command (see [`irreversible_outward_argv`]).
+    /// irreversible-outward command (see [`irreversible_outward_words`]).
     allow_irreversible: Vec<String>,
 }
 
