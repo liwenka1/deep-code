@@ -116,6 +116,61 @@ fn sandbox_network_is_tighten_only_from_the_project_layer() {
     assert_eq!(loaded.config.sandbox_network, NetworkMode::Prompt);
 }
 
+/// `[sandbox] mode` is tighten-only from the project layer, and both directions
+/// are pinned because the guard reads in the OPPOSITE rank direction from
+/// `sandbox.network` (strictness, not permissiveness) — the one that was
+/// silently inverted, letting any checked-out repo turn its own confinement off
+/// with no warning. A repo may ask for `os`; it may never reach `off`.
+#[test]
+fn sandbox_mode_is_tighten_only_from_the_project_layer() {
+    use crate::execution_policy::SandboxMode;
+    assert_eq!(AgentConfig::builtin().sandbox_mode, SandboxMode::Os);
+
+    // Loosening direction: against the builtin `os`, a repo asking for `off`
+    // is ignored with a warning. This is the case the inverted guard accepted.
+    let project_dir = tempfile::tempdir().unwrap();
+    let project = write_config(project_dir.path(), "[sandbox]\nmode = \"off\"\n");
+    let loaded = AgentConfig::load_with(None, Some(project), &no_env);
+    assert_eq!(
+        loaded.config.sandbox_mode,
+        SandboxMode::Os,
+        "a repo must not be able to turn its own sandbox off"
+    );
+    assert!(
+        loaded
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("sandbox.mode")),
+        "ignoring a repo's mode=off must be surfaced: {:?}",
+        loaded.report.warnings
+    );
+
+    // Tightening direction: the user's global `off` (their own machine, their
+    // own call), a repo asking for `os` is a tightening and is accepted — it
+    // must NOT be waved away as "not whitelisted", which the inverted guard did.
+    let global_dir = tempfile::tempdir().unwrap();
+    let global = write_config(global_dir.path(), "[sandbox]\nmode = \"off\"\n");
+    let project_dir = tempfile::tempdir().unwrap();
+    let project = write_config(project_dir.path(), "[sandbox]\nmode = \"os\"\n");
+    let loaded = AgentConfig::load_with(Some(global), Some(project), &no_env);
+    assert_eq!(
+        loaded.config.sandbox_mode,
+        SandboxMode::Os,
+        "a repo may tighten a global off up to os"
+    );
+
+    // The user's own global `off` stands when no project overrides it.
+    let global_dir = tempfile::tempdir().unwrap();
+    let global = write_config(global_dir.path(), "[sandbox]\nmode = \"off\"\n");
+    let loaded = AgentConfig::load_with(Some(global), None, &no_env);
+    assert_eq!(
+        loaded.config.sandbox_mode,
+        SandboxMode::Off,
+        "the user's own global choice is honored"
+    );
+}
+
 /// The project layer is tighten-only for the permission tier. Rejecting just
 /// auto/yolo was not enough: raising `default` → `accept_edits` already
 /// auto-approves every workspace write plus in-workspace `rm/mv/cp/mkdir`,

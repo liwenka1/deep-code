@@ -683,12 +683,20 @@ fn apply_file_overlay(
         }
     }
 
-    // Whether the OS sandbox runs at all. Tighten-only from the project layer in
-    // the same direction as `sandbox.network`: a repo may ask for `os` (the
-    // strict value) but never `off`, because turning confinement off is exactly
-    // the "hostile checkout widens its own gate" case the layered loader exists
-    // to stop. An unrecognized spelling is warned about and leaves the value the
-    // layers below set.
+    // Whether the OS sandbox runs at all. Tighten-only from the project layer:
+    // a repo may ask for `os` (the strict value) but never `off`, because
+    // turning confinement off is exactly the "hostile checkout widens its own
+    // gate" case the layered loader exists to stop. An unrecognized spelling is
+    // warned about and leaves the value the layers below set.
+    //
+    // The comparison is the OPPOSITE direction from `sandbox.network` above, and
+    // that is not a copy-paste slip: `NetworkMode::rank` is a *permissiveness*
+    // rank (`never` < `always`) so widening means a *higher* rank, while
+    // `SandboxMode::rank` is a *strictness* rank (`off` < `os`) so widening
+    // (loosening) means a *lower* rank. Ignore the project value when it is
+    // less strict than the current one — `mode.rank() < current`. The
+    // two-direction loader test pins both halves so this cannot silently invert
+    // again.
     if let Some(mode) = parse_setting(
         file.sandbox.mode.as_deref(),
         "sandbox.mode",
@@ -696,7 +704,7 @@ fn apply_file_overlay(
         pending,
         crate::execution_policy::SandboxMode::parse,
     ) {
-        if project && mode.rank() > config.sandbox_mode.rank() {
+        if project && mode.rank() < config.sandbox_mode.rank() {
             pending.push((
                 TextId::CfgProjectFieldIgnored,
                 vec![("field", format!("sandbox.mode={}", mode.as_setting()))],
