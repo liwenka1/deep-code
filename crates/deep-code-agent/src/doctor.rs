@@ -72,7 +72,13 @@ pub struct ApiKeyReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SandboxReport {
+    /// Whether an OS sandbox will confine this configuration's commands: the
+    /// host has a backend AND `[sandbox] mode` lets it run. `false` under
+    /// `mode = "off"` even on a host with a backend — a supervisor gating on
+    /// `.sandbox.available` must not pass while every command runs unconfined.
+    /// (The host's backend is still named in `detail`.)
     pub available: bool,
+    /// The backend that confines commands, when one does (see `available`).
     pub kind: Option<String>,
     /// What the backend actually enforces. `available` alone is misleading: the
     /// Windows Job Object exists on every host yet confines neither writes nor
@@ -244,12 +250,8 @@ impl DoctorReport {
             default_model: config.model.clone(),
             deepseek,
             sandbox: SandboxReport {
-                available: sandbox.available,
-                kind: if sandbox.available {
-                    Some(sandbox.backend.id().to_string())
-                } else {
-                    None
-                },
+                available: sandbox.available && !mode_off,
+                kind: (sandbox.available && !mode_off).then(|| sandbox.backend.id().to_string()),
                 confines_filesystem: filesystem.is_full(),
                 confines_network: network.is_full(),
                 filesystem,
@@ -458,6 +460,13 @@ mod tests {
         assert_eq!(report.sandbox.filesystem, Enforcement::None);
         assert_eq!(report.sandbox.network, Enforcement::None);
         assert_eq!(report.sandbox.mode_setting, "off");
+        // `available`/`kind` too: a supervisor gating on `.sandbox.available`
+        // passed on a host with a backend while nothing ran confined.
+        assert!(
+            !report.sandbox.available,
+            "mode=off must not report a sandbox"
+        );
+        assert_eq!(report.sandbox.kind, None);
         assert!(
             report.sandbox.detail.contains("mode = \"off\""),
             "the detail must name the switch that turned it off: {}",
@@ -472,6 +481,10 @@ mod tests {
         );
         assert_eq!(
             value["sandbox"]["confines_filesystem"],
+            serde_json::Value::Bool(false)
+        );
+        assert_eq!(
+            value["sandbox"]["available"],
             serde_json::Value::Bool(false)
         );
     }

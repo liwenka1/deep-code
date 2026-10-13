@@ -1,6 +1,6 @@
 //! `deep-code doctor` command.
 
-use deep_code_agent::{AgentConfig, DoctorReport, Enforcement};
+use deep_code_agent::{AgentConfig, DoctorReport, Enforcement, SandboxMode};
 
 use crate::cli::workspace_root;
 
@@ -13,6 +13,27 @@ fn enforcement_label(enforcement: &Enforcement) -> &'static str {
         Enforcement::Full => "yes",
         Enforcement::Partial { .. } => "partial",
         Enforcement::None => "NO",
+    }
+}
+
+/// The one-word sandbox state the text report leads with.
+///
+/// `disabled` is its own answer: under `[sandbox] mode = "off"` the host may
+/// well have a backend, so `unavailable` would blame the host for a setting —
+/// and before `available` folded the switch in, this read `enforcing`'s
+/// neighbours and the lines under it told the user their network setting had
+/// "no effect on this platform", a platform that enforces it fine.
+fn sandbox_state(report: &DoctorReport, overall: &Enforcement) -> &'static str {
+    if report.sandbox.mode_setting == SandboxMode::Off.as_setting() {
+        return "disabled";
+    }
+    if !report.sandbox.available {
+        return "unavailable";
+    }
+    match overall {
+        Enforcement::Full => "enforcing",
+        Enforcement::Partial { .. } => "partial",
+        Enforcement::None => "not enforcing",
     }
 }
 
@@ -154,16 +175,11 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
         report.sandbox.filesystem.clone(),
         report.sandbox.network.clone(),
     );
-    let sandbox_state = if !report.sandbox.available {
-        "unavailable"
-    } else {
-        match overall {
-            Enforcement::Full => "enforcing",
-            Enforcement::Partial { .. } => "partial",
-            Enforcement::None => "not enforcing",
-        }
-    };
-    println!("  sandbox: {} ({})", sandbox_state, report.sandbox.detail);
+    println!(
+        "  sandbox: {} ({})",
+        sandbox_state(&report, &overall),
+        report.sandbox.detail
+    );
     // The configured egress policy, beside what the host can enforce. Without
     // it `[sandbox] network = "never"` was unconfirmable: a typo in the value
     // (or in the key) produced a report identical to one where it had taken
@@ -201,4 +217,33 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
     }
     println!("  skills: {} loaded", report.skills.total_count);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `mode = "off"` reads as a setting, not as a host without a sandbox, and
+    /// the per-dimension lines (with their "no effect on this platform") are
+    /// skipped because `available` is false there.
+    #[test]
+    fn a_sandbox_switched_off_reads_as_disabled() {
+        let workspace = tempfile::tempdir().unwrap();
+        let off = DoctorReport::collect(
+            workspace.path(),
+            &AgentConfig {
+                sandbox_mode: SandboxMode::Off,
+                ..AgentConfig::default()
+            },
+        );
+        let overall =
+            Enforcement::weakest(off.sandbox.filesystem.clone(), off.sandbox.network.clone());
+        assert_eq!(sandbox_state(&off, &overall), "disabled");
+        assert!(!off.sandbox.available);
+
+        let on = DoctorReport::collect(workspace.path(), &AgentConfig::default());
+        let overall =
+            Enforcement::weakest(on.sandbox.filesystem.clone(), on.sandbox.network.clone());
+        assert_ne!(sandbox_state(&on, &overall), "disabled");
+    }
 }
