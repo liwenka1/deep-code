@@ -23,6 +23,7 @@ mod failure_class;
 mod persistence;
 mod persistence_actor;
 mod state;
+use state::Steered;
 mod streaming;
 mod telemetry;
 /// Crate-visible for `TOOL_OUTPUT_BUDGET`: the shell layer's spill decisions
@@ -66,16 +67,6 @@ pub struct UserTurn {
     /// request is assembled and the session stores these same paths, so an image
     /// is never copied into the transcript or into the session file.
     pub images: Vec<PathBuf>,
-    /// True when the runtime itself injected this, not the user — today only the
-    /// budget wrap-up nudge. It rides the steering queue so it lands at the same
-    /// safe tool-batch boundary a user steer does, but it must NOT be recorded as
-    /// a user turn: a user entry here becomes the newest one, which moves
-    /// compaction's "never archive the newest user message" anchor off the real
-    /// task (archiving it into a summary line, persisted — the task is gone after
-    /// `/resume`), and the TUI/SSE would render a runtime nudge as the user's own
-    /// message and retire a pending user steer against it. Recorded as a System
-    /// entry and emitted as no user-injection event (see `drain_steering`).
-    pub is_runtime_notice: bool,
 }
 
 impl UserTurn {
@@ -84,7 +75,6 @@ impl UserTurn {
         Self {
             text: text.into(),
             images: Vec::new(),
-            is_runtime_notice: false,
         }
     }
 
@@ -93,18 +83,6 @@ impl UserTurn {
         Self {
             text: text.into(),
             images,
-            is_runtime_notice: false,
-        }
-    }
-
-    /// A runtime-injected notice (the budget wrap-up), not user input. See
-    /// [`Self::is_runtime_notice`].
-    #[must_use]
-    pub fn notice(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            images: Vec::new(),
-            is_runtime_notice: true,
         }
     }
 
@@ -426,7 +404,7 @@ impl AgentRuntime {
         if state.current_turn_id.is_none() {
             return false;
         }
-        state.steering.push_back(text.into());
+        state.steering.push_back(Steered::User(text.into()));
         true
     }
 
@@ -435,14 +413,14 @@ impl AgentRuntime {
     /// tool-batch boundary a user steer does — appending to the session directly
     /// would race the turn loop mid-request — but is recorded as a System entry
     /// and raises no user-injection event, so it cannot be mistaken for user
-    /// input by compaction, the TUI or SSE (see [`UserTurn::is_runtime_notice`]
-    /// and `drain_steering`). Returns whether a turn was in flight to accept it.
+    /// input by compaction, the TUI or SSE (see `Steered::Notice` and
+    /// `drain_steering`). Returns whether a turn was in flight to accept it.
     pub async fn steer_notice(&self, text: impl Into<String>) -> bool {
         let mut state = self.state.lock().await;
         if state.current_turn_id.is_none() {
             return false;
         }
-        state.steering.push_back(UserTurn::notice(text));
+        state.steering.push_back(Steered::Notice(text.into()));
         true
     }
 

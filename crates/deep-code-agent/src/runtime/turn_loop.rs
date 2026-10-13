@@ -596,23 +596,23 @@ impl AgentRuntime {
     /// go out in arrival order — the UI pops its own pending list FIFO, so that
     /// order is part of the contract.
     async fn drain_steering(&self, turn_id: &TurnId, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
-        let drained: Vec<crate::runtime::UserTurn> = {
+        use super::Steered;
+        let drained: Vec<Steered> = {
             let mut state = self.state.lock().await;
-            let drained: Vec<crate::runtime::UserTurn> = std::mem::take(&mut state.steering).into();
-            for prompt in &drained {
-                if prompt.is_runtime_notice {
+            let drained: Vec<Steered> = std::mem::take(&mut state.steering).into();
+            for steered in &drained {
+                match steered {
+                    Steered::User(prompt) => state
+                        .session
+                        .push_user_with_images(&prompt.text, prompt.images.clone()),
                     // A runtime nudge (the budget wrap-up): recorded as a System
                     // entry, never a user one. As a user entry it would become
                     // the newest user message and pull compaction's anchor off
-                    // the real task — archiving the task into a summary line that
-                    // is then persisted. System entries are not the anchor, so
-                    // the task survives (and a mid-stream System notice is itself
-                    // archivable once the turn moves on).
-                    state.session.push_system(&prompt.text);
-                } else {
-                    state
-                        .session
-                        .push_user_with_images(&prompt.text, prompt.images.clone());
+                    // the real task — archiving the task into a summary line
+                    // that is then persisted. System entries are not the anchor,
+                    // so the task survives (and a mid-stream System notice is
+                    // itself archivable once the turn moves on).
+                    Steered::Notice(text) => state.session.push_system(text),
                 }
             }
             drained
@@ -621,21 +621,20 @@ impl AgentRuntime {
             return;
         }
         self.persist().await;
-        for prompt in drained {
+        for steered in drained {
             // Runtime notices raise no user-injection event: the TUI renders
             // `UserMessageInjected` as the user's own message and retires a
             // pending user steer against it, neither of which is true of a
             // runtime nudge. It stays an internal instruction to the model.
-            if prompt.is_runtime_notice {
-                continue;
+            if let Steered::User(prompt) = steered {
+                emit(
+                    tx,
+                    RuntimeEvent::UserMessageInjected {
+                        turn_id: turn_id.clone(),
+                        text: prompt.text,
+                    },
+                );
             }
-            emit(
-                tx,
-                RuntimeEvent::UserMessageInjected {
-                    turn_id: turn_id.clone(),
-                    text: prompt.text,
-                },
-            );
         }
     }
 }

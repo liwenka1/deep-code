@@ -5511,18 +5511,3 @@ fn the_unattended_denial_note_names_the_floor_it_hit() {
     let generic = crate::unattended_denial_note(&request("shell", Some("builtin:untrusted_shell")));
     assert!(generic.contains("auto_allow"), "{generic}");
 }
-
-/// A runtime notice (`steer_notice` → the budget wrap-up) is flagged distinctly
-/// from a user steer, which is what drives `drain_steering` to record it as a
-/// System entry and raise no user-injection event. The ordinary constructors
-/// (and the `From` impls every pre-existing steer call site uses) stay user
-/// input.
-#[test]
-fn a_runtime_notice_user_turn_is_flagged_distinctly_from_user_input() {
-    use crate::runtime::UserTurn;
-    assert!(UserTurn::notice("wrap up").is_runtime_notice);
-    assert!(!UserTurn::new("do the thing").is_runtime_notice);
-    assert!(!UserTurn::with_images("look", Vec::new()).is_runtime_notice);
-    assert!(!UserTurn::from("typed steer").is_runtime_notice);
-    assert!(!UserTurn::from("typed steer".to_string()).is_runtime_notice);
-}

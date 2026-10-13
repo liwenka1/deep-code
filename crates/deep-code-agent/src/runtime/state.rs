@@ -11,6 +11,31 @@ use crate::session::Session;
 use crate::session_store::{SessionRecord, TurnRecord};
 use crate::tool::ToolCall;
 
+/// One entry of the steering queue: what landed in the in-flight turn at a
+/// tool-batch boundary.
+///
+/// Two kinds, kept apart by the type rather than by a flag on [`UserTurn`]. A
+/// runtime notice (today the budget wrap-up) rides the queue so it lands at the
+/// same safe boundary a user steer does, but it must NOT be recorded as a user
+/// turn: a user entry becomes the newest one, which moves compaction's "never
+/// archive the newest user message" anchor off the real task (archiving it
+/// into a summary line, persisted — gone after `/resume`), and the TUI/SSE
+/// would render a runtime nudge as the user's own message and retire a pending
+/// user steer against it. As a public `bool` on the user-input type, that was
+/// a promise only `drain_steering` kept — `submit_user` or `begin_turn` handed a
+/// flagged turn recorded it as user input all the same. Here a notice cannot
+/// be anything but a notice.
+///
+/// [`UserTurn`]: crate::runtime::UserTurn
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Steered {
+    /// A prompt the user typed while the turn was streaming.
+    User(crate::runtime::UserTurn),
+    /// A runtime-originated instruction to the model: recorded as a System
+    /// entry, announced as no user injection.
+    Notice(String),
+}
+
 /// Internal: the runtime can be in one of these states between
 /// `RuntimeEvent` emissions. Kept crate-private to the runtime module so
 /// callers cannot poke at it.
@@ -51,7 +76,7 @@ pub(super) struct RuntimeState {
     /// Cleared by `begin_turn` (a steer that was never drained must not leak
     /// into the next turn) and by `cancel_turn` (Esc means "changed my mind",
     /// matching the TUI's own queue).
-    pub(super) steering: VecDeque<crate::runtime::UserTurn>,
+    pub(super) steering: VecDeque<Steered>,
     /// Cancellation token for the in-flight turn; rotated by `begin_turn`.
     pub(super) cancel: CancellationToken,
     /// Tools the user approved for the whole session ("a" in the approval
