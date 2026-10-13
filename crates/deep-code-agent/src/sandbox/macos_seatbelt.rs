@@ -203,9 +203,9 @@ fn compose_profile(
     // roots and, when different, the command's cwd), each resolved to the real
     // path Seatbelt matches — on macOS /tmp is a symlink into /private, and an
     // unresolved grant there would never match — with the granted roots and the
-    // cwd pinned to the path they were granted at. See
-    // `SandboxPolicy::resolved_writable_roots` for why re-resolving those was a
-    // fence escape.
+    // cwd pinned to the path they were granted at, and the temp roots resolved
+    // only through symlinks root owns. See `SandboxPolicy::resolved_writable_roots`
+    // for why re-resolving any of them blindly was a fence escape.
     //
     // The grant is a path STRING the kernel matches against the real path of
     // each operation, so pinning holds without a race: a symlink planted where

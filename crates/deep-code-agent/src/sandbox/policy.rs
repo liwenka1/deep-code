@@ -87,35 +87,14 @@ impl SandboxPolicy {
             Self::Unsandboxed => Vec::new(),
             Self::WorkspaceWrite { .. } => {
                 let mut roots: Vec<PathBuf> = Vec::new();
-                for root in granted {
-                    if !roots.contains(root) {
-                        roots.push(root.clone());
-                    }
-                }
-                if !roots.iter().any(|existing| existing == cwd) {
-                    roots.push(cwd.to_path_buf());
-                }
-                let temp = std::env::temp_dir();
-                if !roots.contains(&temp) {
-                    roots.push(temp);
-                }
-                if cfg!(unix) {
-                    let tmp = PathBuf::from("/tmp");
-                    if !roots.contains(&tmp) {
-                        roots.push(tmp);
-                    }
-                }
-                // Linux POSIX shared memory is files under `/dev/shm` (a tmpfs):
-                // Python multiprocessing (Pool/Queue/Lock/ProcessPoolExecutor),
-                // PyTorch DataLoader workers and headless Chromium all create
-                // objects there, and without the grant Landlock refuses the write
-                // with EACCES and those everyday workloads fail. macOS covers the
-                // equivalent through `ipc-posix-sem`. Linux-only: `/dev/shm` does
-                // not exist on macOS, where it would be a dead (or rejected) root.
-                if cfg!(target_os = "linux") {
-                    let shm = PathBuf::from("/dev/shm");
-                    if !roots.contains(&shm) {
-                        roots.push(shm);
+                for root in granted
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(cwd.to_path_buf()))
+                    .chain(system_roots())
+                {
+                    if !roots.contains(&root) {
+                        roots.push(root);
                     }
                 }
                 roots
@@ -124,46 +103,136 @@ impl SandboxPolicy {
     }
 
     /// [`Self::writable_roots`] as one spawn grants them: each resolved to the
-    /// real path the kernel matches — except that a root handed over already
-    /// resolved is left out when it no longer resolves to itself.
+    /// real path the kernel matches, and a root left out when what now stands
+    /// at its path is not what may be granted there.
     ///
-    /// Two kinds of root are in that list, and they resolve differently. The
-    /// temp dirs are system paths behind system symlinks (`/tmp` is
-    /// `/private/tmp` on macOS), resolved here per spawn. Every other root — the
-    /// granted ones and the cwd — was resolved ONCE, when it was granted
-    /// (`WorkspacePolicy`, `resolve_cwd`, `paths::tool_cache_roots`), and is
-    /// pinned to that path.
+    /// Re-resolving a root per spawn is a write-fence escape whenever a
+    /// sandboxed command can put a symlink where the root was. It can, more
+    /// often than it looks: it may write inside every granted root, so it can
+    /// move the directory a nested root sits in — workspace `/tmp/a/ws` with
+    /// `/tmp` granted, or `~/code/org/repo` beside `--add-dir ~/code` — and on
+    /// macOS a `subpath` grant covers the root's OWN entry, so it can move a
+    /// root itself, `$TMPDIR` included (`mv "$TMPDIR" /tmp/x && ln -s ~
+    /// "$TMPDIR"`). The next spawn resolved the root to `$HOME` and granted
+    /// that. Locking each root's entry against rename reached neither the
+    /// directories between two roots nor Linux, and refused legitimate removals
+    /// of a cache root or a cwd root besides. So each kind of root is checked
+    /// for what was put there instead:
     ///
-    /// Re-resolving those per spawn was a write-fence escape. A sandboxed
-    /// command may write inside a granted root, so it can move the directory a
-    /// nested root sits in — workspace `/tmp/a/ws` with `/tmp` granted, or
-    /// `~/code/org/repo` beside `--add-dir ~/code` — and put a symlink where
-    /// the root was: `mv /tmp/a /tmp/a2 && mkdir /tmp/a && ln -s ~ /tmp/a/ws`.
-    /// The next spawn resolved the workspace to `$HOME` and granted that.
-    /// Locking each root's own entry against rename did not reach the
-    /// directories between two roots, and it stopped legitimate removals of a
-    /// cache root or a cwd root besides. A pinned root that resolves somewhere
-    /// else now is a directory that was moved or replaced since it was granted,
-    /// and it is not granted again under its old name.
+    /// - **Granted roots and the cwd** were resolved ONCE, when they were
+    ///   granted (`WorkspacePolicy`, `resolve_cwd`, `paths::tool_cache_roots`),
+    ///   and are pinned to that path: one that resolves anywhere else now is a
+    ///   directory moved or replaced since, and is not granted under its old
+    ///   name.
+    /// - **The system temp roots** ([`system_roots`]) are spelled through
+    ///   system symlinks (`/tmp` is `/private/tmp`, `$TMPDIR` lives under `/var`
+    ///   on macOS), so they are resolved here — but only through symlinks this
+    ///   user could not have planted ([`resolve_system_root`]). That also holds
+    ///   across sessions, where a pin taken at startup would have pinned a
+    ///   symlink a previous session planted.
     ///
     /// A root that does not resolve at all (it does not exist) passes through
     /// as written, as it always did: nothing stands behind it to escape to, and
-    /// a symlink later planted in its place fails this test on the spawn after.
+    /// a symlink later planted in its place fails these tests on the spawn after.
+    ///
+    /// Race-free on both backends, because what is granted is the RESOLVED
+    /// path: Seatbelt matches it against the real path of each operation, and
+    /// Landlock opens it without following any symlink (`linux.rs`), so a swap
+    /// after this check moves nothing.
     pub fn resolved_writable_roots(&self, granted: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
+        self.resolved_writable_roots_with(granted, cwd, &system_roots())
+    }
+
+    /// [`Self::resolved_writable_roots`] with the system roots supplied, so the
+    /// check on them is assertable without changing the process's `$TMPDIR`.
+    fn resolved_writable_roots_with(
+        &self,
+        granted: &[PathBuf],
+        cwd: &Path,
+        system: &[PathBuf],
+    ) -> Vec<PathBuf> {
+        if !self.should_sandbox() {
+            return Vec::new();
+        }
+        let pinned = granted
+            .iter()
+            .cloned()
+            .chain(std::iter::once(cwd.to_path_buf()))
+            .map(|root| resolve_pinned_root(&root));
+        let system = system.iter().map(|root| resolve_system_root(root));
         let mut resolved: Vec<PathBuf> = Vec::new();
-        for root in self.writable_roots(granted, cwd) {
-            let pinned = root == cwd || granted.contains(&root);
-            let real = match crate::paths::canonicalize(&root) {
-                Ok(real) if pinned && real != root => continue,
-                Ok(real) => real,
-                Err(_) => root,
-            };
+        for real in pinned.chain(system).flatten() {
             if !resolved.contains(&real) {
                 resolved.push(real);
             }
         }
         resolved
     }
+}
+
+/// The roots every sandboxed command may write besides the granted ones: the
+/// temp dir, `/tmp` (unix) and `/dev/shm` (Linux). See
+/// [`SandboxPolicy::writable_roots`] for why each is there.
+fn system_roots() -> Vec<PathBuf> {
+    let mut roots = vec![std::env::temp_dir()];
+    if cfg!(unix) {
+        roots.push(PathBuf::from("/tmp"));
+    }
+    // Linux POSIX shared memory is files under `/dev/shm` (a tmpfs): Python
+    // multiprocessing (Pool/Queue/Lock/ProcessPoolExecutor), PyTorch DataLoader
+    // workers and headless Chromium all create objects there, and without the
+    // grant Landlock refuses the write with EACCES and those everyday workloads
+    // fail. macOS covers the equivalent through `ipc-posix-sem`. Linux-only:
+    // `/dev/shm` does not exist on macOS, where it would be a dead (or
+    // rejected) root.
+    if cfg!(target_os = "linux") {
+        roots.push(PathBuf::from("/dev/shm"));
+    }
+    roots
+}
+
+/// A granted root or cwd, resolved — or `None` when it no longer resolves to
+/// the path it was granted at (see [`SandboxPolicy::resolved_writable_roots`]).
+fn resolve_pinned_root(root: &Path) -> Option<PathBuf> {
+    match crate::paths::canonicalize(root) {
+        Ok(real) if real != root => None,
+        Ok(real) => Some(real),
+        Err(_) => Some(root.to_path_buf()),
+    }
+}
+
+/// A system temp root, resolved — or `None` when a symlink on its path is one
+/// this user could have planted.
+///
+/// A system root is MEANT to be reached through symlinks (`/tmp`, `/var` on
+/// macOS), so "resolves to itself" is no test for it. What a sandboxed command
+/// can put in its path is a symlink it owns; the system's own are owned by
+/// root. So every component of the spelled path is checked without following
+/// it, and one that is a symlink owned by anyone but root refuses the root. The
+/// cost is a `$TMPDIR` the user made a symlink themselves, which is
+/// indistinguishable from a planted one and is no longer granted.
+fn resolve_system_root(root: &Path) -> Option<PathBuf> {
+    if has_symlink_not_owned_by_root(root) {
+        return None;
+    }
+    Some(crate::paths::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()))
+}
+
+#[cfg(unix)]
+fn has_symlink_not_owned_by_root(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let mut prefix = PathBuf::new();
+    path.components().any(|component| {
+        prefix.push(component);
+        std::fs::symlink_metadata(&prefix)
+            .is_ok_and(|meta| meta.file_type().is_symlink() && meta.uid() != 0)
+    })
+}
+
+/// No backend confines writes here, so nothing is granted by path.
+#[cfg(not(unix))]
+fn has_symlink_not_owned_by_root(_path: &Path) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -215,6 +284,47 @@ mod tests {
         assert!(!roots.contains(&target), "{roots:?}");
         // The temp roots are resolved, not pinned: `/tmp` may be a system
         // symlink (macOS) and is granted at its real path.
+        let tmp = crate::paths::canonicalize(Path::new("/tmp")).unwrap();
+        assert!(roots.contains(&tmp), "{roots:?}");
+    }
+
+    /// A system temp root is reached through symlinks on purpose (`/tmp`,
+    /// `/var` on macOS), so it is not pinned — but one reached through a
+    /// symlink this user owns is left out, at the symlink's target and under its
+    /// own name: that is what `mv "$TMPDIR" /tmp/x && ln -s ~ "$TMPDIR"` leaves
+    /// behind, last component or any other. The root-owned system links still
+    /// resolve.
+    #[cfg(unix)]
+    #[test]
+    fn a_system_root_reached_through_a_planted_symlink_is_left_out() {
+        let holder = tempfile::tempdir().unwrap();
+        let holder = holder.path().canonicalize().unwrap();
+        let ws = holder.join("ws");
+        let target = holder.join("target");
+        let real = holder.join("real-temp");
+        for dir in [&ws, &target, &real, &target.join("T")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let planted = holder.join("T");
+        std::os::unix::fs::symlink(&target, &planted).unwrap();
+        let via = holder.join("via");
+        std::os::unix::fs::symlink(&target, &via).unwrap();
+
+        let roots = SandboxPolicy::workspace_write().resolved_writable_roots_with(
+            std::slice::from_ref(&ws),
+            &ws,
+            &[
+                planted.clone(),
+                via.join("T"),
+                real.clone(),
+                PathBuf::from("/tmp"),
+            ],
+        );
+        assert!(
+            !roots.contains(&target) && !roots.contains(&target.join("T")),
+            "{roots:?}"
+        );
+        assert!(roots.contains(&real), "{roots:?}");
         let tmp = crate::paths::canonicalize(Path::new("/tmp")).unwrap();
         assert!(roots.contains(&tmp), "{roots:?}");
     }
