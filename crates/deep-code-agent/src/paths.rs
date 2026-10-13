@@ -295,6 +295,11 @@ impl CacheLeaf {
     /// gets no grant: a sandboxed command holding this root may replace the
     /// root's own entry with one (Seatbelt's `subpath` covers the entry itself),
     /// and following it would grant wherever it points on the next call.
+    ///
+    /// The cost, stated rather than discovered: a cache the user moved to another
+    /// volume behind a symlink of their own (`~/.cargo/registry -> /Volumes/…`)
+    /// is indistinguishable from a planted one and is not granted either; its
+    /// writes fail as ordinary write denials, which the denial note explains.
     fn ensure(self, path: PathBuf) -> Option<PathBuf> {
         let parent = canonicalize(path.parent()?).ok()?;
         let path = parent.join(path.file_name()?);
