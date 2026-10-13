@@ -718,14 +718,9 @@ impl SandboxManager {
     /// node/test-runner/dev-server tree it spawned alive — holding ports and
     /// file locks that broke the next build — and lost the process cap. mode=off
     /// removes confinement Windows never had; it must not also remove process
-    /// management.
+    /// management. That is why it takes no policy: nothing here depends on one.
     #[must_use]
-    pub fn confine_spawned(
-        &self,
-        child: &tokio::process::Child,
-        policy: &SandboxPolicy,
-    ) -> Option<SandboxGuard> {
-        let _ = policy;
+    pub fn confine_spawned(&self, child: &tokio::process::Child) -> Option<SandboxGuard> {
         #[cfg(target_os = "windows")]
         {
             // `raw_handle()` is `None` once the child has already exited — the

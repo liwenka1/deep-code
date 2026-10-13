@@ -304,7 +304,7 @@ fn spawn_confined(
     let child = cmd
         .spawn()
         .map_err(|error| ToolError::exec_failed(tool_name, format!("{error_context}: {error}")))?;
-    let guard = sandbox.confine_spawned(&child, policy);
+    let guard = sandbox.confine_spawned(&child);
     Ok((child, guard))
 }
 
