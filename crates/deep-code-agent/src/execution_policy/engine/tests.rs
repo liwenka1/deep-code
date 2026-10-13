@@ -1479,6 +1479,145 @@ fn an_exemption_matches_words_in_order_across_programs() {
     );
 }
 
+/// A `\`-newline is one command to `sh`, and the floor reads it as one. The
+/// quote-blind newline split cut each of these into a segment with no rule —
+/// `git push origin main \` and a program word `--force` — so a continued force
+/// push ran unprompted under yolo or an `auto_allow`.
+///
+/// `sh` grammar only: under `cmd` a backslash is a path separator and a newline
+/// ends the line, so there is nothing to join. Asked of the grammar rather than
+/// `#[cfg]`, so forcing `HOST` runs the other arm here.
+#[test]
+fn a_continued_irreversible_line_still_needs_a_human() {
+    let policy = ExecPolicy::default();
+    let lines = [
+        "git push origin main \\\n  --force",
+        "kubectl \\\n delete ns prod",
+        "terraform \\\n  apply -auto-approve",
+        // Unmodelled by the quote-aware reading (the quote never closes), so
+        // this is the blind fallback, which must join too.
+        "git push origin main \\\n  --force \"",
+    ];
+    for command in lines {
+        assert_eq!(
+            floor_gated(&policy, command),
+            shell_lex::HOST == shell_lex::SH,
+            "{command:?}"
+        );
+    }
+}
+
+/// A command that only MENTIONS an irreversible one is not one. Each of these
+/// was parked for a human — a hard denial wherever nobody can answer (eval, a
+/// sub-agent, headless) — for an ordinary commit or stash.
+///
+/// The first group is git reading `push` only as its subcommand, which holds on
+/// every host. The second is the quote-aware reading, `sh` only: under `cmd`
+/// the line is read blind (quoting differs there), which asks rather than runs.
+#[test]
+fn a_mention_of_an_irreversible_command_is_not_one() {
+    let policy = ExecPolicy::default();
+    for command in [
+        "git commit -m \"docs: explain git push --force policy\"",
+        "git stash push -- ':!vendor'",
+        "git commit -m \"revert push -d change\"",
+        "git -C push status",
+    ] {
+        assert!(!floor_gated(&policy, command), "{command:?}");
+    }
+    if shell_lex::HOST != shell_lex::SH {
+        return;
+    }
+    for command in [
+        "git commit -m \"ci: move release\n\nnpm publish now runs in CI\"",
+        "git commit -m 'release; npm publish next'",
+        "git commit -F - <<'EOF'\nci: move release\n\nnpm publish now runs in CI\nEOF",
+        "git commit -m \"$(cat <<'EOF'\nci: move release\n\nnpm publish now runs in CI\nEOF\n)\"",
+        "# later: npm publish\nnpm test",
+        "echo 'run terraform apply by hand' > NOTES.md",
+    ] {
+        assert!(!floor_gated(&policy, command), "{command:?}");
+    }
+}
+
+/// …and what the shell RUNS is still read, wherever it sits: a substitution
+/// (in double quotes too), a subshell, and a here-document fed to something
+/// that runs its stdin — directly, through a pipe, or on another host.
+#[test]
+fn what_the_shell_runs_inside_a_line_still_needs_a_human() {
+    if shell_lex::HOST != shell_lex::SH {
+        return;
+    }
+    let policy = ExecPolicy::default();
+    for command in [
+        "echo \"published: $(npm publish)\"",
+        "echo `npm publish`",
+        "(cd pkg && npm publish)",
+        "sh <<'EOF'\nnpm publish\nEOF",
+        "cat <<'EOF' | sh\ngit push --force origin main\nEOF",
+        "ssh deploy@host <<'EOF'\nkubectl delete ns prod\nEOF",
+        "bash -c \"$(cat <<'EOF'\nterraform apply -auto-approve\nEOF\n)\"",
+    ] {
+        assert!(floor_gated(&policy, command), "{command:?}");
+    }
+}
+
+/// A `--dry-run` that is another option's VALUE is no dry run: the push and the
+/// merge below really happen. A real dry run — after an operand, a flag known
+/// to take no value, or nothing — stays exempt.
+#[test]
+fn a_dry_run_that_is_an_options_value_is_not_exempt() {
+    let policy = ExecPolicy::default();
+    for command in [
+        "git push --force origin main -o --dry-run",
+        "gh pr merge 12 --body --dry-run",
+        "gh pr merge 12 --subject --dry-run",
+    ] {
+        assert!(floor_gated(&policy, command), "{command:?}");
+    }
+    for command in [
+        "git push --dry-run --force origin main",
+        "git push --force --dry-run origin main",
+        "npm publish --access public --dry-run",
+        "aws s3 rm s3://bucket/key --recursive --dryrun",
+    ] {
+        assert!(!floor_gated(&policy, command), "{command:?}");
+    }
+}
+
+/// The routine deleting spellings beside the ones already covered: a deploy
+/// sync that deletes what the source lacks, a push that prunes remote branches,
+/// and deleting a repository or a release.
+#[test]
+fn routine_remote_deletions_need_a_human() {
+    let policy = ExecPolicy::default();
+    for command in [
+        "aws s3 sync ./dist s3://prod-assets --delete",
+        "git push --prune origin 'refs/heads/*:refs/heads/*'",
+        "gh repo delete org/repo --yes",
+        "gh release delete v1.0.0",
+    ] {
+        assert!(floor_gated(&policy, command), "{command:?}");
+    }
+    assert!(!floor_gated(&policy, "aws s3 sync ./dist s3://prod-assets"));
+}
+
+/// An entry's own words authorize a command only when the entry starts with
+/// that command's program. Matched over every word with no anchor, `git push`
+/// was satisfied by a PR merge whose subject mentioned it. The unquoted
+/// spelling is here so this pins the anchor, not the quote handling.
+#[test]
+fn an_exemption_does_not_match_another_commands_free_text() {
+    let allow_push = ExecPolicy::default().with_allow_irreversible(vec!["git push".to_string()]);
+    for command in [
+        "gh pr merge 42 --squash --subject \"fix: git push retry\"",
+        "gh pr merge 42 --squash --subject fix git push retry",
+    ] {
+        assert!(floor_gated(&allow_push, command), "{command:?}");
+    }
+    assert!(!floor_gated(&allow_push, "git push --force origin main"));
+}
+
 /// Known miss, accepted and pinned so it is a stated boundary rather than an
 /// assumed coverage: a leading global option that takes a value moves the verb
 /// out of the position the rule reads. Modelling each program's option arity is

@@ -4,6 +4,7 @@ use serde_json::Value;
 use super::command_shape;
 use super::shell_deny;
 use super::shell_lex;
+use super::shell_lex::INTERPRETERS;
 
 /// Whether every word of `needle` appears in `haystack`, in order.
 fn words_in_order(needle: &[&str], haystack: &[&str]) -> bool {
@@ -13,7 +14,61 @@ fn words_in_order(needle: &[&str], haystack: &[&str]) -> bool {
         .all(|word| rest.any(|candidate| candidate == word))
 }
 
-/// Whether a token is a `--dry-run` that is actually ON, so the command only
+/// The simple commands of `command` as the irreversible-outward floor reads
+/// them: each one's program word (basename, lowercased, past assignments and
+/// wrappers) and its de-quoted args.
+///
+/// Quote-aware where the line allows it ([`shell_lex::sh_commands`]): what a
+/// quote, a here-document or a `#` comment makes data stays data. The floor read
+/// a quote-blind split before, and that made it refuse ordinary work wherever
+/// nobody could answer it — `git commit -m "…⏎⏎npm publish now runs in CI"`
+/// was cut at the quoted newline into the command `npm publish now runs in CI`.
+///
+/// A here-document body is stepped over unless something on the line runs its
+/// stdin ([`INTERPRETERS`], plus `ssh`): `git commit -F - <<EOF` hands git a
+/// message, but `sh <<EOF` and `cat <<EOF | sh` run the body, so for those the
+/// line is read again with every body as shell lines. One question for the
+/// whole line rather than per here-document — reading a body as commands can
+/// only ask more.
+///
+/// A line the lexer does not model (an unclosed quote, `$'…'`, the `cmd`
+/// grammar) falls back to the quote-blind [`shell_lex::segments`], over the
+/// line as written AND with its continuations joined — two readings, so the
+/// blind join can only add a command, never fold one away (see
+/// [`shell_lex::joined_continuations`]).
+fn irreversible_floor_commands(command: &str) -> Vec<(String, Vec<String>)> {
+    let read_as_sh = |bodies| {
+        shell_lex::sh_commands(command, bodies).map(|read| {
+            let skipped_heredoc = read.skipped_heredoc;
+            let commands: Vec<(String, Vec<String>)> = read
+                .commands
+                .into_iter()
+                .filter_map(shell_deny::program_and_args_of_argv)
+                .collect();
+            (commands, skipped_heredoc)
+        })
+    };
+    if let Some((commands, skipped_heredoc)) = read_as_sh(shell_lex::HeredocBodies::Skip) {
+        let runs_a_body = skipped_heredoc
+            && commands
+                .iter()
+                .any(|(program, _)| program == "ssh" || INTERPRETERS.contains(&program.as_str()));
+        if !runs_a_body {
+            return commands;
+        }
+        if let Some((commands, _)) = read_as_sh(shell_lex::HeredocBodies::Read) {
+            return commands;
+        }
+    }
+    let joined = shell_lex::joined_continuations(shell_lex::HOST, command);
+    std::iter::once(command)
+        .chain(joined.as_deref())
+        .flat_map(shell_lex::segments)
+        .filter_map(shell_deny::program_and_args)
+        .collect()
+}
+
+/// Whether a token is a `--dry-run` that is actually ON, so the command only/// Whether a token is a `--dry-run` that is actually ON, so the command only
 /// reports and is exempt. A bare `--dry-run`/`--dryrun` is on; a
 /// `--dry-run=VALUE` is on unless VALUE turns it back OFF — `npm publish
 /// --dry-run=false` really publishes and `kubectl delete --dry-run=none` really
@@ -33,13 +88,103 @@ fn is_dry_run_on(word: &str) -> bool {
     false
 }
 
+/// Whether `args` carry a dry run that is on and is not some option's value.
+///
+/// `git push --force origin main -o --dry-run` passes `--dry-run` to the remote
+/// as a push option, and `gh pr merge 12 --body --dry-run` makes it the merge
+/// body: both really push or merge, and reading the token alone exempted them.
+/// Telling an option's value from a flag in general is option-arity modelling
+/// (see [`irreversible_outward_words`]), so this asks the cheaper, fail-safe
+/// question instead: a dry run counts when the word before it cannot be an
+/// option waiting for a value — no word at all, an operand, an option that
+/// already carries its value (`--tag=next`), or a flag known to take none. An
+/// option this list does not know costs a question, never an unprompted run.
+fn is_dry_run(args: &[&str]) -> bool {
+    args.iter().enumerate().any(|(index, word)| {
+        is_dry_run_on(word)
+            && index
+                .checked_sub(1)
+                .map(|before| args[before])
+                .is_none_or(|before| {
+                    !before.starts_with('-')
+                        || before.contains('=')
+                        || TAKES_NO_VALUE.contains(&before)
+                })
+    })
+}
+
+/// Flags, of the commands [`irreversible_outward_words`] reads, that take no
+/// value — so a `--dry-run` right after one is a dry run and not its value.
+/// The rules' own trigger flags are here, so `git push --force --dry-run` stays
+/// the check it is; anything missing only costs a question.
+const TAKES_NO_VALUE: &[&str] = &[
+    "-f",
+    "--force",
+    "--force-with-lease",
+    "--force-if-includes",
+    "--mirror",
+    "-d",
+    "--delete",
+    "--prune",
+    "-u",
+    "--set-upstream",
+    "--all",
+    "--tags",
+    "--follow-tags",
+    "--atomic",
+    "--no-verify",
+    "--porcelain",
+    "-q",
+    "--quiet",
+    "-v",
+    "--verbose",
+    "--recursive",
+    "--allow-dirty",
+    "--squash",
+    "--merge",
+    "--rebase",
+    "--auto",
+    "--admin",
+    "--wait",
+];
+
+/// git's global options that take their value as the NEXT word, so the word
+/// after one is not the subcommand (`git -C push status` runs `status` in a
+/// directory named `push`).
+const GIT_GLOBAL_OPTIONS_WITH_VALUE: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--config-env",
+    "--super-prefix",
+    "--attr-source",
+];
+
+/// The index of git's subcommand in `args`: the first word that is neither a
+/// global option nor the value of one.
+fn git_subcommand_index(args: &[&str]) -> Option<usize> {
+    let mut index = 0;
+    while let Some(word) = args.get(index) {
+        if GIT_GLOBAL_OPTIONS_WITH_VALUE.contains(word) {
+            index += 2;
+        } else if word.starts_with('-') {
+            index += 1;
+        } else {
+            return Some(index);
+        }
+    }
+    None
+}
+
 /// The irreversible-outward rule the words of one segment hit, as the short
 /// canonical string that names the class — used for the denial message and the
 /// rule id, never for the exemption comparison (that reads the segment's real
 /// words; see [`ExecPolicy::irreversible_outward`]).
 ///
 /// `program` is the lowercased basename and `args` are quoting-stripped, both
-/// produced by [`shell_deny::program_and_args`], so this reads the same words
+/// produced by [`irreversible_floor_commands`], so this reads the same words
 /// the executor runs: `FOO=1 /usr/bin/env NPM publish` reaches the same arm as
 /// `npm publish`.
 ///
@@ -71,8 +216,9 @@ fn is_dry_run_on(word: &str) -> bool {
 fn irreversible_outward_words(program: &str, args: &[&str]) -> Option<String> {
     let second = args.first().copied();
 
-    // The dry-run exemption, read past off-spellings (`--dry-run=false`).
-    if args.iter().any(|word| is_dry_run_on(word)) {
+    // The dry-run exemption, read past off-spellings (`--dry-run=false`) and
+    // past a `--dry-run` that is another option's value.
+    if is_dry_run(args) {
         return None;
     }
 
@@ -81,13 +227,19 @@ fn irreversible_outward_words(program: &str, args: &[&str]) -> Option<String> {
             // `push` is not always the first argument: `git -C <path> push -f`,
             // `git --no-pager push`, `git -c key=value push`. Anchoring on
             // position 1 missed every one of those, and they are routine
-            // spellings rather than obfuscations.
-            let push_at = args.iter().position(|word| *word == "push")?;
+            // spellings rather than obfuscations. But it IS the subcommand:
+            // any later `push` is an operand of something else — `git stash
+            // push -- ':!vendor'`, or a commit message read word by word —
+            // and reading it as one refused a stash and a commit.
+            let push_at = git_subcommand_index(args)?;
+            if args[push_at] != "push" {
+                return None;
+            }
             let rest = &args[push_at + 1..];
             let matched = rest.iter().copied().find(|word| {
                 matches!(
                     *word,
-                    "--force" | "--force-with-lease" | "--mirror" | "--delete"
+                    "--force" | "--force-with-lease" | "--mirror" | "--delete" | "--prune"
                 ) || word.starts_with("--force-with-lease=")
                     // `+<refspec>` IS a force push, spelled without any flag.
                     || (*word != "+" && word.starts_with('+'))
@@ -129,7 +281,9 @@ fn irreversible_outward_words(program: &str, args: &[&str]) -> Option<String> {
         "gem" if second == Some("push") => Some("gem push".to_string()),
         "gh" if matches!(
             (args.first().copied(), args.get(1).copied()),
-            (Some("pr"), Some("merge")) | (Some("release"), Some("create"))
+            (Some("pr"), Some("merge"))
+                | (Some("release"), Some("create" | "delete"))
+                | (Some("repo"), Some("delete"))
         ) =>
         {
             Some(format!("gh {} {}", args[0], args[1]))
@@ -149,6 +303,12 @@ fn irreversible_outward_words(program: &str, args: &[&str]) -> Option<String> {
             // `s3 rb` removes a whole bucket (`--force` empties it first); the
             // `s3api` verbs are the lower-level spellings of the same deletions.
             (Some("s3"), Some("rb")) => Some("aws s3 rb".to_string()),
+            // `sync --delete` removes every destination object the source lacks
+            // — the standard deploy line, and a bucket wipe when the source is
+            // the wrong directory.
+            (Some("s3"), Some("sync")) if args.contains(&"--delete") => {
+                Some("aws s3 sync --delete".to_string())
+            }
             (Some("s3api"), Some("delete-object")) => Some("aws s3api delete-object".to_string()),
             (Some("s3api"), Some("delete-objects")) => Some("aws s3api delete-objects".to_string()),
             (Some("s3api"), Some("delete-bucket")) => Some("aws s3api delete-bucket".to_string()),
@@ -559,83 +719,77 @@ impl ExecPolicy {
 
     /// The first *unauthorized* irreversible-outward command on a line, as the
     /// short canonical string that names its class (the denial message and rule
-    /// id). `None` when no segment is irreversible, or every irreversible one is
+    /// id). `None` when no command is irreversible, or every irreversible one is
     /// covered by an `[sandbox] allow_irreversible` entry.
     ///
-    /// Each segment is read exactly as the deny floor reads it —
-    /// [`shell_lex::segments`] (which splits on `\n` as well as `;`/`|`/`&`) then
-    /// [`shell_deny::program_and_args`] (past `NAME=value` assignments and the
-    /// `env`/`time`/`command` wrappers, basename-lowercased). The old reading
-    /// scanned a raw argv, so `FOO=1 npm publish`, `env npm publish`, a
-    /// newline-separated script and `NPM publish` all walked straight through.
+    /// Each command is read through [`irreversible_floor_commands`] — quote-aware
+    /// where the line allows it, then past `NAME=value` assignments and the
+    /// `env`/`time`/`command` wrappers, basename-lowercased — so `FOO=1 npm
+    /// publish`, `env npm publish`, `NPM publish`, a newline-separated script and
+    /// a `\`-continued line all reach their rule, while a commit message that
+    /// merely *mentions* `git push --force` or carries a line starting `npm
+    /// publish` stays the data it is.
     ///
-    /// The exemption is checked HERE, per segment, so an authorized first
+    /// The exemption is checked HERE, per command, so an authorized first
     /// command cannot exempt a later unauthorized one: `npm publish && git push
     /// --force` with `allow_irreversible = ["npm publish"]` still reports the
-    /// force push. It is compared against the segment's REAL words (program plus
-    /// cleaned args), not the short `matched` string — that is what the example
-    /// config means by "entries match the words the executor would run", and it
-    /// is why `["git push origin main --force"]` authorizes that exact command
-    /// instead of nothing.
+    /// force push. See [`Self::irreversible_allowed`] for what an entry matches.
     ///
-    /// Best-effort by construction, like the deny floor: [`shell_lex::segments`]
-    /// does not track quotes, so a quoted separator cuts a line into more
-    /// segments and may ask about a command inside a string. That is acceptable
-    /// *here* and nowhere else, because this floor is a "did a human mean to
-    /// authorize this" gate over a short list of everyday commands, not a
-    /// containment boundary — containment is the sandbox's job, and the deny
-    /// floor already handles the catastrophes.
+    /// Best-effort by construction, like the deny floor: an obfuscation it
+    /// cannot read walks past it. That is acceptable *here* and nowhere else,
+    /// because this floor is a "did a human mean to authorize this" gate over a
+    /// short list of everyday commands, not a containment boundary —
+    /// containment is the sandbox's job, and the deny floor already handles the
+    /// catastrophes.
     #[must_use]
     pub fn irreversible_outward(&self, command: &str) -> Option<String> {
-        shell_lex::segments(command)
+        irreversible_floor_commands(command)
             .into_iter()
-            .find_map(|segment| {
-                let (program, args) = shell_deny::program_and_args(segment)?;
+            .find_map(|(program, args)| {
                 let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
                 let matched = irreversible_outward_words(&program, &arg_refs)?;
-                // Authorized segments keep the scan going (return None); only an
+                // Authorized commands keep the scan going (return None); only an
                 // unauthorized one is reported.
-                let mut words = Vec::with_capacity(1 + arg_refs.len());
-                words.push(program.as_str());
-                words.extend_from_slice(&arg_refs);
-                if self.irreversible_allowed(&words) {
+                if self.irreversible_allowed(&program, &arg_refs, &matched) {
                     return None;
                 }
                 Some(matched)
             })
     }
 
-    /// Whether an `[sandbox] allow_irreversible` entry authorizes the real words
-    /// the executor would run for a segment (program word first, then cleaned
-    /// args — see [`Self::irreversible_outward`]).
+    /// Whether an `[sandbox] allow_irreversible` entry authorizes one command:
+    /// its program word, its cleaned args, and the class string the rule
+    /// matched (see [`Self::irreversible_outward`]).
     ///
-    /// The entry's words must appear among those words **in order** — a
-    /// subsequence, not a prefix. Order is enforced so a reordering cannot
-    /// stretch an entry (`"push git"` authorizes nothing); length is not, so an
-    /// entry naming fewer words than the command is the user deliberately
-    /// authorizing the wider thing: `"git push"` covers a force-push.
+    /// The entry's words must appear **in order** — a subsequence, not a
+    /// prefix — in one of two places:
     ///
-    /// Two consequences worth stating, because neither is obvious from the
-    /// spelling of an entry:
+    /// - **The matched class** (`git push --force`, `docker push`, `gh pr
+    ///   merge`). Order is enforced so a reordering cannot stretch an entry
+    ///   (`"push git"` authorizes nothing); length is not, so an entry naming
+    ///   fewer words is the user deliberately authorizing the wider thing:
+    ///   `"git push"` covers a force-push, and the single word `"push"` covers
+    ///   `docker push` as well — a match over words, not programs, which the
+    ///   example config says in as many words.
+    /// - **The command's own words, when the entry starts with its program.**
+    ///   That is what lets an entry written the way the example config advises
+    ///   — `"git push origin main --force"`, the longest run you actually mean
+    ///   — authorize that command instead of nothing, since no class string
+    ///   names a branch.
     ///
-    /// - A match is over words, not programs, so a one-word entry crosses
-    ///   programs: `"push"` authorizes `docker push` as well as
-    ///   `git push --force`. That is the user's choice to write, and the example
-    ///   config says so.
-    /// - Words need not be adjacent, so `"git --mirror"` authorizes
-    ///   `git push --mirror` — and also `git --mirror push`, which is not a real
-    ///   command. Over-covering a spelling nobody can type costs nothing;
-    ///   under-covering a real one would strand it.
-    ///
-    /// Comparing against the command's real words (rather than the short
-    /// `matched` string the old code used) is what lets an entry written the way
-    /// the example config advises — `"git push origin main --force"`, the
-    /// longest run you actually mean — authorize that command instead of nothing.
+    /// The anchor on the program is the point of the second form. Matched over
+    /// every word with no anchor, an entry was satisfied by another command's
+    /// free text: `"git push"` authorized `gh pr merge 42 --subject "fix: git
+    /// push retry"`, a merge the user never named.
     #[must_use]
-    pub fn irreversible_allowed(&self, words: &[&str]) -> bool {
+    pub fn irreversible_allowed(&self, program: &str, args: &[&str], matched: &str) -> bool {
+        let class: Vec<&str> = matched.split_whitespace().collect();
         self.allow_irreversible.iter().any(|entry| {
             let entry: Vec<&str> = entry.split_whitespace().collect();
-            !entry.is_empty() && words_in_order(&entry, words)
+            let Some((first, rest)) = entry.split_first() else {
+                return false;
+            };
+            words_in_order(&entry, &class) || (*first == program && words_in_order(rest, args))
         })
     }
 

@@ -126,6 +126,414 @@ pub(super) fn joined_continuations(grammar: Grammar, line: &str) -> Option<Strin
     Some(joined)
 }
 
+/// Whether [`sh_commands`] reads a here-document's body as more shell lines or
+/// steps over it as data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HeredocBodies {
+    /// Step over every body: it is the receiving command's stdin.
+    Skip,
+    /// Read every body as shell lines, for a line where something on it runs
+    /// its stdin (`sh <<EOF`, `cat <<EOF | sh`, `ssh host <<EOF`).
+    Read,
+}
+
+/// What [`sh_commands`] read: one argv per simple command, quoting removed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct ShCommands {
+    /// Every simple command on the line, in the order each one ended — a
+    /// command substitution's commands come before the command it sits in.
+    pub(super) commands: Vec<Vec<String>>,
+    /// Whether a here-document body was stepped over, so the caller knows a
+    /// [`HeredocBodies::Read`] pass could read more.
+    pub(super) skipped_heredoc: bool,
+}
+
+/// The simple commands of `command` as `sh` splits them, quote-aware: words on
+/// unquoted blanks, `'…'` and `"…"` removed, `\` escapes, a `\`-newline joined,
+/// `#` comments dropped, commands cut at unquoted `;` `&` `|` and newlines, and
+/// `( … )`, `$( … )` and `` ` … ` `` read as commands of their own — inside
+/// double quotes too, where the shell still runs them. A here-document body is
+/// stepped over or read per `bodies`.
+///
+/// `None` for anything it does not model, so the caller falls back to the
+/// quote-blind [`segments`]: an unterminated quote or substitution, a trailing
+/// backslash, `$'…'`/`$"…"`, an escaped backtick inside backticks, and every
+/// grammar but `sh`'s (`cmd` has no `'`, escapes with `^`, and reads `%`).
+///
+/// Not a gate and not the executor's reading ([`parse_unattended`] is both). It
+/// exists for the irreversible-outward floor, whose job is to ask before a
+/// *routine* irreversible spelling runs, and which the quote-blind split made
+/// read data as commands: `git commit -m "…⏎⏎npm publish now runs in CI"` cut at
+/// the quoted newline into the segment `npm publish now runs in CI`, and a
+/// heredoc'd commit message the same way — where nobody can answer the
+/// question, that is a refused commit.
+///
+/// One pass, linear: every character is looked at once, a quoted run is
+/// scanned to its close and jumped, and a skipped body is scanned line by line
+/// to its delimiter.
+pub(super) fn sh_commands(command: &str, bodies: HeredocBodies) -> Option<ShCommands> {
+    sh_commands_in(HOST, command, bodies)
+}
+
+/// [`sh_commands`] under an explicit [`Grammar`], so its reading is pinned from
+/// every host and its refusal of the `cmd` grammar is too.
+pub(super) fn sh_commands_in(
+    grammar: Grammar,
+    command: &str,
+    bodies: HeredocBodies,
+) -> Option<ShCommands> {
+    if grammar != SH {
+        return None;
+    }
+    let chars: Vec<char> = command.chars().collect();
+    let mut lexer = ShLexer {
+        frames: vec![LexFrame::Commands {
+            closer: None,
+            argv: Vec::new(),
+            word: None,
+        }],
+        read: ShCommands::default(),
+        pending: Vec::new(),
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        i = lexer.step(&chars, i, bodies)?;
+    }
+    if lexer.frames.len() != 1 {
+        // An unclosed `"`, `$(`, `(` or backtick: `sh` refuses the line.
+        return None;
+    }
+    lexer.end_command();
+    Some(lexer.read)
+}
+
+/// One open context of [`sh_commands`].
+enum LexFrame {
+    /// A run of commands: the line itself, `( … )`/`$( … )` (closed by `)`), or
+    /// `` ` … ` `` (closed by a backtick).
+    Commands {
+        /// What closes this frame: `None` for the line itself.
+        closer: Option<char>,
+        /// The words of the command being read.
+        argv: Vec<String>,
+        /// The word being read, once anything (even `""`) has opened it.
+        word: Option<String>,
+    },
+    /// Inside `"…"`. Its text belongs to the word of the `Commands` frame below.
+    DoubleQuoted,
+}
+
+/// A here-document waiting for the newline after which its body starts.
+struct PendingHeredoc {
+    /// The delimiter word, quotes removed.
+    delimiter: Vec<char>,
+    /// `<<-`: leading tabs are stripped before the delimiter is compared.
+    strip_tabs: bool,
+}
+
+/// The state of one [`sh_commands`] pass.
+struct ShLexer {
+    /// Open contexts, innermost last; the bottom one is the line itself.
+    frames: Vec<LexFrame>,
+    /// What has been read so far.
+    read: ShCommands,
+    /// Here-documents opened on the current line, in order.
+    pending: Vec<PendingHeredoc>,
+}
+
+impl ShLexer {
+    /// The innermost `Commands` frame's word and argv. A `DoubleQuoted` frame
+    /// only ever sits directly on a `Commands` one, so this looks at most one
+    /// frame down.
+    fn command_frame(&mut self) -> (&mut Vec<String>, &mut Option<String>) {
+        for frame in self.frames.iter_mut().rev() {
+            if let LexFrame::Commands { argv, word, .. } = frame {
+                return (argv, word);
+            }
+        }
+        unreachable!("the bottom frame is always a Commands frame")
+    }
+
+    /// Append `ch` to the word being read.
+    fn push(&mut self, ch: char) {
+        self.command_frame()
+            .1
+            .get_or_insert_with(String::new)
+            .push(ch);
+    }
+
+    /// Make sure a word exists even if nothing is pushed into it (`""`, or a
+    /// substitution standing for a whole word).
+    fn touch_word(&mut self) {
+        self.command_frame().1.get_or_insert_with(String::new);
+    }
+
+    /// Close the word being read, if one is open.
+    fn end_word(&mut self) {
+        let (argv, word) = self.command_frame();
+        if let Some(word) = word.take() {
+            argv.push(word);
+        }
+    }
+
+    /// Close the command being read in the innermost frame and record it.
+    fn end_command(&mut self) {
+        self.end_word();
+        let argv = std::mem::take(self.command_frame().0);
+        if !argv.is_empty() {
+            self.read.commands.push(argv);
+        }
+    }
+
+    /// Open a frame of commands that `closer` ends.
+    fn open(&mut self, closer: char) {
+        self.frames.push(LexFrame::Commands {
+            closer: Some(closer),
+            argv: Vec::new(),
+            word: None,
+        });
+    }
+
+    /// End the innermost frame of commands at its closer.
+    fn close(&mut self) {
+        self.end_command();
+        self.frames.pop();
+    }
+
+    /// Read from `chars[i]`; the index to continue from, or `None` for a line
+    /// this lexer does not model.
+    fn step(&mut self, chars: &[char], i: usize, bodies: HeredocBodies) -> Option<usize> {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        let closer = match self.frames.last() {
+            Some(LexFrame::DoubleQuoted) => return Some(self.step_quoted(c, next, i)),
+            Some(LexFrame::Commands { closer, .. }) => *closer,
+            None => unreachable!("the bottom frame is never popped"),
+        };
+        match c {
+            '\\' => match next {
+                None => None,
+                Some('\n') => Some(i + 2),
+                // A nested backtick spelled `\``: not modelled.
+                Some('`') if closer == Some('`') => None,
+                Some(escaped) => {
+                    self.push(escaped);
+                    Some(i + 2)
+                }
+            },
+            '\'' => {
+                let close = chars[i + 1..].iter().position(|&ch| ch == '\'')? + i + 1;
+                self.touch_word();
+                for &ch in &chars[i + 1..close] {
+                    self.push(ch);
+                }
+                Some(close + 1)
+            }
+            '"' => {
+                self.touch_word();
+                self.frames.push(LexFrame::DoubleQuoted);
+                Some(i + 1)
+            }
+            '$' => match next {
+                Some('(') => {
+                    self.touch_word();
+                    self.open(')');
+                    Some(i + 2)
+                }
+                Some('\'' | '"') => None,
+                _ => {
+                    self.push('$');
+                    Some(i + 1)
+                }
+            },
+            '`' if closer == Some('`') => {
+                self.close();
+                Some(i + 1)
+            }
+            '`' => {
+                self.touch_word();
+                self.open('`');
+                Some(i + 1)
+            }
+            '(' => {
+                self.end_command();
+                self.open(')');
+                Some(i + 1)
+            }
+            ')' => {
+                if closer == Some(')') {
+                    self.close();
+                } else {
+                    // A `case` pattern's `)`: it ends what came before it.
+                    self.end_command();
+                }
+                Some(i + 1)
+            }
+            '#' if self.command_frame().1.is_none() => {
+                // A comment runs to the newline, which is left for the next
+                // step to end the command on.
+                let end = chars[i..]
+                    .iter()
+                    .position(|&ch| ch == '\n')
+                    .map_or(chars.len(), |offset| i + offset);
+                Some(end)
+            }
+            ' ' | '\t' => {
+                self.end_word();
+                Some(i + 1)
+            }
+            '\n' => {
+                self.end_command();
+                Some(self.after_newline(chars, i + 1, bodies))
+            }
+            '&' if self
+                .command_frame()
+                .1
+                .as_deref()
+                .is_some_and(|word| word.ends_with(['>', '<'])) =>
+            {
+                // `2>&1`, `>&2`: a redirection's `&`, not a separator.
+                self.push('&');
+                Some(i + 1)
+            }
+            ';' | '&' | '|' => {
+                self.end_command();
+                Some(i + 1)
+            }
+            '<' if next == Some('<') && chars.get(i + 2) == Some(&'<') => {
+                // A here-string: its word is an ordinary operand.
+                self.end_word();
+                Some(i + 3)
+            }
+            '<' if next == Some('<') => self.heredoc(chars, i + 2),
+            _ => {
+                self.push(c);
+                Some(i + 1)
+            }
+        }
+    }
+
+    /// One character inside `"…"`: only `"`, `\`, `$(` and a backtick are
+    /// special there.
+    fn step_quoted(&mut self, c: char, next: Option<char>, i: usize) -> usize {
+        match c {
+            '"' => {
+                self.frames.pop();
+                i + 1
+            }
+            '\\' => match next {
+                // An unterminated escape at the end: the unclosed quote makes
+                // the whole line `None` anyway.
+                None => i + 1,
+                Some('\n') => i + 2,
+                Some(escaped @ ('"' | '\\' | '$' | '`')) => {
+                    self.push(escaped);
+                    i + 2
+                }
+                Some(other) => {
+                    self.push('\\');
+                    self.push(other);
+                    i + 2
+                }
+            },
+            '$' if next == Some('(') => {
+                self.open(')');
+                i + 2
+            }
+            '`' => {
+                self.open('`');
+                i + 1
+            }
+            _ => {
+                self.push(c);
+                i + 1
+            }
+        }
+    }
+
+    /// `<<` or `<<-` at `chars[start - 2]`: read the delimiter word (quotes
+    /// removed) and queue the body for the next newline.
+    fn heredoc(&mut self, chars: &[char], start: usize) -> Option<usize> {
+        self.end_word();
+        let mut i = start;
+        let strip_tabs = chars.get(i) == Some(&'-');
+        if strip_tabs {
+            i += 1;
+        }
+        while matches!(chars.get(i), Some(' ' | '\t')) {
+            i += 1;
+        }
+        let mut delimiter = Vec::new();
+        while let Some(&ch) = chars.get(i) {
+            match ch {
+                ' ' | '\t' | '\n' | ';' | '&' | '|' | '<' | '>' | '(' | ')' => break,
+                '\'' | '"' => {
+                    let close = chars[i + 1..].iter().position(|&c| c == ch)? + i + 1;
+                    delimiter.extend_from_slice(&chars[i + 1..close]);
+                    i = close + 1;
+                }
+                '\\' => {
+                    delimiter.push(*chars.get(i + 1)?);
+                    i += 2;
+                }
+                _ => {
+                    delimiter.push(ch);
+                    i += 1;
+                }
+            }
+        }
+        if delimiter.is_empty() {
+            return None;
+        }
+        self.pending.push(PendingHeredoc {
+            delimiter,
+            strip_tabs,
+        });
+        Some(i)
+    }
+
+    /// Where reading resumes after a newline at `start - 1`: past the bodies of
+    /// the here-documents that newline opened, or right there.
+    fn after_newline(&mut self, chars: &[char], start: usize, bodies: HeredocBodies) -> usize {
+        if self.pending.is_empty() {
+            return start;
+        }
+        if bodies == HeredocBodies::Read {
+            // The bodies are read in place, as the lines they are.
+            self.pending.clear();
+            return start;
+        }
+        self.read.skipped_heredoc = true;
+        let mut i = start;
+        for doc in std::mem::take(&mut self.pending) {
+            loop {
+                if i >= chars.len() {
+                    // `sh` ends an unterminated body at the end of input.
+                    return chars.len();
+                }
+                let end = chars[i..]
+                    .iter()
+                    .position(|&ch| ch == '\n')
+                    .map_or(chars.len(), |offset| i + offset);
+                let mut line = &chars[i..end];
+                if doc.strip_tabs {
+                    while let [first, rest @ ..] = line {
+                        if *first != '\t' {
+                            break;
+                        }
+                        line = rest;
+                    }
+                }
+                i = end + 1;
+                if line == doc.delimiter.as_slice() {
+                    break;
+                }
+            }
+        }
+        i.min(chars.len())
+    }
+}
+
 /// Words the shell consumes ahead of a segment's program word: control-flow
 /// reserved words (`if true; then rm -rf /; fi` lexes to a segment starting
 /// with `then`), the `!` negation, `time`, and the transparent wrappers whose
@@ -2030,5 +2438,147 @@ mod tests {
         // quadratic, and a model can spell a flag token this long.
         let huge = format!("-t{}", "a".repeat(200_000));
         assert!(!operand_leaves_cwd(&huge));
+    }
+
+    fn sh_words(command: &str, bodies: HeredocBodies) -> Option<Vec<Vec<String>>> {
+        sh_commands_in(SH, command, bodies).map(|read| read.commands)
+    }
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_string()).collect()
+    }
+
+    /// What `sh` makes data stays data, and what it runs is read as a command:
+    /// the reading the irreversible floor needs and the quote-blind
+    /// [`segments`] could not give it.
+    #[test]
+    fn sh_commands_reads_quotes_continuations_and_comments_as_sh_does() {
+        use HeredocBodies::Skip;
+        assert_eq!(
+            sh_words("a b; c 'd e' \"f g\" && h|i", Skip),
+            Some(vec![
+                argv(&["a", "b"]),
+                argv(&["c", "d e", "f g"]),
+                argv(&["h"]),
+                argv(&["i"]),
+            ])
+        );
+        // A `\`-newline joins; an escaped backslash before a newline does not.
+        assert_eq!(
+            sh_words("git push origin main \\\n  --force", Skip),
+            Some(vec![argv(&["git", "push", "origin", "main", "--force"])])
+        );
+        assert_eq!(
+            sh_words("echo a\\\\\nls", Skip),
+            Some(vec![argv(&["echo", "a\\"]), argv(&["ls"])])
+        );
+        // A quoted newline or separator is part of the word.
+        assert_eq!(
+            sh_words("git commit -m \"ci: x\n\nnpm publish; now\"", Skip),
+            Some(vec![argv(&[
+                "git",
+                "commit",
+                "-m",
+                "ci: x\n\nnpm publish; now"
+            ])])
+        );
+        assert_eq!(
+            sh_words("git commit -m 'a\nnpm publish'", Skip),
+            Some(vec![argv(&["git", "commit", "-m", "a\nnpm publish"])])
+        );
+        // `#` opens a comment only at the start of a word.
+        assert_eq!(
+            sh_words("echo a#b # npm publish\nls", Skip),
+            Some(vec![argv(&["echo", "a#b"]), argv(&["ls"])])
+        );
+        // A redirection's `&` is not a separator.
+        assert_eq!(
+            sh_words("npm test 2>&1 >&2", Skip),
+            Some(vec![argv(&["npm", "test", "2>&1", ">&2"])])
+        );
+    }
+
+    /// A substitution runs its commands wherever it sits, double quotes
+    /// included, so each is a command of its own; a here-document body is the
+    /// receiving command's stdin unless the caller asks for it to be read.
+    #[test]
+    fn sh_commands_reads_substitutions_and_steps_over_heredoc_bodies() {
+        use HeredocBodies::{Read, Skip};
+        assert_eq!(
+            sh_words(
+                "echo \"v=$(npm publish)\" `docker push x` (git push -f)",
+                Skip
+            ),
+            Some(vec![
+                argv(&["npm", "publish"]),
+                argv(&["docker", "push", "x"]),
+                argv(&["echo", "v=", ""]),
+                argv(&["git", "push", "-f"]),
+            ])
+        );
+        let commit =
+            "git commit -m \"$(cat <<'EOF'\nfix\n\nnpm publish now runs in CI\nEOF\n)\" && git log";
+        let read = sh_commands_in(SH, commit, Skip).expect("models this line");
+        assert_eq!(
+            read.commands,
+            vec![
+                argv(&["cat"]),
+                argv(&["git", "commit", "-m", ""]),
+                argv(&["git", "log"]),
+            ]
+        );
+        assert!(read.skipped_heredoc);
+        // `<<-` strips leading tabs before comparing the delimiter; a body
+        // with no delimiter line runs to the end of input.
+        assert_eq!(
+            sh_words("git commit -F - <<-EOF\n\tnpm publish\n\tEOF\nls", Skip),
+            Some(vec![argv(&["git", "commit", "-F", "-"]), argv(&["ls"])])
+        );
+        assert_eq!(
+            sh_words("cat <<EOF\nnpm publish", Skip),
+            Some(vec![argv(&["cat"])])
+        );
+        // Read: the body is shell lines.
+        assert_eq!(
+            sh_words("sh <<'EOF'\nnpm publish\nEOF", Read),
+            Some(vec![
+                argv(&["sh"]),
+                argv(&["npm", "publish"]),
+                argv(&["EOF"])
+            ])
+        );
+        // A here-string is an ordinary operand, not a body.
+        assert_eq!(
+            sh_words("bash <<< 'npm publish'", Skip),
+            Some(vec![argv(&["bash", "npm publish"])])
+        );
+    }
+
+    /// What it does not model is `None`, for the caller to read blind instead
+    /// of guessing — including every grammar but `sh`'s.
+    #[test]
+    fn sh_commands_refuses_what_it_does_not_model() {
+        for command in [
+            "npm publish \"",
+            "npm publish 'x",
+            "echo $(npm publish",
+            "echo `npm publish",
+            "echo \\",
+            "echo $'a\\'b'",
+            "echo $\"x\"",
+            "echo `a \\`npm publish\\` b`",
+            "cat <<\nx",
+        ] {
+            assert_eq!(
+                sh_commands_in(SH, command, HeredocBodies::Skip),
+                None,
+                "{command:?}"
+            );
+        }
+        assert_eq!(
+            sh_commands_in(WINDOWS, "npm publish", HeredocBodies::Skip),
+            None,
+            "cmd quotes, escapes and expands differently"
+        );
     }
 }

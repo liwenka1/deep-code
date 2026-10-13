@@ -137,10 +137,11 @@ pub struct AgentConfig {
     pub sandbox_mode: crate::execution_policy::SandboxMode,
     /// Commands that would otherwise hit the irreversible-outward floor
     /// (`[sandbox] allow_irreversible`). Each entry authorizes the commands
-    /// whose executed words contain the entry's words IN ORDER (a subsequence,
-    /// not an identity match — see `ExecPolicy::irreversible_allowed`), so
-    /// `"git push"` covers a force push and `"git push origin main --force"`
-    /// names exactly that command. Empty by default: publishing, force-pushing
+    /// whose matched class, or whose executed words read from the program
+    /// word, contain the entry's words IN ORDER (a subsequence, not an identity
+    /// match — see `ExecPolicy::irreversible_allowed`), so `"git push"` covers
+    /// a force push and `"git push origin main --force"` names exactly that
+    /// command. Empty by default: publishing, force-pushing
     /// and merging are decisions only a human makes, and there is no standing
     /// consent for them.
     pub sandbox_allow_irreversible: Vec<String>,

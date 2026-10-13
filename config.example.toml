@@ -127,9 +127,13 @@
 #
 # Entries match the words the executor would run, IN ORDER, so a flag cannot
 # hide from them: `npm publish --tag next` is matched by "npm publish", and
-# `git push origin main --force` needs the force flag spelled out. A dry run is
-# never refused — `npm publish --dry-run` and `kubectl delete --dry-run=client`
-# publish and delete nothing.
+# `git push origin main --force` needs the force flag spelled out. An entry is
+# read from the command's program word, so "git push" never matches a different
+# command that merely mentions it (a PR merge whose subject says "git push").
+# A dry run is never refused — `npm publish --dry-run` and `kubectl delete
+# --dry-run=client` publish and delete nothing — unless the `--dry-run` could be
+# the value of the option right before it (`git push -f origin main -o
+# --dry-run` really pushes), which asks instead.
 #
 # The entry does not have to name every word, and that is the part to read twice.
 # A shorter entry authorizes the wider thing on purpose: an entry for `git push`

@@ -138,9 +138,14 @@ struct SegmentWords {
 /// Split a segment into [`SegmentWords`]; `None` for an empty segment or one
 /// that is nothing but prefixes (`FOO=bar`, `(`).
 fn segment_words(segment: &str) -> Option<SegmentWords> {
-    let mut tokens = segment.split_whitespace();
+    words_of(segment.split_whitespace().map(clean_token))
+}
+
+/// [`segment_words`] over words that are already split and de-quoted — the
+/// blank split above, or a quote-aware lexer's argv.
+fn words_of(mut tokens: impl Iterator<Item = String>) -> Option<SegmentWords> {
     let program = loop {
-        let cleaned = clean_token(tokens.next()?);
+        let cleaned = tokens.next()?;
         // Assignments are tested on the raw token: the name before the first
         // `=` is what makes it one, and a value may legitimately be a path.
         if is_env_assignment(&cleaned) {
@@ -172,7 +177,7 @@ fn segment_words(segment: &str) -> Option<SegmentWords> {
     };
     Some(SegmentWords {
         program,
-        args: tokens.map(clean_token).collect(),
+        args: tokens.collect(),
     })
 }
 
@@ -193,6 +198,12 @@ fn program_of(segment: &str) -> Option<String> {
 /// `env npm publish` and `FOO=1 NPM publish` walked straight through.
 pub(super) fn program_and_args(segment: &str) -> Option<(String, Vec<String>)> {
     segment_words(segment).map(|words| (words.program, words.args))
+}
+
+/// [`program_and_args`] for one argv that a quote-aware lexer already split and
+/// de-quoted (`shell_lex::sh_commands`), read past the same prefixes.
+pub(super) fn program_and_args_of_argv(argv: Vec<String>) -> Option<(String, Vec<String>)> {
+    words_of(argv.into_iter()).map(|words| (words.program, words.args))
 }
 
 /// Positional/flag tokens after the program word, each with shell quoting
