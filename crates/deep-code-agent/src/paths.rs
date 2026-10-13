@@ -1,6 +1,6 @@
 //! Shared filesystem locations.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// The user's home directory, if the environment names one.
 ///
@@ -284,14 +284,24 @@ enum CacheLeaf {
 }
 
 impl CacheLeaf {
-    /// The path, once it exists — creating it when the parent is there to hold
-    /// it, and giving up when it is not.
+    /// The path, resolved and once it exists — creating it when the parent is
+    /// there to hold it, and giving up when it is not.
+    ///
+    /// Resolved HERE because the sandbox pins every granted root to the path it
+    /// was handed (`SandboxPolicy::resolved_writable_roots`): a cache root that
+    /// does not resolve to itself is not granted at all. The parent is resolved
+    /// (it lies outside every write root, so no sandboxed command can swap it)
+    /// and the leaf is taken by name — never followed. A symlink at the leaf
+    /// gets no grant: a sandboxed command holding this root may replace the
+    /// root's own entry with one (Seatbelt's `subpath` covers the entry itself),
+    /// and following it would grant wherever it points on the next call.
     fn ensure(self, path: PathBuf) -> Option<PathBuf> {
-        if path.exists() {
-            return Some(path);
-        }
-        if !path.parent().is_some_and(Path::exists) {
-            return None;
+        let parent = canonicalize(path.parent()?).ok()?;
+        let path = parent.join(path.file_name()?);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => return None,
+            Ok(_) => return Some(path),
+            Err(_) => {}
         }
         let created = match self {
             Self::Directory => std::fs::create_dir_all(&path).is_ok(),
@@ -398,16 +408,19 @@ mod tests {
     fn a_missing_cache_leaf_is_created_only_where_its_parent_exists() {
         let parent = tempfile::tempdir().unwrap();
 
-        let leaf = parent.path().join("_cacache");
+        // Handed back resolved: the sandbox grants only a root that resolves
+        // to itself.
+        let real = parent.path().canonicalize().unwrap();
+        let leaf = real.join("_cacache");
         assert_eq!(
-            CacheLeaf::Directory.ensure(leaf.clone()),
+            CacheLeaf::Directory.ensure(parent.path().join("_cacache")),
             Some(leaf.clone())
         );
         assert!(leaf.is_dir(), "the directory kind makes a directory");
 
         // …and the file kind must NOT: `create_dir_all` on cargo's advisory lock
         // would leave a directory where cargo expects a file.
-        let lock = parent.path().join(".package-cache");
+        let lock = real.join(".package-cache");
         assert_eq!(CacheLeaf::File.ensure(lock.clone()), Some(lock.clone()));
         assert!(lock.is_file(), "the file kind makes a file");
 
@@ -419,5 +432,18 @@ mod tests {
         let deep = parent.path().join("missing").join("_cacache");
         assert_eq!(CacheLeaf::Directory.ensure(deep.clone()), None);
         assert!(!deep.exists());
+    }
+
+    /// A symlink standing at a cache leaf is never followed into a grant: a
+    /// sandboxed command holding the cache root can replace the root's own
+    /// entry with one, and following it would grant its target on the next call.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_cache_leaf_is_not_granted() {
+        let parent = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let leaf = parent.path().join("_cacache");
+        std::os::unix::fs::symlink(elsewhere.path(), &leaf).unwrap();
+        assert_eq!(CacheLeaf::Directory.ensure(leaf), None);
     }
 }

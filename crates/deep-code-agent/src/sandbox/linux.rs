@@ -44,14 +44,17 @@
 //! unconfined (fail-closed, matching the spawn-site guard).
 
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use landlock::{
-    ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetCreated,
-    RulesetCreatedAttr, RulesetError, path_beneath_rules,
+    ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr,
+    RulesetCreated, RulesetCreatedAttr, RulesetError, path_beneath_rules,
 };
 use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch, sock_filter};
 
@@ -413,25 +416,95 @@ fn build_landlock(
     let device_access = access & !AccessFs::IoctlDev;
     // Pre-filter to existing paths so a missing /dev node can't fail the whole
     // ruleset build (path_beneath_rules errors on paths it can't open).
-    let existing = |paths: Vec<PathBuf>| -> Vec<PathBuf> {
-        paths.into_iter().filter(|path| path.exists()).collect()
-    };
-    let writable = existing(writable_paths(granted_roots, cwd, policy));
-    let devices = existing(device_paths());
+    let devices: Vec<PathBuf> = device_paths()
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect();
+    // `resolved_writable_roots` already includes the temp dir (shared with the
+    // macOS profile so the two backends cannot diverge on it again) and leaves
+    // out a pinned root that no longer resolves to itself.
+    let writable = policy.resolved_writable_roots(granted_roots, cwd);
 
     Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(access)
         .and_then(|ruleset| ruleset.create())
-        .and_then(|created| created.add_rules(path_beneath_rules(&writable, access)))
+        .and_then(|created| created.add_rules(pinned_path_rules(&writable, access)))
         .and_then(|created| created.add_rules(path_beneath_rules(&devices, device_access)))
         .map_err(|error| format!("landlock ruleset: {error}"))
 }
 
-fn writable_paths(granted_roots: &[PathBuf], cwd: &Path, policy: &SandboxPolicy) -> Vec<PathBuf> {
-    // `writable_roots` already includes the temp dir (shared with the macOS
-    // profile so the two backends cannot diverge on it again).
-    policy.writable_roots(granted_roots, cwd)
+/// Landlock rules for the resolved write roots, each opened WITHOUT following a
+/// symlink in any component ([`open_without_symlinks`]).
+///
+/// `path_beneath_rules` opens a rule's path the ordinary way, following every
+/// symlink, so the check that a pinned root still resolves to itself
+/// (`SandboxPolicy::resolved_writable_roots`) would only hold until the open:
+/// a sandboxed background job swapping a symlink in and out of a nested root's
+/// path could land it in between and have the ruleset grant the target. Opened
+/// symlink-free, the descriptor Landlock receives IS the directory that was
+/// checked, or there is no descriptor and no rule. A root that cannot be opened
+/// (missing, or replaced by a symlink) is skipped, as a missing path always was.
+///
+/// The access set narrows to the file rights for a root that is a file (cargo's
+/// `.package-cache` lock), exactly as `path_beneath_rules` does.
+fn pinned_path_rules(
+    paths: &[PathBuf],
+    access: BitFlags<AccessFs>,
+) -> impl Iterator<Item = Result<PathBeneath<OwnedFd>, RulesetError>> + '_ {
+    paths.iter().filter_map(move |path| {
+        let (fd, is_dir) = open_without_symlinks(path).ok()?;
+        let access = if is_dir {
+            access
+        } else {
+            access & AccessFs::from_file(LANDLOCK_ABI)
+        };
+        Some(Ok(PathBeneath::new(fd, access)))
+    })
+}
+
+/// Open `path` as an `O_PATH` descriptor without following a symlink in ANY
+/// component, plus whether it is a directory. `O_NOFOLLOW` alone covers only
+/// the last component, and the escape this closes swaps an intermediate one, so
+/// the path is walked one `openat` at a time from `/`. An intermediate symlink
+/// fails the next step (its descriptor is not a directory); a symlink at the
+/// end opens as the link itself and is refused by type. `path` must be
+/// absolute and resolved — `.`/`..` are refused rather than interpreted.
+fn open_without_symlinks(path: &Path) -> io::Result<(OwnedFd, bool)> {
+    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let open_at = |dir: libc::c_int, name: &CString| -> io::Result<OwnedFd> {
+        // SAFETY: `name` is a NUL-terminated string that outlives the call, and
+        // `dir` is `AT_FDCWD` or a descriptor this function owns and keeps open
+        // across the call.
+        let fd = unsafe { libc::openat(dir, name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by `openat`, so it is open and owned
+        // by nothing else.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    let refuse = |why: &str| io::Error::new(io::ErrorKind::InvalidInput, why.to_string());
+
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return Err(refuse("a write root must be absolute"));
+    }
+    let root = CString::new("/").map_err(|_| refuse("unreachable"))?;
+    let mut current = open_at(libc::AT_FDCWD, &root)?;
+    for component in components {
+        let Component::Normal(name) = component else {
+            return Err(refuse("a write root must be resolved"));
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| refuse("NUL in a write root"))?;
+        current = open_at(current.as_raw_fd(), &name)?;
+    }
+    let file = std::fs::File::from(current);
+    let file_type = file.metadata()?.file_type();
+    if file_type.is_symlink() {
+        return Err(refuse("a symlink stands where the write root was granted"));
+    }
+    Ok((OwnedFd::from(file), file_type.is_dir()))
 }
 
 /// `/dev` nodes a shell needs for redirections. Granted `device_access` (write
@@ -693,6 +766,41 @@ mod tests {
         .stderr(Stdio::piped())
         .output()
         .expect("spawn sandboxed command")
+    }
+
+    /// The ruleset gets a descriptor for exactly the resolved path, or none: a
+    /// symlink in ANY component — the last one, or a directory the root sits
+    /// in, which is the shape the nested-root swap takes — refuses the open
+    /// rather than following it to wherever it points.
+    #[test]
+    fn a_write_root_is_opened_without_following_any_symlink() {
+        let holder = tempfile::tempdir().unwrap();
+        let holder = holder.path().canonicalize().unwrap();
+        let real = holder.join("org").join("repo");
+        std::fs::create_dir_all(&real).unwrap();
+        let file = holder.join("lock");
+        std::fs::write(&file, "").unwrap();
+        let target = holder.join("target");
+        std::fs::create_dir_all(target.join("repo")).unwrap();
+
+        assert!(matches!(open_without_symlinks(&real), Ok((_, true))));
+        assert!(matches!(open_without_symlinks(&file), Ok((_, false))));
+
+        let leaf = holder.join("leaf");
+        std::os::unix::fs::symlink(&target, &leaf).unwrap();
+        assert!(
+            open_without_symlinks(&leaf).is_err(),
+            "a symlink at the end"
+        );
+
+        let via = holder.join("via");
+        std::os::unix::fs::symlink(&target, &via).unwrap();
+        assert!(
+            open_without_symlinks(&via.join("repo")).is_err(),
+            "a symlink in the middle"
+        );
+        assert!(open_without_symlinks(Path::new("relative/path")).is_err());
+        assert!(open_without_symlinks(&real.join("..")).is_err());
     }
 
     #[test]

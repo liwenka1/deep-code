@@ -122,6 +122,48 @@ impl SandboxPolicy {
             }
         }
     }
+
+    /// [`Self::writable_roots`] as one spawn grants them: each resolved to the
+    /// real path the kernel matches — except that a root handed over already
+    /// resolved is left out when it no longer resolves to itself.
+    ///
+    /// Two kinds of root are in that list, and they resolve differently. The
+    /// temp dirs are system paths behind system symlinks (`/tmp` is
+    /// `/private/tmp` on macOS), resolved here per spawn. Every other root — the
+    /// granted ones and the cwd — was resolved ONCE, when it was granted
+    /// (`WorkspacePolicy`, `resolve_cwd`, `paths::tool_cache_roots`), and is
+    /// pinned to that path.
+    ///
+    /// Re-resolving those per spawn was a write-fence escape. A sandboxed
+    /// command may write inside a granted root, so it can move the directory a
+    /// nested root sits in — workspace `/tmp/a/ws` with `/tmp` granted, or
+    /// `~/code/org/repo` beside `--add-dir ~/code` — and put a symlink where
+    /// the root was: `mv /tmp/a /tmp/a2 && mkdir /tmp/a && ln -s ~ /tmp/a/ws`.
+    /// The next spawn resolved the workspace to `$HOME` and granted that.
+    /// Locking each root's own entry against rename did not reach the
+    /// directories between two roots, and it stopped legitimate removals of a
+    /// cache root or a cwd root besides. A pinned root that resolves somewhere
+    /// else now is a directory that was moved or replaced since it was granted,
+    /// and it is not granted again under its old name.
+    ///
+    /// A root that does not resolve at all (it does not exist) passes through
+    /// as written, as it always did: nothing stands behind it to escape to, and
+    /// a symlink later planted in its place fails this test on the spawn after.
+    pub fn resolved_writable_roots(&self, granted: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
+        let mut resolved: Vec<PathBuf> = Vec::new();
+        for root in self.writable_roots(granted, cwd) {
+            let pinned = root == cwd || granted.contains(&root);
+            let real = match crate::paths::canonicalize(&root) {
+                Ok(real) if pinned && real != root => continue,
+                Ok(real) => real,
+                Err(_) => root,
+            };
+            if !resolved.contains(&real) {
+                resolved.push(real);
+            }
+        }
+        resolved
+    }
 }
 
 #[cfg(test)]
@@ -139,6 +181,42 @@ mod tests {
             matched_rule: None,
             network,
         }
+    }
+
+    /// A granted root (or the cwd) is pinned to the path it was granted at: one
+    /// a symlink now stands at is left out — under its old name and at the
+    /// symlink's target alike — while the system temp roots are still resolved
+    /// per spawn, and a root that does not exist passes through as written.
+    /// Both backends read this one list, so this is the pin for each of them.
+    #[cfg(unix)]
+    #[test]
+    fn a_pinned_root_that_resolves_elsewhere_now_is_left_out() {
+        let holder = tempfile::tempdir().unwrap();
+        let holder = holder.path().canonicalize().unwrap();
+        let real = holder.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let target = holder.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let swapped = holder.join("swapped");
+        std::os::unix::fs::symlink(&target, &swapped).unwrap();
+        let missing = holder.join("missing");
+
+        let policy = SandboxPolicy::workspace_write();
+        let roots = policy
+            .resolved_writable_roots(&[real.clone(), swapped.clone(), missing.clone()], &real);
+        assert!(roots.contains(&real), "{roots:?}");
+        assert!(roots.contains(&missing), "{roots:?}");
+        assert!(
+            !roots.contains(&swapped) && !roots.contains(&target),
+            "{roots:?}"
+        );
+        // A swapped cwd is pinned the same way.
+        let roots = policy.resolved_writable_roots(std::slice::from_ref(&real), &swapped);
+        assert!(!roots.contains(&target), "{roots:?}");
+        // The temp roots are resolved, not pinned: `/tmp` may be a system
+        // symlink (macOS) and is granted at its real path.
+        let tmp = crate::paths::canonicalize(Path::new("/tmp")).unwrap();
+        assert!(roots.contains(&tmp), "{roots:?}");
     }
 
     /// `/tmp` must be writable on unix even when the process temp dir is

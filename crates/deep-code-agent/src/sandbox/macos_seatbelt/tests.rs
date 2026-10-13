@@ -187,108 +187,147 @@ fn intermediate_credential_dirs_are_locked_against_rename() {
     );
 }
 
-/// Every writable root must have its OWN entry locked against rename/unlink,
-/// the same way the credential parents are. Without it a `subpath` grant also
-/// covers the root's directory entry, so a sandboxed command can swap the root
-/// for a symlink that the next spawn resolves into a wider write grant. Only
-/// unlink is denied, so ordinary writes beneath the root stay allowed.
+/// A granted root is pinned to the path it was granted at: one that resolves
+/// somewhere else now — a symlink stands where the directory was — gets no
+/// grant, neither under its old name nor at the symlink's target.
+#[cfg(unix)]
 #[test]
-fn every_write_root_entry_is_locked_against_rename() {
-    let ws = Path::new("/tmp/dc-ws");
-    let profile = compose_profile(&SandboxPolicy::workspace_write(), &single_root(ws), ws);
-    let text = profile.render();
+fn a_root_that_resolves_elsewhere_now_is_not_granted() {
+    let holder = tempfile::tempdir().unwrap();
+    let holder = holder.path().canonicalize().unwrap();
+    let target = holder.join("target");
+    std::fs::create_dir(&target).unwrap();
+    let swapped = holder.join("ws");
+    std::os::unix::fs::symlink(&target, &swapped).unwrap();
 
-    // Find every bound WRITE_ROOT_i and assert a matching KEEP_ROOT_i unlink
-    // deny for the same path, after the grant. There is at least one (the
-    // workspace), plus the temp dir(s).
-    let write_roots: Vec<(String, PathBuf)> = profile
+    let profile = compose_profile(
+        &SandboxPolicy::workspace_write(),
+        &single_root(&swapped),
+        &swapped,
+    );
+    let granted: Vec<&PathBuf> = profile
         .bindings
         .iter()
         .filter(|(name, _)| name.starts_with("WRITE_ROOT_"))
-        .cloned()
+        .map(|(_, path)| path)
         .collect();
     assert!(
-        !write_roots.is_empty(),
-        "there must be at least one write root: {:?}",
-        profile.bindings
-    );
-    for (write_name, path) in write_roots {
-        let index = write_name
-            .strip_prefix("WRITE_ROOT_")
-            .expect("name starts with WRITE_ROOT_");
-        let keep_name = format!("KEEP_ROOT_{index}");
-        let keep_path = profile
-            .bindings
+        !granted
             .iter()
-            .find(|(name, _)| *name == keep_name)
-            .map(|(_, p)| p.clone())
-            .unwrap_or_else(|| panic!("{keep_name} must be bound next to {write_name}"));
-        assert_eq!(
-            keep_path, path,
-            "{keep_name} must lock the same path {write_name} granted"
-        );
+            .any(|path| **path == target || **path == swapped),
+        "a swapped root must not be granted: {granted:?}"
+    );
+    // The roots that were not swapped still are: the temp dir and /tmp.
+    assert!(!granted.is_empty());
+}
+
+/// The escape end to end, against the real kernel, in both shapes: a nested
+/// root whose PARENT is moved away (`mv org org2 && mkdir org && ln -s <target>
+/// org/repo` — the shape the old per-root entry lock never reached, since the
+/// workspace sits inside the granted temp dir), and a root moved away and
+/// replaced itself. Each swap is allowed — the fence does not depend on
+/// refusing it — and the next spawn still cannot write the target.
+///
+/// The target sits outside every writable root (`$HOME`, not a temp dir, which
+/// is itself granted).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_root_swapped_for_a_symlink_does_not_move_the_write_grant() {
+    if crate::sandbox::require_backend_or_skip(is_available(), "Seatbelt") {
+        return;
+    }
+    let Some(home) = crate::paths::home_dir() else {
+        eprintln!("no home dir on this host; skipping");
+        return;
+    };
+    let target = home.join(format!(".deep-code-pin-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target);
+    std::fs::create_dir(&target).unwrap();
+    let policy = SandboxPolicy::workspace_write();
+    let outer = tempfile::tempdir().unwrap();
+    let outer = outer.path().canonicalize().unwrap();
+
+    let parent = outer.join("org");
+    let nested = parent.join("repo");
+    std::fs::create_dir_all(&nested).unwrap();
+    let alone = outer.join("alone");
+    std::fs::create_dir(&alone).unwrap();
+    let swaps = [
+        (
+            nested.clone(),
+            format!(
+                "mv {p} {p}2 && mkdir {p} && ln -s {t} {ws}",
+                p = parent.display(),
+                t = target.display(),
+                ws = nested.display()
+            ),
+        ),
+        (
+            alone.clone(),
+            format!(
+                "mv {ws} {ws}.parked && ln -s {t} {ws}",
+                ws = alone.display(),
+                t = target.display()
+            ),
+        ),
+    ];
+    let probe = target.join("pwned");
+    let mut outcomes = Vec::new();
+    for (ws, swap) in &swaps {
+        let swapped = wrap_shell_command(swap, ws, &single_root(ws), &policy)
+            .status()
+            .expect("sandbox-exec should launch")
+            .success();
+        let wrote = wrap_shell_command(
+            &format!("printf x > {}", probe.display()),
+            ws,
+            &single_root(ws),
+            &policy,
+        )
+        .status()
+        .expect("sandbox-exec should launch")
+        .success();
+        outcomes.push((swapped, wrote, probe.exists()));
+    }
+    let _ = std::fs::remove_dir_all(&target);
+    for (index, (swapped, wrote, leaked)) in outcomes.into_iter().enumerate() {
+        assert!(swapped, "swap {index} must run, or this pins nothing");
         assert!(
-            text.contains(&format!(
-                "(deny file-write-unlink (literal (param \"{keep_name}\")))"
-            )),
-            "the write root bound to {keep_name} must have its own entry locked: {text}"
-        );
-        // Last match wins, so the deny must come AFTER the grant it narrows.
-        let grant_at = text
-            .find(&format!(
-                "(allow file-write* (subpath (param \"{write_name}\")))"
-            ))
-            .expect("the grant is present");
-        let deny_at = text
-            .find(&format!(
-                "(deny file-write-unlink (literal (param \"{keep_name}\")))"
-            ))
-            .expect("the deny is present");
-        assert!(
-            deny_at > grant_at,
-            "the entry-lock deny must follow its write grant"
-        );
-        // Only unlink — the root does not become read-only.
-        assert!(
-            !text.contains(&format!(
-                "(deny file-write* (subpath (param \"{keep_name}\")))"
-            )),
-            "the write root must not become read-only: {text}"
+            !wrote && !leaked,
+            "after swap {index}, the old root's grant must not reach the target"
         );
     }
 }
 
-/// End-to-end: a sandboxed command cannot rename a granted root's own entry,
-/// which is step one of swapping it for a symlink the next spawn would resolve
-/// into a wider grant (the write-fence escape). Writes *inside* the root stay
-/// allowed — pinned by the mid-session-grant test above.
+/// Removing a root's own directory is ordinary work and must not be refused:
+/// `npm cache clean --force` removes the `_cacache` cache root, and a cleanup
+/// run from a subdirectory removes the cwd root. Both died on EPERM while each
+/// root's own entry was locked against unlink.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_granted_root_cannot_be_renamed_out_from_under_the_sandbox() {
+fn a_granted_root_can_be_removed() {
     if crate::sandbox::require_backend_or_skip(is_available(), "Seatbelt") {
         return;
     }
     let workspace = tempfile::tempdir().unwrap();
     let ws = workspace.path().canonicalize().unwrap();
-    let parked = ws.with_extension("parked");
-    let _ = std::fs::remove_dir_all(&parked);
+    let web = ws.join("web");
+    std::fs::create_dir(&web).unwrap();
+    let cache = ws.join("cache");
+    std::fs::create_dir(&cache).unwrap();
+    std::fs::write(cache.join("entry"), "x").unwrap();
 
     let status = wrap_shell_command(
-        &format!("mv {} {}", ws.display(), parked.display()),
-        &ws,
-        &single_root(&ws),
+        &format!("cd .. && rm -rf {} {}", web.display(), cache.display()),
+        &web,
+        &[ws.clone(), cache.clone()],
         &SandboxPolicy::workspace_write(),
     )
     .status()
     .expect("sandbox-exec should launch");
-
-    let moved = parked.exists();
-    // Restore before asserting, so a regression does not strand the tempdir.
-    let _ = std::fs::rename(&parked, &ws);
-    let _ = std::fs::remove_dir_all(&parked);
     assert!(
-        !status.success() && !moved,
-        "renaming the workspace root's own entry must be denied"
+        status.success() && !web.exists() && !cache.exists(),
+        "a cwd root and a granted root must be removable"
     );
 }
 
@@ -314,10 +353,11 @@ fn network_rules_appear_only_when_policy_grants_network() {
 fn distinct_cwd_receives_its_own_write_grant() {
     let workspace = tempfile::tempdir().unwrap();
     let elsewhere = tempfile::tempdir().unwrap();
+    // Resolved, as `WorkspacePolicy` and `resolve_cwd` hand them over.
     let profile = compose_profile(
         &SandboxPolicy::workspace_write(),
-        &single_root(workspace.path()),
-        elsewhere.path(),
+        &single_root(&workspace.path().canonicalize().unwrap()),
+        &elsewhere.path().canonicalize().unwrap(),
     );
     let write_roots: Vec<&str> = profile
         .bindings
@@ -345,14 +385,16 @@ fn extra_granted_root_receives_its_own_write_grant() {
     // profile — this is the kernel half of the multi-root feature; the
     // tool layer's WorkspacePolicy is the other half.
     let workspace = tempfile::tempdir().unwrap();
+    let workspace_canonical = workspace.path().canonicalize().unwrap();
     let extra = tempfile::tempdir().unwrap();
-    let granted = vec![workspace.path().to_path_buf(), extra.path().to_path_buf()];
+    let extra_canonical = extra.path().canonicalize().unwrap();
+    // Resolved, as `WorkspacePolicy` hands them over.
+    let granted = vec![workspace_canonical.clone(), extra_canonical.clone()];
     let profile = compose_profile(
         &SandboxPolicy::workspace_write(),
         &granted,
-        workspace.path(),
+        &workspace_canonical,
     );
-    let extra_canonical = extra.path().canonicalize().unwrap();
     assert!(
         profile
             .bindings
