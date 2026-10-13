@@ -4,7 +4,6 @@ use serde_json::Value;
 use super::command_shape;
 use super::shell_deny;
 use super::shell_lex;
-use super::shell_lex::INTERPRETERS;
 
 /// Whether every word of `needle` appears in `haystack`, in order.
 fn words_in_order(needle: &[&str], haystack: &[&str]) -> bool {
@@ -24,12 +23,16 @@ fn words_in_order(needle: &[&str], haystack: &[&str]) -> bool {
 /// nobody could answer it — `git commit -m "…⏎⏎npm publish now runs in CI"`
 /// was cut at the quoted newline into the command `npm publish now runs in CI`.
 ///
-/// A here-document body is stepped over unless something on the line runs its
-/// stdin ([`INTERPRETERS`], plus `ssh`): `git commit -F - <<EOF` hands git a
-/// message, but `sh <<EOF` and `cat <<EOF | sh` run the body, so for those the
-/// line is read again with every body as shell lines. One question for the
-/// whole line rather than per here-document — reading a body as commands can
-/// only ask more.
+/// A here-document body is stepped over only when EVERY command on the line is
+/// a known data sink ([`HEREDOC_DATA_SINKS`]): `git commit -F - <<EOF` hands
+/// git a message and `cat > release.sh <<EOF` writes a file, but `sh <<EOF`,
+/// `cat <<EOF | sh`, `ssh host <<EOF`, `kubectl exec -i pod -- sh <<EOF` and
+/// `timeout 600 bash <<EOF` run the body. Anything else on the line reads the
+/// line again with every body as shell lines. The question is asked of the
+/// list of known sinks, not of a list of known runners, because the runners
+/// arrive wrapped (`timeout`, `nice -n 10`, `docker exec -i app`) and a wrapper
+/// with options hides the program word from this reading; a runner list let
+/// those bodies run unread. Reading a body as commands can only ask more.
 ///
 /// A line the lexer does not model (an unclosed quote, `$'…'`, the `cmd`
 /// grammar) falls back to the quote-blind [`shell_lex::segments`], over the
@@ -50,9 +53,9 @@ fn irreversible_floor_commands(command: &str) -> Vec<(String, Vec<String>)> {
     };
     if let Some((commands, skipped_heredoc)) = read_as_sh(shell_lex::HeredocBodies::Skip) {
         let runs_a_body = skipped_heredoc
-            && commands
+            && !commands
                 .iter()
-                .any(|(program, _)| program == "ssh" || INTERPRETERS.contains(&program.as_str()));
+                .all(|(program, _)| HEREDOC_DATA_SINKS.contains(&program.as_str()));
         if !runs_a_body {
             return commands;
         }
@@ -68,7 +71,17 @@ fn irreversible_floor_commands(command: &str) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-/// Whether a token is a `--dry-run` that is actually ON, so the command only/// Whether a token is a `--dry-run` that is actually ON, so the command only
+/// Programs known not to run their stdin, so a line made only of these steps
+/// over its here-document bodies (see [`irreversible_floor_commands`]): the
+/// receivers an agent heredocs into (a commit message, a file, a PR body) and
+/// the commands routinely chained beside them. Not a list of everything safe —
+/// a program missing here only means its line's bodies are read.
+const HEREDOC_DATA_SINKS: &[&str] = &[
+    "cat", "tee", "git", "gh", "cd", "echo", "printf", "mkdir", "chmod", "touch", "cp", "mv", "ls",
+    "pwd", "grep", "head", "tail", "wc", "sort", "jq", "diff", "true",
+];
+
+/// Whether a token is a `--dry-run` that is actually ON, so the command only
 /// reports and is exempt. A bare `--dry-run`/`--dryrun` is on; a
 /// `--dry-run=VALUE` is on unless VALUE turns it back OFF — `npm publish
 /// --dry-run=false` really publishes and `kubectl delete --dry-run=none` really
@@ -93,60 +106,74 @@ fn is_dry_run_on(word: &str) -> bool {
 /// `git push --force origin main -o --dry-run` passes `--dry-run` to the remote
 /// as a push option, and `gh pr merge 12 --body --dry-run` makes it the merge
 /// body: both really push or merge, and reading the token alone exempted them.
-/// Telling an option's value from a flag in general is option-arity modelling
-/// (see [`irreversible_outward_words`]), so this asks the cheaper, fail-safe
-/// question instead: a dry run counts when the word before it cannot be an
-/// option waiting for a value — no word at all, an operand, an option that
-/// already carries its value (`--tag=next`), or a flag known to take none. An
-/// option this list does not know costs a question, never an unprompted run.
-fn is_dry_run(args: &[&str]) -> bool {
+/// So a `--dry-run` right after one of `program`'s options that takes the next
+/// word as its value ([`options_taking_a_value`]) is that value, not a dry run.
+///
+/// Asked of the value-taking options rather than of the flags known to take
+/// none, deliberately. A list of booleans fails toward asking, and what it
+/// asked about was the routine dry run — `cargo publish --locked --dry-run`,
+/// `npm publish --provenance --dry-run` — refused outright wherever nobody can
+/// answer, for a command that publishes nothing. A `--dry-run` hidden as an
+/// option's value is not a routine spelling; this floor is a consent gate over
+/// routine spellings (an obfuscation it cannot read walks past it), and the
+/// options listed are the ones where that spelling actually reaches a remote.
+fn is_dry_run(program: &str, args: &[&str]) -> bool {
+    let takes_a_value = options_taking_a_value(program);
     args.iter().enumerate().any(|(index, word)| {
         is_dry_run_on(word)
             && index
                 .checked_sub(1)
-                .map(|before| args[before])
-                .is_none_or(|before| {
-                    !before.starts_with('-')
-                        || before.contains('=')
-                        || TAKES_NO_VALUE.contains(&before)
-                })
+                .is_none_or(|before| !takes_a_value.contains(&args[before]))
     })
 }
 
-/// Flags, of the commands [`irreversible_outward_words`] reads, that take no
-/// value — so a `--dry-run` right after one is a dry run and not its value.
-/// The rules' own trigger flags are here, so `git push --force --dry-run` stays
-/// the check it is; anything missing only costs a question.
-const TAKES_NO_VALUE: &[&str] = &[
-    "-f",
-    "--force",
-    "--force-with-lease",
-    "--force-if-includes",
-    "--mirror",
-    "-d",
-    "--delete",
-    "--prune",
-    "-u",
-    "--set-upstream",
-    "--all",
-    "--tags",
-    "--follow-tags",
-    "--atomic",
-    "--no-verify",
-    "--porcelain",
-    "-q",
-    "--quiet",
-    "-v",
-    "--verbose",
-    "--recursive",
-    "--allow-dirty",
-    "--squash",
-    "--merge",
-    "--rebase",
-    "--auto",
-    "--admin",
-    "--wait",
-];
+/// The options of `program` (one the floor reads) that take the NEXT word as
+/// their value, where a value can be free text — so `--dry-run` there is text.
+fn options_taking_a_value(program: &str) -> &'static [&'static str] {
+    match program {
+        "git" => &["-o", "--push-option", "--repo", "--receive-pack", "--exec"],
+        "gh" => &[
+            "-b",
+            "--body",
+            "-F",
+            "--body-file",
+            "-t",
+            "--title",
+            "--subject",
+            "-n",
+            "--notes",
+            "--notes-file",
+            "-R",
+            "--repo",
+        ],
+        "npm" | "yarn" | "pnpm" | "bun" => &["--tag", "--otp", "--registry", "--access", "-w"],
+        "cargo" => &[
+            "--registry",
+            "--index",
+            "--token",
+            "-p",
+            "--package",
+            "--config",
+        ],
+        "kubectl" | "helm" => &["-n", "--namespace", "-l", "--selector", "--context"],
+        "terraform" => &["-var", "-var-file", "-target"],
+        "aws" => &["--profile", "--region", "--exclude", "--include"],
+        "twine" | "poetry" => &["-r", "--repository", "-u", "--username", "-p", "--password"],
+        _ => &[],
+    }
+}
+
+/// Whether an `aws s3 sync` with these operands writes into S3: some S3 URL
+/// that is not the first operand (the source). Fewer than two operands cannot
+/// be told apart, and read as writing.
+fn syncs_into_s3(args: &[&str]) -> bool {
+    let operands: Vec<&str> = args
+        .iter()
+        .copied()
+        .filter(|word| !word.starts_with('-'))
+        .collect();
+    operands.len() < 2 || operands[1..].iter().any(|word| word.starts_with("s3://"))
+}
 
 /// git's global options that take their value as the NEXT word, so the word
 /// after one is not the subcommand (`git -C push status` runs `status` in a
@@ -218,7 +245,7 @@ fn irreversible_outward_words(program: &str, args: &[&str]) -> Option<String> {
 
     // The dry-run exemption, read past off-spellings (`--dry-run=false`) and
     // past a `--dry-run` that is another option's value.
-    if is_dry_run(args) {
+    if is_dry_run(program, args) {
         return None;
     }
 
@@ -305,8 +332,13 @@ fn irreversible_outward_words(program: &str, args: &[&str]) -> Option<String> {
             (Some("s3"), Some("rb")) => Some("aws s3 rb".to_string()),
             // `sync --delete` removes every destination object the source lacks
             // — the standard deploy line, and a bucket wipe when the source is
-            // the wrong directory.
-            (Some("s3"), Some("sync")) if args.contains(&"--delete") => {
+            // the wrong directory. Outward only when the destination is S3: a
+            // download (`sync s3://b ./local --delete`) deletes local files the
+            // next sync can restore. Operands that cannot be told apart (an
+            // option value ahead of them) are read as writing.
+            (Some("s3"), Some("sync"))
+                if args.contains(&"--delete") && syncs_into_s3(&args[2..]) =>
+            {
                 Some("aws s3 sync --delete".to_string())
             }
             (Some("s3api"), Some("delete-object")) => Some("aws s3api delete-object".to_string()),

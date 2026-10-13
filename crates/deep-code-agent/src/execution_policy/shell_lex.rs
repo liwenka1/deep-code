@@ -187,13 +187,10 @@ pub(super) fn sh_commands_in(
     }
     let chars: Vec<char> = command.chars().collect();
     let mut lexer = ShLexer {
-        frames: vec![LexFrame::Commands {
-            closer: None,
-            argv: Vec::new(),
-            word: None,
-        }],
+        frames: vec![LexFrame::Commands(CommandFrame::new(None, false))],
         read: ShCommands::default(),
         pending: Vec::new(),
+        after_redirect: false,
     };
     let mut i = 0;
     while i < chars.len() {
@@ -211,16 +208,40 @@ pub(super) fn sh_commands_in(
 enum LexFrame {
     /// A run of commands: the line itself, `( … )`/`$( … )` (closed by `)`), or
     /// `` ` … ` `` (closed by a backtick).
-    Commands {
-        /// What closes this frame: `None` for the line itself.
-        closer: Option<char>,
-        /// The words of the command being read.
-        argv: Vec<String>,
-        /// The word being read, once anything (even `""`) has opened it.
-        word: Option<String>,
-    },
+    Commands(CommandFrame),
     /// Inside `"…"`. Its text belongs to the word of the `Commands` frame below.
     DoubleQuoted,
+}
+
+/// The state of one [`LexFrame::Commands`].
+struct CommandFrame {
+    /// What closes this frame: `None` for the line itself.
+    closer: Option<char>,
+    /// Whether the frame holds data, not commands: arithmetic (`(( … ))`,
+    /// `$(( … ))`), where `<<` is a shift rather than a here-document, and an
+    /// array (`name=( … )`). Its words are dropped when it closes; a
+    /// substitution inside one still opens a frame of commands of its own.
+    data: bool,
+    /// `case` statements open in this frame, so a pattern's `)` is not taken
+    /// for the frame's closer (`"$(case $x in a) npm publish;; esac)"`).
+    open_cases: u32,
+    /// The words of the command being read.
+    argv: Vec<String>,
+    /// The word being read, once anything (even `""`) has opened it.
+    word: Option<String>,
+}
+
+impl CommandFrame {
+    /// An empty frame that `closer` ends (`None`: the line itself).
+    fn new(closer: Option<char>, data: bool) -> Self {
+        Self {
+            closer,
+            data,
+            open_cases: 0,
+            argv: Vec::new(),
+            word: None,
+        }
+    }
 }
 
 /// A here-document waiting for the newline after which its body starts.
@@ -239,16 +260,19 @@ struct ShLexer {
     read: ShCommands,
     /// Here-documents opened on the current line, in order.
     pending: Vec<PendingHeredoc>,
+    /// Whether the last character added to the current word was an UNQUOTED
+    /// `<` or `>`, so a `&` right after it is a redirection's (`2>&1`) and not
+    /// a separator — a quoted one (`echo "<"& npm publish`) is just text.
+    after_redirect: bool,
 }
 
 impl ShLexer {
-    /// The innermost `Commands` frame's word and argv. A `DoubleQuoted` frame
-    /// only ever sits directly on a `Commands` one, so this looks at most one
-    /// frame down.
-    fn command_frame(&mut self) -> (&mut Vec<String>, &mut Option<String>) {
+    /// The innermost `Commands` frame. A `DoubleQuoted` frame only ever sits
+    /// directly on a `Commands` one, so this looks at most one frame down.
+    fn command_frame(&mut self) -> &mut CommandFrame {
         for frame in self.frames.iter_mut().rev() {
-            if let LexFrame::Commands { argv, word, .. } = frame {
-                return (argv, word);
+            if let LexFrame::Commands(frame) = frame {
+                return frame;
             }
         }
         unreachable!("the bottom frame is always a Commands frame")
@@ -256,8 +280,9 @@ impl ShLexer {
 
     /// Append `ch` to the word being read.
     fn push(&mut self, ch: char) {
+        self.after_redirect = false;
         self.command_frame()
-            .1
+            .word
             .get_or_insert_with(String::new)
             .push(ch);
     }
@@ -265,33 +290,40 @@ impl ShLexer {
     /// Make sure a word exists even if nothing is pushed into it (`""`, or a
     /// substitution standing for a whole word).
     fn touch_word(&mut self) {
-        self.command_frame().1.get_or_insert_with(String::new);
+        self.command_frame().word.get_or_insert_with(String::new);
     }
 
-    /// Close the word being read, if one is open.
+    /// Close the word being read, if one is open, counting the `case`
+    /// statements it opens or closes.
     fn end_word(&mut self) {
-        let (argv, word) = self.command_frame();
-        if let Some(word) = word.take() {
-            argv.push(word);
+        self.after_redirect = false;
+        let frame = self.command_frame();
+        if let Some(word) = frame.word.take() {
+            if frame.argv.is_empty() {
+                match word.as_str() {
+                    "case" => frame.open_cases += 1,
+                    "esac" => frame.open_cases = frame.open_cases.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            frame.argv.push(word);
         }
     }
 
     /// Close the command being read in the innermost frame and record it.
     fn end_command(&mut self) {
         self.end_word();
-        let argv = std::mem::take(self.command_frame().0);
-        if !argv.is_empty() {
+        let frame = self.command_frame();
+        let argv = std::mem::take(&mut frame.argv);
+        if !argv.is_empty() && !frame.data {
             self.read.commands.push(argv);
         }
     }
 
-    /// Open a frame of commands that `closer` ends.
-    fn open(&mut self, closer: char) {
-        self.frames.push(LexFrame::Commands {
-            closer: Some(closer),
-            argv: Vec::new(),
-            word: None,
-        });
+    /// Open a frame that `closer` ends.
+    fn open(&mut self, closer: char, data: bool) {
+        self.frames
+            .push(LexFrame::Commands(CommandFrame::new(Some(closer), data)));
     }
 
     /// End the innermost frame of commands at its closer.
@@ -305,9 +337,9 @@ impl ShLexer {
     fn step(&mut self, chars: &[char], i: usize, bodies: HeredocBodies) -> Option<usize> {
         let c = chars[i];
         let next = chars.get(i + 1).copied();
-        let closer = match self.frames.last() {
+        let (closer, data) = match self.frames.last() {
             Some(LexFrame::DoubleQuoted) => return Some(self.step_quoted(c, next, i)),
-            Some(LexFrame::Commands { closer, .. }) => *closer,
+            Some(LexFrame::Commands(frame)) => (frame.closer, frame.data),
             None => unreachable!("the bottom frame is never popped"),
         };
         match c {
@@ -331,13 +363,14 @@ impl ShLexer {
             }
             '"' => {
                 self.touch_word();
+                self.after_redirect = false;
                 self.frames.push(LexFrame::DoubleQuoted);
                 Some(i + 1)
             }
             '$' => match next {
                 Some('(') => {
                     self.touch_word();
-                    self.open(')');
+                    self.open(')', false);
                     Some(i + 2)
                 }
                 Some('\'' | '"') => None,
@@ -352,16 +385,34 @@ impl ShLexer {
             }
             '`' => {
                 self.touch_word();
-                self.open('`');
+                self.open('`', false);
+                Some(i + 1)
+            }
+            // The second `(` of `((` or `$((`: arithmetic, data.
+            '(' if i > 0 && chars[i - 1] == '(' => {
+                self.open(')', true);
+                Some(i + 1)
+            }
+            // `name=(…)`: an array's elements, data.
+            '(' if self
+                .command_frame()
+                .word
+                .as_deref()
+                .is_some_and(|word| word.ends_with('=')) =>
+            {
+                self.open(')', true);
                 Some(i + 1)
             }
             '(' => {
                 self.end_command();
-                self.open(')');
+                self.open(')', false);
                 Some(i + 1)
             }
             ')' => {
-                if closer == Some(')') {
+                // The word before it first: `esac)` closes the `case`, then
+                // this `)` closes the frame.
+                self.end_word();
+                if closer == Some(')') && self.command_frame().open_cases == 0 {
                     self.close();
                 } else {
                     // A `case` pattern's `)`: it ends what came before it.
@@ -369,7 +420,7 @@ impl ShLexer {
                 }
                 Some(i + 1)
             }
-            '#' if self.command_frame().1.is_none() => {
+            '#' if self.command_frame().word.is_none() => {
                 // A comment runs to the newline, which is left for the next
                 // step to end the command on.
                 let end = chars[i..]
@@ -386,12 +437,7 @@ impl ShLexer {
                 self.end_command();
                 Some(self.after_newline(chars, i + 1, bodies))
             }
-            '&' if self
-                .command_frame()
-                .1
-                .as_deref()
-                .is_some_and(|word| word.ends_with(['>', '<'])) =>
-            {
+            '&' if self.after_redirect => {
                 // `2>&1`, `>&2`: a redirection's `&`, not a separator.
                 self.push('&');
                 Some(i + 1)
@@ -405,7 +451,13 @@ impl ShLexer {
                 self.end_word();
                 Some(i + 3)
             }
-            '<' if next == Some('<') => self.heredoc(chars, i + 2),
+            // In arithmetic `<<` is a shift; read it as text.
+            '<' if next == Some('<') && !data => self.heredoc(chars, i + 2),
+            '<' | '>' => {
+                self.push(c);
+                self.after_redirect = true;
+                Some(i + 1)
+            }
             _ => {
                 self.push(c);
                 Some(i + 1)
@@ -437,11 +489,11 @@ impl ShLexer {
                 }
             },
             '$' if next == Some('(') => {
-                self.open(')');
+                self.open(')', false);
                 i + 2
             }
             '`' => {
-                self.open('`');
+                self.open('`', false);
                 i + 1
             }
             _ => {
@@ -2551,6 +2603,44 @@ mod tests {
         assert_eq!(
             sh_words("bash <<< 'npm publish'", Skip),
             Some(vec![argv(&["bash", "npm publish"])])
+        );
+    }
+
+    /// Contexts whose contents are not commands, or whose `)` is not a closer:
+    /// arithmetic (its `<<` is a shift — read as a here-document it swallowed
+    /// every line after it), an array, and a `case` pattern inside `$( … )`.
+    /// And a quoted `<` is text, so the `&` after it is a separator.
+    #[test]
+    fn sh_commands_reads_arithmetic_arrays_and_case_patterns_as_sh_does() {
+        use HeredocBodies::Skip;
+        assert_eq!(
+            sh_words("echo $((1<<2))\nnpm publish", Skip),
+            Some(vec![argv(&["echo", ""]), argv(&["npm", "publish"])])
+        );
+        assert_eq!(
+            sh_words("(( x = 1 << 4 ))\nls", Skip),
+            Some(vec![argv(&["ls"])])
+        );
+        assert_eq!(
+            sh_words("args=(git push --force) && ls", Skip),
+            Some(vec![argv(&["args="]), argv(&["ls"])])
+        );
+        assert_eq!(
+            sh_words("echo \"$(case $x in a) npm publish;; esac)\"", Skip),
+            Some(vec![
+                argv(&["case", "$x", "in", "a"]),
+                argv(&["npm", "publish"]),
+                argv(&["esac"]),
+                argv(&["echo", ""]),
+            ])
+        );
+        assert_eq!(
+            sh_words("echo \"<\"& npm publish", Skip),
+            Some(vec![argv(&["echo", "<"]), argv(&["npm", "publish"])])
+        );
+        assert_eq!(
+            sh_words("make 2>&1 >&2", Skip),
+            Some(vec![argv(&["make", "2>&1", ">&2"])])
         );
     }
 

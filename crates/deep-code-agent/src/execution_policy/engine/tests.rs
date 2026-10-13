@@ -1535,6 +1535,14 @@ fn a_mention_of_an_irreversible_command_is_not_one() {
         "git commit -m \"$(cat <<'EOF'\nci: move release\n\nnpm publish now runs in CI\nEOF\n)\"",
         "# later: npm publish\nnpm test",
         "echo 'run terraform apply by hand' > NOTES.md",
+        // A file written through a heredoc is data, and so is a commit message
+        // beside a `cd` — every command on these lines is a known data sink.
+        "cat > scripts/release.sh <<'EOF'\nnpm publish\nEOF",
+        "cd pkg && git commit -F - <<'EOF'\nci: move release\n\nnpm publish now runs in CI\nEOF",
+        // A bash array's elements are words, not a subshell.
+        "args=(git push --force) && echo done",
+        // Arithmetic's `<<` is a shift, not a here-document.
+        "echo $((1<<2))",
     ] {
         assert!(!floor_gated(&policy, command), "{command:?}");
     }
@@ -1557,6 +1565,20 @@ fn what_the_shell_runs_inside_a_line_still_needs_a_human() {
         "cat <<'EOF' | sh\ngit push --force origin main\nEOF",
         "ssh deploy@host <<'EOF'\nkubectl delete ns prod\nEOF",
         "bash -c \"$(cat <<'EOF'\nterraform apply -auto-approve\nEOF\n)\"",
+        // Runners that arrive wrapped: the program word this reading sees is
+        // `600`, `-n` or `exec`, never the interpreter. The line is read with
+        // its body as commands because NOT every command on it is a data sink.
+        "timeout 600 bash <<'EOF'\nnpm publish\nEOF",
+        "nice -n 10 bash <<'EOF'\nnpm publish\nEOF",
+        "docker exec -i app sh <<'EOF'\nnpm publish\nEOF",
+        "kubectl exec -i pod -- sh <<'EOF'\nkubectl delete ns prod\nEOF",
+        // An arithmetic `<<` is no here-document, so the line after it is read.
+        "echo $((1<<2))\nnpm publish",
+        "(( x = 1 << 4 ))\ngit push --force origin main",
+        // A quoted `<` is text, so the `&` after it backgrounds a command.
+        "echo \"<\"& npm publish",
+        // A `case` pattern's `)` does not close the substitution it sits in.
+        "echo \"$(case $x in a) npm publish;; esac)\"",
     ] {
         assert!(floor_gated(&policy, command), "{command:?}");
     }
@@ -1580,6 +1602,12 @@ fn a_dry_run_that_is_an_options_value_is_not_exempt() {
         "git push --force --dry-run origin main",
         "npm publish --access public --dry-run",
         "aws s3 rm s3://bucket/key --recursive --dryrun",
+        // A flag this floor knows nothing about is not a value-taking option,
+        // so the routine dry run after it stays a dry run.
+        "cargo publish --locked --dry-run",
+        "cargo publish --all-features --dry-run",
+        "npm publish --provenance --dry-run",
+        "npm publish --ignore-scripts --dry-run",
     ] {
         assert!(!floor_gated(&policy, command), "{command:?}");
     }
@@ -1600,6 +1628,11 @@ fn routine_remote_deletions_need_a_human() {
         assert!(floor_gated(&policy, command), "{command:?}");
     }
     assert!(!floor_gated(&policy, "aws s3 sync ./dist s3://prod-assets"));
+    // A download deletes only local files, which the next sync restores.
+    assert!(!floor_gated(
+        &policy,
+        "aws s3 sync s3://prod-assets ./mirror --delete"
+    ));
 }
 
 /// An entry's own words authorize a command only when the entry starts with
