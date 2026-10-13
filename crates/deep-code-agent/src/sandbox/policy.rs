@@ -201,38 +201,81 @@ fn resolve_pinned_root(root: &Path) -> Option<PathBuf> {
     }
 }
 
-/// A system temp root, resolved — or `None` when a symlink on its path is one
-/// this user could have planted.
+/// A system temp root, resolved by following only the symlinks root owns — or
+/// `None` when its path runs through one this user could have planted.
 ///
 /// A system root is MEANT to be reached through symlinks (`/tmp`, `/var` on
 /// macOS), so "resolves to itself" is no test for it. What a sandboxed command
 /// can put in its path is a symlink it owns; the system's own are owned by
-/// root. So every component of the spelled path is checked without following
-/// it, and one that is a symlink owned by anyone but root refuses the root. The
-/// cost is a `$TMPDIR` the user made a symlink themselves, which is
+/// root. The cost is a `$TMPDIR` the user made a symlink themselves, which is
 /// indistinguishable from a planted one and is no longer granted.
+///
+/// Resolved here, one component at a time, rather than checked and then
+/// handed to `canonicalize`: a sandboxed background job swapping a link in and
+/// out could land it between a check and a second resolution. The path
+/// returned is built from the very observations that were checked, so it names
+/// what was a real directory when looked at; a symlink swapped in afterwards is
+/// matched by nothing (Seatbelt compares real paths, Landlock opens it without
+/// following). A tail that does not exist is kept as written, as before.
+#[cfg(unix)]
 fn resolve_system_root(root: &Path) -> Option<PathBuf> {
-    if has_symlink_not_owned_by_root(root) {
+    use std::ffi::OsString;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    /// More hops than any system spelling takes, fewer than a loop needs.
+    const MAX_LINKS: usize = 40;
+    // A stack, so a path's first component is pushed last.
+    let push_components = |rest: &mut Vec<OsString>, path: &Path| {
+        for component in path.components().rev() {
+            match component {
+                Component::Normal(name) => rest.push(name.to_os_string()),
+                Component::ParentDir => rest.push(OsString::from("..")),
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+            }
+        }
+    };
+    if !root.is_absolute() {
         return None;
     }
-    Some(crate::paths::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()))
+    let mut rest: Vec<OsString> = Vec::new();
+    push_components(&mut rest, root);
+    let mut resolved = PathBuf::from("/");
+    let mut links = 0;
+    while let Some(name) = rest.pop() {
+        if name == ".." {
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&name);
+        let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
+            resolved = candidate;
+            while let Some(name) = rest.pop() {
+                resolved.push(name);
+            }
+            return Some(resolved);
+        };
+        if !meta.file_type().is_symlink() {
+            resolved = candidate;
+            continue;
+        }
+        links += 1;
+        if meta.uid() != 0 || links > MAX_LINKS {
+            return None;
+        }
+        let target = std::fs::read_link(&candidate).ok()?;
+        if target.is_absolute() {
+            resolved = PathBuf::from("/");
+        }
+        push_components(&mut rest, &target);
+    }
+    Some(resolved)
 }
 
-#[cfg(unix)]
-fn has_symlink_not_owned_by_root(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let mut prefix = PathBuf::new();
-    path.components().any(|component| {
-        prefix.push(component);
-        std::fs::symlink_metadata(&prefix)
-            .is_ok_and(|meta| meta.file_type().is_symlink() && meta.uid() != 0)
-    })
-}
-
-/// No backend confines writes here, so nothing is granted by path.
+/// No backend confines writes by path here; resolved the ordinary way.
 #[cfg(not(unix))]
-fn has_symlink_not_owned_by_root(_path: &Path) -> bool {
-    false
+fn resolve_system_root(root: &Path) -> Option<PathBuf> {
+    Some(crate::paths::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()))
 }
 
 #[cfg(test)]
@@ -327,6 +370,13 @@ mod tests {
         assert!(roots.contains(&real), "{roots:?}");
         let tmp = crate::paths::canonicalize(Path::new("/tmp")).unwrap();
         assert!(roots.contains(&tmp), "{roots:?}");
+        // Resolved by hand, a system root lands exactly where `canonicalize`
+        // does when nothing was planted.
+        let temp = std::env::temp_dir();
+        assert_eq!(
+            resolve_system_root(&temp),
+            Some(crate::paths::canonicalize(&temp).unwrap())
+        );
     }
 
     /// `/tmp` must be writable on unix even when the process temp dir is
