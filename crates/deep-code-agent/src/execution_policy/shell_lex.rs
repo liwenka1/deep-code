@@ -87,6 +87,45 @@ pub(super) fn segments(command: &str) -> Vec<&str> {
         .collect()
 }
 
+/// `line` with every `\`-newline removed, the way `sh` joins a continued line
+/// before it reads a single word of it — or `None` when there is nothing to
+/// join (no continuation, or a grammar where `\` is not an escape).
+///
+/// [`segments`] cuts at every newline, so a continued line came apart into
+/// pieces no rule could read: `rm \⏎ -rf /` presented the segment `-rf /`,
+/// whose program word is a flag, while the shell ran `rm -rf /`. A line is
+/// still read as written as well — this is one MORE reading, never a
+/// replacement (see `shell_deny::readings_of`) — because the join is
+/// quote-blind like the split: inside `'…'` or a `#` comment a backslash does
+/// not continue the line, and reading only the joined text there would fold
+/// the next real command into the comment. Read beside the original, a wrong
+/// join can only add a finding, never hide one.
+///
+/// The backslash run is consumed pairwise, so `\\⏎` — an escaped backslash
+/// and then a real line break — is left alone, exactly as `sh` leaves it.
+pub(super) fn joined_continuations(grammar: Grammar, line: &str) -> Option<String> {
+    if !grammar.backslash_escapes || !line.contains("\\\n") {
+        return None;
+    }
+    let mut joined = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            joined.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\n') => {}
+            Some(next) => {
+                joined.push('\\');
+                joined.push(next);
+            }
+            None => joined.push('\\'),
+        }
+    }
+    Some(joined)
+}
+
 /// Words the shell consumes ahead of a segment's program word: control-flow
 /// reserved words (`if true; then rm -rf /; fi` lexes to a segment starting
 /// with `then`), the `!` negation, `time`, and the transparent wrappers whose

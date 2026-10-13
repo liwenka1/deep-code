@@ -52,7 +52,8 @@ use serde::{Deserialize, Serialize};
 
 use super::shell_lex::{
     Grammar, HOST, INTERPRETERS, PREFIX_WORDS, SEGMENT_SEPARATORS, basename_lower, blanks_for,
-    blanks_for_outside_flags, clean_token, operand_leaves_cwd, parse_unattended, segments,
+    blanks_for_outside_flags, clean_token, joined_continuations, operand_leaves_cwd,
+    parse_unattended, segments,
 };
 use crate::i18n::TextId;
 
@@ -612,6 +613,11 @@ pub fn builtin_deny(command: &str) -> Option<DenyReason> {
 ///
 /// The stages:
 ///
+/// * **Line continuation** — `sh` deletes every `\`-newline before it reads a
+///   word, and [`segments`] cuts at every newline, so `rm \⏎ -rf /` came apart
+///   into a segment whose program word was `-rf` ([`joined_continuations`]).
+///   A seed beside the line as written, not a replacement, because the join is
+///   quote-blind.
 /// * **Brace expansion** — the one word expansion that rewrites the program
 ///   word itself. `rm{,} -rf /` runs `rm rm -rf /` and `{rm,-rf,/}` runs
 ///   `rm -rf /`; each presented a program word (`rm{,}`, `}`) that matched no
@@ -622,7 +628,7 @@ pub fn builtin_deny(command: &str) -> Option<DenyReason> {
 ///   `del,/f/s/q,C:\*` and `del=/f/s/q C:\*` are one opaque word to a floor
 ///   that splits on blanks, and a drive wipe to `cmd`.
 ///
-/// Closed under the rewritings, seeded by the expansion. The stages used to be
+/// Closed under the rewritings, seeded by the join and the expansion. The stages used to be
 /// applied one at a time by different halves of the floor, and every gap that
 /// opened was the same shape: a spelling that mixed two of them
 /// (`del,/f;/s/q,C:\*` — `del /f /s /q C:\*` to `cmd`) was read by neither
@@ -679,8 +685,16 @@ fn readings_of(line: &str) -> Vec<Cow<'_, str>> {
 /// end-to-end verdicts stay pinned separately.
 fn readings_of_in(grammar: Grammar, line: &str) -> Vec<Cow<'_, str>> {
     let mut readings: Vec<Cow<'_, str>> = vec![Cow::Borrowed(line)];
-    if line.contains('{') {
-        push_reading(&mut readings, brace_expanded_line(line));
+    if let Some(joined) = joined_continuations(grammar, line) {
+        push_reading(&mut readings, joined);
+    }
+    // Each seed is brace-expanded, the joined one included: `sh` joins a
+    // continued line before it expands a word of it.
+    for seed in 0..readings.len() {
+        if readings[seed].contains('{') {
+            let expanded = brace_expanded_line(&readings[seed]);
+            push_reading(&mut readings, expanded);
+        }
     }
     let normalizations: [fn(Grammar, &str) -> Option<String>; 2] =
         [blanks_for, blanks_for_outside_flags];
