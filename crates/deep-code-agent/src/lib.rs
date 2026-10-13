@@ -81,7 +81,7 @@ pub use image::{
 };
 // Already reachable through `AgentRuntime::session_messages`'s signature;
 // exported so consumers (the headless driver) can actually name them.
-pub use message::{Message, Role};
+pub use message::{Message, Role, last_assistant_text};
 pub use model::{
     ChatRequest, FunctionCallDelta, ToolCallDelta, ToolCallFunctionPayload, ToolCallPayload, Usage,
 };

@@ -141,6 +141,24 @@ impl Message {
     }
 }
 
+/// The last assistant message with visible content, trailing whitespace
+/// trimmed — `None` when no assistant turn said anything.
+///
+/// The last NON-EMPTY one, not the last one: a turn that ends on a tool call,
+/// at a step cap, or with a reasoning-only reply leaves an empty assistant
+/// message behind, and taking the last message before filtering emptiness
+/// threw away whatever was said before it. One definition for every reader of
+/// "what did the model last say" — the headless answer, a sub-agent's partial
+/// hand-off — which had grown three copies, one of them with that bug.
+#[must_use]
+pub fn last_assistant_text(messages: &[Message]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::Assistant && !message.content.trim().is_empty())
+        .map(|message| message.content.trim_end().to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Wire form
 // ---------------------------------------------------------------------------

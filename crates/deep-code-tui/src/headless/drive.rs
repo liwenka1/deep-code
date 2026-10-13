@@ -8,8 +8,7 @@
 //! permission mode, `approval.auto_allow` — never by a headless-only bypass.
 
 use deep_code_agent::{
-    AgentRuntime, ApprovalDecision, Message, Role, RuntimeEvent, TurnTelemetry, Usage,
-    unattended_denial_note,
+    AgentRuntime, ApprovalDecision, RuntimeEvent, TurnTelemetry, Usage, unattended_denial_note,
 };
 
 /// How the driven turn ended.
@@ -108,23 +107,12 @@ pub(crate) async fn drive_to_completion(
     outcome
 }
 
-/// The turn's answer: the last assistant message with visible content.
-/// Reading the session (not concatenating deltas) keeps narration the model
-/// emitted between tool calls out of the printed result.
-pub(crate) fn final_assistant_text(messages: &[Message]) -> Option<String> {
-    messages
-        .iter()
-        .rev()
-        .find(|message| message.role == Role::Assistant && !message.content.trim().is_empty())
-        .map(|message| message.content.trim_end().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use deep_code_agent::{
-        AgentEvent, AgentResult, ChatRequest, FunctionCallDelta, MockEchoTool, ToolCallDelta,
-        ToolRegistry,
+        AgentEvent, AgentResult, ChatRequest, FunctionCallDelta, Message, MockEchoTool, Role,
+        ToolCallDelta, ToolRegistry,
     };
     use std::sync::Mutex as StdMutex;
 
@@ -219,7 +207,7 @@ mod tests {
         assert_eq!(outcome.denied_approvals, 0);
         let messages = runtime.session_messages().await;
         assert_eq!(
-            final_assistant_text(&messages).as_deref(),
+            deep_code_agent::last_assistant_text(&messages).as_deref(),
             Some("final answer")
         );
     }
@@ -249,7 +237,10 @@ mod tests {
         assert_eq!(outcome.denied_approvals, 1);
         assert_eq!(outcome.status, DriveStatus::Finished);
         let messages = runtime.session_messages().await;
-        assert_eq!(final_assistant_text(&messages).as_deref(), Some("done"));
+        assert_eq!(
+            deep_code_agent::last_assistant_text(&messages).as_deref(),
+            Some("done")
+        );
     }
 
     /// The auto-denial the model reads must not claim a human refused it.
@@ -302,9 +293,12 @@ mod tests {
             Message::assistant_turn("the answer\n", "", Vec::new()),
         ];
         assert_eq!(
-            final_assistant_text(&messages).as_deref(),
+            deep_code_agent::last_assistant_text(&messages).as_deref(),
             Some("the answer")
         );
-        assert_eq!(final_assistant_text(&[Message::user("x")]), None);
+        assert_eq!(
+            deep_code_agent::last_assistant_text(&[Message::user("x")]),
+            None
+        );
     }
 }

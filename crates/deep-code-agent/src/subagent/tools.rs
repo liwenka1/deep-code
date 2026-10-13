@@ -5,6 +5,8 @@
 //! from issuing several `agent` calls in a single assistant turn, not from
 //! detached sessions; there is nothing for the model to poll or clean up.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -273,9 +275,23 @@ impl Tool for AgentTool {
                 });
             }
         };
-        let run = std::panic::AssertUnwindSafe(async move {
-            runtime.begin_turn(task).await;
-            run_subagent(runtime, DEFAULT_MAX_STEPS, role, network, progress).await
+        // The child's finished-call count as it grows, read when the grace
+        // window below elapses with no `(steps, …)` from the child.
+        let steps_seen = Arc::new(AtomicU32::new(0));
+        let run = std::panic::AssertUnwindSafe({
+            let steps_seen = Arc::clone(&steps_seen);
+            async move {
+                runtime.begin_turn(task).await;
+                run_subagent(
+                    runtime,
+                    DEFAULT_MAX_STEPS,
+                    role,
+                    network,
+                    steps_seen,
+                    progress,
+                )
+                .await
+            }
         })
         .catch_unwind();
         tokio::pin!(run);
@@ -313,7 +329,7 @@ impl Tool for AgentTool {
                         Err((steps, _inner_reason, partial)) => {
                             let partial = match partial {
                                 Some(report) => Some(report),
-                                None => crate::subagent::runner::partial_report_from(
+                                None => crate::message::last_assistant_text(
                                     &cancel_handle.session_messages().await,
                                 ),
                             };
@@ -321,11 +337,12 @@ impl Tool for AgentTool {
                         }
                     },
                     // Grace window elapsed: no (steps, …) from the child, so
-                    // recover the partial report from its session messages.
+                    // read its step count from the mirror and recover the
+                    // partial report from its session messages.
                     Err(_) => Err((
-                        0,
+                        steps_seen.load(Ordering::Relaxed),
                         reason,
-                        crate::subagent::runner::partial_report_from(
+                        crate::message::last_assistant_text(
                             &cancel_handle.session_messages().await,
                         ),
                     )),

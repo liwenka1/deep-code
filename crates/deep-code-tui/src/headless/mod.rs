@@ -193,11 +193,12 @@ pub async fn run_print(args: PrintArgs) -> i32 {
         emit("error", message);
     }
 
-    // The answer is read from the session, not reassembled from deltas:
-    // the last assistant message is authoritative and skips mid-turn
-    // narration (see `drive::final_assistant_text`).
+    // The answer is read from the session, not reassembled from deltas: the
+    // last assistant message with visible content is authoritative and keeps
+    // the narration the model emitted between tool calls out of the result
+    // (see `deep_code_agent::last_assistant_text`).
     let result = if matches!(outcome.status, DriveStatus::Finished) {
-        drive::final_assistant_text(&handle.session_messages().await).unwrap_or_default()
+        deep_code_agent::last_assistant_text(&handle.session_messages().await).unwrap_or_default()
     } else {
         String::new()
     };

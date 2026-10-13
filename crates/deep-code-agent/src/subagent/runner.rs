@@ -1,24 +1,9 @@
-use crate::message::{Message, Role};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use crate::message::{Role, last_assistant_text};
 use crate::runtime::{AgentRuntime, RuntimeEvent};
 use crate::subagent::roles::SubAgentRole;
-
-/// The child's last substantive words, for a run that ends before the report
-/// contract was reached (step cap, wall-clock timeout, cancel).
-///
-/// Finds the last NON-EMPTY assistant message, not merely the last assistant
-/// message: at the step cap the final assistant turn is the empty content
-/// carrier for the tool call that tripped the cap, so filtering emptiness only
-/// *after* taking the last message returned `None` and threw away the findings
-/// the child had written one or two turns earlier. This is the lookup
-/// `headless::drive::final_assistant_text` already does correctly; shared so the
-/// step-cap arm here and the wall-clock arm in `subagent::tools` agree.
-pub(super) fn partial_report_from(messages: &[Message]) -> Option<String> {
-    messages
-        .iter()
-        .rev()
-        .find(|message| message.role == Role::Assistant && !message.content.trim().is_empty())
-        .map(|message| message.content.trim().to_string())
-}
 
 /// Drive a child runtime's turn loop to completion and return its final
 /// report. Cancellation is *not* observed here via a side token — the caller
@@ -30,6 +15,12 @@ pub(super) fn partial_report_from(messages: &[Message]) -> Option<String> {
 /// "you have no network" denial from a plain allow-list denial, so the child
 /// is pointed at the recovery that actually applies.
 ///
+/// `steps_seen` mirrors the finished-call count as it grows, for a caller that
+/// stops waiting before this returns: the wall-clock arm cancels the child and
+/// gives it a grace window to unwind, and when the window elapses it has no
+/// `(steps, …)` from here — without the mirror it recorded `0` steps for a
+/// child that may have worked for an hour.
+///
 /// `on_progress` receives one short line per child tool call as it starts;
 /// the parent's `agent` tool forwards these through `cx.update`, so a
 /// minutes-long child shows live activity in the parent UI instead of a
@@ -39,6 +30,7 @@ pub async fn run_subagent(
     max_steps: u32,
     role: SubAgentRole,
     network: bool,
+    steps_seen: Arc<AtomicU32>,
     on_progress: impl Fn(String),
 ) -> Result<(String, u32), (u32, String, Option<String>)> {
     let started = std::time::Instant::now();
@@ -46,8 +38,10 @@ pub async fn run_subagent(
     let mut budget_notice_sent = false;
     let mut rx = runtime.drive_turn().await;
 
+    /// The child's last substantive words, for a run that ends before the
+    /// report contract was reached (step cap, a dead stream, an error).
     async fn partial_report(runtime: &AgentRuntime) -> Option<String> {
-        partial_report_from(&runtime.session_messages().await)
+        last_assistant_text(&runtime.session_messages().await)
     }
 
     loop {
@@ -97,23 +91,25 @@ pub async fn run_subagent(
         match event {
             RuntimeEvent::TurnFinished { .. } => {
                 let messages = runtime.session_messages().await;
-                let text = messages
+                // The report contract is the turn's FINAL assistant message.
+                // An empty one (a reasoning-only reply, a stop right after a
+                // tool call) is no report and fails rather than handing the
+                // parent an empty "success" — but what the child said before it
+                // still goes back as the partial hand-off, as on every other
+                // failure arm. Returning `None` here threw those findings away.
+                let report = messages
                     .iter()
                     .rev()
-                    .find(|message| matches!(message.role, crate::message::Role::Assistant))
-                    .map(|message| message.content.clone())
-                    .unwrap_or_default();
-                if text.trim().is_empty() {
-                    // The turn ended without an assistant report (e.g. the model
-                    // stopped on a tool call). Surface it as a failure rather
-                    // than handing the parent an empty "success".
-                    return Err((
+                    .find(|message| message.role == Role::Assistant)
+                    .filter(|message| !message.content.trim().is_empty());
+                return match report {
+                    Some(report) => Ok((report.content.clone(), steps)),
+                    None => Err((
                         steps,
                         "sub-agent finished without a report".to_string(),
-                        None,
-                    ));
-                }
-                return Ok((text, steps));
+                        last_assistant_text(&messages),
+                    )),
+                };
             }
             RuntimeEvent::ApprovalRequired { request, .. } => {
                 let (decision, denial_note) =
@@ -144,6 +140,7 @@ pub async fn run_subagent(
             }
             RuntimeEvent::ToolCallFinished { .. } => {
                 steps += 1;
+                steps_seen.store(steps, Ordering::Relaxed);
             }
             RuntimeEvent::TurnStarted { .. }
             | RuntimeEvent::AssistantDelta { .. }
@@ -170,8 +167,96 @@ pub async fn run_subagent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::{AgentEventStream, LlmClient};
+    use crate::error::AgentResult;
+    use crate::event::AgentEvent;
     use crate::message::Message;
-    use crate::model::{ToolCallFunctionPayload, ToolCallPayload};
+    use crate::model::{
+        ChatRequest, FunctionCallDelta, ToolCallDelta, ToolCallFunctionPayload, ToolCallPayload,
+    };
+    use crate::tool::{MockEchoTool, ToolRegistry};
+
+    /// Request 1 states findings and calls a tool; every later request answers
+    /// with nothing at all — the empty final message a reasoning-only reply or a
+    /// stop right after a tool call leaves behind.
+    #[derive(Default)]
+    struct FindingsThenSilence {
+        requests: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for FindingsThenSilence {
+        fn provider_name(&self) -> &'static str {
+            "findings-then-silence"
+        }
+
+        fn model(&self) -> &str {
+            "findings-then-silence"
+        }
+
+        async fn stream_chat(&self, _request: ChatRequest) -> AgentResult<AgentEventStream> {
+            let first = {
+                let mut requests = self.requests.lock().unwrap();
+                *requests += 1;
+                *requests == 1
+            };
+            let mut events = Vec::new();
+            if first {
+                events.push(AgentEvent::TextDelta {
+                    text: "Found it: the race is in foo.rs:42.".to_string(),
+                });
+                events.push(AgentEvent::ToolCallDelta {
+                    delta: ToolCallDelta {
+                        index: Some(0),
+                        id: Some("call_1".to_string()),
+                        call_type: Some("function".to_string()),
+                        function: Some(FunctionCallDelta {
+                            name: Some(MockEchoTool::NAME.to_string()),
+                            arguments: Some(r#"{"message":"check"}"#.to_string()),
+                        }),
+                    },
+                });
+            }
+            events.push(AgentEvent::Done { usage: None });
+            Ok(Box::pin(futures_util::stream::iter(
+                events.into_iter().map(Ok),
+            )))
+        }
+    }
+
+    /// A turn that FINISHES on an empty assistant message is no report, but the
+    /// findings the child wrote before it are the partial hand-off — the
+    /// finished arm returned `None` there, the very bug the other failure arms
+    /// had already been fixed for. The step mirror the wall-clock arm reads
+    /// tracks the count this returns.
+    #[tokio::test]
+    async fn a_turn_ending_on_an_empty_message_hands_back_what_came_before() {
+        let runtime = AgentRuntime::new(
+            FindingsThenSilence::default(),
+            ToolRegistry::with_mock_tools(),
+        );
+        runtime.begin_turn("find the race").await;
+        let steps_seen = Arc::new(AtomicU32::new(0));
+        let outcome = run_subagent(
+            runtime,
+            10,
+            SubAgentRole::Explore,
+            false,
+            Arc::clone(&steps_seen),
+            |_| {},
+        )
+        .await;
+        let Err((steps, reason, partial)) = outcome else {
+            panic!("an empty final message is no report: {outcome:?}");
+        };
+        assert_eq!(reason, "sub-agent finished without a report");
+        assert_eq!(
+            partial.as_deref(),
+            Some("Found it: the race is in foo.rs:42.")
+        );
+        assert_eq!(steps, 1);
+        assert_eq!(steps_seen.load(Ordering::Relaxed), steps);
+    }
 
     /// At the step cap the child's final assistant turn is the empty content
     /// carrier for the tool call that tripped the cap, so the hand-off must look
@@ -198,7 +283,7 @@ mod tests {
             Message::tool("call_1", "some output"),
         ];
         assert_eq!(
-            partial_report_from(&messages).as_deref(),
+            last_assistant_text(&messages).as_deref(),
             Some("Here is what I found: the race is in foo.rs."),
             "the last non-empty assistant turn is the hand-off, not the empty carrier"
         );
@@ -209,15 +294,15 @@ mod tests {
     /// hand over" from an empty string.
     #[test]
     fn partial_report_is_none_when_nothing_was_said() {
-        assert_eq!(partial_report_from(&[]), None);
+        assert_eq!(last_assistant_text(&[]), None);
         let only_user = vec![Message::user("x"), Message::tool("c", "out")];
-        assert_eq!(partial_report_from(&only_user), None);
+        assert_eq!(last_assistant_text(&only_user), None);
         let blank_tail = vec![
             Message::assistant_turn("real findings", "", vec![]),
             Message::assistant_turn("   \n  ", "", vec![]),
         ];
         assert_eq!(
-            partial_report_from(&blank_tail).as_deref(),
+            last_assistant_text(&blank_tail).as_deref(),
             Some("real findings")
         );
     }
