@@ -4,6 +4,7 @@ use serde_json::Value;
 use super::command_shape;
 use super::shell_deny;
 use super::shell_lex;
+use super::shell_lex::INTERPRETERS;
 
 /// Whether every word of `needle` appears in `haystack`, in order.
 fn words_in_order(needle: &[&str], haystack: &[&str]) -> bool {
@@ -23,16 +24,27 @@ fn words_in_order(needle: &[&str], haystack: &[&str]) -> bool {
 /// nobody could answer it — `git commit -m "…⏎⏎npm publish now runs in CI"`
 /// was cut at the quoted newline into the command `npm publish now runs in CI`.
 ///
-/// A here-document body is stepped over only when EVERY command on the line is
-/// a known data sink ([`HEREDOC_DATA_SINKS`]): `git commit -F - <<EOF` hands
-/// git a message and `cat > release.sh <<EOF` writes a file, but `sh <<EOF`,
-/// `cat <<EOF | sh`, `ssh host <<EOF`, `kubectl exec -i pod -- sh <<EOF` and
-/// `timeout 600 bash <<EOF` run the body. Anything else on the line reads the
-/// line again with every body as shell lines. The question is asked of the
-/// list of known sinks, not of a list of known runners, because the runners
-/// arrive wrapped (`timeout`, `nice -n 10`, `docker exec -i app`) and a wrapper
-/// with options hides the program word from this reading; a runner list let
-/// those bodies run unread. Reading a body as commands can only ask more.
+/// A here-document body is stepped over only when every command it REACHES is
+/// a known data sink ([`HEREDOC_DATA_SINKS`]). What it reaches is the lexer's
+/// to say (`ShCommands::heredoc_receivers`): the pipeline it is fed to, and
+/// whatever a substitution or subshell holding that pipeline feeds in turn.
+/// `git commit -F - <<EOF` hands git a message and `cat > release.sh <<EOF`
+/// writes a file, but `sh <<EOF`, `cat <<EOF | sh`, `ssh host <<EOF`,
+/// `bash -c "$(cat <<EOF …)"`, `kubectl exec -i pod -- sh <<EOF` and `timeout
+/// 600 bash <<EOF` run the body, and such a line is read again with every body
+/// as shell lines.
+///
+/// Two shapes of this question were wrong before it. Asked of a list of known
+/// RUNNERS, it let wrapped ones through (`timeout`, `nice -n 10`, `docker exec
+/// -i app` hide the program word from this reading). Asked of every command on
+/// the LINE, it read the commit message of `cargo build && git commit -F -
+/// <<EOF` as commands, though the body never reaches `cargo` — and refused
+/// that routine commit wherever nobody could answer. Reading a body as
+/// commands can only ask more, which is why the unknown direction is "read".
+///
+/// An interpreter anywhere on the line reads the bodies too, whatever they
+/// reach: `cat > release.sh <<EOF … EOF && sh release.sh` writes the body to a
+/// file and runs it, a hop no reading of the pipe can follow.
 ///
 /// A line the lexer does not model (an unclosed quote, `$'…'`, the `cmd`
 /// grammar) falls back to the quote-blind [`shell_lex::segments`], over the
@@ -40,27 +52,35 @@ fn words_in_order(needle: &[&str], haystack: &[&str]) -> bool {
 /// blind join can only add a command, never fold one away (see
 /// [`shell_lex::joined_continuations`]).
 fn irreversible_floor_commands(command: &str) -> Vec<(String, Vec<String>)> {
+    // Index-aligned with the lexer's commands, so its receiver indices still
+    // name the right ones; an argv with no program word reads as `None`.
     let read_as_sh = |bodies| {
         shell_lex::sh_commands(command, bodies).map(|read| {
-            let skipped_heredoc = read.skipped_heredoc;
-            let commands: Vec<(String, Vec<String>)> = read
+            let commands: Vec<Option<(String, Vec<String>)>> = read
                 .commands
                 .into_iter()
-                .filter_map(shell_deny::program_and_args_of_argv)
+                .map(shell_deny::program_and_args_of_argv)
                 .collect();
-            (commands, skipped_heredoc)
+            (commands, read.skipped_heredoc, read.heredoc_receivers)
         })
     };
-    if let Some((commands, skipped_heredoc)) = read_as_sh(shell_lex::HeredocBodies::Skip) {
-        let runs_a_body = skipped_heredoc
-            && !commands
-                .iter()
-                .all(|(program, _)| HEREDOC_DATA_SINKS.contains(&program.as_str()));
+    if let Some((commands, skipped_heredoc, receivers)) = read_as_sh(shell_lex::HeredocBodies::Skip)
+    {
+        let reaches_a_runner = receivers.iter().any(|&index| {
+            commands[index]
+                .as_ref()
+                .is_some_and(|(program, _)| !HEREDOC_DATA_SINKS.contains(&program.as_str()))
+        });
+        let interpreter_on_the_line = commands
+            .iter()
+            .flatten()
+            .any(|(program, _)| program == "ssh" || INTERPRETERS.contains(&program.as_str()));
+        let runs_a_body = skipped_heredoc && (reaches_a_runner || interpreter_on_the_line);
         if !runs_a_body {
-            return commands;
+            return commands.into_iter().flatten().collect();
         }
-        if let Some((commands, _)) = read_as_sh(shell_lex::HeredocBodies::Read) {
-            return commands;
+        if let Some((commands, _, _)) = read_as_sh(shell_lex::HeredocBodies::Read) {
+            return commands.into_iter().flatten().collect();
         }
     }
     let joined = shell_lex::joined_continuations(shell_lex::HOST, command);
@@ -71,11 +91,11 @@ fn irreversible_floor_commands(command: &str) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-/// Programs known not to run their stdin, so a line made only of these steps
-/// over its here-document bodies (see [`irreversible_floor_commands`]): the
-/// receivers an agent heredocs into (a commit message, a file, a PR body) and
-/// the commands routinely chained beside them. Not a list of everything safe —
-/// a program missing here only means its line's bodies are read.
+/// Programs known not to run their stdin, so a here-document reaching only
+/// these is stepped over (see [`irreversible_floor_commands`]): the receivers
+/// an agent heredocs into (a commit message, a file, a PR body) and the filters
+/// routinely piped between them. Not a list of everything safe — a program
+/// missing here only means a body it receives is read.
 const HEREDOC_DATA_SINKS: &[&str] = &[
     "cat", "tee", "git", "gh", "cd", "echo", "printf", "mkdir", "chmod", "touch", "cp", "mv", "ls",
     "pwd", "grep", "head", "tail", "wc", "sort", "jq", "diff", "true",
@@ -145,8 +165,17 @@ fn options_taking_a_value(program: &str) -> &'static [&'static str] {
             "--notes-file",
             "-R",
             "--repo",
+            "--match-head-commit",
+            "--author-email",
         ],
-        "npm" | "yarn" | "pnpm" | "bun" => &["--tag", "--otp", "--registry", "--access", "-w"],
+        "npm" | "yarn" | "pnpm" | "bun" => &[
+            "--tag",
+            "--otp",
+            "--registry",
+            "--access",
+            "-w",
+            "--workspace",
+        ],
         "cargo" => &[
             "--registry",
             "--index",

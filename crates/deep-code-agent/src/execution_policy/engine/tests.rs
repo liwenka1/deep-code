@@ -1539,6 +1539,9 @@ fn a_mention_of_an_irreversible_command_is_not_one() {
         // beside a `cd` — every command on these lines is a known data sink.
         "cat > scripts/release.sh <<'EOF'\nnpm publish\nEOF",
         "cd pkg && git commit -F - <<'EOF'\nci: move release\n\nnpm publish now runs in CI\nEOF",
+        // The body reaches only `git`, never the build beside it.
+        "cargo build && git commit -F - <<'EOF'\nci: release\n\nnpm publish now runs in CI\nEOF",
+        "make && git commit -F - <<'EOF'\nnpm publish now runs in CI\nEOF",
         // A bash array's elements are words, not a subshell.
         "args=(git push --force) && echo done",
         // Arithmetic's `<<` is a shift, not a here-document.
@@ -1579,6 +1582,12 @@ fn what_the_shell_runs_inside_a_line_still_needs_a_human() {
         "echo \"<\"& npm publish",
         // A `case` pattern's `)` does not close the substitution it sits in.
         "echo \"$(case $x in a) npm publish;; esac)\"",
+        // dash (`/bin/sh` on Debian/Ubuntu) runs `((…))` as two subshells.
+        "((git push --force origin main))",
+        // A subshell's output carries the body on to the pipe after it.
+        "(cat <<'EOF') | sh\nnpm publish\nEOF",
+        // A body written to a script that the same line runs.
+        "cat > release.sh <<'EOF'\nnpm publish\nEOF\nsh release.sh",
     ] {
         assert!(floor_gated(&policy, command), "{command:?}");
     }
@@ -1594,6 +1603,8 @@ fn a_dry_run_that_is_an_options_value_is_not_exempt() {
         "git push --force origin main -o --dry-run",
         "gh pr merge 12 --body --dry-run",
         "gh pr merge 12 --subject --dry-run",
+        "gh pr merge 12 --match-head-commit --dry-run",
+        "npm publish --workspace --dry-run",
     ] {
         assert!(floor_gated(&policy, command), "{command:?}");
     }
