@@ -1556,6 +1556,14 @@ fn a_mention_of_an_irreversible_command_is_not_one() {
         "git commit -F - <<'EOF'\nnpm publish now runs in CI\nEOF\necho $(( (2+3) * 4 ))",
         // A script handed to a shell is read as one, quotes and all.
         "sh -c 'echo \"npm publish is disabled here\"'",
+        // Reserved words, `case` patterns and a function's name after a body
+        // run nothing; `&` in arithmetic is an and, not a background job.
+        "if ! git diff --cached --quiet; then\n  git commit -F - <<'EOF'\nfix: x\n\nnpm publish now runs in CI\nEOF\nelse\n  echo \"nothing to commit\"\nfi",
+        "if git commit -F - <<'EOF'\nfix\n\nnpm publish now runs in CI\nEOF\nthen\n  echo committed\nfi",
+        "git commit -F - <<'EOF'\nfix\n\nnpm publish now runs in CI\nEOF\n{\n  echo ok\n}",
+        "case \"$1\" in\n  commit) git commit -F - <<'EOF'\nnpm publish now runs in CI\nEOF\n  ;;\n  *) echo skip ;;\nesac",
+        "git commit -F - <<'EOF'\nnpm publish now runs in CI\nEOF\nnotify() { echo done; }",
+        "x=$((n & 1)); cargo build && git commit -F - <<'EOF'\nfix\n\nnpm publish now runs in CI\nEOF",
         // A bash array's elements are words, not a subshell.
         "args=(git push --force) && echo done",
         // Arithmetic's `<<` is a shift, not a here-document.
@@ -1592,6 +1600,9 @@ fn what_the_shell_runs_inside_a_line_still_needs_a_human() {
         // An arithmetic `<<` is no here-document, so the line after it is read.
         "echo $((1<<2))\nnpm publish",
         "(( x = 1 << 4 ))\ngit push --force origin main",
+        // A group after `=` in arithmetic is no array: its `<<` is a shift.
+        "echo $((m=(1<<n)-1))\nnpm publish",
+        "echo $((n>=(1<<10)))\nnpm publish",
         // A quoted `<` is text, so the `&` after it backgrounds a command.
         "echo \"<\"& npm publish",
         // A `case` pattern's `)` does not close the substitution it sits in.
@@ -1648,8 +1659,11 @@ fn a_body_that_may_run_by_any_route_still_needs_a_human() {
         "for i in 1 2; do ./x.sh; cat > x.sh <<'EOF'\nnpm publish\nEOF\ndone",
         "while true; do ./x.sh; \"done\"; cat > x.sh <<'EOF'\nnpm publish\nEOF\ndone",
         "./x.sh |\ncat > x.sh <<'EOF'\nnpm publish\nEOF",
+        "./x.sh |\n\n# feed it\ncat > x.sh <<'EOF'\nnpm publish\nEOF",
+        "for i in 1 2; do ./x.sh; function f { :; }; cat > x.sh <<'EOF'\nnpm publish\nEOF\ndone",
         "./x.sh | { true; cat > x.sh <<'EOF'\nnpm publish\nEOF\n}",
         "(sleep 1; ./x.sh) & cat > x.sh <<'EOF'\nnpm publish\nEOF",
+        "echo $((./x.sh & sleep 1) | cat); cat > x.sh <<'EOF'\nnpm publish\nEOF",
         "trap './x.sh' EXIT; cat > x.sh <<'EOF'\nnpm publish\nEOF",
     ] {
         assert!(floor_gated(&policy, command), "{command:?}");
@@ -1677,6 +1691,16 @@ fn a_script_handed_to_a_shell_still_needs_a_human() {
         "eval 'npm publish'",
         "ssh deploy@host 'cd app && npm publish'",
         "echo $((cd x && npm publish) | sh)",
+        "trap 'npm publish' EXIT",
+        // A here-string holding a substitution is still the here-string.
+        "bash <<< \"cd $(git rev-parse --show-toplevel) && npm publish\"",
+        "bash <<< \"cd `pwd` && npm publish\"",
+        // Read the same way beside a body the lexer cannot read as lines (an
+        // apostrophe in prose), and on a line with `$'…'`.
+        "cat > NOTES.md <<'EOF'\nIt's done\nEOF\nssh deploy@prod 'npm publish'",
+        "cat > NOTES.md <<'EOF'\nIt's done\nEOF\ndocker exec app sh -c 'npm publish'",
+        "cat > n.md <<'EOF'\nIt's\nEOF\nbash <<< 'npm publish'",
+        "IFS=$'\\n\\t'; docker exec app sh -c 'npm publish'",
     ] {
         assert!(floor_gated(&policy, command), "{command:?}");
     }

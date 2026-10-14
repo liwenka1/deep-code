@@ -177,8 +177,9 @@ pub(super) struct ShCommands {
 ///
 /// `None` for anything it does not model, so the caller falls back to the
 /// quote-blind [`segments`]: an unterminated quote or substitution, a trailing
-/// backslash, `$'…'`/`$"…"`, an escaped backtick inside backticks, and every
-/// grammar but `sh`'s (`cmd` has no `'`, escapes with `^`, and reads `%`).
+/// backslash, a `$'…'` whose `\'` bash and dash would end in different places,
+/// an escaped backtick inside backticks, and every grammar but `sh`'s (`cmd`
+/// has no `'`, escapes with `^`, and reads `%`).
 ///
 /// Not a gate and not the executor's reading ([`parse_unattended`] is both). It
 /// exists for the irreversible-outward floor, whose job is to ask before a
@@ -212,7 +213,7 @@ pub(super) fn sh_commands_in(
         pending: Vec::new(),
         after_redirect: false,
         after_pipe: false,
-        here_string_next: false,
+        here_string_at: None,
         pipeline_start: 0,
         compounds: Vec::new(),
         backgrounded: false,
@@ -277,6 +278,9 @@ struct CommandFrame {
     /// Whether the next word is in command position: only reserved words
     /// that lead a command (`if`, `!`, `then`, …) came before it in this one.
     command_position: bool,
+    /// Where in `argv` an unquoted `function` in command position sits, so a
+    /// `{` two words after it opens that function's body.
+    function_word: Option<usize>,
     /// The words of the command being read.
     argv: Vec<String>,
     /// The word being read, once anything (even `""`) has opened it.
@@ -297,6 +301,7 @@ impl CommandFrame {
             undecided: false,
             open_cases: 0,
             command_position: true,
+            function_word: None,
             argv: Vec::new(),
             word: None,
             quoted: false,
@@ -304,9 +309,23 @@ impl CommandFrame {
     }
 }
 
+/// What a `$((` still undecided holds — real only if it turns out to be a
+/// substitution.
+#[derive(Default)]
+struct Held {
+    /// The commands read inside it.
+    commands: Vec<Vec<String>>,
+    /// Whether a `&` there put one in the background (in arithmetic `&` is a
+    /// bitwise and).
+    backgrounds: bool,
+}
+
 /// A compound command (`{ … }`, `if`, `case`, a loop) open at the line's top
 /// level.
 struct OpenCompound {
+    /// The reserved word that closes it: `}`, `fi`, `esac` or `done`. Another
+    /// one does not (`function f { :; }` inside a loop closes no loop).
+    closer: &'static str,
     /// Where the pipeline holding it began. It is one stage of that pipeline,
     /// so what follows its closer (`done <<EOF`, `} | sh`) belongs to it too.
     pipeline_start: usize,
@@ -338,8 +357,10 @@ struct ShLexer {
     /// Whether nothing but blanks and comments followed the last `|`, so a
     /// newline continues its pipeline (`cat <<EOF |⏎…⏎EOF⏎sh` runs the body).
     after_pipe: bool,
-    /// Whether the next word ends a here-string (`<<< WORD`).
-    here_string_next: bool,
+    /// While a here-string's word is still to come (`<<< WORD`), how many
+    /// frames were open at its `<<<`: the word that ends in that frame is it,
+    /// not one inside a substitution within it (`<<< "cd $(pwd) && …"`).
+    here_string_at: Option<usize>,
     /// Where the line's current top-level pipeline began: how many commands
     /// had ended before it.
     pipeline_start: usize,
@@ -349,11 +370,11 @@ struct ShLexer {
     backgrounded: bool,
     /// `ShCommands::finished_before_heredoc`, fixed at the first `<<`/`<<<`.
     fence: Option<usize>,
-    /// The commands held for each `$((` still undecided, innermost last. A
-    /// frame that holds pushes to the innermost, which is its own: any `$((`
-    /// opened later inside it has been decided by the time it reads again.
-    /// Each held command is moved once, when its `$((` is decided.
-    held: Vec<Vec<Vec<String>>>,
+    /// What is held for each `$((` still undecided, innermost last. A frame
+    /// that holds adds to the innermost, which is its own: any `$((` opened
+    /// later inside it has been decided by the time it reads again. Each held
+    /// command is moved once, when its `$((` is decided.
+    held: Vec<Held>,
 }
 
 impl ShLexer {
@@ -400,7 +421,16 @@ impl ShLexer {
         let Some(word) = frame.word.take() else {
             return;
         };
-        let reserved = !std::mem::take(&mut frame.quoted) && frame.command_position;
+        // `function NAME {` opens a body like `NAME() {` does.
+        let function_body = word == "{"
+            && frame
+                .function_word
+                .is_some_and(|at| at + 2 == frame.argv.len());
+        let reserved =
+            !std::mem::take(&mut frame.quoted) && (frame.command_position || function_body);
+        if reserved && word == "function" {
+            frame.function_word = Some(frame.argv.len());
+        }
         frame.command_position = reserved && LEADS_A_COMMAND.contains(&word.as_str());
         if reserved {
             match word.as_str() {
@@ -410,7 +440,8 @@ impl ShLexer {
             }
         }
         let top_level = frame.closer.is_none();
-        if std::mem::take(&mut self.here_string_next) {
+        if self.here_string_at == Some(self.frames.len()) {
+            self.here_string_at = None;
             self.read.here_strings.push(word.clone());
         }
         if reserved && top_level {
@@ -422,40 +453,66 @@ impl ShLexer {
     /// A reserved word in command position at the line's top level: open or
     /// close a compound command (see `ShCommands::finished_before_heredoc`).
     fn compound_word(&mut self, word: &str) {
-        match word {
-            "{" | "if" | "case" | "while" | "until" | "for" | "select" => {
-                let is_loop = matches!(word, "while" | "until" | "for" | "select");
-                let piped_into = self.read.commands.len() > self.pipeline_start;
-                let own = (is_loop || piped_into).then_some(self.pipeline_start);
-                let around = self.compounds.last().and_then(|outer| outer.fence_cap);
-                self.compounds.push(OpenCompound {
-                    pipeline_start: self.pipeline_start,
-                    fence_cap: own.into_iter().chain(around).min(),
-                });
-            }
+        let (closer, is_loop) = match word {
+            "{" => ("}", false),
+            "if" => ("fi", false),
+            "case" => ("esac", false),
+            "while" | "until" | "for" | "select" => ("done", true),
             "}" | "fi" | "esac" | "done" => {
-                if let Some(compound) = self.compounds.pop() {
+                if let Some(compound) = self.compounds.pop_if(|open| open.closer == word) {
                     self.pipeline_start = compound.pipeline_start;
                 }
+                return;
             }
-            _ => {}
-        }
+            _ => return,
+        };
+        let piped_into = self.read.commands.len() > self.pipeline_start;
+        let own = (is_loop || piped_into).then_some(self.pipeline_start);
+        let around = self.compounds.last().and_then(|outer| outer.fence_cap);
+        self.compounds.push(OpenCompound {
+            closer,
+            pipeline_start: self.pipeline_start,
+            fence_cap: own.into_iter().chain(around).min(),
+        });
     }
 
     /// Close the command being read in the innermost frame and record it, or
-    /// hold it there until the `$((` around it is decided.
+    /// hold it there until the `$((` around it is decided. Words that are all
+    /// reserved words leading a command (a lone `else`, `then`, `{`) are none:
+    /// nothing runs.
     fn end_command(&mut self) {
         self.end_word();
         let frame = self.command_frame();
         let argv = std::mem::take(&mut frame.argv);
-        frame.command_position = true;
-        if argv.is_empty() || frame.discard {
+        let only_reserved = std::mem::replace(&mut frame.command_position, true);
+        frame.function_word = None;
+        if argv.is_empty() || only_reserved || frame.discard {
             return;
         }
         let holds = frame.holds;
         match self.held.last_mut() {
-            Some(held) if holds => held.push(argv),
+            Some(held) if holds => held.commands.push(argv),
             _ => self.read.commands.push(argv),
+        }
+    }
+
+    /// Drop the words read so far in the command being read: they name or
+    /// match something rather than run (a function's name, a `case` pattern).
+    fn drop_words(&mut self) {
+        self.end_word();
+        let frame = self.command_frame();
+        frame.argv.clear();
+        frame.command_position = true;
+        frame.function_word = None;
+    }
+
+    /// A lone `&` puts what it ends in the background — inside a `$((` not
+    /// yet decided, only if that turns out to be a substitution.
+    fn background(&mut self) {
+        let holds = self.command_frame().holds;
+        match self.held.last_mut() {
+            Some(held) if holds => held.backgrounds = true,
+            _ => self.backgrounded = true,
         }
     }
 
@@ -510,7 +567,7 @@ impl ShLexer {
     /// `CommandFrame::undecided`).
     fn open_undecided(&mut self) {
         self.open(')', true, false);
-        self.held.push(Vec::new());
+        self.held.push(Held::default());
         let frame = self.command_frame();
         frame.holds = true;
         frame.undecided = true;
@@ -528,7 +585,10 @@ impl ShLexer {
         if frame.undecided {
             let held = self.held.pop().unwrap_or_default();
             if !first_of_double {
-                self.read.commands.extend(held);
+                self.read.commands.extend(held.commands);
+                if held.backgrounds {
+                    self.background();
+                }
             }
         }
     }
@@ -583,7 +643,27 @@ impl ShLexer {
                     self.open(')', false, false);
                     Some(i + 2)
                 }
-                Some('\'' | '"') => None,
+                // `$'…'` is a quoted word to bash and `$` before one to dash:
+                // the same word either way, unless a `\'` inside is an escape
+                // to bash and the close to dash — which is not modelled.
+                Some('\'') => {
+                    let close = chars[i + 2..].iter().position(|&ch| ch == '\'')? + i + 2;
+                    let escapes = chars[i + 2..close]
+                        .iter()
+                        .rev()
+                        .take_while(|&&ch| ch == '\\')
+                        .count();
+                    if escapes % 2 == 1 {
+                        return None;
+                    }
+                    self.quote_word();
+                    for &ch in &chars[i + 2..close] {
+                        self.push(ch);
+                    }
+                    Some(close + 1)
+                }
+                // `$"…"` is `"…"` to bash and `$` before it to dash.
+                Some('"') => Some(i + 1),
                 _ => {
                     self.push('$');
                     Some(i + 1)
@@ -604,15 +684,25 @@ impl ShLexer {
                 self.open_group(true);
                 Some(i + 1)
             }
-            // `name=(…)`: an array's elements, data.
-            '(' if self
-                .command_frame()
-                .word
-                .as_deref()
-                .is_some_and(|word| word.ends_with('=')) =>
+            // `name=(…)`: an array's elements, data. Not in arithmetic, where
+            // `m=(1<<n)` is a group whose `<<` is still a shift.
+            '(' if !arithmetic
+                && self
+                    .command_frame()
+                    .word
+                    .as_deref()
+                    .is_some_and(|word| word.ends_with('=')) =>
             {
                 self.open(')', false, true);
                 Some(i + 1)
+            }
+            // `name()`: a function definition, whose name runs nothing here.
+            '(' if !arithmetic
+                && chars[i + 1..].iter().find(|&&ch| !matches!(ch, ' ' | '\t')) == Some(&')') =>
+            {
+                self.drop_words();
+                let close = chars[i + 1..].iter().position(|&ch| ch == ')')? + i + 1;
+                Some(close + 1)
             }
             '(' => {
                 self.end_command();
@@ -626,7 +716,11 @@ impl ShLexer {
                 if closer == Some(')') && self.command_frame().open_cases == 0 {
                     self.close(next == Some(')'));
                 } else {
-                    // A `case` pattern's `)`: it ends what came before it.
+                    // A `case` pattern's `)`: the words before it were the
+                    // pattern, and it ends what came before them.
+                    if self.command_frame().open_cases > 0 {
+                        self.drop_words();
+                    }
                     self.end_pipeline();
                 }
                 Some(i + 1)
@@ -645,8 +739,9 @@ impl ShLexer {
                 Some(i + 1)
             }
             '\n' => {
-                // A newline right after a `|` continues its pipeline.
-                if !std::mem::take(&mut self.after_pipe) {
+                // A newline after a `|` continues its pipeline, through blank
+                // and comment lines too.
+                if !self.after_pipe {
                     self.end_pipeline();
                 }
                 Some(self.after_newline(chars, i + 1, bodies))
@@ -680,7 +775,7 @@ impl ShLexer {
                 // A lone `&` runs what it ends in the background, on beside
                 // whatever follows (bash's `&>` is a redirection instead).
                 if c == '&' && next != Some('>') {
-                    self.backgrounded = true;
+                    self.background();
                 }
                 self.end_pipeline();
                 Some(i + 1)
@@ -690,7 +785,7 @@ impl ShLexer {
                 // here-document's body.
                 self.end_word();
                 self.mark_fed();
-                self.here_string_next = true;
+                self.here_string_at = Some(self.frames.len());
                 Some(i + 3)
             }
             // In arithmetic `<<` is a shift; read it as text.
@@ -2798,6 +2893,15 @@ mod tests {
             sh_words("npm test 2>&1 >&2", Skip),
             Some(vec![argv(&["npm", "test", "2>&1", ">&2"])])
         );
+        // `$'…'` and `$"…"` are quoted words — a `$` and a quoted word to
+        // dash, which ends them in the same place unless a `\'` is escaped.
+        assert_eq!(
+            sh_words("IFS=$'\\n\\t'; git commit -m $\"x y\" $'a\\\\'", Skip),
+            Some(vec![
+                argv(&["IFS=\\n\\t"]),
+                argv(&["git", "commit", "-m", "x y", "a\\\\"]),
+            ])
+        );
     }
 
     /// A substitution runs its commands wherever it sits, double quotes
@@ -2886,6 +2990,19 @@ mod tests {
             ("while a; do if b; then c; cat <<EOF\nx\nEOF\nfi; done", 0),
             // A reserved word right after `then`/`do` is one too.
             ("if a; then while b; do c; cat <<EOF\nx\nEOF\ndone; fi", 1),
+            // A closer closes only its own opener: the `}` of a group this
+            // reading misses (`time -p {`) leaves the loop open, and so does
+            // the `}` of a `function NAME {` body.
+            (
+                "for i in 1 2; do a; time -p { :; }; cat <<EOF\nx\nEOF\ndone",
+                0,
+            ),
+            ("a | { function f { :; }; cat <<EOF\nx\nEOF\n}", 0),
+            // A pipe continues past blank and comment lines.
+            ("a |\n\n# c\ncat > x <<EOF\nx\nEOF", 0),
+            // A `&` inside a `$((` that turns out to be a substitution.
+            ("echo $((a & b) | c); cat <<EOF\nx\nEOF", 0),
+            ("echo $((n & 1)); cat <<EOF\nx\nEOF", 1),
             // A loop that closed first is finished.
             ("for i in 1 2; do a; done\ncat <<EOF\nx\nEOF", 3),
             // `done <<EOF` feeds the loop it closes.
@@ -2900,6 +3017,10 @@ mod tests {
         let read = sh_commands_in(SH, "a && bash <<< 'npm publish' x", HeredocBodies::Skip)
             .expect("models this line");
         assert_eq!(read.here_strings, vec!["npm publish".to_string()]);
+        // The here-string is the word around a substitution, not one inside it.
+        let around = sh_commands_in(SH, "bash <<< \"cd $(pwd) && x\"", HeredocBodies::Skip)
+            .expect("models this line");
+        assert_eq!(around.here_strings, vec!["cd  && x".to_string()]);
         assert_eq!(
             read.commands,
             vec![argv(&["a"]), argv(&["bash", "npm publish", "x"])]
@@ -3012,10 +3133,10 @@ mod tests {
             sh_words("args=(git push --force) && ls", Skip),
             Some(vec![argv(&["args="]), argv(&["ls"])])
         );
+        // The pattern before a `case` arm's `)` is no command.
         assert_eq!(
             sh_words("echo \"$(case $x in a) npm publish;; esac)\"", Skip),
             Some(vec![
-                argv(&["case", "$x", "in", "a"]),
                 argv(&["npm", "publish"]),
                 argv(&["esac"]),
                 argv(&["echo", ""]),
@@ -3047,7 +3168,6 @@ mod tests {
             "echo `npm publish",
             "echo \\",
             "echo $'a\\'b'",
-            "echo $\"x\"",
             "echo `a \\`npm publish\\` b`",
             "cat <<\nx",
         ] {

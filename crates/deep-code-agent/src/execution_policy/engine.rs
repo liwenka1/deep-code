@@ -49,10 +49,10 @@ fn words_in_order(needle: &[&str], haystack: &[&str]) -> bool {
 ///
 /// A script handed to a shell as text is read as lines too
 /// ([`scripts_handed_to_a_shell`]): `sh -c '…'`, `docker exec app sh -c '…'`,
-/// `eval …`, `ssh host '…'`.
+/// `eval …`, `ssh host '…'`, `trap '…' EXIT`.
 ///
-/// A line the lexer does not model (an unclosed quote, `$'…'`, the `cmd`
-/// grammar) falls back to the quote-blind [`shell_lex::segments`], over the
+/// A line the lexer does not model (an unclosed quote, the `cmd` grammar)
+/// falls back to the quote-blind [`shell_lex::segments`], over the
 /// line as written AND with its continuations joined — two readings, so the
 /// blind join can only add a command, never fold one away (see
 /// [`shell_lex::joined_continuations`]).
@@ -90,6 +90,11 @@ fn read_floor_commands(line: &str, nesting: u32, out: &mut Vec<(String, Vec<Stri
 /// One line's commands, with its here-document bodies read as lines when
 /// something that may run them is no known sink — and, on the same condition,
 /// its here-strings, for the caller to read as lines.
+///
+/// Bodies the lexer cannot read as lines (prose with an apostrophe in it) are
+/// read blind, beside the quote-aware reading of the line rather than instead
+/// of it: dropping that reading lost what it alone sees — the `ssh host 'npm
+/// publish'` after such a body was split into the words `npm` and `publish`.
 fn line_commands(line: &str) -> (Vec<(String, Vec<String>)>, Vec<String>) {
     let program_words = |commands: Vec<Vec<String>>| -> Vec<(String, Vec<String>)> {
         commands
@@ -97,24 +102,31 @@ fn line_commands(line: &str) -> (Vec<(String, Vec<String>)>, Vec<String>) {
             .filter_map(shell_deny::program_and_args_of_argv)
             .collect()
     };
-    if let Some(read) = shell_lex::sh_commands(line, HeredocBodies::Skip) {
-        if !runs_what_it_is_fed(&read) {
-            return (program_words(read.commands), Vec::new());
-        }
-        if !read.skipped_heredoc {
-            return (program_words(read.commands), read.here_strings);
-        }
-        if let Some(read) = shell_lex::sh_commands(line, HeredocBodies::Read) {
-            return (program_words(read.commands), read.here_strings);
-        }
+    let Some(read) = shell_lex::sh_commands(line, HeredocBodies::Skip) else {
+        return (blind_commands(line), Vec::new());
+    };
+    if !runs_what_it_is_fed(&read) {
+        return (program_words(read.commands), Vec::new());
     }
+    if !read.skipped_heredoc {
+        return (program_words(read.commands), read.here_strings);
+    }
+    if let Some(reread) = shell_lex::sh_commands(line, HeredocBodies::Read) {
+        return (program_words(reread.commands), reread.here_strings);
+    }
+    let mut commands = program_words(read.commands);
+    commands.extend(blind_commands(line));
+    (commands, read.here_strings)
+}
+
+/// The quote-blind reading of a line (see [`irreversible_floor_commands`]).
+fn blind_commands(line: &str) -> Vec<(String, Vec<String>)> {
     let joined = shell_lex::joined_continuations(shell_lex::HOST, line);
-    let commands = std::iter::once(line)
+    std::iter::once(line)
         .chain(joined.as_deref())
         .flat_map(shell_lex::segments)
         .filter_map(shell_deny::program_and_args)
-        .collect();
-    (commands, Vec::new())
+        .collect()
 }
 
 /// Whether a line feeds a here-document body or a here-string to something
@@ -165,8 +177,9 @@ const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "fi
 /// floor to read as lines: the operands after a [`SHELLS`] member's `-c`
 /// wherever that shell sits in the argv (`docker exec app sh -c '…'`, and
 /// `timeout 600 bash -c '…'`, whose wrapper hides the shell from the program
-/// word), `eval`'s words joined as it joins them, and the operands of `ssh`,
-/// which are its remote command (`ssh host 'cd app && npm publish'`).
+/// word), `eval`'s words joined as it joins them, the operands of `ssh`,
+/// which are its remote command (`ssh host 'cd app && npm publish'`), and the
+/// action of a `trap`, which runs later.
 ///
 /// Only what is handed over as text. `bash deploy.sh` runs a file and its
 /// operand is a path; a shell's here-string is its stdin, which is read like a
@@ -175,6 +188,14 @@ const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "fi
 fn scripts_handed_to_a_shell(program: &str, args: &[String]) -> Vec<String> {
     if program == "eval" {
         return vec![args.join(" ")];
+    }
+    if program == "trap" {
+        return args
+            .iter()
+            .find(|arg| !arg.starts_with('-'))
+            .cloned()
+            .into_iter()
+            .collect();
     }
     let hands_on_text = |base: &str| base == "ssh" || SHELLS.contains(&base);
     let (shell, rest) = if hands_on_text(program) {
