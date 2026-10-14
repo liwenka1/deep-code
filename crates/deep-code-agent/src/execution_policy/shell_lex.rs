@@ -132,8 +132,8 @@ pub(super) fn joined_continuations(grammar: Grammar, line: &str) -> Option<Strin
 pub(super) enum HeredocBodies {
     /// Step over every body: it is the receiving command's stdin.
     Skip,
-    /// Read every body as shell lines, for a line where something on it runs
-    /// its stdin (`sh <<EOF`, `cat <<EOF | sh`, `ssh host <<EOF`).
+    /// Read every body as shell lines, for a line where something may run
+    /// what a body feeds it (`sh <<EOF`, `cat <<EOF | sh`, `ssh host <<EOF`).
     Read,
 }
 
@@ -146,12 +146,26 @@ pub(super) struct ShCommands {
     /// Whether a here-document body was stepped over, so the caller knows a
     /// [`HeredocBodies::Read`] pass could read more.
     pub(super) skipped_heredoc: bool,
-    /// Indices into `commands` of the commands a here-document body reaches:
-    /// every stage of the pipeline it is fed to, and — when that pipeline sits
-    /// in a substitution or subshell — the command whose words or pipeline
-    /// that output becomes, outward. `bash -c "$(cat <<EOF …)"` reaches
-    /// `bash`; `cargo build && git commit -F - <<EOF` reaches only `git`.
-    pub(super) heredoc_receivers: Vec<usize>,
+    /// The words given as here-strings (`bash <<< 'npm publish'`): stdin text
+    /// like a body, though each stays an operand in `commands` too.
+    pub(super) here_strings: Vec<String>,
+    /// How many of `commands`, from the front, had finished before the first
+    /// here-document or here-string fed anything — `cargo build` in `cargo
+    /// build && git commit -F - <<EOF`. None of those can run what was fed.
+    /// Any command from here on can: the pipeline it is fed to, whatever that
+    /// pipeline's output becomes (`bash -c "$(cat <<EOF …)"`), and every later
+    /// command, which can run the file or variable it was stored in (`cat >
+    /// x.sh <<EOF … EOF⏎./x.sh`, `s=$(cat <<EOF …); sh -c "$s"`).
+    ///
+    /// "Finished" is read narrowly: an earlier pipeline at the line's top
+    /// level, ended by `;`, `&&`, `||` or a newline. Not a stage piped into
+    /// the fed pipeline, which runs alongside it (`|⏎` continues a pipeline,
+    /// and a `{ … }` or `if` that is piped into is one stage with what feeds
+    /// it); not anything inside a loop that the fed command sits in, which the
+    /// next iteration runs again; and nothing at all once a background `&`
+    /// came first, since what it started may still be running. 0 when nothing
+    /// was fed.
+    pub(super) finished_before_heredoc: usize,
 }
 
 /// The simple commands of `command` as `sh` splits them, quote-aware: words on
@@ -197,6 +211,13 @@ pub(super) fn sh_commands_in(
         read: ShCommands::default(),
         pending: Vec::new(),
         after_redirect: false,
+        after_pipe: false,
+        here_string_next: false,
+        pipeline_start: 0,
+        compounds: Vec::new(),
+        backgrounded: false,
+        fence: None,
+        held: Vec::new(),
     };
     let mut i = 0;
     while i < chars.len() {
@@ -207,8 +228,15 @@ pub(super) fn sh_commands_in(
         return None;
     }
     lexer.end_pipeline();
+    lexer.read.finished_before_heredoc = lexer.fence.unwrap_or(0);
     Some(lexer.read)
 }
+
+/// Reserved words after which the next word is still in command position
+/// (`if ! { cmd`), so a reserved word there is one too.
+const LEADS_A_COMMAND: &[&str] = &[
+    "!", "{", "if", "then", "else", "elif", "while", "until", "do", "time",
+];
 
 /// One open context of [`sh_commands`].
 enum LexFrame {
@@ -223,32 +251,39 @@ enum LexFrame {
 struct CommandFrame {
     /// What closes this frame: `None` for the line itself.
     closer: Option<char>,
-    /// Whether `<<` is a shift here rather than a here-document: `$(( … ))`
-    /// and `(( … ))`.
+    /// Whether `<<` is a shift here rather than a here-document: `(( … ))`,
+    /// `$(( … ))` and a group inside either.
     arithmetic: bool,
-    /// Whether the words here are data rather than commands: `$(( … ))` (an
-    /// arithmetic expansion to every `sh`) and an array (`name=( … )`, which
-    /// dash refuses). NOT `(( … ))` at the head of a command: bash reads that
-    /// as arithmetic, but dash — `/bin/sh` on Debian and Ubuntu — reads it as
-    /// two nested subshells and RUNS what is inside, so its words are read as
-    /// a command. A substitution inside a data frame still opens a frame of
-    /// commands of its own.
+    /// Whether the words here are data rather than commands: an array
+    /// (`name=( … )`, which dash refuses) and a group inside one. NOT `(( … ))`
+    /// at the head of a command: bash reads that as arithmetic, but dash —
+    /// `/bin/sh` on Debian and Ubuntu — reads it as two nested subshells and
+    /// RUNS what is inside, so its words are read as a command. A substitution
+    /// inside a data frame still opens a frame of commands of its own.
     discard: bool,
-    /// Indices into `ShCommands::commands` of the pipeline being read here.
-    pipeline: Vec<usize>,
-    /// Whether that pipeline is fed a here-document body, directly or through
-    /// a substitution/subshell inside it.
-    pipeline_fed: bool,
-    /// Whether any pipeline of this frame was fed one — so its output, which
-    /// is what this frame stands for in the frame around it, carries it on.
-    fed: bool,
+    /// Whether the commands read here are held back until the `$((` they sit
+    /// in is decided (see `undecided` and `ShLexer::held`): its own frame and
+    /// every group inside it. A substitution inside records its own, which
+    /// run either way.
+    holds: bool,
+    /// Whether this is the inner frame of a `$((`. Every `sh` reads `$(( …
+    /// ))` as arithmetic, but bash reads a `$((` whose `((` does not close as
+    /// `))` as a substitution holding a subshell, and runs it: `$((cd x &&
+    /// npm publish) | sh)`. Only the frame's `)` tells them apart.
+    undecided: bool,
     /// `case` statements open in this frame, so a pattern's `)` is not taken
     /// for the frame's closer (`"$(case $x in a) npm publish;; esac)"`).
     open_cases: u32,
+    /// Whether the next word is in command position: only reserved words
+    /// that lead a command (`if`, `!`, `then`, …) came before it in this one.
+    command_position: bool,
     /// The words of the command being read.
     argv: Vec<String>,
     /// The word being read, once anything (even `""`) has opened it.
     word: Option<String>,
+    /// Whether any of that word was quoted or escaped, so it is no reserved
+    /// word (`"done"` is a command name, `done` closes a loop).
+    quoted: bool,
 }
 
 impl CommandFrame {
@@ -258,14 +293,26 @@ impl CommandFrame {
             closer,
             arithmetic,
             discard,
-            pipeline: Vec::new(),
-            pipeline_fed: false,
-            fed: false,
+            holds: false,
+            undecided: false,
             open_cases: 0,
+            command_position: true,
             argv: Vec::new(),
             word: None,
+            quoted: false,
         }
     }
+}
+
+/// A compound command (`{ … }`, `if`, `case`, a loop) open at the line's top
+/// level.
+struct OpenCompound {
+    /// Where the pipeline holding it began. It is one stage of that pipeline,
+    /// so what follows its closer (`done <<EOF`, `} | sh`) belongs to it too.
+    pipeline_start: usize,
+    /// The most `ShCommands::finished_before_heredoc` can be for a body fed
+    /// inside it, if it or a compound around it is a loop or is piped into.
+    fence_cap: Option<usize>,
 }
 
 /// A here-document waiting for the newline after which its body starts.
@@ -288,6 +335,25 @@ struct ShLexer {
     /// `<` or `>`, so a `&` right after it is a redirection's (`2>&1`) and not
     /// a separator — a quoted one (`echo "<"& npm publish`) is just text.
     after_redirect: bool,
+    /// Whether nothing but blanks and comments followed the last `|`, so a
+    /// newline continues its pipeline (`cat <<EOF |⏎…⏎EOF⏎sh` runs the body).
+    after_pipe: bool,
+    /// Whether the next word ends a here-string (`<<< WORD`).
+    here_string_next: bool,
+    /// Where the line's current top-level pipeline began: how many commands
+    /// had ended before it.
+    pipeline_start: usize,
+    /// Compound commands open at the line's top level, innermost last.
+    compounds: Vec<OpenCompound>,
+    /// Whether a `&` has put something in the background.
+    backgrounded: bool,
+    /// `ShCommands::finished_before_heredoc`, fixed at the first `<<`/`<<<`.
+    fence: Option<usize>,
+    /// The commands held for each `$((` still undecided, innermost last. A
+    /// frame that holds pushes to the innermost, which is its own: any `$((`
+    /// opened later inside it has been decided by the time it reads again.
+    /// Each held command is moved once, when its `$((` is decided.
+    held: Vec<Vec<Vec<String>>>,
 }
 
 impl ShLexer {
@@ -305,6 +371,7 @@ impl ShLexer {
     /// Append `ch` to the word being read.
     fn push(&mut self, ch: char) {
         self.after_redirect = false;
+        self.after_pipe = false;
         self.command_frame()
             .word
             .get_or_insert_with(String::new)
@@ -314,54 +381,112 @@ impl ShLexer {
     /// Make sure a word exists even if nothing is pushed into it (`""`, or a
     /// substitution standing for a whole word).
     fn touch_word(&mut self) {
+        self.after_pipe = false;
         self.command_frame().word.get_or_insert_with(String::new);
     }
 
-    /// Close the word being read, if one is open, counting the `case`
-    /// statements it opens or closes.
+    /// Note that the word being read has a quoted or escaped part.
+    fn quote_word(&mut self) {
+        self.touch_word();
+        self.command_frame().quoted = true;
+    }
+
+    /// Close the word being read, if one is open. An unquoted reserved word in
+    /// command position opens or closes a `case` in this frame and, at the
+    /// line's top level, a compound command.
     fn end_word(&mut self) {
         self.after_redirect = false;
         let frame = self.command_frame();
-        if let Some(word) = frame.word.take() {
-            if frame.argv.is_empty() {
-                match word.as_str() {
-                    "case" => frame.open_cases += 1,
-                    "esac" => frame.open_cases = frame.open_cases.saturating_sub(1),
-                    _ => {}
+        let Some(word) = frame.word.take() else {
+            return;
+        };
+        let reserved = !std::mem::take(&mut frame.quoted) && frame.command_position;
+        frame.command_position = reserved && LEADS_A_COMMAND.contains(&word.as_str());
+        if reserved {
+            match word.as_str() {
+                "case" => frame.open_cases += 1,
+                "esac" => frame.open_cases = frame.open_cases.saturating_sub(1),
+                _ => {}
+            }
+        }
+        let top_level = frame.closer.is_none();
+        if std::mem::take(&mut self.here_string_next) {
+            self.read.here_strings.push(word.clone());
+        }
+        if reserved && top_level {
+            self.compound_word(&word);
+        }
+        self.command_frame().argv.push(word);
+    }
+
+    /// A reserved word in command position at the line's top level: open or
+    /// close a compound command (see `ShCommands::finished_before_heredoc`).
+    fn compound_word(&mut self, word: &str) {
+        match word {
+            "{" | "if" | "case" | "while" | "until" | "for" | "select" => {
+                let is_loop = matches!(word, "while" | "until" | "for" | "select");
+                let piped_into = self.read.commands.len() > self.pipeline_start;
+                let own = (is_loop || piped_into).then_some(self.pipeline_start);
+                let around = self.compounds.last().and_then(|outer| outer.fence_cap);
+                self.compounds.push(OpenCompound {
+                    pipeline_start: self.pipeline_start,
+                    fence_cap: own.into_iter().chain(around).min(),
+                });
+            }
+            "}" | "fi" | "esac" | "done" => {
+                if let Some(compound) = self.compounds.pop() {
+                    self.pipeline_start = compound.pipeline_start;
                 }
             }
-            frame.argv.push(word);
+            _ => {}
         }
     }
 
-    /// Close the command being read in the innermost frame and record it as
-    /// the next stage of that frame's pipeline.
+    /// Close the command being read in the innermost frame and record it, or
+    /// hold it there until the `$((` around it is decided.
     fn end_command(&mut self) {
         self.end_word();
-        let index = self.read.commands.len();
         let frame = self.command_frame();
         let argv = std::mem::take(&mut frame.argv);
-        if !argv.is_empty() && !frame.discard {
-            frame.pipeline.push(index);
-            self.read.commands.push(argv);
+        frame.command_position = true;
+        if argv.is_empty() || frame.discard {
+            return;
+        }
+        let holds = frame.holds;
+        match self.held.last_mut() {
+            Some(held) if holds => held.push(argv),
+            _ => self.read.commands.push(argv),
         }
     }
 
     /// Close the command being read AND the pipeline it ends (any separator
-    /// but a single `|`), handing its stages to the here-document receivers
-    /// when a body was fed to it.
+    /// but a single `|`). At the line's top level the next pipeline starts
+    /// after every command read so far.
     fn end_pipeline(&mut self) {
         self.end_command();
-        let frame = self.command_frame();
-        let stages = std::mem::take(&mut frame.pipeline);
-        if std::mem::take(&mut frame.pipeline_fed) {
-            frame.fed = true;
-            self.read.heredoc_receivers.extend(stages);
+        if self.command_frame().closer.is_none() {
+            self.pipeline_start = self.read.commands.len();
+        }
+    }
+
+    /// A here-document or here-string feeds the command being read. The first
+    /// one fixes how many commands had finished before anything was fed (see
+    /// `ShCommands::finished_before_heredoc`).
+    fn mark_fed(&mut self) {
+        if self.fence.is_none() {
+            let cap = self.compounds.last().and_then(|open| open.fence_cap);
+            let fence = if self.backgrounded {
+                0
+            } else {
+                cap.map_or(self.pipeline_start, |cap| cap.min(self.pipeline_start))
+            };
+            self.fence = Some(fence);
         }
     }
 
     /// Open a frame that `closer` ends.
     fn open(&mut self, closer: char, arithmetic: bool, discard: bool) {
+        self.after_pipe = false;
         self.frames.push(LexFrame::Commands(CommandFrame::new(
             Some(closer),
             arithmetic,
@@ -369,15 +494,42 @@ impl ShLexer {
         )));
     }
 
-    /// End the innermost frame of commands at its closer. A frame that was fed
-    /// a here-document body passes it on to the pipeline around it: its output
-    /// is that command's words (`$( … )`) or that pipeline's input (`( … )`).
-    fn close(&mut self) {
+    /// Open `( … )`, or the inner frame of `(( … ))`: a group of the frame it
+    /// sits in, so the words of an array, of arithmetic or of a `$((` yet to
+    /// be decided stay what they are there.
+    fn open_group(&mut self, arithmetic: bool) {
+        let around = self.command_frame();
+        let arithmetic = arithmetic || around.arithmetic;
+        let discard = around.discard;
+        let holds = around.holds;
+        self.open(')', arithmetic, discard);
+        self.command_frame().holds = holds;
+    }
+
+    /// Open the inner frame of a `$((`, which its `)` decides (see
+    /// `CommandFrame::undecided`).
+    fn open_undecided(&mut self) {
+        self.open(')', true, false);
+        self.held.push(Vec::new());
+        let frame = self.command_frame();
+        frame.holds = true;
+        frame.undecided = true;
+    }
+
+    /// End the innermost frame of commands at its closer, `first_of_double`
+    /// when that closer is the first `)` of `))`. A `$((` frame drops what was
+    /// held for it if it closed as `))` — it was arithmetic — and records it
+    /// if not.
+    fn close(&mut self, first_of_double: bool) {
         self.end_pipeline();
-        let fed = self.command_frame().fed;
-        self.frames.pop();
-        if fed {
-            self.command_frame().pipeline_fed = true;
+        let Some(LexFrame::Commands(frame)) = self.frames.pop() else {
+            unreachable!("only a Commands frame has a closer")
+        };
+        if frame.undecided {
+            let held = self.held.pop().unwrap_or_default();
+            if !first_of_double {
+                self.read.commands.extend(held);
+            }
         }
     }
 
@@ -387,7 +539,7 @@ impl ShLexer {
         let c = chars[i];
         let next = chars.get(i + 1).copied();
         let (closer, arithmetic) = match self.frames.last() {
-            Some(LexFrame::DoubleQuoted) => return Some(self.step_quoted(c, next, i)),
+            Some(LexFrame::DoubleQuoted) => return Some(self.step_quoted(chars, i)),
             Some(LexFrame::Commands(frame)) => (frame.closer, frame.arithmetic),
             None => unreachable!("the bottom frame is never popped"),
         };
@@ -398,25 +550,34 @@ impl ShLexer {
                 // A nested backtick spelled `\``: not modelled.
                 Some('`') if closer == Some('`') => None,
                 Some(escaped) => {
+                    self.quote_word();
                     self.push(escaped);
                     Some(i + 2)
                 }
             },
             '\'' => {
                 let close = chars[i + 1..].iter().position(|&ch| ch == '\'')? + i + 1;
-                self.touch_word();
+                self.quote_word();
                 for &ch in &chars[i + 1..close] {
                     self.push(ch);
                 }
                 Some(close + 1)
             }
             '"' => {
-                self.touch_word();
+                self.quote_word();
                 self.after_redirect = false;
                 self.frames.push(LexFrame::DoubleQuoted);
                 Some(i + 1)
             }
             '$' => match next {
+                // `$((`: arithmetic or a substitution holding a subshell,
+                // which only its `)` decides (see `CommandFrame::undecided`).
+                Some('(') if chars.get(i + 2) == Some(&'(') => {
+                    self.touch_word();
+                    self.open(')', false, false);
+                    self.open_undecided();
+                    Some(i + 3)
+                }
                 Some('(') => {
                     self.touch_word();
                     self.open(')', false, false);
@@ -429,7 +590,7 @@ impl ShLexer {
                 }
             },
             '`' if closer == Some('`') => {
-                self.close();
+                self.close(false);
                 Some(i + 1)
             }
             '`' => {
@@ -437,16 +598,10 @@ impl ShLexer {
                 self.open('`', false, false);
                 Some(i + 1)
             }
-            // The second `(` of `$((`: an arithmetic expansion, data to every
-            // `sh`.
-            '(' if i > 1 && chars[i - 1] == '(' && chars[i - 2] == '$' => {
-                self.open(')', true, true);
-                Some(i + 1)
-            }
             // The second `(` of `((`: arithmetic to bash, a subshell to dash
             // (see `CommandFrame::discard`), so its words are still a command.
             '(' if i > 0 && chars[i - 1] == '(' => {
-                self.open(')', true, false);
+                self.open_group(true);
                 Some(i + 1)
             }
             // `name=(…)`: an array's elements, data.
@@ -461,7 +616,7 @@ impl ShLexer {
             }
             '(' => {
                 self.end_command();
-                self.open(')', false, false);
+                self.open_group(false);
                 Some(i + 1)
             }
             ')' => {
@@ -469,7 +624,7 @@ impl ShLexer {
                 // this `)` closes the frame.
                 self.end_word();
                 if closer == Some(')') && self.command_frame().open_cases == 0 {
-                    self.close();
+                    self.close(next == Some(')'));
                 } else {
                     // A `case` pattern's `)`: it ends what came before it.
                     self.end_pipeline();
@@ -490,7 +645,10 @@ impl ShLexer {
                 Some(i + 1)
             }
             '\n' => {
-                self.end_pipeline();
+                // A newline right after a `|` continues its pipeline.
+                if !std::mem::take(&mut self.after_pipe) {
+                    self.end_pipeline();
+                }
                 Some(self.after_newline(chars, i + 1, bodies))
             }
             '&' if self.after_redirect => {
@@ -498,10 +656,20 @@ impl ShLexer {
                 self.push('&');
                 Some(i + 1)
             }
+            '&' if next == Some('&') => {
+                self.end_pipeline();
+                Some(i + 2)
+            }
+            // `>|` overrides noclobber: a redirection, not a pipe.
+            '|' if self.after_redirect => {
+                self.push('|');
+                Some(i + 1)
+            }
             // A pipe hands this command's output to the next one: same
             // pipeline. `|&` pipes stderr too.
             '|' if next != Some('|') => {
                 self.end_command();
+                self.after_pipe = true;
                 Some(if next == Some('&') { i + 2 } else { i + 1 })
             }
             '|' => {
@@ -509,12 +677,20 @@ impl ShLexer {
                 Some(i + 2)
             }
             ';' | '&' => {
+                // A lone `&` runs what it ends in the background, on beside
+                // whatever follows (bash's `&>` is a redirection instead).
+                if c == '&' && next != Some('>') {
+                    self.backgrounded = true;
+                }
                 self.end_pipeline();
                 Some(i + 1)
             }
             '<' if next == Some('<') && chars.get(i + 2) == Some(&'<') => {
-                // A here-string: its word is an ordinary operand.
+                // A here-string: its word is an operand, and stdin text like a
+                // here-document's body.
                 self.end_word();
+                self.mark_fed();
+                self.here_string_next = true;
                 Some(i + 3)
             }
             // In arithmetic `<<` is a shift; read it as text.
@@ -533,7 +709,9 @@ impl ShLexer {
 
     /// One character inside `"…"`: only `"`, `\`, `$(` and a backtick are
     /// special there.
-    fn step_quoted(&mut self, c: char, next: Option<char>, i: usize) -> usize {
+    fn step_quoted(&mut self, chars: &[char], i: usize) -> usize {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
         match c {
             '"' => {
                 self.frames.pop();
@@ -554,6 +732,11 @@ impl ShLexer {
                     i + 2
                 }
             },
+            '$' if next == Some('(') && chars.get(i + 2) == Some(&'(') => {
+                self.open(')', false, false);
+                self.open_undecided();
+                i + 3
+            }
             '$' if next == Some('(') => {
                 self.open(')', false, false);
                 i + 2
@@ -573,7 +756,7 @@ impl ShLexer {
     /// removed) and queue the body for the next newline.
     fn heredoc(&mut self, chars: &[char], start: usize) -> Option<usize> {
         self.end_word();
-        self.command_frame().pipeline_fed = true;
+        self.mark_fed();
         let mut i = start;
         let strip_tabs = chars.get(i) == Some(&'-');
         if strip_tabs {
@@ -2673,54 +2856,144 @@ mod tests {
         );
     }
 
-    /// What a here-document body reaches: the pipeline it is fed to, and
-    /// whatever a substitution or subshell around that pipeline feeds — never
-    /// a command beside it on the line.
+    /// How many commands had finished before anything was fed: earlier
+    /// top-level pipelines only. A stage piped in (across a newline too), a
+    /// loop around the body, a group or `if` that is piped into, and anything
+    /// after a background `&` may still run once the body exists.
     #[test]
-    fn sh_commands_names_the_commands_a_heredoc_body_reaches() {
-        let receivers = |command: &str| {
+    fn sh_commands_counts_what_finished_before_a_heredoc() {
+        let finished = |command: &str| {
             sh_commands_in(SH, command, HeredocBodies::Skip)
-                .map(|read| (read.commands, read.heredoc_receivers))
+                .map(|read| read.finished_before_heredoc)
         };
+        for (command, expected) in [
+            ("cargo build && git commit -F - <<EOF\nmsg\nEOF", 1),
+            ("make || git commit -F - <<EOF\nmsg\nEOF\nls", 1),
+            ("a; b $(c) && git commit -F - <<EOF\nmsg\nEOF", 3),
+            ("cat <<EOF | sh\nx\nEOF", 0),
+            ("a; b | cat <<EOF\nx\nEOF", 1),
+            // `|⏎` continues the pipeline: `a` runs alongside the body.
+            ("a |\ncat > x <<EOF\nx\nEOF", 0),
+            ("a &\ncat <<EOF\nx\nEOF", 0),
+            // bash's `&>` redirects and backgrounds nothing (`> log` is a
+            // command of its own as dash reads it, and finished too).
+            ("a &> log && cat <<EOF\nx\nEOF", 2),
+            ("{ a; cat <<EOF\nx\nEOF\n}", 1),
+            ("if a; then cat <<EOF\nx\nEOF\nfi", 1),
+            ("a | { b; cat <<EOF\nx\nEOF\n}", 0),
+            ("a | if b; then cat <<EOF\nx\nEOF\nfi", 0),
+            ("for i in 1 2; do a; cat > x <<EOF\nx\nEOF\ndone", 0),
+            ("while a; do if b; then c; cat <<EOF\nx\nEOF\nfi; done", 0),
+            // A reserved word right after `then`/`do` is one too.
+            ("if a; then while b; do c; cat <<EOF\nx\nEOF\ndone; fi", 1),
+            // A loop that closed first is finished.
+            ("for i in 1 2; do a; done\ncat <<EOF\nx\nEOF", 3),
+            // `done <<EOF` feeds the loop it closes.
+            ("while read l; do a; done <<EOF\nx\nEOF", 0),
+            // A quoted `done` is a command, not the loop's close.
+            ("while a; do b; \"done\"; cat <<EOF\nx\nEOF\ndone", 0),
+            // A here-string feeds like a body.
+            ("a && bash <<< 'npm publish'", 1),
+        ] {
+            assert_eq!(finished(command), Some(expected), "{command:?}");
+        }
+        let read = sh_commands_in(SH, "a && bash <<< 'npm publish' x", HeredocBodies::Skip)
+            .expect("models this line");
+        assert_eq!(read.here_strings, vec!["npm publish".to_string()]);
         assert_eq!(
-            receivers("cargo build && git commit -F - <<EOF\nmsg\nEOF"),
-            Some((
-                vec![
-                    argv(&["cargo", "build"]),
-                    argv(&["git", "commit", "-F", "-"])
-                ],
-                vec![1]
-            ))
+            read.commands,
+            vec![argv(&["a"]), argv(&["bash", "npm publish", "x"])]
+        );
+    }
+
+    /// `$((` is arithmetic when its `((` closes as `))` — even with groups
+    /// inside — and otherwise, to bash, a substitution holding a subshell,
+    /// whose commands run. A substitution inside arithmetic runs either way.
+    #[test]
+    fn sh_commands_reads_a_dollar_double_paren_as_bash_decides_it() {
+        use HeredocBodies::Skip;
+        for arithmetic in [
+            "echo $(((1+2)*3))",
+            "echo $(( (1+2) * 3 ))",
+            "echo \"$((1+2))\"",
+            "echo $((1<<2))",
+        ] {
+            assert_eq!(
+                sh_words(arithmetic, Skip),
+                Some(vec![argv(&["echo", ""])]),
+                "{arithmetic:?}"
+            );
+        }
+        // A group inside arithmetic is arithmetic too: its `<<` is a shift,
+        // not a here-document that would swallow the next line.
+        assert_eq!(
+            sh_words("echo $(( (1<<2) ))\nnpm publish", Skip),
+            Some(vec![argv(&["echo", ""]), argv(&["npm", "publish"])])
         );
         assert_eq!(
-            receivers("make || git commit -F - <<EOF\nmsg\nEOF\nls"),
-            Some((
-                vec![
-                    argv(&["make"]),
-                    argv(&["git", "commit", "-F", "-"]),
-                    argv(&["ls"])
-                ],
-                vec![1]
-            ))
+            sh_words("echo $(( $(npm publish) + 1 ))", Skip),
+            Some(vec![argv(&["npm", "publish"]), argv(&["echo", ""])])
         );
         assert_eq!(
-            receivers("cat <<EOF | sh\nx\nEOF"),
-            Some((vec![argv(&["cat"]), argv(&["sh"])], vec![0, 1]))
+            sh_words("echo $((cd x && npm publish) | sh)", Skip),
+            Some(vec![
+                argv(&["cd", "x"]),
+                argv(&["npm", "publish"]),
+                argv(&["sh"]),
+                argv(&["echo", ""]),
+            ])
         );
         assert_eq!(
-            receivers("bash -c \"$(cat <<'EOF'\nx\nEOF\n)\""),
-            Some((vec![argv(&["cat"]), argv(&["bash", "-c", ""])], vec![0, 1]))
+            sh_words("echo \"$((npm publish)\n)\"", Skip),
+            Some(vec![argv(&["npm", "publish"]), argv(&["echo", ""])])
         );
+    }
+
+    /// What a `$((` holds is moved once, when it is decided, and a command's
+    /// reserved words are not re-read per word. Handing held commands outward
+    /// at each group's `)` moved each one once per group around it (14.6 s for
+    /// the nest below), and asking "only reserved words so far?" of the whole
+    /// argv at every word re-read it per word (59.6 s for the `!`s). Healthy,
+    /// each is tens of milliseconds — orders of magnitude apart, which is when
+    /// a clock can tell them apart (see `shell_deny`'s `cost` module).
+    #[test]
+    fn sh_commands_reads_nests_and_reserved_words_in_one_pass() {
+        use HeredocBodies::Skip;
+        let depth = 100_000;
+        let nest = format!(
+            "echo $(({}{}{}))\nnpm publish",
+            "(".repeat(depth),
+            "a;".repeat(depth),
+            ")".repeat(depth)
+        );
+        let start = std::time::Instant::now();
         assert_eq!(
-            receivers("(cat <<EOF) | sh\nx\nEOF"),
-            Some((vec![argv(&["cat"]), argv(&["sh"])], vec![0, 1]))
+            sh_words(&nest, Skip),
+            Some(vec![argv(&["echo", ""]), argv(&["npm", "publish"])])
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "held commands moved once per group: {:?}",
+            start.elapsed()
+        );
+        let bangs = format!("{}npm publish", "! ".repeat(depth));
+        let start = std::time::Instant::now();
+        assert_eq!(
+            sh_words(&bangs, Skip).map(|commands| commands.len()),
+            Some(1)
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "reserved words re-read per word: {:?}",
+            start.elapsed()
         );
     }
 
     /// Contexts whose contents are not commands, or whose `)` is not a closer:
     /// arithmetic (its `<<` is a shift — read as a here-document it swallowed
     /// every line after it), an array, and a `case` pattern inside `$( … )`.
-    /// And a quoted `<` is text, so the `&` after it is a separator.
+    /// And a quoted `<` is text, so the `&` after it is a separator, while the
+    /// `|` of `>|` belongs to its redirection.
     #[test]
     fn sh_commands_reads_arithmetic_arrays_and_case_patterns_as_sh_does() {
         use HeredocBodies::Skip;
@@ -2755,6 +3028,11 @@ mod tests {
         assert_eq!(
             sh_words("make 2>&1 >&2", Skip),
             Some(vec![argv(&["make", "2>&1", ">&2"])])
+        );
+        // `>|` is a redirection that overrides noclobber, not a pipe.
+        assert_eq!(
+            sh_words("cat >| out.txt <<'EOF'\nx\nEOF", Skip),
+            Some(vec![argv(&["cat", ">|", "out.txt"])])
         );
     }
 

@@ -1536,12 +1536,26 @@ fn a_mention_of_an_irreversible_command_is_not_one() {
         "# later: npm publish\nnpm test",
         "echo 'run terraform apply by hand' > NOTES.md",
         // A file written through a heredoc is data, and so is a commit message
-        // beside a `cd` — every command on these lines is a known data sink.
+        // beside a `cd` — everything from the body on is a known data sink.
         "cat > scripts/release.sh <<'EOF'\nnpm publish\nEOF",
         "cd pkg && git commit -F - <<'EOF'\nci: move release\n\nnpm publish now runs in CI\nEOF",
-        // The body reaches only `git`, never the build beside it.
+        // What finished before the body existed cannot run it — an
+        // interpreter included.
         "cargo build && git commit -F - <<'EOF'\nci: release\n\nnpm publish now runs in CI\nEOF",
         "make && git commit -F - <<'EOF'\nnpm publish now runs in CI\nEOF",
+        "python3 -m pytest -q && git commit -F - <<'EOF'\nfix: x\n\ngit push --force is no longer needed\nEOF",
+        "git log --oneline | awk '{print $1}' && git commit -F - <<'EOF'\nnpm publish now runs in CI\nEOF",
+        "for f in a b; do git add \"$f\"; done\ngit commit -F - <<'EOF'\nnpm publish now runs in CI\nEOF",
+        "cargo test &> /tmp/log && git commit -F - <<'EOF'\nnpm publish now runs in CI\nEOF",
+        // A message kept in a variable for a sink, and an `if` around a sink.
+        "msg=$(cat <<'EOF'\nnpm publish now runs in CI\nEOF\n); git commit -m \"$msg\"",
+        "if git diff --quiet; then :; else git commit -F - <<'EOF'\nnpm publish now runs in CI\nEOF\nfi",
+        // `>|` writes a file (over noclobber); it pipes into nothing.
+        "cat >| out.txt <<'EOF'\nnpm publish now runs in CI\nEOF",
+        // Arithmetic after the body is no command, groups inside it included.
+        "git commit -F - <<'EOF'\nnpm publish now runs in CI\nEOF\necho $(( (2+3) * 4 ))",
+        // A script handed to a shell is read as one, quotes and all.
+        "sh -c 'echo \"npm publish is disabled here\"'",
         // A bash array's elements are words, not a subshell.
         "args=(git push --force) && echo done",
         // Arithmetic's `<<` is a shift, not a here-document.
@@ -1569,8 +1583,8 @@ fn what_the_shell_runs_inside_a_line_still_needs_a_human() {
         "ssh deploy@host <<'EOF'\nkubectl delete ns prod\nEOF",
         "bash -c \"$(cat <<'EOF'\nterraform apply -auto-approve\nEOF\n)\"",
         // Runners that arrive wrapped: the program word this reading sees is
-        // `600`, `-n` or `exec`, never the interpreter. The line is read with
-        // its body as commands because NOT every command on it is a data sink.
+        // `600`, `-n` or `exec`, never the interpreter. The body is read as
+        // commands because what it reaches is NOT a known data sink.
         "timeout 600 bash <<'EOF'\nnpm publish\nEOF",
         "nice -n 10 bash <<'EOF'\nnpm publish\nEOF",
         "docker exec -i app sh <<'EOF'\nnpm publish\nEOF",
@@ -1588,6 +1602,81 @@ fn what_the_shell_runs_inside_a_line_still_needs_a_human() {
         "(cat <<'EOF') | sh\nnpm publish\nEOF",
         // A body written to a script that the same line runs.
         "cat > release.sh <<'EOF'\nnpm publish\nEOF\nsh release.sh",
+    ] {
+        assert!(floor_gated(&policy, command), "{command:?}");
+    }
+}
+
+/// A body runs by routes no reading of its pipe can follow — a file, a
+/// variable, a stage or group the lexer does not track, a pipe continued on
+/// the next line — so it is read whenever ANYTHING from its pipeline on is no
+/// known data sink, and only what had finished before it existed is left out.
+/// Each of these ran a body unread when the question was "can the lexer see
+/// it reach a runner".
+#[test]
+fn a_body_that_may_run_by_any_route_still_needs_a_human() {
+    if shell_lex::HOST != shell_lex::SH {
+        return;
+    }
+    let policy = ExecPolicy::default();
+    for command in [
+        // Written to a file, then run — directly, wrapped, or by a tool.
+        "cat > deploy.sh <<'EOF'\nnpm publish\nEOF\nchmod +x deploy.sh && ./deploy.sh",
+        "cat > deploy.sh <<'EOF'\nnpm publish\nEOF\ntimeout 600 bash deploy.sh",
+        "cat > deploy.sh <<'EOF'\nnpm publish\nEOF\nnice -n 10 sh deploy.sh",
+        "cat > deploy.ts <<'EOF'\nnpm publish\nEOF\nnpx tsx deploy.ts",
+        "cat > Makefile <<'EOF'\nall:\n\tnpm publish\nEOF\nmake",
+        "cp /dev/stdin x.sh <<'EOF'\nnpm publish\nEOF\n./x.sh",
+        // A `( … )` stage, or a process substitution, fed by the pipe.
+        "cat <<'EOF' | (docker exec -i app sh)\nnpm publish\nEOF",
+        "cat <<'EOF' | (cd /srv && timeout 60 bash)\nnpm publish\nEOF",
+        "cat <<'EOF' | tee >(docker exec -i app sh)\nnpm publish\nEOF",
+        // Kept in a variable and run; or the substitution IS the program.
+        "s=$(cat <<'EOF'\nnpm publish\nEOF\n); docker exec app sh -c \"$s\"",
+        "s=$(cat <<'EOF'\nnpm publish\nEOF\n); $s",
+        "$(cat <<'EOF'\nnpm publish\nEOF\n)",
+        "cat <<'EOF' | $(echo sh)\nnpm publish\nEOF",
+        // `|⏎` continues the pipeline past the body.
+        "cat <<'EOF' |\nnpm publish\nEOF\ndocker exec -i app sh",
+        // A group or `if` piped onward; a loop fed by its `done`.
+        "{ cat <<'EOF'; } | docker exec -i app sh\nnpm publish\nEOF",
+        "if true; then cat <<'EOF'; fi | docker exec -i app sh\nnpm publish\nEOF",
+        "while read -r l; do sh -c \"$l\"; done <<'EOF'\nnpm publish\nEOF",
+        // Run by something that came first but runs again, alongside, or
+        // later: a loop, a stage piped in (across a newline too), a group
+        // piped into, a background job, a trap.
+        "for i in 1 2; do ./x.sh; cat > x.sh <<'EOF'\nnpm publish\nEOF\ndone",
+        "while true; do ./x.sh; \"done\"; cat > x.sh <<'EOF'\nnpm publish\nEOF\ndone",
+        "./x.sh |\ncat > x.sh <<'EOF'\nnpm publish\nEOF",
+        "./x.sh | { true; cat > x.sh <<'EOF'\nnpm publish\nEOF\n}",
+        "(sleep 1; ./x.sh) & cat > x.sh <<'EOF'\nnpm publish\nEOF",
+        "trap './x.sh' EXIT; cat > x.sh <<'EOF'\nnpm publish\nEOF",
+    ] {
+        assert!(floor_gated(&policy, command), "{command:?}");
+    }
+}
+
+/// A script handed to a shell as text runs, wherever the shell sits in the
+/// argv: a `-c` string, a here-string, `eval`'s words, `ssh`'s remote command.
+/// And bash runs a `$((` that does not close as `))` as a substitution.
+#[test]
+fn a_script_handed_to_a_shell_still_needs_a_human() {
+    if shell_lex::HOST != shell_lex::SH {
+        return;
+    }
+    let policy = ExecPolicy::default();
+    for command in [
+        "sh -c 'npm publish'",
+        "bash -lc 'cd pkg && npm publish'",
+        "docker exec app sh -c 'npm publish'",
+        "timeout 600 bash -c 'git push --force origin main'",
+        "kubectl exec pod -- sh -c 'kubectl delete ns prod'",
+        "bash -c \"bash -c 'npm publish'\"",
+        "bash <<< 'npm publish'",
+        "cat <<< 'npm publish' | sh",
+        "eval 'npm publish'",
+        "ssh deploy@host 'cd app && npm publish'",
+        "echo $((cd x && npm publish) | sh)",
     ] {
         assert!(floor_gated(&policy, command), "{command:?}");
     }

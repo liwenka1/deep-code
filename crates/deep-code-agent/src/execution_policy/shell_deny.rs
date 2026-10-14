@@ -107,7 +107,7 @@ impl DenyReason {
 /// `X[0]=1 rm -rf /` and `X+=1 rm -rf /` as `rm`): `NAME+=value` appends and
 /// `NAME[index]=value` sets an array element. dash refuses both, so on Linux
 /// they were never a bypass — only a spelling the floor must not misread.
-fn is_env_assignment(token: &str) -> bool {
+pub(super) fn is_env_assignment(token: &str) -> bool {
     let Some((name, _value)) = token.split_once('=') else {
         return false;
     };

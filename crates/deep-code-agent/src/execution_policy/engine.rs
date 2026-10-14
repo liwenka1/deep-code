@@ -4,7 +4,7 @@ use serde_json::Value;
 use super::command_shape;
 use super::shell_deny;
 use super::shell_lex;
-use super::shell_lex::INTERPRETERS;
+use super::shell_lex::{HeredocBodies, ShCommands};
 
 /// Whether every word of `needle` appears in `haystack`, in order.
 fn words_in_order(needle: &[&str], haystack: &[&str]) -> bool {
@@ -24,27 +24,32 @@ fn words_in_order(needle: &[&str], haystack: &[&str]) -> bool {
 /// nobody could answer it — `git commit -m "…⏎⏎npm publish now runs in CI"`
 /// was cut at the quoted newline into the command `npm publish now runs in CI`.
 ///
-/// A here-document body is stepped over only when every command it REACHES is
-/// a known data sink ([`HEREDOC_DATA_SINKS`]). What it reaches is the lexer's
-/// to say (`ShCommands::heredoc_receivers`): the pipeline it is fed to, and
-/// whatever a substitution or subshell holding that pipeline feeds in turn.
-/// `git commit -F - <<EOF` hands git a message and `cat > release.sh <<EOF`
-/// writes a file, but `sh <<EOF`, `cat <<EOF | sh`, `ssh host <<EOF`,
-/// `bash -c "$(cat <<EOF …)"`, `kubectl exec -i pod -- sh <<EOF` and `timeout
-/// 600 bash <<EOF` run the body, and such a line is read again with every body
-/// as shell lines.
+/// A here-document body (or a here-string) is stepped over only when every
+/// command that may run it is a known data sink ([`HEREDOC_DATA_SINKS`]). That
+/// is every command from the body's own pipeline on
+/// (`ShCommands::finished_before_heredoc`): the pipeline it is fed to, what
+/// that pipeline's output becomes, and every later command, which can run the
+/// file or variable the body was stored in. `git commit -F - <<EOF` hands git a
+/// message and `cat > notes.md <<EOF` writes a file, but `sh <<EOF`, `cat <<EOF
+/// | sh`, `ssh host <<EOF`, `bash -c "$(cat <<EOF …)"`, `timeout 600 bash
+/// <<EOF` and `cat > x.sh <<EOF … EOF⏎./x.sh` run it, and such a line is read
+/// again with every body as shell lines. What finished before the body existed
+/// cannot run it — that keeps `cargo build && git commit -F - <<EOF` and
+/// `python3 -m pytest && git commit -F - <<EOF` from reading a commit message
+/// as commands — unless it runs its text later ([`RUNS_LATER`]).
 ///
-/// Two shapes of this question were wrong before it. Asked of a list of known
-/// RUNNERS, it let wrapped ones through (`timeout`, `nice -n 10`, `docker exec
-/// -i app` hide the program word from this reading). Asked of every command on
-/// the LINE, it read the commit message of `cargo build && git commit -F -
-/// <<EOF` as commands, though the body never reaches `cargo` — and refused
-/// that routine commit wherever nobody could answer. Reading a body as
-/// commands can only ask more, which is why the unknown direction is "read".
+/// The question had two wrong shapes before this one. Asked of what RUNS a
+/// body — a list of interpreters, then the commands the lexer could see the
+/// body reach — every route the list did not know counted as data, and a body
+/// ran unread: through a wrapper (`timeout 600 bash`), a file (`./x.sh`), a
+/// variable, a `( … )` stage, a `{ … }` group, a pipe continued on the next
+/// line. Asked of the whole line, the sink list read `cargo build`'s
+/// neighbouring commit message as commands, and that refused a routine commit
+/// wherever nobody could answer. Reading a body as commands can only ask more.
 ///
-/// An interpreter anywhere on the line reads the bodies too, whatever they
-/// reach: `cat > release.sh <<EOF … EOF && sh release.sh` writes the body to a
-/// file and runs it, a hop no reading of the pipe can follow.
+/// A script handed to a shell as text is read as lines too
+/// ([`scripts_handed_to_a_shell`]): `sh -c '…'`, `docker exec app sh -c '…'`,
+/// `eval …`, `ssh host '…'`.
 ///
 /// A line the lexer does not model (an unclosed quote, `$'…'`, the `cmd`
 /// grammar) falls back to the quote-blind [`shell_lex::segments`], over the
@@ -52,54 +57,157 @@ fn words_in_order(needle: &[&str], haystack: &[&str]) -> bool {
 /// blind join can only add a command, never fold one away (see
 /// [`shell_lex::joined_continuations`]).
 fn irreversible_floor_commands(command: &str) -> Vec<(String, Vec<String>)> {
-    // Index-aligned with the lexer's commands, so its receiver indices still
-    // name the right ones; an argv with no program word reads as `None`.
-    let read_as_sh = |bodies| {
-        shell_lex::sh_commands(command, bodies).map(|read| {
-            let commands: Vec<Option<(String, Vec<String>)>> = read
-                .commands
-                .into_iter()
-                .map(shell_deny::program_and_args_of_argv)
-                .collect();
-            (commands, read.skipped_heredoc, read.heredoc_receivers)
-        })
-    };
-    if let Some((commands, skipped_heredoc, receivers)) = read_as_sh(shell_lex::HeredocBodies::Skip)
-    {
-        let reaches_a_runner = receivers.iter().any(|&index| {
-            commands[index]
-                .as_ref()
-                .is_some_and(|(program, _)| !HEREDOC_DATA_SINKS.contains(&program.as_str()))
-        });
-        let interpreter_on_the_line = commands
-            .iter()
-            .flatten()
-            .any(|(program, _)| program == "ssh" || INTERPRETERS.contains(&program.as_str()));
-        let runs_a_body = skipped_heredoc && (reaches_a_runner || interpreter_on_the_line);
-        if !runs_a_body {
-            return commands.into_iter().flatten().collect();
+    let mut commands = Vec::new();
+    read_floor_commands(command, SCRIPT_NESTING, &mut commands);
+    commands
+}
+
+/// How many levels of scripts inside arguments [`irreversible_floor_commands`]
+/// reads: `ssh host "bash -c 'npm publish'"` is two. A script nested deeper is
+/// an operand like any other, and only an obfuscation nests that deep.
+const SCRIPT_NESTING: u32 = 4;
+
+/// [`irreversible_floor_commands`] of one line, appended to `out`, with
+/// `nesting` levels of scripts inside arguments left to read.
+fn read_floor_commands(line: &str, nesting: u32, out: &mut Vec<(String, Vec<String>)>) {
+    let (commands, fed_text) = line_commands(line);
+    let deeper = nesting.checked_sub(1);
+    for (program, args) in commands {
+        if let Some(deeper) = deeper {
+            for script in scripts_handed_to_a_shell(&program, &args) {
+                read_floor_commands(&script, deeper, out);
+            }
         }
-        if let Some((commands, _, _)) = read_as_sh(shell_lex::HeredocBodies::Read) {
-            return commands.into_iter().flatten().collect();
+        out.push((program, args));
+    }
+    if let Some(deeper) = deeper {
+        for text in fed_text {
+            read_floor_commands(&text, deeper, out);
         }
     }
-    let joined = shell_lex::joined_continuations(shell_lex::HOST, command);
-    std::iter::once(command)
+}
+
+/// One line's commands, with its here-document bodies read as lines when
+/// something that may run them is no known sink — and, on the same condition,
+/// its here-strings, for the caller to read as lines.
+fn line_commands(line: &str) -> (Vec<(String, Vec<String>)>, Vec<String>) {
+    let program_words = |commands: Vec<Vec<String>>| -> Vec<(String, Vec<String>)> {
+        commands
+            .into_iter()
+            .filter_map(shell_deny::program_and_args_of_argv)
+            .collect()
+    };
+    if let Some(read) = shell_lex::sh_commands(line, HeredocBodies::Skip) {
+        if !runs_what_it_is_fed(&read) {
+            return (program_words(read.commands), Vec::new());
+        }
+        if !read.skipped_heredoc {
+            return (program_words(read.commands), read.here_strings);
+        }
+        if let Some(read) = shell_lex::sh_commands(line, HeredocBodies::Read) {
+            return (program_words(read.commands), read.here_strings);
+        }
+    }
+    let joined = shell_lex::joined_continuations(shell_lex::HOST, line);
+    let commands = std::iter::once(line)
         .chain(joined.as_deref())
         .flat_map(shell_lex::segments)
         .filter_map(shell_deny::program_and_args)
-        .collect()
+        .collect();
+    (commands, Vec::new())
 }
 
-/// Programs known not to run their stdin, so a here-document reaching only
-/// these is stepped over (see [`irreversible_floor_commands`]): the receivers
-/// an agent heredocs into (a commit message, a file, a PR body) and the filters
-/// routinely piped between them. Not a list of everything safe — a program
-/// missing here only means a body it receives is read.
+/// Whether a line feeds a here-document body or a here-string to something
+/// that may run it: a command that is no known data sink, from the first one
+/// fed on, or one that runs its text later wherever it sits.
+fn runs_what_it_is_fed(read: &ShCommands) -> bool {
+    if !read.skipped_heredoc && read.here_strings.is_empty() {
+        return false;
+    }
+    read.commands.iter().enumerate().any(|(index, argv)| {
+        let program =
+            shell_deny::program_and_args_of_argv(argv.clone()).map(|(program, _)| program);
+        let may_run_it = index >= read.finished_before_heredoc
+            || program
+                .as_deref()
+                .is_some_and(|program| RUNS_LATER.contains(&program));
+        may_run_it
+            && match program {
+                Some(program) => !HEREDOC_DATA_SINKS.contains(&program.as_str()),
+                // No program word. Assignments alone run nothing — what later
+                // runs the value is a command of its own — but a substitution
+                // standing as the program runs its output (`$(cat <<EOF …)`),
+                // and a bare wrapper may run its stdin (`… | parallel`).
+                None => !argv.iter().all(|word| shell_deny::is_env_assignment(word)),
+            }
+    })
+}
+
+/// Programs known not to run what they are fed, so a here-document body only
+/// these may reach is stepped over (see [`irreversible_floor_commands`]): the
+/// receivers an agent heredocs into (a commit message, a file, a PR body), the
+/// filters and file commands routinely chained after them, and the words that
+/// close a compound command. Not a list of everything safe — a program missing
+/// here only means a body it may reach is read.
 const HEREDOC_DATA_SINKS: &[&str] = &[
     "cat", "tee", "git", "gh", "cd", "echo", "printf", "mkdir", "chmod", "touch", "cp", "mv", "ls",
-    "pwd", "grep", "head", "tail", "wc", "sort", "jq", "diff", "true",
+    "pwd", "grep", "head", "tail", "wc", "sort", "jq", "diff", "true", "}", "fi", "esac", "done",
 ];
+
+/// Commands that run their text at a later time than the line shows them: a
+/// `trap 'sh x.sh' EXIT` set before a body is written to `x.sh` runs it after.
+const RUNS_LATER: &[&str] = &["trap"];
+
+/// Shells whose `-c` string is a line of shell.
+const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "fish"];
+
+/// The text a command hands to a shell to run as lines of its own, for the
+/// floor to read as lines: the operands after a [`SHELLS`] member's `-c`
+/// wherever that shell sits in the argv (`docker exec app sh -c '…'`, and
+/// `timeout 600 bash -c '…'`, whose wrapper hides the shell from the program
+/// word), `eval`'s words joined as it joins them, and the operands of `ssh`,
+/// which are its remote command (`ssh host 'cd app && npm publish'`).
+///
+/// Only what is handed over as text. `bash deploy.sh` runs a file and its
+/// operand is a path; a shell's here-string is its stdin, which is read like a
+/// here-document body (`ShCommands::here_strings`). Reading an operand that is
+/// not a script costs nothing unless it reads as one of the floor's commands.
+fn scripts_handed_to_a_shell(program: &str, args: &[String]) -> Vec<String> {
+    if program == "eval" {
+        return vec![args.join(" ")];
+    }
+    let hands_on_text = |base: &str| base == "ssh" || SHELLS.contains(&base);
+    let (shell, rest) = if hands_on_text(program) {
+        (program.to_string(), args)
+    } else {
+        let Some(at) = args
+            .iter()
+            .position(|arg| hands_on_text(&shell_lex::basename_lower(arg)))
+        else {
+            return Vec::new();
+        };
+        (shell_lex::basename_lower(&args[at]), &args[at + 1..])
+    };
+    let operands = |words: &[String]| -> Vec<String> {
+        words
+            .iter()
+            .filter(|word| !word.starts_with('-'))
+            .cloned()
+            .collect()
+    };
+    if shell == "ssh" {
+        return operands(rest);
+    }
+    // `-c` in any short-option cluster (`-lc`, `-ec`): the operands after the
+    // options are the script and its `$0`, `$1`, ….
+    match rest.iter().position(|word| {
+        word.strip_prefix('-')
+            .is_some_and(|flags| !flags.starts_with('-') && flags.contains('c'))
+    }) {
+        Some(flag) => operands(&rest[flag + 1..]),
+        None => Vec::new(),
+    }
+}
 
 /// Whether a token is a `--dry-run` that is actually ON, so the command only
 /// reports and is exempt. A bare `--dry-run`/`--dryrun` is on; a
