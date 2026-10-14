@@ -16,7 +16,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
@@ -113,11 +113,14 @@ fn setup_terminal() -> Result<AppTerminal> {
     // Bracketed paste: paste arrives as one `Event::Paste` string. Mouse
     // capture: wheel scrolls the transcript and drag selects text (we render
     // an in-app selection + copy, since capture disables native selection).
+    // Title: without one, terminals that label tabs by the foreground process
+    // (VS Code) show `node` — the npm launcher leads the process group.
     execute!(
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
-        EnableMouseCapture
+        EnableMouseCapture,
+        SetTitle("deep-code")
     )?;
 
     let backend = CrosstermBackend::new(stdout);
