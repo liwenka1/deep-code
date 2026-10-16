@@ -1665,6 +1665,12 @@ fn a_body_that_may_run_by_any_route_still_needs_a_human() {
         "(sleep 1; ./x.sh) & cat > x.sh <<'EOF'\nnpm publish\nEOF",
         "echo $((./x.sh & sleep 1) | cat); cat > x.sh <<'EOF'\nnpm publish\nEOF",
         "trap './x.sh' EXIT; cat > x.sh <<'EOF'\nnpm publish\nEOF",
+        // A group that closes right after a closer inside it (`} fi`, `fi
+        // fi`, `} esac`) still feeds the body to everything it ran.
+        "{ if true; then { sh; } fi; } <<'EOF'\nnpm publish\nEOF",
+        "{ if true; then if true; then sh; fi fi; } <<'EOF'\nnpm publish\nEOF",
+        "{ if a; then { b; } fi; sh; } <<'EOF'\nnpm publish\nEOF",
+        "{ case a in a) { sh; } esac; } <<'EOF'\nnpm publish\nEOF",
     ] {
         assert!(floor_gated(&policy, command), "{command:?}");
     }
@@ -1692,6 +1698,8 @@ fn a_script_handed_to_a_shell_still_needs_a_human() {
         "ssh deploy@host 'cd app && npm publish'",
         "echo $((cd x && npm publish) | sh)",
         "trap 'npm publish' EXIT",
+        // After `--` only a lone `-` resets; `-;…` is an action that runs.
+        "trap -- '-;npm publish' EXIT",
         // A here-string holding a substitution is still the here-string.
         "bash <<< \"cd $(git rev-parse --show-toplevel) && npm publish\"",
         "bash <<< \"cd `pwd` && npm publish\"",

@@ -239,6 +239,14 @@ const LEADS_A_COMMAND: &[&str] = &[
     "!", "{", "if", "then", "else", "elif", "while", "until", "do", "time",
 ];
 
+/// Reserved words that close a compound command. The word right after one is
+/// still read as a reserved word: another closer may follow it directly — `if
+/// a; then { b; } fi`, `fi fi`, `do …; done }` — and read as an ordinary word,
+/// that second closer left its compound open, so the close after it closed
+/// nothing and a body fed to the group around both counted as fed after the
+/// commands inside it.
+const CLOSES_A_COMPOUND: &[&str] = &["}", "fi", "esac", "done"];
+
 /// One open context of [`sh_commands`].
 enum LexFrame {
     /// A run of commands: the line itself, `( … )`/`$( … )` (closed by `)`), or
@@ -431,7 +439,9 @@ impl ShLexer {
         if reserved && word == "function" {
             frame.function_word = Some(frame.argv.len());
         }
-        frame.command_position = reserved && LEADS_A_COMMAND.contains(&word.as_str());
+        frame.command_position = reserved
+            && (LEADS_A_COMMAND.contains(&word.as_str())
+                || CLOSES_A_COMPOUND.contains(&word.as_str()));
         if reserved {
             match word.as_str() {
                 "case" => frame.open_cases += 1,
@@ -478,8 +488,8 @@ impl ShLexer {
 
     /// Close the command being read in the innermost frame and record it, or
     /// hold it there until the `$((` around it is decided. Words that are all
-    /// reserved words leading a command (a lone `else`, `then`, `{`) are none:
-    /// nothing runs.
+    /// reserved words leading or closing a command (a lone `else`, `then`, `{`,
+    /// `fi`) are none: nothing runs.
     fn end_command(&mut self) {
         self.end_word();
         let frame = self.command_frame();
@@ -3003,8 +3013,15 @@ mod tests {
             // A `&` inside a `$((` that turns out to be a substitution.
             ("echo $((a & b) | c); cat <<EOF\nx\nEOF", 0),
             ("echo $((n & 1)); cat <<EOF\nx\nEOF", 1),
-            // A loop that closed first is finished.
-            ("for i in 1 2; do a; done\ncat <<EOF\nx\nEOF", 3),
+            // A loop that closed first is finished. (A lone closer is no
+            // command: `for …` and `do a` are the two.)
+            ("for i in 1 2; do a; done\ncat <<EOF\nx\nEOF", 2),
+            // A closer right after another closes too, so the group around
+            // both closes where it does and what it ran is counted with it.
+            ("a; { if b; then { c; } fi; } <<EOF\nx\nEOF", 1),
+            ("a; { if b; then if c; then d; fi fi; } <<EOF\nx\nEOF", 1),
+            ("a; { case x in y) { b; } esac; } <<EOF\nx\nEOF", 1),
+            ("for i in 1 2; do { a; } done; cat <<EOF\nx\nEOF", 2),
             // `done <<EOF` feeds the loop it closes.
             ("while read l; do a; done <<EOF\nx\nEOF", 0),
             // A quoted `done` is a command, not the loop's close.
@@ -3136,11 +3153,7 @@ mod tests {
         // The pattern before a `case` arm's `)` is no command.
         assert_eq!(
             sh_words("echo \"$(case $x in a) npm publish;; esac)\"", Skip),
-            Some(vec![
-                argv(&["npm", "publish"]),
-                argv(&["esac"]),
-                argv(&["echo", ""]),
-            ])
+            Some(vec![argv(&["npm", "publish"]), argv(&["echo", ""])])
         );
         assert_eq!(
             sh_words("echo \"<\"& npm publish", Skip),

@@ -190,12 +190,7 @@ fn scripts_handed_to_a_shell(program: &str, args: &[String]) -> Vec<String> {
         return vec![args.join(" ")];
     }
     if program == "trap" {
-        return args
-            .iter()
-            .find(|arg| !arg.starts_with('-'))
-            .cloned()
-            .into_iter()
-            .collect();
+        return trap_action(args).map(str::to_string).into_iter().collect();
     }
     let hands_on_text = |base: &str| base == "ssh" || SHELLS.contains(&base);
     let (shell, rest) = if hands_on_text(program) {
@@ -228,6 +223,22 @@ fn scripts_handed_to_a_shell(program: &str, args: &[String]) -> Vec<String> {
         Some(flag) => operands(&rest[flag + 1..]),
         None => Vec::new(),
     }
+}
+
+/// The action a `trap` sets: its first operand, or the one after a `--`. None
+/// when it sets none — `trap - EXIT` resets, `trap -p` and `trap -l` print.
+/// Before a `--` a leading `-` is one of those; after it, only a lone `-` is,
+/// and anything else is the action: `trap -- '-;npm publish' EXIT` runs `npm
+/// publish`, and skipping every `-…` word read `EXIT` as the action instead.
+fn trap_action(args: &[String]) -> Option<&str> {
+    let (first, rest) = args.split_first()?;
+    if first == "--" {
+        return rest
+            .first()
+            .map(String::as_str)
+            .filter(|action| *action != "-");
+    }
+    (!first.starts_with('-')).then_some(first.as_str())
 }
 
 /// Whether a token is a `--dry-run` that is actually ON, so the command only
