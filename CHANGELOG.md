@@ -6,6 +6,21 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [0.4.14] - 2026-10-16
+
+- **Security:** The project-level `[sandbox] mode` tightening check was reversed, so any repository could turn its own sandbox off; the direction is fixed, and a project config can now only tighten the sandbox, not disable it.
+- **Security:** The irreversible floor now reads commands the way the shell assembles them instead of slicing raw argv, so it catches the publish commands it was missing behind assignments, wrapper/interpreter prefixes and `\`-newline continuations; its reader is quote-aware — quoted text a shell will execute counts as a command, and the action of `trap -- '-…'` is read rather than skipped.
+- **Security:** The floors now follow execution into `sh -c`, here-strings and `$((cmd) …)` arithmetic, and judge a heredoc body by where it actually feeds and who might run after it rather than its literal text — `((…))` counts as executed because dash runs it, and routine dry-runs are no longer falsely blocked. The deny floor no longer cuts a `\`-newline continuation in two, so `rm \⏎ -rf /` is no longer read as the program word `-rf`, and consecutive closing words now close the outer compound command.
+- **Security:** The sandbox no longer re-resolves its roots on every spawn. Write roots are pinned at grant time and the temporary root (`$TMPDIR`) is resolved step-by-step, so racing a root's check against its resolve, or swapping a granted root or `$TMPDIR` for a symlink, no longer escapes the write fence; on macOS each write root's own directory entry is locked to close the same gap.
+- **Security:** On Windows the Job Object confinement is no longer dropped together with `mode = "off"`.
+- **Security:** A sub-agent dispatch carrying `allow_commands` was being auto-approved under `accept_edits`/auto; it now prompts there too, so the command list is still put in front of a human rather than resolved by a standing consent.
+- **Security:** rustls is updated to 0.23.46 and quinn-proto to 0.11.19, clearing seven RUSTSEC advisories ahead of this release.
+- The TUI sets the terminal title on startup — so a VS Code tab no longer shows `node` while deep-code is running — and restores the shell's title on exit.
+- With `mode = "off"`, the doctor report and headless runs no longer misreport the sandbox: `available` is now false, the doctor text no longer blames the platform, and a headless run no longer claims the sandbox is in effect.
+- A sub-agent that ends normally with an empty final message no longer loses the findings it wrote earlier, and one that hits its wall-clock timeout now returns its partial report, with the timeout raised above the shell's own limit; the budget wrap-up nudge is no longer injected as a user message, so compaction cannot archive the task it was prompting toward.
+- When a sub-agent wants to run an irreversible command that also needs the network, the irreversible refusal prompt now comes before the network-grant prompt.
+- The sandbox's credential-failure detection is tightened, so an ordinary test failure is no longer mislabeled as a credential failure.
+
 ## [0.4.13] - 2026-10-08
 
 - A sub-agent dispatch can now carry an `allow_commands` list — the command identities the child may run beyond its built-in trust list. A child's own prompts are auto-denied (nobody is watching them), so a shell command outside that list was unreachable in every mode, `yolo` included; naming it here moves the decision to the one place a human still is, and the dispatch prompt lists the commands and asks once. The grant is scoped to that one child: it cannot reach the parent's own policy, a child cannot pass it on to its own children, and it cannot lift the irreversible floor.
@@ -334,3 +349,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.4.11]: https://github.com/liwenka1/deep-code/compare/v0.4.10...v0.4.11
 [0.4.12]: https://github.com/liwenka1/deep-code/compare/v0.4.11...v0.4.12
 [0.4.13]: https://github.com/liwenka1/deep-code/compare/v0.4.12...v0.4.13
+[0.4.14]: https://github.com/liwenka1/deep-code/compare/v0.4.13...v0.4.14
