@@ -87,6 +87,7 @@ fn install_panic_hook() {
             DisableMouseCapture,
             DisableBracketedPaste,
             LeaveAlternateScreen,
+            TitleStack::Pop,
             crossterm::cursor::Show
         );
         // Written to stdout on purpose: stderr is the log file at this point.
@@ -114,12 +115,14 @@ fn setup_terminal() -> Result<AppTerminal> {
     // capture: wheel scrolls the transcript and drag selects text (we render
     // an in-app selection + copy, since capture disables native selection).
     // Title: without one, terminals that label tabs by the foreground process
-    // (VS Code) show `node` — the npm launcher leads the process group.
+    // (VS Code) show `node` — the npm launcher leads the process group. The
+    // shell's title is pushed first so quitting can give it back.
     execute!(
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
         EnableMouseCapture,
+        TitleStack::Push,
         SetTitle("deep-code")
     )?;
 
@@ -136,11 +139,37 @@ fn restore_terminal(terminal: &mut AppTerminal) -> Result<()> {
         terminal.backend_mut(),
         DisableMouseCapture,
         DisableBracketedPaste,
-        LeaveAlternateScreen
+        LeaveAlternateScreen,
+        TitleStack::Pop
     )?;
     terminal.show_cursor()?;
 
     Ok(())
+}
+
+/// The terminal's title stack (XTWINOPS 22/23): push the title the shell had
+/// before setting ours, pop it on the way out. Without the pop the tab keeps
+/// reading `deep-code` after quit until something else sets a title, and most
+/// shells never do. A terminal without the stack ignores both sequences and
+/// keeps our title — what it showed before this existed.
+enum TitleStack {
+    Push,
+    Pop,
+}
+
+impl crossterm::Command for TitleStack {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Push => "\x1b[22;0t",
+            Self::Pop => "\x1b[23;0t",
+        })
+    }
+
+    // A console without VT sequences has no title stack to push to.
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Where the log may be opened — `None` when the path is not ours to write.
