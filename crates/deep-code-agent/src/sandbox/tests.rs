@@ -609,3 +609,47 @@ fn without_confinement_runs_bare_instead_of_refusing() {
         "the default manager confines"
     );
 }
+
+/// Process management is not confinement. On Windows the Job Object is what
+/// kills a cancelled or timed-out command's whole tree and caps its process
+/// count, and `mode = "off"` (`without_confinement`) — which removes
+/// confinement Windows never had — used to drop it too, leaving dev servers
+/// holding ports after a cancel. Both managers must get the same answer, and
+/// the answer is the platform's.
+///
+/// Deliberately not `#[cfg(windows)]`: ungated, it compiles and runs on every
+/// host and only the expectation differs, so it cannot first break on Windows
+/// CI. What it catches does need Windows, though: there the switch could cost
+/// the guard, everywhere else there is no guard to lose.
+#[tokio::test]
+async fn confine_spawned_does_not_depend_on_the_sandbox_switch() {
+    for manager in [SandboxManager::new(), SandboxManager::without_confinement()] {
+        // Alive while it is assigned, as in `windows::tests`.
+        let mut command = if cfg!(windows) {
+            let mut command = tokio::process::Command::new("cmd");
+            command.args(["/C", "ping", "-n", "5", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = tokio::process::Command::new("sleep");
+            command.arg("5");
+            command
+        };
+        let mut child = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn test child");
+        let guard = manager.confine_spawned(&child);
+        assert_eq!(
+            guard.is_some(),
+            cfg!(windows),
+            "confinement_disabled = {}: the Job Object follows the platform, not the switch",
+            manager.confinement_disabled()
+        );
+        // The guard drops after this kill; on Windows that closes the job and
+        // takes the rest of the tree with it.
+        let _ = child.kill().await;
+    }
+}
