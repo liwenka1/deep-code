@@ -210,11 +210,12 @@ pub(crate) const CREDENTIAL_ENTRIES: &[&str] = &[
 /// Ecosystem cache directories a sandboxed command legitimately needs to
 /// WRITE, and that nothing else grants.
 ///
-/// The same argument that puts the temp dir in `SandboxPolicy::writable_roots`
-/// applies here and only here: these are directories the user's own toolchain
-/// writes unconditionally, so a profile without them does not *confine*
-/// `npm install` or a cold `cargo build` — it makes them fail (the EPERM-on-its-
-/// own-cache case `sandbox::write_denial_signature` was taught to recognize).
+/// The same argument that puts the temp dir among the sandbox's system roots
+/// (`system_roots` in `sandbox/policy.rs`) applies here and only here: these
+/// are directories the user's own toolchain writes unconditionally, so a
+/// profile without them does not *confine* `npm install` or a cold `cargo
+/// build` — it makes them fail (the EPERM-on-its-own-cache case
+/// `sandbox::write_denial_signature` was taught to recognize).
 ///
 /// **Subpaths, never the tool's home.** `$CARGO_HOME/config.toml` selects a
 /// source replacement (code execution at the next build) and `~/.npmrc` carries

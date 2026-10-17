@@ -366,7 +366,7 @@ fn distinct_cwd_receives_its_own_write_grant() {
         .map(|(name, _)| name.as_str())
         .collect();
     // Workspace, the distinct cwd, the temp dir, and /tmp — see
-    // `SandboxPolicy::writable_roots` for why the last two are mandatory.
+    // `system_roots` in `sandbox/policy.rs` for why the last two are mandatory.
     assert_eq!(
         write_roots,
         [
@@ -409,7 +409,8 @@ fn extra_granted_root_receives_its_own_write_grant() {
 fn temp_dir_is_always_a_write_root() {
     // Regression guard: `rustc`, `mktemp` and git's xcrun shim all write to
     // $TMPDIR unconditionally, so dropping this grant does not confine
-    // `cargo build`, it breaks it. Both backends read `writable_roots`.
+    // `cargo build`, it breaks it. Both backends grant
+    // `SandboxPolicy::resolved_writable_roots`.
     let workspace = tempfile::tempdir().unwrap();
     let profile = compose_profile(
         &SandboxPolicy::workspace_write(),

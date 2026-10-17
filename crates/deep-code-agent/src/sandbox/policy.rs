@@ -60,53 +60,12 @@ impl SandboxPolicy {
         }
     }
 
-    /// Writable roots: every granted root (the workspace first, then any
-    /// `--add-dir` grants), the command's cwd when it is not already granted,
-    /// the system temp dir, and (unix) `/tmp`.
-    ///
-    /// The temp dir is not a convenience. Toolchains write scratch files there
-    /// unconditionally — `rustc` allocates a temp dir per invocation, git's
-    /// xcrun shim caches there, every `mktemp` caller needs it — so a profile
-    /// without it does not *confine* `cargo build`, it makes it fail outright.
-    /// Granting it is no escalation either: the sandbox exists to hold commands
-    /// inside the granted boundary, and `$TMPDIR` is per-user ephemeral space
-    /// the user's own processes already write to. Both backends read this list,
-    /// so the grant cannot drift per-platform again.
-    ///
-    /// `/tmp` rides the same argument. On Linux it IS the temp dir; on macOS
-    /// the temp dir is `$TMPDIR` (`/var/folders/…`) and `/tmp` is a separate
-    /// place tools land on when they cannot ask for the real one: inside the
-    /// sandbox `confstr(_CS_DARWIN_USER_TEMP_DIR)` fails (the dirhelper mach
-    /// service is behind deny-default), so Apple's xcrun shim — run by every
-    /// `git` invocation — falls back to `/tmp` and, without this grant, spams
-    /// "Operation not permitted" on stderr. That noise isn't cosmetic: it
-    /// carries the write-denial signature, so a git run that failed for a
-    /// different reason gets misclassified as a write-boundary denial.
-    /// Sticky world-writable `/tmp` is space every unconfined process already
-    /// writes to; granting it widens nothing that matters.
-    pub fn writable_roots(&self, granted: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
-        match self {
-            Self::Unsandboxed => Vec::new(),
-            Self::WorkspaceWrite { .. } => {
-                let mut roots: Vec<PathBuf> = Vec::new();
-                for root in granted
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::once(cwd.to_path_buf()))
-                    .chain(system_roots())
-                {
-                    if !roots.contains(&root) {
-                        roots.push(root);
-                    }
-                }
-                roots
-            }
-        }
-    }
-
-    /// [`Self::writable_roots`] as one spawn grants them: each resolved to the
-    /// real path the kernel matches, and a root left out when what now stands
-    /// at its path is not what may be granted there.
+    /// The roots one spawn may write: every granted root (the workspace first,
+    /// then any `--add-dir` grants), the command's cwd when it is not already
+    /// granted, and the system temp roots ([`system_roots`]) — each resolved to
+    /// the real path the kernel matches, and a root left out when what now
+    /// stands at its path is not what may be granted there. Both backends grant
+    /// exactly this list, so the grant cannot drift per-platform again.
     ///
     /// Re-resolving a root per spawn is a write-fence escape whenever a
     /// sandboxed command can put a symlink where the root was. It can, more
@@ -183,8 +142,27 @@ impl SandboxPolicy {
 }
 
 /// The roots every sandboxed command may write besides the granted ones: the
-/// temp dir, `/tmp` (unix) and `/dev/shm` (Linux). See
-/// [`SandboxPolicy::writable_roots`] for why each is there.
+/// temp dir, `/tmp` (unix) and `/dev/shm` (Linux, explained inline below).
+///
+/// The temp dir is not a convenience. Toolchains write scratch files there
+/// unconditionally — `rustc` allocates a temp dir per invocation, git's xcrun
+/// shim caches there, every `mktemp` caller needs it — so a profile without it
+/// does not *confine* `cargo build`, it makes it fail outright. Granting it is
+/// no escalation either: the sandbox exists to hold commands inside the granted
+/// boundary, and `$TMPDIR` is per-user ephemeral space the user's own processes
+/// already write to.
+///
+/// `/tmp` rides the same argument. On Linux it IS the temp dir; on macOS the
+/// temp dir is `$TMPDIR` (`/var/folders/…`) and `/tmp` is a separate place
+/// tools land on when they cannot ask for the real one: inside the sandbox
+/// `confstr(_CS_DARWIN_USER_TEMP_DIR)` fails (the dirhelper mach service is
+/// behind deny-default), so Apple's xcrun shim — run by every `git` invocation
+/// — falls back to `/tmp` and, without this grant, spams "Operation not
+/// permitted" on stderr. That noise isn't cosmetic: it carries the write-denial
+/// signature, so a git run that failed for a different reason gets
+/// misclassified as a write-boundary denial. Sticky world-writable `/tmp` is
+/// space every unconfined process already writes to; granting it widens
+/// nothing that matters.
 fn system_roots() -> Vec<PathBuf> {
     let mut roots = vec![std::env::temp_dir()];
     if cfg!(unix) {
@@ -458,19 +436,16 @@ mod tests {
     #[test]
     fn tmp_is_always_a_writable_root_on_unix() {
         let ws = Path::new("/w");
-        let roots = SandboxPolicy::workspace_write().writable_roots(&[ws.to_path_buf()], ws);
+        let roots =
+            SandboxPolicy::workspace_write().resolved_writable_roots(&[ws.to_path_buf()], ws);
+        // Granted at its real path: on macOS `/tmp` is a root-owned symlink.
+        let tmp = crate::paths::canonicalize(Path::new("/tmp")).unwrap();
         assert!(
-            roots.contains(&PathBuf::from("/tmp")),
+            roots.contains(&tmp),
             "unix roots must include /tmp: {roots:?}"
         );
         // And exactly once, even when the temp dir already is /tmp (Linux).
-        assert_eq!(
-            roots
-                .iter()
-                .filter(|root| *root == &PathBuf::from("/tmp"))
-                .count(),
-            1
-        );
+        assert_eq!(roots.iter().filter(|root| **root == tmp).count(), 1);
     }
 
     /// Linux POSIX shared memory needs `/dev/shm` writable, or multiprocessing
@@ -479,9 +454,13 @@ mod tests {
     #[test]
     fn dev_shm_is_a_writable_root_on_linux() {
         let ws = Path::new("/w");
-        let roots = SandboxPolicy::workspace_write().writable_roots(&[ws.to_path_buf()], ws);
+        let roots =
+            SandboxPolicy::workspace_write().resolved_writable_roots(&[ws.to_path_buf()], ws);
+        // At its real path when it has one; as written where it does not exist.
+        let shm = crate::paths::canonicalize(Path::new("/dev/shm"))
+            .unwrap_or_else(|_| PathBuf::from("/dev/shm"));
         assert!(
-            roots.contains(&PathBuf::from("/dev/shm")),
+            roots.contains(&shm),
             "linux roots must include /dev/shm: {roots:?}"
         );
     }
