@@ -114,9 +114,12 @@ fn setup_terminal() -> Result<AppTerminal> {
     // Bracketed paste: paste arrives as one `Event::Paste` string. Mouse
     // capture: wheel scrolls the transcript and drag selects text (we render
     // an in-app selection + copy, since capture disables native selection).
-    // Title: without one, terminals that label tabs by the foreground process
-    // (VS Code) show `node` — the npm launcher leads the process group. The
-    // shell's title is pushed first so quitting can give it back.
+    // Title: names the window or tab in terminals that show a title a program
+    // sets. Not VS Code's tab, though: by default it is `${process}`, the
+    // foreground process — for the npm install the `node` launcher, which leads
+    // the process group — and an OSC title never reaches that label (measured
+    // against VS Code's own node-pty). The shell's title is pushed first so
+    // quitting can give it back.
     execute!(
         stdout,
         EnterAlternateScreen,
@@ -151,7 +154,8 @@ fn restore_terminal(terminal: &mut AppTerminal) -> Result<()> {
 /// before setting ours, pop it on the way out. Without the pop the tab keeps
 /// reading `deep-code` after quit until something else sets a title, and most
 /// shells never do. A terminal without the stack ignores both sequences and
-/// keeps our title — what it showed before this existed.
+/// keeps our title — what it showed before this existed. VS Code is one: its
+/// xterm.js implements the stack but leaves it switched off (`windowOptions`).
 enum TitleStack {
     Push,
     Pop,
