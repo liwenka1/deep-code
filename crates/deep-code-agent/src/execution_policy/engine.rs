@@ -1516,10 +1516,6 @@ pub fn accept_edits_approvable(tool_name: &str, arguments: &Value) -> bool {
     }
 }
 
-/// Whether an `agent` call's `role` argument names a role whose child may write
-/// (see [`crate::subagent::SubAgentRole::allows_writes`]). Absent role means
-/// `general` (read-only); an unparsable role fails closed to "writes" — the
-/// tool itself will reject it, but if that ever drifts, prompt rather than pass.
 /// The `matched_rule` prefix on a plan no automatic path may approve.
 ///
 /// It rides `matched_rule` rather than a new plan field on purpose: that field is
@@ -1580,6 +1576,10 @@ pub fn normalize_allow_commands(entries: &[String]) -> Vec<String> {
     normalized
 }
 
+/// Whether an `agent` call's `role` argument names a role whose child may write
+/// (see [`crate::subagent::SubAgentRole::allows_writes`]). Absent role means
+/// `general` (read-only); an unparsable role fails closed to "writes" — the
+/// tool itself will reject it, but if that ever drifts, prompt rather than pass.
 fn subagent_role_writes(arguments: &Value) -> bool {
     let role = arguments
         .get("role")
