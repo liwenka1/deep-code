@@ -1017,6 +1017,11 @@ pub(super) const PREFIX_WORDS: &[&str] = &[
 /// rest of the session, and in AcceptEdits the model writes that script with
 /// no prompt either. `awk`/`osascript` are here for the same reason a level
 /// down: their program text can `system()` / `do shell script` out.
+///
+/// Every shell whose `-c` script the irreversible floor reads (`SHELLS` in
+/// `engine.rs`) is one by that rule, and a test holds the two lists together:
+/// `ash` and `mksh` were read there and missing here, so `curl … | ash` was not
+/// refused and one "a" on `ash setup.sh` covered `ash <any script>`.
 pub(super) const INTERPRETERS: &[&str] = &[
     // The shell's own text-executing builtins.
     "eval",
@@ -1030,6 +1035,8 @@ pub(super) const INTERPRETERS: &[&str] = &[
     "zsh",
     "dash",
     "ksh",
+    "ash",
+    "mksh",
     "fish",
     "perl",
     "python",
@@ -1949,6 +1956,8 @@ mod tests {
         "zsh",
         "dash",
         "ksh",
+        "ash",
+        "mksh",
         "fish",
         "perl",
         "python",

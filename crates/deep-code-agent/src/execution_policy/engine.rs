@@ -170,7 +170,9 @@ const HEREDOC_DATA_SINKS: &[&str] = &[
 /// `trap 'sh x.sh' EXIT` set before a body is written to `x.sh` runs it after.
 const RUNS_LATER: &[&str] = &["trap"];
 
-/// Shells whose `-c` string is a line of shell.
+/// Shells whose `-c` string is a line of shell. Each is an interpreter to the
+/// deny floor and the identity side as well (`shell_lex::INTERPRETERS`), and a
+/// test holds the two lists together.
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "fish"];
 
 /// The text a command hands to a shell to run as lines of its own, for the
