@@ -199,9 +199,22 @@ pub(crate) fn report_withheld_root(root: &Path, why: &str) -> bool {
         .unwrap_or_else(PoisonError::into_inner)
         .insert(root.to_path_buf());
     if first {
-        eprintln!("sandbox: write root {} withheld: {why}", root.display());
+        eprintln!("{}", withheld_root_line(root, why));
     }
     first
+}
+
+/// The line [`report_withheld_root`] prints, neutralized whole
+/// ([`crate::text_sanitize::neutralize_display_text`]). Both halves can carry a
+/// name a sandboxed command chose — the root itself, or in `why` the place a
+/// symlink it planted at a root points to — and under `-p` stderr is the user's
+/// terminal: a directory named `x\e]0;…\a\e[2J\nFAKE: …` would retitle it,
+/// clear it and forge the next line. The TUI's log redirect is best-effort too.
+fn withheld_root_line(root: &Path, why: &str) -> String {
+    crate::text_sanitize::neutralize_display_text(&format!(
+        "sandbox: write root {} withheld: {why}",
+        root.display()
+    ))
 }
 
 /// A granted root or cwd, resolved — or `None` when it no longer resolves to
@@ -372,6 +385,28 @@ mod tests {
         assert!(report_withheld_root(&first, "test"));
         assert!(!report_withheld_root(&first, "test"), "reported twice");
         assert!(report_withheld_root(&second, "test"), "silenced by another");
+    }
+
+    /// The report is one inert line. The root's name and the target a planted
+    /// symlink points to are both a sandboxed command's choice, and under `-p`
+    /// the line lands on the user's terminal: control characters (escape
+    /// sequences, a newline that would forge the next line) must arrive as
+    /// spaces and bidi overrides not at all — neutralized, not dropped, so the
+    /// path stays recognizable.
+    #[test]
+    fn a_withheld_root_line_cannot_steer_the_terminal() {
+        let hostile = "x\u{1b}]0;PWNED\u{7}\u{1b}[2J\u{202e}\nFAKE: approval granted";
+        let line = withheld_root_line(
+            &Path::new("/w").join(hostile),
+            &format!("it resolves to /t/{hostile} now"),
+        );
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert!(!line.contains('\u{202e}'), "{line:?}");
+        assert_eq!(
+            line.matches("FAKE: approval granted").count(),
+            2,
+            "{line:?}"
+        );
     }
 
     /// A system temp root is reached through symlinks on purpose (`/tmp`,
