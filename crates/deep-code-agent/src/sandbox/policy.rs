@@ -125,8 +125,9 @@ impl SandboxPolicy {
             if resolved.is_none() {
                 report_withheld_root(
                     root,
-                    "it does not resolve through root-owned symlinks alone, and a symlink this \
-                     user owns on its path could have been planted by a sandboxed command",
+                    "its path does not resolve through root-owned symlinks alone: a link a \
+                     non-root user owns (what a sandboxed command would plant), a link loop or \
+                     unreadable link, or a relative path",
                 );
             }
             resolved
