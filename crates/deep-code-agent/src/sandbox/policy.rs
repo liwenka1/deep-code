@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use crate::execution_policy::ToolExecutionPlan;
 
@@ -159,7 +161,17 @@ impl SandboxPolicy {
             .cloned()
             .chain(std::iter::once(cwd.to_path_buf()))
             .map(|root| resolve_pinned_root(&root));
-        let system = system.iter().map(|root| resolve_system_root(root));
+        let system = system.iter().map(|root| {
+            let resolved = resolve_system_root(root);
+            if resolved.is_none() {
+                report_withheld_root(
+                    root,
+                    "it does not resolve through root-owned symlinks alone, and a symlink this \
+                     user owns on its path could have been planted by a sandboxed command",
+                );
+            }
+            resolved
+        });
         let mut resolved: Vec<PathBuf> = Vec::new();
         for real in pinned.chain(system).flatten() {
             if !resolved.contains(&real) {
@@ -191,11 +203,44 @@ fn system_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// Say — once per path, for the life of the process — that a write root was
+/// withheld, and why. Returns whether this call was the one that said it.
+///
+/// Withholding fails closed, which is right, but it used to fail silently: what
+/// the user saw was a build dying with "Operation not permitted" in a directory
+/// they believed writable, and nothing anywhere named the cause. One line on
+/// stderr — by then the TUI has pointed it at `.deep-code/deep-code.log`, and a
+/// headless run keeps stdout for its output. Once per path, because every spawn
+/// re-checks the roots, and a cache moved behind a symlink is withheld from
+/// every networked command.
+pub(crate) fn report_withheld_root(root: &Path, why: &str) -> bool {
+    static REPORTED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let first = REPORTED
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(root.to_path_buf());
+    if first {
+        eprintln!("sandbox: write root {} withheld: {why}", root.display());
+    }
+    first
+}
+
 /// A granted root or cwd, resolved — or `None` when it no longer resolves to
 /// the path it was granted at (see [`SandboxPolicy::resolved_writable_roots`]).
 fn resolve_pinned_root(root: &Path) -> Option<PathBuf> {
     match crate::paths::canonicalize(root) {
-        Ok(real) if real != root => None,
+        Ok(real) if real != root => {
+            report_withheld_root(
+                root,
+                &format!(
+                    "it resolves to {} now, not to the path it was granted at — moved or \
+                     replaced since",
+                    real.display()
+                ),
+            );
+            None
+        }
         Ok(real) => Some(real),
         Err(_) => Some(root.to_path_buf()),
     }
@@ -322,6 +367,12 @@ mod tests {
             !roots.contains(&swapped) && !roots.contains(&target),
             "{roots:?}"
         );
+        // …and not silently: the spawn that withheld it reported it (asking
+        // again finds it already said).
+        assert!(
+            !report_withheld_root(&swapped, "probe"),
+            "a swapped root was withheld without a word"
+        );
         // A swapped cwd is pinned the same way.
         let roots = policy.resolved_writable_roots(std::slice::from_ref(&real), &swapped);
         assert!(!roots.contains(&target), "{roots:?}");
@@ -329,6 +380,20 @@ mod tests {
         // symlink (macOS) and is granted at its real path.
         let tmp = crate::paths::canonicalize(Path::new("/tmp")).unwrap();
         assert!(roots.contains(&tmp), "{roots:?}");
+    }
+
+    /// A withheld root is reported once per path. Every spawn re-checks the
+    /// roots, so without this a cache moved behind a symlink would put a line
+    /// in the log for every networked command; and a different root is its own
+    /// report, so the first one cannot silence the rest.
+    #[test]
+    fn a_withheld_root_is_reported_once_per_path() {
+        let holder = tempfile::tempdir().unwrap();
+        let first = holder.path().join("first");
+        let second = holder.path().join("second");
+        assert!(report_withheld_root(&first, "test"));
+        assert!(!report_withheld_root(&first, "test"), "reported twice");
+        assert!(report_withheld_root(&second, "test"), "silenced by another");
     }
 
     /// A system temp root is reached through symlinks on purpose (`/tmp`,
@@ -366,6 +431,10 @@ mod tests {
         assert!(
             !roots.contains(&target) && !roots.contains(&target.join("T")),
             "{roots:?}"
+        );
+        assert!(
+            !report_withheld_root(&planted, "probe"),
+            "a planted temp root was withheld without a word"
         );
         assert!(roots.contains(&real), "{roots:?}");
         let tmp = crate::paths::canonicalize(Path::new("/tmp")).unwrap();

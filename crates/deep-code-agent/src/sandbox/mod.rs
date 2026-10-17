@@ -10,6 +10,7 @@ mod macos_seatbelt;
 mod windows;
 
 pub use policy::SandboxPolicy;
+pub(crate) use policy::report_withheld_root;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

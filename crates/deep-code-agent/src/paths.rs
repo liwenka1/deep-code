@@ -299,12 +299,20 @@ impl CacheLeaf {
     /// The cost, stated rather than discovered: a cache the user moved to another
     /// volume behind a symlink of their own (`~/.cargo/registry -> /Volumes/…`)
     /// is indistinguishable from a planted one and is not granted either; its
-    /// writes fail as ordinary write denials, which the denial note explains.
+    /// writes fail as ordinary write denials, which the denial note explains,
+    /// and the log names the leaf and the reason.
     fn ensure(self, path: PathBuf) -> Option<PathBuf> {
         let parent = canonicalize(path.parent()?).ok()?;
         let path = parent.join(path.file_name()?);
         match std::fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() => return None,
+            Ok(meta) if meta.file_type().is_symlink() => {
+                crate::sandbox::report_withheld_root(
+                    &path,
+                    "the cache directory is a symlink, which a sandboxed command could have \
+                     planted — and a cache moved behind a link of the user's own looks the same",
+                );
+                return None;
+            }
             Ok(_) => return Some(path),
             Err(_) => {}
         }
@@ -450,5 +458,12 @@ mod tests {
         let leaf = parent.path().join("_cacache");
         std::os::unix::fs::symlink(elsewhere.path(), &leaf).unwrap();
         assert_eq!(CacheLeaf::Directory.ensure(leaf), None);
+        // …and not silently: the call that withheld it reported it (asking
+        // again finds it already said), under the path `ensure` resolved.
+        let withheld = canonicalize(parent.path()).unwrap().join("_cacache");
+        assert!(
+            !crate::sandbox::report_withheld_root(&withheld, "probe"),
+            "a symlinked cache leaf was withheld without a word"
+        );
     }
 }
