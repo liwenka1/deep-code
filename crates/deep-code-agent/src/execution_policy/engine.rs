@@ -172,8 +172,13 @@ const RUNS_LATER: &[&str] = &["trap"];
 
 /// Shells whose `-c` string is a line of shell. Each is an interpreter to the
 /// deny floor and the identity side as well (`shell_lex::INTERPRETERS`), and a
-/// test holds the two lists together.
-const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "fish"];
+/// test holds the two lists together. Read as `sh` whatever their own language
+/// (`fish`, the csh family, `nu`): approximate, but a word this reads as a
+/// command is one more thing gated, never one less.
+const SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "yash", "posh", "rbash", "fish", "csh",
+    "tcsh", "nu", "elvish", "xonsh",
+];
 
 /// The text a command hands to a shell to run as lines of its own, for the
 /// floor to read as lines: the operands after a [`SHELLS`] member's `-c`
