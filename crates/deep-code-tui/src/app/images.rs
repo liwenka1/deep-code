@@ -235,34 +235,6 @@ impl App {
             .retain(|image| self.input.contains(image.chip.as_str()));
     }
 
-    /// The attachment chip that ends exactly at the cursor.
-    ///
-    /// Used to delete one as a unit: backspacing through `[图片 #1 PNG]` a
-    /// character at a time is never what someone means, and the alternative is
-    /// a half-eaten chip that `sync_images` then throws away.
-    pub(crate) fn chip_ending_at_cursor(&self) -> Option<usize> {
-        let byte = byte_idx(
-            self.input.as_str(),
-            self.input_cursor.min(char_count(&self.input)),
-        );
-        let prefix = &self.input[..byte];
-        self.attached_images
-            .iter()
-            .position(|image| prefix.ends_with(image.chip.as_str()))
-    }
-
-    /// The attachment chip that starts exactly at the cursor, for Delete.
-    pub(crate) fn chip_starting_at_cursor(&self) -> Option<usize> {
-        let byte = byte_idx(
-            self.input.as_str(),
-            self.input_cursor.min(char_count(&self.input)),
-        );
-        let tail = &self.input[byte..];
-        self.attached_images
-            .iter()
-            .position(|image| tail.starts_with(image.chip.as_str()))
-    }
-
     /// The images to send, in the order they appear in the draft.
     ///
     /// Ordered by chip position rather than by attachment order: the chips are

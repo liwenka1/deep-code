@@ -3069,6 +3069,163 @@ fn backspace_takes_a_whole_chip_and_its_image() {
     assert!(chip_chars > 1, "sanity: a chip is not a single character");
 }
 
+/// `[图片 #1 PNG]` + ` 和 ` + `[粘贴 #1 +2 行]` after `看 `: one chip of each
+/// kind. Returns the image chip's and the paste chip's `[start, end)`.
+fn draft_with_both_chips(app: &mut App, dir: &std::path::Path) -> ((usize, usize), (usize, usize)) {
+    for ch in "看 ".chars() {
+        app.push_char(ch);
+    }
+    assert!(app.attach_image(write_test_png(dir, "shot.png")));
+    for ch in " 和 ".chars() {
+        app.push_char(ch);
+    }
+    app.paste_str("一\n二".to_string());
+    let image_end = 2 + app.attached_images[0].chip.chars().count();
+    let paste_start = image_end + 3;
+    let paste_end = paste_start + app.pasted_blocks[0].0.chars().count();
+    ((2, image_end), (paste_start, paste_end))
+}
+
+/// The draft still says what it said: both chips whole, the picture attached,
+/// the paste expanding on send.
+fn assert_chips_intact(app: &App) {
+    assert!(
+        app.input.contains(&app.attached_images[0].chip),
+        "{:?}",
+        app.input
+    );
+    assert!(
+        app.input.contains(&app.pasted_blocks[0].0),
+        "{:?}",
+        app.input
+    );
+    assert_eq!(
+        app.attached_images.len(),
+        1,
+        "the picture is still attached"
+    );
+    assert!(app.expand_pasted(&app.input).contains("一\n二"));
+}
+
+/// ←/→ step over a chip whole. A character at a time, the caret stopped inside
+/// one, and a character typed there broke it — the picture silently dropped,
+/// the placeholder sent instead of the paste.
+#[test]
+fn arrows_step_over_a_chip_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new();
+    let ((image_start, image_end), (paste_start, paste_end)) =
+        draft_with_both_chips(&mut app, dir.path());
+    assert_eq!(app.input_cursor, paste_end);
+
+    app.cursor_left();
+    assert_eq!(app.input_cursor, paste_start, "← over the paste chip");
+    app.cursor_right();
+    assert_eq!(app.input_cursor, paste_end, "→ over the paste chip");
+
+    app.input_cursor = image_end;
+    app.cursor_left();
+    assert_eq!(app.input_cursor, image_start, "← over the image chip");
+    app.cursor_right();
+    assert_eq!(app.input_cursor, image_end, "→ over the image chip");
+
+    // Typed where the arrows left the caret, on both sides of both chips.
+    for at in [paste_end, paste_start, image_end, image_start] {
+        app.input_cursor = at;
+        app.push_char('x');
+    }
+    assert_chips_intact(&app);
+}
+
+/// A chip has spaces inside it, so its words are not word stops: Ctrl+←/→ go
+/// past the whole chip.
+#[test]
+fn word_movement_does_not_stop_inside_a_chip() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new();
+    let ((image_start, image_end), (paste_start, paste_end)) =
+        draft_with_both_chips(&mut app, dir.path());
+
+    app.word_left();
+    assert_eq!(app.input_cursor, paste_start);
+    app.word_left();
+    assert_eq!(app.input_cursor, image_end + 1, "the start of 和");
+    app.word_left();
+    assert_eq!(app.input_cursor, image_start);
+    app.word_right();
+    assert_eq!(app.input_cursor, image_end);
+    app.input_cursor = image_end + 2;
+    app.word_right();
+    assert_eq!(app.input_cursor, paste_end);
+
+    // Glued to a word, a chip is part of it: no stop at the chip's edge.
+    let chip = app.attached_images[0].chip.clone();
+    app.input = format!("x{chip}y z");
+    let glued_end = chip.chars().count() + 2;
+    app.input_cursor = glued_end;
+    app.word_left();
+    assert_eq!(app.input_cursor, 0, "x, the chip and y are one word");
+    app.word_right();
+    assert_eq!(app.input_cursor, glued_end);
+}
+
+/// Backspace and Delete take a paste chip whole, as they do an image chip.
+/// What one keypress left of `[粘贴 #1 +2 行]` matched no placeholder, so the
+/// stub was sent and the pasted text was not.
+#[test]
+fn backspace_and_delete_take_a_paste_chip_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new();
+    let (_, (paste_start, _)) = draft_with_both_chips(&mut app, dir.path());
+    let before = app.input.chars().take(paste_start).collect::<String>();
+
+    app.backspace();
+    assert_eq!(
+        app.input, before,
+        "the whole paste chip went in one keypress"
+    );
+    assert_eq!(app.input_cursor, paste_start);
+
+    app.paste_str("三\n四".to_string());
+    app.input_cursor = paste_start;
+    app.delete_forward();
+    assert_eq!(app.input, before, "and Delete takes it from the front");
+    assert_eq!(app.attached_images.len(), 1, "the image chip is untouched");
+}
+
+/// ↑/↓ carry the column into the next line, and that column can be inside a
+/// chip there; the caret comes to rest on the nearer edge instead.
+#[test]
+fn up_and_down_never_leave_the_caret_inside_a_chip() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new();
+    assert!(app.attach_image(write_test_png(dir.path(), "shot.png")));
+    let chip = app.attached_images[0].chip.clone();
+    // Line 0 is the chip, line 1 plain text as long.
+    app.push_newline();
+    for ch in "abcdefghijklmn".chars() {
+        app.push_char(ch);
+    }
+    let line1 = chip.chars().count() + 1;
+
+    app.input_cursor = line1 + 3;
+    app.on_up();
+    assert_eq!(app.input_cursor, 0, "column 3 is nearer the chip's start");
+    app.input_cursor = line1 + 9;
+    app.on_up();
+    assert_eq!(app.input_cursor, line1 - 1, "column 9 is nearer its end");
+
+    // And down into it, from a line above.
+    app.input = format!("abcdefghijklmn\n{chip}");
+    app.input_cursor = 9;
+    app.on_down();
+    assert_eq!(app.input_cursor, 15 + chip.chars().count());
+    app.input_cursor = 3;
+    app.on_down();
+    assert_eq!(app.input_cursor, 15);
+    assert_eq!(app.attached_images.len(), 1);
+}
+
 /// An attachment whose chip is gone must not be sent. This is what makes every
 /// other deletion route (`Ctrl+W`, `Ctrl+U`, a selection overwrite) safe without
 /// teaching each of them about chips.

@@ -10,6 +10,17 @@
 
 use super::*;
 
+/// Which edge of a chip a caret bound for its inside comes to rest on.
+#[derive(Debug, Clone, Copy)]
+enum ChipExit {
+    /// Its start: the caret was moving left.
+    Start,
+    /// Its end: the caret was moving right.
+    End,
+    /// Whichever is closer: ↑/↓ carrying a column into it.
+    Nearest,
+}
+
 impl App {
     pub fn push_char(&mut self, value: char) {
         let cursor = self.input_cursor.min(char_count(&self.input));
@@ -28,10 +39,15 @@ impl App {
         // Stepping into `[图片 #1 PNG]` a character at a time is never what
         // someone means, and it would leave a half-eaten chip for
         // `sync_images` to throw away — the picture vanishing with no gesture
-        // that looks like it removed it.
-        if let Some(index) = self.chip_ending_at_cursor() {
-            let cursor = self.input_cursor.min(char_count(&self.input));
-            let start = cursor.saturating_sub(char_count(&self.attached_images[index].chip));
+        // that looks like it removed it. A paste chip likewise: what is left of
+        // `[粘贴 #1 +3 行]` is no placeholder `expand_pasted` recognizes, so the
+        // stub was sent and the pasted text silently was not.
+        let cursor = self.input_cursor.min(char_count(&self.input));
+        if let Some((start, _)) = self
+            .chip_spans()
+            .into_iter()
+            .find(|&(_, end)| end == cursor)
+        {
             self.cut_chip(start, cursor);
             return;
         }
@@ -59,10 +75,13 @@ impl App {
             return;
         }
         // Mirror of Backspace: a chip in front of the cursor goes as a unit.
-        if let Some(index) = self.chip_starting_at_cursor() {
-            let start = self.input_cursor;
-            let end = start + char_count(&self.attached_images[index].chip);
-            self.cut_chip(start, end);
+        let cursor = self.input_cursor;
+        if let Some((_, end)) = self
+            .chip_spans()
+            .into_iter()
+            .find(|&(start, _)| start == cursor)
+        {
+            self.cut_chip(cursor, end);
             return;
         }
         remove_char_at(&mut self.input, self.input_cursor);
@@ -71,13 +90,13 @@ impl App {
         self.refresh_completion();
     }
 
-    /// Remove one attachment chip as a unit.
+    /// Remove one chip as a unit.
     ///
     /// `start`/`end` are char indices into `input`: Backspace deletes a chip that
     /// ends at the cursor, Delete deletes one that starts there, and both land
     /// here so the two paths cannot drift on the other bookkeeping.
     ///
-    /// The attachment itself is *not* removed here — `sync_images`, reached
+    /// An image's attachment is *not* removed here — `sync_images`, reached
     /// through `refresh_completion`, drops it only once no copy of its chip is
     /// left in the draft. That is what makes a chip the user copied and pasted a
     /// second time behave: deleting one copy keeps the image, because the other
@@ -89,19 +108,75 @@ impl App {
         self.refresh_completion();
     }
 
-    /// Move cursor one character left.
+    /// Move cursor one character left — or over a whole chip that ends here.
     pub fn cursor_left(&mut self) {
         if self.input_cursor == 0 {
             return;
         }
-        self.input_cursor -= 1;
+        self.input_cursor = self.out_of_chip(self.input_cursor - 1, ChipExit::Start);
     }
 
-    /// Move cursor one character right.
+    /// Move cursor one character right — or over a whole chip that starts here.
     pub fn cursor_right(&mut self) {
         if self.input_cursor < char_count(&self.input) {
-            self.input_cursor += 1;
+            self.input_cursor = self.out_of_chip(self.input_cursor + 1, ChipExit::End);
         }
+    }
+
+    /// Where a caret bound for `index` comes to rest so that it is never inside
+    /// a chip — an attached image's `[图片 #1 PNG]` or a collapsed paste's
+    /// `[粘贴 #1 +3 行]`.
+    ///
+    /// Both are found by their exact text: `sync_images` keeps a picture only
+    /// while its chip is in the draft, and `expand_pasted` swaps back only an
+    /// intact placeholder. So one character typed inside a chip silently drops
+    /// the picture, or sends the placeholder instead of the pasted text — and
+    /// arrowing through a chip a character at a time put the caret there.
+    /// Backspace and Delete take a chip whole for the same reason; this is that
+    /// rule for everything that moves the caret.
+    fn out_of_chip(&self, index: usize, exit: ChipExit) -> usize {
+        let spans = self.chip_spans();
+        let mut index = index;
+        // At most one step per chip: the composer never lays one chip over
+        // another, but nothing has to rely on that for this to end.
+        for _ in 0..spans.len() {
+            let Some(&(start, end)) = spans
+                .iter()
+                .find(|&&(start, end)| start < index && index < end)
+            else {
+                break;
+            };
+            index = match exit {
+                ChipExit::Start => start,
+                ChipExit::End => end,
+                ChipExit::Nearest if index - start <= end - index => start,
+                ChipExit::Nearest => end,
+            };
+        }
+        index
+    }
+
+    /// Every chip in the draft as a `[start, end)` range of char indices — each
+    /// occurrence, since a chip copied and pasted stands in two places.
+    fn chip_spans(&self) -> Vec<(usize, usize)> {
+        let labels = self
+            .attached_images
+            .iter()
+            .map(|image| image.chip.as_str())
+            .chain(
+                self.pasted_blocks
+                    .iter()
+                    .map(|(placeholder, _)| placeholder.as_str()),
+            )
+            .filter(|label| !label.is_empty());
+        let mut spans = Vec::new();
+        for label in labels {
+            for (byte, _) in self.input.match_indices(label) {
+                let start = char_count(&self.input[..byte]);
+                spans.push((start, start + char_count(label)));
+            }
+        }
+        spans
     }
 
     /// Move cursor to start of the current logical line.
@@ -243,8 +318,17 @@ impl App {
         while i > 0 && chars[i - 1].is_whitespace() {
             i -= 1;
         }
-        while i > 0 && !chars[i - 1].is_whitespace() {
-            i -= 1;
+        // A chip has spaces in it, but it is one word — together with any word
+        // it is glued to — so a stop inside one goes on past it.
+        loop {
+            while i > 0 && !chars[i - 1].is_whitespace() {
+                i -= 1;
+            }
+            let past = self.out_of_chip(i, ChipExit::Start);
+            if past == i {
+                break;
+            }
+            i = past;
         }
         self.input_cursor = i;
     }
@@ -257,8 +341,16 @@ impl App {
         while i < len && chars[i].is_whitespace() {
             i += 1;
         }
-        while i < len && !chars[i].is_whitespace() {
-            i += 1;
+        // As in `word_left`: a chip and any word glued to it are one word.
+        loop {
+            while i < len && !chars[i].is_whitespace() {
+                i += 1;
+            }
+            let past = self.out_of_chip(i, ChipExit::End);
+            if past == i {
+                break;
+            }
+            i = past;
         }
         self.input_cursor = i;
     }
@@ -317,7 +409,10 @@ impl App {
         }
         let target = line - 1;
         let len = self.logical_line_len(target);
-        self.input_cursor = self.line_start_char(target) + col.min(len);
+        self.input_cursor = self.out_of_chip(
+            self.line_start_char(target) + col.min(len),
+            ChipExit::Nearest,
+        );
         true
     }
 
@@ -329,7 +424,10 @@ impl App {
         }
         let target = line + 1;
         let len = self.logical_line_len(target);
-        self.input_cursor = self.line_start_char(target) + col.min(len);
+        self.input_cursor = self.out_of_chip(
+            self.line_start_char(target) + col.min(len),
+            ChipExit::Nearest,
+        );
         true
     }
 
