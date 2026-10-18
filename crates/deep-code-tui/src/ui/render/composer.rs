@@ -67,6 +67,9 @@ pub(crate) struct LayoutResult {
     pub cursor_col: usize,
     /// Total visual rows across the whole input (for scroll calculations).
     pub total_rows: usize,
+    /// The row of the whole input shown at the top of the viewport: where it is
+    /// scrolled to, which the next frame passes back in as `scroll_top`.
+    pub first_row: usize,
 }
 
 /// Layout the text, wrapping at `width`, scrolling to keep the cursor
@@ -78,11 +81,19 @@ pub(crate) struct LayoutResult {
 /// it the renderer's `min(inner_height - 1)` clamp silently rewrote the caret to
 /// row 0, which is the "cursor snaps back to the first line when the text is
 /// exactly one line long" bug.
+///
+/// `scroll_top` is the previous frame's [`LayoutResult::first_row`]. The window
+/// stays there while the caret is inside it and moves only as far as it takes to
+/// bring the caret back in. Derived from the caret alone, the window pinned the
+/// caret to its bottom row, so a click on a row higher up scrolled the text under
+/// the pointer the moment the caret moved there. `0` reproduces that derivation
+/// exactly.
 pub(crate) fn layout_input(
     input: &str,
     cursor_chars: usize,
     width: usize,
     max_visible_rows: usize,
+    scroll_top: usize,
 ) -> LayoutResult {
     let mut lines = wrap_input_lines(input, width);
     let max_visible = max_visible_rows.max(1);
@@ -100,14 +111,16 @@ pub(crate) fn layout_input(
     }
     let total_rows = lines.len().max(1);
 
-    // Scroll to keep the cursor visible.
-    let mut start = 0usize;
-    if cursor_row >= max_visible {
+    // Scroll only as far as it takes to keep the cursor visible.
+    let mut start = scroll_top;
+    if cursor_row < start {
+        start = cursor_row;
+    } else if cursor_row >= start + max_visible {
         start = cursor_row + 1 - max_visible;
     }
-    if start + max_visible > lines.len() {
-        start = lines.len().saturating_sub(max_visible);
-    }
+    // Never so far down that rows the text could fill stand empty: the draft
+    // may have shrunk since the last frame.
+    start = start.min(lines.len().saturating_sub(max_visible));
     let visible = lines[start..start + lines[start..].len().min(max_visible)].to_vec();
     let cursor_visible_row = cursor_row.saturating_sub(start);
 
@@ -116,6 +129,7 @@ pub(crate) fn layout_input(
         cursor_visible_row,
         cursor_col: cursor_col.min(width.saturating_sub(1)),
         total_rows,
+        first_row: start,
     }
 }
 
@@ -144,6 +158,14 @@ pub(crate) fn layout_input(
 /// it is written down rather than left for the next reader to rediscover. It is
 /// pinned by
 /// `a_newline_at_an_exactly_filled_line_does_not_add_a_second_row`.
+///
+/// A row can also end short of `width`: a wide grapheme that does not fit the
+/// cell left over starts the next row and leaves that cell blank. A caret just
+/// before such a grapheme is drawn on it, at the start of the next row — the
+/// same answer the filled row gets, and where a click on the grapheme puts it
+/// (`char_index_at`). Drawn in the blank cell instead, it showed up at the far
+/// end of the row above the one clicked. Pinned by
+/// `a_caret_before_a_glyph_that_did_not_fit_is_drawn_on_it`.
 pub(super) fn cursor_row_col(input: &str, cursor_chars: usize, width: usize) -> (usize, usize) {
     let mut row = 0usize;
     let mut col = 0usize;
@@ -151,6 +173,13 @@ pub(super) fn cursor_row_col(input: &str, cursor_chars: usize, width: usize) -> 
 
     for grapheme in input.graphemes(true) {
         if char_idx >= cursor_chars {
+            // The grapheme after the caret: if it opens the next row for lack
+            // of room, the caret goes with it. (A filled row is the pending
+            // wrap below; a newline ends the caret's row.)
+            if grapheme != "\n" && col != 0 && col < width && col + grapheme.width() > width {
+                row += 1;
+                col = 0;
+            }
             break;
         }
         let num_chars = grapheme.chars().count();
@@ -198,6 +227,62 @@ pub(super) fn cursor_row_col(input: &str, cursor_chars: usize, width: usize) -> 
     (row, col)
 }
 
+/// The caret position a click on visual `(row, col)` asks for: the inverse of
+/// [`cursor_row_col`], over the rows [`wrap_input_lines`] draws. `row` counts
+/// from the top of the whole input, not of the scrolled window.
+///
+/// A click on a grapheme puts the caret before it — after it on the right half
+/// of a wide one (the second cell of `中`). A click right of a row's text puts it
+/// at the end of that row, whether the row ended at a newline or left a blank
+/// tail because the next grapheme did not fit; one below the last row, at the
+/// end of the text. The end of a row that wrapped is the start of the next, and
+/// is drawn there.
+///
+/// The walk is `cursor_row_col`'s, rule for rule and in the same order (a `\n`
+/// ahead of a pending wrap), and that is what makes the cell a caret is drawn in
+/// map back to a position drawn in that same cell. Pinned by
+/// `a_click_on_the_caret_cell_keeps_the_caret_there`, and against the drawn rows
+/// by `a_click_on_a_drawn_grapheme_lands_on_it`.
+pub(crate) fn char_index_at(input: &str, width: usize, row: usize, col: usize) -> usize {
+    let width = width.max(1);
+    let mut at_row = 0usize;
+    let mut at_col = 0usize;
+    let mut char_idx = 0usize;
+
+    for grapheme in input.graphemes(true) {
+        let num_chars = grapheme.chars().count();
+        if grapheme == "\n" {
+            if at_row == row {
+                return char_idx;
+            }
+            at_row += 1;
+            at_col = 0;
+            char_idx += num_chars;
+            continue;
+        }
+        let gw = grapheme.width();
+        // A filled row, or one this grapheme does not fit on: it opens the next.
+        if at_col >= width || (at_col + gw > width && at_col != 0) {
+            if at_row == row {
+                return char_idx;
+            }
+            at_row += 1;
+            at_col = 0;
+        }
+        if at_row == row && col < at_col + gw {
+            let right_half = (col - at_col) * 2 >= gw;
+            return if right_half {
+                char_idx + num_chars
+            } else {
+                char_idx
+            };
+        }
+        at_col += gw;
+        char_idx += num_chars;
+    }
+    char_idx
+}
+
 /// Split text into logical lines, then wrap each line at `width`.
 pub(super) fn wrap_input_lines(input: &str, width: usize) -> Vec<String> {
     if width == 0 {
@@ -215,17 +300,22 @@ pub(super) fn wrap_input_lines(input: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// The prompt marker on the composer's first row. Continuation rows get a
+/// matching indent, so the text starts [`GUTTER`] columns in on every row.
+const PROMPT: &str = "› ";
+const GUTTER: u16 = 2;
+
+/// Draw the composer; returns the rows its text went on (gutter included), for
+/// [`composer_snapshot`].
 pub(super) fn render_input_from_layout(
     frame: &mut Frame<'_>,
     app: &App,
     layout: &LayoutResult,
     area: ratatui::layout::Rect,
-) {
+) -> ratatui::layout::Rect {
     // Borderless composer: just a dim rule above and below, with a "› "
     // prompt marker. The streaming state shows in the status line, so the
     // composer needs no title.
-    const PROMPT: &str = "› ";
-    const GUTTER: u16 = 2;
     let style = Style::default();
     let prompt_style = Style::default()
         .fg(Color::Cyan)
@@ -296,5 +386,33 @@ pub(super) fn render_input_from_layout(
         );
         let cursor_x = text_x.saturating_add(u16::try_from(layout.cursor_col).unwrap_or(u16::MAX));
         frame.set_cursor_position((cursor_x, cursor_y));
+    }
+
+    ratatui::layout::Rect {
+        height: u16::try_from(visible.len())
+            .unwrap_or(u16::MAX)
+            .min(inner_area.height),
+        ..inner_area
+    }
+}
+
+/// What a click on the composer has to know about the frame just drawn: where
+/// its text rows are (`rows`, from [`render_input_from_layout`]), which row of
+/// the input is at the top, and the text they were wrapped from.
+pub(super) fn composer_snapshot(
+    rows: ratatui::layout::Rect,
+    layout: &LayoutResult,
+    wrap_width: usize,
+    text: String,
+) -> ComposerSnapshot {
+    ComposerSnapshot {
+        x: rows.x,
+        text_x: rows.x.saturating_add(GUTTER),
+        y: rows.y,
+        width: rows.width,
+        rows: rows.height,
+        wrap_width,
+        first_row: layout.first_row,
+        text,
     }
 }

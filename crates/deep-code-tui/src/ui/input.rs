@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{
     self, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
-    MouseEventKind,
+    MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 
@@ -64,36 +64,39 @@ pub(super) fn dispatch_terminal_event(
             Ok(true)
         }
         Event::Mouse(mouse) => {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => app.scroll_up(),
-                MouseEventKind::ScrollDown => app.scroll_down(),
-                MouseEventKind::Down(MouseButton::Left) => {
-                    app.mouse_press(mouse.column, mouse.row);
-                }
-                MouseEventKind::Drag(MouseButton::Left) => {
-                    app.selection_update(mouse.column, mouse.row);
-                }
-                MouseEventKind::Up(MouseButton::Left) => {
-                    if let Some(text) = app.mouse_release(mouse.column, mouse.row) {
-                        crate::clipboard::copy(&text);
-                        // The clipboard helper (clip.exe / pbcopy / xclip)
-                        // is a child process that can reset the console
-                        // mode on Windows; re-assert mouse capture.
-                        let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
-                        app.status = tr_with(
-                            app.lang,
-                            TextId::CopiedSelection,
-                            &[("count", &text.chars().count().to_string())],
-                        );
-                    }
-                }
-                _ => {}
+            if let Some(text) = handle_mouse(app, mouse) {
+                crate::clipboard::copy(&text);
+                // The clipboard helper (clip.exe / pbcopy / xclip) is a child
+                // process that can reset the console mode on Windows;
+                // re-assert mouse capture.
+                let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
+                app.status = tr_with(
+                    app.lang,
+                    TextId::CopiedSelection,
+                    &[("count", &text.chars().count().to_string())],
+                );
             }
             Ok(true)
         }
         Event::Resize(..) => Ok(true),
         _ => Ok(false),
     }
+}
+
+/// Route one mouse event; returns the text a finished drag selected, for the
+/// caller to put on the clipboard.
+fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Option<String> {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.scroll_up(),
+        MouseEventKind::ScrollDown => app.scroll_down(),
+        MouseEventKind::Down(MouseButton::Left) => app.mouse_press(mouse.column, mouse.row),
+        MouseEventKind::Drag(MouseButton::Left) => app.selection_update(mouse.column, mouse.row),
+        MouseEventKind::Up(MouseButton::Left) => {
+            return app.mouse_release(mouse.column, mouse.row);
+        }
+        _ => {}
+    }
+    None
 }
 
 /// The character a key event would type, for paste-burst reconstruction.
@@ -598,5 +601,374 @@ mod tests {
         );
         assert!(app.input.is_empty(), "composer clears once queued");
         assert!(app.is_streaming, "queueing must not end the current turn");
+    }
+
+    // -----------------------------------------------------------------------
+    // Clicks on the composer, through the same routing the terminal's events
+    // take, on a frame actually drawn.
+    // -----------------------------------------------------------------------
+
+    use deep_code_agent::i18n::Lang;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn mouse(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// A press and a release on one cell; returns what a drag would have copied.
+    fn click(app: &mut App, col: u16, row: u16) -> Option<String> {
+        handle_mouse(
+            app,
+            mouse(MouseEventKind::Down(MouseButton::Left), col, row),
+        );
+        handle_mouse(app, mouse(MouseEventKind::Up(MouseButton::Left), col, row))
+    }
+
+    fn drag(app: &mut App, from: (u16, u16), to: (u16, u16)) -> Option<String> {
+        handle_mouse(
+            app,
+            mouse(MouseEventKind::Down(MouseButton::Left), from.0, from.1),
+        );
+        handle_mouse(
+            app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), to.0, to.1),
+        );
+        handle_mouse(
+            app,
+            mouse(MouseEventKind::Up(MouseButton::Left), to.0, to.1),
+        )
+    }
+
+    fn en_app(draft: &str) -> App {
+        let mut app = App::new();
+        app.lang = Lang::En;
+        app.input = draft.to_string();
+        app.input_cursor = app.input.chars().count();
+        app
+    }
+
+    /// Draw the whole app; the screen as rows, and the caret the terminal was
+    /// handed — the observable a person checks after clicking.
+    fn draw(terminal: &mut Terminal<TestBackend>, app: &mut App) -> (Vec<String>, (u16, u16)) {
+        terminal
+            .draw(|frame| super::super::render::render(frame, app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..buffer.area.height)
+            .map(|row| {
+                (0..buffer.area.width)
+                    .map(|col| buffer[(col, row)].symbol())
+                    .collect()
+            })
+            .collect();
+        let caret = terminal.get_cursor_position().unwrap();
+        (rows, (caret.x, caret.y))
+    }
+
+    /// The cell a glyph was drawn in (the left one, for a wide glyph). The
+    /// markers are glyphs no chrome draws — Greek, a rare ideograph — so the
+    /// search cannot be satisfied by the welcome card or the status line.
+    fn cell_of(terminal: &Terminal<TestBackend>, glyph: &str) -> (u16, u16) {
+        let buffer = terminal.backend().buffer();
+        for row in 0..buffer.area.height {
+            for col in 0..buffer.area.width {
+                if buffer[(col, row)].symbol() == glyph {
+                    return (col, row);
+                }
+            }
+        }
+        panic!("{glyph:?} is not on screen");
+    }
+
+    /// A click on the composer's text moves the caret to the click — and the
+    /// caret is then drawn in the cell that was clicked.
+    #[test]
+    fn a_click_on_the_composer_puts_the_caret_there() {
+        // (draft, glyph clicked, which of its cells, caret index, glyph the
+        // caret must then be drawn on)
+        let wrapped = format!("{}bbΞ", "a".repeat(38));
+        let cases: [(&str, &str, u16, usize, &str); 5] = [
+            ("alpha Ψ beta", "Ψ", 0, 6, "Ψ"),
+            ("左龘右", "龘", 0, 1, "龘"),
+            // The right half of a wide glyph is the position after it.
+            ("左龘右", "龘", 1, 2, "右"),
+            // 38 columns of text at width 40: Ξ is on the second row.
+            (&wrapped, "Ξ", 0, 40, "Ξ"),
+            ("first\nsecond Ω", "Ω", 0, 13, "Ω"),
+        ];
+        for (draft, glyph, cell, want, caret_on) in cases {
+            let mut app = en_app(draft);
+            let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+            draw(&mut terminal, &mut app);
+            let (x, y) = cell_of(&terminal, glyph);
+
+            assert_eq!(click(&mut app, x + cell, y), None, "a click copies nothing");
+            assert_eq!(app.input_cursor, want, "{draft:?}: cell {cell} of {glyph}");
+            let (_, caret) = draw(&mut terminal, &mut app);
+            assert_eq!(caret, cell_of(&terminal, caret_on), "{draft:?}");
+        }
+    }
+
+    /// A click beside the text: on the `› ` gutter it is the start of that row,
+    /// right of a line it is the end of that line.
+    #[test]
+    fn a_click_beside_the_composer_text_takes_the_end_of_its_row() {
+        let mut app = en_app(&format!("{}bbΞ", "a".repeat(38)));
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        draw(&mut terminal, &mut app);
+        let (_, second_row) = cell_of(&terminal, "Ξ");
+        click(&mut app, 0, second_row);
+        assert_eq!(app.input_cursor, 38, "the gutter of the second row");
+        let (_, caret) = draw(&mut terminal, &mut app);
+        assert_eq!(caret, (2, second_row));
+
+        let mut app = en_app("Ψ short\nsecond line");
+        draw(&mut terminal, &mut app);
+        let (_, first_row) = cell_of(&terminal, "Ψ");
+        click(&mut app, 30, first_row);
+        assert_eq!(app.input_cursor, 7, "right of the first line: its end");
+        let (_, caret) = draw(&mut terminal, &mut app);
+        assert_eq!(caret, (2 + 7, first_row));
+
+        // The rules above and below the text are not text.
+        app.input_cursor = 3;
+        click(&mut app, 4, first_row - 1);
+        click(&mut app, 4, first_row + 2);
+        assert_eq!(app.input_cursor, 3, "a click on the composer's border");
+    }
+
+    /// A press on the composer ends the transcript's gesture too. Left in place,
+    /// the selection a previous drag made was still there when this click's
+    /// release arrived, and the release copied it again.
+    #[test]
+    fn a_click_on_the_composer_drops_a_transcript_selection() {
+        let mut app = en_app("Ξ draft");
+        app.history.push(crate::history::HistoryCell::user(
+            "ΨΨ some transcript text ΩΩ",
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        draw(&mut terminal, &mut app);
+        let copied = drag(&mut app, cell_of(&terminal, "Ψ"), cell_of(&terminal, "Ω"));
+        assert!(
+            copied.is_some(),
+            "sanity: the drag selected transcript text"
+        );
+
+        let (x, y) = cell_of(&terminal, "Ξ");
+        assert_eq!(
+            click(&mut app, x, y),
+            None,
+            "the old selection copied again"
+        );
+        assert!(app.selection.is_none());
+        assert_eq!(app.input_cursor, 0);
+    }
+
+    /// In a draft taller than the composer, a click on a row of the window must
+    /// not scroll it: the text under the pointer stays where it was. The window
+    /// used to be re-derived from the caret, pinning it to the bottom row, so
+    /// the clicked row slid down out from under the click.
+    #[test]
+    fn a_click_in_a_scrolled_draft_does_not_move_the_text_under_the_pointer() {
+        // Twelve rows of 38, one letter each, and a part-filled last row.
+        let letters = "ΑΒΓΔΕΖΗΘΙΚΛΜ";
+        let mut draft: String = letters
+            .chars()
+            .map(|ch| ch.to_string().repeat(38))
+            .collect();
+        draft.push('Ψ');
+        let mut app = en_app(&draft);
+        let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        let (before, _) = draw(&mut terminal, &mut app);
+        // Six rows show, the caret's (Ψ) last: Θ is the top one.
+        let (x, y) = cell_of(&terminal, "Θ");
+        assert!(
+            !before.iter().any(|row| row.contains('Η')),
+            "the row above the window is hidden"
+        );
+
+        click(&mut app, x + 5, y);
+        assert_eq!(app.input_cursor, 7 * 38 + 5);
+        let (after, caret) = draw(&mut terminal, &mut app);
+        assert_eq!(after, before, "the window moved under the click");
+        assert_eq!(caret, (x + 5, y));
+    }
+
+    /// A wide glyph that does not fit the end of a row starts the next one,
+    /// leaving a blank cell behind — an everyday shape in Chinese text. A click
+    /// on that glyph is the position before it, and the caret has to be drawn
+    /// on it: it used to be drawn in the blank cell at the end of the row
+    /// above, and when that row was scrolled out of the window, the window
+    /// followed it up.
+    #[test]
+    fn a_click_on_a_glyph_that_wrapped_for_lack_of_room_draws_the_caret_on_it() {
+        // 37 of the 38 text columns, then a wide glyph that needs two.
+        let mut app = en_app(&format!("{}龘Ξ", "a".repeat(37)));
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        draw(&mut terminal, &mut app);
+        let glyph = cell_of(&terminal, "龘");
+        click(&mut app, glyph.0, glyph.1);
+        assert_eq!(app.input_cursor, 37);
+        let (_, caret) = draw(&mut terminal, &mut app);
+        assert_eq!(caret, glyph, "the caret is drawn on the glyph clicked");
+
+        // Every row opens with such a glyph; the window shows the last six.
+        let wide = "一二三四五六七八九十百千";
+        let mut draft: String = wide
+            .chars()
+            .map(|ch| format!("{ch}{}", "a".repeat(35)))
+            .collect();
+        draft.push_str("\nΨ");
+        let mut app = en_app(&draft);
+        let (before, _) = draw(&mut terminal, &mut app);
+        let top = cell_of(&terminal, "八");
+        assert!(
+            !before.iter().any(|row| row.contains('七')),
+            "八 opens the window"
+        );
+        click(&mut app, top.0, top.1);
+        assert_eq!(app.input_cursor, 7 * 36);
+        let (after, caret) = draw(&mut terminal, &mut app);
+        assert_eq!(after, before, "the window moved under the click");
+        assert_eq!(caret, top);
+    }
+
+    /// The completion menu's frame lays the composer out on its own path, and
+    /// a click there must land the same way.
+    #[test]
+    fn a_click_lands_in_the_composer_while_the_completion_menu_is_open() {
+        let mut app = en_app("");
+        for ch in "/re".chars() {
+            app.push_char(ch);
+        }
+        assert!(app.completion_open(), "sanity: `/re` opens the menu");
+        let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
+        draw(&mut terminal, &mut app);
+        let composer = app.composer.clone().expect("the composer takes clicks");
+        click(&mut app, composer.text_x + 1, composer.y);
+        assert_eq!(app.input_cursor, 1, "between / and r");
+        let (_, caret) = draw(&mut terminal, &mut app);
+        assert_eq!(caret, (composer.text_x + 1, composer.y));
+    }
+
+    /// A click on a chip lands beside it, never in it. An image chip and a
+    /// paste chip are found by their exact text, so a character typed inside
+    /// one drops the picture, or sends the placeholder instead of the paste.
+    #[test]
+    fn a_click_on_a_chip_lands_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("shot.png");
+        std::fs::write(
+            &png,
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3],
+        )
+        .unwrap();
+        let mut app = en_app("");
+        for ch in "see ".chars() {
+            app.push_char(ch);
+        }
+        assert!(app.attach_image(png));
+        for ch in " and ".chars() {
+            app.push_char(ch);
+        }
+        app.paste_str("one\ntwo".to_string());
+        let image = app.attached_images[0].chip.clone();
+        let paste = app.pasted_blocks[0].0.clone();
+        let image_start = 4;
+        let image_end = image_start + image.chars().count();
+        let paste_start = image_end + 5;
+        let paste_end = paste_start + paste.chars().count();
+        assert_eq!(app.input, format!("see {image} and {paste}"));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        // ASCII on one row: the char at index `i` is drawn at `text_x + i`.
+        let at = |app: &App, index: usize| {
+            let composer = app.composer.as_ref().expect("the composer takes clicks");
+            (composer.text_x + index as u16, composer.y)
+        };
+        for (index, want) in [
+            (image_start + 1, image_start),
+            (image_end - 1, image_end),
+            (paste_start + 2, paste_start),
+            (paste_end - 3, paste_end),
+        ] {
+            draw(&mut terminal, &mut app);
+            let (x, y) = at(&app, index);
+            click(&mut app, x, y);
+            assert_eq!(app.input_cursor, want, "click on index {index}");
+        }
+
+        // Typing where the click left the caret keeps both chips whole.
+        app.input_cursor = image_end;
+        app.push_char('!');
+        assert!(app.input.contains(&image) && app.input.contains(&paste));
+        assert_eq!(app.attached_images.len(), 1, "the image is still attached");
+        assert!(app.expand_pasted(&app.input).contains("one\ntwo"));
+    }
+
+    /// Under an approval panel the composer is drawn but takes no input — its
+    /// keys are y/a/n — so it takes no click either.
+    #[test]
+    fn the_composer_takes_no_click_under_an_approval_panel() {
+        let mut app = en_app("draft text");
+        app.park_approval(deep_code_agent::ApprovalRequest {
+            network: false,
+            call_id: "call_1".to_string(),
+            tool_name: "mock_echo".to_string(),
+            description: "echo".to_string(),
+            arguments: serde_json::json!({}),
+            risk_level: deep_code_agent::RiskLevel::Low,
+            requires_sandbox: false,
+            read_only: true,
+            matched_rule: None,
+            justification: None,
+            resolved_target: None,
+            preview: None,
+            safety_notes: Vec::new(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
+        let (rows, _) = draw(&mut terminal, &mut app);
+        let y = rows
+            .iter()
+            .position(|row| row.contains("draft text"))
+            .expect("the composer is still drawn") as u16;
+        // Checked after every click: the last cell is right of the text, where
+        // a click that did land would put the caret back at the end.
+        for x in 0..60 {
+            click(&mut app, x, y);
+            assert_eq!(
+                app.input_cursor, 10,
+                "a click at column {x} moved the caret"
+            );
+        }
+        assert!(app.pending_approval.is_some());
+    }
+
+    /// A frame drawn before the latest edit says nothing about where the text
+    /// is now (redraws are rate-limited, so a click can arrive in between).
+    /// Such a click is dropped; the next frame takes it.
+    #[test]
+    fn a_click_on_a_frame_older_than_the_draft_is_dropped() {
+        let mut app = en_app("Ψabc");
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        draw(&mut terminal, &mut app);
+        let (x, y) = cell_of(&terminal, "Ψ");
+
+        app.push_char('d');
+        click(&mut app, x, y);
+        assert_eq!(
+            app.input_cursor, 5,
+            "the click was on a frame without the d"
+        );
+
+        draw(&mut terminal, &mut app);
+        click(&mut app, x, y);
+        assert_eq!(app.input_cursor, 0);
     }
 }

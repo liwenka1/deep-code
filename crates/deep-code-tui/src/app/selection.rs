@@ -90,6 +90,12 @@ impl App {
     /// Left button down: start a selection and remember what the press landed
     /// on, so the release can tell a click from a drag.
     pub(crate) fn mouse_press(&mut self, col: u16, row: u16) {
+        // On the composer it moves the caret, and is nothing to the transcript:
+        // it starts no selection and arms no fold.
+        if self.place_caret_at(col, row) {
+            self.clear_selection();
+            return;
+        }
         let target = self.fold_target_at(col, row);
         self.mouse_down = Some(ClickPress {
             col,

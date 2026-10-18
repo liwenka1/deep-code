@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Widget};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, FoldTarget, TranscriptSnapshot};
+use crate::app::{App, ComposerSnapshot, FoldTarget, TranscriptSnapshot};
 use crate::history::HistoryCell;
 use crate::markdown::render_markdown;
 use deep_code_agent::SafetyNote;
@@ -35,12 +35,14 @@ use transcript::*;
 // Items with callers outside `ui::render` keep their crate-visible paths.
 // (`LayoutResult` is deliberately absent: `layout_input`'s callers outside
 // this module never name the type, so re-exporting it would be dead.)
-pub(crate) use composer::{layout_input, neutralize_composer_text};
+pub(crate) use composer::{char_index_at, layout_input, neutralize_composer_text};
 pub(crate) use transcript::sanitize_for_clipboard;
 
 pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(picker) = &app.resume_picker {
         render_resume_picker(frame, picker, app.lang);
+        // The overlay covers the composer: nothing of it is there to click.
+        app.composer = None;
         return;
     }
 
@@ -52,11 +54,15 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         app.input_cursor,
         inner_width as usize,
         COMPOSER_MAX_VISIBLE_ROWS,
+        app.composer_scroll,
     );
+    app.composer_scroll = layout.first_row;
     let visual_rows = layout.total_rows.clamp(1, COMPOSER_MAX_VISIBLE_ROWS);
     let input_height = Constraint::Length(visual_rows as u16 + 2);
 
-    let snapshot: TranscriptSnapshot = if app.pending_approval.is_some() {
+    // The composer's text rows, when it takes clicks. Under an approval panel it
+    // is drawn but not editable — its keys are y/a/n — so it takes none.
+    let (snapshot, composer_rows) = if app.pending_approval.is_some() {
         // Carved by hand, not by the constraint solver. `Constraint::Min(5)`
         // on the transcript carries MIN_SIZE_GE strength (STRONG*100) while
         // the panel's `Constraint::Length` carries LENGTH_SIZE_EQ (STRONG*10),
@@ -99,7 +105,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_approval_panel(frame, app, panel, row(transcript_h, panel_h));
         render_input_from_layout(frame, app, &layout, row(transcript_h + panel_h, input_h));
         render_status(frame, app, row(transcript_h + panel_h + input_h, status_h));
-        snap
+        (snap, None)
     } else if let Some(menu) = app.completion.clone() {
         // Cloned for the frame: `render_messages` now takes `&mut App` (it
         // memoizes each cell's rendered lines), so nothing may hold a borrow
@@ -116,20 +122,22 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
             .split(frame.area());
         let snap = render_messages(frame, app, chunks[0]);
         render_completion_menu(frame, &menu, chunks[1], app.lang);
-        render_input_from_layout(frame, app, &layout, chunks[2]);
+        let rows = render_input_from_layout(frame, app, &layout, chunks[2]);
         render_status(frame, app, chunks[3]);
-        snap
+        (snap, Some(rows))
     } else {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(5), input_height, Constraint::Length(1)])
             .split(frame.area());
         let snap = render_messages(frame, app, chunks[0]);
-        render_input_from_layout(frame, app, &layout, chunks[1]);
+        let rows = render_input_from_layout(frame, app, &layout, chunks[1]);
         render_status(frame, app, chunks[2]);
-        snap
+        (snap, Some(rows))
     };
     app.set_transcript_snapshot(snapshot);
+    app.composer = composer_rows
+        .map(|rows| composer_snapshot(rows, &layout, inner_width as usize, composer_text));
 }
 
 /// In-app `/resume` overlay. Mirrors the standalone startup picker's minimal

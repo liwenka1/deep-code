@@ -2497,10 +2497,10 @@ fn layout_input_materializes_the_row_the_caret_needs() {
     let w = 10;
     let max_vis = 6;
 
-    let short = layout_input("aaaaaaaaa", 9, w, max_vis);
+    let short = layout_input("aaaaaaaaa", 9, w, max_vis, 0);
     assert_eq!((short.total_rows, short.cursor_visible_row), (1, 0));
 
-    let exact = layout_input("aaaaaaaaaa", 10, w, max_vis);
+    let exact = layout_input("aaaaaaaaaa", 10, w, max_vis, 0);
     assert_eq!(
         (exact.total_rows, exact.cursor_visible_row),
         (2, 1),
@@ -2509,11 +2509,11 @@ fn layout_input_materializes_the_row_the_caret_needs() {
 
     // Same row count as `exact` on purpose: the newline opened the row the caret
     // was already pending on, so this must not become three rows.
-    let exact_nl = layout_input(&format!("{}\n", "a".repeat(10)), 11, w, max_vis);
+    let exact_nl = layout_input(&format!("{}\n", "a".repeat(10)), 11, w, max_vis, 0);
     assert_eq!((exact_nl.total_rows, exact_nl.cursor_visible_row), (2, 1));
 
     // Seven full rows plus the caret's row, scrolled to keep the caret visible.
-    let scrolled = layout_input(&"a".repeat(70), 70, w, max_vis);
+    let scrolled = layout_input(&"a".repeat(70), 70, w, max_vis, 0);
     assert_eq!((scrolled.total_rows, scrolled.cursor_visible_row), (8, 5));
     assert_eq!(scrolled.visible_lines.len(), max_vis);
 }
@@ -2617,6 +2617,204 @@ fn composer_caret_is_clamped_when_the_terminal_cannot_show_its_row() {
         rows[cy as usize].contains("aaaa"),
         "with no free row the caret stays on a text row:\n{screen}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Click → caret: `char_index_at` against the caret and against the drawn rows
+// ---------------------------------------------------------------------------
+
+/// Drafts that reach every placement rule: exact fills with and without a
+/// newline after them, a wide glyph that does not fit the rest of its row,
+/// empty lines, multi-char graphemes, zero-width marks, wide glyphs at widths
+/// narrower than themselves.
+const CLICK_CORPUS: &[&str] = &[
+    "",
+    "\n",
+    "hello",
+    "aaaaaaaaaa",
+    "aaaaaaaaaa\nb",
+    "aaaaaaaaaa\n\nb",
+    "ab\n\ncd\n",
+    "aaaaaaaaaaaaaaaaaaaaaaa",
+    "中中中中中",
+    "aaaaaaaaa中x",
+    "a中b中c中d中e中f中g",
+    "e\u{301}e\u{301}x\u{301}",
+    "\u{301}leading mark",
+    "👍🏽 thumbs 🇨🇳 flag",
+    "tab\there",
+    "line one\nline two runs past ten\n中文也会折行吗",
+];
+
+/// The char index at every grapheme boundary of `text` — the only places a
+/// caret can be.
+fn caret_positions(text: &str) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(text.graphemes(true).scan(0, |at, grapheme| {
+            *at += grapheme.chars().count();
+            Some(*at)
+        }))
+        .collect()
+}
+
+/// Clicking the cell a caret is drawn in must leave the caret drawn in that
+/// cell. Not always at the same index: a caret at the end of an exactly-filled
+/// line is drawn at the start of the next row, which is also where the
+/// position after the newline is drawn — either one is the click's honest
+/// answer. What must never happen is a click that moves the caret somewhere
+/// the user did not point.
+#[test]
+fn a_click_on_the_caret_cell_keeps_the_caret_there() {
+    for raw in CLICK_CORPUS {
+        let text = neutralize_composer_text(raw);
+        for width in (1..=12).chain([40]) {
+            for index in caret_positions(&text) {
+                let (row, col) = cursor_row_col(&text, index, width);
+                let clicked = char_index_at(&text, width, row, col);
+                assert_eq!(
+                    cursor_row_col(&text, clicked, width),
+                    (row, col),
+                    "text={text:?} width={width}: the caret at {index} is drawn at \
+                     ({row}, {col}), and a click there put it at {clicked}"
+                );
+            }
+        }
+    }
+}
+
+/// The same inverse checked against what is DRAWN rather than against the
+/// caret arithmetic it mirrors: rows rebuilt from `wrap_text` with their own
+/// char offsets, and every cell of every grapheme on them clicked. The left
+/// cell of a grapheme is before it; the right cell of a wide one is after it.
+#[test]
+fn a_click_on_a_drawn_grapheme_lands_on_it() {
+    for raw in CLICK_CORPUS {
+        let text = neutralize_composer_text(raw);
+        for width in (1..=12).chain([40]) {
+            let mut rows: Vec<(String, usize)> = Vec::new();
+            let mut offset = 0;
+            for logical in text.split('\n') {
+                for row in wrap_text(logical, width) {
+                    let chars = row.chars().count();
+                    rows.push((row, offset));
+                    offset += chars;
+                }
+                offset += 1; // the newline
+            }
+            let drawn: Vec<String> = rows.iter().map(|(row, _)| row.clone()).collect();
+            assert_eq!(
+                drawn,
+                wrap_input_lines(&text, width),
+                "the model is the drawing"
+            );
+
+            for (row_index, (row, start)) in rows.iter().enumerate() {
+                let mut col = 0;
+                let mut index = *start;
+                for grapheme in row.graphemes(true) {
+                    let gw = grapheme.width();
+                    let after = index + grapheme.chars().count();
+                    for cell in col..col + gw {
+                        let want = if cell == col { index } else { after };
+                        assert_eq!(
+                            char_index_at(&text, width, row_index, cell),
+                            want,
+                            "text={text:?} width={width}: row {row_index} cell {cell} is \
+                             {grapheme:?}"
+                        );
+                    }
+                    col += gw;
+                    index = after;
+                }
+            }
+        }
+    }
+}
+
+/// Where a click on no grapheme goes: the end of the row it is beside, or the
+/// end of the text below the last row.
+#[test]
+fn a_click_beside_or_below_the_text_lands_at_the_end_of_that_row() {
+    let w = 10;
+    // Right of a line that ends at a newline: before the newline, not after it.
+    assert_eq!(char_index_at("ab\ncd", w, 0, 7), 2);
+    assert_eq!(char_index_at("ab\ncd", w, 1, 7), 5);
+    // The blank tail a wide glyph left by not fitting: the end of that row,
+    // which is the position just before the glyph.
+    assert_eq!(char_index_at("aaaaaaaaa中x", w, 0, 9), 9);
+    // Below the last row, and on the empty row a trailing newline opens.
+    assert_eq!(char_index_at("ab\ncd", w, 5, 0), 5);
+    assert_eq!(char_index_at("ab\n", w, 1, 3), 3);
+    // An empty line between two others: its one position.
+    assert_eq!(char_index_at("ab\n\ncd", w, 1, 4), 3);
+}
+
+/// A caret before a glyph that did not fit the rest of its row is drawn where
+/// that glyph is — at the start of the next row — not in the blank cell left
+/// behind, where it read as the far end of the row above.
+#[test]
+fn a_caret_before_a_glyph_that_did_not_fit_is_drawn_on_it() {
+    let w = 10;
+    assert_eq!(cursor_row_col("aaaaaaaaa中x", 9, w), (1, 0));
+    // Only when it does not fit: a narrow one takes the last cell.
+    assert_eq!(cursor_row_col("aaaaaaaaaxy", 9, w), (0, 9));
+    // And not before a newline, which ends the caret's own row.
+    assert_eq!(cursor_row_col("aaaaaaaaa\nb", 9, w), (0, 9));
+    // Mid-row it is unchanged: the caret is drawn on the grapheme after it.
+    assert_eq!(cursor_row_col("ab中cd", 2, w), (0, 2));
+}
+
+/// The window keeps still while the caret moves inside it, and follows the
+/// caret only as far as it has to when it leaves. Passing `0` is the old
+/// caret-only derivation, which pinned the caret to the bottom row.
+#[test]
+fn the_composer_window_stays_put_while_the_caret_is_inside_it() {
+    let (w, rows) = (10, 6);
+    // Ten rows, the last one partly filled.
+    let text = "a".repeat(95);
+
+    let at_end = layout_input(&text, 95, w, rows, 0);
+    assert_eq!(
+        at_end.first_row, 4,
+        "caret on row 9 of 10: rows 4..=9 shown"
+    );
+
+    // Up to row 5 — still inside: nothing scrolls.
+    let inside = layout_input(&text, 55, w, rows, at_end.first_row);
+    assert_eq!(inside.first_row, 4);
+    assert_eq!(inside.cursor_visible_row, 1);
+
+    // Up to row 2 — above the window: it follows, and only that far.
+    let above = layout_input(&text, 25, w, rows, 4);
+    assert_eq!((above.first_row, above.cursor_visible_row), (2, 0));
+
+    // Back down to row 9 from a window at the top: it follows to the bottom.
+    let below = layout_input(&text, 95, w, rows, 0);
+    assert_eq!((below.first_row, below.cursor_visible_row), (4, 5));
+
+    // The draft shrinks under a scrolled window: no rows left standing empty.
+    let shrunk = layout_input(&"a".repeat(30), 30, w, rows, 4);
+    assert_eq!(shrunk.first_row, 0);
+
+    // The one move made while the caret stays inside: an exactly-filled draft
+    // has a row only because its caret is at the end, and once the caret
+    // leaves, keeping the window would leave its bottom row blank while a row
+    // of text sat hidden above it. One row, and only in that case.
+    let filled = "a".repeat(90);
+    assert_eq!(layout_input(&filled, 90, w, rows, 0).first_row, 4);
+    assert_eq!(layout_input(&filled, 55, w, rows, 4).first_row, 3);
+
+    // From 0 the old derivation, row for row: the bottom-pinned window.
+    for text in [&text, &filled] {
+        for cursor in 0..=text.len() {
+            let (cursor_row, _) = cursor_row_col(text, cursor, w);
+            let layout = layout_input(text, cursor, w, rows, 0);
+            let pinned = cursor_row
+                .saturating_sub(rows - 1)
+                .min(layout.total_rows.saturating_sub(rows));
+            assert_eq!(layout.first_row, pinned, "cursor {cursor}");
+        }
+    }
 }
 
 /// A queued (steered) prompt has to be VISIBLE while it waits — the whole point

@@ -221,6 +221,12 @@ pub struct App {
     /// Where the pending left-button press landed, what it controlled, and how
     /// many cells the scrollback cap had already dropped.
     pub(crate) mouse_down: Option<ClickPress>,
+    /// Geometry + text of the last composer render, so a click can be mapped to
+    /// a caret position. `None` while the composer takes no clicks.
+    pub(crate) composer: Option<ComposerSnapshot>,
+    /// The composer row shown at the top of its window in the last frame, kept
+    /// so the window does not move while the caret stays inside it.
+    pub(crate) composer_scroll: usize,
     /// Open `/resume` modal: rendered as an in-app overlay (no alt-screen
     /// churn, so switching sessions doesn't flicker) over the live TUI.
     pub(crate) resume_picker: Option<ResumePicker>,
@@ -335,6 +341,39 @@ pub(crate) struct TranscriptSnapshot {
     /// inside an expanded body has to stay an ordinary click, or starting a text
     /// selection in it would fold the block shut.
     pub fold_headers: Vec<(usize, FoldTarget)>,
+}
+
+/// What the composer looked like at the last render — used to translate a
+/// mouse `(col, row)` into a caret position.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ComposerSnapshot {
+    /// The text rows on screen, from the prompt gutter's first column (`x`) to
+    /// the right edge. `rows` counts only the rows actually drawn, which is
+    /// fewer than the layout's when the frame is too short to hold them.
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub rows: u16,
+    /// The first column of text, past the `› ` gutter.
+    pub text_x: u16,
+    /// The width the text was wrapped at, and the row of the whole input drawn
+    /// on row `y`.
+    pub wrap_width: usize,
+    pub first_row: usize,
+    /// The text those rows were wrapped from (as displayed: see
+    /// `neutralize_composer_text`). Clicks are mapped against it, so a frame
+    /// drawn before the latest edit is recognizable as stale.
+    pub text: String,
+}
+
+impl ComposerSnapshot {
+    /// Whether an absolute `(col, row)` is on one of the drawn text rows.
+    fn contains(&self, col: u16, row: u16) -> bool {
+        row >= self.y
+            && row < self.y.saturating_add(self.rows)
+            && col >= self.x
+            && col < self.x.saturating_add(self.width)
+    }
 }
 
 /// What a click on a foldable block's header acts on.
@@ -645,6 +684,8 @@ impl App {
             transcript: None,
             selection: None,
             mouse_down: None,
+            composer: None,
+            composer_scroll: 0,
             resume_picker: None,
             lang,
             permission_mode,

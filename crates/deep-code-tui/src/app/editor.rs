@@ -17,7 +17,7 @@ enum ChipExit {
     Start,
     /// Its end: the caret was moving right.
     End,
-    /// Whichever is closer: ↑/↓ carrying a column into it.
+    /// Whichever is closer: a click, or ↑/↓ carrying a column into it.
     Nearest,
 }
 
@@ -123,6 +123,34 @@ impl App {
         }
     }
 
+    /// A left-button press at an absolute `(col, row)`: when it is on the
+    /// composer's text rows, put the caret where it points and return true.
+    ///
+    /// Mapped against the frame the user clicked on ([`ComposerSnapshot`]). When
+    /// the draft has changed since that frame was drawn — redraws are
+    /// rate-limited, so an edit can land between a frame and a click — its rows
+    /// no longer say where anything is, and the press does nothing.
+    pub(crate) fn place_caret_at(&mut self, col: u16, row: u16) -> bool {
+        let Some(composer) = self.composer.as_ref() else {
+            return false;
+        };
+        if !composer.contains(col, row) {
+            return false;
+        }
+        if crate::ui::render::neutralize_composer_text(&self.input) != composer.text {
+            return true;
+        }
+        let index = crate::ui::render::char_index_at(
+            &composer.text,
+            composer.wrap_width,
+            composer.first_row + usize::from(row - composer.y),
+            // The gutter left of the text reads as the start of its row.
+            usize::from(col.saturating_sub(composer.text_x)),
+        );
+        self.input_cursor = self.out_of_chip(index, ChipExit::Nearest);
+        true
+    }
+
     /// Where a caret bound for `index` comes to rest so that it is never inside
     /// a chip — an attached image's `[图片 #1 PNG]` or a collapsed paste's
     /// `[粘贴 #1 +3 行]`.
@@ -131,9 +159,9 @@ impl App {
     /// while its chip is in the draft, and `expand_pasted` swaps back only an
     /// intact placeholder. So one character typed inside a chip silently drops
     /// the picture, or sends the placeholder instead of the pasted text — and
-    /// arrowing through a chip a character at a time put the caret there.
-    /// Backspace and Delete take a chip whole for the same reason; this is that
-    /// rule for everything that moves the caret.
+    /// arrowing through a chip a character at a time put the caret there, as a
+    /// click on one would. Backspace and Delete take a chip whole for the same
+    /// reason; this is that rule for everything that moves the caret.
     fn out_of_chip(&self, index: usize, exit: ChipExit) -> usize {
         let spans = self.chip_spans();
         let mut index = index;
