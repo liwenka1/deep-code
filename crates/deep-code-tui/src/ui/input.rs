@@ -86,6 +86,13 @@ pub(super) fn dispatch_terminal_event(
 /// Route one mouse event; returns the text a finished drag selected, for the
 /// caller to put on the clipboard.
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Option<String> {
+    // The `/resume` overlay covers the transcript and the composer, but the
+    // last frame's transcript snapshot outlives it: a drag across the overlay
+    // copied text from the hidden transcript, a click folded a block nobody
+    // could see, and the wheel scrolled it.
+    if app.resume_picker_open() {
+        return None;
+    }
     match mouse.kind {
         MouseEventKind::ScrollUp => app.scroll_up(),
         MouseEventKind::ScrollDown => app.scroll_down(),
@@ -970,5 +977,54 @@ mod tests {
         draw(&mut terminal, &mut app);
         click(&mut app, x, y);
         assert_eq!(app.input_cursor, 0);
+    }
+
+    /// The `/resume` overlay covers everything, but the transcript's snapshot
+    /// from the last frame under it survived: the same drag that selects and
+    /// copies text with the overlay closed copied the hidden transcript with it
+    /// open, and the wheel scrolled what nobody could see.
+    #[test]
+    fn the_mouse_does_nothing_under_the_resume_picker() {
+        use deep_code_agent::{SessionEntry, SessionRecord};
+
+        let mut app = en_app("");
+        app.history
+            .push(crate::history::HistoryCell::user("ΨΨ hidden transcript ΩΩ"));
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        draw(&mut terminal, &mut app);
+        let from = cell_of(&terminal, "Ψ");
+        let to = cell_of(&terminal, "Ω");
+        let copied = drag(&mut app, from, to);
+        assert!(
+            copied
+                .as_deref()
+                .is_some_and(|text| text.contains("hidden")),
+            "sanity: with the overlay closed this drag copies {copied:?}"
+        );
+
+        let mut record = SessionRecord::new(std::path::PathBuf::from("/tmp/ws"), "system");
+        record.entries = vec![
+            std::sync::Arc::new(SessionEntry::system("system")),
+            std::sync::Arc::new(SessionEntry::user("earlier")),
+        ];
+        // What `open_resume_picker` does on the way in.
+        app.clear_selection();
+        app.resume_picker = Some(crate::app::ResumePicker {
+            sessions: vec![record],
+            selected: 0,
+        });
+        draw(&mut terminal, &mut app);
+        assert_eq!(
+            drag(&mut app, from, to),
+            None,
+            "copied the hidden transcript"
+        );
+        assert!(app.selection.is_none());
+        let scrolled = app.scroll_offset;
+        handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, from.0, from.1));
+        assert_eq!(
+            app.scroll_offset, scrolled,
+            "scrolled the hidden transcript"
+        );
     }
 }
