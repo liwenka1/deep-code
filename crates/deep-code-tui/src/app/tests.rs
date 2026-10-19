@@ -3193,6 +3193,69 @@ fn backspace_and_delete_take_a_paste_chip_whole() {
     assert_eq!(app.attached_images.len(), 1, "the image chip is untouched");
 }
 
+/// Ctrl+W (Alt+Backspace too) takes a chip whole. It used to delete back to the
+/// last space inside the label: what was left of `[粘贴 #1 +2 行]` matched no
+/// placeholder, so the stub was sent and the paste was not, and an image chip
+/// cut short took its picture with it.
+#[test]
+fn ctrl_w_takes_a_chip_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new();
+    let ((image_start, image_end), (paste_start, _)) = draft_with_both_chips(&mut app, dir.path());
+    let draft = app.input.clone();
+    let upto = |n: usize| draft.chars().take(n).collect::<String>();
+
+    app.delete_word_back();
+    assert_eq!(app.input, upto(paste_start), "the paste chip, whole");
+    app.delete_word_back();
+    assert_eq!(app.input, upto(image_end + 1), "和 and the space after it");
+    assert_eq!(app.attached_images.len(), 1, "the image chip is untouched");
+    app.delete_word_back();
+    assert_eq!(app.input, upto(image_start), "the image chip, whole");
+    assert!(app.attached_images.is_empty(), "and its picture with it");
+}
+
+/// From every caret position, Ctrl+W deletes exactly what Ctrl+← steps over:
+/// the two agree on what a word is, so a chip is one word to both — together
+/// with a word glued to it.
+#[test]
+fn ctrl_w_deletes_what_ctrl_left_steps_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new();
+    let (image, paste) = draft_with_both_chips(&mut app, dir.path());
+    let images = app.attached_images.clone();
+    let chip = images[0].chip.clone();
+    let glued = (1, 1 + chip.chars().count());
+    for (draft, chips) in [
+        (app.input.clone(), vec![image, paste]),
+        (format!("x{chip}y  z "), vec![glued]),
+    ] {
+        for caret in 0..=draft.chars().count() {
+            if chips
+                .iter()
+                .any(|&(start, end)| start < caret && caret < end)
+            {
+                continue; // no caret rests inside a chip
+            }
+            app.input = draft.clone();
+            app.attached_images = images.clone();
+            app.input_cursor = caret;
+            app.word_left();
+            let word_start = app.input_cursor;
+
+            app.input_cursor = caret;
+            app.delete_word_back();
+            let want: String = draft
+                .chars()
+                .take(word_start)
+                .chain(draft.chars().skip(caret))
+                .collect();
+            assert_eq!(app.input, want, "{draft:?} with the caret at {caret}");
+            assert_eq!(app.input_cursor, word_start);
+        }
+    }
+}
+
 /// ↑/↓ carry the column into the next line, and that column can be inside a
 /// chip there; the caret comes to rest on the nearer edge instead.
 #[test]
@@ -3226,9 +3289,9 @@ fn up_and_down_never_leave_the_caret_inside_a_chip() {
     assert_eq!(app.attached_images.len(), 1);
 }
 
-/// An attachment whose chip is gone must not be sent. This is what makes every
-/// other deletion route (`Ctrl+W`, `Ctrl+U`, a selection overwrite) safe without
-/// teaching each of them about chips.
+/// An attachment whose chip is gone must not be sent. Matching on the chip is
+/// what lets a route that knows nothing about chips — `Ctrl+U` here, taking the
+/// whole line — drop the picture along with its chip.
 #[test]
 fn an_attachment_whose_chip_was_cut_away_is_dropped() {
     let dir = tempfile::tempdir().unwrap();

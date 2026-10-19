@@ -222,11 +222,11 @@ impl App {
 
     /// Drop every attachment whose chip is no longer in the draft.
     ///
-    /// Runs after any edit. Deleting a chip by any route — `Ctrl+W` cutting
-    /// through the middle of one, `Ctrl+U` taking the line, a drag-selection
-    /// overwrite — has to take the attachment with it, or the user sends a
-    /// picture they can no longer see. Matching on the chip rather than on a
-    /// cursor offset is what makes that true for all of those at once.
+    /// Runs after any edit. Deleting a chip by any route — Backspace, Delete or
+    /// `Ctrl+W` taking it whole, `Ctrl+U`/`Ctrl+K` taking the line it is on —
+    /// has to take the attachment with it, or the user sends a picture they
+    /// can no longer see. Matching on the chip rather than on a cursor offset
+    /// is what makes that true for all of those at once.
     pub(crate) fn sync_images(&mut self) {
         if self.attached_images.is_empty() {
             return;

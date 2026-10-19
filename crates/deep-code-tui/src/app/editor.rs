@@ -298,18 +298,17 @@ impl App {
     }
 
     /// Delete the word (and any whitespace) before the cursor (Ctrl+W).
+    ///
+    /// The word is the one Ctrl+← steps over, so a chip goes whole. Cut back
+    /// to the last space inside its label instead, what was left of
+    /// `[粘贴 #1 +2 行]` matched no placeholder — the stub was sent and the
+    /// pasted text was not — and an image chip cut short took its picture
+    /// with it.
     pub fn delete_word_back(&mut self) {
         if self.input_cursor == 0 {
             return;
         }
-        let chars: Vec<char> = self.input.chars().collect();
-        let mut start = self.input_cursor.min(chars.len());
-        while start > 0 && chars[start - 1].is_whitespace() {
-            start -= 1;
-        }
-        while start > 0 && !chars[start - 1].is_whitespace() {
-            start -= 1;
-        }
+        let start = self.word_start_before(self.input_cursor);
         self.drain_chars(start, self.input_cursor);
         self.input_cursor = start;
         self.history_cursor = None;
@@ -338,11 +337,15 @@ impl App {
 
     /// Move cursor to the previous word start (Ctrl/Alt + Left).
     pub fn word_left(&mut self) {
-        if self.input_cursor == 0 {
-            return;
-        }
+        self.input_cursor = self.word_start_before(self.input_cursor);
+    }
+
+    /// Where the word before `cursor` starts, past any whitespace in between —
+    /// for both Ctrl+← and Ctrl+W, so the word one steps over is the word the
+    /// other deletes.
+    fn word_start_before(&self, cursor: usize) -> usize {
         let chars: Vec<char> = self.input.chars().collect();
-        let mut i = self.input_cursor.min(chars.len());
+        let mut i = cursor.min(chars.len());
         while i > 0 && chars[i - 1].is_whitespace() {
             i -= 1;
         }
@@ -358,7 +361,7 @@ impl App {
             }
             i = past;
         }
-        self.input_cursor = i;
+        i
     }
 
     /// Move cursor to the next word end (Ctrl/Alt + Right).
