@@ -16,7 +16,12 @@ impl App {
         // The draft is the only thing that says which attachments still exist,
         // and every edit funnels through here, so this is where the list is
         // brought back in line with the text — rather than at each of the ten
-        // mutation sites that would each have to remember to do it.
+        // mutation sites that would each have to remember to do it. Three
+        // routes skip it. The two that replace the whole draft — a recalled
+        // prompt, a cleared composer — set the attachments along with the text
+        // and close the menu themselves (`HistoryPrompt::restore`,
+        // `clear_input`); `accept_completion` has just taken the menu, and the
+        // text it rewrites — a `/command`, an `@` token — holds no chip.
         self.sync_images();
         self.completion = self.compute_completion();
     }
@@ -99,10 +104,25 @@ impl App {
     /// Apply the selected completion to the input. Returns true when the
     /// completed value is a ready-to-run slash command (no argument), so the
     /// caller can submit immediately on Enter.
+    ///
+    /// Only a menu the draft would offer now is applied; any other is closed
+    /// and nothing happens. A menu that outlived its text completes words that
+    /// are gone — a recalled prompt used to inherit the menu of what was typed
+    /// before it, and Enter ran `/clear` in its place, or Tab swapped its last
+    /// word, chip tail and all, for a path. The routes that replace the draft
+    /// close the menu now; this keeps the next one that forgets from doing
+    /// either. Compared without `selected`, which moving through the menu
+    /// changes.
     pub(crate) fn accept_completion(&mut self) -> bool {
         let Some(menu) = self.completion.take() else {
             return false;
         };
+        if self
+            .compute_completion()
+            .is_none_or(|now| now.kind != menu.kind || now.items != menu.items)
+        {
+            return false;
+        }
         let Some((value, _)) = menu.items.get(menu.selected) else {
             return false;
         };

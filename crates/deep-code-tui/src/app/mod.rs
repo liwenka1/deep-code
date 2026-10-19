@@ -406,10 +406,21 @@ pub(crate) struct HistoryPrompt {
 
 impl HistoryPrompt {
     /// What `↑` puts back into the composer.
+    ///
+    /// The completion menu closes with the text it was completing. Left open
+    /// over a recalled prompt, Enter or Tab applied it there: `/c` then Ctrl+P
+    /// then Enter ran `/clear` instead of sending what was recalled, and `@ma`
+    /// then Ctrl+P then Tab swapped the recalled prompt's last word for a path —
+    /// the tail of an image chip, when the prompt ended in one, so the chip
+    /// broke and its picture went. Closed, not recomputed: a recalled `/help`
+    /// would reopen the menu, and the menu takes `↑`, so the next `↑` would
+    /// stop walking the history. The draft `history_next` walks back to is the
+    /// one exception, and it recomputes the menu there itself.
     fn restore(&self, app: &mut App) {
         app.input = self.text.clone();
         app.attached_images = self.images.clone();
         app.cursor_to_end();
+        app.close_completion();
     }
 }
 /// Cap on prompts queued behind one streaming turn. Reaching it keeps the text
@@ -826,6 +837,10 @@ impl App {
         // composer that still holds images would count against the per-message
         // cap for no visible reason.
         self.attached_images.clear();
+        // And the menu goes with the text it was completing: Ctrl+C clears the
+        // composer without closing it, and Enter then applied it to nothing —
+        // `/c`, Ctrl+C, Enter ran `/clear`.
+        self.close_completion();
     }
 
     /// Esc cancel stack: close completion menu > deny approval (handled by

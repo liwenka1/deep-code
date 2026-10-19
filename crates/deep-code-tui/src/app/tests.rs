@@ -994,6 +994,106 @@ fn escape_closes_completion_before_clearing_input() {
     assert!(!app.should_quit);
 }
 
+/// Recalling a prompt closes the completion menu. Left open, it went on
+/// completing the text the recall replaced, and Enter or Tab applied it to the
+/// recalled prompt: `/c`, Ctrl+P, Enter ran `/clear` instead of sending it;
+/// `@ma`, Ctrl+P, Tab put a path in place of its last word — for this prompt
+/// the tail of an image chip, so the chip broke and the picture went. (↑ never
+/// got this far: an open menu takes it.) Walking back to the draft brings its
+/// own menu back, since that text was being typed.
+#[test]
+fn recalling_a_prompt_closes_the_completion_menu() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new();
+    app.workspace_files = vec!["src/main.rs".to_string()];
+    for ch in "look at this ".chars() {
+        app.push_char(ch);
+    }
+    assert!(app.attach_image(write_test_png(dir.path(), "shot.png")));
+    let recalled = app.input.clone();
+    app.remember_prompt(&recalled);
+    app.clear_input();
+
+    for typed in ["/c", "@ma"] {
+        for ch in typed.chars() {
+            app.push_char(ch);
+        }
+        let menu = app.completion.clone();
+        assert!(menu.is_some(), "sanity: {typed} opens a menu");
+
+        app.history_prev();
+        assert_eq!(app.input, recalled);
+        assert!(
+            !app.completion_open(),
+            "{typed}: the menu outlived its text"
+        );
+
+        app.history_next();
+        assert_eq!(app.input, typed, "the draft is back");
+        assert_eq!(app.completion, menu, "{typed}: and so is its menu");
+        app.clear_input();
+    }
+}
+
+/// Ctrl+C clears the composer and the menu with it. The menu used to stay,
+/// completing nothing, and Enter applied it: `/c`, Ctrl+C, Enter ran `/clear`.
+#[test]
+fn clearing_the_composer_closes_the_completion_menu() {
+    let mut app = App::new();
+    app.push_char('/');
+    app.push_char('c');
+    assert!(app.completion_open(), "sanity: /c opens the command menu");
+
+    app.handle_ctrl_c();
+
+    assert!(app.input.is_empty());
+    assert!(!app.completion_open(), "the menu outlived its text");
+}
+
+/// A menu is applied only while the draft would still offer it. Every route
+/// that replaces the draft closes the menu (above); this is what keeps the next
+/// route that forgets from running a command nobody chose, or from putting a
+/// path in place of whatever the draft now ends with. Compared on the entries,
+/// not on the shape of the last word: `@src/lib.rs` is a token the file menu
+/// completes, just not with this menu's `src/main.rs`.
+#[test]
+fn a_menu_the_draft_would_not_offer_is_not_applied() {
+    let mut app = App::new();
+    app.workspace_files = vec!["src/main.rs".to_string(), "src/lib.rs".to_string()];
+
+    // A menu moved through is still the draft's own: it applies the entry picked.
+    app.push_char('/');
+    app.push_char('c');
+    app.completion_down();
+    let menu = app.completion.as_ref().expect("menu open");
+    let picked = menu.items[menu.selected].0.clone();
+    assert_ne!(menu.selected, 0, "sanity: moved off the first entry");
+    app.accept_completion();
+    assert_eq!(app.input, picked);
+
+    // Replaced behind the menu's back, which is what a route that forgets does.
+    for (typed, replaced) in [
+        ("/c", "/model"),
+        ("@ma", "look at @src/lib.rs"),
+        ("@ma", "look at this"),
+    ] {
+        app.clear_input();
+        for ch in typed.chars() {
+            app.push_char(ch);
+        }
+        assert!(app.completion_open(), "sanity: {typed} opens a menu");
+        app.input = replaced.to_string();
+        app.cursor_to_end();
+
+        assert!(
+            !app.accept_completion(),
+            "{typed}'s menu applied to {replaced:?}"
+        );
+        assert_eq!(app.input, replaced);
+        assert!(!app.completion_open(), "and the stale menu is gone");
+    }
+}
+
 #[tokio::test]
 async fn approval_a_key_resolves_for_session() {
     let mut app = App::new();

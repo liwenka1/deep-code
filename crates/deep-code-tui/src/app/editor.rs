@@ -541,6 +541,9 @@ impl App {
                 self.history_cursor = None;
                 let draft = std::mem::take(&mut self.history_draft);
                 draft.restore(self);
+                // Unlike a recalled prompt, the draft was being typed, menu and
+                // all: coming back to it brings back the menu its text offers.
+                self.refresh_completion();
             }
         }
     }

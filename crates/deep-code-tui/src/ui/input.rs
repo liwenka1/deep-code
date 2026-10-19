@@ -610,6 +610,55 @@ mod tests {
         assert!(app.is_streaming, "queueing must not end the current turn");
     }
 
+    /// Recall over an open menu, through real keys: `/c` opens the command
+    /// menu, Ctrl+P (which the menu does not take, unlike ↑) recalls a prompt,
+    /// Enter sends it. The menu used to stay open over the recalled prompt, and
+    /// Enter applied it — ran `/clear`, its first entry — so what was recalled
+    /// was never sent. Mid-stream, so Enter queues it instead of starting a turn.
+    #[test]
+    fn enter_sends_a_prompt_recalled_over_an_open_menu() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        let mut app = App::new();
+        app.remember_prompt("rerun the flaky test");
+        app.is_streaming = true;
+        for ch in "/c".chars() {
+            handle_key(&mut app, plain(KeyCode::Char(ch)));
+        }
+        assert!(app.completion_open(), "sanity: /c opens the command menu");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.input, "rerun the flaky test");
+        handle_key(&mut app, plain(KeyCode::Enter));
+
+        assert_eq!(
+            app.steering_queue,
+            vec!["rerun the flaky test".to_string()],
+            "Enter sent the recalled prompt, not the menu's `/clear`"
+        );
+    }
+
+    /// ↑ walks back past a prompt that was a slash command. Recalling it closes
+    /// the menu rather than recomputing one for it: a recalled `/help` would
+    /// open the command menu, the menu takes ↑, and the walk would stop there.
+    #[test]
+    fn up_walks_past_a_recalled_slash_command() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        let mut app = App::new();
+        app.remember_prompt("first");
+        app.remember_prompt("/help");
+        handle_key(&mut app, plain(KeyCode::Up));
+        assert_eq!(app.input, "/help");
+        handle_key(&mut app, plain(KeyCode::Up));
+        assert_eq!(app.input, "first", "the menu took ↑");
+    }
+
     // -----------------------------------------------------------------------
     // Clicks on the composer, through the same routing the terminal's events
     // take, on a frame actually drawn.
