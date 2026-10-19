@@ -3315,20 +3315,106 @@ fn ctrl_w_takes_a_chip_whole() {
     assert!(app.attached_images.is_empty(), "and its picture with it");
 }
 
+/// Two chips with nothing between them — what dragging two files in at once
+/// leaves — are one word to Ctrl+W, and both pictures go; one copy of a chip
+/// the draft holds twice goes alone, and the picture stays, named by the other.
+/// The draft above has neither shape, and each breaks a label on its own: a
+/// stop that gets out of the nearer chip but not the one it lands in, or a
+/// chip found by its first copy only.
+#[test]
+fn ctrl_w_takes_glued_chips_whole_and_spares_another_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = write_test_png(dir.path(), "one.png");
+    let second = write_test_png(dir.path(), "two.png");
+    let mut app = App::new();
+    for ch in "看 ".chars() {
+        app.push_char(ch);
+    }
+    app.paste_str(format!("{}\n{}", first.display(), second.display()));
+    let chips: Vec<String> = app
+        .attached_images
+        .iter()
+        .map(|image| image.chip.clone())
+        .collect();
+    assert_eq!(app.input, format!("看 {}{}", chips[0], chips[1]), "sanity");
+
+    app.delete_word_back();
+    assert_eq!(app.input, "看 ", "both chips, whole");
+    assert!(app.attached_images.is_empty(), "and both pictures");
+
+    let mut app = App::new();
+    assert!(app.attach_image(first));
+    let chip = app.attached_images[0].chip.clone();
+    // The chip copied and pasted back in, as text.
+    app.insert_str_at_cursor(&format!(" x {chip}"));
+
+    app.delete_word_back();
+    assert_eq!(app.input, format!("{chip} x "), "the second copy, whole");
+    assert_eq!(
+        app.attached_images.len(),
+        1,
+        "the first copy still names the picture"
+    );
+}
+
+/// Backspace and Delete take one copy of a chip the draft holds twice, and the
+/// picture stays while the other copy still names it: `cut_chip` leaves the
+/// attachment to `sync_images` for exactly this. The last copy takes it along.
+#[test]
+fn backspace_and_delete_spare_a_picture_another_copy_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new();
+    assert!(app.attach_image(write_test_png(dir.path(), "shot.png")));
+    let chip = app.attached_images[0].chip.clone();
+    // The chip copied and pasted back in, as text.
+    app.insert_str_at_cursor(&format!(" x {chip}"));
+
+    app.backspace();
+    assert_eq!(app.input, format!("{chip} x "), "the second copy, whole");
+    assert_eq!(
+        app.attached_images.len(),
+        1,
+        "the first copy still names the picture"
+    );
+
+    app.input_cursor = 0;
+    app.delete_forward();
+    assert_eq!(app.input, " x ", "the first copy, whole");
+    assert!(
+        app.attached_images.is_empty(),
+        "the last copy took the picture"
+    );
+}
+
 /// From every caret position, Ctrl+W deletes exactly what Ctrl+← steps over:
 /// the two agree on what a word is, so a chip is one word to both — together
-/// with a word glued to it.
+/// with a word glued to it, or a chip glued to it.
 #[test]
 fn ctrl_w_deletes_what_ctrl_left_steps_over() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new();
     let (image, paste) = draft_with_both_chips(&mut app, dir.path());
-    let images = app.attached_images.clone();
-    let chip = images[0].chip.clone();
-    let glued = (1, 1 + chip.chars().count());
-    for (draft, chips) in [
-        (app.input.clone(), vec![image, paste]),
-        (format!("x{chip}y  z "), vec![glued]),
+    let both_chips = app.input.clone();
+    let one = app.attached_images.clone();
+    let chip = one[0].chip.clone();
+    let width = chip.chars().count();
+    assert!(app.attach_image(write_test_png(dir.path(), "two.png")));
+    let two = app.attached_images.clone();
+    let other = two[1].chip.clone();
+    let other_end = 2 + width + other.chars().count();
+    for (draft, images, chips) in [
+        (both_chips, &one, vec![image, paste]),
+        (format!("x{chip}y  z "), &one, vec![(1, 1 + width)]),
+        (
+            format!("看 {chip}{other}"),
+            &two,
+            vec![(2, 2 + width), (2 + width, other_end)],
+        ),
+        (
+            format!("{chip} x {chip}"),
+            &one,
+            vec![(0, width), (width + 3, 2 * width + 3)],
+        ),
     ] {
         for caret in 0..=draft.chars().count() {
             if chips
