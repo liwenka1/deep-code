@@ -27,11 +27,21 @@ impl App {
             return;
         }
         let sent = self.expand_pasted(&display);
+        // `/apikey` stops here: it never enters the recallable prompt history,
+        // and never reaches the model. Recognised on the text as sent, chips
+        // expanded, rather than on the composer's: a key pasted together with
+        // its line ending collapses into a `[粘贴 #1 +1 行]` chip, and read off
+        // the chip that line was no command at all — it was remembered, and sent
+        // like any prompt, into the session transcript with it.
+        let as_sent = sent.trim();
+        if as_sent.starts_with("/apikey") {
+            self.handle_slash_command(as_sent);
+            self.clear_input();
+            return;
+        }
         // Collected before anything clears the composer: this is what the turn
         // will actually carry.
         let images = self.attached_image_paths();
-        // Never let the API key into the recallable prompt history.
-        //
         // Remembered *before* the vision refusal below, so a prompt that was never
         // sent still lands in `↑`. That is deliberate and follows the rule the
         // tests pin (`/help` is remembered too): the history is what the user
@@ -39,9 +49,7 @@ impl App {
         // the refusal leaves the draft in place, so the common fix is `/model
         // flash` and Enter, but a user who cleared the draft first gets their
         // images back with one `↑` instead of retyping.
-        if !display.starts_with("/apikey") {
-            self.remember_prompt(&sent);
-        }
+        self.remember_prompt(&sent);
 
         // `/image` edits the *draft*, not the session, so it cannot go through
         // the branch below: that branch clears the composer after a command

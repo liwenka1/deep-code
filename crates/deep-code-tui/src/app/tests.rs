@@ -935,6 +935,51 @@ fn apikey_command_validates_writes_and_stays_out_of_history() {
     );
 }
 
+/// A key pasted together with its line ending is still `/apikey`, and stays
+/// out of the history and away from the model. The paste collapses into a
+/// `[粘贴 #1 +1 行]` chip, whose text says nothing about a key: read off the
+/// composer, the line was no command at all — it was remembered, and sent like
+/// any prompt (mid-stream, as here, queued to steer the live turn), and the
+/// session transcript kept it.
+#[test]
+fn a_pasted_apikey_line_never_reaches_the_history_or_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    for paste in [
+        "/apikey sk-0123456789abcdef\n",
+        "\n/apikey sk-0123456789abcdef\n\n",
+    ] {
+        let mut app = App::new();
+        app.global_config_path = dir.path().join("config.toml");
+        app.is_streaming = true;
+        app.paste_str(paste.to_string());
+        assert_eq!(app.pasted_blocks.len(), 1, "sanity: collapsed into a chip");
+
+        app.submit();
+
+        assert!(app.prompt_history.is_empty(), "{paste:?}: remembered");
+        assert!(
+            app.steering_queue.is_empty(),
+            "{paste:?}: sent to the model"
+        );
+        assert!(
+            app.history
+                .iter()
+                .all(|cell| !format!("{cell:?}").contains("sk-0123456789abcdef")),
+            "{paste:?}: in the transcript"
+        );
+        assert!(
+            app.input.is_empty(),
+            "{paste:?}: the command clears the composer"
+        );
+        let config = std::fs::read_to_string(&app.global_config_path).unwrap();
+        assert!(
+            config.contains("sk-0123456789abcdef"),
+            "{paste:?}: the key was not set"
+        );
+        std::fs::remove_file(&app.global_config_path).unwrap();
+    }
+}
+
 #[test]
 fn model_command_resolves_aliases_persists_and_keeps_session() {
     let dir = tempfile::tempdir().unwrap();
