@@ -6,6 +6,19 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [0.4.15] - 2026-10-20
+
+- **Security:** Pasting `/apikey sk-…` onto the end of a line folded it into the paste block, so the key was swept into the ↑ history, sent to the model, and written into the session record; pasting at a line's end now keeps the `/apikey` command intact.
+- **Security:** Shells that appear in neither list were missed by all three readers — `csh`/`tcsh`, which ship with macOS, and `ash`/`mksh` — so `curl … | ash` was not refused and a single `a` covered `ash <any script>`.
+- **Security:** The `withheld write root` stderr line is now stripped of control characters; before, a sandboxed command could use them to manipulate the terminal.
+- Clicking the input box moves the cursor to where you clicked.
+- When a recalled history prompt is refused on send — a generation is already running with an image, the model doesn't take images, or the queue is full — the draft it displaced comes back instead of being lost.
+- After recalling history or clearing with Ctrl+C, the completion menu no longer stays open: Enter used to run `/clear`, and Tab used to trim the block off the end of the recalled prompt.
+- Ctrl+W word-delete no longer cuts an image or paste block in half — before it dropped paste content and quietly removed images.
+- With the `/resume` list open, the mouse no longer acts on the transcript it covers.
+- The cursor can no longer land inside an image or paste block — typing there corrupted the block, and backspace only deleted one character of the paste block.
+- The sandbox now says when a write root is withheld, and says why: before, the write just failed as a mysterious EPERM, the two explanations it did give named the wrong cause, and Windows could report a withholding that never happened.
+
 ## [0.4.14] - 2026-10-16
 
 - **Security:** The project-level `[sandbox] mode` tightening check was reversed, so any repository could turn its own sandbox off; the direction is fixed, and a project config can now only tighten the sandbox, not disable it.
@@ -350,3 +363,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.4.12]: https://github.com/liwenka1/deep-code/compare/v0.4.11...v0.4.12
 [0.4.13]: https://github.com/liwenka1/deep-code/compare/v0.4.12...v0.4.13
 [0.4.14]: https://github.com/liwenka1/deep-code/compare/v0.4.13...v0.4.14
+[0.4.15]: https://github.com/liwenka1/deep-code/compare/v0.4.14...v0.4.15
