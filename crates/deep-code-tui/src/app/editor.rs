@@ -561,7 +561,15 @@ impl App {
                 self.prompt_history.remove(0);
             }
         }
-        self.history_cursor = None;
-        self.history_draft = HistoryPrompt::default();
+        // Remembering is not where a walk through the history ends. The send
+        // can still be refused — an image mid-stream, a model that takes none,
+        // a full queue — and then the composer keeps the recalled prompt, and
+        // the draft parked behind it has to stay one `↓` away; ending the walk
+        // here dropped that draft on every refusal. So the walk goes on from
+        // the newest entry, the prompt just remembered, and ends where the
+        // composer is cleared (`clear_input`).
+        if self.history_cursor.is_some() {
+            self.history_cursor = Some(self.prompt_history.len() - 1);
+        }
     }
 }

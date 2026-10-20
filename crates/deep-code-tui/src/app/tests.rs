@@ -715,6 +715,182 @@ fn prompt_history_caps_at_limit() {
     assert_eq!(app.prompt_history[99].text, "prompt-149");
 }
 
+/// A refused send keeps the composer, and the walk through the history with
+/// it: the draft `↑` parked behind a recalled prompt is still one `↓` away, and
+/// `↑` goes on to the prompt before the one just remembered; a prompt typed
+/// afresh is not swapped by `↓` for a draft nobody parked. The prompt is
+/// remembered before the refusal, so a refused prompt still lands in the
+/// history — and remembering it used to end the walk too, which dropped the
+/// draft: `↓` found nothing.
+#[test]
+fn a_refused_send_keeps_the_walk_through_the_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let shot = write_test_png(dir.path(), "shot.png");
+    // Which refusal an image meets depends on the model, so the model is
+    // pinned rather than left to whatever a developer's own config names.
+    let (takes_images, takes_none) = (
+        deep_code_agent::DEEPSEEK_FLASH,
+        deep_code_agent::DEEPSEEK_V4_PRO,
+    );
+    assert_eq!(
+        supports_vision_for_model(takes_images),
+        Some(true),
+        "sanity"
+    );
+    assert_eq!(supports_vision_for_model(takes_none), Some(false), "sanity");
+    // Sets up what will refuse the next send, and writes the prompt it refuses
+    // into the empty composer.
+    let refused = |app: &mut App, refusal: &str| {
+        app.is_streaming = true;
+        if refusal == "a full queue" {
+            app.steering_queue = vec![String::new(); STEERING_QUEUE_CAP];
+            app.insert_str_at_cursor("rerun the flaky test");
+        } else {
+            app.configured_model = if refusal == "an image mid-stream" {
+                takes_images
+            } else {
+                takes_none
+            }
+            .to_string();
+            assert!(app.attach_image(shot.clone()));
+            app.insert_str_at_cursor(" what is this?");
+        }
+    };
+    // `before` is sent, then the prompt `refused` writes, then `after`; a draft
+    // is typed, `↑` pressed `ups` times to recall that prompt, and it is sent
+    // again — and refused.
+    let resent = |refusal: &str, before: &[&str], after: &[&str], ups: usize| {
+        let mut app = App::new();
+        for prompt in before {
+            app.remember_prompt(prompt);
+        }
+        refused(&mut app, refusal);
+        let prompt = app.input.clone();
+        app.remember_prompt(&prompt);
+        app.clear_input();
+        for prompt in after {
+            app.remember_prompt(prompt);
+        }
+        for ch in "half a thought".chars() {
+            app.push_char(ch);
+        }
+        for _ in 0..ups {
+            app.history_prev();
+        }
+        assert_eq!(app.input, prompt, "sanity: recalled");
+        app.submit();
+        assert_eq!(
+            app.input, prompt,
+            "{refusal}: refused, so the composer keeps it"
+        );
+        app
+    };
+
+    for refusal in [
+        "an image mid-stream",
+        "a model that takes no image",
+        "a full queue",
+    ] {
+        let mut app = resent(refusal, &["older"], &["newest"], 2);
+        app.history_next();
+        assert_eq!(
+            app.input, "half a thought",
+            "{refusal}: the draft is one ↓ away"
+        );
+        let mut app = resent(refusal, &["older"], &["newest"], 2);
+        app.history_prev();
+        assert_eq!(
+            app.input, "newest",
+            "{refusal}: ↑ goes on to the prompt before it"
+        );
+
+        let mut app = App::new();
+        app.remember_prompt("older");
+        refused(&mut app, refusal);
+        let prompt = app.input.clone();
+        app.submit();
+        assert_eq!(app.input, prompt, "{refusal}: sanity, refused");
+        app.history_next();
+        assert_eq!(
+            app.input, prompt,
+            "{refusal}: ↓ swapped a typed prompt for a draft nobody parked"
+        );
+    }
+
+    // Where the walk goes on from must not depend on whether remembering the
+    // prompt pushed an entry: a copy that is already the newest is not pushed
+    // again, and a push into a full history evicts the oldest entry, shifting
+    // every index under the walk.
+    let full: Vec<String> = (0..PROMPT_HISTORY_CAP).map(|i| format!("p{i}")).collect();
+    let full: Vec<&str> = full.iter().map(String::as_str).collect();
+    let copy = ["between", "rerun the flaky test"];
+    for (case, before, after, ups, previous) in [
+        ("a copy already newest", &[][..], &copy[..], 3, "between"),
+        ("a full history", &full[..50], &full[51..], 50, "p99"),
+    ] {
+        let mut app = resent("a full queue", before, after, ups);
+        app.history_next();
+        assert_eq!(
+            app.input, "half a thought",
+            "{case}: the draft is one ↓ away"
+        );
+        let mut app = resent("a full queue", before, after, ups);
+        app.history_prev();
+        assert_eq!(
+            app.input, previous,
+            "{case}: ↑ goes on to the prompt before it"
+        );
+    }
+}
+
+/// Clearing the composer ends the walk through the history, whichever way it
+/// is cleared — a send (a steered one here; a send that starts a turn clears
+/// through the same `clear_input`), Ctrl+C, Esc: `↓` has no draft to bring
+/// back, and `↑` starts again from the newest prompt. Remembering a prompt no
+/// longer ends the walk (a refused send keeps it), so this rests on
+/// `clear_input` alone.
+#[test]
+fn clearing_the_composer_ends_the_walk_through_the_history() {
+    // Recalls "older" over a draft, then clears the composer `clear`'s way.
+    let cleared = |clear: &str| {
+        let mut app = App::new();
+        app.remember_prompt("older");
+        app.remember_prompt("newest");
+        for ch in "half a thought".chars() {
+            app.push_char(ch);
+        }
+        app.history_prev();
+        app.history_prev();
+        assert_eq!(app.input, "older", "sanity");
+        match clear {
+            "a send" => {
+                app.is_streaming = true;
+                app.submit();
+                assert_eq!(app.steering_queue, vec!["older".to_string()], "sanity");
+            }
+            "Ctrl+C" => app.handle_ctrl_c(),
+            _ => app.handle_escape(),
+        }
+        assert!(app.input.is_empty(), "{clear}: sanity, cleared");
+        app
+    };
+    for clear in ["a send", "Ctrl+C", "Esc"] {
+        let mut app = cleared(clear);
+        app.history_next();
+        assert!(
+            app.input.is_empty(),
+            "{clear}: the walk is over, so ↓ brings no draft back"
+        );
+        let mut app = cleared(clear);
+        app.history_prev();
+        let newest = if clear == "a send" { "older" } else { "newest" };
+        assert_eq!(
+            app.input, newest,
+            "{clear}: ↑ starts again from the newest prompt"
+        );
+    }
+}
+
 #[test]
 fn apikey_command_validates_writes_and_stays_out_of_history() {
     let dir = tempfile::tempdir().unwrap();

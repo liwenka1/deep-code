@@ -841,6 +841,13 @@ impl App {
         // composer without closing it, and Enter then applied it to nothing —
         // `/c`, Ctrl+C, Enter ran `/clear`.
         self.close_completion();
+        // A walk through the history ends here too, and the draft parked behind
+        // a recalled prompt with it: what the composer held was sent or thrown
+        // away, so `↑` starts again from the newest prompt. Here rather than
+        // where the prompt is remembered, because a refused send keeps the
+        // composer, and the walk with it (`remember_prompt`).
+        self.history_cursor = None;
+        self.history_draft = HistoryPrompt::default();
     }
 
     /// Esc cancel stack: close completion menu > deny approval (handled by
@@ -853,7 +860,6 @@ impl App {
             self.cancel_streaming_turn();
         } else if !self.input.is_empty() {
             self.clear_input();
-            self.history_cursor = None;
             self.status = self.tr(TextId::StatusInputClearedEsc).to_string();
         } else {
             self.should_quit = true;
@@ -868,7 +874,6 @@ impl App {
             self.cancel_streaming_turn();
         } else if !self.input.is_empty() {
             self.clear_input();
-            self.history_cursor = None;
             self.ctrl_c_pending = false;
             self.status = self.tr(TextId::StatusInputClearedCtrlC).to_string();
         } else if self.ctrl_c_pending {
