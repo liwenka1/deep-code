@@ -27,6 +27,27 @@ impl App {
     }
 
     fn compute_completion(&self) -> Option<CompletionMenu> {
+        // `/skill <partial>`: the skill names, until the name is followed by
+        // whitespace (the user is typing arguments by then). Rides the slash
+        // menu — accepting one replaces the whole draft with `/skill name `.
+        if let Some(partial) = self.input.strip_prefix("/skill ")
+            && !partial.contains(char::is_whitespace)
+        {
+            let filter = partial.to_lowercase();
+            let items: Vec<(String, String)> = self
+                .skills
+                .list()
+                .iter()
+                .filter(|skill| skill.name.to_lowercase().starts_with(&filter))
+                .take(COMPLETION_MENU_ITEMS)
+                .map(|skill| (format!("/skill {} ", skill.name), skill.description.clone()))
+                .collect();
+            return (!items.is_empty()).then_some(CompletionMenu {
+                kind: CompletionKind::Slash,
+                items,
+                selected: 0,
+            });
+        }
         if let Some(rest) = self.input.strip_prefix('/') {
             if self.input.contains(char::is_whitespace) {
                 return None;

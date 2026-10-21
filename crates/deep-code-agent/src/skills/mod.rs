@@ -7,6 +7,9 @@
 //! can open the full instructions only when needed.
 
 mod frontmatter;
+mod tool;
+
+pub use tool::SkillTool;
 
 use std::collections::HashSet;
 use std::fs;
@@ -45,6 +48,12 @@ pub struct Skill {
     /// Where the `SKILL.md` actually lives. The directory name is allowed to
     /// differ from `name`, so consumers must use this path as-is.
     pub path: PathBuf,
+    /// Where `path` resolved to at discovery (symlinks followed). The `skill`
+    /// tool serves the file only while it still resolves there: the workspace
+    /// is model-writable, and a manifest swapped for a symlink after launch
+    /// must not be read through. Falls back to `path` when it could not be
+    /// resolved, in which case the tool refuses (nothing to compare against).
+    pub identity: PathBuf,
 }
 
 /// Every skill found under one or more roots, plus any problems hit while
@@ -155,12 +164,17 @@ impl SkillRegistry {
                         continue;
                     }
                     match frontmatter::read_skill_file(&text) {
-                        Ok(parsed) => self.entries.push(Skill {
-                            name: parsed.name,
-                            description: parsed.description,
-                            body: parsed.body,
-                            path: manifest,
-                        }),
+                        Ok(parsed) => {
+                            let identity =
+                                fs::canonicalize(&manifest).unwrap_or_else(|_| manifest.clone());
+                            self.entries.push(Skill {
+                                name: parsed.name,
+                                description: parsed.description,
+                                body: parsed.body,
+                                path: manifest,
+                                identity,
+                            });
+                        }
                         Err(why) => {
                             self.note(format!("skipping {}: {why}", manifest.display()));
                         }
@@ -186,7 +200,6 @@ impl SkillRegistry {
     }
 
     /// Look up a skill by its metadata name.
-    #[cfg(test)]
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&Skill> {
         self.entries.iter().find(|skill| skill.name == name)
@@ -309,8 +322,9 @@ pub fn render_skills_block(registry: &SkillRegistry) -> Option<String> {
     let mut block = String::from("## Skills\n");
     block.push_str(
         "Reusable instruction sets found on this machine. Each line names a skill, \
-summarizes when it applies, and points at its SKILL.md; read that file before \
-acting on a skill.\n\n### Available skills\n",
+summarizes when it applies, and shows where its SKILL.md lives; before acting on a \
+skill, call the `skill` tool with its name to get the full instructions.\n\n\
+### Available skills\n",
     );
 
     let mut used = block.chars().count();
@@ -353,11 +367,13 @@ acting on a skill.\n\n### Available skills\n",
     Some(block)
 }
 
-/// Append the rendered skills index for `workspace` to a base system prompt.
-/// Returns `base` untouched when no skills are installed.
+/// Append the rendered skills index of `registry` to a base system prompt.
+/// Returns `base` untouched when no skills are installed. The launch
+/// discovers once and shares the registry between the prompt and the `skill`
+/// tool, so the two can never disagree about what exists.
 #[must_use]
-pub fn build_system_prompt(base: &str, workspace: &Path) -> String {
-    match render_skills_block(&discover_in_workspace(workspace)) {
+pub fn build_system_prompt_from(base: &str, registry: &SkillRegistry) -> String {
+    match render_skills_block(registry) {
         Some(block) => format!("{base}\n\n{block}"),
         None => base.to_string(),
     }

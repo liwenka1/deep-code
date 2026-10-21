@@ -325,6 +325,7 @@ fn tool_calling_state(autonomous_approvals: bool) -> AppState {
         sandbox_off: false,
         extra_roots: Vec::new(),
         instructions: deep_code_agent::ProjectInstructions::default(),
+        skills: Arc::new(deep_code_agent::SkillRegistry::default()),
     };
     AppState {
         version: "0.1.0".to_string(),

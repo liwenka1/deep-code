@@ -116,6 +116,9 @@ pub use session_store::{
     TurnRecord, format_sessions_storage_note, now_ms,
 };
 pub use shell_tools::JobStore;
+// `/skill` lists and runs the skills the launch discovered; the registry is the
+// launch's, so the menu and the prompt's index can never differ.
+pub use skills::{Skill, SkillRegistry};
 pub use subagent::{SharedSubAgentManager, SubAgentManager, is_subagent_tool};
 // Every crate that can put text on a terminal needs this, which is why it is
 // here and not in the TUI: `deep-code-runtime` cannot depend on `deep-code-tui`

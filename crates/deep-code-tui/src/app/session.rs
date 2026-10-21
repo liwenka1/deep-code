@@ -20,8 +20,10 @@ impl App {
             sandbox_off,
             extra_roots,
             instructions,
+            skills,
         } = launched;
         self.instructions = instructions;
+        self.skills = skills;
         // Parked, not pushed. Two of the three callers rebuild the transcript
         // AFTER adopting — `switch_session` clears then hydrates, and
         // `start_new_conversation` clears then writes the welcome cell — so

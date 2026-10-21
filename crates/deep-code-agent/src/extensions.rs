@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use tokio_util::sync::CancellationToken;
@@ -7,7 +6,7 @@ use crate::client::LlmClient;
 use crate::config::AgentConfig;
 use crate::execution_policy::SharedPermissionMode;
 use crate::instructions::ProjectInstructions;
-use crate::skills::build_system_prompt;
+use crate::skills::{SkillRegistry, build_system_prompt_from};
 use crate::subagent::{DEFAULT_MAX_CONCURRENT, SubAgentServices, register_subagent_tools};
 use crate::tool::ToolRegistry;
 use crate::workspace_policy::WorkspacePolicy;
@@ -86,14 +85,14 @@ pub fn platform_block() -> &'static str {
 /// discipline (which they may override).
 pub fn build_runtime_system_prompt(
     base: &str,
-    workspace: &Path,
+    skills: &SkillRegistry,
     instructions: &ProjectInstructions,
 ) -> String {
     let head = match instructions.block() {
         Some(block) => format!("{base}\n\n{block}"),
         None => base.to_string(),
     };
-    let prompt = build_system_prompt(&head, workspace);
+    let prompt = build_system_prompt_from(&head, skills);
     format!(
         "{prompt}\n\n{}\n\n{TOOL_DISCIPLINE}\n\n{SUBAGENT_GUIDANCE}",
         platform_block()
@@ -136,9 +135,11 @@ mod tests {
 
     #[test]
     fn runtime_prompt_includes_tool_discipline_and_subagent_guidance() {
-        let dir = TempDir::new().unwrap();
-        let prompt =
-            build_runtime_system_prompt("base prompt", dir.path(), &ProjectInstructions::default());
+        let prompt = build_runtime_system_prompt(
+            "base prompt",
+            &SkillRegistry::default(),
+            &ProjectInstructions::default(),
+        );
         assert!(prompt.starts_with("base prompt"));
         assert!(prompt.contains("工具使用纪律"));
         assert!(prompt.contains("不要反复读取同一文件"));
@@ -152,9 +153,11 @@ mod tests {
     /// (`ls`, `$VAR`, `2>/dev/null` all fail under cmd.exe).
     #[test]
     fn runtime_prompt_states_the_host_shell() {
-        let dir = TempDir::new().unwrap();
-        let prompt =
-            build_runtime_system_prompt("base", dir.path(), &ProjectInstructions::default());
+        let prompt = build_runtime_system_prompt(
+            "base",
+            &SkillRegistry::default(),
+            &ProjectInstructions::default(),
+        );
         let expected_shell = if cfg!(windows) { "cmd.exe /C" } else { "sh -c" };
         assert!(
             prompt.contains(expected_shell),
@@ -189,7 +192,8 @@ mod tests {
         let file = dir.path().join(crate::instructions::INSTRUCTIONS_FILE);
         std::fs::write(&file, "tests live in tests.rs").unwrap();
         let instructions = ProjectInstructions::load_from(None, &file);
-        let prompt = build_runtime_system_prompt("base prompt", dir.path(), &instructions);
+        let skills = crate::skills::discover_in_workspace(dir.path());
+        let prompt = build_runtime_system_prompt("base prompt", &skills, &instructions);
         let at = |needle: &str| {
             prompt
                 .find(needle)
@@ -201,7 +205,7 @@ mod tests {
         assert!(at("## Skills") < at("工具使用纪律"));
 
         let without =
-            build_runtime_system_prompt("base prompt", dir.path(), &ProjectInstructions::default());
+            build_runtime_system_prompt("base prompt", &skills, &ProjectInstructions::default());
         assert!(!without.contains("Project instructions"));
     }
 }

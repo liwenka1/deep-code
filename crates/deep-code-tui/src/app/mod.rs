@@ -187,6 +187,10 @@ pub struct App {
     /// card reports them, and a runtime swap (`/clear`, `/resume`) replaces
     /// them along with the prompt they describe.
     pub(crate) instructions: deep_code_agent::ProjectInstructions,
+    /// The skills the current runtime discovered — what `/skill` lists, offers
+    /// in the completion menu, and runs. Replaced on every runtime swap along
+    /// with the prompt whose index names them.
+    pub(crate) skills: Arc<deep_code_agent::SkillRegistry>,
     pub(crate) last_telemetry: Option<TurnTelemetry>,
     pub(crate) prompt_history: Vec<HistoryPrompt>,
     history_cursor: Option<usize>,
@@ -576,6 +580,7 @@ impl App {
             sandbox_off,
             extra_roots,
             instructions,
+            skills,
         } = launched;
         let subagent_shutdown = Some(stop_hook);
         let job_store = Some(job_store);
@@ -695,6 +700,7 @@ impl App {
             configured_reasoning,
             web_backend,
             instructions,
+            skills,
             last_telemetry: None,
             prompt_history: Vec::new(),
             history_cursor: None,

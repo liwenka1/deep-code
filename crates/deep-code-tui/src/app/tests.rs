@@ -3920,3 +3920,163 @@ async fn init_sends_the_brief_as_a_turn_and_refuses_mid_stream() {
     assert!(busy.steering_queue.is_empty(), "and nothing is queued");
     assert!(busy.status.contains("/init"), "{}", busy.status);
 }
+
+fn skills_fixture(skills: &[(&str, &str, &str)]) -> Arc<deep_code_agent::SkillRegistry> {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, description, body) in skills {
+        let skill = dir.path().join(name);
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n{body}\n"),
+        )
+        .unwrap();
+    }
+    let registry = deep_code_agent::SkillRegistry::discover(dir.path());
+    // The registry holds its own copies; the directory may go.
+    assert_eq!(registry.len(), skills.len());
+    Arc::new(registry)
+}
+
+/// `/skill` alone lists what was discovered; an unknown name is refused in
+/// the status line without sending anything.
+#[test]
+fn skill_lists_and_refuses_unknown_names() {
+    let mut app = App::new();
+    app.skills = skills_fixture(&[
+        ("release", "ship a version", "run the workflow"),
+        ("review", "check a diff", "read it"),
+    ]);
+    assert!(app.handle_slash_command("/skill"));
+    assert!(
+        matches!(
+            app.history.last(),
+            Some(HistoryCell::System { text })
+                if text.contains("release — ship a version") && text.contains("review — check a diff")
+        ),
+        "{:?}",
+        app.history.last()
+    );
+
+    let cells = app.history.len();
+    assert!(app.handle_slash_command("/skill nope now"));
+    assert_eq!(app.history.len(), cells, "an unknown skill sends nothing");
+    assert!(app.status.contains("nope"), "{}", app.status);
+
+    let mut bare = App::new();
+    bare.skills = Arc::new(deep_code_agent::SkillRegistry::default());
+    assert!(bare.handle_slash_command("/skill"));
+    assert!(
+        matches!(bare.history.last(), Some(HistoryCell::System { text }) if text.contains("SKILL.md")),
+        "{:?}",
+        bare.history.last()
+    );
+}
+
+/// `/skill <name> <args>` sends the body as the turn, with `$ARGUMENTS`
+/// substituted — or the arguments appended when the body has no placeholder
+/// — while the transcript shows the command line. Refused mid-stream.
+#[tokio::test]
+async fn skill_sends_the_body_with_arguments_and_refuses_mid_stream() {
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let make = |captured: &Arc<std::sync::Mutex<Option<String>>>| {
+        let mut app = App::new();
+        app.runtime = Arc::new(deep_code_agent::AgentRuntime::new(
+            BriefCapturingClient {
+                last_user_message: Arc::clone(captured),
+            },
+            deep_code_agent::ToolRegistry::new(),
+        ));
+        app.skills = skills_fixture(&[
+            (
+                "fix",
+                "fix an issue",
+                "Fix issue $ARGUMENTS and add a test.",
+            ),
+            ("tidy", "tidy up", "Run the formatter."),
+        ]);
+        app
+    };
+    let wait_for = |captured: &Arc<std::sync::Mutex<Option<String>>>| {
+        let captured = Arc::clone(captured);
+        async move {
+            for _ in 0..300 {
+                if let Some(sent) = captured.lock().unwrap().take() {
+                    return sent;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the brief never reached the model");
+        }
+    };
+
+    let mut app = make(&captured);
+    app.insert_str_at_cursor("/skill fix #42 in the parser");
+    app.submit();
+    assert!(app.is_streaming);
+    assert!(
+        matches!(app.history.last(), Some(HistoryCell::User { text }) if text == "/skill fix #42 in the parser"),
+        "{:?}",
+        app.history.last()
+    );
+    let sent = wait_for(&captured).await;
+    assert!(
+        sent.contains("Fix issue #42 in the parser and add a test.")
+            && !sent.contains("$ARGUMENTS"),
+        "{sent}"
+    );
+    assert!(sent.contains("「fix」"), "{sent}");
+
+    let mut app = make(&captured);
+    app.insert_str_at_cursor("/skill tidy the src tree");
+    app.submit();
+    let sent = wait_for(&captured).await;
+    assert!(
+        sent.contains("Run the formatter.") && sent.contains("Arguments: the src tree"),
+        "{sent}"
+    );
+
+    let mut app = make(&captured);
+    app.insert_str_at_cursor("/skill tidy");
+    app.submit();
+    let sent = wait_for(&captured).await;
+    assert!(sent.ends_with("Run the formatter."), "{sent}");
+
+    let mut busy = make(&captured);
+    busy.is_streaming = true;
+    let cells = busy.history.len();
+    busy.insert_str_at_cursor("/skill tidy");
+    busy.submit();
+    assert_eq!(busy.history.len(), cells);
+    assert!(busy.steering_queue.is_empty());
+    assert!(busy.status.contains("/skill"), "{}", busy.status);
+}
+
+/// After `/skill ` the menu offers the skill names (with their descriptions
+/// as hints) until the name is complete; accepting one fills `/skill name `.
+#[test]
+fn skill_names_complete_after_the_command() {
+    let mut app = App::new();
+    app.skills = skills_fixture(&[
+        ("release", "ship a version", "x"),
+        ("review", "check a diff", "x"),
+        ("tidy", "tidy up", "x"),
+    ]);
+    app.insert_str_at_cursor("/skill re");
+    let menu = app.completion.clone().expect("names are offered");
+    assert_eq!(
+        menu.items,
+        vec![
+            ("/skill release ".to_string(), "ship a version".to_string()),
+            ("/skill review ".to_string(), "check a diff".to_string()),
+        ]
+    );
+    assert!(!app.accept_completion(), "a skill still wants arguments");
+    assert_eq!(app.input, "/skill release ");
+    assert!(
+        !app.completion_open(),
+        "once the name is followed by whitespace the arguments are the user's"
+    );
+    app.insert_str_at_cursor("now");
+    assert!(!app.completion_open());
+}

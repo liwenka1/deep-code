@@ -1025,7 +1025,9 @@ impl ExecPolicy {
 
     pub fn classify_tool(tool_name: &str) -> ToolKind {
         match tool_name {
-            "read_file" | "list_dir" => ToolKind::ReadOnlyFile,
+            // `skill` reads through the launch-time registry, never through the
+            // roots; same posture as a file read, no gate.
+            "read_file" | "list_dir" | "skill" => ToolKind::ReadOnlyFile,
             "grep_files" => ToolKind::Search,
             "write_file" | "apply_patch" => ToolKind::WriteFile,
             "shell" => ToolKind::Shell,

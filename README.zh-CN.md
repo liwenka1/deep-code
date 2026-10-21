@@ -181,8 +181,10 @@ jobs:
 
 deep-code **不内置 MCP**。它本来就有 shell,所以扩展能力的方式是**写个脚本/命令 + 一份 `SKILL.md`**:一行摘要注入系统提示、模型按需读取 SKILL.md 正文,再通过 `shell` 工具调用你的脚本。
 
-- **发现**:把带 `name`/`description` frontmatter 的 `SKILL.md` 放进 skills 目录(全局 `~/.deep-code/skills/<name>/` 或项目 `<workspace>/.deep-code/skills/<name>/`);其一行摘要常驻提示,正文只在相关时才读入上下文。
-- **执行**:能力就是普通命令(`psql`、`curl`、你自己的脚本……),经 `shell` 工具运行,同样受审批门与执行策略约束。
+- **发现**:把带 `name`/`description` frontmatter 的 `SKILL.md` 放进 skills 目录——随仓库分发的放 `<workspace>/skills/<name>/`,自己的放 `~/.deep-code/skills/<name>/`(`<workspace>/.deep-code/skills/` 也会读,但 deep-code 自己写在那里的 `.gitignore` 会把它挡在 git 之外)。启动、`/clear`、resume 时发现;一行摘要常驻提示,正文只在被要求时才进入上下文。
+- **读取**:模型用 `skill` 工具按名字取一个 skill 的完整指令——包括 `~/.deep-code` 下的,那里任何文件工具和沙箱内 shell 都够不着。每次调用都重读文件,但若它已不再解析到发现时的位置(启动后被换成符号链接的清单不是指令)则拒绝。
+- **自己运行**:`/skill <名称> [参数]` 把该 skill 的指令作为你的提示发出;正文里的 `$ARGUMENTS` 替换成名称后面打的内容(没有占位符就追加在末尾)。只打 `/skill` 列出已发现的,`/skill ` 之后补全菜单会给出名称。
+- **执行**:能力就是普通命令(`psql`、`curl`、你自己的脚本……),经 `shell` 工具运行,同样受审批门与执行策略约束。本仓库自己在 [`skills/`](./skills) 下带了三个:`preflight`、`release`、`review`。
 - **为什么不做 MCP**:对有 shell 的 agent,shell 就是通用工具协议。一份几十 token 的 SKILL.md 摘要按需加载,比把整套工具 schema 常驻每一轮请求更省上下文。用管道(`| head` 等)裁剪结果、只把关键片段带回上下文。确需现成的 MCP 生态 server 时,用支持 MCP 的宿主即可——deep-code 保持精简。
 
 ## 评测(SWE-bench)

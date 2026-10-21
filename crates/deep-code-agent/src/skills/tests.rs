@@ -234,6 +234,10 @@ fn rendered_block_lists_name_summary_and_path() {
     let registry = SkillRegistry::discover(tmp.path());
     let block = render_skills_block(&registry).expect("non-empty registry renders");
     assert!(block.starts_with("## Skills\n"));
+    assert!(
+        block.contains("call the `skill` tool"),
+        "the index must point at the tool, not at a path the model may not be able to read: {block}"
+    );
     assert!(block.contains("- review — check the diff carefully -> "));
     assert!(
         block.contains(
@@ -301,7 +305,7 @@ fn system_prompt_gains_skills_block_when_skills_exist() {
         "appears in the prompt",
     );
 
-    let prompt = build_system_prompt("Base instructions.", tmp.path());
+    let prompt = build_system_prompt_from("Base instructions.", &discover_in_workspace(tmp.path()));
     assert!(prompt.starts_with("Base instructions."));
     assert!(prompt.contains("prompt-demo"));
     assert!(prompt.contains("appears in the prompt"));

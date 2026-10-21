@@ -3,6 +3,8 @@ use deep_code_agent::{
     RuntimeEvent, SessionStore, estimate_token_count, format_sessions_storage_note, web_enabled,
 };
 
+use std::sync::Arc;
+
 use crate::app::App;
 use crate::history::HistoryCell;
 use deep_code_agent::i18n::{Lang, TextId, tr};
@@ -26,6 +28,9 @@ improve it without dropping existing content; write <workspace>/AGENTS.md with w
 200 lines, organised in sections (overview / commands / conventions / pitfalls), concrete and \
 actionable; finish with two or three sentences on what you wrote and what you are unsure about.";
 
+/// What `/skill <name> <arguments>` substitutes in a skill body, when present.
+pub(crate) const SKILL_ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
+
 /// (command, hint id, takes an argument). Single source for the completion
 /// menu and `/help`; hints are looked up from the language pack when the menu
 /// or `/help` text is built.
@@ -46,6 +51,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, TextId, bool)] = &[
     ("/compact", TextId::HintCompact, false),
     ("/context", TextId::HintContext, false),
     ("/init", TextId::HintInit, false),
+    ("/skill", TextId::HintSkill, true),
     ("/lang", TextId::HintLang, true),
     ("/add-dir", TextId::HintAddDir, true),
     ("/image", TextId::HintImage, true),
@@ -142,6 +148,11 @@ impl App {
                 self.init_command();
                 true
             }
+            _ if prompt == "/skill" || prompt.starts_with("/skill ") => {
+                let arg = prompt.strip_prefix("/skill").unwrap_or_default().trim();
+                self.skill_command(arg);
+                true
+            }
             _ if prompt == "/lang" || prompt.starts_with("/lang ") => {
                 let arg = prompt.strip_prefix("/lang").unwrap_or_default().trim();
                 self.set_lang_command(arg);
@@ -169,6 +180,62 @@ impl App {
             Vec::new(),
             Some("/init".to_string()),
         );
+    }
+
+    /// `/skill`: list the discovered skills, or run one by name.
+    ///
+    /// Running a skill sends its instructions as a turn of the user's own:
+    /// `$ARGUMENTS` in the body is replaced by whatever followed the name, or
+    /// the arguments are appended when the body has no placeholder. The body
+    /// is the launch-time copy — the same text the prompt's index was built
+    /// from — so an edit shows up with the next session, like the index. The
+    /// transcript shows the command line; the session record keeps the brief.
+    /// Refused while a turn is running, like `/init`, for the same reason.
+    fn skill_command(&mut self, arg: &str) {
+        if arg.is_empty() {
+            let skills = Arc::clone(&self.skills);
+            let text = if skills.is_empty() {
+                self.tr(TextId::SkillListEmpty).to_string()
+            } else {
+                let mut text = self.tr(TextId::SkillListHeader).to_string();
+                for skill in skills.list() {
+                    text.push_str("\n  ");
+                    text.push_str(&skill.name);
+                    if !skill.description.is_empty() {
+                        text.push_str(" — ");
+                        text.push_str(&skill.description);
+                    }
+                }
+                text
+            };
+            self.history.push(HistoryCell::system(text));
+            return;
+        }
+        let (name, arguments) = arg
+            .split_once(char::is_whitespace)
+            .map_or((arg, ""), |(name, rest)| (name, rest.trim()));
+        let skills = Arc::clone(&self.skills);
+        let Some(skill) = skills.get(name) else {
+            self.status = self.tr_with(TextId::StatusSkillUnknown, &[("name", name)]);
+            return;
+        };
+        if self.is_streaming || self.pending_approval.is_some() {
+            self.status = self.tr(TextId::StatusSkillBusy).to_string();
+            return;
+        }
+        let body = if skill.body.contains(SKILL_ARGUMENTS_PLACEHOLDER) {
+            skill.body.replace(SKILL_ARGUMENTS_PLACEHOLDER, arguments)
+        } else if arguments.is_empty() {
+            skill.body.clone()
+        } else {
+            format!("{}\n\n参数 / Arguments: {arguments}", skill.body)
+        };
+        let text = format!(
+            "按 skill「{name}」执行 / Follow the skill \"{name}\":\n\n{body}",
+            name = skill.name
+        );
+        let shown = format!("/skill {arg}");
+        self.start_user_turn(text, Vec::new(), Some(shown));
     }
 
     /// `/compact`: fold old history into a summary now, whether or not the

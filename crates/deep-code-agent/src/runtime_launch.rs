@@ -15,6 +15,7 @@ use crate::instructions::ProjectInstructions;
 use crate::runtime::AgentRuntime;
 use crate::session_store::{JsonSessionStore, SessionRecord, SessionStore};
 use crate::shell_tools::{JobStore, shell_tool_registry_from};
+use crate::skills::{SkillRegistry, discover_in_workspace};
 use crate::subagent::SharedSubAgentManager;
 use crate::tool::ToolRegistry;
 use crate::workspace_policy::{WorkspacePolicy, WorkspaceRoots};
@@ -55,6 +56,10 @@ pub struct LaunchedRuntime {
     /// The AGENTS.md files this runtime's prompt carries (sources, truncation),
     /// read once at this launch. Their warnings are already in `warnings`.
     pub instructions: ProjectInstructions,
+    /// The skills discovered at this launch — what the prompt's index lists and
+    /// what the `skill` tool serves. Shared with the UI so `/skill` offers the
+    /// same set.
+    pub skills: Arc<SkillRegistry>,
 }
 
 impl LaunchedRuntime {
@@ -86,6 +91,7 @@ pub fn build_tool_registry(
     config: &AgentConfig,
     warnings: &mut Vec<String>,
     ui_lang: &SharedLang,
+    skills: &Arc<SkillRegistry>,
 ) -> (ToolRegistry, JobStore, Option<WorkspacePolicy>) {
     let mut registry = ToolRegistry::new();
     // The exec policy set here is the one the runtime consults for every call,
@@ -121,6 +127,14 @@ pub fn build_tool_registry(
             &crate::web_tools::WebBackend::from_config(config),
         ));
     }
+    // Mounted only when the index lists something: a tool whose every call
+    // can only answer "no such skill" is tokens spent on a dead end.
+    if !skills.is_empty() {
+        registry.register(crate::skills::SkillTool::new(
+            Arc::clone(skills),
+            ui_lang.clone(),
+        ));
+    }
     (registry, job_store, boundary)
 }
 
@@ -151,8 +165,12 @@ fn web_enabled_from(disable_flag: Option<&str>) -> bool {
 }
 
 #[must_use]
-pub fn runtime_system_prompt(roots: &WorkspaceRoots, instructions: &ProjectInstructions) -> String {
-    let base = build_runtime_system_prompt(DEFAULT_SYSTEM_PROMPT, &roots.primary, instructions);
+pub fn runtime_system_prompt(
+    roots: &WorkspaceRoots,
+    instructions: &ProjectInstructions,
+    skills: &SkillRegistry,
+) -> String {
+    let base = build_runtime_system_prompt(DEFAULT_SYSTEM_PROMPT, skills, instructions);
     let summary = build_workspace_summary(&roots.primary, &roots.extras);
     format!("{base}\n\n{summary}")
 }
@@ -191,7 +209,10 @@ pub fn launch_runtime(
     // Read here, once per launch — this is the "read at startup / `/clear`"
     // moment the AGENTS.md semantics promise (resume has its own, below).
     let instructions = ProjectInstructions::load(&roots.primary);
-    let prompt = runtime_system_prompt(&roots, &instructions);
+    // Discovered once and shared: the prompt's index and the `skill` tool must
+    // describe the same set.
+    let skills = Arc::new(discover_in_workspace(&roots.primary));
+    let prompt = runtime_system_prompt(&roots, &instructions, &skills);
     let ui_lang = SharedLang::new(Lang::from_env(&config.language));
     if config.api_key.is_some()
         && let Ok(client) = DeepSeekClient::new(config.clone())
@@ -201,6 +222,7 @@ pub fn launch_runtime(
             roots,
             ui_lang,
             instructions,
+            skills,
         );
         return launch_fresh(client, parts, config, &prompt, &parent_cancel);
     }
@@ -210,6 +232,7 @@ pub fn launch_runtime(
         roots,
         ui_lang.clone(),
         instructions,
+        skills,
     );
     launch_fresh(
         EchoClient::new(ui_lang),
@@ -271,6 +294,7 @@ struct LaunchParts {
     warnings: Vec<String>,
     ui_lang: SharedLang,
     instructions: ProjectInstructions,
+    skills: Arc<SkillRegistry>,
 }
 
 impl LaunchParts {
@@ -282,6 +306,7 @@ impl LaunchParts {
         roots: WorkspaceRoots,
         ui_lang: SharedLang,
         instructions: ProjectInstructions,
+        skills: Arc<SkillRegistry>,
     ) -> Self {
         Self {
             backend_label,
@@ -289,6 +314,7 @@ impl LaunchParts {
             warnings: instructions.warnings.clone(),
             ui_lang,
             instructions,
+            skills,
         }
     }
 }
@@ -336,6 +362,7 @@ fn assemble_launch<C: LlmClient + Clone + 'static>(
         roots,
         ui_lang,
         instructions,
+        skills,
         warnings: _,
     } = parts;
     let (runtime, session_id) = make_runtime((*client).clone(), tools);
@@ -356,6 +383,7 @@ fn assemble_launch<C: LlmClient + Clone + 'static>(
         permission_mode,
         extra_roots: roots.extras,
         instructions,
+        skills,
     }
 }
 
@@ -382,6 +410,7 @@ struct ResumedSession {
     roots: WorkspaceRoots,
     warnings: Vec<String>,
     instructions: ProjectInstructions,
+    skills: Arc<SkillRegistry>,
 }
 
 /// The resumed launch for either client backend: rebuild the runtime from the
@@ -403,6 +432,7 @@ fn finish_resumed_launch<C: LlmClient + Clone + 'static>(
         roots,
         warnings,
         instructions,
+        skills,
     } = session;
     assemble_launch(
         client,
@@ -412,6 +442,7 @@ fn finish_resumed_launch<C: LlmClient + Clone + 'static>(
             warnings,
             ui_lang,
             instructions,
+            skills,
         },
         config,
         parent_cancel,
@@ -609,7 +640,8 @@ fn launch_resumed(
     // as they were when the record was born.
     let instructions = ProjectInstructions::load(&roots.primary);
     warnings.extend(instructions.warnings.iter().cloned());
-    record.set_system_prompt(runtime_system_prompt(&roots, &instructions));
+    let skills = Arc::new(discover_in_workspace(&roots.primary));
+    record.set_system_prompt(runtime_system_prompt(&roots, &instructions, &skills));
     let workspace = record.workspace.clone();
     let store = match JsonSessionStore::for_workspace(&workspace) {
         Ok(store) => store,
@@ -637,6 +669,7 @@ fn launch_resumed(
         roots,
         warnings,
         instructions,
+        skills,
     };
     let ui_lang = SharedLang::new(Lang::from_env(&config.language));
     if config.api_key.is_some()
@@ -676,7 +709,8 @@ fn build_parent_tools<C: LlmClient + 'static>(
     let roots = &parts.roots;
     let ui_lang = &parts.ui_lang;
     let child_instructions = parts.instructions.block();
-    let (mut registry, job_store, boundary) = build_tool_registry(roots, config, warnings, ui_lang);
+    let (mut registry, job_store, boundary) =
+        build_tool_registry(roots, config, warnings, ui_lang, &parts.skills);
     // Sub-agents inherit the parent's live boundary; without one (workspace
     // unresolvable — the fs tool groups are disabled too) there is nothing a
     // child could correctly work inside, so the dispatch tool stays unmounted.

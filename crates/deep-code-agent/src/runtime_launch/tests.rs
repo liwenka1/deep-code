@@ -13,6 +13,7 @@ fn parent_tool_names<C: LlmClient + Clone + 'static>(
         WorkspaceRoots::from(workspace),
         SharedLang::default(),
         ProjectInstructions::default(),
+        Arc::new(discover_in_workspace(workspace)),
     );
     let tools = build_parent_tools(
         Arc::new(client),
@@ -88,6 +89,7 @@ fn launch_assembly_warns_about_dead_auto_allow_entries() {
         WorkspaceRoots::from(dir.path()),
         ui_lang.clone(),
         ProjectInstructions::default(),
+        Arc::new(SkillRegistry::default()),
     );
     let _tools = build_parent_tools(
         Arc::new(EchoClient::new(ui_lang)),
@@ -760,4 +762,32 @@ fn an_oversized_agents_md_warns_at_launch() {
         "{:?}",
         launched.warnings
     );
+}
+
+/// The `skill` tool rides the registry the launch discovered: mounted when
+/// there is something to serve, absent when there is not.
+#[test]
+fn the_skill_tool_is_mounted_only_when_skills_exist() {
+    let empty = tempfile::TempDir::new().unwrap();
+    let names = parent_tool_names(
+        EchoClient::new(SharedLang::default()),
+        &AgentConfig::builtin(),
+        empty.path(),
+    );
+    assert!(!names.iter().any(|name| name == "skill"), "{names:?}");
+
+    let with = tempfile::TempDir::new().unwrap();
+    let dir = with.path().join("skills").join("demo");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: d\n---\nbody\n",
+    )
+    .unwrap();
+    let names = parent_tool_names(
+        EchoClient::new(SharedLang::default()),
+        &AgentConfig::builtin(),
+        with.path(),
+    );
+    assert!(names.iter().any(|name| name == "skill"), "{names:?}");
 }
