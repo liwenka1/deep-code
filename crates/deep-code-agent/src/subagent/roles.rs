@@ -136,7 +136,16 @@ fn normalize(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace('-', "_")
 }
 
-pub fn build_system_prompt(role: SubAgentRole, network: bool) -> String {
+/// A child's system prompt: role intro, its real network grant, the parent's
+/// project instructions (AGENTS.md) when any, the host facts, and the report
+/// contract. Instructions sit before the host facts for the same reason they
+/// follow the identity in the parent's prompt: they are the user's words about
+/// this repository, read before the generic material.
+pub fn build_system_prompt(
+    role: SubAgentRole,
+    network: bool,
+    instructions: Option<&str>,
+) -> String {
     // Children run shell commands too and start from a blank context, so they
     // need the same host facts the parent gets — otherwise each one rediscovers
     // "this is not POSIX" one failed command at a time. The network line must
@@ -148,8 +157,11 @@ pub fn build_system_prompt(role: SubAgentRole, network: bool) -> String {
     } else {
         NETWORK_DENIED_BLOCK
     };
+    let instructions = instructions
+        .map(|block| format!("{block}\n\n"))
+        .unwrap_or_default();
     format!(
-        "{}\n{}\n\n{}\n\n{}",
+        "{}\n{}\n\n{instructions}{}\n\n{}",
         role.intro(),
         network_block,
         crate::extensions::platform_block(),
@@ -285,7 +297,7 @@ mod tests {
     /// Children run shell too and start blank, so they need the same host facts.
     #[test]
     fn child_prompt_states_the_host_shell() {
-        let prompt = build_system_prompt(SubAgentRole::General, false);
+        let prompt = build_system_prompt(SubAgentRole::General, false, None);
         let expected_shell = if cfg!(windows) { "cmd.exe /C" } else { "sh -c" };
         assert!(
             prompt.contains(expected_shell),
@@ -299,7 +311,7 @@ mod tests {
     /// tools it was granted.
     #[test]
     fn child_prompt_states_the_real_network_grant() {
-        let offline = build_system_prompt(SubAgentRole::Explore, false);
+        let offline = build_system_prompt(SubAgentRole::Explore, false, None);
         assert!(
             offline.contains("NO network access"),
             "offline child must be told so: {offline}"
@@ -309,7 +321,7 @@ mod tests {
             "offline child must know the re-dispatch path: {offline}"
         );
 
-        let online = build_system_prompt(SubAgentRole::Explore, true);
+        let online = build_system_prompt(SubAgentRole::Explore, true, None);
         assert!(
             online.contains("WITH network access"),
             "granted child must be told so: {online}"
@@ -318,5 +330,23 @@ mod tests {
             online.contains("fetch_url"),
             "granted child must know its web tools: {online}"
         );
+    }
+
+    /// A child gets the parent's AGENTS.md block, after its own role and
+    /// network lines and before the host facts — and nothing when the parent
+    /// had none.
+    #[test]
+    fn child_prompt_carries_the_project_instructions() {
+        let block = "# Project instructions (AGENTS.md)\n\ntests live in tests.rs";
+        let prompt = build_system_prompt(SubAgentRole::Implementer, false, Some(block));
+        let at = |needle: &str| {
+            prompt
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {prompt}"))
+        };
+        assert!(at("NO network access") < at("tests live in tests.rs"));
+        assert!(at("tests live in tests.rs") < at("运行环境"));
+        let bare = build_system_prompt(SubAgentRole::Implementer, false, None);
+        assert!(!bare.contains("Project instructions"));
     }
 }

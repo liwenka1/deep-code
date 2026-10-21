@@ -11,6 +11,7 @@ use crate::echo_client::EchoClient;
 use crate::execution_policy::SharedPermissionMode;
 use crate::extensions::{attach_agent_extensions, build_runtime_system_prompt};
 use crate::i18n::{Lang, SharedLang};
+use crate::instructions::ProjectInstructions;
 use crate::runtime::AgentRuntime;
 use crate::session_store::{JsonSessionStore, SessionRecord, SessionStore};
 use crate::shell_tools::{JobStore, shell_tool_registry_from};
@@ -51,6 +52,9 @@ pub struct LaunchedRuntime {
     /// unioned with a resumed record's own grants). Exposed so consumers can
     /// show the user the real boundary without re-deriving the union.
     pub extra_roots: Vec<PathBuf>,
+    /// The AGENTS.md files this runtime's prompt carries (sources, truncation),
+    /// read once at this launch. Their warnings are already in `warnings`.
+    pub instructions: ProjectInstructions,
 }
 
 impl LaunchedRuntime {
@@ -147,8 +151,8 @@ fn web_enabled_from(disable_flag: Option<&str>) -> bool {
 }
 
 #[must_use]
-pub fn runtime_system_prompt(roots: &WorkspaceRoots) -> String {
-    let base = build_runtime_system_prompt(DEFAULT_SYSTEM_PROMPT, &roots.primary);
+pub fn runtime_system_prompt(roots: &WorkspaceRoots, instructions: &ProjectInstructions) -> String {
+    let base = build_runtime_system_prompt(DEFAULT_SYSTEM_PROMPT, &roots.primary, instructions);
     let summary = build_workspace_summary(&roots.primary, &roots.extras);
     format!("{base}\n\n{summary}")
 }
@@ -184,30 +188,35 @@ pub fn launch_runtime(
         return launch_resumed(config, record, primary_raw, roots.extras, &parent_cancel);
     }
 
-    let prompt = runtime_system_prompt(&roots);
+    // Read here, once per launch — this is the "read at startup / `/clear`"
+    // moment the AGENTS.md semantics promise (resume has its own, below).
+    let instructions = ProjectInstructions::load(&roots.primary);
+    let prompt = runtime_system_prompt(&roots, &instructions);
     let ui_lang = SharedLang::new(Lang::from_env(&config.language));
     if config.api_key.is_some()
         && let Ok(client) = DeepSeekClient::new(config.clone())
     {
-        return launch_fresh(
-            client,
+        let parts = LaunchParts::fresh(
             format!("DeepSeek {}", config.model),
-            config,
             roots,
-            &prompt,
-            &parent_cancel,
             ui_lang,
+            instructions,
         );
+        return launch_fresh(client, parts, config, &prompt, &parent_cancel);
     }
 
-    launch_fresh(
-        EchoClient::new(ui_lang.clone()),
+    let parts = LaunchParts::fresh(
         "offline echo (set DEEPSEEK_API_KEY for DeepSeek)".to_string(),
-        config,
         roots,
+        ui_lang.clone(),
+        instructions,
+    );
+    launch_fresh(
+        EchoClient::new(ui_lang),
+        parts,
+        config,
         &prompt,
         &parent_cancel,
-        ui_lang,
     )
 }
 
@@ -215,21 +224,18 @@ pub fn launch_runtime(
 /// the store is available, fall back to an in-memory one with a warning.
 fn launch_fresh<C: LlmClient + Clone + 'static>(
     client: C,
-    backend_label: String,
+    mut parts: LaunchParts,
     config: &AgentConfig,
-    roots: WorkspaceRoots,
     prompt: &str,
     parent_cancel: &CancellationToken,
-    ui_lang: SharedLang,
 ) -> LaunchedRuntime {
-    let mut warnings = Vec::new();
     // Decide persistence before assembling tools: the fallback path must not
     // rebuild (and silently drop) a full extensions set, and the failure
     // reason must reach the user instead of being swallowed.
-    let persisted = match prepare_persisted_session(&roots, prompt) {
+    let persisted = match prepare_persisted_session(&parts.roots, prompt) {
         Ok(pair) => Some(pair),
         Err(reason) => {
-            warnings.push(format!(
+            parts.warnings.push(format!(
                 "session persistence unavailable; this session will not be saved ({reason})"
             ));
             None
@@ -237,12 +243,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
     };
     assemble_launch(
         client,
-        LaunchParts {
-            backend_label,
-            roots,
-            warnings,
-            ui_lang,
-        },
+        parts,
         config,
         parent_cancel,
         |client, tools| match persisted {
@@ -269,6 +270,27 @@ struct LaunchParts {
     roots: WorkspaceRoots,
     warnings: Vec<String>,
     ui_lang: SharedLang,
+    instructions: ProjectInstructions,
+}
+
+impl LaunchParts {
+    /// Parts for a fresh launch. The instruction loader's own complaints (a
+    /// refused symlink, a cut) open the warning list: they are about the
+    /// prompt this very launch is about to send.
+    fn fresh(
+        backend_label: String,
+        roots: WorkspaceRoots,
+        ui_lang: SharedLang,
+        instructions: ProjectInstructions,
+    ) -> Self {
+        Self {
+            backend_label,
+            roots,
+            warnings: instructions.warnings.clone(),
+            ui_lang,
+            instructions,
+        }
+    }
 }
 
 /// The tail every launch shares once its client and parts are settled: build
@@ -280,17 +302,14 @@ struct LaunchParts {
 /// fresh and resumed paths used to spell these thirty lines twice.
 fn assemble_launch<C: LlmClient + Clone + 'static>(
     client: C,
-    parts: LaunchParts,
+    mut parts: LaunchParts,
     config: &AgentConfig,
     parent_cancel: &CancellationToken,
     make_runtime: impl FnOnce(C, ToolRegistry) -> (AgentRuntime, Option<String>),
 ) -> LaunchedRuntime {
-    let LaunchParts {
-        backend_label,
-        roots,
-        mut warnings,
-        ui_lang,
-    } = parts;
+    // Taken out first: the tool build appends to the list while it reads the
+    // rest of the parts.
+    let mut warnings = std::mem::take(&mut parts.warnings);
     let client = Arc::new(client);
     // Built here rather than after the tools, because the child runtimes
     // constructed inside `build_parent_tools` share THIS handle: one atomic, so
@@ -307,12 +326,18 @@ fn assemble_launch<C: LlmClient + Clone + 'static>(
     } = build_parent_tools(
         Arc::clone(&client),
         config,
-        &roots,
+        &parts,
         parent_cancel,
         &permission_mode,
         &mut warnings,
-        &ui_lang,
     );
+    let LaunchParts {
+        backend_label,
+        roots,
+        ui_lang,
+        instructions,
+        warnings: _,
+    } = parts;
     let (runtime, session_id) = make_runtime((*client).clone(), tools);
     let runtime = attach_workspace_helpers(runtime, &roots.primary, config, &mut warnings)
         .with_boundary(boundary)
@@ -330,6 +355,7 @@ fn assemble_launch<C: LlmClient + Clone + 'static>(
         warnings,
         permission_mode,
         extra_roots: roots.extras,
+        instructions,
     }
 }
 
@@ -355,6 +381,7 @@ struct ResumedSession {
     store: JsonSessionStore,
     roots: WorkspaceRoots,
     warnings: Vec<String>,
+    instructions: ProjectInstructions,
 }
 
 /// The resumed launch for either client backend: rebuild the runtime from the
@@ -375,6 +402,7 @@ fn finish_resumed_launch<C: LlmClient + Clone + 'static>(
         store,
         roots,
         warnings,
+        instructions,
     } = session;
     assemble_launch(
         client,
@@ -383,6 +411,7 @@ fn finish_resumed_launch<C: LlmClient + Clone + 'static>(
             roots,
             warnings,
             ui_lang,
+            instructions,
         },
         config,
         parent_cancel,
@@ -575,7 +604,12 @@ fn launch_resumed(
     // the effective roots; a stale grant dropped above likewise stops being
     // advertised. Costs one provider prefix-cache miss on the resumed
     // conversation; an unusable grant costs the whole feature.
-    record.set_system_prompt(runtime_system_prompt(&roots));
+    // Re-read on resume for the same reason the prompt is rebuilt at all: a
+    // resumed conversation should carry the instructions as they are now, not
+    // as they were when the record was born.
+    let instructions = ProjectInstructions::load(&roots.primary);
+    warnings.extend(instructions.warnings.iter().cloned());
+    record.set_system_prompt(runtime_system_prompt(&roots, &instructions));
     let workspace = record.workspace.clone();
     let store = match JsonSessionStore::for_workspace(&workspace) {
         Ok(store) => store,
@@ -602,6 +636,7 @@ fn launch_resumed(
         store,
         roots,
         warnings,
+        instructions,
     };
     let ui_lang = SharedLang::new(Lang::from_env(&config.language));
     if config.api_key.is_some()
@@ -627,15 +662,20 @@ fn launch_resumed(
     )
 }
 
+/// Reads the roots, the language handle and the instructions block from
+/// `parts`; `warnings` is the same list `parts` carried, handed over separately
+/// because this appends to it while the rest of the parts stay borrowed.
 fn build_parent_tools<C: LlmClient + 'static>(
     client: Arc<C>,
     config: &AgentConfig,
-    roots: &WorkspaceRoots,
+    parts: &LaunchParts,
     parent_cancel: &CancellationToken,
     permission_mode: &SharedPermissionMode,
     warnings: &mut Vec<String>,
-    ui_lang: &SharedLang,
 ) -> ParentTools {
+    let roots = &parts.roots;
+    let ui_lang = &parts.ui_lang;
+    let child_instructions = parts.instructions.block();
     let (mut registry, job_store, boundary) = build_tool_registry(roots, config, warnings, ui_lang);
     // Sub-agents inherit the parent's live boundary; without one (workspace
     // unresolvable — the fs tool groups are disabled too) there is nothing a
@@ -649,6 +689,7 @@ fn build_parent_tools<C: LlmClient + 'static>(
                 policy.clone(),
                 parent_cancel.clone(),
                 permission_mode.clone(),
+                child_instructions.map(str::to_string),
             );
             let shutdown: Box<dyn Fn() + Send + Sync> = Box::new({
                 let extensions = Arc::clone(&extensions);

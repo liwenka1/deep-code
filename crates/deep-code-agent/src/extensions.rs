@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 use crate::client::LlmClient;
 use crate::config::AgentConfig;
 use crate::execution_policy::SharedPermissionMode;
+use crate::instructions::ProjectInstructions;
 use crate::skills::build_system_prompt;
 use crate::subagent::{DEFAULT_MAX_CONCURRENT, SubAgentServices, register_subagent_tools};
 use crate::tool::ToolRegistry;
@@ -77,8 +78,22 @@ pub fn platform_block() -> &'static str {
     }
 }
 
-pub fn build_runtime_system_prompt(base: &str, workspace: &Path) -> String {
-    let prompt = build_system_prompt(base, workspace);
+/// The parent's system prompt: the base identity, then the project
+/// instructions (AGENTS.md) when any exist, then the skills index, then the
+/// host facts and the two discipline blocks. Instructions sit right after the
+/// identity because they are the user's own words about how to work here —
+/// before the skills (which they may refer to) and before the generic
+/// discipline (which they may override).
+pub fn build_runtime_system_prompt(
+    base: &str,
+    workspace: &Path,
+    instructions: &ProjectInstructions,
+) -> String {
+    let head = match instructions.block() {
+        Some(block) => format!("{base}\n\n{block}"),
+        None => base.to_string(),
+    };
+    let prompt = build_system_prompt(&head, workspace);
     format!(
         "{prompt}\n\n{}\n\n{TOOL_DISCIPLINE}\n\n{SUBAGENT_GUIDANCE}",
         platform_block()
@@ -92,17 +107,21 @@ pub fn attach_agent_extensions(
     boundary: WorkspacePolicy,
     parent_cancel: CancellationToken,
     permission_mode: SharedPermissionMode,
+    child_instructions: Option<String>,
 ) -> Arc<AgentExtensions> {
     let exec_policy = registry.policy().clone();
-    let subagent = Arc::new(SubAgentServices::new(
-        client,
-        agent_config,
-        boundary,
-        parent_cancel,
-        permission_mode,
-        DEFAULT_MAX_CONCURRENT,
-        exec_policy,
-    ));
+    let subagent = Arc::new(
+        SubAgentServices::new(
+            client,
+            agent_config,
+            boundary,
+            parent_cancel,
+            permission_mode,
+            DEFAULT_MAX_CONCURRENT,
+            exec_policy,
+        )
+        .with_instructions(child_instructions),
+    );
     // Capability tiers: L1 = unconditional core, L2 = kept but gated,
     // L3 = reducible to core primitives (slated for removal/reduction).
     // L2: sub-agents are a deliberate capability; kept.
@@ -118,7 +137,8 @@ mod tests {
     #[test]
     fn runtime_prompt_includes_tool_discipline_and_subagent_guidance() {
         let dir = TempDir::new().unwrap();
-        let prompt = build_runtime_system_prompt("base prompt", dir.path());
+        let prompt =
+            build_runtime_system_prompt("base prompt", dir.path(), &ProjectInstructions::default());
         assert!(prompt.starts_with("base prompt"));
         assert!(prompt.contains("工具使用纪律"));
         assert!(prompt.contains("不要反复读取同一文件"));
@@ -133,7 +153,8 @@ mod tests {
     #[test]
     fn runtime_prompt_states_the_host_shell() {
         let dir = TempDir::new().unwrap();
-        let prompt = build_runtime_system_prompt("base", dir.path());
+        let prompt =
+            build_runtime_system_prompt("base", dir.path(), &ProjectInstructions::default());
         let expected_shell = if cfg!(windows) { "cmd.exe /C" } else { "sh -c" };
         assert!(
             prompt.contains(expected_shell),
@@ -150,5 +171,37 @@ mod tests {
                 "platform block leaks source indentation: {line:?}"
             );
         }
+    }
+
+    /// Instructions follow the identity line and precede the skills index and
+    /// the generic discipline: the user's words about this repository come
+    /// before anything the model might weigh against them.
+    #[test]
+    fn project_instructions_follow_the_base_and_precede_the_skills_index() {
+        let dir = TempDir::new().unwrap();
+        let skill = dir.path().join("skills").join("demo");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: demo\ndescription: a demo skill\n---\nbody\n",
+        )
+        .unwrap();
+        let file = dir.path().join(crate::instructions::INSTRUCTIONS_FILE);
+        std::fs::write(&file, "tests live in tests.rs").unwrap();
+        let instructions = ProjectInstructions::load_from(None, &file);
+        let prompt = build_runtime_system_prompt("base prompt", dir.path(), &instructions);
+        let at = |needle: &str| {
+            prompt
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {prompt}"))
+        };
+        assert!(prompt.starts_with("base prompt"));
+        assert!(at("# Project instructions (AGENTS.md)") < at("tests live in tests.rs"));
+        assert!(at("tests live in tests.rs") < at("## Skills"));
+        assert!(at("## Skills") < at("工具使用纪律"));
+
+        let without =
+            build_runtime_system_prompt("base prompt", dir.path(), &ProjectInstructions::default());
+        assert!(!without.contains("Project instructions"));
     }
 }

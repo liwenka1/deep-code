@@ -14,6 +14,7 @@ mod execution_policy;
 mod extensions;
 pub mod i18n;
 mod image;
+mod instructions;
 mod lsp;
 mod message;
 mod model;
@@ -70,6 +71,12 @@ pub use execution_policy::{
     is_needs_human_rule, shell_command_of,
 };
 pub use i18n::{Lang, TextId, tr, tr_with};
+// The welcome card says which AGENTS.md files were loaded and whether they
+// were cut; the launch loads them, the UI only reports.
+pub use instructions::{
+    INSTRUCTIONS_FILE, InstructionScope, InstructionSource, MAX_INSTRUCTIONS_CHARS,
+    ProjectInstructions,
+};
 // The TUI reads the clipboard and writes the bytes, the runtime reads them back
 // and builds the URL, and compaction charges them against the window. All three
 // sides come through here so there is exactly one definition of what an

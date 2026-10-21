@@ -228,7 +228,7 @@ impl Tool for AgentTool {
         let runtime = AgentRuntime::with_system_prompt_shared(
             std::sync::Arc::clone(&self.services.client),
             child_tools,
-            child_system_prompt(role, network),
+            child_system_prompt(role, network, self.services.instructions.as_deref()),
             child_config,
             true,
         )

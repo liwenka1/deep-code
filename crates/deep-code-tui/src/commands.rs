@@ -7,6 +7,25 @@ use crate::app::App;
 use crate::history::HistoryCell;
 use deep_code_agent::i18n::{Lang, TextId, tr};
 
+/// The `/init` brief. Model-facing, so bilingual like the runtime's other
+/// prompt text and never localized; the file it asks for is read by
+/// `deep_code_agent::ProjectInstructions` at the next launch.
+const INIT_BRIEF: &str = "\
+请为这个仓库生成（或改进）项目指令文件 AGENTS.md。它会在每个会话开始时注入系统提示，\
+所以只写对后续工作真正有用、又不能从代码一眼看出的事实。\n\
+1. 先调查：目录结构、构建/测试/lint 命令、代码风格与命名约定、提交规范、测试布局、容易踩的坑。\n\
+2. 如果工作区根目录已有 AGENTS.md，先读取并在它的基础上改进，不要丢弃已有内容。\n\
+3. 用 write_file 写入工作区根目录的 AGENTS.md：200 行以内，按小节组织（项目概览 / 常用命令 / \
+约定 / 注意事项），具体、可执行。\n\
+4. 最后用两三句话说明写了什么，以及哪些内容你不确定、需要人确认。\n\
+/ Generate (or improve) AGENTS.md for this repository. It is injected into the system prompt at \
+the start of every session, so keep only facts that help later work and cannot be read off the \
+code at a glance. Investigate first (layout, build/test/lint commands, style and naming \
+conventions, commit rules, test layout, pitfalls); if an AGENTS.md already exists, read it and \
+improve it without dropping existing content; write <workspace>/AGENTS.md with write_file — under \
+200 lines, organised in sections (overview / commands / conventions / pitfalls), concrete and \
+actionable; finish with two or three sentences on what you wrote and what you are unsure about.";
+
 /// (command, hint id, takes an argument). Single source for the completion
 /// menu and `/help`; hints are looked up from the language pack when the menu
 /// or `/help` text is built.
@@ -26,6 +45,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, TextId, bool)] = &[
     ("/find", TextId::HintFind, true),
     ("/compact", TextId::HintCompact, false),
     ("/context", TextId::HintContext, false),
+    ("/init", TextId::HintInit, false),
     ("/lang", TextId::HintLang, true),
     ("/add-dir", TextId::HintAddDir, true),
     ("/image", TextId::HintImage, true),
@@ -118,6 +138,10 @@ impl App {
                 self.context_command();
                 true
             }
+            "/init" => {
+                self.init_command();
+                true
+            }
             _ if prompt == "/lang" || prompt.starts_with("/lang ") => {
                 let arg = prompt.strip_prefix("/lang").unwrap_or_default().trim();
                 self.set_lang_command(arg);
@@ -125,6 +149,26 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// `/init`: ask the model to draft (or improve) this repository's AGENTS.md.
+    ///
+    /// A canned brief sent as an ordinary turn — the model investigates and
+    /// writes the file through its normal tools, so the write goes through the
+    /// same approval gate as any other edit. The transcript shows `/init`; the
+    /// brief itself lands in the session record like any prompt. Refused while
+    /// a turn is running: the brief must not be queued behind unrelated work,
+    /// and steering it into a live turn would mix two tasks.
+    fn init_command(&mut self) {
+        if self.is_streaming || self.pending_approval.is_some() {
+            self.status = self.tr(TextId::StatusInitBusy).to_string();
+            return;
+        }
+        self.start_user_turn(
+            INIT_BRIEF.to_string(),
+            Vec::new(),
+            Some("/init".to_string()),
+        );
     }
 
     /// `/compact`: fold old history into a summary now, whether or not the

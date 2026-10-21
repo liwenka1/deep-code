@@ -506,6 +506,7 @@ fn welcome_text(offline: bool, lang: Lang) -> String {
         workspace: "~/code/deep-code".to_string(),
         resumed_turns: None,
         persistent: true,
+        instructions: None,
     };
     cell_lines(&cell, 60, lang)
         .iter()
@@ -2922,4 +2923,33 @@ fn the_transcript_memo_never_changes_what_is_drawn() {
     let after_shift = screen(&mut terminal, &mut app);
     assert!(!after_shift.contains("first question"), "{after_shift}");
     assert!(after_shift.contains("replaced body"), "{after_shift}");
+}
+
+/// The welcome card names the AGENTS.md files the prompt carries — and shows
+/// no such line at all when there are none, instead of a blank value.
+#[test]
+fn welcome_cell_names_the_loaded_instructions() {
+    let cell = |instructions: Option<&str>| HistoryCell::Welcome {
+        version: "0.1.0".to_string(),
+        model: "deepseek-flash".to_string(),
+        reasoning: "medium".to_string(),
+        offline: false,
+        workspace: "~/code/deep-code".to_string(),
+        resumed_turns: None,
+        persistent: true,
+        instructions: instructions.map(str::to_string),
+    };
+    let text = |cell: &HistoryCell| -> String {
+        cell_lines(cell, 60, Lang::Zh)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect()
+    };
+    let with = text(&cell(Some("AGENTS.md（12 行）")));
+    assert!(
+        with.contains("指令") && with.contains("AGENTS.md（12 行）"),
+        "{with}"
+    );
+    let without = text(&cell(None));
+    assert!(!without.contains("指令"), "{without}");
 }

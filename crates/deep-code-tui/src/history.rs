@@ -49,6 +49,45 @@ pub(crate) fn session_summary(
     }
 }
 
+/// The welcome card's "Rules" value: each AGENTS.md that was loaded with its
+/// kept line count, plus a truncation suffix when the cap cut something.
+/// `None` when nothing was loaded — the card then shows no line at all rather
+/// than nagging about a file most repositories do not have yet.
+pub(crate) fn instructions_summary(
+    lang: Lang,
+    instructions: &deep_code_agent::ProjectInstructions,
+) -> Option<String> {
+    if instructions.sources.is_empty() {
+        return None;
+    }
+    let mut text = instructions
+        .sources
+        .iter()
+        .map(|source| {
+            let lines = source.lines.to_string();
+            match source.scope {
+                deep_code_agent::InstructionScope::Workspace => tr_with(
+                    lang,
+                    TextId::InstructionsSourceWorkspace,
+                    &[("lines", &lines)],
+                ),
+                deep_code_agent::InstructionScope::Global => {
+                    tr_with(lang, TextId::InstructionsSourceGlobal, &[("lines", &lines)])
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
+    if instructions.truncated {
+        text.push_str(&tr_with(
+            lang,
+            TextId::InstructionsTruncatedSuffix,
+            &[("max", &deep_code_agent::MAX_INSTRUCTIONS_CHARS.to_string())],
+        ));
+    }
+    Some(text)
+}
+
 /// One completed call inside a [`HistoryCell::ToolBatch`].
 ///
 /// Deliberately carries no approval state and no result status: a batch only
@@ -198,6 +237,9 @@ pub enum HistoryCell {
         resumed_turns: Option<usize>,
         /// Whether the fresh session is persisted (ignored when resumed).
         persistent: bool,
+        /// Which AGENTS.md files the prompt carries, already worded for the
+        /// card (see [`instructions_summary`]); `None` when there are none.
+        instructions: Option<String>,
     },
     System {
         text: String,

@@ -91,7 +91,7 @@ deepcode eval            # SWE-bench 评测 rollout(见下文)
 deepcode session list|resume|delete|export
 ```
 
-常用 slash 命令:`/help` `/model` `/apikey` `/lang` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy` `/add-dir` `/image`(`/help` 查看全部与快捷键)。
+常用 slash 命令:`/help` `/model` `/apikey` `/lang` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy` `/add-dir` `/image` `/init`(`/help` 查看全部与快捷键)。
 
 ### 跨仓库联调(`--add-dir`)
 
@@ -167,6 +167,15 @@ jobs:
 **联网工具。**当 `provider.base_url` 指向 `api.deepseek.com`(默认值)且配置了 key 时,`web_search` 与 `fetch_url` 由 DeepSeek 的 Search & Fetch API 提供:搜索词和抓取的 URL 会发送给 DeepSeek——也就是本来就收到你全部提示词的那一方——`fetch_url` 返回的是页面的 Markdown,长页面分块返回(`offset` 续读)。换成其他端点时 `web_search` 不可用(工具描述和返回结果都会如实说明),`fetch_url` 退回由本机直接抓取、经 SSRF 守卫、HTML 压成纯文本。两者和其他联网调用一样都要过审批。环境变量 `DEEP_CODE_DISABLE_WEB`:设为 `1`/`true`/`on` 即可卸载这两个工具,用于断网或审计场景。`/status` 显示 `web=on (<后端>)|off`,`deepcode doctor` 报告同样的信息。
 
 在 macOS / Linux 上,shell/job 命令在 OS 沙箱内运行且**默认不带网络**(详见[亮点](#亮点))。`[sandbox] network = prompt|always|never` 可调,项目层只许收紧。**Windows 上没有沙箱约束**,因此本段的断网与写入限制均不生效(`network` 设置是空操作),声明联网仍会转审批、deny 底板仍然生效;跑 `deepcode doctor` 看本机实况。
+
+## 项目指令(AGENTS.md)
+
+把模型应当了解的仓库事实——构建/测试命令、约定、目录布局、容易踩的坑——写进工作区根目录的 `AGENTS.md`。它会紧跟助手身份那一句注入 system prompt,主会话和它派出的每个子代理都能看到。个人的 `~/.deep-code/AGENTS.md` 先于它读取,放那些跟着你跨仓库走的习惯。
+
+- **每个对话只读一次**:启动、`/clear`、resume 时各读一次。改了文件,下一个对话生效,不会在对话中途变——prompt 是会话记录里持久化的第一条,也是服务端缓存前缀的开头。
+- **两份合计上限 24,000 字符**,超出部分丢弃,prompt 里留一句说明、启动时给一条警告。建议 200 行以内——文件越长,遵循度越低。
+- `/init` 让模型先调查仓库再起草一份(已有则在其基础上改进),写文件照常过审批门。欢迎卡片会显示加载了哪些文件、各多少行;`/context` 能看到 prompt 本身。
+- **指令是上下文,不是权限。**`AGENTS.md` 里的内容碰不到执行策略、审批门和沙箱——仓库可以告诉模型在这里怎么干活,但扩不大它能干什么。工作区的 `AGENTS.md` 若是符号链接会被拒绝(一个 checkout 可以把它指向私钥,内容会随第一个请求发往服务端)。只读主工作区,`--add-dir` 的附加根不读。
 
 ## 扩展能力(skills + shell)
 

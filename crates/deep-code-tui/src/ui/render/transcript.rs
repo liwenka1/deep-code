@@ -437,6 +437,7 @@ pub(super) fn cell_lines_unsanitized(
             workspace,
             resumed_turns,
             persistent,
+            instructions,
         } => {
             let cyan = Style::default()
                 .fg(Color::Cyan)
@@ -480,6 +481,12 @@ pub(super) fn cell_lines_unsanitized(
                     *persistent,
                 )),
             ]));
+            if let Some(instructions) = instructions {
+                lines.push(Line::from(vec![
+                    label(TextId::WelcomeInstructionsLabel),
+                    Span::raw(instructions.clone()),
+                ]));
+            }
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 tr(lang, TextId::WelcomeIntro),

@@ -8,14 +8,19 @@ fn parent_tool_names<C: LlmClient + Clone + 'static>(
     workspace: &Path,
 ) -> Vec<String> {
     let cancel = CancellationToken::new();
+    let parts = LaunchParts::fresh(
+        String::new(),
+        WorkspaceRoots::from(workspace),
+        SharedLang::default(),
+        ProjectInstructions::default(),
+    );
     let tools = build_parent_tools(
         Arc::new(client),
         config,
-        &WorkspaceRoots::from(workspace),
+        &parts,
         &cancel,
         &SharedPermissionMode::default(),
         &mut Vec::new(),
-        &SharedLang::default(),
     );
     tools
         .registry
@@ -78,14 +83,19 @@ fn launch_assembly_warns_about_dead_auto_allow_entries() {
     let mut warnings = Vec::new();
     let cancel = CancellationToken::new();
     let ui_lang = SharedLang::default();
+    let parts = LaunchParts::fresh(
+        String::new(),
+        WorkspaceRoots::from(dir.path()),
+        ui_lang.clone(),
+        ProjectInstructions::default(),
+    );
     let _tools = build_parent_tools(
-        Arc::new(EchoClient::new(ui_lang.clone())),
+        Arc::new(EchoClient::new(ui_lang)),
         &config,
-        &WorkspaceRoots::from(dir.path()),
+        &parts,
         &cancel,
         &SharedPermissionMode::default(),
         &mut warnings,
-        &ui_lang,
     );
     assert!(
         warnings.iter().any(|warning| warning.contains("\"read_\"")),
@@ -653,4 +663,101 @@ fn online_launch_names_the_provider_and_is_not_offline() {
     );
     assert!(echo_resumed.offline);
     assert_eq!(echo_resumed.backend_label, "offline echo (resumed)");
+}
+
+/// AGENTS.md is read at every launch — which is what startup, `/clear` and a
+/// resume all are — and never watched in between: a second launch over an
+/// edited file carries the new text, and a resumed record's stale prompt is
+/// rebuilt from the file as it is now.
+#[tokio::test]
+async fn agents_md_is_read_at_each_launch_and_on_resume() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let ws = workspace.path().canonicalize().unwrap();
+    let file = ws.join(crate::instructions::INSTRUCTIONS_FILE);
+    std::fs::write(&file, "rule one: tests live in tests.rs\n").unwrap();
+    let config = AgentConfig::builtin();
+
+    let first = launch_runtime(&config, ws.clone(), None);
+    let system = first.handle.session_messages().await[0].content.clone();
+    assert!(system.starts_with(DEFAULT_SYSTEM_PROMPT), "{system}");
+    assert!(
+        system.contains("# Project instructions (AGENTS.md)") && system.contains("rule one"),
+        "{system}"
+    );
+    assert!(
+        first.instructions.sources.iter().any(|source| source.scope
+            == crate::instructions::InstructionScope::Workspace
+            && source.path == file),
+        "{:?}",
+        first.instructions.sources
+    );
+    let id = crate::session_store::SessionId::parse(
+        first
+            .session_id
+            .clone()
+            .expect("a fresh launch in a writable workspace persists"),
+    )
+    .unwrap();
+    // Shut down first: persistence is flushed on the way out, and the record
+    // is read back from disk exactly as `-c` would read it.
+    first.shutdown().await;
+    let record = JsonSessionStore::for_workspace(&ws)
+        .unwrap()
+        .load(&id)
+        .unwrap();
+
+    std::fs::write(&file, "rule two: never force-push\n").unwrap();
+    let second = launch_runtime(&config, ws.clone(), None);
+    let system = second.handle.session_messages().await[0].content.clone();
+    assert!(
+        system.contains("rule two") && !system.contains("rule one"),
+        "{system}"
+    );
+    second.shutdown().await;
+
+    // The record still carries the first prompt; resuming rebuilds it.
+    let resumed = launch_runtime(&config, ws.clone(), Some(record));
+    let system = resumed.handle.session_messages().await[0].content.clone();
+    assert!(
+        system.contains("rule two") && !system.contains("rule one"),
+        "{system}"
+    );
+    resumed.shutdown().await;
+
+    // No file: no block, no source, no warning about it.
+    std::fs::remove_file(&file).unwrap();
+    let bare = launch_runtime(&config, ws, None);
+    let system = bare.handle.session_messages().await[0].content.clone();
+    assert!(!system.contains("# Project instructions"), "{system}");
+    assert!(
+        !bare
+            .instructions
+            .sources
+            .iter()
+            .any(|source| source.scope == crate::instructions::InstructionScope::Workspace)
+    );
+    bare.shutdown().await;
+}
+
+/// The loader's complaints ride the launch warnings, where the UI shows
+/// every other launch-time degradation.
+#[test]
+fn an_oversized_agents_md_warns_at_launch() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let ws = workspace.path().canonicalize().unwrap();
+    std::fs::write(
+        ws.join(crate::instructions::INSTRUCTIONS_FILE),
+        "x".repeat(crate::instructions::MAX_INSTRUCTIONS_CHARS + 1),
+    )
+    .unwrap();
+    let launched = launch_runtime(&AgentConfig::builtin(), ws, None);
+    assert!(launched.instructions.truncated);
+    assert!(
+        launched
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("AGENTS.md") && warning.contains("limit")),
+        "{:?}",
+        launched.warnings
+    );
 }

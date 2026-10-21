@@ -50,6 +50,14 @@ pub struct SubAgentServices {
     /// on it.
     pub permission_mode: SharedPermissionMode,
     pub exec_policy: ExecPolicy,
+    /// The parent's project-instructions block (AGENTS.md), handed to every
+    /// child's system prompt. A child starts from a blank context, and the
+    /// repository's conventions are the part of the parent's context it most
+    /// needs — an implementer that does not know where tests live writes them
+    /// in the wrong place. The same text the parent read, not a re-read: a
+    /// mid-session edit reaches children with the next session, like the
+    /// parent.
+    pub instructions: Option<String>,
 }
 
 impl SubAgentServices {
@@ -71,7 +79,15 @@ impl SubAgentServices {
             parent_cancel,
             permission_mode,
             exec_policy,
+            instructions: None,
         }
+    }
+
+    /// Builder-style: the parent's AGENTS.md block, for every child's prompt.
+    #[must_use]
+    pub(crate) fn with_instructions(mut self, instructions: Option<String>) -> Self {
+        self.instructions = instructions;
+        self
     }
 
     /// Cancel every child (all child tokens derive from `parent_cancel`) and
@@ -107,6 +123,7 @@ pub fn attach_subagent_tools(
             boundary,
             parent_cancel,
             SharedPermissionMode::default(),
+            None,
         )
         .subagent,
     )
@@ -206,6 +223,10 @@ fn include_workspace_tool(role: SubAgentRole, name: &str) -> bool {
 }
 
 #[must_use]
-pub fn child_system_prompt(role: SubAgentRole, network: bool) -> String {
-    build_system_prompt(role, network)
+pub fn child_system_prompt(
+    role: SubAgentRole,
+    network: bool,
+    instructions: Option<&str>,
+) -> String {
+    build_system_prompt(role, network, instructions)
 }

@@ -153,6 +153,20 @@ impl App {
         }
 
         self.clear_input();
+        self.start_user_turn(sent, images, None);
+    }
+
+    /// Start a turn from `text` (plus `images`) right now — the tail of
+    /// [`Self::submit`] once the composer and the slash commands are out of the
+    /// way, shared with `/init`, which sends a canned brief. `shown` is what
+    /// the transcript's user cell displays when that should not be the full
+    /// text; the session record always keeps what was actually sent.
+    pub(crate) fn start_user_turn(
+        &mut self,
+        text: String,
+        images: Vec<std::path::PathBuf>,
+        shown: Option<String>,
+    ) {
         self.error = None;
         // A turn that streamed content but never saw its terminal event (e.g.
         // the stream channel closed mid-approval) would be silently discarded
@@ -166,9 +180,10 @@ impl App {
             &[("backend", &self.backend_label)],
         );
 
-        self.history.push(HistoryCell::user(sent.clone()));
+        self.history
+            .push(HistoryCell::user(shown.unwrap_or_else(|| text.clone())));
 
-        self.start_stream(StreamRequest::User(UserTurn::with_images(sent, images)));
+        self.start_stream(StreamRequest::User(UserTurn::with_images(text, images)));
     }
 
     /// Send any prompts queued (steered) while the just-finished turn was

@@ -19,7 +19,9 @@ impl App {
             permission_mode,
             sandbox_off,
             extra_roots,
+            instructions,
         } = launched;
+        self.instructions = instructions;
         // Parked, not pushed. Two of the three callers rebuild the transcript
         // AFTER adopting — `switch_session` clears then hydrates, and
         // `start_new_conversation` clears then writes the welcome cell — so
@@ -440,6 +442,7 @@ impl App {
             workspace_display,
             None,
             persistent,
+            crate::history::instructions_summary(self.lang, &self.instructions),
         );
         self.history.push(cell);
         // After the welcome cell, and after the clear above — which used to

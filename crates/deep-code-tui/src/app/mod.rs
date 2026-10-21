@@ -183,6 +183,10 @@ pub struct App {
     /// mount switch, because "web=on" alone says nothing about whether search
     /// can actually work on the configured endpoint.
     pub(crate) web_backend: &'static str,
+    /// The AGENTS.md files the current runtime's prompt carries; the welcome
+    /// card reports them, and a runtime swap (`/clear`, `/resume`) replaces
+    /// them along with the prompt they describe.
+    pub(crate) instructions: deep_code_agent::ProjectInstructions,
     pub(crate) last_telemetry: Option<TurnTelemetry>,
     pub(crate) prompt_history: Vec<HistoryPrompt>,
     history_cursor: Option<usize>,
@@ -489,6 +493,7 @@ fn welcome_cell(
     workspace: String,
     resumed_turns: Option<usize>,
     persistent: bool,
+    instructions: Option<String>,
 ) -> HistoryCell {
     HistoryCell::Welcome {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -498,6 +503,7 @@ fn welcome_cell(
         workspace,
         resumed_turns,
         persistent,
+        instructions,
     }
 }
 
@@ -569,6 +575,7 @@ impl App {
             permission_mode,
             sandbox_off,
             extra_roots,
+            instructions,
         } = launched;
         let subagent_shutdown = Some(stop_hook);
         let job_store = Some(job_store);
@@ -587,6 +594,7 @@ impl App {
             workspace_display,
             resumed_turns,
             persistent,
+            crate::history::instructions_summary(lang, &instructions),
         )];
 
         // Hydrate FIRST, then warn. `switch_session` already orders it this way
@@ -686,6 +694,7 @@ impl App {
             configured_model,
             configured_reasoning,
             web_backend,
+            instructions,
             last_telemetry: None,
             prompt_history: Vec::new(),
             history_cursor: None,

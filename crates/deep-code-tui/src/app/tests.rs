@@ -3834,3 +3834,89 @@ fn image_command_accepts_a_quoted_or_escaped_path() {
         assert_eq!(app.attached_image_paths(), vec![path.clone()]);
     }
 }
+
+/// A model stand-in that answers nothing and remembers the last user message
+/// it was sent, so a test can check what a turn actually carried without a
+/// network — `App::new()` launches against whatever key the machine has.
+struct BriefCapturingClient {
+    last_user_message: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+#[async_trait::async_trait]
+impl deep_code_agent::LlmClient for BriefCapturingClient {
+    fn provider_name(&self) -> &'static str {
+        "capturing"
+    }
+
+    fn model(&self) -> &str {
+        "capturing"
+    }
+
+    async fn stream_chat(
+        &self,
+        request: deep_code_agent::ChatRequest,
+    ) -> deep_code_agent::AgentResult<deep_code_agent::AgentEventStream> {
+        let last = request
+            .messages
+            .iter()
+            .rfind(|message| message.role == deep_code_agent::Role::User)
+            .map(|message| message.content.clone());
+        *self.last_user_message.lock().unwrap() = last;
+        let stream = async_stream::try_stream! {
+            yield deep_code_agent::AgentEvent::TextDelta { text: "ok".to_string() };
+            yield deep_code_agent::AgentEvent::Done { usage: None };
+        };
+        Ok(Box::pin(stream))
+    }
+}
+
+/// `/init` sends the AGENTS.md brief as a turn of its own: the transcript
+/// shows the command, the model gets the brief. While a turn is running it is
+/// refused outright — neither queued nor steered — and nothing is sent.
+#[tokio::test]
+async fn init_sends_the_brief_as_a_turn_and_refuses_mid_stream() {
+    let mut app = App::new();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+    app.runtime = Arc::new(deep_code_agent::AgentRuntime::new(
+        BriefCapturingClient {
+            last_user_message: Arc::clone(&captured),
+        },
+        deep_code_agent::ToolRegistry::new(),
+    ));
+    app.insert_str_at_cursor("/init");
+    app.submit();
+    assert!(app.is_streaming);
+    assert!(app.input.is_empty());
+    assert!(
+        matches!(app.history.last(), Some(HistoryCell::User { text }) if text == "/init"),
+        "{:?}",
+        app.history.last()
+    );
+    let mut sent = None;
+    for _ in 0..300 {
+        sent = captured.lock().unwrap().clone();
+        if sent.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let sent = sent.expect("the brief reaches the model");
+    assert!(
+        sent.contains("AGENTS.md") && sent.contains("write_file"),
+        "{sent}"
+    );
+    assert_ne!(sent, "/init");
+
+    let mut busy = App::new();
+    busy.is_streaming = true;
+    let cells = busy.history.len();
+    busy.insert_str_at_cursor("/init");
+    busy.submit();
+    assert_eq!(
+        busy.history.len(),
+        cells,
+        "nothing is sent while a turn runs"
+    );
+    assert!(busy.steering_queue.is_empty(), "and nothing is queued");
+    assert!(busy.status.contains("/init"), "{}", busy.status);
+}

@@ -805,3 +805,33 @@ fn checkpoint_lines_include_restore_command() {
             .any(|line| line == "Restore: /restore checkpoint_1")
     );
 }
+
+/// The "Rules" value lists every loaded file with the lines actually kept,
+/// global first, and says when the cap cut something.
+#[test]
+fn instructions_summary_lists_sources_and_truncation() {
+    use deep_code_agent::{InstructionScope, InstructionSource, ProjectInstructions};
+    let mut instructions = ProjectInstructions::default();
+    assert_eq!(super::instructions_summary(Lang::Zh, &instructions), None);
+    instructions.sources = vec![
+        InstructionSource {
+            scope: InstructionScope::Global,
+            path: "/home/x/.deep-code/AGENTS.md".into(),
+            lines: 10,
+        },
+        InstructionSource {
+            scope: InstructionScope::Workspace,
+            path: "/ws/AGENTS.md".into(),
+            lines: 42,
+        },
+    ];
+    assert_eq!(
+        super::instructions_summary(Lang::Zh, &instructions).as_deref(),
+        Some("~/.deep-code/AGENTS.md（10 行） + AGENTS.md（42 行）")
+    );
+    instructions.truncated = true;
+    assert_eq!(
+        super::instructions_summary(Lang::En, &instructions).as_deref(),
+        Some("~/.deep-code/AGENTS.md (10 lines) + AGENTS.md (42 lines) · truncated to 24000 chars")
+    );
+}
