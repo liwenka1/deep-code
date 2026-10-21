@@ -1536,3 +1536,80 @@ async fn write_file_rejects_dangling_target_symlink() {
     );
     assert!(matches!(outcome, Err(ToolError::InvalidArguments { .. })));
 }
+
+/// The write tools carry, for the UI only, the diff of what they actually
+/// wrote: a fuzzy-indent patch shows the re-indented text it spliced (not the
+/// model's `new`), a new file is all additions and says so, and a diff past
+/// the cap is cut and flagged. The model-facing `content` is unchanged.
+#[tokio::test]
+async fn write_tools_carry_the_real_diff_in_details() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("lib.rs"),
+        "fn f() {\n\tlet x = compute();\n}\n",
+    )
+    .unwrap();
+    let result = run(
+        tmp.path(),
+        "apply_patch",
+        json!({"path": "lib.rs", "old": "    let x = compute();", "new": "    let y = 42;"}),
+    )
+    .await;
+    assert_eq!(result.status, ToolResultStatus::Success);
+    let edit = result.details.as_ref().expect("details")["edit"].clone();
+    assert_eq!(edit["path"], "lib.rs");
+    assert_eq!(edit["added"], 1);
+    assert_eq!(edit["removed"], 1);
+    assert_eq!(edit["new_file"], false);
+    assert_eq!(edit["truncated"], false);
+    let diff = edit["diff"].as_str().unwrap();
+    assert!(diff.contains("-\tlet x = compute();"), "{diff}");
+    assert!(
+        diff.contains("+\tlet y = 42;") && !diff.contains("+    let y"),
+        "the diff shows the tab-indented text that was written, not `new` as given: {diff}"
+    );
+    assert!(
+        !result.content.contains("diff"),
+        "the model-facing result stays as it was: {}",
+        result.content
+    );
+
+    let result = run(
+        tmp.path(),
+        "write_file",
+        json!({"path": "new.txt", "content": "a\nb\n"}),
+    )
+    .await;
+    let edit = result.details.as_ref().expect("details")["edit"].clone();
+    assert_eq!(edit["new_file"], true);
+    assert_eq!(edit["added"], 2);
+    assert_eq!(edit["removed"], 0);
+
+    let result = run(
+        tmp.path(),
+        "write_file",
+        json!({"path": "new.txt", "content": "a\nc\n"}),
+    )
+    .await;
+    let edit = result.details.as_ref().expect("details")["edit"].clone();
+    assert_eq!(edit["new_file"], false);
+    assert_eq!(edit["added"], 1);
+    assert_eq!(edit["removed"], 1);
+    assert!(
+        edit["diff"].as_str().unwrap().contains("-b\n+c"),
+        "{}",
+        edit["diff"]
+    );
+
+    let huge = "x".repeat(70) + "\n";
+    let result = run(
+        tmp.path(),
+        "write_file",
+        json!({"path": "big.txt", "content": huge.repeat(1_500)}),
+    )
+    .await;
+    let edit = result.details.as_ref().expect("details")["edit"].clone();
+    assert_eq!(edit["truncated"], true);
+    assert_eq!(edit["diff"].as_str().unwrap().chars().count(), 64 * 1024);
+    assert_eq!(edit["added"], 1_500, "counts are taken before the cut");
+}

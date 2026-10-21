@@ -6,6 +6,7 @@ mod commands;
 mod doctor_cli;
 mod eval_cli;
 mod event_routing;
+mod git_diff;
 mod github;
 mod headless;
 mod highlight;

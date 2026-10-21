@@ -52,6 +52,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, TextId, bool)] = &[
     ("/context", TextId::HintContext, false),
     ("/init", TextId::HintInit, false),
     ("/skill", TextId::HintSkill, true),
+    ("/diff", TextId::HintDiff, true),
     ("/lang", TextId::HintLang, true),
     ("/add-dir", TextId::HintAddDir, true),
     ("/image", TextId::HintImage, true),
@@ -153,6 +154,11 @@ impl App {
                 self.skill_command(arg);
                 true
             }
+            _ if prompt == "/diff" || prompt.starts_with("/diff ") => {
+                let arg = prompt.strip_prefix("/diff").unwrap_or_default().trim();
+                self.diff_command(arg);
+                true
+            }
             _ if prompt == "/lang" || prompt.starts_with("/lang ") => {
                 let arg = prompt.strip_prefix("/lang").unwrap_or_default().trim();
                 self.set_lang_command(arg);
@@ -236,6 +242,62 @@ impl App {
         );
         let shown = format!("/skill {arg}");
         self.start_user_turn(text, Vec::new(), Some(shown));
+    }
+
+    /// `/diff [path]`: the working tree against `HEAD`, through the user's own
+    /// git, rendered like a write's diff and opened in full — the user asked
+    /// for it. Untracked files are named separately: they are not in a diff,
+    /// and forgetting them is the usual way a change ships incomplete.
+    fn diff_command(&mut self, arg: &str) {
+        use crate::git_diff::{GitDiffError, working_tree_diff};
+        let scope = (!arg.is_empty()).then_some(arg);
+        let report = match working_tree_diff(&self.workspace, scope) {
+            Ok(report) => report,
+            Err(GitDiffError::GitMissing) => {
+                let text = self.tr(TextId::DiffGitMissing).to_string();
+                self.history.push(HistoryCell::system(text));
+                return;
+            }
+            Err(GitDiffError::NotARepository) => {
+                let text = self.tr(TextId::DiffNotGitRepo).to_string();
+                self.history.push(HistoryCell::system(text));
+                return;
+            }
+            Err(GitDiffError::Failed(error)) => {
+                let text = self.tr_with(TextId::DiffFailed, &[("error", &error)]);
+                self.history.push(HistoryCell::system(text));
+                return;
+            }
+        };
+        if report.diff.trim().is_empty() && report.untracked.is_empty() {
+            let text = self.tr(TextId::DiffClean).to_string();
+            self.history.push(HistoryCell::system(text));
+            return;
+        }
+        if !report.diff.trim().is_empty() {
+            let path = scope.map_or_else(
+                || self.tr(TextId::DiffWorkingTreeLabel).to_string(),
+                str::to_string,
+            );
+            self.history.push(HistoryCell::Diff {
+                path,
+                diff: report.diff,
+                added: report.added,
+                removed: report.removed,
+                truncated: report.truncated,
+                new_file: false,
+                expanded: true,
+            });
+        }
+        if !report.untracked.is_empty() {
+            const LISTED: usize = 20;
+            let mut files = report.untracked[..report.untracked.len().min(LISTED)].join(", ");
+            if report.untracked.len() > LISTED {
+                files.push_str(", …");
+            }
+            let text = self.tr_with(TextId::DiffUntracked, &[("files", &files)]);
+            self.history.push(HistoryCell::system(text));
+        }
     }
 
     /// `/compact`: fold old history into a summary now, whether or not the

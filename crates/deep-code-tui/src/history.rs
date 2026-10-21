@@ -49,6 +49,69 @@ pub(crate) fn session_summary(
     }
 }
 
+/// A diff block opens expanded up to this many lines and folded beyond: a
+/// long rewrite should not push the conversation off the screen uninvited,
+/// while a typical edit is read in place.
+pub(crate) const DIFF_FOLD_LINES: usize = 40;
+
+/// The header row of a diff block: the path, then `+added −removed`, then the
+/// tags that change how to read it (a new file, a cut).
+pub(crate) fn diff_header(
+    lang: Lang,
+    path: &str,
+    added: usize,
+    removed: usize,
+    truncated: bool,
+    new_file: bool,
+) -> String {
+    let mut header = format!("{path}  +{added} −{removed}");
+    if new_file {
+        header.push_str(" · ");
+        header.push_str(tr(lang, TextId::DiffNewFileTag));
+    }
+    if truncated {
+        header.push_str(" · ");
+        header.push_str(tr(lang, TextId::DiffTruncatedTag));
+    }
+    header
+}
+
+impl HistoryCell {
+    /// The diff block a write tool's result carries (`details.edit`), if any.
+    /// A result without one, or with an empty diff, adds nothing.
+    pub(crate) fn edit_diff(details: Option<&serde_json::Value>) -> Option<Self> {
+        let edit = details?.get("edit")?;
+        let diff = edit.get("diff")?.as_str()?.to_string();
+        if diff.trim().is_empty() {
+            return None;
+        }
+        let count = |key: &str| {
+            edit.get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize
+        };
+        let flag = |key: &str| {
+            edit.get(key)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        };
+        let expanded = diff.lines().count() <= DIFF_FOLD_LINES;
+        Some(Self::Diff {
+            path: edit
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            added: count("added"),
+            removed: count("removed"),
+            truncated: flag("truncated"),
+            new_file: flag("new_file"),
+            diff,
+            expanded,
+        })
+    }
+}
+
 /// The welcome card's "Rules" value: each AGENTS.md that was loaded with its
 /// kept line count, plus a truncation suffix when the cap cut something.
 /// `None` when nothing was loaded — the card then shows no line at all rather
@@ -241,6 +304,27 @@ pub enum HistoryCell {
         /// card (see [`instructions_summary`]); `None` when there are none.
         instructions: Option<String>,
     },
+    /// What a write actually changed, right under the tool's result row: the
+    /// unified diff of the file before and after, as the tool computed it from
+    /// the bytes it wrote — so a fuzzy-matched `apply_patch` shows the
+    /// re-indented text it spliced, not the model's `new` argument. `/diff`
+    /// renders the working tree the same way. Live-only: the session record
+    /// keeps the model-facing result, not this, so a resumed transcript shows
+    /// none.
+    Diff {
+        /// Workspace-relative file path, or the `/diff` scope label.
+        path: String,
+        diff: String,
+        added: usize,
+        removed: usize,
+        /// The producer cut the diff at its cap; what is here is the head.
+        truncated: bool,
+        /// Created by this write — the diff is all additions.
+        new_file: bool,
+        /// Header only, or open; lives in the cell for the reasons `Reasoning`
+        /// gives.
+        expanded: bool,
+    },
     System {
         text: String,
     },
@@ -394,6 +478,21 @@ impl HistoryCell {
                 )]
             }
             Self::ToolStream { text } => text.lines().map(str::to_string).collect(),
+            // `/copy` and a selection get the whole diff whether or not the
+            // block is open — folding is a display choice.
+            Self::Diff {
+                path,
+                diff,
+                added,
+                removed,
+                truncated,
+                new_file,
+                ..
+            } => std::iter::once(diff_header(
+                lang, path, *added, *removed, *truncated, *new_file,
+            ))
+            .chain(diff.lines().map(str::to_string))
+            .collect(),
             // `/copy` gets what the model actually ran, not the folded summary
             // — the same rule as reasoning. The entries are rendered through
             // the standalone variants' own formatters so the two can never

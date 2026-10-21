@@ -4080,3 +4080,206 @@ fn skill_names_complete_after_the_command() {
     app.insert_str_at_cursor("now");
     assert!(!app.completion_open());
 }
+
+fn edit_result(diff: &str, added: usize, removed: usize) -> deep_code_agent::ToolResult {
+    let mut result =
+        deep_code_agent::ToolResult::success("call_1", "apply_patch", r#"{"path":"a.rs"}"#);
+    result.details = Some(serde_json::json!({
+        "edit": {
+            "path": "a.rs", "diff": diff, "added": added, "removed": removed,
+            "truncated": false, "new_file": false
+        }
+    }));
+    result
+}
+
+/// A write's result is followed by its diff block: open when it is short,
+/// folded to its header past 40 lines. A result without a diff adds nothing.
+#[test]
+fn a_write_result_with_a_diff_gets_a_diff_cell_under_its_result() {
+    let finish = |app: &mut App, result: deep_code_agent::ToolResult| {
+        let turn_id = deep_code_agent::TurnId("turn_1".to_string());
+        let tool_call_id = deep_code_agent::ToolCallId("call_1".to_string());
+        app.apply_runtime_event(RuntimeEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            prompt: "edit".to_string(),
+        });
+        app.apply_runtime_event(RuntimeEvent::ToolCallStarted {
+            turn_id: turn_id.clone(),
+            tool_call_id: tool_call_id.clone(),
+            tool_name: "apply_patch".to_string(),
+            arguments: serde_json::json!({ "path": "a.rs" }),
+        });
+        app.apply_runtime_event(RuntimeEvent::ToolCallFinished {
+            turn_id: Some(turn_id),
+            tool_call_id,
+            result,
+        });
+    };
+
+    let mut app = App::new();
+    finish(&mut app, edit_result("@@ -1 +1 @@\n-old\n+new\n", 1, 1));
+    let n = app.history.len();
+    assert!(matches!(app.history[n - 2], HistoryCell::ToolResult { .. }));
+    assert!(
+        matches!(
+            &app.history[n - 1],
+            HistoryCell::Diff { path, diff, added: 1, removed: 1, expanded: true, .. }
+                if path == "a.rs" && diff.contains("+new")
+        ),
+        "{:?}",
+        app.history[n - 1]
+    );
+
+    let mut app = App::new();
+    let long: String = (0..41).map(|i| format!("+line {i}\n")).collect();
+    finish(&mut app, edit_result(&long, 41, 0));
+    assert!(
+        matches!(
+            app.history.last(),
+            Some(HistoryCell::Diff {
+                expanded: false,
+                ..
+            })
+        ),
+        "{:?}",
+        app.history.last()
+    );
+
+    let mut app = App::new();
+    let cells = app.history.len();
+    finish(
+        &mut app,
+        deep_code_agent::ToolResult::success("call_1", "apply_patch", "{}"),
+    );
+    assert!(
+        !app.history[cells..]
+            .iter()
+            .any(|cell| matches!(cell, HistoryCell::Diff { .. }))
+    );
+}
+
+/// A click on a diff header folds and unfolds that block, like a reasoning
+/// header — the row is a control, so nothing is copied.
+#[test]
+fn a_click_on_a_diff_header_folds_and_unfolds_that_block() {
+    let mut app = App::new();
+    app.history.push(HistoryCell::Diff {
+        path: "a.rs".to_string(),
+        diff: "@@ -1 +1 @@\n-old\n+new\n".to_string(),
+        added: 1,
+        removed: 1,
+        truncated: false,
+        new_file: false,
+        expanded: true,
+    });
+    let index = app.history.len() - 1;
+    app.set_transcript_snapshot(TranscriptSnapshot {
+        fold_headers: vec![(0, FoldTarget::HistoryDiff(index))],
+        ..snapshot(&["▾ a.rs  +1 −1", "    @@ -1 +1 @@", "    -old", "    +new"])
+    });
+    app.mouse_press(1, 0);
+    assert!(app.mouse_release(1, 0).is_none());
+    assert!(matches!(
+        &app.history[index],
+        HistoryCell::Diff {
+            expanded: false,
+            ..
+        }
+    ));
+    app.mouse_press(1, 0);
+    app.mouse_release(1, 0);
+    assert!(matches!(
+        &app.history[index],
+        HistoryCell::Diff { expanded: true, .. }
+    ));
+}
+
+fn git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `/diff` shows the working tree against HEAD as an open diff block and names
+/// untracked files; scoped to a path it shows only that path; outside a
+/// repository it says so instead of failing silently.
+#[test]
+fn diff_command_shows_the_working_tree_and_untracked_files() {
+    if !git_available() {
+        eprintln!("git not available; skipping");
+        return;
+    }
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    std::fs::write(repo.path().join("a.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(repo.path().join("b.txt"), "b\n").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "base"]);
+    std::fs::write(repo.path().join("a.txt"), "one\nthree\n").unwrap();
+    std::fs::write(repo.path().join("b.txt"), "bee\n").unwrap();
+    std::fs::write(repo.path().join("untracked.txt"), "?\n").unwrap();
+
+    let mut app = App::new();
+    app.workspace = repo.path().to_path_buf();
+    assert!(app.handle_slash_command("/diff"));
+    let n = app.history.len();
+    assert!(
+        matches!(
+            &app.history[n - 2],
+            HistoryCell::Diff { diff, added: 2, removed: 2, expanded: true, .. }
+                if diff.contains("-two") && diff.contains("+three") && diff.contains("+bee")
+        ),
+        "{:?}",
+        app.history[n - 2]
+    );
+    assert!(
+        matches!(&app.history[n - 1], HistoryCell::System { text } if text.contains("untracked.txt")),
+        "{:?}",
+        app.history[n - 1]
+    );
+
+    assert!(app.handle_slash_command("/diff a.txt"));
+    assert!(
+        matches!(
+            app.history.last(),
+            Some(HistoryCell::Diff { path, diff, added: 1, removed: 1, .. })
+                if path == "a.txt" && !diff.contains("bee")
+        ),
+        "{:?}",
+        app.history.last()
+    );
+
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "all"]);
+    assert!(app.handle_slash_command("/diff"));
+    assert!(
+        matches!(app.history.last(), Some(HistoryCell::System { text }) if text.contains("HEAD")),
+        "{:?}",
+        app.history.last()
+    );
+
+    let mut outside = App::new();
+    assert!(outside.handle_slash_command("/diff"));
+    assert!(
+        matches!(outside.history.last(), Some(HistoryCell::System { text }) if text.contains("git")),
+        "{:?}",
+        outside.history.last()
+    );
+}

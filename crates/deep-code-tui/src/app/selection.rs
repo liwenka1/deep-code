@@ -142,6 +142,9 @@ impl App {
             FoldTarget::HistoryToolBatch(index) => {
                 index.checked_sub(dropped).map(FoldTarget::HistoryToolBatch)
             }
+            FoldTarget::HistoryDiff(index) => {
+                index.checked_sub(dropped).map(FoldTarget::HistoryDiff)
+            }
             live @ FoldTarget::LiveReasoning => Some(live),
         }
     }
@@ -169,6 +172,11 @@ impl App {
             }
             FoldTarget::HistoryToolBatch(index) => {
                 if let Some(HistoryCell::ToolBatch { expanded, .. }) = self.history.get_mut(index) {
+                    *expanded = !*expanded;
+                }
+            }
+            FoldTarget::HistoryDiff(index) => {
+                if let Some(HistoryCell::Diff { expanded, .. }) = self.history.get_mut(index) {
                     *expanded = !*expanded;
                 }
             }

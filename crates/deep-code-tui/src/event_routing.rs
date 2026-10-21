@@ -190,6 +190,10 @@ impl App {
                         }
                         self.history.extend(finished.diagnostics);
                         self.push_tool_result_cell(&result, summary);
+                        // The write's real diff, when the tool carried one.
+                        if let Some(diff) = HistoryCell::edit_diff(result.details.as_ref()) {
+                            self.history.push(diff);
+                        }
                     }
                 }
             }

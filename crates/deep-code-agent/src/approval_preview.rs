@@ -119,7 +119,7 @@ fn write_file_preview(path: &Path, content: &str, lang: Lang) -> String {
 /// diff, which previews just as well.
 const DIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
 
-fn unified_diff(old: &str, new: &str) -> String {
+pub(crate) fn unified_diff(old: &str, new: &str) -> String {
     TextDiff::configure()
         .timeout(DIFF_TIMEOUT)
         .diff_lines(old, new)

@@ -400,6 +400,7 @@ impl ComposerSnapshot {
 pub(crate) enum FoldTarget {
     HistoryReasoning(usize),
     HistoryToolBatch(usize),
+    HistoryDiff(usize),
     LiveReasoning,
 }
 

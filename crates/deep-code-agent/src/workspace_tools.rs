@@ -817,6 +817,45 @@ fn write_no_follow(path: &std::path::Path, content: &[u8]) -> std::io::Result<()
 /// symlink that was there beforehand, and an intermediate loop would have
 /// failed the canonicalize before this open. So `ELOOP` here means the leaf,
 /// and it means the race — which is exactly what the caller needs told.
+/// Chars of unified diff a write tool carries in its UI `details`. Past this
+/// the transcript would be scrolling a rewrite, not showing an edit; the head
+/// is kept and the record says it was cut.
+const DETAILS_DIFF_MAX_CHARS: usize = 64 * 1024;
+
+/// The UI-facing record of what a write actually did: a unified diff of the
+/// file before and after, built from the bytes that were written — so a
+/// fuzzy-matched `apply_patch` shows the re-indented text it spliced, not the
+/// model's `new` argument, and a CRLF file shows its own line endings. Never
+/// sent to the model (`ToolOutput::details`), so its size costs no context.
+fn edit_details(display: &str, before: &str, after: &str, new_file: bool) -> serde_json::Value {
+    let diff = crate::approval_preview::unified_diff(before, after);
+    let (added, removed) = diff
+        .lines()
+        .fold((0usize, 0usize), |(added, removed), line| {
+            match line.as_bytes().first() {
+                Some(b'+') => (added + 1, removed),
+                Some(b'-') => (added, removed + 1),
+                _ => (added, removed),
+            }
+        });
+    let truncated = diff.chars().count() > DETAILS_DIFF_MAX_CHARS;
+    let diff: String = if truncated {
+        diff.chars().take(DETAILS_DIFF_MAX_CHARS).collect()
+    } else {
+        diff
+    };
+    json!({
+        "edit": {
+            "path": display,
+            "diff": diff,
+            "added": added,
+            "removed": removed,
+            "truncated": truncated,
+            "new_file": new_file,
+        }
+    })
+}
+
 fn write_failed(tool_name: &str, relative: &str, error: &std::io::Error) -> ToolError {
     #[cfg(unix)]
     let diagnosis = if error.raw_os_error() == Some(libc::ELOOP) {
@@ -939,6 +978,18 @@ impl WriteFileTool {
         // Refuse a FIFO/socket/device/dir destination before opening it: writing
         // to a FIFO blocks the thread until a reader appears, hanging the turn.
         refuse_non_regular_file(Self::NAME, &self.root.relative_display(&path), &path)?;
+        // What is there now, for the diff the UI shows after the write. Read
+        // before the write and only for the record: a file that is missing is
+        // a new file, one that is unreadable or past the read cap simply gets
+        // no diff — this must never turn a writable path into a failed write.
+        let before = match fs::metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
+            Ok(metadata) if metadata.len() <= MAX_FILE_BYTES => fs::read(&path)
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+            _ => None,
+        };
+        let new_file = !path.exists();
         // `fs::write` opens `O_CREAT|O_WRONLY|O_TRUNC` and FOLLOWS a symlink at
         // the final component. Resolution rejects a symlink that is already
         // there, but it cannot rule out one planted in the window between that
@@ -954,10 +1005,17 @@ impl WriteFileTool {
         write_no_follow(&path, params.content.as_bytes()).map_err(|error| {
             write_failed(Self::NAME, &self.root.relative_display(&path), &error)
         })?;
-        Ok(ToolOutput::text(json_string(json!({
-            "path": self.root.relative_display(&path),
+        let display = self.root.relative_display(&path);
+        let output = ToolOutput::text(json_string(json!({
+            "path": display,
             "bytes_written": params.content.len()
-        }))))
+        })));
+        Ok(match before {
+            Some(before) => {
+                output.with_details(edit_details(&display, &before, &params.content, new_file))
+            }
+            None => output,
+        })
     }
 }
 
@@ -1082,7 +1140,8 @@ impl ApplyPatchTool {
             "path": display,
             "replacements": 1,
             "match": located.kind.label(),
-        }))))
+        })))
+        .with_details(edit_details(&display, &contents, &updated, false)))
     }
 }
 

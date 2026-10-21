@@ -2953,3 +2953,49 @@ fn welcome_cell_names_the_loaded_instructions() {
     let without = text(&cell(None));
     assert!(!without.contains("指令"), "{without}");
 }
+
+/// A diff block's header names the path and the counts; open, its added and
+/// removed lines are green and red with their indentation kept; folded, only
+/// the header row (and the spacer) is drawn.
+#[test]
+fn diff_cell_colours_changes_and_folds_to_its_header() {
+    let cell = |expanded: bool| HistoryCell::Diff {
+        path: "src/a.rs".to_string(),
+        diff: "@@ -1,2 +1,2 @@\n-    old\n+    new\n context\n".to_string(),
+        added: 1,
+        removed: 1,
+        truncated: true,
+        new_file: false,
+        expanded,
+    };
+    let lines = cell_lines(&cell(true), 60, Lang::Zh);
+    let text: String = lines
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+        .collect();
+    assert!(
+        text.contains("src/a.rs") && text.contains("+1") && text.contains("−1"),
+        "{text}"
+    );
+    assert!(text.contains("已截断") && text.contains("64 KiB"), "{text}");
+    let style_of = |needle: &str| {
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains(needle))
+            .map(|span| span.style)
+            .unwrap_or_else(|| panic!("missing span {needle}"))
+    };
+    assert_eq!(style_of("+    new").fg, Some(Color::Green));
+    assert_eq!(style_of("-    old").fg, Some(Color::Red));
+    assert_eq!(style_of("@@").fg, Some(Color::Cyan));
+
+    let folded = cell_lines(&cell(false), 60, Lang::Zh);
+    assert_eq!(folded.len(), 2, "{folded:?}");
+    let header: String = folded[0]
+        .spans
+        .iter()
+        .map(|span| span.content.to_string())
+        .collect();
+    assert!(header.starts_with("▸ src/a.rs"), "{header}");
+}

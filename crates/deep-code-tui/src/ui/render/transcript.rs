@@ -52,6 +52,9 @@ pub(super) fn render_messages(
             HistoryCell::ToolBatch { .. } => {
                 fold_headers.push((lines.len(), FoldTarget::HistoryToolBatch(index)));
             }
+            HistoryCell::Diff { .. } => {
+                fold_headers.push((lines.len(), FoldTarget::HistoryDiff(index)));
+            }
             _ => {}
         }
         lines.extend(app.cell_lines[&index].lines().iter().cloned());
@@ -421,6 +424,44 @@ fn reasoning_header(text: &str, expanded: bool, lang: Lang) -> Line<'static> {
     ])
 }
 
+/// The header row of a diff block — and, like the reasoning header, the row a
+/// click lands on to fold or unfold it. Counts are coloured like the lines
+/// they count.
+fn diff_header_line(
+    path: &str,
+    added: usize,
+    removed: usize,
+    truncated: bool,
+    new_file: bool,
+    expanded: bool,
+    lang: Lang,
+) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let marker = if expanded { "▾" } else { "▸" };
+    let mut spans = vec![
+        Span::styled(format!("{marker} "), dim),
+        Span::styled(
+            path.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  +{added}"), Style::default().fg(Color::Green)),
+        Span::styled(format!(" −{removed}"), Style::default().fg(Color::Red)),
+    ];
+    if new_file {
+        spans.push(Span::styled(
+            format!(" · {}", tr(lang, TextId::DiffNewFileTag)),
+            dim,
+        ));
+    }
+    if truncated {
+        spans.push(Span::styled(
+            format!(" · {}", tr(lang, TextId::DiffTruncatedTag)),
+            dim,
+        ));
+    }
+    Line::from(spans)
+}
+
 pub(super) fn cell_lines_unsanitized(
     cell: &HistoryCell,
     width: u16,
@@ -558,6 +599,43 @@ pub(super) fn cell_lines_unsanitized(
             .lines()
             .flat_map(|logical| wrap_prefixed("    ", logical, width, dim, dim))
             .collect(),
+        // A write's diff: the header row always, the coloured hunks when open.
+        // Leading spaces are a diff line's alignment, so lines are not trimmed.
+        HistoryCell::Diff {
+            path,
+            diff,
+            added,
+            removed,
+            truncated,
+            new_file,
+            expanded,
+        } => {
+            let mut lines = vec![diff_header_line(
+                path, *added, *removed, *truncated, *new_file, *expanded, lang,
+            )];
+            if *expanded {
+                let added_style = Style::default().fg(Color::Green);
+                let removed_style = Style::default().fg(Color::Red);
+                let hunk = Style::default().fg(Color::Cyan);
+                for raw in diff.lines() {
+                    let style = match raw.as_bytes().first() {
+                        Some(b'+') => added_style,
+                        Some(b'-') => removed_style,
+                        Some(b'@') => hunk,
+                        _ => dim,
+                    };
+                    lines.extend(wrap_prefixed("    ", raw, width, style, style));
+                }
+                if *truncated {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}", tr(lang, TextId::DiffTruncatedNote)),
+                        dim,
+                    )));
+                }
+            }
+            lines.push(Line::default());
+            lines
+        }
         // Diagnostics / Checkpoint / Compaction / System: dim secondary lines.
         _ => {
             let mut lines = Vec::new();
