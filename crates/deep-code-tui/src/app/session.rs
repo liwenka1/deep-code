@@ -136,6 +136,7 @@ impl App {
         self.cost_currency = agent_config.cost_currency;
         self.configured_model = agent_config.model.clone();
         self.configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
+        self.web_backend = deep_code_agent::WebBackend::from_config(&agent_config).id();
         // `lang` is deliberately NOT re-resolved here: it changes only at
         // launch and via /lang, so a runtime swap can never flip the UI
         // language out from under the user (or the tests).

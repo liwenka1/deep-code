@@ -201,6 +201,9 @@ impl Tool for AgentTool {
             network,
             &allow_commands,
             &child_ui_lang,
+            // The child searches and fetches through the same backend as its
+            // parent: same provider endpoint, same key.
+            &crate::web_tools::WebBackend::from_config(&self.services.agent_config),
         );
         // Reconnaissance roles run pinned to the flash tier (a fixed model id
         // bypasses per-turn auto-routing in the child); other roles inherit

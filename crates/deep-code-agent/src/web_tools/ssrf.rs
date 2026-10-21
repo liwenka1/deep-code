@@ -20,7 +20,7 @@ use reqwest::redirect::Policy;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Redirect hops followed before giving up; every hop is re-validated.
 const MAX_REDIRECTS: usize = 5;
-const USER_AGENT: &str = concat!("deep-code/", env!("CARGO_PKG_VERSION"));
+pub(super) const USER_AGENT: &str = concat!("deep-code/", env!("CARGO_PKG_VERSION"));
 
 /// GET with manual redirect handling. Each hop's host is resolved and
 /// validated exactly once, and the connection is pinned to the validated
@@ -80,7 +80,11 @@ pub(super) fn pinned_get(
 /// address (SSRF guard). For domain hosts, returns the validated address the
 /// caller must pin its connection to; IP-literal hosts involve no DNS and
 /// need no pin. `allow_private` is a test-only escape hatch.
-fn check_url(url: &Url, allow_private: bool, lang: Lang) -> Result<Option<SocketAddr>, String> {
+pub(super) fn check_url(
+    url: &Url,
+    allow_private: bool,
+    lang: Lang,
+) -> Result<Option<SocketAddr>, String> {
     match url.scheme() {
         "http" | "https" => {}
         other => {

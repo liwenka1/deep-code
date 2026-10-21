@@ -200,8 +200,21 @@ pub struct DoctorReport {
     pub deepseek: DeepSeekDoctorReport,
     pub sandbox: SandboxReport,
     pub skills: SkillsDoctorReport,
+    pub web: WebDoctorReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_layers: Option<ConfigLayersDoctorReport>,
+}
+
+/// The web tools' mount state and backend. `enabled` is the
+/// `DEEP_CODE_DISABLE_WEB` gate; `backend` is which service answers when they
+/// are mounted — DeepSeek's Search & Fetch API on DeepSeek's own endpoint with
+/// a key, else local fetch only (and no search). Reported because the two are
+/// decided in different places (an env var, the provider config) and a user
+/// whose `web_search` keeps failing should be able to see why from one line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WebDoctorReport {
+    pub enabled: bool,
+    pub backend: String,
 }
 
 impl DoctorReport {
@@ -212,6 +225,12 @@ impl DoctorReport {
         let sandbox = detect_capabilities();
         let skills = collect_skills(workspace);
         let deepseek = collect_deepseek(config);
+        let web = WebDoctorReport {
+            enabled: crate::runtime_launch::web_enabled(),
+            backend: crate::web_tools::WebBackend::from_config(config)
+                .id()
+                .to_string(),
+        };
 
         // `[sandbox] mode = "off"` means the OS sandbox does not run at all, so
         // what the host CAN enforce is not what this configuration WILL enforce.
@@ -261,6 +280,7 @@ impl DoctorReport {
                 mode_setting: config.sandbox_mode.as_setting().to_string(),
             },
             skills,
+            web,
             config_layers: None,
         }
     }

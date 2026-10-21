@@ -564,7 +564,11 @@ impl App {
         self.history.push(HistoryCell::system(format!(
             "Status:\nbackend={}\nweb={}\nsession={session}\ncheckpoint={checkpoint}\nmode={mode}\nconfigured_model={}\nconfigured_reasoning={}\nhistory_cells={}{trimmed}{}",
             self.backend_label,
-            if web_enabled() { "on" } else { "off" },
+            if web_enabled() {
+                format!("on ({})", self.web_backend)
+            } else {
+                "off".to_string()
+            },
             self.configured_model,
             self.configured_reasoning,
             self.history.len(),

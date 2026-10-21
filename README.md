@@ -164,7 +164,7 @@ Common keys: `provider.model` (`pro`/`flash`/`auto`), `provider.reasoning_effort
 
 > Keep the API key in an environment variable or the global config; `api_key` in project-level config is ignored, so it can't leak with the repo.
 
-`DEEP_CODE_DISABLE_WEB`: set to `1`/`true`/`on` to disable web tools (`web_search`/`fetch_url`) for offline or audited environments. Enabled by default; `/status` shows current `web=on|off`.
+**Web tools.** `web_search` and `fetch_url` are served by DeepSeek's Search & Fetch API when `provider.base_url` points at `api.deepseek.com` (the default) and a key is configured: search queries and fetched URLs go to DeepSeek — the same party that already receives your prompts — and `fetch_url` returns the page as Markdown, in chunks (`offset`) for long pages. On any other endpoint `web_search` is unavailable (its description and its result both say so) and `fetch_url` fetches directly from this machine behind the SSRF guard, with HTML reduced to text. Both prompt for approval like any other network call. `DEEP_CODE_DISABLE_WEB`: set to `1`/`true`/`on` to unmount them for offline or audited environments. `/status` shows `web=on (<backend>)|off`; `deepcode doctor` reports the same.
 
 On macOS / Linux, shell/job commands run inside the OS sandbox with **no network by default** (see [Highlights](#highlights) for details). `[sandbox] network = prompt|always|never` tunes this, project config can only tighten. **On Windows there is no sandbox confinement** — the no-network and write-confinement guarantees do not apply (`network` is a no-op); declared network still routes to approval and the deny floor still applies. Run `deepcode doctor` for the ground truth on your machine.
 

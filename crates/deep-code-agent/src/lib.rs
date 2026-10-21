@@ -121,5 +121,8 @@ pub use tool::{
     ApprovalDecision, ApprovalRequest, MockEchoTool, ToolError, ToolRegistry, ToolResult,
     ToolResultStatus,
 };
+// `/status` names which backend the web tools run on; the decision is made
+// here from the provider config, so the TUI asks rather than re-deriving it.
+pub use web_tools::WebBackend;
 pub use workspace_policy::WorkspaceRoots;
 pub use workspace_summary::list_workspace_files;

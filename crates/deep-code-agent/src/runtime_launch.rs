@@ -112,7 +112,10 @@ pub fn build_tool_registry(
         registry.register(crate::root_grant::RequestWriteRootTool);
     }
     if web_enabled() {
-        registry.extend(crate::web_tools::web_tool_registry(ui_lang));
+        registry.extend(crate::web_tools::web_tool_registry(
+            ui_lang,
+            &crate::web_tools::WebBackend::from_config(config),
+        ));
     }
     (registry, job_store, boundary)
 }

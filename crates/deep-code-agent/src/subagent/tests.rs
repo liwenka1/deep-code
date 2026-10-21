@@ -957,6 +957,7 @@ None.
                 network,
                 &[],
                 &lang,
+                &crate::web_tools::WebBackend::local_only(),
             )
             .0
         };
@@ -1019,6 +1020,7 @@ None.
                 false, // NOT dispatched with network
                 &[],   // and no allow_commands
                 &lang,
+                &crate::web_tools::WebBackend::local_only(),
             )
             .0
         };
@@ -1147,6 +1149,7 @@ None.
             false, // no network grant
             &["git push".to_string()],
             &lang,
+            &crate::web_tools::WebBackend::local_only(),
         );
         let runtime = AgentRuntime::new(SummaryClient, registry);
         let request = |command: &str, network: bool| ApprovalRequest {

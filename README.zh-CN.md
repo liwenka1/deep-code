@@ -164,7 +164,7 @@ jobs:
 
 > API Key 建议放在环境变量或全局配置;项目级配置中的 `api_key` 会被忽略,以防随仓库泄露。
 
-环境变量 `DEEP_CODE_DISABLE_WEB`:设为 `1`/`true`/`on` 即可关闭联网工具(`web_search`/`fetch_url`),用于断网或审计场景;默认开启。`/status` 会显示当前 `web=on|off`。
+**联网工具。**当 `provider.base_url` 指向 `api.deepseek.com`(默认值)且配置了 key 时,`web_search` 与 `fetch_url` 由 DeepSeek 的 Search & Fetch API 提供:搜索词和抓取的 URL 会发送给 DeepSeek——也就是本来就收到你全部提示词的那一方——`fetch_url` 返回的是页面的 Markdown,长页面分块返回(`offset` 续读)。换成其他端点时 `web_search` 不可用(工具描述和返回结果都会如实说明),`fetch_url` 退回由本机直接抓取、经 SSRF 守卫、HTML 压成纯文本。两者和其他联网调用一样都要过审批。环境变量 `DEEP_CODE_DISABLE_WEB`:设为 `1`/`true`/`on` 即可卸载这两个工具,用于断网或审计场景。`/status` 显示 `web=on (<后端>)|off`,`deepcode doctor` 报告同样的信息。
 
 在 macOS / Linux 上,shell/job 命令在 OS 沙箱内运行且**默认不带网络**(详见[亮点](#亮点))。`[sandbox] network = prompt|always|never` 可调,项目层只许收紧。**Windows 上没有沙箱约束**,因此本段的断网与写入限制均不生效(`network` 设置是空操作),声明联网仍会转审批、deny 底板仍然生效;跑 `deepcode doctor` 看本机实况。
 

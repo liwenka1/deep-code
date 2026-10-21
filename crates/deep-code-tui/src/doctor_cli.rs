@@ -216,6 +216,10 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
         }
     }
     println!("  skills: {} loaded", report.skills.total_count);
+    println!(
+        "  web: enabled={} backend={}",
+        report.web.enabled, report.web.backend
+    );
     Ok(())
 }
 

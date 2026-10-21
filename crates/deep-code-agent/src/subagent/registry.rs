@@ -138,6 +138,7 @@ pub(crate) fn child_tool_registry(
     network: bool,
     allow_commands: &[String],
     ui_lang: &crate::i18n::SharedLang,
+    web_backend: &crate::web_tools::WebBackend,
 ) -> (ToolRegistry, JobStore) {
     let workspace_tools = workspace_tool_registry_from(boundary.clone());
     let mut registry =
@@ -192,7 +193,7 @@ pub(crate) fn child_tool_registry(
         // the SSRF pin, the research half of "this child may reach the
         // network". Absent a grant they are absent, not merely gated — an
         // unattended prompt could only be auto-denied anyway.
-        registry.extend(crate::web_tools::web_tool_registry(ui_lang));
+        registry.extend(crate::web_tools::web_tool_registry(ui_lang, web_backend));
     }
     (registry, job_store)
 }

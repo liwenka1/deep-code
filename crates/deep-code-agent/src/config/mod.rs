@@ -18,6 +18,14 @@ use crate::pricing::CostCurrency;
 use crate::reasoning::ReasoningEffortSetting;
 
 pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/beta";
+/// Host of DeepSeek's own API. The web tools key their backend choice on it:
+/// only this host serves the Search & Fetch API (see
+/// [`AgentConfig::deepseek_tools_api_base`]).
+pub const DEEPSEEK_API_HOST: &str = "api.deepseek.com";
+/// Base of DeepSeek's Search & Fetch API. Fixed rather than derived from
+/// `base_url`: the chat endpoint may sit under `/beta` or `/v1`, the tools
+/// live in one place, and the two are not related by path.
+pub const DEEPSEEK_TOOLS_API_BASE: &str = "https://api.deepseek.com/v1/tools";
 pub const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 
 /// Provider/runtime secrets that live in the parent process environment (the
@@ -219,6 +227,22 @@ impl AgentConfig {
     #[must_use]
     pub fn uses_beta_endpoint(&self) -> bool {
         self.base_url.contains("/beta")
+    }
+
+    /// Base of the Search & Fetch API when the configured provider endpoint is
+    /// DeepSeek's own host over HTTPS; `None` for any other endpoint (a proxy,
+    /// a compatible server), which has no such service to call. Matched on the
+    /// host, case-insensitively, and never on a suffix: `api.deepseek.com.evil`
+    /// is someone else's host. Plaintext does not qualify — the key goes in
+    /// the request.
+    #[must_use]
+    pub fn deepseek_tools_api_base(&self) -> Option<String> {
+        let url = reqwest::Url::parse(&self.base_url).ok()?;
+        let is_deepseek = url.scheme() == "https"
+            && url
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case(DEEPSEEK_API_HOST));
+        is_deepseek.then(|| DEEPSEEK_TOOLS_API_BASE.to_string())
     }
 }
 

@@ -178,6 +178,11 @@ pub struct App {
     pub(crate) cost_currency: CostCurrency,
     pub(crate) configured_model: String,
     pub(crate) configured_reasoning: String,
+    /// Which service answers `web_search`/`fetch_url` for this config (see
+    /// [`deep_code_agent::WebBackend::id`]); `/status` prints it next to the
+    /// mount switch, because "web=on" alone says nothing about whether search
+    /// can actually work on the configured endpoint.
+    pub(crate) web_backend: &'static str,
     pub(crate) last_telemetry: Option<TurnTelemetry>,
     pub(crate) prompt_history: Vec<HistoryPrompt>,
     history_cursor: Option<usize>,
@@ -540,6 +545,7 @@ impl App {
         let cost_currency = agent_config.cost_currency;
         let configured_model = agent_config.model.clone();
         let configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
+        let web_backend = deep_code_agent::WebBackend::from_config(&agent_config).id();
         let workspace_display = home_relative(&workspace);
         let launched = launch_runtime(
             &agent_config,
@@ -679,6 +685,7 @@ impl App {
             cost_currency,
             configured_model,
             configured_reasoning,
+            web_backend,
             last_telemetry: None,
             prompt_history: Vec::new(),
             history_cursor: None,

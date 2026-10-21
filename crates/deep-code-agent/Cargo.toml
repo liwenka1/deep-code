@@ -11,11 +11,9 @@ description = "deep-code agent core library (scaffold)"
 anyhow = "1"
 async-stream = "0.3"
 async-trait = "0.1"
-form_urlencoded = "1"
 futures-core = "0.3"
 futures-util = "0.3"
 ignore = "0.4"
-percent-encoding = "2"
 regex = "1"
 # HMAC-SHA256 + CSPRNG for the session-record grant tag. Already in the tree
 # via rustls (reqwest), so depending on it directly adds no new build cost.
