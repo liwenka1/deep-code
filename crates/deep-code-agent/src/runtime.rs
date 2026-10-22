@@ -166,6 +166,12 @@ pub struct CompactionReport {
     /// Estimated model-visible context tokens either side of the fold.
     pub tokens_before: u32,
     pub tokens_after: u32,
+    /// The summary is the model's handover (the normal case). `false` means
+    /// the mechanical fold stood in — the model could not deliver one — and
+    /// `fallback_reason` says why, so the UI can tell the user this summary is
+    /// the lesser kind.
+    pub model_written: bool,
+    pub fallback_reason: Option<String>,
 }
 
 impl AgentRuntime {

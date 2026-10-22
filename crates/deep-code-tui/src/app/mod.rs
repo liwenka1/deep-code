@@ -51,9 +51,12 @@ pub struct LaunchConfig {
 
 /// Updates pushed from the bridge task into the UI thread.
 #[derive(Debug, Clone, PartialEq)]
-enum UiUpdate {
+pub(crate) enum UiUpdate {
     Event(Box<RuntimeEvent>),
     StreamFinished,
+    /// `/compact` finished: the report, or `None` when there was nothing to
+    /// fold. Boxed for the same reason the event is.
+    Compacted(Option<Box<deep_code_agent::CompactionReport>>),
 }
 
 enum StreamRequest {
@@ -191,6 +194,10 @@ pub struct App {
     /// in the completion menu, and runs. Replaced on every runtime swap along
     /// with the prompt whose index names them.
     pub(crate) skills: Arc<deep_code_agent::SkillRegistry>,
+    /// A `/compact` is in flight: the model is writing the handover summary
+    /// off the UI thread. Prompts and runtime swaps wait for it like they wait
+    /// for a streaming turn; the result lands through `ui_rx`.
+    pub(crate) compacting: bool,
     pub(crate) last_telemetry: Option<TurnTelemetry>,
     pub(crate) prompt_history: Vec<HistoryPrompt>,
     history_cursor: Option<usize>,
@@ -702,6 +709,7 @@ impl App {
             web_backend,
             instructions,
             skills,
+            compacting: false,
             last_telemetry: None,
             prompt_history: Vec::new(),
             history_cursor: None,
@@ -871,6 +879,13 @@ impl App {
         // composer, and the walk with it (`remember_prompt`).
         self.history_cursor = None;
         self.history_draft = HistoryPrompt::default();
+    }
+
+    /// Whether the runtime is mid-work: a turn streaming, an approval parked,
+    /// or a `/compact` writing its summary. The guard every command that
+    /// swaps the runtime or appends to the session checks first.
+    pub(crate) fn runtime_busy(&self) -> bool {
+        self.is_streaming || self.pending_approval.is_some() || self.compacting
     }
 
     /// Esc cancel stack: close completion menu > deny approval (handled by

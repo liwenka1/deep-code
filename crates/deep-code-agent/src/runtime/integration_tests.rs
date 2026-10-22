@@ -5047,12 +5047,18 @@ async fn a_context_overflow_refusal_compacts_and_retries() {
     // request that was refused. Without this the test would pass on a rescue
     // that compacted and then re-sent the identical context.
     let counts = client.message_counts();
+    // Three turns, the refused attempt, the handover summarizer's own request
+    // (two messages: its instructions and the flattened transcript), the retry.
     assert_eq!(
         counts.len(),
-        5,
-        "one refused attempt, one retry: {counts:?}"
+        6,
+        "one refused attempt, one summarizer request, one retry: {counts:?}"
     );
-    let (refused, retried) = (counts[3], counts[4]);
+    assert_eq!(
+        counts[4], 2,
+        "the summarizer sends its own two-message request: {counts:?}"
+    );
+    let (refused, retried) = (counts[3], counts[5]);
     assert!(
         retried < refused,
         "the retry must carry a smaller context: refused={refused} retried={retried} ({counts:?})"
@@ -5122,7 +5128,7 @@ async fn compact_now_folds_history_and_reports_a_short_one_as_a_no_op() {
 
     // A transcript too short to archive answers so, rather than pretending.
     assert!(
-        runtime.compact_now().await.is_none(),
+        runtime.compact_now(None).await.is_none(),
         "a fresh session has nothing worth folding"
     );
 
@@ -5131,7 +5137,7 @@ async fn compact_now_folds_history_and_reports_a_short_one_as_a_no_op() {
         drain(&mut rx).await;
     }
 
-    let report = runtime.compact_now().await.expect("history to fold");
+    let report = runtime.compact_now(None).await.expect("history to fold");
     assert!(report.archived_entries > 0);
     assert!(
         !report.summary.is_empty(),
@@ -5147,7 +5153,7 @@ async fn compact_now_folds_history_and_reports_a_short_one_as_a_no_op() {
     // The second call has nothing left to do: the only entry in the archivable
     // range is the summary the first call just wrote, and folding that would
     // report work on every call while the context never actually shrinks.
-    assert!(runtime.compact_now().await.is_none());
+    assert!(runtime.compact_now(None).await.is_none());
 }
 
 /// Folding is NOT automatically a win, and `archived_entries > 0` cannot say
@@ -5186,7 +5192,7 @@ async fn compacting_only_short_messages_reports_a_context_that_grew() {
         drain(&mut rx).await;
     }
 
-    let report = runtime.compact_now().await.expect("history to fold");
+    let report = runtime.compact_now(None).await.expect("history to fold");
     assert!(report.archived_entries > 0);
     assert!(
         report.tokens_after > report.tokens_before,
@@ -5510,4 +5516,166 @@ fn the_unattended_denial_note_names_the_floor_it_hit() {
     );
     let generic = crate::unattended_denial_note(&request("shell", Some("builtin:untrusted_shell")));
     assert!(generic.contains("auto_allow"), "{generic}");
+}
+
+/// Scripted like [`ScriptedClient`], and keeps every request it was sent, as
+/// JSON, so a test can read what a side request (the handover summarizer)
+/// actually carried.
+struct CapturingClient {
+    scripts: Mutex<Vec<Vec<AgentEvent>>>,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+#[async_trait::async_trait]
+impl LlmClient for CapturingClient {
+    fn provider_name(&self) -> &'static str {
+        "capturing"
+    }
+
+    fn model(&self) -> &str {
+        "capturing-model"
+    }
+
+    async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push(serde_json::to_value(&request).unwrap());
+        let events = {
+            let mut scripts = self.scripts.lock().unwrap();
+            if scripts.is_empty() {
+                Vec::new()
+            } else {
+                scripts.remove(0)
+            }
+        };
+        let stream = try_stream! {
+            for event in events {
+                yield event;
+            }
+        };
+        let stream: Pin<Box<dyn Stream<Item = AgentResult<AgentEvent>> + Send>> = Box::pin(stream);
+        Ok(stream)
+    }
+}
+
+fn ok_turn() -> Vec<AgentEvent> {
+    vec![
+        AgentEvent::TextDelta {
+            text: "ok".to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]
+}
+
+/// `/compact` asks the model for a handover of the archived range — a
+/// separate, tool-less request on the flash tier carrying the user's focus,
+/// the archived turns and none of the retained tail — and the model's text
+/// becomes the compaction entry the next request is built on.
+#[tokio::test]
+async fn compaction_asks_the_model_for_a_handover_summary() {
+    let handover = "# 会话交接摘要 / Session handover\n## 任务与目标 / Task and goals\n- prompt 0 asked for the thing";
+    let mut scripts: Vec<Vec<AgentEvent>> = (0..6).map(|_| ok_turn()).collect();
+    scripts.push(vec![
+        AgentEvent::TextDelta {
+            text: handover.to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let client = CapturingClient {
+        scripts: Mutex::new(scripts),
+        requests: Arc::clone(&requests),
+    };
+    let runtime = AgentRuntime::with_config(
+        client,
+        ToolRegistry::default(),
+        crate::config::AgentConfig::builtin(),
+    );
+    for index in 0..6 {
+        let mut rx = runtime.submit_user(format!("prompt {index}")).await;
+        drain(&mut rx).await;
+    }
+
+    let report = runtime
+        .compact_now(Some("只关心 prompt 0"))
+        .await
+        .expect("six turns leave something to fold");
+    assert!(report.model_written, "{report:?}");
+    assert_eq!(report.fallback_reason, None);
+    assert_eq!(report.summary, handover);
+    // u0 a0 u1 a1 u2 a2 u3: the five-entry tail starts at a3.
+    assert_eq!(report.archived_entries, 7);
+
+    let sent = requests.lock().unwrap().clone();
+    assert_eq!(sent.len(), 7, "one summarizer request after six turns");
+    let request = &sent[6];
+    assert_eq!(request["model"], DEEPSEEK_FLASH);
+    assert!(
+        request
+            .get("tools")
+            .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)),
+        "the summarizer reads, it does not call tools: {request}"
+    );
+    assert_eq!(request["messages"][0]["role"], "system");
+    assert!(
+        request["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Session handover")
+    );
+    let brief = request["messages"][1]["content"].as_str().unwrap();
+    assert!(brief.contains("只关心 prompt 0"), "{brief}");
+    assert!(
+        brief.contains("prompt 0") && brief.contains("prompt 3"),
+        "{brief}"
+    );
+    assert!(
+        !brief.contains("prompt 4") && !brief.contains("prompt 5"),
+        "the retained tail is not summarized: {brief}"
+    );
+
+    // The session now opens with the handover (this runtime has no system
+    // prompt), and the retained tail follows it verbatim.
+    let wire = runtime.session_messages().await;
+    assert!(wire[0].content.contains(handover), "{:?}", wire[0]);
+    assert!(wire.iter().any(|message| message.content == "prompt 5"));
+}
+
+/// When the summarizer fails — here the provider answers with an error — the
+/// fold still happens, with the mechanical digest, and the report says why.
+#[tokio::test]
+async fn compaction_falls_back_to_the_mechanical_fold_when_the_model_fails() {
+    let mut scripts: Vec<Vec<AgentEvent>> = (0..6).map(|_| ok_turn()).collect();
+    scripts.push(vec![AgentEvent::Error {
+        message: "summarizer boom".to_string(),
+    }]);
+    let client = CapturingClient {
+        scripts: Mutex::new(scripts),
+        requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let runtime = AgentRuntime::with_config(
+        client,
+        ToolRegistry::default(),
+        crate::config::AgentConfig::builtin(),
+    );
+    for index in 0..6 {
+        let mut rx = runtime.submit_user(format!("prompt {index}")).await;
+        drain(&mut rx).await;
+    }
+    let report = runtime.compact_now(None).await.expect("something to fold");
+    assert!(!report.model_written);
+    assert!(
+        report
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("summarizer boom")),
+        "{report:?}"
+    );
+    assert!(
+        report.summary.contains("- 用户 / user: prompt 0"),
+        "the mechanical digest stands in: {}",
+        report.summary
+    );
+    assert_eq!(report.archived_entries, 7);
 }

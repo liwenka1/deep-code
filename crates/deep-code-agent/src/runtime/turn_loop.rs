@@ -315,7 +315,7 @@ impl AgentRuntime {
                     // new turn. Hence a warning rather than an error, and no
                     // TurnStarted.
                     overflow_rescued = true;
-                    if self.compact_session(Some(tx)).await.is_none() {
+                    if self.compact_session(Some(tx), None).await.is_none() {
                         // Nothing left to archive: the oversized part is this
                         // turn's own retained tail — a single huge tool result,
                         // say — which the retention rule keeps by design and

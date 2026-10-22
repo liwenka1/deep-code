@@ -100,6 +100,13 @@ impl App {
             return;
         }
 
+        // A compaction is rewriting the history the next turn would be built on:
+        // refuse (keeping the draft) rather than race it.
+        if self.compacting {
+            self.status = self.tr(TextId::StatusCompacting).to_string();
+            return;
+        }
+
         // Steering: a plain prompt typed mid-stream is queued, not dropped.
         // It's sent as a follow-up when the turn ends — the user no longer has
         // to wait for a long turn to finish before lining up the next message.
@@ -270,7 +277,7 @@ impl App {
         // behind it would keep running with nobody observing — tools execute,
         // files change, cost accrues, and an approval request parks forever with
         // no UI to answer it.
-        if self.is_streaming && self.ui_rx.is_none() {
+        if (self.is_streaming || self.compacting) && self.ui_rx.is_none() {
             self.ui_rx = Some(rx);
         }
 
@@ -315,9 +322,31 @@ impl App {
         });
     }
 
+    /// Run `/compact` off the UI thread: the model writes the handover, and
+    /// that takes as long as reading the archived history takes. The result
+    /// comes back through the same channel a turn's events do; `compacting`
+    /// holds the composer and the runtime-swapping commands until it lands.
+    /// The caller has already checked that nothing else is in flight.
+    pub(crate) fn start_compaction(&mut self, focus: Option<&str>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.ui_rx = Some(rx);
+        self.compacting = true;
+        self.status = self.tr(TextId::StatusCompacting).to_string();
+        let runtime = Arc::clone(&self.runtime);
+        let focus = focus.map(str::to_string);
+        tokio::spawn(async move {
+            let report = runtime.compact_now(focus.as_deref()).await;
+            let _ = tx.send(UiUpdate::Compacted(report.map(Box::new)));
+        });
+    }
+
     pub(super) fn apply_ui_update(&mut self, update: UiUpdate) {
         match update {
             UiUpdate::Event(event) => self.apply_runtime_event(*event),
+            UiUpdate::Compacted(report) => {
+                self.compacting = false;
+                self.finish_compaction(report.map(|report| *report));
+            }
             UiUpdate::StreamFinished => {
                 // Reaching here with `is_streaming` still set means the channel
                 // closed without any terminal event (runtime panic, or an

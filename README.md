@@ -32,7 +32,7 @@ A DeepSeek-powered terminal coding agent, written in Rust. One small binary: str
 **Sessions you can trust**
 
 - Persistence + `-c` resume + `-r` picker; per-turn checkpoints with `/restore` rollback, snapshotted via copy-on-write clones where the filesystem supports it (APFS / Btrfs / XFS).
-- Automatic context compaction with a bounded summary carry; costs are tracked per request (including cache hit/miss savings and sub-agent spend), shown in `/status`, in your currency of choice.
+- Context compaction — automatic near the window, or `/compact [focus]` on demand — asks the model for a structured handover summary (task, done, files touched, decisions, pending, the user's instructions) and replaces the archived history with it; if that request fails the fold degrades to a mechanical digest and says so; costs are tracked per request (including cache hit/miss savings and sub-agent spend), shown in `/status`, in your currency of choice.
 - Shell output past the inline window is saved to a file **in full** (64 MB per-stream cap, head kept) and the result names its path — the head of a long build log (where the first error lives) stays retrievable instead of vanishing. Files live under the workspace's `.deep-code/spill/`, are skipped by checkpoints and default code search, small outputs never touch disk, and runs idle for a week are pruned at the next launch.
 
 **A TUI that stays honest**

@@ -182,7 +182,7 @@ impl App {
     /// the same reason, or under two spellings it misses and the workspace
     /// gets recorded as its own "additional" root.
     pub(crate) fn add_dir_command(&mut self, raw: &str) {
-        if self.is_streaming || self.pending_approval.is_some() {
+        if self.runtime_busy() {
             self.status = self.tr(TextId::BusyRelaunchConfig).to_string();
             return;
         }
@@ -248,7 +248,7 @@ impl App {
     /// The old runtime is shut down first so its persistence flush lands
     /// before the session record is re-read.
     pub(crate) fn relaunch_runtime(&mut self) -> Result<(), String> {
-        if self.is_streaming || self.pending_approval.is_some() {
+        if self.runtime_busy() {
             return Err(self.tr(TextId::BusyRelaunchConfig).to_string());
         }
 
@@ -283,7 +283,7 @@ impl App {
     /// Open the in-app `/resume` modal, listing the workspace's non-empty
     /// sessions (newest-first). No-ops with a status note when none qualify.
     pub(crate) fn open_resume_picker(&mut self) {
-        if self.is_streaming || self.pending_approval.is_some() {
+        if self.runtime_busy() {
             self.status = self.tr(TextId::BusySwitchSession).to_string();
             return;
         }
@@ -375,7 +375,7 @@ impl App {
     /// down (flushing its persistence), relaunch resuming `record`, and rebuild
     /// the visible transcript. This is what `/resume` executes.
     pub(crate) fn switch_session(&mut self, record: SessionRecord) -> Result<(), String> {
-        if self.is_streaming || self.pending_approval.is_some() {
+        if self.runtime_busy() {
             return Err(self.tr(TextId::BusySwitchSession).to_string());
         }
         if self.session_id.as_deref() == Some(record.id.as_str()) {
@@ -417,7 +417,7 @@ impl App {
     /// session is flushed to disk (recoverable via `/resume`), a brand-new
     /// session is launched, and the view resets to the welcome header.
     pub(crate) fn start_new_conversation(&mut self) {
-        if self.is_streaming || self.pending_approval.is_some() {
+        if self.runtime_busy() {
             self.status = self.tr(TextId::BusyNewConversation).to_string();
             return;
         }

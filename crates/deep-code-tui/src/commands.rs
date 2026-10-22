@@ -48,7 +48,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, TextId, bool)] = &[
     ("/sessions", TextId::HintSessions, false),
     ("/agents", TextId::HintAgents, false),
     ("/find", TextId::HintFind, true),
-    ("/compact", TextId::HintCompact, false),
+    ("/compact", TextId::HintCompact, true),
     ("/context", TextId::HintContext, false),
     ("/init", TextId::HintInit, false),
     ("/skill", TextId::HintSkill, true),
@@ -137,8 +137,9 @@ impl App {
                 }
                 true
             }
-            "/compact" => {
-                self.compact_now_command();
+            _ if prompt == "/compact" || prompt.starts_with("/compact ") => {
+                let focus = prompt.strip_prefix("/compact").unwrap_or_default().trim();
+                self.compact_now_command((!focus.is_empty()).then_some(focus));
                 true
             }
             "/context" => {
@@ -177,7 +178,7 @@ impl App {
     /// a turn is running: the brief must not be queued behind unrelated work,
     /// and steering it into a live turn would mix two tasks.
     fn init_command(&mut self) {
-        if self.is_streaming || self.pending_approval.is_some() {
+        if self.runtime_busy() {
             self.status = self.tr(TextId::StatusInitBusy).to_string();
             return;
         }
@@ -225,7 +226,7 @@ impl App {
             self.status = self.tr_with(TextId::StatusSkillUnknown, &[("name", name)]);
             return;
         };
-        if self.is_streaming || self.pending_approval.is_some() {
+        if self.runtime_busy() {
             self.status = self.tr(TextId::StatusSkillBusy).to_string();
             return;
         }
@@ -307,25 +308,37 @@ impl App {
     /// does not — that the last twenty turns were a dead-end exploration, or
     /// that a big task is about to start and the window should be cleared
     /// first. Compaction is not otherwise reachable by hand.
-    fn compact_now_command(&mut self) {
+    fn compact_now_command(&mut self, focus: Option<&str>) {
         // Same busy guard as the other state-changing commands: a compaction
         // swaps the session's entry list under the running turn, and the
         // summary cell would then land above output that already streamed.
         // (The runtime keeps the in-flight request alive either way —
-        // `compact_entries` never archives the newest user entry — so this is
-        // about keeping what is on screen true, not about safety.)
-        if self.is_streaming || self.pending_approval.is_some() {
+        // the fold never archives the newest user entry — so this is about
+        // keeping what is on screen true, not about safety.)
+        if self.runtime_busy() {
             self.status = self.tr(TextId::BusyCompact).to_string();
             return;
         }
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             self.status = self.tr(TextId::CompactOutsideRuntime).to_string();
             return;
-        };
-        let runtime = std::sync::Arc::clone(&self.runtime);
-        let result = tokio::task::block_in_place(|| handle.block_on(runtime.compact_now()));
-        match result {
+        }
+        self.start_compaction(focus);
+    }
+
+    /// What `/compact` shows once the runtime answers: the fold's cell with
+    /// the token counts either side, after a warning when the summary is the
+    /// mechanical kind; or the honest "nothing to do" when the history was
+    /// already short — the fold deliberately refuses to archive its own
+    /// summary, so that is a normal answer, and saying it is the difference
+    /// between a command that worked and one that looks broken.
+    pub(crate) fn finish_compaction(&mut self, report: Option<deep_code_agent::CompactionReport>) {
+        match report {
             Some(report) => {
+                if let Some(reason) = &report.fallback_reason {
+                    let text = self.tr_with(TextId::CompactionFallback, &[("reason", reason)]);
+                    self.history.push(HistoryCell::system(text));
+                }
                 self.history.push(HistoryCell::Compaction {
                     archived_entries: report.archived_entries,
                     context_tokens: Some((report.tokens_before, report.tokens_after)),
@@ -336,11 +349,6 @@ impl App {
                     &[("count", &report.archived_entries.to_string())],
                 );
             }
-            // Not a failure. A short transcript has nothing to fold, and
-            // `compact_entries` deliberately refuses to archive its own
-            // summary — so "nothing to do" is the correct answer, and saying it
-            // is the difference between a command that worked and one that
-            // looks broken.
             None => {
                 self.status = self.tr(TextId::CompactedNothing).to_string();
             }
@@ -944,7 +952,7 @@ impl App {
         // the live turn, which keeps writing on top of it. The runtime refuses
         // it too, but stopping here keeps the transcript honest (no "restored"
         // cell above still-streaming output).
-        if self.is_streaming || self.pending_approval.is_some() {
+        if self.runtime_busy() {
             self.status = self.tr(TextId::BusyRestore).to_string();
             return;
         }

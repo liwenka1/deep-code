@@ -251,6 +251,9 @@ impl App {
             RuntimeEvent::CompactionApplied {
                 archived_count,
                 summary,
+                // The mechanical case already announced itself with the
+                // `Warning` the runtime emits just before this event.
+                model_written: _,
             } => {
                 self.history.push(HistoryCell::Compaction {
                     archived_entries: archived_count,

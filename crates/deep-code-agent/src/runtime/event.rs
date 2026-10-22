@@ -168,6 +168,9 @@ pub enum RuntimeEvent {
     CompactionApplied {
         archived_count: usize,
         summary: String,
+        /// The summary is the model's handover; `false` is the mechanical
+        /// fold, announced by a `Warning` just before this event.
+        model_written: bool,
     },
     /// Workspace snapshot stored under `.deep-code/checkpoints/`.
     CheckpointCreated { id: CheckpointId, label: String },
@@ -465,6 +468,7 @@ mod tests {
                 RuntimeEvent::CompactionApplied {
                     archived_count: 2,
                     summary: "…".to_string(),
+                    model_written: true,
                 },
                 "compaction.applied",
                 None,

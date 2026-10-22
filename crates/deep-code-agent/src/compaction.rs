@@ -16,7 +16,7 @@ const RECENT_TAIL_ENTRIES: usize = 5;
 /// Cap on the prior summary carried forward as the new summary's prefix.
 /// Chars, not tokens: for CJK-heavy summaries this is roughly a same-sized
 /// token budget (~8k), a small slice of the ~800k-token compaction threshold.
-/// See the fold comment in [`compact_entries`] for why capping the HEAD keeps
+/// See [`mechanical_summary`] for why capping the HEAD keeps
 /// the prefix byte-stable and the total bounded.
 const COMPACTION_CARRY_MAX_CHARS: usize = 8_000;
 
@@ -110,109 +110,310 @@ pub fn should_compact(model: &str, messages: &[Message], override_tokens: Option
     estimate_token_count(messages) >= threshold
 }
 
-/// Keep the leading system entry, summarize archived middle entries into one
-/// Compaction entry, retain the recent tail. `archived_count` counts entries.
-/// Entries come and go as `Arc`s: retained/tail entries are pointer clones,
-/// only the new Compaction entry is allocated.
-#[must_use]
-pub fn compact_entries(entries: &[Arc<SessionEntry>]) -> CompactionResult {
-    let unchanged = || CompactionResult {
-        entries: entries.to_vec(),
-        summary: String::new(),
-        archived_count: 0,
-    };
-    if entries.len() <= RECENT_TAIL_ENTRIES + 1 {
-        return unchanged();
+/// Where a compaction cuts: `head..tail_start` is archived; the entries
+/// before `head` (the system prompt) and from `tail_start` on (the recent
+/// tail, extended back to the newest user entry) are kept verbatim. `carried`
+/// is the previous compaction's summary when the archived range opens with
+/// one — text a new summary has to absorb rather than forget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionPlan {
+    head: usize,
+    tail_start: usize,
+    pub carried: Option<String>,
+}
+
+impl CompactionPlan {
+    /// The entries this plan removes.
+    #[must_use]
+    pub fn archived<'a>(&self, entries: &'a [Arc<SessionEntry>]) -> &'a [Arc<SessionEntry>] {
+        &entries[self.head..self.tail_start]
     }
 
-    let system = entries
-        .first()
-        .filter(|entry| matches!(entry.kind, EntryKind::System { .. }))
-        .cloned();
+    /// The archived entries that are new since the previous compaction — the
+    /// range without the carried summary at its head.
+    #[must_use]
+    pub fn fresh<'a>(&self, entries: &'a [Arc<SessionEntry>]) -> &'a [Arc<SessionEntry>] {
+        let archived = self.archived(entries);
+        match archived.split_first() {
+            Some((first, rest)) if matches!(first.kind, EntryKind::Compaction { .. }) => rest,
+            _ => archived,
+        }
+    }
+}
+
+/// Decide what a compaction of `entries` would archive, or `None` when there
+/// is nothing to: a short transcript, or a range holding only the previous
+/// compaction's summary.
+///
+/// Never archives the newest user message. A turn that runs many tool steps
+/// (>= [`RECENT_TAIL_ENTRIES`]) before compaction fires would otherwise push
+/// the current request out of the retained tail and fold it into the summary —
+/// and the next request then carries NO user message at all, so the model
+/// loses its task (or the provider rejects a user-less request). The tail is
+/// extended back to the last user entry instead, so the active turn stays
+/// intact and only history before it is archived.
+#[must_use]
+pub fn plan_compaction(entries: &[Arc<SessionEntry>]) -> Option<CompactionPlan> {
+    if entries.len() <= RECENT_TAIL_ENTRIES + 1 {
+        return None;
+    }
+    let head = usize::from(
+        entries
+            .first()
+            .is_some_and(|entry| matches!(entry.kind, EntryKind::System { .. })),
+    );
     let mut tail_start = entries.len().saturating_sub(RECENT_TAIL_ENTRIES);
-    // Never archive the newest user message. A turn that runs many tool steps
-    // (>= RECENT_TAIL_ENTRIES) before compaction fires would otherwise push the
-    // current request out of the retained tail and fold it into the summary —
-    // and the next request then carries NO user message at all, so the model
-    // loses its task (or the provider rejects a user-less request). Extend the
-    // tail back to include the last user entry when it sits before the window;
-    // this keeps the active turn intact and only archives history before it.
     if let Some(last_user) = entries
         .iter()
         .rposition(|entry| matches!(entry.kind, EntryKind::User { .. }))
     {
         tail_start = tail_start.min(last_user);
     }
-    let head_offset = usize::from(system.is_some());
-    if tail_start <= head_offset {
-        return unchanged();
+    if tail_start <= head {
+        return None;
     }
-
-    let archived = &entries[head_offset..tail_start];
+    let archived = &entries[head..tail_start];
     // Nothing new to archive: the only entry in range is the compaction summary
     // already produced by the last pass. Folding it just reproduces the same
     // entry, but with `archived_count = 1` — and the caller (`maybe_compact`)
     // treats any nonzero count as real work, so it rewrites the session, emits
-    // `CompactionApplied` and pushes an ~8k-char compaction cell into the
-    // transcript on EVERY step. Once a single turn's own tail exceeds the
-    // threshold (routine at a lowered `context.compaction_threshold`), that
-    // fires every model round while the context never actually shrinks. Report
-    // a no-op so the caller bails. (A range that also holds fresh entries —
-    // `[C, user, …]` — is real progress and falls through.)
+    // `CompactionApplied` and pushes a compaction cell into the transcript on
+    // EVERY step. Once a single turn's own tail exceeds the threshold (routine
+    // at a lowered `context.compaction_threshold`), that fires every model
+    // round while the context never actually shrinks. (A range that also holds
+    // fresh entries — `[C, user, …]` — is real progress and falls through.)
     if let [only] = archived
         && matches!(only.kind, EntryKind::Compaction { .. })
     {
-        return unchanged();
+        return None;
     }
-    // Cache-aware summary fold. DeepSeek prompt caching is automatic longest-
-    // prefix matching, so a byte-stable `[system, summary…]` prefix lets the
-    // cache warmed right after one compaction survive the NEXT compaction
-    // instead of a full miss every time. When the archived range already opens
-    // with a prior compaction summary, carry that text forward verbatim as the
-    // PREFIX of the new summary (appending only the freshly-archived tail),
-    // rather than re-summarizing it into a lossy `- 系统: …` line that would
-    // rewrite the prefix bytes. Still destructive — only the summary text is
-    // additive; the archived entries are dropped as before.
-    //
-    // The carried base is capped ([`COMPACTION_CARRY_MAX_CHARS`]) or the
-    // summary grows without bound and slowly becomes the context hog
-    // compaction exists to prevent. `truncate_chars` keeps the FIRST N chars,
-    // so the clamp is idempotent — once over the cap, every later compaction
-    // reproduces byte-identical leading text (prefix cache keeps hitting) and
-    // the summary stays bounded at cap + the newest archived chunk. The cost
-    // is that middle history ages out; the frozen head and the fresh tail
-    // survive, which is the usual compression trade.
-    let summary = match archived.split_first() {
-        Some((first, rest)) => match &first.kind {
-            EntryKind::Compaction { summary: base, .. } if rest.is_empty() => {
-                truncate_chars(base, COMPACTION_CARRY_MAX_CHARS)
-            }
-            EntryKind::Compaction { summary: base, .. } => {
-                format!(
-                    "{}\n{}",
-                    truncate_chars(base, COMPACTION_CARRY_MAX_CHARS),
-                    summarize_archived_entries(rest)
-                )
-            }
-            _ => summarize_archived_entries(archived),
-        },
-        None => summarize_archived_entries(archived),
+    let carried = match &archived[0].kind {
+        EntryKind::Compaction { summary, .. } => Some(summary.clone()),
+        _ => None,
     };
-    let mut out = Vec::with_capacity(2 + RECENT_TAIL_ENTRIES);
-    if let Some(system_entry) = system {
-        out.push(system_entry);
+    Some(CompactionPlan {
+        head,
+        tail_start,
+        carried,
+    })
+}
+
+/// The fold's summary when no model writes one: the carried text, capped,
+/// followed by one clipped line per archived message. The fallback for a
+/// handover request that failed, and what the runtime used for every
+/// compaction before the model wrote them.
+///
+/// Cache-aware: the carried head is kept byte-identical (not re-summarized),
+/// so a provider's prefix cache warmed after one compaction survives the next.
+/// Capped at [`COMPACTION_CARRY_MAX_CHARS`] or the summary grows without bound
+/// and slowly becomes the context hog compaction exists to prevent;
+/// `truncate_chars` keeps the FIRST N chars, so the clamp is idempotent and the
+/// leading text stays stable across compactions. The cost is that middle
+/// history ages out; the frozen head and the fresh tail survive.
+#[must_use]
+pub fn mechanical_summary(plan: &CompactionPlan, entries: &[Arc<SessionEntry>]) -> String {
+    let fresh = plan.fresh(entries);
+    match &plan.carried {
+        Some(base) if fresh.is_empty() => truncate_chars(base, COMPACTION_CARRY_MAX_CHARS),
+        Some(base) => format!(
+            "{}\n{}",
+            truncate_chars(base, COMPACTION_CARRY_MAX_CHARS),
+            summarize_archived_entries(fresh)
+        ),
+        None => summarize_archived_entries(fresh),
     }
+}
+
+/// Replace the planned range with one Compaction entry carrying `summary`.
+/// Entries come and go as `Arc`s: retained/tail entries are pointer clones,
+/// only the new Compaction entry is allocated. `archived_count` counts
+/// entries, the carried summary entry included.
+#[must_use]
+pub fn apply_compaction(
+    entries: &[Arc<SessionEntry>],
+    plan: &CompactionPlan,
+    summary: String,
+) -> CompactionResult {
+    let archived = plan.archived(entries);
+    let mut out = Vec::with_capacity(plan.head + 1 + entries.len() - plan.tail_start);
+    out.extend_from_slice(&entries[..plan.head]);
     out.push(Arc::new(SessionEntry::compaction(
         summary.clone(),
         archived.len(),
     )));
-    out.extend_from_slice(&entries[tail_start..]);
-
+    out.extend_from_slice(&entries[plan.tail_start..]);
     CompactionResult {
         archived_count: archived.len(),
         entries: out,
         summary,
     }
+}
+
+/// Keep the leading system entry, fold the archived middle into one
+/// Compaction entry with the mechanical summary, retain the recent tail.
+/// Unchanged entries when there is nothing to archive (`archived_count == 0`).
+/// The runtime composes the same three steps itself (with the model's
+/// summary in the middle); this one-call form is what the fold's own tests
+/// drive.
+#[cfg(test)]
+#[must_use]
+pub fn compact_entries(entries: &[Arc<SessionEntry>]) -> CompactionResult {
+    match plan_compaction(entries) {
+        Some(plan) => {
+            let summary = mechanical_summary(&plan, entries);
+            apply_compaction(entries, &plan, summary)
+        }
+        None => CompactionResult {
+            entries: entries.to_vec(),
+            summary: String::new(),
+            archived_count: 0,
+        },
+    }
+}
+
+/// Longest flattened transcript handed to the summarizer. Past it the middle
+/// is elided: the opening states the task and the end holds the current
+/// state, and both matter more than the stretch between.
+const MAX_HANDOVER_CHARS: usize = 400_000;
+const HANDOVER_HEAD_CHARS: usize = 120_000;
+/// Per-message clip in the flattened transcript (user and assistant text).
+const HANDOVER_TEXT_CHARS: usize = 20_000;
+const HANDOVER_TOOL_ARGS_CHARS: usize = 2_000;
+const HANDOVER_TOOL_RESULT_CHARS: usize = 3_000;
+/// Cap on a summary the model writes, and on the previous summary fed back
+/// in. A handover longer than this is a transcript again.
+pub const MAX_HANDOVER_SUMMARY_CHARS: usize = 16_000;
+
+/// The summarizer's instructions. Model-facing, bilingual like the rest of the
+/// runtime's prompt text, never localized. The section list is the contract:
+/// the next assistant reads the result cold, so it has to say what the task
+/// is, what is done, which files changed, what was decided and what is left —
+/// concretely enough to act on without the archived messages.
+pub const HANDOVER_SYSTEM_PROMPT: &str = "\
+你是编码会话的交接记录员。下面是一段即将从上下文中移除的对话记录（用户、助手、工具调用与结果）。\
+请写一份交接摘要，给一个完全没有这段记忆、要接着干活的助手看。\n\
+要求：\n\
+- 只写记录里有的事实，不编造、不推测；对话中途改过主意的，以最新的为准，并说明改了。\n\
+- 具体到可以直接执行：文件路径、函数/命令/标识符原文、报错原文、数值、用户明确提出的要求与偏好。\n\
+- 按下面的小节组织，空的小节直接省略；用 Markdown；只输出摘要本身，不要开场白或结尾。\n\
+- 通常 300–1500 字；只有会话确实复杂才更长，最多 3000 字。\n\n\
+# 会话交接摘要 / Session handover\n\
+## 任务与目标 / Task and goals\n\
+## 已完成 / Done so far\n\
+## 涉及的文件 / Files touched（路径 + 各改了什么）\n\
+## 关键决定与发现 / Decisions and findings\n\
+## 未完成与下一步 / Pending and next steps\n\
+## 用户的要求与偏好 / User instructions and preferences\n\
+## 须保留的细节 / Details to keep（命令、报错、id、数值）\n\n\
+/ You are the handover scribe for a coding session. Summarize the transcript below for an \
+assistant that has no other memory of it: facts from the transcript only, never invented; when \
+the conversation changed course the newest decision wins, and say so; concrete enough to act on \
+(paths, identifiers, commands, error text, values, the user's explicit instructions and \
+preferences); organised under the headings above with empty sections omitted; Markdown; the \
+summary only, with no preamble or closing.";
+
+/// The summarizer's user message: the focus the user asked for, the previous
+/// summary to merge, the flattened transcript of the fresh entries, the ask.
+#[must_use]
+pub fn handover_request(
+    plan: &CompactionPlan,
+    entries: &[Arc<SessionEntry>],
+    focus: Option<&str>,
+) -> String {
+    let mut text = String::new();
+    if let Some(focus) = focus.map(str::trim).filter(|focus| !focus.is_empty()) {
+        text.push_str("本次压缩特别关注 / Pay particular attention to: ");
+        text.push_str(focus);
+        text.push_str("\n\n");
+    }
+    if let Some(prior) = &plan.carried {
+        text.push_str(
+            "## 之前的交接摘要 / Previous handover (merge it in; keep what still matters)\n",
+        );
+        text.push_str(&truncate_chars(prior, MAX_HANDOVER_SUMMARY_CHARS));
+        text.push_str("\n\n");
+    }
+    text.push_str("## 对话记录 / Transcript\n");
+    text.push_str(&clip_middle(
+        &flatten_entries(plan.fresh(entries)),
+        MAX_HANDOVER_CHARS,
+        HANDOVER_HEAD_CHARS,
+    ));
+    text.push_str("\n\n请现在输出交接摘要。/ Write the handover summary now.");
+    text
+}
+
+/// The archived entries as one labelled transcript. Not the wire messages: a
+/// request that replays `tool_calls` needs the tools declared and the
+/// reasoning passed back, and the summarizer wants neither — it reads.
+fn flatten_entries(entries: &[Arc<SessionEntry>]) -> String {
+    let mut out = String::new();
+    for entry in entries {
+        match &entry.kind {
+            EntryKind::User { content, images } => {
+                out.push_str("### 用户 / User\n");
+                out.push_str(&truncate_chars(content, HANDOVER_TEXT_CHARS));
+                if !images.is_empty() {
+                    out.push_str(&format!(
+                        "\n[附图 {count} 张 / {count} image(s) attached]",
+                        count = images.len()
+                    ));
+                }
+            }
+            EntryKind::Assistant {
+                content, exchanges, ..
+            } => {
+                out.push_str("### 助手 / Assistant\n");
+                out.push_str(&truncate_chars(content, HANDOVER_TEXT_CHARS));
+                for exchange in exchanges {
+                    out.push_str(&format!(
+                        "\n[工具调用 / tool call] {} {}",
+                        exchange.call.function.name,
+                        truncate_chars(&exchange.call.function.arguments, HANDOVER_TOOL_ARGS_CHARS)
+                    ));
+                    match &exchange.result {
+                        Some(result) => out.push_str(&format!(
+                            "\n[结果 / result: {}] {}",
+                            result_label(result.status),
+                            truncate_chars(&result.content, HANDOVER_TOOL_RESULT_CHARS)
+                        )),
+                        None => out.push_str("\n[结果 / result: 未完成 / interrupted]"),
+                    }
+                }
+            }
+            EntryKind::System { content } => {
+                out.push_str("### 系统 / System\n");
+                out.push_str(&truncate_chars(content, HANDOVER_TEXT_CHARS));
+            }
+            EntryKind::Compaction { summary, .. } => {
+                out.push_str("### 之前的摘要 / Earlier summary\n");
+                out.push_str(&truncate_chars(summary, MAX_HANDOVER_SUMMARY_CHARS));
+            }
+        }
+        out.push_str("\n\n");
+    }
+    out.trim_end().to_string()
+}
+
+fn result_label(status: crate::tool::ToolResultStatus) -> &'static str {
+    match status {
+        crate::tool::ToolResultStatus::Success => "success",
+        crate::tool::ToolResultStatus::Error => "error",
+        crate::tool::ToolResultStatus::Denied => "denied",
+    }
+}
+
+/// `text` whole when it fits `max` chars, else its first `head` chars, an
+/// elision marker, and its last `max - head` chars.
+fn clip_middle(text: &str, max: usize, head: usize) -> String {
+    let total = text.chars().count();
+    if total <= max {
+        return text.to_string();
+    }
+    let tail = max.saturating_sub(head);
+    let start: String = text.chars().take(head).collect();
+    let end: String = text.chars().skip(total - tail).collect();
+    format!("{start}\n[... 中间省略 / middle elided ...]\n{end}")
 }
 
 /// Summarize archived entries via their derived wire messages, so the summary

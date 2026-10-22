@@ -847,7 +847,7 @@ fn root_grant_requested_path(call: &ToolCall) -> String {
 /// off-catalog model records as zero (pricing is table-driven), so an off-DeepSeek
 /// `base_url` is best-effort, not a supported multi-provider mode. Either way the
 /// raw `auto` sentinel never leaks to the API layer.
-fn classifier_model_for(
+pub(super) fn classifier_model_for(
     config: &crate::config::AgentConfig,
     registry: &crate::model_registry::ModelRegistry,
 ) -> String {

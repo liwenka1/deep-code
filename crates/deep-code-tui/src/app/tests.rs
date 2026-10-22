@@ -3172,12 +3172,94 @@ async fn compact_on_a_short_session_reports_nothing_to_do() {
     let before = app.history.len();
 
     assert!(app.handle_slash_command("/compact"));
+    assert!(app.compacting, "the fold runs off the UI thread");
+    assert_eq!(
+        app.status,
+        tr(app.lang, TextId::StatusCompacting).to_string()
+    );
+    settle_compaction(&mut app).await;
 
     assert_eq!(
         app.status,
         tr(app.lang, TextId::CompactedNothing).to_string()
     );
     assert_eq!(app.history.len(), before, "nothing folded, no cell");
+}
+
+/// Pump the UI channel until the in-flight compaction has reported back.
+async fn settle_compaction(app: &mut App) {
+    for _ in 0..500 {
+        app.drain_stream_updates();
+        if !app.compacting {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the compaction never reported back");
+}
+
+/// Pump the UI channel until the streaming turn has ended.
+async fn settle_turn(app: &mut App) {
+    for _ in 0..500 {
+        app.drain_stream_updates();
+        if !app.is_streaming {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the turn never ended");
+}
+
+/// `/compact <focus>` hands the focus to the model's handover request, shows
+/// the model's text as the compaction cell, and holds the composer while the
+/// summary is being written.
+#[tokio::test(flavor = "multi_thread")]
+async fn compact_passes_the_focus_to_the_model_and_shows_its_summary() {
+    let mut app = App::new();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+    app.runtime = Arc::new(deep_code_agent::AgentRuntime::new(
+        BriefCapturingClient {
+            last_user_message: Arc::clone(&captured),
+        },
+        deep_code_agent::ToolRegistry::new(),
+    ));
+    for index in 0..6 {
+        app.insert_str_at_cursor(&format!("prompt {index}"));
+        app.submit();
+        settle_turn(&mut app).await;
+    }
+
+    assert!(app.handle_slash_command("/compact 只保留 prompt 0 的结论"));
+    assert!(app.compacting);
+    // Held, not queued or sent: the history is being rewritten underneath.
+    let cells = app.history.len();
+    app.insert_str_at_cursor("another prompt");
+    app.submit();
+    assert_eq!(app.input, "another prompt", "the draft is kept");
+    assert_eq!(app.history.len(), cells);
+    assert!(app.steering_queue.is_empty());
+    app.clear_input();
+
+    settle_compaction(&mut app).await;
+    let brief = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the summarizer was asked");
+    assert!(brief.contains("只保留 prompt 0 的结论"), "{brief}");
+    assert!(
+        brief.contains("prompt 0") && !brief.contains("prompt 5"),
+        "{brief}"
+    );
+    assert!(
+        matches!(
+            app.history.last(),
+            Some(HistoryCell::Compaction { summary, archived_entries: 7, .. }) if summary == "ok"
+        ),
+        "{:?}",
+        app.history.last()
+    );
+    assert!(!app.compacting);
 }
 
 /// `/context` exists because the transcript and the model's context diverge: it
