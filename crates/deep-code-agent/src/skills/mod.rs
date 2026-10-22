@@ -72,7 +72,7 @@ impl SkillRegistry {
     /// treated as a leaf (files under it are that skill's own material, not
     /// further skills); a child without one is queued for scanning. Hidden
     /// children (`.git`, `.cache`, ...) are never entered. Symlinks are
-    /// followed, with canonical-path bookkeeping plus [`MAX_WALK_DEPTH`]
+    /// followed, with canonical-path bookkeeping plus `MAX_WALK_DEPTH`
     /// keeping cyclic layouts finite.
     #[must_use]
     pub fn discover(dir: &Path) -> Self {

@@ -22,6 +22,12 @@ cd "$(dirname "$0")/.."
 
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
+# ci.yml's rustdoc job, both halves: the public pass catches a doc link that
+# points at a private item from an item that just became public (re-exporting
+# a type is enough), the private pass catches everything else. The public one
+# runs first in CI too, so a red there means the private pass never ran.
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items
 
 case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*)

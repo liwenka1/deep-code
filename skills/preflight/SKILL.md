@@ -11,7 +11,8 @@ commit must pass it on its own.
 1. From the repository root run `scripts/preflight.sh`. It is the local mirror
    of `.github/workflows/ci.yml` for this platform, in this order:
    `cargo fmt --all -- --check` → `cargo clippy --locked --workspace --all-targets -- -D warnings`
-   → `DEEPCODE_REQUIRE_SANDBOX=1 cargo test --locked --workspace --all-targets`
+   → `RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps` (then again with
+   `--document-private-items`) → `DEEPCODE_REQUIRE_SANDBOX=1 cargo test --locked --workspace --all-targets`
    → `DEEPCODE_REQUIRE_SANDBOX=1 cargo test --locked --workspace --doc`.
    It stops at the first failing stage.
 2. The script runs for several minutes; run it as a background job and read the
@@ -22,6 +23,9 @@ commit must pass it on its own.
      (8/7)" means bundle into a struct or use a builder method.
    - tests: find the panic line (`panicked at <file>:<line>`), read the test's
      doc comment first — it states which claim the test pins.
+   - rustdoc: a doc comment links to a private item from something public — this
+     fires the moment a type is re-exported from `lib.rs`; drop the link brackets
+     or make the item public.
    - doctests: a `///` code block was compiled as Rust; fence non-Rust examples
      with ```text.
 4. Green here is not green on CI for two things the script cannot check:
