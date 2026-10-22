@@ -529,6 +529,13 @@ impl App {
     }
 
     fn set_api_key(&mut self, arg: &str) {
+        // Refused before anything is written. The relaunch below refuses a
+        // busy runtime too, but only after the global config already held the
+        // change: the next session got it and this one did not.
+        if self.runtime_busy() {
+            self.status = self.busy_status(TextId::BusyRelaunchConfig);
+            return;
+        }
         if let Err(message) = deep_code_agent::validate_api_key(arg, self.lang) {
             self.status = message;
             return;
@@ -603,6 +610,11 @@ impl App {
                 }
             }
         };
+        // Before the write, for the reason `set_api_key` gives.
+        if self.runtime_busy() {
+            self.status = self.busy_status(TextId::BusyRelaunchConfig);
+            return;
+        }
         let update = deep_code_agent::GlobalConfigUpdate::Model(resolved.clone());
         match deep_code_agent::write_global_config_update(
             &self.global_config_path,
@@ -624,6 +636,11 @@ impl App {
     }
 
     fn logout(&mut self) {
+        // Before the write, for the reason `set_api_key` gives.
+        if self.runtime_busy() {
+            self.status = self.busy_status(TextId::BusyRelaunchConfig);
+            return;
+        }
         let update = deep_code_agent::GlobalConfigUpdate::ApiKey(None);
         match deep_code_agent::write_global_config_update(
             &self.global_config_path,

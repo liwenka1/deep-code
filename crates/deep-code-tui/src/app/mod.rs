@@ -195,15 +195,10 @@ pub struct App {
     /// in the completion menu, and runs. Replaced on every runtime swap along
     /// with the prompt whose index names them.
     pub(crate) skills: Arc<deep_code_agent::SkillRegistry>,
-    /// A `/compact` is in flight: the model is writing the handover summary
-    /// off the UI thread. Prompts and runtime swaps wait for it like they wait
-    /// for a streaming turn; the result lands through `ui_rx`.
-    pub(crate) compacting: bool,
-    /// The running `/compact`'s cancel token, fired by Esc or Ctrl+C. Held
-    /// here rather than in the runtime so the press reaches it synchronously:
-    /// an Esc typed before the compaction task got its first poll still stops
-    /// it.
-    pub(crate) compaction_cancel: Option<deep_code_agent::CancellationToken>,
+    /// The `/compact` in flight, if any: the model is writing the handover
+    /// summary off the UI thread. Prompts and runtime swaps wait for it like
+    /// they wait for a streaming turn; the result lands through `ui_rx`.
+    pub(crate) compaction: Option<RunningCompaction>,
     /// When the running turn started a compaction (`CompactionStarted`), while
     /// it lasts: the activity label says what the wait is for instead of
     /// "generating" with nothing appearing. Cleared by the turn's next event.
@@ -433,7 +428,12 @@ impl ComposerSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Notification {
     TurnFinished,
+    /// A long turn that ended in an error: the user who walked away needs
+    /// to come back to it just the same.
+    TurnFailed,
     ApprovalNeeded,
+    /// A long `/compact` finished, whichever way.
+    CompactionFinished,
 }
 
 impl Notification {
@@ -443,9 +443,31 @@ impl Notification {
     pub(crate) fn terminal_sequence(self) -> String {
         let message = match self {
             Self::TurnFinished => "deep-code: turn finished",
+            Self::TurnFailed => "deep-code: turn ended with an error",
             Self::ApprovalNeeded => "deep-code: approval needed",
+            Self::CompactionFinished => "deep-code: compaction finished",
         };
         format!("\x07\x1b]9;{message}\x07")
+    }
+}
+
+/// A `/compact` the model is writing the summary for.
+#[derive(Debug, Clone)]
+pub(crate) struct RunningCompaction {
+    /// Fired by Esc or Ctrl+C. Held here rather than in the runtime so the
+    /// press reaches it synchronously: an Esc typed before the compaction task
+    /// got its first poll still stops it.
+    pub(crate) cancel: deep_code_agent::CancellationToken,
+    /// When it started, for the notification when it ends.
+    pub(crate) since: std::time::Instant,
+}
+
+impl RunningCompaction {
+    pub(crate) fn new() -> Self {
+        Self {
+            cancel: deep_code_agent::CancellationToken::new(),
+            since: std::time::Instant::now(),
+        }
     }
 }
 
@@ -772,8 +794,7 @@ impl App {
             web_backend,
             instructions,
             skills,
-            compacting: false,
-            compaction_cancel: None,
+            compaction: None,
             turn_compaction_since: None,
             esc_quit_pending: false,
             notify_pending: None,
@@ -971,7 +992,12 @@ impl App {
     /// or a `/compact` writing its summary. The guard every command that
     /// swaps the runtime or appends to the session checks first.
     pub(crate) fn runtime_busy(&self) -> bool {
-        self.is_streaming || self.pending_approval.is_some() || self.compacting
+        self.is_streaming || self.pending_approval.is_some() || self.compacting()
+    }
+
+    /// Whether a `/compact` is in flight.
+    pub(crate) fn compacting(&self) -> bool {
+        self.compaction.is_some()
     }
 
     /// What a command refused by [`Self::runtime_busy`] says: its own message
@@ -979,7 +1005,7 @@ impl App {
     /// turn-shaped messages tell the user to cancel the turn with Esc, and
     /// with no turn running that advice used to arm quit instead.
     pub(crate) fn busy_status(&self, turn_busy: TextId) -> String {
-        let id = if self.compacting {
+        let id = if self.compacting() {
             TextId::BusyCompacting
         } else {
             turn_busy
@@ -995,7 +1021,7 @@ impl App {
             self.close_completion();
         } else if self.is_streaming {
             self.cancel_streaming_turn();
-        } else if self.compacting {
+        } else if self.compacting() {
             self.cancel_compaction();
         } else if !self.input.is_empty() {
             self.clear_input();
@@ -1034,7 +1060,7 @@ impl App {
         if self.is_streaming {
             self.ctrl_c_pending = false;
             self.cancel_streaming_turn();
-        } else if self.compacting {
+        } else if self.compacting() {
             self.ctrl_c_pending = false;
             self.cancel_compaction();
         } else if !self.input.is_empty() {

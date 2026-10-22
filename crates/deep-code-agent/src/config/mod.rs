@@ -118,9 +118,9 @@ pub struct AgentConfig {
     /// detection so a typo degrades gracefully instead of failing the load.
     pub language: String,
     /// `[ui] notifications`: whether the TUI rings the terminal (BEL + an OSC 9
-    /// notification) when a long turn ends or an approval is waiting. On by
-    /// default — the point of a long-running turn is that the user has looked
-    /// away. Any layer may set it; it changes nothing the model can do.
+    /// notification) when a long turn or `/compact` ends, an error included,
+    /// or an approval is waiting. On by default — the point of a long-running
+    /// turn is that the user has looked away. Any layer may set it; it changes nothing the model can do.
     pub notifications: bool,
     /// Session permission mode to start in. Project config may only set it to
     /// `Default`/`AcceptEdits` — a repo must not be able to launch you into

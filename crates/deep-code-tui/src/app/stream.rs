@@ -57,7 +57,7 @@ impl App {
         // typed line is cleared first so what is left is only the chip (bare
         // `/image` inserts nothing, and clears the line the same way).
         if display == "/image" || display.starts_with("/image ") {
-            let arg = display
+            let arg = as_sent
                 .strip_prefix("/image")
                 .unwrap_or_default()
                 .trim()
@@ -70,7 +70,13 @@ impl App {
         // Slash commands are interactive directives, not conversation — they
         // run immediately (against the live UI) rather than queueing behind a
         // stream, in both idle and streaming states.
-        if display.starts_with('/') && self.handle_slash_command(&display) {
+        //
+        // Recognised on what was typed (a command is never pasted into
+        // existence) but run on what was sent, chips expanded: a focus pasted
+        // after `/compact `, a path after `/add-dir ` or a query after `/find `
+        // reached the command as its `[粘贴 #1 +5 行]` label otherwise, and the
+        // pasted text was dropped with the composer.
+        if display.starts_with('/') && self.handle_slash_command(as_sent) {
             self.clear_input();
             return;
         }
@@ -102,7 +108,7 @@ impl App {
 
         // A compaction is rewriting the history the next turn would be built on:
         // refuse (keeping the draft) rather than race it.
-        if self.compacting {
+        if self.compacting() {
             self.status = self.tr(TextId::StatusCompacting).to_string();
             return;
         }
@@ -286,9 +292,8 @@ impl App {
         // ever arrive on this channel again, and re-installing it below would
         // leave `compacting` set — every prompt and every runtime swap refused
         // until a restart.
-        if disconnected && self.compacting && self.ui_rx.is_none() {
-            self.compacting = false;
-            self.compaction_cancel = None;
+        if disconnected && self.compacting() && self.ui_rx.is_none() {
+            self.compaction = None;
             self.status = self.tr_with(
                 TextId::CompactFailed,
                 &[("reason", "the compaction task stopped without an answer")],
@@ -301,7 +306,7 @@ impl App {
         // behind it would keep running with nobody observing — tools execute,
         // files change, cost accrues, and an approval request parks forever with
         // no UI to answer it.
-        if (self.is_streaming || self.compacting) && self.ui_rx.is_none() {
+        if (self.is_streaming || self.compacting()) && self.ui_rx.is_none() {
             self.ui_rx = Some(rx);
         }
 
@@ -348,16 +353,16 @@ impl App {
 
     /// Run `/compact` off the UI thread: the model writes the handover, and
     /// that takes as long as reading the archived history takes. The result
-    /// comes back through the same channel a turn's events do; `compacting`
+    /// comes back through the same channel a turn's events do; `compaction`
     /// holds the composer and the runtime-swapping commands until it lands,
     /// and Esc or Ctrl+C fires its cancel token meanwhile.
     /// The caller has already checked that nothing else is in flight.
     pub(crate) fn start_compaction(&mut self, focus: Option<&str>) {
         let (tx, rx) = mpsc::unbounded_channel();
         self.ui_rx = Some(rx);
-        self.compacting = true;
-        let cancel = deep_code_agent::CancellationToken::new();
-        self.compaction_cancel = Some(cancel.clone());
+        let running = RunningCompaction::new();
+        let cancel = running.cancel.clone();
+        self.compaction = Some(running);
         self.status = self.tr(TextId::StatusCompacting).to_string();
         let runtime = Arc::clone(&self.runtime);
         let focus = focus.map(str::to_string);
@@ -371,8 +376,8 @@ impl App {
     /// history untouched — still arrives through the channel and closes the
     /// busy state, so this only fires the token.
     pub(super) fn cancel_compaction(&mut self) {
-        if let Some(cancel) = &self.compaction_cancel {
-            cancel.cancel();
+        if let Some(running) = &self.compaction {
+            running.cancel.cancel();
         }
         self.status = self.tr(TextId::StatusCompactCancelling).to_string();
     }
@@ -381,8 +386,15 @@ impl App {
         match update {
             UiUpdate::Event(event) => self.apply_runtime_event(*event),
             UiUpdate::Compacted(outcome) => {
-                self.compacting = false;
-                self.compaction_cancel = None;
+                // Rung for a long one however it ended, except a cancel: the
+                // user who pressed Esc is the one person already looking.
+                let long = self
+                    .compaction
+                    .take()
+                    .is_some_and(|running| running.since.elapsed() >= NOTIFY_MIN_TURN);
+                if long && !matches!(*outcome, deep_code_agent::CompactNowOutcome::Cancelled) {
+                    self.request_notification(Notification::CompactionFinished);
+                }
                 self.finish_compaction(*outcome);
             }
             UiUpdate::StreamFinished => {

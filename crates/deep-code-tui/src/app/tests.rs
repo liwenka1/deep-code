@@ -939,8 +939,10 @@ fn apikey_command_validates_writes_and_stays_out_of_history() {
 /// out of the history and away from the model. The paste collapses into a
 /// `[粘贴 #1 +1 行]` chip, whose text says nothing about a key: read off the
 /// composer, the line was no command at all — it was remembered, and sent like
-/// any prompt (mid-stream, as here, queued to steer the live turn), and the
-/// session transcript kept it.
+/// any prompt (mid-stream, queued to steer the live turn), and the session
+/// transcript kept it. Mid-stream the command is refused before it writes
+/// anything (a relaunch cannot happen under a running turn); idle, it sets the
+/// key.
 #[test]
 fn a_pasted_apikey_line_never_reaches_the_history_or_the_model() {
     let dir = tempfile::tempdir().unwrap();
@@ -948,35 +950,43 @@ fn a_pasted_apikey_line_never_reaches_the_history_or_the_model() {
         "/apikey sk-0123456789abcdef\n",
         "\n/apikey sk-0123456789abcdef\n\n",
     ] {
-        let mut app = App::new();
-        app.global_config_path = dir.path().join("config.toml");
-        app.is_streaming = true;
-        app.paste_str(paste.to_string());
-        assert_eq!(app.pasted_blocks.len(), 1, "sanity: collapsed into a chip");
+        for streaming in [true, false] {
+            let mut app = App::new();
+            app.global_config_path = dir.path().join("config.toml");
+            app.is_streaming = streaming;
+            app.paste_str(paste.to_string());
+            assert_eq!(app.pasted_blocks.len(), 1, "sanity: collapsed into a chip");
 
-        app.submit();
+            app.submit();
 
-        assert!(app.prompt_history.is_empty(), "{paste:?}: remembered");
-        assert!(
-            app.steering_queue.is_empty(),
-            "{paste:?}: sent to the model"
-        );
-        assert!(
-            app.history
-                .iter()
-                .all(|cell| !format!("{cell:?}").contains("sk-0123456789abcdef")),
-            "{paste:?}: in the transcript"
-        );
-        assert!(
-            app.input.is_empty(),
-            "{paste:?}: the command clears the composer"
-        );
-        let config = std::fs::read_to_string(&app.global_config_path).unwrap();
-        assert!(
-            config.contains("sk-0123456789abcdef"),
-            "{paste:?}: the key was not set"
-        );
-        std::fs::remove_file(&app.global_config_path).unwrap();
+            let case = format!("{paste:?} (streaming: {streaming})");
+            assert!(app.prompt_history.is_empty(), "{case}: remembered");
+            assert!(app.steering_queue.is_empty(), "{case}: sent to the model");
+            assert!(
+                app.history
+                    .iter()
+                    .all(|cell| !format!("{cell:?}").contains("sk-0123456789abcdef")),
+                "{case}: in the transcript"
+            );
+            assert!(
+                app.input.is_empty(),
+                "{case}: the command clears the composer"
+            );
+            if streaming {
+                assert!(
+                    !app.global_config_path.exists(),
+                    "{case}: written while a turn runs"
+                );
+                assert_eq!(app.status, tr(app.lang, TextId::BusyRelaunchConfig));
+            } else {
+                let config = std::fs::read_to_string(&app.global_config_path).unwrap();
+                assert!(
+                    config.contains("sk-0123456789abcdef"),
+                    "{case}: the key was not set"
+                );
+                std::fs::remove_file(&app.global_config_path).unwrap();
+            }
+        }
     }
 }
 
@@ -3172,7 +3182,7 @@ async fn compact_on_a_short_session_reports_nothing_to_do() {
     let before = app.history.len();
 
     assert!(app.handle_slash_command("/compact"));
-    assert!(app.compacting, "the fold runs off the UI thread");
+    assert!(app.compacting(), "the fold runs off the UI thread");
     assert_eq!(
         app.status,
         tr(app.lang, TextId::StatusCompacting).to_string()
@@ -3190,7 +3200,7 @@ async fn compact_on_a_short_session_reports_nothing_to_do() {
 async fn settle_compaction(app: &mut App) {
     for _ in 0..500 {
         app.drain_stream_updates();
-        if !app.compacting {
+        if !app.compacting() {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -3230,7 +3240,7 @@ async fn compact_passes_the_focus_to_the_model_and_shows_its_summary() {
     }
 
     assert!(app.handle_slash_command("/compact 只保留 prompt 0 的结论"));
-    assert!(app.compacting);
+    assert!(app.compacting());
     // Held, not queued or sent: the history is being rewritten underneath.
     let cells = app.history.len();
     app.insert_str_at_cursor("another prompt");
@@ -3259,7 +3269,7 @@ async fn compact_passes_the_focus_to_the_model_and_shows_its_summary() {
         "{:?}",
         app.history.last()
     );
-    assert!(!app.compacting);
+    assert!(!app.compacting());
 }
 
 /// Turns answer "ok"; the handover summarizer never answers at all.
@@ -3313,7 +3323,7 @@ async fn esc_and_ctrl_c_cancel_a_running_compact() {
         }
         let cells = app.history.len();
         assert!(app.handle_slash_command("/compact"));
-        assert!(app.compacting);
+        assert!(app.compacting());
         // Another state-changing command is refused with the compaction's own
         // message, which names the way out.
         assert!(app.handle_slash_command("/restore abc"));
@@ -3347,11 +3357,11 @@ fn a_compaction_that_never_answers_releases_the_composer() {
     let mut app = App::new();
     let (tx, rx) = mpsc::unbounded_channel();
     app.ui_rx = Some(rx);
-    app.compacting = true;
+    app.compaction = Some(RunningCompaction::new());
     drop(tx);
 
     assert!(app.drain_stream_updates());
-    assert!(!app.compacting);
+    assert!(!app.compacting());
     assert!(!app.runtime_busy());
     assert!(app.ui_rx.is_none());
     assert_eq!(
@@ -3407,6 +3417,154 @@ fn a_compaction_inside_the_turn_names_the_wait() {
     });
     let label = app.streaming_activity().unwrap();
     assert!(label.contains("生成中"), "{label}");
+}
+
+/// A focus pasted after `/compact ` reaches the summarizer as text. The command
+/// used to run on the composer's display text, so the model was asked to pay
+/// attention to `[粘贴 #1 +3 行]` and the pasted list went with the composer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pasted_compact_focus_reaches_the_summarizer() {
+    let mut app = App::new();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+    app.runtime = Arc::new(deep_code_agent::AgentRuntime::new(
+        BriefCapturingClient {
+            last_user_message: Arc::clone(&captured),
+        },
+        deep_code_agent::ToolRegistry::new(),
+    ));
+    for index in 0..6 {
+        app.insert_str_at_cursor(&format!("prompt {index}"));
+        app.submit();
+        settle_turn(&mut app).await;
+    }
+
+    app.insert_str_at_cursor("/compact ");
+    app.paste_str("keep:\n- the parser decision\n- the failing test names\n".to_string());
+    assert!(
+        app.input.contains("[粘贴 #"),
+        "folded into a chip: {}",
+        app.input
+    );
+    app.submit();
+    assert!(app.compacting());
+    settle_compaction(&mut app).await;
+
+    let brief = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the summarizer was asked");
+    assert!(brief.contains("- the failing test names"), "{brief}");
+    assert!(!brief.contains("[粘贴"), "{brief}");
+}
+
+/// A query pasted after `/find ` is searched for as the text it is, not as its
+/// chip's label.
+#[test]
+fn a_pasted_find_query_is_searched_as_text() {
+    let mut app = App::new();
+    let mut lines: Vec<String> = (0..20).map(|index| format!("line {index}")).collect();
+    lines[7] = "error[E0308]: mismatched types".to_string();
+    app.transcript = Some(TranscriptSnapshot {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 10,
+        scroll_top: 0,
+        lines,
+        fold_headers: Vec::new(),
+    });
+    app.insert_str_at_cursor("/find ");
+    app.paste_str("error[E0308]: mismatched types\n".to_string());
+    assert!(
+        app.input.contains("[粘贴 #"),
+        "folded into a chip: {}",
+        app.input
+    );
+    app.submit();
+    assert_eq!(
+        app.find_state.as_ref().map(|(_, line)| *line),
+        Some(7),
+        "{}",
+        app.status
+    );
+}
+
+/// `/model`, `/apikey` and `/logout` are refused before they write anything
+/// while the runtime is busy. They used to save the global config first and
+/// only then find the relaunch refused: the change reached the next session and
+/// not this one.
+#[test]
+fn config_commands_write_nothing_while_the_runtime_is_busy() {
+    for command in ["/model flash", "/apikey sk-0123456789abcdef", "/logout"] {
+        for busy in ["streaming", "compacting"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = App::new();
+            app.global_config_path = dir.path().join("config.toml");
+            match busy {
+                "streaming" => app.is_streaming = true,
+                _ => app.compaction = Some(RunningCompaction::new()),
+            }
+            assert!(app.handle_slash_command(command), "{command}");
+            assert!(
+                !app.global_config_path.exists(),
+                "{command} while {busy} wrote the config"
+            );
+            let expected = if busy == "compacting" {
+                TextId::BusyCompacting
+            } else {
+                TextId::BusyRelaunchConfig
+            };
+            assert_eq!(app.status, tr(app.lang, expected), "{command} while {busy}");
+        }
+    }
+}
+
+/// A long turn that ends in an error rings like one that finished, and so does
+/// a long `/compact` — unless the user cancelled it, being the one person
+/// already looking.
+#[test]
+fn long_failed_turns_and_long_compactions_notify() {
+    let mut app = App::new();
+    app.is_streaming = true;
+    app.streaming_since =
+        std::time::Instant::now().checked_sub(NOTIFY_MIN_TURN + std::time::Duration::from_secs(1));
+    app.apply_runtime_event(RuntimeEvent::Error {
+        turn_id: None,
+        message: "boom".to_string(),
+    });
+    assert_eq!(app.take_notification(), Some(Notification::TurnFailed));
+
+    let long_ago =
+        std::time::Instant::now().checked_sub(NOTIFY_MIN_TURN + std::time::Duration::from_secs(1));
+    for (outcome, rings) in [
+        (deep_code_agent::CompactNowOutcome::NothingToFold, true),
+        (
+            deep_code_agent::CompactNowOutcome::Failed("boom".to_string()),
+            true,
+        ),
+        (deep_code_agent::CompactNowOutcome::Cancelled, false),
+    ] {
+        let mut app = App::new();
+        app.compaction = Some(RunningCompaction {
+            cancel: deep_code_agent::CancellationToken::new(),
+            since: long_ago.unwrap(),
+        });
+        app.apply_ui_update(UiUpdate::Compacted(Box::new(outcome.clone())));
+        assert_eq!(
+            app.take_notification(),
+            rings.then_some(Notification::CompactionFinished),
+            "{outcome:?}"
+        );
+        assert!(!app.compacting());
+    }
+
+    let mut quick = App::new();
+    quick.compaction = Some(RunningCompaction::new());
+    quick.apply_ui_update(UiUpdate::Compacted(Box::new(
+        deep_code_agent::CompactNowOutcome::NothingToFold,
+    )));
+    assert_eq!(quick.take_notification(), None, "a quick one stays silent");
 }
 
 /// `/context` exists because the transcript and the model's context diverge: it

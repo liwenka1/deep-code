@@ -317,7 +317,16 @@ impl App {
                 self.pending_steering_flush = true;
             }
             RuntimeEvent::TurnCancelled { .. } => self.finish_turn_cancelled(),
-            RuntimeEvent::Error { message, .. } => self.record_error(message),
+            RuntimeEvent::Error { message, .. } => {
+                if self.is_streaming
+                    && self
+                        .streaming_since
+                        .is_some_and(|since| since.elapsed() >= crate::app::NOTIFY_MIN_TURN)
+                {
+                    self.request_notification(crate::app::Notification::TurnFailed);
+                }
+                self.record_error(message);
+            }
         }
     }
 
