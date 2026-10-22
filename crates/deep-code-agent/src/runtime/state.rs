@@ -78,7 +78,16 @@ pub(super) struct RuntimeState {
     /// matching the TUI's own queue).
     pub(super) steering: VecDeque<Steered>,
     /// Cancellation token for the in-flight turn; rotated by `begin_turn`.
+    ///
+    /// It stays cancelled after an Esc until the next turn begins, so nothing
+    /// that runs between turns may race it: a hand-run compaction did, and
+    /// lost on the first poll every time a turn had been cancelled before it.
     pub(super) cancel: CancellationToken,
+    /// A threshold compaction already ran (or failed) in this turn; reset by
+    /// `begin_turn`. One per turn: past the first, all that is left to archive
+    /// is the previous turn's tail, one entry per step, and each of those
+    /// folds would cost a summarizer round trip of its own.
+    pub(super) threshold_compaction_tried: bool,
     /// Tools the user approved for the whole session ("a" in the approval
     /// panel). In-memory only: forgotten when the runtime shuts down.
     pub(super) session_approved: HashSet<String>,

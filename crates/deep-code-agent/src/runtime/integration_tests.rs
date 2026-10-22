@@ -5116,7 +5116,12 @@ async fn compact_now_folds_history_and_reports_a_short_one_as_a_no_op() {
             AgentEvent::Done { usage: None },
         ]
     };
-    let client = ScriptedClient::new(vec![reply("one"), reply("two"), reply("three")]);
+    let client = ScriptedClient::new(vec![
+        reply("one"),
+        reply("two"),
+        reply("three"),
+        reply("the handover"),
+    ]);
     let runtime = AgentRuntime::with_new_session(
         client,
         ToolRegistry::default(),
@@ -5127,8 +5132,9 @@ async fn compact_now_folds_history_and_reports_a_short_one_as_a_no_op() {
     .unwrap();
 
     // A transcript too short to archive answers so, rather than pretending.
-    assert!(
-        runtime.compact_now(None).await.is_none(),
+    assert_eq!(
+        compact(&runtime, None).await,
+        CompactNowOutcome::NothingToFold,
         "a fresh session has nothing worth folding"
     );
 
@@ -5137,7 +5143,7 @@ async fn compact_now_folds_history_and_reports_a_short_one_as_a_no_op() {
         drain(&mut rx).await;
     }
 
-    let report = runtime.compact_now(None).await.expect("history to fold");
+    let report = folded(compact(&runtime, None).await);
     assert!(report.archived_entries > 0);
     assert!(
         !report.summary.is_empty(),
@@ -5153,17 +5159,35 @@ async fn compact_now_folds_history_and_reports_a_short_one_as_a_no_op() {
     // The second call has nothing left to do: the only entry in the archivable
     // range is the summary the first call just wrote, and folding that would
     // report work on every call while the context never actually shrinks.
-    assert!(runtime.compact_now(None).await.is_none());
+    assert_eq!(
+        compact(&runtime, None).await,
+        CompactNowOutcome::NothingToFold
+    );
+}
+
+/// `/compact` with a fresh, never-fired token.
+async fn compact(runtime: &AgentRuntime, focus: Option<&str>) -> CompactNowOutcome {
+    runtime
+        .compact_now(focus, &tokio_util::sync::CancellationToken::new())
+        .await
+}
+
+/// The report of a compaction that folded, or a panic naming what came back.
+fn folded(outcome: CompactNowOutcome) -> CompactionReport {
+    match outcome {
+        CompactNowOutcome::Folded(report) => report,
+        other => panic!("expected a fold, got {other:?}"),
+    }
 }
 
 /// Folding is NOT automatically a win, and `archived_entries > 0` cannot say
 /// whether it was one.
 ///
-/// A summary line costs `min(len, 160)` chars **plus** a `- 角色 / role: `
-/// label, so a history whose messages are all short comes out *longer* than it
-/// went in. That is the shape a plain chat session has — and the exact case
-/// where a user reaches for `/compact` and then cannot tell whether it did
-/// anything. The report carries both numbers so the UI can say so.
+/// A handover has sections and headings, so on a history whose messages are
+/// all short the summary can come out *longer* than what it replaced. That is
+/// the shape a plain chat session has — and the exact case where a user
+/// reaches for `/compact` and then cannot tell whether it did anything. The
+/// report carries both numbers so the UI can say so.
 #[tokio::test]
 async fn compacting_only_short_messages_reports_a_context_that_grew() {
     let workspace = tempfile::tempdir().unwrap();
@@ -5177,7 +5201,11 @@ async fn compacting_only_short_messages_reports_a_context_that_grew() {
             AgentEvent::Done { usage: None },
         ]
     };
-    let client = ScriptedClient::new(vec![reply("a"), reply("b"), reply("c")]);
+    let handover = format!(
+        "# 会话交接摘要 / Session handover\n## 已完成 / Done so far\n{}",
+        "- the user said one, two and three\n".repeat(8)
+    );
+    let client = ScriptedClient::new(vec![reply("a"), reply("b"), reply("c"), reply(&handover)]);
     let runtime = AgentRuntime::with_new_session(
         client,
         ToolRegistry::default(),
@@ -5192,7 +5220,7 @@ async fn compacting_only_short_messages_reports_a_context_that_grew() {
         drain(&mut rx).await;
     }
 
-    let report = runtime.compact_now(None).await.expect("history to fold");
+    let report = folded(compact(&runtime, None).await);
     assert!(report.archived_entries > 0);
     assert!(
         report.tokens_after > report.tokens_before,
@@ -5598,12 +5626,8 @@ async fn compaction_asks_the_model_for_a_handover_summary() {
         drain(&mut rx).await;
     }
 
-    let report = runtime
-        .compact_now(Some("只关心 prompt 0"))
-        .await
-        .expect("six turns leave something to fold");
-    assert!(report.model_written, "{report:?}");
-    assert_eq!(report.fallback_reason, None);
+    let report = folded(compact(&runtime, Some("只关心 prompt 0")).await);
+    assert!(!report.cut_short, "{report:?}");
     assert_eq!(report.summary, handover);
     // u0 a0 u1 a1 u2 a2 u3: the five-entry tail starts at a3.
     assert_eq!(report.archived_entries, 7);
@@ -5653,10 +5677,12 @@ async fn compaction_asks_the_model_for_a_handover_summary() {
     assert!(wire.iter().any(|message| message.content == "prompt 5"));
 }
 
-/// When the summarizer fails — here the provider answers with an error — the
-/// fold still happens, with the mechanical digest, and the report says why.
+/// When the summarizer fails — here the provider answers with an error — a
+/// hand-run compaction folds nothing and says why. The mechanical digest it
+/// used to write instead was permanent: the originals were gone, and every
+/// later turn built on one clipped line per message.
 #[tokio::test]
-async fn compaction_falls_back_to_the_mechanical_fold_when_the_model_fails() {
+async fn a_failed_summary_leaves_the_history_untouched() {
     let mut scripts: Vec<Vec<AgentEvent>> = (0..6).map(|_| ok_turn()).collect();
     scripts.push(vec![AgentEvent::Error {
         message: "summarizer boom".to_string(),
@@ -5674,19 +5700,667 @@ async fn compaction_falls_back_to_the_mechanical_fold_when_the_model_fails() {
         let mut rx = runtime.submit_user(format!("prompt {index}")).await;
         drain(&mut rx).await;
     }
-    let report = runtime.compact_now(None).await.expect("something to fold");
-    assert!(!report.model_written);
+    let before = runtime.session_messages().await;
+    let outcome = compact(&runtime, None).await;
+    assert!(
+        matches!(&outcome, CompactNowOutcome::Failed(reason) if reason.contains("summarizer boom")),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        runtime.session_messages().await,
+        before,
+        "nothing was folded"
+    );
+}
+
+/// Whether a request is the handover summarizer's, by its instructions.
+fn is_handover_request(request: &ChatRequest) -> bool {
+    request
+        .messages
+        .first()
+        .is_some_and(|message| message.content.contains("Session handover"))
+}
+
+/// Ordinary turns get `ok_turn`; the handover summarizer gets whatever
+/// `handover` produces for its n-th request (0-based), and every handover is
+/// counted.
+struct HandoverClient {
+    handovers: Arc<Mutex<usize>>,
+    handover: Box<dyn Fn(usize) -> AgentResult<Vec<AgentEvent>> + Send + Sync>,
+}
+
+impl HandoverClient {
+    fn new(
+        handover: impl Fn(usize) -> AgentResult<Vec<AgentEvent>> + Send + Sync + 'static,
+    ) -> (Self, Arc<Mutex<usize>>) {
+        let handovers = Arc::new(Mutex::new(0));
+        (
+            Self {
+                handovers: Arc::clone(&handovers),
+                handover: Box::new(handover),
+            },
+            handovers,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmClient for HandoverClient {
+    fn provider_name(&self) -> &'static str {
+        "handover"
+    }
+
+    fn model(&self) -> &str {
+        "handover-model"
+    }
+
+    async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
+        let events = if is_handover_request(&request) {
+            let index = {
+                let mut handovers = self.handovers.lock().unwrap();
+                *handovers += 1;
+                *handovers - 1
+            };
+            (self.handover)(index)?
+        } else {
+            ok_turn()
+        };
+        let stream = try_stream! {
+            for event in events {
+                yield event;
+            }
+        };
+        let stream: Pin<Box<dyn Stream<Item = AgentResult<AgentEvent>> + Send>> = Box::pin(stream);
+        Ok(stream)
+    }
+}
+
+fn handover_reply(text: &str) -> Vec<AgentEvent> {
+    vec![
+        AgentEvent::TextDelta {
+            text: text.to_string(),
+        },
+        AgentEvent::Done { usage: None },
+    ]
+}
+
+/// The offline backend answers every request with its setup hint. Taken for a
+/// handover, that hint replaced the archived history — on `/compact`, and on a
+/// threshold fold just the same. Neither may ask it.
+#[tokio::test]
+async fn the_offline_backend_is_never_asked_for_a_handover() {
+    let client = crate::echo_client::EchoClient::new(crate::i18n::SharedLang::default());
+    let config = crate::config::AgentConfig {
+        compaction_threshold: Some(1),
+        ..crate::config::AgentConfig::builtin()
+    };
+    let runtime = AgentRuntime::with_config(client, ToolRegistry::default(), config);
+    let mut events = Vec::new();
+    for index in 0..6 {
+        let mut rx = runtime
+            .submit_user(format!("decision {index}: keep the parser API"))
+            .await;
+        events.extend(drain(&mut rx).await);
+    }
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::CompactionStarted | RuntimeEvent::CompactionApplied { .. }
+        )),
+        "{events:?}"
+    );
+
+    assert_eq!(compact(&runtime, None).await, CompactNowOutcome::Offline);
+    let wire = runtime.session_messages().await;
+    assert!(
+        wire.iter()
+            .any(|message| message.content == "decision 0: keep the parser API"),
+        "the archived turns are still there: {wire:?}"
+    );
+    assert!(
+        !wire
+            .iter()
+            .any(|message| message.content.contains("会话摘要")),
+        "{wire:?}"
+    );
+}
+
+/// The turn's cancel token stays cancelled after an Esc until the next turn
+/// begins. `/compact` raced it, so the natural recovery step — cancel a
+/// wandering turn, then compact — failed on the first poll every time, without
+/// sending a request, and folded mechanically.
+#[tokio::test]
+async fn compacting_after_a_cancelled_turn_still_asks_the_model() {
+    struct HangingTurnClient {
+        calls: Mutex<usize>,
+        started: Arc<tokio::sync::Notify>,
+        handovers: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for HangingTurnClient {
+        fn provider_name(&self) -> &'static str {
+            "hanging"
+        }
+
+        fn model(&self) -> &str {
+            "hanging"
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
+            if is_handover_request(&request) {
+                *self.handovers.lock().unwrap() += 1;
+                let stream = try_stream! {
+                    yield AgentEvent::TextDelta { text: "# handover\n- the model wrote this".to_string() };
+                    yield AgentEvent::Done { usage: None };
+                };
+                return Ok(Box::pin(stream));
+            }
+            let call = {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            if call <= 6 {
+                let stream = try_stream! {
+                    for event in ok_turn() {
+                        yield event;
+                    }
+                };
+                return Ok(Box::pin(stream));
+            }
+            self.started.notify_one();
+            let stream = try_stream! {
+                std::future::pending::<()>().await;
+                yield AgentEvent::Done { usage: None };
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let handovers = Arc::new(Mutex::new(0));
+    let runtime = AgentRuntime::with_config(
+        HangingTurnClient {
+            calls: Mutex::new(0),
+            started: Arc::clone(&started),
+            handovers: Arc::clone(&handovers),
+        },
+        ToolRegistry::default(),
+        crate::config::AgentConfig::builtin(),
+    );
+    for index in 0..6 {
+        let mut rx = runtime.submit_user(format!("prompt {index}")).await;
+        drain(&mut rx).await;
+    }
+    let mut rx = runtime.submit_user("prompt 6, cancelled with Esc").await;
+    started.notified().await;
+    drop(runtime.cancel_turn().await);
+    let events = drain(&mut rx).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnCancelled { .. })),
+        "{events:?}"
+    );
+
+    let report = folded(compact(&runtime, Some("keep the parser decisions")).await);
+    assert_eq!(report.summary, "# handover\n- the model wrote this");
+    assert_eq!(*handovers.lock().unwrap(), 1, "the summarizer was asked");
+}
+
+/// The summarizer's request gets the turn requests' open-phase retry: a 503 at
+/// a busy hour is answered by the next attempt, not by giving up the fold.
+#[tokio::test]
+async fn the_handover_request_is_retried_after_a_transient_error() {
+    let (client, handovers) = HandoverClient::new(|index| {
+        if index == 0 {
+            Err(AgentError::Api {
+                status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                message: "busy".to_string(),
+            })
+        } else {
+            Ok(handover_reply("# handover\n- written on the second try"))
+        }
+    });
+    let runtime = AgentRuntime::with_config(
+        client,
+        ToolRegistry::default(),
+        crate::config::AgentConfig::builtin(),
+    );
+    for index in 0..6 {
+        let mut rx = runtime.submit_user(format!("prompt {index}")).await;
+        drain(&mut rx).await;
+    }
+    let report = folded(compact(&runtime, None).await);
+    assert_eq!(report.summary, "# handover\n- written on the second try");
+    assert_eq!(*handovers.lock().unwrap(), 2);
+}
+
+/// An Esc while a threshold fold waits on the summarizer ends the turn and
+/// folds nothing. It used to commit the mechanical digest on the way out —
+/// permanently, though the next turn would have had the time to ask again.
+#[tokio::test]
+async fn an_esc_during_a_threshold_compaction_folds_nothing() {
+    struct StallingHandoverClient {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for StallingHandoverClient {
+        fn provider_name(&self) -> &'static str {
+            "stalling"
+        }
+
+        fn model(&self) -> &str {
+            "stalling"
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
+            if !is_handover_request(&request) {
+                let stream = try_stream! {
+                    for event in ok_turn() {
+                        yield event;
+                    }
+                };
+                return Ok(Box::pin(stream));
+            }
+            self.started.notify_one();
+            let stream = try_stream! {
+                std::future::pending::<()>().await;
+                yield AgentEvent::Done { usage: None };
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let config = crate::config::AgentConfig {
+        compaction_threshold: Some(1),
+        ..crate::config::AgentConfig::builtin()
+    };
+    let runtime = AgentRuntime::with_config(
+        StallingHandoverClient {
+            started: Arc::clone(&started),
+        },
+        ToolRegistry::default(),
+        config,
+    );
+    let mut turn = 0;
+    let events = loop {
+        let mut rx = runtime.submit_user(format!("prompt {turn}")).await;
+        let mut events = Vec::new();
+        let stalled = loop {
+            tokio::select! {
+                () = started.notified() => break true,
+                event = rx.recv() => match event {
+                    Some(event) => events.push(event),
+                    None => break false,
+                },
+            }
+        };
+        if stalled {
+            drop(runtime.cancel_turn().await);
+            events.extend(drain(&mut rx).await);
+            break events;
+        }
+        turn += 1;
+        assert!(turn < 10, "the threshold fold never started");
+    };
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::CompactionStarted)),
+        "the wait was announced: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::CompactionApplied { .. } | RuntimeEvent::Warning { .. }
+        )),
+        "{events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(RuntimeEvent::TurnCancelled { .. })),
+        "{events:?}"
+    );
+    let wire = runtime.session_messages().await;
+    assert!(
+        wire.iter().any(|message| message.content == "prompt 0"),
+        "{wire:?}"
+    );
+    assert!(
+        !wire
+            .iter()
+            .any(|message| message.content.contains("会话摘要")),
+        "{wire:?}"
+    );
+}
+
+/// A threshold fold runs at most once per turn. Past the first, all a fold
+/// could still archive is the previous turn's tail, one entry per step as the
+/// window slides — and each of those used to be a summarizer round trip of its
+/// own, before every model step of the turn.
+#[tokio::test]
+async fn a_threshold_compaction_runs_at_most_once_per_turn() {
+    struct StepClient {
+        normal: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for StepClient {
+        fn provider_name(&self) -> &'static str {
+            "step"
+        }
+
+        fn model(&self) -> &str {
+            "step"
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
+            let events = if is_handover_request(&request) {
+                handover_reply("# handover")
+            } else {
+                let n = {
+                    let mut normal = self.normal.lock().unwrap();
+                    *normal += 1;
+                    *normal
+                };
+                // Requests 1..=3: three short turns. 4..=7: the tool steps of
+                // the fourth turn, which then answers.
+                if (4..=7).contains(&n) {
+                    vec![
+                        AgentEvent::ToolCallDelta {
+                            delta: tool_call_delta(
+                                &format!("call_{n}"),
+                                MockEchoTool::NAME,
+                                r#"{"message":"hi"}"#,
+                            ),
+                        },
+                        AgentEvent::Done { usage: None },
+                    ]
+                } else {
+                    ok_turn()
+                }
+            };
+            let stream = try_stream! {
+                for event in events {
+                    yield event;
+                }
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
+    let config = crate::config::AgentConfig {
+        compaction_threshold: Some(1),
+        ..crate::config::AgentConfig::builtin()
+    };
+    let runtime = AgentRuntime::with_config(
+        StepClient {
+            normal: Mutex::new(0),
+        },
+        ToolRegistry::with_mock_tools(),
+        config,
+    )
+    .with_permission_mode(crate::execution_policy::SharedPermissionMode::new(
+        crate::execution_policy::PermissionMode::Yolo,
+    ));
+    for index in 0..3 {
+        let mut rx = runtime.submit_user(format!("prompt {index}")).await;
+        drain(&mut rx).await;
+    }
+    let mut rx = runtime.submit_user("prompt 3: a multi-step task").await;
+    let events = drain(&mut rx).await;
+
+    let started = events
+        .iter()
+        .filter(|event| matches!(event, RuntimeEvent::CompactionStarted))
+        .count();
+    let applied: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| matches!(event, RuntimeEvent::CompactionApplied { .. }))
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(started, 1, "one summarizer request in the turn: {events:?}");
+    assert_eq!(applied.len(), 1, "{events:?}");
+    let started_at = events
+        .iter()
+        .position(|event| matches!(event, RuntimeEvent::CompactionStarted))
+        .unwrap();
+    assert!(started_at < applied[0], "{events:?}");
+    assert!(
+        matches!(events.last(), Some(RuntimeEvent::TurnFinished { .. })),
+        "{events:?}"
+    );
+}
+
+/// A threshold fold whose summarizer fails is skipped, said so, and not tried
+/// again before every later step of the same turn.
+#[tokio::test]
+async fn a_failed_threshold_compaction_is_skipped_for_the_turn() {
+    struct FailingSummaryClient {
+        normal: Mutex<usize>,
+        handovers: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for FailingSummaryClient {
+        fn provider_name(&self) -> &'static str {
+            "failing-summary"
+        }
+
+        fn model(&self) -> &str {
+            "failing-summary"
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
+            let events = if is_handover_request(&request) {
+                *self.handovers.lock().unwrap() += 1;
+                vec![AgentEvent::Error {
+                    message: "summarizer boom".to_string(),
+                }]
+            } else {
+                let n = {
+                    let mut normal = self.normal.lock().unwrap();
+                    *normal += 1;
+                    *normal
+                };
+                // Three short turns, then a fourth that takes three tool steps:
+                // each step is a point where the fold could be tried again.
+                if (4..=6).contains(&n) {
+                    vec![
+                        AgentEvent::ToolCallDelta {
+                            delta: tool_call_delta(
+                                &format!("call_{n}"),
+                                MockEchoTool::NAME,
+                                r#"{"message":"hi"}"#,
+                            ),
+                        },
+                        AgentEvent::Done { usage: None },
+                    ]
+                } else {
+                    ok_turn()
+                }
+            };
+            let stream = try_stream! {
+                for event in events {
+                    yield event;
+                }
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
+    let handovers = Arc::new(Mutex::new(0));
+    let config = crate::config::AgentConfig {
+        compaction_threshold: Some(1),
+        ..crate::config::AgentConfig::builtin()
+    };
+    let runtime = AgentRuntime::with_config(
+        FailingSummaryClient {
+            normal: Mutex::new(0),
+            handovers: Arc::clone(&handovers),
+        },
+        ToolRegistry::with_mock_tools(),
+        config,
+    )
+    .with_permission_mode(crate::execution_policy::SharedPermissionMode::new(
+        crate::execution_policy::PermissionMode::Yolo,
+    ));
+    for index in 0..3 {
+        let mut rx = runtime.submit_user(format!("prompt {index}")).await;
+        drain(&mut rx).await;
+    }
+    let mut rx = runtime.submit_user("prompt 3: a multi-step task").await;
+    let events = drain(&mut rx).await;
+
+    assert_eq!(
+        *handovers.lock().unwrap(),
+        1,
+        "tried once in the turn, not before every step: {events:?}"
+    );
+    let skipped = crate::tr_with(
+        crate::i18n::Lang::En,
+        crate::TextId::CompactionSkipped,
+        &[("reason", "summarizer boom")],
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Warning { message } if *message == skipped)),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::CompactionApplied { .. })),
+        "{events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(RuntimeEvent::TurnFinished { .. })),
+        "the turn goes on with the history it had: {events:?}"
+    );
+    let wire = runtime.session_messages().await;
+    assert!(
+        wire.iter().any(|message| message.content == "prompt 0"),
+        "{wire:?}"
+    );
+}
+
+/// A summary that used the whole output allowance is one the provider stopped,
+/// not one the model finished: it is kept, and says so.
+#[tokio::test]
+async fn a_summary_that_hits_the_token_cap_is_marked_cut_short() {
+    let (client, _handovers) = HandoverClient::new(|_| {
+        Ok(vec![
+            AgentEvent::TextDelta {
+                text: "# handover\n## 已完成 / Done so far\n- a lot".to_string(),
+            },
+            AgentEvent::Done {
+                usage: Some(crate::model::Usage {
+                    completion_tokens: Some(12_000),
+                    ..Default::default()
+                }),
+            },
+        ])
+    });
+    let runtime = AgentRuntime::with_config(
+        client,
+        ToolRegistry::default(),
+        crate::config::AgentConfig::builtin(),
+    );
+    for index in 0..6 {
+        let mut rx = runtime.submit_user(format!("prompt {index}")).await;
+        drain(&mut rx).await;
+    }
+    let report = folded(compact(&runtime, None).await);
+    assert!(report.cut_short, "{report:?}");
     assert!(
         report
-            .fallback_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("summarizer boom")),
-        "{report:?}"
-    );
-    assert!(
-        report.summary.contains("- 用户 / user: prompt 0"),
-        "the mechanical digest stands in: {}",
+            .summary
+            .ends_with(crate::compaction::HANDOVER_CUT_SHORT_NOTE),
+        "{}",
         report.summary
     );
-    assert_eq!(report.archived_entries, 7);
+}
+
+/// A turn that lands while `/compact` writes its summary is kept: the plan's
+/// indices still name the same archived entries, and the new ones belong to
+/// the kept tail. Comparing the whole list used to throw the summary away for
+/// any append at all.
+#[tokio::test]
+async fn a_turn_that_lands_while_compact_writes_is_kept() {
+    struct GatedHandoverClient {
+        started: Arc<tokio::sync::Notify>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for GatedHandoverClient {
+        fn provider_name(&self) -> &'static str {
+            "gated"
+        }
+
+        fn model(&self) -> &str {
+            "gated"
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
+            if !is_handover_request(&request) {
+                let stream = try_stream! {
+                    for event in ok_turn() {
+                        yield event;
+                    }
+                };
+                return Ok(Box::pin(stream));
+            }
+            self.started.notify_one();
+            let gate = Arc::clone(&self.gate);
+            let stream = try_stream! {
+                gate.notified().await;
+                yield AgentEvent::TextDelta { text: "# handover".to_string() };
+                yield AgentEvent::Done { usage: None };
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let runtime = AgentRuntime::with_config(
+        GatedHandoverClient {
+            started: Arc::clone(&started),
+            gate: Arc::clone(&gate),
+        },
+        ToolRegistry::default(),
+        crate::config::AgentConfig::builtin(),
+    );
+    for index in 0..6 {
+        let mut rx = runtime.submit_user(format!("prompt {index}")).await;
+        drain(&mut rx).await;
+    }
+    let compacting = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { compact(&runtime, None).await })
+    };
+    started.notified().await;
+    let mut rx = runtime.submit_user("a late prompt").await;
+    drain(&mut rx).await;
+    gate.notify_one();
+
+    let report = folded(compacting.await.unwrap());
+    assert_eq!(report.summary, "# handover");
+    let wire = runtime.session_messages().await;
+    assert!(
+        wire.iter()
+            .any(|message| message.content == "a late prompt"),
+        "{wire:?}"
+    );
+    assert!(
+        !wire.iter().any(|message| message.content == "prompt 0"),
+        "{wire:?}"
+    );
 }

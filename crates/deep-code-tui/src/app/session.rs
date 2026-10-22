@@ -183,7 +183,7 @@ impl App {
     /// gets recorded as its own "additional" root.
     pub(crate) fn add_dir_command(&mut self, raw: &str) {
         if self.runtime_busy() {
-            self.status = self.tr(TextId::BusyRelaunchConfig).to_string();
+            self.status = self.busy_status(TextId::BusyRelaunchConfig);
             return;
         }
         let trimmed = raw.trim();
@@ -249,7 +249,7 @@ impl App {
     /// before the session record is re-read.
     pub(crate) fn relaunch_runtime(&mut self) -> Result<(), String> {
         if self.runtime_busy() {
-            return Err(self.tr(TextId::BusyRelaunchConfig).to_string());
+            return Err(self.busy_status(TextId::BusyRelaunchConfig));
         }
 
         // Flush the old runtime first so re-reading the current session below
@@ -284,7 +284,7 @@ impl App {
     /// sessions (newest-first). No-ops with a status note when none qualify.
     pub(crate) fn open_resume_picker(&mut self) {
         if self.runtime_busy() {
-            self.status = self.tr(TextId::BusySwitchSession).to_string();
+            self.status = self.busy_status(TextId::BusySwitchSession);
             return;
         }
         let sessions = match JsonSessionStore::for_workspace(self.workspace.clone())
@@ -376,7 +376,7 @@ impl App {
     /// the visible transcript. This is what `/resume` executes.
     pub(crate) fn switch_session(&mut self, record: SessionRecord) -> Result<(), String> {
         if self.runtime_busy() {
-            return Err(self.tr(TextId::BusySwitchSession).to_string());
+            return Err(self.busy_status(TextId::BusySwitchSession));
         }
         if self.session_id.as_deref() == Some(record.id.as_str()) {
             self.status = self.tr(TextId::StatusAlreadyCurrent).to_string();
@@ -418,7 +418,7 @@ impl App {
     /// session is launched, and the view resets to the welcome header.
     pub(crate) fn start_new_conversation(&mut self) {
         if self.runtime_busy() {
-            self.status = self.tr(TextId::BusyNewConversation).to_string();
+            self.status = self.busy_status(TextId::BusyNewConversation);
             return;
         }
 

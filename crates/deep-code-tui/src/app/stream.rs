@@ -267,9 +267,33 @@ impl App {
         };
 
         let mut applied = false;
-        while let Ok(update) = rx.try_recv() {
-            self.apply_ui_update(update);
-            applied = true;
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(update) => {
+                    self.apply_ui_update(update);
+                    applied = true;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        // The compaction task died without reporting (a panic): nothing will
+        // ever arrive on this channel again, and re-installing it below would
+        // leave `compacting` set — every prompt and every runtime swap refused
+        // until a restart.
+        if disconnected && self.compacting && self.ui_rx.is_none() {
+            self.compacting = false;
+            self.compaction_cancel = None;
+            self.status = self.tr_with(
+                TextId::CompactFailed,
+                &[("reason", "the compaction task stopped without an answer")],
+            );
+            return true;
         }
 
         // Only put `rx` back when nothing claimed the slot while we were
@@ -325,27 +349,41 @@ impl App {
     /// Run `/compact` off the UI thread: the model writes the handover, and
     /// that takes as long as reading the archived history takes. The result
     /// comes back through the same channel a turn's events do; `compacting`
-    /// holds the composer and the runtime-swapping commands until it lands.
+    /// holds the composer and the runtime-swapping commands until it lands,
+    /// and Esc or Ctrl+C fires its cancel token meanwhile.
     /// The caller has already checked that nothing else is in flight.
     pub(crate) fn start_compaction(&mut self, focus: Option<&str>) {
         let (tx, rx) = mpsc::unbounded_channel();
         self.ui_rx = Some(rx);
         self.compacting = true;
+        let cancel = deep_code_agent::CancellationToken::new();
+        self.compaction_cancel = Some(cancel.clone());
         self.status = self.tr(TextId::StatusCompacting).to_string();
         let runtime = Arc::clone(&self.runtime);
         let focus = focus.map(str::to_string);
         tokio::spawn(async move {
-            let report = runtime.compact_now(focus.as_deref()).await;
-            let _ = tx.send(UiUpdate::Compacted(report.map(Box::new)));
+            let outcome = runtime.compact_now(focus.as_deref(), &cancel).await;
+            let _ = tx.send(UiUpdate::Compacted(Box::new(outcome)));
         });
+    }
+
+    /// Esc or Ctrl+C while `/compact` runs: stop it. The answer — cancelled,
+    /// history untouched — still arrives through the channel and closes the
+    /// busy state, so this only fires the token.
+    pub(super) fn cancel_compaction(&mut self) {
+        if let Some(cancel) = &self.compaction_cancel {
+            cancel.cancel();
+        }
+        self.status = self.tr(TextId::StatusCompactCancelling).to_string();
     }
 
     pub(super) fn apply_ui_update(&mut self, update: UiUpdate) {
         match update {
             UiUpdate::Event(event) => self.apply_runtime_event(*event),
-            UiUpdate::Compacted(report) => {
+            UiUpdate::Compacted(outcome) => {
                 self.compacting = false;
-                self.finish_compaction(report.map(|report| *report));
+                self.compaction_cancel = None;
+                self.finish_compaction(*outcome);
             }
             UiUpdate::StreamFinished => {
                 // Reaching here with `is_streaming` still set means the channel

@@ -9,6 +9,7 @@ use crate::model::{ChatRequest, Usage};
 use crate::model_registry::{DEEPSEEK_V4_PRO, context_window_for_model};
 use crate::model_route::{RouteContext, resolve_turn_route};
 use crate::runtime::AgentRuntime;
+use crate::runtime::compaction_flow::{FoldOutcome, Trigger};
 use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
 use crate::runtime::telemetry::probe_prefix;
 use crate::runtime::tool_result::{BatchOutcome, runtime_error_from_tool_error, tool_call_payload};
@@ -219,9 +220,8 @@ impl AgentRuntime {
             // turn grew the context without ever re-checking the threshold — the
             // exact shape that overflows the window, and a context-overflow 400
             // is not retriable and has no recovery path.
-            if self.maybe_compact(&route.effective_model, tx, false).await {
-                // compaction event already emitted; continue with trimmed history
-            }
+            self.maybe_compact(&route.effective_model, tx, &cancel)
+                .await;
 
             // Mid-turn steering lands here. The iteration above ran to its
             // `continue`, i.e. a tool batch finished, so the session now ends on
@@ -315,25 +315,37 @@ impl AgentRuntime {
                     // new turn. Hence a warning rather than an error, and no
                     // TurnStarted.
                     overflow_rescued = true;
-                    if self.compact_session(Some(tx), None).await.is_none() {
+                    match self
+                        .compact_session(Trigger::OverflowRescue, Some(tx), None, &cancel)
+                        .await
+                    {
+                        FoldOutcome::Applied(_) => {}
+                        FoldOutcome::Cancelled => {
+                            self.finish_turn_cancelled(&turn_id, tx).await;
+                            return;
+                        }
                         // Nothing left to archive: the oversized part is this
                         // turn's own retained tail — a single huge tool result,
                         // say — which the retention rule keeps by design and
                         // compaction can never reach. Report that instead of
-                        // re-raising the raw 400, and name the way out.
-                        emit(
-                            tx,
-                            RuntimeEvent::Error {
-                                turn_id: Some(turn_id.clone()),
-                                message: crate::tr_with(
-                                    self.ui_lang(),
-                                    crate::TextId::ErrContextOverflow,
-                                    &[("estimate", &estimated_context_tokens.to_string())],
-                                ),
-                            },
-                        );
-                        self.abort_turn(&turn_id).await;
-                        return;
+                        // re-raising the raw 400, and name the way out. (A
+                        // rescue folds mechanically when the summarizer fails,
+                        // so the other two arms only share this one's ending.)
+                        FoldOutcome::Nothing | FoldOutcome::Offline | FoldOutcome::Failed(_) => {
+                            emit(
+                                tx,
+                                RuntimeEvent::Error {
+                                    turn_id: Some(turn_id.clone()),
+                                    message: crate::tr_with(
+                                        self.ui_lang(),
+                                        crate::TextId::ErrContextOverflow,
+                                        &[("estimate", &estimated_context_tokens.to_string())],
+                                    ),
+                                },
+                            );
+                            self.abort_turn(&turn_id).await;
+                            return;
+                        }
                     }
                     emit(
                         tx,

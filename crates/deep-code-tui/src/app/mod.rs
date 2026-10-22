@@ -55,9 +55,9 @@ pub struct LaunchConfig {
 pub(crate) enum UiUpdate {
     Event(Box<RuntimeEvent>),
     StreamFinished,
-    /// `/compact` finished: the report, or `None` when there was nothing to
-    /// fold. Boxed for the same reason the event is.
-    Compacted(Option<Box<deep_code_agent::CompactionReport>>),
+    /// `/compact` finished, one way or another. Boxed for the same reason
+    /// the event is.
+    Compacted(Box<deep_code_agent::CompactNowOutcome>),
 }
 
 enum StreamRequest {
@@ -199,6 +199,15 @@ pub struct App {
     /// off the UI thread. Prompts and runtime swaps wait for it like they wait
     /// for a streaming turn; the result lands through `ui_rx`.
     pub(crate) compacting: bool,
+    /// The running `/compact`'s cancel token, fired by Esc or Ctrl+C. Held
+    /// here rather than in the runtime so the press reaches it synchronously:
+    /// an Esc typed before the compaction task got its first poll still stops
+    /// it.
+    pub(crate) compaction_cancel: Option<deep_code_agent::CancellationToken>,
+    /// When the running turn started a compaction (`CompactionStarted`), while
+    /// it lasts: the activity label says what the wait is for instead of
+    /// "generating" with nothing appearing. Cleared by the turn's next event.
+    pub(crate) turn_compaction_since: Option<std::time::Instant>,
     /// Esc on an idle, empty composer arms this; a second Esc quits, any
     /// other key disarms it — the same two-press shape as Ctrl+C, so one
     /// reflexive Esc after a cancelled turn can no longer end the session.
@@ -764,6 +773,8 @@ impl App {
             instructions,
             skills,
             compacting: false,
+            compaction_cancel: None,
+            turn_compaction_since: None,
             esc_quit_pending: false,
             notify_pending: None,
             notifications_enabled: agent_config.notifications,
@@ -857,6 +868,18 @@ impl App {
         let elapsed = self.streaming_since?.elapsed();
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let frame = FRAMES[(elapsed.as_millis() / 120 % FRAMES.len() as u128) as usize];
+        // A compaction inside the turn owns the wait the same way: a minute of
+        // "generating" with nothing appearing reads as a hang, and Esc is the
+        // reflex that follows.
+        if let Some(since) = self.turn_compaction_since {
+            return Some(format!(
+                "{frame} {}",
+                self.tr_with(
+                    TextId::StreamingCompacting,
+                    &[("secs", &since.elapsed().as_secs().to_string())],
+                )
+            ));
+        }
         // A running tool owns the wait: "generating 180s" while a sub-agent or
         // a build runs for minutes reads as a hang. When several tools run in
         // a batch the newest is the one whose start the user just watched;
@@ -951,14 +974,29 @@ impl App {
         self.is_streaming || self.pending_approval.is_some() || self.compacting
     }
 
+    /// What a command refused by [`Self::runtime_busy`] says: its own message
+    /// while a turn runs, and the compaction's while `/compact` does. The
+    /// turn-shaped messages tell the user to cancel the turn with Esc, and
+    /// with no turn running that advice used to arm quit instead.
+    pub(crate) fn busy_status(&self, turn_busy: TextId) -> String {
+        let id = if self.compacting {
+            TextId::BusyCompacting
+        } else {
+            turn_busy
+        };
+        self.tr(id).to_string()
+    }
+
     /// Esc cancel stack: close completion menu > deny approval (handled by
-    /// the approval branch in `ui::handle_key`) > cancel the streaming turn
-    /// > clear input > quit.
+    /// the approval branch in `ui::handle_key`) > cancel the streaming turn or
+    /// the running `/compact` > clear input > quit.
     pub fn handle_escape(&mut self) {
         if self.completion_open() {
             self.close_completion();
         } else if self.is_streaming {
             self.cancel_streaming_turn();
+        } else if self.compacting {
+            self.cancel_compaction();
         } else if !self.input.is_empty() {
             self.clear_input();
             // Armed here too, so the message below stays true: the next Esc
@@ -990,12 +1028,15 @@ impl App {
         self.notify_pending.take()
     }
 
-    /// Graceful Ctrl+C: interrupt a stream, else clear input, else require a
-    /// second consecutive press to actually quit.
+    /// Graceful Ctrl+C: interrupt a stream or a `/compact`, else clear input,
+    /// else require a second consecutive press to actually quit.
     pub fn handle_ctrl_c(&mut self) {
         if self.is_streaming {
             self.ctrl_c_pending = false;
             self.cancel_streaming_turn();
+        } else if self.compacting {
+            self.ctrl_c_pending = false;
+            self.cancel_compaction();
         } else if !self.input.is_empty() {
             self.clear_input();
             self.ctrl_c_pending = false;

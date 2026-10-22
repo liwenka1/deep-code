@@ -3262,6 +3262,153 @@ async fn compact_passes_the_focus_to_the_model_and_shows_its_summary() {
     assert!(!app.compacting);
 }
 
+/// Turns answer "ok"; the handover summarizer never answers at all.
+struct StallingSummaryClient;
+
+#[async_trait::async_trait]
+impl deep_code_agent::LlmClient for StallingSummaryClient {
+    fn provider_name(&self) -> &'static str {
+        "stalling"
+    }
+
+    fn model(&self) -> &str {
+        "stalling"
+    }
+
+    async fn stream_chat(
+        &self,
+        request: deep_code_agent::ChatRequest,
+    ) -> deep_code_agent::AgentResult<deep_code_agent::AgentEventStream> {
+        let summarizer = request
+            .messages
+            .first()
+            .is_some_and(|message| message.content.contains("Session handover"));
+        let stream = async_stream::try_stream! {
+            if summarizer {
+                std::future::pending::<()>().await;
+            }
+            yield deep_code_agent::AgentEvent::TextDelta { text: "ok".to_string() };
+            yield deep_code_agent::AgentEvent::Done { usage: None };
+        };
+        Ok(Box::pin(stream))
+    }
+}
+
+/// Esc and Ctrl+C stop a running `/compact`, and the history stays as it was.
+/// Neither used to reach it: with no turn streaming, Esc on the empty composer
+/// armed quit — the very advice the busy message gave — and the next Esc left
+/// the app mid-compaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn esc_and_ctrl_c_cancel_a_running_compact() {
+    for key in ["Esc", "Ctrl+C"] {
+        let mut app = App::new();
+        app.runtime = Arc::new(deep_code_agent::AgentRuntime::new(
+            StallingSummaryClient,
+            deep_code_agent::ToolRegistry::new(),
+        ));
+        for index in 0..6 {
+            app.insert_str_at_cursor(&format!("prompt {index}"));
+            app.submit();
+            settle_turn(&mut app).await;
+        }
+        let cells = app.history.len();
+        assert!(app.handle_slash_command("/compact"));
+        assert!(app.compacting);
+        // Another state-changing command is refused with the compaction's own
+        // message, which names the way out.
+        assert!(app.handle_slash_command("/restore abc"));
+        assert_eq!(app.status, tr(app.lang, TextId::BusyCompacting), "{key}");
+
+        match key {
+            "Esc" => app.handle_escape(),
+            _ => app.handle_ctrl_c(),
+        }
+        assert!(
+            !app.esc_quit_pending && !app.ctrl_c_pending,
+            "{key} cancelled the compaction; it did not arm quit"
+        );
+        settle_compaction(&mut app).await;
+        assert_eq!(app.status, tr(app.lang, TextId::CompactCancelled), "{key}");
+        assert!(!app.should_quit);
+        assert_eq!(app.history.len(), cells, "{key}: nothing folded");
+        let wire = app.runtime.session_messages().await;
+        assert!(
+            wire.iter().any(|message| message.content == "prompt 0"),
+            "{key}: {wire:?}"
+        );
+    }
+}
+
+/// A compaction task that ends without answering (a panic) releases the busy
+/// state. Its channel was re-installed as if more were coming, and `compacting`
+/// stayed set: every prompt and runtime swap refused until a restart.
+#[test]
+fn a_compaction_that_never_answers_releases_the_composer() {
+    let mut app = App::new();
+    let (tx, rx) = mpsc::unbounded_channel();
+    app.ui_rx = Some(rx);
+    app.compacting = true;
+    drop(tx);
+
+    assert!(app.drain_stream_updates());
+    assert!(!app.compacting);
+    assert!(!app.runtime_busy());
+    assert!(app.ui_rx.is_none());
+    assert_eq!(
+        app.status,
+        tr_with(
+            app.lang,
+            TextId::CompactFailed,
+            &[("reason", "the compaction task stopped without an answer")]
+        )
+    );
+}
+
+/// `/compact` that folded nothing says why, in the transcript, and that the
+/// history is as it was.
+#[test]
+fn a_compact_that_could_not_fold_says_why() {
+    let mut app = App::new();
+    let before = app.history.len();
+    app.finish_compaction(deep_code_agent::CompactNowOutcome::Offline);
+    assert!(matches!(
+        app.history.last(),
+        Some(HistoryCell::System { text }) if *text == tr(app.lang, TextId::CompactOffline)
+    ));
+    app.finish_compaction(deep_code_agent::CompactNowOutcome::Failed(
+        "no reply within 180s".to_string(),
+    ));
+    assert!(matches!(
+        app.history.last(),
+        Some(HistoryCell::System { text }) if text.contains("no reply within 180s")
+    ));
+    assert_eq!(app.history.len(), before + 2);
+    app.finish_compaction(deep_code_agent::CompactNowOutcome::Cancelled);
+    assert_eq!(app.status, tr(app.lang, TextId::CompactCancelled));
+    assert_eq!(
+        app.history.len(),
+        before + 2,
+        "a cancel is the user's own act"
+    );
+}
+
+/// While a compaction inside the turn waits on the summarizer, the activity
+/// label says so; the turn's next event ends it.
+#[test]
+fn a_compaction_inside_the_turn_names_the_wait() {
+    let mut app = App::new();
+    app.is_streaming = true;
+    app.streaming_since = Some(std::time::Instant::now());
+    app.apply_runtime_event(RuntimeEvent::CompactionStarted);
+    let label = app.streaming_activity().unwrap();
+    assert!(label.contains("压缩上下文中"), "{label}");
+    app.apply_runtime_event(RuntimeEvent::Warning {
+        message: "skipped".to_string(),
+    });
+    let label = app.streaming_activity().unwrap();
+    assert!(label.contains("生成中"), "{label}");
+}
+
 /// `/context` exists because the transcript and the model's context diverge: it
 /// lists the wire messages, not the cells above them.
 #[tokio::test(flavor = "multi_thread")]

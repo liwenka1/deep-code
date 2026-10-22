@@ -104,7 +104,7 @@ pub use paths::{canonicalize, ensure_owned_dirs};
 pub use pricing::{CostCurrency, CostEstimate};
 pub use root_grant::REQUEST_WRITE_ROOT_TOOL;
 pub use runtime::{
-    AgentRuntime, CompactionReport, MAX_TURN_STEPS, PrefixStatus, RuntimeEvent,
+    AgentRuntime, CompactNowOutcome, CompactionReport, MAX_TURN_STEPS, PrefixStatus, RuntimeEvent,
     RuntimeEventReceiver, ToolCallId, TurnId, TurnTelemetry, UserTurn, is_network_tool,
     session_consent_recordable, unattended_denial_note,
 };
@@ -117,6 +117,9 @@ pub use session_store::{
     TurnRecord, format_sessions_storage_note, now_ms,
 };
 pub use shell_tools::JobStore;
+/// The token [`AgentRuntime::compact_now`] takes, re-exported so a front-end
+/// can hold and fire one without depending on `tokio-util` itself.
+pub use tokio_util::sync::CancellationToken;
 // `/skill` lists and runs the skills the launch discovered; the registry is the
 // launch's, so the menu and the prompt's index can never differ.
 pub use skills::{Skill, SkillRegistry};

@@ -156,6 +156,7 @@ pub async fn run_subagent(
             RuntimeEvent::CheckpointCreated { .. }
             | RuntimeEvent::WorkspaceRestored { .. }
             | RuntimeEvent::DiagnosticsUpdated { .. }
+            | RuntimeEvent::CompactionStarted
             | RuntimeEvent::CompactionApplied { .. }
             | RuntimeEvent::RootGranted { .. }
             | RuntimeEvent::UserMessageInjected { .. }

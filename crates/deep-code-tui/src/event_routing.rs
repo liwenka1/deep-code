@@ -7,6 +7,11 @@ use deep_code_agent::i18n::TextId;
 
 impl App {
     pub(crate) fn apply_runtime_event(&mut self, event: RuntimeEvent) {
+        // A compaction inside the turn is synchronous in the runtime's loop,
+        // so whatever the turn says next means it is over.
+        if !matches!(event, RuntimeEvent::CompactionStarted) {
+            self.turn_compaction_since = None;
+        }
         match event {
             RuntimeEvent::TurnStarted { .. } => {
                 // Never drop a predecessor that streamed content but missed
@@ -254,6 +259,9 @@ impl App {
                     });
                 }
                 self.status = self.tr_with(TextId::StatusDiagnostics, &[("summary", &summary)]);
+            }
+            RuntimeEvent::CompactionStarted => {
+                self.turn_compaction_since = Some(std::time::Instant::now());
             }
             RuntimeEvent::CompactionApplied {
                 archived_count,

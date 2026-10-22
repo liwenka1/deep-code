@@ -164,6 +164,11 @@ pub enum RuntimeEvent {
     /// Current turn was cancelled by the user. Terminal for the turn; any
     /// unfinished tool calls already have synthesized error results recorded.
     TurnCancelled { turn_id: TurnId },
+    /// A compaction inside the turn started asking the model for its handover
+    /// summary, which on a long history takes a minute or more. Lets a UI say
+    /// what the wait is for; the next event — `CompactionApplied`, a
+    /// `Warning`, or the end of the turn — closes it.
+    CompactionStarted,
     /// Transcript compaction was applied before the model request.
     CompactionApplied {
         archived_count: usize,
@@ -229,6 +234,7 @@ impl RuntimeEvent {
             Self::CheckpointCreated { .. } => "checkpoint.created",
             Self::WorkspaceRestored { .. } => "workspace.restored",
             Self::DiagnosticsUpdated { .. } => "diagnostics.updated",
+            Self::CompactionStarted => "compaction.started",
             Self::CompactionApplied { .. } => "compaction.applied",
             Self::Warning { .. } => "warning",
             Self::Error { .. } => "error",
@@ -259,6 +265,7 @@ impl RuntimeEvent {
             | Self::RootGranted { turn_id, .. }
             | Self::Error { turn_id, .. } => turn_id.as_ref(),
             Self::SessionUpdated { .. }
+            | Self::CompactionStarted
             | Self::CompactionApplied { .. }
             | Self::CheckpointCreated { .. }
             | Self::WorkspaceRestored { .. }
@@ -464,6 +471,7 @@ mod tests {
                 "diagnostics.updated",
                 None,
             ),
+            (RuntimeEvent::CompactionStarted, "compaction.started", None),
             (
                 RuntimeEvent::CompactionApplied {
                     archived_count: 2,
@@ -489,7 +497,7 @@ mod tests {
                 some_turn,
             ),
         ];
-        assert_eq!(cases.len(), 20, "a new variant must be pinned here too");
+        assert_eq!(cases.len(), 21, "a new variant must be pinned here too");
         for (event, kind, turn_id) in &cases {
             assert_eq!(event.wire_kind(), *kind, "{event:?}");
             assert_eq!(event.turn_id(), *turn_id, "{event:?}");

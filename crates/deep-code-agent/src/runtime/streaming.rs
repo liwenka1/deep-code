@@ -193,7 +193,51 @@ impl AgentRuntime {
                 .as_api_value()
                 .map(str::to_string);
 
-        Ok(GuardedStream {
+        Ok(self.guarded(request, inner, retries_left, retries_used, backoff))
+    }
+
+    /// Open a stream for a request no turn route governs — the compaction
+    /// handover — with the open-phase retry and the stream guards a turn
+    /// request gets. No Pro→Flash fallback: the request already names the model
+    /// it wants, and that model is the cheap one.
+    ///
+    /// The handover is the one request whose answer cannot be had later: a
+    /// fold either gets its summary now or does not happen. A single 503 at a
+    /// busy hour, unretried, used to cost the session its model-written
+    /// summary for good.
+    pub(super) async fn open_side_stream(
+        &self,
+        request: ChatRequest,
+    ) -> AgentResult<GuardedStream> {
+        let mut retries_left = self.config.stream_max_retries;
+        let mut retries_used = 0u32;
+        let mut backoff = INITIAL_BACKOFF;
+        let inner = loop {
+            match self.client.stream_chat(request.clone()).await {
+                Ok(stream) => break stream,
+                Err(error) if retries_left > 0 && open_error_retriable(&error) => {
+                    retries_left -= 1;
+                    retries_used += 1;
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        Ok(self.guarded(request, inner, retries_left, retries_used, backoff))
+    }
+
+    /// Wrap an opened stream in the guards, carrying the retry budget the open
+    /// phase left over into the transparent re-opens.
+    fn guarded(
+        &self,
+        request: ChatRequest,
+        inner: AgentEventStream,
+        retries_left: u32,
+        retries_used: u32,
+        backoff: Duration,
+    ) -> GuardedStream {
+        GuardedStream {
             client: Arc::clone(&self.client),
             request,
             inner,
@@ -207,7 +251,7 @@ impl AgentRuntime {
             backoff,
             any_content: false,
             finished: false,
-        })
+        }
     }
 
     async fn stream_with_fallback(

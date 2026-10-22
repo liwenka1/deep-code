@@ -161,8 +161,11 @@ pub struct AgentRuntime {
 /// sessions where compaction fires.
 ///
 /// The token estimates are here for the same reason the count alone is not
-/// enough: folding one short message preserves it verbatim (the excerpt cap is
-/// 160 chars), so `archived_entries > 0` does not imply the context shrank.
+/// enough: a summary can come out longer than the few short messages it
+/// replaced, so `archived_entries > 0` does not imply the context shrank.
+///
+/// Always the model's summary: a hand-run compaction never falls back to the
+/// mechanical fold (see [`CompactNowOutcome`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionReport {
     pub archived_entries: usize,
@@ -170,12 +173,29 @@ pub struct CompactionReport {
     /// Estimated model-visible context tokens either side of the fold.
     pub tokens_before: u32,
     pub tokens_after: u32,
-    /// The summary is the model's handover (the normal case). `false` means
-    /// the mechanical fold stood in — the model could not deliver one — and
-    /// `fallback_reason` says why, so the UI can tell the user this summary is
-    /// the lesser kind.
-    pub model_written: bool,
-    pub fallback_reason: Option<String>,
+    /// The model ran into the output cap mid-summary, so the later sections
+    /// may be missing. The summary itself says so too.
+    pub cut_short: bool,
+}
+
+/// How a hand-run compaction ([`AgentRuntime::compact_now`]) ended.
+///
+/// Only [`Self::Folded`] changed the history. Every other answer leaves it
+/// exactly as it was: the archived entries are what a later compaction would
+/// summarize, and a fold the user did not get to see succeed — a lossy
+/// one-line-per-message digest written because the summarizer failed — could
+/// not be undone once the originals were gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactNowOutcome {
+    Folded(CompactionReport),
+    /// Nothing to archive: the history is already short.
+    NothingToFold,
+    /// No model to write the summary (the offline backend).
+    Offline,
+    /// The summarizer could not deliver; the reason is for display.
+    Failed(String),
+    /// The caller's cancel token fired while the summary was being written.
+    Cancelled,
 }
 
 impl AgentRuntime {
@@ -377,6 +397,7 @@ impl AgentRuntime {
             state.current_prompt = Some(prompt);
             state.current_turn_id = Some(turn_id);
             state.cancel = CancellationToken::new();
+            state.threshold_compaction_tried = false;
             // Per-turn struggle counter and the "triggered this turn" flag
             // reset; the `cascade_escalated` latch intentionally persists for
             // the rest of the session.

@@ -179,7 +179,7 @@ impl App {
     /// and steering it into a live turn would mix two tasks.
     fn init_command(&mut self) {
         if self.runtime_busy() {
-            self.status = self.tr(TextId::StatusInitBusy).to_string();
+            self.status = self.busy_status(TextId::StatusInitBusy);
             return;
         }
         self.start_user_turn(
@@ -227,7 +227,7 @@ impl App {
             return;
         };
         if self.runtime_busy() {
-            self.status = self.tr(TextId::StatusSkillBusy).to_string();
+            self.status = self.busy_status(TextId::StatusSkillBusy);
             return;
         }
         let body = if skill.body.contains(SKILL_ARGUMENTS_PLACEHOLDER) {
@@ -316,7 +316,7 @@ impl App {
         // the fold never archives the newest user entry — so this is about
         // keeping what is on screen true, not about safety.)
         if self.runtime_busy() {
-            self.status = self.tr(TextId::BusyCompact).to_string();
+            self.status = self.busy_status(TextId::BusyCompact);
             return;
         }
         if tokio::runtime::Handle::try_current().is_err() {
@@ -327,30 +327,45 @@ impl App {
     }
 
     /// What `/compact` shows once the runtime answers: the fold's cell with
-    /// the token counts either side, after a warning when the summary is the
-    /// mechanical kind; or the honest "nothing to do" when the history was
-    /// already short — the fold deliberately refuses to archive its own
-    /// summary, so that is a normal answer, and saying it is the difference
-    /// between a command that worked and one that looks broken.
-    pub(crate) fn finish_compaction(&mut self, report: Option<deep_code_agent::CompactionReport>) {
-        match report {
-            Some(report) => {
-                if let Some(reason) = &report.fallback_reason {
-                    let text = self.tr_with(TextId::CompactionFallback, &[("reason", reason)]);
-                    self.history.push(HistoryCell::system(text));
-                }
+    /// the token counts either side; the honest "nothing to do" when the
+    /// history was already short — the fold deliberately refuses to archive
+    /// its own summary, so that is a normal answer, and saying it is the
+    /// difference between a command that worked and one that looks broken;
+    /// and, when no summary could be written, why — with the history untouched,
+    /// which is what makes running it again a safe thing to suggest.
+    pub(crate) fn finish_compaction(&mut self, outcome: deep_code_agent::CompactNowOutcome) {
+        use deep_code_agent::CompactNowOutcome;
+        match outcome {
+            CompactNowOutcome::Folded(report) => {
                 self.history.push(HistoryCell::compaction(
                     report.archived_entries,
                     Some((report.tokens_before, report.tokens_after)),
                     report.summary,
                 ));
+                if report.cut_short {
+                    let text = self.tr(TextId::CompactionCutShort).to_string();
+                    self.history.push(HistoryCell::system(text));
+                }
                 self.status = self.tr_with(
                     TextId::StatusCompacted,
                     &[("count", &report.archived_entries.to_string())],
                 );
             }
-            None => {
+            CompactNowOutcome::NothingToFold => {
                 self.status = self.tr(TextId::CompactedNothing).to_string();
+            }
+            CompactNowOutcome::Offline => {
+                let text = self.tr(TextId::CompactOffline).to_string();
+                self.history.push(HistoryCell::system(text.clone()));
+                self.status = text;
+            }
+            CompactNowOutcome::Failed(reason) => {
+                let text = self.tr_with(TextId::CompactFailed, &[("reason", &reason)]);
+                self.history.push(HistoryCell::system(text.clone()));
+                self.status = text;
+            }
+            CompactNowOutcome::Cancelled => {
+                self.status = self.tr(TextId::CompactCancelled).to_string();
             }
         }
     }
@@ -953,7 +968,7 @@ impl App {
         // it too, but stopping here keeps the transcript honest (no "restored"
         // cell above still-streaming output).
         if self.runtime_busy() {
-            self.status = self.tr(TextId::BusyRestore).to_string();
+            self.status = self.busy_status(TextId::BusyRestore);
             return;
         }
         // Route through the runtime handle (the one place that owns the

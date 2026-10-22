@@ -15,10 +15,16 @@ const RECENT_TAIL_ENTRIES: usize = 5;
 
 /// Cap on the prior summary carried forward as the new summary's prefix.
 /// Chars, not tokens: for CJK-heavy summaries this is roughly a same-sized
-/// token budget (~8k), a small slice of the ~800k-token compaction threshold.
+/// token budget (~16k), a small slice of the ~800k-token compaction threshold.
 /// See [`mechanical_summary`] for why capping the HEAD keeps
 /// the prefix byte-stable and the total bounded.
-const COMPACTION_CARRY_MAX_CHARS: usize = 8_000;
+///
+/// No smaller than the longest summary the model is allowed to write. The
+/// carried text is usually a model handover now, and the sections it closes
+/// with — what is pending, what the user asked for, the details to keep — are
+/// the ones a head-keeping cut would drop first. At 8k a fallback fold after
+/// a long handover silently lost exactly those.
+const COMPACTION_CARRY_MAX_CHARS: usize = MAX_HANDOVER_SUMMARY_CHARS;
 
 /// Effective compaction threshold: env override or 80% of model context window.
 #[must_use]
@@ -123,6 +129,13 @@ pub struct CompactionPlan {
 }
 
 impl CompactionPlan {
+    /// Index of the first entry the plan keeps after the archived range:
+    /// everything before it is either the leading system entry or archived.
+    #[must_use]
+    pub fn tail_start(&self) -> usize {
+        self.tail_start
+    }
+
     /// The entries this plan removes.
     #[must_use]
     pub fn archived<'a>(&self, entries: &'a [Arc<SessionEntry>]) -> &'a [Arc<SessionEntry>] {
@@ -283,6 +296,11 @@ const HANDOVER_TOOL_RESULT_CHARS: usize = 3_000;
 /// Cap on a summary the model writes, and on the previous summary fed back
 /// in. A handover longer than this is a transcript again.
 pub const MAX_HANDOVER_SUMMARY_CHARS: usize = 16_000;
+
+/// Appended to a handover the model did not get to finish (it ran into the
+/// output cap), so the next assistant does not read a missing "pending" or
+/// "user preferences" section as "there was nothing there".
+pub const HANDOVER_CUT_SHORT_NOTE: &str = "[交接摘要写到长度上限被截断，后面的小节可能缺失 / The handover summary was cut off at the length limit; later sections may be missing]";
 
 /// The summarizer's instructions. Model-facing, bilingual like the rest of the
 /// runtime's prompt text, never localized. The section list is the contract:
@@ -741,6 +759,34 @@ mod tests {
             "summary growth must stay bounded near the cap, got {} chars",
             second.summary.chars().count()
         );
+    }
+
+    /// The mechanical fallback carries the previous summary whole when it is a
+    /// model handover of any length the summarizer may write. Its closing
+    /// sections — pending work, the user's instructions, the details to keep —
+    /// are the ones a head-keeping cut drops first, and at the old 8k cap a
+    /// fallback after a long handover dropped exactly those.
+    #[test]
+    fn the_mechanical_fallback_keeps_a_long_handover_whole() {
+        let handover = format!(
+            "# 会话交接摘要 / Session handover\n## 已完成 / Done so far\n{}\n## 用户的要求与偏好 / User instructions and preferences\n- never touch the vendored parser",
+            "- 做完了一件事\n".repeat(1_400)
+        );
+        assert!(handover.chars().count() > 8_000);
+        assert!(handover.chars().count() <= MAX_HANDOVER_SUMMARY_CHARS);
+        let mut entries = vec![Arc::new(SessionEntry::compaction(handover.clone(), 9))];
+        for index in 0..8 {
+            entries.push(Arc::new(SessionEntry::user(format!("u{index}"))));
+            entries.push(Arc::new(SessionEntry::assistant(
+                format!("a{index}"),
+                None,
+                Vec::new(),
+            )));
+        }
+        let plan = plan_compaction(&entries).expect("something to fold");
+        let summary = mechanical_summary(&plan, &entries);
+        assert!(summary.starts_with(&handover), "carried whole");
+        assert!(summary.contains("never touch the vendored parser"));
     }
 
     #[test]
