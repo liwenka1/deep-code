@@ -577,10 +577,22 @@ async fn save_transcript(
 /// Bare-clone cache: SWE-bench reuses the same repos for many instances
 /// (django alone is ~1/3 of Lite); re-fetching per instance wastes GBs.
 fn cache_dir() -> PathBuf {
-    // Same HOME→USERPROFILE fallback the config layers use (Windows-safe).
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    cache_dir_under(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+/// [`cache_dir`] with the two variables handed in. The same rule the agent's
+/// own home lookup follows: `HOME` then `USERPROFILE`, and an empty or
+/// relative value is no home — here the temp directory stands in, rather than
+/// a cache under whatever directory the run started from.
+fn cache_dir_under(
+    home: Option<std::ffi::OsString>,
+    profile: Option<std::ffi::OsString>,
+) -> PathBuf {
+    [home, profile]
+        .into_iter()
+        .flatten()
         .map(PathBuf::from)
+        .find(|path| path.is_absolute())
         .unwrap_or_else(std::env::temp_dir)
         .join(".cache")
         .join("deep-code")
@@ -748,6 +760,17 @@ fn utc_now_iso() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// An empty or relative `HOME` is no home: the cache goes to the temp
+    /// directory, not under whatever directory the run started from.
+    #[test]
+    fn the_repo_cache_is_never_relative() {
+        let temp = std::env::temp_dir();
+        assert!(super::cache_dir_under(Some("".into()), None).starts_with(&temp));
+        assert!(super::cache_dir_under(Some("home".into()), None).starts_with(&temp));
+        assert!(super::cache_dir_under(None, None).starts_with(&temp));
+        assert!(super::cache_dir_under(Some(temp.clone().into()), None).is_absolute());
+    }
+
     use super::*;
 
     #[tokio::test]

@@ -217,13 +217,15 @@ impl AgentRuntime {
             }
         };
 
-        // A cancel that landed while the summary was finishing still means
-        // "stop": nothing is folded once it has fired, whatever came back.
-        if cancel.is_cancelled() {
-            return FoldOutcome::Cancelled;
-        }
         let (result, compacted) = {
             let mut state = self.state.lock().await;
+            // A cancel that landed while the summary was finishing — or while
+            // this waited for the lock — still means "stop": nothing is folded
+            // once it has fired, whatever came back. Checked under the lock,
+            // with no await between here and the write.
+            if cancel.is_cancelled() {
+                return FoldOutcome::Cancelled;
+            }
             let current = state.session.entries().to_vec();
             // The summary describes the snapshot's archived range. Inside this
             // runtime's own turn loop nothing rewrites the session while a fold

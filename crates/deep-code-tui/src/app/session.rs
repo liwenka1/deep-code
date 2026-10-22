@@ -141,8 +141,13 @@ impl App {
         self.web_backend = deep_code_agent::WebBackend::from_config(&agent_config).id();
         // `lang` is deliberately NOT re-resolved here: it changes only at
         // launch and via /lang, so a runtime swap can never flip the UI
-        // language out from under the user (or the tests).
+        // language out from under the user (or the tests). The new runtime
+        // is handed the same language, or its own text — errors, approval
+        // previews, compaction warnings — reverts to whatever the config said
+        // while the screen around it stays in the user's choice: a `/lang`
+        // that could not be saved, an environment override.
         self.adopt_runtime(launched);
+        self.runtime.set_ui_lang(self.lang);
     }
 
     /// Append the effective-grants line to the transcript. Called wherever the

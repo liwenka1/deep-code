@@ -227,22 +227,28 @@ struct Heading {
 /// A setext underline turns the paragraph above it into a heading only when
 /// that paragraph is not inside a list item or a quote: under one, `---` is a
 /// rule, and taking it for a heading cut the section off there. A list item's
-/// continuation lines — indented, lazy, or an indented paragraph after a
-/// blank line — stay inside the item.
+/// continuation lines — indented, lazy, or a paragraph after a blank line
+/// indented to the item's content column — stay inside the item; a quote does
+/// not reach past a blank line. An HTML comment or a link reference
+/// definition is a block of its own, not part of the paragraph below it.
 fn markdown_headings(lines: &[&str]) -> Vec<Heading> {
     let mut headings = Vec::new();
     let mut fence: Option<(u8, usize)> = None;
+    let mut in_comment = false;
     // The open paragraph: its first line, and whether it is inside a list
     // item or a quote.
     let mut paragraph: Option<(usize, bool)> = None;
-    // A list or quote is open: an indented paragraph after a blank line still
-    // belongs to it.
-    let mut in_container = false;
+    // The content column of the open list item, if a list is open.
+    let mut list_content: Option<usize> = None;
     for (index, line) in lines.iter().enumerate() {
         if let Some((marker, length)) = fence {
             if closes_fence(line, marker, length) {
                 fence = None;
             }
+            continue;
+        }
+        if in_comment {
+            in_comment = !line.contains("-->");
             continue;
         }
         if line.trim().is_empty() {
@@ -253,9 +259,27 @@ fn markdown_headings(lines: &[&str]) -> Vec<Heading> {
         let Some(rest) = block_indent(line) else {
             continue;
         };
+        let indent = line.len() - rest.len();
+        // A block starting left of the open item's content ends the list.
+        let top_level = list_content.is_none_or(|column| indent < column);
+        let ends_list = |list_content: &mut Option<usize>| {
+            if top_level {
+                *list_content = None;
+            }
+        };
         if let Some(open) = opens_fence(line) {
             fence = Some(open);
             paragraph = None;
+            ends_list(&mut list_content);
+            continue;
+        }
+        if let Some(comment) = rest.strip_prefix("<!--") {
+            in_comment = !comment.contains("-->");
+            paragraph = None;
+            ends_list(&mut list_content);
+            continue;
+        }
+        if paragraph.is_none() && is_link_definition(rest) {
             continue;
         }
         if let Some((level, title)) = atx_heading(line) {
@@ -266,7 +290,7 @@ fn markdown_headings(lines: &[&str]) -> Vec<Heading> {
                 title: title.to_string(),
             });
             paragraph = None;
-            in_container = false;
+            ends_list(&mut list_content);
             continue;
         }
         if let Some(level) = setext_underline(line) {
@@ -284,13 +308,14 @@ fn markdown_headings(lines: &[&str]) -> Vec<Heading> {
                         title,
                     });
                     paragraph = None;
-                    in_container = false;
+                    list_content = None;
                     continue;
                 }
                 // `---` with nothing it may underline is a rule; a lone `===`
                 // is text and falls through.
                 _ if level == 2 => {
                     paragraph = None;
+                    ends_list(&mut list_content);
                     continue;
                 }
                 _ => {}
@@ -298,18 +323,19 @@ fn markdown_headings(lines: &[&str]) -> Vec<Heading> {
         }
         if is_thematic_break(rest) {
             paragraph = None;
+            ends_list(&mut list_content);
             continue;
         }
-        let container = starts_container(rest);
-        let indented = rest.len() < line.len();
-        if container {
-            in_container = true;
-        } else if paragraph.is_none() && !indented {
-            in_container = false;
+        let item = list_item_content(rest);
+        let quote = rest.starts_with('>');
+        if let Some(offset) = item {
+            list_content = Some(indent + offset);
+        } else if paragraph.is_none() && top_level {
+            list_content = None;
         }
         paragraph = Some(match paragraph {
-            Some((first, contained)) => (first, contained || container),
-            None => (index, container || (in_container && indented)),
+            Some((first, contained)) => (first, contained || item.is_some() || quote),
+            None => (index, item.is_some() || quote || !top_level),
         });
     }
     headings
@@ -382,20 +408,46 @@ fn setext_underline(line: &str) -> Option<usize> {
     rest.chars().all(|ch| ch == marker).then_some(level)
 }
 
-/// A list item or a quote opens here: a bullet or an ordered marker followed
-/// by a space (or nothing), or a `>`.
-fn starts_container(rest: &str) -> bool {
-    let rest = rest.trim_end();
-    if rest.starts_with('>') {
-        return true;
+/// Where a list item's content starts, counted from its marker: the marker,
+/// then the spaces after it (one, when the item is empty or the spaces run to
+/// five or more). `None` when the line opens no list item.
+fn list_item_content(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let marker = if matches!(bytes.first(), Some(b'-' | b'*' | b'+')) {
+        1
+    } else {
+        let digits = bytes
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if !(1..=9).contains(&digits) || !matches!(bytes.get(digits), Some(b'.' | b')')) {
+            return None;
+        }
+        digits + 1
+    };
+    let after = &rest[marker..];
+    if after.trim().is_empty() {
+        return Some(marker + 1);
     }
-    let bullet = rest.starts_with(['-', '*', '+'])
-        && (rest.len() == 1 || rest[1..].starts_with([' ', '\t']));
-    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    let ordered = (1..=9).contains(&digits)
-        && rest[digits..].starts_with(['.', ')'])
-        && (rest.len() == digits + 1 || rest[digits + 1..].starts_with([' ', '\t']));
-    bullet || ordered
+    let spaces = after
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    match spaces {
+        0 => None,
+        1..=4 => Some(marker + spaces),
+        _ => Some(marker + 1),
+    }
+}
+
+/// A link reference definition's first line (`[label]: destination`): a
+/// block of its own when it does not continue a paragraph.
+fn is_link_definition(rest: &str) -> bool {
+    rest.strip_prefix('[')
+        .and_then(|after| after.split_once("]:"))
+        .is_some_and(|(label, destination)| {
+            !label.trim().is_empty() && !label.contains(']') && !destination.trim().is_empty()
+        })
 }
 
 /// A thematic break: three or more `*`, `-` or `_`, the same one, with only
@@ -840,6 +892,63 @@ mod tests {
                 "a rule after a blank line is not a heading",
                 "## Compact Instructions\n- keep X\n\n---\n- keep Y\n## Next\ny",
                 Some("- keep X\n\n---\n- keep Y"),
+            ),
+        ];
+        for (case, body, expected) in cases {
+            let dir = TempDir::new().unwrap();
+            write(&dir, "ws", body);
+            assert_eq!(
+                load(&dir, true).compact_instructions.as_deref(),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    /// What is NOT inside a list item or a quote is not taken for it: a quote
+    /// ends at a blank line, a list item reaches only as far as its content
+    /// column, and a fence or a rule at the top level ends the list. Each of
+    /// these used to let the section run past the next real heading and hand
+    /// the following section to the summarizer as standing instructions. An
+    /// HTML comment or a link definition above a setext title is not part of
+    /// its paragraph.
+    #[test]
+    fn a_heading_after_a_list_or_quote_still_ends_the_section() {
+        let cases: [(&str, &str, Option<&str>); 7] = [
+            (
+                "a quote, a blank line, an indented heading",
+                "## Compact Instructions\n> keep X\n\n  Next\n  ----\nsecret",
+                Some("> keep X"),
+            ),
+            (
+                "an ordered item, a heading indented short of its content",
+                "## Compact Instructions\n1. keep X\n\n  Next\n  ----\nsecret",
+                Some("1. keep X"),
+            ),
+            (
+                "a bullet item, a heading indented short of its content",
+                "## Compact Instructions\n- keep X\n\n Next\n ----\nsecret",
+                Some("- keep X"),
+            ),
+            (
+                "a list closed by a top-level fence",
+                "## Compact Instructions\n- keep X\n```sh\nls\n```\n  Next\n  ----\nsecret",
+                Some("- keep X\n```sh\nls\n```"),
+            ),
+            (
+                "a list closed by a top-level rule",
+                "## Compact Instructions\n- keep X\n\n* * *\n\n  Next\n  ----\nsecret",
+                Some("- keep X\n\n* * *"),
+            ),
+            (
+                "an HTML comment above a setext title",
+                "<!-- keep -->\nCompact Instructions\n---\n- keep X",
+                Some("- keep X"),
+            ),
+            (
+                "a link definition above a setext title",
+                "[ref]: https://example.com\nCompact Instructions\n---\n- keep X",
+                Some("- keep X"),
             ),
         ];
         for (case, body, expected) in cases {

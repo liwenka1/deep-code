@@ -64,10 +64,11 @@ impl AgentRuntime {
     /// TUI flips on `/lang` via the runtime handle, so a switch is picked up by
     /// the next rendered string without a relaunch or a per-call approval-mode
     /// env re-parse.
-    /// Crate-wide rather than `pub(super)`: the sub-agent runner renders the
-    /// child's own budget notice and must use the child's language, and the
-    /// child runtime is the thing that knows it.
-    pub(crate) fn ui_lang(&self) -> crate::i18n::Lang {
+    /// The language the runtime renders its user-facing text in. Public so
+    /// a front-end can check it follows its own: the sub-agent runner renders
+    /// the child's budget notice in the child's language, and a TUI relaunch
+    /// hands the new runtime the language the user switched to.
+    pub fn ui_lang(&self) -> crate::i18n::Lang {
         self.ui_lang.get()
     }
 

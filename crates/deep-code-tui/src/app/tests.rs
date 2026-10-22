@@ -1018,6 +1018,22 @@ fn lang_switches_for_the_session_without_a_home_directory() {
     assert_eq!(app.status, tr(Lang::En, TextId::LangSwitchedNotSaved));
 }
 
+/// A runtime swap hands the new runtime the language the screen is in. A
+/// relaunch built it from the config, so after a `/lang` that could not be
+/// saved the runtime's own text — errors, approval previews, compaction
+/// warnings — went back to the old language while the UI stayed in the new.
+#[test]
+fn a_new_runtime_speaks_the_language_the_screen_is_in() {
+    for lang in [Lang::En, Lang::Zh] {
+        let mut app = App::new();
+        app.global_config_path = None;
+        assert!(app.handle_slash_command(&format!("/lang {}", lang.as_setting())));
+        assert!(app.handle_slash_command("/clear"));
+        assert_eq!(app.lang, lang);
+        assert_eq!(app.runtime.ui_lang(), lang, "after /clear");
+    }
+}
+
 #[test]
 fn model_command_resolves_aliases_persists_and_keeps_session() {
     let dir = tempfile::tempdir().unwrap();
