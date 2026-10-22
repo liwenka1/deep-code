@@ -108,7 +108,7 @@ pub fn attach_agent_extensions(
     boundary: WorkspacePolicy,
     parent_cancel: CancellationToken,
     permission_mode: SharedPermissionMode,
-    child_instructions: Option<String>,
+    child_instructions: &crate::ProjectInstructions,
 ) -> Arc<AgentExtensions> {
     let exec_policy = registry.policy().clone();
     let subagent = Arc::new(

@@ -58,6 +58,10 @@ pub struct SubAgentServices {
     /// mid-session edit reaches children with the next session, like the
     /// parent.
     pub instructions: Option<String>,
+    /// The parent's `Compact Instructions` (from the same AGENTS.md files),
+    /// for a child's own compactions — what the project says a summary must
+    /// keep holds inside a dispatch as much as outside it.
+    pub compact_instructions: Option<String>,
 }
 
 impl SubAgentServices {
@@ -80,13 +84,17 @@ impl SubAgentServices {
             permission_mode,
             exec_policy,
             instructions: None,
+            compact_instructions: None,
         }
     }
 
-    /// Builder-style: the parent's AGENTS.md block, for every child's prompt.
+    /// Builder-style: what the parent read from AGENTS.md — the block, for
+    /// every child's prompt, and the `Compact Instructions`, for every child's
+    /// compactions.
     #[must_use]
-    pub(crate) fn with_instructions(mut self, instructions: Option<String>) -> Self {
-        self.instructions = instructions;
+    pub(crate) fn with_instructions(mut self, instructions: &crate::ProjectInstructions) -> Self {
+        self.instructions = instructions.block().map(str::to_string);
+        self.compact_instructions = instructions.compact_instructions.clone();
         self
     }
 
@@ -123,7 +131,7 @@ pub fn attach_subagent_tools(
             boundary,
             parent_cancel,
             SharedPermissionMode::default(),
-            None,
+            &crate::ProjectInstructions::default(),
         )
         .subagent,
     )

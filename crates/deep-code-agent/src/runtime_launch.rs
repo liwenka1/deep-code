@@ -712,7 +712,6 @@ fn build_parent_tools<C: LlmClient + 'static>(
 ) -> ParentTools {
     let roots = &parts.roots;
     let ui_lang = &parts.ui_lang;
-    let child_instructions = parts.instructions.block();
     let (mut registry, job_store, boundary) =
         build_tool_registry(roots, config, warnings, ui_lang, &parts.skills);
     // Sub-agents inherit the parent's live boundary; without one (workspace
@@ -727,7 +726,7 @@ fn build_parent_tools<C: LlmClient + 'static>(
                 policy.clone(),
                 parent_cancel.clone(),
                 permission_mode.clone(),
-                child_instructions.map(str::to_string),
+                &parts.instructions,
             );
             let shutdown: Box<dyn Fn() + Send + Sync> = Box::new({
                 let extensions = Arc::clone(&extensions);

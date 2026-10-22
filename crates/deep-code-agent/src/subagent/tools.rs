@@ -27,6 +27,30 @@ use crate::workspace_policy::invalid;
 
 const AGENT_TOOL: &str = "agent";
 
+/// A child's runtime: the parent's client and mode handle, the role's tools
+/// and prompt, and what the parent read from AGENTS.md — the block in the
+/// prompt, the `Compact Instructions` for the child's own compactions.
+pub(super) fn child_runtime(
+    services: &SubAgentServices,
+    role: SubAgentRole,
+    network: bool,
+    tools: crate::tool::ToolRegistry,
+    config: crate::config::AgentConfig,
+) -> AgentRuntime {
+    AgentRuntime::with_system_prompt_shared(
+        Arc::clone(&services.client),
+        tools,
+        child_system_prompt(role, network, services.instructions.as_deref()),
+        config,
+        true,
+    )
+    // The child shares the parent's mode handle (see
+    // `SubAgentServices::permission_mode`). This is the one line that makes
+    // "yolo" mean the same thing inside a dispatch as outside it.
+    .with_permission_mode(services.permission_mode.clone())
+    .with_compact_instructions(services.compact_instructions.clone())
+}
+
 /// Wall-clock ceiling for one child run — a backstop against a child that stops
 /// making progress (a slow model call that never returns), not a bound on
 /// legitimate work, which the step budget covers.
@@ -225,17 +249,7 @@ impl Tool for AgentTool {
                 child_config.model = model.to_string();
             }
         }
-        let runtime = AgentRuntime::with_system_prompt_shared(
-            std::sync::Arc::clone(&self.services.client),
-            child_tools,
-            child_system_prompt(role, network, self.services.instructions.as_deref()),
-            child_config,
-            true,
-        )
-        // The child shares the parent's mode handle (see
-        // `SubAgentServices::permission_mode`). This is the one line that makes
-        // "yolo" mean the same thing inside a dispatch as outside it.
-        .with_permission_mode(self.services.permission_mode.clone());
+        let runtime = child_runtime(&self.services, role, network, child_tools, child_config);
 
         {
             let mut manager = self
@@ -454,5 +468,43 @@ mod tests {
     #[test]
     fn no_partial_report_adds_nothing() {
         assert!(partial_report_suffix(None).is_empty());
+    }
+
+    /// A child gets the parent's `Compact Instructions` along with its AGENTS.md
+    /// block: what the project says a summary must keep holds inside a dispatch
+    /// as much as outside it.
+    #[test]
+    fn a_child_runtime_carries_the_parents_compact_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("AGENTS.md");
+        std::fs::write(
+            &agents,
+            "# Repo\ntests live in tests.rs\n\n## Compact Instructions\n- keep the failing test names\n",
+        )
+        .unwrap();
+        let instructions = crate::ProjectInstructions::load_from(None, &agents);
+        let services = super::SubAgentServices::new(
+            std::sync::Arc::new(crate::echo_client::EchoClient::new(
+                crate::i18n::SharedLang::default(),
+            )),
+            crate::config::AgentConfig::builtin(),
+            crate::workspace_policy::WorkspacePolicy::new(dir.path().to_path_buf()).unwrap(),
+            tokio_util::sync::CancellationToken::new(),
+            crate::execution_policy::SharedPermissionMode::default(),
+            1,
+            crate::tool::ToolRegistry::new().policy().clone(),
+        )
+        .with_instructions(&instructions);
+        let runtime = super::child_runtime(
+            &services,
+            super::SubAgentRole::Explore,
+            false,
+            crate::tool::ToolRegistry::new(),
+            crate::config::AgentConfig::builtin(),
+        );
+        assert_eq!(
+            runtime.compact_instructions_for_test().as_deref(),
+            Some("- keep the failing test names")
+        );
     }
 }

@@ -175,52 +175,180 @@ impl ProjectInstructions {
     }
 }
 
-/// The body of a `Compact Instructions` section: from the heading line
-/// (`#`–`######`, title `Compact Instructions`, `压缩说明` or `压缩指令`,
-/// case-insensitive) to the next heading of the same or a higher level, or
-/// the end of the file. `None` when there is no such heading or the section
-/// is blank. The section stays in the prompt block too — it is part of the
-/// file — this is the copy the summarizer gets on its own.
+/// The body of a `Compact Instructions` section: from its heading (any level,
+/// ATX `## Title` or setext `Title` over `===`/`---`, title `Compact
+/// Instructions`, `压缩说明` or `压缩指令`, case-insensitive, an ASCII or
+/// full-width colon allowed) to the next heading of the same or a higher
+/// level, or the end of the file. `None` when there is no such heading or the
+/// section is blank. The section stays in the prompt block too — it is part of
+/// the file — this is the copy the summarizer gets on its own.
 ///
-/// Lines inside fenced code blocks are code, not structure: a `# comment` in
-/// a shell example must not end the section early, and an example of the
-/// heading itself must not start one.
+/// Headings are read the way a Markdown renderer reads them, because the only
+/// symptom of a miss is a missing `· 含压缩说明` on the welcome card: up to
+/// three spaces of indentation, a tab after the `#`s, a closing `##` run.
+/// Lines inside fenced code blocks are code, not structure — a `# comment` in
+/// a shell example must not end the section early, an example of the heading
+/// must not start one, and a fence only closes on its own character at least
+/// as long as it opened, so a ```` block may quote a ``` one.
 fn compact_instructions_section(body: &str) -> Option<String> {
-    fn heading_level(line: &str) -> Option<(usize, &str)> {
-        let hashes = line.bytes().take_while(|byte| *byte == b'#').count();
-        ((1..=6).contains(&hashes) && line[hashes..].starts_with(' '))
-            .then(|| (hashes, line[hashes..].trim()))
-    }
     let is_title = |title: &str| {
-        let title = title.trim().trim_end_matches(':').trim();
+        let title = title.trim().trim_end_matches([':', '：']).trim();
         title.eq_ignore_ascii_case("compact instructions")
             || title == "压缩说明"
             || title == "压缩指令"
     };
     let lines: Vec<&str> = body.lines().collect();
-    let mut in_fence = false;
-    let headings: Vec<Option<(usize, &str)>> = lines
+    let roles = markdown_line_roles(&lines);
+    let start = roles
         .iter()
-        .map(|line| {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-                in_fence = !in_fence;
-                return None;
-            }
-            (!in_fence).then(|| heading_level(line)).flatten()
-        })
-        .collect();
-    let start = headings
+        .position(|role| matches!(role, LineRole::Heading { title, .. } if is_title(title)))?;
+    let LineRole::Heading { level, .. } = roles[start] else {
+        return None;
+    };
+    let body_start = if matches!(roles.get(start + 1), Some(LineRole::Underline)) {
+        start + 2
+    } else {
+        start + 1
+    };
+    let end = roles[body_start..]
         .iter()
-        .position(|heading| heading.is_some_and(|(_, title)| is_title(title)))?;
-    let level = headings[start]?.0;
-    let end = headings[start + 1..]
-        .iter()
-        .position(|heading| heading.is_some_and(|(found, _)| found <= level))
-        .map_or(lines.len(), |offset| start + 1 + offset);
-    let section = lines[start + 1..end].join("\n");
+        .position(|role| matches!(role, LineRole::Heading { level: found, .. } if *found <= level))
+        .map_or(lines.len(), |offset| body_start + offset);
+    let section = lines[body_start..end].join("\n");
     let section = section.trim();
     (!section.is_empty()).then(|| section.to_string())
+}
+
+/// What a line is to the section finder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineRole<'a> {
+    Text,
+    /// An ATX heading, or the text line of a setext one.
+    Heading {
+        level: usize,
+        title: &'a str,
+    },
+    /// The `===` / `---` line under a setext heading's text.
+    Underline,
+    /// A fence line, or a line inside a fenced code block.
+    Code,
+}
+
+fn markdown_line_roles<'a>(lines: &[&'a str]) -> Vec<LineRole<'a>> {
+    let mut roles = vec![LineRole::Text; lines.len()];
+    let mut fence: Option<(u8, usize)> = None;
+    for (index, line) in lines.iter().enumerate() {
+        if let Some((marker, length)) = fence {
+            roles[index] = LineRole::Code;
+            if closes_fence(line, marker, length) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(open) = opens_fence(line) {
+            fence = Some(open);
+            roles[index] = LineRole::Code;
+        } else if let Some((level, title)) = atx_heading(line) {
+            roles[index] = LineRole::Heading { level, title };
+        } else if let Some(level) = setext_underline(line)
+            && index > 0
+            && roles[index - 1] == LineRole::Text
+            && is_paragraph_line(lines[index - 1])
+        {
+            roles[index - 1] = LineRole::Heading {
+                level,
+                title: lines[index - 1].trim(),
+            };
+            roles[index] = LineRole::Underline;
+        }
+    }
+    roles
+}
+
+/// The line past at most three spaces of indentation; `None` for four or
+/// more (or a leading tab), which make an indented code line, not structure.
+fn block_indent(line: &str) -> Option<&str> {
+    let spaces = line.bytes().take_while(|byte| *byte == b' ').count();
+    (spaces <= 3 && !line[spaces..].starts_with('\t')).then(|| &line[spaces..])
+}
+
+/// A fence opener: three or more backticks or tildes (a backtick fence's info
+/// string may not contain a backtick). Its marker byte and length.
+fn opens_fence(line: &str) -> Option<(u8, usize)> {
+    let rest = block_indent(line)?;
+    let marker = *rest.as_bytes().first()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let length = rest.bytes().take_while(|byte| *byte == marker).count();
+    if length < 3 || (marker == b'`' && rest[length..].contains('`')) {
+        return None;
+    }
+    Some((marker, length))
+}
+
+/// The closer for a fence opened with `length` × `marker`: the same marker,
+/// at least as many, nothing after them but spaces.
+fn closes_fence(line: &str, marker: u8, length: usize) -> bool {
+    let Some(rest) = block_indent(line) else {
+        return false;
+    };
+    let run = rest.bytes().take_while(|byte| *byte == marker).count();
+    run >= length && rest[run..].trim().is_empty()
+}
+
+/// An ATX heading's level and title, the closing `#` run removed.
+fn atx_heading(line: &str) -> Option<(usize, &str)> {
+    let rest = block_indent(line)?;
+    let hashes = rest.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let after = &rest[hashes..];
+    if !after.is_empty() && !after.starts_with([' ', '\t']) {
+        return None;
+    }
+    let title = after.trim();
+    let unclosed = title.trim_end_matches('#');
+    let title = if unclosed.is_empty() {
+        ""
+    } else if unclosed.ends_with([' ', '\t']) {
+        unclosed.trim_end()
+    } else {
+        title
+    };
+    Some((hashes, title))
+}
+
+/// A setext underline's level: a run of `=` (1) or `-` (2), nothing else.
+fn setext_underline(line: &str) -> Option<usize> {
+    let rest = block_indent(line)?.trim_end();
+    let marker = rest.chars().next()?;
+    let level = match marker {
+        '=' => 1,
+        '-' => 2,
+        _ => return None,
+    };
+    rest.chars().all(|ch| ch == marker).then_some(level)
+}
+
+/// A line a setext underline can turn into a heading: paragraph text, not a
+/// list item or a quote (under those a `---` is a rule).
+fn is_paragraph_line(line: &str) -> bool {
+    let Some(rest) = block_indent(line) else {
+        return false;
+    };
+    let rest = rest.trim_end();
+    if rest.is_empty() || rest.starts_with('>') {
+        return false;
+    }
+    let bullet = rest.starts_with(['-', '*', '+'])
+        && (rest.len() == 1 || rest[1..].starts_with([' ', '\t']));
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let ordered = (1..=9).contains(&digits)
+        && rest[digits..].starts_with(['.', ')'])
+        && (rest.len() == digits + 1 || rest[digits + 1..].starts_with([' ', '\t']));
+    !bullet && !ordered
 }
 
 fn render_section(scope: InstructionScope, body: &str, cut: bool) -> String {
@@ -274,7 +402,9 @@ fn read_instructions(path: &Path, scope: InstructionScope) -> Result<Option<Stri
         .and_then(|file| file.take(MAX_READ_BYTES).read_to_end(&mut bytes))
         .map_err(|error| format!("{}: cannot read ({error}); ignored", path.display()))?;
     let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
-    let text = text.trim();
+    // An editor's byte-order mark is not text: left in, it sat in front of a
+    // first-line heading and hid it from the section finder.
+    let text = text.trim_start_matches('\u{feff}').trim();
     if text.is_empty() {
         return Ok(None);
     }
@@ -583,5 +713,83 @@ mod tests {
             MAX_COMPACT_INSTRUCTIONS_CHARS + 1,
             "capped, with the ellipsis"
         );
+    }
+
+    /// Headings are read the way a Markdown renderer reads them. Every case
+    /// here used to drop the section, or cut it, without a word — the only
+    /// symptom a missing `· 含压缩说明` on the welcome card.
+    #[test]
+    fn compact_instructions_headings_are_read_like_markdown() {
+        let cases: [(&str, &str, Option<&str>); 12] = [
+            (
+                "a byte-order mark before a first-line heading",
+                "\u{feff}## Compact Instructions\n- keep X\n## Next\ny",
+                Some("- keep X"),
+            ),
+            (
+                "a full-width colon",
+                "# R\n## 压缩说明：\n- keep X\n## Next\ny",
+                Some("- keep X"),
+            ),
+            (
+                "an indented heading",
+                "# R\n   ## Compact Instructions\n- keep X\n## Next\ny",
+                Some("- keep X"),
+            ),
+            (
+                "four spaces make code, not a heading",
+                "# R\n    ## Compact Instructions\n- keep X\n",
+                None,
+            ),
+            (
+                "a closing hash run",
+                "# R\n## Compact Instructions ##\n- keep X\n## Next\ny",
+                Some("- keep X"),
+            ),
+            (
+                "a tab after the hashes",
+                "# R\n##\tCompact Instructions\n- keep X\n## Next\ny",
+                Some("- keep X"),
+            ),
+            (
+                "a longer fence quoting a shorter one",
+                "# R\n## Compact Instructions\n- keep X\n````md\n```sh\n# not a heading\n```\n````\n- keep Y\n## Next\ny",
+                Some("- keep X\n````md\n```sh\n# not a heading\n```\n````\n- keep Y"),
+            ),
+            (
+                "a tilde line inside a backtick fence",
+                "# R\n## Compact Instructions\n- keep X\n```md\n~~~\n# not a heading\n~~~\n```\n- keep Y\n## Next\ny",
+                Some("- keep X\n```md\n~~~\n# not a heading\n~~~\n```\n- keep Y"),
+            ),
+            (
+                "a setext heading after the section ends it",
+                "# R\n## Compact Instructions\n- keep X\n\nOther\n=====\nsecret stuff",
+                Some("- keep X"),
+            ),
+            (
+                "a setext heading can be the section's own",
+                "Compact Instructions\n---\n- keep X\n\nNext\n----\ny",
+                Some("- keep X"),
+            ),
+            (
+                "a rule under a list item is not a heading",
+                "## Compact Instructions\n- keep X\n---\n- keep Y\n## Next\ny",
+                Some("- keep X\n---\n- keep Y"),
+            ),
+            (
+                "a rule after a blank line is not a heading",
+                "## Compact Instructions\n- keep X\n\n---\n- keep Y\n## Next\ny",
+                Some("- keep X\n\n---\n- keep Y"),
+            ),
+        ];
+        for (case, body, expected) in cases {
+            let dir = TempDir::new().unwrap();
+            write(&dir, "ws", body);
+            assert_eq!(
+                load(&dir, true).compact_instructions.as_deref(),
+                expected,
+                "{case}"
+            );
+        }
     }
 }
