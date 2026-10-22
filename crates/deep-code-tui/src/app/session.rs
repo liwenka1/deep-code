@@ -95,11 +95,9 @@ impl App {
     /// `AgentConfig::load` here once dropped the saved key on `/resume`.
     fn load_layered_config(&self) -> AgentConfig {
         let project = self.workspace.join(".deep-code").join("config.toml");
-        AgentConfig::load_with(
-            Some(self.global_config_path.clone()),
-            Some(project),
-            &|name| std::env::var(name).ok(),
-        )
+        AgentConfig::load_with(self.global_config_path.clone(), Some(project), &|name| {
+            std::env::var(name).ok()
+        })
         .config
     }
 

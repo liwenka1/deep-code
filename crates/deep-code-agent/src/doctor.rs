@@ -11,12 +11,24 @@ use crate::paths::home_dir;
 use crate::sandbox::{Enforcement, detect_capabilities};
 use crate::skills::{discover_in_workspace, global_skills_dir, workspace_skills_dir};
 
-/// Path of the global user config file loaded by [`AgentConfig::load`].
+/// Path of the global user config file loaded by [`AgentConfig::load`], or
+/// `None` when there is no home directory to keep it in.
+///
+/// Never a relative fallback. The process runs from the workspace, so
+/// `.deep-code/config.toml` relative to it IS the project config: `/apikey`
+/// wrote the key into a file a repository may commit, and a relaunch read the
+/// project file back as the global layer, the one trusted with
+/// `approval.auto_allow`.
 #[must_use]
-pub fn default_config_path() -> PathBuf {
-    home_dir()
+pub fn default_config_path() -> Option<PathBuf> {
+    config_path_under(home_dir())
+}
+
+/// [`default_config_path`] with the home directory handed in; a relative one
+/// (an empty `HOME`, say) counts as none, for the reason given there.
+fn config_path_under(home: Option<PathBuf>) -> Option<PathBuf> {
+    home.filter(|home| home.is_absolute())
         .map(|home| home.join(".deep-code").join("config.toml"))
-        .unwrap_or_else(|| PathBuf::from(".deep-code/config.toml"))
 }
 
 /// How the layered configuration was assembled, for `deep-code doctor`.
@@ -221,7 +233,7 @@ impl DoctorReport {
     #[must_use]
     pub fn collect(workspace: &Path, config: &AgentConfig) -> Self {
         let config_path = default_config_path();
-        let config_present = config_path.is_file();
+        let config_present = config_path.as_deref().is_some_and(Path::is_file);
         let sandbox = detect_capabilities();
         let skills = collect_skills(workspace);
         let deepseek = collect_deepseek(config);
@@ -261,7 +273,10 @@ impl DoctorReport {
 
         Self {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            config_path: config_path.display().to_string(),
+            // Empty without a home directory: there is no global config then.
+            config_path: config_path
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
             config_present,
             workspace: workspace.display().to_string(),
             api_key: api_key_report(config),
@@ -401,6 +416,21 @@ fn collect_skills(workspace: &Path) -> SkillsDoctorReport {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// No home directory, or a relative one, means no global config path — not
+    /// `.deep-code/config.toml` under the working directory, which is the
+    /// workspace's own project config.
+    #[test]
+    fn the_global_config_path_is_never_relative() {
+        assert_eq!(config_path_under(None), None);
+        assert_eq!(config_path_under(Some(PathBuf::new())), None);
+        assert_eq!(config_path_under(Some(PathBuf::from("home"))), None);
+        let home = std::env::temp_dir();
+        assert_eq!(
+            config_path_under(Some(home.clone())),
+            Some(home.join(".deep-code").join("config.toml"))
+        );
+    }
 
     #[test]
     fn doctor_report_serializes_to_json() {

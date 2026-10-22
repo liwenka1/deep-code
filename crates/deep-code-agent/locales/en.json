@@ -124,6 +124,7 @@
   "FindNotFound": "\"{query}\" not found",
   "UsageFind": "Usage: /find <keyword>",
   "BusyRelaunchConfig": "Streaming or awaiting approval; retry the config change later",
+  "GlobalConfigUnavailable": "There is no home directory to keep the global config in; set HOME (USERPROFILE on Windows) and try again",
   "SessionReloadFailedRestart": "Could not reload the current session; restarted with a new one",
   "BusySwitchSession": "Streaming or awaiting approval; cannot switch sessions",
   "BusyRestore": "Streaming or awaiting approval; cancel the turn (Esc) before restoring",

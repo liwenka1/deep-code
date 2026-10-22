@@ -124,6 +124,7 @@
   "FindNotFound": "未找到 “{query}”",
   "UsageFind": "用法: /find <关键词>",
   "BusyRelaunchConfig": "正在流式输出或等待审批，请稍后再切换配置",
+  "GlobalConfigUnavailable": "没有主目录，无法保存全局配置；设置 HOME（Windows 上是 USERPROFILE）后再试",
   "SessionReloadFailedRestart": "无法读取当前会话记录，已重启为新会话",
   "BusySwitchSession": "正在流式输出或等待审批，无法切换会话",
   "BusyRestore": "正在流式输出或等待审批，请先取消本轮（Esc）再回退",

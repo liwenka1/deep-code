@@ -65,11 +65,15 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
     println!("deep-code doctor");
     println!("  version: {}", report.version);
     println!("  workspace: {}", clean(&report.workspace));
-    println!(
-        "  config: {} (present={})",
-        clean(&report.config_path),
-        report.config_present
-    );
+    if report.config_path.is_empty() {
+        println!("  config: none (no home directory)");
+    } else {
+        println!(
+            "  config: {} (present={})",
+            clean(&report.config_path),
+            report.config_present
+        );
+    }
     // Everything below that can carry repo-controlled text goes through the
     // sanitizer: layer paths and the raw `toml::de::Error` (which echoes the
     // offending source line), the layer warnings (which interpolate

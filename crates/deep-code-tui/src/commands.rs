@@ -500,11 +500,11 @@ impl App {
             return;
         };
         let update = deep_code_agent::GlobalConfigUpdate::Language(lang.as_setting().to_string());
-        match deep_code_agent::write_global_config_update(
-            &self.global_config_path,
-            &update,
-            self.lang,
-        ) {
+        let Some(config_path) = self.global_config_path.clone() else {
+            self.status = self.tr(TextId::GlobalConfigUnavailable).to_string();
+            return;
+        };
+        match deep_code_agent::write_global_config_update(&config_path, &update, self.lang) {
             Ok(_) => {
                 // Switch the TUI immediately and push the new language into the
                 // running runtime (its cached UI language for error diagnostics
@@ -541,11 +541,11 @@ impl App {
             return;
         }
         let update = deep_code_agent::GlobalConfigUpdate::ApiKey(Some(arg.trim().to_string()));
-        match deep_code_agent::write_global_config_update(
-            &self.global_config_path,
-            &update,
-            self.lang,
-        ) {
+        let Some(config_path) = self.global_config_path.clone() else {
+            self.status = self.tr(TextId::GlobalConfigUnavailable).to_string();
+            return;
+        };
+        match deep_code_agent::write_global_config_update(&config_path, &update, self.lang) {
             Ok(path) => match self.relaunch_runtime() {
                 Ok(()) => {
                     self.history.push(HistoryCell::system(self.tr_with(
@@ -616,11 +616,11 @@ impl App {
             return;
         }
         let update = deep_code_agent::GlobalConfigUpdate::Model(resolved.clone());
-        match deep_code_agent::write_global_config_update(
-            &self.global_config_path,
-            &update,
-            self.lang,
-        ) {
+        let Some(config_path) = self.global_config_path.clone() else {
+            self.status = self.tr(TextId::GlobalConfigUnavailable).to_string();
+            return;
+        };
+        match deep_code_agent::write_global_config_update(&config_path, &update, self.lang) {
             Ok(_) => match self.relaunch_runtime() {
                 Ok(()) => {
                     self.history.push(HistoryCell::system(self.tr_with(
@@ -642,11 +642,11 @@ impl App {
             return;
         }
         let update = deep_code_agent::GlobalConfigUpdate::ApiKey(None);
-        match deep_code_agent::write_global_config_update(
-            &self.global_config_path,
-            &update,
-            self.lang,
-        ) {
+        let Some(config_path) = self.global_config_path.clone() else {
+            self.status = self.tr(TextId::GlobalConfigUnavailable).to_string();
+            return;
+        };
+        match deep_code_agent::write_global_config_update(&config_path, &update, self.lang) {
             Ok(_) => match self.relaunch_runtime() {
                 Ok(()) => {
                     self.history

@@ -304,6 +304,7 @@ text_ids! {
     UsageFind,
     // 会话管理
     BusyRelaunchConfig,
+    GlobalConfigUnavailable,
     SessionReloadFailedRestart,
     BusySwitchSession,
     BusyRestore,

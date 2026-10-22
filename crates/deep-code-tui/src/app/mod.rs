@@ -229,8 +229,10 @@ pub struct App {
     /// Resolved once at launch; every runtime swap and store access must
     /// reuse it instead of re-deriving from the process working directory.
     pub(crate) workspace: PathBuf,
-    /// Target of `/apikey` `/model` `/logout` writes; overridable in tests.
-    pub(crate) global_config_path: PathBuf,
+    /// Target of `/apikey` `/model` `/logout` `/lang` writes, and the global
+    /// layer a relaunch reads; overridable in tests. `None` without a home
+    /// directory: those commands then refuse rather than write somewhere else.
+    pub(crate) global_config_path: Option<PathBuf>,
     /// When the current stream segment began, for the live activity
     /// indicator. Only read while `is_streaming`.
     pub(crate) streaming_since: Option<std::time::Instant>,
@@ -950,6 +952,14 @@ impl App {
         app.prompt_history_path = None;
         app.prompt_history.clear();
         app
+    }
+
+    /// The global config path a test pointed the app at.
+    #[cfg(test)]
+    pub(crate) fn global_config(&self) -> &std::path::Path {
+        self.global_config_path
+            .as_deref()
+            .expect("the test set a global config path")
     }
 
     /// Drop the oldest transcript cells beyond [`MAX_HISTORY_CELLS`]. Called

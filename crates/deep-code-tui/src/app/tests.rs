@@ -895,12 +895,12 @@ fn clearing_the_composer_ends_the_walk_through_the_history() {
 fn apikey_command_validates_writes_and_stays_out_of_history() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new();
-    app.global_config_path = dir.path().join("config.toml");
+    app.global_config_path = Some(dir.path().join("config.toml"));
 
     // Invalid key: rejected, nothing written, nothing remembered.
     app.input = "/apikey short".to_string();
     app.submit();
-    assert!(!app.global_config_path.exists());
+    assert!(!app.global_config().exists());
     assert!(app.prompt_history.is_empty());
     assert!(app.status.contains("API key") || app.status.contains("长度"));
 
@@ -908,7 +908,7 @@ fn apikey_command_validates_writes_and_stays_out_of_history() {
     // key is recallable nowhere (history, prompts, status).
     app.input = "/apikey sk-0123456789abcdef".to_string();
     app.submit();
-    let contents = std::fs::read_to_string(&app.global_config_path).unwrap();
+    let contents = std::fs::read_to_string(app.global_config()).unwrap();
     assert!(contents.contains("sk-0123456789abcdef"));
     assert!(
         app.prompt_history.is_empty(),
@@ -952,7 +952,7 @@ fn a_pasted_apikey_line_never_reaches_the_history_or_the_model() {
     ] {
         for streaming in [true, false] {
             let mut app = App::new();
-            app.global_config_path = dir.path().join("config.toml");
+            app.global_config_path = Some(dir.path().join("config.toml"));
             app.is_streaming = streaming;
             app.paste_str(paste.to_string());
             assert_eq!(app.pasted_blocks.len(), 1, "sanity: collapsed into a chip");
@@ -974,19 +974,41 @@ fn a_pasted_apikey_line_never_reaches_the_history_or_the_model() {
             );
             if streaming {
                 assert!(
-                    !app.global_config_path.exists(),
+                    !app.global_config().exists(),
                     "{case}: written while a turn runs"
                 );
                 assert_eq!(app.status, tr(app.lang, TextId::BusyRelaunchConfig));
             } else {
-                let config = std::fs::read_to_string(&app.global_config_path).unwrap();
+                let config = std::fs::read_to_string(app.global_config()).unwrap();
                 assert!(
                     config.contains("sk-0123456789abcdef"),
                     "{case}: the key was not set"
                 );
-                std::fs::remove_file(&app.global_config_path).unwrap();
+                std::fs::remove_file(app.global_config()).unwrap();
             }
         }
+    }
+}
+
+/// Without a home directory the config-writing commands refuse and say why.
+/// They used to write `.deep-code/config.toml` relative to the working
+/// directory — the workspace's own project config, an API key included.
+#[test]
+fn config_commands_refuse_without_a_home_directory() {
+    for command in [
+        "/model flash",
+        "/apikey sk-0123456789abcdef",
+        "/logout",
+        "/lang en",
+    ] {
+        let mut app = App::new();
+        app.global_config_path = None;
+        assert!(app.handle_slash_command(command), "{command}");
+        assert_eq!(
+            app.status,
+            tr(app.lang, TextId::GlobalConfigUnavailable),
+            "{command}"
+        );
     }
 }
 
@@ -994,7 +1016,7 @@ fn a_pasted_apikey_line_never_reaches_the_history_or_the_model() {
 fn model_command_resolves_aliases_persists_and_keeps_session() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new();
-    app.global_config_path = dir.path().join("config.toml");
+    app.global_config_path = Some(dir.path().join("config.toml"));
     let original_session = app.session_id.clone();
     assert!(
         original_session.is_some(),
@@ -1003,7 +1025,7 @@ fn model_command_resolves_aliases_persists_and_keeps_session() {
 
     assert!(app.handle_slash_command("/model flash"));
     assert_eq!(app.configured_model, deep_code_agent::DEEPSEEK_FLASH);
-    let contents = std::fs::read_to_string(&app.global_config_path).unwrap();
+    let contents = std::fs::read_to_string(app.global_config()).unwrap();
     // The CANONICAL id is what gets persisted, not the alias that was typed —
     // so the assertion is written against the constant rather than a literal,
     // and a future rename has to come here and mean it.
@@ -1091,18 +1113,18 @@ fn any_other_key_disarms_pending_yolo() {
 fn lang_command_switches_live_and_persists() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new();
-    app.global_config_path = dir.path().join("config.toml");
+    app.global_config_path = Some(dir.path().join("config.toml"));
     assert_eq!(app.lang, Lang::Zh);
 
     // Bare /lang reports the current language without touching config.
     assert!(app.handle_slash_command("/lang"));
     assert!(app.status.contains("中文"), "{}", app.status);
-    assert!(!app.global_config_path.exists());
+    assert!(!app.global_config().exists());
 
     // /lang en switches immediately, persists, and confirms in English.
     assert!(app.handle_slash_command("/lang en"));
     assert_eq!(app.lang, Lang::En);
-    let contents = std::fs::read_to_string(&app.global_config_path).unwrap();
+    let contents = std::fs::read_to_string(app.global_config()).unwrap();
     assert!(contents.contains("language = \"en\""));
     assert!(app.status.contains("English"), "{}", app.status);
 
@@ -1120,7 +1142,7 @@ fn lang_command_switches_live_and_persists() {
     assert!(app.handle_slash_command("/lang zh"));
     assert_eq!(app.lang, Lang::Zh);
     assert!(
-        std::fs::read_to_string(&app.global_config_path)
+        std::fs::read_to_string(app.global_config())
             .unwrap()
             .contains("language = \"zh\"")
     );
@@ -1130,18 +1152,18 @@ fn lang_command_switches_live_and_persists() {
 fn logout_removes_key_from_global_config() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new();
-    app.global_config_path = dir.path().join("config.toml");
+    app.global_config_path = Some(dir.path().join("config.toml"));
 
     assert!(app.handle_slash_command("/apikey sk-0123456789abcdef"));
     assert!(
-        std::fs::read_to_string(&app.global_config_path)
+        std::fs::read_to_string(app.global_config())
             .unwrap()
             .contains("api_key")
     );
 
     assert!(app.handle_slash_command("/logout"));
     assert!(
-        !std::fs::read_to_string(&app.global_config_path)
+        !std::fs::read_to_string(app.global_config())
             .unwrap()
             .contains("api_key")
     );
@@ -3500,14 +3522,14 @@ fn config_commands_write_nothing_while_the_runtime_is_busy() {
         for busy in ["streaming", "compacting"] {
             let dir = tempfile::tempdir().unwrap();
             let mut app = App::new();
-            app.global_config_path = dir.path().join("config.toml");
+            app.global_config_path = Some(dir.path().join("config.toml"));
             match busy {
                 "streaming" => app.is_streaming = true,
                 _ => app.compaction = Some(RunningCompaction::new()),
             }
             assert!(app.handle_slash_command(command), "{command}");
             assert!(
-                !app.global_config_path.exists(),
+                !app.global_config().exists(),
                 "{command} while {busy} wrote the config"
             );
             let expected = if busy == "compacting" {
