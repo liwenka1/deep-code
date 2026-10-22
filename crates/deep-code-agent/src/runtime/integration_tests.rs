@@ -5591,7 +5591,8 @@ async fn compaction_asks_the_model_for_a_handover_summary() {
         client,
         ToolRegistry::default(),
         crate::config::AgentConfig::builtin(),
-    );
+    )
+    .with_compact_instructions(Some("- always keep the failing test names".to_string()));
     for index in 0..6 {
         let mut rx = runtime.submit_user(format!("prompt {index}")).await;
         drain(&mut rx).await;
@@ -5626,6 +5627,16 @@ async fn compaction_asks_the_model_for_a_handover_summary() {
     );
     let brief = request["messages"][1]["content"].as_str().unwrap();
     assert!(brief.contains("只关心 prompt 0"), "{brief}");
+    assert!(
+        brief.contains("Compaction instructions from AGENTS.md")
+            && brief.contains("- always keep the failing test names"),
+        "the project's standing instructions ride every handover: {brief}"
+    );
+    assert!(
+        brief.find("always keep the failing test names").unwrap()
+            < brief.find("只关心 prompt 0").unwrap(),
+        "standing instructions come before the one-off focus: {brief}"
+    );
     assert!(
         brief.contains("prompt 0") && brief.contains("prompt 3"),
         "{brief}"

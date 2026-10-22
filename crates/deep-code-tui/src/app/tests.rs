@@ -4594,3 +4594,42 @@ fn a_todo_write_result_gets_a_task_list_cell() {
         "no list, no cell"
     );
 }
+
+/// A click on a compaction title folds and unfolds the summary, like a diff
+/// header — the row is a control, so nothing is copied.
+#[test]
+fn a_click_on_a_compaction_title_folds_and_unfolds_the_summary() {
+    let mut app = App::new();
+    app.history.push(HistoryCell::compaction(
+        3,
+        None,
+        (0..20).map(|i| format!("line {i}\n")).collect(),
+    ));
+    let index = app.history.len() - 1;
+    assert!(matches!(
+        &app.history[index],
+        HistoryCell::Compaction {
+            expanded: false,
+            ..
+        }
+    ));
+    app.set_transcript_snapshot(TranscriptSnapshot {
+        fold_headers: vec![(0, FoldTarget::HistoryCompaction(index))],
+        ..snapshot(&["▸ 已折叠最早的 3 条记录"])
+    });
+    app.mouse_press(1, 0);
+    assert!(app.mouse_release(1, 0).is_none());
+    assert!(matches!(
+        &app.history[index],
+        HistoryCell::Compaction { expanded: true, .. }
+    ));
+    app.mouse_press(1, 0);
+    app.mouse_release(1, 0);
+    assert!(matches!(
+        &app.history[index],
+        HistoryCell::Compaction {
+            expanded: false,
+            ..
+        }
+    ));
+}

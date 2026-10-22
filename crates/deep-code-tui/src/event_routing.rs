@@ -262,14 +262,14 @@ impl App {
                 // `Warning` the runtime emits just before this event.
                 model_written: _,
             } => {
-                self.history.push(HistoryCell::Compaction {
-                    archived_entries: archived_count,
-                    // The automatic path fires on a threshold, so "did it buy
-                    // anything" is not in question — and `CompactionApplied`
-                    // carries no token counts to answer it with anyway.
-                    context_tokens: None,
-                    summary: summary.clone(),
-                });
+                // The automatic path fires on a threshold, so "did it buy
+                // anything" is not in question — and `CompactionApplied`
+                // carries no token counts to answer it with anyway.
+                self.history.push(HistoryCell::compaction(
+                    archived_count,
+                    None,
+                    summary.clone(),
+                ));
                 self.status = self.tr_with(
                     TextId::StatusCompacted,
                     &[("count", &archived_count.to_string())],

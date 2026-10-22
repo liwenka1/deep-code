@@ -448,6 +448,7 @@ pub(crate) enum FoldTarget {
     HistoryReasoning(usize),
     HistoryToolBatch(usize),
     HistoryDiff(usize),
+    HistoryCompaction(usize),
     LiveReasoning,
 }
 

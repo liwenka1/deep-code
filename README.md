@@ -176,6 +176,7 @@ Put what the model should know about a repository — build and test commands, c
 - **Read once per conversation**: at startup, on `/clear`, and on resume. An edit takes effect in the next conversation, never mid-way — the prompt is a persisted record entry and the head of the provider's cached prefix.
 - **Capped at 24,000 characters** across both files; past that the rest is dropped, with a note in the prompt and a launch warning. Aim for under 200 lines — adherence drops as the file grows.
 - `/init` asks the model to draft one (or improve the one you have) after investigating the repository; the write goes through the normal approval gate. The welcome card shows which files were loaded and how many lines; `/context` shows the prompt itself.
+- A `## Compact Instructions` section (`## 压缩说明` works too) is also handed to the compaction summarizer on every `/compact`: what this project must never lose when history is folded — the unpushed commit list, the failing test names, decisions the user vetoed. It is the standing counterpart of a one-off `/compact <focus>`.
 - **Instructions are context, not permission.** Nothing in `AGENTS.md` reaches the execution policy, the approval gate or the sandbox — a repository can tell the model how to work here, and cannot widen what it may do. A workspace `AGENTS.md` that is a symbolic link is refused (a checkout could point it at a private key, and the target would go to the provider on the first request). Only the primary workspace is read, not `--add-dir` roots.
 
 ## Extending (skills + shell)

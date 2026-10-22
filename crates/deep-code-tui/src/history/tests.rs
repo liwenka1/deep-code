@@ -118,6 +118,7 @@ fn hydrate_history_keeps_assistant_tool_calls_and_results() {
             archived_entries: 2,
             context_tokens: None,
             summary,
+            ..
         } if summary == "older conversation summary"
     )));
     assert!(cells.iter().any(|cell| matches!(
@@ -134,6 +135,7 @@ fn a_compaction_cell_says_what_was_folded_and_what_the_model_now_sees() {
         archived_entries: 3,
         context_tokens: Some((120_000, 45_000)),
         summary: "- 用户 / user: 做点事".to_string(),
+        expanded: true,
     };
     let lines = measured.lines(Lang::Zh);
 
@@ -157,6 +159,7 @@ fn a_compaction_cell_says_what_was_folded_and_what_the_model_now_sees() {
         archived_entries: 2,
         context_tokens: None,
         summary: "…".to_string(),
+        expanded: true,
     };
     let lines = replayed.lines(Lang::En);
     assert!(lines[0].contains("2 record"), "{}", lines[0]);
@@ -833,5 +836,12 @@ fn instructions_summary_lists_sources_and_truncation() {
     assert_eq!(
         super::instructions_summary(Lang::En, &instructions).as_deref(),
         Some("~/.deep-code/AGENTS.md (10 lines) + AGENTS.md (42 lines) · truncated to 24000 chars")
+    );
+    instructions.compact_instructions = Some("- keep the vetoes".to_string());
+    assert_eq!(
+        super::instructions_summary(Lang::Zh, &instructions).as_deref(),
+        Some(
+            "~/.deep-code/AGENTS.md（10 行） + AGENTS.md（42 行） · 已截断至 24000 字符 · 含压缩说明"
+        )
     );
 }

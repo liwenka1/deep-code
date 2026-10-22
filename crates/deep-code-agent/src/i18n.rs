@@ -155,6 +155,7 @@ text_ids! {
     InstructionsSourceWorkspace,
     InstructionsSourceGlobal,
     InstructionsTruncatedSuffix,
+    InstructionsCompactSuffix,
     StatusInitBusy,
     StatusSkillBusy,
     StatusSkillUnknown,

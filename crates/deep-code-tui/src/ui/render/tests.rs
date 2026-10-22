@@ -3052,3 +3052,94 @@ fn todo_cell_draws_the_tally_and_marks_each_state() {
     );
     assert_eq!(style_of("run the tests").add_modifier, Modifier::empty());
 }
+
+/// A compaction cell's title row is always drawn and carries the fold marker;
+/// the summary follows only when the cell is open. A long handover opens
+/// folded, a short one open.
+#[test]
+fn compaction_cell_folds_to_its_title() {
+    let long: String = (0..30).map(|i| format!("- fact {i}\n")).collect();
+    let cell = HistoryCell::compaction(7, Some((90_000, 12_000)), long.clone());
+    assert!(
+        matches!(
+            cell,
+            HistoryCell::Compaction {
+                expanded: false,
+                ..
+            }
+        ),
+        "long summaries open folded"
+    );
+    let folded = cell_lines(&cell, 80, Lang::Zh);
+    let text: String = folded
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+        .collect();
+    assert!(text.starts_with("▸ 已折叠最早的 7 条记录"), "{text}");
+    assert!(!text.contains("fact 3"), "folded: no summary lines: {text}");
+    assert_eq!(folded.len(), 2, "title + spacer: {folded:?}");
+
+    let open = HistoryCell::Compaction {
+        archived_entries: 7,
+        context_tokens: None,
+        summary: long,
+        expanded: true,
+    };
+    let lines = cell_lines(&open, 80, Lang::Zh);
+    let text: String = lines
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+        .collect();
+    assert!(text.starts_with("▾ 已折叠最早的 7 条记录"), "{text}");
+    assert!(
+        text.contains("模型当前看到的历史") && text.contains("fact 29"),
+        "{text}"
+    );
+
+    let short = HistoryCell::compaction(2, None, "one line".to_string());
+    assert!(matches!(
+        short,
+        HistoryCell::Compaction { expanded: true, .. }
+    ));
+}
+
+/// A long handover opens folded to its title row — a page of dim summary
+/// must not push the conversation off the screen — and the row is a fold
+/// header: a click on it opens the summary.
+#[test]
+fn a_long_compaction_opens_folded_and_a_click_on_its_title_opens_it() {
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.history.push(HistoryCell::compaction(
+        9,
+        Some((80_000, 9_000)),
+        (0..14).map(|i| format!("- handover fact {i}\n")).collect(),
+    ));
+    let index = app.history.len() - 1;
+
+    let folded = frame(&mut app, 72, 50);
+    assert!(
+        folded.contains("▸ Folded the oldest 9 record(s)"),
+        "{folded}"
+    );
+    assert!(!folded.contains("handover fact"), "{folded}");
+
+    let snapshot = app.transcript.clone().expect("snapshot");
+    let (line, _) = snapshot
+        .fold_headers
+        .iter()
+        .find(|(_, target)| *target == FoldTarget::HistoryCompaction(index))
+        .copied()
+        .expect("the title row is clickable");
+    let row = snapshot.y + (line - snapshot.scroll_top) as u16;
+    app.mouse_press(snapshot.x + 1, row);
+    app.mouse_release(snapshot.x + 1, row);
+
+    let opened = frame(&mut app, 72, 50);
+    assert!(
+        opened.contains("▾ Folded the oldest 9 record(s)")
+            && opened.contains("What the model now sees")
+            && opened.contains("handover fact 13"),
+        "opening must bring the summary back:\n{opened}"
+    );
+}

@@ -97,6 +97,7 @@ impl AgentRuntime {
             checkpoints: None,
             workspace: Some(workspace.clone()),
             boundary: None,
+            compact_instructions: None,
             lsp: None,
             persistence: Some(build_persistence(store, record)),
             permission_mode: crate::execution_policy::SharedPermissionMode::default(),

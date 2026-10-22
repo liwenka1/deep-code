@@ -55,6 +55,9 @@ pub(super) fn render_messages(
             HistoryCell::Diff { .. } => {
                 fold_headers.push((lines.len(), FoldTarget::HistoryDiff(index)));
             }
+            HistoryCell::Compaction { .. } => {
+                fold_headers.push((lines.len(), FoldTarget::HistoryCompaction(index)));
+            }
             _ => {}
         }
         lines.extend(app.cell_lines[&index].lines().iter().cloned());
@@ -665,7 +668,22 @@ pub(super) fn cell_lines_unsanitized(
             lines.push(Line::default());
             lines
         }
-        // Diagnostics / Checkpoint / Compaction / System: dim secondary lines.
+        // A compaction: the title row always (it is the fold header), the
+        // "what the model sees" line and the summary when open.
+        HistoryCell::Compaction { expanded, .. } => {
+            let mut text = cell.lines(lang).into_iter();
+            let title = text.next().unwrap_or_default();
+            let marker = if *expanded { "▾ " } else { "▸ " };
+            let mut lines = wrap_prefixed(marker, &title, width, dim, dim);
+            if *expanded {
+                for logical in text {
+                    lines.extend(wrap_styled(&logical, width, dim));
+                }
+            }
+            lines.push(Line::default());
+            lines
+        }
+        // Diagnostics / Checkpoint / System: dim secondary lines.
         _ => {
             let mut lines = Vec::new();
             for logical in cell.lines(lang) {

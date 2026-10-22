@@ -7,6 +7,7 @@
   "InstructionsSourceWorkspace": "AGENTS.md ({lines} lines)",
   "InstructionsSourceGlobal": "~/.deep-code/AGENTS.md ({lines} lines)",
   "InstructionsTruncatedSuffix": " · truncated to {max} chars",
+  "InstructionsCompactSuffix": " · with compact instructions",
   "StatusInitBusy": "/init: wait for the current turn to finish first",
   "StatusSkillBusy": "/skill: wait for the current turn to finish first",
   "StatusSkillUnknown": "No skill named '{name}' — /skill lists the available ones",

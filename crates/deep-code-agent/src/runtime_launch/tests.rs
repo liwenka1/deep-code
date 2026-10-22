@@ -804,3 +804,26 @@ fn todo_write_is_mounted_for_the_parent() {
     );
     assert!(names.iter().any(|name| name == "todo_write"), "{names:?}");
 }
+
+/// A workspace AGENTS.md with a `Compact Instructions` section reaches the
+/// launched runtime's handover summarizer; the loader reports it too.
+#[test]
+fn compact_instructions_are_wired_from_agents_md_into_the_launch() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        workspace
+            .path()
+            .join(crate::instructions::INSTRUCTIONS_FILE),
+        "# Rules\nbe terse\n\n## Compact Instructions\n- keep the unpushed commit list\n",
+    )
+    .unwrap();
+    let launched = launch_runtime(&AgentConfig::builtin(), workspace.path(), None);
+    assert_eq!(
+        launched.instructions.compact_instructions.as_deref(),
+        Some("- keep the unpushed commit list")
+    );
+    assert_eq!(
+        launched.handle.compact_instructions_for_test(),
+        Some("- keep the unpushed commit list".to_string())
+    );
+}

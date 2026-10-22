@@ -145,6 +145,9 @@ impl App {
             FoldTarget::HistoryDiff(index) => {
                 index.checked_sub(dropped).map(FoldTarget::HistoryDiff)
             }
+            FoldTarget::HistoryCompaction(index) => index
+                .checked_sub(dropped)
+                .map(FoldTarget::HistoryCompaction),
             live @ FoldTarget::LiveReasoning => Some(live),
         }
     }
@@ -177,6 +180,12 @@ impl App {
             }
             FoldTarget::HistoryDiff(index) => {
                 if let Some(HistoryCell::Diff { expanded, .. }) = self.history.get_mut(index) {
+                    *expanded = !*expanded;
+                }
+            }
+            FoldTarget::HistoryCompaction(index) => {
+                if let Some(HistoryCell::Compaction { expanded, .. }) = self.history.get_mut(index)
+                {
                     *expanded = !*expanded;
                 }
             }

@@ -136,6 +136,10 @@ pub struct AgentRuntime {
     /// (checkpoints, LSP, session store) stays on the primary `workspace`
     /// above. `None` for bare test runtimes without fs tools.
     boundary: Option<crate::workspace_policy::WorkspacePolicy>,
+    /// The project's `Compact Instructions` (from AGENTS.md), handed to the
+    /// handover summarizer with every compaction. Read at launch with the
+    /// rest of the instructions; `None` when no file has the section.
+    compact_instructions: Option<String>,
     lsp: Option<Arc<LspManager>>,
     persistence: Option<Arc<Persistence>>,
     /// Session permission mode, shared (lock-free) with the TUI so it can show
@@ -194,6 +198,7 @@ impl AgentRuntime {
             checkpoints: None,
             workspace: None,
             boundary: None,
+            compact_instructions: None,
             lsp: None,
             persistence: None,
             permission_mode: SharedPermissionMode::default(),
@@ -239,6 +244,7 @@ impl AgentRuntime {
             checkpoints: None,
             workspace: None,
             boundary: None,
+            compact_instructions: None,
             lsp: None,
             persistence: None,
             permission_mode: SharedPermissionMode::default(),
@@ -266,6 +272,15 @@ impl AgentRuntime {
         self
     }
 
+    /// Attach the project's compaction instructions (see
+    /// [`crate::ProjectInstructions::compact_instructions`]). Builder-style,
+    /// launch-only.
+    #[must_use]
+    pub(crate) fn with_compact_instructions(mut self, instructions: Option<String>) -> Self {
+        self.compact_instructions = instructions;
+        self
+    }
+
     /// Attach the launch-created shared UI language (see [`Self::set_ui_lang`]).
     /// Builder-style, mirroring [`Self::with_permission_mode`]; lets the offline
     /// echo client and the runtime share one language atomic so `/lang` reaches
@@ -274,6 +289,12 @@ impl AgentRuntime {
     pub fn with_ui_lang(mut self, ui_lang: crate::i18n::SharedLang) -> Self {
         self.ui_lang = ui_lang;
         self
+    }
+
+    /// What the summarizer will be handed as standing instructions.
+    #[cfg(test)]
+    pub(crate) fn compact_instructions_for_test(&self) -> Option<String> {
+        self.compact_instructions.clone()
     }
 
     /// The runtime's current session permission mode.

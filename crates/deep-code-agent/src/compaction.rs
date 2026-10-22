@@ -296,7 +296,8 @@ pub const HANDOVER_SYSTEM_PROMPT: &str = "\
 - 只写记录里有的事实，不编造、不推测；对话中途改过主意的，以最新的为准，并说明改了。\n\
 - 具体到可以直接执行：文件路径、函数/命令/标识符原文、报错原文、数值、用户明确提出的要求与偏好。\n\
 - 按下面的小节组织，空的小节直接省略；用 Markdown；只输出摘要本身，不要开场白或结尾。\n\
-- 通常 300–1500 字；只有会话确实复杂才更长，最多 3000 字。\n\n\
+- 通常 300–1500 字；只有会话确实复杂才更长，最多 3000 字。\n\
+- 若附有「压缩说明」，按它的要求保留与组织内容，它优先于下面的默认小节。\n\n\
 # 会话交接摘要 / Session handover\n\
 ## 任务与目标 / Task and goals\n\
 ## 已完成 / Done so far\n\
@@ -310,17 +311,28 @@ assistant that has no other memory of it: facts from the transcript only, never 
 the conversation changed course the newest decision wins, and say so; concrete enough to act on \
 (paths, identifiers, commands, error text, values, the user's explicit instructions and \
 preferences); organised under the headings above with empty sections omitted; Markdown; the \
-summary only, with no preamble or closing.";
+summary only, with no preamble or closing. When compaction instructions are attached, follow \
+them — they take precedence over the default sections.";
 
-/// The summarizer's user message: the focus the user asked for, the previous
-/// summary to merge, the flattened transcript of the fresh entries, the ask.
+/// The summarizer's user message: the project's standing compaction
+/// instructions, the focus the user asked for this time, the previous summary
+/// to merge, the flattened transcript of the fresh entries, the ask.
 #[must_use]
 pub fn handover_request(
     plan: &CompactionPlan,
     entries: &[Arc<SessionEntry>],
     focus: Option<&str>,
+    compact_instructions: Option<&str>,
 ) -> String {
     let mut text = String::new();
+    if let Some(standing) = compact_instructions
+        .map(str::trim)
+        .filter(|standing| !standing.is_empty())
+    {
+        text.push_str("## 压缩说明（来自 AGENTS.md）/ Compaction instructions from AGENTS.md\n");
+        text.push_str(standing);
+        text.push_str("\n\n");
+    }
     if let Some(focus) = focus.map(str::trim).filter(|focus| !focus.is_empty()) {
         text.push_str("本次压缩特别关注 / Pay particular attention to: ");
         text.push_str(focus);

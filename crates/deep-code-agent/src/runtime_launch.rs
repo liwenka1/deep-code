@@ -371,6 +371,7 @@ fn assemble_launch<C: LlmClient + Clone + 'static>(
     let (runtime, session_id) = make_runtime((*client).clone(), tools);
     let runtime = attach_workspace_helpers(runtime, &roots.primary, config, &mut warnings)
         .with_boundary(boundary)
+        .with_compact_instructions(instructions.compact_instructions.clone())
         .with_permission_mode(permission_mode.clone())
         .with_ui_lang(ui_lang);
     LaunchedRuntime {

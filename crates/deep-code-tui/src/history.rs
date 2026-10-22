@@ -162,9 +162,11 @@ impl HistoryCell {
 }
 
 /// The welcome card's "Rules" value: each AGENTS.md that was loaded with its
-/// kept line count, plus a truncation suffix when the cap cut something.
-/// `None` when nothing was loaded — the card then shows no line at all rather
-/// than nagging about a file most repositories do not have yet.
+/// kept line count, a truncation suffix when the cap cut something, and a
+/// note when a `Compact Instructions` section was found (the one way to see
+/// that the heading was recognised short of running `/compact`). `None` when
+/// nothing was loaded — the card then shows no line at all rather than
+/// nagging about a file most repositories do not have yet.
 pub(crate) fn instructions_summary(
     lang: Lang,
     instructions: &deep_code_agent::ProjectInstructions,
@@ -196,6 +198,9 @@ pub(crate) fn instructions_summary(
             TextId::InstructionsTruncatedSuffix,
             &[("max", &deep_code_agent::MAX_INSTRUCTIONS_CHARS.to_string())],
         ));
+    }
+    if instructions.compact_instructions.is_some() {
+        text.push_str(tr(lang, TextId::InstructionsCompactSuffix));
     }
     Some(text)
 }
@@ -468,13 +473,38 @@ pub enum HistoryCell {
         /// record cannot — the record stores no token counts).
         context_tokens: Option<(u32, u32)>,
         summary: String,
+        /// Open (summary shown) or folded to its title row. A long handover is
+        /// a page of dim text that pushes the conversation off the screen, so
+        /// past `COMPACTION_FOLD_LINES` it opens folded; lives in the cell for
+        /// the reasons `Reasoning` gives.
+        expanded: bool,
     },
 }
+
+/// A compaction cell opens with its summary shown up to this many lines and
+/// folded to its title beyond.
+pub(crate) const COMPACTION_FOLD_LINES: usize = 12;
 
 impl HistoryCell {
     #[must_use]
     pub fn system(text: impl Into<String>) -> Self {
         Self::System { text: text.into() }
+    }
+
+    /// A compaction cell, open or folded by the summary's length.
+    #[must_use]
+    pub fn compaction(
+        archived_entries: usize,
+        context_tokens: Option<(u32, u32)>,
+        summary: String,
+    ) -> Self {
+        let expanded = summary.lines().count() <= COMPACTION_FOLD_LINES;
+        Self::Compaction {
+            archived_entries,
+            context_tokens,
+            summary,
+            expanded,
+        }
     }
 
     #[must_use]
@@ -601,6 +631,7 @@ impl HistoryCell {
                 archived_entries,
                 context_tokens,
                 summary,
+                ..
             } => {
                 let count = archived_entries.to_string();
                 let title = match context_tokens {
@@ -773,13 +804,13 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
                 summary,
                 archived_count,
             } => {
-                current_turn.push(HistoryCell::Compaction {
-                    archived_entries: *archived_count,
-                    // The record carries no token counts, so a replayed cell can
-                    // say what was folded but not what it bought.
-                    context_tokens: None,
-                    summary: summary.clone(),
-                });
+                // The record carries no token counts, so a replayed cell can
+                // say what was folded but not what it bought.
+                current_turn.push(HistoryCell::compaction(
+                    *archived_count,
+                    None,
+                    summary.clone(),
+                ));
             }
         }
     }

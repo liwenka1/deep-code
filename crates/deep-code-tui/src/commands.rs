@@ -339,11 +339,11 @@ impl App {
                     let text = self.tr_with(TextId::CompactionFallback, &[("reason", reason)]);
                     self.history.push(HistoryCell::system(text));
                 }
-                self.history.push(HistoryCell::Compaction {
-                    archived_entries: report.archived_entries,
-                    context_tokens: Some((report.tokens_before, report.tokens_after)),
-                    summary: report.summary,
-                });
+                self.history.push(HistoryCell::compaction(
+                    report.archived_entries,
+                    Some((report.tokens_before, report.tokens_after)),
+                    report.summary,
+                ));
                 self.status = self.tr_with(
                     TextId::StatusCompacted,
                     &[("count", &report.archived_entries.to_string())],

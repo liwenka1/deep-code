@@ -38,6 +38,11 @@ pub const INSTRUCTIONS_FILE: &str = "AGENTS.md";
 /// the other).
 pub const MAX_INSTRUCTIONS_CHARS: usize = 24_000;
 
+/// Cap on the compaction instructions pulled out of the files. They ride on
+/// every handover request; a page of them is a page the summarizer reads
+/// before the transcript.
+pub const MAX_COMPACT_INSTRUCTIONS_CHARS: usize = 4_000;
+
 /// Bytes read from either file before giving up on the rest. Well above the
 /// character cap in any encoding, so a file this large is cut by the cap
 /// anyway; this only keeps a multi-gigabyte path from being read whole.
@@ -78,6 +83,10 @@ pub struct ProjectInstructions {
     /// Human-facing problems: a file that could not be read, a refused
     /// symlink, the truncation. Launch surfaces them with its other warnings.
     pub warnings: Vec<String>,
+    /// The `## Compact Instructions` (or `## 压缩说明`) sections of the files,
+    /// global then workspace, for the compaction summarizer: what this project
+    /// must not lose when history is folded. `None` when no file has one.
+    pub compact_instructions: Option<String>,
 }
 
 impl ProjectInstructions {
@@ -97,6 +106,7 @@ impl ProjectInstructions {
         let mut out = Self::default();
         let mut budget = MAX_INSTRUCTIONS_CHARS;
         let mut sections = Vec::new();
+        let mut compact: Vec<String> = Vec::new();
         let candidates = global
             .map(|path| (InstructionScope::Global, path.to_path_buf()))
             .into_iter()
@@ -113,6 +123,9 @@ impl ProjectInstructions {
                     continue;
                 }
             };
+            if let Some(section) = compact_instructions_section(&body) {
+                compact.push(section);
+            }
             let total = body.chars().count();
             let kept: String = body.chars().take(budget).collect();
             let kept_chars = kept.chars().count();
@@ -136,7 +149,16 @@ impl ProjectInstructions {
             }
         }
         if !sections.is_empty() {
-            out.block = Some(format!("{BLOCK_HEADING}\n\n{}", sections.join("\n\n")));
+            out.block = Some(format!(
+                "{BLOCK_HEADING}\n\n{sections}",
+                sections = sections.join("\n\n")
+            ));
+        }
+        if !compact.is_empty() {
+            out.compact_instructions = Some(crate::text_util::truncate_chars(
+                &compact.join("\n\n"),
+                MAX_COMPACT_INSTRUCTIONS_CHARS,
+            ));
         }
         out
     }
@@ -151,6 +173,54 @@ impl ProjectInstructions {
     pub fn is_empty(&self) -> bool {
         self.block.is_none()
     }
+}
+
+/// The body of a `Compact Instructions` section: from the heading line
+/// (`#`–`######`, title `Compact Instructions`, `压缩说明` or `压缩指令`,
+/// case-insensitive) to the next heading of the same or a higher level, or
+/// the end of the file. `None` when there is no such heading or the section
+/// is blank. The section stays in the prompt block too — it is part of the
+/// file — this is the copy the summarizer gets on its own.
+///
+/// Lines inside fenced code blocks are code, not structure: a `# comment` in
+/// a shell example must not end the section early, and an example of the
+/// heading itself must not start one.
+fn compact_instructions_section(body: &str) -> Option<String> {
+    fn heading_level(line: &str) -> Option<(usize, &str)> {
+        let hashes = line.bytes().take_while(|byte| *byte == b'#').count();
+        ((1..=6).contains(&hashes) && line[hashes..].starts_with(' '))
+            .then(|| (hashes, line[hashes..].trim()))
+    }
+    let is_title = |title: &str| {
+        let title = title.trim().trim_end_matches(':').trim();
+        title.eq_ignore_ascii_case("compact instructions")
+            || title == "压缩说明"
+            || title == "压缩指令"
+    };
+    let lines: Vec<&str> = body.lines().collect();
+    let mut in_fence = false;
+    let headings: Vec<Option<(usize, &str)>> = lines
+        .iter()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                in_fence = !in_fence;
+                return None;
+            }
+            (!in_fence).then(|| heading_level(line)).flatten()
+        })
+        .collect();
+    let start = headings
+        .iter()
+        .position(|heading| heading.is_some_and(|(_, title)| is_title(title)))?;
+    let level = headings[start]?.0;
+    let end = headings[start + 1..]
+        .iter()
+        .position(|heading| heading.is_some_and(|(found, _)| found <= level))
+        .map_or(lines.len(), |offset| start + 1 + offset);
+    let section = lines[start + 1..end].join("\n");
+    let section = section.trim();
+    (!section.is_empty()).then(|| section.to_string())
 }
 
 fn render_section(scope: InstructionScope, body: &str, cut: bool) -> String {
@@ -440,6 +510,78 @@ mod tests {
                 && loaded.warnings[0].contains(&workspace_link.display().to_string()),
             "{:?}",
             loaded.warnings
+        );
+    }
+
+    /// The `Compact Instructions` section is lifted out for the summarizer —
+    /// from either file, in order, under any heading level or spelling the
+    /// docs name — and nothing else of the file comes with it.
+    #[test]
+    fn compact_instructions_are_extracted_from_both_files() {
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir,
+            "home",
+            "# Me\nterse answers\n\n### compact instructions:\n- keep my vetoes\n\n### Other\nnope",
+        );
+        write(
+            &dir,
+            "ws",
+            "# Repo\nrules\n\n## 压缩说明\n- 保留未推送的 commit 列表\n- keep failing test names\n\n## Commands\ncargo test\n",
+        );
+        let loaded = load(&dir, true);
+        assert_eq!(
+            loaded.compact_instructions.as_deref(),
+            Some("- keep my vetoes\n\n- 保留未推送的 commit 列表\n- keep failing test names")
+        );
+        // Still part of the prompt block: it is text in the file like any other.
+        assert!(loaded.block().unwrap().contains("保留未推送的 commit 列表"));
+
+        let dir = TempDir::new().unwrap();
+        write(&dir, "ws", "# Repo\n## Compact Instructions\n\n## Next\nx");
+        assert_eq!(
+            load(&dir, true).compact_instructions,
+            None,
+            "a blank section is none"
+        );
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir,
+            "ws",
+            "# Repo\n```md\n## Compact Instructions\nan example, not the section\n```\n\
+             ## Compact Instructions\n- keep this\n```sh\n# the gate, not a heading\n\
+             scripts/preflight.sh\n```\n## Next\nx\n",
+        );
+        assert_eq!(
+            load(&dir, true).compact_instructions.as_deref(),
+            Some("- keep this\n```sh\n# the gate, not a heading\nscripts/preflight.sh\n```"),
+            "fenced code is neither a heading nor the end of the section"
+        );
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir,
+            "ws",
+            "# Repo\nmentions compact instructions in prose\n",
+        );
+        assert_eq!(
+            load(&dir, true).compact_instructions,
+            None,
+            "prose is not a heading"
+        );
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir,
+            "ws",
+            &format!(
+                "## Compact Instructions\n{}",
+                "k".repeat(MAX_COMPACT_INSTRUCTIONS_CHARS + 10)
+            ),
+        );
+        let long = load(&dir, true).compact_instructions.unwrap();
+        assert_eq!(
+            long.chars().count(),
+            MAX_COMPACT_INSTRUCTIONS_CHARS + 1,
+            "capped, with the ellipsis"
         );
     }
 }

@@ -7,6 +7,7 @@
   "InstructionsSourceWorkspace": "AGENTS.md（{lines} 行）",
   "InstructionsSourceGlobal": "~/.deep-code/AGENTS.md（{lines} 行）",
   "InstructionsTruncatedSuffix": " · 已截断至 {max} 字符",
+  "InstructionsCompactSuffix": " · 含压缩说明",
   "StatusInitBusy": "/init：请等当前回合结束后再试",
   "StatusSkillBusy": "/skill：请等当前回合结束后再试",
   "StatusSkillUnknown": "没有名为 '{name}' 的 skill——/skill 可列出可用的",

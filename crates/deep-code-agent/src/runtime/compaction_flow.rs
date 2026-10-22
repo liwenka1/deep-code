@@ -209,7 +209,12 @@ impl AgentRuntime {
             model.clone(),
             vec![
                 Message::system(HANDOVER_SYSTEM_PROMPT),
-                Message::user(handover_request(plan, entries, focus)),
+                Message::user(handover_request(
+                    plan,
+                    entries,
+                    focus,
+                    self.compact_instructions.as_deref(),
+                )),
             ],
         );
         request.max_tokens = Some(HANDOVER_MAX_TOKENS);
