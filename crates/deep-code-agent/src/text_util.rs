@@ -12,9 +12,40 @@ pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
     format!("{head}…")
 }
 
+/// `text` whole when it is at most `max` chars; past that its first `head` and
+/// last `tail` chars with `marker(elided)` between them. Chars, not bytes, so
+/// a multi-byte character is never split.
+#[must_use]
+pub(crate) fn clip_middle(
+    text: &str,
+    max: usize,
+    head: usize,
+    tail: usize,
+    marker: impl FnOnce(usize) -> String,
+) -> String {
+    let total = text.chars().count();
+    if total <= max {
+        return text.to_string();
+    }
+    let start: String = text.chars().take(head).collect();
+    let end: String = text.chars().skip(total.saturating_sub(tail)).collect();
+    format!("{start}{}{end}", marker(total.saturating_sub(head + tail)))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::truncate_chars;
+    use super::{clip_middle, truncate_chars};
+
+    #[test]
+    fn clip_middle_keeps_both_ends_and_counts_the_cut() {
+        assert_eq!(clip_middle("short", 10, 2, 2, |_| "…".to_string()), "short");
+        assert_eq!(
+            clip_middle("前前前中中中后后后", 6, 3, 3, |cut| format!(
+                "[{cut}]"
+            )),
+            "前前前[3]后后后"
+        );
+    }
 
     #[test]
     fn keeps_short_text_and_marks_truncation() {

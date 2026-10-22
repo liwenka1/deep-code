@@ -367,10 +367,12 @@ pub fn handover_request(
         text.push_str("\n\n");
     }
     text.push_str("## 对话记录 / Transcript\n");
-    text.push_str(&clip_middle(
+    text.push_str(&crate::text_util::clip_middle(
         &flatten_entries(plan.fresh(entries)),
         MAX_HANDOVER_CHARS,
         HANDOVER_HEAD_CHARS,
+        MAX_HANDOVER_CHARS - HANDOVER_HEAD_CHARS,
+        |_| "\n[... 中间省略 / middle elided ...]\n".to_string(),
     ));
     text.push_str("\n\n请现在输出交接摘要。/ Write the handover summary now.");
     text
@@ -487,19 +489,6 @@ fn result_label(status: crate::tool::ToolResultStatus) -> &'static str {
         crate::tool::ToolResultStatus::Error => "error",
         crate::tool::ToolResultStatus::Denied => "denied",
     }
-}
-
-/// `text` whole when it fits `max` chars, else its first `head` chars, an
-/// elision marker, and its last `max - head` chars.
-fn clip_middle(text: &str, max: usize, head: usize) -> String {
-    let total = text.chars().count();
-    if total <= max {
-        return text.to_string();
-    }
-    let tail = max.saturating_sub(head);
-    let start: String = text.chars().take(head).collect();
-    let end: String = text.chars().skip(total - tail).collect();
-    format!("{start}\n[... 中间省略 / middle elided ...]\n{end}")
 }
 
 /// Summarize archived entries via their derived wire messages, so the summary

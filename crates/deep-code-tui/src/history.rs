@@ -507,6 +507,38 @@ impl HistoryCell {
         }
     }
 
+    /// Whether this is a foldable block, shown folded.
+    #[must_use]
+    pub(crate) fn is_folded(&self) -> bool {
+        matches!(
+            self,
+            Self::Reasoning {
+                expanded: false,
+                ..
+            } | Self::ToolBatch {
+                expanded: false,
+                ..
+            } | Self::Diff {
+                expanded: false,
+                ..
+            } | Self::Compaction {
+                expanded: false,
+                ..
+            }
+        )
+    }
+
+    /// Open a foldable block; any other cell is left as it is.
+    pub(crate) fn set_expanded(&mut self) {
+        if let Self::Reasoning { expanded, .. }
+        | Self::ToolBatch { expanded, .. }
+        | Self::Diff { expanded, .. }
+        | Self::Compaction { expanded, .. } = self
+        {
+            *expanded = true;
+        }
+    }
+
     #[must_use]
     pub fn user(text: impl Into<String>) -> Self {
         Self::User { text: text.into() }

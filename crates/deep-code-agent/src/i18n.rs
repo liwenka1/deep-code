@@ -293,6 +293,7 @@ text_ids! {
     CompactionTitle,
     CompactionTitleMeasured,
     CompactionWhatModelSees,
+    CompactionWhatModelSeesFolded,
     // 粘贴 chip
     PasteChipLines,
     PasteChipChars,
@@ -301,6 +302,7 @@ text_ids! {
     FindFound,
     FindExhausted,
     FindNotFound,
+    FindUnfolding,
     UsageFind,
     // 会话管理
     BusyRelaunchConfig,

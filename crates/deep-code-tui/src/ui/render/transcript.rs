@@ -668,8 +668,10 @@ pub(super) fn cell_lines_unsanitized(
             lines.push(Line::default());
             lines
         }
-        // A compaction: the title row always (it is the fold header), the
-        // "what the model sees" line and the summary when open.
+        // A compaction: the title row always (it is the fold header) and the
+        // line saying what the model now sees — the point of the cell, folded
+        // or not: without it the block reads as "the conversation above was
+        // rewritten", which is not what happened. The summary when open.
         HistoryCell::Compaction { expanded, .. } => {
             let mut text = cell.lines(lang).into_iter();
             let title = text.next().unwrap_or_default();
@@ -679,6 +681,12 @@ pub(super) fn cell_lines_unsanitized(
                 for logical in text {
                     lines.extend(wrap_styled(&logical, width, dim));
                 }
+            } else {
+                lines.extend(wrap_styled(
+                    tr(lang, TextId::CompactionWhatModelSeesFolded),
+                    width,
+                    dim,
+                ));
             }
             lines.push(Line::default());
             lines

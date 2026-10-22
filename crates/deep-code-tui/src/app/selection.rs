@@ -45,6 +45,15 @@ impl App {
                     .find_state
                     .take()
                     .is_some_and(|(previous, _)| previous == query);
+                // Not on screen, but maybe inside a folded block: open the
+                // newest one that has it, and search again once the next frame
+                // has drawn it. A long compaction summary opens folded, and its
+                // text was out of `/find`'s reach.
+                if !was_continuing && self.unfold_newest_match(&needle) {
+                    self.pending_find = Some(query.to_string());
+                    self.status = self.tr_with(TextId::FindUnfolding, &[("query", query)]);
+                    return;
+                }
                 if was_continuing {
                     self.status = self.tr_with(TextId::FindExhausted, &[("query", query)]);
                 } else {
@@ -52,6 +61,33 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Open the newest folded block whose hidden text holds `needle`
+    /// (lowercased); whether there was one.
+    fn unfold_newest_match(&mut self, needle: &str) -> bool {
+        let lang = self.lang;
+        let Some(cell) = self.history.iter_mut().rev().find(|cell| {
+            cell.is_folded()
+                && cell
+                    .lines(lang)
+                    .iter()
+                    .any(|line| line.to_lowercase().contains(needle))
+        }) else {
+            return false;
+        };
+        cell.set_expanded();
+        true
+    }
+
+    /// The `/find` a fold-opening search left for after the next draw, when
+    /// the opened block is in the transcript snapshot. Whether there was one.
+    pub(crate) fn run_pending_find(&mut self) -> bool {
+        let Some(query) = self.pending_find.take() else {
+            return false;
+        };
+        self.find_in_transcript(&query);
+        true
     }
 
     /// Map an absolute mouse `(col, row)` to a `(line, display_col)` position

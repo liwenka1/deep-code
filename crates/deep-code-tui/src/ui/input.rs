@@ -10,7 +10,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 
-use crate::app::App;
+use crate::app::{App, QuitKey};
 use deep_code_agent::i18n::{TextId, tr_with};
 
 use super::AppTerminal;
@@ -190,15 +190,19 @@ fn is_shift_tab(key: &KeyEvent) -> bool {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
-    // Any key other than Ctrl+C disarms the "press again to quit" guard.
+    // Any key other than the one that armed the "press again to quit" guard
+    // disarms it: only a second consecutive press of the same key quits.
     let is_ctrl_c = matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         && key.modifiers.contains(KeyModifiers::CONTROL);
-    if !is_ctrl_c {
-        app.clear_ctrl_c_guard();
-    }
-    // Same for the Esc guard: only a second consecutive Esc quits.
-    if key.code != KeyCode::Esc {
-        app.clear_esc_guard();
+    let quit_key = if is_ctrl_c {
+        Some(QuitKey::CtrlC)
+    } else if key.code == KeyCode::Esc {
+        Some(QuitKey::Esc)
+    } else {
+        None
+    };
+    if quit_key.is_none() || app.quit_armed.as_ref().map(|(armed, _)| *armed) != quit_key {
+        app.clear_quit_guard();
     }
     // Any key other than Shift+Tab disarms the pending-Yolo confirm.
     if !is_shift_tab(&key) {
@@ -1147,5 +1151,27 @@ mod tests {
         assert!(!app.history_search_open(), "Ctrl+A leaves the search");
         assert_eq!(app.input, "earlier prompt");
         assert_eq!(app.input_cursor, 0, "and still moves to the line start");
+    }
+
+    /// Only a second consecutive press of the key that armed the quit quits:
+    /// any other key in between — the other quit key included — disarms it.
+    #[test]
+    fn another_key_between_the_two_quit_presses_disarms_the_quit() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let esc = KeyEvent::from(KeyCode::Esc);
+        for (first, between) in [
+            (esc, KeyEvent::from(KeyCode::Left)),
+            (ctrl_c, KeyEvent::from(KeyCode::Left)),
+            (esc, ctrl_c),
+            (ctrl_c, esc),
+        ] {
+            let mut app = en_app("");
+            handle_key(&mut app, first);
+            handle_key(&mut app, between);
+            handle_key(&mut app, first);
+            assert!(!app.should_quit, "{first:?} then {between:?}");
+            handle_key(&mut app, first);
+            assert!(app.should_quit, "{first:?} twice in a row");
+        }
     }
 }

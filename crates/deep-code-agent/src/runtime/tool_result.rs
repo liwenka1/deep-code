@@ -530,14 +530,13 @@ const TOOL_OUTPUT_TAIL: usize = 4_000;
 /// the next request stays small without losing the most relevant ends.
 /// Counts by `char` to stay UTF-8 safe.
 pub(super) fn truncate_tool_output(content: &str) -> String {
-    let total = content.chars().count();
-    if total <= TOOL_OUTPUT_BUDGET {
-        return content.to_string();
-    }
-    let head: String = content.chars().take(TOOL_OUTPUT_HEAD).collect();
-    let tail: String = content.chars().skip(total - TOOL_OUTPUT_TAIL).collect();
-    let elided = total - TOOL_OUTPUT_HEAD - TOOL_OUTPUT_TAIL;
-    format!("{head}\n\n...[省略 {elided} 字符 / {elided} chars truncated]...\n\n{tail}")
+    crate::text_util::clip_middle(
+        content,
+        TOOL_OUTPUT_BUDGET,
+        TOOL_OUTPUT_HEAD,
+        TOOL_OUTPUT_TAIL,
+        |elided| format!("\n\n...[省略 {elided} 字符 / {elided} chars truncated]...\n\n"),
+    )
 }
 
 pub(super) fn tool_call_payload(call: &ToolCall) -> ToolCallPayload {

@@ -31,16 +31,30 @@ impl TodoWriteTool {
     pub const NAME: &'static str = "todo_write";
 }
 
+/// An item's status. The schema names three; the spellings models commonly
+/// reach for besides them are accepted too. A rejected call is a tool error,
+/// and repeated tool errors in a turn move the rest of the session to the
+/// stronger, pricier model — a cost far out of proportion to `completed`
+/// instead of `done`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
+    #[serde(alias = "todo", alias = "not_started", alias = "open")]
     Pending,
+    #[serde(
+        alias = "in-progress",
+        alias = "active",
+        alias = "doing",
+        alias = "started"
+    )]
     InProgress,
+    #[serde(alias = "completed", alias = "complete", alias = "finished")]
     Done,
 }
 
+/// One item. Fields beyond these two — an `id`, a `priority` — are ignored
+/// rather than refused, for the reason [`TodoStatus`] gives.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct TodoItem {
     /// What has to happen, as one line.
     content: String,
@@ -128,6 +142,30 @@ mod tests {
             .await
     }
 
+    /// The spellings models commonly send besides the three the schema names
+    /// are accepted, and an item's extra fields are ignored: a refusal is a
+    /// tool error, and two of those in a turn move the session to the
+    /// pricier model.
+    #[tokio::test]
+    async fn common_status_spellings_and_extra_fields_are_accepted() {
+        let result = run(json!({ "items": [
+            { "id": 1, "content": "read the parser", "status": "completed", "priority": "high" },
+            { "id": 2, "content": "write the fix", "status": "in-progress" },
+            { "id": 3, "content": "run the tests", "status": "todo" }
+        ] }))
+        .await
+        .expect("accepted");
+        assert_eq!(result.status, ToolResultStatus::Success, "{result:?}");
+        let todos = &result.details.as_ref().unwrap()["todos"];
+        assert_eq!(todos[0]["status"], "done");
+        assert_eq!(todos[1]["status"], "in_progress");
+        assert_eq!(todos[2]["status"], "pending");
+        assert!(
+            todos[0].get("id").is_none(),
+            "extra fields are dropped: {todos}"
+        );
+    }
+
     /// The model gets a tally; the UI gets the trimmed list, in order, with
     /// the statuses it sent.
     #[tokio::test]
@@ -167,10 +205,6 @@ mod tests {
             (
                 json!({ "items": [{ "content": "x", "status": "blocked" }] }),
                 "blocked",
-            ),
-            (
-                json!({ "items": [{ "content": "x", "status": "done", "extra": 1 }] }),
-                "extra",
             ),
         ] {
             let error = run(arguments).await.unwrap_err();

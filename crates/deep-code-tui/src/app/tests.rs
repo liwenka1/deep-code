@@ -2080,7 +2080,7 @@ fn ctrl_c_requires_double_press_when_idle() {
     let mut app = App::new();
     app.handle_ctrl_c();
     assert!(!app.should_quit, "first Ctrl+C must not quit");
-    assert!(app.ctrl_c_pending);
+    assert!(app.quit_armed_by(QuitKey::CtrlC));
     assert!(app.status.contains("再按一次"));
     app.handle_ctrl_c();
     assert!(app.should_quit, "second consecutive Ctrl+C quits");
@@ -2095,18 +2095,21 @@ fn ctrl_c_clears_input_before_quitting() {
     app.handle_ctrl_c();
     assert!(app.input.is_empty());
     assert!(!app.should_quit);
-    assert!(!app.ctrl_c_pending, "clearing input does not arm the guard");
+    assert!(
+        !app.quit_armed_by(QuitKey::CtrlC),
+        "clearing input does not arm the guard"
+    );
 }
 
 #[test]
 fn ctrl_c_guard_disarmed_by_other_key() {
     let mut app = App::new();
     app.handle_ctrl_c(); // arm
-    assert!(app.ctrl_c_pending);
-    app.clear_ctrl_c_guard(); // any other key disarms
+    assert!(app.quit_armed_by(QuitKey::CtrlC));
+    app.clear_quit_guard(); // any other key disarms
     app.handle_ctrl_c(); // counts as a fresh first press
     assert!(!app.should_quit);
-    assert!(app.ctrl_c_pending);
+    assert!(app.quit_armed_by(QuitKey::CtrlC));
 }
 
 #[test]
@@ -3356,7 +3359,7 @@ async fn esc_and_ctrl_c_cancel_a_running_compact() {
             _ => app.handle_ctrl_c(),
         }
         assert!(
-            !app.esc_quit_pending && !app.ctrl_c_pending,
+            app.quit_armed.is_none(),
             "{key} cancelled the compaction; it did not arm quit"
         );
         settle_compaction(&mut app).await;
@@ -4705,7 +4708,7 @@ fn escape_on_an_idle_empty_composer_quits_only_on_the_second_press() {
         "one reflexive Esc must not end the session"
     );
     assert_eq!(app.status, tr(app.lang, TextId::StatusEscQuitConfirm));
-    app.clear_esc_guard();
+    app.clear_quit_guard();
     app.handle_escape();
     assert!(!app.should_quit, "a key in between disarms the guard");
     app.handle_escape();
@@ -4720,6 +4723,28 @@ fn escape_on_an_idle_empty_composer_quits_only_on_the_second_press() {
         app.should_quit,
         "after clearing, the promised 'Esc again' quits"
     );
+}
+
+/// The two-press quit holds only while its warning is on the status row. A
+/// mouse copy or a `/compact` landing replaces the warning without a key, and
+/// the next press used to quit on a promise no longer on screen.
+#[test]
+fn the_quit_guard_lapses_when_its_warning_is_replaced() {
+    for key in [QuitKey::Esc, QuitKey::CtrlC] {
+        let mut app = App::new();
+        let press = |app: &mut App| match key {
+            QuitKey::Esc => app.handle_escape(),
+            QuitKey::CtrlC => app.handle_ctrl_c(),
+        };
+        press(&mut app);
+        assert!(app.quit_armed_by(key), "{key:?}");
+        app.finish_compaction(deep_code_agent::CompactNowOutcome::NothingToFold);
+        press(&mut app);
+        assert!(!app.should_quit, "{key:?}: its warning was gone");
+        assert!(app.quit_armed_by(key), "{key:?}: asked again instead");
+        press(&mut app);
+        assert!(app.should_quit, "{key:?}");
+    }
 }
 
 /// A turn that ran for a while rings the terminal when it ends, an approval

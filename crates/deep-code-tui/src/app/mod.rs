@@ -107,9 +107,13 @@ pub struct App {
     pub status: String,
     pub error: Option<String>,
     pub should_quit: bool,
-    /// Armed by a first Ctrl+C on an idle, empty composer; a second
-    /// consecutive Ctrl+C then quits. Reset by any other key.
-    pub(crate) ctrl_c_pending: bool,
+    /// Armed by a first Esc or Ctrl+C on an idle, empty composer (Esc also by
+    /// clearing a draft), with the warning it put on the status row; a second
+    /// consecutive press of the same key quits — while that warning is still
+    /// what the row says. Any other key disarms it, and so does anything that
+    /// replaces the warning (a mouse copy, a `/compact` landing): the second
+    /// press then would quit on a promise no longer on screen.
+    pub(crate) quit_armed: Option<(QuitKey, String)>,
     pub is_streaming: bool,
     /// Prompts typed while a turn was streaming, queued in order. Drained and
     /// sent as one combined follow-up when the turn ends (see `submit` and the
@@ -145,6 +149,9 @@ pub struct App {
     /// `/find` continuation state: (query, line index of the last match in
     /// the transcript snapshot). Repeating the same query searches upward.
     pub(crate) find_state: Option<(String, usize)>,
+    /// A `/find` that opened a folded block, to run again after the next
+    /// draw puts the block's text in the snapshot.
+    pub(crate) pending_find: Option<String>,
     pub scroll_offset: usize,
     pub approval_scroll_offset: usize,
     /// Currently highlighted approval option: 0 = y (approve), 1 = a (session),
@@ -203,10 +210,6 @@ pub struct App {
     /// it lasts: the activity label says what the wait is for instead of
     /// "generating" with nothing appearing. Cleared by the turn's next event.
     pub(crate) turn_compaction_since: Option<std::time::Instant>,
-    /// Esc on an idle, empty composer arms this; a second Esc quits, any
-    /// other key disarms it — the same two-press shape as Ctrl+C, so one
-    /// reflexive Esc after a cancelled turn can no longer end the session.
-    pub(crate) esc_quit_pending: bool,
     /// A terminal notification the render loop owes the user, taken by
     /// [`Self::take_notification`] right after the next draw.
     pub(crate) notify_pending: Option<Notification>,
@@ -417,13 +420,6 @@ impl ComposerSnapshot {
     }
 }
 
-/// What a click on a foldable block's header acts on.
-///
-/// A block is either folded into the scrollback (`History*`, by index) or still
-/// streaming in the live preview (`LiveReasoning`), and those live in different
-/// places on `App` — hence one variant per thing that can actually be toggled,
-/// rather than a generic "path" into a state tree two of whose members do not
-/// exist.
 /// What the terminal is rung for. Each becomes BEL plus an OSC 9 message, which
 /// terminals that show desktop notifications (iTerm2, WezTerm, Ghostty, kitty)
 /// turn into one and every other terminal ignores after the bell.
@@ -473,9 +469,23 @@ impl RunningCompaction {
     }
 }
 
+/// A key that quits on a second press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuitKey {
+    Esc,
+    CtrlC,
+}
+
 /// A turn shorter than this ends silently: the user is still looking.
 pub(crate) const NOTIFY_MIN_TURN: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// What a click on a foldable block's header acts on.
+///
+/// A block is either folded into the scrollback (`History*`, by index) or still
+/// streaming in the live preview (`LiveReasoning`), and those live in different
+/// places on `App` — hence one variant per thing that can actually be toggled,
+/// rather than a generic "path" into a state tree two of whose members do not
+/// exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FoldTarget {
     HistoryReasoning(usize),
@@ -766,7 +776,7 @@ impl App {
             status: String::new(),
             error: None,
             should_quit: false,
-            ctrl_c_pending: false,
+            quit_armed: None,
             is_streaming: false,
             steering_queue: Vec::new(),
             pending_steering_flush: false,
@@ -778,6 +788,7 @@ impl App {
             save_error_notified: false,
             trimmed_cells: 0,
             find_state: None,
+            pending_find: None,
             scroll_offset: 0,
             approval_scroll_offset: 0,
             approval_focus: 0,
@@ -798,7 +809,6 @@ impl App {
             skills,
             compaction: None,
             turn_compaction_since: None,
-            esc_quit_pending: false,
             notify_pending: None,
             notifications_enabled: agent_config.notifications,
             prompt_history_path,
@@ -1035,21 +1045,33 @@ impl App {
             self.cancel_compaction();
         } else if !self.input.is_empty() {
             self.clear_input();
-            // Armed here too, so the message below stays true: the next Esc
-            // does quit.
-            self.esc_quit_pending = true;
-            self.status = self.tr(TextId::StatusInputClearedEsc).to_string();
-        } else if self.esc_quit_pending {
+            // Armed here too, so the message stays true: the next Esc does
+            // quit.
+            self.arm_quit(QuitKey::Esc, TextId::StatusInputClearedEsc);
+        } else if self.quit_armed_by(QuitKey::Esc) {
             self.should_quit = true;
         } else {
-            self.esc_quit_pending = true;
-            self.status = self.tr(TextId::StatusEscQuitConfirm).to_string();
+            self.arm_quit(QuitKey::Esc, TextId::StatusEscQuitConfirm);
         }
     }
 
-    /// Any non-Esc key disarms the Esc quit guard.
-    pub fn clear_esc_guard(&mut self) {
-        self.esc_quit_pending = false;
+    /// Arm the two-press quit for `key`, saying so on the status row.
+    fn arm_quit(&mut self, key: QuitKey, warning: TextId) {
+        let warning = self.tr(warning).to_string();
+        self.status = warning.clone();
+        self.quit_armed = Some((key, warning));
+    }
+
+    /// Whether `key` armed the quit and its warning is still on the row.
+    pub(crate) fn quit_armed_by(&self, key: QuitKey) -> bool {
+        self.quit_armed
+            .as_ref()
+            .is_some_and(|(armed, warning)| *armed == key && self.status == *warning)
+    }
+
+    /// Disarm the two-press quit — every key but the one that armed it.
+    pub fn clear_quit_guard(&mut self) {
+        self.quit_armed = None;
     }
 
     /// Owe the user a terminal notification, unless they turned them off.
@@ -1066,28 +1088,26 @@ impl App {
 
     /// Graceful Ctrl+C: interrupt a stream or a `/compact`, else clear input,
     /// else require a second consecutive press to actually quit.
+    ///
+    /// Unlike Esc, clearing a draft does not arm the quit: Ctrl+C is the line
+    /// clearing reflex shells teach, and a second press right after one that
+    /// cleared the line is that reflex again, not a decision to leave.
     pub fn handle_ctrl_c(&mut self) {
         if self.is_streaming {
-            self.ctrl_c_pending = false;
+            self.clear_quit_guard();
             self.cancel_streaming_turn();
         } else if self.compacting() {
-            self.ctrl_c_pending = false;
+            self.clear_quit_guard();
             self.cancel_compaction();
         } else if !self.input.is_empty() {
             self.clear_input();
-            self.ctrl_c_pending = false;
+            self.clear_quit_guard();
             self.status = self.tr(TextId::StatusInputClearedCtrlC).to_string();
-        } else if self.ctrl_c_pending {
+        } else if self.quit_armed_by(QuitKey::CtrlC) {
             self.should_quit = true;
         } else {
-            self.ctrl_c_pending = true;
-            self.status = self.tr(TextId::StatusCtrlCQuitConfirm).to_string();
+            self.arm_quit(QuitKey::CtrlC, TextId::StatusCtrlCQuitConfirm);
         }
-    }
-
-    /// Any non-Ctrl+C key disarms the quit guard.
-    pub fn clear_ctrl_c_guard(&mut self) {
-        self.ctrl_c_pending = false;
     }
 
     pub fn scroll_up(&mut self) {

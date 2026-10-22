@@ -3077,7 +3077,14 @@ fn compaction_cell_folds_to_its_title() {
         .collect();
     assert!(text.starts_with("▸ 已折叠最早的 7 条记录"), "{text}");
     assert!(!text.contains("fact 3"), "folded: no summary lines: {text}");
-    assert_eq!(folded.len(), 2, "title + spacer: {folded:?}");
+    assert!(
+        text.contains("模型当前看到的是这份摘要"),
+        "folded, it still says what the model sees: {text}"
+    );
+    assert!(
+        folded.len() < 6,
+        "title, what the model sees, spacer — none of the 30 summary lines: {folded:?}"
+    );
 
     let open = HistoryCell::Compaction {
         archived_entries: 7,
@@ -3166,4 +3173,37 @@ fn an_open_history_search_is_always_on_the_status_row() {
         let text = frame(&mut app, 120, 24);
         assert!(text.contains("reverse-i-search"), "{state}: {text}");
     }
+}
+
+/// `/find` reaches into folded blocks: when nothing on screen matches, it opens
+/// the newest folded block that holds the text and jumps to it once the next
+/// frame has drawn it. A long compaction summary opens folded, and its text
+/// was out of `/find`'s reach.
+#[test]
+fn find_opens_a_folded_block_that_holds_the_match() {
+    let mut app = App::new();
+    app.lang = Lang::En;
+    let mut summary: String = (0..20)
+        .map(|index| format!("- handover fact {index}\n"))
+        .collect();
+    summary.push_str("- the parser decision\n");
+    app.history.push(HistoryCell::compaction(9, None, summary));
+    let index = app.history.len() - 1;
+    assert!(app.history[index].is_folded());
+
+    let _ = frame(&mut app, 80, 30);
+    app.find_in_transcript("parser decision");
+    assert!(!app.history[index].is_folded(), "the block was opened");
+    assert!(app.find_state.is_none(), "nothing to jump to yet");
+
+    let _ = frame(&mut app, 80, 30);
+    assert!(app.run_pending_find());
+    let (_, line) = app.find_state.clone().expect("found once drawn");
+    let snapshot = app.transcript.as_ref().unwrap();
+    assert!(
+        snapshot.lines[line].contains("the parser decision"),
+        "{:?}",
+        snapshot.lines[line]
+    );
+    assert!(!app.run_pending_find(), "run once");
 }

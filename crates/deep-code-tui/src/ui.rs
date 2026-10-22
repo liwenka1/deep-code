@@ -311,6 +311,10 @@ fn run_loop(terminal: &mut AppTerminal, app: &mut App, shutdown: &AtomicBool) ->
             last_draw = Some(Instant::now());
             needs_redraw = false;
         }
+        // After the draw, when the block a `/find` opened is in the snapshot.
+        if app.run_pending_find() {
+            needs_redraw = true;
+        }
         // After the draw, so the screen already shows what the bell is for.
         if let Some(kind) = app.take_notification() {
             let _ = execute!(terminal.backend_mut(), Print(kind.terminal_sequence()));
