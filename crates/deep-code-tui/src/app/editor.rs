@@ -560,6 +560,13 @@ impl App {
             if self.prompt_history.len() > PROMPT_HISTORY_CAP {
                 self.prompt_history.remove(0);
             }
+            // Text only, and never a key: `/apikey` is intercepted before this
+            // is reached, but a second line of defence costs one comparison.
+            if let Some(path) = &self.prompt_history_path
+                && !prompt.trim_start().starts_with("/apikey")
+            {
+                crate::prompt_history::append(path, prompt);
+            }
         }
         // Remembering is not where a walk through the history ends. The send
         // can still be refused — an image mid-stream, a model that takes none,

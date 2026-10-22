@@ -12,6 +12,7 @@ mod headless;
 mod highlight;
 mod history;
 mod markdown;
+mod prompt_history;
 mod session_cli;
 mod startup;
 mod ui;

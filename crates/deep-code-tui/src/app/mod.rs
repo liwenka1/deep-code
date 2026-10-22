@@ -30,6 +30,7 @@ mod approval;
 pub(crate) use approval::APPROVAL_ARM_DELAY;
 mod completion;
 mod editor;
+mod history_search;
 mod images;
 mod selection;
 mod session;
@@ -207,6 +208,11 @@ pub struct App {
     pub(crate) notify_pending: Option<Notification>,
     /// `[ui] notifications`.
     pub(crate) notifications_enabled: bool,
+    /// Where this workspace's prompt history is appended, or `None` to keep
+    /// it in memory only (no home directory; every test).
+    pub(crate) prompt_history_path: Option<std::path::PathBuf>,
+    /// The open Ctrl+R search, if any; see `history_search`.
+    pub(crate) history_search: Option<history_search::HistorySearch>,
     pub(crate) last_telemetry: Option<TurnTelemetry>,
     pub(crate) prompt_history: Vec<HistoryPrompt>,
     history_cursor: Option<usize>,
@@ -445,7 +451,7 @@ pub(crate) enum FoldTarget {
     LiveReasoning,
 }
 
-const PROMPT_HISTORY_CAP: usize = 100;
+pub(crate) const PROMPT_HISTORY_CAP: usize = 100;
 
 /// One recalled prompt: the text plus the images that were attached to it.
 ///
@@ -598,6 +604,19 @@ impl App {
         let configured_model = agent_config.model.clone();
         let configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
         let web_backend = deep_code_agent::WebBackend::from_config(&agent_config).id();
+        // What `↑` offers before anything was typed this run: the prompts of
+        // this workspace's earlier sessions, oldest first.
+        let prompt_history_path = crate::prompt_history::history_path(&workspace);
+        let prompt_history: Vec<HistoryPrompt> = prompt_history_path
+            .as_deref()
+            .map(|path| crate::prompt_history::load(path, PROMPT_HISTORY_CAP))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|text| HistoryPrompt {
+                text,
+                images: Vec::new(),
+            })
+            .collect();
         let workspace_display = home_relative(&workspace);
         let launched = launch_runtime(
             &agent_config,
@@ -747,8 +766,10 @@ impl App {
             esc_quit_pending: false,
             notify_pending: None,
             notifications_enabled: agent_config.notifications,
+            prompt_history_path,
+            history_search: None,
             last_telemetry: None,
-            prompt_history: Vec::new(),
+            prompt_history,
             history_cursor: None,
             history_draft: HistoryPrompt::default(),
             completion: None,
@@ -879,6 +900,10 @@ impl App {
         // Tests assert Chinese copy; pin the language so the developer's or
         // CI machine's LANG can never flake them.
         app.lang = Lang::Zh;
+        // And never touch the developer's own `~/.deep-code/prompt-history`:
+        // the test workspace is a temp dir, but the file would be real.
+        app.prompt_history_path = None;
+        app.prompt_history.clear();
         app
     }
 

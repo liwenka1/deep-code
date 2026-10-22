@@ -4467,3 +4467,84 @@ fn long_turns_and_approvals_notify_but_quick_turns_do_not() {
             .contains("\x1b]9;deep-code")
     );
 }
+
+/// Sent prompts are appended to the workspace's history file — text only,
+/// never a `/apikey` line, never the same prompt twice in a row — and the
+/// file reads back oldest first.
+#[test]
+fn remembered_prompts_persist_to_the_history_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("history").join("h.jsonl");
+    let mut app = App::new();
+    app.prompt_history_path = Some(path.clone());
+    app.remember_prompt("first");
+    app.remember_prompt("/apikey sk-secret");
+    app.remember_prompt("second");
+    app.remember_prompt("second");
+    assert_eq!(
+        crate::prompt_history::load(&path, PROMPT_HISTORY_CAP),
+        vec!["first", "second"]
+    );
+}
+
+/// Ctrl+R shows the newest prompt containing the query, steps to older ones,
+/// restarts from the newest when the query changes, keeps the last match when
+/// nothing older matches, and Esc puts the draft back while Enter keeps the
+/// recalled prompt.
+#[test]
+fn ctrl_r_searches_the_history_backwards_and_restores_the_draft_on_escape() {
+    let mut app = App::new();
+    for text in ["fix the parser", "run tests", "fix the lexer"] {
+        app.prompt_history.push(HistoryPrompt {
+            text: text.to_string(),
+            images: Vec::new(),
+        });
+    }
+    app.insert_str_at_cursor("my draft");
+
+    app.history_search_start();
+    assert!(app.history_search_open());
+    assert_eq!(
+        app.input, "fix the lexer",
+        "an empty query shows the newest prompt"
+    );
+    for ch in "FIX".chars() {
+        app.history_search_push(ch);
+    }
+    assert_eq!(app.input, "fix the lexer", "matching ignores case");
+    assert!(app.status.contains("1 / 2"), "{}", app.status);
+    app.history_search_older();
+    assert_eq!(app.input, "fix the parser");
+    assert!(app.status.contains("2 / 2"), "{}", app.status);
+    app.history_search_older();
+    assert_eq!(
+        app.input, "fix the parser",
+        "nothing older: the last match stays"
+    );
+    assert!(app.status.contains("无匹配"), "{}", app.status);
+    app.history_search_push('z');
+    assert!(app.status.contains("无匹配"), "{}", app.status);
+    app.history_search_backspace();
+    assert_eq!(
+        app.input, "fix the lexer",
+        "a changed query restarts from the newest"
+    );
+    app.history_search_cancel();
+    assert!(!app.history_search_open());
+    assert_eq!(app.input, "my draft", "Esc puts the draft back");
+    assert!(app.status.is_empty());
+
+    app.history_search_start();
+    app.history_search_push('r');
+    app.history_search_accept();
+    assert!(!app.history_search_open());
+    assert_eq!(
+        app.input, "fix the lexer",
+        "Enter keeps the recalled prompt"
+    );
+
+    let mut empty = App::new();
+    empty.history_search_start();
+    assert!(empty.status.contains("还没有历史"), "{}", empty.status);
+    empty.history_search_cancel();
+}

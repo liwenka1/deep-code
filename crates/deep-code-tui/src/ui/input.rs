@@ -263,6 +263,41 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Ctrl+R opens the history search, or steps it to the next older match.
+    if matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        app.history_search_start();
+        return;
+    }
+    // While the search is open it owns the typing keys; anything else keeps
+    // the shown match and goes on to do its usual job.
+    if app.history_search_open() {
+        match key.code {
+            KeyCode::Esc => {
+                app.history_search_cancel();
+                return;
+            }
+            KeyCode::Enter => {
+                app.history_search_accept();
+                return;
+            }
+            KeyCode::Backspace => {
+                app.history_search_backspace();
+                return;
+            }
+            KeyCode::Up => {
+                app.history_search_older();
+                return;
+            }
+            KeyCode::Char(value) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
+                app.history_search_push(value);
+                return;
+            }
+            _ => app.history_search_accept(),
+        }
+    }
+
     // Completion menu takes over navigation/accept keys while open; plain
     // characters and backspace fall through so typing keeps filtering.
     if app.completion_open() {
@@ -1079,5 +1114,38 @@ mod tests {
             app.scroll_offset, scrolled,
             "scrolled the hidden transcript"
         );
+    }
+
+    /// Ctrl+R opens the search over the draft; Esc closes it with the draft
+    /// back; a key the search does not own keeps the match and still does its
+    /// own job.
+    #[test]
+    fn ctrl_r_opens_the_history_search_and_other_keys_leave_it() {
+        let mut app = en_app("draft");
+        app.prompt_history.push(crate::app::HistoryPrompt {
+            text: "earlier prompt".to_string(),
+            images: Vec::new(),
+        });
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+        assert!(app.history_search_open());
+        assert_eq!(app.input, "earlier prompt");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(!app.history_search_open());
+        assert_eq!(app.input, "draft");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        assert!(!app.history_search_open(), "Ctrl+A leaves the search");
+        assert_eq!(app.input, "earlier prompt");
+        assert_eq!(app.input_cursor, 0, "and still moves to the line start");
     }
 }
