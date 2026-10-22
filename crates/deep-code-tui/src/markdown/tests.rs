@@ -387,6 +387,10 @@ fn any_paragraph_renders_in_linear_time_on_a_small_stack() {
         // Closers that find no opener of their own marker above a long stack
         // of the other one: each must not walk the whole stack again.
         format!("{}{}", "_a ".repeat(n / 2), "a* ".repeat(n / 2)),
+        // Brackets sharing one far target that turns out invalid: each used
+        // to copy the rest of the line before finding out.
+        format!("{}](x y)", "[".repeat(n / 2)),
+        format!("{})", "[a]( ".repeat(n / 5)),
     ];
     // Each takes tens of milliseconds unoptimized; the quadratic parser took
     // seconds on the bracket lines alone and overflowed on the marker ones.
@@ -429,6 +433,9 @@ fn delimiter_runs_pair_the_way_markdown_pairs_them() {
         "a ** b",
         "****",
         "a_b_c",
+        "edit __init__.py",
+        "if __name__ == '__main__':",
+        "__bold__",
     ] {
         let lines = render_markdown(literal, 80);
         assert_eq!(
@@ -489,4 +496,9 @@ fn delimiter_runs_pair_the_way_markdown_pairs_them() {
     let spans = spans_of("***x** y*");
     assert!(modifiers(&spans, "x").contains(Modifier::BOLD | Modifier::ITALIC));
     assert_eq!(modifiers(&spans, " y"), Modifier::ITALIC);
+
+    // A dunder inside bold stays a dunder; a single `_` still italicizes.
+    let spans = spans_of("**__init__.py** and _soft_");
+    assert!(modifiers(&spans, "__init__.py").contains(Modifier::BOLD));
+    assert_eq!(modifiers(&spans, "soft"), Modifier::ITALIC);
 }

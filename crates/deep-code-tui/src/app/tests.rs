@@ -995,12 +995,7 @@ fn a_pasted_apikey_line_never_reaches_the_history_or_the_model() {
 /// directory — the workspace's own project config, an API key included.
 #[test]
 fn config_commands_refuse_without_a_home_directory() {
-    for command in [
-        "/model flash",
-        "/apikey sk-0123456789abcdef",
-        "/logout",
-        "/lang en",
-    ] {
+    for command in ["/model flash", "/apikey sk-0123456789abcdef", "/logout"] {
         let mut app = App::new();
         app.global_config_path = None;
         assert!(app.handle_slash_command(command), "{command}");
@@ -1010,6 +1005,17 @@ fn config_commands_refuse_without_a_home_directory() {
             "{command}"
         );
     }
+}
+
+/// `/lang` without a home directory still switches the language for this
+/// session — that touches nothing on disk — and says the choice is not kept.
+#[test]
+fn lang_switches_for_the_session_without_a_home_directory() {
+    let mut app = App::new();
+    app.global_config_path = None;
+    assert!(app.handle_slash_command("/lang en"));
+    assert_eq!(app.lang, Lang::En);
+    assert_eq!(app.status, tr(Lang::En, TextId::LangSwitchedNotSaved));
 }
 
 #[test]

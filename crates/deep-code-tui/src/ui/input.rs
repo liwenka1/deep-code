@@ -1153,6 +1153,26 @@ mod tests {
         assert_eq!(app.input_cursor, 0, "and still moves to the line start");
     }
 
+    /// With a turn's error on the status row, the quit warning still shows
+    /// before the second press quits: the row draws an error in place of the
+    /// status, and arming used to leave the error there.
+    #[test]
+    fn the_quit_warning_is_drawn_even_after_an_error() {
+        let esc = KeyEvent::from(KeyCode::Esc);
+        let mut terminal = Terminal::new(TestBackend::new(120, 16)).unwrap();
+        let mut app = en_app("");
+        app.error = Some("API error 500: upstream timeout".to_string());
+        handle_key(&mut app, esc);
+        let (rows, _) = draw(&mut terminal, &mut app);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Press Esc again to quit")),
+            "{rows:#?}"
+        );
+        handle_key(&mut app, esc);
+        assert!(app.should_quit);
+    }
+
     /// Only a second consecutive press of the key that armed the quit quits:
     /// any other key in between — the other quit key included — disarms it.
     #[test]

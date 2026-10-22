@@ -236,6 +236,7 @@
   "LangCurrent": "Current UI language: {lang}. Usage: /lang zh|en",
   "LangName": "English",
   "LangSwitched": "UI language set to English (written to the global config)",
+  "LangSwitchedNotSaved": "Switched the interface language; there is no home directory, so the choice is not saved",
   "LangUnknown": "Unknown language '{value}'. Available: zh, en",
   "ErrMissingApiKey": "Missing DeepSeek API key; set the DEEPSEEK_API_KEY environment variable, or get one at https://platform.deepseek.com\n1. Register and create an API key at https://platform.deepseek.com\n2. export DEEPSEEK_API_KEY=sk-...\n3. If your network to DeepSeek is unstable, try a proxy or mirror endpoint (deep-code defaults to https://api.deepseek.com/beta)",
   "ErrHttp": "HTTP request failed: {error}\nCould not reach DeepSeek — check your network, proxy settings, or the DeepSeek endpoint; configure a working proxy if your connection is unstable.",

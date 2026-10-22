@@ -500,8 +500,14 @@ impl App {
             return;
         };
         let update = deep_code_agent::GlobalConfigUpdate::Language(lang.as_setting().to_string());
+        // Without a home directory the choice cannot be kept, but the switch
+        // itself touches nothing on disk: it happens for this session.
         let Some(config_path) = self.global_config_path.clone() else {
-            self.status = self.tr(TextId::GlobalConfigUnavailable).to_string();
+            self.lang = lang;
+            self.runtime.set_ui_lang(lang);
+            let message = tr(lang, TextId::LangSwitchedNotSaved).to_string();
+            self.history.push(HistoryCell::system(message.clone()));
+            self.status = message;
             return;
         };
         match deep_code_agent::write_global_config_update(&config_path, &update, self.lang) {

@@ -149,9 +149,12 @@ pub struct App {
     /// `/find` continuation state: (query, line index of the last match in
     /// the transcript snapshot). Repeating the same query searches upward.
     pub(crate) find_state: Option<(String, usize)>,
-    /// A `/find` that opened a folded block, to run again after the next
-    /// draw puts the block's text in the snapshot.
-    pub(crate) pending_find: Option<String>,
+    /// A `/find` that opened a folded block, to run again once a frame drawn
+    /// after that puts the block's text in the snapshot: the query, and
+    /// `transcript_frames` when the block opened.
+    pub(crate) pending_find: Option<(String, u64)>,
+    /// Transcript snapshots recorded so far — which frame the snapshot is.
+    pub(crate) transcript_frames: u64,
     pub scroll_offset: usize,
     pub approval_scroll_offset: usize,
     /// Currently highlighted approval option: 0 = y (approve), 1 = a (session),
@@ -789,6 +792,7 @@ impl App {
             trimmed_cells: 0,
             find_state: None,
             pending_find: None,
+            transcript_frames: 0,
             scroll_offset: 0,
             approval_scroll_offset: 0,
             approval_focus: 0,
@@ -1055,9 +1059,13 @@ impl App {
         }
     }
 
-    /// Arm the two-press quit for `key`, saying so on the status row.
+    /// Arm the two-press quit for `key`, saying so on the status row. A
+    /// turn's error stops being shown there: the row draws an error in place
+    /// of the status, and the second press must not quit on a warning that
+    /// was never on screen. The error stays in the transcript.
     fn arm_quit(&mut self, key: QuitKey, warning: TextId) {
         let warning = self.tr(warning).to_string();
+        self.error = None;
         self.status = warning.clone();
         self.quit_armed = Some((key, warning));
     }

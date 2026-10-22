@@ -124,9 +124,13 @@ fn rewrite(path: &Path, prompts: &[String]) {
 
 /// Append one prompt. Creates the directory on first use through the same
 /// "must be a real directory" rule every other `~/.deep-code` writer follows,
-/// and refuses a symlink in the file's place (with `O_NOFOLLOW` on unix, so the
-/// refusal is the kernel's). The record goes out in one write: two instances
-/// appending at once used to tear each other's lines apart.
+/// and refuses a symlink in the file's place — with `O_NOFOLLOW` on unix, so
+/// the refusal is the kernel's; Windows `OpenOptions` has no such flag, so
+/// there the check-then-open window remains. The record goes out in one
+/// write: two instances appending at once used to tear each other's lines
+/// apart. (A launch that trims the file can still drop a line another
+/// instance appends between the trim's read and its rename: history is a
+/// convenience, and the trim is rare.)
 pub(crate) fn append(path: &Path, text: &str) {
     if text.len() > MAX_PERSISTED_PROMPT_BYTES {
         return;

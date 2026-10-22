@@ -5,6 +5,7 @@ impl App {
     /// Record what the transcript render produced, for mouse → text mapping.
     pub(crate) fn set_transcript_snapshot(&mut self, snap: TranscriptSnapshot) {
         self.transcript = Some(snap);
+        self.transcript_frames += 1;
     }
 
     /// `/find`: jump to the nearest earlier transcript line containing
@@ -13,6 +14,14 @@ impl App {
     /// Searches the last render's plain-text lines, so what it finds is
     /// exactly what is on screen.
     pub(crate) fn find_in_transcript(&mut self, query: &str) {
+        self.find_in(query, true);
+    }
+
+    /// [`Self::find_in_transcript`]; `may_unfold` is off for the search a
+    /// fold-opening one left behind, which runs once and opens nothing more —
+    /// a match the snapshot cannot show (split across wrapped rows) used to
+    /// open every folded block holding it, one per frame.
+    fn find_in(&mut self, query: &str, may_unfold: bool) {
         let Some(snapshot) = self.transcript.as_ref() else {
             self.status = self.tr(TextId::FindNoTranscript).to_string();
             return;
@@ -49,8 +58,8 @@ impl App {
                 // newest one that has it, and search again once the next frame
                 // has drawn it. A long compaction summary opens folded, and its
                 // text was out of `/find`'s reach.
-                if !was_continuing && self.unfold_newest_match(&needle) {
-                    self.pending_find = Some(query.to_string());
+                if may_unfold && !was_continuing && self.unfold_newest_match(&needle) {
+                    self.pending_find = Some((query.to_string(), self.transcript_frames));
                     self.status = self.tr_with(TextId::FindUnfolding, &[("query", query)]);
                     return;
                 }
@@ -81,12 +90,19 @@ impl App {
     }
 
     /// The `/find` a fold-opening search left for after the next draw, when
-    /// the opened block is in the transcript snapshot. Whether there was one.
+    /// the opened block is in the transcript snapshot; whether it ran. It
+    /// waits for a frame drawn after the block opened: the run loop draws at
+    /// most every few dozen milliseconds, and searching the frame before that
+    /// reported "not found" with the block standing open.
     pub(crate) fn run_pending_find(&mut self) -> bool {
-        let Some(query) = self.pending_find.take() else {
+        let Some((query, opened_at)) = self.pending_find.take() else {
             return false;
         };
-        self.find_in_transcript(&query);
+        if self.transcript_frames == opened_at {
+            self.pending_find = Some((query, opened_at));
+            return false;
+        }
+        self.find_in(&query, false);
         true
     }
 

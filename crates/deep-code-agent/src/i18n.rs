@@ -405,6 +405,7 @@ text_ids! {
     LangCurrent,
     LangName,
     LangSwitched,
+    LangSwitchedNotSaved,
     LangUnknown,
     // AgentError 用户可见诊断(agent crate)
     ErrMissingApiKey,

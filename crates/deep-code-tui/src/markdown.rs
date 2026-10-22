@@ -514,6 +514,7 @@ fn inline_styled(text: &str, base: Style) -> Vec<(String, Style)> {
     let next_backtick = next_index_table(&chars, '`');
     let next_bracket = next_index_table(&chars, ']');
     let next_paren = next_index_table(&chars, ')');
+    let next_space = next_index_where(&chars, |ch| ch.is_whitespace());
     let mut pieces: Vec<Piece> = Vec::new();
     let mut delims: Vec<Delim> = Vec::new();
     let mut plain = String::new();
@@ -548,7 +549,14 @@ fn inline_styled(text: &str, base: Style) -> Vec<(String, Style)> {
                 .count();
             let before = index.checked_sub(1).map(|at| chars[at]);
             let after = chars.get(index + run).copied();
-            let (can_open, can_close) = flanking(ch, before, after);
+            // `__` is never a delimiter: a Python dunder (`__init__.py`,
+            // `__name__`) is far likelier in a reply than `__bold__`, which
+            // this renderer never drew as bold anyway.
+            let (can_open, can_close) = if ch == '_' && run > 1 {
+                (false, false)
+            } else {
+                flanking(ch, before, after)
+            };
             if can_open || can_close {
                 flush(&mut plain, &mut pieces);
                 let id = delims.len();
@@ -576,39 +584,41 @@ fn inline_styled(text: &str, base: Style) -> Vec<(String, Style)> {
             index += run;
             continue;
         }
+        // The target is checked by position before anything is collected: a
+        // line of `[` sharing one far `](x y)`, or a run of `[a]( ` before a
+        // single `)`, used to copy the rest of the line once per bracket.
         if ch == '['
             && let Some(label_end) = next_at(&next_bracket, index + 1)
             && label_end > index + 1
             && chars.get(label_end + 1) == Some(&'(')
             && let Some(url_end) = next_at(&next_paren, label_end + 2)
+            && url_end > label_end + 2
+            && next_at(&next_space, label_end + 2).is_none_or(|space| space > url_end)
         {
             let label: String = chars[index + 1..label_end].iter().collect();
             let url: String = chars[label_end + 2..url_end].iter().collect();
-            if !url.is_empty() && !url.contains(char::is_whitespace) {
-                flush(&mut plain, &mut pieces);
-                // One level deep at most: a label ends at the first `]`, so
-                // it cannot hold a link of its own.
-                for (text, style) in inline_styled(&label, base.add_modifier(Modifier::UNDERLINED))
-                {
-                    pieces.push(Piece {
-                        text,
-                        style,
-                        delim: None,
-                    });
-                }
-                // The target stays visible: a terminal has no hover, and a link
-                // whose destination is hidden is a link the reader cannot judge
-                // — unless the label already is the destination.
-                if label != url {
-                    pieces.push(Piece {
-                        text: format!(" ({url})"),
-                        style: base.patch(link_target_style()),
-                        delim: None,
-                    });
-                }
-                index = url_end + 1;
-                continue;
+            flush(&mut plain, &mut pieces);
+            // One level deep at most: a label ends at the first `]`, so
+            // it cannot hold a link of its own.
+            for (text, style) in inline_styled(&label, base.add_modifier(Modifier::UNDERLINED)) {
+                pieces.push(Piece {
+                    text,
+                    style,
+                    delim: None,
+                });
             }
+            // The target stays visible: a terminal has no hover, and a link
+            // whose destination is hidden is a link the reader cannot judge
+            // — unless the label already is the destination.
+            if label != url {
+                pieces.push(Piece {
+                    text: format!(" ({url})"),
+                    style: base.patch(link_target_style()),
+                    delim: None,
+                });
+            }
+            index = url_end + 1;
+            continue;
         }
         plain.push(ch);
         index += 1;
@@ -753,13 +763,14 @@ fn flanking(marker: char, before: Option<char>, after: Option<char>) -> (bool, b
 /// finding a closer is a lookup, not a scan. A line of `[` with no `]` cost a
 /// scan to the end per bracket.
 fn next_index_table(chars: &[char], needle: char) -> Vec<usize> {
+    next_index_where(chars, |ch| ch == needle)
+}
+
+/// [`next_index_table`] for any character `wanted` accepts.
+fn next_index_where(chars: &[char], wanted: impl Fn(char) -> bool) -> Vec<usize> {
     let mut table = vec![usize::MAX; chars.len() + 1];
     for at in (0..chars.len()).rev() {
-        table[at] = if chars[at] == needle {
-            at
-        } else {
-            table[at + 1]
-        };
+        table[at] = if wanted(chars[at]) { at } else { table[at + 1] };
     }
     table
 }

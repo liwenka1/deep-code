@@ -236,6 +236,7 @@
   "LangCurrent": "当前界面语言: {lang}。用法: /lang zh|en",
   "LangName": "中文",
   "LangSwitched": "界面语言已切换为中文（已写入全局配置）",
+  "LangSwitchedNotSaved": "已切换界面语言;没有主目录,这个选择不会被保存",
   "LangUnknown": "未知语言 '{value}'。可用: zh, en",
   "ErrMissingApiKey": "缺少 DeepSeek API Key；请设置环境变量 DEEPSEEK_API_KEY，或在 https://platform.deepseek.com 获取密钥\n1. 在 https://platform.deepseek.com 注册并创建 API Key\n2. export DEEPSEEK_API_KEY=sk-...\n3. 国内网络若连接不稳定，可尝试代理或镜像端点（deep-code 默认使用 https://api.deepseek.com/beta）",
   "ErrHttp": "HTTP 请求失败：{error}\n网络连接 DeepSeek 失败，请检查本机网络、代理设置或 DeepSeek endpoint；国内网络不稳定时建议配置可用代理。",

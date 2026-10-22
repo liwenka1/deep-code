@@ -3195,6 +3195,10 @@ fn find_opens_a_folded_block_that_holds_the_match() {
     app.find_in_transcript("parser decision");
     assert!(!app.history[index].is_folded(), "the block was opened");
     assert!(app.find_state.is_none(), "nothing to jump to yet");
+    assert!(
+        !app.run_pending_find(),
+        "the frame the block opened in is not drawn yet: the search waits"
+    );
 
     let _ = frame(&mut app, 80, 30);
     assert!(app.run_pending_find());
@@ -3206,4 +3210,60 @@ fn find_opens_a_folded_block_that_holds_the_match() {
         snapshot.lines[line]
     );
     assert!(!app.run_pending_find(), "run once");
+}
+
+/// A match the wrapped snapshot cannot show — split across two rows — opens
+/// one folded block and stops there. The re-run opened the next folded block
+/// holding it, frame after frame, until every one stood open.
+#[test]
+fn a_find_that_wrapping_hides_opens_one_block_at_most() {
+    // Aperiodic, so a window split by wrapping appears nowhere else whole.
+    let mut seed: u64 = 0x1234_5678;
+    let word: String = (0..300)
+        .map(|_| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            char::from(b'a' + ((seed >> 33) % 26) as u8)
+        })
+        .collect();
+    let summary = |n: usize| -> String {
+        let mut text: String = (0..20).map(|i| format!("- fact {n}.{i}\n")).collect();
+        text.push_str(&format!("- {word}\n"));
+        text
+    };
+    // The window of the word that the 60-column render splits across rows.
+    let mut probe = App::new();
+    probe.lang = Lang::En;
+    probe
+        .history
+        .push(HistoryCell::compaction(9, None, summary(0)));
+    let last = probe.history.len() - 1;
+    probe.history[last].set_expanded();
+    let _ = frame(&mut probe, 60, 200);
+    let shown = probe.transcript.as_ref().unwrap().lines.join("\n");
+    let needle = (0..word.len() - 12)
+        .map(|at| word[at..at + 12].to_string())
+        .find(|window| !shown.contains(window.as_str()))
+        .expect("wrapping splits the word somewhere");
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    for n in 0..3 {
+        app.history
+            .push(HistoryCell::compaction(9, None, summary(n)));
+    }
+    let _ = frame(&mut app, 60, 200);
+    app.find_in_transcript(&needle);
+    for _ in 0..5 {
+        let _ = frame(&mut app, 60, 200);
+        app.run_pending_find();
+    }
+    let opened = app
+        .history
+        .iter()
+        .filter(|cell| matches!(cell, HistoryCell::Compaction { expanded: true, .. }))
+        .count();
+    assert_eq!(opened, 1, "{}", app.status);
+    assert!(app.pending_find.is_none());
 }
