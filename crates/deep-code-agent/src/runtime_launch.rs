@@ -127,6 +127,9 @@ pub fn build_tool_registry(
             &crate::web_tools::WebBackend::from_config(config),
         ));
     }
+    // The model's own task list: parent only (a child's work is one task) and
+    // always, since it needs no boundary.
+    registry.register(crate::todo_tool::TodoWriteTool);
     // Mounted only when the index lists something: a tool whose every call
     // can only answer "no such skill" is tokens spent on a dead end.
     if !skills.is_empty() {

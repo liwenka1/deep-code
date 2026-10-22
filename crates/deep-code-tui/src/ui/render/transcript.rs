@@ -599,6 +599,35 @@ pub(super) fn cell_lines_unsanitized(
             .lines()
             .flat_map(|logical| wrap_prefixed("    ", logical, width, dim, dim))
             .collect(),
+        // The model's task list: a header with the tally, then one row per
+        // item — done rows dim and struck through, the one in progress bold.
+        HistoryCell::Todo { items } => {
+            let done = items
+                .iter()
+                .filter(|item| item.state == crate::history::TodoState::Done)
+                .count();
+            let mut lines = vec![Line::from(vec![
+                Span::styled("☰ ", dim),
+                Span::styled(
+                    tr(lang, TextId::TodoHeader).to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {done}/{}", items.len()), dim),
+            ])];
+            for item in items {
+                let style = match item.state {
+                    crate::history::TodoState::Done => dim.add_modifier(Modifier::CROSSED_OUT),
+                    crate::history::TodoState::InProgress => Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                    crate::history::TodoState::Pending => Style::default(),
+                };
+                let prefix = format!("  {} ", item.state.glyph());
+                lines.extend(wrap_prefixed(&prefix, &item.content, width, style, dim));
+            }
+            lines.push(Line::default());
+            lines
+        }
         // A write's diff: the header row always, the coloured hunks when open.
         // Leading spaces are a diff line's alignment, so lines are not trimmed.
         HistoryCell::Diff {

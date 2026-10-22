@@ -1223,3 +1223,31 @@ None.
         );
     }
 }
+
+/// A child never gets `todo_write`: its work is one task, and the list is the
+/// parent's statement of the plan to the user.
+#[test]
+fn a_child_registry_has_no_todo_tool() {
+    let workspace = tempfile::tempdir().unwrap();
+    let boundary = crate::workspace_policy::WorkspacePolicy::new(workspace.path().to_path_buf())
+        .expect("test workspace must resolve");
+    for role in [
+        crate::subagent::SubAgentRole::Implementer,
+        crate::subagent::SubAgentRole::Explore,
+    ] {
+        let (registry, _jobs) = crate::subagent::registry::child_tool_registry(
+            &boundary,
+            role,
+            crate::execution_policy::ExecPolicy::default(),
+            true,
+            &[],
+            &crate::i18n::SharedLang::default(),
+            &crate::web_tools::WebBackend::local_only(),
+        );
+        let names: Vec<String> = registry.specs().into_iter().map(|spec| spec.name).collect();
+        assert!(
+            !names.iter().any(|name| name == "todo_write"),
+            "{role:?}: {names:?}"
+        );
+    }
+}

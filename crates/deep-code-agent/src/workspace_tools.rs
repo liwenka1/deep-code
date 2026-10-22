@@ -1037,7 +1037,8 @@ impl Tool for WriteFileTool {
     }
 
     fn description(&self) -> &str {
-        "Create or overwrite a UTF-8 file inside the workspace. Requires approval."
+        "Create or overwrite a UTF-8 file inside the workspace. Gated by the session's approval \
+         policy: it prompts in the default tier and runs unprompted under accept_edits and above."
     }
 
     fn requires_approval(&self) -> bool {
@@ -1585,7 +1586,8 @@ impl Tool for ApplyPatchTool {
         "Replace `old` with `new` in one workspace file. `old` must identify a unique location; \
          it is matched exactly first, then falling back to ignoring indentation and normalizing \
          typographic punctuation. Include enough surrounding context to make `old` unique. \
-         Requires approval."
+         Gated by the session's approval policy: it prompts in the default tier and runs \
+         unprompted under accept_edits and above."
     }
 
     fn requires_approval(&self) -> bool {

@@ -49,6 +49,55 @@ pub(crate) fn session_summary(
     }
 }
 
+/// One line of the model's task list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodoEntry {
+    pub content: String,
+    pub state: TodoState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoState {
+    Pending,
+    InProgress,
+    Done,
+}
+
+impl TodoState {
+    /// The checkbox the transcript draws: open, half, ticked.
+    #[must_use]
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Self::Pending => "☐",
+            Self::InProgress => "◐",
+            Self::Done => "☑",
+        }
+    }
+}
+
+impl HistoryCell {
+    /// The task list a `todo_write` result carries (`details.todos`), if any.
+    /// Unknown statuses read as pending rather than dropping the item: the
+    /// list is the model's statement of its plan, and a line with a strange
+    /// status is still a line of the plan.
+    pub(crate) fn todo_from(details: Option<&serde_json::Value>) -> Option<Self> {
+        let todos = details?.get("todos")?.as_array()?;
+        let items = todos
+            .iter()
+            .filter_map(|item| {
+                let content = item.get("content")?.as_str()?.to_string();
+                let state = match item.get("status").and_then(serde_json::Value::as_str) {
+                    Some("done") => TodoState::Done,
+                    Some("in_progress") => TodoState::InProgress,
+                    _ => TodoState::Pending,
+                };
+                Some(TodoEntry { content, state })
+            })
+            .collect();
+        Some(Self::Todo { items })
+    }
+}
+
 /// A diff block opens expanded up to this many lines and folded beyond: a
 /// long rewrite should not push the conversation off the screen uninvited,
 /// while a typical edit is read in place.
@@ -325,6 +374,12 @@ pub enum HistoryCell {
         /// gives.
         expanded: bool,
     },
+    /// The model's task list, as `todo_write` last sent it. Every call
+    /// replaces the whole list, so each cell is a complete snapshot; the
+    /// newest one on screen is the current plan.
+    Todo {
+        items: Vec<TodoEntry>,
+    },
     System {
         text: String,
     },
@@ -478,6 +533,23 @@ impl HistoryCell {
                 )]
             }
             Self::ToolStream { text } => text.lines().map(str::to_string).collect(),
+            Self::Todo { items } => {
+                let done = items
+                    .iter()
+                    .filter(|item| item.state == TodoState::Done)
+                    .count();
+                std::iter::once(format!(
+                    "{} {done}/{}",
+                    tr(lang, TextId::TodoHeader),
+                    items.len()
+                ))
+                .chain(
+                    items
+                        .iter()
+                        .map(|item| format!("{} {}", item.state.glyph(), item.content)),
+                )
+                .collect()
+            }
             // `/copy` and a selection get the whole diff whether or not the
             // block is open — folding is a display choice.
             Self::Diff {

@@ -2999,3 +2999,56 @@ fn diff_cell_colours_changes_and_folds_to_its_header() {
         .collect();
     assert!(header.starts_with("▸ src/a.rs"), "{header}");
 }
+
+/// The task list draws a tally header and one row per item: done rows dim
+/// and struck through, the one in progress bold, pending plain.
+#[test]
+fn todo_cell_draws_the_tally_and_marks_each_state() {
+    use crate::history::{TodoEntry, TodoState};
+    let cell = HistoryCell::Todo {
+        items: vec![
+            TodoEntry {
+                content: "read the parser".to_string(),
+                state: TodoState::Done,
+            },
+            TodoEntry {
+                content: "write the fix".to_string(),
+                state: TodoState::InProgress,
+            },
+            TodoEntry {
+                content: "run the tests".to_string(),
+                state: TodoState::Pending,
+            },
+        ],
+    };
+    let lines = cell_lines(&cell, 60, Lang::Zh);
+    let text: String = lines
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+        .collect();
+    assert!(text.contains("待办") && text.contains("1/3"), "{text}");
+    assert!(
+        text.contains("☑ read the parser") && text.contains("◐ write the fix"),
+        "{text}"
+    );
+    assert!(text.contains("☐ run the tests"), "{text}");
+    let style_of = |needle: &str| {
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains(needle))
+            .map(|span| span.style)
+            .unwrap_or_else(|| panic!("missing span {needle}"))
+    };
+    assert!(
+        style_of("read the parser")
+            .add_modifier
+            .contains(Modifier::CROSSED_OUT)
+    );
+    assert!(
+        style_of("write the fix")
+            .add_modifier
+            .contains(Modifier::BOLD)
+    );
+    assert_eq!(style_of("run the tests").add_modifier, Modifier::empty());
+}

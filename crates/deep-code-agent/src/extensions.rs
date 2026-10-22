@@ -35,7 +35,9 @@ pub const TOOL_DISCIPLINE: &str = "\
 - 先规划再行动：想清楚需要哪些信息，再决定调用哪些工具。\n\
 - 一次性读取所需文件，不要反复读取同一文件；能从已有上下文推断的内容不要再调工具确认。\n\
 - 调查类调用尽量批量进行；拿到足够信息后直接给出结论或一次性完成修改，避免一步一调的碎步操作。\n\
-- 工具结果已在上下文中，无需重复获取。";
+- 工具结果已在上下文中，无需重复获取。\n\
+- 三步以上的任务先用 todo_write 列出清单，开始一步标 in_progress、做完标 done（每次提交完整列表），\
+让用户看得到进度；一两步的小事不用。";
 
 /// Sub-agent delegation guidance for the parent runtime. The `agent` tool is
 /// always mounted, but otherwise the model has only its one-line description —

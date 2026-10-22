@@ -4548,3 +4548,49 @@ fn ctrl_r_searches_the_history_backwards_and_restores_the_draft_on_escape() {
     assert!(empty.status.contains("还没有历史"), "{}", empty.status);
     empty.history_search_cancel();
 }
+
+/// A `todo_write` result is followed by the task list as a cell; unknown
+/// statuses read as pending, and a result without a list adds nothing.
+#[test]
+fn a_todo_write_result_gets_a_task_list_cell() {
+    let mut app = App::new();
+    let turn_id = deep_code_agent::TurnId("turn_1".to_string());
+    let tool_call_id = deep_code_agent::ToolCallId("call_1".to_string());
+    app.apply_runtime_event(RuntimeEvent::TurnStarted {
+        turn_id: turn_id.clone(),
+        prompt: "plan".to_string(),
+    });
+    app.apply_runtime_event(RuntimeEvent::ToolCallStarted {
+        turn_id: turn_id.clone(),
+        tool_call_id: tool_call_id.clone(),
+        tool_name: "todo_write".to_string(),
+        arguments: serde_json::json!({ "items": [] }),
+    });
+    let mut result = deep_code_agent::ToolResult::success(
+        "call_1",
+        "todo_write",
+        "todo: 1/3 done, 1 in progress, 1 pending",
+    );
+    result.details = Some(serde_json::json!({ "todos": [
+        { "content": "read", "status": "done" },
+        { "content": "write", "status": "in_progress" },
+        { "content": "test", "status": "someday" }
+    ] }));
+    app.apply_runtime_event(RuntimeEvent::ToolCallFinished {
+        turn_id: Some(turn_id),
+        tool_call_id,
+        result,
+    });
+    let Some(HistoryCell::Todo { items }) = app.history.last() else {
+        panic!("expected a todo cell, got {:?}", app.history.last());
+    };
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0].state, crate::history::TodoState::Done);
+    assert_eq!(items[1].state, crate::history::TodoState::InProgress);
+    assert_eq!(items[2].state, crate::history::TodoState::Pending);
+    assert_eq!(items[2].content, "test");
+    assert!(
+        HistoryCell::todo_from(Some(&serde_json::json!({ "edit": {} }))).is_none(),
+        "no list, no cell"
+    );
+}

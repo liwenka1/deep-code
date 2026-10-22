@@ -791,3 +791,16 @@ fn the_skill_tool_is_mounted_only_when_skills_exist() {
     );
     assert!(names.iter().any(|name| name == "skill"), "{names:?}");
 }
+
+/// `todo_write` is mounted for the main session whatever the workspace holds
+/// (the child half of this claim lives with the sub-agent tests).
+#[test]
+fn todo_write_is_mounted_for_the_parent() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let names = parent_tool_names(
+        EchoClient::new(SharedLang::default()),
+        &AgentConfig::builtin(),
+        workspace.path(),
+    );
+    assert!(names.iter().any(|name| name == "todo_write"), "{names:?}");
+}

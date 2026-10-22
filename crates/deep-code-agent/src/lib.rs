@@ -39,6 +39,7 @@ mod task_class;
 mod test_symlinks;
 mod text_sanitize;
 mod text_util;
+mod todo_tool;
 mod tool;
 mod web_tools;
 mod workspace_policy;

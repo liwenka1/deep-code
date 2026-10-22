@@ -197,6 +197,10 @@ impl App {
                         if let Some(diff) = HistoryCell::edit_diff(result.details.as_ref()) {
                             self.history.push(diff);
                         }
+                        // The task list, when `todo_write` just replaced it.
+                        if let Some(todo) = HistoryCell::todo_from(result.details.as_ref()) {
+                            self.history.push(todo);
+                        }
                     }
                 }
             }
