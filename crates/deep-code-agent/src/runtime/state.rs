@@ -83,11 +83,14 @@ pub(super) struct RuntimeState {
     /// that runs between turns may race it: a hand-run compaction did, and
     /// lost on the first poll every time a turn had been cancelled before it.
     pub(super) cancel: CancellationToken,
-    /// A threshold compaction already ran (or failed) in this turn; reset by
-    /// `begin_turn`. One per turn: past the first, all that is left to archive
-    /// is the previous turn's tail, one entry per step, and each of those
-    /// folds would cost a summarizer round trip of its own.
-    pub(super) threshold_compaction_tried: bool,
+    /// The turn a threshold compaction already ran (or failed) in. One per
+    /// turn: past the first, all that is left to archive is the previous
+    /// turn's tail, one entry per step, and each of those folds would cost a
+    /// summarizer round trip of its own. Keyed by the turn rather than a flag
+    /// `begin_turn` resets: a cancelled turn's loop can still be on its way
+    /// out of a fold when the next turn begins, and a flag it set then was
+    /// the next turn's one fold, spent.
+    pub(super) threshold_compaction_tried: Option<TurnId>,
     /// Tools the user approved for the whole session ("a" in the approval
     /// panel). In-memory only: forgotten when the runtime shuts down.
     pub(super) session_approved: HashSet<String>,

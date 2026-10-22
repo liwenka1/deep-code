@@ -220,7 +220,7 @@ impl AgentRuntime {
             // turn grew the context without ever re-checking the threshold — the
             // exact shape that overflows the window, and a context-overflow 400
             // is not retriable and has no recovery path.
-            self.maybe_compact(&route.effective_model, tx, &cancel)
+            self.maybe_compact(&route.effective_model, tx, &cancel, &turn_id)
                 .await;
 
             // Mid-turn steering lands here. The iteration above ran to its

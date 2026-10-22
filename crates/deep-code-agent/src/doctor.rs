@@ -383,10 +383,12 @@ fn api_key_report(config: &AgentConfig) -> ApiKeyReport {
 fn collect_skills(workspace: &Path) -> SkillsDoctorReport {
     let registry = discover_in_workspace(workspace);
     let dirs = [
-        workspace_skills_dir(workspace),
-        workspace.join(".deep-code").join("skills"),
+        Some(workspace_skills_dir(workspace)),
+        Some(workspace.join(".deep-code").join("skills")),
         global_skills_dir(),
-    ];
+    ]
+    .into_iter()
+    .flatten();
     let mut directories = Vec::new();
     for path in dirs {
         let present = path.is_dir();

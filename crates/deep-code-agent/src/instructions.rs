@@ -198,71 +198,121 @@ fn compact_instructions_section(body: &str) -> Option<String> {
             || title == "压缩指令"
     };
     let lines: Vec<&str> = body.lines().collect();
-    let roles = markdown_line_roles(&lines);
-    let start = roles
+    let headings = markdown_headings(&lines);
+    let (at, section) = headings
         .iter()
-        .position(|role| matches!(role, LineRole::Heading { title, .. } if is_title(title)))?;
-    let LineRole::Heading { level, .. } = roles[start] else {
-        return None;
-    };
-    let body_start = if matches!(roles.get(start + 1), Some(LineRole::Underline)) {
-        start + 2
-    } else {
-        start + 1
-    };
-    let end = roles[body_start..]
+        .enumerate()
+        .find(|(_, heading)| is_title(&heading.title))?;
+    let end = headings[at + 1..]
         .iter()
-        .position(|role| matches!(role, LineRole::Heading { level: found, .. } if *found <= level))
-        .map_or(lines.len(), |offset| body_start + offset);
-    let section = lines[body_start..end].join("\n");
+        .find(|heading| heading.level <= section.level)
+        .map_or(lines.len(), |heading| heading.first_line);
+    let section = lines[section.last_line + 1..end].join("\n");
     let section = section.trim();
     (!section.is_empty()).then(|| section.to_string())
 }
 
-/// What a line is to the section finder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LineRole<'a> {
-    Text,
-    /// An ATX heading, or the text line of a setext one.
-    Heading {
-        level: usize,
-        title: &'a str,
-    },
-    /// The `===` / `---` line under a setext heading's text.
-    Underline,
-    /// A fence line, or a line inside a fenced code block.
-    Code,
+/// A heading and the lines it spans: one for an ATX heading, the paragraph
+/// and its underline for a setext one, whose title is the whole paragraph.
+#[derive(Debug)]
+struct Heading {
+    first_line: usize,
+    last_line: usize,
+    level: usize,
+    title: String,
 }
 
-fn markdown_line_roles<'a>(lines: &[&'a str]) -> Vec<LineRole<'a>> {
-    let mut roles = vec![LineRole::Text; lines.len()];
+/// The file's headings, read the way a Markdown renderer reads them.
+///
+/// A setext underline turns the paragraph above it into a heading only when
+/// that paragraph is not inside a list item or a quote: under one, `---` is a
+/// rule, and taking it for a heading cut the section off there. A list item's
+/// continuation lines — indented, lazy, or an indented paragraph after a
+/// blank line — stay inside the item.
+fn markdown_headings(lines: &[&str]) -> Vec<Heading> {
+    let mut headings = Vec::new();
     let mut fence: Option<(u8, usize)> = None;
+    // The open paragraph: its first line, and whether it is inside a list
+    // item or a quote.
+    let mut paragraph: Option<(usize, bool)> = None;
+    // A list or quote is open: an indented paragraph after a blank line still
+    // belongs to it.
+    let mut in_container = false;
     for (index, line) in lines.iter().enumerate() {
         if let Some((marker, length)) = fence {
-            roles[index] = LineRole::Code;
             if closes_fence(line, marker, length) {
                 fence = None;
             }
             continue;
         }
+        if line.trim().is_empty() {
+            paragraph = None;
+            continue;
+        }
+        // Four spaces or a tab: a paragraph's continuation, or indented code.
+        let Some(rest) = block_indent(line) else {
+            continue;
+        };
         if let Some(open) = opens_fence(line) {
             fence = Some(open);
-            roles[index] = LineRole::Code;
-        } else if let Some((level, title)) = atx_heading(line) {
-            roles[index] = LineRole::Heading { level, title };
-        } else if let Some(level) = setext_underline(line)
-            && index > 0
-            && roles[index - 1] == LineRole::Text
-            && is_paragraph_line(lines[index - 1])
-        {
-            roles[index - 1] = LineRole::Heading {
-                level,
-                title: lines[index - 1].trim(),
-            };
-            roles[index] = LineRole::Underline;
+            paragraph = None;
+            continue;
         }
+        if let Some((level, title)) = atx_heading(line) {
+            headings.push(Heading {
+                first_line: index,
+                last_line: index,
+                level,
+                title: title.to_string(),
+            });
+            paragraph = None;
+            in_container = false;
+            continue;
+        }
+        if let Some(level) = setext_underline(line) {
+            match paragraph {
+                Some((first, false)) => {
+                    let title = lines[first..index]
+                        .iter()
+                        .map(|line| line.trim())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    headings.push(Heading {
+                        first_line: first,
+                        last_line: index,
+                        level,
+                        title,
+                    });
+                    paragraph = None;
+                    in_container = false;
+                    continue;
+                }
+                // `---` with nothing it may underline is a rule; a lone `===`
+                // is text and falls through.
+                _ if level == 2 => {
+                    paragraph = None;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if is_thematic_break(rest) {
+            paragraph = None;
+            continue;
+        }
+        let container = starts_container(rest);
+        let indented = rest.len() < line.len();
+        if container {
+            in_container = true;
+        } else if paragraph.is_none() && !indented {
+            in_container = false;
+        }
+        paragraph = Some(match paragraph {
+            Some((first, contained)) => (first, contained || container),
+            None => (index, container || (in_container && indented)),
+        });
     }
-    roles
+    headings
 }
 
 /// The line past at most three spaces of indentation; `None` for four or
@@ -332,15 +382,12 @@ fn setext_underline(line: &str) -> Option<usize> {
     rest.chars().all(|ch| ch == marker).then_some(level)
 }
 
-/// A line a setext underline can turn into a heading: paragraph text, not a
-/// list item or a quote (under those a `---` is a rule).
-fn is_paragraph_line(line: &str) -> bool {
-    let Some(rest) = block_indent(line) else {
-        return false;
-    };
+/// A list item or a quote opens here: a bullet or an ordered marker followed
+/// by a space (or nothing), or a `>`.
+fn starts_container(rest: &str) -> bool {
     let rest = rest.trim_end();
-    if rest.is_empty() || rest.starts_with('>') {
-        return false;
+    if rest.starts_with('>') {
+        return true;
     }
     let bullet = rest.starts_with(['-', '*', '+'])
         && (rest.len() == 1 || rest[1..].starts_with([' ', '\t']));
@@ -348,7 +395,20 @@ fn is_paragraph_line(line: &str) -> bool {
     let ordered = (1..=9).contains(&digits)
         && rest[digits..].starts_with(['.', ')'])
         && (rest.len() == digits + 1 || rest[digits + 1..].starts_with([' ', '\t']));
-    !bullet && !ordered
+    bullet || ordered
+}
+
+/// A thematic break: three or more `*`, `-` or `_`, the same one, with only
+/// spaces or tabs between them.
+fn is_thematic_break(rest: &str) -> bool {
+    let Some(first) = rest.chars().find(|ch| !matches!(ch, ' ' | '\t')) else {
+        return false;
+    };
+    matches!(first, '*' | '-' | '_')
+        && rest
+            .chars()
+            .all(|ch| ch == first || ch == ' ' || ch == '\t')
+        && rest.chars().filter(|ch| *ch == first).count() >= 3
 }
 
 fn render_section(scope: InstructionScope, body: &str, cut: bool) -> String {
@@ -780,6 +840,51 @@ mod tests {
                 "a rule after a blank line is not a heading",
                 "## Compact Instructions\n- keep X\n\n---\n- keep Y\n## Next\ny",
                 Some("- keep X\n\n---\n- keep Y"),
+            ),
+        ];
+        for (case, body, expected) in cases {
+            let dir = TempDir::new().unwrap();
+            write(&dir, "ws", body);
+            assert_eq!(
+                load(&dir, true).compact_instructions.as_deref(),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    /// A `---` under a list item's or a quote's text is a rule, not a heading
+    /// that ends the section, and a setext heading's title is its whole
+    /// paragraph — the last line alone made a false section.
+    #[test]
+    fn a_rule_inside_a_list_or_quote_does_not_end_the_section() {
+        let cases: [(&str, &str, Option<&str>); 5] = [
+            (
+                "an indented continuation line",
+                "## Compact Instructions\n- keep the failing test names,\n  and the commands that reproduce them\n---\n- keep Y\n## Next\ny",
+                Some(
+                    "- keep the failing test names,\n  and the commands that reproduce them\n---\n- keep Y",
+                ),
+            ),
+            (
+                "a lazy continuation line",
+                "## Compact Instructions\n- keep X\nand its reason\n---\n- keep Y\n## Next\ny",
+                Some("- keep X\nand its reason\n---\n- keep Y"),
+            ),
+            (
+                "a quote's continuation line",
+                "## Compact Instructions\n> keep X\nand its reason\n---\n- keep Y\n## Next\ny",
+                Some("> keep X\nand its reason\n---\n- keep Y"),
+            ),
+            (
+                "an item's indented paragraph after a blank line",
+                "## Compact Instructions\n- keep X\n\n  more about X\n---\n- keep Y\n## Next\ny",
+                Some("- keep X\n\n  more about X\n---\n- keep Y"),
+            ),
+            (
+                "a two-line paragraph over a rule",
+                "# R\nSome intro\nCompact Instructions\n---\n- keep X\n",
+                None,
             ),
         ];
         for (case, body, expected) in cases {

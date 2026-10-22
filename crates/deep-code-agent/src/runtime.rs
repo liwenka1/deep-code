@@ -397,7 +397,6 @@ impl AgentRuntime {
             state.current_prompt = Some(prompt);
             state.current_turn_id = Some(turn_id);
             state.cancel = CancellationToken::new();
-            state.threshold_compaction_tried = false;
             // Per-turn struggle counter and the "triggered this turn" flag
             // reset; the `cascade_escalated` latch intentionally persists for
             // the rest of the session.

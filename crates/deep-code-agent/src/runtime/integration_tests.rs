@@ -6364,3 +6364,203 @@ async fn a_turn_that_lands_while_compact_writes_is_kept() {
         "{wire:?}"
     );
 }
+
+/// A cancelled turn's loop, still on its way out of a threshold fold when the
+/// next turn begins (the HTTP server starts a new prompt that way), cannot
+/// spend the next turn's one fold. A flag `begin_turn` reset was set again by
+/// the old loop on its way out, and the new turn never compacted.
+#[tokio::test]
+async fn a_cancelled_turn_cannot_spend_the_next_turns_threshold_fold() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct StallableHandover {
+        stall: Arc<AtomicBool>,
+        started: Arc<tokio::sync::Notify>,
+        handovers: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for StallableHandover {
+        fn provider_name(&self) -> &'static str {
+            "stallable"
+        }
+
+        fn model(&self) -> &str {
+            "stallable"
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
+            let events = if is_handover_request(&request) {
+                *self.handovers.lock().unwrap() += 1;
+                if self.stall.load(Ordering::SeqCst) {
+                    self.started.notify_one();
+                    let stream = try_stream! {
+                        std::future::pending::<()>().await;
+                        yield AgentEvent::Done { usage: None };
+                    };
+                    return Ok(Box::pin(stream));
+                }
+                handover_reply("# handover\n- ok")
+            } else {
+                ok_turn()
+            };
+            let stream = try_stream! {
+                for event in events {
+                    yield event;
+                }
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
+    let stall = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let handovers = Arc::new(Mutex::new(0));
+    let config = crate::config::AgentConfig {
+        compaction_threshold: Some(1),
+        ..crate::config::AgentConfig::builtin()
+    };
+    let runtime = AgentRuntime::with_config(
+        StallableHandover {
+            stall: Arc::clone(&stall),
+            started: Arc::clone(&started),
+            handovers: Arc::clone(&handovers),
+        },
+        ToolRegistry::default(),
+        config,
+    );
+    for index in 0..6 {
+        let mut rx = runtime.submit_user(format!("prompt {index}")).await;
+        drain(&mut rx).await;
+    }
+    stall.store(true, Ordering::SeqCst);
+    let mut first = runtime.submit_user("turn A").await;
+    started.notified().await;
+    // The next prompt begins while turn A waits on its summarizer: its token
+    // is cancelled, and its loop leaves the fold after B has begun.
+    runtime.begin_turn("turn B").await;
+    drain(&mut first).await;
+    stall.store(false, Ordering::SeqCst);
+    let before = *handovers.lock().unwrap();
+    let mut second = runtime.drive_turn().await;
+    let events = drain(&mut second).await;
+    assert_eq!(
+        *handovers.lock().unwrap() - before,
+        1,
+        "turn B tried its own threshold fold: {events:?}"
+    );
+}
+
+/// A summarizer stream that stops without its closing chunk ended mid-reply:
+/// the fragment is not folded as if it were a summary.
+#[tokio::test]
+async fn a_summary_stream_that_never_finished_is_no_summary() {
+    let (client, _handovers) = HandoverClient::new(|_| {
+        Ok(vec![AgentEvent::TextDelta {
+            text: "# handover\n## 已完成 / Done so far\n- half of the".to_string(),
+        }])
+    });
+    let runtime = AgentRuntime::with_config(
+        client,
+        ToolRegistry::default(),
+        crate::config::AgentConfig::builtin(),
+    );
+    for index in 0..6 {
+        let mut rx = runtime.submit_user(format!("prompt {index}")).await;
+        drain(&mut rx).await;
+    }
+    let before = runtime.session_messages().await;
+    let outcome = compact(&runtime, None).await;
+    assert!(
+        matches!(&outcome, CompactNowOutcome::Failed(reason) if reason.contains("ended before")),
+        "{outcome:?}"
+    );
+    assert_eq!(runtime.session_messages().await, before);
+}
+
+/// A summary past the length cap keeps its cut-short note inside the cap, so
+/// the next fold — which carries the summary clipped to that cap — keeps it.
+#[tokio::test]
+async fn the_cut_short_note_fits_inside_the_cap() {
+    let (client, _handovers) = HandoverClient::new(|_| {
+        Ok(handover_reply(&format!(
+            "# handover\n{}",
+            "- 很长的一行事实\n".repeat(3_000)
+        )))
+    });
+    let runtime = AgentRuntime::with_config(
+        client,
+        ToolRegistry::default(),
+        crate::config::AgentConfig::builtin(),
+    );
+    for index in 0..6 {
+        let mut rx = runtime.submit_user(format!("prompt {index}")).await;
+        drain(&mut rx).await;
+    }
+    let report = folded(compact(&runtime, None).await);
+    assert!(report.cut_short);
+    assert!(
+        report.summary.chars().count() <= crate::compaction::MAX_HANDOVER_SUMMARY_CHARS,
+        "{} chars",
+        report.summary.chars().count()
+    );
+    assert!(
+        report
+            .summary
+            .ends_with(crate::compaction::HANDOVER_CUT_SHORT_NOTE)
+    );
+}
+
+/// A cancel that lands while the summary is finishing still means "stop":
+/// the summary that came back with it is not folded in.
+#[tokio::test]
+async fn a_cancel_as_the_summary_finishes_folds_nothing() {
+    struct CancellingSummaryClient {
+        cancel: tokio_util::sync::CancellationToken,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for CancellingSummaryClient {
+        fn provider_name(&self) -> &'static str {
+            "cancelling"
+        }
+
+        fn model(&self) -> &str {
+            "cancelling"
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
+            let summarizer = is_handover_request(&request);
+            let cancel = self.cancel.clone();
+            let stream = try_stream! {
+                if summarizer {
+                    yield AgentEvent::TextDelta { text: "# handover".to_string() };
+                    // The press lands in the same poll that delivers the end
+                    // of the summary.
+                    cancel.cancel();
+                } else {
+                    yield AgentEvent::TextDelta { text: "ok".to_string() };
+                }
+                yield AgentEvent::Done { usage: None };
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let runtime = AgentRuntime::with_config(
+        CancellingSummaryClient {
+            cancel: cancel.clone(),
+        },
+        ToolRegistry::default(),
+        crate::config::AgentConfig::builtin(),
+    );
+    for index in 0..6 {
+        let mut rx = runtime.submit_user(format!("prompt {index}")).await;
+        drain(&mut rx).await;
+    }
+    let before = runtime.session_messages().await;
+    let outcome = runtime.compact_now(None, &cancel).await;
+    assert_eq!(outcome, CompactNowOutcome::Cancelled);
+    assert_eq!(runtime.session_messages().await, before);
+}

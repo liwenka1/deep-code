@@ -1,5 +1,6 @@
 //! Shared filesystem locations.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// The user's home directory, if the environment names one.
@@ -10,9 +11,21 @@ use std::path::PathBuf;
 /// helper: if two call sites disagreed about what "home" is, a value written
 /// by one feature would silently be invisible to another.
 pub(crate) fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+/// [`home_dir`] with the two variables handed in. An empty or relative value
+/// names no home: everything built on it — the global config, the skills
+/// root, the directories the sandbox seals — resolved against the working
+/// directory, which is the workspace, and `HOME=""` loaded the workspace's own
+/// `.deep-code/config.toml` as the global layer, the one trusted with
+/// `approval.auto_allow`.
+fn home_from(home: Option<OsString>, profile: Option<OsString>) -> Option<PathBuf> {
+    [home, profile]
+        .into_iter()
+        .flatten()
         .map(PathBuf::from)
+        .find(|path| path.is_absolute())
 }
 
 /// The data-volume alias macOS splices into the system volume's namespace.
@@ -379,6 +392,23 @@ pub(crate) fn sensitive_paths() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// An empty or relative `HOME` is no home, and `USERPROFILE` is still
+    /// consulted after one.
+    #[test]
+    fn a_relative_home_is_no_home() {
+        let absolute = std::env::temp_dir();
+        assert_eq!(super::home_from(Some(OsString::new()), None), None);
+        assert_eq!(super::home_from(Some("home".into()), None), None);
+        assert_eq!(
+            super::home_from(Some(OsString::new()), Some(absolute.clone().into())),
+            Some(absolute.clone())
+        );
+        assert_eq!(
+            super::home_from(Some(absolute.clone().into()), Some("other".into())),
+            Some(absolute)
+        );
+    }
+
     use super::*;
 
     /// Subpaths of the tools' homes, never the homes themselves:

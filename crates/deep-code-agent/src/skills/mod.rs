@@ -246,14 +246,12 @@ fn is_hidden(path: &Path) -> bool {
         .is_some_and(|component| component.starts_with('.'))
 }
 
-/// The user-level skills root: `~/.deep-code/skills`. Falls back to a
-/// relative path when `$HOME` is unset (containers, stripped-down CI).
+/// The user-level skills root: `~/.deep-code/skills`, or `None` without a
+/// home directory — never a path relative to the working directory, which
+/// would make some other directory the user's own.
 #[must_use]
-pub fn global_skills_dir() -> PathBuf {
-    match crate::paths::home_dir() {
-        Some(home) => home.join(".deep-code").join("skills"),
-        None => PathBuf::from(".deep-code/skills"),
-    }
+pub fn global_skills_dir() -> Option<PathBuf> {
+    crate::paths::home_dir().map(|home| home.join(".deep-code").join("skills"))
 }
 
 /// The project-local skills root: `<workspace>/skills`.
@@ -273,10 +271,12 @@ pub fn workspace_skills_dir(workspace: &Path) -> PathBuf {
 #[must_use]
 pub fn skills_directories(workspace: &Path) -> Vec<PathBuf> {
     let candidates = [
-        workspace_skills_dir(workspace),
-        workspace.join(".deep-code").join("skills"),
+        Some(workspace_skills_dir(workspace)),
+        Some(workspace.join(".deep-code").join("skills")),
         global_skills_dir(),
-    ];
+    ]
+    .into_iter()
+    .flatten();
     let mut resolved = HashSet::new();
     let mut roots = Vec::new();
     for candidate in candidates {

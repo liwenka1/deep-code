@@ -13,7 +13,7 @@ use crate::event::AgentEvent;
 use crate::message::Message;
 use crate::model::ChatRequest;
 use crate::reasoning::ReasoningEffort;
-use crate::runtime::event::{RuntimeEvent, emit};
+use crate::runtime::event::{RuntimeEvent, TurnId, emit};
 use crate::runtime::{AgentRuntime, CompactNowOutcome, CompactionReport};
 use crate::session_entry::SessionEntry;
 use crate::text_util::truncate_chars;
@@ -104,10 +104,11 @@ impl AgentRuntime {
         model: &str,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
         cancel: &CancellationToken,
+        turn_id: &TurnId,
     ) {
         let wire = {
             let state = self.state.lock().await;
-            if state.threshold_compaction_tried {
+            if state.threshold_compaction_tried.as_ref() == Some(turn_id) {
                 return;
             }
             state.session.wire_messages()
@@ -119,7 +120,7 @@ impl AgentRuntime {
             .compact_session(Trigger::Threshold, Some(tx), None, cancel)
             .await;
         if !matches!(outcome, FoldOutcome::Nothing) {
-            self.state.lock().await.threshold_compaction_tried = true;
+            self.state.lock().await.threshold_compaction_tried = Some(turn_id.clone());
         }
     }
 
@@ -216,6 +217,11 @@ impl AgentRuntime {
             }
         };
 
+        // A cancel that landed while the summary was finishing still means
+        // "stop": nothing is folded once it has fired, whatever came back.
+        if cancel.is_cancelled() {
+            return FoldOutcome::Cancelled;
+        }
         let (result, compacted) = {
             let mut state = self.state.lock().await;
             let current = state.session.entries().to_vec();
@@ -391,12 +397,14 @@ impl AgentRuntime {
             .map_err(|error| error.to_string())?;
         let mut text = String::new();
         let mut hit_token_cap = false;
+        let mut finished = false;
         while let Some(event) = stream.next().await {
             match event {
                 Ok(AgentEvent::TextDelta { text: delta }) => text.push_str(&delta),
                 Ok(AgentEvent::Error { message }) => return Err(message),
                 Err(error) => return Err(error.to_string()),
                 Ok(AgentEvent::Done { usage }) => {
+                    finished = true;
                     if let Some(usage) = usage.as_ref() {
                         self.accumulate_request_usage(model, usage).await;
                         // The client does not surface `finish_reason`, but a
@@ -411,16 +419,30 @@ impl AgentRuntime {
                 Ok(_) => {}
             }
         }
+        // A stream that stopped without the provider's closing chunk ended
+        // mid-reply, however clean the end looked: whatever arrived is a
+        // fragment, not a summary.
+        if !finished {
+            return Err("the reply ended before the model finished".to_string());
+        }
         let text = text.trim();
         if text.is_empty() {
             return Err("empty reply".to_string());
         }
         let cut_short = hit_token_cap || text.chars().count() > MAX_HANDOVER_SUMMARY_CHARS;
-        let mut text = truncate_chars(text, MAX_HANDOVER_SUMMARY_CHARS);
-        if cut_short {
-            text.push_str("\n\n");
-            text.push_str(HANDOVER_CUT_SHORT_NOTE);
+        if !cut_short {
+            return Ok(Handover {
+                text: text.to_string(),
+                cut_short,
+            });
         }
+        // The note goes inside the cap, not past it: the next fold carries
+        // the summary clipped to that cap, and the note it would cut off is
+        // the one telling the reader the summary is incomplete.
+        let room = MAX_HANDOVER_SUMMARY_CHARS - HANDOVER_CUT_SHORT_NOTE.chars().count() - 3;
+        let mut text = truncate_chars(text, room);
+        text.push_str("\n\n");
+        text.push_str(HANDOVER_CUT_SHORT_NOTE);
         Ok(Handover { text, cut_short })
     }
 }
