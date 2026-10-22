@@ -473,68 +473,138 @@ fn inline_spans(text: &str) -> Vec<(String, Style)> {
     spans
 }
 
+/// One stretch of a paragraph before emphasis is resolved: literal text, a code
+/// span, a link's label or target — or a run of `*` / `_` (`delim`), whose
+/// text is whatever of the run no emphasis used.
+struct Piece {
+    text: String,
+    style: Style,
+    delim: Option<usize>,
+}
+
+/// A run of `*` or `_` that may open or close emphasis, on the delimiter stack.
+/// The stack is a linked list over the vector, so removing a delimiter costs
+/// nothing and a look-back never walks one that is gone.
+struct Delim {
+    piece: usize,
+    marker: char,
+    /// Characters of the run no emphasis has used yet.
+    remaining: usize,
+    /// The run's length as written, for the rule of three.
+    written: usize,
+    can_open: bool,
+    can_close: bool,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+/// The paragraph's spans: tokenized left to right, then emphasis matched over
+/// the delimiter runs the way Markdown does it — a run is one delimiter (the
+/// second `*` of a `**` that found no partner is not an italic opener of its
+/// own, so `src/**/*.rs` stays a glob), closers pair with the nearest
+/// eligible opener, and two runs whose lengths sum to a multiple of three do
+/// not pair when one of them could go either way.
+///
+/// Linear, and not recursive: it renders every frame of a streaming reply,
+/// and the recursive parser before it took quadratic time and a stack frame
+/// per two characters on a line of `*`, deep enough to overflow and abort the
+/// terminal UI on a model stuck repeating one.
 fn inline_styled(text: &str, base: Style) -> Vec<(String, Style)> {
     let chars: Vec<char> = text.chars().collect();
-    let mut spans: Vec<(String, Style)> = Vec::new();
+    let next_backtick = next_index_table(&chars, '`');
+    let next_bracket = next_index_table(&chars, ']');
+    let next_paren = next_index_table(&chars, ')');
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut delims: Vec<Delim> = Vec::new();
     let mut plain = String::new();
-    let mut index = 0;
-    let flush = |plain: &mut String, spans: &mut Vec<(String, Style)>| {
+    let flush = |plain: &mut String, pieces: &mut Vec<Piece>| {
         if !plain.is_empty() {
-            spans.push((std::mem::take(plain), base));
+            pieces.push(Piece {
+                text: std::mem::take(plain),
+                style: base,
+                delim: None,
+            });
         }
     };
+    let mut index = 0;
     while index < chars.len() {
         let ch = chars[index];
         if ch == '`'
-            && let Some(close) = find_char(&chars, index + 1, '`')
+            && let Some(close) = next_at(&next_backtick, index + 1)
         {
-            flush(&mut plain, &mut spans);
-            let code: String = chars[index + 1..close].iter().collect();
-            spans.push((code, base.patch(code_style())));
+            flush(&mut plain, &mut pieces);
+            pieces.push(Piece {
+                text: chars[index + 1..close].iter().collect(),
+                style: base.patch(code_style()),
+                delim: None,
+            });
             index = close + 1;
             continue;
         }
-        if ch == '*'
-            && chars.get(index + 1) == Some(&'*')
-            && let Some(close) = find_pair(&chars, index + 2, '*')
-            && emphasis_content_ok(&chars[index + 2..close])
-        {
-            flush(&mut plain, &mut spans);
-            let inner: String = chars[index + 2..close].iter().collect();
-            spans.extend(inline_styled(&inner, base.add_modifier(Modifier::BOLD)));
-            index = close + 2;
-            continue;
-        }
-        if (ch == '*' || ch == '_')
-            && let Some(close) = find_single(&chars, index + 1, ch)
-            && emphasis_content_ok(&chars[index + 1..close])
-            && (ch == '*' || word_boundary(&chars, index, close))
-        {
-            flush(&mut plain, &mut spans);
-            let inner: String = chars[index + 1..close].iter().collect();
-            spans.extend(inline_styled(&inner, base.add_modifier(Modifier::ITALIC)));
-            index = close + 1;
+        if ch == '*' || ch == '_' {
+            let run = chars[index..]
+                .iter()
+                .take_while(|next| **next == ch)
+                .count();
+            let before = index.checked_sub(1).map(|at| chars[at]);
+            let after = chars.get(index + run).copied();
+            let (can_open, can_close) = flanking(ch, before, after);
+            if can_open || can_close {
+                flush(&mut plain, &mut pieces);
+                let id = delims.len();
+                if let Some(last) = delims.last_mut() {
+                    last.next = Some(id);
+                }
+                delims.push(Delim {
+                    piece: pieces.len(),
+                    marker: ch,
+                    remaining: run,
+                    written: run,
+                    can_open,
+                    can_close,
+                    prev: id.checked_sub(1),
+                    next: None,
+                });
+                pieces.push(Piece {
+                    text: String::new(),
+                    style: base,
+                    delim: Some(id),
+                });
+            } else {
+                plain.extend(std::iter::repeat_n(ch, run));
+            }
+            index += run;
             continue;
         }
         if ch == '['
-            && let Some(label_end) = find_char(&chars, index + 1, ']')
-            && chars.get(label_end + 1) == Some(&'(')
-            && let Some(url_end) = find_char(&chars, label_end + 2, ')')
+            && let Some(label_end) = next_at(&next_bracket, index + 1)
             && label_end > index + 1
+            && chars.get(label_end + 1) == Some(&'(')
+            && let Some(url_end) = next_at(&next_paren, label_end + 2)
         {
             let label: String = chars[index + 1..label_end].iter().collect();
             let url: String = chars[label_end + 2..url_end].iter().collect();
             if !url.is_empty() && !url.contains(char::is_whitespace) {
-                flush(&mut plain, &mut spans);
-                spans.extend(inline_styled(
-                    &label,
-                    base.add_modifier(Modifier::UNDERLINED),
-                ));
+                flush(&mut plain, &mut pieces);
+                // One level deep at most: a label ends at the first `]`, so
+                // it cannot hold a link of its own.
+                for (text, style) in inline_styled(&label, base.add_modifier(Modifier::UNDERLINED))
+                {
+                    pieces.push(Piece {
+                        text,
+                        style,
+                        delim: None,
+                    });
+                }
                 // The target stays visible: a terminal has no hover, and a link
                 // whose destination is hidden is a link the reader cannot judge
                 // — unless the label already is the destination.
                 if label != url {
-                    spans.push((format!(" ({url})"), base.patch(link_target_style())));
+                    pieces.push(Piece {
+                        text: format!(" ({url})"),
+                        style: base.patch(link_target_style()),
+                        delim: None,
+                    });
                 }
                 index = url_end + 1;
                 continue;
@@ -543,51 +613,159 @@ fn inline_styled(text: &str, base: Style) -> Vec<(String, Style)> {
         plain.push(ch);
         index += 1;
     }
-    flush(&mut plain, &mut spans);
+    flush(&mut plain, &mut pieces);
+
+    let emphasis = match_emphasis(&mut delims);
+    // The ranges as running counts: +1 after an opener, −1 at its closer.
+    let mut bold = vec![0i32; pieces.len() + 1];
+    let mut italic = vec![0i32; pieces.len() + 1];
+    for (opener, closer, strong) in emphasis {
+        let counts = if strong { &mut bold } else { &mut italic };
+        counts[delims[opener].piece + 1] += 1;
+        counts[delims[closer].piece] -= 1;
+    }
+    let mut spans: Vec<(String, Style)> = Vec::new();
+    let (mut bold_depth, mut italic_depth) = (0, 0);
+    for (at, piece) in pieces.into_iter().enumerate() {
+        bold_depth += bold[at];
+        italic_depth += italic[at];
+        let text = match piece.delim {
+            Some(id) => std::iter::repeat_n(delims[id].marker, delims[id].remaining).collect(),
+            None => piece.text,
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let mut style = piece.style;
+        if bold_depth > 0 {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if italic_depth > 0 {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        match spans.last_mut() {
+            Some((last, last_style)) if *last_style == style => last.push_str(&text),
+            _ => spans.push((text, style)),
+        }
+    }
     spans
 }
 
-fn find_char(chars: &[char], from: usize, needle: char) -> Option<usize> {
-    chars[from.min(chars.len())..]
-        .iter()
-        .position(|ch| *ch == needle)
-        .map(|offset| from + offset)
-}
-
-/// The first lone `needle` at or after `from` — a doubled one is a bold
-/// marker and belongs to the inner span, so `*a **b** c*` closes at the end.
-fn find_single(chars: &[char], from: usize, needle: char) -> Option<usize> {
-    let mut at = from;
-    while at < chars.len() {
-        if chars[at] == needle {
-            if chars.get(at + 1) == Some(&needle) {
-                at += 2;
-                continue;
-            }
-            return Some(at);
+/// Pair the delimiter runs into emphasis, as `(opener, closer, strong)`
+/// indices into `delims`; what a pairing uses comes off both runs' `remaining`.
+///
+/// Markdown's procedure: each closer, left to right, takes the nearest opener
+/// of its own marker below it, skipping any the rule of three forbids; the
+/// runs in between are dropped from the stack (they stay literal text, inside
+/// the emphasis). A closer that finds nothing records how far down it looked,
+/// per marker, per whether it could also open and per length mod 3, so a
+/// later closer of the same kind never searches that stretch again — the part
+/// that keeps a line of unmatched runs linear.
+fn match_emphasis(delims: &mut [Delim]) -> Vec<(usize, usize, bool)> {
+    let mut found = Vec::new();
+    let mut bottom: [[[Option<usize>; 3]; 2]; 2] = [[[None; 3]; 2]; 2];
+    let mut current = (!delims.is_empty()).then_some(0);
+    while let Some(closer) = current {
+        if !delims[closer].can_close {
+            current = delims[closer].next;
+            continue;
         }
-        at += 1;
+        let key = (
+            usize::from(delims[closer].marker == '_'),
+            usize::from(delims[closer].can_open),
+            delims[closer].written % 3,
+        );
+        let floor = bottom[key.0][key.1][key.2];
+        let mut candidate = delims[closer].prev;
+        let mut opener = None;
+        while let Some(at) = candidate {
+            if floor.is_some_and(|floor| at <= floor) {
+                break;
+            }
+            let (open, close) = (&delims[at], &delims[closer]);
+            let odd = (open.can_close || close.can_open)
+                && (open.written + close.written) % 3 == 0
+                && !(open.written % 3 == 0 && close.written % 3 == 0);
+            if open.marker == close.marker && open.can_open && !odd {
+                opener = Some(at);
+                break;
+            }
+            candidate = open.prev;
+        }
+        let Some(open) = opener else {
+            bottom[key.0][key.1][key.2] = delims[closer].prev;
+            let next = delims[closer].next;
+            if !delims[closer].can_open {
+                unlink(delims, closer);
+            }
+            current = next;
+            continue;
+        };
+        let strong = delims[open].remaining >= 2 && delims[closer].remaining >= 2;
+        let used = if strong { 2 } else { 1 };
+        delims[open].remaining -= used;
+        delims[closer].remaining -= used;
+        found.push((open, closer, strong));
+        delims[open].next = Some(closer);
+        delims[closer].prev = Some(open);
+        if delims[open].remaining == 0 {
+            unlink(delims, open);
+        }
+        if delims[closer].remaining == 0 {
+            let next = delims[closer].next;
+            unlink(delims, closer);
+            current = next;
+        }
     }
-    None
+    found
 }
 
-/// The first `needle needle` at or after `from`.
-fn find_pair(chars: &[char], from: usize, needle: char) -> Option<usize> {
-    (from..chars.len().saturating_sub(1)).find(|&at| chars[at] == needle && chars[at + 1] == needle)
+fn unlink(delims: &mut [Delim], at: usize) {
+    let (prev, next) = (delims[at].prev, delims[at].next);
+    if let Some(prev) = prev {
+        delims[prev].next = next;
+    }
+    if let Some(next) = next {
+        delims[next].prev = prev;
+    }
 }
 
-/// Emphasis needs content that does not start or end with whitespace — the
-/// rule that keeps `2 * 3 * 4` arithmetic out of italics.
-fn emphasis_content_ok(content: &[char]) -> bool {
-    content.first().is_some_and(|ch| !ch.is_whitespace())
-        && content.last().is_some_and(|ch| !ch.is_whitespace())
+/// Whether a `*` / `_` run may open and may close emphasis. Looser than
+/// Markdown's flanking rules on purpose: emphasis only needs non-blank text
+/// on its inner side, so `**注意：**这里` is bold — a strict renderer leaves it
+/// literal because the closer sits between a punctuation mark and a letter,
+/// and that is the shape bold takes in Chinese prose. `_` also needs a word
+/// boundary on its outer side, so `snake_case_names` stay literal.
+fn flanking(marker: char, before: Option<char>, after: Option<char>) -> (bool, bool) {
+    let can_open = after.is_some_and(|ch| !ch.is_whitespace());
+    let can_close = before.is_some_and(|ch| !ch.is_whitespace());
+    if marker == '_' {
+        (
+            can_open && !before.is_some_and(char::is_alphanumeric),
+            can_close && !after.is_some_and(char::is_alphanumeric),
+        )
+    } else {
+        (can_open, can_close)
+    }
 }
 
-/// `_` emphasis only at word boundaries, so `snake_case_names` stay literal.
-fn word_boundary(chars: &[char], open: usize, close: usize) -> bool {
-    let before = open.checked_sub(1).map(|at| chars[at]);
-    let after = chars.get(close + 1).copied();
-    !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+/// For each position, the index of the first `needle` at or after it — so
+/// finding a closer is a lookup, not a scan. A line of `[` with no `]` cost a
+/// scan to the end per bracket.
+fn next_index_table(chars: &[char], needle: char) -> Vec<usize> {
+    let mut table = vec![usize::MAX; chars.len() + 1];
+    for at in (0..chars.len()).rev() {
+        table[at] = if chars[at] == needle {
+            at
+        } else {
+            table[at + 1]
+        };
+    }
+    table
+}
+
+fn next_at(table: &[usize], from: usize) -> Option<usize> {
+    table.get(from).copied().filter(|at| *at != usize::MAX)
 }
 
 fn link_target_style() -> Style {

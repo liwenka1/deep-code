@@ -361,3 +361,132 @@ fn inline_bold_italic_and_links_are_styled() {
     let lines = render_markdown("[https://x.y](https://x.y)", 80);
     assert_eq!(line_text(&lines[0]), "https://x.y");
 }
+
+/// Any paragraph renders in time linear in its length, without a stack frame
+/// per character: a reply is re-rendered every frame while it streams, and a
+/// model stuck repeating `*` or `_` produced a line the recursive parser took
+/// quadratic time over and, past a few thousand characters on a thread with
+/// the Windows main-thread stack, overflowed on — aborting with the terminal
+/// still raw, and again on every `/resume` of that session.
+#[test]
+fn any_paragraph_renders_in_linear_time_on_a_small_stack() {
+    let n = 100_000;
+    let inputs = vec![
+        "*".repeat(n),
+        "_".repeat(n),
+        "*a".repeat(n / 2),
+        "**a".repeat(n / 3),
+        "*_".repeat(n / 2),
+        "a*b".repeat(n / 3),
+        "[".repeat(n),
+        "[a]".repeat(n / 3),
+        "[a](".repeat(n / 4),
+        "`".repeat(n),
+        format!("{}x{}", "*a ".repeat(n / 6), " a*".repeat(n / 6)),
+        format!("{}x", "_a ".repeat(n / 3)),
+        // Closers that find no opener of their own marker above a long stack
+        // of the other one: each must not walk the whole stack again.
+        format!("{}{}", "_a ".repeat(n / 2), "a* ".repeat(n / 2)),
+    ];
+    // Each takes tens of milliseconds unoptimized; the quadratic parser took
+    // seconds on the bracket lines alone and overflowed on the marker ones.
+    let rendering = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            inputs
+                .iter()
+                .map(|input| {
+                    let started = std::time::Instant::now();
+                    let lines = render_markdown(input, 100);
+                    assert!(!lines.is_empty());
+                    (input.chars().take(6).collect::<String>(), started.elapsed())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    let timings = rendering
+        .join()
+        .expect("rendering must not need a deep stack");
+    for (input, took) in timings {
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "{input:?}… took {took:?}"
+        );
+    }
+}
+
+/// Delimiter runs pair the way Markdown pairs them: a run is one delimiter, so
+/// the second `*` of a `**` that found no partner is not an italic opener of
+/// its own, and runs whose lengths add up to a multiple of three do not pair
+/// when one could go either way. Bold after punctuation in Chinese prose
+/// still works.
+#[test]
+fn delimiter_runs_pair_the_way_markdown_pairs_them() {
+    for literal in [
+        "edit src/**/*.rs",
+        "match **/*.rs files",
+        "use *.rs and *.toml",
+        "a ** b",
+        "****",
+        "a_b_c",
+    ] {
+        let lines = render_markdown(literal, 80);
+        assert_eq!(
+            line_text(&lines[0]),
+            literal,
+            "{literal:?} must stay literal"
+        );
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|span| span.style.add_modifier.is_empty()),
+            "{literal:?}: {:?}",
+            lines[0].spans
+        );
+    }
+
+    let spans_of = |text: &str| -> Vec<(String, Style)> {
+        render_markdown(text, 80)[0]
+            .spans
+            .iter()
+            .map(|span| (span.content.to_string(), span.style))
+            .collect()
+    };
+    let modifiers = |spans: &[(String, Style)], needle: &str| {
+        spans
+            .iter()
+            .find(|(text, _)| text == needle)
+            .map(|(_, style)| style.add_modifier)
+            .unwrap_or_else(|| panic!("no span {needle:?} in {spans:?}"))
+    };
+
+    let spans = spans_of("***key*** done");
+    assert_eq!(
+        spans
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<String>(),
+        "key done"
+    );
+    assert!(modifiers(&spans, "key").contains(Modifier::BOLD | Modifier::ITALIC));
+
+    let spans = spans_of("**注意：**这里要改");
+    assert_eq!(
+        spans
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<String>(),
+        "注意：这里要改"
+    );
+    assert!(modifiers(&spans, "注意：").contains(Modifier::BOLD));
+
+    let spans = spans_of("**a**b**c**");
+    assert!(modifiers(&spans, "a").contains(Modifier::BOLD));
+    assert!(!modifiers(&spans, "b").contains(Modifier::BOLD));
+    assert!(modifiers(&spans, "c").contains(Modifier::BOLD));
+
+    let spans = spans_of("***x** y*");
+    assert!(modifiers(&spans, "x").contains(Modifier::BOLD | Modifier::ITALIC));
+    assert_eq!(modifiers(&spans, " y"), Modifier::ITALIC);
+}
