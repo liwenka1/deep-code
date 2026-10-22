@@ -409,6 +409,7 @@ struct CheckpointsSection {
 #[serde(default)]
 struct UiSection {
     language: Option<String>,
+    notifications: Option<bool>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -638,6 +639,12 @@ fn apply_file_overlay(
         },
     ) {
         config.language = language;
+    }
+
+    // Terminal notifications: a UI preference like the language, harmless
+    // from any layer.
+    if let Some(enabled) = file.ui.notifications {
+        config.notifications = enabled;
     }
 
     // Diagnostics preference, tighten-only from the project layer. Turning LSP

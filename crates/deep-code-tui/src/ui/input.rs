@@ -196,6 +196,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     if !is_ctrl_c {
         app.clear_ctrl_c_guard();
     }
+    // Same for the Esc guard: only a second consecutive Esc quits.
+    if key.code != KeyCode::Esc {
+        app.clear_esc_guard();
+    }
     // Any key other than Shift+Tab disarms the pending-Yolo confirm.
     if !is_shift_tab(&key) {
         app.clear_yolo_arm();

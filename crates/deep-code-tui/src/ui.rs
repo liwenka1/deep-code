@@ -15,6 +15,7 @@ use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
 use crossterm::execute;
+use crossterm::style::Print;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
@@ -309,6 +310,10 @@ fn run_loop(terminal: &mut AppTerminal, app: &mut App, shutdown: &AtomicBool) ->
             terminal.draw(|frame| render::render(frame, app))?;
             last_draw = Some(Instant::now());
             needs_redraw = false;
+        }
+        // After the draw, so the screen already shows what the bell is for.
+        if let Some(kind) = app.take_notification() {
+            let _ = execute!(terminal.backend_mut(), Print(kind.terminal_sequence()));
         }
 
         if event::poll(Duration::from_millis(40))? {

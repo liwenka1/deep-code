@@ -117,6 +117,11 @@ pub struct AgentConfig {
     /// Stored raw; the TUI owns resolution — unknown values fall back to
     /// detection so a typo degrades gracefully instead of failing the load.
     pub language: String,
+    /// `[ui] notifications`: whether the TUI rings the terminal (BEL + an OSC 9
+    /// notification) when a long turn ends or an approval is waiting. On by
+    /// default — the point of a long-running turn is that the user has looked
+    /// away. Any layer may set it; it changes nothing the model can do.
+    pub notifications: bool,
     /// Session permission mode to start in. Project config may only set it to
     /// `Default`/`AcceptEdits` — a repo must not be able to launch you into
     /// `Auto`/`Yolo` (enforced in the layered loader).
@@ -197,6 +202,7 @@ impl AgentConfig {
             approval_auto_allow: Vec::new(),
             checkpoint_max_snapshots: crate::checkpoint::DEFAULT_MAX_SNAPSHOTS,
             language: "auto".to_string(),
+            notifications: true,
             default_permission_mode: PermissionMode::Default,
             lsp_enabled: true,
             vision_detail: ImageDetail::Auto,

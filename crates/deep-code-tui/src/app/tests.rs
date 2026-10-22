@@ -4365,3 +4365,105 @@ fn diff_command_shows_the_working_tree_and_untracked_files() {
         outside.history.last()
     );
 }
+
+/// Esc on an idle, empty composer arms a quit and says so; the second Esc
+/// quits; any other key in between disarms it. Clearing input with Esc arms
+/// it too, so "Esc again to quit" stays a true statement.
+#[test]
+fn escape_on_an_idle_empty_composer_quits_only_on_the_second_press() {
+    let mut app = App::new();
+    app.handle_escape();
+    assert!(
+        !app.should_quit,
+        "one reflexive Esc must not end the session"
+    );
+    assert_eq!(app.status, tr(app.lang, TextId::StatusEscQuitConfirm));
+    app.clear_esc_guard();
+    app.handle_escape();
+    assert!(!app.should_quit, "a key in between disarms the guard");
+    app.handle_escape();
+    assert!(app.should_quit, "two consecutive presses quit");
+
+    let mut app = App::new();
+    app.insert_str_at_cursor("draft");
+    app.handle_escape();
+    assert!(app.input.is_empty() && !app.should_quit);
+    app.handle_escape();
+    assert!(
+        app.should_quit,
+        "after clearing, the promised 'Esc again' quits"
+    );
+}
+
+/// A turn that ran for a while rings the terminal when it ends, an approval
+/// always does, a quick turn never does, and `[ui] notifications = false`
+/// silences all of it. The pending notification is taken exactly once.
+#[test]
+fn long_turns_and_approvals_notify_but_quick_turns_do_not() {
+    let turn_id = deep_code_agent::TurnId("turn_1".to_string());
+    let finished = |app: &mut App, age: std::time::Duration| {
+        app.is_streaming = true;
+        app.streaming_since = std::time::Instant::now().checked_sub(age);
+        app.apply_runtime_event(RuntimeEvent::TurnFinished {
+            turn_id: turn_id.clone(),
+            usage: None,
+            telemetry: None,
+        });
+    };
+    let mut app = App::new();
+    finished(&mut app, std::time::Duration::from_secs(1));
+    assert_eq!(app.take_notification(), None, "a quick turn stays silent");
+
+    finished(
+        &mut app,
+        NOTIFY_MIN_TURN + std::time::Duration::from_secs(1),
+    );
+    assert_eq!(app.take_notification(), Some(Notification::TurnFinished));
+    assert_eq!(app.take_notification(), None, "taken once");
+
+    let request = deep_code_agent::ApprovalRequest {
+        network: false,
+        call_id: "call_1".to_string(),
+        tool_name: "mock_echo".to_string(),
+        description: "echo".to_string(),
+        arguments: serde_json::json!({}),
+        risk_level: deep_code_agent::RiskLevel::Low,
+        requires_sandbox: false,
+        read_only: true,
+        matched_rule: None,
+        justification: None,
+        resolved_target: None,
+        preview: None,
+        safety_notes: Vec::new(),
+    };
+    app.is_streaming = true;
+    app.apply_runtime_event(RuntimeEvent::ApprovalRequired {
+        turn_id: Some(turn_id.clone()),
+        tool_call_id: None,
+        request: request.clone(),
+    });
+    assert_eq!(app.take_notification(), Some(Notification::ApprovalNeeded));
+
+    let mut silent = App::new();
+    silent.notifications_enabled = false;
+    finished(&mut silent, NOTIFY_MIN_TURN * 2);
+    silent.pending_approval = None;
+    silent.is_streaming = true;
+    silent.apply_runtime_event(RuntimeEvent::ApprovalRequired {
+        turn_id: Some(turn_id),
+        tool_call_id: None,
+        request,
+    });
+    assert_eq!(silent.take_notification(), None);
+
+    assert!(
+        Notification::TurnFinished
+            .terminal_sequence()
+            .starts_with('\x07')
+    );
+    assert!(
+        Notification::ApprovalNeeded
+            .terminal_sequence()
+            .contains("\x1b]9;deep-code")
+    );
+}

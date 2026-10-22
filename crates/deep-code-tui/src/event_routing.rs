@@ -91,6 +91,9 @@ impl App {
             }
             RuntimeEvent::ApprovalRequired { request, .. } => {
                 self.set_active_approval(request.clone());
+                // Always, however short the turn: a parked approval needs the
+                // human, and nothing happens until they come back.
+                self.request_notification(crate::app::Notification::ApprovalNeeded);
                 let sandbox = if request.requires_sandbox {
                     self.tr(TextId::WordYes)
                 } else {
@@ -274,6 +277,12 @@ impl App {
                 ));
             }
             RuntimeEvent::TurnFinished { telemetry, .. } => {
+                if self
+                    .streaming_since
+                    .is_some_and(|since| since.elapsed() >= crate::app::NOTIFY_MIN_TURN)
+                {
+                    self.request_notification(crate::app::Notification::TurnFinished);
+                }
                 self.flush_active_turn();
                 self.last_telemetry = telemetry.clone();
                 // The durable frame (mode/backend/session/telemetry) comes

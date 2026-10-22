@@ -893,3 +893,19 @@ fn turn_budget_defaults_and_is_only_lowered_from_the_project_layer() {
         "a finite project value tightens a global 0 (no ceiling)"
     );
 }
+
+#[test]
+fn ui_notifications_default_on_and_any_layer_may_turn_them_off() {
+    assert!(AgentConfig::builtin().notifications);
+    let dir = tempfile::tempdir().unwrap();
+    let global = write_config(dir.path(), "[ui]\nnotifications = false\n");
+    let loaded = AgentConfig::load_with(Some(global), None, &no_env);
+    assert!(!loaded.config.notifications);
+    let project_dir = tempfile::tempdir().unwrap();
+    let project = write_config(project_dir.path(), "[ui]\nnotifications = false\n");
+    let loaded = AgentConfig::load_with(None, Some(project), &no_env);
+    assert!(
+        !loaded.config.notifications,
+        "a UI preference may come from the project file"
+    );
+}

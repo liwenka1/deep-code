@@ -279,6 +279,10 @@
 # Interface language: auto (follows the system LANG/LC_ALL), zh, or en.
 # DEEP_CODE_LANG outranks this; /lang switches and persists it from the TUI.
 # language = "auto"
+# Ring the terminal (BEL + an OSC 9 desktop notification where the terminal
+# supports it) when a turn that ran for a while finishes, or when an approval
+# is waiting for you. Set to false for a silent session.
+# notifications = true
 
 [vision]
 # How attached images are handed to the model. Only `deepseek-flash` accepts

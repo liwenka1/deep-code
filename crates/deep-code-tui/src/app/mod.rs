@@ -198,6 +198,15 @@ pub struct App {
     /// off the UI thread. Prompts and runtime swaps wait for it like they wait
     /// for a streaming turn; the result lands through `ui_rx`.
     pub(crate) compacting: bool,
+    /// Esc on an idle, empty composer arms this; a second Esc quits, any
+    /// other key disarms it — the same two-press shape as Ctrl+C, so one
+    /// reflexive Esc after a cancelled turn can no longer end the session.
+    pub(crate) esc_quit_pending: bool,
+    /// A terminal notification the render loop owes the user, taken by
+    /// [`Self::take_notification`] right after the next draw.
+    pub(crate) notify_pending: Option<Notification>,
+    /// `[ui] notifications`.
+    pub(crate) notifications_enabled: bool,
     pub(crate) last_telemetry: Option<TurnTelemetry>,
     pub(crate) prompt_history: Vec<HistoryPrompt>,
     history_cursor: Option<usize>,
@@ -403,6 +412,31 @@ impl ComposerSnapshot {
 /// places on `App` — hence one variant per thing that can actually be toggled,
 /// rather than a generic "path" into a state tree two of whose members do not
 /// exist.
+/// What the terminal is rung for. Each becomes BEL plus an OSC 9 message, which
+/// terminals that show desktop notifications (iTerm2, WezTerm, Ghostty, kitty)
+/// turn into one and every other terminal ignores after the bell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Notification {
+    TurnFinished,
+    ApprovalNeeded,
+}
+
+impl Notification {
+    /// The bytes to write to the terminal. English on purpose: the OSC 9 body
+    /// lands in the desktop's notification centre, outside the UI language.
+    #[must_use]
+    pub(crate) fn terminal_sequence(self) -> String {
+        let message = match self {
+            Self::TurnFinished => "deep-code: turn finished",
+            Self::ApprovalNeeded => "deep-code: approval needed",
+        };
+        format!("\x07\x1b]9;{message}\x07")
+    }
+}
+
+/// A turn shorter than this ends silently: the user is still looking.
+pub(crate) const NOTIFY_MIN_TURN: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FoldTarget {
     HistoryReasoning(usize),
@@ -710,6 +744,9 @@ impl App {
             instructions,
             skills,
             compacting: false,
+            esc_quit_pending: false,
+            notify_pending: None,
+            notifications_enabled: agent_config.notifications,
             last_telemetry: None,
             prompt_history: Vec::new(),
             history_cursor: None,
@@ -898,10 +935,33 @@ impl App {
             self.cancel_streaming_turn();
         } else if !self.input.is_empty() {
             self.clear_input();
+            // Armed here too, so the message below stays true: the next Esc
+            // does quit.
+            self.esc_quit_pending = true;
             self.status = self.tr(TextId::StatusInputClearedEsc).to_string();
-        } else {
+        } else if self.esc_quit_pending {
             self.should_quit = true;
+        } else {
+            self.esc_quit_pending = true;
+            self.status = self.tr(TextId::StatusEscQuitConfirm).to_string();
         }
+    }
+
+    /// Any non-Esc key disarms the Esc quit guard.
+    pub fn clear_esc_guard(&mut self) {
+        self.esc_quit_pending = false;
+    }
+
+    /// Owe the user a terminal notification, unless they turned them off.
+    pub(crate) fn request_notification(&mut self, kind: Notification) {
+        if self.notifications_enabled {
+            self.notify_pending = Some(kind);
+        }
+    }
+
+    /// The notification to ring now, once.
+    pub(crate) fn take_notification(&mut self) -> Option<Notification> {
+        self.notify_pending.take()
     }
 
     /// Graceful Ctrl+C: interrupt a stream, else clear input, else require a

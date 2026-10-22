@@ -253,6 +253,7 @@ text_ids! {
     CompactedNothing,
     CompactionFallback,
     StatusCompacting,
+    StatusEscQuitConfirm,
     SystemWarning,
     // 请求被服务端以"超出上下文窗口"拒绝、已强制压缩并重试时的提示。
     ContextOverflowRescued,
