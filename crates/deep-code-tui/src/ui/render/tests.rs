@@ -3143,3 +3143,27 @@ fn a_long_compaction_opens_folded_and_a_click_on_its_title_opens_it() {
         "opening must bring the summary back:\n{opened}"
     );
 }
+
+/// An open Ctrl+R search is on the status row while a turn streams and while an
+/// error is showing. It takes the keys — Esc included — so a search the row did
+/// not show turned an Esc meant for the turn into closing something unseen.
+#[test]
+fn an_open_history_search_is_always_on_the_status_row() {
+    for state in ["streaming", "error"] {
+        let mut app = App::new();
+        app.lang = Lang::En;
+        app.prompt_history.push(crate::app::HistoryPrompt {
+            text: "fix the parser".to_string(),
+            images: Vec::new(),
+        });
+        if state == "streaming" {
+            app.is_streaming = true;
+            app.streaming_since = Some(std::time::Instant::now());
+        } else {
+            app.error = Some("boom".to_string());
+        }
+        app.history_search_start();
+        let text = frame(&mut app, 120, 24);
+        assert!(text.contains("reverse-i-search"), "{state}: {text}");
+    }
+}

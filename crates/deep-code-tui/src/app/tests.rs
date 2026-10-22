@@ -4839,18 +4839,34 @@ fn ctrl_r_searches_the_history_backwards_and_restores_the_draft_on_escape() {
         app.history_search_push(ch);
     }
     assert_eq!(app.input, "fix the lexer", "matching ignores case");
-    assert!(app.status.contains("1 / 2"), "{}", app.status);
+    assert!(
+        search_status(&app).contains("1 / 2"),
+        "{}",
+        search_status(&app)
+    );
     app.history_search_older();
     assert_eq!(app.input, "fix the parser");
-    assert!(app.status.contains("2 / 2"), "{}", app.status);
+    assert!(
+        search_status(&app).contains("2 / 2"),
+        "{}",
+        search_status(&app)
+    );
     app.history_search_older();
     assert_eq!(
         app.input, "fix the parser",
         "nothing older: the last match stays"
     );
-    assert!(app.status.contains("无匹配"), "{}", app.status);
+    assert!(
+        search_status(&app).contains("无匹配"),
+        "{}",
+        search_status(&app)
+    );
     app.history_search_push('z');
-    assert!(app.status.contains("无匹配"), "{}", app.status);
+    assert!(
+        search_status(&app).contains("无匹配"),
+        "{}",
+        search_status(&app)
+    );
     app.history_search_backspace();
     assert_eq!(
         app.input, "fix the lexer",
@@ -4872,8 +4888,108 @@ fn ctrl_r_searches_the_history_backwards_and_restores_the_draft_on_escape() {
 
     let mut empty = App::new();
     empty.history_search_start();
-    assert!(empty.status.contains("还没有历史"), "{}", empty.status);
+    assert!(
+        search_status(&empty).contains("还没有历史"),
+        "{}",
+        search_status(&empty)
+    );
     empty.history_search_cancel();
+}
+
+/// Accepting a search that never matched — an empty history, the first Ctrl+R
+/// in a workspace — puts the draft back, pictures and all. The search took the
+/// composer, and Enter, an arrow or Ctrl+A used to leave it empty.
+#[test]
+fn a_search_that_never_matched_gives_the_draft_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new();
+    app.insert_str_at_cursor("my long draft that took a while to type ");
+    assert!(app.attach_image(write_test_png(dir.path(), "shot.png")));
+    let draft = app.input.clone();
+    app.history_search_start();
+    assert_eq!(app.input, "", "the search took the composer");
+    app.history_search_accept();
+    assert_eq!(app.input, draft);
+    assert_eq!(app.attached_images.len(), 1);
+}
+
+/// A search over history keeps the draft one `↓` away, whether the search was
+/// opened over it or over a prompt an `↑` walk had recalled with the draft
+/// parked behind it. Opening the search used to end the walk: `↓` did nothing
+/// and the next `↑` overwrote the parked draft.
+#[test]
+fn a_search_keeps_the_draft_one_down_arrow_away() {
+    let fill = |app: &mut App| {
+        for text in ["alpha", "beta", "gamma"] {
+            app.prompt_history.push(HistoryPrompt {
+                text: text.to_string(),
+                images: Vec::new(),
+            });
+        }
+    };
+
+    // Opened over the draft, a match accepted: ↓ walks newer, then back.
+    let mut app = App::new();
+    fill(&mut app);
+    app.insert_str_at_cursor("my draft");
+    app.history_search_start();
+    app.history_search_push('b');
+    app.history_search_accept();
+    assert_eq!(app.input, "beta");
+    app.on_down();
+    assert_eq!(app.input, "gamma");
+    app.on_down();
+    assert_eq!(app.input, "my draft");
+
+    // Opened during an ↑ walk, a match accepted.
+    let mut app = App::new();
+    fill(&mut app);
+    app.insert_str_at_cursor("my draft");
+    app.on_up();
+    assert_eq!(app.input, "gamma");
+    app.history_search_start();
+    app.history_search_push('a');
+    app.history_search_push('l');
+    app.history_search_accept();
+    assert_eq!(app.input, "alpha");
+    for expected in ["beta", "gamma", "my draft"] {
+        app.on_down();
+        assert_eq!(app.input, expected);
+    }
+
+    // Opened during an ↑ walk, Esc: the recalled prompt, the walk where it was.
+    let mut app = App::new();
+    fill(&mut app);
+    app.insert_str_at_cursor("my draft");
+    app.on_up();
+    app.on_up();
+    assert_eq!(app.input, "beta");
+    app.history_search_start();
+    app.history_search_push('z');
+    app.history_search_cancel();
+    assert_eq!(app.input, "beta");
+    app.on_down();
+    assert_eq!(app.input, "gamma");
+    app.on_down();
+    assert_eq!(app.input, "my draft");
+
+    // A query that stopped matching keeps the last match, readline style,
+    // and the draft is still one ↓ past the newest.
+    let mut app = App::new();
+    fill(&mut app);
+    app.insert_str_at_cursor("my draft");
+    app.history_search_start();
+    for ch in "gz".chars() {
+        app.history_search_push(ch);
+    }
+    app.history_search_accept();
+    assert_eq!(app.input, "gamma");
+    app.on_down();
+    assert_eq!(app.input, "my draft");
+}
+
+fn search_status(app: &App) -> String {
+    app.history_search_status().unwrap_or_default().to_string()
 }
 
 /// A `todo_write` result is followed by the task list as a cell; unknown

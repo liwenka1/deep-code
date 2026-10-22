@@ -376,7 +376,16 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) 
         ));
     }
 
-    if let Some(error) = &app.error {
+    // An open Ctrl+R search owns the row while it lasts, ahead of an error or
+    // a streaming turn: it takes the keys — Esc included — so a search that
+    // is not on screen turned the user's Esc on a running turn into closing
+    // something they could not see.
+    if let Some(search) = app.history_search_status() {
+        spans.push(Span::styled(
+            neutralize_display_text(search),
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if let Some(error) = &app.error {
         spans.push(Span::styled(
             tr(app.lang, TextId::ErrorPrefix),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
