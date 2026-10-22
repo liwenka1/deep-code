@@ -265,3 +265,99 @@ fn inline_code_inside_cells_keeps_its_style() {
         .expect("inline code span inside a table cell");
     assert_eq!(code_span.style.fg, Some(Color::Cyan));
 }
+
+/// A numbered list keeps its numbers as written — a restart at 10 stays 10 —
+/// and continuation rows hang under the text, not under the number.
+#[test]
+fn numbered_lists_keep_their_numbers() {
+    let blocks = parse_blocks("1. first\n2. second\n- dash\n10. tenth");
+    assert!(matches!(
+        &blocks[0],
+        MarkdownBlock::ListItem { number: Some(number), text, .. }
+            if number == "1." && text == "first"
+    ));
+    assert!(matches!(
+        &blocks[2],
+        MarkdownBlock::ListItem { number: None, .. }
+    ));
+    assert!(matches!(
+        &blocks[3],
+        MarkdownBlock::ListItem { number: Some(number), .. } if number == "10."
+    ));
+
+    let lines = render_markdown("1. first\n2. second", 40);
+    assert_eq!(line_text(&lines[0]), "1. first");
+    assert_eq!(line_text(&lines[1]), "2. second");
+
+    let wrapped = render_markdown(&format!("12. {}", "x".repeat(30)), 16);
+    assert!(line_text(&wrapped[0]).starts_with("12. x"));
+    assert!(
+        line_text(&wrapped[1]).starts_with("    x"),
+        "continuation hangs under the text: {:?}",
+        line_text(&wrapped[1])
+    );
+}
+
+/// Bold, italic and links get their modifiers; a link's target stays visible
+/// after its label. Markers without a closer, emphasis around spaces
+/// (arithmetic) and underscores inside identifiers stay literal.
+#[test]
+fn inline_bold_italic_and_links_are_styled() {
+    let lines = render_markdown(
+        "say **loud** and *soft* or _soft_ then [docs](https://x.y/d) and `code`",
+        120,
+    );
+    let spans: Vec<(String, Style)> = lines[0]
+        .spans
+        .iter()
+        .map(|span| (span.content.to_string(), span.style))
+        .collect();
+    let style_of = |needle: &str| {
+        spans
+            .iter()
+            .find(|(text, _)| text == needle)
+            .map(|(_, style)| *style)
+            .unwrap_or_else(|| panic!("no span {needle:?} in {spans:?}"))
+    };
+    assert!(style_of("loud").add_modifier.contains(Modifier::BOLD));
+    assert!(style_of("soft").add_modifier.contains(Modifier::ITALIC));
+    assert!(style_of("docs").add_modifier.contains(Modifier::UNDERLINED));
+    assert_eq!(style_of("code").fg, Some(Color::Cyan));
+    assert_eq!(
+        line_text(&lines[0]),
+        "say loud and soft or soft then docs (https://x.y/d) and code"
+    );
+
+    for literal in [
+        "2 * 3 * 4",
+        "a ** b",
+        "snake_case_name here",
+        "**unclosed",
+        "[not a link] (x)",
+        "[spaced](a b)",
+    ] {
+        let lines = render_markdown(literal, 80);
+        assert_eq!(
+            line_text(&lines[0]),
+            literal,
+            "{literal:?} must stay literal"
+        );
+    }
+
+    // Nesting: bold inside italic keeps both; code inside bold stays code.
+    let lines = render_markdown("*a **b** c* and **`x`**", 80);
+    let spans: Vec<(String, Style)> = lines[0]
+        .spans
+        .iter()
+        .map(|span| (span.content.to_string(), span.style))
+        .collect();
+    let b = spans.iter().find(|(text, _)| text == "b").unwrap().1;
+    assert!(b.add_modifier.contains(Modifier::BOLD | Modifier::ITALIC));
+    let x = spans.iter().find(|(text, _)| text == "x").unwrap().1;
+    assert_eq!(x.fg, Some(Color::Cyan));
+    assert!(x.add_modifier.contains(Modifier::BOLD));
+
+    // A link whose label is its own target prints the target once.
+    let lines = render_markdown("[https://x.y](https://x.y)", 80);
+    assert_eq!(line_text(&lines[0]), "https://x.y");
+}

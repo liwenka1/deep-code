@@ -2,9 +2,10 @@
 //!
 //! Two phases, following the reference design: a width-independent block
 //! parse ([`parse_blocks`]) and a width-dependent line layout
-//! ([`render_markdown`]). Resizing only re-runs the second phase. Only
-//! fenced code, inline code, headings, simple lists, and pipe tables are
-//! styled — everything else stays plain text.
+//! ([`render_markdown`]). Resizing only re-runs the second phase. Fenced
+//! code, headings, bullet and numbered lists, pipe tables, and the inline
+//! forms a model actually writes — `code`, `**bold**`, `*italic*`, `[links](url)` —
+//! are styled; everything else stays plain text.
 
 use ratatui::prelude::{Color, Line, Modifier, Span, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -29,6 +30,12 @@ pub enum MarkdownBlock {
     },
     ListItem {
         indent: usize,
+        /// The marker as written: `None` for a bullet, `Some("3.")` for a
+        /// numbered item. Kept rather than normalized so a list that starts
+        /// at 2, or restarts, renders as the author numbered it — and so a
+        /// numbered list is not silently turned into bullets, which lost the
+        /// ordinal every time a model wrote "step 1 … step 7".
+        number: Option<String>,
         text: String,
     },
     Table {
@@ -84,9 +91,10 @@ pub fn parse_blocks(text: &str) -> Vec<MarkdownBlock> {
             index += 1;
             continue;
         }
-        if let Some(rest) = parse_list_item(trimmed) {
+        if let Some((number, rest)) = parse_list_item(trimmed) {
             blocks.push(MarkdownBlock::ListItem {
                 indent: line.len() - trimmed.len(),
+                number: number.map(str::to_string),
                 text: rest.to_string(),
             });
             index += 1;
@@ -170,11 +178,20 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
                 }
                 out.push(Line::styled("```", fence_style()));
             }
-            MarkdownBlock::ListItem { indent, text } => {
+            MarkdownBlock::ListItem {
+                indent,
+                number,
+                text,
+            } => {
                 let pad = " ".repeat(indent.min(8));
-                let mut spans = vec![(format!("{pad}• "), Style::default())];
+                let marker = match &number {
+                    Some(number) => format!("{number} "),
+                    None => "• ".to_string(),
+                };
+                let hanging = pad.len() + marker.width();
+                let mut spans = vec![(format!("{pad}{marker}"), Style::default())];
                 spans.extend(inline_spans(&text));
-                out.extend(wrap_spans(spans, width, pad.len() + 2));
+                out.extend(wrap_spans(spans, width, hanging));
             }
             MarkdownBlock::Table {
                 alignments,
@@ -205,13 +222,17 @@ fn parse_heading(line: &str) -> Option<(u8, &str)> {
     }
 }
 
-fn parse_list_item(line: &str) -> Option<&str> {
+/// A list item's marker (`None` for a bullet, the `3.` text for a numbered
+/// one) and its text.
+fn parse_list_item(line: &str) -> Option<(Option<&str>, &str)> {
     if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-        return Some(rest);
+        return Some((None, rest));
     }
     let digits = line.bytes().take_while(u8::is_ascii_digit).count();
     if digits > 0 {
-        line[digits..].strip_prefix(". ")
+        line[digits..]
+            .strip_prefix(". ")
+            .map(|rest| (Some(&line[..digits + 1]), rest))
     } else {
         None
     }
@@ -439,34 +460,138 @@ fn spans_width(spans: &[(String, Style)]) -> usize {
     spans.iter().map(|(text, _)| text.as_str().width()).sum()
 }
 
-/// Split a paragraph into plain and `inline code` spans. Unmatched backticks
-/// stay literal.
+/// Split a paragraph into styled spans: `code`, `**bold**`, `*italic*` /
+/// `_italic_`, and `[text](url)` links. Code wins over everything inside it;
+/// bold and italic nest in each other. A marker with no closer, or an
+/// emphasis whose content starts or ends with a space (`a * b`), stays
+/// literal — the model's prose is not rewritten on a guess.
 fn inline_spans(text: &str) -> Vec<(String, Style)> {
-    let mut spans = Vec::new();
-    let mut rest = text;
-    loop {
-        let Some(start) = rest.find('`') else {
-            if !rest.is_empty() {
-                spans.push((rest.to_string(), Style::default()));
-            }
-            break;
-        };
-        let Some(end) = rest[start + 1..].find('`') else {
-            if !rest.is_empty() {
-                spans.push((rest.to_string(), Style::default()));
-            }
-            break;
-        };
-        if start > 0 {
-            spans.push((rest[..start].to_string(), Style::default()));
-        }
-        spans.push((rest[start + 1..start + 1 + end].to_string(), code_style()));
-        rest = &rest[start + end + 2..];
-    }
+    let mut spans = inline_styled(text, Style::default());
     if spans.is_empty() {
         spans.push((String::new(), Style::default()));
     }
     spans
+}
+
+fn inline_styled(text: &str, base: Style) -> Vec<(String, Style)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans: Vec<(String, Style)> = Vec::new();
+    let mut plain = String::new();
+    let mut index = 0;
+    let flush = |plain: &mut String, spans: &mut Vec<(String, Style)>| {
+        if !plain.is_empty() {
+            spans.push((std::mem::take(plain), base));
+        }
+    };
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '`'
+            && let Some(close) = find_char(&chars, index + 1, '`')
+        {
+            flush(&mut plain, &mut spans);
+            let code: String = chars[index + 1..close].iter().collect();
+            spans.push((code, base.patch(code_style())));
+            index = close + 1;
+            continue;
+        }
+        if ch == '*'
+            && chars.get(index + 1) == Some(&'*')
+            && let Some(close) = find_pair(&chars, index + 2, '*')
+            && emphasis_content_ok(&chars[index + 2..close])
+        {
+            flush(&mut plain, &mut spans);
+            let inner: String = chars[index + 2..close].iter().collect();
+            spans.extend(inline_styled(&inner, base.add_modifier(Modifier::BOLD)));
+            index = close + 2;
+            continue;
+        }
+        if (ch == '*' || ch == '_')
+            && let Some(close) = find_single(&chars, index + 1, ch)
+            && emphasis_content_ok(&chars[index + 1..close])
+            && (ch == '*' || word_boundary(&chars, index, close))
+        {
+            flush(&mut plain, &mut spans);
+            let inner: String = chars[index + 1..close].iter().collect();
+            spans.extend(inline_styled(&inner, base.add_modifier(Modifier::ITALIC)));
+            index = close + 1;
+            continue;
+        }
+        if ch == '['
+            && let Some(label_end) = find_char(&chars, index + 1, ']')
+            && chars.get(label_end + 1) == Some(&'(')
+            && let Some(url_end) = find_char(&chars, label_end + 2, ')')
+            && label_end > index + 1
+        {
+            let label: String = chars[index + 1..label_end].iter().collect();
+            let url: String = chars[label_end + 2..url_end].iter().collect();
+            if !url.is_empty() && !url.contains(char::is_whitespace) {
+                flush(&mut plain, &mut spans);
+                spans.extend(inline_styled(
+                    &label,
+                    base.add_modifier(Modifier::UNDERLINED),
+                ));
+                // The target stays visible: a terminal has no hover, and a link
+                // whose destination is hidden is a link the reader cannot judge
+                // — unless the label already is the destination.
+                if label != url {
+                    spans.push((format!(" ({url})"), base.patch(link_target_style())));
+                }
+                index = url_end + 1;
+                continue;
+            }
+        }
+        plain.push(ch);
+        index += 1;
+    }
+    flush(&mut plain, &mut spans);
+    spans
+}
+
+fn find_char(chars: &[char], from: usize, needle: char) -> Option<usize> {
+    chars[from.min(chars.len())..]
+        .iter()
+        .position(|ch| *ch == needle)
+        .map(|offset| from + offset)
+}
+
+/// The first lone `needle` at or after `from` — a doubled one is a bold
+/// marker and belongs to the inner span, so `*a **b** c*` closes at the end.
+fn find_single(chars: &[char], from: usize, needle: char) -> Option<usize> {
+    let mut at = from;
+    while at < chars.len() {
+        if chars[at] == needle {
+            if chars.get(at + 1) == Some(&needle) {
+                at += 2;
+                continue;
+            }
+            return Some(at);
+        }
+        at += 1;
+    }
+    None
+}
+
+/// The first `needle needle` at or after `from`.
+fn find_pair(chars: &[char], from: usize, needle: char) -> Option<usize> {
+    (from..chars.len().saturating_sub(1)).find(|&at| chars[at] == needle && chars[at + 1] == needle)
+}
+
+/// Emphasis needs content that does not start or end with whitespace — the
+/// rule that keeps `2 * 3 * 4` arithmetic out of italics.
+fn emphasis_content_ok(content: &[char]) -> bool {
+    content.first().is_some_and(|ch| !ch.is_whitespace())
+        && content.last().is_some_and(|ch| !ch.is_whitespace())
+}
+
+/// `_` emphasis only at word boundaries, so `snake_case_names` stay literal.
+fn word_boundary(chars: &[char], open: usize, close: usize) -> bool {
+    let before = open.checked_sub(1).map(|at| chars[at]);
+    let after = chars.get(close + 1).copied();
+    !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+}
+
+fn link_target_style() -> Style {
+    Style::default().fg(Color::DarkGray)
 }
 
 /// Width-aware (CJK = 2 cells) char wrapping that preserves span styles.
