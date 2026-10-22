@@ -3515,6 +3515,32 @@ fn a_pasted_find_query_is_searched_as_text() {
     );
 }
 
+/// A `/` followed by a pasted word is text, not a command the paste assembled:
+/// the command word has to be typed.
+#[test]
+fn a_pasted_word_after_a_slash_is_not_a_command() {
+    let mut app = App::new();
+    app.is_streaming = true;
+    let cells = app.history.len();
+    app.insert_str_at_cursor("/");
+    app.paste_str("help\n".to_string());
+    assert!(
+        app.input.contains("[粘贴 #"),
+        "folded into a chip: {}",
+        app.input
+    );
+    app.submit();
+    assert_eq!(app.history.len(), cells, "no /help output");
+    assert_eq!(
+        app.steering_queue
+            .iter()
+            .map(|text| text.trim())
+            .collect::<Vec<_>>(),
+        vec!["/help"],
+        "sent as text"
+    );
+}
+
 /// `/model`, `/apikey` and `/logout` are refused before they write anything
 /// while the runtime is busy. They used to save the global config first and
 /// only then find the relaunch refused: the change reached the next session and

@@ -71,12 +71,18 @@ impl App {
         // run immediately (against the live UI) rather than queueing behind a
         // stream, in both idle and streaming states.
         //
-        // Recognised on what was typed (a command is never pasted into
-        // existence) but run on what was sent, chips expanded: a focus pasted
-        // after `/compact `, a path after `/add-dir ` or a query after `/find `
-        // reached the command as its `[粘贴 #1 +5 行]` label otherwise, and the
-        // pasted text was dropped with the composer.
-        if display.starts_with('/') && self.handle_slash_command(as_sent) {
+        // Recognised on what was typed but run on what was sent, chips
+        // expanded: a focus pasted after `/compact `, a path after `/add-dir `
+        // or a query after `/find ` reached the command as its
+        // `[粘贴 #1 +5 行]` label otherwise, and the pasted text was dropped
+        // with the composer. The command word itself has to be the typed one —
+        // a `/` followed by a pasted `clear` is text, not a command a paste
+        // assembled.
+        let command_word = |text: &str| text.split_whitespace().next().map(str::to_string);
+        if display.starts_with('/')
+            && command_word(&display) == command_word(as_sent)
+            && self.handle_slash_command(as_sent)
+        {
             self.clear_input();
             return;
         }
