@@ -28,6 +28,16 @@ const STDOUT_BYTE_CAP: usize = DIFF_MAX_CHARS * 4;
 /// short; a flood is a bug in what we spawned, not something to quote.
 const STDERR_BYTE_CAP: usize = 8 * 1024;
 
+/// How long a child gets to notice that its stdout is gone and exit on its own
+/// before it is killed. Killing alone is not enough on Windows (the `git` on
+/// PATH is a shim around the real process), and waiting alone is not guaranteed
+/// either — so: close, wait, kill.
+const EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Ceiling on waiting for the stderr reader. A pipe inherited by a process we
+/// no longer control must never turn into a frozen screen.
+const STDERR_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug)]
 pub(crate) struct DiffReport {
     /// `git diff` output, `+++`/`---` headers included, cut at
@@ -193,15 +203,22 @@ fn git_bounded(workspace: &Path, args: &[&str]) -> Result<Bounded, GitDiffError>
             }
         })?;
     let mut stderr_pipe = child.stderr.take();
-    let stderr_reader = std::thread::spawn(move || {
+    // Delivered over a channel, not joined: on Windows `git` on PATH is a shim
+    // that launches the real `git.exe`, so a pipe can stay open after the
+    // process we spawned is gone, and `read_to_end` would wait for an EOF that
+    // never comes — the whole TUI froze there, with no keystroke able to
+    // interrupt it.
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+    let _reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
         if let Some(stream) = stderr_pipe.as_mut() {
             let _ = stream.take(STDERR_BYTE_CAP as u64).read_to_end(&mut bytes);
         }
-        bytes
+        let _ = stderr_tx.send(bytes);
     });
     let mut bytes = Vec::new();
-    if let Some(stdout) = child.stdout.as_mut() {
+    let mut stdout_pipe = child.stdout.take();
+    if let Some(stdout) = stdout_pipe.as_mut() {
         // One byte past the cap, so "truncated" means "there was more".
         let _ = stdout
             .take(STDOUT_BYTE_CAP as u64 + 1)
@@ -210,14 +227,28 @@ fn git_bounded(workspace: &Path, args: &[&str]) -> Result<Bounded, GitDiffError>
     let truncated = bytes.len() > STDOUT_BYTE_CAP;
     if truncated {
         bytes.truncate(STDOUT_BYTE_CAP);
-        // Waiting for the rest would block for as long as git keeps writing
-        // into a pipe nobody drains — the one thing this function is for.
+        // Close our end first: a writer whose pipe is gone fails its next
+        // write and exits on its own, including the real `git.exe` behind a
+        // shim. Killing alone would only take the shim down.
+        drop(stdout_pipe);
+        let deadline = std::time::Instant::now() + EXIT_GRACE;
+        while std::time::Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // And whatever is left gets killed, so `wait` below cannot sit on a
+        // process that is waiting for a pipe we closed.
         let _ = child.kill();
     }
     let status = child
         .wait()
         .map_err(|error| GitDiffError::Failed(error.to_string()))?;
-    let stderr = stderr_reader.join().unwrap_or_default();
+    // Bounded: an inherited stderr pipe is not worth a frozen screen, and the
+    // message it carries is the error text, which a truncated run already
+    // reports as truncation.
+    let stderr = stderr_rx.recv_timeout(STDERR_GRACE).unwrap_or_default();
     Ok(Bounded {
         ok: status.success(),
         stdout: String::from_utf8_lossy(&bytes).into_owned(),
