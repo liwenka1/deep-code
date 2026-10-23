@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use super::SkillRegistry;
+use super::{MAX_SKILL_BYTES, SkillRegistry};
 use crate::i18n::{SharedLang, TextId, tr, tr_with};
 use crate::runtime::tool_result::TOOL_OUTPUT_BUDGET;
 use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, run_blocking};
@@ -36,9 +36,6 @@ use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, run_blocking};
 const WRAPPER_RESERVE: usize = 400;
 /// Floor on the chunk size, so every call makes progress whatever the header.
 const MIN_CHUNK_CHARS: usize = 1_000;
-/// Bytes read per call. Instructions past this are not instructions anyone
-/// follows; it only keeps a runaway file from being read whole.
-const MAX_READ_BYTES: u64 = 256 * 1024;
 /// Names listed in the unknown-skill error before an ellipsis.
 const LISTED_NAMES: usize = 20;
 
@@ -109,14 +106,25 @@ impl SkillTool {
             }
         }
         let mut bytes = Vec::new();
+        // One byte past the cap, so `size_capped` means "the file had more"
+        // and a file that ends exactly at the cap is read whole.
         if let Err(error) = fs::File::open(&skill.path)
-            .and_then(|file| file.take(MAX_READ_BYTES).read_to_end(&mut bytes))
+            .and_then(|file| file.take(MAX_SKILL_BYTES + 1).read_to_end(&mut bytes))
         {
             return Ok(ToolOutput::soft_error(tr_with(
                 lang,
                 TextId::SkillUnreadable,
                 &[("name", name), ("error", &error.to_string())],
             )));
+        }
+        let size_capped = bytes.len() as u64 > MAX_SKILL_BYTES;
+        if size_capped {
+            bytes.truncate(MAX_SKILL_BYTES as usize);
+            // Up to the last complete character, so the cut never shows up as
+            // a U+FFFD in the middle of the instructions.
+            if let Err(error) = std::str::from_utf8(&bytes) {
+                bytes.truncate(error.valid_up_to());
+            }
         }
         let text = String::from_utf8_lossy(&bytes);
         // A file that lost its metadata block since launch is still served —
@@ -159,6 +167,17 @@ impl SkillTool {
                     ("total", &total.to_string()),
                     ("next_offset", &end.to_string()),
                 ],
+            ));
+        } else if size_capped {
+            // The end of what could be read, which is not the end of the file.
+            // "End of instructions" here told the model it had the whole skill
+            // while the tail had never been read at all — the one kind of
+            // refusal the caller cannot see.
+            out.push_str("\n\n");
+            out.push_str(&tr_with(
+                lang,
+                TextId::SkillSizeCapped,
+                &[("max", &(MAX_SKILL_BYTES / 1024).to_string())],
             ));
         } else if offset > 0 {
             out.push_str("\n\n");
@@ -371,6 +390,56 @@ mod tests {
             result.content
         );
         assert!(result.content.ends_with("body via link"));
+    }
+
+    /// The `offset=` a continuation note names, or `None` on the last page.
+    fn next_offset(text: &str) -> Option<usize> {
+        let start = text.rfind("offset=")? + "offset=".len();
+        text[start..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .ok()
+    }
+
+    /// A `SKILL.md` past the read cap is served up to its last readable chunk
+    /// and then says the file continues. It used to print "end of
+    /// instructions" there, telling the model it had the whole skill while the
+    /// tail had never been read — a refusal the caller cannot see.
+    #[tokio::test]
+    async fn a_manifest_past_the_read_cap_ends_with_the_cap_not_with_end_of_instructions() {
+        let dir = TempDir::new().unwrap();
+        // Multi-byte on purpose: the cap counts bytes and must land on a char
+        // boundary, or the skill would come back as unreadable garbage.
+        let body = "日".repeat((MAX_SKILL_BYTES as usize + 20_000) / 3);
+        plant(dir.path(), "big", &body);
+        let tool = tool_for(dir.path());
+
+        let mut offset = 0;
+        let mut last = String::new();
+        for _ in 0..64 {
+            let result = call(&tool, json!({ "name": "big", "offset": offset })).await;
+            assert_eq!(
+                result.status,
+                ToolResultStatus::Success,
+                "{}",
+                result.content
+            );
+            last = result.content;
+            match next_offset(&last) {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        assert!(
+            last.contains("单次读取上限"),
+            "the last page has to say the file continues: {last}"
+        );
+        assert!(
+            !last.contains("指令结束"),
+            "it must not claim the instructions ended: {last}"
+        );
     }
 
     #[test]

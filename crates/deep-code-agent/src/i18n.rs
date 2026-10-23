@@ -444,6 +444,8 @@ text_ids! {
     SkillUnreadable,
     SkillContinue,
     SkillEnd,
+    // The file had more than `MAX_SKILL_BYTES: the tool cannot read past it.
+    SkillSizeCapped,
     SkillOffsetBeyondEnd,
     WebClientInitError,
     WebRequestError,

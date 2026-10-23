@@ -13,7 +13,20 @@ pub use tool::SkillTool;
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+/// Bytes of a `SKILL.md` anyone reads: discovery loads the head, the `skill`
+/// tool chunks within it. One number for both readers, or they disagree about
+/// what "the whole file" means — the tool would report "end of instructions"
+/// at a point discovery had already read past.
+///
+/// A manifest past it is loaded truncated with a warning rather than dropped
+/// (the index still names it, and the head is still usable), and the tool says
+/// at the end that the file continues. Before the bound, a 2 GB `SKILL.md` in
+/// a cloned repository was read into memory at every launch, `/clear` and
+/// `--resume`.
+pub(crate) const MAX_SKILL_BYTES: u64 = 256 * 1024;
 
 /// Longest description rendered into the prompt index. The index only needs
 /// enough text to *choose* a skill — detailed guidance belongs in the skill
@@ -155,13 +168,22 @@ impl SkillRegistry {
             }
 
             let manifest = child.join("SKILL.md");
-            match fs::read_to_string(&manifest) {
-                Ok(text) => {
+            match Self::read_manifest(&manifest) {
+                Ok((text, truncated)) => {
                     // Loaded or not, this directory is spoken for: never
                     // descend into a skill directory, and never load the
                     // same physical directory twice via a symlink alias.
                     if !claim(&child, seen) {
                         continue;
+                    }
+                    if truncated {
+                        self.note(format!(
+                            "{}: larger than {} KiB; the skill is listed, but only its first \
+                             {} KiB can be read",
+                            manifest.display(),
+                            MAX_SKILL_BYTES / 1024,
+                            MAX_SKILL_BYTES / 1024,
+                        ));
                     }
                     match frontmatter::read_skill_file(&text) {
                         Ok(parsed) => {
@@ -197,6 +219,37 @@ impl SkillRegistry {
 
     fn note(&mut self, warning: String) {
         self.warnings.push(warning);
+    }
+
+    /// Read one `SKILL.md`, bounded by [`MAX_SKILL_BYTES`]; `true` when the
+    /// file had more that was not read.
+    ///
+    /// The bound is applied to the *read*, not to the string afterwards: a
+    /// limit checked after `read_to_string` has already paid the allocation it
+    /// exists to prevent.
+    fn read_manifest(path: &Path) -> std::io::Result<(String, bool)> {
+        let mut bytes = Vec::new();
+        // One byte past the cap: a file that ends exactly at it is whole.
+        fs::File::open(path)?
+            .take(MAX_SKILL_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        let truncated = bytes.len() as u64 > MAX_SKILL_BYTES;
+        if truncated {
+            bytes.truncate(MAX_SKILL_BYTES as usize);
+            // The cap counts bytes, so it can land inside a multi-byte
+            // character. Stop at the last complete one: a long CJK skill must
+            // not come back as "not valid UTF-8".
+            if let Err(error) = std::str::from_utf8(&bytes) {
+                bytes.truncate(error.valid_up_to());
+            }
+        }
+        let text = String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )
+        })?;
+        Ok((text, truncated))
     }
 
     /// Look up a skill by its metadata name.

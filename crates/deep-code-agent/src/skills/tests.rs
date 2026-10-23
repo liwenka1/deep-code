@@ -50,6 +50,45 @@ fn plant_skill(root: &Path, dir_name: &str, skill_name: &str, summary: &str) {
     .unwrap();
 }
 
+/// A `SKILL.md` past the read cap is still listed — truncated, with a warning.
+/// The launch reads at most `MAX_SKILL_BYTES` from any file in a cloned
+/// repository; a skill that silently vanished from the index would be the same
+/// "refusal the caller cannot see" the walk's own warnings exist to avoid.
+#[test]
+fn a_manifest_past_the_read_cap_is_loaded_truncated_and_reported() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("big");
+    fs::create_dir_all(&home).unwrap();
+    // Multi-byte on purpose: the cap counts bytes and has to stop at a whole
+    // character rather than rejecting the file as invalid UTF-8.
+    let body = "日".repeat((MAX_SKILL_BYTES as usize + 10_000) / 3);
+    fs::write(
+        home.join("SKILL.md"),
+        format!("---\nname: big\ndescription: d\n---\n{body}\n"),
+    )
+    .unwrap();
+
+    let registry = SkillRegistry::discover(tmp.path());
+    let skill = registry.get("big").expect("the skill is still listed");
+    assert!(
+        skill.body.len() <= MAX_SKILL_BYTES as usize,
+        "the body has to be bounded: {} bytes",
+        skill.body.len()
+    );
+    assert!(
+        !skill.body.is_empty(),
+        "truncated is not the same as dropped"
+    );
+    assert!(
+        registry
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("big") && warning.contains("KiB")),
+        "{:?}",
+        registry.warnings()
+    );
+}
+
 #[test]
 fn discover_finds_direct_and_nested_skills() {
     let tmp = TempDir::new().unwrap();

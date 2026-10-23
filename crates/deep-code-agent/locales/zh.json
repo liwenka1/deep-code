@@ -271,6 +271,7 @@
   "SkillUnreadable": "无法读取 skill '{name}'：{error}",
   "SkillContinue": "[已截断：显示第 {start}–{end} 字符，共 {total}；再次调用 skill 并传 offset={next_offset} 继续]",
   "SkillEnd": "[指令结束]",
+  "SkillSizeCapped": "[已到单次读取上限：这个 SKILL.md 大于 {max} KiB，后面的内容无法通过本工具读到]",
   "SkillOffsetBeyondEnd": "offset {offset} 超出指令末尾（共 {total} 字符）",
   "WebClientInitError": "初始化 HTTP 客户端失败：{error}",
   "WebRequestError": "请求失败：{error}",

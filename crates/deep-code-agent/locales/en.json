@@ -271,6 +271,7 @@
   "SkillUnreadable": "Cannot read skill '{name}': {error}",
   "SkillContinue": "[truncated: characters {start}–{end} of {total} shown; call skill again with offset={next_offset} to continue]",
   "SkillEnd": "[end of instructions]",
+  "SkillSizeCapped": "[stopped at the read cap: this SKILL.md is larger than {max} KiB, and the rest cannot be read through this tool]",
   "SkillOffsetBeyondEnd": "offset {offset} is past the end of the instructions ({total} characters)",
   "WebClientInitError": "Failed to initialize the HTTP client: {error}",
   "WebRequestError": "Request failed: {error}",
