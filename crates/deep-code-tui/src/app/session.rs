@@ -139,6 +139,11 @@ impl App {
         self.configured_model = agent_config.model.clone();
         self.configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
         self.web_backend = deep_code_agent::WebBackend::from_config(&agent_config).id();
+        // `[ui] notifications` is read here for the same reason as the three
+        // above: it is a config value, and a swap that forgot it left the old
+        // answer in place until the process restarted. (`lang` is the
+        // deliberate exception, right below.)
+        self.notifications_enabled = agent_config.notifications;
         // `lang` is deliberately NOT re-resolved here: it changes only at
         // launch and via /lang, so a runtime swap can never flip the UI
         // language out from under the user (or the tests). The new runtime

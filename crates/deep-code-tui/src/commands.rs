@@ -31,6 +31,18 @@ actionable; finish with two or three sentences on what you wrote and what you ar
 /// What `/skill <name> <arguments>` substitutes in a skill body, when present.
 pub(crate) const SKILL_ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
 
+/// Chars of a skill body carried into the turn `/skill` sends — the same
+/// budget the `skill` tool chunks to. A skill is read on demand, not pasted
+/// whole: the launch copy can be as large as its `SKILL.md`, and sending all
+/// of it is a request the user never asked for.
+const SKILL_TURN_CHARS: usize = 12_000;
+
+/// Appended when a body was cut at [`SKILL_TURN_CHARS`]. Model-facing, so
+/// bilingual like the runtime's other prompt text and never localized.
+const SKILL_TURN_CUT_NOTE: &str = "\n\n[以上是正文的开头 / the beginning only: 这份 skill 的正文超过 \
+{N} 字符，其余部分请调用 skill 工具并传 offset 继续读 / call the skill tool with offset to \
+continue]";
+
 /// (command, hint id, takes an argument). Single source for the completion
 /// menu and `/help`; hints are looked up from the language pack when the menu
 /// or `/help` text is built.
@@ -195,9 +207,12 @@ impl App {
     /// `$ARGUMENTS` in the body is replaced by whatever followed the name, or
     /// the arguments are appended when the body has no placeholder. The body
     /// is the launch-time copy — the same text the prompt's index was built
-    /// from — so an edit shows up with the next session, like the index. The
-    /// transcript shows the command line; the session record keeps the brief.
-    /// Refused while a turn is running, like `/init`, for the same reason.
+    /// from — so an edit shows up with the next session, like the index. Past
+    /// [`SKILL_TURN_CHARS`] the turn carries the head with a note naming the
+    /// `skill` tool and its offset, rather than the whole file.
+    /// The transcript shows the command line; the session record keeps the
+    /// brief. Refused while a turn is running, like `/init`, for the same
+    /// reason.
     fn skill_command(&mut self, arg: &str) {
         if arg.is_empty() {
             let skills = Arc::clone(&self.skills);
@@ -236,6 +251,15 @@ impl App {
             skill.body.clone()
         } else {
             format!("{}\n\n参数 / Arguments: {arguments}", skill.body)
+        };
+        let body = if body.chars().count() > SKILL_TURN_CHARS {
+            let head: String = body.chars().take(SKILL_TURN_CHARS).collect();
+            format!(
+                "{head}{}",
+                SKILL_TURN_CUT_NOTE.replace("{N}", &SKILL_TURN_CHARS.to_string())
+            )
+        } else {
+            body
         };
         let text = format!(
             "按 skill「{name}」执行 / Follow the skill \"{name}\":\n\n{body}",

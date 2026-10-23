@@ -1049,9 +1049,14 @@ impl App {
             self.cancel_compaction();
         } else if !self.input.is_empty() {
             self.clear_input();
-            // Armed here too, so the message stays true: the next Esc does
-            // quit.
-            self.arm_quit(QuitKey::Esc, TextId::StatusInputClearedEsc);
+            // Not armed, and any earlier arm dropped: clearing the line is the
+            // shell reflex, and the press right after it is that reflex again,
+            // not a decision to leave. Ctrl+C's branch below makes the same
+            // argument — the two keys differed here for no reason, and "Esc
+            // again to quit" was a promise made by a keystroke nobody meant as
+            // one. Arm the quit only from an already-empty composer.
+            self.clear_quit_guard();
+            self.status = self.tr(TextId::StatusInputClearedEsc).to_string();
         } else if self.quit_armed_by(QuitKey::Esc) {
             self.should_quit = true;
         } else {

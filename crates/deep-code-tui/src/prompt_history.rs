@@ -17,7 +17,7 @@
 //! home directory or a full disk must never stop a prompt from being sent.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const HISTORY_DIR: &str = "prompt-history";
@@ -145,7 +145,9 @@ pub(crate) fn append(path: &Path, text: &str) {
         return;
     }
     let mut options = fs::OpenOptions::new();
-    options.create(true).append(true);
+    // Read as well as append: the tail check below is what keeps a torn record
+    // from eating the next one.
+    options.create(true).append(true).read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -154,7 +156,20 @@ pub(crate) fn append(path: &Path, text: &str) {
     let Ok(mut file) = options.open(path) else {
         return;
     };
-    let mut line = serde_json::json!({ "text": text }).to_string();
+    let mut line = String::new();
+    // A crash or a full disk mid-write leaves the last record with no trailing
+    // newline. Appending onto it glued the two records into one unparseable
+    // line, which `load` then dropped whole: one lost prompt became two. Writes
+    // land at the end whatever the read position is (`append`), so starting a
+    // fresh line costs nothing.
+    let mut tail = [0u8; 1];
+    let torn = file.seek(SeekFrom::End(-1)).is_ok()
+        && file.read(&mut tail).is_ok_and(|read| read == 1)
+        && tail[0] != b'\n';
+    if torn {
+        line.push('\n');
+    }
+    line.push_str(&serde_json::json!({ "text": text }).to_string());
     line.push('\n');
     let _ = file.write_all(line.as_bytes());
 }
@@ -184,6 +199,19 @@ mod tests {
             load(&path, 2),
             vec!["prompt 3\nsecond line", "prompt 4\nsecond line"]
         );
+    }
+
+    /// A record torn by a crash (no trailing newline) used to take the next one
+    /// with it: the append glued both into a single unparseable line, and
+    /// `load` dropped that whole line — one lost prompt became two.
+    #[test]
+    fn a_torn_last_record_does_not_swallow_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        // Exactly what a crash mid-`write_all` leaves behind.
+        fs::write(&path, r#"{"text":"torn"#).unwrap();
+        append(&path, "after the crash");
+        assert_eq!(load(&path, 10), vec!["after the crash"]);
     }
 
     #[test]

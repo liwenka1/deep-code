@@ -78,7 +78,7 @@
   "StatusSteeringQueued": "已排队 ({count}) — 本回合下一个步骤或结束时发送",
   "PendingSteerLabel": "待发送 · 本回合下一个步骤后发出：",
   "StatusSteeringQueueFull": "队列已满 ({count}) — 草稿保留在输入框,等当前回合结束",
-  "StatusInputClearedEsc": "已清空输入 (再按 Esc 退出)",
+  "StatusInputClearedEsc": "已清空输入",
   "StatusInputClearedCtrlC": "已清空输入",
   "StatusCtrlCQuitConfirm": "再按一次 Ctrl+C 退出",
   "StatusCancelling": "正在取消本轮... (取消在工具边界生效)",

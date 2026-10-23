@@ -2525,7 +2525,7 @@ fn steering_queue_is_capped_and_keeps_the_draft() {
 }
 
 #[test]
-fn escape_ladder_clears_input_then_quits() {
+fn escape_ladder_clears_input_then_arms_then_quits() {
     let mut app = App::new();
     app.input = "draft".to_string();
 
@@ -2534,6 +2534,9 @@ fn escape_ladder_clears_input_then_quits() {
     assert!(!app.should_quit);
     assert!(app.status.contains("已清空输入"));
 
+    // Clearing is not a promise to leave: the next press asks.
+    app.handle_escape();
+    assert!(!app.should_quit);
     app.handle_escape();
     assert!(app.should_quit);
 }
@@ -4512,6 +4515,70 @@ async fn skill_sends_the_body_with_arguments_and_refuses_mid_stream() {
     assert!(busy.status.contains("/skill"), "{}", busy.status);
 }
 
+/// A body longer than the turn budget goes out cut, with a note naming the
+/// `skill` tool and its offset. The launch copy can be as large as its
+/// `SKILL.md`, and `/skill` pasted all of it into one request.
+#[tokio::test]
+async fn skill_cuts_a_body_longer_than_the_turn_budget_and_names_the_tool() {
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let body = format!("{}{}", "step. ".repeat(3_000), "TAIL-MARKER");
+    let mut app = App::new();
+    app.runtime = Arc::new(deep_code_agent::AgentRuntime::new(
+        BriefCapturingClient {
+            last_user_message: Arc::clone(&captured),
+        },
+        deep_code_agent::ToolRegistry::new(),
+    ));
+    app.skills = skills_fixture(&[("huge", "a long one", &body)]);
+    app.insert_str_at_cursor("/skill huge");
+    app.submit();
+
+    let mut sent = None;
+    for _ in 0..300 {
+        if let Some(text) = captured.lock().unwrap().take() {
+            sent = Some(text);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let sent = sent.expect("the brief never reached the model");
+    assert!(
+        sent.contains("call the skill tool with offset"),
+        "the cut has to say where the rest is: {sent}"
+    );
+    assert!(
+        !sent.contains("TAIL-MARKER"),
+        "the tail belongs to the tool, not to the turn"
+    );
+    assert!(
+        sent.chars().count() < 13_000,
+        "the turn stayed near the budget: {} chars",
+        sent.chars().count()
+    );
+}
+
+/// `[ui] notifications` is a config value like the model or the web
+/// backend, so a runtime swap has to adopt it: turning them off and then
+/// running `/clear` used to keep ringing until the process restarted.
+#[test]
+fn a_runtime_swap_adopts_the_notifications_setting() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new();
+    app.workspace = dir.path().to_path_buf();
+    app.global_config_path = Some(dir.path().join("config.toml"));
+    assert!(app.notifications_enabled, "the builtin default is on");
+
+    let project = dir.path().join(".deep-code");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("config.toml"), "[ui]\nnotifications = false\n").unwrap();
+
+    assert!(app.handle_slash_command("/clear"));
+    assert!(
+        !app.notifications_enabled,
+        "the swap has to adopt the config, not just the fields it remembers"
+    );
+}
+
 /// After `/skill ` the menu offers the skill names (with their descriptions
 /// as hints) until the name is complete; accepting one fills `/skill name `.
 #[test]
@@ -4745,8 +4812,9 @@ fn diff_command_shows_the_working_tree_and_untracked_files() {
 }
 
 /// Esc on an idle, empty composer arms a quit and says so; the second Esc
-/// quits; any other key in between disarms it. Clearing input with Esc arms
-/// it too, so "Esc again to quit" stays a true statement.
+/// quits; any other key in between disarms it. Clearing a draft with Esc does
+/// NOT arm it — the press after a clear is the same reflex again, which is the
+/// argument Ctrl+C's branch has always made.
 #[test]
 fn escape_on_an_idle_empty_composer_quits_only_on_the_second_press() {
     let mut app = App::new();
@@ -4766,11 +4834,14 @@ fn escape_on_an_idle_empty_composer_quits_only_on_the_second_press() {
     app.insert_str_at_cursor("draft");
     app.handle_escape();
     assert!(app.input.is_empty() && !app.should_quit);
-    app.handle_escape();
     assert!(
-        app.should_quit,
-        "after clearing, the promised 'Esc again' quits"
+        !app.quit_armed_by(QuitKey::Esc),
+        "clearing the line is not a decision to leave"
     );
+    app.handle_escape();
+    assert!(!app.should_quit, "the press after a clear only asks");
+    app.handle_escape();
+    assert!(app.should_quit, "and the one after that quits");
 }
 
 /// The two-press quit holds only while its warning is on the status row. A
