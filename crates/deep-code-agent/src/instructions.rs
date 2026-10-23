@@ -475,6 +475,58 @@ fn render_section(scope: InstructionScope, body: &str, cut: bool) -> String {
     }
 }
 
+/// Open an instruction file without following a final symlink.
+///
+/// The workspace file is refused when it is a link — a checkout can point it at
+/// anything on the machine and the target would go to the provider in the
+/// system prompt — and the `symlink_metadata` check above cannot be the last
+/// word on its own: between that stat and this open, a concurrent writer can
+/// swap the file for `ln -s ~/.ssh/id_rsa AGENTS.md`. `O_NOFOLLOW` makes the
+/// refusal the kernel's, so the check and the open are one step. Written once
+/// here because the write path (`workspace_tools`) closed the same race the
+/// same way, and two spellings of that rule can drift apart.
+fn open_instructions(path: &Path, scope: InstructionScope) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    set_no_follow(&mut options, scope == InstructionScope::Workspace);
+    options.open(path)
+}
+
+/// Ask the kernel not to follow a final symlink. Separate from the caller so
+/// the non-unix build has one empty body to explain rather than a `cfg` that
+/// leaves `mut` unused.
+fn set_no_follow(options: &mut fs::OpenOptions, guard: bool) {
+    #[cfg(unix)]
+    {
+        if guard {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+    }
+    // Windows has no equivalent flag. There the `symlink_metadata` check is the
+    // whole guard, and it keeps the window it always had.
+    #[cfg(not(unix))]
+    {
+        let _ = (options, guard);
+    }
+}
+
+/// Whether `error` is the kernel refusing a symlink under `O_NOFOLLOW`.
+///
+/// `ELOOP` is the documented one; macOS has historically reported `EMLINK` for
+/// some of these, and the message it maps to is the same either way.
+fn is_symlink_refusal(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(error.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 /// The file's text, normalized (CRLF → LF, outer whitespace trimmed); `None`
 /// when it does not exist or is empty; `Err` with the human-facing reason when
 /// it exists but must not or cannot be read.
@@ -510,8 +562,25 @@ fn read_instructions(path: &Path, scope: InstructionScope) -> Result<Option<Stri
         return Err(format!("{}: not a regular file; ignored", path.display()));
     }
     let mut bytes = Vec::new();
-    fs::File::open(path)
-        .and_then(|file| file.take(MAX_READ_BYTES).read_to_end(&mut bytes))
+    let file = match open_instructions(path, scope) {
+        Ok(file) => file,
+        // The kernel's own refusal, dressed in the same words as the stat
+        // check above instead of quoting ELOOP at a human.
+        Err(error) if scope == InstructionScope::Workspace && is_symlink_refusal(&error) => {
+            return Err(format!(
+                "{}: is a symbolic link; a workspace AGENTS.md must be a regular file (ignored)",
+                path.display()
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "{}: cannot read ({error}); ignored",
+                path.display()
+            ));
+        }
+    };
+    file.take(MAX_READ_BYTES)
+        .read_to_end(&mut bytes)
         .map_err(|error| format!("{}: cannot read ({error}); ignored", path.display()))?;
     let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
     // An editor's byte-order mark is not text: left in, it sat in front of a
@@ -753,6 +822,30 @@ mod tests {
             "{:?}",
             loaded.warnings
         );
+    }
+
+    /// `O_NOFOLLOW` closes the window between the stat and the open: the
+    /// refusal is the kernel's, so a swap in between cannot be read through.
+    /// The stat check still runs first — it produces the friendly message and
+    /// covers platforms without the flag — but it is no longer the only guard.
+    #[test]
+    fn the_open_itself_refuses_a_workspace_link() {
+        let dir = TempDir::new().unwrap();
+        let secret = dir.path().join("secret.txt");
+        fs::write(&secret, "PRIVATE KEY MATERIAL").unwrap();
+        let link = dir.path().join(INSTRUCTIONS_FILE);
+        if !crate::test_symlinks::symlink_file_for_test(&secret, &link) {
+            return;
+        }
+        // Straight to the flags: this is the half that survives a swap after
+        // the metadata check.
+        let error = open_instructions(&link, InstructionScope::Workspace)
+            .expect_err("a workspace link must not be openable");
+        assert!(is_symlink_refusal(&error), "{error}");
+        // The user's own global link stays readable, and a regular file is
+        // still a regular file.
+        assert!(open_instructions(&link, InstructionScope::Global).is_ok());
+        assert!(open_instructions(&secret, InstructionScope::Workspace).is_ok());
     }
 
     /// The `Compact Instructions` section is lifted out for the summarizer —
