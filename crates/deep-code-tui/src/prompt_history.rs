@@ -17,7 +17,7 @@
 //! home directory or a full disk must never stop a prompt from being sent.
 
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const HISTORY_DIR: &str = "prompt-history";
@@ -73,6 +73,21 @@ pub(crate) fn load(path: &Path, cap: usize) -> Vec<String> {
     let Ok(raw) = fs::read(path) else {
         return Vec::new();
     };
+    // A record torn by a crash or a full disk leaves the file without its
+    // trailing newline. Repaired here, at launch and before this process
+    // appends anything, rather than on every append: the append path must stay
+    // one atomic `write` (`concurrent_appends_keep_every_line_whole` is about
+    // exactly that), and a "does the file end with a newline?" probe before
+    // each write is a race against the other instance — a stale answer adds an
+    // empty line, and eight threads appending two hundred records each was
+    // enough to hit it.
+    let raw: &[u8] = match torn_tail_start(&raw) {
+        Some(start) => {
+            drop_torn_tail(path, start);
+            &raw[..start]
+        }
+        None => &raw,
+    };
     let lines: Vec<&[u8]> = raw
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
@@ -91,6 +106,41 @@ pub(crate) fn load(path: &Path, cap: usize) -> Vec<String> {
         rewrite(path, &prompts);
     }
     prompts
+}
+
+/// Where the last complete record ends, when the file's tail is a torn one:
+/// `None` when the file ends with a newline (or is empty), `Some(len)` when it
+/// does not — i.e. the last record never finished being written.
+fn torn_tail_start(raw: &[u8]) -> Option<usize> {
+    match raw.last() {
+        None | Some(b'\n') => None,
+        Some(_) => Some(
+            raw.iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1),
+        ),
+    }
+}
+
+/// Cut a torn tail off the file, keeping `keep` bytes.
+///
+/// Not through a link, the same rule `append` follows: a link in the file's
+/// place is somebody else's file, and truncating it would be worse than the
+/// torn record. Best-effort throughout — history is a convenience.
+fn drop_torn_tail(path: &Path, keep: usize) {
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    if let Ok(file) = options.open(path) {
+        let _ = file.set_len(keep as u64);
+    }
 }
 
 /// Replace the file with `prompts`, through a sibling temp file and a rename,
@@ -145,9 +195,7 @@ pub(crate) fn append(path: &Path, text: &str) {
         return;
     }
     let mut options = fs::OpenOptions::new();
-    // Read as well as append: the tail check below is what keeps a torn record
-    // from eating the next one.
-    options.create(true).append(true).read(true);
+    options.create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -156,20 +204,11 @@ pub(crate) fn append(path: &Path, text: &str) {
     let Ok(mut file) = options.open(path) else {
         return;
     };
-    let mut line = String::new();
-    // A crash or a full disk mid-write leaves the last record with no trailing
-    // newline. Appending onto it glued the two records into one unparseable
-    // line, which `load` then dropped whole: one lost prompt became two. Writes
-    // land at the end whatever the read position is (`append`), so starting a
-    // fresh line costs nothing.
-    let mut tail = [0u8; 1];
-    let torn = file.seek(SeekFrom::End(-1)).is_ok()
-        && file.read(&mut tail).is_ok_and(|read| read == 1)
-        && tail[0] != b'\n';
-    if torn {
-        line.push('\n');
-    }
-    line.push_str(&serde_json::json!({ "text": text }).to_string());
+    // One `write`, always: two instances appending at once keep their records
+    // whole only because POSIX promises a single `O_APPEND` write lands whole.
+    // Anything that has to inspect the file first belongs in `load`, which
+    // runs at launch, before this process appends (see `torn_tail_start`).
+    let mut line = serde_json::json!({ "text": text }).to_string();
     line.push('\n');
     let _ = file.write_all(line.as_bytes());
 }
@@ -203,15 +242,30 @@ mod tests {
 
     /// A record torn by a crash (no trailing newline) used to take the next one
     /// with it: the append glued both into a single unparseable line, and
-    /// `load` dropped that whole line — one lost prompt became two.
+    /// `load` dropped that whole line — one lost prompt became two. The repair
+    /// happens at launch, in `load`, before this process appends anything.
     #[test]
-    fn a_torn_last_record_does_not_swallow_the_next_one() {
+    fn a_torn_last_record_is_repaired_before_the_next_append() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.jsonl");
         // Exactly what a crash mid-`write_all` leaves behind.
         fs::write(&path, r#"{"text":"torn"#).unwrap();
+        // A launch reads the history first; that is where the tail is cut.
+        assert_eq!(load(&path, 10), Vec::<String>::new());
         append(&path, "after the crash");
         assert_eq!(load(&path, 10), vec!["after the crash"]);
+    }
+
+    /// The repair only ever removes a tail that could not have been a record:
+    /// a file that ends with its newline is left byte-for-byte alone.
+    #[test]
+    fn a_complete_file_is_not_touched_by_a_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        append(&path, "one");
+        let before = fs::read_to_string(&path).unwrap();
+        assert_eq!(load(&path, 10), vec!["one"]);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
     }
 
     #[test]
