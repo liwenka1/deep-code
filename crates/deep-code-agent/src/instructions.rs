@@ -824,10 +824,12 @@ mod tests {
         );
     }
 
-    /// `O_NOFOLLOW` closes the window between the stat and the open: the
-    /// refusal is the kernel's, so a swap in between cannot be read through.
-    /// The stat check still runs first — it produces the friendly message and
-    /// covers platforms without the flag — but it is no longer the only guard.
+    /// On unix the kernel refuses the link, so the refusal survives a swap
+    /// between the stat and the open. Windows has no equivalent flag
+    /// (`set_no_follow` is empty there), and the stat check is the whole guard
+    /// on that platform — so this pins the unix half only, and says so rather
+    /// than asserting a refusal Windows cannot make.
+    #[cfg(unix)]
     #[test]
     fn the_open_itself_refuses_a_workspace_link() {
         let dir = TempDir::new().unwrap();

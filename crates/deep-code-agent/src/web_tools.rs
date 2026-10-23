@@ -895,7 +895,7 @@ fn decode_entities(text: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, ToSocketAddrs};
     use std::sync::mpsc;
 
     use serde_json::json;
@@ -1584,24 +1584,35 @@ mod tests {
         assert!(result.content.contains("8192"), "{}", result.content);
     }
 
+    /// A name this machine cannot resolve, or `None` when the environment
+    /// answers for `invalid` too (a resolver that hands back `0.0.0.0` or a
+    /// captive portal) — the tests below rest on the name not resolving, so
+    /// they skip rather than assert a premise the machine does not meet.
+    fn unresolvable_probe_url() -> Option<&'static str> {
+        const URL: &str = "https://nonexistent.invalid/page";
+        if ("nonexistent.invalid", 443).to_socket_addrs().is_ok() {
+            eprintln!("this resolver answers for .invalid; skipping");
+            return None;
+        }
+        Some(URL)
+    }
+
     /// The API path does not require this machine to resolve the URL: the page
     /// is fetched on DeepSeek's network, so a lookup that fails here decides
     /// nothing — and behind an egress proxy (no direct DNS) requiring it
     /// refused *every* public URL while `web_search` kept working.
     ///
     /// `invalid` is reserved by RFC 6761 and never resolves, so the input is
-    /// deterministic.
+    /// deterministic on any resolver that honours that.
     #[tokio::test]
     async fn the_api_path_does_not_need_a_local_dns_answer() {
+        let Some(url) = unresolvable_probe_url() else {
+            return;
+        };
         let (base, _seen) =
             serve_api_once(200, json!({ "title": "t", "content": "page" }).to_string());
         let tool = FetchUrlTool::new(zh(), &WebBackend::test_api(&base));
-        let result = run(
-            &tool,
-            FetchUrlTool::NAME,
-            json!({ "url": "https://nonexistent.invalid/page" }),
-        )
-        .await;
+        let result = run(&tool, FetchUrlTool::NAME, json!({ "url": url })).await;
         assert_eq!(
             result.status,
             ToolResultStatus::Success,
@@ -1635,16 +1646,14 @@ mod tests {
     /// check per redirect hop, so this is the first of two.)
     #[tokio::test]
     async fn the_local_path_still_refuses_a_host_it_cannot_resolve() {
+        let Some(url) = unresolvable_probe_url() else {
+            return;
+        };
         let tool = FetchUrlTool {
             allow_private: false,
             ..FetchUrlTool::new(zh(), &WebBackend::local_only())
         };
-        let result = run(
-            &tool,
-            FetchUrlTool::NAME,
-            json!({ "url": "https://nonexistent.invalid/page" }),
-        )
-        .await;
+        let result = run(&tool, FetchUrlTool::NAME, json!({ "url": url })).await;
         assert_eq!(result.status, ToolResultStatus::Error);
         assert!(
             result.content.contains("无法解析主机"),

@@ -6467,10 +6467,12 @@ async fn a_fold_saves_its_summary_and_cost_with_the_entries_it_describes() {
     assert_eq!(*handovers.lock().unwrap(), 1);
 
     // Deliberately no `shutdown()`: that persists everything, and the case
-    // pinned here is the process going away right after the fold.
+    // pinned here is the process going away right after the fold. The wait is
+    // generous (5s) because the save is asynchronous and a two-core CI runner
+    // runs this whole suite in parallel.
     let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
     let mut saved = None;
-    for _ in 0..200 {
+    for _ in 0..500 {
         if let Ok(record) = store.load(&id)
             && record.summary.is_some()
         {
