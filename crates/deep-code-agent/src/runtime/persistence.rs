@@ -111,6 +111,18 @@ impl AgentRuntime {
     }
 
     pub(super) async fn persist(&self) {
+        self.persist_with(|_| {}).await;
+    }
+
+    /// [`Self::persist`] with a chance to amend the record under the same lock
+    /// it is written under.
+    ///
+    /// Compaction needs this: its summary and archived count describe exactly
+    /// the entry list saved with them, so one save has to carry all three. It
+    /// also flushes the lifetime cost totals, which a hand-built record did
+    /// not — the summarizer request is billed to the session like any other,
+    /// and a `/compact` followed by a quit used to lose that spend.
+    pub(super) async fn persist_with(&self, edit: impl FnOnce(&mut SessionRecord)) {
         let Some(persistence) = self.persistence.as_ref() else {
             return;
         };
@@ -132,6 +144,7 @@ impl AgentRuntime {
             record.session_cache_hit_tokens = cache_hit;
             record.session_cache_miss_tokens = cache_miss;
             record.session_cache_savings = savings;
+            edit(&mut record);
             record.touch();
         }
         persistence.actor.request_save();

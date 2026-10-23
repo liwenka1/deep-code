@@ -8,7 +8,7 @@ use super::*;
 use crate::client::AgentEventStream;
 use crate::error::{AgentError, AgentResult};
 use crate::event::AgentEvent;
-use crate::model::{ChatRequest, FunctionCallDelta, ToolCallDelta};
+use crate::model::{ChatRequest, FunctionCallDelta, ToolCallDelta, Usage};
 use crate::model_registry::{DEEPSEEK_FLASH, DEEPSEEK_V4_PRO};
 use crate::runtime::diagnostics::append_diagnostics;
 use crate::session_store::SessionStore;
@@ -6417,6 +6417,85 @@ async fn a_turn_that_lands_while_compact_writes_is_kept() {
     assert!(
         !wire.iter().any(|message| message.content == "prompt 0"),
         "{wire:?}"
+    );
+}
+
+/// A fold's summary, its archived count and the summarizer's spend have to
+/// land in the same saved record the entries do.
+///
+/// The summary request is billed to the session like any other, so a
+/// `/compact` followed by a quit used to lose that spend from the file; a
+/// resume then under-reported the session. The record was also assembled from
+/// a snapshot taken before the state lock was released, so an entry another
+/// front-end appended meanwhile could be written back over.
+#[tokio::test]
+async fn a_fold_saves_its_summary_and_cost_with_the_entries_it_describes() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (client, handovers) = HandoverClient::new(|_| {
+        Ok(vec![
+            AgentEvent::TextDelta {
+                text: "# handover".to_string(),
+            },
+            AgentEvent::Done {
+                usage: Some(Usage {
+                    prompt_tokens: Some(10),
+                    completion_tokens: Some(5),
+                    // A plain counter, so the assertion does not depend on the
+                    // price table: only the summarizer's request can set it.
+                    prompt_cache_hit_tokens: Some(1234),
+                    ..Usage::default()
+                }),
+            },
+        ])
+    });
+    let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let record = crate::session_store::SessionRecord::new(workspace.path().to_path_buf(), "system");
+    let id = record.id.clone();
+    let runtime = AgentRuntime::from_session_record(
+        client,
+        ToolRegistry::default(),
+        record,
+        store,
+        crate::config::AgentConfig::builtin(),
+    );
+    for index in 0..6 {
+        let mut rx = runtime.submit_user(format!("prompt {index}")).await;
+        drain(&mut rx).await;
+    }
+    let report = folded(compact(&runtime, None).await);
+    assert!(report.archived_entries > 0);
+    assert_eq!(*handovers.lock().unwrap(), 1);
+
+    // Deliberately no `shutdown()`: that persists everything, and the case
+    // pinned here is the process going away right after the fold.
+    let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let mut saved = None;
+    for _ in 0..200 {
+        if let Ok(record) = store.load(&id)
+            && record.summary.is_some()
+        {
+            saved = Some(record);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let saved = saved.expect("the fold's save reached the store");
+    assert_eq!(saved.summary.as_deref(), Some("# handover"));
+    assert!(
+        saved
+            .compaction
+            .as_deref()
+            .is_some_and(|label| label.starts_with("archived=")),
+        "{:?}",
+        saved.compaction
+    );
+    assert!(
+        !saved.entries.is_empty(),
+        "the summary was saved over an empty transcript"
+    );
+    assert_eq!(
+        saved.session_cache_hit_tokens, 1234,
+        "the summarizer's usage is session spend and has to be in the file"
     );
 }
 

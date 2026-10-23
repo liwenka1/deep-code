@@ -217,7 +217,7 @@ impl AgentRuntime {
             }
         };
 
-        let (result, compacted) = {
+        let result = {
             let mut state = self.state.lock().await;
             // A cancel that landed while the summary was finishing — or while
             // this waited for the lock — still means "stop": nothing is folded
@@ -263,20 +263,20 @@ impl AgentRuntime {
             // `Changed` on its own — which is also the accurate label, where
             // the reset used to make the turn after a compaction read
             // `FirstTurn`.
-            let compacted = state.session.entries().to_vec();
-            (result, compacted)
+            result
         };
         let cut_short = cut_short && fallback_reason.is_none();
-        if let Some(persistence) = self.persistence.as_ref() {
-            {
-                let mut record = persistence.record.lock().await;
-                record.entries = compacted;
-                record.summary = Some(result.summary.clone());
-                record.compaction = Some(format!("archived={}", result.archived_count));
-                record.touch();
-            }
-            persistence.actor.request_save();
-        }
+        // One save for the whole fold: the summary and the archived count
+        // describe exactly the entry list written with them, and that save
+        // carries the summarizer's spend in the session totals. Hand-building
+        // the record here instead dropped the spend from the file — a
+        // `/compact` followed by a quit lost it — and could put back an entry
+        // list another front-end had appended to since the snapshot above.
+        self.persist_with(|record| {
+            record.summary = Some(result.summary.clone());
+            record.compaction = Some(format!("archived={}", result.archived_count));
+        })
+        .await;
         if let Some(tx) = tx {
             if let Some(reason) = &fallback_reason {
                 emit(
