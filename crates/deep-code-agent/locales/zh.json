@@ -254,7 +254,7 @@
   "WebUrlParseError": "无法解析 URL：{error}",
   "WebHttpStatus": "HTTP 状态 {status}",
   "WebReadBodyError": "读取响应失败：{error}",
-  "WebContentTruncated": "[下载已按 512 KiB 上限截断，下文为截断前的内容]",
+  "WebContentTruncated": "[下载已按 {max} 上限截断，下文为截断前的内容]",
   "WebSearchNoResults": "该查询没有搜索结果",
   "WebSearchUnavailable": "当前端点不提供 web_search：需要 DeepSeek 官方端点（api.deepseek.com）和 API key",
   "WebApiRequestError": "调用 DeepSeek 工具 API 失败：{error}",

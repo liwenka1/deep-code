@@ -254,7 +254,7 @@
   "WebUrlParseError": "Cannot parse URL: {error}",
   "WebHttpStatus": "HTTP status {status}",
   "WebReadBodyError": "Failed to read response: {error}",
-  "WebContentTruncated": "[download capped at the 512 KiB fetch limit; the text below is what fit]",
+  "WebContentTruncated": "[download capped at the {max} fetch limit; the text below is what fit]",
   "WebSearchNoResults": "No search results for this query",
   "WebSearchUnavailable": "web_search is not available on this endpoint: it needs DeepSeek's API endpoint (api.deepseek.com) and an API key",
   "WebApiRequestError": "Request to the DeepSeek tools API failed: {error}",

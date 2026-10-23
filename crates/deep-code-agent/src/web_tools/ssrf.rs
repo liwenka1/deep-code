@@ -80,40 +80,18 @@ pub(super) fn pinned_get(
 /// address (SSRF guard). For domain hosts, returns the validated address the
 /// caller must pin its connection to; IP-literal hosts involve no DNS and
 /// need no pin. `allow_private` is a test-only escape hatch.
+///
+/// This is the guard for a request **this machine** sends. [`check_api_url`] is
+/// the one that governs a fetch the provider performs.
 pub(super) fn check_url(
     url: &Url,
     allow_private: bool,
     lang: Lang,
 ) -> Result<Option<SocketAddr>, String> {
-    match url.scheme() {
-        "http" | "https" => {}
-        other => {
-            return Err(tr_with(
-                lang,
-                TextId::WebSchemeNotAllowed,
-                &[("scheme", other)],
-            ));
-        }
-    }
-    let host = url
-        .host_str()
-        .ok_or_else(|| tr(lang, TextId::WebUrlNoHost).to_string())?;
-    if allow_private {
-        return Ok(None);
-    }
-    // IP-literal host: no resolution happens, so validate the literal directly.
-    if let Ok(ip) = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<IpAddr>()
-    {
-        if !ip_is_public(ip) {
-            return Err(tr_with(
-                lang,
-                TextId::WebPrivateHostBlocked,
-                &[("host", host)],
-            ));
-        }
+    let host = check_syntax(url, allow_private, lang)?;
+    if allow_private || literal_ip(host).is_some() {
+        // Nothing was resolved: an address literal was validated by
+        // `check_syntax` itself, and there is no address to pin.
         return Ok(None);
     }
     let port = url.port_or_known_default().unwrap_or(443);
@@ -140,6 +118,85 @@ pub(super) fn check_url(
         }
     }
     Ok(Some(addrs[0]))
+}
+
+/// The guard for a fetch the **provider** performs (the Search & Fetch API).
+///
+/// Resolution is best-effort here, and its two outcomes are treated
+/// differently on purpose:
+///
+/// * It resolves to a private address → refuse. This machine can see that the
+///   name points inside the user's network, and handing that name to a third
+///   party leaks it (the service would also fetch it, from its own network).
+/// * It cannot resolve at all → let the service decide. The address this
+///   machine resolves is not the address the service reaches, so a failed
+///   lookup decides nothing about the fetch — and on a machine whose DNS goes
+///   through its egress proxy (or whose resolver cannot answer for a public
+///   name) requiring it refused *every* public URL, while `web_search` kept
+///   working because search checks no URL at all.
+///
+/// What is always checked, without DNS: the scheme, and a literal private
+/// address. Credentials are checked by the caller on both paths. Redirects
+/// are the service's to follow — its own policy rejects what it will not fetch.
+pub(super) fn check_api_url(url: &Url, allow_private: bool, lang: Lang) -> Result<(), String> {
+    let host = check_syntax(url, allow_private, lang)?;
+    if allow_private || literal_ip(host).is_some() {
+        return Ok(());
+    }
+    let port = url.port_or_known_default().unwrap_or(443);
+    let Ok(addrs) = (host, port).to_socket_addrs() else {
+        // Not resolvable from here. The service resolves it from its own
+        // network; a name that only exists there (or a proxy-only resolver
+        // here) must not be refused for that reason alone.
+        return Ok(());
+    };
+    for addr in addrs {
+        if !ip_is_public(addr.ip()) {
+            return Err(tr_with(
+                lang,
+                TextId::WebPrivateResolvedBlocked,
+                &[("host", host), ("addr", &addr.ip().to_string())],
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The checks that hold wherever the request is sent from: an http(s) scheme,
+/// a host, and — for an IP-literal host — the address itself. Returns the host.
+fn check_syntax(url: &Url, allow_private: bool, lang: Lang) -> Result<&str, String> {
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(tr_with(
+                lang,
+                TextId::WebSchemeNotAllowed,
+                &[("scheme", other)],
+            ));
+        }
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| tr(lang, TextId::WebUrlNoHost).to_string())?;
+    if !allow_private
+        && let Some(ip) = literal_ip(host)
+        && !ip_is_public(ip)
+    {
+        return Err(tr_with(
+            lang,
+            TextId::WebPrivateHostBlocked,
+            &[("host", host)],
+        ));
+    }
+    Ok(host)
+}
+
+/// The address an IP-literal host names, if it is one.
+fn literal_ip(host: &str) -> Option<IpAddr> {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()
 }
 
 fn ip_is_public(ip: IpAddr) -> bool {

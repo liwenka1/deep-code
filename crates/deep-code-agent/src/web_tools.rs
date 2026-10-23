@@ -14,18 +14,23 @@
 //! session-wide consent), `[sandbox] network = "never"` refuses them, and
 //! `DEEP_CODE_DISABLE_WEB` unmounts them.
 //!
-//! The SSRF guard runs on every URL the model hands in, on BOTH fetch paths.
-//! When DeepSeek's service does the fetching it is their network that reaches
-//! the target, so the guard protects nothing on this host — but a loopback
-//! literal or an internal hostname is not a research target, and sending it to
-//! a third party would leak the name of something behind the user's firewall.
-//! Refusing first is the honest answer either way.
+//! The two fetch paths are guarded differently, because the request leaves from
+//! different places. The local path's guard resolves the host, refuses anything
+//! that is not a public address, and pins every redirect hop to the address it
+//! checked. The API path's request leaves DeepSeek's network, so a lookup that
+//! fails here must not refuse a URL the service could fetch (with a proxy for
+//! egress and no direct DNS, that refused every fetch while `web_search` kept
+//! working); a name that *does* resolve to a private address here is still
+//! refused, because sending a name from behind the user's firewall to a third
+//! party leaks it. Literal private addresses and embedded credentials are
+//! refused on both paths, and redirects are the service's to follow.
 //!
 //! Both wrap their blocking `reqwest` bodies in [`crate::tool::run_blocking`],
 //! so requests land on the spawn_blocking pool.
 
+use std::collections::VecDeque;
 use std::io::Read;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -47,6 +52,14 @@ mod ssrf;
 /// Raw download cap on the local fetch path (the API path has no body to cap:
 /// the service returns Markdown, and [`render_fetched`] pages it).
 const DEFAULT_MAX_FETCH_BYTES: usize = 512 * 1024;
+/// One retry on the statuses the service documents as transient — 408, 429,
+/// 5xx — because a failed Search/Fetch request is not billed and the model has
+/// no way to know it could ask again.
+const RETRY_DELAY: Duration = Duration::from_millis(500);
+/// Longest wait honoured from a `Retry-After`. Past it the answer is the error
+/// rather than the wait: a tool call may not sit for half a minute inside the
+/// model's turn (and behind it, an approval).
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(2);
 const DEFAULT_SEARCH_RESULTS: usize = 5;
 const MAX_SEARCH_RESULTS: usize = 10;
 /// The search service's own limit on `query`; checked here so the model gets
@@ -58,6 +71,10 @@ const MAX_URL_CHARS: usize = 8192;
 /// with room to spare, and a summary is a pointer to a page, not the page.
 const SUMMARY_CHARS: usize = 400;
 const TITLE_CHARS: usize = 200;
+/// Longest URL rendered per hit. A result URL is a link to click, not prose:
+/// past a couple of hundred characters it is a redirect chain that crowds out
+/// the summary the model actually reads.
+const URL_CHARS: usize = 300;
 /// Chars held back from [`TOOL_OUTPUT_BUDGET`] for the fetched page's header
 /// and its continuation note, so a chunk never trips the runtime's head/tail
 /// truncation — which would silently drop the MIDDLE of a page while the note
@@ -79,8 +96,9 @@ DeepSeek's API endpoint (api.deepseek.com) and an API key, so a call only return
 Use fetch_url for URLs you already know.";
 const FETCH_DESC_API: &str = "Fetch a public http(s) URL through DeepSeek's fetch service and \
 return the page as Markdown (title, then content). Long pages come back in chunks: when a result \
-ends with a truncation note, call again with the `offset` it names to continue. Private/internal \
-addresses and URLs with embedded credentials are refused.";
+ends with a truncation note, call again with the `offset` it names to continue. The fetch — \
+including any redirect it follows — happens on DeepSeek's network. A literal private/internal \
+address, a host that resolves to one from here, and a URL with embedded credentials are refused.";
 const FETCH_DESC_LOCAL: &str = "Fetch a public http(s) URL from this machine and return its \
 text (HTML is reduced to readable text; the download is capped at 512 KiB). Long pages come back \
 in chunks: when a result ends with a truncation note, call again with the `offset` it names to \
@@ -162,6 +180,11 @@ pub fn web_tool_registry(ui_lang: &SharedLang, backend: &WebBackend) -> ToolRegi
 ///
 /// No SSRF pin here: the destination is the configured provider host, trusted
 /// exactly as much as the chat endpoint the same key is sent to.
+///
+/// Retried once on the statuses the service documents as transient (408, 429,
+/// 5xx). Both calls are billed per *successful* request, so a retry after a
+/// failure costs nothing but time, and the alternative is the model — which
+/// has no idea it could retry — asking again, which also costs an approval.
 fn api_post(
     api: &ToolsApi,
     path: &str,
@@ -180,46 +203,95 @@ fn api_post(
                 &[("error", &error.to_string())],
             )
         })?;
-    let response = client
-        .post(format!("{}/{path}", api.base))
-        .bearer_auth(&api.api_key)
-        .json(body)
-        .send()
-        .map_err(|error| {
+    let url = format!("{}/{path}", api.base);
+    // What the service said the last time it failed *before* the retry. A
+    // retry whose own connection cannot be made must report that first answer:
+    // "HTTP 503: busy" is information, "error sending request" is not.
+    let mut first_failure: Option<String> = None;
+    let mut retried = false;
+    let failure = |status: reqwest::StatusCode, text: &str| -> String {
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let message = api_error_message(text);
+            if message.is_empty() {
+                tr(lang, TextId::WebApiRateLimited).to_string()
+            } else {
+                // The service's own words: they name *which* limit (account QPS
+                // or the per-domain fetch cap) and how long to wait.
+                format!("{} {message}", tr(lang, TextId::WebApiRateLimited))
+            }
+        } else {
             tr_with(
                 lang,
-                TextId::WebApiRequestError,
-                &[("error", &error.to_string())],
+                TextId::WebApiHttpStatus,
+                &[
+                    ("status", &status.to_string()),
+                    ("message", &api_error_message(text)),
+                ],
             )
-        })?;
-    let status = response.status();
-    let text = response.text().map_err(|error| {
-        tr_with(
-            lang,
-            TextId::WebReadBodyError,
-            &[("error", &error.to_string())],
-        )
-    })?;
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Err(tr(lang, TextId::WebApiRateLimited).to_string());
+        }
+    };
+    loop {
+        let response = match client
+            .post(&url)
+            .bearer_auth(&api.api_key)
+            .json(body)
+            .send()
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(first_failure.unwrap_or_else(|| {
+                    tr_with(
+                        lang,
+                        TextId::WebApiRequestError,
+                        &[("error", &error.to_string())],
+                    )
+                }));
+            }
+        };
+        let status = response.status();
+        // Read before the body is consumed, and honour it when it is short: a
+        // service asking for thirty seconds is not a stall this tool may take,
+        // so past the cap the answer is the error, not the wait.
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        let text = match response.text() {
+            Ok(text) => text,
+            Err(error) => {
+                return Err(first_failure.unwrap_or_else(|| {
+                    tr_with(
+                        lang,
+                        TextId::WebReadBodyError,
+                        &[("error", &error.to_string())],
+                    )
+                }));
+            }
+        };
+        if status.is_success() {
+            return serde_json::from_str(&text).map_err(|error| {
+                tr_with(
+                    lang,
+                    TextId::WebApiBadResponse,
+                    &[("error", &error.to_string())],
+                )
+            });
+        }
+        let transient = status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error();
+        if transient && !retried {
+            retried = true;
+            first_failure = Some(failure(status, &text));
+            let wait = retry_after.unwrap_or(RETRY_DELAY).min(MAX_RETRY_WAIT);
+            // Blocking on purpose: this runs on the tool's own blocking worker.
+            std::thread::sleep(wait);
+            continue;
+        }
+        return Err(failure(status, &text));
     }
-    if !status.is_success() {
-        return Err(tr_with(
-            lang,
-            TextId::WebApiHttpStatus,
-            &[
-                ("status", &status.to_string()),
-                ("message", &api_error_message(&text)),
-            ],
-        ));
-    }
-    serde_json::from_str(&text).map_err(|error| {
-        tr_with(
-            lang,
-            TextId::WebApiBadResponse,
-            &[("error", &error.to_string())],
-        )
-    })
 }
 
 /// The `error.message` of an OpenAI-shaped error body, else the body itself;
@@ -247,6 +319,58 @@ pub struct FetchUrlTool {
     max_bytes: usize,
     description: &'static str,
     lang: SharedLang,
+    /// Pages already fetched this session. Shared by clones of the tool (the
+    /// registry hands out one clone per call), dropped with the tool when the
+    /// runtime is relaunched.
+    cache: Arc<Mutex<FetchCache>>,
+}
+
+/// How many pages are kept for continuation. A session can fetch for hours;
+/// the pages are bounded by count here and by [`DEFAULT_MAX_FETCH_BYTES`] each,
+/// so the worst case is a few megabytes rather than the whole session.
+const CACHED_PAGES: usize = 8;
+
+/// One page as this session rendered it: title, text, and the note about the
+/// download having been cut. Stored post-render because that is what the
+/// `offset` a continuation names indexes into.
+#[derive(Debug, Clone)]
+struct CachedPage {
+    url: String,
+    title: String,
+    content: String,
+    note: Option<String>,
+}
+
+/// Why this exists: `offset` is a character index into the rendering, so a
+/// continuation has to page through *the same* text. Refetching both re-bills
+/// the request (Search and Fetch are billed per successful call) and lets the
+/// boundaries drift if the page changed in between — the chunk the model was
+/// told to read next may then be different text.
+///
+/// Only continuations read it. `offset == 0` always refetches and overwrites the
+/// entry, so "fetch this URL again" keeps meaning "get me the page as it is
+/// now".
+#[derive(Debug, Default)]
+struct FetchCache {
+    pages: VecDeque<CachedPage>,
+}
+
+impl FetchCache {
+    fn get(&mut self, url: &str) -> Option<CachedPage> {
+        let index = self.pages.iter().position(|page| page.url == url)?;
+        let page = self.pages.remove(index)?;
+        // Most recently used last: that is the end the cap drops from.
+        self.pages.push_back(page.clone());
+        Some(page)
+    }
+
+    fn put(&mut self, page: CachedPage) {
+        self.pages.retain(|old| old.url != page.url);
+        self.pages.push_back(page);
+        while self.pages.len() > CACHED_PAGES {
+            self.pages.pop_front();
+        }
+    }
 }
 
 impl FetchUrlTool {
@@ -265,6 +389,7 @@ impl FetchUrlTool {
             max_bytes: DEFAULT_MAX_FETCH_BYTES,
             description,
             lang,
+            cache: Arc::new(Mutex::new(FetchCache::default())),
         }
     }
 
@@ -288,22 +413,78 @@ impl FetchUrlTool {
                 tr(lang, TextId::WebUrlHasCredentials).to_string(),
             ));
         }
-        // Before any request leaves this process — see the module docs for why
-        // the API path checks too. `pinned_get` repeats it per redirect hop.
-        if let Err(reason) = ssrf::check_url(&parsed, self.allow_private, lang) {
+        // Which guard applies depends on who sends the request. The local path's
+        // request leaves this machine, so its host must resolve to a public
+        // address and the connection is pinned to it (`pinned_get` repeats that
+        // per redirect hop). The API path's request leaves DeepSeek's, so a
+        // lookup that fails here must not refuse a URL the service can reach —
+        // but a name this machine *can* see pointing inside the user's network
+        // is still refused, because handing it to a third party leaks it.
+        let guard = if self.api.is_some() {
+            ssrf::check_api_url(&parsed, self.allow_private, lang)
+        } else {
+            ssrf::check_url(&parsed, self.allow_private, lang).map(|_| ())
+        };
+        if let Err(reason) = guard {
             return Ok(ToolOutput::soft_error(reason));
+        }
+        // Length is a property of the argument, not of the backend: the service
+        // documents 8192 characters and the local reader has no business
+        // accepting a longer one either (a URL that long leaves no room for the
+        // page in the tool's output budget).
+        if params.url.chars().count() > MAX_URL_CHARS {
+            return Ok(ToolOutput::soft_error(tr_with(
+                lang,
+                TextId::WebUrlTooLong,
+                &[("max", &MAX_URL_CHARS.to_string())],
+            )));
         }
         let offset = params.offset.unwrap_or(0);
 
-        let (title, content, source_note) = match &self.api {
-            Some(api) => {
-                if params.url.chars().count() > MAX_URL_CHARS {
-                    return Ok(ToolOutput::soft_error(tr_with(
-                        lang,
-                        TextId::WebUrlTooLong,
-                        &[("max", &MAX_URL_CHARS.to_string())],
-                    )));
+        // A continuation pages through the text this session already fetched —
+        // see `FetchCache`. `offset == 0` always refetches, so "fetch it again"
+        // keeps meaning "get me the page as it is now".
+        let cached = if offset > 0 {
+            self.cache
+                .lock()
+                .ok()
+                .and_then(|mut cache| cache.get(parsed.as_str()))
+        } else {
+            None
+        };
+        let page = match cached {
+            Some(page) => page,
+            None => {
+                let page = match self.fetch_page(&parsed, lang) {
+                    Ok(page) => page,
+                    Err(output) => return Ok(output),
+                };
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.put(page.clone());
                 }
+                page
+            }
+        };
+
+        match render_fetched(
+            &parsed,
+            &page.title,
+            &page.content,
+            page.note.as_deref(),
+            offset,
+            lang,
+        ) {
+            Ok(text) => Ok(ToolOutput::text(text)),
+            Err(reason) => Ok(ToolOutput::soft_error(reason)),
+        }
+    }
+
+    /// One fresh fetch: whichever path the backend chose, rendered into the
+    /// page the continuation cache stores. `Err` is the tool output for a
+    /// refusal (a soft error), already localized.
+    fn fetch_page(&self, parsed: &Url, lang: Lang) -> Result<CachedPage, ToolOutput> {
+        let (title, content, note) = match &self.api {
+            Some(api) => {
                 let response = match api_post(
                     api,
                     "fetch",
@@ -312,10 +493,10 @@ impl FetchUrlTool {
                     lang,
                 ) {
                     Ok(response) => response,
-                    Err(reason) => return Ok(ToolOutput::soft_error(reason)),
+                    Err(reason) => return Err(ToolOutput::soft_error(reason)),
                 };
                 let Some(content) = response.get("content").and_then(Value::as_str) else {
-                    return Ok(ToolOutput::soft_error(tr_with(
+                    return Err(ToolOutput::soft_error(tr_with(
                         lang,
                         TextId::WebApiBadResponse,
                         &[("error", "missing `content`")],
@@ -331,11 +512,11 @@ impl FetchUrlTool {
             None => {
                 let response = match ssrf::pinned_get(parsed.clone(), self.allow_private, lang) {
                     Ok(response) => response,
-                    Err(reason) => return Ok(ToolOutput::soft_error(reason)),
+                    Err(reason) => return Err(ToolOutput::soft_error(reason)),
                 };
                 let status = response.status();
                 if !status.is_success() {
-                    return Ok(ToolOutput::soft_error(tr_with(
+                    return Err(ToolOutput::soft_error(tr_with(
                         lang,
                         TextId::WebHttpStatus,
                         &[("status", &status.to_string())],
@@ -351,7 +532,7 @@ impl FetchUrlTool {
                 let mut body = Vec::new();
                 let mut limited = response.take(self.max_bytes as u64 + 1);
                 if let Err(error) = limited.read_to_end(&mut body) {
-                    return Ok(ToolOutput::soft_error(tr_with(
+                    return Err(ToolOutput::soft_error(tr_with(
                         lang,
                         TextId::WebReadBodyError,
                         &[("error", &error.to_string())],
@@ -368,15 +549,22 @@ impl FetchUrlTool {
                 (
                     String::new(),
                     text,
-                    capped.then(|| tr(lang, TextId::WebContentTruncated)),
+                    capped.then(|| {
+                        tr_with(
+                            lang,
+                            TextId::WebContentTruncated,
+                            &[("max", &human_bytes(self.max_bytes))],
+                        )
+                    }),
                 )
             }
         };
-
-        match render_fetched(&parsed, &title, &content, source_note, offset, lang) {
-            Ok(text) => Ok(ToolOutput::text(text)),
-            Err(reason) => Ok(ToolOutput::soft_error(reason)),
-        }
+        Ok(CachedPage {
+            url: parsed.as_str().to_string(),
+            title,
+            content,
+            note,
+        })
     }
 }
 
@@ -540,6 +728,11 @@ impl WebSearchTool {
                 tr(lang, TextId::WebSearchNoResults).to_string(),
             ));
         }
+        // The service is asked for `count` and normally honours it, but a
+        // result set larger than the output budget would have its middle cut
+        // by the runtime's head/tail trim — silently dropping whole hits while
+        // the status still read Success.
+        let hits: Vec<SearchHit> = hits.into_iter().take(max_results).collect();
         Ok(ToolOutput::text(render_search_hits(&hits)))
     }
 }
@@ -621,7 +814,7 @@ fn render_search_hits(hits: &[SearchHit]) -> String {
             "{}. {}\n   {}\n",
             index + 1,
             truncate_chars(title, TITLE_CHARS),
-            hit.url
+            truncate_chars(hit.url.as_str(), URL_CHARS)
         ));
         let meta: Vec<&str> = [hit.date.as_str(), hit.site_name.as_str()]
             .into_iter()
@@ -640,6 +833,18 @@ fn render_search_hits(hits: &[SearchHit]) -> String {
         }
     }
     out
+}
+
+/// A download cap for a human: `512 KiB`, or `16 bytes` when the cap is too
+/// small to round to a whole KiB. The note used to spell "512 KiB" as a
+/// constant while the actual limit was a field, so the text claimed a cap the
+/// code was not applying.
+fn human_bytes(bytes: usize) -> String {
+    if bytes >= 1024 && bytes.is_multiple_of(1024) {
+        format!("{} KiB", bytes / 1024)
+    } else {
+        format!("{bytes} bytes")
+    }
 }
 
 /// Crude but dependency-free HTML → text for the local fetch path: drop
@@ -736,6 +941,38 @@ mod tests {
         body: Value,
     }
 
+    /// Read one HTTP request off `stream` and hand back `(head, body)`.
+    fn read_http_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            if read == 0 {
+                return (String::new(), Vec::new());
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            let Some(split) = buffer.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buffer[..split]).to_string();
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            let body_start = split + 4;
+            if buffer.len() < body_start + length {
+                continue;
+            }
+            return (head, buffer[body_start..body_start + length].to_vec());
+        }
+    }
+
     /// A one-shot tools-API server: answers with `status` + `body` and hands
     /// the request it received back through the channel. Returns the base to
     /// give [`WebBackend::test_api`].
@@ -747,48 +984,26 @@ mod tests {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
-            let mut buffer = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                let read = stream.read(&mut chunk).unwrap_or(0);
-                if read == 0 {
-                    break;
-                }
-                buffer.extend_from_slice(&chunk[..read]);
-                let Some(split) = buffer.windows(4).position(|w| w == b"\r\n\r\n") else {
-                    continue;
-                };
-                let head = String::from_utf8_lossy(&buffer[..split]).to_string();
-                let header = |name: &str| {
-                    head.lines().find_map(|line| {
-                        let (key, value) = line.split_once(':')?;
-                        key.trim()
-                            .eq_ignore_ascii_case(name)
-                            .then(|| value.trim().to_string())
-                    })
-                };
-                let length = header("content-length")
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let body_start = split + 4;
-                if buffer.len() < body_start + length {
-                    continue;
-                }
-                let path = head
-                    .lines()
-                    .next()
-                    .and_then(|line| line.split_whitespace().nth(1))
-                    .unwrap_or_default()
-                    .to_string();
-                let body = serde_json::from_slice(&buffer[body_start..body_start + length])
-                    .unwrap_or(Value::Null);
-                let _ = tx.send(Captured {
-                    path,
-                    authorization: header("authorization"),
-                    body,
-                });
-                break;
-            }
+            let (head, request_body) = read_http_request(&mut stream);
+            let header = |name: &str| {
+                head.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.trim()
+                        .eq_ignore_ascii_case(name)
+                        .then(|| value.trim().to_string())
+                })
+            };
+            let path = head
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or_default()
+                .to_string();
+            let _ = tx.send(Captured {
+                path,
+                authorization: header("authorization"),
+                body: serde_json::from_slice(&request_body).unwrap_or(Value::Null),
+            });
             let response = format!(
                 "HTTP/1.1 {status} Whatever\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -796,6 +1011,27 @@ mod tests {
             let _ = stream.write_all(response.as_bytes());
         });
         (format!("http://127.0.0.1:{port}"), rx)
+    }
+
+    /// A tools-API server that answers `responses` in order, one per
+    /// connection — what a retry needs: one endpoint, two different answers.
+    fn serve_api_responses(responses: Vec<(u16, String)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = read_http_request(&mut stream);
+                let response = format!(
+                    "HTTP/1.1 {status} Whatever\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{port}")
     }
 
     async fn run(tool: &dyn ErasedTool, name: &str, arguments: Value) -> crate::tool::ToolResult {
@@ -916,6 +1152,161 @@ mod tests {
         let blurb = result.content.lines().nth(2).unwrap().trim();
         assert_eq!(blurb.chars().count(), SUMMARY_CHARS + 1, "{blurb}");
         assert!(blurb.ends_with('…'));
+    }
+
+    /// The count is enforced here rather than trusted to the service: a body
+    /// with more hits than were asked for used to be rendered whole, and past
+    /// the output budget the runtime's head/tail trim dropped whole hits from
+    /// the middle while the status still read Success.
+    #[tokio::test]
+    async fn web_search_renders_no_more_hits_than_were_asked_for() {
+        let results: Vec<serde_json::Value> = (0..5)
+            .map(|index| {
+                json!({
+                    "title": format!("hit {index}"),
+                    "url": format!("https://e.com/{index}"),
+                    "summary": "s",
+                })
+            })
+            .collect();
+        let (base, _seen) = serve_api_once(200, json!({ "results": results }).to_string());
+        let tool = WebSearchTool::new(zh(), &WebBackend::test_api(&base));
+        let result = run(
+            &tool,
+            WebSearchTool::NAME,
+            json!({ "query": "q", "max_results": 2 }),
+        )
+        .await;
+        assert_eq!(result.status, ToolResultStatus::Success);
+        assert!(result.content.contains("1. hit 0"), "{}", result.content);
+        assert!(result.content.contains("2. hit 1"), "{}", result.content);
+        assert!(
+            !result.content.contains("hit 2"),
+            "a third hit was neither asked for nor wanted: {}",
+            result.content
+        );
+    }
+
+    /// A result URL is capped on its own: an unbounded URL line was the one
+    /// field that could still push a page of hits past the output budget.
+    #[tokio::test]
+    async fn web_search_caps_each_url() {
+        let long = format!("https://e.com/{}", "a".repeat(URL_CHARS + 50));
+        let (base, _seen) = serve_api_once(
+            200,
+            json!({ "results": [{ "title": "t", "url": long, "summary": "s" }] }).to_string(),
+        );
+        let tool = WebSearchTool::new(zh(), &WebBackend::test_api(&base));
+        let result = run(&tool, WebSearchTool::NAME, json!({ "query": "q" })).await;
+        let url_line = result.content.lines().nth(1).unwrap().trim();
+        assert_eq!(url_line.chars().count(), URL_CHARS + 1, "{url_line}");
+        assert!(url_line.ends_with('…'));
+    }
+
+    /// A continuation pages the text this session already fetched: the mock
+    /// answers exactly one request, so a second fetch could only fail. That is
+    /// also the money: Search and Fetch bill per successful request, and a
+    /// page read in five chunks used to be paid for five times. And the
+    /// boundaries stay put — `offset` indexes the rendering the model was told
+    /// to continue, not a fresh one.
+    #[tokio::test]
+    async fn fetch_url_continues_from_the_cached_page_without_asking_again() {
+        let content = "abcdefghij".repeat(20);
+        let (base, _seen) =
+            serve_api_once(200, json!({ "title": "t", "content": content }).to_string());
+        let tool = FetchUrlTool {
+            allow_private: true,
+            ..FetchUrlTool::new(zh(), &WebBackend::test_api(&base))
+        };
+        let url = format!("{base}/page");
+        let first = run(&tool, FetchUrlTool::NAME, json!({ "url": url })).await;
+        assert_eq!(first.status, ToolResultStatus::Success, "{}", first.content);
+
+        let second = run(
+            &tool,
+            FetchUrlTool::NAME,
+            json!({ "url": url, "offset": 6 }),
+        )
+        .await;
+        assert_eq!(
+            second.status,
+            ToolResultStatus::Success,
+            "{}",
+            second.content
+        );
+        assert!(
+            second.content.contains(&content[6..12]),
+            "the continuation starts where the note said: {}",
+            second.content
+        );
+    }
+
+    /// `offset == 0` is a fresh fetch by definition: asking for a URL again
+    /// must not answer with what the cache still has.
+    #[tokio::test]
+    async fn fetch_url_refetches_from_the_top() {
+        let (base, _seen) = serve_api_once(
+            200,
+            json!({ "title": "t", "content": "abcdefghij" }).to_string(),
+        );
+        let tool = FetchUrlTool {
+            allow_private: true,
+            ..FetchUrlTool::new(zh(), &WebBackend::test_api(&base))
+        };
+        let url = format!("{base}/page");
+        let first = run(&tool, FetchUrlTool::NAME, json!({ "url": url })).await;
+        assert_eq!(first.status, ToolResultStatus::Success, "{}", first.content);
+        // The mock is gone: only a real refetch can answer this, and that is the
+        // point — a cached page would have come back as Success.
+        let again = run(&tool, FetchUrlTool::NAME, json!({ "url": url })).await;
+        assert_eq!(again.status, ToolResultStatus::Error, "{}", again.content);
+    }
+
+    /// A 5xx is the service's own "try again later": one bounded retry absorbs
+    /// a blip instead of costing the model a turn and the user an approval.
+    #[tokio::test]
+    async fn a_transient_failure_is_retried_once() {
+        let base = serve_api_responses(vec![
+            (503, json!({ "error": { "message": "busy" } }).to_string()),
+            (
+                200,
+                json!({ "results": [{ "title": "t", "url": "https://e.com/", "summary": "s" }] })
+                    .to_string(),
+            ),
+        ]);
+        let tool = WebSearchTool::new(zh(), &WebBackend::test_api(&base));
+        let result = run(&tool, WebSearchTool::NAME, json!({ "query": "q" })).await;
+        assert_eq!(
+            result.status,
+            ToolResultStatus::Success,
+            "{}",
+            result.content
+        );
+    }
+
+    /// A 429 that survives the retry keeps the service's own words: they name
+    /// which limit was hit and how long to wait, and the fixed sentence alone
+    /// threw that away.
+    #[tokio::test]
+    async fn a_rate_limit_that_survives_the_retry_keeps_the_service_message() {
+        let base = serve_api_responses(vec![
+            (
+                429,
+                json!({ "error": { "message": "account QPS exceeded" } }).to_string(),
+            ),
+            (
+                429,
+                json!({ "error": { "message": "per-domain fetch limit: wait 2s" } }).to_string(),
+            ),
+        ]);
+        let tool = WebSearchTool::new(zh(), &WebBackend::test_api(&base));
+        let result = run(&tool, WebSearchTool::NAME, json!({ "query": "q" })).await;
+        assert_eq!(result.status, ToolResultStatus::Error);
+        assert!(
+            result.content.contains("per-domain fetch limit"),
+            "the service's message has to survive: {}",
+            result.content
+        );
     }
 
     /// No API means no search — the tool says so in its description (so the
@@ -1180,6 +1571,88 @@ mod tests {
         assert!(!text.contains("body{}"));
     }
 
+    /// The URL length limit is a property of the argument, not of the backend:
+    /// only the API path used to check it, so on a non-DeepSeek endpoint a
+    /// 9000-character URL went out — and a URL that long leaves no room for the
+    /// page in the tool's output budget.
+    #[tokio::test]
+    async fn a_url_past_the_limit_is_refused_on_the_local_path_too() {
+        let tool = local_fetch_tool();
+        let long = format!("http://127.0.0.1:9/{}", "a".repeat(MAX_URL_CHARS));
+        let result = run(&tool, FetchUrlTool::NAME, json!({ "url": long })).await;
+        assert_eq!(result.status, ToolResultStatus::Error);
+        assert!(result.content.contains("8192"), "{}", result.content);
+    }
+
+    /// The API path does not require this machine to resolve the URL: the page
+    /// is fetched on DeepSeek's network, so a lookup that fails here decides
+    /// nothing — and behind an egress proxy (no direct DNS) requiring it
+    /// refused *every* public URL while `web_search` kept working.
+    ///
+    /// `invalid` is reserved by RFC 6761 and never resolves, so the input is
+    /// deterministic.
+    #[tokio::test]
+    async fn the_api_path_does_not_need_a_local_dns_answer() {
+        let (base, _seen) =
+            serve_api_once(200, json!({ "title": "t", "content": "page" }).to_string());
+        let tool = FetchUrlTool::new(zh(), &WebBackend::test_api(&base));
+        let result = run(
+            &tool,
+            FetchUrlTool::NAME,
+            json!({ "url": "https://nonexistent.invalid/page" }),
+        )
+        .await;
+        assert_eq!(
+            result.status,
+            ToolResultStatus::Success,
+            "{}",
+            result.content
+        );
+    }
+
+    /// …but a name this machine *can* see pointing inside the network is still
+    /// refused before it is sent: handing it to a third party leaks it, and no
+    /// proxy excuses that.
+    #[tokio::test]
+    async fn the_api_path_still_refuses_a_host_that_resolves_to_a_private_address() {
+        let (base, _seen) =
+            serve_api_once(200, json!({ "title": "t", "content": "page" }).to_string());
+        let tool = FetchUrlTool::new(zh(), &WebBackend::test_api(&base));
+        let result = run(
+            &tool,
+            FetchUrlTool::NAME,
+            json!({ "url": "http://localhost:9/" }),
+        )
+        .await;
+        assert_eq!(result.status, ToolResultStatus::Error);
+        assert!(result.content.contains("localhost"), "{}", result.content);
+    }
+
+    /// The local path keeps the resolving guard, because there the request
+    /// leaves this machine: a host it cannot resolve is refused by the guard —
+    /// not by a connection that then fails — rather than handed to a client
+    /// that would resolve it again at connect time. (`pinned_get` repeats the
+    /// check per redirect hop, so this is the first of two.)
+    #[tokio::test]
+    async fn the_local_path_still_refuses_a_host_it_cannot_resolve() {
+        let tool = FetchUrlTool {
+            allow_private: false,
+            ..FetchUrlTool::new(zh(), &WebBackend::local_only())
+        };
+        let result = run(
+            &tool,
+            FetchUrlTool::NAME,
+            json!({ "url": "https://nonexistent.invalid/page" }),
+        )
+        .await;
+        assert_eq!(result.status, ToolResultStatus::Error);
+        assert!(
+            result.content.contains("无法解析主机"),
+            "the guard's own refusal, not a failed connection: {}",
+            result.content
+        );
+    }
+
     /// The local path (non-DeepSeek endpoints) still works: HTML is reduced to
     /// text, the raw download is capped with a note, and the same `offset`
     /// paging applies to whatever text survived.
@@ -1194,7 +1667,7 @@ mod tests {
         assert_eq!(
             result.content,
             format!(
-                "{url}\n[下载已按 512 KiB 上限截断，下文为截断前的内容]\n\n{}",
+                "{url}\n[下载已按 16 bytes 上限截断，下文为截断前的内容]\n\n{}",
                 "x".repeat(16)
             )
         );
