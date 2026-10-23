@@ -239,24 +239,25 @@ pub fn mechanical_summary(plan: &CompactionPlan, entries: &[Arc<SessionEntry>]) 
 
 /// Replace the planned range with one Compaction entry carrying `summary`.
 /// Entries come and go as `Arc`s: retained/tail entries are pointer clones,
-/// only the new Compaction entry is allocated. `archived_count` counts
-/// entries, the carried summary entry included.
+/// only the new Compaction entry is allocated. `archived_count` counts the
+/// entries this fold folded: the previous summary that the archived range
+/// carries at its head is not one of them. Counting it made the figure the UI
+/// reports ("folded the earliest N records") grow by one on every fold after
+/// the first — live, and again on resume, since the same number is stored in
+/// the entry.
 #[must_use]
 pub fn apply_compaction(
     entries: &[Arc<SessionEntry>],
     plan: &CompactionPlan,
     summary: String,
 ) -> CompactionResult {
-    let archived = plan.archived(entries);
+    let folded = plan.fresh(entries).len();
     let mut out = Vec::with_capacity(plan.head + 1 + entries.len() - plan.tail_start);
     out.extend_from_slice(&entries[..plan.head]);
-    out.push(Arc::new(SessionEntry::compaction(
-        summary.clone(),
-        archived.len(),
-    )));
+    out.push(Arc::new(SessionEntry::compaction(summary.clone(), folded)));
     out.extend_from_slice(&entries[plan.tail_start..]);
     CompactionResult {
-        archived_count: archived.len(),
+        archived_count: folded,
         entries: out,
         summary,
     }
@@ -682,6 +683,48 @@ mod tests {
                 .any(|m| m.role == Role::User && m.content == "FIX THE LOGIN BUG"),
             "the task must reach the wire as a user message"
         );
+    }
+
+    /// The figure the UI reports ("folded the earliest N records") counts
+    /// records this fold folded. The archived range starts with the previous
+    /// summary — a record the user never wrote — and counting it made the
+    /// number grow by one on every fold after the first, both live and on a
+    /// resumed session (the same number is stored in the entry).
+    #[test]
+    fn a_fold_counts_its_own_records_not_the_summary_it_replaces() {
+        let mut entries = vec![
+            Arc::new(SessionEntry::system("sys")),
+            Arc::new(SessionEntry::compaction("prior summary".to_string(), 7)),
+        ];
+        for turn in 0..3 {
+            entries.push(Arc::new(SessionEntry::user(format!("task {turn}"))));
+            entries.push(Arc::new(SessionEntry::assistant(
+                format!("answer {turn}"),
+                None,
+                Vec::new(),
+            )));
+        }
+        entries.push(Arc::new(SessionEntry::user("active task")));
+        for step in 0..RECENT_TAIL_ENTRIES + 1 {
+            entries.push(Arc::new(SessionEntry::assistant(
+                format!("step {step}"),
+                None,
+                Vec::new(),
+            )));
+        }
+
+        let plan = plan_compaction(&entries).expect("history to fold");
+        let archived = plan.archived(&entries).len();
+        let fresh = plan.fresh(&entries).len();
+        assert_eq!(fresh + 1, archived, "the range carries the prior summary");
+
+        let result = compact_entries(&entries);
+        assert_eq!(result.archived_count, fresh);
+        let stored = result.entries.iter().find_map(|entry| match &entry.kind {
+            EntryKind::Compaction { archived_count, .. } => Some(*archived_count),
+            _ => None,
+        });
+        assert_eq!(stored, Some(fresh), "a resumed cell reads this number");
     }
 
     /// The budget wrap-up is injected as a System entry, not a user one, for
