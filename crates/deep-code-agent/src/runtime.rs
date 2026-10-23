@@ -23,7 +23,7 @@ mod failure_class;
 mod persistence;
 mod persistence_actor;
 mod state;
-use state::Steered;
+use state::{Steered, TurnBudget};
 mod streaming;
 mod telemetry;
 /// Crate-visible for `TOOL_OUTPUT_BUDGET`: the shell layer's spill decisions
@@ -395,7 +395,11 @@ impl AgentRuntime {
             state.pending = None;
             state.current_turn = Some(TurnRecord::new());
             state.current_prompt = Some(prompt);
-            state.current_turn_id = Some(turn_id);
+            state.current_turn_id = Some(turn_id.clone());
+            // A fresh step budget for this turn, and only for it: the step cap
+            // and the two one-shot nudges survive the approval parks inside a
+            // turn (see `TurnBudget`), so only a new turn starts from zero.
+            state.turn_budget = Some(TurnBudget::new(turn_id));
             state.cancel = CancellationToken::new();
             // Per-turn struggle counter and the "triggered this turn" flag
             // reset; the `cascade_escalated` latch intentionally persists for

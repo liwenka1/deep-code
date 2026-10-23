@@ -37,6 +37,36 @@ pub(super) enum Steered {
 }
 
 /// Internal: the runtime can be in one of these states between
+/// One turn's step budget: how many model requests it has made, and the two
+/// one-shot nudges that ride on the count.
+///
+/// Here rather than as locals of `run_loop` because an approval park returns
+/// from the loop and `resume_after_batch` re-enters it fresh: a local counter
+/// began again from zero at every human answer, so the step cap was multiplied
+/// by the number of approvals in the turn, and "one forced-compaction rescue"
+/// and "one wrap-up notice" were each handed out again per resume. Keyed by
+/// turn for the same reason `threshold_compaction_tried` is: a superseded
+/// loop can still be on its way out and must not spend the next turn's
+/// allowance.
+#[derive(Debug, Clone)]
+pub(super) struct TurnBudget {
+    pub(super) turn: TurnId,
+    pub(super) steps: u32,
+    pub(super) overflow_rescued: bool,
+    pub(super) wrap_up_sent: bool,
+}
+
+impl TurnBudget {
+    pub(super) fn new(turn: TurnId) -> Self {
+        Self {
+            turn,
+            steps: 0,
+            overflow_rescued: false,
+            wrap_up_sent: false,
+        }
+    }
+}
+
 /// `RuntimeEvent` emissions. Kept crate-private to the runtime module so
 /// callers cannot poke at it.
 #[derive(Debug, Default)]
@@ -91,6 +121,9 @@ pub(super) struct RuntimeState {
     /// out of a fold when the next turn begins, and a flag it set then was
     /// the next turn's one fold, spent.
     pub(super) threshold_compaction_tried: Option<TurnId>,
+    /// This turn's step budget. Replaced (not mutated) by `begin_turn`, so a
+    /// late-finishing loop compares its own id against it and stops.
+    pub(super) turn_budget: Option<TurnBudget>,
     /// Tools the user approved for the whole session ("a" in the approval
     /// panel). In-memory only: forgotten when the runtime shuts down.
     pub(super) session_approved: HashSet<String>,

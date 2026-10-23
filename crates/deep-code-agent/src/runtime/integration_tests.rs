@@ -398,6 +398,61 @@ async fn approve_path_feeds_tool_result_into_next_turn() {
     assert_eq!(messages[3].content, "thanks");
 }
 
+/// A turn's step budget counts the whole turn, and an approval park is inside
+/// the turn.
+///
+/// These counters used to be locals of `run_loop`, and a park returns from that
+/// loop while `resume_after_batch` re-enters it: every human answer restarted
+/// the count at zero, so `[budget] turn_steps` was really "steps between two
+/// approvals" and a model that asks for one gated tool per round never hit the
+/// cap at all.
+#[tokio::test]
+async fn an_approval_park_does_not_refill_the_turns_step_budget() {
+    const CAP: u32 = 3;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let scripts: Vec<Vec<AgentEvent>> = (0..8)
+        .map(|_| {
+            vec![
+                AgentEvent::ToolCallDelta {
+                    delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+                },
+                AgentEvent::Done { usage: None },
+            ]
+        })
+        .collect();
+    let client = CapturingClient {
+        scripts: Mutex::new(scripts),
+        requests: Arc::clone(&requests),
+    };
+    let mut config = crate::config::AgentConfig::builtin();
+    config.turn_steps = CAP;
+    let runtime = AgentRuntime::with_config(client, ToolRegistry::with_mock_tools(), config);
+
+    let mut rx = runtime.submit_user("echo forever").await;
+    let mut events = drain(&mut rx).await;
+    // Answer every park the way a user would. The turn has to end on the cap,
+    // not on a script running out.
+    for _ in 0..8 {
+        if !matches!(events.last(), Some(RuntimeEvent::ApprovalRequired { .. })) {
+            break;
+        }
+        let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+        events = drain(&mut rx).await;
+    }
+
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        CAP as usize,
+        "the cap counts model requests for the whole turn, approvals included"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Error { .. })),
+        "the turn has to end on the step limit: {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn yolo_mode_auto_approves_gated_tool_without_parking() {
     use crate::execution_policy::{PermissionMode, SharedPermissionMode};

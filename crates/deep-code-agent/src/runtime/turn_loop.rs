@@ -59,6 +59,48 @@ pub(crate) fn budget_wrap_up_due(used: u32, limit: u32, already_sent: bool) -> b
 const BOUNDARY_DENIAL_BREAKER: u32 = 3;
 
 impl AgentRuntime {
+    /// Spend one step of `turn_id`'s budget: increments the count and hands
+    /// back `(steps, wrap_up_sent, overflow_rescued)`.
+    ///
+    /// `None` when the state's budget belongs to a newer turn — a superseded
+    /// loop still on its way out must not spend, or reset, the allowance of the
+    /// turn that replaced it.
+    ///
+    /// See [`super::state::TurnBudget`] for why this is state and not a local.
+    async fn spend_step(&self, turn_id: &TurnId) -> Option<(u32, bool, bool)> {
+        let mut state = self.state.lock().await;
+        let budget = state.turn_budget.as_mut()?;
+        if &budget.turn != turn_id {
+            return None;
+        }
+        budget.steps += 1;
+        Some((budget.steps, budget.wrap_up_sent, budget.overflow_rescued))
+    }
+
+    /// Record that the one wrap-up nudge has been sent this turn.
+    async fn mark_wrap_up_sent(&self, turn_id: &TurnId) {
+        let mut state = self.state.lock().await;
+        if let Some(budget) = state.turn_budget.as_mut()
+            && &budget.turn == turn_id
+        {
+            budget.wrap_up_sent = true;
+        }
+    }
+
+    /// Record that this turn has used its one forced-compaction rescue.
+    ///
+    /// One per turn, because a second overflow means the oversized part is the
+    /// turn's own retained tail — which compaction structurally cannot reach,
+    /// so retrying would only re-bill the same rejected request.
+    async fn mark_overflow_rescued(&self, turn_id: &TurnId) {
+        let mut state = self.state.lock().await;
+        if let Some(budget) = state.turn_budget.as_mut()
+            && &budget.turn == turn_id
+        {
+            budget.overflow_rescued = true;
+        }
+    }
+
     /// UI language for user-facing runtime text (error diagnostics, approval
     /// previews). Reads the shared [`crate::i18n::SharedLang`] atomic that the
     /// TUI flips on `/lang` via the runtime handle, so a switch is picked up by
@@ -150,14 +192,6 @@ impl AgentRuntime {
         );
 
         let mut stream_retries = 0u32;
-        let mut steps = 0u32;
-        // One forced-compaction rescue per turn at most (see the `Some(Err)`
-        // arm below). A second overflow means the oversized part is this turn's
-        // own retained tail, which compaction structurally cannot reach —
-        // retrying again would only re-bill the same rejected request.
-        let mut overflow_rescued = false;
-        // One wrap-up instruction per turn (see `budget_wrap_up_due`).
-        let mut budget_notice_sent = false;
 
         loop {
             // Bound the model/tool ping-pong. Every iteration is one API request
@@ -167,7 +201,17 @@ impl AgentRuntime {
             // `auto_allow`/Yolo) would bill the user's key until they notice and
             // press Esc. Sub-agents have had a step cap all along; the parent
             // loop, which is the one holding the key, had none.
-            steps += 1;
+            //
+            // The count, the forced-compaction rescue and the wrap-up guard all
+            // live in `TurnBudget` (the state) rather than here: an approval
+            // park leaves this loop and `resume_after_batch` enters it again, so
+            // locals started over at every human answer. `None` means the
+            // budget belongs to a newer turn — this loop was superseded and has
+            // nothing left to spend.
+            let Some((steps, wrap_up_sent, overflow_rescued)) = self.spend_step(&turn_id).await
+            else {
+                return;
+            };
             // `0` is the user's explicit "no ceiling": the loop then has no
             // step stop at all, and the only exits left are cancel, a stream
             // error, an empty tool batch or an approval park. That is a real
@@ -206,8 +250,8 @@ impl AgentRuntime {
             // The cost is one prefix break for the rest of the turn, which is
             // the price of saying anything mid-turn at all. Worth it: the
             // alternative is a turn that dies mid-edit with nothing said.
-            if budget_wrap_up_due(steps, cap, budget_notice_sent) {
-                budget_notice_sent = true;
+            if budget_wrap_up_due(steps, cap, wrap_up_sent) {
+                self.mark_wrap_up_sent(&turn_id).await;
                 let text = crate::tr_with(
                     self.ui_lang(),
                     crate::TextId::TurnBudgetWrapUp,
@@ -315,7 +359,8 @@ impl AgentRuntime {
                     // over a now-shorter history, so a UI must not read it as a
                     // new turn. Hence a warning rather than an error, and no
                     // TurnStarted.
-                    overflow_rescued = true;
+                    // Turn-scoped, so a resumed loop cannot rescue twice.
+                    self.mark_overflow_rescued(&turn_id).await;
                     match self
                         .compact_session(Trigger::OverflowRescue, Some(tx), None, &cancel)
                         .await
