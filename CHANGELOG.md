@@ -6,6 +6,10 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [0.4.17] - 2026-10-26
+
+- On Windows, pasting an image is now bound to Alt+V, and the paste hint text is shown differently depending on the terminal.
+
 ## [0.4.16] - 2026-10-26
 
 - **Security:** A slash command's command word must now be typed: text pasted after `/` is no longer run as a command, so pasted content can't be smuggled into the command position.
@@ -385,3 +389,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.4.14]: https://github.com/liwenka1/deep-code/compare/v0.4.13...v0.4.14
 [0.4.15]: https://github.com/liwenka1/deep-code/compare/v0.4.14...v0.4.15
 [0.4.16]: https://github.com/liwenka1/deep-code/compare/v0.4.15...v0.4.16
+[0.4.17]: https://github.com/liwenka1/deep-code/compare/v0.4.16...v0.4.17
