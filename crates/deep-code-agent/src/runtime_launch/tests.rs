@@ -611,40 +611,101 @@ fn fresh_launch_drops_extras_equal_to_the_primary() {
     assert!(launched.extra_roots.is_empty());
 }
 
+/// Both `DEEP_CODE_DISABLE_*` gates read their flag the same way, through one
+/// function: unset or an explicit "not disabled" spelling leaves the capability
+/// on, and anything else — a typo included — turns it off, because these are the
+/// switches a session that must not act is started with.
 #[test]
-fn web_gate_defaults_on_and_respects_disable_flag() {
-    // Unset or explicit "not disabled" values keep web on.
-    assert!(web_enabled_from(None));
-    assert!(web_enabled_from(Some("0")));
-    assert!(web_enabled_from(Some("false")));
-    assert!(web_enabled_from(Some("  OFF ")));
-    assert!(web_enabled_from(Some("")));
-    // Explicit disable values gate it off, case-insensitively.
-    assert!(!web_enabled_from(Some("1")));
-    assert!(!web_enabled_from(Some("true")));
-    assert!(!web_enabled_from(Some("TRUE")));
-    assert!(!web_enabled_from(Some("on")));
-    assert!(!web_enabled_from(Some("yes")));
-    // Fail-closed: an unrecognized/typo value disables rather than leaks web.
-    assert!(!web_enabled_from(Some("disabel")));
+fn disable_gates_share_one_reading() {
+    for on in [
+        None,
+        Some("0"),
+        Some("false"),
+        Some("NO"),
+        Some("  OFF "),
+        Some(""),
+    ] {
+        assert!(flag_enabled(on), "{on:?} must leave the capability on");
+    }
+    for off in [
+        Some("1"),
+        Some("true"),
+        Some("TRUE"),
+        Some("on"),
+        Some("yes"),
+        // Fail-closed: an unrecognized value disables rather than leaks.
+        Some("disabel"),
+    ] {
+        assert!(!flag_enabled(off), "{off:?} must turn it off");
+    }
 }
 
+/// The `agent` tool has two conditions and both are checked: this session mounts
+/// tools at all, and a child would have a boundary to work inside. Pinned on the
+/// predicate because the second combination is unreachable through the launch —
+/// no boundary is produced when the gate is off — so a test on the assembled
+/// registry cannot tell the two apart.
 #[test]
-fn tools_gate_defaults_on_and_respects_disable_flag() {
-    // Same reading as the web gate: only an explicit "not disabled" keeps the
-    // tool registry mounted.
-    assert!(tools_enabled_from(None));
-    assert!(tools_enabled_from(Some("0")));
-    assert!(tools_enabled_from(Some("false")));
-    assert!(tools_enabled_from(Some("  OFF ")));
-    assert!(tools_enabled_from(Some("")));
-    assert!(!tools_enabled_from(Some("1")));
-    assert!(!tools_enabled_from(Some("true")));
-    assert!(!tools_enabled_from(Some("TRUE")));
-    assert!(!tools_enabled_from(Some("on")));
-    assert!(!tools_enabled_from(Some("yes")));
-    // Fail-closed: a typo unmounts every tool rather than leaving them on.
-    assert!(!tools_enabled_from(Some("disabel")));
+fn the_agent_tool_needs_both_the_gate_and_a_boundary() {
+    assert!(
+        mounts_agent_tool(true, true),
+        "tools and a boundary mount it"
+    );
+    assert!(!mounts_agent_tool(true, false), "no boundary, no child");
+    assert!(
+        !mounts_agent_tool(false, true),
+        "a pure-chat session mounts no tool, boundary or not"
+    );
+    assert!(!mounts_agent_tool(false, false));
+}
+
+/// The switch's one claim: a pure-chat session mounts nothing. Asserted on the
+/// FINISHED parent registry, because `agent` is mounted by the extension pass
+/// rather than by `build_tool_registry` — that gate is asked separately there
+/// precisely so this answer cannot depend on the boundary being `None` by
+/// accident.
+#[test]
+fn a_pure_chat_session_mounts_no_tool_at_all() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ui_lang = SharedLang::default();
+    let parts = LaunchParts::fresh(
+        String::new(),
+        WorkspaceRoots::from(dir.path()),
+        ui_lang.clone(),
+        ProjectInstructions::default(),
+        Arc::new(discover_in_workspace(dir.path())),
+    );
+    let mut warnings = Vec::new();
+    let tools = build_parent_tools_gated(
+        Arc::new(EchoClient::new(ui_lang)),
+        &AgentConfig {
+            approval_auto_allow: vec!["read_file".to_string()],
+            ..AgentConfig::builtin()
+        },
+        &parts,
+        &CancellationToken::new(),
+        &SharedPermissionMode::default(),
+        &mut warnings,
+        false,
+    );
+    let mounted: Vec<String> = tools
+        .registry
+        .specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect();
+    assert!(
+        mounted.is_empty(),
+        "a pure-chat session mounted {mounted:?}"
+    );
+    assert!(tools.boundary.is_none(), "no boundary without tools");
+    // One line, naming the switch. Not the "names tools this session did not
+    // mount" warning, which would blame the boundary or read as a typo.
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("DEEP_CODE_DISABLE_TOOLS"),
+        "{warnings:?}"
+    );
 }
 
 /// With an API key both launch paths pick the online client. `offline` is

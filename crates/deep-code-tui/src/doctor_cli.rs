@@ -219,10 +219,18 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
             println!("    → [sandbox] network has no effect on this platform.");
         }
     }
-    println!("  skills: {} loaded", report.skills.total_count);
+    // The master gate first: with `DEEP_CODE_DISABLE_TOOLS` set nothing is
+    // mounted at all, and the two lines below would otherwise each report
+    // itself available in a session that carries neither.
+    let unmounted = if report.tools.enabled {
+        ""
+    } else {
+        " (not mounted: tools disabled)"
+    };
+    println!("  skills: {} loaded{unmounted}", report.skills.total_count);
     println!("  tools: enabled={}", report.tools.enabled);
     println!(
-        "  web: enabled={} backend={}",
+        "  web: enabled={} backend={}{unmounted}",
         report.web.enabled, report.web.backend
     );
     Ok(())

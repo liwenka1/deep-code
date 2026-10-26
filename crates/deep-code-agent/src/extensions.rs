@@ -85,15 +85,26 @@ pub fn platform_block() -> &'static str {
 /// identity because they are the user's own words about how to work here —
 /// before the skills (which they may refer to) and before the generic
 /// discipline (which they may override).
+///
+/// `tools` false means a pure-chat session (`DEEP_CODE_DISABLE_TOOLS`) has no
+/// tool mounted, and then everything after the instructions goes: the two
+/// discipline blocks exist to steer `shell`, `todo_write` and the `agent` tool,
+/// the skills index addresses a `skill` tool, and the host block is a shell
+/// dialect. Telling the model how to call what it does not have is the kind of
+/// claim it acts on — it would narrate tool use it cannot perform.
 pub fn build_runtime_system_prompt(
     base: &str,
     skills: &SkillRegistry,
     instructions: &ProjectInstructions,
+    tools: bool,
 ) -> String {
     let head = match instructions.block() {
         Some(block) => format!("{base}\n\n{block}"),
         None => base.to_string(),
     };
+    if !tools {
+        return head;
+    }
     let prompt = build_system_prompt_from(&head, skills);
     format!(
         "{prompt}\n\n{}\n\n{TOOL_DISCIPLINE}\n\n{SUBAGENT_GUIDANCE}",
@@ -141,6 +152,7 @@ mod tests {
             "base prompt",
             &SkillRegistry::default(),
             &ProjectInstructions::default(),
+            true,
         );
         assert!(prompt.starts_with("base prompt"));
         assert!(prompt.contains("工具使用纪律"));
@@ -159,6 +171,7 @@ mod tests {
             "base",
             &SkillRegistry::default(),
             &ProjectInstructions::default(),
+            true,
         );
         let expected_shell = if cfg!(windows) { "cmd.exe /C" } else { "sh -c" };
         assert!(
@@ -195,7 +208,7 @@ mod tests {
         std::fs::write(&file, "tests live in tests.rs").unwrap();
         let instructions = ProjectInstructions::load_from(None, &file);
         let skills = crate::skills::discover_in_workspace(dir.path());
-        let prompt = build_runtime_system_prompt("base prompt", &skills, &instructions);
+        let prompt = build_runtime_system_prompt("base prompt", &skills, &instructions, true);
         let at = |needle: &str| {
             prompt
                 .find(needle)
@@ -206,8 +219,28 @@ mod tests {
         assert!(at("tests live in tests.rs") < at("## Skills"));
         assert!(at("## Skills") < at("工具使用纪律"));
 
-        let without =
-            build_runtime_system_prompt("base prompt", &skills, &ProjectInstructions::default());
+        let without = build_runtime_system_prompt(
+            "base prompt",
+            &skills,
+            &ProjectInstructions::default(),
+            true,
+        );
         assert!(!without.contains("Project instructions"));
+    }
+
+    /// A pure-chat session (`DEEP_CODE_DISABLE_TOOLS`) mounts no tool, so the
+    /// prompt must not describe any: the two discipline blocks steer `shell`,
+    /// `todo_write` and the `agent` tool, the skills index addresses a `skill`
+    /// tool, and the host block is a shell dialect. Each is a claim the model
+    /// would act on — narrating tool use it cannot perform.
+    #[test]
+    fn a_pure_chat_prompt_describes_no_tools() {
+        let prompt = build_runtime_system_prompt(
+            "base prompt",
+            &SkillRegistry::default(),
+            &ProjectInstructions::default(),
+            false,
+        );
+        assert_eq!(prompt, "base prompt");
     }
 }

@@ -168,6 +168,8 @@ jobs:
 
 **联网工具。**当 `provider.base_url` 指向 `api.deepseek.com`(默认值)且配置了 key 时,`web_search` 与 `fetch_url` 由 DeepSeek 的 Search & Fetch API 提供:搜索词和抓取的 URL 会发送给 DeepSeek——也就是本来就收到你全部提示词的那一方——`fetch_url` 返回的是页面的 Markdown,长页面分块返回(`offset` 续读)。抓取本身(包括它跟随的重定向)发生在 DeepSeek 的网络上,域名由那边解析;字面量内网地址、带内嵌凭据的 URL、以及**本机**能解析到内网地址的域名,在发出之前就会被拒绝(你防火墙之内的名字不会交给第三方);本机解析不到的域名则交给服务端判断——在走代理、没有直连 DNS 的环境里,这是唯一还能用的选择。换成其他端点时 `web_search` 不可用(工具描述和返回结果都会如实说明),`fetch_url` 退回由本机直接抓取:解析域名、拒绝任何非公网地址、逐跳钉住重定向、HTML 压成纯文本。两者和其他联网调用一样都要过审批。环境变量 `DEEP_CODE_DISABLE_WEB`:设为 `1`/`true`/`on` 即可卸载这两个工具,用于断网或审计场景。`/status` 显示 `web=on (<后端>)|off`,`deepcode doctor` 报告同样的信息。
 
+**工具。**上面那个开关和 `DEEP_CODE_DISABLE_WEB` 一样只走环境变量:"没有工具"取决于这个进程是怎么起的,不是它指向哪个工作区。`agent` 也一并卸载,提示词跟着 registry 走——没有工具可调时,纪律段落、skills 索引与工作区摘要都不再写入,而不是描述这个会话并不具备的能力。关闭时 `deepcode doctor` 的 skills 与 web 两行也会注明它们未被挂载。
+
 在 macOS / Linux 上,shell/job 命令在 OS 沙箱内运行且**默认不带网络**(详见[亮点](#亮点))。`[sandbox] network = prompt|always|never` 可调,项目层只许收紧。**Windows 上没有沙箱约束**,因此本段的断网与写入限制均不生效(`network` 设置是空操作),声明联网仍会转审批、deny 底板仍然生效;跑 `deepcode doctor` 看本机实况。
 
 ## 项目指令(AGENTS.md)

@@ -85,8 +85,18 @@ impl LaunchedRuntime {
 /// boundary cannot be constructed (unresolvable root), both groups are
 /// disabled and `request_write_root` is not mounted either — there is no
 /// boundary to widen.
+/// The parent tool registry for one launch. `tools_on` false is a pure-chat
+/// session (`DEEP_CODE_DISABLE_TOOLS`): nothing is mounted, so the request
+/// carries no tool schemas and the model has nothing to call; the job store and
+/// the write boundary mean nothing without tools, so they come back empty
+/// rather than half-built.
+///
+/// The gate arrives as a parameter instead of being read here so that "no tool
+/// is mounted" is a claim about a value — which a test can pin — and not about
+/// an environment variable a parallel test could set underneath it.
 #[must_use]
 pub fn build_tool_registry(
+    tools_on: bool,
     roots: &WorkspaceRoots,
     config: &AgentConfig,
     warnings: &mut Vec<String>,
@@ -94,11 +104,7 @@ pub fn build_tool_registry(
     skills: &Arc<SkillRegistry>,
 ) -> (ToolRegistry, JobStore, Option<WorkspacePolicy>) {
     let mut registry = ToolRegistry::new();
-    // Pure-chat session (`DEEP_CODE_DISABLE_TOOLS`): nothing is mounted, so the
-    // request carries no tool schemas and the model has nothing to call. The
-    // job store and the write boundary mean nothing without tools, so they come
-    // back empty rather than half-built.
-    if !tools_enabled() {
+    if !tools_on {
         return (registry, JobStore::default(), None);
     }
     // The exec policy set here is the one the runtime consults for every call,
@@ -154,24 +160,11 @@ pub fn build_tool_registry(
 /// them off, e.g. for network-restricted or audit-sensitive sessions.
 #[must_use]
 pub fn web_enabled() -> bool {
-    web_enabled_from(
+    flag_enabled(
         std::env::var(crate::config::DISABLE_WEB_ENV)
             .ok()
             .as_deref(),
     )
-}
-
-fn web_enabled_from(disable_flag: Option<&str>) -> bool {
-    match disable_flag {
-        None => true,
-        // Fail-closed: web stays on only for an explicit "not disabled" value;
-        // any other set value (including a typo) disables it, since this gate
-        // exists for network-restricted / audit sessions.
-        Some(raw) => matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "" | "0" | "false" | "off" | "no"
-        ),
-    }
 }
 
 /// Whether any model-facing tool is mounted. On by default; set
@@ -179,22 +172,29 @@ fn web_enabled_from(disable_flag: Option<&str>) -> bool {
 /// `0`/`false`/`off`/`no` (case-insensitive; blank counts as unset) to run a
 /// pure-chat session: no workspace, shell, web, skill or `todo_write` tool is
 /// registered, so the request carries an empty tool list. See
-/// [`build_tool_registry`], which is the one place this is consulted.
+/// `build_tool_registry`, which is the one place this is consulted.
 #[must_use]
 pub fn tools_enabled() -> bool {
-    tools_enabled_from(
+    flag_enabled(
         std::env::var(crate::config::DISABLE_TOOLS_ENV)
             .ok()
             .as_deref(),
     )
 }
 
-fn tools_enabled_from(disable_flag: Option<&str>) -> bool {
+/// The one reading every `DEEP_CODE_DISABLE_*` switch shares: unset, or an
+/// explicit "not disabled" spelling, leaves the capability on; any other set
+/// value — a typo included — turns it off, because each of these gates exists
+/// for a session that must not do the thing.
+///
+/// One function rather than one per switch: `web_enabled` and `tools_enabled`
+/// answered this identically by copying each other, and the copy's comment
+/// promised the two readings would stay identical. That is a promise prose
+/// cannot keep once someone edits one of them, and these are the switches
+/// sessions are run under when they must not act.
+fn flag_enabled(disable_flag: Option<&str>) -> bool {
     match disable_flag {
         None => true,
-        // Same fail-closed reading as `web_enabled_from`: an explicit "not
-        // disabled" value keeps tools on, anything else (a typo included)
-        // unmounts them — the gate exists for sessions that must not act.
         Some(raw) => matches!(
             raw.trim().to_ascii_lowercase().as_str(),
             "" | "0" | "false" | "off" | "no"
@@ -208,7 +208,14 @@ pub fn runtime_system_prompt(
     instructions: &ProjectInstructions,
     skills: &SkillRegistry,
 ) -> String {
-    let base = build_runtime_system_prompt(DEFAULT_SYSTEM_PROMPT, skills, instructions);
+    let tools = tools_enabled();
+    let base = build_runtime_system_prompt(DEFAULT_SYSTEM_PROMPT, skills, instructions, tools);
+    if !tools {
+        // A pure-chat session has no workspace to speak of: it is handed no tool
+        // that could read one, so listing the files would only invite talk about
+        // a repository the model cannot open.
+        return base;
+    }
     let summary = build_workspace_summary(&roots.primary, &roots.extras);
     format!("{base}\n\n{summary}")
 }
@@ -745,15 +752,53 @@ fn build_parent_tools<C: LlmClient + 'static>(
     permission_mode: &SharedPermissionMode,
     warnings: &mut Vec<String>,
 ) -> ParentTools {
+    build_parent_tools_gated(
+        client,
+        config,
+        parts,
+        parent_cancel,
+        permission_mode,
+        warnings,
+        tools_enabled(),
+    )
+}
+
+/// Whether the `agent` tool is mounted: this session mounts tools at all, AND a
+/// child would have a boundary to work inside.
+///
+/// A predicate of its own because the second condition is unreachable today —
+/// [`build_tool_registry`] hands back no boundary whenever the gate is off — so
+/// as a condition inside the mount it cannot be pinned, and mutation testing
+/// found the gate could be deleted with every test still green.
+fn mounts_agent_tool(tools_on: bool, has_boundary: bool) -> bool {
+    tools_on && has_boundary
+}
+
+/// [`build_parent_tools`] with the pure-chat gate handed in. `agent` is mounted
+/// here, not in [`build_tool_registry`], so "a pure-chat session mounts no
+/// tools" cannot rest on the boundary happening to be `None` — the reason it is
+/// unmounted today, and nothing to do with this switch. Asking the gate again
+/// is what makes the two independent.
+fn build_parent_tools_gated<C: LlmClient + 'static>(
+    client: Arc<C>,
+    config: &AgentConfig,
+    parts: &LaunchParts,
+    parent_cancel: &CancellationToken,
+    permission_mode: &SharedPermissionMode,
+    warnings: &mut Vec<String>,
+    tools_on: bool,
+) -> ParentTools {
     let roots = &parts.roots;
     let ui_lang = &parts.ui_lang;
     let (mut registry, job_store, boundary) =
-        build_tool_registry(roots, config, warnings, ui_lang, &parts.skills);
+        build_tool_registry(tools_on, roots, config, warnings, ui_lang, &parts.skills);
     // Sub-agents inherit the parent's live boundary; without one (workspace
     // unresolvable — the fs tool groups are disabled too) there is nothing a
     // child could correctly work inside, so the dispatch tool stays unmounted.
     let (subagent_manager, shutdown): (SharedSubAgentManager, Box<dyn Fn() + Send + Sync>) =
-        if let Some(policy) = &boundary {
+        if mounts_agent_tool(tools_on, boundary.is_some())
+            && let Some(policy) = &boundary
+        {
             let extensions = attach_agent_extensions(
                 &mut registry,
                 client,
@@ -769,7 +814,11 @@ fn build_parent_tools<C: LlmClient + 'static>(
             });
             (extensions.subagent_manager(), shutdown)
         } else {
-            warnings.push("sub-agent tools disabled: no workspace boundary".to_string());
+            // A missing boundary is a degradation only when tools were meant to be
+            // mounted; a pure-chat session has none on purpose and needs no warning.
+            if tools_on {
+                warnings.push("sub-agent tools disabled: no workspace boundary".to_string());
+            }
             let idle = Arc::new(std::sync::RwLock::new(
                 crate::subagent::SubAgentManager::new(0),
             ));
@@ -779,7 +828,17 @@ fn build_parent_tools<C: LlmClient + 'static>(
     // consent is an exact-name match, so an entry no registered tool answers
     // to can never fire — and stays silently "configured" forever unless
     // someone says so here, the first place config and the full tool set meet.
-    warn_unmatched_auto_allow(&registry, &config.approval_auto_allow, warnings);
+    if tools_on {
+        warn_unmatched_auto_allow(&registry, &config.approval_auto_allow, warnings);
+    } else if !config.approval_auto_allow.is_empty() {
+        // Every entry is unmounted by request, so the "did not mount" wording
+        // would blame a gate the user set deliberately; name the real cause.
+        warnings.push(
+            "approval.auto_allow has no effect: this session mounts no tools \
+             (DEEP_CODE_DISABLE_TOOLS)"
+                .to_string(),
+        );
+    }
     ParentTools {
         registry,
         subagent_manager,
