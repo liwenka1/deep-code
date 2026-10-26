@@ -6,6 +6,26 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [0.4.16] - 2026-10-26
+
+- **Security:** A slash command's command word must now be typed: text pasted after `/` is no longer run as a command, so pasted content can't be smuggled into the command position.
+- **Security:** In the conversation handed to the summary-writing model, tool arguments and results are now quoted line by line, so a file or web page the agent read can no longer impersonate the user's speech.
+- **Security:** The workspace `AGENTS.md` symlink check is now done by the kernel at open time instead of as a separate check-then-open, closing the window in which a symlink could be swapped in between the two.
+- **Security:** rustls-webpki and webpki-roots are updated to 0.103.16 and 1.0.10, clearing RUSTSEC-2026-0381 and RUSTSEC-2026-0382.
+- `web_search` and `fetch_url` now go through the DeepSeek Search & Fetch API: fetch returns Markdown and continues reading in offset-sized blocks, requests are guarded along separate paths by who sent them, continuation reads reuse the session cache, and 429/5xx responses are retried once.
+- Project instructions from `AGENTS.md` are now injected into the system prompt, and `/init` lets the model draft the file. Its "Compact Instructions" section is handed to the summary-writing model on every compaction, with the header recognized by Markdown rules and included when a sub-agent compacts.
+- A new skill tool fetches a `SKILL.md` body by name, and `/skill <name> [args]` runs a skill directly; the body has a size cap and no longer reports "instructions ended" when it was actually truncated.
+- A new `todo_write` tool keeps a task list, and the transcript renders progress as a checkbox list; it accepts the common status spellings, and the tool description and `/help` key help are corrected.
+- Compaction now has the model write a structured handoff summary instead of a mechanical fold: `/compact [focus]` accepts notes, and the TUI no longer freezes while compacting. Over-long summaries fold by default and expand on clicking the title, a folded summary still says what the model saw, a pasted focus is passed verbatim, and a summary that can't be written or is cancelled no longer leaves the mechanical folding permanently in the session; the fold count no longer counts the previous summary as a record, and newlines in the summary and the cross-turn compaction marker survive.
+- Prompt history now persists across runs, and Ctrl+R reverse-searches it: Ctrl+R no longer loses the draft being edited, and the search state shows in the status bar during streaming and on errors. The history file has a size cap, one bad byte no longer wipes it, a torn trailing line is repaired at startup with appends back to a single atomic write, and with no home directory the global config and history are no longer written into the workspace.
+- A bell now rings when a long turn ends, while waiting for approval, and when a long `/compact` or an error-ended turn finishes (`[ui] notifications`), re-read when the runtime changes. At idle, Esc is a double-press to exit, Esc clearing no longer arms that exit, and the exit confirmation only applies while the prompt is still showing — not after an error ends the turn.
+- While the agent is busy, config commands are now refused before they write anything rather than after.
+- After every file write the transcript now shows the diff actually written, and `/diff [path]` shows workspace changes; `/diff` no longer hangs on Windows (its finishing waits are capped) and no longer reads git's entire output into memory.
+- Markdown ordered lists keep their numbering, and bold, italics and links render by their markers; inline parsing is now linear and non-recursive, so a long line of `*`/`_` no longer overflows the stack and crashes the interface, and `src/**/*.rs` is no longer read as italics. Dunder underscores and squared parentheses are handled, lists extend only to the content column, separator lines inside lists render correctly, and tool names no longer wrap onto their own line.
+- After the runtime is switched, the language now follows the interface.
+- Resuming from an approval no longer resets the turn budget: the step cap and the one-shot rescue now actually count per turn.
+- `/find` now finds content inside folded blocks and re-runs at the right time.
+
 ## [0.4.15] - 2026-10-20
 
 - **Security:** Pasting `/apikey sk-…` onto the end of a line folded it into the paste block, so the key was swept into the ↑ history, sent to the model, and written into the session record; pasting at a line's end now keeps the `/apikey` command intact.
@@ -364,3 +384,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.4.13]: https://github.com/liwenka1/deep-code/compare/v0.4.12...v0.4.13
 [0.4.14]: https://github.com/liwenka1/deep-code/compare/v0.4.13...v0.4.14
 [0.4.15]: https://github.com/liwenka1/deep-code/compare/v0.4.14...v0.4.15
+[0.4.16]: https://github.com/liwenka1/deep-code/compare/v0.4.15...v0.4.16
