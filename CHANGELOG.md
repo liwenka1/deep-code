@@ -6,6 +6,11 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [0.4.18] - 2026-10-26
+
+- In chat-only mode, the prompt no longer describes tools that aren't available.
+- In headless runs, setting `DEEP_CODE_DISABLE_TOOLS` unloads all tools.
+
 ## [0.4.17] - 2026-10-26
 
 - On Windows, pasting an image is now bound to Alt+V, and the paste hint text is shown differently depending on the terminal.
@@ -390,3 +395,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.4.15]: https://github.com/liwenka1/deep-code/compare/v0.4.14...v0.4.15
 [0.4.16]: https://github.com/liwenka1/deep-code/compare/v0.4.15...v0.4.16
 [0.4.17]: https://github.com/liwenka1/deep-code/compare/v0.4.16...v0.4.17
+[0.4.18]: https://github.com/liwenka1/deep-code/compare/v0.4.17...v0.4.18
