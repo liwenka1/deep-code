@@ -346,17 +346,23 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.handle_escape(),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.handle_ctrl_c(),
-        // Ctrl+V on Windows in raw mode is NOT intercepted by the terminal,
-        // so it would fall through to push_char('v') and corrupt the input.
-        // Ignore it — the terminal handles paste via its own mechanism
-        // (right-click / menu) and injects characters directly.
+        // A terminal that handles the paste itself never sends us this key —
+        // most of them do, and VS Code's integrated terminal swallows it even
+        // with bracketed paste off, so an image-only clipboard there produces
+        // no event at all. `Alt+V` below is the trigger that works regardless;
+        // this arm stays for the terminals that do forward the key.
         KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            // Deliberately not a no-op. A terminal that handles the paste itself
-            // never sends us this key — we get an `Event::Paste` instead — so a
-            // Ctrl+V that *does* arrive is a terminal asking us to read the
-            // clipboard, and an image is the only thing bracketed paste cannot
-            // carry. With no image on the clipboard this does nothing, which
-            // keeps the key transparent for terminals that forward it for text.
+            // Deliberately not a no-op: a Ctrl+V that *does* arrive is a
+            // terminal asking us to read the clipboard, and an image is the
+            // only thing bracketed paste cannot carry. With no image on the
+            // clipboard the status line says so and the key stays harmless.
+            app.paste_clipboard_image();
+        }
+        // The same request on a key no terminal binds. macOS is left out on
+        // purpose: Option+V types `√` there, and its terminals forward Ctrl+V
+        // as a key, so this arm would be a character taken away for nothing.
+        #[cfg(not(target_os = "macos"))]
+        KeyCode::Char('v' | 'V') if key.modifiers.contains(KeyModifiers::ALT) => {
             app.paste_clipboard_image();
         }
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => app.push_newline(),
