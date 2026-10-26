@@ -790,19 +790,39 @@ async fn auto_mode_inherits_accept_edits_fs_grant_without_asking() {
 
     let mut rx = runtime.submit_user("make a dir").await;
     let events = drain(&mut rx).await;
-    assert!(
-        events
-            .iter()
-            .all(|event| !matches!(event, RuntimeEvent::ApprovalRequired { .. })),
-        "Auto must inherit AcceptEdits's bounded fs-edit grant, not park on it"
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, RuntimeEvent::ToolCallFinished { .. })),
-        "the mkdir should have run to completion"
-    );
-    assert!(workspace.path().join("sub").is_dir(), "mkdir actually ran");
+    // Which answer is correct depends on whether this host can run `mkdir` as
+    // argv at all. On Windows it is a `cmd` builtin, so `program_runs_as_argv`
+    // says no unless Git's `usr/bin` is on PATH — and then the call must keep
+    // PROMPTING (`command_runnable_unattended`) rather than be auto-approved
+    // into an argv that fails to spawn. Asserting only the first answer is what
+    // made this test green on a CI runner that ships Git's utilities and red on
+    // a dev machine that does not; both answers are the grant working.
+    if crate::sandbox::program_runs_as_argv("mkdir") {
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, RuntimeEvent::ApprovalRequired { .. })),
+            "Auto must inherit AcceptEdits's bounded fs-edit grant, not park on it"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::ToolCallFinished { .. })),
+            "the mkdir should have run to completion"
+        );
+        assert!(workspace.path().join("sub").is_dir(), "mkdir actually ran");
+    } else {
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::ApprovalRequired { .. })),
+            "a program that cannot run as argv must keep prompting"
+        );
+        assert!(
+            !workspace.path().join("sub").is_dir(),
+            "nothing ran before a human answered"
+        );
+    }
 }
 
 /// The AcceptEdits allowance covers a bounded fs-edit only when the program
@@ -4824,7 +4844,11 @@ async fn execution_authority_follows_who_resolved_the_prompt() {
          call on the policy's parse"
     );
 
-    // AcceptEdits: the fs-edit allowance is a parse → Parse.
+    // AcceptEdits: the fs-edit allowance is a parse → Parse — for a program the
+    // executor can actually run as argv. `mkdir` is a `cmd` builtin on Windows
+    // and resolves to no executable there unless Git's `usr/bin` is on PATH, in
+    // which case the call must keep prompting (`command_runnable_unattended`)
+    // instead of taking a `Parse` that would then fail to spawn.
     let client = ScriptedClient::new(vec![shell_script("call_1", "mkdir sub"), done_script()]);
     let mut registry = ToolRegistry::default();
     registry.register(AuthorityProbeTool);
@@ -4832,7 +4856,20 @@ async fn execution_authority_follows_who_resolved_the_prompt() {
         .with_permission_mode(SharedPermissionMode::new(PermissionMode::AcceptEdits));
     let mut rx = runtime.submit_user("go").await;
     let events = drain(&mut rx).await;
-    assert_eq!(finished_contents(&events), ["mkdir sub: Parse"]);
+    if crate::sandbox::program_runs_as_argv("mkdir") {
+        assert_eq!(finished_contents(&events), ["mkdir sub: Parse"]);
+    } else {
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::ApprovalRequired { .. })),
+            "an unrunnable program word must keep prompting, not auto-approve"
+        );
+        assert!(
+            finished_contents(&events).is_empty(),
+            "nothing may run before a human answers"
+        );
+    }
 
     // Yolo waves the text through without reading it → Approved (the shell
     // runs it, as before: nobody parsed anything).
