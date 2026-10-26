@@ -421,7 +421,7 @@ fn signal_is_ignored(signum: libc::c_int) -> bool {
 /// with the TUI (`ui::run`) so both entry points drain on the same signals.
 ///
 /// SIGHUP is watched only when it is not already ignored: a `nohup`'d process
-/// must keep ignoring it (see [`signal_is_ignored`]) so it survives the terminal
+/// must keep ignoring it (`signal_is_ignored`, unix only) so it survives the terminal
 /// closing, rather than have this handler turn a hang-up into a shutdown.
 pub(crate) async fn terminate_signal() {
     #[cfg(unix)]
