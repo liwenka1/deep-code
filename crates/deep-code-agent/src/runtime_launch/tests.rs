@@ -629,6 +629,24 @@ fn web_gate_defaults_on_and_respects_disable_flag() {
     assert!(!web_enabled_from(Some("disabel")));
 }
 
+#[test]
+fn tools_gate_defaults_on_and_respects_disable_flag() {
+    // Same reading as the web gate: only an explicit "not disabled" keeps the
+    // tool registry mounted.
+    assert!(tools_enabled_from(None));
+    assert!(tools_enabled_from(Some("0")));
+    assert!(tools_enabled_from(Some("false")));
+    assert!(tools_enabled_from(Some("  OFF ")));
+    assert!(tools_enabled_from(Some("")));
+    assert!(!tools_enabled_from(Some("1")));
+    assert!(!tools_enabled_from(Some("true")));
+    assert!(!tools_enabled_from(Some("TRUE")));
+    assert!(!tools_enabled_from(Some("on")));
+    assert!(!tools_enabled_from(Some("yes")));
+    // Fail-closed: a typo unmounts every tool rather than leaving them on.
+    assert!(!tools_enabled_from(Some("disabel")));
+}
+
 /// With an API key both launch paths pick the online client. `offline` is
 /// derived from the client's provider name (not a per-path literal), so it
 /// must come out false here, and the label must name the provider — the

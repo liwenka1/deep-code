@@ -94,6 +94,13 @@ pub fn build_tool_registry(
     skills: &Arc<SkillRegistry>,
 ) -> (ToolRegistry, JobStore, Option<WorkspacePolicy>) {
     let mut registry = ToolRegistry::new();
+    // Pure-chat session (`DEEP_CODE_DISABLE_TOOLS`): nothing is mounted, so the
+    // request carries no tool schemas and the model has nothing to call. The
+    // job store and the write boundary mean nothing without tools, so they come
+    // back empty rather than half-built.
+    if !tools_enabled() {
+        return (registry, JobStore::default(), None);
+    }
     // The exec policy set here is the one the runtime consults for every call,
     // and the one sub-agent registries clone — the single place config-driven
     // gating enters: the network mode, the OS-sandbox switch, and the
@@ -160,6 +167,34 @@ fn web_enabled_from(disable_flag: Option<&str>) -> bool {
         // Fail-closed: web stays on only for an explicit "not disabled" value;
         // any other set value (including a typo) disables it, since this gate
         // exists for network-restricted / audit sessions.
+        Some(raw) => matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        ),
+    }
+}
+
+/// Whether any model-facing tool is mounted. On by default; set
+/// `DEEP_CODE_DISABLE_TOOLS` to any non-empty value other than
+/// `0`/`false`/`off`/`no` (case-insensitive; blank counts as unset) to run a
+/// pure-chat session: no workspace, shell, web, skill or `todo_write` tool is
+/// registered, so the request carries an empty tool list. See
+/// [`build_tool_registry`], which is the one place this is consulted.
+#[must_use]
+pub fn tools_enabled() -> bool {
+    tools_enabled_from(
+        std::env::var(crate::config::DISABLE_TOOLS_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn tools_enabled_from(disable_flag: Option<&str>) -> bool {
+    match disable_flag {
+        None => true,
+        // Same fail-closed reading as `web_enabled_from`: an explicit "not
+        // disabled" value keeps tools on, anything else (a typo included)
+        // unmounts them — the gate exists for sessions that must not act.
         Some(raw) => matches!(
             raw.trim().to_ascii_lowercase().as_str(),
             "" | "0" | "false" | "off" | "no"

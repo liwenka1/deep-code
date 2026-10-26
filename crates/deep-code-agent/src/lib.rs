@@ -108,7 +108,7 @@ pub use runtime::{
     RuntimeEventReceiver, ToolCallId, TurnId, TurnTelemetry, UserTurn, is_network_tool,
     session_consent_recordable, unattended_denial_note,
 };
-pub use runtime_launch::{LaunchedRuntime, launch_runtime, web_enabled};
+pub use runtime_launch::{LaunchedRuntime, launch_runtime, tools_enabled, web_enabled};
 pub use sandbox::{Enforcement, EnforcementGap, sandbox_available, sandbox_enforcement};
 pub use session::Session;
 pub use session_entry::{Ask, EntryKind, ExchangeResult, SessionEntry, ToolExchange};

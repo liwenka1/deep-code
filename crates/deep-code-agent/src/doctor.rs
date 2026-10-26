@@ -213,6 +213,7 @@ pub struct DoctorReport {
     pub sandbox: SandboxReport,
     pub skills: SkillsDoctorReport,
     pub web: WebDoctorReport,
+    pub tools: ToolsDoctorReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_layers: Option<ConfigLayersDoctorReport>,
 }
@@ -227,6 +228,15 @@ pub struct DoctorReport {
 pub struct WebDoctorReport {
     pub enabled: bool,
     pub backend: String,
+}
+
+/// Whether any model-facing tool is mounted at all. `enabled` is the
+/// `DEEP_CODE_DISABLE_TOOLS` gate: a pure-chat session (desktop pets, audit
+/// runs) reports `false` here, which is the one line that explains why the
+/// model never calls anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolsDoctorReport {
+    pub enabled: bool,
 }
 
 impl DoctorReport {
@@ -296,6 +306,9 @@ impl DoctorReport {
             },
             skills,
             web,
+            tools: ToolsDoctorReport {
+                enabled: crate::runtime_launch::tools_enabled(),
+            },
             config_layers: None,
         }
     }

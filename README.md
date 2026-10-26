@@ -122,6 +122,7 @@ deepcode -p "..." --output-format stream-json    # NDJSON, same envelopes as the
 ```
 
 - **Same approval posture as the CI bot**: a call that would prompt is auto-denied — never parked — with one stderr line per denial. Capability comes from the existing knobs: `--permission-mode accept_edits|auto|yolo`, `approval.auto_allow`, `DEEP_CODE_APPROVAL_AUTO_ALLOW` — the `auto` tier's Flash judge needs no human present, so it works headless. The deny floor stays non-negotiable.
+- **No tools at all**: `DEEP_CODE_DISABLE_TOOLS=1` (any non-empty value other than `0`/`false`/`off`/`no`) unmounts every tool — workspace, shell, web, skills and `todo_write` — so the turn is pure chat: the request carries no tool schemas, the model has nothing to call, and `deepcode doctor` reports `tools: enabled=false`. A desktop pet asks its question without handing a model your filesystem.
 - **Exit codes**: `0` finished / `1` error / `2` usage / `124` timeout (`--timeout SECS`) / `130` Ctrl-C.
 - One-shot runs persist a session too: stderr prints the id, and `deepcode -c` picks the thread up interactively any time.
 

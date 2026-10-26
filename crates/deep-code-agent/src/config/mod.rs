@@ -72,6 +72,13 @@ pub const CHECKPOINT_MAX_SNAPSHOTS_ENV: &str = "DEEP_CODE_CHECKPOINT_MAX_SNAPSHO
 /// (case-insensitive; blank counts as unset) to gate off the L2 web tools
 /// (`web_search`, `fetch_url`). Env-only for now — not yet a config-file field.
 pub const DISABLE_WEB_ENV: &str = "DEEP_CODE_DISABLE_WEB";
+/// Set to any non-empty value other than `0`/`false`/`off`/`no`
+/// (case-insensitive; blank counts as unset) to unmount **every** model-facing
+/// tool for this process: a pure-chat session (desktop pets, audit runs, docs
+/// Q&A). Env-only, like [`DISABLE_WEB_ENV`] — a config-file equivalent would
+/// have to survive a checked-out repository, and "no tools" is a property of
+/// how this one process was started.
+pub const DISABLE_TOOLS_ENV: &str = "DEEP_CODE_DISABLE_TOOLS";
 
 pub const DEFAULT_STREAM_MAX_RETRIES: u32 = 3;
 pub const DEFAULT_STREAM_CHUNK_TIMEOUT_SECS: u64 = 300;
