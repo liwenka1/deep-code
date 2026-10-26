@@ -34,7 +34,12 @@ pub enum PermissionMode {
     /// every operand a relative in-tree spelling — the sandbox bounds their
     /// writes, the spelling rule bounds the reads a `cp` from outside would
     /// make; cc's `acceptEdits`); still prompt for other shell commands, any
-    /// network declaration, and everything else.
+    /// network declaration, and everything else. A listed program counts only
+    /// when this host can run it as argv: an unattended command runs without a
+    /// shell, so a name that resolves to a `cmd` builtin (Windows' `mkdir`) or
+    /// to a `.cmd`/`.bat` wrapper keeps PROMPTING instead of being auto-approved
+    /// into a spawn that would fail (`command_runnable_unattended` in
+    /// `runtime/approval_flow.rs`).
     AcceptEdits,
     /// Everything `AcceptEdits` waves through, plus a cheap classifier model
     /// judging the rest — behind three floors it cannot override: a root grant
