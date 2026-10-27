@@ -3,6 +3,112 @@ use deep_code_agent::DoctorReport;
 use serde_json::json;
 use std::time::Duration;
 
+async fn body_paused_at_approval(state: &AppState) -> axum::body::BodyDataStream {
+    use futures_util::StreamExt;
+    let sse = prompt_sse(
+        State(state.clone()),
+        Json(PromptRequest {
+            prompt: "hello".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    let mut body = sse.into_response().into_body().into_data_stream();
+    loop {
+        let chunk = body.next().await.unwrap().unwrap();
+        if String::from_utf8_lossy(&chunk).contains("event: approval.required") {
+            return body;
+        }
+    }
+}
+
+#[tokio::test]
+async fn approval_is_ready_as_soon_as_its_event_is_visible() {
+    use futures_util::StreamExt;
+    let state = tool_calling_state(false);
+    let mut body = body_paused_at_approval(&state).await;
+    // No extra body poll: models a client answering while SSE is backpressured.
+    let result = submit_approval(
+        State(state.clone()),
+        Json(ApprovalRequestBody {
+            call_id: "call_1".into(),
+            decision: ApprovalDecision::Approved,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(result.accepted);
+    let mut rest = String::new();
+    while let Some(chunk) = body.next().await {
+        rest.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+    }
+    assert!(rest.contains("event: turn.completed"), "{rest}");
+    assert!(rest.contains("mock_echo: hello"), "{rest}");
+    assert!(state.approval.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn disconnect_at_approval_event_cleans_up_without_resuming_the_stream() {
+    let state = tool_calling_state(false);
+    let body = body_paused_at_approval(&state).await;
+    assert!(state.approval.lock().await.is_some());
+    drop(body);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let pending = state.approval.lock().await.is_some();
+            let live = state
+                .runtime
+                .lock()
+                .await
+                .handle
+                .live_turn_id()
+                .await
+                .is_some();
+            if !pending && !live {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let response = submit_approval(
+        State(state.clone()),
+        Json(ApprovalRequestBody {
+            call_id: "call_1".into(),
+            decision: ApprovalDecision::Approved,
+        }),
+    )
+    .await;
+    assert_eq!(response.err().unwrap().status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn late_approval_cleanup_cannot_remove_a_new_slot_with_the_same_call_id() {
+    let state = tool_calling_state(false);
+    let body = body_paused_at_approval(&state).await;
+    // Hold the slot lock until a successor has replaced it, forcing the old
+    // stream's deferred cleanup to run after the replacement.
+    let mut slot = state.approval.lock().await;
+    let request = slot.as_ref().unwrap().request.clone();
+    drop(body);
+    let owner = Arc::new(());
+    let (tx, _rx) = oneshot::channel();
+    *slot = Some(PendingApproval {
+        request,
+        respond: tx,
+        owner: Arc::clone(&owner),
+    });
+    // Let the destructor's task queue for the lock, so our next lock follows it.
+    tokio::task::yield_now().await;
+    drop(slot);
+    let slot = state.approval.lock().await;
+    assert!(
+        slot.as_ref()
+            .is_some_and(|pending| Arc::ptr_eq(&pending.owner, &owner))
+    );
+}
+
 static RUNTIME_TOKEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn lock_runtime_token_env() -> std::sync::MutexGuard<'static, ()> {
@@ -131,6 +237,7 @@ async fn stale_approval_after_disconnect_returns_conflict() {
             }))
             .unwrap(),
             respond: tx,
+            owner: Arc::new(()),
         });
     }
     let result = resolve_pending_approval(

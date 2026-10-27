@@ -283,9 +283,13 @@ impl AgentRuntime {
             // this is the only place a request's exact messages exist next to
             // what the last turn sent, and the last iteration's probe is the one
             // telemetry reports.
-            let (messages, prior_prefix) = {
+            let (messages, prior_prefix, reply_anchor) = {
                 let state = self.state.lock().await;
-                (state.session.wire_messages(), state.last_prefix)
+                (
+                    state.session.wire_messages(),
+                    state.last_prefix,
+                    state.session.entries().last().cloned(),
+                )
             };
             // Resolving an image reads a file, so it happens outside the lock.
             //
@@ -531,12 +535,8 @@ impl AgentRuntime {
                 // Partial assistant output stays in the transcript; partial
                 // tool-call deltas are discarded before they become real
                 // calls, so no tool_call/tool pairing is broken.
-                if !text_buffer.is_empty() || !reasoning_buffer.is_empty() {
-                    let mut state = self.state.lock().await;
-                    state
-                        .session
-                        .push_assistant(text_buffer, reasoning_buffer, Vec::new());
-                }
+                self.record_partial_reply(reply_anchor.as_ref(), text_buffer, reasoning_buffer)
+                    .await;
                 self.finish_turn_cancelled(&turn_id, tx).await;
                 return;
             }
@@ -544,12 +544,8 @@ impl AgentRuntime {
             if had_error {
                 // Same semantics as cancellation: streamed partial output is
                 // kept (no tool_calls were pushed, so pairing is intact).
-                if !text_buffer.is_empty() || !reasoning_buffer.is_empty() {
-                    let mut state = self.state.lock().await;
-                    state
-                        .session
-                        .push_assistant(text_buffer, reasoning_buffer, Vec::new());
-                }
+                self.record_partial_reply(reply_anchor.as_ref(), text_buffer, reasoning_buffer)
+                    .await;
                 self.abort_turn(&turn_id).await;
                 return;
             }
@@ -566,12 +562,26 @@ impl AgentRuntime {
                 }
             };
 
-            if calls.is_empty() {
+            {
                 let mut state = self.state.lock().await;
-                state
-                    .session
-                    .push_assistant(text_buffer, reasoning_buffer, Vec::new());
-                drop(state);
+                // A successor can start while this loop waits for the lock,
+                // including after a successful stream. Never append an old
+                // batch to the successor's history or execute its calls.
+                if state.current_turn_id.as_ref() != Some(&turn_id) || cancel.is_cancelled() {
+                    drop(state);
+                    self.record_partial_reply(reply_anchor.as_ref(), text_buffer, reasoning_buffer)
+                        .await;
+                    self.finish_turn_cancelled(&turn_id, tx).await;
+                    return;
+                }
+                state.session.push_assistant(
+                    text_buffer,
+                    reasoning_buffer,
+                    calls.iter().map(tool_call_payload).collect(),
+                );
+            }
+
+            if calls.is_empty() {
                 self.persist().await;
                 self.emit_session_updated(tx).await;
                 // No end-of-turn snapshot: it would be near-identical to the
@@ -604,7 +614,6 @@ impl AgentRuntime {
                 return;
             }
 
-            let payloads = calls.iter().map(tool_call_payload).collect::<Vec<_>>();
             for call in &calls {
                 emit(
                     tx,
@@ -617,12 +626,6 @@ impl AgentRuntime {
                 );
             }
 
-            {
-                let mut state = self.state.lock().await;
-                state
-                    .session
-                    .push_assistant(text_buffer, reasoning_buffer, payloads);
-            }
             self.persist().await;
             self.emit_session_updated(tx).await;
 
@@ -643,6 +646,29 @@ impl AgentRuntime {
                 }
                 BatchOutcome::AwaitingApproval | BatchOutcome::Cancelled => return,
             }
+        }
+    }
+
+    async fn record_partial_reply(
+        &self,
+        anchor: Option<&std::sync::Arc<crate::session_entry::SessionEntry>>,
+        text: String,
+        reasoning: String,
+    ) {
+        if text.is_empty() && reasoning.is_empty() {
+            return;
+        }
+        let Some(anchor) = anchor else { return };
+        let inserted = self
+            .state
+            .lock()
+            .await
+            .session
+            .insert_partial_assistant_after(anchor, text, reasoning);
+        // A superseded turn's finish_turn is a no-op, so save this insertion
+        // here as well as on the ordinary cancellation/error path.
+        if inserted {
+            self.persist().await;
         }
     }
 

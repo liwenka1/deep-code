@@ -100,6 +100,33 @@ impl Session {
         ));
     }
 
+    /// Keep a late partial reply beside the request it answered. A newer turn
+    /// may already have appended its user message. If compaction replaced the
+    /// anchor, discard the fragment instead of attaching it to a different turn.
+    pub(crate) fn insert_partial_assistant_after(
+        &mut self,
+        anchor: &Arc<SessionEntry>,
+        content: String,
+        reasoning: String,
+    ) -> bool {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| Arc::ptr_eq(entry, anchor))
+        else {
+            return false;
+        };
+        self.entries.insert(
+            index + 1,
+            Arc::new(SessionEntry::assistant(
+                content,
+                Some(reasoning),
+                Vec::new(),
+            )),
+        );
+        true
+    }
+
     /// Record a tool result into the newest assistant entry's matching
     /// pending exchange. Calls always belong to the latest assistant entry
     /// (the runtime pushes the entry immediately before executing its batch).
@@ -274,6 +301,18 @@ pub(crate) fn entry_wire_messages(entry: &SessionEntry) -> Vec<Message> {
 mod tests {
     use super::*;
     use crate::model::{ToolCallFunctionPayload, ToolCallPayload};
+
+    #[test]
+    fn late_partial_reply_cannot_reappear_after_its_anchor_was_compacted() {
+        let mut session = Session::new();
+        session.push_user("old task");
+        let anchor = session.entries().last().unwrap().clone();
+        session.replace_entries(vec![Arc::new(SessionEntry::compaction("summary", 1))]);
+        session.push_user("new task");
+        let before = session.wire_messages();
+        assert!(!session.insert_partial_assistant_after(&anchor, "late".into(), "reason".into()));
+        assert_eq!(session.wire_messages(), before);
+    }
 
     fn tool_call(id: &str) -> ToolCallPayload {
         ToolCallPayload {

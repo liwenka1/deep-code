@@ -87,6 +87,7 @@ pub(crate) struct AppState {
 struct PendingApproval {
     request: ApprovalRequest,
     respond: oneshot::Sender<ApprovalDecision>,
+    owner: Arc<()>,
 }
 
 struct ActiveTurnLease {
@@ -123,13 +124,12 @@ impl Drop for ActiveTurnLease {
 
 /// Cleanup for an approval parked on a client that may disconnect: if the SSE
 /// stream is dropped while waiting on `/v1/approvals`, remove the stale slot
-/// entry (so later callers get an honest 409 instead of "accepted") and deny
-/// the runtime's pending approval so the turn completes instead of wedging
-/// mid-approval. Disarmed on the normal resume path.
+/// entry (so later callers get an honest 409 instead of "accepted"). The
+/// accompanying ActiveTurnLease cancels that turn; cleanup must not resume an
+/// unobserved model loop. Disarmed on the normal resume path.
 struct ApprovalSlotGuard {
     slot: Arc<Mutex<Option<PendingApproval>>>,
-    runtime: Arc<Mutex<LaunchedRuntime>>,
-    call_id: String,
+    owner: Arc<()>,
     armed: bool,
 }
 
@@ -145,30 +145,15 @@ impl Drop for ApprovalSlotGuard {
             return;
         }
         let slot = Arc::clone(&self.slot);
-        let runtime = Arc::clone(&self.runtime);
-        let call_id = std::mem::take(&mut self.call_id);
+        let owner = Arc::clone(&self.owner);
         tokio::spawn(async move {
-            let removed = {
-                let mut slot = slot.lock().await;
-                if slot
-                    .as_ref()
-                    .is_some_and(|pending| pending.request.call_id == call_id)
-                {
-                    slot.take()
-                } else {
-                    None
-                }
-            };
-            // Only deny if the stale entry was still ours; a no-longer-pending
-            // approval makes this a benign no-op on the runtime side.
-            if removed.is_some() {
-                let runtime = runtime.lock().await;
-                drop(
-                    runtime
-                        .handle
-                        .submit_approval(ApprovalDecision::Denied)
-                        .await,
-                );
+            let mut slot = slot.lock().await;
+            // Call ids come from the model and can repeat across turns.
+            if slot
+                .as_ref()
+                .is_some_and(|pending| Arc::ptr_eq(&pending.owner, &owner))
+            {
+                slot.take();
             }
         });
     }
@@ -560,11 +545,12 @@ async fn prompt_sse(
         loop {
             let mut resume_after_approval = false;
             while let Some(event) = event_stream.recv().await {
-                yield Ok(thread_sse_event(envelopes.event(&event)));
+                let outgoing = thread_sse_event(envelopes.event(&event));
 
                 match event {
                     RuntimeEvent::ApprovalRequired { request, .. } => {
                         let (decision, denial_note) = if autonomous_approvals {
+                            yield Ok(outgoing);
                             // Headless/unattended: no HTTP client will POST to
                             // /v1/approvals, so parking here would hang the turn
                             // until the connection dies. Deny deterministically
@@ -580,20 +566,24 @@ async fn prompt_sse(
                             )
                         } else {
                             let (tx, rx) = oneshot::channel();
-                            let call_id = request.call_id.clone();
+                            let owner = Arc::new(());
                             {
                                 let mut slot = approval_gate.lock().await;
                                 *slot = Some(PendingApproval {
                                     request,
                                     respond: tx,
+                                    owner: Arc::clone(&owner),
                                 });
                             }
                             let mut slot_guard = ApprovalSlotGuard {
                                 slot: approval_gate.clone(),
-                                runtime: runtime.clone(),
-                                call_id,
+                                owner,
                                 armed: true,
                             };
+                            // Once the client can see the event, its approval
+                            // must already be accepted, even while SSE polling
+                            // is paused. Arm cleanup before that same yield.
+                            yield Ok(outgoing);
                             let decision = rx.await.unwrap_or(ApprovalDecision::Denied);
                             slot_guard.disarm();
                             {
@@ -615,9 +605,10 @@ async fn prompt_sse(
                     RuntimeEvent::TurnFinished { .. }
                     | RuntimeEvent::TurnCancelled { .. }
                     | RuntimeEvent::Error { .. } => {
+                        yield Ok(outgoing);
                         return;
                     }
-                    _ => {}
+                    _ => yield Ok(outgoing),
                 }
             }
             if !resume_after_approval {
@@ -662,20 +653,18 @@ async fn resolve_pending_approval(
 ) -> Result<Json<ApprovalResponse>, ApiError> {
     let pending = {
         let mut slot = state.approval.lock().await;
+        let Some(pending) = slot.as_ref() else {
+            return Err(ApiError::conflict("no pending approval"));
+        };
+        if pending.request.call_id != body.call_id {
+            return Err(ApiError::bad_request(format!(
+                "call_id mismatch: expected '{}', got '{}'",
+                pending.request.call_id, body.call_id
+            )));
+        }
         slot.take()
+            .expect("pending approval checked under this lock")
     };
-    let Some(pending) = pending else {
-        return Err(ApiError::conflict("no pending approval"));
-    };
-    if pending.request.call_id != body.call_id {
-        let expected = pending.request.call_id.clone();
-        let mut slot = state.approval.lock().await;
-        *slot = Some(pending);
-        return Err(ApiError::bad_request(format!(
-            "call_id mismatch: expected '{expected}', got '{}'",
-            body.call_id
-        )));
-    }
     if pending.respond.send(body.decision).is_err() {
         // The prompt stream that parked this approval is gone (client
         // disconnected); claiming "accepted" would be a lie.

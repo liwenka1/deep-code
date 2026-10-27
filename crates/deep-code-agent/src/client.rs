@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::time::Duration;
 
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -12,6 +13,9 @@ use crate::event::{AgentEvent, chunk_to_events};
 use crate::model::{ChatRequest, StreamChunk};
 
 pub type AgentEventStream = Pin<Box<dyn Stream<Item = AgentResult<AgentEvent>> + Send>>;
+
+const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
@@ -85,7 +89,19 @@ impl LlmClient for DeepSeekClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let message = response.text().await.unwrap_or_else(|_| status.to_string());
+            // The header timeout has ended and the stream guards do not exist
+            // yet. Bound this diagnostic read independently, keeping the HTTP
+            // status so 429/5xx still reach the retry/fallback policy.
+            let timeout = self
+                .config
+                .timeout
+                .unwrap_or(ERROR_BODY_TIMEOUT)
+                .min(ERROR_BODY_TIMEOUT);
+            let message = match tokio::time::timeout(timeout, read_error_body(response)).await {
+                Ok(Ok(message)) => message,
+                Ok(Err(error)) => format!("{status} (error body could not be read: {error})"),
+                Err(_) => format!("{status} (error body timed out)"),
+            };
             return Err(AgentError::Api { status, message });
         }
 
@@ -111,6 +127,24 @@ impl LlmClient for DeepSeekClient {
 
         Ok(Box::pin(stream))
     }
+}
+
+async fn read_error_body(response: reqwest::Response) -> Result<String, reqwest::Error> {
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let take = chunk.len().min(MAX_ERROR_BODY_BYTES + 1 - bytes.len());
+        bytes.extend_from_slice(&chunk[..take]);
+        if bytes.len() > MAX_ERROR_BODY_BYTES {
+            bytes.truncate(MAX_ERROR_BODY_BYTES);
+            return Ok(format!(
+                "{}\n[error response truncated]",
+                String::from_utf8_lossy(&bytes)
+            ));
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Incremental SSE decoder.
@@ -249,6 +283,10 @@ pub(crate) fn parse_sse_data(data: &str) -> AgentResult<Vec<AgentEvent>> {
     let chunk: StreamChunk = serde_json::from_str(data)?;
     Ok(chunk_to_events(chunk))
 }
+
+#[cfg(test)]
+#[path = "client/http_tests.rs"]
+mod http_tests;
 
 #[cfg(test)]
 mod tests {

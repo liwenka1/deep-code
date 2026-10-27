@@ -175,12 +175,13 @@ pub async fn approves<C: LlmClient + ?Sized>(
                 Ok(AgentEvent::Error { .. }) | Err(_) => return (false, usage),
                 Ok(AgentEvent::Done { usage: done_usage }) => {
                     usage = done_usage;
-                    break;
+                    return (parse_approve(&text), usage);
                 }
                 _ => {}
             }
         }
-        (parse_approve(&text), usage)
+        // A parseable fragment is not a completed approval decision.
+        (false, usage)
     })
     .await;
     // Timed out → ask, same as any other judge failure.

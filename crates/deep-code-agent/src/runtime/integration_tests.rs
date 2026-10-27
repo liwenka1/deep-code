@@ -14,6 +14,212 @@ use crate::runtime::diagnostics::append_diagnostics;
 use crate::session_store::SessionStore;
 use crate::tool::{MockEchoTool, Tool, ToolError, ToolRegistry, ToolResultStatus};
 
+#[tokio::test]
+async fn premature_eof_never_completes_a_turn() {
+    for script in [
+        vec![],
+        vec![AgentEvent::TextDelta {
+            text: "unfinished reply".into(),
+        }],
+        vec![AgentEvent::ReasoningDelta {
+            text: "unfinished reasoning".into(),
+        }],
+    ] {
+        let runtime = AgentRuntime::with_config(
+            ScriptedClient::new(vec![script]),
+            ToolRegistry::default(),
+            AgentConfig::builtin(),
+        );
+        let mut rx = runtime.submit_user("hello").await;
+        let events = drain(&mut rx).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, RuntimeEvent::Error { .. }))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::TurnFinished { .. }))
+        );
+        assert!(runtime.live_turn_id().await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn premature_eof_never_executes_a_write_from_an_unfinished_batch() {
+    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
+    for finished in [false, true] {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut script = vec![AgentEvent::ToolCallDelta {
+            delta: tool_call_delta(
+                "write_1",
+                "write_file",
+                r#"{"path":"created.txt","content":"hello"}"#,
+            ),
+        }];
+        if finished {
+            script.push(AgentEvent::Done { usage: None });
+        }
+        let client = ScriptedClient::new(vec![script, vec![AgentEvent::Done { usage: None }]]);
+        let runtime = AgentRuntime::with_config(
+            client,
+            crate::workspace_tools::workspace_tool_registry(workspace.path()).unwrap(),
+            AgentConfig::builtin(),
+        )
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::AcceptEdits));
+        let mut rx = runtime.submit_user("write a file").await;
+        let events = drain(&mut rx).await;
+        assert_eq!(
+            workspace.path().join("created.txt").exists(),
+            finished,
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::TurnFinished { .. })),
+            finished
+        );
+    }
+}
+
+#[tokio::test]
+async fn superseded_partial_reply_stays_with_its_request_and_is_saved() {
+    let workspace = tempfile::tempdir().unwrap();
+    let runtime = AgentRuntime::with_new_session(
+        HangThenRecoverClient::new(),
+        ToolRegistry::default(),
+        "system",
+        workspace.path(),
+        &AgentConfig::builtin(),
+    )
+    .unwrap();
+    let mut rx = runtime.submit_user("first").await;
+    while let Some(event) = rx.recv().await {
+        if matches!(event, RuntimeEvent::AssistantDelta { .. }) {
+            break;
+        }
+    }
+    runtime.begin_turn("second").await;
+    drain(&mut rx).await;
+    let messages = runtime.session_messages().await;
+    let text: Vec<_> = messages.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(text, ["system", "first", "partial", "second"]);
+    assert!(
+        runtime.live_turn_id().await.is_some(),
+        "old finalization must not finish the new turn"
+    );
+    let persistence = runtime.persistence.as_ref().unwrap();
+    persistence.actor.flush().await;
+    let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let saved = store.load(&runtime.session_id().await.unwrap()).unwrap();
+    assert_eq!(
+        crate::session::Session::from_entries(saved.entries).wire_messages(),
+        messages
+    );
+    let mut rx = runtime.drive_turn().await;
+    assert!(matches!(
+        drain(&mut rx).await.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn unfinished_judge_reply_cannot_approve_a_call() {
+    let input = crate::approval_classifier::ClassifierInput {
+        tool_name: "shell",
+        action: "echo hello",
+        risk_level: crate::execution_policy::RiskLevel::Low,
+        safety_notes: &[],
+        user_task: "say hello",
+    };
+    for finished in [false, true] {
+        let mut events = vec![AgentEvent::TextDelta {
+            text: r#"{"approve":true}"#.into(),
+        }];
+        if finished {
+            events.push(AgentEvent::Done { usage: None });
+        }
+        let client = ScriptedClient::new(vec![events]);
+        let (approved, _) = crate::approval_classifier::approves(&client, "test", &input).await;
+        assert_eq!(approved, finished);
+    }
+}
+
+#[tokio::test]
+async fn superseded_error_or_completed_reply_stays_with_its_request() {
+    struct SupersedingClient(Arc<Mutex<Option<AgentRuntime>>>, bool);
+    #[async_trait::async_trait]
+    impl LlmClient for SupersedingClient {
+        fn provider_name(&self) -> &'static str {
+            "scripted"
+        }
+        fn model(&self) -> &str {
+            "scripted"
+        }
+        async fn stream_chat(&self, _: ChatRequest) -> AgentResult<AgentEventStream> {
+            let holder = Arc::clone(&self.0);
+            let completed = self.1;
+            Ok(Box::pin(try_stream! {
+                yield AgentEvent::TextDelta { text: "partial".into() };
+                yield AgentEvent::ReasoningDelta { text: "partial reasoning".into() };
+                if completed {
+                    yield AgentEvent::ToolCallDelta {
+                        delta: tool_call_delta("stale_call", "read_file", r#"{"message":"old task"}"#),
+                    };
+                    yield AgentEvent::Done { usage: None };
+                }
+                // Force a successor to arrive in the same poll as the old
+                // provider error or EOF, past select!'s cancellation check.
+                let runtime = holder.lock().unwrap().take().unwrap();
+                runtime.begin_turn("second").await;
+                if !completed {
+                    yield AgentEvent::Error { message: "provider failed".into() };
+                }
+            }))
+        }
+    }
+    for completed in [false, true] {
+        let holder = Arc::new(Mutex::new(None));
+        let runtime = AgentRuntime::with_config(
+            SupersedingClient(Arc::clone(&holder), completed),
+            ToolRegistry::default(),
+            AgentConfig::builtin(),
+        );
+        *holder.lock().unwrap() = Some(runtime.clone());
+        let mut rx = runtime.submit_user("first").await;
+        let events = drain(&mut rx).await;
+        assert_eq!(
+            events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::Error { .. })),
+            !completed
+        );
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            RuntimeEvent::ToolCallStarted { .. } | RuntimeEvent::TurnFinished { .. }
+        )));
+        let messages = runtime.session_messages().await;
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "partial", "second"]
+        );
+        assert_eq!(
+            messages[1].reasoning_content.as_deref(),
+            Some("partial reasoning")
+        );
+        assert!(runtime.live_turn_id().await.is_some());
+    }
+}
+
 #[test]
 fn append_diagnostics_joins_blocks() {
     assert_eq!(
@@ -1852,7 +2058,8 @@ async fn a_compacted_prefix_reports_changed() {
         ]
     };
     const TURNS: usize = 8;
-    let client = ScriptedClient::new((0..TURNS).map(|_| turn()).collect());
+    // Each turn may also ask the model for a compaction summary.
+    let client = ScriptedClient::new((0..TURNS * 2).map(|_| turn()).collect());
     let mut config = crate::config::AgentConfig::builtin();
     // Low enough that compaction fires as soon as there are enough entries to
     // archive (`compact_entries` keeps a five-entry tail, so that takes a few
@@ -1875,6 +2082,10 @@ async fn a_compacted_prefix_reports_changed() {
                 _ => {}
             }
         }
+        assert!(
+            status.is_some(),
+            "turn {index} must finish, not exhaust its mock stream"
+        );
         if compacted {
             compacted_turns += 1;
             assert_eq!(

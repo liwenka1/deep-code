@@ -50,6 +50,7 @@ pub(super) struct GuardedStream {
     retries_used: u32,
     backoff: Duration,
     any_content: bool,
+    saw_done: bool,
     finished: bool,
 }
 
@@ -87,10 +88,16 @@ impl GuardedStream {
                 }
                 Ok(None) => {
                     self.finished = true;
+                    if !self.saw_done {
+                        return Some(Err(AgentError::Parse(
+                            "the reply ended before the model finished".to_string(),
+                        )));
+                    }
                     return None;
                 }
                 Ok(Some(Ok(event))) => {
                     self.any_content = true;
+                    self.saw_done |= matches!(event, AgentEvent::Done { .. });
                     self.bytes_seen += event_content_len(&event) as u64;
                     if self.bytes_seen > self.max_bytes {
                         self.finished = true;
@@ -250,6 +257,7 @@ impl AgentRuntime {
             retries_used,
             backoff,
             any_content: false,
+            saw_done: false,
             finished: false,
         }
     }
