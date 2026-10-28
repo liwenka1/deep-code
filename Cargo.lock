@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "deep-code-agent"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -518,7 +518,7 @@ dependencies = [
 
 [[package]]
 name = "deep-code-eval"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "anyhow",
  "deep-code-agent",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "deep-code-runtime"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "deep-code-tui"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "anyhow",
  "arboard",
