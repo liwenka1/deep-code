@@ -18,8 +18,11 @@ fn a_live_store_cannot_be_redirected_to_another_workspaces_sessions() {
         .join(".deep-code/sessions")
         .join(format!("{}.json", record.id.as_str()));
     let original_bytes = fs::read(&foreign_path).unwrap();
-    fs::rename(&workspace, root.path().join("previous")).unwrap();
-    if !crate::test_symlinks::symlink_dir_for_test(&outside, &workspace) {
+    let moved = crate::test_symlinks::move_open_dir_for_redirect_test(
+        &workspace,
+        &root.path().join("previous"),
+    );
+    if moved && !crate::test_symlinks::symlink_dir_for_test(&outside, &workspace) {
         return;
     }
     record.touch();

@@ -82,6 +82,27 @@ pub(crate) fn remove_symlink_dir_for_test(link: &Path) {
     std::fs::remove_file(link).unwrap();
 }
 
+/// Try to move a directory before replacing its old name with a symlink.
+/// Windows capability handles omit FILE_SHARE_DELETE and can prevent the move
+/// itself. `false` records that prevention; callers still check their pinned
+/// I/O and the untouched external target instead of skipping the test.
+pub(crate) fn move_open_dir_for_redirect_test(source: &Path, destination: &Path) -> bool {
+    match std::fs::rename(source, destination) {
+        Ok(()) => true,
+        #[cfg(windows)]
+        Err(error) if matches!(error.raw_os_error(), Some(5 | 32)) => {
+            assert!(source.is_dir(), "the pinned directory must still exist");
+            assert!(!destination.exists(), "the directory must not have moved");
+            false
+        }
+        Err(error) => panic!(
+            "cannot move {} to {} for a directory-redirection test: {error}",
+            source.display(),
+            destination.display()
+        ),
+    }
+}
+
 #[cfg(unix)]
 fn unix_must_succeed(result: std::io::Result<()>, target: &Path, link: &Path) -> bool {
     if let Err(error) = result {

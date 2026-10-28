@@ -91,8 +91,10 @@ impl JsonSessionStore {
             drop(file);
             self.directory
                 .rename(&temporary, &self.directory, filename)?;
+            // Linux capability directories use O_PATH, which fsync rejects.
+            // Reopen this same pinned directory for reading before syncing it.
             #[cfg(unix)]
-            self.directory.try_clone()?.into_std_file().sync_all()?;
+            self.directory.open(".")?.sync_all()?;
             Ok(())
         })();
         if let Err(error) = saved {

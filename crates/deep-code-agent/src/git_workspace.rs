@@ -682,14 +682,22 @@ mod tests {
         std::fs::write(outside.join("tracked.txt"), "private-sentinel\n").unwrap();
         let mut isolated = IsolatedGit::new_in(&workspace, &root.path().join("state/git")).unwrap();
         let approved = workspace.canonicalize().unwrap();
-        std::fs::rename(&workspace, root.path().join("previous-workspace")).unwrap();
-        if !crate::test_symlinks::symlink_dir_for_test(&outside, &workspace) {
+        let moved = crate::test_symlinks::move_open_dir_for_redirect_test(
+            &workspace,
+            &root.path().join("previous-workspace"),
+        );
+        if moved && !crate::test_symlinks::symlink_dir_for_test(&outside, &workspace) {
             return;
         }
         let diff = checked(output(isolated.command().args(["diff", "HEAD"])).unwrap()).unwrap();
         assert!(diff.is_empty(), "{}", String::from_utf8_lossy(&diff));
-        assert!(isolated.refresh().is_err());
-        assert!(IsolatedGit::new_in_pinned(&approved, &root.path().join("state/git")).is_err());
+        if moved {
+            assert!(isolated.refresh().is_err());
+            assert!(IsolatedGit::new_in_pinned(&approved, &root.path().join("state/git")).is_err());
+        } else {
+            // Windows stopped the replacement before any link was planted.
+            isolated.refresh().unwrap();
+        }
     }
 
     #[cfg(unix)]
@@ -759,6 +767,7 @@ mod tests {
     fn symlink_type_changes_keep_git_modes_and_never_follow_targets() {
         for original_link in [false, true] {
             let (root, workspace) = fixture();
+            git(&workspace, &["config", "core.symlinks", "true"]);
             let name = workspace.join("tracked.txt");
             if original_link {
                 std::fs::remove_file(&name).unwrap();
@@ -788,6 +797,8 @@ mod tests {
     fn symlinked_git_control_files_do_not_become_rules_in_the_private_view() {
         for tracked in [false, true] {
             let (root, workspace) = fixture();
+            git(&workspace, &["config", "core.autocrlf", "false"]);
+            git(&workspace, &["config", "core.symlinks", "true"]);
             for (name, target) in [(".gitignore", "*"), (".gitattributes", "* text")] {
                 if !crate::test_symlinks::symlink_file_for_test(
                     Path::new(target),
