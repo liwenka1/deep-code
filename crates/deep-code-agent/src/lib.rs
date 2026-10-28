@@ -12,6 +12,7 @@ mod error;
 mod event;
 mod execution_policy;
 mod extensions;
+mod git_workspace;
 pub mod i18n;
 mod image;
 mod instructions;
@@ -21,6 +22,7 @@ mod model;
 mod model_registry;
 mod model_route;
 mod paths;
+mod pinned_dir;
 mod pricing;
 mod reasoning;
 mod root_grant;
@@ -71,6 +73,7 @@ pub use execution_policy::{
     NetworkMode, PermissionMode, RiskLevel, SafetyNote, SandboxMode, SharedPermissionMode,
     is_needs_human_rule, shell_command_of,
 };
+pub use git_workspace::{GitOutput, IsolatedGit, IsolatedGitError};
 pub use i18n::{Lang, TextId, tr, tr_with};
 // The welcome card says which AGENTS.md files were loaded and whether they
 // were cut; the launch loads them, the UI only reports.
@@ -85,7 +88,7 @@ pub use instructions::{
 pub use image::{
     Attachment, ImageDetail, ImageError, ImageFormat, ImageRef, MAX_IMAGE_BYTES,
     MAX_IMAGES_PER_MESSAGE, MAX_TOKENS_PER_IMAGE, MAX_TOTAL_BYTES, StoreError, data_url, hydrate,
-    inspect, store,
+    inspect, store, store_in_pinned_workspace,
 };
 // Already reachable through `AgentRuntime::session_messages`'s signature;
 // exported so consumers (the headless driver) can actually name them.
@@ -101,6 +104,7 @@ pub use model_registry::{
 // real directory" rule. Exported rather than re-spelled: two independent
 // spellings of one rule cannot be made to fail together.
 pub use paths::{canonicalize, ensure_owned_dirs};
+pub use pinned_dir::validate_pinned_workspace;
 pub use pricing::{CostCurrency, CostEstimate};
 pub use root_grant::REQUEST_WRITE_ROOT_TOOL;
 pub use runtime::{
@@ -108,7 +112,9 @@ pub use runtime::{
     RuntimeEventReceiver, ToolCallId, TurnId, TurnTelemetry, UserTurn, is_network_tool,
     session_consent_recordable, unattended_denial_note,
 };
-pub use runtime_launch::{LaunchedRuntime, launch_runtime, tools_enabled, web_enabled};
+pub use runtime_launch::{
+    LaunchedRuntime, launch_runtime, relaunch_runtime, tools_enabled, web_enabled,
+};
 pub use sandbox::{Enforcement, EnforcementGap, sandbox_available, sandbox_enforcement};
 pub use session::Session;
 pub use session_entry::{Ask, EntryKind, ExchangeResult, SessionEntry, ToolExchange};

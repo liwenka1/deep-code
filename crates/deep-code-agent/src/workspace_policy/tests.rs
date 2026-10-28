@@ -1,5 +1,21 @@
 use super::*;
 
+#[test]
+fn constructing_a_pinned_policy_cannot_resolve_a_grant_to_a_new_directory() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let old = crate::paths::canonicalize(workspace.path())
+        .unwrap()
+        .join("approved");
+    std::fs::create_dir(&old).unwrap();
+    let roots = WorkspaceRoots::new(workspace.path(), vec![old.clone()]);
+    std::fs::remove_dir(&old).unwrap();
+    if !crate::test_symlinks::symlink_dir_for_test(outside.path(), &old) {
+        return;
+    }
+    assert!(WorkspacePolicy::new_pinned(roots).is_err());
+}
+
 fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let canonical = dir.path().canonicalize().unwrap();

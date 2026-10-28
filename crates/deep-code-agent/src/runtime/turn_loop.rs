@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::compaction::estimate_token_count;
 use crate::error::AgentError;
@@ -159,14 +160,21 @@ impl AgentRuntime {
     /// Drive the model/tool loop until either the turn finishes or an
     /// approval is required. All paths emit a terminal [`RuntimeEvent`]
     /// (`TurnFinished`, `ApprovalRequired`, or `Error`) before returning.
-    pub(super) async fn run_loop(&self, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
-        let (user_prompt, cancel, route_ctx) = {
+    pub(super) async fn run_loop(
+        &self,
+        turn_id: TurnId,
+        cancel: CancellationToken,
+        tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let (user_prompt, route_ctx) = {
             let state = self.state.lock().await;
+            if state.current_turn_id.as_ref() != Some(&turn_id) {
+                return;
+            }
             let context_tokens = estimate_token_count(&state.session.wire_messages());
             let prompt = state.current_prompt.clone().unwrap_or_default();
             (
                 prompt.text.clone(),
-                state.cancel.clone(),
                 RouteContext {
                     context_tokens,
                     context_window: context_window_for_model(DEEPSEEK_V4_PRO),
@@ -175,7 +183,6 @@ impl AgentRuntime {
                 },
             )
         };
-        let turn_id = self.current_turn_id().await;
         if cancel.is_cancelled() {
             self.finish_turn_cancelled(&turn_id, tx).await;
             return;

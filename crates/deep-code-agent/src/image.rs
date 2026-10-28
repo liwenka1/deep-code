@@ -30,8 +30,6 @@ use crate::message::Message;
 /// Where pasted images are kept, under the workspace root — the same
 /// `.deep-code` tree the session files live in.
 const IMAGES_DIR: &str = ".deep-code/images";
-/// Both levels of [`IMAGES_DIR`] are ours and must be real directories.
-const OWNED_STORE_DIRS: usize = 2;
 
 /// Inline cap for one image, from the Vision guide's Limits table.
 pub const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
@@ -584,28 +582,65 @@ impl From<std::io::Error> for StoreError {
 /// `ring` rather than a fresh hash dependency: it is already a direct dependency
 /// for the session-record grant tag, so this adds no build cost.
 pub fn store(workspace: &Path, data: &[u8]) -> Result<PathBuf, StoreError> {
+    let canonical = crate::paths::canonicalize(workspace)?;
+    store_at(&canonical, workspace, data)
+}
+
+/// Store into a root the UI already approved, refusing redirection of the root
+/// or any ancestor instead of resolving an inherited path as fresh intent.
+pub fn store_in_pinned_workspace(workspace: &Path, data: &[u8]) -> Result<PathBuf, StoreError> {
+    store_at(workspace, workspace, data)
+}
+
+fn store_at(canonical: &Path, display: &Path, data: &[u8]) -> Result<PathBuf, StoreError> {
+    use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+    use cap_std::fs::OpenOptions;
+    use std::io::{Read, Write};
+
     let format = ImageFormat::sniff(data).ok_or(StoreError::UnsupportedFormat)?;
-    let directory = workspace.join(IMAGES_DIR);
-    // Two levels are ours — `.deep-code` and `images` under it — and both must
-    // be real directories. Plain `create_dir_all` follows a symlink at either
-    // level, which is how a repository shipping `.deep-code` as a link would
-    // relocate every pasted screenshot outside the workspace. Same rule, same
-    // reason, as `JsonSessionStore::for_workspace`.
-    crate::paths::ensure_owned_dirs(&directory, OWNED_STORE_DIRS)?;
-    // Images share `.deep-code` with the session transcripts, whose writer owns
-    // the self-ignore. Doing it here too makes "this directory is not committed"
-    // independent of which writer ran first.
-    if let Some(state_dir) = directory.parent() {
-        crate::session_store::write_self_ignore(state_dir);
-    }
+    let root = crate::pinned_dir::open_canonical(canonical)?;
+    let state = crate::pinned_dir::owned_child(&root, ".deep-code")?;
+    let images = crate::pinned_dir::owned_child(&state, "images")?;
+    // All writes, including the self-ignore, stay relative to pinned handles.
+    // A renamed parent cannot redirect either creation into another directory.
+    let _ = state
+        .open_with(
+            ".gitignore",
+            OpenOptions::new().write(true).create_new(true),
+        )
+        .and_then(|mut file| file.write_all(crate::session_store::SELF_IGNORE_BODY.as_bytes()));
     let digest = ring::digest::digest(&ring::digest::SHA256, data);
-    let path = directory.join(format!("{}.{}", hex(digest.as_ref()), format.extension()));
-    // Same bytes, same name, same contents — rewriting is wasted I/O on the
-    // common "pasted that again" path.
-    if !path.exists() {
-        std::fs::write(&path, data)?;
+    let name = format!("{}.{}", hex(digest.as_ref()), format.extension());
+    match images.open_with(&name, OpenOptions::new().write(true).create_new(true)) {
+        Ok(mut file) => file.write_all(data)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
     }
-    Ok(path)
+    // Reopen through the approved root too: if a parent was moved while we
+    // wrote, refuse to return a path that now points somewhere else.
+    let current_root = crate::pinned_dir::open_canonical(canonical)?;
+    let current = current_root
+        .open_dir_nofollow(".deep-code")?
+        .open_dir_nofollow("images")?;
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = current.open_with(&name, &options)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != data.len() as u64 {
+        return Err(std::io::Error::other("image cache contents do not match its hash").into());
+    }
+    let mut existing = Vec::new();
+    file.take(data.len() as u64 + 1)
+        .read_to_end(&mut existing)?;
+    if existing != data {
+        return Err(std::io::Error::other("image cache contents do not match its hash").into());
+    }
+    Ok(display.join(IMAGES_DIR).join(name))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -783,6 +818,74 @@ mod tests {
         assert!(first.starts_with(dir.path().join(IMAGES_DIR)), "{first:?}");
         assert!(first.to_string_lossy().ends_with(".png"));
         assert_eq!(std::fs::read(&first).unwrap(), PNG);
+    }
+
+    #[test]
+    fn store_refuses_existing_and_dangling_leaf_symlinks() {
+        for existing in [false, true] {
+            let dir = tempdir().unwrap();
+            let outside = tempdir().unwrap();
+            let target = outside.path().join("image.png");
+            if existing {
+                std::fs::write(&target, PNG).unwrap();
+            }
+            let path = store(dir.path(), PNG).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            if !crate::test_symlinks::symlink_file_for_test(&target, &path) {
+                return;
+            }
+            assert!(store(dir.path(), PNG).is_err());
+            assert_eq!(target.exists(), existing);
+            if existing {
+                assert_eq!(std::fs::read(target).unwrap(), PNG);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_parent_during_store_cannot_write_outside_the_workspace() {
+        for replace_state in [false, true] {
+            let root = tempdir().unwrap();
+            let workspace = root.path().join("workspace");
+            let outside = root.path().join("outside");
+            std::fs::create_dir_all(workspace.join(IMAGES_DIR)).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            let state = workspace.join(".deep-code");
+            let changed = if replace_state {
+                state.clone()
+            } else {
+                state.join("images")
+            };
+            let saved = workspace.join("parked");
+            let marker = state.join(".gitignore");
+            let target = outside.clone();
+            let worker = std::thread::spawn(move || {
+                while !marker.exists() {
+                    std::thread::yield_now();
+                }
+                std::fs::rename(&changed, saved).unwrap();
+                std::os::unix::fs::symlink(target, changed).unwrap();
+            });
+            // The self-ignore is created only after directory handles are
+            // open; hashing gives the redirect time to finish before writing.
+            let mut image = vec![0; 16 * 1024 * 1024];
+            image[..PNG.len()].copy_from_slice(PNG);
+            let _ = store(&workspace, &image);
+            worker.join().unwrap();
+            assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn store_refuses_a_corrupt_cache_entry_without_overwriting_it() {
+        let dir = tempdir().unwrap();
+        let path = store(dir.path(), PNG).unwrap();
+        let mut corrupt = PNG.to_vec();
+        *corrupt.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, &corrupt).unwrap();
+        assert!(store(dir.path(), PNG).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), corrupt);
     }
 
     /// A clipboard file list can hand us a JPEG as easily as a PNG, so the name

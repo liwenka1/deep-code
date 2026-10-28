@@ -122,19 +122,19 @@ impl App {
     /// Launch a fresh runtime from the current layered config (optionally
     /// resuming `resume`) and adopt it, carrying the config-derived display
     /// state. The caller must have shut the previous runtime down first.
-    fn launch_and_adopt(&mut self, resume: Option<SessionRecord>) {
+    fn launch_and_adopt(&mut self, resume: Option<SessionRecord>) -> Result<(), String> {
+        deep_code_agent::validate_pinned_workspace(&self.workspace)
+            .map_err(|error| error.to_string())?;
         let agent_config = self.load_layered_config();
-        // Grants are process-scoped: the human expressed them for this run
-        // (launch flags or `/add-dir`), so every swap re-passes the current
-        // set. A `/clear` session is born with them, and a `/resume` unions
-        // them into the target record — the same semantics `-c --add-dir`
-        // already has. Dropping them on a swap instead would deny the model
-        // mid-task on paths it legitimately wrote a moment earlier.
-        let launched = launch_runtime(
+        // Preserve unchanged process grants across swaps, but keep their
+        // provenance: an old path is not fresh user intent to authorize
+        // whatever directory it might now resolve to.
+        let launched = deep_code_agent::relaunch_runtime(
             &agent_config,
             deep_code_agent::WorkspaceRoots::new(self.workspace.clone(), self.extra_roots.clone()),
             resume,
-        );
+        )
+        .map_err(|error| error.to_string())?;
         self.cost_currency = agent_config.cost_currency;
         self.configured_model = agent_config.model.clone();
         self.configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
@@ -153,6 +153,7 @@ impl App {
         // that could not be saved, an environment override.
         self.adopt_runtime(launched);
         self.runtime.set_ui_lang(self.lang);
+        Ok(())
     }
 
     /// Append the effective-grants line to the transcript. Called wherever the
@@ -260,24 +261,26 @@ impl App {
             return Err(self.busy_status(TextId::BusyRelaunchConfig));
         }
 
+        deep_code_agent::validate_pinned_workspace(&self.workspace)
+            .map_err(|error| error.to_string())?;
         // Flush the old runtime first so re-reading the current session below
         // sees its latest writes.
         self.shutdown_current_runtime();
 
         let resume = self.session_id.as_ref().and_then(|id| {
-            let store = JsonSessionStore::for_workspace(self.workspace.clone()).ok()?;
+            let store = JsonSessionStore::for_pinned_workspace(&self.workspace).ok()?;
             let session_id = deep_code_agent::SessionId::parse(id).ok()?;
             store.load(&session_id).ok()
         });
         if resume.is_none() && self.session_id.is_some() {
             // The old runtime is already down; relaunch a fresh session so the
             // app stays usable instead of pointing at a dead runtime.
-            self.launch_and_adopt(None);
+            self.launch_and_adopt(None)?;
             self.flush_launch_warnings();
             return Err(self.tr(TextId::SessionReloadFailedRestart).to_string());
         }
 
-        self.launch_and_adopt(resume);
+        self.launch_and_adopt(resume)?;
         // No rebuild on this path (`/model`, `/apikey`, `/add-dir` keep the
         // transcript), so the warnings belong at the end of it, immediately.
         self.flush_launch_warnings();
@@ -295,7 +298,7 @@ impl App {
             self.status = self.busy_status(TextId::BusySwitchSession);
             return;
         }
-        let sessions = match JsonSessionStore::for_workspace(self.workspace.clone())
+        let sessions = match JsonSessionStore::for_pinned_workspace(&self.workspace)
             .and_then(|store| store.list())
         {
             Ok(list) => list
@@ -358,7 +361,7 @@ impl App {
     /// Load session `id` and switch to it in place. Surfaces a readable status
     /// on a bad id / missing record rather than failing the command.
     pub(crate) fn switch_session_by_id(&mut self, id: &str) -> Result<(), String> {
-        let store = JsonSessionStore::for_workspace(&self.workspace).map_err(|error| {
+        let store = JsonSessionStore::for_pinned_workspace(&self.workspace).map_err(|error| {
             self.tr_with(
                 TextId::SessionStoreOpenFailed,
                 &[("error", &error.to_string())],
@@ -391,8 +394,10 @@ impl App {
             return Ok(());
         }
 
+        deep_code_agent::validate_pinned_workspace(&self.workspace)
+            .map_err(|error| error.to_string())?;
         self.shutdown_current_runtime();
-        self.launch_and_adopt(Some(record.clone()));
+        self.launch_and_adopt(Some(record.clone()))?;
 
         self.history.clear();
         self.active_turn = None;
@@ -430,9 +435,16 @@ impl App {
             return;
         }
 
+        if let Err(error) = deep_code_agent::validate_pinned_workspace(&self.workspace) {
+            self.status = error.to_string();
+            return;
+        }
         let workspace_display = home_relative(&self.workspace);
         self.shutdown_current_runtime();
-        self.launch_and_adopt(None);
+        if let Err(error) = self.launch_and_adopt(None) {
+            self.status = error;
+            return;
+        }
 
         let persistent = self.session_id.is_some();
         self.history.clear();

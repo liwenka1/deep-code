@@ -2225,6 +2225,106 @@ async fn session_approval_skips_future_prompts_for_same_tool() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn superseded_approval_cannot_execute_record_consent_or_drive_the_successor() {
+    for decision in [
+        ApprovalDecision::Approved,
+        ApprovalDecision::ApprovedForSession,
+    ] {
+        let client = ScriptedClient::new(vec![
+            vec![
+                AgentEvent::ToolCallDelta {
+                    delta: tool_call_delta("old_call", MockEchoTool::NAME, r#"{"message":"old"}"#),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+            vec![
+                AgentEvent::TextDelta {
+                    text: "new reply".into(),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+        ]);
+        let runtime = AgentRuntime::with_config(
+            client,
+            ToolRegistry::with_mock_tools(),
+            AgentConfig::builtin(),
+        );
+        let mut rx = runtime.submit_user("old prompt").await;
+        assert!(
+            drain(&mut rx)
+                .await
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::ApprovalRequired { .. }))
+        );
+        let old_id = runtime.live_turn_id().await.unwrap();
+        let mut approved = runtime.submit_approval(decision).await;
+        // No yield between submission and supersession: the approval task has
+        // not yet been polled and must retain the old turn's cancelled token.
+        runtime.begin_turn("new prompt").await;
+        let new_id = runtime.live_turn_id().await.unwrap();
+        let events = drain(&mut approved).await;
+        assert!(
+            events.iter().any(|event| matches!(event,
+                RuntimeEvent::ToolCallFinished { turn_id: Some(id), result, .. }
+                    if id == &old_id && result.status == ToolResultStatus::Error
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                RuntimeEvent::AssistantDelta { .. } | RuntimeEvent::TurnFinished { .. }
+            )),
+            "{events:?}"
+        );
+        assert_eq!(runtime.live_turn_id().await, Some(new_id));
+        assert!(runtime.state.lock().await.session_approved.is_empty());
+        let mut rx = runtime.drive_turn().await;
+        assert!(
+            drain(&mut rx)
+                .await
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::TurnFinished { .. }))
+        );
+        assert_eq!(
+            runtime.session_messages().await.last().unwrap().content,
+            "new reply"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn superseded_root_approval_cannot_widen_the_successors_boundary() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let (tools, boundary) = root_grant_fixture(workspace.path());
+    let runtime = AgentRuntime::with_config(
+        ScriptedClient::new(vec![request_root_script(outside.path())]),
+        tools,
+        AgentConfig::builtin(),
+    )
+    .with_boundary(Some(boundary.clone()));
+    let mut rx = runtime.submit_user("grant a root").await;
+    assert!(
+        drain(&mut rx)
+            .await
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::ApprovalRequired { .. }))
+    );
+    let mut approved = runtime.submit_approval(ApprovalDecision::Approved).await;
+    runtime.begin_turn("new prompt").await;
+    let new_id = runtime.live_turn_id().await;
+    let events = drain(&mut approved).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::RootGranted { .. }))
+    );
+    assert!(boundary.to_roots().extras.is_empty());
+    assert_eq!(runtime.live_turn_id().await, new_id);
+}
+
 /// The writer-side contract for `ExchangeResult::asked`, which is what a resumed
 /// transcript reads to badge and fold exactly as the live one did.
 ///

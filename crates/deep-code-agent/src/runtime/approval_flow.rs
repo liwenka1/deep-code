@@ -410,6 +410,7 @@ impl AgentRuntime {
             user_task,
         };
         let model = self.classifier_model();
+        let turn_id = self.state.lock().await.current_turn_id.clone();
         // Race the judge against cancellation so Esc during a slow classifier
         // reply aborts the call into "ask" instead of blocking the turn.
         let (approved, usage) = tokio::select! {
@@ -418,7 +419,8 @@ impl AgentRuntime {
             verdict = crate::approval_classifier::approves(&*self.client, &model, &input) => verdict,
         };
         if let Some(usage) = usage {
-            self.record_classifier_cost(&model, &usage).await;
+            self.record_classifier_cost(&model, &usage, turn_id.as_ref())
+                .await;
         }
         approved.then_some(AutoApproval::Judge)
     }
@@ -432,7 +434,12 @@ impl AgentRuntime {
     /// totals. The judge runs on a separate (cheap) model from the turn, so its
     /// usage never flows through the turn telemetry; without this the reported
     /// cost silently under-counts every auto-mode gated call.
-    async fn record_classifier_cost(&self, model: &str, usage: &crate::model::Usage) {
+    async fn record_classifier_cost(
+        &self,
+        model: &str,
+        usage: &crate::model::Usage,
+        turn_id: Option<&TurnId>,
+    ) {
         let cost = crate::pricing::calculate_turn_cost(model, usage);
         let cache_hit = usage.prompt_cache_hit_tokens.unwrap_or(0);
         let cache_miss = usage.prompt_cache_miss_tokens.unwrap_or(0);
@@ -441,10 +448,14 @@ impl AgentRuntime {
         // Turn totals too: the judge fires during this turn's approval gate, so
         // the turn `cost` (headless/bot output, `/status`) must include it — not
         // only the session total.
-        state.turn_cost.usd += cost.usd;
-        state.turn_cost.cny += cost.cny;
-        state.turn_cache_hit_tokens += u64::from(cache_hit);
-        state.turn_cache_miss_tokens += u64::from(cache_miss);
+        // A completed judge can wait for this lock while begin_turn replaces
+        // the turn. Its spend must not enter the successor's counters.
+        if turn_id.is_some() && state.current_turn_id.as_ref() == turn_id {
+            state.turn_cost.usd += cost.usd;
+            state.turn_cost.cny += cost.cny;
+            state.turn_cache_hit_tokens += u64::from(cache_hit);
+            state.turn_cache_miss_tokens += u64::from(cache_miss);
+        }
         state.session_cost.usd += cost.usd;
         state.session_cost.cny += cost.cny;
         // Fold cache tokens too, so the session cache-hit rate/savings read
@@ -466,63 +477,47 @@ impl AgentRuntime {
         denial_note: Option<String>,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        let cancel = self.state.lock().await.cancel.clone();
         let PendingToolBatch {
             current,
             remaining,
             turn_id,
+            cancel,
             root_grant_target,
         } = pending;
-        if cancel.is_cancelled() {
-            let mut calls = remaining;
-            calls.push_front(current);
-            self.finish_cancelled_calls(calls, &turn_id, tx).await;
-            return;
-        }
-        // "Approve for session" is recorded here and executes as a plain
-        // approve; shell-class tools, sub-agent dispatch and root grants only
-        // get the one-time approval (`session_consent_recordable` is the
-        // panel-side view of these same two rules).
-        let decision = if decision == ApprovalDecision::ApprovedForSession {
-            // A `needs-human` call records NOTHING, and this is the enforcement
-            // half of `session_consent_recordable`'s contract (the panel's
-            // option list is the other). Re-derived from the registry rather than
-            // carried in the parked batch, matching how the two rules beside it
-            // already work (`session_allowable` by name, `shell_consent_key` from
-            // the call): `evaluate_tool` is a pure function of the call and the
-            // policy, so this is the same plan the panel was shown.
-            let needs_human = crate::execution_policy::is_needs_human_rule(
-                self.tools.evaluate_tool(&current).matched_rule.as_deref(),
-            );
-            if needs_human {
-                // Fall through to a plain one-time approve: the human said yes,
-                // and the only thing refused here is remembering it.
-            } else if session_allowable(&current.name) {
-                self.state
-                    .lock()
-                    .await
-                    .session_approved
-                    .insert(current.name.clone());
-            } else if let Some((identity, network)) = shell_consent_key(&current) {
-                // Shell: remember this command's identity for the session so
-                // repeated `cargo test`/`git push`/… stop prompting (compound
-                // commands still prompt — the key is None for them). A consent
-                // given with egress also covers the same command offline, which
-                // is strictly less; one given offline covers only offline — the
-                // network variant asks again.
-                let mut state = self.state.lock().await;
-                if network {
-                    state
-                        .session_trusted_shell_prefixes
-                        .insert((identity.clone(), false));
-                }
-                state
-                    .session_trusted_shell_prefixes
-                    .insert((identity, network));
+        // Validate ownership and record standing consent under the same lock.
+        // `begin_turn` may have superseded this batch after it was submitted
+        // but before this spawned task received its first poll.
+        let decision = {
+            let mut state = self.state.lock().await;
+            if state.current_turn_id.as_ref() != Some(&turn_id) || cancel.is_cancelled() {
+                drop(state);
+                let mut calls = remaining;
+                calls.push_front(current);
+                self.finish_cancelled_calls(calls, &turn_id, tx).await;
+                return;
             }
-            ApprovalDecision::Approved
-        } else {
-            decision
+            if decision == ApprovalDecision::ApprovedForSession {
+                let needs_human = crate::execution_policy::is_needs_human_rule(
+                    self.tools.evaluate_tool(&current).matched_rule.as_deref(),
+                );
+                if !needs_human {
+                    if session_allowable(&current.name) {
+                        state.session_approved.insert(current.name.clone());
+                    } else if let Some((identity, network)) = shell_consent_key(&current) {
+                        if network {
+                            state
+                                .session_trusted_shell_prefixes
+                                .insert((identity.clone(), false));
+                        }
+                        state
+                            .session_trusted_shell_prefixes
+                            .insert((identity, network));
+                    }
+                }
+                ApprovalDecision::Approved
+            } else {
+                decision
+            }
         };
         // What goes into the record. Every path that reaches this function is
         // resolving a PARKED call — one that was put in front of whoever answers
@@ -559,8 +554,14 @@ impl AgentRuntime {
                     result
                 }
                 _ => {
-                    self.apply_root_grant(&current, root_grant_target.as_deref(), &turn_id, tx)
-                        .await
+                    self.apply_root_grant(
+                        &current,
+                        root_grant_target.as_deref(),
+                        &turn_id,
+                        &cancel,
+                        tx,
+                    )
+                    .await
                 }
             };
             self.record_tool_result(&current, result, ask, tx, turn_id.clone())
@@ -604,6 +605,7 @@ impl AgentRuntime {
                     current,
                     remaining,
                     turn_id: turn_id.clone(),
+                    cancel: cancel.clone(),
                     // A root grant never reaches this re-prompt path (it
                     // is intercepted above, before run_tool); None keeps
                     // the grant fail-closed if that ever changes.
@@ -611,7 +613,7 @@ impl AgentRuntime {
                 };
                 let unparked = {
                     let mut state = self.state.lock().await;
-                    if cancel.is_cancelled() {
+                    if cancel.is_cancelled() || state.current_turn_id.as_ref() != Some(&turn_id) {
                         Some(batch)
                     } else {
                         state.pending = Some(batch);
@@ -663,13 +665,17 @@ impl AgentRuntime {
         cancel: &CancellationToken,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
+        if !self.owns_turn(turn_id, cancel).await {
+            self.finish_cancelled_calls(remaining, turn_id, tx).await;
+            return;
+        }
         if self
             .process_tool_batch(remaining, turn_id, cancel, tx)
             .await
             == BatchOutcome::Completed
             && !self.boundary_breaker_tripped(turn_id, tx).await
         {
-            self.run_loop(tx).await;
+            self.run_loop(turn_id.clone(), cancel.clone(), tx).await;
         }
     }
 
@@ -729,6 +735,7 @@ impl AgentRuntime {
         call: &ToolCall,
         prompt_target: Option<&std::path::Path>,
         turn_id: &TurnId,
+        cancel: &CancellationToken,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) -> ToolResult {
         use crate::workspace_policy::RootGrantOutcome;
@@ -769,7 +776,15 @@ impl AgentRuntime {
                 ),
             );
         }
-        match boundary.grant_resolved(fresh) {
+        let state = self.state.lock().await;
+        if state.current_turn_id.as_ref() != Some(turn_id) || cancel.is_cancelled() {
+            let mut result = ToolResult::denied(call);
+            result.content = super::tool_result::CANCELLED_TOOL_RESULT.to_string();
+            return result;
+        }
+        let outcome = boundary.grant_resolved(fresh);
+        drop(state);
+        match outcome {
             RootGrantOutcome::Granted { canonical } => {
                 // Same durability contract as --add-dir: the grant is part of
                 // the session, so a resume must restore it.
@@ -1170,6 +1185,7 @@ mod tests {
             crate::echo_client::EchoClient::new(crate::i18n::SharedLang::default()),
             crate::tool::ToolRegistry::new(),
         );
+        runtime.begin_turn("approve a shell call").await;
         let pending = PendingToolBatch {
             current: crate::tool::ToolCall::new(
                 "c1",
@@ -1177,7 +1193,8 @@ mod tests {
                 json!({ "command": "git push --force origin main" }),
             ),
             remaining: std::collections::VecDeque::new(),
-            turn_id: crate::runtime::event::TurnId("turn_1".to_string()),
+            turn_id: runtime.live_turn_id().await.unwrap(),
+            cancel: runtime.state.lock().await.cancel.clone(),
             root_grant_target: None,
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1275,6 +1292,8 @@ mod tests {
 
         let runtime =
             crate::runtime::AgentRuntime::new(MuteClient, crate::tool::ToolRegistry::default());
+        runtime.begin_turn("original").await;
+        let turn_id = runtime.state.lock().await.current_turn_id.clone();
         // The wrapper around `classifier_model_for`, pinned on the same
         // runtime: builtin config routes to the Flash judge.
         assert_eq!(runtime.classifier_model(), DEEPSEEK_FLASH);
@@ -1287,7 +1306,9 @@ mod tests {
             prompt_cache_hit_tokens: Some(10),
             prompt_cache_miss_tokens: Some(5),
         };
-        runtime.record_classifier_cost(DEEPSEEK_FLASH, &usage).await;
+        runtime
+            .record_classifier_cost(DEEPSEEK_FLASH, &usage, turn_id.as_ref())
+            .await;
         let (cost_1, savings_1) = {
             let state = runtime.state.lock().await;
             assert_eq!(state.session_cache_hit_tokens, 10);
@@ -1309,7 +1330,9 @@ mod tests {
             (state.session_cost, state.session_cache_savings)
         };
 
-        runtime.record_classifier_cost(DEEPSEEK_FLASH, &usage).await;
+        runtime
+            .record_classifier_cost(DEEPSEEK_FLASH, &usage, turn_id.as_ref())
+            .await;
         let state = runtime.state.lock().await;
         assert_eq!(state.session_cache_hit_tokens, 20);
         assert_eq!(state.session_cache_miss_tokens, 10);
@@ -1323,5 +1346,18 @@ mod tests {
         );
         assert!(state.session_cache_savings.usd > savings_1.usd);
         assert!(state.session_cache_savings.cny > savings_1.cny);
+        drop(state);
+
+        runtime.begin_turn("successor").await;
+        runtime
+            .record_classifier_cost(DEEPSEEK_FLASH, &usage, turn_id.as_ref())
+            .await;
+        let state = runtime.state.lock().await;
+        assert_eq!(state.session_cache_hit_tokens, 30);
+        assert_eq!(state.session_cache_miss_tokens, 15);
+        assert_eq!(state.turn_cache_hit_tokens, 0);
+        assert_eq!(state.turn_cache_miss_tokens, 0);
+        assert_eq!(state.turn_cost.usd, 0.0);
+        assert_eq!(state.turn_cost.cny, 0.0);
     }
 }

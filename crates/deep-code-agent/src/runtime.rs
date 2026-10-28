@@ -424,15 +424,27 @@ impl AgentRuntime {
     pub async fn drive_turn(&self) -> RuntimeEventReceiver {
         let (tx, rx) = mpsc::unbounded_channel();
         let (turn_id, prompt) = self.current_turn_context().await;
-        emit(&tx, RuntimeEvent::TurnStarted { turn_id, prompt });
+        emit(
+            &tx,
+            RuntimeEvent::TurnStarted {
+                turn_id: turn_id.clone(),
+                prompt,
+            },
+        );
         self.emit_session_updated(&tx).await;
         // The turn's cancel token, so an Esc/quit during a large before-turn
         // snapshot aborts the copy promptly instead of after the whole tree.
-        let cancel = self.state.lock().await.cancel.clone();
+        let cancel = {
+            let state = self.state.lock().await;
+            if state.current_turn_id.as_ref() != Some(&turn_id) {
+                return rx;
+            }
+            state.cancel.clone()
+        };
         self.snapshot_turn("before_turn", &cancel, &tx).await;
         let runtime = self.clone();
         tokio::spawn(async move {
-            runtime.run_loop(&tx).await;
+            runtime.run_loop(turn_id, cancel, &tx).await;
         });
         rx
     }
@@ -605,6 +617,11 @@ impl AgentRuntime {
         self.state.lock().await.current_turn_id.clone()
     }
 
+    async fn owns_turn(&self, turn_id: &TurnId, cancel: &CancellationToken) -> bool {
+        let state = self.state.lock().await;
+        state.current_turn_id.as_ref() == Some(turn_id) && !cancel.is_cancelled()
+    }
+
     /// This session's accumulated spend — cost plus the cache traffic behind
     /// it. A sub-agent runtime exposes it so the parent can fold the child's
     /// spend into its own session totals via `ToolCx::report_spend`.
@@ -616,15 +633,6 @@ impl AgentRuntime {
             cache_miss_tokens: state.session_cache_miss_tokens,
             cache_savings: state.session_cache_savings,
         }
-    }
-
-    async fn current_turn_id(&self) -> TurnId {
-        self.state
-            .lock()
-            .await
-            .current_turn_id
-            .clone()
-            .unwrap_or_else(TurnId::new)
     }
 
     async fn current_turn_context(&self) -> (TurnId, String) {

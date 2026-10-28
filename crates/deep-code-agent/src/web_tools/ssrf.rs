@@ -34,6 +34,9 @@ pub(super) fn pinned_get(
     for _ in 0..=MAX_REDIRECTS {
         let pin = check_url(&url, allow_private, lang)?;
         let mut builder = Client::builder()
+            // A proxy resolves the destination itself, bypassing `resolve`
+            // below. This transport must connect to the address we checked.
+            .no_proxy()
             .timeout(FETCH_TIMEOUT)
             .user_agent(USER_AGENT)
             .redirect(Policy::none());
@@ -296,6 +299,94 @@ fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
 mod tests {
     use super::*;
     use reqwest::Url;
+
+    #[test]
+    fn pinned_get_ignores_environment_proxies() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        const CHILD_URL: &str = "DEEP_CODE_SSRF_PROXY_TEST_URL";
+        if let Ok(url) = std::env::var(CHILD_URL) {
+            let response = pinned_get(Url::parse(&url).unwrap(), true, Lang::En).unwrap();
+            assert_eq!(response.text().unwrap(), "direct-origin");
+            return;
+        }
+
+        fn server(
+            body: &'static str,
+            stop: Arc<AtomicBool>,
+            hits: Arc<AtomicUsize>,
+        ) -> (String, std::thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}/probe", listener.local_addr().unwrap());
+            let worker = std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut socket, _)) => {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            socket
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .unwrap();
+                            let mut request = [0; 8192];
+                            let _ = socket.read(&mut request);
+                            let _ = write!(
+                                socket,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("test listener: {error}"),
+                    }
+                }
+            });
+            (url, worker)
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let origin_hits = Arc::new(AtomicUsize::new(0));
+        let proxy_hits = Arc::new(AtomicUsize::new(0));
+        let (origin, origin_worker) = server("direct-origin", stop.clone(), origin_hits.clone());
+        let (proxy, proxy_worker) = server("proxy-response", stop.clone(), proxy_hits.clone());
+        // Isolate environment changes from parallel tests and exercise the
+        // real pinned_get transport. No DNS or external network is required.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "web_tools::ssrf::tests::pinned_get_ignores_environment_proxies",
+                "--nocapture",
+            ])
+            .env(CHILD_URL, origin)
+            .env("NO_PROXY", "")
+            .env("no_proxy", "");
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            child.env(key, &proxy);
+        }
+        let result = child.output().unwrap();
+        stop.store(true, Ordering::SeqCst);
+        origin_worker.join().unwrap();
+        proxy_worker.join().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        assert_eq!(origin_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(proxy_hits.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn ssrf_guard_rejects_private_hosts() {

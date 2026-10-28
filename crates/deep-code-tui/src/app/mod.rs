@@ -642,6 +642,7 @@ impl App {
     #[must_use]
     pub fn launch(config: LaunchConfig) -> Self {
         let workspace = config.workspace.clone().unwrap_or_else(workspace_root);
+        let workspace = deep_code_agent::canonicalize(&workspace).unwrap_or(workspace);
         let workspace_files = deep_code_agent::list_workspace_files(&workspace, 2000);
         let loaded = AgentConfig::load(&workspace);
         let config_warnings = loaded.report.warnings.clone();

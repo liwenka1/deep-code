@@ -78,7 +78,18 @@ pub(crate) enum RootGrantOutcome {
 
 impl WorkspacePolicy {
     pub(crate) fn new(roots: impl Into<WorkspaceRoots>) -> Result<Self, ToolError> {
-        let WorkspaceRoots { primary, extras } = roots.into();
+        Self::new_inner(roots.into(), false)
+    }
+
+    /// Launch has already fixed each extra root's canonical identity. Never
+    /// resolve an inherited grant into a different directory while assembling
+    /// tools, even if a link was swapped after the launch-time validation.
+    pub(crate) fn new_pinned(roots: WorkspaceRoots) -> Result<Self, ToolError> {
+        Self::new_inner(roots, true)
+    }
+
+    fn new_inner(roots: WorkspaceRoots, pinned: bool) -> Result<Self, ToolError> {
+        let WorkspaceRoots { primary, extras } = roots;
         let canonical_primary = crate::paths::canonicalize(&primary).map_err(|error| {
             ToolError::exec_failed(
                 "workspace",
@@ -88,6 +99,12 @@ impl WorkspacePolicy {
                 ),
             )
         })?;
+        if pinned && canonical_primary != primary {
+            return Err(ToolError::exec_failed(
+                "workspace",
+                "primary workspace no longer resolves to its approved directory",
+            ));
+        }
         let mut canonical_extras: Vec<PathBuf> = Vec::new();
         for extra in extras {
             // A grant that cannot be resolved refuses the launch instead of
@@ -104,6 +121,15 @@ impl WorkspacePolicy {
                     ),
                 )
             })?;
+            if pinned && canonical != extra {
+                return Err(ToolError::exec_failed(
+                    "workspace",
+                    format!(
+                        "write grant {} no longer resolves to its approved directory",
+                        extra.display()
+                    ),
+                ));
+            }
             if !canonical.is_dir() {
                 return Err(ToolError::exec_failed(
                     "workspace",

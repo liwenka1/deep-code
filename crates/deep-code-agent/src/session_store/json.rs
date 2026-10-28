@@ -1,7 +1,10 @@
-use std::fs::{self, File};
-use std::io::Write;
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, OpenOptions};
+#[cfg(test)]
+use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
 use super::migrate::{SessionRecordV1, migrate_v1};
 use super::{
@@ -9,35 +12,31 @@ use super::{
     sessions_dir_for_workspace, validate_session_id,
 };
 
-/// `<workspace>/.deep-code` and the `sessions` directory inside it — the two
-/// levels deep-code owns here. Above them the path is the user's.
-const OWNED_STATE_DIRS: usize = 2;
-
 /// JSON file backend: one pretty-printed file per session.
 #[derive(Debug, Clone)]
 pub struct JsonSessionStore {
     root: PathBuf,
+    directory: Arc<Dir>,
 }
 
 impl JsonSessionStore {
     pub fn for_workspace(workspace: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
-        let root = sessions_dir_for_workspace(workspace.as_ref());
-        // `.deep-code` and `sessions` under it are both ours, so both must be
-        // real directories. Plain `create_dir_all` follows a symlink at either
-        // level, and a repository shipping `.deep-code` as a link then
-        // relocated every session transcript outside the workspace. That is the
-        // same escape `write_self_ignore` closes one level down at the leaf —
-        // which buys nothing if the directory holding the leaf was already
-        // redirected.
-        crate::paths::ensure_owned_dirs(&root, OWNED_STATE_DIRS).map_err(|error| {
-            SessionStoreError::Io {
-                message: format!("failed to create {}: {error}", root.display()),
-            }
-        })?;
-        if let Some(state_dir) = root.parent() {
-            Self::write_self_ignore(state_dir);
-        }
-        Ok(Self { root })
+        let canonical = crate::paths::canonicalize(workspace.as_ref()).map_err(store_io)?;
+        let mut store = Self::for_pinned_workspace(&canonical)?;
+        store.root = sessions_dir_for_workspace(workspace.as_ref());
+        Ok(store)
+    }
+
+    /// Reuse an approved canonical root without following a replacement link.
+    pub fn for_pinned_workspace(workspace: &Path) -> Result<Self, SessionStoreError> {
+        let root = crate::pinned_dir::open_canonical(workspace).map_err(store_io)?;
+        let state = crate::pinned_dir::owned_child(&root, ".deep-code").map_err(store_io)?;
+        let directory = crate::pinned_dir::owned_child(&state, "sessions").map_err(store_io)?;
+        Self::write_self_ignore(&state);
+        Ok(Self {
+            root: sessions_dir_for_workspace(workspace),
+            directory: Arc::new(directory),
+        })
     }
 
     fn path_for(&self, id: &SessionId) -> Result<PathBuf, SessionStoreError> {
@@ -69,95 +68,72 @@ impl JsonSessionStore {
     /// is a link whether or not its target does"); this was its unaudited
     /// sibling. `create_new` asks the kernel the question atomically, which
     /// also closes the exists→write gap.
-    pub(crate) fn write_self_ignore(state_dir: &Path) {
-        const BODY: &str = "# Written by deep-code: this directory holds session transcripts and logs.\n\
-             # Deleting this file does not opt out — deep-code writes it back next session.\n\
-             # To commit this directory after all, edit this file instead (e.g. remove the\n\
-             # `*` line); deep-code never touches an existing .gitignore.\n\
-             *\n";
-        let marker = state_dir.join(".gitignore");
-        let _ = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&marker)
-            .and_then(|mut file| std::io::Write::write_all(&mut file, BODY.as_bytes()));
+    fn write_self_ignore(state_dir: &Dir) {
+        let _ = state_dir
+            .open_with(
+                ".gitignore",
+                OpenOptions::new().write(true).create_new(true),
+            )
+            .and_then(|mut file| file.write_all(super::SELF_IGNORE_BODY.as_bytes()));
     }
 
-    fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), SessionStoreError> {
-        let parent = path.parent().ok_or_else(|| SessionStoreError::Io {
-            message: format!("session path has no parent: {}", path.display()),
+    fn write_atomic(&self, path: &Path, contents: &[u8]) -> Result<(), SessionStoreError> {
+        let filename = path.file_name().ok_or_else(|| SessionStoreError::Io {
+            message: "session path has no filename".into(),
         })?;
-        let stem = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("session");
-        // pid + nanos, not milliseconds: two processes sharing one workspace
-        // (`deep-code -c` in two terminals, or a TUI alongside `serve --resume`)
-        // each run their own save loop. On a millisecond-only name their staging
-        // files collide, the second `File::create` truncates the first mid-write,
-        // and a half-written JSON can get renamed over the live session — which
-        // then fails to parse and reads to the user as "my session disappeared".
-        let tmp_path = parent.join(format!(
-            ".{stem}.{}.{}.tmp",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        ));
-        let write_result = (|| {
-            let mut file = File::create(&tmp_path).map_err(|error| SessionStoreError::Io {
-                message: format!("failed to create {}: {error}", tmp_path.display()),
-            })?;
-            file.write_all(contents)
-                .map_err(|error| SessionStoreError::Io {
-                    message: format!("failed to write {}: {error}", tmp_path.display()),
-                })?;
-            file.sync_all().map_err(|error| SessionStoreError::Io {
-                message: format!("failed to fsync {}: {error}", tmp_path.display()),
-            })?;
+        let temporary = format!(".{}.tmp", uuid::Uuid::new_v4());
+        let saved = (|| -> std::io::Result<()> {
+            let mut file = self
+                .directory
+                .open_with(&temporary, OpenOptions::new().write(true).create_new(true))?;
+            file.write_all(contents)?;
+            file.sync_all()?;
+            drop(file);
+            self.directory
+                .rename(&temporary, &self.directory, filename)?;
+            #[cfg(unix)]
+            self.directory.try_clone()?.into_std_file().sync_all()?;
             Ok(())
         })();
-        // Never leave staging files behind on a failed save: they are invisible
-        // to `list` (dot-prefixed, no `.json`) so nothing would ever clean them.
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(error);
-        }
-        if let Err(error) = fs::rename(&tmp_path, path) {
-            let _ = fs::remove_file(&tmp_path);
+        if let Err(error) = saved {
+            let _ = self.directory.remove_file(&temporary);
             return Err(SessionStoreError::Io {
-                message: format!(
-                    "failed to rename {} -> {}: {error}",
-                    tmp_path.display(),
-                    path.display()
-                ),
+                message: format!("failed to save {}: {error}", path.display()),
             });
         }
-        sync_directory(parent)?;
         Ok(())
     }
 }
 
-fn sync_directory(path: &Path) -> Result<(), SessionStoreError> {
-    #[cfg(unix)]
-    {
-        let dir = File::open(path).map_err(|error| SessionStoreError::Io {
-            message: format!("failed to open directory {}: {error}", path.display()),
-        })?;
-        dir.sync_all().map_err(|error| SessionStoreError::Io {
-            message: format!("failed to fsync directory {}: {error}", path.display()),
-        })?;
+fn store_io(error: std::io::Error) -> SessionStoreError {
+    SessionStoreError::Io {
+        message: error.to_string(),
     }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
 }
 
 impl JsonSessionStore {
     fn read_file(&self, path: &Path) -> Result<SessionRecord, SessionStoreError> {
-        let raw = fs::read_to_string(path).map_err(|error| {
+        let read = || -> std::io::Result<String> {
+            let mut options = OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            #[cfg(unix)]
+            {
+                use cap_std::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NONBLOCK);
+            }
+            let mut file = self.directory.open_with(
+                path.file_name()
+                    .ok_or_else(|| std::io::Error::other("invalid session filename"))?,
+                &options,
+            )?;
+            if !file.metadata()?.is_file() {
+                return Err(std::io::Error::other("session entry is not a regular file"));
+            }
+            let mut contents = String::new();
+            file.read_to_string(&mut contents)?;
+            Ok(contents)
+        };
+        let raw = read().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 SessionStoreError::NotFound {
                     id: path
@@ -205,7 +181,7 @@ impl SessionStore for JsonSessionStore {
     fn save_serialized(&self, id: &SessionId, json: &str) -> Result<(), SessionStoreError> {
         validate_session_id(id.as_str())?;
         let path = self.path_for(id)?;
-        Self::write_atomic(&path, json.as_bytes())
+        self.write_atomic(&path, json.as_bytes())
     }
 
     fn load(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError> {
@@ -221,15 +197,18 @@ impl SessionStore for JsonSessionStore {
 
     fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError> {
         let mut records = Vec::new();
-        let entries = fs::read_dir(&self.root).map_err(|error| SessionStoreError::Io {
-            message: format!("failed to read {}: {error}", self.root.display()),
-        })?;
+        let entries = self
+            .directory
+            .entries()
+            .map_err(|error| SessionStoreError::Io {
+                message: format!("failed to read {}: {error}", self.root.display()),
+            })?;
 
         for entry in entries {
             let entry = entry.map_err(|error| SessionStoreError::Io {
                 message: format!("failed to read session directory entry: {error}"),
             })?;
-            let path = entry.path();
+            let path = self.root.join(entry.file_name());
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
@@ -263,14 +242,20 @@ impl SessionStore for JsonSessionStore {
 
     fn delete(&self, id: &SessionId) -> Result<(), SessionStoreError> {
         let path = self.path_for(id)?;
-        if !path.is_file() {
+        if !self
+            .directory
+            .symlink_metadata(path.file_name().expect("validated filename"))
+            .is_ok_and(|metadata| metadata.is_file())
+        {
             return Err(SessionStoreError::NotFound {
                 id: id.as_str().to_string(),
             });
         }
-        fs::remove_file(&path).map_err(|error| SessionStoreError::Io {
-            message: format!("failed to delete {}: {error}", path.display()),
-        })
+        self.directory
+            .remove_file(path.file_name().expect("validated filename"))
+            .map_err(|error| SessionStoreError::Io {
+                message: format!("failed to delete {}: {error}", path.display()),
+            })
     }
 }
 

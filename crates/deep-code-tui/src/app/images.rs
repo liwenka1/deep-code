@@ -454,7 +454,7 @@ impl App {
             );
             return false;
         }
-        match deep_code_agent::store(&self.workspace, bytes) {
+        match deep_code_agent::store_in_pinned_workspace(&self.workspace, bytes) {
             Ok(path) => self.attach_image(path),
             Err(error) => {
                 self.status =

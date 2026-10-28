@@ -118,6 +118,11 @@ impl AgentRuntime {
         turn_id: &TurnId,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) -> Result<ToolRunOutcome, ToolError> {
+        if !self.owns_turn(turn_id, cancel).await {
+            let mut result = ToolResult::denied(call);
+            result.content = CANCELLED_TOOL_RESULT.to_string();
+            return Ok(ToolRunOutcome::Result { result });
+        }
         // A sink for spend a tool incurs out-of-band (a sub-agent's own request
         // spend never reaches this turn's telemetry). Folded into the session
         // totals after the tool returns.
@@ -158,10 +163,12 @@ impl AgentRuntime {
             // CI bot print, and `/status` shows) must include it. Folding only
             // into the session left the per-turn number low by the child's whole
             // spend on any turn that dispatched an `agent`.
-            state.turn_cost.usd += reported.cost.usd;
-            state.turn_cost.cny += reported.cost.cny;
-            state.turn_cache_hit_tokens += reported.cache_hit_tokens;
-            state.turn_cache_miss_tokens += reported.cache_miss_tokens;
+            if state.current_turn_id.as_ref() == Some(turn_id) {
+                state.turn_cost.usd += reported.cost.usd;
+                state.turn_cost.cny += reported.cost.cny;
+                state.turn_cache_hit_tokens += reported.cache_hit_tokens;
+                state.turn_cache_miss_tokens += reported.cache_miss_tokens;
+            }
             state.session_cost.usd += reported.cost.usd;
             state.session_cost.cny += reported.cost.cny;
             state.session_cache_hit_tokens += reported.cache_hit_tokens;
@@ -217,7 +224,7 @@ impl AgentRuntime {
         while let Some(call) = remaining.pop_front() {
             // Cancellation takes effect at call boundaries; the in-flight
             // tool (if any) completed on the blocking pool.
-            if cancel.is_cancelled() {
+            if !self.owns_turn(turn_id, cancel).await {
                 remaining.push_front(call);
                 self.finish_cancelled_calls(remaining, turn_id, tx).await;
                 return BatchOutcome::Cancelled;
@@ -363,11 +370,13 @@ impl AgentRuntime {
                         current: call,
                         remaining,
                         turn_id: turn_id.clone(),
+                        cancel: cancel.clone(),
                         root_grant_target,
                     };
                     let unparked = {
                         let mut state = self.state.lock().await;
-                        if cancel.is_cancelled() {
+                        if cancel.is_cancelled() || state.current_turn_id.as_ref() != Some(turn_id)
+                        {
                             Some(batch)
                         } else {
                             state.pending = Some(batch);
@@ -418,6 +427,7 @@ impl AgentRuntime {
             current,
             mut remaining,
             turn_id,
+            cancel: _,
             root_grant_target: _,
         } = pending;
         remaining.push_front(current);
@@ -500,7 +510,9 @@ impl AgentRuntime {
                     },
                 );
             }
-            record_failure_signals(&mut state, call, &result);
+            if state.current_turn_id.as_ref() == Some(&turn_id) {
+                record_failure_signals(&mut state, call, &result);
+            }
         }
         // Persistence and SessionUpdated are flushed once per batch boundary
         // (see process_tool_batch / finish_cancelled_calls), not per call.

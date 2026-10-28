@@ -1,15 +1,12 @@
 //! `/diff`: the working tree against `HEAD`, through the user's own git.
 //!
-//! Read-only by construction. `--no-ext-diff --no-textconv` keep a
-//! repository's configuration from running a diff driver of its choosing,
-//! `--no-optional-locks` keeps git from refreshing the index on the side, and
-//! the two secrets this process may hold are removed from the child's
-//! environment — git needs neither. The path argument always follows `--`, so
-//! whatever the user typed is a path, never an option.
+//! The workspace is read-only: all index/worktree queries use isolated Git
+//! metadata, with repository-defined filters, hooks and fsmonitor unavailable.
+//! Output remains bounded and a path argument always follows `--`.
 
-use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+
+use deep_code_agent::{IsolatedGit, IsolatedGitError};
 
 /// Chars of diff carried into the transcript. The same cap the write tools
 /// apply to their own diffs: past it the output is a scroll, not a review.
@@ -23,20 +20,6 @@ pub(crate) const DIFF_MAX_CHARS: usize = 64 * 1024;
 /// rewritten tree to the end buffered hundreds of megabytes and froze the UI
 /// for as long as git kept writing. Past the cap the child is killed instead.
 const STDOUT_BYTE_CAP: usize = DIFF_MAX_CHARS * 4;
-
-/// Bytes of a child's stderr kept for the error message. Real messages are
-/// short; a flood is a bug in what we spawned, not something to quote.
-const STDERR_BYTE_CAP: usize = 8 * 1024;
-
-/// How long a child gets to notice that its stdout is gone and exit on its own
-/// before it is killed. Killing alone is not enough on Windows (the `git` on
-/// PATH is a shim around the real process), and waiting alone is not guaranteed
-/// either — so: close, wait, kill.
-const EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// Ceiling on waiting for the stderr reader. A pipe inherited by a process we
-/// no longer control must never turn into a frozen screen.
-const STDERR_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug)]
 pub(crate) struct DiffReport {
@@ -65,25 +48,13 @@ pub(crate) fn working_tree_diff(
     workspace: &Path,
     path: Option<&str>,
 ) -> Result<DiffReport, GitDiffError> {
-    let inside = git(workspace, &["rev-parse", "--is-inside-work-tree"])?;
-    if !inside.status.success() {
-        return Err(GitDiffError::NotARepository);
-    }
-    let mut output = git_bounded(workspace, &diff_args(Some("HEAD"), path))?;
-    // A killed-for-length run is not a failure: its exit status is a failure
-    // only because we stopped reading, and the prefix is the answer.
+    let repository = IsolatedGit::new_pinned(workspace).map_err(git_error)?;
+    let base = Some(repository.diff_base());
+    let output = git_bounded(&repository, &diff_args(base, path))?;
     if !output.ok && !output.truncated {
-        let retry = output.stderr.contains("unknown revision")
-            || output.stderr.contains("ambiguous argument 'HEAD'")
-            || output.stderr.contains("bad revision");
-        if retry {
-            output = git_bounded(workspace, &diff_args(None, path))?;
-        }
-        if !output.ok && !output.truncated {
-            return Err(GitDiffError::Failed(deep_code_agent::collapse_whitespace(
-                &output.stderr,
-            )));
-        }
+        return Err(GitDiffError::Failed(deep_code_agent::collapse_whitespace(
+            &output.stderr,
+        )));
     }
     let raw = output.stdout;
     let (added, removed) = count_changes(&raw);
@@ -100,7 +71,7 @@ pub(crate) fn working_tree_diff(
     if let Some(path) = path {
         untracked_args.extend(["--", path]);
     }
-    let untracked = git_bounded(workspace, &untracked_args)
+    let untracked = git_bounded(&repository, &untracked_args)
         .ok()
         // A truncated listing still names the first files, which is all the
         // transcript shows (twenty, then an ellipsis).
@@ -129,6 +100,7 @@ fn diff_args<'a>(base: Option<&'a str>, path: Option<&'a str>) -> Vec<&'a str> {
         "diff",
         "--no-ext-diff",
         "--no-textconv",
+        "--ignore-submodules=dirty",
         "--no-color",
     ];
     args.extend(base);
@@ -138,26 +110,12 @@ fn diff_args<'a>(base: Option<&'a str>, path: Option<&'a str>) -> Vec<&'a str> {
     args
 }
 
-fn git(workspace: &Path, args: &[&str]) -> Result<std::process::Output, GitDiffError> {
-    Command::new("git")
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(workspace)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env_remove("GIT_EXTERNAL_DIFF")
-        .env_remove("GIT_PAGER")
-        .env_remove("DEEPSEEK_API_KEY")
-        .env_remove("DEEP_CODE_RUNTIME_TOKEN")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                GitDiffError::GitMissing
-            } else {
-                GitDiffError::Failed(error.to_string())
-            }
-        })
+fn git_error(error: IsolatedGitError) -> GitDiffError {
+    match error {
+        IsolatedGitError::GitMissing => GitDiffError::GitMissing,
+        IsolatedGitError::NotARepository => GitDiffError::NotARepository,
+        other => GitDiffError::Failed(other.to_string()),
+    }
 }
 
 /// One child's answer, with both streams bounded.
@@ -171,89 +129,19 @@ struct Bounded {
     truncated: bool,
 }
 
-/// [`git`] with a ceiling on what it can make this process hold.
+/// Run isolated Git with a ceiling on what it can make this process hold.
 ///
-/// `Command::output` reads both pipes to the end before returning, so one
-/// `/diff` against a rewritten tree — a deleted `node_modules`, a regenerated
-/// lock file, a checked-in fixture — buffered the whole thing and then threw
-/// all but 64K chars away. It runs on the render thread, so that was a frozen
-/// terminal, not a slow command. Here stdout stops at [`STDOUT_BYTE_CAP`] (and
-/// the child is killed), stderr at [`STDERR_BYTE_CAP`], and stderr is drained
-/// on its own thread so a child filling it cannot deadlock the wait.
-fn git_bounded(workspace: &Path, args: &[&str]) -> Result<Bounded, GitDiffError> {
-    let mut child = Command::new("git")
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(workspace)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env_remove("GIT_EXTERNAL_DIFF")
-        .env_remove("GIT_PAGER")
-        .env_remove("DEEPSEEK_API_KEY")
-        .env_remove("DEEP_CODE_RUNTIME_TOKEN")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                GitDiffError::GitMissing
-            } else {
-                GitDiffError::Failed(error.to_string())
-            }
-        })?;
-    let mut stderr_pipe = child.stderr.take();
-    // Delivered over a channel, not joined: on Windows `git` on PATH is a shim
-    // that launches the real `git.exe`, so a pipe can stay open after the
-    // process we spawned is gone, and `read_to_end` would wait for an EOF that
-    // never comes — the whole TUI froze there, with no keystroke able to
-    // interrupt it.
-    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
-    let _reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(stream) = stderr_pipe.as_mut() {
-            let _ = stream.take(STDERR_BYTE_CAP as u64).read_to_end(&mut bytes);
-        }
-        let _ = stderr_tx.send(bytes);
-    });
-    let mut bytes = Vec::new();
-    let mut stdout_pipe = child.stdout.take();
-    if let Some(stdout) = stdout_pipe.as_mut() {
-        // One byte past the cap, so "truncated" means "there was more".
-        let _ = stdout
-            .take(STDOUT_BYTE_CAP as u64 + 1)
-            .read_to_end(&mut bytes);
-    }
-    let truncated = bytes.len() > STDOUT_BYTE_CAP;
-    if truncated {
-        bytes.truncate(STDOUT_BYTE_CAP);
-        // Close our end first: a writer whose pipe is gone fails its next
-        // write and exits on its own, including the real `git.exe` behind a
-        // shim. Killing alone would only take the shim down.
-        drop(stdout_pipe);
-        let deadline = std::time::Instant::now() + EXIT_GRACE;
-        while std::time::Instant::now() < deadline {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        // And whatever is left gets killed, so `wait` below cannot sit on a
-        // process that is waiting for a pipe we closed.
-        let _ = child.kill();
-    }
-    let status = child
-        .wait()
-        .map_err(|error| GitDiffError::Failed(error.to_string()))?;
-    // Bounded: an inherited stderr pipe is not worth a frozen screen, and the
-    // message it carries is the error text, which a truncated run already
-    // reports as truncation.
-    let stderr = stderr_rx.recv_timeout(STDERR_GRACE).unwrap_or_default();
+/// The shared runner bounds stdout and stderr, reads both concurrently, and
+/// times out commands and inherited pipes that do not finish.
+fn git_bounded(repository: &IsolatedGit, args: &[&str]) -> Result<Bounded, GitDiffError> {
+    let result = repository
+        .run_bounded(args, STDOUT_BYTE_CAP)
+        .map_err(git_error)?;
     Ok(Bounded {
-        ok: status.success(),
-        stdout: String::from_utf8_lossy(&bytes).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        truncated,
+        ok: result.output.status.success(),
+        stdout: String::from_utf8_lossy(&result.output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&result.output.stderr).into_owned(),
+        truncated: result.truncated,
     })
 }
 
@@ -276,6 +164,7 @@ pub(crate) fn count_changes(diff: &str) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
 
     fn git(workspace: &Path, args: &[&str]) -> bool {
         Command::new("git")
@@ -323,7 +212,8 @@ mod tests {
             eprintln!("git not available; skipping");
             return;
         };
-        let report = working_tree_diff(repo.path(), None).expect("the diff still answers");
+        let report = working_tree_diff(&repo.path().canonicalize().unwrap(), None)
+            .expect("the diff still answers");
         assert!(report.truncated, "a diff past the cap has to say so");
         assert_eq!(
             report.diff.chars().count(),
@@ -342,7 +232,8 @@ mod tests {
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["commit", "-q", "-m", "big"]);
         std::fs::write(repo.path().join("small.txt"), "two\n").unwrap();
-        let small = working_tree_diff(repo.path(), Some("small.txt")).expect("a small diff");
+        let small = working_tree_diff(&repo.path().canonicalize().unwrap(), Some("small.txt"))
+            .expect("a small diff");
         assert!(!small.truncated, "{small:?}");
         assert!(small.diff.contains("+two") && small.diff.contains("-one"));
     }
@@ -353,6 +244,38 @@ mod tests {
             "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n context\n+more\n";
         assert_eq!(count_changes(diff), (2, 1));
         assert_eq!(count_changes(""), (0, 0));
+    }
+
+    #[test]
+    fn diff_does_not_run_fsmonitor_or_clean_filters() {
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        assert!(git(repo.path(), &["init", "-q"]));
+        std::fs::write(repo.path().join("tracked.txt"), "before\n").unwrap();
+        assert!(git(repo.path(), &["add", "."]));
+        assert!(git(repo.path(), &["commit", "-qm", "base"]));
+        let marker = outside
+            .path()
+            .join("executed")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let program = format!("echo executed > '{marker}'; cat");
+        assert!(git(repo.path(), &["config", "core.fsmonitor", &program]));
+        assert!(git(repo.path(), &["config", "filter.evil.clean", &program]));
+        std::fs::write(
+            repo.path().join(".gitattributes"),
+            "tracked.txt filter=evil\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("tracked.txt"), "after\n").unwrap();
+        let index = std::fs::read(repo.path().join(".git/index")).unwrap();
+        let report = working_tree_diff(&repo.path().canonicalize().unwrap(), None).unwrap();
+        assert!(report.diff.contains("+after"));
+        assert!(!outside.path().join("executed").exists());
+        assert_eq!(
+            std::fs::read(repo.path().join(".git/index")).unwrap(),
+            index
+        );
     }
 
     #[test]

@@ -275,6 +275,12 @@ impl App {
     /// and forgetting them is the usual way a change ships incomplete.
     fn diff_command(&mut self, arg: &str) {
         use crate::git_diff::{GitDiffError, working_tree_diff};
+        if let Err(error) = deep_code_agent::validate_pinned_workspace(&self.workspace) {
+            self.history.push(HistoryCell::system(
+                self.tr_with(TextId::DiffFailed, &[("error", &error.to_string())]),
+            ));
+            return;
+        }
         let scope = (!arg.is_empty()).then_some(arg);
         let report = match working_tree_diff(&self.workspace, scope) {
             Ok(report) => report,

@@ -17,9 +17,11 @@ pub use json::JsonSessionStore;
 
 /// Make sure `<state_dir>/.gitignore` excludes everything, for every writer of
 /// `<workspace>/.deep-code` — not just whichever one happens to run first.
-pub(crate) fn write_self_ignore(state_dir: &Path) {
-    JsonSessionStore::write_self_ignore(state_dir);
-}
+pub(crate) const SELF_IGNORE_BODY: &str = "# Written by deep-code: this directory holds session transcripts and logs.\n\
+             # Deleting this file does not opt out — deep-code writes it back next session.\n\
+             # To commit this directory after all, edit this file instead (e.g. remove the\n\
+             # `*` line); deep-code never touches an existing .gitignore.\n\
+             *\n";
 
 use crate::checkpoint::CheckpointId;
 use crate::pricing::CostEstimate;

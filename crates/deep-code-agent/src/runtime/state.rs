@@ -181,6 +181,8 @@ pub(super) struct PendingToolBatch {
     pub(super) current: ToolCall,
     pub(super) remaining: VecDeque<ToolCall>,
     pub(super) turn_id: TurnId,
+    /// The token of the turn that parked this batch, never a successor's.
+    pub(super) cancel: CancellationToken,
     /// For a parked `request_write_root` only: the canonical directory that
     /// was resolved when the prompt was built — the exact path the human saw.
     /// The grant re-resolves the request on approval and must land on this

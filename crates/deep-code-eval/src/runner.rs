@@ -365,6 +365,18 @@ async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> I
         Err(_) => return error_result("checkout timed out".to_string(), &start),
     }
 
+    // Snapshot trusted metadata before any model tools can change HEAD or the
+    // index. The snapshot lives outside both workspace and sandbox temp roots.
+    let patch_repository = match deep_code_agent::IsolatedGit::new(workspace.path()) {
+        Ok(repository) => repository,
+        Err(error) => {
+            return error_result(
+                format!("failed to prepare patch extraction: {error}"),
+                &start,
+            );
+        }
+    };
+
     let launched = launch_runtime(&config.agent_config, workspace.path().to_path_buf(), None);
     for warning in &launched.warnings {
         eprintln!("warning: {warning}");
@@ -422,7 +434,7 @@ async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> I
         eprintln!("warning: transcript not saved for {instance_id}: {error}");
     }
 
-    let patch = match extract_git_diff(workspace.path()).await {
+    let patch = match extract_git_diff(patch_repository).await {
         Ok(patch) => patch,
         Err(e) => return error_result(format!("patch extraction failed: {e}"), &start),
     };
@@ -691,49 +703,35 @@ async fn checkout_repo(repo: &str, commit: &str, dest: &Path) -> anyhow::Result<
 /// Extract the working-tree diff, including newly created files. The runtime
 /// writes sessions/checkpoints under `.deep-code/` inside the workspace —
 /// exclude it so agent bookkeeping never leaks into the model patch.
-async fn extract_git_diff(workspace: &Path) -> anyhow::Result<String> {
-    let ws = workspace.to_string_lossy().into_owned();
-    // The agent just ran over an UNTRUSTED benchmark repo and may have written
-    // .git/config, hooks, core.fsmonitor, or a .gitattributes ext-diff/textconv
-    // driver to run code inside these unsandboxed git commands. Override the
-    // execution surfaces we can: no system config, hooks disabled, fsmonitor
-    // off, and the diff drivers suppressed. Residual: an in-tree .gitattributes
-    // clean filter still runs on `git add` (there is no per-invocation switch to
-    // disable in-tree filters); the dataset repos are the official SWE-bench set.
-    let base: &[&str] = &[
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-C",
-        &ws,
-    ];
-    let run = |extra: &[&str]| {
-        let args: Vec<String> = base
-            .iter()
-            .chain(extra.iter())
-            .map(|s| (*s).to_string())
-            .collect();
-        async move {
-            tokio::process::Command::new("git")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .args(&args)
-                .output()
-                .await
+async fn extract_git_diff(mut repository: deep_code_agent::IsolatedGit) -> anyhow::Result<String> {
+    tokio::task::spawn_blocking(move || {
+        repository.refresh()?;
+        let add = repository.stage_all()?;
+        if !add.status.success() {
+            anyhow::bail!(
+                "git add failed: {}",
+                String::from_utf8_lossy(&add.stderr).trim()
+            );
         }
-    };
-    let add = run(&["add", "-A", "--", ".", ":(exclude).deep-code"]).await?;
-    if !add.status.success() {
-        anyhow::bail!(
-            "git add failed: {}",
-            String::from_utf8_lossy(&add.stderr).trim()
-        );
-    }
-    let output = run(&["diff", "--cached", "--no-ext-diff", "--no-textconv"]).await?;
-    if !output.status.success() {
-        anyhow::bail!("git diff --cached failed");
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        let result = repository.run_bounded(
+            &[
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=dirty",
+            ],
+            64 * 1024 * 1024,
+        )?;
+        if result.truncated {
+            anyhow::bail!("Git patch exceeds 64 MiB");
+        }
+        if !result.output.status.success() {
+            anyhow::bail!("git diff --cached failed");
+        }
+        Ok(String::from_utf8_lossy(&result.output.stdout).into_owned())
+    })
+    .await?
 }
 
 /// Current UTC time as ISO-8601 (`YYYY-MM-DDTHH:MM:SSZ`), std-only.
@@ -772,6 +770,62 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn patch_extraction_ignores_model_git_configuration_head_and_index() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ws = workspace.path().to_str().unwrap();
+        git(&["-C", ws, "init", "-q"]).await.unwrap();
+        std::fs::write(workspace.path().join("tracked.txt"), "before\n").unwrap();
+        git(&["-C", ws, "add", "."]).await.unwrap();
+        git(&[
+            "-C",
+            ws,
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-qm",
+            "baseline",
+        ])
+        .await
+        .unwrap();
+        let repository = deep_code_agent::IsolatedGit::new(workspace.path()).unwrap();
+        let marker = outside
+            .path()
+            .join("executed")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let program = format!("echo executed > '{marker}'; cat");
+        git(&["-C", ws, "config", "filter.evil.clean", &program])
+            .await
+            .unwrap();
+        std::fs::write(
+            workspace.path().join(".gitattributes"),
+            "*.txt filter=evil\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.path().join("tracked.txt"), "after\n").unwrap();
+        std::fs::write(workspace.path().join("new.txt"), "new\n").unwrap();
+        std::fs::write(workspace.path().join(".git/HEAD"), "invalid model head\n").unwrap();
+        std::fs::write(workspace.path().join(".git/index"), "invalid model index").unwrap();
+        let patch = extract_git_diff(repository).await.unwrap();
+        assert!(
+            patch.contains("-before") && patch.contains("+after") && patch.contains("+new"),
+            "{patch}"
+        );
+        assert!(!outside.path().join("executed").exists());
+        assert_eq!(
+            std::fs::read(workspace.path().join(".git/index")).unwrap(),
+            b"invalid model index"
+        );
+    }
 
     #[tokio::test]
     async fn transcript_copy_takes_sessions_and_leaves_checkpoints() {

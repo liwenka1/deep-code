@@ -1,6 +1,53 @@
 use super::*;
 
 #[test]
+fn a_live_store_cannot_be_redirected_to_another_workspaces_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let outside = root.path().join("outside");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let store = JsonSessionStore::for_workspace(&workspace).unwrap();
+    let external = JsonSessionStore::for_workspace(&outside).unwrap();
+    let mut record = SessionRecord::new(workspace.clone(), "original");
+    store.save(&mut record).unwrap();
+    let mut foreign = record.clone();
+    foreign.workspace = outside.clone();
+    external.save(&mut foreign).unwrap();
+    let foreign_path = outside
+        .join(".deep-code/sessions")
+        .join(format!("{}.json", record.id.as_str()));
+    let original_bytes = fs::read(&foreign_path).unwrap();
+    fs::rename(&workspace, root.path().join("previous")).unwrap();
+    if !crate::test_symlinks::symlink_dir_for_test(&outside, &workspace) {
+        return;
+    }
+    record.touch();
+    store.save(&mut record).unwrap();
+    assert_eq!(fs::read(&foreign_path).unwrap(), original_bytes);
+    assert_eq!(store.load(&record.id).unwrap().workspace, record.workspace);
+    store.delete(&record.id).unwrap();
+    assert_eq!(fs::read(foreign_path).unwrap(), original_bytes);
+}
+
+#[test]
+fn session_reads_refuse_leaf_symlinks() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let mut record = SessionRecord::new(workspace.path().to_path_buf(), "original");
+    store.save(&mut record).unwrap();
+    let filename = store.path_for(&record.id).unwrap();
+    let external = outside.path().join("session.json");
+    fs::rename(&filename, &external).unwrap();
+    if !crate::test_symlinks::symlink_file_for_test(&external, &filename) {
+        return;
+    }
+    assert!(store.load(&record.id).is_err());
+    assert!(store.list().unwrap().is_empty());
+}
+
+#[test]
 fn json_store_rejects_invalid_session_id() {
     let dir = tempfile::tempdir().unwrap();
     let store = JsonSessionStore::for_workspace(dir.path()).unwrap();

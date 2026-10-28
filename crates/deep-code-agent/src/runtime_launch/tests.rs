@@ -10,7 +10,7 @@ fn parent_tool_names<C: LlmClient + Clone + 'static>(
     let cancel = CancellationToken::new();
     let parts = LaunchParts::fresh(
         String::new(),
-        WorkspaceRoots::from(workspace),
+        WorkspaceRoots::from(crate::paths::canonicalize(workspace).unwrap()),
         SharedLang::default(),
         ProjectInstructions::default(),
         Arc::new(discover_in_workspace(workspace)),
@@ -431,6 +431,57 @@ fn resume_drops_a_signed_root_that_now_resolves_elsewhere() {
         "the drop must be surfaced: {:?}",
         launched.warnings
     );
+}
+
+#[test]
+fn rebuilding_does_not_regrant_redirected_process_roots() {
+    let workspace = tempfile::tempdir().unwrap();
+    let ws = crate::paths::canonicalize(workspace.path()).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let old = ws.join("approved");
+    std::fs::create_dir(&old).unwrap();
+    let record =
+        signed(SessionRecord::new(ws.clone(), "prompt").with_extra_roots(vec![old.clone()]));
+    std::fs::rename(&old, ws.join("previous-approved")).unwrap();
+    if !crate::test_symlinks::symlink_dir_for_test(outside.path(), &old) {
+        return;
+    }
+    for resume in [None, Some(record)] {
+        let launched = relaunch_runtime(
+            &AgentConfig::builtin(),
+            WorkspaceRoots::new(&ws, vec![old.clone()]),
+            resume,
+        )
+        .unwrap();
+        assert!(launched.extra_roots.is_empty());
+        assert!(
+            launched
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("dropping inherited write grant"))
+        );
+    }
+}
+
+#[test]
+fn rebuilding_refuses_a_redirected_primary_before_creating_host_state() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = crate::paths::canonicalize(root.path())
+        .unwrap()
+        .join("workspace");
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::rename(&workspace, root.path().join("previous")).unwrap();
+    if !crate::test_symlinks::symlink_dir_for_test(outside.path(), &workspace) {
+        return;
+    }
+    let result = relaunch_runtime(
+        &AgentConfig::builtin(),
+        WorkspaceRoots::new(workspace, vec![]),
+        None,
+    );
+    assert!(result.is_err());
+    assert!(!outside.path().join(".deep-code").exists());
 }
 
 /// A validly signed record copied VERBATIM into another workspace must not

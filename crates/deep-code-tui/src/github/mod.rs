@@ -259,8 +259,12 @@ fn prompt(label: &str) -> Result<String, String> {
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
+    expand_tilde_with_home(path, std::env::var_os("HOME"))
+}
+
+fn expand_tilde_with_home(path: &str, user_home: Option<std::ffi::OsString>) -> PathBuf {
     match path.strip_prefix("~/") {
-        Some(rest) => match std::env::var_os("HOME") {
+        Some(rest) => match user_home {
             Some(home) => PathBuf::from(home).join(rest),
             None => PathBuf::from(path),
         },
@@ -616,13 +620,10 @@ mod tests {
 
     #[test]
     fn tilde_expands_only_at_the_start() {
-        unsafe { std::env::set_var("HOME", "/home/test") };
-        assert_eq!(
-            expand_tilde("~/key.pem"),
-            PathBuf::from("/home/test/key.pem")
-        );
-        assert_eq!(expand_tilde("/abs/key.pem"), PathBuf::from("/abs/key.pem"));
-        assert_eq!(expand_tilde("rel/~/x.pem"), PathBuf::from("rel/~/x.pem"));
+        let expand = |path| expand_tilde_with_home(path, Some("/home/test".into()));
+        assert_eq!(expand("~/key.pem"), PathBuf::from("/home/test/key.pem"));
+        assert_eq!(expand("/abs/key.pem"), PathBuf::from("/abs/key.pem"));
+        assert_eq!(expand("rel/~/x.pem"), PathBuf::from("rel/~/x.pem"));
     }
 
     #[test]

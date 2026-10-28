@@ -118,7 +118,7 @@ pub fn build_tool_registry(
             .with_allow_irreversible(config.sandbox_allow_irreversible.clone()),
     );
     let mut job_store = JobStore::default();
-    let boundary = match WorkspacePolicy::new(roots.clone()) {
+    let boundary = match WorkspacePolicy::new_pinned(roots.clone()) {
         Ok(policy) => Some(policy),
         Err(error) => {
             warnings.push(format!("workspace tools disabled: {error}"));
@@ -220,13 +220,58 @@ pub fn runtime_system_prompt(
     format!("{base}\n\n{summary}")
 }
 
+/// Rebuild with grants already held by this process. Their canonical spelling
+/// is the approved identity, so resolving an old spelling to a new directory
+/// must narrow the grant set rather than act like a fresh `--add-dir`.
+pub fn relaunch_runtime(
+    config: &AgentConfig,
+    mut roots: WorkspaceRoots,
+    resume: Option<SessionRecord>,
+) -> std::io::Result<LaunchedRuntime> {
+    crate::pinned_dir::validate_pinned_workspace(&roots.primary)?;
+    let mut warnings = Vec::new();
+    roots.extras.retain(|root| {
+        match crate::paths::canonicalize(root) {
+            Ok(canonical) if canonical == *root && canonical.is_dir() => true,
+            _ => {
+                warnings.push(format!(
+                    "dropping inherited write grant {}: it is no longer the directory that was approved; re-grant with /add-dir if intended",
+                    root.display()
+                ));
+                false
+            }
+        }
+    });
+    let mut launched = launch_runtime_pinned(config, roots, resume);
+    launched.warnings.splice(0..0, warnings);
+    Ok(launched)
+}
+
 pub fn launch_runtime(
     config: &AgentConfig,
     roots: impl Into<WorkspaceRoots>,
     resume: Option<SessionRecord>,
 ) -> LaunchedRuntime {
-    let parent_cancel = CancellationToken::new();
     let mut roots = roots.into();
+    if let Ok(canonical) = crate::paths::canonicalize(&roots.primary) {
+        roots.primary = canonical;
+    }
+    // Fresh user input is resolved once. Subsequent construction checks this
+    // identity instead of authorizing whichever target a path later names.
+    for extra in &mut roots.extras {
+        if let Ok(canonical) = crate::paths::canonicalize(extra.as_path()) {
+            *extra = canonical;
+        }
+    }
+    launch_runtime_pinned(config, roots, resume)
+}
+
+fn launch_runtime_pinned(
+    config: &AgentConfig,
+    mut roots: WorkspaceRoots,
+    resume: Option<SessionRecord>,
+) -> LaunchedRuntime {
+    let parent_cancel = CancellationToken::new();
     // `--add-dir $(pwd)` and friends: an extra equal to the primary grants
     // nothing (the workspace is always writable) and would list the workspace
     // as its own "additional" root in the startup banner, summary and record.
@@ -439,8 +484,8 @@ fn prepare_persisted_session(
     roots: &WorkspaceRoots,
     system_prompt: &str,
 ) -> Result<(JsonSessionStore, SessionRecord), String> {
-    let store =
-        JsonSessionStore::for_workspace(&roots.primary).map_err(|error| error.to_string())?;
+    let store = JsonSessionStore::for_pinned_workspace(&roots.primary)
+        .map_err(|error| error.to_string())?;
     let mut record = SessionRecord::new(roots.primary.clone(), system_prompt)
         .with_extra_roots(roots.extras.clone());
     store.save(&mut record).map_err(|error| error.to_string())?;
@@ -556,8 +601,8 @@ fn launch_resumed(
             record.workspace.display(),
             caller_workspace.display()
         ));
-        record.workspace = caller_workspace;
     }
+    record.workspace = caller_workspace;
     // Does this record's grant list come from this host AND belong to this
     // workspace? Checked over the list as recorded — before the resolution pass
     // below removes anything — so that a since-deleted sibling repo costs only
@@ -689,10 +734,10 @@ fn launch_resumed(
     let skills = Arc::new(discover_in_workspace(&roots.primary));
     record.set_system_prompt(runtime_system_prompt(&roots, &instructions, &skills));
     let workspace = record.workspace.clone();
-    let store = match JsonSessionStore::for_workspace(&workspace) {
+    let store = match JsonSessionStore::for_pinned_workspace(&workspace) {
         Ok(store) => store,
         Err(error) => {
-            let mut launched = launch_runtime(config, roots, None);
+            let mut launched = launch_runtime_pinned(config, roots, None);
             launched
                 .warnings
                 .insert(0, format!("session store unavailable: {error}"));

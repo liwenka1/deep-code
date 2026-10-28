@@ -3011,6 +3011,67 @@ fn clear_carries_grants_into_the_new_session() {
 }
 
 #[test]
+fn runtime_rebuilds_drop_redirected_inherited_grants() {
+    for clear in [false, true] {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut app = App::launch(LaunchConfig {
+            workspace: Some(workspace.path().to_path_buf()),
+            ..LaunchConfig::default()
+        });
+        let old = app.workspace.join("approved");
+        std::fs::create_dir(&old).unwrap();
+        app.add_dir_command(old.to_str().unwrap());
+        assert_eq!(
+            app.extra_roots,
+            vec![deep_code_agent::canonicalize(&old).unwrap()]
+        );
+        std::fs::rename(&old, app.workspace.join("old-approved")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &old).unwrap();
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_dir(outside.path(), &old) {
+            if error.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("cannot create grant redirect: {error}");
+        }
+        if clear {
+            app.handle_slash_command("/clear");
+        } else {
+            app.relaunch_runtime().unwrap();
+        }
+        assert!(app.extra_roots.is_empty());
+        assert!(app.history.iter().any(|cell| matches!(cell,
+            HistoryCell::System { text } if text.contains("dropping inherited write grant")
+        )));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn redirected_primary_refuses_rebuild_clear_and_diff_without_touching_the_target() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir(&workspace).unwrap();
+    let mut app = App::launch(LaunchConfig {
+        workspace: Some(workspace.clone()),
+        ..LaunchConfig::default()
+    });
+    let runtime = Arc::clone(&app.runtime);
+    let session = app.session_id.clone();
+    std::fs::rename(&workspace, root.path().join("previous")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &workspace).unwrap();
+    assert!(app.relaunch_runtime().is_err());
+    app.start_new_conversation();
+    assert!(Arc::ptr_eq(&runtime, &app.runtime));
+    assert_eq!(app.session_id, session);
+    app.handle_slash_command("/diff");
+    assert!(!outside.path().join(".deep-code").exists());
+}
+
+#[test]
 fn switch_session_adopts_and_banners_the_records_grants() {
     let mut app = App::new();
     let extra = tempfile::tempdir().unwrap();
@@ -3086,14 +3147,15 @@ fn launch_surfaces_runtime_warnings_in_the_transcript() {
 /// never READ; this is the failure one step past that — read, then discarded.
 #[test]
 fn a_swap_that_degrades_keeps_its_warnings_after_the_transcript_is_rebuilt() {
-    let blocker = tempfile::NamedTempFile::new().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    // Keep the approved primary valid, while making persistence unavailable.
+    std::fs::write(directory.path().join(".deep-code"), "blocked").unwrap();
     let mut app = App::launch(LaunchConfig {
-        workspace: Some(blocker.path().join("workspace")),
+        workspace: Some(directory.path().to_path_buf()),
         ..LaunchConfig::default()
     });
 
-    // `/clear` relaunches into the same broken workspace, so the relaunch
-    // degrades exactly like the launch did.
+    // `/clear` relaunches with the same unavailable state directory.
     assert!(app.handle_slash_command("/clear"));
 
     let warnings: Vec<&str> = app
@@ -3107,7 +3169,7 @@ fn a_swap_that_degrades_keeps_its_warnings_after_the_transcript_is_rebuilt() {
     assert!(
         warnings
             .iter()
-            .any(|text| text.contains("workspace tools disabled")),
+            .any(|text| text.contains("session persistence unavailable")),
         "the rebuilt transcript dropped the swap's warnings: {warnings:?}"
     );
 }
@@ -3121,12 +3183,14 @@ fn a_swap_that_degrades_keeps_its_warnings_after_the_transcript_is_rebuilt() {
 /// left all 200 tests green. Three of the four points were unguarded.
 #[test]
 fn every_swap_path_delivers_its_warnings() {
-    let blocker = tempfile::NamedTempFile::new().unwrap();
-    let workspace = blocker.path().join("workspace");
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().canonicalize().unwrap();
+    std::fs::write(workspace.join(".deep-code"), "blocked").unwrap();
     let degraded = |app: &App| -> bool {
         app.history.iter().any(|cell| match cell {
             crate::history::HistoryCell::System { text } => {
-                text.contains("workspace tools disabled")
+                text.contains("session persistence unavailable")
+                    || text.contains("session store unavailable")
             }
             _ => false,
         })
@@ -3138,7 +3202,7 @@ fn every_swap_path_delivers_its_warnings() {
         ..LaunchConfig::default()
     });
     let record = deep_code_agent::SessionRecord::new(workspace.clone(), "system");
-    app.switch_session(record).ok();
+    app.switch_session(record).unwrap();
     assert!(degraded(&app), "/resume dropped the swap's warnings");
 
     // `/model` & friends — relaunch_runtime does NOT clear the transcript.
@@ -3147,14 +3211,14 @@ fn every_swap_path_delivers_its_warnings() {
         ..LaunchConfig::default()
     });
     app.history.clear();
-    app.relaunch_runtime().ok();
+    app.relaunch_runtime().unwrap();
     assert!(degraded(&app), "relaunch_runtime dropped its warnings");
 
     // ...and says it once, not once per relaunch: the cause is still true
     // after each swap, so the identical block was re-appended every time.
     let before = app.history.len();
-    app.relaunch_runtime().ok();
-    app.relaunch_runtime().ok();
+    app.relaunch_runtime().unwrap();
+    app.relaunch_runtime().unwrap();
     assert_eq!(
         app.history.len(),
         before,
@@ -4564,7 +4628,7 @@ async fn skill_cuts_a_body_longer_than_the_turn_budget_and_names_the_tool() {
 fn a_runtime_swap_adopts_the_notifications_setting() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new();
-    app.workspace = dir.path().to_path_buf();
+    app.workspace = deep_code_agent::canonicalize(dir.path()).unwrap();
     app.global_config_path = Some(dir.path().join("config.toml"));
     assert!(app.notifications_enabled, "the builtin default is on");
 
@@ -4764,7 +4828,7 @@ fn diff_command_shows_the_working_tree_and_untracked_files() {
     std::fs::write(repo.path().join("untracked.txt"), "?\n").unwrap();
 
     let mut app = App::new();
-    app.workspace = repo.path().to_path_buf();
+    app.workspace = deep_code_agent::canonicalize(repo.path()).unwrap();
     assert!(app.handle_slash_command("/diff"));
     let n = app.history.len();
     assert!(
