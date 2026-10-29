@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 use deep_code_agent::{Lang, PermissionMode, format_sessions_storage_note};
 
-use crate::headless::OutputFormat;
+use crate::headless::{
+    EXIT_FAILURE, EXIT_INTERRUPT, EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE, OutputFormat,
+};
 
 /// What the interactive TUI should open with. A bare `deep-code` starts
 /// fresh; resuming is opt-in, so stale context never leaks in by default.
@@ -216,11 +218,7 @@ pub fn parse_args() -> CliArgs {
 /// interactive and headless must never block on a keyboard.
 fn parse_print_args(mut args: Vec<String>) -> CliArgs {
     let prog = program_name();
-    let usage = format!(
-        "Usage: {prog} -p [PROMPT] [--output-format text|json|stream-json] \
-[--permission-mode default|accept_edits|auto|yolo] [--timeout SECS] [--verbose] \
-[--add-dir DIR]... [--new | -c | --resume <id>]"
-    );
+    let usage = format!("Usage: {prog} -p {}", print_flag_groups());
 
     let mut prompt: Option<String> = None;
     let mut intent = StartupIntent::New;
@@ -903,6 +901,35 @@ fn resolve_program_name(override_name: Option<String>, argv0: Option<String>) ->
         .unwrap_or_else(|| "deepcode".to_string())
 }
 
+/// The `-p` flag list, one group per line, in the order `--help` shows them.
+///
+/// One source for two surfaces: `--help` prints the groups on their own lines,
+/// and the usage line [`parse_print_args`] dumps on a bad argv joins them into
+/// one. They used to be written twice by hand and had drifted — `--help` was
+/// missing `--add-dir` and `[--new | -c | --resume ID]` and abbreviated the
+/// permission modes to `MODE`, so the help a user asked for was *less*
+/// complete than the help they got by mistyping a flag.
+const PRINT_FLAG_GROUPS: [&str; 4] = [
+    "[PROMPT] [--output-format text|json|stream-json]",
+    "[--permission-mode default|accept_edits|auto|yolo] [--timeout SECS]",
+    "[--verbose] [--add-dir DIR]...",
+    "[--new | -c | --resume ID]",
+];
+
+/// Every `-p` flag on one line: the error-path usage.
+fn print_flag_groups() -> String {
+    PRINT_FLAG_GROUPS.join(" ")
+}
+
+/// The `-p` exit codes, rendered from the constants the headless run actually
+/// returns, so the help cannot go on naming a code the process stopped using.
+fn print_exit_codes() -> String {
+    format!(
+        "exit {EXIT_OK} finished | {EXIT_FAILURE} error | {EXIT_USAGE} usage \
+| {EXIT_TIMEOUT} timeout | {EXIT_INTERRUPT} interrupt"
+    )
+}
+
 /// The `--help` body.
 ///
 /// English, like every other line this binary prints outside the TUI. It was
@@ -913,20 +940,32 @@ fn resolve_program_name(override_name: Option<String>, argv0: Option<String>) ->
 /// the CLI. The TUI stays bilingual; these are the command-line surfaces.
 fn usage_text() -> String {
     let prog = program_name();
-    [
+    let mut lines = vec![
         "Commands:".to_string(),
         format!("  {prog}                # new session"),
-        format!("  {prog} -c             # continue the latest session"),
+        format!("  {prog} -c             # continue the latest session in this workspace"),
         format!("  {prog} -r             # pick a session to resume"),
         format!(
             "  {prog} --add-dir DIR  # extra writable directory (repeatable; works with -p/serve, saved with the session)"
         ),
         format!(
-            "  {prog} -p \"PROMPT\"    # headless one-shot; reads stdin when no prompt is given, combines with -c/--resume"
+            "  {prog} -p \"PROMPT\"    # headless one-shot: the answer on stdout, diagnostics on stderr"
         ),
         format!(
-            "  {prog} -p [PROMPT] [--output-format text|json|stream-json] [--permission-mode MODE] [--timeout SECS] [--verbose]"
+            "                          #   piped stdin is attached as DATA below the instruction"
         ),
+        format!("                          #   {}", print_exit_codes()),
+    ];
+    // One group per line, the same groups the error path joins: a flag added
+    // to `PRINT_FLAG_GROUPS` appears here without anyone remembering to.
+    for (index, group) in PRINT_FLAG_GROUPS.iter().enumerate() {
+        if index == 0 {
+            lines.push(format!("  {prog} -p {group}"));
+        } else {
+            lines.push(format!("              {group}"));
+        }
+    }
+    lines.extend([
         format!("  {prog} github install [--with-app]   # install the CI bot into this repo (--print to preview)"),
         format!("  {prog} github status                 # show the CI bot's status"),
         format!("  {prog} doctor [--json]"),
@@ -935,8 +974,8 @@ fn usage_text() -> String {
         format!("  {prog} eval [--subset lite] [--sample N] [--parallel N] [--json] [--markdown]"),
         String::new(),
         format!("  {prog} --help | --version"),
-    ]
-    .join("\n")
+    ]);
+    lines.join("\n")
 }
 
 /// Usage on the error path: stderr, because the caller exits non-zero.

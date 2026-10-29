@@ -124,6 +124,7 @@ deepcode -p "..." --output-format stream-json    # NDJSON 逐事件,与 serve �
 - **审批姿态与 CI bot 相同**:会弹窗的调用一律自动拒绝、绝不挂起,每次拒绝在 stderr 打一行。放行能力用既有开关:`--permission-mode accept_edits|auto|yolo`、`approval.auto_allow`、`DEEP_CODE_APPROVAL_AUTO_ALLOW`——`auto` 档的 Flash 判官不需要人在场,无头下照常工作。deny 底板照旧不可越过。
 - **一个工具都不挂**:`DEEP_CODE_DISABLE_TOOLS=1`(除 `0`/`false`/`off`/`no` 之外的任意非空值)卸载全部工具——workspace、shell、联网、skills、`todo_write` 都不挂,这一轮就是纯聊天:请求里连工具 schema 都没有,模型没有可调的东西,`deepcode doctor` 显示 `tools: enabled=false`。桌宠就是靠它问问题、而不把文件系统交给模型。
 - **退出码**:`0` 完成 / `1` 出错 / `2` 用法错误 / `124` 超时(`--timeout SECS`)/ `130` Ctrl-C。
+- **用程序调用时要关掉 stdin**:以“继承但空闲”的 stdin 启动(守护进程、`spawn` 的 stdio 用默认值、不带 `-n` 的 `ssh`)时,macOS/Linux 上会先等最多 2 秒等数据,Windows 上则**直接挂住**——而且 `--timeout` 兜不住,因为这个读发生在计时开始之前。传 `/dev/null`(`stdio: ['ignore', 'pipe', 'pipe']`、`Stdio::null()`、`stdin=subprocess.DEVNULL`)即可:立即读到 EOF、零开销。真的带数据的管道不受影响——那些数据以 `--- stdin ---` 为分隔拼在指令下方,`git diff | deepcode -p "…"` 就是这样工作的。
 - 单发同样落会话:stderr 会给出 id,随时 `deepcode -c` 进 TUI 接着这条线聊。
 
 ## 在 CI 里用(GitHub Actions)

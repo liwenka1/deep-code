@@ -334,6 +334,86 @@ fn the_help_body_is_english_like_every_other_cli_line() {
     assert!(usage.contains("--add-dir"));
 }
 
+/// The `-p` flag list is rendered from `PRINT_FLAG_GROUPS` in `--help` and on
+/// the usage line a bad `-p` argv prints, so the two can no longer disagree;
+/// this pins the other half — that the help body still shows all of it.
+///
+/// It did not. `--help` carried a shorter `-p` line than the error path:
+/// `--add-dir` and `[--new | -c | --resume ID]` were missing and the
+/// permission modes were abbreviated to `MODE`, so the help a user asked for
+/// described less than the help they got by typing a flag wrong.
+#[test]
+fn the_help_body_shows_every_print_flag_group() {
+    let usage = usage_text();
+    for group in PRINT_FLAG_GROUPS {
+        assert!(
+            usage.contains(group),
+            "help drops the -p flag group {group}:\n{usage}"
+        );
+    }
+    for code in [
+        EXIT_OK,
+        EXIT_FAILURE,
+        EXIT_USAGE,
+        EXIT_TIMEOUT,
+        EXIT_INTERRUPT,
+    ] {
+        assert!(
+            usage.contains(&code.to_string()),
+            "help is missing exit code {code}:\n{usage}"
+        );
+    }
+}
+
+/// Every flag the `-p` help advertises has to parse, and every flag that
+/// parses has to be advertised — the second direction is what stops the help
+/// from teaching an invocation the binary rejects, which is how the `-p` line
+/// came to promise `stdin` semantics `input::compose_prompt` did not have.
+///
+/// `SAMPLES` is the only place that knows which flags take a value; the
+/// comparison is against `PRINT_FLAG_GROUPS`, so editing a group without the
+/// parser (or the parser without the group) fails here rather than in a
+/// user's terminal.
+#[test]
+fn every_documented_print_flag_parses() {
+    const SAMPLES: [(&str, &[&str]); 7] = [
+        ("--output-format", &["--output-format", "json"]),
+        ("--permission-mode", &["--permission-mode", "auto"]),
+        ("--timeout", &["--timeout", "60"]),
+        ("--verbose", &["--verbose"]),
+        ("--add-dir", &["--add-dir", env!("CARGO_MANIFEST_DIR")]),
+        ("--new", &["--new"]),
+        ("--resume", &["--resume", "session_9_0"]),
+    ];
+    for (name, row) in SAMPLES {
+        let mut argv = vec!["-p", "do it"];
+        argv.extend_from_slice(row);
+        // `parse_print_args` exits the process on an unknown flag, so reaching
+        // the assertion at all is the claim that the flag parses.
+        let print = print_args(&argv);
+        assert_eq!(
+            print.prompt.as_deref(),
+            Some("do it"),
+            "{name} swallowed the prompt"
+        );
+        assert!(
+            print_flag_groups().contains(name),
+            "{name} parses but the -p help never mentions it"
+        );
+    }
+    for token in print_flag_groups().split_whitespace() {
+        // Strips the brackets a group wraps a flag in (`[--new`, `--verbose`).
+        let name = token.trim_matches(|c: char| !(c == '-' || c.is_ascii_alphanumeric()));
+        if !name.starts_with("--") {
+            continue;
+        }
+        assert!(
+            SAMPLES.iter().any(|(known, _)| *known == name),
+            "{name} is advertised in the -p help but this test never proves it parses"
+        );
+    }
+}
+
 /// The npm package links `deepcode` and spawns `deepcode-bin`, so argv[0] names
 /// a command that is on nobody's PATH. Every usage line, `--version` and every
 /// "Try `… --help`" error printed it — the first lines a new user reads. The

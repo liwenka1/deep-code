@@ -24,12 +24,16 @@ use deep_code_agent::{
 use crate::cli::{PrintArgs, StartupIntent, program_name, workspace_root};
 use drive::DriveStatus;
 
-const EXIT_OK: i32 = 0;
-const EXIT_FAILURE: i32 = 1;
-const EXIT_USAGE: i32 = 2;
+/// The exit codes a `-p` run can end with. `pub(crate)` because `--help`
+/// renders them: they are the one piece of the headless contract that has to
+/// be in the help body, and a second hand-written copy of them there would be
+/// free to say something the process no longer does.
+pub(crate) const EXIT_OK: i32 = 0;
+pub(crate) const EXIT_FAILURE: i32 = 1;
+pub(crate) const EXIT_USAGE: i32 = 2;
 /// Conventional shell codes: 124 mirrors GNU `timeout`, 130 mirrors SIGINT.
-const EXIT_TIMEOUT: i32 = 124;
-const EXIT_INTERRUPT: i32 = 130;
+pub(crate) const EXIT_TIMEOUT: i32 = 124;
+pub(crate) const EXIT_INTERRUPT: i32 = 130;
 
 pub async fn run_print(args: PrintArgs) -> i32 {
     let has_positional = args

@@ -70,7 +70,10 @@ fn stdin_has_input_ready() -> bool {
 }
 
 /// Non-unix: no `poll(2)` here, so keep the historical behavior (read to end).
-/// The idle-pipe hang is a documented residual on Windows headless runs.
+/// The idle-pipe hang is a documented residual on Windows headless runs: the
+/// headless section of `README.md` tells wrapper authors to pass `/dev/null`,
+/// and says why `--timeout` cannot cover it — this read runs before the
+/// deadline is armed.
 #[cfg(not(unix))]
 fn stdin_has_input_ready() -> bool {
     true
