@@ -12,6 +12,9 @@ mod drive;
 mod input;
 mod output;
 
+#[cfg(test)]
+mod contract_docs;
+
 pub use output::OutputFormat;
 
 use std::collections::HashMap;

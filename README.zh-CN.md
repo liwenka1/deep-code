@@ -127,6 +127,40 @@ deepcode -p "..." --output-format stream-json    # NDJSON 逐事件,与 serve �
 - **用程序调用时要关掉 stdin**:以“继承但空闲”的 stdin 启动(守护进程、`spawn` 的 stdio 用默认值、不带 `-n` 的 `ssh`)时,macOS/Linux 上会先等最多 2 秒等数据,Windows 上则**直接挂住**——而且 `--timeout` 兜不住,因为这个读发生在计时开始之前。传 `/dev/null`(`stdio: ['ignore', 'pipe', 'pipe']`、`Stdio::null()`、`stdin=subprocess.DEVNULL`)即可:立即读到 EOF、零开销。真的带数据的管道不受影响——那些数据以 `--- stdin ---` 为分隔拼在指令下方,`git diff | deepcode -p "…"` 就是这样工作的。
 - 单发同样落会话:stderr 会给出 id,随时 `deepcode -c` 进 TUI 接着这条线聊。
 
+### 从别的程序里驱动它
+
+`-p` 就是个普通命令:spawn 它、读 stdout、按 `status` 分支。加 `--output-format json` 时 stdout 恰好是一个对象,包装器可以依赖的是下面这张表,而不是它周围的文字。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `status` | string | `finished` / `cancelled` / `timeout` / `error`——唯一该拿来分支的字段 |
+| `result` | string | 答案;`status` 不是 `finished` 时为空 |
+| `reasoning` | string | 本轮的思考文本,模型没输出时为空 |
+| `error` | string (optional) | 恰好当 `status` 不是 `finished` 时出现 |
+| `session_id` | string (optional) | 存下来,用于接着这条线继续 |
+| `denied_approvals` | number | 因为没人在场批准而被自动拒绝的工具调用数 |
+| `duration_ms` | number | 本轮墙钟耗时 |
+| `cost` | object (optional) | `{ usd, cny }` |
+| `usage` | object (optional) | token 计数 |
+
+- **字段只增不改、不改义**:后续版本可能多出新键;这里写过的内容不会改变含义,除非抬这份契约的版本号(目前是 `1`)。
+- **按 `status` 判定,不要看退出码**:被取消的一轮退出码是 `1` 而不是 `124`——退出码说的是进程怎么结束,`status` 说的才是这一轮发生了什么。退出码见上面的无头小节。
+- **包装器里绝不要用 `-c`**:它的含义是"*本工作区*最新的会话",两个调用并发抢它会互相认领对方的线程。用默认的 `--new` 起步,存下 `session_id`,再用 `--resume <id>` 续。
+- **`denied_approvals > 0` 不是"答案不好"**:有工具因为没人在场批准而被拒绝,重试会以同样方式失败——要么放宽 `--permission-mode` / `approval.auto_allow`,要么把这个拒绝报出去。
+- **spawn 时关掉 stdin**——见上一条:继承但空闲的管道在 macOS/Linux 上白等 2 秒,在 Windows 上挂住。
+- `telemetry` 也会跟着输出,但那是诊断用的 blob,不属于这份契约。
+
+想让你写集成的那个 agent 也知道这些,把下面这段粘进它读的指令文件(`AGENTS.md`、`.cursor/rules` 等):
+
+```text
+Calling deep-code headless: spawn `deepcode -p "<instruction>" --timeout 300 --output-format json`
+and branch on `.status`. `.result` is the answer; `.error` says why when it is not "finished".
+`.denied_approvals > 0` means a tool was refused for want of a human — do not retry, fix the
+permission posture. Start with `--new` and keep `.session_id`; never `-c` (workspace-wide latest,
+races). Close stdin when spawning: an idle inherited pipe costs 2s on macOS/Linux, hangs on
+Windows. `deepcode --help` lists the current flags.
+```
+
 ## 在 CI 里用(GitHub Actions)
 
 给任意仓库装一个 `/deepcode` 机器人:评论 → 改代码 → 开草稿 PR → 回帖。一条命令:

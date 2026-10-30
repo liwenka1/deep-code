@@ -909,7 +909,10 @@ fn resolve_program_name(override_name: Option<String>, argv0: Option<String>) ->
 /// missing `--add-dir` and `[--new | -c | --resume ID]` and abbreviated the
 /// permission modes to `MODE`, so the help a user asked for was *less*
 /// complete than the help they got by mistyping a flag.
-const PRINT_FLAG_GROUPS: [&str; 4] = [
+///
+/// `pub(crate)` only so `contract_docs` can hold the README's flag list to the
+/// same set of flags the parser accepts.
+pub(crate) const PRINT_FLAG_GROUPS: [&str; 4] = [
     "[PROMPT] [--output-format text|json|stream-json]",
     "[--permission-mode default|accept_edits|auto|yolo] [--timeout SECS]",
     "[--verbose] [--add-dir DIR]...",

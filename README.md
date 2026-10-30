@@ -127,6 +127,40 @@ deepcode -p "..." --output-format stream-json    # NDJSON, same envelopes as the
 - **Close stdin when you spawn it**: an *inherited but idle* stdin — a daemon, a `spawn` that left stdio at its default, `ssh` without `-n` — makes the run wait up to 2 s for data on macOS/Linux and **hang on Windows**, and `--timeout` does not cover it, because that read happens before the deadline is armed. Pass `/dev/null` (`stdio: ['ignore', 'pipe', 'pipe']`, `Stdio::null()`, `stdin=subprocess.DEVNULL`): it reads EOF at once and costs nothing. A pipe that *does* carry data is unaffected — that data rides below the instruction after a `--- stdin ---` marker, which is how `git diff | deepcode -p "…"` works.
 - One-shot runs persist a session too: stderr prints the id, and `deepcode -c` picks the thread up interactively any time.
 
+### Driving it from another program
+
+`-p` is a plain command: spawn it, read stdout, branch on `status`. With `--output-format json` stdout is exactly one object, and the table below — not the prose around it — is what a wrapper may rely on.
+
+| field | type | notes |
+| --- | --- | --- |
+| `status` | string | `finished` / `cancelled` / `timeout` / `error` — the field to branch on |
+| `result` | string | the answer; empty unless `status` is `finished` |
+| `reasoning` | string | the turn's reasoning text, empty when the model emitted none |
+| `error` | string (optional) | present exactly when `status` is not `finished` |
+| `session_id` | string (optional) | persist it to continue this thread |
+| `denied_approvals` | number | tool calls auto-denied because nobody was there to approve |
+| `duration_ms` | number | wall clock for the turn |
+| `cost` | object (optional) | `{ usd, cny }` |
+| `usage` | object (optional) | token counts |
+
+- **Fields are added, never renamed or repurposed.** A new key may appear in a later release; nothing documented here changes meaning without a bump of this contract's version, which is `1`.
+- **Decide by `status`, not by the exit code.** A cancelled turn exits `1`, not `124`: the exit code says how the process ended, `status` says what happened to the turn. The codes are listed in the headless section above.
+- **Never use `-c` in a wrapper.** It means "the latest session in *this workspace*", so two calls racing on it adopt each other's thread. Start with `--new` (the default), keep `session_id`, continue with `--resume <id>`.
+- **`denied_approvals > 0` is not a bad answer.** A tool was refused because no human was there to approve it, and retrying fails the same way — widen `--permission-mode` or `approval.auto_allow`, or report the refusal.
+- **Close stdin when you spawn it** — see the bullet above: an inherited idle pipe costs 2 s on macOS/Linux and hangs on Windows.
+- `telemetry` also rides along as a diagnostic blob; it is not part of this contract.
+
+To let the agent writing your integration know all of this, paste the block below into the instruction file it reads (`AGENTS.md`, `.cursor/rules`, …):
+
+```text
+Calling deep-code headless: spawn `deepcode -p "<instruction>" --timeout 300 --output-format json`
+and branch on `.status`. `.result` is the answer; `.error` says why when it is not "finished".
+`.denied_approvals > 0` means a tool was refused for want of a human — do not retry, fix the
+permission posture. Start with `--new` and keep `.session_id`; never `-c` (workspace-wide latest,
+races). Close stdin when spawning: an idle inherited pipe costs 2s on macOS/Linux, hangs on
+Windows. `deepcode --help` lists the current flags.
+```
+
 ## Use it in CI (GitHub Actions)
 
 Give any repository a `/deepcode` bot — comment → edit code → open a draft PR → reply in the thread — with one command:
