@@ -6,6 +6,10 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [0.4.20] - 2026-10-30
+
+- The `--help` text for `-p` now shows the complete flag list, generated from the same list the parser accepts instead of a hand-written copy that had drifted: it was missing `--add-dir` and the `[--new | -c | --resume ID]` session choice and abbreviated the permission modes to `MODE`, so the help a user asked for was less complete than the usage line a mistyped flag printed.
+
 ## [0.4.19] - 2026-10-28
 
 - **Security:** `/diff`, eval patch extraction and the agent's own Git use now run against an isolated Git environment instead of the host repository's — metadata is kept outside the workspace and refused if it resolves inside it, only whitelisted file-content settings are imported, the source objects are read-only alternates, and system/global config, hooks, fsmonitor, clean filters, submodule recursion and lazy fetch are all disabled, so a repository's config, hooks or filters can no longer run code or shape what deep-code reads.
@@ -404,3 +408,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.4.17]: https://github.com/liwenka1/deep-code/compare/v0.4.16...v0.4.17
 [0.4.18]: https://github.com/liwenka1/deep-code/compare/v0.4.17...v0.4.18
 [0.4.19]: https://github.com/liwenka1/deep-code/compare/v0.4.18...v0.4.19
+[0.4.20]: https://github.com/liwenka1/deep-code/compare/v0.4.19...v0.4.20
