@@ -193,6 +193,24 @@ fn resolve_for_write_leaves_the_disk_untouched() {
 }
 
 #[test]
+fn write_paths_with_trailing_directory_markers_are_rejected() {
+    let (_dir, root) = canonical_tempdir();
+    let policy = WorkspacePolicy::new(root.clone()).unwrap();
+    for raw in ["newdir/", "newdir/."] {
+        let error = policy
+            .resolve_for_write(raw, "write_file")
+            .expect_err("a directory spelling must not become a file target");
+        assert!(
+            error
+                .to_string()
+                .contains("must name a file, not a directory"),
+            "the rejection should explain the path kind: {error}"
+        );
+    }
+    assert!(!root.join("newdir").exists());
+}
+
+#[test]
 fn absolute_path_outside_all_roots_is_rejected() {
     let (_a, primary) = canonical_tempdir();
     let (_b, extra) = canonical_tempdir();

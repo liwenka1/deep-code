@@ -24,12 +24,13 @@ pub const DEEPSEEK_FLASH: &str = "deepseek-flash";
 /// Pseudo-model: lets the turn router pick pro/flash per prompt.
 pub const AUTO_MODEL: &str = "auto";
 
-/// Context window assumed for an id the catalog does not know — a
-/// `Passthrough` model. That can be a model newer than this binary OR an older
-/// id pinned from a config, so this is a guess and not a claim about the model.
+/// Conservative context window used for an id the catalog does not know — a
+/// `Passthrough` model. A one-million-token fallback let an unlisted local or
+/// proxy model receive requests far beyond its real limit before compaction;
+/// 128k is a safer ceiling until the provider/catalog supplies an exact value.
 /// Every catalog entry carries its own window in `assets/models.toml`; this is
 /// only the fallback.
-pub const DEFAULT_CONTEXT_WINDOW: u32 = 1_000_000;
+pub const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
 
 /// Per-model token pricing in both billing currencies.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -284,9 +285,8 @@ pub(crate) fn builtin_registry() -> &'static ModelRegistry {
     &REGISTRY
 }
 
-/// Context window for `model`: the catalog entry's own window, or
-/// [`DEFAULT_CONTEXT_WINDOW`] — a guess, not a claim about the model — when the
-/// id is not in the catalog.
+/// Context window for `model`: the catalog entry's own window, or the
+/// conservative [`DEFAULT_CONTEXT_WINDOW`] when the id is not in the catalog.
 #[must_use]
 pub fn context_window_for_model(model: &str) -> u32 {
     builtin_registry()
@@ -546,7 +546,8 @@ mod tests {
             compaction_threshold_for_model(DEEPSEEK_V4_PRO),
             window / 100 * 80
         );
-        // Ids the catalog does not know fall back to the default window.
+        // Ids the catalog does not know use the conservative fallback rather
+        // than claiming the largest first-party window.
         assert_eq!(context_window_for_model("mystery"), DEFAULT_CONTEXT_WINDOW);
     }
 }

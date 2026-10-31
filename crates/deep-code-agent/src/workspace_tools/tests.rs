@@ -226,6 +226,31 @@ async fn list_dir_returns_structured_entries() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn list_dir_reports_size_without_read_permission() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("write_only.txt");
+    fs::write(&path, "secret").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o200)).unwrap();
+    if fs::read(&path).is_ok() {
+        return;
+    }
+
+    let result = run(tmp.path(), "list_dir", json!({"path": "."})).await;
+    let output: Value = serde_json::from_str(&result.content).unwrap();
+    let entry = output["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "write_only.txt")
+        .expect("the unreadable file must still be listed");
+    assert_eq!(entry["kind"], "file");
+    assert_eq!(entry["size_bytes"], 6);
+}
+
 /// A directory with more than `MAX_LIST_ENTRIES` children is capped: the window
 /// is the first `MAX_LIST_ENTRIES` names, and the result reports the true total
 /// so the caller knows to narrow — without paying a `metadata()` per entry or

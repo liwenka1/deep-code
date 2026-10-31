@@ -1,6 +1,11 @@
+use std::ffi::OsString;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
+
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
+use cap_std::fs::{Dir, OpenOptions};
 
 use crate::tool::ToolError;
 
@@ -76,7 +81,67 @@ pub(crate) enum RootGrantOutcome {
     AlreadyGranted { canonical: PathBuf },
 }
 
+/// A path whose parent directory is held open as a capability. Keeping the
+/// parent handle for the whole tool call removes the final ambient-path race:
+/// replacing an intermediate directory after validation cannot redirect a
+/// later read or write.
+pub(crate) struct SafePath {
+    path: PathBuf,
+    parent: Dir,
+    leaf: OsString,
+}
+
+impl SafePath {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn symlink_metadata(&self) -> std::io::Result<cap_std::fs::Metadata> {
+        self.parent.symlink_metadata(&self.leaf)
+    }
+
+    pub(crate) fn metadata(&self) -> std::io::Result<cap_std::fs::Metadata> {
+        // `metadata` must not open the target: a FIFO would block until a
+        // writer appears. The parent capability makes this no-follow stat
+        // race-safe, and callers reject non-regular file types before reading.
+        self.parent.symlink_metadata(&self.leaf)
+    }
+
+    pub(crate) fn open_read(&self) -> std::io::Result<cap_std::fs::File> {
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No).nonblock(true);
+        self.parent.open_with(&self.leaf, &options)
+    }
+
+    pub(crate) fn read_to_string(&self) -> std::io::Result<String> {
+        let mut file = self.open_read()?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        Ok(contents)
+    }
+
+    pub(crate) fn read_bytes(&self) -> std::io::Result<Vec<u8>> {
+        let mut file = self.open_read()?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn replace(&self, content: &[u8]) -> std::io::Result<()> {
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .follow(FollowSymlinks::No)
+            .nonblock(true);
+        let mut file = self.parent.open_with(&self.leaf, &options)?;
+        file.write_all(content)
+    }
+}
+
 impl WorkspacePolicy {
+    #[allow(dead_code)]
     pub(crate) fn new(roots: impl Into<WorkspaceRoots>) -> Result<Self, ToolError> {
         Self::new_inner(roots.into(), false)
     }
@@ -169,6 +234,7 @@ impl WorkspacePolicy {
 
     /// A point-in-time [`WorkspaceRoots`] view (for summaries, prompts, and
     /// approval previews that want the value shape).
+    #[allow(dead_code)]
     pub(crate) fn to_roots(&self) -> WorkspaceRoots {
         WorkspaceRoots {
             primary: self.primary.clone(),
@@ -344,11 +410,201 @@ impl WorkspacePolicy {
         Ok(canonical)
     }
 
+    /// Open an existing path through directory capabilities rather than by
+    /// reusing the checked ambient path. Every directory component is opened
+    /// with `open_dir_nofollow`, and the leaf is opened with
+    /// `FollowSymlinks::No`, so a link planted after `resolve_existing` cannot
+    /// redirect the read outside the granted root.
+    pub(crate) fn open_existing(&self, raw: &str, tool_name: &str) -> Result<SafePath, ToolError> {
+        let path = self.resolve_existing(raw, tool_name)?;
+        self.open_existing_path(&path, tool_name)
+    }
+
+    /// Capability-backed equivalent of [`Self::open_existing`] for a path
+    /// already produced by a directory walk.
+    pub(crate) fn open_existing_path(
+        &self,
+        path: &Path,
+        tool_name: &str,
+    ) -> Result<SafePath, ToolError> {
+        let canonical = crate::paths::canonicalize(path).map_err(|error| {
+            ToolError::exec_failed(
+                tool_name,
+                format!("failed to resolve {}: {error}", self.relative_display(path)),
+            )
+        })?;
+        if !self.is_granted(&canonical) {
+            return Err(path_error(
+                tool_name,
+                &path.to_string_lossy(),
+                OUTSIDE_ROOTS,
+            ));
+        }
+        let (root, relative) = self.root_relative(&canonical, tool_name)?;
+        let (parent, leaf) = self.open_parent(&root, &relative, false, tool_name)?;
+        let handle = SafePath {
+            path: canonical,
+            parent,
+            leaf,
+        };
+        Ok(handle)
+    }
+
+    pub(crate) fn open_existing_dir(
+        &self,
+        raw: &str,
+        tool_name: &str,
+    ) -> Result<(PathBuf, Dir), ToolError> {
+        let path = self.resolve_existing(raw, tool_name)?;
+        let (root, relative) = self.root_relative(&path, tool_name)?;
+        let mut directory = crate::pinned_dir::open_canonical(&root).map_err(|error| {
+            ToolError::exec_failed(
+                tool_name,
+                format!("failed to open workspace root {}: {error}", root.display()),
+            )
+        })?;
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Err(path_error(
+                    tool_name,
+                    raw,
+                    "path contains an invalid component",
+                ));
+            };
+            directory = directory.open_dir_nofollow(name).map_err(|error| {
+                ToolError::exec_failed(
+                    tool_name,
+                    format!("failed to open {}: {error}", self.relative_display(&path)),
+                )
+            })?;
+        }
+        if !directory
+            .dir_metadata()
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false)
+        {
+            return Err(invalid(tool_name, "path is not a directory"));
+        }
+        Ok((path, directory))
+    }
+
+    /// Prepare a write target without touching the filesystem. Execution uses
+    /// [`Self::prepare_write_target`] so the missing parent chain is created
+    /// component by component under a capability handle.
+    pub(crate) fn prepare_write_target(
+        &self,
+        raw: &str,
+        tool_name: &str,
+    ) -> Result<SafePath, ToolError> {
+        let candidate = self.resolve_for_write(raw, tool_name)?;
+        let (root, relative) = self.root_relative(&candidate, tool_name)?;
+        let (parent, leaf) = self
+            .open_parent(&root, &relative, true, tool_name)
+            .map_err(|error| self.write_parent_failure(&candidate, tool_name, error))?;
+        Ok(SafePath {
+            path: candidate,
+            parent,
+            leaf,
+        })
+    }
+
+    fn write_parent_failure(
+        &self,
+        candidate: &Path,
+        tool_name: &str,
+        error: ToolError,
+    ) -> ToolError {
+        let parent = candidate.parent().unwrap_or(candidate);
+        let diagnosis = if contains_symlink(parent, &self.granted_roots()).unwrap_or(false) {
+            " (symlinks in the destination path are not allowed)"
+        } else if first_file_segment(parent).is_some() {
+            " (a file already exists on that path, so the directory cannot be created)"
+        } else {
+            ""
+        };
+        ToolError::exec_failed(
+            tool_name,
+            format!(
+                "failed to create destination directory {}: {}{}",
+                self.relative_display(parent),
+                error.message(),
+                diagnosis
+            ),
+        )
+    }
+
+    fn root_relative(&self, path: &Path, tool_name: &str) -> Result<(PathBuf, PathBuf), ToolError> {
+        let root = self
+            .granted_roots()
+            .into_iter()
+            .filter(|candidate| path.starts_with(candidate))
+            .max_by_key(|candidate| candidate.components().count())
+            .ok_or_else(|| path_error(tool_name, &path.to_string_lossy(), OUTSIDE_ROOTS))?;
+        let relative = path
+            .strip_prefix(&root)
+            .map(Path::to_path_buf)
+            .map_err(|_| path_error(tool_name, &path.to_string_lossy(), OUTSIDE_ROOTS))?;
+        Ok((root, relative))
+    }
+
+    fn open_parent(
+        &self,
+        root: &Path,
+        relative: &Path,
+        create_missing: bool,
+        tool_name: &str,
+    ) -> Result<(Dir, OsString), ToolError> {
+        let mut components = relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(name.to_os_string()),
+                _ => None,
+            });
+        let leaf = components
+            .next_back()
+            .ok_or_else(|| invalid(tool_name, "path must name a file inside a granted root"))?;
+        let mut directory = crate::pinned_dir::open_canonical(root).map_err(|error| {
+            ToolError::exec_failed(
+                tool_name,
+                format!("failed to open workspace root {}: {error}", root.display()),
+            )
+        })?;
+        for name in components {
+            match directory.open_dir_nofollow(&name) {
+                Ok(next) => directory = next,
+                Err(error) if create_missing && error.kind() == std::io::ErrorKind::NotFound => {
+                    directory.create_dir(&name).map_err(|create_error| {
+                        ToolError::exec_failed(
+                            tool_name,
+                            format!("failed to create destination directory: {create_error}"),
+                        )
+                    })?;
+                    directory = directory.open_dir_nofollow(&name).map_err(|open_error| {
+                        ToolError::exec_failed(
+                            tool_name,
+                            format!("failed to open destination directory: {open_error}"),
+                        )
+                    })?;
+                }
+                Err(error) => {
+                    return Err(ToolError::exec_failed(
+                        tool_name,
+                        format!("failed to open destination directory: {error}"),
+                    ));
+                }
+            }
+        }
+        Ok((directory, leaf))
+    }
+
     pub(crate) fn resolve_for_write(
         &self,
         raw: &str,
         tool_name: &str,
     ) -> Result<PathBuf, ToolError> {
+        if has_trailing_directory_marker(raw) {
+            return Err(invalid(tool_name, "path must name a file, not a directory"));
+        }
         let candidate = self.prepare_candidate(raw, tool_name)?;
         // `symlink_metadata`, NOT `exists()`: the latter follows symlinks, so a
         // symlink whose target does not exist yet reported `false` and fell to
@@ -415,15 +671,15 @@ impl WorkspacePolicy {
         // write must leave no trace — missing parents used to be created
         // right here, which meant rendering the approval panel planted
         // directories the user then declined. Execution creates them via
-        // [`Self::prepare_for_write`] after the decision.
+        // [`Self::prepare_write_target`] after the decision.
         // `symlink_metadata`, not `exists()`: the latter FOLLOWS links, so a
         // dangling one answers "absent" and this walk climbs straight past the
         // very entry `contains_symlink` below is meant to judge. That is the
         // exact predicate, in this exact function, whose `exists()` spelling
         // 45 lines up is documented as a past write-through — safe here today
-        // only because `create_dir_all` in `prepare_for_write` happens to
-        // re-fail with EEXIST on a dangling link, which is an accident of
-        // std's internals and nothing this file controls.
+        // only because the capability-backed parent walk in
+        // [`Self::prepare_write_target`] refuses every non-directory
+        // component, including a link planted after this check.
         let mut existing = parent;
         while existing.symlink_metadata().is_err() {
             match existing.parent() {
@@ -461,69 +717,19 @@ impl WorkspacePolicy {
         Ok(candidate)
     }
 
-    /// [`Self::resolve_for_write`] plus the one side effect execution needs:
-    /// missing parent directories are created rather than refused. A coding
-    /// agent adds new modules constantly, and failing `write_file` on
-    /// `src/new_mod/thing.rs` forced the model into a separate, separately
-    /// approved `mkdir -p` for a directory the write tool was already
-    /// authorized to create.
-    ///
-    /// Kept out of resolution itself so that preview/approval can resolve the
-    /// same path without leaving anything on disk (see the note inside
-    /// [`Self::resolve_for_write`]). Only the executing tool calls this.
+    /// Test helper for the capability-backed write preparation. Production
+    /// writes call [`Self::prepare_write_target`] directly so they retain the
+    /// parent handle through the final open.
+    #[cfg(test)]
     pub(crate) fn prepare_for_write(
         &self,
         raw: &str,
         tool_name: &str,
     ) -> Result<PathBuf, ToolError> {
         let candidate = self.resolve_for_write(raw, tool_name)?;
-        // The disk can change between the resolve above and the mkdir below.
-        // That same-instant window existed when the mkdir lived inside
-        // resolution and is inherited, not widened, by the split; it is also
-        // not closable from here — the missing segments could not be
-        // canonicalized at check time precisely because they did not exist.
-        if let Some(parent) = candidate.parent() {
-            // No exists() pre-check: create_dir_all already succeeds on an
-            // existing directory, and a gate here would only read like a
-            // semantic guard while widening the race window above.
-            fs::create_dir_all(parent).map_err(|error| {
-                // Two failures reach here, and neither errno reads as its own
-                // cause: a symlink planted or dangling among the segments
-                // resolution vetted as merely missing, and an ordinary FILE
-                // sitting where a directory has to go. Name whichever it is,
-                // so the model learns the rule instead of retrying into word
-                // salad.
-                //
-                // Not one shared errno, as this note used to claim. The
-                // symlink is EEXIST(17); the file is EEXIST only when it
-                // blocks at the FINAL segment of `parent`, and ENOTDIR(20)
-                // whenever it blocks further up — which is the shape
-                // `prepare_for_write_names_the_file_blocking_the_directory`
-                // actually builds. Unreadable either way, which is the point.
-                //
-                // `unwrap_or(false)` on the probe: if the inspection itself
-                // fails we do not know, and guessing "symlink" would be a
-                // false accusation — the bare OS error is the honest fallback.
-                let diagnosis = if contains_symlink(parent, &self.granted_roots()).unwrap_or(false)
-                {
-                    " (symlinks in the destination path are not allowed)"
-                } else if first_file_segment(parent).is_some() {
-                    " (a file already exists on that path, so the directory cannot be created)"
-                } else {
-                    ""
-                };
-                ToolError::exec_failed(
-                    tool_name,
-                    format!(
-                        "failed to create destination directory {}: {error}{diagnosis}",
-                        // Workspace-relative, like every sibling error in this
-                        // module — this one was the last to spell an absolute
-                        // host path into a model-facing message.
-                        self.relative_display(parent)
-                    ),
-                )
-            })?;
-        }
+        let (root, relative) = self.root_relative(&candidate, tool_name)?;
+        self.open_parent(&root, &relative, true, tool_name)
+            .map_err(|error| self.write_parent_failure(&candidate, tool_name, error))?;
         Ok(candidate)
     }
 
@@ -680,8 +886,9 @@ fn stattable_segments(path: &Path) -> impl Iterator<Item = (usize, PathBuf)> + '
 }
 
 /// The first ancestor segment of `path` that exists and is NOT a directory —
-/// the plain file blocking a `create_dir_all`. `None` when nothing on the path
-/// is a non-directory, which is the ordinary case for every other failure.
+/// the plain file blocking component-by-component parent creation. `None` when
+/// nothing on the path is a non-directory, which is the ordinary case for
+/// every other failure.
 fn first_file_segment(path: &Path) -> Option<PathBuf> {
     for (_, current) in stattable_segments(path) {
         match fs::symlink_metadata(&current) {
@@ -724,6 +931,13 @@ pub(crate) fn contains_symlink(path: &Path, skip: &[PathBuf]) -> std::io::Result
 
 fn path_error(tool_name: &str, raw: &str, message: &str) -> ToolError {
     invalid(tool_name, format!("invalid path '{raw}': {message}"))
+}
+
+fn has_trailing_directory_marker(raw: &str) -> bool {
+    raw == "."
+        || raw.ends_with('/')
+        || raw.ends_with("/.")
+        || cfg!(windows) && (raw.ends_with('\\') || raw.ends_with("\\."))
 }
 
 #[cfg(test)]

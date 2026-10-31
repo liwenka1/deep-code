@@ -1,5 +1,3 @@
-use std::fs;
-
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use regex::RegexBuilder;
@@ -114,8 +112,22 @@ impl ReadFileTool {
             .max_lines
             .unwrap_or(DEFAULT_READ_LINES)
             .clamp(1, MAX_READ_LINES);
-        let path = self.root.resolve_existing(&params.path, Self::NAME)?;
-        let metadata = fs::metadata(&path).map_err(|error| {
+        let handle =
+            self.root
+                .open_existing(&params.path, Self::NAME)
+                .map_err(|error| match error {
+                    ToolError::ExecutionFailed { message, .. } => ToolError::exec_failed(
+                        Self::NAME,
+                        format!(
+                            "{} could not be read: {message}",
+                            self.root
+                                .relative_display(std::path::Path::new(&params.path))
+                        ),
+                    ),
+                    other => other,
+                })?;
+        let path = handle.path().to_path_buf();
+        let metadata = handle.metadata().map_err(|error| {
             ToolError::exec_failed(
                 Self::NAME,
                 format!(
@@ -136,7 +148,7 @@ impl ReadFileTool {
                 ),
             ));
         }
-        let contents = fs::read_to_string(&path).map_err(|error| {
+        let contents = handle.read_to_string().map_err(|error| {
             // Name the cause, and use the workspace-relative spelling. One
             // `map_err` covered both "the bytes are not UTF-8" and every IO
             // failure, so a permission error came back as "failed to read X as
@@ -251,10 +263,7 @@ impl ListDirTool {
 
     fn list_sync(&self, params: ListDirParams) -> Result<ToolOutput, ToolError> {
         let path_arg = params.path.as_deref().unwrap_or(".");
-        let path = self.root.resolve_existing(path_arg, Self::NAME)?;
-        if !path.is_dir() {
-            return Err(invalid(Self::NAME, "path is not a directory"));
-        }
+        let (path, directory) = self.root.open_existing_dir(path_arg, Self::NAME)?;
         // Collect the raw entries first: a readdir yields names without a stat,
         // so a directory with a huge number of children is capped BEFORE paying
         // one `metadata()` per entry and before serialising a JSON array large
@@ -262,7 +271,8 @@ impl ListDirTool {
         // ONCE here, so the sort compares precomputed keys instead of cloning the
         // name twice per comparison — the difference between O(n) and O(n·log n)
         // allocations on a directory whose size is the whole reason for the cap.
-        let raw = fs::read_dir(&path)
+        let raw = directory
+            .entries()
             .map_err(|error| {
                 ToolError::exec_failed(
                     Self::NAME,
@@ -272,7 +282,7 @@ impl ListDirTool {
                     ),
                 )
             })?
-            .collect::<Result<Vec<fs::DirEntry>, _>>()
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|error| {
                 ToolError::exec_failed(
                     Self::NAME,
@@ -282,7 +292,7 @@ impl ListDirTool {
         let total = raw.len();
         // Sort by name so the retained window is stable and alphabetical; within
         // one directory name order equals the path order the output used before.
-        let mut keyed: Vec<(std::ffi::OsString, fs::DirEntry)> = raw
+        let mut keyed: Vec<(std::ffi::OsString, cap_std::fs::DirEntry)> = raw
             .into_iter()
             .map(|entry| (entry.file_name(), entry))
             .collect();
@@ -307,12 +317,20 @@ impl ListDirTool {
                 } else {
                     "other"
                 };
-                let metadata = entry.metadata().ok();
+                let metadata = if file_type.is_file() {
+                    directory
+                        .symlink_metadata(entry.file_name())
+                        .ok()
+                        .filter(|metadata| metadata.is_file())
+                } else {
+                    None
+                };
+                let entry_path = path.join(entry.file_name());
                 Ok(json!({
                     "name": entry.file_name().to_string_lossy(),
-                    "path": self.root.relative_display(&entry.path()),
+                    "path": self.root.relative_display(&entry_path),
                     "kind": kind,
-                    "size_bytes": metadata.as_ref().map(fs::Metadata::len),
+                    "size_bytes": metadata.as_ref().map(|metadata| metadata.len()),
                 }))
             })
             .collect::<Result<Vec<_>, ToolError>>()?;
@@ -558,14 +576,22 @@ impl GrepFilesTool {
                     continue;
                 }
             }
-            // `entry.metadata()` reuses the walker's own stat instead of a
-            // third follow-the-path traversal. It is an lstat for the tree
-            // walk; the one exception is a search rooted AT a file, where
-            // `WalkBuilder` forces `follow_links` on regardless of our
-            // setting. Harmless either way — the two checks above already
-            // established this entry is a plain file, and `search_path` came
-            // out of `resolve_existing` symlink-free.
-            let Ok(metadata) = entry.metadata() else {
+            // The walker's path is only an enumeration hint. Re-open it from
+            // the approved root with no-follow capabilities before reading or
+            // even trusting its size; otherwise an intermediate directory
+            // swapped after the walk could redirect this in-process tool.
+            let safe = match self.root.open_existing_path(path, Self::NAME) {
+                Ok(safe) => safe,
+                Err(_) => {
+                    skipped_unreadable += 1;
+                    push_capped(
+                        &mut skipped_unreadable_paths,
+                        self.root.relative_display(path),
+                    );
+                    continue;
+                }
+            };
+            let Ok(metadata) = safe.metadata() else {
                 skipped_unreadable += 1;
                 push_capped(
                     &mut skipped_unreadable_paths,
@@ -581,7 +607,7 @@ impl GrepFilesTool {
                 );
                 continue;
             }
-            let contents = match fs::read_to_string(path) {
+            let contents = match safe.read_to_string() {
                 Ok(contents) => contents,
                 // `InvalidData` is "not UTF-8" — a PNG, not a permission
                 // problem. Filed together they produced an unanswerable list:
@@ -748,52 +774,20 @@ impl GrepFilesTool {
     }
 }
 
-/// `fs::write` with `O_NOFOLLOW` where the platform has it: a symlink at the
-/// final component fails the open instead of being written through.
+/// Legacy syscall helper kept for the focused regression test below. Runtime
+/// writes use the capability-backed [`crate::workspace_policy::SafePath`]
+/// instead, which protects every component rather than only the leaf.
 ///
 /// `create_new` is not usable here either way, because overwriting an existing
 /// file is the tool's normal job.
 ///
-/// On Windows the guarantee is currently the resolve-time `symlink_metadata`
-/// check alone. Stated as the status quo rather than as an impossibility: an
-/// earlier wording claimed Windows "has no equivalent flag", which overstates
-/// it — `OpenOptionsExt::custom_flags` feeds `dwFlagsAndAttributes`, and
-/// `FILE_FLAG_OPEN_REPARSE_POINT` (0x0020_0000) does suppress reparse-point
-/// traversal. Not adopted here because the exact failure mode interacts with
-/// `FILE_FLAG_BACKUP_SEMANTICS` and nobody has run it on Windows; it is a
-/// candidate, not a closed question.
-/// Refuse a destination that exists but is not a regular file or a symlink — a
-/// directory, FIFO, socket or device node.
-///
-/// Opening a FIFO for read or write BLOCKS until the other end is opened, so a
-/// `write_file`/`apply_patch` at a FIFO path would hang the blocking-pool thread
-/// (and the turn) forever with no timeout. `read_file` already guards this; the
-/// write tools did not. A symlink is deliberately left to the caller's own
-/// `O_NOFOLLOW` / symlink handling, which reports it precisely.
-fn refuse_non_regular_file(
-    tool_name: &str,
-    relative: &str,
-    path: &std::path::Path,
-) -> Result<(), ToolError> {
-    if let Ok(meta) = path.symlink_metadata() {
-        let kind = meta.file_type();
-        if !kind.is_file() && !kind.is_symlink() {
-            return Err(invalid(
-                tool_name,
-                format!(
-                    "{relative} exists but is not a regular file (a directory, FIFO, socket \
-                     or device); refusing to touch it"
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
+/// The production path is platform-independent through `cap_std`; this helper
+/// only documents and pins the Unix primitive used by the historical test.
+#[cfg(test)]
 fn write_no_follow(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
-    let mut options = fs::OpenOptions::new();
+    let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
@@ -804,19 +798,17 @@ fn write_no_follow(path: &std::path::Path, content: &[u8]) -> std::io::Result<()
     options.open(path)?.write_all(content)
 }
 
-/// [`write_no_follow`]'s failure, mapped to a message that names the rule.
+/// A no-follow write failure, mapped to a message that names the rule.
 ///
-/// `O_NOFOLLOW` refuses a symlinked final component with `ELOOP`, whose stock
-/// text is "Too many levels of symbolic links" — for a *single* link. Handed
-/// that bare, the model reads a loop it must have built rather than the
+/// A no-follow open refuses a symlinked final component with `ELOOP`, whose
+/// stock text is "Too many levels of symbolic links" — for a *single* link.
+/// Handed that bare, the model reads a loop it must have built rather than the
 /// boundary it just hit, and retries into word salad. This is the same
-/// unreadable-errno problem [`WorkspacePolicy::prepare_for_write`] grew a
-/// diagnosis for; the write leaf gets the matching half.
+/// unreadable-errno problem the workspace parent walk grew a diagnosis for;
+/// the write leaf gets the matching half.
 ///
-/// Only the last component is in question: resolution already refused a
-/// symlink that was there beforehand, and an intermediate loop would have
-/// failed the canonicalize before this open. So `ELOOP` here means the leaf,
-/// and it means the race — which is exactly what the caller needs told.
+/// The capability-backed runtime path applies this rule to every component;
+/// the legacy test helper below only exercises the leaf primitive.
 /// Chars of unified diff a write tool carries in its UI `details`. Past this
 /// the transcript would be scrolling a rewrite, not showing an edit; the head
 /// is kept and the record says it was cut.
@@ -974,35 +966,42 @@ impl WriteFileTool {
         // `prepare_`, not `resolve_`: execution is the one place allowed to
         // create missing parent directories — preview/approval resolve the
         // same path side-effect-free.
-        let path = self.root.prepare_for_write(&params.path, Self::NAME)?;
+        let target = self.root.prepare_write_target(&params.path, Self::NAME)?;
+        let path = target.path().to_path_buf();
         // Refuse a FIFO/socket/device/dir destination before opening it: writing
         // to a FIFO blocks the thread until a reader appears, hanging the turn.
-        refuse_non_regular_file(Self::NAME, &self.root.relative_display(&path), &path)?;
+        if let Ok(metadata) = target.symlink_metadata() {
+            let kind = metadata.file_type();
+            if kind.is_symlink() {
+                return Err(invalid(
+                    Self::NAME,
+                    "symlinks in the destination path are not allowed",
+                ));
+            }
+            if !kind.is_file() {
+                return Err(invalid(
+                    Self::NAME,
+                    format!(
+                        "{} exists but is not a regular file (a directory, FIFO, socket or device); refusing to touch it",
+                        self.root.relative_display(&path)
+                    ),
+                ));
+            }
+        }
         // What is there now, for the diff the UI shows after the write. Read
         // before the write and only for the record: a file that is missing is
         // a new file, one that is unreadable or past the read cap simply gets
         // no diff — this must never turn a writable path into a failed write.
-        let before = match fs::metadata(&path) {
+        let before = match target.metadata() {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
-            Ok(metadata) if metadata.len() <= MAX_FILE_BYTES => fs::read(&path)
+            Ok(metadata) if metadata.len() <= MAX_FILE_BYTES => target
+                .read_bytes()
                 .ok()
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
             _ => None,
         };
-        let new_file = !path.exists();
-        // `fs::write` opens `O_CREAT|O_WRONLY|O_TRUNC` and FOLLOWS a symlink at
-        // the final component. Resolution rejects a symlink that is already
-        // there, but it cannot rule out one planted in the window between that
-        // check and this open — and planting it is an ordinary permitted write
-        // inside a granted root, while these tools run in-process where no
-        // sandbox sees them. `O_NOFOLLOW` states the refusal to the kernel, so
-        // the leaf half of that race closes regardless of timing. The same
-        // lock `jobs::create_spill_file` already uses.
-        //
-        // It does NOT cover a directory symlink planted at an intermediate
-        // segment — `O_NOFOLLOW` only inspects the last component — which
-        // stays the residue described in `prepare_for_write`.
-        write_no_follow(&path, params.content.as_bytes()).map_err(|error| {
+        let new_file = target.symlink_metadata().map(|_| false).unwrap_or(true);
+        target.replace(params.content.as_bytes()).map_err(|error| {
             write_failed(Self::NAME, &self.root.relative_display(&path), &error)
         })?;
         let display = self.root.relative_display(&path);
@@ -1073,12 +1072,24 @@ impl ApplyPatchTool {
                 "old and new are identical; no change intended",
             ));
         }
-        let path = self.root.resolve_existing(&params.path, Self::NAME)?;
+        let target = self.root.open_existing(&params.path, Self::NAME)?;
+        let path = target.path().to_path_buf();
         // Reading a FIFO blocks until a writer appears; refuse a non-regular
-        // target before `read_to_string` can hang the turn (see
-        // `refuse_non_regular_file`). `resolve_existing` guarantees it exists.
-        refuse_non_regular_file(Self::NAME, &self.root.relative_display(&path), &path)?;
-        let contents = fs::read_to_string(&path).map_err(|error| {
+        // target before `read_to_string` can hang the turn. The capability
+        // handle is checked and then reused for the eventual replacement.
+        let metadata = target.metadata().map_err(|error| {
+            ToolError::exec_failed(
+                Self::NAME,
+                format!(
+                    "failed to read metadata for {}: {error}",
+                    self.root.relative_display(&path)
+                ),
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(invalid(Self::NAME, "path is not a regular file"));
+        }
+        let contents = target.read_to_string().map_err(|error| {
             // Name the cause, and use the workspace-relative spelling. One
             // `map_err` covered both "the bytes are not UTF-8" and every IO
             // failure, so a permission error came back as "failed to read X as
@@ -1126,15 +1137,14 @@ impl ApplyPatchTool {
             replacement,
             &contents[located.end..]
         );
-        // `write_no_follow`, not `fs::write`, for the reason spelled out at
-        // `WriteFileTool::write_sync` — and here the window is WIDER, not
-        // narrower: `resolve_existing` above is followed by a read, a fuzzy
-        // `locate_match`, and a CRLF pass before this open, all of which a
-        // concurrent `job` can outlive. `apply_patch` is the same
+        // The capability handle, not an ambient path, is used here. The window
+        // is WIDER, not narrower: the existing file is followed by a read, a
+        // fuzzy `locate_match`, and a CRLF pass before this open, all of which
+        // a concurrent `job` can outlive. `apply_patch` is the same
         // `ToolKind::WriteFile` as `write_file` and auto-approves under
         // `accept_edits`, so leaving it on the following open made the lock on
         // its twin decorative.
-        write_no_follow(&path, updated.as_bytes()).map_err(|error| {
+        target.replace(updated.as_bytes()).map_err(|error| {
             write_failed(Self::NAME, &self.root.relative_display(&path), &error)
         })?;
         Ok(ToolOutput::text(json_string(json!({

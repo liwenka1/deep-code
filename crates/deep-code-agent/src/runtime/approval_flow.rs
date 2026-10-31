@@ -683,7 +683,7 @@ impl AgentRuntime {
     /// boundary so absolute paths into mid-session grants resolve too.
     pub(super) fn approval_preview(&self, call: &ToolCall) -> Option<String> {
         let boundary = self.boundary.as_ref()?;
-        crate::approval_preview::build_approval_preview(call, &boundary.to_roots(), self.ui_lang())
+        crate::approval_preview::build_approval_preview_with_policy(call, boundary, self.ui_lang())
     }
 
     /// Prompt-time triage of a call about to be parked for approval. For a

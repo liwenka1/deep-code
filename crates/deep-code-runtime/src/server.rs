@@ -18,11 +18,12 @@ use axum::{Json, middleware};
 use deep_code_agent::{
     AgentConfig, ApprovalDecision, ApprovalRequest, JsonSessionStore, LaunchedRuntime,
     RuntimeEvent, SessionId, SessionRecord, SessionStore, TurnId, launch_runtime,
-    neutralize_display_text, now_ms, unattended_denial_note,
+    neutralize_display_text, unattended_denial_note,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, oneshot};
+use uuid::Uuid;
 
 use crate::auth::{RUNTIME_TOKEN_ENV, token_matches};
 use crate::events::{EnvelopeStream, RuntimeEnvelope};
@@ -513,7 +514,10 @@ async fn prompt_sse(
         return Err(ApiError::bad_request("prompt must not be empty"));
     }
     let prompt = body.prompt;
-    let thread_id = format!("prompt_{}", now_ms());
+    // Millisecond timestamps collide when two requests arrive in the same
+    // tick. A unique request id keeps active-turn ownership and SSE item ids
+    // unambiguous even under concurrent clients.
+    let thread_id = format!("prompt_{}", Uuid::new_v4());
 
     let active_turn_lease = acquire_active_turn(&state, &thread_id)?;
     let lease_turn_id = Arc::clone(&active_turn_lease.turn_id);

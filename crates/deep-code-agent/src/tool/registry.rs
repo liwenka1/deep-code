@@ -56,8 +56,12 @@ impl ToolRegistry {
     /// run for typed tools) is computed once here, not per request.
     pub fn register_erased(&mut self, tool: Arc<dyn ErasedTool>) {
         let spec = tool.spec();
-        self.tools
-            .insert(spec.name.clone(), RegisteredTool { spec, tool });
+        let name = spec.name.clone();
+        assert!(
+            !self.tools.contains_key(&name),
+            "duplicate tool name '{name}' registered; refusing to overwrite the existing tool"
+        );
+        self.tools.insert(name, RegisteredTool { spec, tool });
     }
 
     /// Fixture registry for tests (including `deep-code-runtime`'s, which is why
@@ -70,6 +74,15 @@ impl ToolRegistry {
     }
 
     pub fn extend(&mut self, other: ToolRegistry) {
+        if let Some(name) = other
+            .tools
+            .keys()
+            .find(|name| self.tools.contains_key(*name))
+        {
+            panic!(
+                "duplicate tool name '{name}' while extending a registry; refusing to overwrite the existing tool"
+            );
+        }
         self.tools.extend(other.tools);
     }
 
@@ -213,5 +226,34 @@ impl ToolRegistry {
             .execute(call, &cx)
             .await
             .map(|result| ToolRunOutcome::Result { result })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_registration_is_rejected_instead_of_overwritten() {
+        let mut registry = ToolRegistry::new();
+        registry.register(MockEchoTool);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.register(MockEchoTool);
+        }));
+        assert!(panic.is_err(), "duplicate tool names must fail fast");
+        assert_eq!(registry.specs().len(), 1);
+    }
+
+    #[test]
+    fn duplicate_extension_is_rejected_instead_of_overwritten() {
+        let mut registry = ToolRegistry::new();
+        registry.register(MockEchoTool);
+        let mut other = ToolRegistry::new();
+        other.register(MockEchoTool);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.extend(other);
+        }));
+        assert!(panic.is_err(), "duplicate tool names must fail fast");
+        assert_eq!(registry.specs().len(), 1);
     }
 }

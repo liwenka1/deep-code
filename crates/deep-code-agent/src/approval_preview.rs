@@ -6,7 +6,6 @@
 //! the current workspace state, and attach it to the
 //! [`crate::tool::ApprovalRequest`] before it reaches the UI.
 
-use std::fs;
 use std::path::Path;
 
 use serde_json::Value;
@@ -26,9 +25,24 @@ const NEW_FILE_HEAD_LINES: usize = 20;
 /// Best-effort preview: `None` means "nothing to add beyond the arguments"
 /// (unknown tool, unresolvable path, malformed args) — approval proceeds with
 /// the raw-argument display as before.
+#[allow(dead_code)]
 pub(crate) fn build_approval_preview(
     call: &ToolCall,
     roots: &WorkspaceRoots,
+    lang: Lang,
+) -> Option<String> {
+    let policy = WorkspacePolicy::new(roots.clone()).ok()?;
+    build_approval_preview_with_policy(call, &policy, lang)
+}
+
+/// Build a preview against the live policy already used by the runtime. The
+/// roots overload above remains convenient for isolated callers/tests, but a
+/// runtime must not reconstruct a policy after a root path has been swapped:
+/// doing so could make the preview read from a new directory the session never
+/// approved.
+pub(crate) fn build_approval_preview_with_policy(
+    call: &ToolCall,
+    policy: &WorkspacePolicy,
     lang: Lang,
 ) -> Option<String> {
     match call.name.as_str() {
@@ -45,40 +59,43 @@ pub(crate) fn build_approval_preview(
             // would reject — and never rejects paths the execution would
             // accept, which is what a single-root policy would do to an
             // `--add-dir` write.
-            let policy = WorkspacePolicy::new(roots.clone()).ok()?;
             let path = policy.resolve_for_write(rel, "write_file").ok()?;
-            Some(write_file_preview(&path, content, lang))
+            Some(write_file_preview(policy, &path, content, lang))
         }
         _ => None,
     }
 }
 
-fn write_file_preview(path: &Path, content: &str, lang: Lang) -> String {
-    if !path.exists() {
-        let total = content.lines().count();
-        let mut out = format!(
-            "{}\n",
-            tr_with(
-                lang,
-                TextId::PreviewNewFile,
-                &[("total", &total.to_string())]
-            )
-        );
-        for line in content.lines().take(NEW_FILE_HEAD_LINES) {
-            out.push_str("+ ");
-            out.push_str(line);
-            out.push('\n');
+fn write_file_preview(policy: &WorkspacePolicy, path: &Path, content: &str, lang: Lang) -> String {
+    let handle = match policy.open_existing_path(path, "write_file") {
+        Ok(handle) => handle,
+        Err(_) if path.symlink_metadata().is_err() => {
+            let total = content.lines().count();
+            let mut out = format!(
+                "{}\n",
+                tr_with(
+                    lang,
+                    TextId::PreviewNewFile,
+                    &[("total", &total.to_string())]
+                )
+            );
+            for line in content.lines().take(NEW_FILE_HEAD_LINES) {
+                out.push_str("+ ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            if total > NEW_FILE_HEAD_LINES {
+                out.push_str(&tr_with(
+                    lang,
+                    TextId::PreviewMoreLines,
+                    &[("count", &(total - NEW_FILE_HEAD_LINES).to_string())],
+                ));
+            }
+            return clamp_preview(&out, lang);
         }
-        if total > NEW_FILE_HEAD_LINES {
-            out.push_str(&tr_with(
-                lang,
-                TextId::PreviewMoreLines,
-                &[("count", &(total - NEW_FILE_HEAD_LINES).to_string())],
-            ));
-        }
-        return clamp_preview(&out, lang);
-    }
-    match fs::metadata(path) {
+        Err(_) => return tr(lang, TextId::PreviewReadFail).to_string(),
+    };
+    match handle.metadata() {
         Ok(metadata) if metadata.len() > MAX_SOURCE_BYTES => {
             // The number comes from the same constant that decided the refusal
             // one line up. It used to be baked into the locale string, so this
@@ -95,7 +112,7 @@ fn write_file_preview(path: &Path, content: &str, lang: Lang) -> String {
         Err(_) => return tr(lang, TextId::PreviewReadFail).to_string(),
         Ok(_) => {}
     }
-    match fs::read_to_string(path) {
+    match handle.read_to_string() {
         Ok(existing) => {
             let diff = unified_diff(&existing, content);
             if diff.trim().is_empty() {
@@ -161,6 +178,7 @@ fn clamp_preview(preview: &str, lang: Lang) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
 
     fn call(name: &str, arguments: Value) -> ToolCall {
         ToolCall::new("call_1", name, arguments)
