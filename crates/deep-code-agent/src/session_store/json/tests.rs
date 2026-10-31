@@ -118,7 +118,7 @@ fn a_copied_session_file_does_not_write_back_to_the_original() {
 }
 
 #[test]
-fn json_store_round_trips_extra_roots_and_defaults_them_on_old_files() {
+fn json_store_rejects_old_schema_files() {
     let dir = tempfile::tempdir().unwrap();
     let extra = tempfile::tempdir().unwrap();
     let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
@@ -131,70 +131,29 @@ fn json_store_round_trips_extra_roots_and_defaults_them_on_old_files() {
     let loaded = store.load(&record.id).unwrap();
     assert_eq!(loaded.extra_roots, vec![extra.path().to_path_buf()]);
 
-    // A v2 file written before the field existed loads with no grants
-    // (serde default), not an error.
+    // A v2 file written before the authenticated format is no longer accepted
+    // during the pre-release hard cutover.
     let mut legacy = serde_json::to_value(&record).unwrap();
     legacy.as_object_mut().unwrap().remove("extra_roots");
+    legacy.as_object_mut().unwrap().remove("record_mac");
+    legacy["schema_version"] = serde_json::json!(2);
     legacy["id"] = serde_json::json!("session_7_0");
     let path = dir
         .path()
         .join(".deep-code/sessions")
         .join("session_7_0.json");
     std::fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
-    let pre_field = store.load(&SessionId("session_7_0".to_string())).unwrap();
-    assert!(pre_field.extra_roots.is_empty());
-}
-
-#[test]
-fn json_store_migrates_v1_files_on_load() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
-    let v1_json = serde_json::json!({
-        "schema_version": 1,
-        "id": "session_1_0",
-        "workspace": dir.path(),
-        "created_at_ms": 1,
-        "updated_at_ms": 2,
-        "config": {
-            "base_url": "https://api.deepseek.com/beta",
-            "model": "deepseek-v4-pro",
-            "timeout_secs": 60,
-            "api_key_present": false
-        },
-        "messages": [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": "", "tool_calls": [{
-                "id": "c1", "type": "function",
-                "function": {"name": "shell", "arguments": "{}"}
-            }]}
-            // interrupted: no tool message — the migration leaves a
-            // pending exchange instead of requiring a repair pass
-        ],
-        "turns": []
-    });
-    let path = dir
-        .path()
-        .join(".deep-code/sessions")
-        .join("session_1_0.json");
-    std::fs::write(&path, serde_json::to_string_pretty(&v1_json).unwrap()).unwrap();
-
-    let mut loaded = store.load(&SessionId("session_1_0".to_string())).unwrap();
-    assert_eq!(loaded.schema_version, super::SESSION_SCHEMA_VERSION);
-    assert_eq!(loaded.entries.len(), 3);
-    assert_eq!(loaded.preview(), "hi");
-
-    // Saving writes the file back as v2; reloading stays stable.
-    store.save(&mut loaded).unwrap();
-    let reloaded = store.load(&loaded.id).unwrap();
-    assert_eq!(reloaded.entries, loaded.entries);
+    assert!(matches!(
+        store.load(&SessionId("session_7_0".to_string())),
+        Err(SessionStoreError::UnsupportedSchema { found: 2, .. })
+    ));
 }
 
 #[test]
 fn json_store_rejects_future_schema() {
     let dir = tempfile::tempdir().unwrap();
     let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
-    let future = serde_json::json!({"schema_version": 3, "id": "session_9_0"});
+    let future = serde_json::json!({"schema_version": 4, "id": "session_9_0"});
     let path = dir
         .path()
         .join(".deep-code/sessions")
@@ -203,7 +162,7 @@ fn json_store_rejects_future_schema() {
 
     assert!(matches!(
         store.load(&SessionId("session_9_0".to_string())),
-        Err(SessionStoreError::UnsupportedSchema { found: 3, .. })
+        Err(SessionStoreError::UnsupportedSchema { found: 4, .. })
     ));
 }
 
@@ -223,6 +182,104 @@ fn json_store_list_sorts_by_updated_at_desc() {
     let listed = store.list().unwrap();
     assert_eq!(listed.len(), 2);
     assert_eq!(listed[0].id, newer.id);
+}
+
+#[test]
+fn json_store_list_skips_a_record_with_a_forged_timestamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
+    store.save(&mut record).unwrap();
+    let path = store.path_for(&record.id).unwrap();
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    json["updated_at_ms"] = serde_json::json!(u64::MAX);
+    fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+    assert!(
+        store.list().unwrap().is_empty(),
+        "a timestamp edit must not make a forged session the latest"
+    );
+}
+
+#[test]
+fn json_store_refuses_an_oversized_session_before_parsing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    let id = SessionId("session_oversized".to_string());
+    let path = store.path_for(&id).unwrap();
+    fs::write(
+        &path,
+        vec![b'x'; usize::try_from(MAX_SESSION_FILE_BYTES + 1).unwrap()],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        store.load(&id),
+        Err(SessionStoreError::TooLarge { .. })
+    ));
+    assert!(store.list().unwrap().is_empty());
+}
+
+#[test]
+fn json_store_list_keeps_only_the_newest_bounded_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    for index in 0..(MAX_SESSION_LIST + 8) {
+        let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
+        record.updated_at_ms = index as u64;
+        store.save(&mut record).unwrap();
+    }
+
+    let listed = store.list().unwrap();
+    assert_eq!(listed.len(), MAX_SESSION_LIST);
+    assert_eq!(listed[0].updated_at_ms, (MAX_SESSION_LIST + 7) as u64);
+    assert_eq!(listed.last().unwrap().updated_at_ms, 8);
+}
+
+#[test]
+fn json_store_list_keeps_an_older_resumable_session_ahead_of_newer_empty_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+
+    let mut resumable = SessionRecord::new(dir.path().to_path_buf(), "system");
+    resumable.updated_at_ms = 1;
+    resumable.entries.push(std::sync::Arc::new(
+        crate::session_entry::SessionEntry::user("continue me"),
+    ));
+    let resumable_id = resumable.id.clone();
+    store.save(&mut resumable).unwrap();
+
+    for index in 0..MAX_SESSION_LIST {
+        let mut empty = SessionRecord::new(dir.path().to_path_buf(), "system");
+        empty.updated_at_ms = (index + 2) as u64;
+        store.save(&mut empty).unwrap();
+    }
+
+    let listed = store.list().unwrap();
+    assert_eq!(listed.len(), MAX_SESSION_LIST);
+    assert!(listed.iter().any(|record| record.id == resumable_id));
+}
+
+#[test]
+fn json_store_rejects_unresumable_writes_without_replacing_the_previous_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
+    store.save(&mut record).unwrap();
+    let path = store.path_for(&record.id).unwrap();
+    let previous = fs::read(&path).unwrap();
+
+    for _ in 0..=MAX_SESSION_ENTRIES {
+        record.entries.push(std::sync::Arc::new(
+            crate::session_entry::SessionEntry::user("entry"),
+        ));
+    }
+    assert!(matches!(
+        store.save(&mut record),
+        Err(SessionStoreError::TooManyEntries { .. })
+    ));
+    assert_eq!(fs::read(path).unwrap(), previous);
 }
 
 /// The state directory holds full conversation transcripts and the log, and

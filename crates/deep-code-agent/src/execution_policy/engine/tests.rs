@@ -1825,20 +1825,22 @@ fn an_exemption_does_not_match_another_commands_free_text() {
     assert!(!floor_gated(&allow_push, "git push --force origin main"));
 }
 
-/// Known miss, accepted and pinned so it is a stated boundary rather than an
-/// assumed coverage: a leading global option that takes a value moves the verb
-/// out of the position the rule reads. Modelling each program's option arity is
-/// a parser, not a floor, and `SECURITY.md` says this in as many words.
+/// Common leading options must not move an irreversible verb out of the floor's
+/// view. Boolean flags are skipped and value-taking options consume their value
+/// before the subcommand is inspected.
 #[test]
-fn a_leading_option_that_takes_a_value_is_a_known_miss() {
+fn leading_options_do_not_hide_irreversible_subcommands() {
     let policy = ExecPolicy::default();
-    assert!(
-        !floor_gated(&policy, "kubectl -n prod delete pod api"),
-        "the verb is out of position: documented, not covered"
-    );
-    // The same command with the option after the verb IS covered, so the miss is
-    // about position and not about `kubectl delete` being absent from the list.
-    assert!(floor_gated(&policy, "kubectl delete -n prod pod api"));
+    for command in [
+        "kubectl -n prod delete pod api",
+        "kubectl --namespace prod drain node/worker",
+        "npm -s publish",
+        "pnpm -r publish",
+        "yarn --silent publish",
+        "gh --repo owner/repo pr merge 1",
+    ] {
+        assert!(floor_gated(&policy, command), "{command:?}");
+    }
 }
 
 /// The interactive modes reach a push and a test suite the same way: a human

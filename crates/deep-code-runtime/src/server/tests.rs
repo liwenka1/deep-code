@@ -421,6 +421,7 @@ fn tool_calling_state(autonomous_approvals: bool) -> AppState {
         handle: Arc::new(runtime),
         backend_label: "scripted".to_string(),
         session_id: None,
+        resume_record: None,
         subagent_manager: Arc::new(std::sync::RwLock::new(
             deep_code_agent::SubAgentManager::new(2),
         )),

@@ -2136,8 +2136,8 @@ fn completion_menu_neutralizes_hostile_filenames() {
 /// Both resume-picker sanitizations were unpinned: deleting either the row
 /// title's filter or the storage-note's left all 200 tests green. Session
 /// records live at `<workspace>/.deep-code/sessions`, inside the tree the
-/// model can write, and `list()` validates only the FILENAME — never the
-/// body — so both fields are model-reachable.
+/// model can write, and `list()` keeps only host-authenticated records, so
+/// both fields remain safe before they reach the picker.
 #[test]
 fn resume_picker_neutralizes_every_model_reachable_field() {
     use ratatui::Terminal;

@@ -196,8 +196,8 @@ fn run_picker(sessions: &[SessionRecord], lang: Lang) -> Result<StartupChoice> {
                     // Same rule, same reason, as the in-app twin in
                     // `ui::render::render_resume_picker`: session records live
                     // at `<workspace>/.deep-code/sessions`, inside the tree the
-                    // model can write, `list()` validates only the FILENAME and
-                    // never the record body, and `session_title` builds this row
+                    // model can write, `list()` keeps only host-authenticated
+                    // records, and `session_title` builds this row
                     // with `split_whitespace`, which keeps `\x1b` intact. This
                     // copy runs on a real backend before `App` exists — it is
                     // the first thing the user sees — and was left unsanitized

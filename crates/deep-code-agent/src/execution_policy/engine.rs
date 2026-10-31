@@ -320,8 +320,14 @@ fn options_taking_a_value(program: &str) -> &'static [&'static str] {
             "--otp",
             "--registry",
             "--access",
+            "--prefix",
+            "--userconfig",
+            "--cache",
+            "--globalconfig",
+            "--loglevel",
             "-w",
             "--workspace",
+            "-C",
         ],
         "cargo" => &[
             "--registry",
@@ -331,7 +337,25 @@ fn options_taking_a_value(program: &str) -> &'static [&'static str] {
             "--package",
             "--config",
         ],
-        "kubectl" | "helm" => &["-n", "--namespace", "-l", "--selector", "--context"],
+        "kubectl" | "helm" => &[
+            "-n",
+            "--namespace",
+            "-l",
+            "--selector",
+            "--context",
+            "--kubeconfig",
+            "--server",
+            "--token",
+            "--as",
+            "--as-group",
+            "--as-uid",
+            "--cache-dir",
+            "--certificate-authority",
+            "--client-certificate",
+            "--client-key",
+            "--cluster",
+            "--user",
+        ],
         "terraform" => &["-var", "-var-file", "-target"],
         "aws" => &["--profile", "--region", "--exclude", "--include"],
         "twine" | "poetry" => &["-r", "--repository", "-u", "--username", "-p", "--password"],
@@ -364,6 +388,31 @@ const GIT_GLOBAL_OPTIONS_WITH_VALUE: &[&str] = &[
     "--super-prefix",
     "--attr-source",
 ];
+
+/// The global options of the package/deployment tools whose next word is a
+/// value. Unknown options are still skipped as one word; this catches the
+/// common boolean flags without pretending to be a complete CLI parser.
+fn subcommand_index_after_options(program: &str, args: &[&str]) -> Option<usize> {
+    if program == "git" {
+        return git_subcommand_index(args);
+    }
+    let value_options = options_taking_a_value(program);
+    let mut index = 0;
+    while let Some(word) = args.get(index) {
+        if *word == "--" {
+            return (index + 1 < args.len()).then_some(index + 1);
+        }
+        let option_name = word.split_once('=').map_or(*word, |(name, _)| name);
+        if value_options.contains(&option_name) && !word.contains('=') {
+            index += 2;
+        } else if word.starts_with('-') {
+            index += 1;
+        } else {
+            return Some(index);
+        }
+    }
+    None
+}
 
 /// The index of git's subcommand in `args`: the first word that is neither a
 /// global option nor the value of one.
@@ -407,23 +456,19 @@ fn git_subcommand_index(args: &[&str]) -> Option<usize> {
 /// the class once. An over-eager floor strands legitimate work, which is the
 /// failure mode this codebase keeps choosing against.
 ///
-/// Known misses, accepted: a verb in a position this rule does not read is not
-/// refused, and a leading option is the usual reason — `kubectl -n prod delete
-/// pod api` passes where `kubectl delete -n prod pod api` is refused, and
-/// `pnpm -r publish` / `npm -s publish` pass where `pnpm publish` is refused
-/// (that arm still reads the subcommand at position 1). Chasing it means
-/// modelling each program's option arity, which is a parser, not a floor; the
-/// honest boundary is that this is a consent gate over the routine spellings
-/// (`SECURITY.md` says so in those words, the known misses included), and
-/// containment is the sandbox's job rather than this list's.
+/// Unknown option arities remain a deliberate boundary: a flag whose value is
+/// not known to this small parser can move the verb out of view. The common
+/// boolean and value-taking spellings are handled below, while containment is
+/// still the sandbox's job rather than this list's.
 fn irreversible_outward_words(program: &str, args: &[&str]) -> Option<String> {
-    let second = args.first().copied();
-
     // The dry-run exemption, read past off-spellings (`--dry-run=false`) and
     // past a `--dry-run` that is another option's value.
     if is_dry_run(program, args) {
         return None;
     }
+
+    let subcommand_at = subcommand_index_after_options(program, args);
+    let subcommand = subcommand_at.and_then(|index| args.get(index).copied());
 
     match program {
         "git" => {
@@ -464,64 +509,72 @@ fn irreversible_outward_words(program: &str, args: &[&str]) -> Option<String> {
         // Yarn Berry publishes with `yarn npm publish`; the bare-`publish` arm
         // below never sees it because its subcommand is `npm`.
         "yarn"
-            if matches!(
-                (second, args.get(1).copied()),
-                (Some("npm"), Some("publish"))
-            ) =>
+            if subcommand == Some("npm")
+                && subcommand_at.and_then(|index| args.get(index + 1).copied())
+                    == Some("publish") =>
         {
             Some("yarn npm publish".to_string())
         }
-        "npm" | "yarn" | "pnpm" | "bun" if second == Some("publish") => {
+        "npm" | "yarn" | "pnpm" | "bun" if subcommand == Some("publish") => {
             Some(format!("{program} publish"))
         }
         // `cargo publish` is this tool's own home ecosystem, and its build/test
         // are default-trusted — the one publish spelling most likely to run
         // beside trusted commands. `twine`/`poetry`/`gem` round out the package
         // publishers the docs already name.
-        "cargo" if second == Some("publish") => Some("cargo publish".to_string()),
-        "twine" if second == Some("upload") => Some("twine upload".to_string()),
-        "poetry" if second == Some("publish") => Some("poetry publish".to_string()),
-        "gem" if second == Some("push") => Some("gem push".to_string()),
-        "gh" if matches!(
-            (args.first().copied(), args.get(1).copied()),
-            (Some("pr"), Some("merge"))
-                | (Some("release"), Some("create" | "delete"))
-                | (Some("repo"), Some("delete"))
-        ) =>
-        {
-            Some(format!("gh {} {}", args[0], args[1]))
-        }
-        "terraform" if matches!(second, Some("apply" | "destroy")) => {
-            Some(format!("terraform {}", second.unwrap_or_default()))
-        }
-        "kubectl" if matches!(second, Some("delete" | "drain")) => {
-            Some(format!("kubectl {}", second.unwrap_or_default()))
-        }
-        "docker" if second == Some("push") => Some("docker push".to_string()),
-        "helm" if matches!(second, Some("uninstall" | "delete")) => {
-            Some(format!("helm {}", second.unwrap_or_default()))
-        }
-        "aws" => match (args.first().copied(), args.get(1).copied()) {
-            (Some("s3"), Some("rm")) => Some("aws s3 rm".to_string()),
-            // `s3 rb` removes a whole bucket (`--force` empties it first); the
-            // `s3api` verbs are the lower-level spellings of the same deletions.
-            (Some("s3"), Some("rb")) => Some("aws s3 rb".to_string()),
-            // `sync --delete` removes every destination object the source lacks
-            // — the standard deploy line, and a bucket wipe when the source is
-            // the wrong directory. Outward only when the destination is S3: a
-            // download (`sync s3://b ./local --delete`) deletes local files the
-            // next sync can restore. Operands that cannot be told apart (an
-            // option value ahead of them) are read as writing.
-            (Some("s3"), Some("sync"))
-                if args.contains(&"--delete") && syncs_into_s3(&args[2..]) =>
-            {
-                Some("aws s3 sync --delete".to_string())
+        "cargo" if subcommand == Some("publish") => Some("cargo publish".to_string()),
+        "twine" if subcommand == Some("upload") => Some("twine upload".to_string()),
+        "poetry" if subcommand == Some("publish") => Some("poetry publish".to_string()),
+        "gem" if subcommand == Some("push") => Some("gem push".to_string()),
+        "gh" if matches!(subcommand, Some("pr" | "release" | "repo")) => {
+            let index = subcommand_at?;
+            let next = args.get(index + 1).copied()?;
+            if matches!(
+                (subcommand, next),
+                (Some("pr"), "merge")
+                    | (Some("release"), "create" | "delete")
+                    | (Some("repo"), "delete")
+            ) {
+                Some(format!("gh {} {next}", subcommand.unwrap_or_default()))
+            } else {
+                None
             }
-            (Some("s3api"), Some("delete-object")) => Some("aws s3api delete-object".to_string()),
-            (Some("s3api"), Some("delete-objects")) => Some("aws s3api delete-objects".to_string()),
-            (Some("s3api"), Some("delete-bucket")) => Some("aws s3api delete-bucket".to_string()),
-            _ => None,
-        },
+        }
+        "terraform" if matches!(subcommand, Some("apply" | "destroy")) => {
+            Some(format!("terraform {}", subcommand.unwrap_or_default()))
+        }
+        "kubectl" if matches!(subcommand, Some("delete" | "drain")) => {
+            Some(format!("kubectl {}", subcommand.unwrap_or_default()))
+        }
+        "docker" if subcommand == Some("push") => Some("docker push".to_string()),
+        "helm" if matches!(subcommand, Some("uninstall" | "delete")) => {
+            Some(format!("helm {}", subcommand.unwrap_or_default()))
+        }
+        "aws" => {
+            let index = subcommand_at?;
+            let service = args.get(index).copied()?;
+            match (service, args.get(index + 1).copied()) {
+                ("s3", Some("rm")) => Some("aws s3 rm".to_string()),
+                // `s3 rb` removes a whole bucket (`--force` empties it first); the
+                // `s3api` verbs are the lower-level spellings of the same deletions.
+                ("s3", Some("rb")) => Some("aws s3 rb".to_string()),
+                // `sync --delete` removes every destination object the source lacks
+                // — the standard deploy line, and a bucket wipe when the source is
+                // the wrong directory. Outward only when the destination is S3: a
+                // download (`sync s3://b ./local --delete`) deletes local files the
+                // next sync can restore. Operands that cannot be told apart (an
+                // option value ahead of them) are read as writing.
+                ("s3", Some("sync"))
+                    if args.contains(&"--delete") && syncs_into_s3(&args[index + 2..]) =>
+                {
+                    Some("aws s3 sync --delete".to_string())
+                }
+                ("s3api", Some("delete-object")) => Some("aws s3api delete-object".to_string()),
+                ("s3api", Some("delete-objects")) => Some("aws s3api delete-objects".to_string()),
+                ("s3api", Some("delete-bucket")) => Some("aws s3api delete-bucket".to_string()),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

@@ -5,7 +5,6 @@
 //! replace JSON later without touching the runtime.
 
 mod json;
-mod migrate;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,9 +27,21 @@ use crate::pricing::CostEstimate;
 use crate::session_entry::{EntryKind, SessionEntry};
 
 /// Current on-disk schema version. Bump when making breaking layout changes.
-/// v1 stored wire messages; v2 stores [`SessionEntry`] values (v1 files are
-/// migrated transparently on load).
-pub const SESSION_SCHEMA_VERSION: u32 = 2;
+/// Schema v3 is the first format written with authenticated records. Older
+/// files are intentionally unsupported while the project is still pre-release.
+pub const SESSION_SCHEMA_VERSION: u32 = 3;
+
+/// Hard limits for the JSON backend. Session files live in the workspace and
+/// can therefore be written by the model; loading them must not turn into an
+/// unbounded allocation or a picker-wide memory blow-up.
+pub(crate) const MAX_SESSION_FILE_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_SESSION_ENTRIES: usize = 4096;
+/// Maximum number of records retained by the picker/list API.
+pub(crate) const MAX_SESSION_LIST: usize = 32;
+/// Hard scan budgets keep a model-created directory full of session files from
+/// turning every `-c` launch into an unbounded parse and I/O job.
+pub(crate) const MAX_SESSION_SCAN: usize = 256;
+pub(crate) const MAX_SESSION_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 
 const SESSIONS_DIR: &str = ".deep-code/sessions";
 
@@ -53,10 +64,9 @@ impl SessionId {
 }
 
 /// One user turn's boundary timestamp. Only `started_at_ms` and `turns.len()`
-/// are ever read (the turn count and the checkpoint-to-turn time window); the
-/// prompt/usage/finish-time this once carried were write-only, so they were
-/// dropped. Old session files that still contain them load fine — `SessionRecord`
-/// has no `deny_unknown_fields`, so serde ignores the extra keys.
+/// are ever read (the turn count and the checkpoint-to-turn time window).
+/// `SessionRecord` has no `deny_unknown_fields`, so harmless extra keys remain
+/// ignorable within the current schema.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnRecord {
     pub started_at_ms: u64,
@@ -98,12 +108,10 @@ impl Default for TurnRecord {
 
 /// Full persisted session state.
 ///
-/// MUST NOT gain `#[serde(deny_unknown_fields)]` — loading old session files
-/// depends on unknown keys being ignored. Fields removed over time (e.g. the
-/// former `config` snapshot and per-turn `tool_results`) still appear in files
-/// written by older builds; deny-unknown would make every such file
-/// unloadable. The same holds for [`TurnRecord`], [`SessionEntry`], and
-/// [`EntryKind`]. New fields are added with `#[serde(default)]` instead.
+/// MUST NOT gain `#[serde(deny_unknown_fields)]` — fields may be removed or
+/// added within the current schema without making a record needlessly brittle.
+/// Older schema versions are rejected before deserialization. The same holds
+/// for [`TurnRecord`], [`SessionEntry`], and [`EntryKind`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub schema_version: u32,
@@ -112,8 +120,8 @@ pub struct SessionRecord {
     /// Extra writable roots granted at launch (`--add-dir`), canonical. Kept in
     /// the record so `-c`/`--resume` restores the same boundary the session was
     /// working under — a resume that silently dropped a grant would break the
-    /// model mid-task on paths it legitimately wrote last turn. Defaulted for
-    /// files that predate the field.
+    /// model mid-task on paths it legitimately wrote last turn. Defaulted when
+    /// the current record carries no grants.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_roots: Vec<PathBuf>,
     /// Authorship tag over [`Self::extra_roots`], stamped on every save (see
@@ -124,9 +132,15 @@ pub struct SessionRecord {
     /// unnecessary — when nothing is granted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_roots_mac: Option<String>,
+    /// Authorship tag over the complete persisted record. The root tag above
+    /// remains useful for the narrow grant check, while this tag prevents a
+    /// workspace-writable session file from injecting transcript entries,
+    /// timestamps, or other persisted state into a resumed runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_mac: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
-    /// Domain-level conversation entries (schema v2). Wire messages are
+    /// Domain-level conversation entries (schema v3). Wire messages are
     /// derived via [`crate::session::Session::wire_messages`]. Shared by
     /// `Arc` with the live [`crate::session::Session`], so flushing the
     /// transcript into the record copies pointers, not entry bytes; serde
@@ -169,6 +183,7 @@ impl SessionRecord {
             workspace,
             extra_roots: Vec::new(),
             extra_roots_mac: None,
+            record_mac: None,
             created_at_ms: now,
             updated_at_ms: now,
             entries,
@@ -197,7 +212,7 @@ impl SessionRecord {
     /// existed when the session was created, and a root added on `-c
     /// --add-dir` (or dropped as stale) would otherwise stay invisible for
     /// the rest of the session's life. Defensive about position anyway:
-    /// v1-migrated files are shaped by old data, not this constructor.
+    /// Older on-disk formats are rejected before this constructor is used.
     pub fn set_system_prompt(&mut self, system_prompt: impl Into<String>) {
         let entry = std::sync::Arc::new(SessionEntry::system(system_prompt.into()));
         let slot = self
@@ -233,7 +248,7 @@ impl SessionRecord {
     }
 
     /// Derived wire-message count. Consumers report this (not the entry
-    /// count) so displayed numbers stay stable across the v1→v2 migration.
+    /// count) so displayed numbers stay stable across persisted sessions.
     #[must_use]
     pub fn message_count(&self) -> usize {
         self.entries
@@ -251,6 +266,20 @@ pub enum SessionStoreError {
     Io { message: String },
     #[error("session storage serialization failed: {message}")]
     Serialization { message: String },
+    #[error("session '{id}' could not be authenticated for persistence")]
+    AuthenticationUnavailable { id: String },
+    #[error("session file {path} is too large ({bytes} bytes; limit {limit})")]
+    TooLarge {
+        path: String,
+        bytes: u64,
+        limit: u64,
+    },
+    #[error("session file {path} has too many entries ({count}; limit {limit})")]
+    TooManyEntries {
+        path: String,
+        count: usize,
+        limit: usize,
+    },
     #[error("unsupported session schema version {found} (expected {expected})")]
     UnsupportedSchema { found: u32, expected: u32 },
     #[error("invalid session id '{id}'")]
@@ -267,14 +296,37 @@ pub enum SessionStoreError {
 /// and every persistence path funnels through here, so there is no way to
 /// write a record whose grants are unsigned or stale.
 pub(crate) fn serialize_record(record: &mut SessionRecord) -> Result<String, SessionStoreError> {
+    if record.entries.len() > MAX_SESSION_ENTRIES {
+        return Err(SessionStoreError::TooManyEntries {
+            path: record.id.as_str().to_string(),
+            count: record.entries.len(),
+            limit: MAX_SESSION_ENTRIES,
+        });
+    }
     record.extra_roots_mac = crate::session_integrity::sign_roots(
         record.id.as_str(),
         &record.workspace,
         &record.extra_roots,
     );
-    serde_json::to_string_pretty(record).map_err(|error| SessionStoreError::Serialization {
-        message: error.to_string(),
-    })
+    record.record_mac = Some(
+        crate::session_integrity::sign_record(record).ok_or_else(|| {
+            SessionStoreError::AuthenticationUnavailable {
+                id: record.id.as_str().to_string(),
+            }
+        })?,
+    );
+    let json =
+        serde_json::to_string_pretty(record).map_err(|error| SessionStoreError::Serialization {
+            message: error.to_string(),
+        })?;
+    if json.len() as u64 > MAX_SESSION_FILE_BYTES {
+        return Err(SessionStoreError::TooLarge {
+            path: record.id.as_str().to_string(),
+            bytes: json.len() as u64,
+            limit: MAX_SESSION_FILE_BYTES,
+        });
+    }
+    Ok(json)
 }
 
 /// Backend-agnostic session persistence.
@@ -408,8 +460,8 @@ mod tests {
         ));
         assert_eq!(record.entries.len(), 2);
 
-        // Defensive branch: a (v1-shaped) record with no system entry gets one
-        // inserted at the front rather than silently keeping none.
+        // Defensive branch: a record with no system entry gets one inserted at
+        // the front rather than silently keeping none.
         record.entries.remove(0);
         record.set_system_prompt("fresh prompt");
         assert!(matches!(
@@ -417,38 +469,5 @@ mod tests {
             EntryKind::System { content } if content == "fresh prompt"
         ));
         assert_eq!(record.entries.len(), 2);
-    }
-
-    /// v2 files written before `config`, per-turn `tool_results`, and entry
-    /// `id`/`parent` were dropped still carry those keys; loading must ignore
-    /// them instead of failing.
-    #[test]
-    fn v2_files_with_since_removed_fields_still_parse() {
-        let legacy = serde_json::json!({
-            "schema_version": 2,
-            "id": "session_1_0",
-            "workspace": "/tmp/ws",
-            "created_at_ms": 1,
-            "updated_at_ms": 2,
-            "config": {"base_url": "x", "model": "m", "timeout_secs": null, "api_key_present": false},
-            "entries": [
-                {"id": "e1_0", "parent": null, "type": "system", "content": "sys"},
-                {"id": "e2_1", "parent": "e1_0", "type": "user", "content": "hi"}
-            ],
-            "turns": [{
-                "user_prompt": "hi",
-                "tool_results": [{"call_id": "c1", "tool_name": "shell", "content": "ok", "status": "success"}],
-                "usage": null,
-                "started_at_ms": 1,
-                "finished_at_ms": 2
-            }],
-        });
-        let record: SessionRecord = serde_json::from_value(legacy).unwrap();
-        assert_eq!(record.entries.len(), 2);
-        assert_eq!(record.preview(), "hi");
-        assert_eq!(record.turns.len(), 1);
-        // The slimmed TurnRecord keeps only started_at_ms; the old
-        // user_prompt/usage/finished_at_ms keys are ignored, not rejected.
-        assert_eq!(record.turns[0].started_at_ms, 1);
     }
 }

@@ -29,6 +29,10 @@ pub struct LaunchedRuntime {
     pub handle: Arc<AgentRuntime>,
     pub backend_label: String,
     pub session_id: Option<String>,
+    /// The record after resume validation and sanitization. Consumers that
+    /// render restored history must use this value rather than the untrusted
+    /// input record they passed to [`launch_runtime`].
+    pub resume_record: Option<SessionRecord>,
     pub subagent_manager: SharedSubAgentManager,
     pub job_store: JobStore,
     pub stop_hook: Box<dyn Fn() + Send + Sync>,
@@ -289,8 +293,8 @@ fn launch_runtime_pinned(
         // claims, and the record's grants are re-vetted. Both because the
         // record is a model-writable file: it lives at
         // `<workspace>/.deep-code/sessions/<id>.json`, inside the primary
-        // writable root, and `-c` selects the newest by an `updated_at_ms`
-        // read out of that same file. Taking `record.workspace` on trust let a
+        // writable root, and `-c` selects the newest host-authenticated record
+        // by its signed `updated_at_ms`. Taking `record.workspace` on trust let a
         // written record move the primary root anywhere — `/` included — and
         // took the session store along with it.
         return launch_resumed(config, record, primary_raw, roots.extras, &parent_cancel);
@@ -466,6 +470,7 @@ fn assemble_launch<C: LlmClient + Clone + 'static>(
         sandbox_off: !config.sandbox_mode.is_os(),
         backend_label,
         session_id,
+        resume_record: None,
         subagent_manager,
         job_store,
         stop_hook: shutdown,
@@ -525,7 +530,8 @@ fn finish_resumed_launch<C: LlmClient + Clone + 'static>(
         instructions,
         skills,
     } = session;
-    assemble_launch(
+    let effective_record = record.clone();
+    let mut launched = assemble_launch(
         client,
         LaunchParts {
             backend_label,
@@ -544,7 +550,9 @@ fn finish_resumed_launch<C: LlmClient + Clone + 'static>(
                 Some(session_id),
             )
         },
-    )
+    );
+    launched.resume_record = Some(effective_record);
+    launched
 }
 
 fn launch_resumed(
@@ -555,6 +563,29 @@ fn launch_resumed(
     parent_cancel: &CancellationToken,
 ) -> LaunchedRuntime {
     let mut warnings = Vec::new();
+    // The session file is writable from inside the workspace. A root-only tag
+    // therefore cannot make the transcript trustworthy: a forged user/image
+    // entry would still be sent to the provider on the next turn. Verify the
+    // complete record before any entry reaches `Session::from_entries`.
+    if !crate::session_integrity::verify_record(&record) {
+        warnings.push(
+            "discarding the unverified session transcript and persisted state: the session file "
+                .to_string()
+                + "was modified without a host authenticity tag. The session will resume with a "
+                + "fresh system prompt.",
+        );
+        record.entries.clear();
+        record.turns.clear();
+        record.checkpoints.clear();
+        record.summary = None;
+        record.compaction = None;
+        record.session_cost = crate::pricing::CostEstimate::default();
+        record.session_cache_hit_tokens = 0;
+        record.session_cache_miss_tokens = 0;
+        record.session_cache_savings = crate::pricing::CostEstimate::default();
+        record.updated_at_ms = crate::session_store::now_ms();
+        record.record_mac = None;
+    }
     // Do the grants in this record actually come from this host?
     //
     // The floor below can only refuse what is *categorically* off limits —

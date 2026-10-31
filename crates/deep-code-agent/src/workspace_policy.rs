@@ -813,8 +813,8 @@ fn sensitive_overlap<'a>(canonical: &Path, secrets: &'a [PathBuf]) -> Option<&'a
 /// 2. A grant restored from a session record on resume. The record lives at
 ///    `<workspace>/.deep-code/sessions/<id>.json`, **inside the primary
 ///    writable root**, so it is an ordinary `write_file` target for the model;
-///    and `-c` picks the newest record by an `updated_at_ms` read straight out
-///    of that file. Without this floor every check above was bypassable by
+///    and `-c` picks the newest host-authenticated record by its signed
+///    `updated_at_ms`. Without this floor every check above was bypassable by
 ///    writing a record with `extra_roots: ["/"]` and a large timestamp — the
 ///    approval prompt was not defeated, it was skipped.
 ///

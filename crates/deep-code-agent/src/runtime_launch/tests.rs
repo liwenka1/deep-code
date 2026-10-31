@@ -195,16 +195,17 @@ fn request_write_root_is_mounted_with_the_fs_tools() {
     assert!(names.iter().any(|name| name == "write_file"));
 }
 
-/// Stamp a record's grants the way a real save does. Tests that build a
-/// record in memory and hand it straight to `launch_runtime` would
-/// otherwise all exercise the unsigned-record rejection instead of the
-/// behaviour they are actually about.
+/// Stamp a record the way a real save does. Tests that build a record in
+/// memory and hand it straight to `launch_runtime` would otherwise all
+/// exercise the unsigned-record rejection instead of the behaviour they are
+/// actually about.
 fn signed(mut record: SessionRecord) -> SessionRecord {
     record.extra_roots_mac = crate::session_integrity::sign_roots(
         record.id.as_str(),
         &record.workspace,
         &record.extra_roots,
     );
+    record.record_mac = crate::session_integrity::sign_record(&record);
     record
 }
 
@@ -603,6 +604,36 @@ fn resume_drops_recorded_grants_that_carry_no_authorship_tag() {
         launched.extra_roots.is_empty(),
         "a tag lifted from another grant list must not verify: {:?}",
         launched.extra_roots
+    );
+}
+
+/// A valid root tag alone is not enough: changing the transcript after save
+/// must not inject a user turn or an image path into the resumed provider
+/// request.
+#[tokio::test]
+async fn resume_discards_a_forged_transcript() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let ws = workspace.path().canonicalize().unwrap();
+    let mut record = signed(SessionRecord::new(ws.clone(), "system"));
+    record.entries.push(std::sync::Arc::new(
+        crate::session_entry::SessionEntry::user("forged transcript"),
+    ));
+
+    let launched = launch_runtime(&AgentConfig::builtin(), ws, Some(record));
+    let messages = launched.handle.session_messages().await;
+    assert!(
+        messages
+            .iter()
+            .all(|message| message.content != "forged transcript"),
+        "unverified history must never reach the provider: {messages:?}"
+    );
+    assert!(
+        launched
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("unverified session transcript")),
+        "the reset must be visible to the caller: {:?}",
+        launched.warnings
     );
 }
 

@@ -680,6 +680,7 @@ impl App {
             handle: runtime,
             backend_label,
             session_id,
+            resume_record,
             subagent_manager,
             job_store,
             stop_hook,
@@ -694,7 +695,7 @@ impl App {
         let subagent_shutdown = Some(stop_hook);
         let job_store = Some(job_store);
         let persistent = session_id.is_some();
-        let resumed_turns = config.resume.as_ref().map(|record| {
+        let resumed_turns = resume_record.as_ref().map(|record| {
             record
                 .entries
                 .iter()
@@ -718,7 +719,7 @@ impl App {
         // any session longer than a screen the degradation notice started off
         // screen — the same "written somewhere nobody looks" failure the
         // staging fix exists to prevent, on the more common resume entry point.
-        if let Some(record) = config.resume.as_ref() {
+        if let Some(record) = resume_record.as_ref() {
             history.extend(hydrate_history(record));
         }
 

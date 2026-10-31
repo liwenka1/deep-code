@@ -2,12 +2,12 @@
 //!
 //! A session record lives at `<workspace>/.deep-code/sessions/<id>.json` —
 //! deliberately inside the primary writable root, so the model can write it
-//! like any other file — and `-c` picks the newest by an `updated_at_ms` read
-//! out of that same file. Its `extra_roots` then become the resumed session's
-//! write boundary. That made the record a channel for granting a root with
-//! nobody asked: write one naming `~/.cargo` (a `rustc-wrapper` there runs on
-//! the next `cargo build`) or `~/Library/LaunchAgents`, give it a large
-//! timestamp, and the next `-c` restores it silently.
+//! like any other file — and `-c` ranks only host-authenticated records by their
+//! signed `updated_at_ms`. Its `extra_roots` then become the resumed session's
+//! write boundary. Before the full-record tag, a model-written file could name
+//! `~/.cargo` (a `rustc-wrapper` there runs on the next `cargo build`) or
+//! `~/Library/LaunchAgents`, give it a large timestamp, and the next `-c` would
+//! restore it silently.
 //!
 //! `refuse_as_unattended_root` is the floor for that channel, but a floor can
 //! only enumerate what is *categorically* forbidden — the filesystem root, the
@@ -17,8 +17,9 @@
 //!
 //! So instead of judging the path, this authenticates the author. Grants are
 //! tagged with an HMAC keyed by a secret the model cannot reach, and a record
-//! whose tag does not verify has its grants dropped. Forging a record still
-//! works — it just cannot carry authority any more.
+//! whose tag does not verify has its transcript and grants dropped on resume.
+//! Forging a record therefore cannot carry either conversation state or
+//! authority into the next provider turn.
 //!
 //! **Where the key is safe, and where it is not.** The key lives in
 //! `~/.deep-code`, which the model-requested grant channel refuses to make
@@ -42,7 +43,7 @@
 //! - A shell on **Windows**, which has no filesystem confinement whatsoever
 //!   (`sandbox::windows` reports `Enforcement::None`) — so read *and* write.
 //!
-//! What the tag buys in all three cases is that forging now requires reaching
+//! What the tags buy in all three cases is that forging now requires reaching
 //! the key, rather than merely writing the session file — which the model can
 //! already write, as an ordinary file inside its own workspace.
 
@@ -140,6 +141,39 @@ fn message(id: &str, workspace: &Path, roots: &[PathBuf]) -> Vec<u8> {
         push(root.as_os_str().as_encoded_bytes());
     }
     out
+}
+
+/// Canonical bytes for the full record tag. The tag itself is cleared before
+/// serialization, and serde's deterministic struct-field order gives every
+/// writer the same representation without trusting map iteration order.
+fn record_message(record: &crate::session_store::SessionRecord) -> Option<Vec<u8>> {
+    let mut unsigned = record.clone();
+    unsigned.record_mac = None;
+    serde_json::to_vec(&unsigned).ok()
+}
+
+/// Tag for the complete persisted record, or `None` when the host key is not
+/// available.
+#[must_use]
+pub(crate) fn sign_record(record: &crate::session_store::SessionRecord) -> Option<String> {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key()?);
+    let tag = ring::hmac::sign(&key, &record_message(record)?);
+    Some(to_hex(tag.as_ref()))
+}
+
+/// Verify every persisted field, including the transcript and timestamps.
+#[must_use]
+pub(crate) fn verify_record(record: &crate::session_store::SessionRecord) -> bool {
+    let (Some(key_bytes), Some(tag), Some(message)) =
+        (key(), record.record_mac.as_deref(), record_message(record))
+    else {
+        return false;
+    };
+    let Some(tag) = from_hex(tag) else {
+        return false;
+    };
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key_bytes);
+    ring::hmac::verify(&key, &message, &tag).is_ok()
 }
 
 /// Tag for this record's grant list, or `None` when there is no key (and
@@ -262,5 +296,19 @@ mod tests {
     #[test]
     fn an_empty_grant_list_needs_no_tag() {
         assert!(verify_roots("sess-1", Path::new("/ws"), &[], None));
+    }
+
+    #[test]
+    fn a_record_tag_covers_the_transcript_and_timestamps() {
+        let mut record = crate::session_store::SessionRecord::new(PathBuf::from("/ws"), "system");
+        let Some(tag) = sign_record(&record) else {
+            eprintln!("no key on this host; skipping");
+            return;
+        };
+        record.record_mac = Some(tag);
+        assert!(verify_record(&record));
+
+        record.updated_at_ms = record.updated_at_ms.saturating_add(1);
+        assert!(!verify_record(&record));
     }
 }

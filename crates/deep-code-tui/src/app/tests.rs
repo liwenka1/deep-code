@@ -3094,6 +3094,39 @@ fn switch_session_adopts_and_banners_the_records_grants() {
     ));
 }
 
+#[test]
+fn launch_hydrates_only_the_sanitized_resume_record() {
+    let workspace = tempfile::tempdir().unwrap();
+    let ws = workspace.path().canonicalize().unwrap();
+    let mut record = SessionRecord::new(ws.clone(), "system");
+    record
+        .entries
+        .push(std::sync::Arc::new(deep_code_agent::SessionEntry::user(
+            "forged transcript",
+        )));
+
+    let app = App::launch(LaunchConfig {
+        workspace: Some(ws),
+        resume: Some(record),
+        ..LaunchConfig::default()
+    });
+
+    assert!(
+        !app.history.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::User { text } if text == "forged transcript"
+        )),
+        "the UI must hydrate the same sanitized record the runtime uses"
+    );
+    assert!(
+        app.history.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::System { text } if text.contains("unverified session transcript")
+        )),
+        "the sanitization warning must remain visible"
+    );
+}
+
 /// Launch degradations must reach the transcript. `LaunchedRuntime::warnings`
 /// documents "the consumer must surface these" — the library cannot write to
 /// stderr because raw mode owns the screen — yet only `adopt_runtime` (the

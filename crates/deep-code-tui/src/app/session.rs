@@ -1,7 +1,7 @@
 use super::*;
 
 impl App {
-    pub(crate) fn adopt_runtime(&mut self, launched: LaunchedRuntime) {
+    pub(crate) fn adopt_runtime(&mut self, launched: LaunchedRuntime) -> Option<SessionRecord> {
         // Exhaustive destructuring for the same reason `App::launch` uses it:
         // a field added to `LaunchedRuntime` must be given a home in BOTH
         // consumers, and skipping one has to be written down as `field: _`.
@@ -11,6 +11,7 @@ impl App {
             handle,
             backend_label,
             session_id,
+            resume_record,
             subagent_manager,
             job_store,
             stop_hook,
@@ -62,6 +63,7 @@ impl App {
         // removal of confinement or cry wolf about one that is gone.
         self.sandbox_off = sandbox_off;
         self.permission_mode.set(previous_mode);
+        resume_record
     }
 
     /// Drain the warnings parked by [`Self::adopt_runtime`] into the visible
@@ -122,7 +124,10 @@ impl App {
     /// Launch a fresh runtime from the current layered config (optionally
     /// resuming `resume`) and adopt it, carrying the config-derived display
     /// state. The caller must have shut the previous runtime down first.
-    fn launch_and_adopt(&mut self, resume: Option<SessionRecord>) -> Result<(), String> {
+    fn launch_and_adopt(
+        &mut self,
+        resume: Option<SessionRecord>,
+    ) -> Result<Option<SessionRecord>, String> {
         deep_code_agent::validate_pinned_workspace(&self.workspace)
             .map_err(|error| error.to_string())?;
         let agent_config = self.load_layered_config();
@@ -151,9 +156,9 @@ impl App {
         // previews, compaction warnings — reverts to whatever the config said
         // while the screen around it stays in the user's choice: a `/lang`
         // that could not be saved, an environment override.
-        self.adopt_runtime(launched);
+        let effective_resume = self.adopt_runtime(launched);
         self.runtime.set_ui_lang(self.lang);
-        Ok(())
+        Ok(effective_resume)
     }
 
     /// Append the effective-grants line to the transcript. Called wherever the
@@ -397,7 +402,7 @@ impl App {
         deep_code_agent::validate_pinned_workspace(&self.workspace)
             .map_err(|error| error.to_string())?;
         self.shutdown_current_runtime();
-        self.launch_and_adopt(Some(record.clone()))?;
+        let effective_record = self.launch_and_adopt(Some(record.clone()))?;
 
         self.history.clear();
         self.active_turn = None;
@@ -409,7 +414,9 @@ impl App {
         // different session and auto-send there.
         self.steering_queue.clear();
         self.pending_steering_flush = false;
-        self.history.extend(hydrate_history(&record));
+        if let Some(effective_record) = effective_record.as_ref() {
+            self.history.extend(hydrate_history(effective_record));
+        }
         // After the rebuild, so the clear above cannot erase them: resuming is
         // the path that drops grants carrying no valid authorship tag, and the
         // banner below would otherwise state a narrowed boundary with nothing

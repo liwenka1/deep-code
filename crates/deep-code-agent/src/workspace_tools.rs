@@ -4,6 +4,7 @@ use regex::RegexBuilder;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;
 
 use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, run_blocking};
@@ -264,41 +265,43 @@ impl ListDirTool {
     fn list_sync(&self, params: ListDirParams) -> Result<ToolOutput, ToolError> {
         let path_arg = params.path.as_deref().unwrap_or(".");
         let (path, directory) = self.root.open_existing_dir(path_arg, Self::NAME)?;
-        // Collect the raw entries first: a readdir yields names without a stat,
-        // so a directory with a huge number of children is capped BEFORE paying
-        // one `metadata()` per entry and before serialising a JSON array large
-        // enough to bury the model's context. Each entry is paired with its name
-        // ONCE here, so the sort compares precomputed keys instead of cloning the
-        // name twice per comparison — the difference between O(n) and O(n·log n)
-        // allocations on a directory whose size is the whole reason for the cap.
-        let raw = directory
-            .entries()
-            .map_err(|error| {
-                ToolError::exec_failed(
-                    Self::NAME,
-                    format!(
-                        "failed to list {}: {error}",
-                        self.root.relative_display(&path)
-                    ),
-                )
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
+        // Keep only the alphabetically first window while streaming readdir.
+        // The old collect-and-sort path held every child in memory before
+        // applying the output cap, so a flat cache could still exhaust the
+        // process. The bounded map makes memory proportional to the response
+        // limit while the counter preserves the true total for the caller.
+        let mut total = 0;
+        let mut keyed: BTreeMap<std::ffi::OsString, cap_std::fs::DirEntry> = BTreeMap::new();
+        for entry in directory.entries().map_err(|error| {
+            ToolError::exec_failed(
+                Self::NAME,
+                format!(
+                    "failed to list {}: {error}",
+                    self.root.relative_display(&path)
+                ),
+            )
+        })? {
+            let entry = entry.map_err(|error| {
                 ToolError::exec_failed(
                     Self::NAME,
                     format!("failed to read directory entry: {error}"),
                 )
             })?;
-        let total = raw.len();
-        // Sort by name so the retained window is stable and alphabetical; within
-        // one directory name order equals the path order the output used before.
-        let mut keyed: Vec<(std::ffi::OsString, cap_std::fs::DirEntry)> = raw
-            .into_iter()
-            .map(|entry| (entry.file_name(), entry))
-            .collect();
-        keyed.sort_by(|(left, _), (right, _)| left.cmp(right));
+            total += 1;
+            let name = entry.file_name();
+            if keyed.len() < MAX_LIST_ENTRIES {
+                keyed.insert(name, entry);
+            } else if keyed
+                .keys()
+                .next_back()
+                .is_some_and(|last| name.as_os_str() < last.as_os_str())
+            {
+                let _ = keyed.pop_last();
+                keyed.insert(name, entry);
+            }
+        }
+        let keyed: Vec<(std::ffi::OsString, cap_std::fs::DirEntry)> = keyed.into_iter().collect();
         let truncated = total > MAX_LIST_ENTRIES;
-        keyed.truncate(MAX_LIST_ENTRIES);
         let entries = keyed
             .iter()
             .map(|(_, entry)| {
