@@ -2400,14 +2400,12 @@ async fn the_record_says_when_a_human_was_asked() {
         })
         .collect();
     assert_eq!(exchanges.len(), 2, "both calls were recorded");
-    assert_eq!(
+    assert!(
         exchanges[0].result.as_ref().expect("result").asked,
-        Some(true),
         "the call a human answered says so — it must not be folded away on resume"
     );
-    assert_eq!(
-        exchanges[1].result.as_ref().expect("result").asked,
-        Some(false),
+    assert!(
+        !exchanges[1].result.as_ref().expect("result").asked,
         "the standing consent answered before anyone was asked, so this is quiet"
     );
 }

@@ -131,18 +131,18 @@ fn json_store_rejects_old_schema_files() {
     let loaded = store.load(&record.id).unwrap();
     assert_eq!(loaded.extra_roots, vec![extra.path().to_path_buf()]);
 
-    // A v2 file written before the authenticated format is no longer accepted
-    // during the pre-release hard cutover.
-    let mut legacy = serde_json::to_value(&record).unwrap();
-    legacy.as_object_mut().unwrap().remove("extra_roots");
-    legacy.as_object_mut().unwrap().remove("record_mac");
-    legacy["schema_version"] = serde_json::json!(2);
-    legacy["id"] = serde_json::json!("session_7_0");
+    // Records from the previous layout are rejected by the hard schema
+    // boundary.
+    let mut old_schema = serde_json::to_value(&record).unwrap();
+    old_schema.as_object_mut().unwrap().remove("extra_roots");
+    old_schema.as_object_mut().unwrap().remove("record_mac");
+    old_schema["schema_version"] = serde_json::json!(2);
+    old_schema["id"] = serde_json::json!("session_7_0");
     let path = dir
         .path()
         .join(".deep-code/sessions")
         .join("session_7_0.json");
-    std::fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_string_pretty(&old_schema).unwrap()).unwrap();
     assert!(matches!(
         store.load(&SessionId("session_7_0".to_string())),
         Err(SessionStoreError::UnsupportedSchema { found: 2, .. })

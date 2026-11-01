@@ -1060,20 +1060,10 @@ fn model_command_resolves_aliases_persists_and_keeps_session() {
         "config switch must resume the same session"
     );
 
-    // A FORMER id the API still accepts resolves to that same canonical id, so
-    // configs written before the rename keep working and keep rewriting
-    // themselves forward. This is the compatibility promise of the rename —
-    // and the string below is a LITERAL on purpose: what is under test is that
-    // the old SPELLING still resolves, which the constant cannot express.
-    //
-    // Start on a DIFFERENT model first. `set_model` returns early on a name it
-    // cannot resolve, leaving `configured_model` untouched, so asserting from
-    // the value the previous step already left there would pass whether the
-    // alias resolved or was rejected.
     assert!(app.handle_slash_command("/model pro"));
     assert_eq!(app.configured_model, deep_code_agent::DEEPSEEK_V4_PRO);
 
-    assert!(app.handle_slash_command("/model deepseek-v4-flash"));
+    assert!(app.handle_slash_command("/model flash"));
     assert_eq!(app.configured_model, deep_code_agent::DEEPSEEK_FLASH);
 
     assert!(app.handle_slash_command("/model nope"));

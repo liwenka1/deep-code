@@ -102,23 +102,6 @@ pub struct SandboxReport {
     /// outright. A supervisor reading this must be able to tell those apart.
     pub filesystem: Enforcement,
     pub network: Enforcement,
-    /// The pre-0.4.5 shape of the two fields above, retained so a supervisor
-    /// written against the old schema keeps working.
-    ///
-    /// Dropping them was a silent break in the worst direction. `jq -e
-    /// '.sandbox.confines_network'` started returning `null` — falsy — so a
-    /// fully enforcing host read as unconfined; and a Python or JS supervisor
-    /// doing `if report["sandbox"]["filesystem"]:` now tests a *dict*, which is
-    /// truthy even when it says `{"level": "none"}` — so a Windows host, which
-    /// confines nothing, read as confined. That is the exact overclaim the
-    /// `Enforcement` split was introduced to eliminate, reappearing on the
-    /// machine-readable surface.
-    ///
-    /// Derived from `is_full`, not `is_enforced`: a boolean cannot express
-    /// "confined except for this", and of the two available lies the one that
-    /// understates protection is the one that fails safe.
-    pub confines_filesystem: bool,
-    pub confines_network: bool,
     pub detail: String,
     /// The configured egress policy (`[sandbox] network`), as the setting is
     /// spelled — what the gate will DO, beside what the backend CAN enforce.
@@ -256,12 +239,9 @@ impl DoctorReport {
 
         // `[sandbox] mode = "off"` means the OS sandbox does not run at all, so
         // what the host CAN enforce is not what this configuration WILL enforce.
-        // Fold the switch into every enforcement dimension here, at the one place
-        // the report is built, so the booleans, the levels and the text headline
-        // all tell the truth together. Before this they came straight from the
-        // host probe, and `doctor --json` reported `confines_network = true`
-        // (the documented `jq -e '.sandbox.confines_network'` supervisor gate
-        // passing) while every command actually ran unconfined.
+        // Fold the switch into every enforcement dimension here, at the one
+        // place the report is built, so the levels and text headline tell the
+        // truth together.
         let mode_off = !config.sandbox_mode.is_os();
         let (filesystem, network, detail) = if mode_off {
             (
@@ -296,8 +276,6 @@ impl DoctorReport {
             sandbox: SandboxReport {
                 available: sandbox.available && !mode_off,
                 kind: (sandbox.available && !mode_off).then(|| sandbox.backend.id().to_string()),
-                confines_filesystem: filesystem.is_full(),
-                confines_network: network.is_full(),
                 filesystem,
                 network,
                 detail,
@@ -458,10 +436,8 @@ mod tests {
         assert!(json.contains("\"skills\""));
     }
 
-    /// `doctor --json` is the documented contract for local supervisors, and a
-    /// rename here is invisible at build time — it only surfaces in someone
-    /// else's script. So pin the keys and, for the compatibility booleans, the
-    /// relationship they must keep to the structured fields they mirror.
+    /// `doctor --json` is the documented contract for local supervisors, so
+    /// pin the current keys.
     #[test]
     fn sandbox_json_keeps_its_documented_keys() {
         let workspace = TempDir::new().unwrap();
@@ -479,31 +455,18 @@ mod tests {
             "kind",
             "filesystem",
             "network",
-            "confines_filesystem",
-            "confines_network",
             "detail",
             "network_setting",
             "mode_setting",
         ] {
             assert!(object.contains_key(key), "sandbox.{key} missing from JSON");
         }
-        // The structured field is an object carrying a level; the boolean is the
-        // old shape. A supervisor keying on either must reach the same verdict.
+        // Each structured field carries its enforcement level.
         assert!(sandbox["filesystem"]["level"].is_string());
-        assert_eq!(
-            sandbox["confines_filesystem"],
-            serde_json::Value::Bool(report.sandbox.filesystem.is_full())
-        );
-        assert_eq!(
-            sandbox["confines_network"],
-            serde_json::Value::Bool(report.sandbox.network.is_full())
-        );
     }
 
-    /// `[sandbox] mode = "off"` turns the OS sandbox off, so the report must say
-    /// so on the booleans and the levels too — not only in `mode_setting`. The
-    /// documented `jq -e '.sandbox.confines_network'` supervisor gate reads the
-    /// boolean, and it must fail when nothing is confined.
+    /// `[sandbox] mode = "off"` turns the OS sandbox off, so the report must
+    /// say so in both levels and the headline.
     #[test]
     fn mode_off_reports_no_confinement_everywhere_not_only_in_the_setting() {
         let workspace = TempDir::new().unwrap();
@@ -513,14 +476,6 @@ mod tests {
                 sandbox_mode: crate::execution_policy::SandboxMode::Off,
                 ..AgentConfig::default()
             },
-        );
-        assert!(
-            !report.sandbox.confines_filesystem,
-            "mode=off must not claim filesystem confinement"
-        );
-        assert!(
-            !report.sandbox.confines_network,
-            "mode=off must not claim network confinement"
         );
         assert_eq!(report.sandbox.filesystem, Enforcement::None);
         assert_eq!(report.sandbox.network, Enforcement::None);
@@ -537,17 +492,8 @@ mod tests {
             "the detail must name the switch that turned it off: {}",
             report.sandbox.detail
         );
-        // The JSON booleans (the supervisor contract) agree.
         let value: serde_json::Value =
             serde_json::from_str(&report.to_json_pretty().unwrap()).unwrap();
-        assert_eq!(
-            value["sandbox"]["confines_network"],
-            serde_json::Value::Bool(false)
-        );
-        assert_eq!(
-            value["sandbox"]["confines_filesystem"],
-            serde_json::Value::Bool(false)
-        );
         assert_eq!(
             value["sandbox"]["available"],
             serde_json::Value::Bool(false)

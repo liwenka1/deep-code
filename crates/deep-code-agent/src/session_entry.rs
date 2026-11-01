@@ -30,7 +30,7 @@ impl SessionEntry {
 
     /// Number of wire messages this entry derives to (an assistant entry
     /// emits one tool message per exchange). Consumers report this count so
-    /// it stays stable across the v1→v2 schema migration.
+    /// the derived wire representation stays stable.
     #[must_use]
     pub fn wire_message_count(&self) -> usize {
         match &self.kind {
@@ -99,9 +99,8 @@ pub enum EntryKind {
         /// Local image files attached to this turn, in the order the user
         /// attached them.
         ///
-        /// Additive and defaulted, so a session written by this build is still
-        /// read by one that predates the field, and an older session reads back
-        /// as a turn without images.
+        /// Omitted when empty; deserialization treats an omitted value as no
+        /// images.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<PathBuf>,
     },
@@ -174,25 +173,7 @@ pub struct ExchangeResult {
     /// live. Treating them as asks would un-fold every command under the
     /// permission modes chosen precisely to stop asking.
     ///
-    /// Three states, and the third is the point:
-    ///
-    /// * `Some(true)` — a human was shown the request; their answer is in
-    ///   `status` (`Success` = granted, `Denied` = refused);
-    /// * `Some(false)` — nobody was asked: the policy never raised the gate, a
-    ///   standing consent resolved it, it was refused outright without asking
-    ///   (a hard `PolicyVerdict::Deny`), or the wait was cancelled;
-    /// * `None` — recorded before this field existed. **Unknown**, which is not
-    ///   the same as "nobody asked", and a reader must not treat it as such.
-    ///
-    /// The writer spells the same thing as [`Ask::Asked`] / [`Ask::Unasked`]:
-    /// `Some(true)` is exactly `Ask::Asked`, because a bare `true` in the middle
-    /// of `record_tool_result`'s argument list is the sort of thing that gets
-    /// flipped without anyone noticing. Only the *reader* sees the `Option`,
-    /// where the third state is what a resumed transcript has to cope with.
-    ///
-    /// Additive and defaulted: a session written by this build is still read by
-    /// an older one (which ignores the field) and an older session reads back as
-    /// `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub asked: Option<bool>,
+    /// `true` when the approval gate put the call in front of a human, `false`
+    /// when policy or standing consent resolved it without a prompt.
+    pub asked: bool,
 }

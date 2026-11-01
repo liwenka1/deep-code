@@ -113,8 +113,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     let mut file = options.open(path)?;
     file.write_all(bytes)?;
-    // A pre-existing key file created before the mode was applied (or by an
-    // older build) gets tightened on the way past.
+    // Tighten permissions on every successful write as well.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -188,9 +187,7 @@ pub(crate) fn sign_roots(id: &str, workspace: &Path, roots: &[PathBuf]) -> Optio
 /// Whether `tag` really was produced by this host for exactly these grants.
 ///
 /// An empty grant list needs no tag: there is nothing to authorize, so a
-/// record that grants nothing verifies whether or not it carries one. That is
-/// what lets records written before this field existed resume normally
-/// instead of every one of them warning.
+/// record that grants nothing verifies whether or not it carries one.
 #[must_use]
 pub(crate) fn verify_roots(
     id: &str,
@@ -291,8 +288,7 @@ mod tests {
         );
     }
 
-    /// Nothing granted, nothing to authorize — otherwise every record written
-    /// before this field existed would warn on resume.
+    /// Nothing granted, nothing to authorize.
     #[test]
     fn an_empty_grant_list_needs_no_tag() {
         assert!(verify_roots("sess-1", Path::new("/ws"), &[], None));

@@ -56,8 +56,6 @@ pub enum ImageDetail {
     /// Downscaled to 512×512 first: faster and cheaper when fine detail does
     /// not matter.
     Low,
-    /// The original image. Provided for compatibility; same as `Original`.
-    High,
     /// The original image.
     Original,
     /// Automatic selection, currently equivalent to `Original`.
@@ -70,7 +68,6 @@ impl ImageDetail {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Low => "low",
-            Self::High => "high",
             Self::Original => "original",
             Self::Auto => "auto",
         }
@@ -82,7 +79,6 @@ impl ImageDetail {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "low" => Some(Self::Low),
-            "high" => Some(Self::High),
             "original" => Some(Self::Original),
             "auto" => Some(Self::Auto),
             _ => None,
@@ -1056,7 +1052,7 @@ mod tests {
             "external",
             vec![ImageRef::Url {
                 url: "https://example.com/a.jpg".to_string(),
-                detail: Some(ImageDetail::High),
+                detail: Some(ImageDetail::Original),
             }],
         )];
 
@@ -1323,12 +1319,7 @@ mod tests {
 
     #[test]
     fn detail_round_trips_through_its_wire_spelling() {
-        for detail in [
-            ImageDetail::Low,
-            ImageDetail::High,
-            ImageDetail::Original,
-            ImageDetail::Auto,
-        ] {
+        for detail in [ImageDetail::Low, ImageDetail::Original, ImageDetail::Auto] {
             assert_eq!(ImageDetail::parse(detail.as_str()), Some(detail));
         }
         assert_eq!(ImageDetail::parse(" LOW "), Some(ImageDetail::Low));

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::image::ImageRef;
-use crate::message::{Message, Role};
+use crate::message::Message;
 use crate::model::ToolCallPayload;
 use crate::session_entry::{Ask, EntryKind, ExchangeResult, SessionEntry, ToolExchange};
 use crate::tool::ToolResultStatus;
@@ -133,9 +133,8 @@ impl Session {
     /// Returns false when no pending exchange matches.
     ///
     /// `ask` is whether the approval gate put this call in front of a human —
-    /// see [`ExchangeResult::asked`]. The caller always knows (it is the layer
-    /// that ran the gate), so this is unambiguous on the way in and only the
-    /// *reader* has to cope with records that predate the field.
+    /// see [`ExchangeResult::asked`]. The completed current record always
+    /// stores this decision.
     pub fn record_tool_result(
         &mut self,
         call_id: &str,
@@ -175,7 +174,7 @@ impl Session {
         exchange.result = Some(ExchangeResult {
             content,
             status,
-            asked: Some(ask == Ask::Asked),
+            asked: ask == Ask::Asked,
         });
         true
     }
@@ -190,71 +189,6 @@ impl Session {
             .iter()
             .flat_map(|entry| entry_wire_messages(entry))
             .collect()
-    }
-
-    /// Group wire messages back into entries — the inverse of
-    /// [`Session::wire_messages`] for protocol-valid histories. Used to load
-    /// schema-v1 records; unanswered `tool_calls` become pending exchanges
-    /// (the old `repair_dangling_tool_calls` semantics, applied structurally).
-    #[must_use]
-    pub fn from_wire_messages(messages: &[Message]) -> Self {
-        let mut entries: Vec<SessionEntry> = Vec::new();
-        for message in messages {
-            match message.role {
-                Role::System => {
-                    if let Some(summary) = message.content.strip_prefix(COMPACTION_SUMMARY_PREFIX) {
-                        entries.push(SessionEntry::compaction(summary.to_string(), 0));
-                    } else {
-                        entries.push(SessionEntry::system(message.content.clone()));
-                    }
-                }
-                Role::User => entries.push(SessionEntry::user(message.content.clone())),
-                Role::Assistant => {
-                    let exchanges = message
-                        .tool_calls
-                        .iter()
-                        .cloned()
-                        .map(ToolExchange::pending)
-                        .collect();
-                    entries.push(SessionEntry::assistant(
-                        message.content.clone(),
-                        message.reasoning_content.clone(),
-                        exchanges,
-                    ));
-                }
-                Role::Tool => {
-                    let Some(call_id) = message.tool_call_id.as_deref() else {
-                        continue;
-                    };
-                    let slot = entries.iter_mut().rev().find_map(|entry| {
-                        let EntryKind::Assistant { exchanges, .. } = &mut entry.kind else {
-                            return None;
-                        };
-                        exchanges.iter_mut().find(|exchange| {
-                            exchange.call.id == call_id && exchange.result.is_none()
-                        })
-                    });
-                    if let Some(exchange) = slot {
-                        // Wire messages carry no status; the schema-v2
-                        // migration recovers it from TurnRecord. In-memory
-                        // resume only needs the content for wire round-trips —
-                        // and it has no approval state either, so whether a
-                        // human was asked is left unknown rather than guessed.
-                        exchange.result = Some(ExchangeResult {
-                            content: message.content.clone(),
-                            status: ToolResultStatus::Success,
-                            asked: None,
-                        });
-                    }
-                    // Orphan tool messages (no matching call) were already
-                    // protocol-invalid in v1; drop them.
-                }
-            }
-        }
-        // Construction mutates entries freely above; sharing starts here.
-        Self {
-            entries: entries.into_iter().map(Arc::new).collect(),
-        }
     }
 }
 
@@ -342,65 +276,9 @@ mod tests {
     }
 
     #[test]
-    fn wire_synthesizes_placeholder_for_interrupted_exchange() {
-        let session = Session::from_wire_messages(&[
-            Message::user("写个 README"),
-            Message::assistant_with_tool_calls("", vec![tool_call("call_1")]),
-            // interrupted here: no tool result was persisted
-            Message::user("继续"),
-        ]);
-        let messages = session.wire_messages();
-        assert_eq!(messages.len(), 4);
-        // Synthetic tool result derived right after the tool_calls message.
-        assert_eq!(messages[2].role, Role::Tool);
-        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(messages[2].content, INTERRUPTED_TOOL_RESULT);
-        assert_eq!(messages[3].role, Role::User);
-    }
-
-    #[test]
-    fn wire_covers_each_unanswered_parallel_call() {
-        let session = Session::from_wire_messages(&[
-            Message::assistant_with_tool_calls("", vec![tool_call("a"), tool_call("b")]),
-            Message::tool("a", "done"),
-            // "b" never answered
-        ]);
-        let wire = session.wire_messages();
-        let answered: Vec<(String, &str)> = wire
-            .iter()
-            .filter(|message| message.role == Role::Tool)
-            .map(|message| {
-                (
-                    message.tool_call_id.clone().unwrap(),
-                    if message.content == "done" {
-                        "done"
-                    } else {
-                        "synth"
-                    },
-                )
-            })
-            .collect();
-        assert_eq!(
-            answered,
-            vec![("a".to_string(), "done"), ("b".to_string(), "synth")]
-        );
-    }
-
-    #[test]
-    fn wire_round_trips_paired_history() {
-        let original = vec![
-            Message::assistant_with_tool_calls("", vec![tool_call("call_1")]),
-            Message::tool("call_1", "ok"),
-            Message::user("thanks"),
-        ];
-        let session = Session::from_wire_messages(&original);
-        assert_eq!(session.wire_messages(), original);
-    }
-
-    #[test]
-    fn golden_wire_equivalence_with_v1_construction() {
+    fn golden_wire_equivalence_with_hand_built_messages() {
         // Build a representative transcript through the domain API and assert
-        // the derived wire equals the hand-built v1 message vector — this is
+        // the derived wire equals the hand-built message vector — this is
         // what keeps the DeepSeek prefix-cache fingerprint stable across the
         // refactor.
         let mut session = Session::new();
@@ -426,7 +304,7 @@ mod tests {
         session.push_assistant("改好了", "", Vec::new());
         session.push_user("thanks");
 
-        let v1 = vec![
+        let expected = vec![
             Message::system("you are deep-code"),
             Message::user("修个 bug"),
             Message::assistant_turn(
@@ -439,10 +317,7 @@ mod tests {
             Message::assistant_turn("改好了", "", Vec::new()),
             Message::user("thanks"),
         ];
-        assert_eq!(session.wire_messages(), v1);
-
-        // And the grouping inverse reproduces the same wire.
-        assert_eq!(Session::from_wire_messages(&v1).wire_messages(), v1);
+        assert_eq!(session.wire_messages(), expected);
     }
 
     #[test]
@@ -478,24 +353,5 @@ mod tests {
             ToolResultStatus::Success,
             Ask::Unasked
         ));
-    }
-
-    #[test]
-    fn compaction_summary_round_trips_through_grouping() {
-        let mut session = Session::new();
-        session.replace_entries(vec![
-            Arc::new(SessionEntry::system("sys")),
-            Arc::new(SessionEntry::compaction("- 用户: 旧对话", 12)),
-            Arc::new(SessionEntry::user("new question")),
-        ]);
-        let wire = session.wire_messages();
-        assert!(wire[1].content.starts_with("[会话摘要"));
-
-        let regrouped = Session::from_wire_messages(&wire);
-        assert!(matches!(
-            &regrouped.entries()[1].kind,
-            EntryKind::Compaction { summary, .. } if summary == "- 用户: 旧对话"
-        ));
-        assert_eq!(regrouped.wire_messages(), wire);
     }
 }

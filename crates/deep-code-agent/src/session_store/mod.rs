@@ -27,8 +27,8 @@ use crate::pricing::CostEstimate;
 use crate::session_entry::{EntryKind, SessionEntry};
 
 /// Current on-disk schema version. Bump when making breaking layout changes.
-/// Schema v3 is the first format written with authenticated records. Older
-/// files are intentionally unsupported while the project is still pre-release.
+/// Schema v3 is the authenticated record format. Older layouts are outside the
+/// current storage contract.
 pub const SESSION_SCHEMA_VERSION: u32 = 3;
 
 /// Hard limits for the JSON backend. Session files live in the workspace and
@@ -148,7 +148,6 @@ pub struct SessionRecord {
     pub entries: Vec<std::sync::Arc<SessionEntry>>,
     pub turns: Vec<TurnRecord>,
     /// Workspace snapshots created during this session.
-    #[serde(default)]
     pub checkpoints: Vec<CheckpointRecord>,
     /// Transcript summary produced by compaction. Derived field mirroring the
     /// latest Compaction entry, kept for status lines and events.
@@ -160,15 +159,10 @@ pub struct SessionRecord {
     /// Cumulative token cost over the session's whole lifetime. Persisted so a
     /// resumed session's displayed total continues from where it left off
     /// instead of resetting to zero. The runtime's in-memory accumulators are
-    /// flushed here on every save and restored on resume. Defaulted for old
-    /// files that predate the field (they resume at zero, as before).
-    #[serde(default)]
+    /// flushed here on every save and restored on resume.
     pub session_cost: CostEstimate,
-    #[serde(default)]
     pub session_cache_hit_tokens: u64,
-    #[serde(default)]
     pub session_cache_miss_tokens: u64,
-    #[serde(default)]
     pub session_cache_savings: CostEstimate,
 }
 

@@ -447,7 +447,7 @@ struct BudgetSection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct VisionSection {
-    /// `low` | `high` | `original` | `auto`; see [`ImageDetail`].
+    /// `low` | `original` | `auto`; see [`ImageDetail`].
     detail: Option<String>,
     #[serde(flatten)]
     unknown: UnknownKeys,

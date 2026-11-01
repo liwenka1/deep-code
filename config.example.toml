@@ -57,7 +57,6 @@
 # base_url = "https://api.deepseek.com/beta"
 
 # Model: deepseek-v4-pro, deepseek-flash, or auto (routed per task).
-# The former name deepseek-v4-flash still resolves.
 # model = "auto"
 
 # Reasoning effort: off, low, medium, high, max.
@@ -293,7 +292,6 @@
 #
 #   low       downscales to 512x512 first - faster and cheaper, and the wrong
 #             choice when you are attaching a screenshot to read text off
-#   high      the original image (same as `original`)
 #   original  the original image
 #   auto      let the API decide; currently the same as `original`
 #

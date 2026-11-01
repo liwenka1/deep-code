@@ -916,7 +916,7 @@ mod tests {
             result: Some(crate::session_entry::ExchangeResult {
                 content: injected.to_string(),
                 status: crate::tool::ToolResultStatus::Success,
-                asked: None,
+                asked: false,
             }),
         };
         let entries = vec![
@@ -990,7 +990,7 @@ mod tests {
             result: Some(crate::session_entry::ExchangeResult {
                 content: injected.to_string(),
                 status: crate::tool::ToolResultStatus::Success,
-                asked: None,
+                asked: false,
             }),
         };
         let entries = vec![
