@@ -842,9 +842,7 @@ fn write_no_follow_refuses_a_symlinked_target() {
 /// and their results are deliberately ignored: the only question asked is
 /// whether the victim outside the boundary ever changed.
 #[cfg(unix)]
-fn victim_survives_a_planted_symlink(
-    write: impl Fn(&Path) -> Result<(), String>,
-) -> (String, usize) {
+fn victim_survives_a_planted_symlink(write: impl Fn(&Path) -> Result<(), String>) -> String {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -853,6 +851,16 @@ fn victim_survives_a_planted_symlink(
     let victim = outside.path().join("victim.txt");
     fs::write(&victim, "ORIGINAL\n").unwrap();
     let target = tmp.path().join("notes.txt");
+
+    // Exercise the ordinary write path once while the target is a known-good
+    // regular file. The race below is only a confinement check: whether a
+    // loaded CI runner happens to hit the tiny successful-write window is not
+    // a property of the implementation and must not decide the test result.
+    fs::write(&target, "filler\nOLD\n").unwrap();
+    assert!(
+        write(tmp.path()).is_ok(),
+        "the write tool must succeed for a regular in-workspace target"
+    );
 
     let stop = Arc::new(AtomicBool::new(false));
     let flipper = std::thread::spawn({
@@ -867,34 +875,16 @@ fn victim_survives_a_planted_symlink(
         }
     });
 
-    // `O_NOFOLLOW` makes the victim untouchable regardless of interleaving, so
-    // a correct implementation never lets it escape no matter how the loop
-    // races. `landed` counts successful writes: it catches a loop that never
-    // runs at all (an injected `return Err(..)` left both tests green,
-    // asserting nothing).
-    //
-    // We deliberately do NOT assert on how many writes were refused by the
-    // O_NOFOLLOW leaf check. That count only rises when the flipper lands in
-    // the narrow TOCTOU window — the link DOWN when the tool resolves, UP by
-    // the time it opens — and whether a scheduler ever hits that window inside
-    // a bounded loop is pure timing. It is reliably hit on a fast multi-core
-    // dev box and can be missed entirely on a loaded CI runner, especially for
-    // `apply_patch`, whose read/`locate_match` step turns most "link is up"
-    // iterations into no-match errors before they ever reach the open.
-    // Requiring a non-zero count flaked the suite RED on CI while the code was
-    // correct. The guard's correctness — including that a no-op
-    // `write_no_follow` returning `Ok(())` is caught — is pinned
-    // deterministically by `write_no_follow_refuses_a_symlinked_target`, which
-    // plants the link and calls the primitive directly, no race needed.
-    let mut landed = 0usize;
+    // The capability-backed open makes the victim untouchable regardless of
+    // interleaving. A loaded CI runner may miss the narrow successful-write
+    // window entirely, so do not make the result depend on how many calls
+    // happened to land there.
     for _ in 0..3000 {
-        if write(tmp.path()).is_ok() {
-            landed += 1;
-        }
+        let _ = write(tmp.path());
     }
     stop.store(true, Ordering::Relaxed);
     flipper.join().unwrap();
-    (fs::read_to_string(&victim).unwrap(), landed)
+    fs::read_to_string(&victim).unwrap()
 }
 
 /// The CALL-SITE half of the `O_NOFOLLOW` guarantee, for both tools that write.
@@ -912,7 +902,7 @@ fn victim_survives_a_planted_symlink(
 #[cfg(unix)]
 #[test]
 fn write_file_never_follows_a_symlink_planted_mid_write() {
-    let (survived, landed) = victim_survives_a_planted_symlink(|root| {
+    let survived = victim_survives_a_planted_symlink(|root| {
         let policy = WorkspacePolicy::new(root.to_path_buf()).unwrap();
         let tool = WriteFileTool::new(policy);
         tool.write_sync(WriteFileParams {
@@ -926,16 +916,12 @@ fn write_file_never_follows_a_symlink_planted_mid_write() {
         survived, "ORIGINAL\n",
         "write_file followed a symlink out of the workspace"
     );
-    assert!(
-        landed > 0,
-        "the race was never exercised: every write failed"
-    );
 }
 
 #[cfg(unix)]
 #[test]
 fn apply_patch_never_follows_a_symlink_planted_mid_write() {
-    let (survived, landed) = victim_survives_a_planted_symlink(|root| {
+    let survived = victim_survives_a_planted_symlink(|root| {
         let policy = WorkspacePolicy::new(root.to_path_buf()).unwrap();
         let tool = ApplyPatchTool::new(policy);
         tool.patch_sync(ApplyPatchParams {
@@ -949,10 +935,6 @@ fn apply_patch_never_follows_a_symlink_planted_mid_write() {
     assert_eq!(
         survived, "ORIGINAL\n",
         "apply_patch followed a symlink out of the workspace"
-    );
-    assert!(
-        landed > 0,
-        "the race was never exercised: every patch failed"
     );
 }
 

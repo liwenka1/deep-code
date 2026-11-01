@@ -786,7 +786,7 @@ impl GrepFilesTool {
 ///
 /// The production path is platform-independent through `cap_std`; this helper
 /// only documents and pins the Unix primitive used by the historical test.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn write_no_follow(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
