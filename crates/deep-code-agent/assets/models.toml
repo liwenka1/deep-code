@@ -98,7 +98,13 @@ output_cny = 27.0
 [[model]]
 id = "deepseek-flash"
 # `flash` is the advertised short name (see the `pro` note above).
-aliases = ["flash"]
+#
+# `deepseek-v4-flash` is the name releases up to 0.4.10 wrote into
+# `provider.model`, and the API still accepts it for this model (billing it at
+# the Flash rate), so a config carrying it has to keep resolving. 0.4.11's
+# changelog promised exactly that; dropping it would send those configs through
+# as an uncatalogued `Passthrough` id with no window, price or vision row.
+aliases = ["flash", "deepseek-v4-flash"]
 version = "DeepSeek-V4.1-Flash"
 
 supports_reasoning = true

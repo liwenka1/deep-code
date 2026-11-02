@@ -410,6 +410,21 @@ impl GrepFilesTool {
             .build()
             .map_err(|error| invalid(Self::NAME, format!("invalid regex pattern: {error}")))?;
         let search_path = self.root.resolve_existing(path_arg, Self::NAME)?;
+        // The walk starts inside one granted root and never follows a link, so
+        // every file it yields is a canonical path under that root. Open the
+        // root once per call: the per-file open used to canonicalize and
+        // re-open it, which is two extra syscalls per path component on a walk
+        // that can visit tens of thousands of files.
+        let (walk_root, _) = self.root.root_relative(&search_path, Self::NAME)?;
+        let walk_root_dir = crate::pinned_dir::open_canonical(&walk_root).map_err(|error| {
+            ToolError::exec_failed(
+                Self::NAME,
+                format!(
+                    "failed to open workspace root {}: {error}",
+                    walk_root.display()
+                ),
+            )
+        })?;
         let mut files_searched = 0usize;
         // Refusals are counted, not silently dropped: a file this loop refuses
         // to search is a place a match may be hiding, and "0 matches" without
@@ -582,18 +597,24 @@ impl GrepFilesTool {
             // The walker's path is only an enumeration hint. Re-open it from
             // the approved root with no-follow capabilities before reading or
             // even trusting its size; otherwise an intermediate directory
-            // swapped after the walk could redirect this in-process tool.
-            let safe = match self.root.open_existing_path(path, Self::NAME) {
-                Ok(safe) => safe,
-                Err(_) => {
-                    skipped_unreadable += 1;
-                    push_capped(
-                        &mut skipped_unreadable_paths,
-                        self.root.relative_display(path),
-                    );
-                    continue;
-                }
-            };
+            // swapped after the walk could redirect this in-process tool. The
+            // root handle was opened once above, and the walk never followed a
+            // link, so `path` is canonical under it.
+            let safe =
+                match self
+                    .root
+                    .open_existing_beneath(path, &walk_root, &walk_root_dir, Self::NAME)
+                {
+                    Ok(safe) => safe,
+                    Err(_) => {
+                        skipped_unreadable += 1;
+                        push_capped(
+                            &mut skipped_unreadable_paths,
+                            self.root.relative_display(path),
+                        );
+                        continue;
+                    }
+                };
             let Ok(metadata) = safe.no_follow_metadata() else {
                 skipped_unreadable += 1;
                 push_capped(

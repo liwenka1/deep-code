@@ -437,6 +437,37 @@ impl WorkspacePolicy {
         Ok(handle)
     }
 
+    /// Capability-backed open for a path the caller already knows is canonical
+    /// and inside `root`, reusing a root handle it opened once.
+    ///
+    /// This is the per-file path in `grep_files`: canonicalizing and re-opening
+    /// the root for every file in a tree cost two extra syscalls per path
+    /// component per file, on a walk that can visit tens of thousands. The
+    /// safety properties are the ones [`Self::open_parent_from`] enforces —
+    /// every component opened with `open_dir_nofollow`, the leaf never opened
+    /// here at all.
+    ///
+    /// `canonical` must be canonical and under `root`; `root` must be one of
+    /// [`Self::granted_roots`]. The only caller gets both from
+    /// [`Self::root_relative`] on a walk that does not follow links.
+    pub(crate) fn open_existing_beneath(
+        &self,
+        canonical: &Path,
+        root: &Path,
+        root_dir: &Dir,
+        tool_name: &str,
+    ) -> Result<SafePath, ToolError> {
+        let relative = canonical
+            .strip_prefix(root)
+            .map_err(|_| path_error(tool_name, &canonical.to_string_lossy(), OUTSIDE_ROOTS))?;
+        let (parent, leaf) = self.open_parent_from(root_dir, relative, false, tool_name)?;
+        Ok(SafePath {
+            path: canonical.to_path_buf(),
+            parent,
+            leaf,
+        })
+    }
+
     pub(crate) fn open_existing_dir(
         &self,
         raw: &str,
@@ -520,7 +551,11 @@ impl WorkspacePolicy {
         )
     }
 
-    fn root_relative(&self, path: &Path, tool_name: &str) -> Result<(PathBuf, PathBuf), ToolError> {
+    pub(crate) fn root_relative(
+        &self,
+        path: &Path,
+        tool_name: &str,
+    ) -> Result<(PathBuf, PathBuf), ToolError> {
         let root = self
             .granted_roots()
             .into_iter()
@@ -541,6 +576,25 @@ impl WorkspacePolicy {
         create_missing: bool,
         tool_name: &str,
     ) -> Result<(Dir, OsString), ToolError> {
+        let directory = crate::pinned_dir::open_canonical(root).map_err(|error| {
+            ToolError::exec_failed(
+                tool_name,
+                format!("failed to open workspace root {}: {error}", root.display()),
+            )
+        })?;
+        self.open_parent_from(&directory, relative, create_missing, tool_name)
+    }
+
+    /// The component walk half of [`Self::open_parent`], against a root handle
+    /// the caller already holds — `grep_files` opens the root once per call
+    /// instead of once per file.
+    fn open_parent_from(
+        &self,
+        root_dir: &Dir,
+        relative: &Path,
+        create_missing: bool,
+        tool_name: &str,
+    ) -> Result<(Dir, OsString), ToolError> {
         let mut components = relative
             .components()
             .filter_map(|component| match component {
@@ -550,10 +604,10 @@ impl WorkspacePolicy {
         let leaf = components
             .next_back()
             .ok_or_else(|| invalid(tool_name, "path must name a file inside a granted root"))?;
-        let mut directory = crate::pinned_dir::open_canonical(root).map_err(|error| {
+        let mut directory = root_dir.try_clone().map_err(|error| {
             ToolError::exec_failed(
                 tool_name,
-                format!("failed to open workspace root {}: {error}", root.display()),
+                format!("failed to reuse the workspace root handle: {error}"),
             )
         })?;
         for name in components {
