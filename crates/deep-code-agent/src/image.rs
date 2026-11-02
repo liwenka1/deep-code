@@ -73,13 +73,15 @@ impl ImageDetail {
         }
     }
 
-    /// Parse a configured value. `None` for anything the API does not list, so
-    /// a typo is reported rather than silently sent.
+    /// Parse a configured value. Accepts the API's own spellings (`low`,
+    /// `high`) as well as this codebase's alias (`original`), so a config
+    /// written against either vocabulary keeps loading; `None` for anything
+    /// else, so a typo is reported rather than silently sent.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "low" => Some(Self::Low),
-            "original" => Some(Self::Original),
+            "high" | "original" => Some(Self::Original),
             "auto" => Some(Self::Auto),
             _ => None,
         }
@@ -1323,6 +1325,11 @@ mod tests {
             assert_eq!(ImageDetail::parse(detail.as_str()), Some(detail));
         }
         assert_eq!(ImageDetail::parse(" LOW "), Some(ImageDetail::Low));
+        // `high` is the API's own spelling for the same thing, and 0.4.20's
+        // example config documented it: a config carrying it must keep
+        // loading rather than degrade to a warning and `auto`.
+        assert_eq!(ImageDetail::parse("high"), Some(ImageDetail::Original));
+        assert_eq!(ImageDetail::parse("HIGH"), Some(ImageDetail::Original));
     }
 
     #[test]

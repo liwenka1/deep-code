@@ -328,6 +328,11 @@ fn options_taking_a_value(program: &str) -> &'static [&'static str] {
             "-w",
             "--workspace",
             "-C",
+            // pnpm's workspace filter (`-F`) and yarn berry's directory.
+            "--filter",
+            "-F",
+            "--cwd",
+            "--dir",
         ],
         "cargo" => &[
             "--registry",
@@ -337,7 +342,7 @@ fn options_taking_a_value(program: &str) -> &'static [&'static str] {
             "--package",
             "--config",
         ],
-        "kubectl" | "helm" => &[
+        "kubectl" => &[
             "-n",
             "--namespace",
             "-l",
@@ -355,10 +360,60 @@ fn options_taking_a_value(program: &str) -> &'static [&'static str] {
             "--client-key",
             "--cluster",
             "--user",
+            "--v",
+            "--request-timeout",
+            "--tls-server-name",
+        ],
+        // helm spells its cluster options `--kube-*`. Sharing kubectl's list
+        // meant none of them consumed their value, so
+        // `helm --kube-context prod uninstall rel` read `prod` as the verb and
+        // the floor never fired.
+        "helm" => &[
+            "-n",
+            "--namespace",
+            "--kube-context",
+            "--kube-apiserver",
+            "--kube-as-user",
+            "--kube-as-group",
+            "--kube-token",
+            "--kube-ca-file",
+            "--kube-tls-server-name",
+            "--kubeconfig",
+            "--registry-config",
+            "--repository-cache",
+            "--repository-config",
+            "--burst-limit",
+            "--qps",
         ],
         "terraform" => &["-var", "-var-file", "-target"],
-        "aws" => &["--profile", "--region", "--exclude", "--include"],
+        "aws" => &[
+            "--profile",
+            "--region",
+            "--exclude",
+            "--include",
+            "--output",
+            "--query",
+            "--endpoint-url",
+            "--ca-bundle",
+            "--cli-read-timeout",
+            "--cli-connect-timeout",
+            "--cli-binary-format",
+            "--color",
+        ],
         "twine" | "poetry" => &["-r", "--repository", "-u", "--username", "-p", "--password"],
+        // `docker --context prod push` and `gem --config-file ~/.gemrc push`
+        // were read as subcommands named `prod` / `~/.gemrc`.
+        "docker" => &[
+            "--context",
+            "-H",
+            "--host",
+            "--config",
+            "--log-level",
+            "--tlscacert",
+            "--tlscert",
+            "--tlskey",
+        ],
+        "gem" => &["--config-file"],
         _ => &[],
     }
 }
@@ -401,6 +456,11 @@ fn subcommand_index_after_options(program: &str, args: &[&str]) -> Option<usize>
     while let Some(word) = args.get(index) {
         if *word == "--" {
             return (index + 1 < args.len()).then_some(index + 1);
+        }
+        // `cargo +nightly publish` selects a toolchain; it is not the verb.
+        if program == "cargo" && word.starts_with('+') {
+            index += 1;
+            continue;
         }
         let option_name = word.split_once('=').map_or(*word, |(name, _)| name);
         if value_options.contains(&option_name) && !word.contains('=') {

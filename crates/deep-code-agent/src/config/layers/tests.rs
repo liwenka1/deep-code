@@ -562,12 +562,13 @@ fn world_readable_global_key_file_warns_chmod() {
 #[test]
 fn every_enum_setting_warns_on_an_unrecognized_spelling() {
     // (section, key, a spelling no parser accepts)
-    const SETTINGS: [(&str, &str, &str); 5] = [
+    const SETTINGS: [(&str, &str, &str); 6] = [
         ("provider", "reasoning_effort", "maximum"),
         ("cost", "currency", "eur"),
         ("sandbox", "network", "nevr"),
         ("approval", "default_mode", "yoloo"),
         ("ui", "language", "kling0n"),
+        ("vision", "detail", "hihg"),
     ];
 
     for (section, key, bad) in SETTINGS {

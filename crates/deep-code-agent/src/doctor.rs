@@ -463,6 +463,15 @@ mod tests {
         }
         // Each structured field carries its enforcement level.
         assert!(sandbox["filesystem"]["level"].is_string());
+        // The pre-0.4.20 spellings are retired, and nothing may quietly bring
+        // them back: a supervisor reading a stale key would report an
+        // enforcement level this build never set.
+        for removed in ["confines_filesystem", "confines_network"] {
+            assert!(
+                !object.contains_key(removed),
+                "sandbox.{removed} is a retired key and must not be re-added"
+            );
+        }
     }
 
     /// `[sandbox] mode = "off"` turns the OS sandbox off, so the report must

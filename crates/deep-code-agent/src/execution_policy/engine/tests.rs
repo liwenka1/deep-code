@@ -1834,12 +1834,66 @@ fn leading_options_do_not_hide_irreversible_subcommands() {
     for command in [
         "kubectl -n prod delete pod api",
         "kubectl --namespace prod drain node/worker",
+        "kubectl --v 6 delete ns prod",
         "npm -s publish",
         "pnpm -r publish",
+        "pnpm -F web publish",
         "yarn --silent publish",
+        "yarn --cwd ./pkg publish",
+        "cargo +nightly publish",
         "gh --repo owner/repo pr merge 1",
+        "aws --output json s3 rb s3://prod-assets --force",
+        "docker --context prod push registry.example/x:1",
+        "helm --kube-context prod uninstall release",
+        "gem --config-file ~/.gemrc push pkg.gem",
     ] {
         assert!(floor_gated(&policy, command), "{command:?}");
+    }
+}
+
+/// Every value-taking option in the table must actually consume its value.
+///
+/// A wrong entry is invisible from the outside: the word after the option is
+/// read as the verb, no arm matches, and the floor simply stops firing — which
+/// looks like "nothing to gate" rather than "the table is wrong". The helm row
+/// was copied from kubectl and named options helm does not have, so none of
+/// helm's own `--kube-*` spellings were covered.
+#[test]
+fn every_known_value_option_consumes_its_value() {
+    // (program, a verb that program's floor arm reads)
+    for (program, verb) in [
+        ("gh", "pr"),
+        ("npm", "publish"),
+        ("yarn", "publish"),
+        ("pnpm", "publish"),
+        ("bun", "publish"),
+        ("cargo", "publish"),
+        ("kubectl", "delete"),
+        ("helm", "uninstall"),
+        ("terraform", "apply"),
+        ("aws", "s3"),
+        ("twine", "upload"),
+        ("poetry", "publish"),
+        ("docker", "push"),
+        ("gem", "push"),
+    ] {
+        for option in options_taking_a_value(program) {
+            let args = [*option, "VALUE", verb];
+            assert_eq!(
+                subcommand_index_after_options(program, &args),
+                Some(2),
+                "{program} {option} VALUE {verb}: the option did not take its value"
+            );
+        }
+    }
+    // git's globals use a second walker; the same rule has to hold there.
+    for option in GIT_GLOBAL_OPTIONS_WITH_VALUE {
+        let args = [*option, "VALUE", "push"];
+        assert_eq!(
+            subcommand_index_after_options("git", &args),
+            Some(2),
+            "git {option} VALUE push"
+        );
     }
 }
 
