@@ -205,7 +205,7 @@ fn signed(mut record: SessionRecord) -> SessionRecord {
         &record.workspace,
         &record.extra_roots,
     );
-    record.record_mac = crate::session_integrity::sign_record(&record);
+    record.record_mac = crate::session_integrity::sign_record(&mut record);
     record
 }
 

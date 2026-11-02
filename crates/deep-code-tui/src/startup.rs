@@ -57,6 +57,11 @@ pub fn choose_startup(
     }
 
     let sessions = store.list()?; // newest-first
+    // `list()` collects what it had to skip instead of printing it: here, before
+    // the alternate screen, stderr is still the terminal the user is looking at.
+    for line in store.take_diagnostics() {
+        eprintln!("{line}");
+    }
     match resolve(&intent, sessions) {
         Resolution::New => Ok(None),
         Resolution::Resume(record) => Ok(Some(*record)),

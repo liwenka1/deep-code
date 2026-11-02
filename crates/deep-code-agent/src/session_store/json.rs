@@ -17,6 +17,12 @@ use super::{
 pub struct JsonSessionStore {
     root: PathBuf,
     directory: Arc<Dir>,
+    /// Records `list()` refused to return, as one line each. Collected instead
+    /// of printed: a library that writes to stderr cannot be shown by the
+    /// caller that asked for the list, and in the TUI it was swallowed by the
+    /// log redirect — leaving "No saved sessions." to explain a directory full
+    /// of files.
+    diagnostics: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl JsonSessionStore {
@@ -36,7 +42,28 @@ impl JsonSessionStore {
         Ok(Self {
             root: sessions_dir_for_workspace(workspace),
             directory: Arc::new(directory),
+            diagnostics: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
+    }
+
+    /// Take the lines accumulated by earlier [`SessionStore::list`] calls:
+    /// sessions skipped because they could not be trusted or read. Empty is
+    /// the normal answer.
+    #[must_use]
+    pub fn take_diagnostics(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .diagnostics
+                .lock()
+                .expect("session diagnostics lock poisoned"),
+        )
+    }
+
+    fn diagnose(&self, message: String) {
+        self.diagnostics
+            .lock()
+            .expect("session diagnostics lock poisoned")
+            .push(message);
     }
 
     fn path_for(&self, id: &SessionId) -> Result<PathBuf, SessionStoreError> {
@@ -204,7 +231,7 @@ impl SessionStore for JsonSessionStore {
                 limit: MAX_SESSION_FILE_BYTES,
             });
         }
-        let record: SessionRecord =
+        let mut record: SessionRecord =
             serde_json::from_str(json).map_err(|error| SessionStoreError::Serialization {
                 message: format!("failed to parse {}: {error}", path.display()),
             })?;
@@ -230,7 +257,7 @@ impl SessionStore for JsonSessionStore {
                 ),
             });
         }
-        if !crate::session_integrity::verify_record(&record) {
+        if !crate::session_integrity::verify_record(&mut record) {
             return Err(SessionStoreError::AuthenticationUnavailable {
                 id: id.as_str().to_string(),
             });
@@ -245,13 +272,16 @@ impl SessionStore for JsonSessionStore {
         // inside it; without this, the resumed runtime would save back under that
         // original id and silently clobber the source session. Binding the id to
         // the file it was loaded from makes a fork write to itself.
-        let authenticated = crate::session_integrity::verify_record(&record);
+        let authenticated = crate::session_integrity::verify_record(&mut record);
         record.id = id.clone();
         // A deliberately copied session file is a valid fork when its
-        // original contents were host-authenticated. Rebind the id and issue
-        // a fresh in-memory tag so the resumed runtime can still verify it.
+        // original contents were host-authenticated: rebind the id and re-tag
+        // the transcript, so the resumed runtime can still verify it. The
+        // narrow grant tag is NOT re-issued — it names the id and workspace it
+        // was approved under, so a fork keeps its conversation and loses its
+        // authority (`runtime_launch` drops the grants, with a warning).
         if authenticated {
-            record.record_mac = crate::session_integrity::sign_record(&record);
+            record.record_mac = crate::session_integrity::sign_record(&mut record);
         }
         Ok(record)
     }
@@ -299,11 +329,11 @@ impl SessionStore for JsonSessionStore {
             scanned_bytes = scanned_bytes.saturating_add(file_bytes);
             match self.read_file(&path) {
                 Ok(mut record) => {
-                    if !crate::session_integrity::verify_record(&record) {
-                        eprintln!(
+                    if !crate::session_integrity::verify_record(&mut record) {
+                        self.diagnose(format!(
                             "skipping unauthenticated session {} (modified file)",
                             path.display()
-                        );
+                        ));
                         continue;
                     }
                     // Bind the id to the filename, as `load` does and for the same
@@ -311,7 +341,7 @@ impl SessionStore for JsonSessionStore {
                     // the file that actually holds the session, not an id copied
                     // inside it.
                     record.id = SessionId(stem.to_string());
-                    record.record_mac = crate::session_integrity::sign_record(&record);
+                    record.record_mac = crate::session_integrity::sign_record(&mut record);
                     let target = if record.has_user_entry() {
                         &mut resumable
                     } else {
@@ -329,10 +359,16 @@ impl SessionStore for JsonSessionStore {
                     }
                 }
                 Err(SessionStoreError::UnsupportedSchema { .. }) => {
-                    eprintln!("skipping unsupported session file {}", path.display());
+                    self.diagnose(format!(
+                        "skipping unsupported session file {}",
+                        path.display()
+                    ));
                 }
                 Err(error) => {
-                    eprintln!("skipping unreadable session {}: {error}", path.display());
+                    self.diagnose(format!(
+                        "skipping unreadable session {}: {error}",
+                        path.display()
+                    ));
                 }
             }
         }

@@ -388,3 +388,193 @@ fn json_store_export_is_pretty_json() {
     assert!(exported.contains("\"schema_version\""));
     assert!(exported.contains('\n'));
 }
+
+/// The fields of [`SessionRecord`] are part of the signed bytes:
+/// `session_integrity::record_message` signs a re-serialization of the parsed
+/// struct, so adding or removing a field changes the tag for every existing
+/// record. `list()` would then treat those files as forged and `/resume` would
+/// discard their transcripts.
+///
+/// Adding a field is therefore allowed only together with a
+/// `SESSION_SCHEMA_VERSION` bump. This list is the tripwire that makes the bump
+/// deliberate: if you are reading this because the assertion failed, bump the
+/// version (and update the list) rather than deleting the test.
+#[test]
+fn the_signed_field_set_is_pinned() {
+    let mut record = SessionRecord::new(PathBuf::from("/ws"), "system");
+    // Populate every optional field too, so no key hides behind its
+    // `skip_serializing_if`.
+    record.extra_roots = vec![PathBuf::from("/extra")];
+    record.extra_roots_mac = Some("tag".to_string());
+    record.record_mac = Some("tag".to_string());
+    record.summary = Some("summary".to_string());
+    record.compaction = Some("archived=1".to_string());
+
+    let value = serde_json::to_value(&record).unwrap();
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .expect("a record is a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "checkpoints",
+            "compaction",
+            "created_at_ms",
+            "entries",
+            "extra_roots",
+            "extra_roots_mac",
+            "id",
+            "record_mac",
+            "schema_version",
+            "session_cache_hit_tokens",
+            "session_cache_miss_tokens",
+            "session_cache_savings",
+            "session_cost",
+            "summary",
+            "turns",
+            "updated_at_ms",
+            "workspace",
+        ],
+        "the record's shape is part of the host tag: bump SESSION_SCHEMA_VERSION \
+         when it changes, and update this list"
+    );
+}
+
+/// A key this build does not know is dropped at parse time, so it never reaches
+/// the signed message. That is what makes a forward-compatible writer safe: the
+/// record stays verifiable and `list()` still offers it.
+#[test]
+fn an_unknown_field_does_not_make_a_record_look_forged() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
+    store.save(&mut record).unwrap();
+    let path = store.path_for(&record.id).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["a_field_from_a_newer_build"] = serde_json::json!({"nested": true});
+    fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+    let listed = store.list().unwrap();
+    assert_eq!(listed.len(), 1, "an unknown key must not hide the session");
+    assert_eq!(listed[0].id, record.id);
+}
+
+/// The other direction: a *required* field that disappears is a parse error, not
+/// an empty session. The distinction matters because the version check is what
+/// lets a schema bump reject old files explicitly; a parser that filled the gap
+/// with a default would hand an unverifiable record to `/resume`, which then
+/// clears the transcript and writes the empty result back.
+#[test]
+fn a_record_missing_a_required_field_is_refused_rather_than_emptied() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
+    store.save(&mut record).unwrap();
+    let path = store.path_for(&record.id).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("session_cost")
+        .expect("session_cost is persisted");
+    fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+    assert!(matches!(
+        store.load(&record.id),
+        Err(SessionStoreError::Serialization { .. })
+    ));
+    assert!(store.list().unwrap().is_empty());
+    let diagnostics = store.take_diagnostics();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|line| line.contains("unreadable session")),
+        "{diagnostics:?}"
+    );
+}
+
+/// A record that fails its tag is skipped by `list()` — and the reason is
+/// handed to the caller instead of written to stderr, where the TUI's log
+/// redirect swallowed it and `-c` said "No saved sessions." over a directory
+/// full of files.
+#[test]
+fn list_hands_its_skip_reasons_to_the_caller() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
+    store.save(&mut record).unwrap();
+    let path = store.path_for(&record.id).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    // `updated_at_ms` is inside the tag.
+    value["updated_at_ms"] = serde_json::json!(1);
+    fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+    assert!(store.list().unwrap().is_empty());
+    let diagnostics = store.take_diagnostics();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|line| line.contains("unauthenticated session")),
+        "{diagnostics:?}"
+    );
+    assert!(
+        store.take_diagnostics().is_empty(),
+        "taking the diagnostics must drain them"
+    );
+}
+
+/// A copied session file is a fork, and the two tags deliberately disagree
+/// about what that means: the conversation travels (the record tag is re-issued
+/// for the new id, so `/resume` does not treat a legitimately copied file as a
+/// forged one), and the write grants do not (the grant tag names the id and
+/// workspace they were approved under, so `runtime_launch` drops them with a
+/// warning).
+///
+/// Pinning both halves keeps the next reader from "fixing" one into the other:
+/// re-signing the grants would carry one workspace's authority into another,
+/// and not re-signing the record would throw away the transcript of a fork.
+#[test]
+fn a_forked_session_keeps_its_transcript_and_loses_its_grants() {
+    let dir = tempfile::tempdir().unwrap();
+    let extra = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
+    record.extra_roots = vec![extra.path().to_path_buf()];
+    record.entries.push(std::sync::Arc::new(
+        crate::session_entry::SessionEntry::user("keep me"),
+    ));
+    store.save(&mut record).unwrap();
+
+    let fork = SessionId("session_forked_1".to_string());
+    fs::copy(
+        store.path_for(&record.id).unwrap(),
+        store.path_for(&fork).unwrap(),
+    )
+    .unwrap();
+
+    let mut loaded = store.load(&fork).unwrap();
+    assert_eq!(loaded.id, fork, "the filename wins over the stored id");
+    assert_eq!(
+        loaded.entries.len(),
+        record.entries.len(),
+        "a fork keeps the conversation"
+    );
+    assert!(
+        crate::session_integrity::verify_record(&mut loaded),
+        "the fork's re-issued record tag must verify, or `/resume` would \
+         discard the transcript it just kept"
+    );
+    assert!(
+        !crate::session_integrity::verify_roots(
+            loaded.id.as_str(),
+            &loaded.workspace,
+            &loaded.extra_roots,
+            loaded.extra_roots_mac.as_deref(),
+        ),
+        "a fork must not inherit the original session's write grants"
+    );
+}

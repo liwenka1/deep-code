@@ -303,13 +303,29 @@ impl App {
             self.status = self.busy_status(TextId::BusySwitchSession);
             return;
         }
-        let sessions = match JsonSessionStore::for_pinned_workspace(&self.workspace)
-            .and_then(|store| store.list())
-        {
-            Ok(list) => list
-                .into_iter()
-                .filter(crate::startup::has_user_message)
-                .collect::<Vec<_>>(),
+        let store = match JsonSessionStore::for_pinned_workspace(&self.workspace) {
+            Ok(store) => store,
+            Err(error) => {
+                self.status =
+                    self.tr_with(TextId::SessionsReadFailed, &[("error", &error.to_string())]);
+                return;
+            }
+        };
+        let sessions = match store.list() {
+            Ok(list) => {
+                // Sessions the store refused to return (unverified file, schema
+                // it cannot read). Before this they went to stderr, which the
+                // TUI redirects into the log — invisible exactly when the
+                // picker is about to tell the user there is nothing to resume.
+                let skipped = store.take_diagnostics();
+                if !skipped.is_empty() {
+                    self.history
+                        .push(crate::history::HistoryCell::system(skipped.join("\n")));
+                }
+                list.into_iter()
+                    .filter(crate::startup::has_user_message)
+                    .collect::<Vec<_>>()
+            }
             Err(error) => {
                 self.status =
                     self.tr_with(TextId::SessionsReadFailed, &[("error", &error.to_string())]);

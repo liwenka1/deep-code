@@ -567,7 +567,7 @@ fn launch_resumed(
     // therefore cannot make the transcript trustworthy: a forged user/image
     // entry would still be sent to the provider on the next turn. Verify the
     // complete record before any entry reaches `Session::from_entries`.
-    if !crate::session_integrity::verify_record(&record) {
+    if !crate::session_integrity::verify_record(&mut record) {
         warnings.push(
             "discarding the unverified session transcript and persisted state: the session file "
                 .to_string()

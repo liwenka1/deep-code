@@ -938,17 +938,23 @@ impl App {
 
     fn list_sessions(&mut self) {
         match JsonSessionStore::for_workspace(self.workspace.clone()) {
-            Ok(store) => match store.list() {
-                Ok(records) if records.is_empty() => {
-                    self.status = self.tr(TextId::NoSavedSessions).to_string();
-                }
-                Ok(records) => {
-                    let note =
-                        format_sessions_storage_note(&self.workspace, &crate::cli::program_name());
-                    self.history.push(HistoryCell::system(format!(
-                        "{note}\n{}\n{}",
-                        self.tr(TextId::SessionsHeader),
-                        records
+            Ok(store) => {
+                let listed = store.list();
+                let diagnostics = store.take_diagnostics();
+                match listed {
+                    Ok(records) if records.is_empty() => {
+                        if !diagnostics.is_empty() {
+                            self.history
+                                .push(HistoryCell::system(diagnostics.join("\n")));
+                        }
+                        self.status = self.tr(TextId::NoSavedSessions).to_string();
+                    }
+                    Ok(records) => {
+                        let note = format_sessions_storage_note(
+                            &self.workspace,
+                            &crate::cli::program_name(),
+                        );
+                        let mut body = records
                             .iter()
                             .map(|record| {
                                 format!(
@@ -959,18 +965,26 @@ impl App {
                                 )
                             })
                             .collect::<Vec<_>>()
-                            .join("\n")
-                    )));
-                    self.status = self.tr_with(
-                        TextId::SessionsCount,
-                        &[("count", &records.len().to_string())],
-                    );
+                            .join("\n");
+                        if !diagnostics.is_empty() {
+                            body.push_str("\n\n");
+                            body.push_str(&diagnostics.join("\n"));
+                        }
+                        self.history.push(HistoryCell::system(format!(
+                            "{note}\n{}\n{body}",
+                            self.tr(TextId::SessionsHeader),
+                        )));
+                        self.status = self.tr_with(
+                            TextId::SessionsCount,
+                            &[("count", &records.len().to_string())],
+                        );
+                    }
+                    Err(error) => {
+                        self.status =
+                            self.tr_with(TextId::ListFailed, &[("error", &error.to_string())]);
+                    }
                 }
-                Err(error) => {
-                    self.status =
-                        self.tr_with(TextId::ListFailed, &[("error", &error.to_string())]);
-                }
-            },
+            }
             Err(error) => {
                 self.status = self.tr_with(
                     TextId::SessionsUnavailable,

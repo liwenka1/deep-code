@@ -56,39 +56,84 @@ const KEY_FILE: &str = "session-key";
 /// HMAC-SHA256 output, hex — 32 bytes in, 64 chars out.
 const KEY_BYTES: usize = 32;
 
-/// Loaded once per process. `None` means no key could be read or created, in
+/// Why the host could not produce a signing key.
+///
+/// This is user-visible: without a key nothing can be persisted, and the old
+/// wording ("could not be authenticated for persistence") sent people looking
+/// for a corrupt session file instead of an unwritable home directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyUnavailable {
+    NoHomeDirectory,
+    NotCreatable,
+}
+
+impl std::fmt::Display for KeyUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoHomeDirectory => f.write_str(
+                "no home directory is set, so ~/.deep-code/session-key cannot be created",
+            ),
+            Self::NotCreatable => f.write_str(
+                "~/.deep-code/session-key could not be created (is the home directory writable?)",
+            ),
+        }
+    }
+}
+
+/// Loaded once per process. An `Err` means no key could be read or created, in
 /// which case nothing verifies and every recorded grant is dropped: losing a
 /// grant only ever narrows the boundary, so that is the safe direction to
 /// fail, and the caller says so out loud.
-static KEY: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+static KEY: OnceLock<Result<[u8; KEY_BYTES], KeyUnavailable>> = OnceLock::new();
 
-fn key() -> Option<&'static [u8]> {
-    KEY.get_or_init(load_or_create_key).as_deref()
+// Per-test override. A test build starts with a fixed key so the suite never
+// touches `$HOME` — a run that silently skipped when the home directory was
+// read-only reported green for a channel it never exercised. A test can
+// override it, including with `Err`, to drive the fail-closed path.
+#[cfg(test)]
+thread_local! {
+    static KEY_OVERRIDE: std::cell::Cell<Option<Result<[u8; KEY_BYTES], KeyUnavailable>>> =
+        const { std::cell::Cell::new(Some(Ok([0x5a; KEY_BYTES]))) };
 }
 
-fn load_or_create_key() -> Option<Vec<u8>> {
-    let dir = crate::paths::home_dir()?.join(crate::paths::DEEP_CODE_DIR);
+fn key() -> Result<[u8; KEY_BYTES], KeyUnavailable> {
+    #[cfg(test)]
+    if let Some(overridden) = KEY_OVERRIDE.with(std::cell::Cell::get) {
+        return overridden;
+    }
+    match KEY.get_or_init(load_or_create_key) {
+        Ok(bytes) => Ok(*bytes),
+        Err(reason) => Err(*reason),
+    }
+}
+
+fn load_or_create_key() -> Result<[u8; KEY_BYTES], KeyUnavailable> {
+    let dir = crate::paths::home_dir()
+        .map(|home| home.join(crate::paths::DEEP_CODE_DIR))
+        .ok_or(KeyUnavailable::NoHomeDirectory)?;
     let path = dir.join(KEY_FILE);
     if let Ok(existing) = std::fs::read(&path)
-        && existing.len() == KEY_BYTES
+        && let Ok(bytes) = <[u8; KEY_BYTES]>::try_from(existing)
     {
-        return Some(existing);
+        return Ok(bytes);
     }
-    std::fs::create_dir_all(&dir).ok()?;
-    let fresh = random_key()?;
-    write_private(&path, &fresh).ok()?;
+    std::fs::create_dir_all(&dir).map_err(|_| KeyUnavailable::NotCreatable)?;
+    let fresh = random_key().ok_or(KeyUnavailable::NotCreatable)?;
+    write_private(&path, &fresh).map_err(|_| KeyUnavailable::NotCreatable)?;
     // Re-read rather than trusting the write: two processes launching at once
     // both generate a key and the loser's bytes are the ones on disk. Whoever
     // reads last wins consistently, so both agree on one key.
     match std::fs::read(&path) {
-        Ok(stored) if stored.len() == KEY_BYTES => Some(stored),
-        _ => Some(fresh),
+        Ok(stored) if stored.len() == KEY_BYTES => {
+            Ok(<[u8; KEY_BYTES]>::try_from(stored).unwrap_or(fresh))
+        }
+        _ => Ok(fresh),
     }
 }
 
-fn random_key() -> Option<Vec<u8>> {
+fn random_key() -> Option<[u8; KEY_BYTES]> {
     use ring::rand::SecureRandom;
-    let mut bytes = vec![0_u8; KEY_BYTES];
+    let mut bytes = [0_u8; KEY_BYTES];
     ring::rand::SystemRandom::new().fill(&mut bytes).ok()?;
     Some(bytes)
 }
@@ -142,36 +187,53 @@ fn message(id: &str, workspace: &Path, roots: &[PathBuf]) -> Vec<u8> {
     out
 }
 
-/// Canonical bytes for the full record tag. The tag itself is cleared before
-/// serialization, and serde's deterministic struct-field order gives every
-/// writer the same representation without trusting map iteration order.
-fn record_message(record: &crate::session_store::SessionRecord) -> Option<Vec<u8>> {
-    let mut unsigned = record.clone();
-    unsigned.record_mac = None;
-    serde_json::to_vec(&unsigned).ok()
+/// Whether this host can sign at all. Serialization paths check it first so a
+/// missing key is reported as itself, not as a broken record.
+pub(crate) fn ensure_key() -> Result<(), KeyUnavailable> {
+    key().map(|_| ())
+}
+
+/// Canonical bytes for the full record tag.
+///
+/// The tag is cleared for the duration of the call and restored afterwards, so
+/// signing does not deep-clone a transcript that can be megabytes, and serde's
+/// deterministic struct-field order gives every writer the same representation
+/// without trusting map iteration order.
+///
+/// Note what this signs: a *re-serialization of the parsed struct*, not the
+/// bytes on disk. Adding a persisted field therefore changes the message for
+/// every existing record. That is why adding one requires bumping
+/// `SESSION_SCHEMA_VERSION`: the version check rejects old files explicitly,
+/// instead of letting them fail verification and be discarded as if forged.
+fn record_message(record: &mut crate::session_store::SessionRecord) -> Option<Vec<u8>> {
+    let tag = record.record_mac.take();
+    let message = serde_json::to_vec(&*record).ok();
+    record.record_mac = tag;
+    message
 }
 
 /// Tag for the complete persisted record, or `None` when the host key is not
-/// available.
+/// available or the record cannot be serialized.
 #[must_use]
-pub(crate) fn sign_record(record: &crate::session_store::SessionRecord) -> Option<String> {
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key()?);
+pub(crate) fn sign_record(record: &mut crate::session_store::SessionRecord) -> Option<String> {
+    let key_bytes = key().ok()?;
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes);
     let tag = ring::hmac::sign(&key, &record_message(record)?);
     Some(to_hex(tag.as_ref()))
 }
 
 /// Verify every persisted field, including the transcript and timestamps.
 #[must_use]
-pub(crate) fn verify_record(record: &crate::session_store::SessionRecord) -> bool {
-    let (Some(key_bytes), Some(tag), Some(message)) =
-        (key(), record.record_mac.as_deref(), record_message(record))
+pub(crate) fn verify_record(record: &mut crate::session_store::SessionRecord) -> bool {
+    let (Ok(key_bytes), Some(tag), Some(message)) =
+        (key(), record.record_mac.clone(), record_message(record))
     else {
         return false;
     };
-    let Some(tag) = from_hex(tag) else {
+    let Some(tag) = from_hex(&tag) else {
         return false;
     };
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key_bytes);
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes);
     ring::hmac::verify(&key, &message, &tag).is_ok()
 }
 
@@ -179,7 +241,8 @@ pub(crate) fn verify_record(record: &crate::session_store::SessionRecord) -> boo
 /// therefore nothing to claim).
 #[must_use]
 pub(crate) fn sign_roots(id: &str, workspace: &Path, roots: &[PathBuf]) -> Option<String> {
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key()?);
+    let key_bytes = key().ok()?;
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes);
     let tag = ring::hmac::sign(&key, &message(id, workspace, roots));
     Some(to_hex(tag.as_ref()))
 }
@@ -198,13 +261,13 @@ pub(crate) fn verify_roots(
     if roots.is_empty() {
         return true;
     }
-    let (Some(key_bytes), Some(tag)) = (key(), tag) else {
+    let (Ok(key_bytes), Some(tag)) = (key(), tag) else {
         return false;
     };
     let Some(tag) = from_hex(tag) else {
         return false;
     };
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key_bytes);
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes);
     // `ring::hmac::verify` is constant-time.
     ring::hmac::verify(&key, &message(id, workspace, roots), &tag).is_ok()
 }
@@ -237,10 +300,9 @@ mod tests {
 
     #[test]
     fn a_tag_verifies_only_for_exactly_what_was_signed() {
-        let Some(tag) = sign_roots("sess-1", Path::new("/ws"), &roots()) else {
-            eprintln!("no key on this host; skipping");
-            return;
-        };
+        // Test builds always have a key (see `key()`); a skip here used to hide
+        // an unrunnable channel behind a green suite.
+        let tag = sign_roots("sess-1", Path::new("/ws"), &roots()).expect("test key");
         assert!(verify_roots(
             "sess-1",
             Path::new("/ws"),
@@ -297,14 +359,24 @@ mod tests {
     #[test]
     fn a_record_tag_covers_the_transcript_and_timestamps() {
         let mut record = crate::session_store::SessionRecord::new(PathBuf::from("/ws"), "system");
-        let Some(tag) = sign_record(&record) else {
-            eprintln!("no key on this host; skipping");
-            return;
-        };
+        let tag = sign_record(&mut record).expect("test key");
         record.record_mac = Some(tag);
-        assert!(verify_record(&record));
+        assert!(verify_record(&mut record));
 
         record.updated_at_ms = record.updated_at_ms.saturating_add(1);
-        assert!(!verify_record(&record));
+        assert!(!verify_record(&mut record));
+    }
+
+    /// A host with no usable key must say so: nothing can be persisted, and the
+    /// error has to name the key, not the session file.
+    #[test]
+    fn a_missing_key_is_reported_as_a_key_problem() {
+        let previous = KEY_OVERRIDE.with(std::cell::Cell::get);
+        KEY_OVERRIDE.with(|slot| slot.set(Some(Err(KeyUnavailable::NotCreatable))));
+        assert_eq!(ensure_key(), Err(KeyUnavailable::NotCreatable));
+        let mut record = crate::session_store::SessionRecord::new(PathBuf::from("/ws"), "system");
+        assert_eq!(sign_record(&mut record), None);
+        assert!(!verify_record(&mut record));
+        KEY_OVERRIDE.with(|slot| slot.set(previous));
     }
 }

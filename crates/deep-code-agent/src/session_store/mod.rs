@@ -108,10 +108,18 @@ impl Default for TurnRecord {
 
 /// Full persisted session state.
 ///
-/// MUST NOT gain `#[serde(deny_unknown_fields)]` — fields may be removed or
-/// added within the current schema without making a record needlessly brittle.
-/// Older schema versions are rejected before deserialization. The same holds
-/// for [`TurnRecord`], [`SessionEntry`], and [`EntryKind`].
+/// MUST NOT gain `#[serde(deny_unknown_fields)]` — an unknown key is ignored so
+/// a record written by a newer build stays readable, and whether it can be
+/// trusted is the host tag's decision, not the parser's.
+///
+/// **Adding or removing a persisted field REQUIRES bumping
+/// `SESSION_SCHEMA_VERSION`.** `record_mac` signs a re-serialization of the
+/// parsed struct (see `session_integrity`), so the shape of the struct is part
+/// of the signed bytes: a new field changes the message for every existing
+/// record, verification then fails, and the transcript is discarded on the next
+/// resume. The version check turns that into an explicit "unsupported schema"
+/// rejection instead. The same holds for [`TurnRecord`], [`SessionEntry`],
+/// [`EntryKind`], and every other nested type reachable from here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub schema_version: u32,
@@ -262,6 +270,8 @@ pub enum SessionStoreError {
     Serialization { message: String },
     #[error("session '{id}' could not be authenticated for persistence")]
     AuthenticationUnavailable { id: String },
+    #[error("no session signing key is available: {detail}")]
+    KeyUnavailable { detail: String },
     #[error("session file {path} is too large ({bytes} bytes; limit {limit})")]
     TooLarge {
         path: String,
@@ -282,21 +292,22 @@ pub enum SessionStoreError {
 
 /// Serialize a record to the on-disk JSON form. Shared by the default
 /// [`SessionStore::save`] and the persistence actor, which serializes under the
-/// record lock and writes with it released — avoiding a full-record clone.
-/// Seal the record's grant list, then serialize.
+/// record lock and writes with it released — never deep-cloning the record just
+/// to snapshot it.
 ///
 /// Sealing belongs to saving, which is why this (and [`SessionStore::save`])
-/// take `&mut`: the tag has to describe the grants as they are being written,
-/// and every persistence path funnels through here, so there is no way to
-/// write a record whose grants are unsigned or stale.
+/// take `&mut`: both tags have to describe the record as it is being written,
+/// and every persistence path funnels through here, so there is no way to write
+/// a record whose transcript or grants are unsigned or stale.
+///
+/// The entry-count and size limits are NOT re-checked here: they belong to
+/// [`save_serialized`](SessionStore::save_serialized), which knows the
+/// destination path and can name it in the error. Repeating them here filled
+/// the error's `path` field with a session id.
 pub(crate) fn serialize_record(record: &mut SessionRecord) -> Result<String, SessionStoreError> {
-    if record.entries.len() > MAX_SESSION_ENTRIES {
-        return Err(SessionStoreError::TooManyEntries {
-            path: record.id.as_str().to_string(),
-            count: record.entries.len(),
-            limit: MAX_SESSION_ENTRIES,
-        });
-    }
+    crate::session_integrity::ensure_key().map_err(|reason| SessionStoreError::KeyUnavailable {
+        detail: reason.to_string(),
+    })?;
     record.extra_roots_mac = crate::session_integrity::sign_roots(
         record.id.as_str(),
         &record.workspace,
@@ -304,23 +315,14 @@ pub(crate) fn serialize_record(record: &mut SessionRecord) -> Result<String, Ses
     );
     record.record_mac = Some(
         crate::session_integrity::sign_record(record).ok_or_else(|| {
-            SessionStoreError::AuthenticationUnavailable {
-                id: record.id.as_str().to_string(),
+            SessionStoreError::Serialization {
+                message: "the session record could not be serialized for signing".to_string(),
             }
         })?,
     );
-    let json =
-        serde_json::to_string_pretty(record).map_err(|error| SessionStoreError::Serialization {
-            message: error.to_string(),
-        })?;
-    if json.len() as u64 > MAX_SESSION_FILE_BYTES {
-        return Err(SessionStoreError::TooLarge {
-            path: record.id.as_str().to_string(),
-            bytes: json.len() as u64,
-            limit: MAX_SESSION_FILE_BYTES,
-        });
-    }
-    Ok(json)
+    serde_json::to_string_pretty(record).map_err(|error| SessionStoreError::Serialization {
+        message: error.to_string(),
+    })
 }
 
 /// Backend-agnostic session persistence.

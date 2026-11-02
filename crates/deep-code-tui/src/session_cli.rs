@@ -30,6 +30,9 @@ pub fn list() -> anyhow::Result<()> {
         format_sessions_storage_note(&workspace, &crate::cli::program_name())
     );
     let records = store.list()?;
+    for line in store.take_diagnostics() {
+        eprintln!("{line}");
+    }
     if records.is_empty() {
         println!("No saved sessions.");
         return Ok(());

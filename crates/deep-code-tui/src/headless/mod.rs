@@ -366,7 +366,11 @@ fn resolve_resume_record(
         }
         StartupIntent::ContinueLatest => {
             let store = open_store(workspace)?;
-            match store.list() {
+            let listed = store.list();
+            for line in store.take_diagnostics() {
+                eprintln!("{line}");
+            }
+            match listed {
                 // Newest first; skip sessions with no user message, exactly
                 // like the TUI's `-c` (an empty session is not "the latest").
                 Ok(records) => Ok(records.into_iter().find(crate::startup::has_user_message)),
