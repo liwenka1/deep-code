@@ -13,7 +13,7 @@ use similar::TextDiff;
 
 use crate::i18n::{Lang, TextId, tr, tr_with};
 use crate::tool::ToolCall;
-use crate::workspace_policy::{WorkspacePolicy, WorkspaceRoots};
+use crate::workspace_policy::WorkspacePolicy;
 
 const MAX_PREVIEW_LINES: usize = 40;
 const MAX_PREVIEW_BYTES: usize = 4 * 1024;
@@ -22,24 +22,11 @@ const MAX_PREVIEW_BYTES: usize = 4 * 1024;
 const MAX_SOURCE_BYTES: u64 = crate::workspace_tools::MAX_FILE_BYTES;
 const NEW_FILE_HEAD_LINES: usize = 20;
 
-/// Best-effort preview: `None` means "nothing to add beyond the arguments"
-/// (unknown tool, unresolvable path, malformed args) — approval proceeds with
-/// the raw-argument display as before.
-#[allow(dead_code)]
-pub(crate) fn build_approval_preview(
-    call: &ToolCall,
-    roots: &WorkspaceRoots,
-    lang: Lang,
-) -> Option<String> {
-    let policy = WorkspacePolicy::new(roots.clone()).ok()?;
-    build_approval_preview_with_policy(call, &policy, lang)
-}
-
-/// Build a preview against the live policy already used by the runtime. The
-/// roots overload above remains convenient for isolated callers/tests, but a
+/// Build a preview against the live policy already used by the runtime. A
 /// runtime must not reconstruct a policy after a root path has been swapped:
 /// doing so could make the preview read from a new directory the session never
-/// approved.
+/// approved. Callers that only have a `WorkspaceRoots` value (tests, isolated
+/// tooling) build the policy themselves and pass it here.
 pub(crate) fn build_approval_preview_with_policy(
     call: &ToolCall,
     policy: &WorkspacePolicy,
@@ -95,7 +82,7 @@ fn write_file_preview(policy: &WorkspacePolicy, path: &Path, content: &str, lang
         }
         Err(_) => return tr(lang, TextId::PreviewReadFail).to_string(),
     };
-    match handle.metadata() {
+    match handle.no_follow_metadata() {
         Ok(metadata) if metadata.len() > MAX_SOURCE_BYTES => {
             // The number comes from the same constant that decided the refusal
             // one line up. It used to be baked into the locale string, so this
@@ -177,6 +164,7 @@ fn clamp_preview(preview: &str, lang: Lang) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace_policy::WorkspaceRoots;
     use serde_json::json;
     use std::fs;
 
@@ -184,10 +172,18 @@ mod tests {
         ToolCall::new("call_1", name, arguments)
     }
 
+    /// Preview against a freshly built policy. These tests are about WHAT the
+    /// preview shows; the runtime path — which must reuse the live policy
+    /// rather than rebuild one — is covered in `runtime/integration_tests.rs`.
+    fn preview(call: &ToolCall, roots: &WorkspaceRoots, lang: Lang) -> Option<String> {
+        let policy = WorkspacePolicy::new(roots.clone()).ok()?;
+        build_approval_preview_with_policy(call, &policy, lang)
+    }
+
     #[test]
     fn apply_patch_preview_shows_unified_diff() {
         let workspace = tempfile::tempdir().unwrap();
-        let preview = build_approval_preview(
+        let preview = preview(
             &call(
                 "apply_patch",
                 json!({"path": "a.rs", "old": "fn old() {}", "new": "fn new() {}"}),
@@ -204,7 +200,7 @@ mod tests {
     fn write_file_preview_diffs_against_existing_content() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("note.txt"), "one\ntwo\n").unwrap();
-        let preview = build_approval_preview(
+        let preview = preview(
             &call(
                 "write_file",
                 json!({"path": "note.txt", "content": "one\nthree\n"}),
@@ -236,7 +232,7 @@ mod tests {
             vec![b'x'; usize::try_from(MAX_SOURCE_BYTES).unwrap() + 1],
         )
         .unwrap();
-        let preview = build_approval_preview(
+        let preview = preview(
             &call("write_file", json!({"path": "big.bin", "content": "hi\n"})),
             &WorkspaceRoots::from(workspace.path()),
             Lang::En,
@@ -269,7 +265,7 @@ mod tests {
     #[test]
     fn write_file_preview_creates_no_directories() {
         let workspace = tempfile::tempdir().unwrap();
-        let preview = build_approval_preview(
+        let preview = preview(
             &call(
                 "write_file",
                 json!({"path": "src/new_mod/thing.rs", "content": "hi\n"}),
@@ -287,7 +283,7 @@ mod tests {
     #[test]
     fn write_file_preview_summarizes_new_files() {
         let workspace = tempfile::tempdir().unwrap();
-        let preview = build_approval_preview(
+        let preview = preview(
             &call(
                 "write_file",
                 json!({"path": "fresh.txt", "content": "hello\nworld\n"}),
@@ -307,7 +303,7 @@ mod tests {
             .map(|index| format!("line-{index}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let preview = build_approval_preview(
+        let preview = preview(
             &call("write_file", json!({"path": "big.txt", "content": content})),
             &WorkspaceRoots::from(workspace.path()),
             Lang::Zh,
@@ -321,7 +317,7 @@ mod tests {
     fn traversal_paths_produce_no_preview() {
         let workspace = tempfile::tempdir().unwrap();
         assert!(
-            build_approval_preview(
+            preview(
                 &call(
                     "write_file",
                     json!({"path": "../outside.txt", "content": "x"}),
@@ -337,7 +333,7 @@ mod tests {
     fn unknown_tools_produce_no_preview() {
         let workspace = tempfile::tempdir().unwrap();
         assert!(
-            build_approval_preview(
+            preview(
                 &call("shell", json!({"command": "ls"})),
                 &WorkspaceRoots::from(workspace.path()),
                 Lang::Zh

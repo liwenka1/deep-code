@@ -30,6 +30,23 @@ pub(crate) fn open_canonical(path: &Path) -> io::Result<Dir> {
     Ok(directory)
 }
 
+/// Whether `error` is the kernel refusing to follow a symlink under a
+/// no-follow open or stat.
+///
+/// `ELOOP` is the documented one; macOS has historically reported `EMLINK`
+/// for some of these, and the message it maps to is the same either way.
+pub(crate) fn is_symlink_refusal(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(error.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 /// Check inherited primary roots before loading config, stopping a runtime or
 /// opening session storage at a path that may no longer name the approved root.
 pub fn validate_pinned_workspace(path: &Path) -> io::Result<()> {

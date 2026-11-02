@@ -183,9 +183,10 @@ impl ActiveTurn {
     /// A badge means a human answered, so a call left waiting when its turn is
     /// cancelled must not keep the `pending` badge: nobody is going to answer it
     /// now, and the transcript would assert a decision that never happened. It
-    /// becomes `Unknown` — "no answer was recorded" — which is also what a
-    /// resumed transcript reports for the same call, since the runtime records
-    /// the cancel as an unasked call (`tool_result.rs::finish_cancelled_calls`).
+    /// becomes `Unknown` — "no answer was recorded". That is the live form of
+    /// what a resumed transcript shows for the same call: the runtime records
+    /// the cancel as an unasked call (`tool_result.rs::finish_cancelled_calls`),
+    /// so `asked: false` hydrates it as `NotRequired`. Neither renders a badge.
     pub fn abandon_unanswered_approvals(&mut self) {
         for tool in &mut self.tools {
             if tool.approval == ToolApprovalState::Required {

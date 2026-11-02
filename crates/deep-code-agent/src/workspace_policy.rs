@@ -96,14 +96,12 @@ impl SafePath {
         &self.path
     }
 
-    pub(crate) fn symlink_metadata(&self) -> std::io::Result<cap_std::fs::Metadata> {
-        self.parent.symlink_metadata(&self.leaf)
-    }
-
-    pub(crate) fn metadata(&self) -> std::io::Result<cap_std::fs::Metadata> {
-        // `metadata` must not open the target: a FIFO would block until a
-        // writer appears. The parent capability makes this no-follow stat
-        // race-safe, and callers reject non-regular file types before reading.
+    /// The leaf's own metadata, never the target of a symlink at it.
+    ///
+    /// This must not open the target: a FIFO would block until a writer
+    /// appears. The parent capability makes this no-follow stat race-safe, and
+    /// callers reject non-regular file types before reading.
+    pub(crate) fn no_follow_metadata(&self) -> std::io::Result<cap_std::fs::Metadata> {
         self.parent.symlink_metadata(&self.leaf)
     }
 
@@ -141,6 +139,9 @@ impl SafePath {
 }
 
 impl WorkspacePolicy {
+    /// Build a policy that canonicalizes its roots. Test-only: every production
+    /// launch goes through [`Self::new_pinned`], which refuses a root that no
+    /// longer resolves to its approved directory.
     #[allow(dead_code)]
     pub(crate) fn new(roots: impl Into<WorkspaceRoots>) -> Result<Self, ToolError> {
         Self::new_inner(roots.into(), false)
@@ -230,20 +231,6 @@ impl WorkspacePolicy {
         roots.push(self.primary.clone());
         roots.extend(extras.iter().cloned());
         roots
-    }
-
-    /// A point-in-time [`WorkspaceRoots`] view (for summaries, prompts, and
-    /// approval previews that want the value shape).
-    #[allow(dead_code)]
-    pub(crate) fn to_roots(&self) -> WorkspaceRoots {
-        WorkspaceRoots {
-            primary: self.primary.clone(),
-            extras: self
-                .extras
-                .read()
-                .expect("workspace boundary lock poisoned")
-                .clone(),
-        }
     }
 
     /// Resolve and vet a model-requested grant target, granting nothing.

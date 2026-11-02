@@ -173,7 +173,7 @@ pub struct ExchangeResult {
     /// live. Treating them as asks would un-fold every command under the
     /// permission modes chosen precisely to stop asking.
     ///
-    /// `true` when the approval gate put the call in front of a human, `false`
-    /// when policy or standing consent resolved it without a prompt.
+    /// `true` when the gate put the call in front of a human; `false` when
+    /// policy or standing consent resolved it without a prompt.
     pub asked: bool,
 }

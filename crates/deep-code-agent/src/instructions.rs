@@ -27,6 +27,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::pinned_dir::is_symlink_refusal;
+
 /// The file name looked for in both locations.
 pub const INSTRUCTIONS_FILE: &str = "AGENTS.md";
 
@@ -508,22 +510,6 @@ fn set_no_follow(options: &mut fs::OpenOptions, guard: bool) {
     #[cfg(not(unix))]
     {
         let _ = (options, guard);
-    }
-}
-
-/// Whether `error` is the kernel refusing a symlink under `O_NOFOLLOW`.
-///
-/// `ELOOP` is the documented one; macOS has historically reported `EMLINK` for
-/// some of these, and the message it maps to is the same either way.
-fn is_symlink_refusal(error: &std::io::Error) -> bool {
-    #[cfg(unix)]
-    {
-        matches!(error.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = error;
-        false
     }
 }
 

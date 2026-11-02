@@ -783,29 +783,34 @@ async fn grep_files_reports_an_unreadable_directory() {
     assert_eq!(output["matches"][0]["path"], "small.txt");
 }
 
-/// The leaf half of the resolve -> write race, exercised at the syscall lock
-/// rather than through resolution. Resolution refuses a symlink that is
-/// already sitting at the target, but it cannot refuse one planted in the
-/// window between that check and the open — and planting it is an ordinary
-/// permitted write inside a granted root. `O_NOFOLLOW` makes the refusal
-/// timing-independent, so this asserts on the primitive directly: whatever
-/// resolution decided, the write itself will not follow a link.
+/// The leaf half of the resolve -> write race, exercised on the production
+/// primitive rather than on a copy of it. `SafePath` opens the parent while the
+/// leaf is still a regular file, and the link is planted between that and the
+/// write — which is exactly the window `O_NOFOLLOW` exists to close. A test
+/// that re-implemented the open would keep passing if `SafePath::replace`
+/// dropped the flag.
 ///
 /// unix-only because the flag is: Windows has no equivalent, and there the
 /// guarantee remains resolution's `symlink_metadata` check alone.
 #[cfg(unix)]
 #[test]
-fn write_no_follow_refuses_a_symlinked_target() {
+fn safe_path_replace_refuses_a_symlinked_leaf() {
     let tmp = tempdir().unwrap();
     let outside = tempdir().unwrap();
     let victim = outside.path().join("victim.txt");
     fs::write(&victim, "ORIGINAL\n").unwrap();
-    let planted = tmp.path().join("notes.txt");
-    assert!(crate::test_symlinks::symlink_file_for_test(
-        &victim, &planted
-    ));
 
-    let error = super::write_no_follow(&planted, b"OVERWRITTEN\n")
+    let policy = WorkspacePolicy::new(tmp.path().to_path_buf()).unwrap();
+    let target = policy
+        .prepare_write_target("notes.txt", "write_file")
+        .unwrap();
+    assert!(
+        crate::test_symlinks::symlink_file_for_test(&victim, &tmp.path().join("notes.txt")),
+        "a symlink is needed for this test"
+    );
+
+    let error = target
+        .replace(b"OVERWRITTEN\n")
         .expect_err("a symlinked target must not be written through");
     assert_eq!(
         fs::read_to_string(&victim).unwrap(),
@@ -817,19 +822,16 @@ fn write_no_follow_refuses_a_symlinked_target() {
     // built. `write_failed`'s whole reason to exist is that bare ELOOP says
     // "Too many levels of symbolic links" for a single link, and nothing
     // asserted the replacement text: reverting the diagnosis to "" left the
-    // suite green. Pinned here, on the primitive, deterministically — the race
-    // tests below assert only the robust facts (the victim never escapes, the
-    // loop ran), because whether the O_NOFOLLOW leaf check is reached DURING a
-    // race depends on hitting a narrow TOCTOU window a CI scheduler may miss.
-    #[cfg(unix)]
-    {
-        let rendered =
-            super::write_failed("write_file", &planted.display().to_string(), &error).to_string();
-        assert!(
-            rendered.contains("symlink"),
-            "the ELOOP refusal must name the rule it enforced: {rendered}"
-        );
-    }
+    // suite green. Pinned here, on the production primitive, deterministically —
+    // the race tests below assert only the robust facts (the victim never
+    // escapes, the loop ran), because whether the O_NOFOLLOW leaf check is
+    // reached DURING a race depends on hitting a narrow TOCTOU window a CI
+    // scheduler may miss.
+    let rendered = super::write_failed("write_file", "notes.txt", &error).to_string();
+    assert!(
+        rendered.contains("symlink"),
+        "an ELOOP/EMLINK refusal must name the rule it enforced: {rendered}"
+    );
 }
 
 /// Drives one write tool against the real race and reports whether the

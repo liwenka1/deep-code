@@ -2321,7 +2321,11 @@ async fn superseded_root_approval_cannot_widen_the_successors_boundary() {
             .iter()
             .any(|event| matches!(event, RuntimeEvent::RootGranted { .. }))
     );
-    assert!(boundary.to_roots().extras.is_empty());
+    assert_eq!(
+        boundary.granted_roots().len(),
+        1,
+        "the primary root only: the extra grant must be gone"
+    );
     assert_eq!(runtime.live_turn_id().await, new_id);
 }
 

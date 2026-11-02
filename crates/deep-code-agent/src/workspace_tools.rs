@@ -128,7 +128,7 @@ impl ReadFileTool {
                     other => other,
                 })?;
         let path = handle.path().to_path_buf();
-        let metadata = handle.metadata().map_err(|error| {
+        let metadata = handle.no_follow_metadata().map_err(|error| {
             ToolError::exec_failed(
                 Self::NAME,
                 format!(
@@ -594,7 +594,7 @@ impl GrepFilesTool {
                     continue;
                 }
             };
-            let Ok(metadata) = safe.metadata() else {
+            let Ok(metadata) = safe.no_follow_metadata() else {
                 skipped_unreadable += 1;
                 push_capped(
                     &mut skipped_unreadable_paths,
@@ -777,41 +777,6 @@ impl GrepFilesTool {
     }
 }
 
-/// Legacy syscall helper kept for the focused regression test below. Runtime
-/// writes use the capability-backed [`crate::workspace_policy::SafePath`]
-/// instead, which protects every component rather than only the leaf.
-///
-/// `create_new` is not usable here either way, because overwriting an existing
-/// file is the tool's normal job.
-///
-/// The production path is platform-independent through `cap_std`; this helper
-/// only documents and pins the Unix primitive used by the historical test.
-#[cfg(all(test, unix))]
-fn write_no_follow(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-
-    options.open(path)?.write_all(content)
-}
-
-/// A no-follow write failure, mapped to a message that names the rule.
-///
-/// A no-follow open refuses a symlinked final component with `ELOOP`, whose
-/// stock text is "Too many levels of symbolic links" — for a *single* link.
-/// Handed that bare, the model reads a loop it must have built rather than the
-/// boundary it just hit, and retries into word salad. This is the same
-/// unreadable-errno problem the workspace parent walk grew a diagnosis for;
-/// the write leaf gets the matching half.
-///
-/// The capability-backed runtime path applies this rule to every component;
-/// the legacy test helper below only exercises the leaf primitive.
 /// Chars of unified diff a write tool carries in its UI `details`. Past this
 /// the transcript would be scrolling a rewrite, not showing an edit; the head
 /// is kept and the record says it was cut.
@@ -851,15 +816,20 @@ fn edit_details(display: &str, before: &str, after: &str, new_file: bool) -> ser
     })
 }
 
+/// A no-follow write failure, mapped to a message that names the rule.
+///
+/// A no-follow open refuses a symlinked final component with `ELOOP` (or, on
+/// macOS, `EMLINK`), whose stock text is "Too many levels of symbolic links" —
+/// for a *single* link. Handed that bare, the model reads a loop it must have
+/// built rather than the boundary it just hit, and retries into word salad.
+/// This is the same unreadable-errno problem the workspace parent walk grew a
+/// diagnosis for; the write leaf gets the matching half.
 fn write_failed(tool_name: &str, relative: &str, error: &std::io::Error) -> ToolError {
-    #[cfg(unix)]
-    let diagnosis = if error.raw_os_error() == Some(libc::ELOOP) {
+    let diagnosis = if crate::pinned_dir::is_symlink_refusal(error) {
         " (the final path component is a symlink; symlinks are never written through)"
     } else {
         ""
     };
-    #[cfg(not(unix))]
-    let diagnosis = "";
     ToolError::exec_failed(
         tool_name,
         format!("failed to write {}: {error}{diagnosis}", relative),
@@ -973,7 +943,7 @@ impl WriteFileTool {
         let path = target.path().to_path_buf();
         // Refuse a FIFO/socket/device/dir destination before opening it: writing
         // to a FIFO blocks the thread until a reader appears, hanging the turn.
-        if let Ok(metadata) = target.symlink_metadata() {
+        if let Ok(metadata) = target.no_follow_metadata() {
             let kind = metadata.file_type();
             if kind.is_symlink() {
                 return Err(invalid(
@@ -995,7 +965,7 @@ impl WriteFileTool {
         // before the write and only for the record: a file that is missing is
         // a new file, one that is unreadable or past the read cap simply gets
         // no diff — this must never turn a writable path into a failed write.
-        let before = match target.metadata() {
+        let before = match target.no_follow_metadata() {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
             Ok(metadata) if metadata.len() <= MAX_FILE_BYTES => target
                 .read_bytes()
@@ -1003,7 +973,7 @@ impl WriteFileTool {
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
             _ => None,
         };
-        let new_file = target.symlink_metadata().map(|_| false).unwrap_or(true);
+        let new_file = target.no_follow_metadata().map(|_| false).unwrap_or(true);
         target.replace(params.content.as_bytes()).map_err(|error| {
             write_failed(Self::NAME, &self.root.relative_display(&path), &error)
         })?;
@@ -1080,7 +1050,7 @@ impl ApplyPatchTool {
         // Reading a FIFO blocks until a writer appears; refuse a non-regular
         // target before `read_to_string` can hang the turn. The capability
         // handle is checked and then reused for the eventual replacement.
-        let metadata = target.metadata().map_err(|error| {
+        let metadata = target.no_follow_metadata().map_err(|error| {
             ToolError::exec_failed(
                 Self::NAME,
                 format!(

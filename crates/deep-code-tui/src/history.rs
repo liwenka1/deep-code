@@ -546,8 +546,10 @@ impl HistoryCell {
             } => {
                 let args = truncate_chars(&collapse_whitespace(arguments), 72);
                 let badge = match approval {
-                    // A pending request carries no badge until a decision is
-                    // available.
+                    // Neither an ungated call nor one whose question was
+                    // abandoned carries a badge: no decision was ever made
+                    // (`Unknown` is a turn cancelled while its question was
+                    // still pending).
                     ToolApprovalState::NotRequired | ToolApprovalState::Unknown => String::new(),
                     other => format!(" [{}]", other.label(lang)),
                 };
