@@ -21,7 +21,9 @@ ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 schemars = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
+# Session HMACs cover re-serialized records, including f64 cost totals.
+# Parsing must preserve those bits or our own saved records fail verification.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 similar = "2"
 thiserror = "2"
 tempfile = "3"

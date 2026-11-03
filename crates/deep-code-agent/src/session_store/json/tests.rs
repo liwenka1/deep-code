@@ -86,6 +86,47 @@ fn json_store_round_trips_session() {
     ));
 }
 
+#[test]
+fn session_signatures_survive_real_cost_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
+    record.entries.push(std::sync::Arc::new(
+        crate::session_entry::SessionEntry::user("keep this conversation"),
+    ));
+
+    for model in [
+        crate::model_registry::DEEPSEEK_FLASH,
+        crate::model_registry::DEEPSEEK_V4_PRO,
+    ] {
+        for input in [22, 1_001, 12_345] {
+            // Flash's first case produces USD 0.00012660000000000001.
+            // Without float_roundtrip, parsing rounds it to 0.0001266 and
+            // save_serialized rejects the signature we just generated.
+            let cost = crate::pricing::calculate_turn_cost(
+                model,
+                &crate::model::Usage {
+                    prompt_tokens: Some(input),
+                    completion_tokens: Some(100),
+                    ..Default::default()
+                },
+            );
+            let savings = crate::pricing::cache_savings(model, input);
+            record.session_cost.usd += cost.usd;
+            record.session_cost.cny += cost.cny;
+            record.session_cache_savings.usd += savings.usd;
+            record.session_cache_savings.cny += savings.cny;
+
+            store.save(&mut record).unwrap();
+            let mut loaded = store.load(&record.id).unwrap();
+            assert_eq!(loaded, record, "{model}, input={input}");
+            assert!(crate::session_integrity::verify_record(&mut loaded));
+            assert_eq!(store.list().unwrap(), vec![record.clone()]);
+            assert!(store.take_diagnostics().is_empty());
+        }
+    }
+}
+
 /// A session file copied to a new name (a "fork") must load under the NEW id and
 /// save back to its own file — never to the id stored inside it, which would
 /// clobber the original session.
