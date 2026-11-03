@@ -5,9 +5,8 @@ mod input;
 // painting the same screen deserve one filter, not a copy each.
 pub(crate) mod render;
 
-use std::io::{self, Stdout, Write};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::interruptible_output::Output;
+use std::io::{self, BufWriter, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -19,6 +18,7 @@ use crossterm::style::Print;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
+use deep_code_agent::CancellationToken;
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::app::{App, LaunchConfig};
@@ -29,43 +29,59 @@ const MIN_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 /// While streaming, repaint at least this often so the activity indicator
 /// animates through a long time-to-first-token wait.
 const STREAM_TICK_INTERVAL: Duration = Duration::from_millis(120);
-type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
+type AppTerminal = Terminal<CrosstermBackend<BufWriter<Output>>>;
 
-pub async fn run(config: LaunchConfig) -> Result<()> {
-    // The alternate-screen TUI owns the terminal; any stray write to stderr
-    // (LSP "server unavailable" notices, persistence warnings, panics) would
-    // paint raw text over the rendered buffer. Send stderr to a log file so it
-    // can never corrupt the screen.
-    redirect_stderr_to_log();
-    // Must come after the redirect (so the default hook's message lands in the
-    // log) and before raw mode (so a panic in `setup_terminal` is covered too).
-    install_panic_hook();
-    let mut terminal = setup_terminal()?;
-    let mut app = App::launch(config);
-    // SIGTERM/SIGHUP (a supervisor, or the terminal window being closed) must
-    // run the same cleanup path as a quit — restore the terminal, flush the
-    // session, kill job process trees and LSP children — instead of the default
-    // action killing the process and orphaning them. The sync render loop cannot
-    // await a signal, so a task flips a flag the loop checks each tick (Ctrl-C is
-    // already delivered as a key event in raw mode, so SIGINT needs no arm here).
-    let shutdown = Arc::new(AtomicBool::new(false));
-    {
-        let shutdown = Arc::clone(&shutdown);
-        tokio::spawn(async move {
-            crate::headless::terminate_signal().await;
-            shutdown.store(true, Ordering::SeqCst);
-        });
-    }
-    let result = run_loop(&mut terminal, &mut app, &shutdown);
+/// Install once before startup and keep SIGINT routed through the scan,
+/// picker and TUI. Tokio does not restore the default handler when a signal
+/// receiver is dropped. Register synchronously on Unix so transitions cannot
+/// lose an interrupt before the listener task is first polled.
+pub(crate) fn watch_interrupt() -> io::Result<crate::interrupt::Interrupt> {
+    crate::interrupt::Interrupt::watch()
+}
+
+pub async fn run(config: LaunchConfig, interrupted: &CancellationToken) -> Result<()> {
+    // Configuration, prompt history and skill discovery can block in file I/O.
+    // Wait interruptibly and enter raw mode only after initialization succeeds.
+    let mut initializing = tokio::task::spawn_blocking(move || {
+        // Keep background diagnostics off the eventual alternate screen. The
+        // log itself is workspace I/O, so opening it also belongs on the worker.
+        redirect_stderr_to_log();
+        install_panic_hook();
+        App::launch(config)
+    });
+    let mut app = tokio::select! {
+        biased;
+        () = interrupted.cancelled() => {
+            // Dispose of a late result if the caller remains alive. No terminal
+            // state has changed, so main can immediately exit with code 130.
+            tokio::spawn(async move {
+                if let Ok(app) = initializing.await {
+                    app.shutdown_runtime().await;
+                }
+            });
+            return Err(deep_code_agent::SessionStoreError::Cancelled.into());
+        }
+        result = &mut initializing => result?,
+    };
+    let (mut terminal, mut cleanup) = match setup_terminal(interrupted) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            app.shutdown_runtime().await;
+            return Err(error);
+        }
+    };
+    let result = run_loop(&mut terminal, &mut app, interrupted);
     // Nothing may `?` past `shutdown_runtime`: an early return here skips the
     // final persist/flush and leaks job process trees and LSP children. The
     // loop result used to take that exit, and after that was fixed the
     // terminal-restore `?` still did. The loop error is reported first — it is
     // the root cause, a failed restore is at most a symptom.
-    let restored = restore_terminal(&mut terminal);
+    let restored = cleanup.restore();
     app.shutdown_runtime().await;
-    result?;
-    restored?;
+    if !interrupted.is_cancelled() {
+        result?;
+        restored?;
+    }
     Ok(())
 }
 
@@ -74,15 +90,19 @@ pub async fn run(config: LaunchConfig) -> Result<()> {
 /// Three things conspire to make an unhandled panic invisible *and* leave the
 /// terminal unusable: stderr is redirected to the log file above, the release
 /// profile sets `panic = "abort"` (so no unwinding, no destructor, and
-/// `restore_terminal` never runs), and raw mode + alternate screen + mouse
+/// normal terminal cleanup never runs), and raw mode + alternate screen + mouse
 /// capture are all still active. Without this hook the user sees a frozen blank
 /// terminal with no echo and has to blind-type `reset`. Hooks still run under
 /// `panic = "abort"`, so this works in release.
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let mut stdout = io::stdout();
         let _ = disable_raw_mode();
+        let Ok(stdout) = Output::stdout(&CancellationToken::new()) else {
+            previous(info);
+            return;
+        };
+        let mut stdout = BufWriter::new(stdout.cleanup());
         let _ = execute!(
             stdout,
             DisableMouseCapture,
@@ -109,9 +129,9 @@ fn install_panic_hook() {
     }));
 }
 
-fn setup_terminal() -> Result<AppTerminal> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
+fn setup_terminal(interrupted: &CancellationToken) -> Result<(AppTerminal, TerminalCleanup)> {
+    let cleanup = TerminalCleanup::new(interrupted, true)?;
+    let mut stdout = cleanup.writer();
     // Bracketed paste: paste arrives as one `Event::Paste` string. Mouse
     // capture: wheel scrolls the transcript and drag selects text (we render
     // an in-app selection + copy, since capture disables native selection).
@@ -134,21 +154,58 @@ fn setup_terminal() -> Result<AppTerminal> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    Ok(terminal)
+    Ok((terminal, cleanup))
 }
 
-fn restore_terminal(terminal: &mut AppTerminal) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        DisableBracketedPaste,
-        LeaveAlternateScreen,
-        TitleStack::Pop
-    )?;
-    terminal.show_cursor()?;
+/// Restores raw mode even if entering/drawing the terminal returns an error.
+/// Escape-sequence delivery gets a fixed budget when the output has stalled.
+pub(crate) struct TerminalCleanup {
+    output: Output,
+    title: bool,
+    active: bool,
+}
 
-    Ok(())
+impl TerminalCleanup {
+    pub fn new(interrupted: &CancellationToken, title: bool) -> io::Result<Self> {
+        let output = Output::stdout(interrupted)?;
+        enable_raw_mode()?;
+        Ok(Self {
+            output,
+            title,
+            active: true,
+        })
+    }
+
+    pub fn writer(&self) -> BufWriter<Output> {
+        BufWriter::new(self.output.clone())
+    }
+
+    pub fn restore(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        let raw = disable_raw_mode();
+        let mut output = BufWriter::new(self.output.cleanup());
+        let display = execute!(
+            output,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
+        if self.title {
+            let _ = execute!(output, TitleStack::Pop);
+        }
+        self.output.discard_terminal_writes();
+        raw.and(display)
+    }
+}
+
+impl Drop for TerminalCleanup {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
 }
 
 /// The terminal's title stack (XTWINOPS 22/23): push the title the shell had
@@ -280,13 +337,20 @@ fn redirect_stderr_to_log() {
 #[cfg(not(any(unix, windows)))]
 fn redirect_stderr_to_log() {}
 
-fn run_loop(terminal: &mut AppTerminal, app: &mut App, shutdown: &AtomicBool) -> Result<()> {
+fn run_loop(
+    terminal: &mut AppTerminal,
+    app: &mut App,
+    interrupted: &CancellationToken,
+) -> Result<()> {
     let mut needs_redraw = true;
     let mut last_draw: Option<Instant> = None;
     let mut was_streaming = app.is_streaming;
 
-    while !app.should_quit && !shutdown.load(Ordering::SeqCst) {
+    while !app.should_quit && !interrupted.is_cancelled() {
         if app.drain_stream_updates() {
+            needs_redraw = true;
+        }
+        if app.poll_session_scan() {
             needs_redraw = true;
         }
 
@@ -335,6 +399,165 @@ pub(crate) const COMPOSER_MAX_VISIBLE_ROWS: usize = 6;
 #[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::open_log_path_in;
+
+    #[cfg(unix)]
+    #[test]
+    fn sigint_interrupts_blocked_startup_io_before_raw_mode() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "DEEP_CODE_TUI_STARTUP_IO_TEST";
+        if let Ok(intent) = std::env::var(CHILD) {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result: anyhow::Result<()> = runtime.block_on(async {
+                let interrupted = super::watch_interrupt()?;
+                let workspace = std::env::current_dir()?;
+                let store_workspace = workspace.clone();
+                let store = crate::startup::blocking_io(&interrupted, move || {
+                    deep_code_agent::JsonSessionStore::for_workspace(store_workspace)
+                })
+                .await??;
+                let intent = match intent.as_str() {
+                    "continue" => crate::cli::StartupIntent::ContinueLatest,
+                    "picker" => crate::cli::StartupIntent::ResumePicker,
+                    _ => crate::cli::StartupIntent::New,
+                };
+                let resume =
+                    crate::startup::choose_startup(&store, intent, &workspace, &interrupted)
+                        .await?;
+                super::run(
+                    crate::app::LaunchConfig {
+                        workspace: Some(workspace),
+                        resume,
+                        ..Default::default()
+                    },
+                    &interrupted,
+                )
+                .await
+            });
+            assert!(matches!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<deep_code_agent::SessionStoreError>(),
+                Some(deep_code_agent::SessionStoreError::Cancelled)
+            ));
+            // Like main, do not wait for the blocked worker during runtime drop.
+            std::process::exit(130);
+        }
+
+        for intent in ["new", "continue", "picker"] {
+            for blocked in [".deep-code/config.toml", "skills/blocked/SKILL.md"] {
+                let workspace = tempfile::tempdir().unwrap();
+                let path = workspace.path().join(blocked);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let fifo = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                // SAFETY: valid NUL-terminated path in this test's workspace.
+                assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "ui::tests::sigint_interrupts_blocked_startup_io_before_raw_mode",
+                    ])
+                    .env(CHILD, intent)
+                    .current_dir(workspace.path())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                // Wait until the actual startup reader opens the FIFO. Keeping
+                // the writer open without data blocks the read indefinitely.
+                let writer = loop {
+                    if let Ok(writer) = std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&path)
+                    {
+                        break writer;
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let output = child.wait_with_output().unwrap();
+                        panic!("{intent}: startup never reached {blocked}: {output:?}");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                // SAFETY: the PID belongs to this test's live child process.
+                assert_eq!(
+                    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
+                    0
+                );
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while child.try_wait().unwrap().is_none() {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("{intent}: SIGINT was ignored while reading {blocked}");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let output = child.wait_with_output().unwrap();
+                drop(writer);
+                assert_eq!(output.status.code(), Some(130), "{output:?}");
+                assert!(
+                    !output
+                        .stdout
+                        .windows(8)
+                        .any(|bytes| bytes == b"\x1b[?1049h")
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigint_stays_handled_after_startup_scan() {
+        // A real SIGINT must target an isolated process, not the test runner.
+        const CHILD: &str = "DEEP_CODE_SIGINT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ui::tests::sigint_stays_handled_after_startup_scan",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "SIGINT regression child failed: {status}");
+            return;
+        }
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let interrupted = super::watch_interrupt().unwrap();
+                let workspace = tempfile::tempdir().unwrap();
+                let store =
+                    deep_code_agent::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+                for intent in [
+                    crate::cli::StartupIntent::ContinueLatest,
+                    crate::cli::StartupIntent::ResumePicker,
+                ] {
+                    crate::startup::choose_startup(&store, intent, workspace.path(), &interrupted)
+                        .await
+                        .unwrap();
+                }
+                // Both startup scans have returned, but the UI's shared token
+                // must still receive an external interrupt.
+                // SAFETY: this is the isolated child and the handler is installed.
+                assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+                tokio::time::timeout(std::time::Duration::from_secs(5), interrupted.cancelled())
+                    .await
+                    .expect("SIGINT was ignored after startup");
+            });
+    }
 
     /// Cross-platform half of the guard: `.deep-code` has to be a real
     /// directory. Anything else there is not ours to write under, and the old

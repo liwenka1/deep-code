@@ -277,6 +277,7 @@ pub struct App {
     /// Open `/resume` modal: rendered as an in-app overlay (no alt-screen
     /// churn, so switching sessions doesn't flicker) over the live TUI.
     pub(crate) resume_picker: Option<ResumePicker>,
+    session_scan: Option<session::PendingSessionScan>,
     /// UI language, resolved from config at launch; `/lang` switches it live.
     pub(crate) lang: Lang,
     /// Session permission mode, shared (lock-free) with the runtime's approval
@@ -838,6 +839,7 @@ impl App {
             composer: None,
             composer_scroll: 0,
             resume_picker: None,
+            session_scan: None,
             lang,
             permission_mode,
             sandbox_off,
@@ -1039,10 +1041,14 @@ impl App {
         self.tr(id).to_string()
     }
 
-    /// Esc cancel stack: close completion menu > deny approval (handled by
-    /// the approval branch in `ui::handle_key`) > cancel the streaming turn or
+    /// Esc cancel stack after modal approvals: cancel a pending session scan >
+    /// close completion menu > cancel the streaming turn or
     /// the running `/compact` > clear input > quit.
     pub fn handle_escape(&mut self) {
+        if self.cancel_session_scan() {
+            self.clear_quit_guard();
+            return;
+        }
         if self.completion_open() {
             self.close_completion();
         } else if self.is_streaming {
@@ -1108,6 +1114,10 @@ impl App {
     /// clearing reflex shells teach, and a second press right after one that
     /// cleared the line is that reflex again, not a decision to leave.
     pub fn handle_ctrl_c(&mut self) {
+        if self.cancel_session_scan() {
+            self.clear_quit_guard();
+            return;
+        }
         if self.is_streaming {
             self.clear_quit_guard();
             self.cancel_streaming_turn();
@@ -1167,6 +1177,9 @@ impl App {
     }
 
     pub async fn shutdown_runtime(&self) {
+        if let Some(scan) = &self.session_scan {
+            scan.cancel();
+        }
         if let Some(shutdown) = &self.subagent_shutdown {
             shutdown();
         }

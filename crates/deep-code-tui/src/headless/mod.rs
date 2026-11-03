@@ -8,15 +8,22 @@
 //! only the requested output; everything diagnostic goes to stderr, so
 //! `deep-code -p … | jq` stays clean.
 
+mod diagnostics;
 mod drive;
 mod input;
 mod output;
 
+#[cfg(all(test, unix))]
+mod backpressure_tests;
 #[cfg(test)]
 mod contract_docs;
 
 pub use output::OutputFormat;
 
+#[cfg(all(test, unix))]
+use crate::interrupt::signal_is_ignored;
+use crate::interruptible_output::{Output, stderr_writer};
+use deep_code_agent::CancellationToken;
 use std::collections::HashMap;
 
 use deep_code_agent::{
@@ -24,7 +31,10 @@ use deep_code_agent::{
     SessionStore, launch_runtime, neutralize_display_text, now_ms,
 };
 
-use crate::cli::{PrintArgs, StartupIntent, program_name, workspace_root};
+#[cfg(test)]
+use crate::cli::workspace_root;
+use crate::cli::{PrintArgs, StartupIntent, program_name};
+use diagnostics::Diagnostics;
 use drive::DriveStatus;
 
 /// The exit codes a `-p` run can end with. `pub(crate)` because `--help`
@@ -39,23 +49,84 @@ pub(crate) const EXIT_TIMEOUT: i32 = 124;
 pub(crate) const EXIT_INTERRUPT: i32 = 130;
 
 pub async fn run_print(args: PrintArgs) -> i32 {
+    let interrupted = match crate::interrupt::Interrupt::watch() {
+        Ok(interrupted) => interrupted,
+        Err(_) => return EXIT_FAILURE,
+    };
+    let diagnostics = match stderr_writer().and_then(Diagnostics::new) {
+        Ok(diagnostics) => diagnostics,
+        Err(_) => return EXIT_FAILURE,
+    };
+    let stdout = match Output::stdout(&interrupted.child_token()) {
+        Ok(stdout) => stdout,
+        Err(_) => return EXIT_FAILURE,
+    };
+    let interruption = interrupted.cancelled();
+    tokio::pin!(interruption);
+    let code =
+        run_with_diagnostics(args, &diagnostics, &stdout, &interrupted, &mut interruption).await;
+    if interrupted.is_cancelled() {
+        return EXIT_INTERRUPT;
+    }
+    if code == EXIT_TIMEOUT {
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(200), diagnostics.flush()).await;
+        return if interrupted.is_cancelled() {
+            EXIT_INTERRUPT
+        } else {
+            code
+        };
+    }
+    tokio::select! {
+        biased;
+        () = interrupted.cancelled() => EXIT_INTERRUPT,
+        () = diagnostics.flush() => code,
+    }
+}
+
+async fn run_with_diagnostics(
+    args: PrintArgs,
+    diagnostics: &Diagnostics,
+    stdout: &Output,
+    interrupted_token: &CancellationToken,
+    interruption: &mut (impl std::future::Future<Output = ()> + Unpin),
+) -> i32 {
     let has_positional = args
         .prompt
         .as_deref()
         .is_some_and(|text| !text.trim().is_empty());
-    let Some(prompt) = input::compose_prompt(
-        args.prompt.as_deref(),
-        input::read_piped_stdin(has_positional).as_deref(),
-    ) else {
-        eprintln!(
+    let piped = match crate::startup::blocking_io(interrupted_token, move || {
+        input::read_piped_stdin(has_positional)
+    })
+    .await
+    {
+        Ok(piped) => piped,
+        Err(_) => return EXIT_INTERRUPT,
+    };
+    let Some(prompt) = input::compose_prompt(args.prompt.as_deref(), piped.as_deref()) else {
+        diagnostics.line(format!(
             "nothing to run: pass a prompt (`{} -p \"…\"`) or pipe one on stdin",
             program_name()
-        );
+        ));
         return EXIT_USAGE;
     };
 
-    let workspace = workspace_root();
-    let loaded = AgentConfig::load(&workspace);
+    let workspace = match std::env::current_dir() {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            diagnostics.line(format!("failed to resolve workspace: {error}"));
+            return EXIT_FAILURE;
+        }
+    };
+    let config_workspace = workspace.clone();
+    let loaded = match crate::startup::blocking_io(interrupted_token, move || {
+        AgentConfig::load(&config_workspace)
+    })
+    .await
+    {
+        Ok(loaded) => loaded,
+        Err(_) => return EXIT_INTERRUPT,
+    };
     // Sanitized for the same reason `trace_to_stderr` below is: under `-p`
     // stderr is a real terminal (`redirect_stderr_to_log` runs only from
     // `ui::run`). These interpolate `provider.base_url` and friends read out of
@@ -65,31 +136,69 @@ pub async fn run_print(args: PrintArgs) -> i32 {
     // English: `-p` prints English throughout and makes no `tr` call, while
     // `report.warnings` follows `ui.language` — see `ConfigLoadReport::warnings_in`.
     for warning in loaded.report.warnings_in(deep_code_agent::Lang::En) {
-        emit("config", &warning);
+        emit(diagnostics, "config", &warning);
     }
 
-    let resume = match resolve_resume_record(&args.intent, &workspace) {
+    let resume = match resolve_resume_record(
+        &args.intent,
+        &workspace,
+        &mut *interruption,
+        diagnostics,
+        interrupted_token,
+    )
+    .await
+    {
         Ok(resume) => resume,
         Err(code) => return code,
     };
+    // Drain startup diagnostics interruptibly before starting initialization.
+    if tokio::select! {
+        biased;
+        () = &mut *interruption => true,
+        () = diagnostics.flush() => false,
+    } {
+        diagnostics.line("interrupted before initialization");
+        return EXIT_INTERRUPT;
+    }
 
-    let launched = launch_runtime(
-        &loaded.config,
-        deep_code_agent::WorkspaceRoots::new(workspace, args.add_dirs.clone()),
-        resume,
-    );
+    // Skill/configuration reads can block. Keep polling the signal receivers
+    // while initialization runs, and never start a turn from a late result.
+    let roots = deep_code_agent::WorkspaceRoots::new(workspace, args.add_dirs.clone());
+    let mut initializing =
+        tokio::task::spawn_blocking(move || launch_runtime(&loaded.config, roots, resume));
+    let launched = tokio::select! {
+        biased;
+        () = &mut *interruption => {
+            // If this caller stays alive, clean up a runtime that finishes
+            // after cancellation. The CLI itself exits with 130 immediately.
+            tokio::spawn(async move {
+                if let Ok(launched) = initializing.await {
+                    launched.shutdown().await;
+                }
+            });
+            diagnostics.line("interrupted: cancelling initialization");
+            return EXIT_INTERRUPT;
+        }
+        result = &mut initializing => match result {
+            Ok(launched) => launched,
+            Err(error) => {
+                diagnostics.line(format!("runtime initialization failed: {error}"));
+                return EXIT_FAILURE;
+            }
+        },
+    };
     // Same surface, same reason — and the same format string as the sanitized
     // one 190 lines below, which is how this one hid. These interpolate
     // `record.workspace` and `record.extra_roots[i]` straight out of the
     // session JSON, a file the model can write; the message being concealed is
     // "dropping N write grant(s)".
     for warning in &launched.warnings {
-        emit("warning", warning);
+        emit(diagnostics, "warning", warning);
     }
     if launched.offline {
-        eprintln!(
+        diagnostics.line(
             "headless mode needs a DeepSeek API key: set DEEPSEEK_API_KEY, or store one once \
-             via `/apikey` in the interactive TUI"
+             via `/apikey` in the interactive TUI",
         );
         launched.shutdown().await;
         return EXIT_FAILURE;
@@ -102,28 +211,66 @@ pub async fn run_print(args: PrintArgs) -> i32 {
             // naming it would promise a boundary that is not there — the deny
             // floor is then all that is left.
             if launched.sandbox_off {
-                eprintln!(
+                diagnostics.line(
                     "yolo: gated calls run without asking (a write-root request is the one \
                      exception, and unattended it is denied); [sandbox] mode = \"off\", so the \
                      OS sandbox is NOT running — the deny floor is the only remaining \
-                     containment and shell/job commands otherwise run unconfined"
+                     containment and shell/job commands otherwise run unconfined",
                 );
             } else {
-                eprintln!(
+                diagnostics.line(
                     "yolo: gated calls run without asking (a write-root request is the one \
                      exception, and unattended it is denied); the deny floor and the OS \
-                     sandbox (where available) are the remaining containment"
+                     sandbox (where available) are the remaining containment",
                 );
             }
         }
     }
 
+    if tokio::select! {
+        biased;
+        () = &mut *interruption => true,
+        () = diagnostics.flush() => false,
+    } {
+        launched.shutdown().await;
+        return EXIT_INTERRUPT;
+    }
+
+    run_turn(
+        args,
+        prompt,
+        launched,
+        diagnostics,
+        stdout,
+        interrupted_token,
+    )
+    .await
+}
+
+async fn run_turn(
+    args: PrintArgs,
+    prompt: String,
+    launched: deep_code_agent::LaunchedRuntime,
+    diagnostics: &Diagnostics,
+    stdout: &Output,
+    interrupted_token: &CancellationToken,
+) -> i32 {
+    let interruption = interrupted_token.cancelled();
+    tokio::pin!(interruption);
     // stream-json mirrors the SSE contract, including the leading
     // user.message envelope, so existing jq consumers port over unchanged.
     let mut emitter = matches!(args.output, OutputFormat::StreamJson)
-        .then(|| output::NdjsonEmitter::new(format!("print_{}", now_ms()), std::io::stdout()));
+        .then(|| output::NdjsonEmitter::new(format!("print_{}", now_ms()), Vec::new()));
     if let Some(emitter) = emitter.as_mut() {
         emitter.manual("user.message", serde_json::json!({ "content": prompt }));
+        if stdout.send(&emitter.take_pending()).await.is_err() {
+            launched.shutdown().await;
+            return if interrupted_token.is_cancelled() {
+                EXIT_INTERRUPT
+            } else {
+                EXIT_FAILURE
+            };
+        }
     }
 
     let handle = launched.handle.clone();
@@ -132,15 +279,21 @@ pub async fn run_print(args: PrintArgs) -> i32 {
     let started = std::time::Instant::now();
     let mut interrupted = false;
     let mut timed_out = false;
+    let output_abandoned = std::cell::Cell::new(false);
 
     let outcome = {
         let emitter = &mut emitter;
         let mut tool_names: HashMap<String, String> = HashMap::new();
-        let mut on_event = |event: &RuntimeEvent| {
+        let mut on_event = async |event: &RuntimeEvent| {
             if let Some(emitter) = emitter.as_mut() {
                 emitter.event(event);
+                if let Err(error) = stdout.send(&emitter.take_pending()).await {
+                    output_abandoned.set(true);
+                    return Err(error);
+                }
             }
-            trace_to_stderr(event, verbose, &mut tool_names);
+            trace_to_stderr(diagnostics, event, verbose, &mut tool_names);
+            Ok(())
         };
 
         // `checked_add`, not `+`: a large-but-valid `--timeout` (or the bot's
@@ -151,53 +304,61 @@ pub async fn run_print(args: PrintArgs) -> i32 {
         let deadline = args.timeout_secs.and_then(|secs| {
             tokio::time::Instant::now().checked_add(std::time::Duration::from_secs(secs))
         });
-        let drive = drive::drive_to_completion(&handle, prompt.clone(), &mut on_event);
+        let turn_started = std::cell::Cell::new(false);
+        let drive = async {
+            turn_started.set(true);
+            drive::drive_to_completion(&handle, prompt.clone(), &mut on_event).await
+        };
         tokio::pin!(drive);
-        // Registered once and reused, so a SIGTERM/SIGHUP arriving between loop
-        // turns is not missed. The `if !interrupted` guard disables the arm
-        // after the first hit.
-        let terminated = terminate_signal();
-        tokio::pin!(terminated);
         loop {
             tokio::select! {
+                biased;
+                // Cancel once, then let the driver observe the terminal event
+                // or the cancelled output delivery and finalize the report.
+                () = &mut interruption, if !interrupted => {
+                    interrupted = true;
+                    // An interrupt queued during initialization must win over
+                    // the first poll of the drive (which submits the prompt).
+                    if !turn_started.get() {
+                        break drive::DriveOutcome {
+                            status: DriveStatus::Cancelled,
+                            reasoning: String::new(),
+                            usage: None,
+                            telemetry: None,
+                            denied_approvals: 0,
+                        };
+                    }
+                    diagnostics.line("interrupted: cancelling the turn…");
+                    canceller.cancel_turn().await;
+                }
                 outcome = &mut drive => break outcome,
-                // First interrupt cancels the turn and lets the loop finalize
-                // (the cancel arm kills tool process groups); the guard keeps
-                // a second press from re-cancelling instead of exiting.
-                _ = tokio::signal::ctrl_c(), if !interrupted => {
-                    interrupted = true;
-                    eprintln!("interrupted: cancelling the turn…");
-                    canceller.cancel_turn().await;
-                }
-                // SIGTERM/SIGHUP (a supervisor, `timeout`, a closed shell) must
-                // drain like Ctrl-C, not kill the process before cleanup: the
-                // cancel tears down tool process groups, and the post-loop
-                // `shutdown()` kills background jobs. Without this a `kill` left
-                // dev servers/watchers orphaned and the session tail unpersisted.
-                () = &mut terminated, if !interrupted => {
-                    interrupted = true;
-                    eprintln!("terminated: cancelling the turn…");
-                    canceller.cancel_turn().await;
-                }
                 () = sleep_until(deadline), if deadline.is_some() && !timed_out && !interrupted => {
                     timed_out = true;
-                    eprintln!(
+                    stdout.cancel();
+                    diagnostics.line(format!(
                         "timeout after {}s: cancelling the turn…",
                         args.timeout_secs.unwrap_or(0)
-                    );
+                    ));
                     canceller.cancel_turn().await;
                 }
             }
         }
     };
 
-    let (status, exit_code, error) = classify(&outcome.status, interrupted, timed_out, &args);
+    // The driver may observe cancellation while delivering its last event.
+    interrupted |= interrupted_token.is_cancelled();
+    let drive_status = if output_abandoned.get() && (interrupted || timed_out) {
+        &DriveStatus::Cancelled
+    } else {
+        &outcome.status
+    };
+    let (status, exit_code, error) = classify(drive_status, interrupted, timed_out, &args);
     if let Some(message) = &error {
         // `RuntimeEvent::Error` carries tool failures, which quote the paths
         // and commands the model chose. `trace_to_stderr` does not handle that
         // variant, so this is its only surfacing point — while the TUI status
         // row sanitizes the identical value.
-        emit("error", message);
+        emit(diagnostics, "error", message);
     }
 
     // The answer is read from the session, not reassembled from deltas: the
@@ -226,31 +387,56 @@ pub async fn run_print(args: PrintArgs) -> i32 {
         telemetry: outcome.telemetry,
     };
 
-    match args.output {
+    // Shut down tools/persistence before waiting for a final consumer that may
+    // never read again. Cancellation reports get a bounded best-effort write.
+    launched.shutdown().await;
+    let final_stdout = if interrupted || timed_out {
+        stdout.cleanup()
+    } else {
+        stdout.clone()
+    };
+    let bytes = match args.output {
         OutputFormat::StreamJson => {
             if let (Some(emitter), Ok(payload)) = (emitter.as_mut(), serde_json::to_value(&report))
             {
                 emitter.manual("print.result", payload);
+                emitter.take_pending()
+            } else {
+                Vec::new()
             }
         }
-        OutputFormat::Json => println!("{}", output::report_to_json(&report)),
+        OutputFormat::Json => format!("{}\n", output::report_to_json(&report)).into_bytes(),
         OutputFormat::Text => {
             if !report.result.is_empty() {
-                println!("{}", report.result);
-            } else if report.status == "finished" {
-                eprintln!("(the turn finished without assistant text)");
+                format!("{}\n", report.result).into_bytes()
+            } else {
+                if report.status == "finished" {
+                    diagnostics.line("(the turn finished without assistant text)");
+                }
+                Vec::new()
             }
         }
-    }
+    };
+    // Never append a new JSON envelope after cancelling a partial frame.
+    let delivered = if output_abandoned.get() {
+        Ok(())
+    } else {
+        final_stdout.send(&bytes).await
+    };
     if let Some(session_id) = &report.session_id {
-        eprintln!(
+        diagnostics.line(format!(
             "session: {session_id}  (continue interactively with `{} -c`)",
             program_name()
-        );
+        ));
     }
 
-    launched.shutdown().await;
-    exit_code
+    if interrupted_token.is_cancelled() {
+        EXIT_INTERRUPT
+    } else if delivered.is_err() && exit_code == EXIT_OK {
+        EXIT_FAILURE
+    } else {
+        exit_code
+    }
 }
 
 /// Map the drive status plus what *we* did (interrupt, timeout) to the
@@ -300,8 +486,8 @@ fn classify(
 /// Honest about what pins this: the test below covers the sanitizing, not the
 /// wiring. Nothing stops a future caller from reaching for `eprintln!` again;
 /// what this buys is that there is now an obvious right way to do it.
-fn emit(prefix: &str, text: &str) {
-    eprintln!("{}", emit_line(prefix, text));
+fn emit(diagnostics: &Diagnostics, prefix: &str, text: &str) {
+    diagnostics.line(emit_line(prefix, text));
 }
 
 /// The pure half of [`emit`], so the sanitizing can be asserted.
@@ -312,7 +498,12 @@ fn emit_line(prefix: &str, text: &str) -> String {
 /// One stderr line per notable event. Approval denials always print — they
 /// are the honest answer to "why didn't it edit anything"; tool traffic only
 /// with `--verbose`.
-fn trace_to_stderr(event: &RuntimeEvent, verbose: bool, tool_names: &mut HashMap<String, String>) {
+fn trace_to_stderr(
+    diagnostics: &Diagnostics,
+    event: &RuntimeEvent,
+    verbose: bool,
+    tool_names: &mut HashMap<String, String>,
+) {
     // Every field below is model-chosen, and in `-p` mode stderr is a real
     // terminal: `redirect_stderr_to_log` is called from `ui::run` only, so the
     // TUI's protection does not extend here. An `\x1b[8m` in a hallucinated
@@ -326,13 +517,15 @@ fn trace_to_stderr(event: &RuntimeEvent, verbose: bool, tool_names: &mut HashMap
     // parsing it; nobody pipes `→ read_file`.
     let clean = neutralize_display_text;
     match event {
-        RuntimeEvent::Warning { message } => eprintln!("warning: {}", clean(message)),
+        RuntimeEvent::Warning { message } => {
+            diagnostics.line(format!("warning: {}", clean(message)))
+        }
         RuntimeEvent::ApprovalRequired { request, .. } => {
-            eprintln!(
+            diagnostics.line(format!(
                 "approval auto-denied: {} — {}",
                 clean(&request.tool_name),
                 clean(&request.description)
-            );
+            ));
         }
         RuntimeEvent::ToolCallStarted {
             tool_call_id,
@@ -340,13 +533,13 @@ fn trace_to_stderr(event: &RuntimeEvent, verbose: bool, tool_names: &mut HashMap
             ..
         } if verbose => {
             tool_names.insert(tool_call_id.as_str().to_string(), tool_name.clone());
-            eprintln!("→ {}", clean(tool_name));
+            diagnostics.line(format!("→ {}", clean(tool_name)));
         }
         RuntimeEvent::ToolCallFinished { tool_call_id, .. } if verbose => {
             let name = tool_names
                 .remove(tool_call_id.as_str())
                 .unwrap_or_else(|| "tool".to_string());
-            eprintln!("← {}", clean(&name));
+            diagnostics.line(format!("← {}", clean(&name)));
         }
         _ => {}
     }
@@ -354,45 +547,65 @@ fn trace_to_stderr(event: &RuntimeEvent, verbose: bool, tool_names: &mut HashMap
 
 /// Resolve which stored session (if any) this run continues.
 /// `Err` carries the process exit code.
-fn resolve_resume_record(
+async fn resolve_resume_record(
     intent: &StartupIntent,
     workspace: &std::path::Path,
+    interruption: impl std::future::Future<Output = ()>,
+    diagnostics: &Diagnostics,
+    interrupted: &CancellationToken,
 ) -> Result<Option<SessionRecord>, i32> {
     match intent {
         StartupIntent::New => Ok(None),
         StartupIntent::ResumePicker => {
-            eprintln!("the session picker is interactive; use `--resume <id>` (or `-c`) with -p");
+            diagnostics
+                .line("the session picker is interactive; use `--resume <id>` (or `-c`) with -p");
             Err(EXIT_USAGE)
         }
         StartupIntent::ContinueLatest => {
-            let store = open_store(workspace)?;
-            let listed = store.list();
-            for line in store.take_diagnostics() {
-                eprintln!("{line}");
-            }
+            let store = open_store(workspace, diagnostics, interrupted).await?;
+            diagnostics.line("scanning saved sessions… (Ctrl+C to cancel)");
+            let listed = match crate::session_scan::SessionScan::start(store) {
+                Ok(scan) => crate::session_scan::wait_with_interrupt(scan, interruption).await,
+                Err(error) => Err(error),
+            };
             match listed {
                 // Newest first; skip sessions with no user message, exactly
                 // like the TUI's `-c` (an empty session is not "the latest").
-                Ok(records) => Ok(records.into_iter().find(crate::startup::has_user_message)),
+                Ok(listing) => {
+                    for line in listing.diagnostics {
+                        emit(diagnostics, "session", &line);
+                    }
+                    Ok(listing
+                        .records
+                        .into_iter()
+                        .find(crate::startup::has_user_message))
+                }
+                Err(deep_code_agent::SessionStoreError::Cancelled) => {
+                    diagnostics.line("session scan cancelled");
+                    Err(EXIT_INTERRUPT)
+                }
                 Err(error) => {
-                    eprintln!("cannot list sessions: {error}");
+                    diagnostics.line(format!("cannot list sessions: {error}"));
                     Err(EXIT_FAILURE)
                 }
             }
         }
         StartupIntent::ResumeId(id) => {
-            let store = open_store(workspace)?;
+            let store = open_store(workspace, diagnostics, interrupted).await?;
             let session_id = match SessionId::parse(id) {
                 Ok(session_id) => session_id,
                 Err(error) => {
-                    eprintln!("invalid session id '{id}': {error}");
+                    diagnostics.line(format!("invalid session id '{id}': {error}"));
                     return Err(EXIT_FAILURE);
                 }
             };
-            match store.load(&session_id) {
+            let loaded = crate::startup::blocking_io(interrupted, move || store.load(&session_id))
+                .await
+                .map_err(|_| EXIT_INTERRUPT)?;
+            match loaded {
                 Ok(record) => Ok(Some(record)),
                 Err(error) => {
-                    eprintln!("cannot resume '{id}': {error}");
+                    diagnostics.line(format!("cannot resume '{id}': {error}"));
                     Err(EXIT_FAILURE)
                 }
             }
@@ -400,69 +613,21 @@ fn resolve_resume_record(
     }
 }
 
-fn open_store(workspace: &std::path::Path) -> Result<JsonSessionStore, i32> {
-    JsonSessionStore::for_workspace(workspace).map_err(|error| {
-        eprintln!("session storage unavailable: {error}");
+async fn open_store(
+    workspace: &std::path::Path,
+    diagnostics: &Diagnostics,
+    interrupted: &CancellationToken,
+) -> Result<JsonSessionStore, i32> {
+    let workspace = workspace.to_path_buf();
+    crate::startup::blocking_io(interrupted, move || {
+        JsonSessionStore::for_workspace(workspace)
+    })
+    .await
+    .map_err(|_| EXIT_INTERRUPT)?
+    .map_err(|error| {
+        diagnostics.line(format!("session storage unavailable: {error}"));
         EXIT_FAILURE
     })
-}
-
-/// Whether `signum`'s disposition is currently `SIG_IGN`.
-///
-/// `nohup` sets `SIGHUP` to `SIG_IGN` so a job survives the terminal closing.
-/// Installing a tokio signal handler REPLACES that disposition, so a
-/// `nohup deepcode -p … &` started catching SIGHUP and cancelling on terminal
-/// close — the exact thing nohup exists to prevent (a 4e117e1 regression). We
-/// query the disposition first and leave an ignored signal alone.
-#[cfg(unix)]
-fn signal_is_ignored(signum: libc::c_int) -> bool {
-    // SAFETY: querying the current disposition with a null new-action is the
-    // documented read-only form of sigaction(2); `old` is fully written by it.
-    unsafe {
-        let mut old: libc::sigaction = std::mem::zeroed();
-        if libc::sigaction(signum, std::ptr::null(), &mut old) != 0 {
-            return false;
-        }
-        old.sa_sigaction == libc::SIG_IGN
-    }
-}
-
-/// Resolves on the first SIGTERM or SIGHUP (unix); pends forever elsewhere.
-/// Ctrl-C (SIGINT) is handled separately via [`tokio::signal::ctrl_c`]. Shared
-/// with the TUI (`ui::run`) so both entry points drain on the same signals.
-///
-/// SIGHUP is watched only when it is not already ignored: a `nohup`'d process
-/// must keep ignoring it (`signal_is_ignored`, unix only) so it survives the terminal
-/// closing, rather than have this handler turn a hang-up into a shutdown.
-pub(crate) async fn terminate_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let hup = if signal_is_ignored(libc::SIGHUP) {
-            None
-        } else {
-            signal(SignalKind::hangup()).ok()
-        };
-        match (signal(SignalKind::terminate()), hup) {
-            (Ok(mut term), Some(mut hup)) => {
-                tokio::select! {
-                    _ = term.recv() => {}
-                    _ = hup.recv() => {}
-                }
-            }
-            (Ok(mut term), None) => {
-                term.recv().await;
-            }
-            (Err(_), Some(mut hup)) => {
-                hup.recv().await;
-            }
-            (Err(_), None) => std::future::pending::<()>().await,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        std::future::pending::<()>().await;
-    }
 }
 
 /// Total future for the optional wall-clock deadline; pends forever when no
@@ -478,12 +643,110 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn initialization_stays_interruptible_after_continue_scan() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "DEEP_CODE_HEADLESS_SIGNAL_TEST";
+        if let Ok(intent) = std::env::var(CHILD) {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let code = runtime.block_on(run_print(PrintArgs {
+                prompt: Some("must not start a turn".to_string()),
+                intent: if intent == "continue" {
+                    StartupIntent::ContinueLatest
+                } else {
+                    StartupIntent::New
+                },
+                output: OutputFormat::StreamJson,
+                permission_mode: None,
+                timeout_secs: None,
+                verbose: false,
+                add_dirs: Vec::new(),
+            }));
+            // Match main: exit without waiting for blocked initialization I/O.
+            std::process::exit(code);
+        }
+
+        for intent in ["new", "continue"] {
+            for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                let workspace = tempfile::tempdir().unwrap();
+                let skill = workspace.path().join("skills/blocked");
+                std::fs::create_dir_all(&skill).unwrap();
+                let path = skill.join("SKILL.md");
+                let fifo = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                // SAFETY: valid NUL-terminated path in this test's workspace.
+                assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "headless::tests::initialization_stays_interruptible_after_continue_scan",
+                    ])
+                    .env(CHILD, intent)
+                    .current_dir(workspace.path())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                // Opening the writer succeeds only once skill discovery has
+                // opened the reader. Keep it open without data to block init.
+                let writer = loop {
+                    if let Ok(writer) = std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&path)
+                    {
+                        break writer;
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let output = child.wait_with_output().unwrap();
+                        panic!("initialization never reached skill loading: {output:?}");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                // SAFETY: the PID belongs to this test's live child process.
+                assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, signal) }, 0);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while child.try_wait().unwrap().is_none() {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("{intent}: signal {signal} was ignored during initialization");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let output = child.wait_with_output().unwrap();
+                drop(writer);
+                assert_eq!(output.status.code(), Some(EXIT_INTERRUPT), "{output:?}");
+                assert!(!String::from_utf8_lossy(&output.stdout).contains("user.message"));
+            }
+        }
+    }
+
     /// `signal_is_ignored` must report an ignored disposition truthfully, so a
-    /// `nohup`'d run leaves SIGHUP alone. Set → assert → restore synchronously
-    /// (no other test in this binary sends itself SIGHUP).
+    /// `nohup`'d run leaves SIGHUP alone. Use a child so concurrently spawned
+    /// regression processes cannot accidentally inherit a temporary SIG_IGN.
     #[cfg(unix)]
     #[test]
     fn detects_an_ignored_sighup() {
+        const CHILD: &str = "DEEP_CODE_IGNORED_HUP_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "headless::tests::detects_an_ignored_sighup"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
         assert!(
             !signal_is_ignored(libc::SIGHUP),
             "precondition: SIGHUP is not ignored by default under the test harness"

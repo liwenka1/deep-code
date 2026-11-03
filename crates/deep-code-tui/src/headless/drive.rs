@@ -42,7 +42,7 @@ pub(crate) struct DriveOutcome {
 pub(crate) async fn drive_to_completion(
     runtime: &AgentRuntime,
     prompt: String,
-    on_event: &mut dyn FnMut(&RuntimeEvent),
+    on_event: &mut impl AsyncFnMut(&RuntimeEvent) -> std::io::Result<()>,
 ) -> DriveOutcome {
     let mut outcome = DriveOutcome {
         status: DriveStatus::Incomplete,
@@ -56,7 +56,11 @@ pub(crate) async fn drive_to_completion(
     'turn: loop {
         let mut resumed = false;
         while let Some(event) = events.recv().await {
-            on_event(&event);
+            if let Err(error) = on_event(&event).await {
+                runtime.cancel_turn().await;
+                outcome.status = DriveStatus::Failed(format!("output failed: {error}"));
+                break 'turn;
+            }
             match event {
                 RuntimeEvent::ReasoningDelta { text, .. } => outcome.reasoning.push_str(&text),
                 RuntimeEvent::ApprovalRequired { ref request, .. } => {
@@ -200,7 +204,7 @@ mod tests {
             ToolRegistry::with_mock_tools(),
         );
 
-        let outcome = drive_to_completion(&runtime, "hi".to_string(), &mut |_| {}).await;
+        let outcome = drive_to_completion(&runtime, "hi".to_string(), &mut async |_| Ok(())).await;
 
         assert_eq!(outcome.status, DriveStatus::Finished);
         assert_eq!(outcome.reasoning, "thinking…");
@@ -223,10 +227,11 @@ mod tests {
         );
 
         let mut saw_approval_event = false;
-        let outcome = drive_to_completion(&runtime, "hi".to_string(), &mut |event| {
+        let outcome = drive_to_completion(&runtime, "hi".to_string(), &mut async |event| {
             if matches!(event, RuntimeEvent::ApprovalRequired { .. }) {
                 saw_approval_event = true;
             }
+            Ok(())
         })
         .await;
 
@@ -262,7 +267,7 @@ mod tests {
             ToolRegistry::with_mock_tools(),
         );
 
-        let outcome = drive_to_completion(&runtime, "hi".to_string(), &mut |_| {}).await;
+        let outcome = drive_to_completion(&runtime, "hi".to_string(), &mut async |_| Ok(())).await;
         assert_eq!(outcome.denied_approvals, 1);
 
         let messages = runtime.session_messages().await;

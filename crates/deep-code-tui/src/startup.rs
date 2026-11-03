@@ -2,19 +2,16 @@
 //! resuming is opt-in via `-c` (latest) or `-r` (picker). Starting fresh by
 //! default keeps stale context from silently leaking into a new task.
 
-use std::io::{self, Stdout};
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::terminal::EnterAlternateScreen;
 use deep_code_agent::{
-    AgentConfig, JsonSessionStore, SessionId, SessionRecord, SessionStore,
-    format_sessions_storage_note, now_ms,
+    AgentConfig, CancellationToken, JsonSessionStore, SessionId, SessionRecord, SessionStore,
+    SessionStoreError, format_sessions_storage_note, now_ms,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style};
@@ -40,14 +37,34 @@ enum Resolution {
     Pick(Vec<SessionRecord>),
 }
 
-pub fn choose_startup(
+/// Keep the signal task and its caller responsive during startup file I/O.
+/// Cancellation returns to main, which exits without waiting for blocked I/O.
+pub(crate) async fn blocking_io<T: Send + 'static>(
+    interrupted: &CancellationToken,
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    tokio::select! {
+        biased;
+        () = interrupted.cancelled() => Err(SessionStoreError::Cancelled.into()),
+        result = tokio::task::spawn_blocking(read) => Ok(result?),
+    }
+}
+
+pub async fn choose_startup(
     store: &JsonSessionStore,
     intent: StartupIntent,
     workspace: &Path,
+    interrupted: &CancellationToken,
 ) -> Result<Option<SessionRecord>> {
     match &intent {
         // A specific id is loaded directly (and surfaces a clear "not found").
-        StartupIntent::ResumeId(id) => return Ok(Some(store.load(&SessionId::parse(id)?)?)),
+        StartupIntent::ResumeId(id) => {
+            let id = SessionId::parse(id)?;
+            let store = store.clone();
+            return Ok(Some(
+                blocking_io(interrupted, move || store.load(&id)).await??,
+            ));
+        }
         // A fresh session needs no listing. `store.list()` fully deserializes
         // every session file on disk; on a long-lived workspace with hundreds
         // of sessions that added a visible stall to the most common launch
@@ -56,25 +73,33 @@ pub fn choose_startup(
         StartupIntent::ContinueLatest | StartupIntent::ResumePicker => {}
     }
 
-    let sessions = store.list()?; // newest-first
+    let workspace = workspace.to_path_buf();
+    let lang = blocking_io(interrupted, move || {
+        Lang::from_env(&AgentConfig::load(&workspace).config.language)
+    })
+    .await?;
+    let diagnostics = crate::interruptible_output::Output::stderr(interrupted)?;
+    diagnostics
+        .send(format!("{}\n", tr(lang, TextId::StartupScanningSessions)).as_bytes())
+        .await?;
+    let listing = crate::session_scan::wait_with_interrupt(
+        crate::session_scan::SessionScan::start(store.clone())?,
+        interrupted.cancelled(),
+    )
+    .await?;
+    let sessions = listing.records; // newest-first, only after a complete scan
     // `list()` collects what it had to skip instead of printing it: here, before
     // the alternate screen, stderr is still the terminal the user is looking at.
-    for line in store.take_diagnostics() {
-        eprintln!("{line}");
+    for line in listing.diagnostics {
+        diagnostics.send(format!("{line}\n").as_bytes()).await?;
     }
     match resolve(&intent, sessions) {
         Resolution::New => Ok(None),
         Resolution::Resume(record) => Ok(Some(*record)),
-        Resolution::Pick(list) => {
-            // Resolve the UI language only now that the picker will actually
-            // render (the `-r` path). The common launches never load config
-            // here — App::launch loads it once for the main UI.
-            let lang = Lang::from_env(&AgentConfig::load(workspace).config.language);
-            match run_picker(&list, lang)? {
-                StartupChoice::NewSession => Ok(None),
-                StartupChoice::Resume(index) => Ok(list.into_iter().nth(index)),
-            }
-        }
+        Resolution::Pick(list) => match run_picker(&list, lang, interrupted)? {
+            StartupChoice::NewSession => Ok(None),
+            StartupChoice::Resume(index) => Ok(list.into_iter().nth(index)),
+        },
     }
 }
 
@@ -142,12 +167,20 @@ pub(crate) fn relative_time(now_ms: u64, then_ms: u64, lang: Lang) -> String {
     }
 }
 
-fn run_picker(sessions: &[SessionRecord], lang: Lang) -> Result<StartupChoice> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
+fn run_picker(
+    sessions: &[SessionRecord],
+    lang: Lang,
+    interrupted: &CancellationToken,
+) -> Result<StartupChoice> {
+    let cleanup = crate::ui::TerminalCleanup::new(interrupted, false)?;
+    let mut stdout = cleanup.writer();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    // Drop cleanup before Terminal even when drawing/reading returns an error.
+    // ratatui's destructor otherwise prints a synchronous stderr error if its
+    // attempt to show the cursor uses an already-cancelled writer.
+    let mut cleanup = cleanup;
     terminal.clear()?;
 
     // `record.workspace` is a path deserialized from the session JSON, which
@@ -166,6 +199,10 @@ fn run_picker(sessions: &[SessionRecord], lang: Lang) -> Result<StartupChoice> {
     let mut selected = 0usize;
 
     let result = loop {
+        if interrupted.is_cancelled() {
+            cleanup.restore()?;
+            return Err(SessionStoreError::Cancelled.into());
+        }
         terminal.draw(|frame| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -265,7 +302,7 @@ fn run_picker(sessions: &[SessionRecord], lang: Lang) -> Result<StartupChoice> {
                 KeyCode::Enter => break StartupChoice::Resume(selected),
                 KeyCode::Char('n') | KeyCode::Esc => break StartupChoice::NewSession,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    restore_terminal(&mut terminal)?;
+                    cleanup.restore()?;
                     std::process::exit(0);
                 }
                 _ => {}
@@ -273,15 +310,8 @@ fn run_picker(sessions: &[SessionRecord], lang: Lang) -> Result<StartupChoice> {
         }
     };
 
-    restore_terminal(&mut terminal)?;
+    cleanup.restore()?;
     Ok(result)
-}
-
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
 }
 
 #[cfg(test)]

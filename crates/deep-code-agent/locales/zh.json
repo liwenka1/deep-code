@@ -133,6 +133,8 @@
   "SessionsReadFailed": "无法读取历史会话: {error}",
   "NoResumableSessions": "没有可恢复的历史会话",
   "StatusPickSession": "选择要恢复的历史会话 (↑/↓ · Enter · Esc 取消)",
+  "StatusScanningSessions": "正在扫描历史会话… (Esc / Ctrl+C 取消)",
+  "StartupScanningSessions": "正在扫描历史会话… (Ctrl+C 取消)",
   "StatusResumeCancelled": "已取消，留在当前会话",
   "SessionStoreOpenFailed": "无法打开会话存储: {error}",
   "SessionIdInvalid": "无效的会话 id '{id}': {error}",

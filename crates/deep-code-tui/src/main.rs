@@ -11,9 +11,12 @@ mod github;
 mod headless;
 mod highlight;
 mod history;
+mod interrupt;
+mod interruptible_output;
 mod markdown;
 mod prompt_history;
 mod session_cli;
+mod session_scan;
 mod startup;
 mod ui;
 
@@ -22,21 +25,14 @@ use deep_code_agent::JsonSessionStore;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    run().await
+}
+
+async fn run() -> anyhow::Result<()> {
     let CliArgs { mode } = parse_args();
     match mode {
         RunMode::Tui { intent, add_dirs } => {
-            let workspace = workspace_root();
-            let store = JsonSessionStore::for_workspace(workspace.clone())?;
-            // The picker (only the `-r` path) resolves the UI language itself,
-            // lazily, from the workspace config — App::launch loads it again
-            // for the main UI.
-            let record = startup::choose_startup(&store, intent, &workspace)?;
-            ui::run(app::LaunchConfig {
-                resume: record,
-                workspace: None,
-                extra_roots: add_dirs,
-            })
-            .await
+            std::process::exit(run_tui(intent, add_dirs).await);
         }
         RunMode::Print(print_args) => {
             // Exit code is part of the headless contract (0 ok / 1 error /
@@ -91,5 +87,45 @@ async fn main() -> anyhow::Result<()> {
         RunMode::SessionList => session_cli::list(),
         RunMode::SessionDelete { id } => session_cli::delete(id),
         RunMode::SessionExport { id } => session_cli::export(id),
+    }
+}
+
+/// Own the listener through error reporting as well as startup and rendering.
+async fn run_tui(intent: cli::StartupIntent, add_dirs: Vec<std::path::PathBuf>) -> i32 {
+    let workspace = workspace_root();
+    let interrupted = match ui::watch_interrupt() {
+        Ok(interrupted) => interrupted,
+        Err(_) => return 1,
+    };
+    let result: anyhow::Result<()> = async {
+        let store_workspace = workspace.clone();
+        let store = startup::blocking_io(&interrupted, move || {
+            JsonSessionStore::for_workspace(store_workspace)
+        })
+        .await??;
+        // Resume scans run off-thread and service Ctrl+C before raw mode.
+        let record = startup::choose_startup(&store, intent, &workspace, &interrupted).await?;
+        ui::run(
+            app::LaunchConfig {
+                resume: record,
+                workspace: None,
+                extra_roots: add_dirs,
+            },
+            &interrupted,
+        )
+        .await
+    }
+    .await;
+    // Handle errors while the listener is still alive. Returning an
+    // anyhow error from main would print synchronously after dropping it.
+    if interrupted.is_cancelled() {
+        130
+    } else if let Err(error) = result {
+        if let Ok(output) = interruptible_output::Output::stderr(&interrupted) {
+            let _ = output.send(format!("Error: {error:#}\n").as_bytes()).await;
+        }
+        if interrupted.is_cancelled() { 130 } else { 1 }
+    } else {
+        0
     }
 }

@@ -38,10 +38,6 @@ pub(crate) const MAX_SESSION_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const MAX_SESSION_ENTRIES: usize = 4096;
 /// Maximum number of records retained by the picker/list API.
 pub(crate) const MAX_SESSION_LIST: usize = 32;
-/// Hard scan budgets keep a model-created directory full of session files from
-/// turning every `-c` launch into an unbounded parse and I/O job.
-pub(crate) const MAX_SESSION_SCAN: usize = 256;
-pub(crate) const MAX_SESSION_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 
 const SESSIONS_DIR: &str = ".deep-code/sessions";
 
@@ -262,6 +258,8 @@ impl SessionRecord {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionStoreError {
+    #[error("session scan cancelled")]
+    Cancelled,
     #[error("session '{id}' was not found")]
     NotFound { id: String },
     #[error("session storage I/O failed: {message}")]

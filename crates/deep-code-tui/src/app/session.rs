@@ -1,5 +1,24 @@
 use super::*;
 
+#[cfg(test)]
+mod tests;
+
+pub(super) enum SessionScanPurpose {
+    Picker,
+    List,
+}
+
+pub(super) struct PendingSessionScan {
+    purpose: SessionScanPurpose,
+    task: crate::session_scan::SessionScan,
+}
+
+impl PendingSessionScan {
+    pub(super) fn cancel(&self) {
+        self.task.cancel();
+    }
+}
+
 impl App {
     pub(crate) fn adopt_runtime(&mut self, launched: LaunchedRuntime) -> Option<SessionRecord> {
         // Exhaustive destructuring for the same reason `App::launch` uses it:
@@ -107,6 +126,7 @@ impl App {
     /// Every runtime swap calls this first so the old session's persistence
     /// lands on disk before anything re-reads it.
     fn shutdown_current_runtime(&mut self) {
+        self.session_scan = None;
         if let Some(stop) = self.subagent_shutdown.take() {
             stop();
         }
@@ -303,35 +323,115 @@ impl App {
             self.status = self.busy_status(TextId::BusySwitchSession);
             return;
         }
-        let store = match JsonSessionStore::for_pinned_workspace(&self.workspace) {
-            Ok(store) => store,
+        self.begin_session_scan(SessionScanPurpose::Picker);
+    }
+
+    pub(crate) fn list_sessions(&mut self) {
+        self.begin_session_scan(SessionScanPurpose::List);
+    }
+
+    fn begin_session_scan(&mut self, purpose: SessionScanPurpose) {
+        // A newer request owns a new receiver; a cancelled worker can never
+        // deliver a stale picker/list into it.
+        self.session_scan = None;
+        match JsonSessionStore::for_pinned_workspace(&self.workspace)
+            .and_then(crate::session_scan::SessionScan::start)
+        {
+            Ok(task) => {
+                self.session_scan = Some(PendingSessionScan { purpose, task });
+                self.status = self.tr(TextId::StatusScanningSessions).to_string();
+            }
             Err(error) => {
                 self.status =
                     self.tr_with(TextId::SessionsReadFailed, &[("error", &error.to_string())]);
-                return;
             }
+        }
+    }
+
+    pub(crate) fn cancel_session_scan(&mut self) -> bool {
+        if self.session_scan.take().is_some() {
+            self.status = self.tr(TextId::StatusResumeCancelled).to_string();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Nonblocking: the terminal loop still drains keys and runtime events
+    /// while the worker reads the directory.
+    pub(crate) fn poll_session_scan(&mut self) -> bool {
+        let Some(result) = self
+            .session_scan
+            .as_mut()
+            .and_then(|scan| scan.task.try_result())
+        else {
+            return false;
         };
-        let sessions = match store.list() {
-            Ok(list) => {
-                // Sessions the store refused to return (unverified file, schema
-                // it cannot read). Before this they went to stderr, which the
-                // TUI redirects into the log — invisible exactly when the
-                // picker is about to tell the user there is nothing to resume.
-                let skipped = store.take_diagnostics();
-                if !skipped.is_empty() {
+        let purpose = self
+            .session_scan
+            .take()
+            .expect("scan result has an owner")
+            .purpose;
+        match result {
+            Ok(listing) => {
+                if !listing.diagnostics.is_empty() {
                     self.history
-                        .push(crate::history::HistoryCell::system(skipped.join("\n")));
+                        .push(HistoryCell::system(listing.diagnostics.join("\n")));
                 }
-                list.into_iter()
-                    .filter(crate::startup::has_user_message)
-                    .collect::<Vec<_>>()
+                match purpose {
+                    SessionScanPurpose::Picker if !self.runtime_busy() => {
+                        self.show_resume_picker(listing.records);
+                    }
+                    SessionScanPurpose::Picker => {
+                        self.status = self.busy_status(TextId::BusySwitchSession);
+                    }
+                    SessionScanPurpose::List => self.show_session_list(listing.records),
+                }
             }
             Err(error) => {
                 self.status =
                     self.tr_with(TextId::SessionsReadFailed, &[("error", &error.to_string())]);
-                return;
             }
-        };
+        }
+        true
+    }
+
+    fn show_session_list(&mut self, records: Vec<SessionRecord>) {
+        if records.is_empty() {
+            self.status = self.tr(TextId::NoSavedSessions).to_string();
+            return;
+        }
+        let note = deep_code_agent::format_sessions_storage_note(
+            &self.workspace,
+            &crate::cli::program_name(),
+        );
+        let body = records
+            .iter()
+            .map(|record| {
+                format!(
+                    "- {} ({} msgs) {}",
+                    record.id.as_str(),
+                    record.message_count(),
+                    record.preview().replace('\n', " ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.history.push(HistoryCell::system(format!(
+            "{note}\n{}\n{body}",
+            self.tr(TextId::SessionsHeader),
+        )));
+        self.status = self.tr_with(
+            TextId::SessionsCount,
+            &[("count", &records.len().to_string())],
+        );
+    }
+
+    fn show_resume_picker(&mut self, records: Vec<SessionRecord>) {
+        let sessions: Vec<_> = records
+            .into_iter()
+            .filter(crate::startup::has_user_message)
+            .collect();
         if sessions.is_empty() {
             self.status = self.tr(TextId::NoResumableSessions).to_string();
             return;
@@ -382,6 +482,7 @@ impl App {
     /// Load session `id` and switch to it in place. Surfaces a readable status
     /// on a bad id / missing record rather than failing the command.
     pub(crate) fn switch_session_by_id(&mut self, id: &str) -> Result<(), String> {
+        self.cancel_session_scan();
         let store = JsonSessionStore::for_pinned_workspace(&self.workspace).map_err(|error| {
             self.tr_with(
                 TextId::SessionStoreOpenFailed,

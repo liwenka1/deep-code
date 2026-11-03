@@ -1,6 +1,67 @@
 use super::*;
 
 #[test]
+fn a_cancelled_session_scan_returns_an_error_instead_of_an_empty_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    assert!(matches!(
+        store.list_cancellable(&cancel),
+        Err(SessionStoreError::Cancelled)
+    ));
+
+    let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
+    store.save(&mut record).unwrap();
+    assert!(matches!(
+        store.list_cancellable(&cancel),
+        Err(SessionStoreError::Cancelled)
+    ));
+    assert_eq!(store.list().unwrap(), vec![record]);
+}
+
+#[tokio::test]
+async fn cancelling_a_running_scan_stops_between_large_invalid_files() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    // The reported regression: 300 directory entries sharing 7 MiB of invalid
+    // JSON still cause about 2 GiB of reads/parsing if cancellation is ignored.
+    let source = store.root.join("invalid_0.json");
+    let mut invalid = vec![b' '; 7 * 1024 * 1024];
+    *invalid.last_mut().unwrap() = b'{';
+    fs::write(&source, invalid).unwrap();
+    for index in 1..300 {
+        fs::hard_link(&source, store.root.join(format!("invalid_{index}.json"))).unwrap();
+    }
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let worker_cancel = cancel.clone();
+    let worker_store = store.clone();
+    let worker = tokio::task::spawn_blocking(move || worker_store.list_cancellable(&worker_cancel));
+    // Observe real progress before cancelling: a pre-cancelled token alone
+    // cannot catch a missing cancellation check inside the file loop.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while store.take_diagnostics().is_empty() {
+            assert!(
+                !worker.is_finished(),
+                "scan never reported its invalid input"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(SessionStoreError::Cancelled)));
+}
+
+#[test]
 fn a_live_store_cannot_be_redirected_to_another_workspaces_sessions() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -276,6 +337,88 @@ fn json_store_list_keeps_only_the_newest_bounded_window() {
     assert_eq!(listed.len(), MAX_SESSION_LIST);
     assert_eq!(listed[0].updated_at_ms, (MAX_SESSION_LIST + 7) as u64);
     assert_eq!(listed.last().unwrap().updated_at_ms, 8);
+}
+
+#[test]
+fn list_finds_the_latest_session_beyond_the_former_entry_scan_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    for index in 0..257 {
+        let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
+        record.updated_at_ms = index;
+        record.entries.push(std::sync::Arc::new(
+            crate::session_entry::SessionEntry::user("continue me"),
+        ));
+        store.save(&mut record).unwrap();
+    }
+
+    // Pick the actual last directory entry, rather than assuming filesystem
+    // enumeration follows creation order or sorts the filenames.
+    let last = store.directory.entries().unwrap().last().unwrap().unwrap();
+    let path = store.root.join(last.file_name());
+    let mut newest = store.read_file(&path).unwrap();
+    newest.updated_at_ms = 1_000;
+    let json = super::super::serialize_record(&mut newest).unwrap();
+    // Overwrite in place to keep the directory entries unchanged.
+    fs::write(&path, json).unwrap();
+
+    let listed = store.list().unwrap();
+    assert_eq!(listed.len(), MAX_SESSION_LIST);
+    assert_eq!(listed[0], newest);
+    assert!(store.take_diagnostics().is_empty());
+}
+
+#[test]
+fn list_finds_the_latest_session_beyond_the_former_byte_scan_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    // Legal trailing JSON whitespace keeps this fixture's parsed records
+    // small while exercising over 64 MiB of real filesystem input.
+    let write_padded = |record: &mut SessionRecord| {
+        let mut json = super::super::serialize_record(record).unwrap();
+        json.push_str(&" ".repeat(7 * 1024 * 1024));
+        assert!((json.len() as u64) < MAX_SESSION_FILE_BYTES);
+        fs::write(store.path_for(&record.id).unwrap(), json).unwrap();
+    };
+    for index in 0..10 {
+        let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
+        record.updated_at_ms = index;
+        record.entries.push(std::sync::Arc::new(
+            crate::session_entry::SessionEntry::user("continue me"),
+        ));
+        write_padded(&mut record);
+    }
+    let last = store.directory.entries().unwrap().last().unwrap().unwrap();
+    let mut newest = store.read_file(&store.root.join(last.file_name())).unwrap();
+    newest.updated_at_ms = 1_000;
+    write_padded(&mut newest);
+
+    let listed = store.list().unwrap();
+    assert_eq!(listed.len(), 10);
+    assert_eq!(listed[0], newest);
+    assert!(store.take_diagnostics().is_empty());
+}
+
+#[test]
+fn list_bounds_diagnostics_without_hiding_valid_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    for index in 0..300 {
+        fs::write(store.root.join(format!("invalid_{index}.json")), "{").unwrap();
+    }
+    let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
+    store.save(&mut record).unwrap();
+
+    assert_eq!(store.list().unwrap(), vec![record.clone()]);
+    let diagnostics = store.take_diagnostics();
+    assert_eq!(diagnostics.len(), MAX_SESSION_DIAGNOSTICS + 1);
+    assert!(diagnostics.last().unwrap().contains("diagnostics omitted"));
+    assert!(store.take_diagnostics().is_empty());
+    // Repeated scans without a drain must also remain bounded.
+    for _ in 0..2 {
+        assert_eq!(store.list().unwrap(), vec![record.clone()]);
+    }
+    assert_eq!(store.take_diagnostics().len(), MAX_SESSION_DIAGNOSTICS + 1);
 }
 
 #[test]

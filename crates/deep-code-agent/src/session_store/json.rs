@@ -7,18 +7,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{
-    MAX_SESSION_ENTRIES, MAX_SESSION_FILE_BYTES, MAX_SESSION_LIST, MAX_SESSION_SCAN,
-    MAX_SESSION_SCAN_BYTES, SESSION_SCHEMA_VERSION, SessionId, SessionRecord, SessionStore,
-    SessionStoreError, sessions_dir_for_workspace, validate_session_id,
+    MAX_SESSION_ENTRIES, MAX_SESSION_FILE_BYTES, MAX_SESSION_LIST, SESSION_SCHEMA_VERSION,
+    SessionId, SessionRecord, SessionStore, SessionStoreError, sessions_dir_for_workspace,
+    validate_session_id,
 };
+
+/// Bound diagnostics as well as retained records while scanning the directory.
+const MAX_SESSION_DIAGNOSTICS: usize = 32;
 
 /// JSON file backend: one pretty-printed file per session.
 #[derive(Debug, Clone)]
 pub struct JsonSessionStore {
     root: PathBuf,
     directory: Arc<Dir>,
-    /// Records `list()` refused to return, as one line each. Collected instead
-    /// of printed: a library that writes to stderr cannot be shown by the
+    /// A bounded sample of records `list()` refused to return, one per line.
+    /// Collected instead of printed: library stderr cannot be shown by the
     /// caller that asked for the list, and in the TUI it was swallowed by the
     /// log redirect — leaving "No saved sessions." to explain a directory full
     /// of files.
@@ -47,8 +50,8 @@ impl JsonSessionStore {
     }
 
     /// Take the lines accumulated by earlier [`SessionStore::list`] calls:
-    /// sessions skipped because they could not be trusted or read. Empty is
-    /// the normal answer.
+    /// sessions skipped because they could not be trusted or read. A final
+    /// line reports when further diagnostics were omitted. Empty is normal.
     #[must_use]
     pub fn take_diagnostics(&self) -> Vec<String> {
         std::mem::take(
@@ -60,10 +63,15 @@ impl JsonSessionStore {
     }
 
     fn diagnose(&self, message: String) {
-        self.diagnostics
+        let mut diagnostics = self
+            .diagnostics
             .lock()
-            .expect("session diagnostics lock poisoned")
-            .push(message);
+            .expect("session diagnostics lock poisoned");
+        if diagnostics.len() < MAX_SESSION_DIAGNOSTICS {
+            diagnostics.push(message);
+        } else if diagnostics.len() == MAX_SESSION_DIAGNOSTICS {
+            diagnostics.push("additional session diagnostics omitted".to_string());
+        }
     }
 
     fn path_for(&self, id: &SessionId) -> Result<PathBuf, SessionStoreError> {
@@ -220,6 +228,118 @@ impl JsonSessionStore {
     }
 }
 
+impl JsonSessionStore {
+    /// Synchronous, cancellable scan of every candidate. UI callers must run
+    /// this on a worker and cancel when its result is no longer needed.
+    /// Cancellation is checked between size-limited files; a partial list is
+    /// never returned.
+    pub fn list_cancellable(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<SessionRecord>, SessionStoreError> {
+        check_scan_cancelled(cancel)?;
+        // Keep the bounded window useful for both the session list and resume:
+        // empty sessions may fill the newest slots, but an older non-empty
+        // session must remain available to `-c` and `/resume`.
+        // Directory order is unrelated to the signed update timestamps. Scan
+        // every candidate before choosing the window: stopping after a fixed
+        // number of entries or bytes can silently resume an older session.
+        // Stream one size-limited record at a time and bound both the retained
+        // windows and diagnostics, so memory does not grow with directory size.
+        let mut resumable = Vec::new();
+        let mut empty = Vec::new();
+        let entries = self
+            .directory
+            .entries()
+            .map_err(|error| SessionStoreError::Io {
+                message: format!("failed to read {}: {error}", self.root.display()),
+            })?;
+
+        for entry in entries {
+            check_scan_cancelled(cancel)?;
+            let entry = entry.map_err(|error| SessionStoreError::Io {
+                message: format!("failed to read session directory entry: {error}"),
+            })?;
+            let path = self.root.join(entry.file_name());
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if validate_session_id(stem).is_err() {
+                continue;
+            }
+            let record = self.read_file(&path);
+            check_scan_cancelled(cancel)?;
+            match record {
+                Ok(mut record) => {
+                    if !crate::session_integrity::verify_record(&mut record) {
+                        self.diagnose(format!(
+                            "skipping unauthenticated session {} (modified file)",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                    // Bind the id to the filename, as `load` does and for the same
+                    // reason: the picker and any resume off this list must target
+                    // the file that actually holds the session, not an id copied
+                    // inside it.
+                    record.id = SessionId(stem.to_string());
+                    record.record_mac = crate::session_integrity::sign_record(&mut record);
+                    let target = if record.has_user_entry() {
+                        &mut resumable
+                    } else {
+                        &mut empty
+                    };
+                    if target.len() < MAX_SESSION_LIST {
+                        target.push(record);
+                    } else if let Some((oldest_index, oldest)) = target
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, candidate)| candidate.updated_at_ms)
+                        && record.updated_at_ms > oldest.updated_at_ms
+                    {
+                        target[oldest_index] = record;
+                    }
+                }
+                Err(SessionStoreError::UnsupportedSchema { .. }) => {
+                    self.diagnose(format!(
+                        "skipping unsupported session file {}",
+                        path.display()
+                    ));
+                }
+                Err(error) => {
+                    self.diagnose(format!(
+                        "skipping unreadable session {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+
+        check_scan_cancelled(cancel)?;
+        resumable.sort_by_key(|record| std::cmp::Reverse(record.updated_at_ms));
+        empty.sort_by_key(|record| std::cmp::Reverse(record.updated_at_ms));
+        resumable.truncate(MAX_SESSION_LIST);
+        empty.truncate(MAX_SESSION_LIST.saturating_sub(resumable.len()));
+        resumable.extend(empty);
+        let mut records = resumable;
+        records.sort_by_key(|record| std::cmp::Reverse(record.updated_at_ms));
+        Ok(records)
+    }
+}
+
+fn check_scan_cancelled(
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(), SessionStoreError> {
+    if cancel.is_cancelled() {
+        Err(SessionStoreError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 impl SessionStore for JsonSessionStore {
     fn save_serialized(&self, id: &SessionId, json: &str) -> Result<(), SessionStoreError> {
         validate_session_id(id.as_str())?;
@@ -287,100 +407,7 @@ impl SessionStore for JsonSessionStore {
     }
 
     fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError> {
-        // Keep the bounded window useful for both the session list and resume:
-        // empty sessions may fill the newest slots, but an older non-empty
-        // session must remain available to `-c` and `/resume`.
-        let mut resumable = Vec::new();
-        let mut empty = Vec::new();
-        let mut scanned_bytes = 0_u64;
-        let entries = self
-            .directory
-            .entries()
-            .map_err(|error| SessionStoreError::Io {
-                message: format!("failed to read {}: {error}", self.root.display()),
-            })?;
-
-        for (scanned, entry) in entries.enumerate() {
-            if scanned >= MAX_SESSION_SCAN {
-                break;
-            }
-            let entry = entry.map_err(|error| SessionStoreError::Io {
-                message: format!("failed to read session directory entry: {error}"),
-            })?;
-            let path = self.root.join(entry.file_name());
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            if validate_session_id(stem).is_err() {
-                continue;
-            }
-            let file_bytes = self
-                .directory
-                .symlink_metadata(entry.file_name())
-                .ok()
-                .filter(|metadata| metadata.is_file())
-                .map_or(0, |metadata| metadata.len());
-            if scanned_bytes.saturating_add(file_bytes) > MAX_SESSION_SCAN_BYTES {
-                continue;
-            }
-            scanned_bytes = scanned_bytes.saturating_add(file_bytes);
-            match self.read_file(&path) {
-                Ok(mut record) => {
-                    if !crate::session_integrity::verify_record(&mut record) {
-                        self.diagnose(format!(
-                            "skipping unauthenticated session {} (modified file)",
-                            path.display()
-                        ));
-                        continue;
-                    }
-                    // Bind the id to the filename, as `load` does and for the same
-                    // reason: the picker and any resume off this list must target
-                    // the file that actually holds the session, not an id copied
-                    // inside it.
-                    record.id = SessionId(stem.to_string());
-                    record.record_mac = crate::session_integrity::sign_record(&mut record);
-                    let target = if record.has_user_entry() {
-                        &mut resumable
-                    } else {
-                        &mut empty
-                    };
-                    if target.len() < MAX_SESSION_LIST {
-                        target.push(record);
-                    } else if let Some((oldest_index, oldest)) = target
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, candidate)| candidate.updated_at_ms)
-                        && record.updated_at_ms > oldest.updated_at_ms
-                    {
-                        target[oldest_index] = record;
-                    }
-                }
-                Err(SessionStoreError::UnsupportedSchema { .. }) => {
-                    self.diagnose(format!(
-                        "skipping unsupported session file {}",
-                        path.display()
-                    ));
-                }
-                Err(error) => {
-                    self.diagnose(format!(
-                        "skipping unreadable session {}: {error}",
-                        path.display()
-                    ));
-                }
-            }
-        }
-
-        resumable.sort_by_key(|record| std::cmp::Reverse(record.updated_at_ms));
-        empty.sort_by_key(|record| std::cmp::Reverse(record.updated_at_ms));
-        resumable.truncate(MAX_SESSION_LIST);
-        empty.truncate(MAX_SESSION_LIST.saturating_sub(resumable.len()));
-        resumable.extend(empty);
-        let mut records = resumable;
-        records.sort_by_key(|record| std::cmp::Reverse(record.updated_at_ms));
-        Ok(records)
+        self.list_cancellable(&tokio_util::sync::CancellationToken::new())
     }
 
     fn delete(&self, id: &SessionId) -> Result<(), SessionStoreError> {

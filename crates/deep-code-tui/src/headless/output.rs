@@ -102,6 +102,12 @@ impl<W: Write> NdjsonEmitter<W> {
     }
 }
 
+impl NdjsonEmitter<Vec<u8>> {
+    pub(crate) fn take_pending(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

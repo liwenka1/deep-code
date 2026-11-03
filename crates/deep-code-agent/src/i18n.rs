@@ -314,6 +314,8 @@ text_ids! {
     SessionsReadFailed,
     NoResumableSessions,
     StatusPickSession,
+    StatusScanningSessions,
+    StartupScanningSessions,
     StatusResumeCancelled,
     SessionStoreOpenFailed,
     SessionIdInvalid,

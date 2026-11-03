@@ -22,6 +22,9 @@ fn open_session_store() -> JsonSessionStore {
     }
 }
 
+// This one-shot command keeps the OS interrupt disposition throughout file
+// reads and stdout/stderr writes, including writes blocked by a full pipe.
+// A scan-scoped Tokio signal receiver would leave SIGINT intercepted afterward.
 pub fn list() -> anyhow::Result<()> {
     let workspace = workspace_root();
     let store = open_session_store();
@@ -29,6 +32,7 @@ pub fn list() -> anyhow::Result<()> {
         "# {}",
         format_sessions_storage_note(&workspace, &crate::cli::program_name())
     );
+    eprintln!("scanning saved sessions… (Ctrl+C to cancel)");
     let records = store.list()?;
     for line in store.take_diagnostics() {
         eprintln!("{line}");
@@ -96,6 +100,143 @@ fn session_list_preview(preview: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn sigint_terminates_session_list_when_output_pipes_fill() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "DEEP_CODE_SESSION_LIST_PIPE_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            list().unwrap();
+            std::process::exit(0);
+        }
+
+        for blocked in ["stdout", "stderr"] {
+            let workspace = tempfile::tempdir().unwrap();
+            let store = JsonSessionStore::for_workspace(workspace.path()).unwrap();
+            // Enough output to exhaust the 4 KiB left free in the pipe below.
+            for index in 0..32 {
+                let id = format!("{index:02}_{}", "a".repeat(125));
+                if blocked == "stderr" {
+                    std::fs::write(
+                        workspace
+                            .path()
+                            .join(".deep-code/sessions")
+                            .join(format!("{id}.json")),
+                        "{",
+                    )
+                    .unwrap();
+                } else {
+                    let mut record = deep_code_agent::SessionRecord::new(
+                        workspace.path().to_path_buf(),
+                        "system",
+                    );
+                    record.id = SessionId::parse(&id).unwrap();
+                    record
+                        .entries
+                        .push(std::sync::Arc::new(deep_code_agent::SessionEntry::user(
+                            "😀".repeat(61),
+                        )));
+                    store.save(&mut record).unwrap();
+                }
+            }
+            let mut fds = [-1; 2];
+            // SAFETY: pipe writes two owned file descriptors into this array.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            // SAFETY: each descriptor is owned exactly once by its File.
+            let (mut reader, mut writer) = unsafe {
+                (
+                    std::fs::File::from_raw_fd(fds[0]),
+                    std::fs::File::from_raw_fd(fds[1]),
+                )
+            };
+            // Fill without assuming the host's pipe capacity, then leave room
+            // for the header/progress lines so blocking occurs AFTER the scan.
+            // SAFETY: these fcntl calls operate on the live write descriptor.
+            assert_eq!(
+                unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+                0
+            );
+            let mut prefilled = 0;
+            loop {
+                match writer.write(&[b'x'; 4096]) {
+                    Ok(count) => prefilled += count,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    other => panic!("could not fill output pipe: {other:?}"),
+                }
+            }
+            reader.read_exact(&mut [0; 4096]).unwrap();
+            // SAFETY: restore blocking writes on the descriptor inherited by the child.
+            assert_eq!(
+                unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, 0) },
+                0
+            );
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "session_cli::tests::sigint_terminates_session_list_when_output_pipes_fill",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .current_dir(workspace.path())
+                .stdin(Stdio::null());
+            if blocked == "stdout" {
+                command.stdout(writer).stderr(Stdio::null());
+            } else {
+                command.stderr(writer).stdout(Stdio::null());
+            }
+            let mut child = command.spawn().unwrap();
+            drop(command);
+            let fd = reader.as_raw_fd();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let mut queued: libc::c_int = 0;
+                // SAFETY: fd is live and FIONREAD writes one integer. Observe
+                // output without draining it and accidentally unblocking writes.
+                assert_eq!(unsafe { libc::ioctl(fd, libc::FIONREAD, &mut queued) }, 0);
+                if queued as usize >= prefilled - 4096 + 2048 {
+                    break;
+                }
+                if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+                    let _ = child.kill();
+                    let output = child.wait_with_output().unwrap();
+                    panic!("{blocked} never filled with list output: {output:?}");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Let the writer reach pipe capacity; the reader stays undrained
+            // until the process has exited, including after the interrupt.
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "fixture must block output"
+            );
+            // SAFETY: the PID belongs to this test's live child process.
+            assert_eq!(
+                unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
+                0
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert_eq!(status.signal(), Some(libc::SIGINT), "{blocked}: {status}");
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("SIGINT was ignored with a full {blocked} pipe");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
 
     #[test]
     fn session_list_preview_neutralizes_a_planted_session() {

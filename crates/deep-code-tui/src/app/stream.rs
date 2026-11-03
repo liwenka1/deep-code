@@ -326,6 +326,9 @@ impl App {
     }
 
     pub(super) fn start_stream(&mut self, request: StreamRequest) {
+        // A prompt/approval advances the session while a picker is loading.
+        // Retire its receiver so a late scan cannot open over the live turn.
+        self.session_scan = None;
         let (tx, rx) = mpsc::unbounded_channel();
         self.ui_rx = Some(rx);
         self.cancel_requested = false;
