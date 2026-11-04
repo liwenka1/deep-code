@@ -31,8 +31,6 @@ use deep_code_agent::{
     SessionStore, launch_runtime, neutralize_display_text, now_ms,
 };
 
-#[cfg(test)]
-use crate::cli::workspace_root;
 use crate::cli::{PrintArgs, StartupIntent, program_name};
 use diagnostics::Diagnostics;
 use drive::DriveStatus;
