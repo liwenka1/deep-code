@@ -15,6 +15,64 @@ use crate::session_store::SessionStore;
 use crate::tool::{MockEchoTool, Tool, ToolError, ToolRegistry, ToolResultStatus};
 
 #[tokio::test]
+async fn the_final_session_update_reports_the_completed_save_failure() {
+    use crate::session_store::{SessionId, SessionRecord, SessionStoreError};
+
+    struct FailingStore;
+    impl SessionStore for FailingStore {
+        fn save_serialized(&self, _: &SessionId, _: &str) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Serialization {
+                message: "test save failed".into(),
+            })
+        }
+        fn load(&self, _: &SessionId) -> Result<SessionRecord, SessionStoreError> {
+            unreachable!()
+        }
+        fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError> {
+            unreachable!()
+        }
+        fn delete(&self, _: &SessionId) -> Result<(), SessionStoreError> {
+            unreachable!()
+        }
+    }
+    let mut runtime = AgentRuntime::new(
+        ScriptedClient::new(vec![ok_turn()]),
+        ToolRegistry::default(),
+    );
+    let record = Arc::new(tokio::sync::Mutex::new(SessionRecord::new(
+        PathBuf::from("test-workspace"),
+        "system",
+    )));
+    runtime.persistence = Some(Arc::new(state::Persistence {
+        actor: persistence_actor::PersistenceActorHandle::spawn(
+            Arc::new(FailingStore),
+            record.clone(),
+        ),
+        record,
+    }));
+    let mut rx = runtime.submit_user("hello").await;
+    let events = drain(&mut rx).await;
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+    let last_update = events
+        .iter()
+        .rev()
+        .find(|event| matches!(event, RuntimeEvent::SessionUpdated { .. }));
+    assert!(
+        matches!(last_update, Some(RuntimeEvent::SessionUpdated { save_error: Some(error), turn_count: 1, .. }) if error.contains("test save failed")),
+        "{events:?}"
+    );
+    assert!(
+        runtime
+            .last_save_error()
+            .unwrap()
+            .contains("test save failed")
+    );
+}
+
+#[tokio::test]
 async fn premature_eof_never_completes_a_turn() {
     for script in [
         vec![],

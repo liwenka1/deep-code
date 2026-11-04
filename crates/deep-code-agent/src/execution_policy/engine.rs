@@ -315,7 +315,7 @@ fn options_taking_a_value(program: &str) -> &'static [&'static str] {
             "--match-head-commit",
             "--author-email",
         ],
-        "npm" | "yarn" | "pnpm" | "bun" => &[
+        "npm" => &[
             "--tag",
             "--otp",
             "--registry",
@@ -328,11 +328,45 @@ fn options_taking_a_value(program: &str) -> &'static [&'static str] {
             "-w",
             "--workspace",
             "-C",
-            // pnpm's workspace filter (`-F`) and yarn berry's directory.
+        ],
+        // pnpm's -w is the BOOLEAN --workspace-root. npm's identically
+        // spelled option consumes a workspace name. Sharing their arities
+        // swallowed `publish` in `pnpm -w publish`, bypassing the human gate.
+        "pnpm" => &[
+            "--tag",
+            "--otp",
+            "--registry",
+            "--access",
+            "--prefix",
+            "--userconfig",
+            "--cache",
+            "--globalconfig",
+            "--loglevel",
+            "-C",
+            "--dir",
+            "--filter",
+            "--filter-prod",
+            "-F",
+        ],
+        "yarn" => &[
+            "--tag",
+            "--otp",
+            "--registry",
+            "--access",
+            "--cwd",
+            "--use-yarnrc",
+            "--mutex",
+        ],
+        "bun" => &[
+            "--tag",
+            "--otp",
+            "--registry",
+            "--access",
+            "--cwd",
             "--filter",
             "-F",
-            "--cwd",
-            "--dir",
+            "--env-file",
+            "--config",
         ],
         "cargo" => &[
             "--registry",

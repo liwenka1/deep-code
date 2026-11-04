@@ -110,6 +110,15 @@ impl AgentRuntime {
         Some(persistence.record.lock().await.id.clone())
     }
 
+    /// Failure of the latest completed save, cleared by a successful retry.
+    /// Call after [`Self::shutdown`] to check the final durable snapshot.
+    #[must_use]
+    pub fn last_save_error(&self) -> Option<String> {
+        self.persistence
+            .as_ref()
+            .and_then(|persistence| persistence.actor.last_save_error())
+    }
+
     pub(super) async fn persist(&self) {
         self.persist_with(|_| {}).await;
     }

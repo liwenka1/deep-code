@@ -67,6 +67,15 @@ impl Output {
         Self::new(stderr_writer()?, interrupted)
     }
 
+    /// Use one wall-clock budget for every write in a headless turn, including
+    /// its initial envelope and final report.
+    pub fn with_deadline(&self, deadline: Option<Instant>) -> Self {
+        Self {
+            deadline,
+            ..self.clone()
+        }
+    }
+
     /// Cleanup may still write after cancellation, but must never hold up exit.
     pub fn cleanup(&self) -> Self {
         Self {
@@ -99,10 +108,7 @@ impl Output {
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "output cleanup timed out",
-            ));
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "output timed out"));
         }
         Ok(())
     }

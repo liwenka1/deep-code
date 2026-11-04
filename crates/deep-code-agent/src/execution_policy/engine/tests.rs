@@ -1851,13 +1851,44 @@ fn leading_options_do_not_hide_irreversible_subcommands() {
     }
 }
 
+/// Real CLI spellings, independent of the implementation's option table:
+/// npm -w takes a name, whereas pnpm -w is --workspace-root (no value).
+#[test]
+fn package_manager_workspace_flags_keep_their_own_arities() {
+    let policy = ExecPolicy::default();
+    for command in [
+        "pnpm -w publish",
+        "pnpm --workspace-root publish",
+        "pnpm -r -w publish",
+        "pnpm --filter web -w publish --tag next",
+        "npm -w web publish",
+        "npm --workspace web publish",
+        "npm -C ./web publish",
+        "yarn --cwd ./web npm publish",
+        "bun --cwd ./web publish",
+        "bun publish -F web",
+    ] {
+        for network in [false, true] {
+            let plan = evaluate_shell_command(&policy, command, network);
+            assert!(
+                is_needs_human_rule(plan.matched_rule.as_deref()),
+                "{command}: {plan:?}"
+            );
+        }
+        assert!(!floor_gated(&policy, &format!("{command} --dry-run")));
+    }
+    // A workspace named "publish" is data, not an irreversible verb.
+    assert!(!floor_gated(&policy, "npm -w publish install"));
+    assert!(!floor_gated(&policy, "npm -C publish install"));
+    assert!(floor_gated(&policy, "bun publish -F --dry-run"));
+    assert!(!floor_gated(&policy, "pnpm -w install"));
+    assert!(!floor_gated(&policy, "pnpm -w --dry-run publish"));
+}
+
 /// Every value-taking option in the table must actually consume its value.
 ///
-/// A wrong entry is invisible from the outside: the word after the option is
-/// read as the verb, no arm matches, and the floor simply stops firing — which
-/// looks like "nothing to gate" rather than "the table is wrong". The helm row
-/// was copied from kubectl and named options helm does not have, so none of
-/// helm's own `--kube-*` spellings were covered.
+/// This checks walker/table wiring only. It cannot validate the table's CLI
+/// semantics; independent real-command cases above cover those differences.
 #[test]
 fn every_known_value_option_consumes_its_value() {
     // (program, a verb that program's floor arm reads)

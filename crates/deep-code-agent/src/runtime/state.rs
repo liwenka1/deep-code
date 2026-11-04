@@ -121,6 +121,9 @@ pub(super) struct RuntimeState {
     /// out of a fold when the next turn begins, and a flag it set then was
     /// the next turn's one fold, spent.
     pub(super) threshold_compaction_tried: Option<TurnId>,
+    /// Storage pressure is independent of the token threshold: a turn that
+    /// already tried a context fold may still need one after a large tool batch.
+    pub(super) storage_compaction_tried: Option<TurnId>,
     /// This turn's step budget. Replaced (not mutated) by `begin_turn`, so a
     /// late-finishing loop compares its own id against it and stops.
     pub(super) turn_budget: Option<TurnBudget>,

@@ -43,6 +43,9 @@ pub(super) enum Trigger {
     /// request still fits the window, so the fold is optional: a failure skips
     /// it for the rest of the turn instead of writing the lossy kind.
     Threshold,
+    /// The persisted record is approaching a JSON size or entry-count limit.
+    /// Preserve room to save even when the summarizer is unavailable.
+    StoragePressure,
     /// The provider refused the request as over its window. Folding is the only
     /// way the turn can go on, so the mechanical summary stands in when the
     /// model cannot write one.
@@ -86,8 +89,9 @@ struct Handover {
 }
 
 impl AgentRuntime {
-    /// The threshold compaction before a model step: when the estimate says
-    /// the context crossed `compaction_threshold`, and at most once per turn.
+    /// Compact before a model step when either context tokens or the persisted
+    /// record approaches its limit. Each trigger gets at most one attempt per
+    /// turn; a storage fold also satisfies the context threshold attempt.
     ///
     /// Once per turn because a fold never reaches the turn's own entries (the
     /// newest user message anchors the kept tail): after the first, all that
@@ -106,21 +110,34 @@ impl AgentRuntime {
         cancel: &CancellationToken,
         turn_id: &TurnId,
     ) {
-        let wire = {
+        let storage_pressure = if let Some(persistence) = &self.persistence {
+            persistence.record.lock().await.approaching_storage_limit()
+        } else {
+            false
+        };
+        let trigger = {
             let state = self.state.lock().await;
-            if state.threshold_compaction_tried.as_ref() == Some(turn_id) {
+            if storage_pressure && state.storage_compaction_tried.as_ref() != Some(turn_id) {
+                Trigger::StoragePressure
+            } else if state.threshold_compaction_tried.as_ref() != Some(turn_id)
+                && should_compact(
+                    model,
+                    &state.session.wire_messages(),
+                    self.config.compaction_threshold,
+                )
+            {
+                Trigger::Threshold
+            } else {
                 return;
             }
-            state.session.wire_messages()
         };
-        if !should_compact(model, &wire, self.config.compaction_threshold) {
-            return;
+        let outcome = self.compact_session(trigger, Some(tx), None, cancel).await;
+        let mut state = self.state.lock().await;
+        if trigger == Trigger::StoragePressure {
+            state.storage_compaction_tried = Some(turn_id.clone());
         }
-        let outcome = self
-            .compact_session(Trigger::Threshold, Some(tx), None, cancel)
-            .await;
         if !matches!(outcome, FoldOutcome::Nothing) {
-            self.state.lock().await.threshold_compaction_tried = Some(turn_id.clone());
+            state.threshold_compaction_tried = Some(turn_id.clone());
         }
     }
 
@@ -167,7 +184,8 @@ impl AgentRuntime {
 
     /// Fold history: ask the model for a handover summary of the archived
     /// range and replace the range with it. When the model cannot deliver, only
-    /// an overflow rescue folds anyway (mechanically); see [`Trigger`].
+    /// an overflow rescue or storage pressure folds anyway (mechanically);
+    /// see [`Trigger`].
     ///
     /// `tx` is `None` for a compaction no turn is running (`/compact`): its
     /// events have no turn stream to ride, so the caller renders the outcome
@@ -203,7 +221,7 @@ impl AgentRuntime {
             // The turn is ending, or the user changed their mind: either way
             // nothing is folded, and a later compaction has the originals.
             Err(HandoverError::Cancelled) => return FoldOutcome::Cancelled,
-            Err(error) if trigger == Trigger::OverflowRescue => {
+            Err(error) if matches!(trigger, Trigger::OverflowRescue | Trigger::StoragePressure) => {
                 let reason = match error {
                     HandoverError::Failed(reason) => reason,
                     HandoverError::Offline | HandoverError::Cancelled => "offline".to_string(),
@@ -243,7 +261,7 @@ impl AgentRuntime {
                     .all(|(now, then)| Arc::ptr_eq(now, then));
             let result = if prefix_intact {
                 apply_compaction(&current, &plan, summary)
-            } else if trigger == Trigger::OverflowRescue {
+            } else if matches!(trigger, Trigger::OverflowRescue | Trigger::StoragePressure) {
                 let Some(plan) = plan_compaction(&current) else {
                     return FoldOutcome::Nothing;
                 };

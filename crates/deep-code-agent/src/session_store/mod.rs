@@ -171,6 +171,31 @@ pub struct SessionRecord {
 }
 
 impl SessionRecord {
+    /// Leave room for the next model/tool batch before the JSON backend's hard
+    /// limits. Short messages and JSON escaping can exhaust disk limits long
+    /// before the token-based context threshold is reached.
+    pub(crate) fn approaching_storage_limit(&self) -> bool {
+        if self.entries.len() >= MAX_SESSION_ENTRIES * 3 / 4 {
+            return true;
+        }
+        struct Budget(u64);
+        impl std::io::Write for Budget {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.checked_sub(bytes.len() as u64).ok_or_else(|| {
+                    std::io::Error::other("session compaction size threshold reached")
+                })?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // Count the actual on-disk representation, including metadata, without
+        // allocating a second copy of the transcript. An unserializable record
+        // also needs attention rather than being treated as safely small.
+        serde_json::to_writer_pretty(Budget(MAX_SESSION_FILE_BYTES * 3 / 4), self).is_err()
+    }
+
     #[must_use]
     pub fn new(workspace: PathBuf, system_prompt: impl Into<String>) -> Self {
         let now = now_ms();

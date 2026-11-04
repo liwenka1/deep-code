@@ -17,6 +17,8 @@ mod output;
 mod backpressure_tests;
 #[cfg(test)]
 mod contract_docs;
+#[cfg(test)]
+mod persistence_tests;
 
 pub use output::OutputFormat;
 
@@ -253,6 +255,13 @@ async fn run_turn(
     stdout: &Output,
     interrupted_token: &CancellationToken,
 ) -> i32 {
+    let started = std::time::Instant::now();
+    // An unrepresentably large timeout degrades to no deadline, never a panic.
+    // Start before the first frame and retain the same budget for the result.
+    let deadline = args
+        .timeout_secs
+        .and_then(|secs| started.checked_add(std::time::Duration::from_secs(secs)));
+    let stdout = stdout.with_deadline(deadline);
     let interruption = interrupted_token.cancelled();
     tokio::pin!(interruption);
     // stream-json mirrors the SSE contract, including the leading
@@ -261,11 +270,15 @@ async fn run_turn(
         .then(|| output::NdjsonEmitter::new(format!("print_{}", now_ms()), Vec::new()));
     if let Some(emitter) = emitter.as_mut() {
         emitter.manual("user.message", serde_json::json!({ "content": prompt }));
-        if stdout.send(&emitter.take_pending()).await.is_err() {
+        if let Err(error) = stdout.send(&emitter.take_pending()).await {
             launched.shutdown().await;
             return if interrupted_token.is_cancelled() {
                 EXIT_INTERRUPT
+            } else if deadline_reached(deadline) {
+                diagnostics.line("timeout while writing the initial user.message");
+                EXIT_TIMEOUT
             } else {
+                emit(diagnostics, "output error", &error.to_string());
                 EXIT_FAILURE
             };
         }
@@ -274,7 +287,6 @@ async fn run_turn(
     let handle = launched.handle.clone();
     let canceller = launched.handle.clone();
     let verbose = args.verbose;
-    let started = std::time::Instant::now();
     let mut interrupted = false;
     let mut timed_out = false;
     let output_abandoned = std::cell::Cell::new(false);
@@ -294,14 +306,6 @@ async fn run_turn(
             Ok(())
         };
 
-        // `checked_add`, not `+`: a large-but-valid `--timeout` (or the bot's
-        // `agent-timeout`) would otherwise overflow the Instant and panic
-        // (exit 101), which is neither the documented `2 usage` nor `124 timeout`.
-        // An un-representable deadline degrades to "no deadline" — a timeout that
-        // far out never meaningfully fires anyway.
-        let deadline = args.timeout_secs.and_then(|secs| {
-            tokio::time::Instant::now().checked_add(std::time::Duration::from_secs(secs))
-        });
         let turn_started = std::cell::Cell::new(false);
         let drive = async {
             turn_started.set(true);
@@ -329,28 +333,57 @@ async fn run_turn(
                     diagnostics.line("interrupted: cancelling the turn…");
                     canceller.cancel_turn().await;
                 }
-                outcome = &mut drive => break outcome,
                 () = sleep_until(deadline), if deadline.is_some() && !timed_out && !interrupted => {
                     timed_out = true;
                     stdout.cancel();
+                    // A deadline already reached before the driver's first
+                    // poll must not submit a fresh, uncancelled turn afterwards.
+                    if !turn_started.get() {
+                        break drive::DriveOutcome {
+                            status: DriveStatus::Cancelled,
+                            reasoning: String::new(),
+                            usage: None,
+                            telemetry: None,
+                            denied_approvals: 0,
+                        };
+                    }
                     diagnostics.line(format!(
                         "timeout after {}s: cancelling the turn…",
                         args.timeout_secs.unwrap_or(0)
                     ));
                     canceller.cancel_turn().await;
                 }
+                outcome = &mut drive => break outcome,
             }
         }
     };
 
-    // The driver may observe cancellation while delivering its last event.
+    // Shut down tools and flush the final save before declaring success or
+    // waiting for a final consumer that may never read again.
+    let session_id = launched.session_id.clone();
+    launched.shutdown().await;
+    let save_error = handle
+        .last_save_error()
+        .map(|error| format!("session could not be saved: {error}"));
+    // Output delivery can observe its deadline before the driver's timer arm.
+    timed_out |= deadline_reached(deadline);
     interrupted |= interrupted_token.is_cancelled();
-    let drive_status = if output_abandoned.get() && (interrupted || timed_out) {
-        &DriveStatus::Cancelled
+    let drive_status = if timed_out || (output_abandoned.get() && interrupted) {
+        if let Some(error) = &save_error {
+            emit(diagnostics, "error", error);
+        }
+        DriveStatus::Cancelled
+    } else if let Some(error) = &save_error {
+        if matches!(outcome.status, DriveStatus::Finished) {
+            DriveStatus::Failed(error.clone())
+        } else {
+            emit(diagnostics, "error", error);
+            outcome.status.clone()
+        }
     } else {
-        &outcome.status
+        outcome.status.clone()
     };
-    let (status, exit_code, error) = classify(drive_status, interrupted, timed_out, &args);
+    let (status, exit_code, error) = classify(&drive_status, interrupted, timed_out, &args);
     if let Some(message) = &error {
         // `RuntimeEvent::Error` carries tool failures, which quote the paths
         // and commands the model chose. `trace_to_stderr` does not handle that
@@ -363,7 +396,7 @@ async fn run_turn(
     // last assistant message with visible content is authoritative and keeps
     // the narration the model emitted between tool calls out of the result
     // (see `deep_code_agent::last_assistant_text`).
-    let result = if matches!(outcome.status, DriveStatus::Finished) {
+    let result = if matches!(drive_status, DriveStatus::Finished) {
         deep_code_agent::last_assistant_text(&handle.session_messages().await).unwrap_or_default()
     } else {
         String::new()
@@ -374,7 +407,7 @@ async fn run_turn(
         result,
         reasoning: outcome.reasoning,
         error,
-        session_id: launched.session_id.clone(),
+        session_id,
         denied_approvals: outcome.denied_approvals,
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         cost: outcome
@@ -385,9 +418,7 @@ async fn run_turn(
         telemetry: outcome.telemetry,
     };
 
-    // Shut down tools/persistence before waiting for a final consumer that may
-    // never read again. Cancellation reports get a bounded best-effort write.
-    launched.shutdown().await;
+    // Cancellation reports get a bounded best-effort write.
     let final_stdout = if interrupted || timed_out {
         stdout.cleanup()
     } else {
@@ -421,7 +452,9 @@ async fn run_turn(
     } else {
         final_stdout.send(&bytes).await
     };
-    if let Some(session_id) = &report.session_id {
+    if let Some(session_id) = &report.session_id
+        && save_error.is_none()
+    {
         diagnostics.line(format!(
             "session: {session_id}  (continue interactively with `{} -c`)",
             program_name()
@@ -429,11 +462,27 @@ async fn run_turn(
     }
 
     if interrupted_token.is_cancelled() {
-        EXIT_INTERRUPT
-    } else if delivered.is_err() && exit_code == EXIT_OK {
+        return EXIT_INTERRUPT;
+    }
+    if timed_out || deadline_reached(deadline) {
+        diagnostics.line("timeout while completing the turn output");
+        return EXIT_TIMEOUT;
+    }
+    if let Err(error) = &delivered {
+        emit(diagnostics, "output error", &error.to_string());
+    }
+    let code = if delivered.is_err() && exit_code == EXIT_OK {
         EXIT_FAILURE
     } else {
         exit_code
+    };
+    // stderr is delivered by a separate writer too. Its final acknowledgement
+    // must share the turn's budget rather than parking exit on a full pipe.
+    tokio::select! {
+        biased;
+        () = interrupted_token.cancelled() => EXIT_INTERRUPT,
+        () = sleep_until(deadline) => EXIT_TIMEOUT,
+        () = diagnostics.flush() => code,
     }
 }
 
@@ -630,9 +679,16 @@ async fn open_store(
 
 /// Total future for the optional wall-clock deadline; pends forever when no
 /// timeout was requested (the select! guard also keeps it unpolled then).
-async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+fn deadline_reached(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+}
+
+async fn sleep_until(deadline: Option<std::time::Instant>) {
     match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        // Tokio's timer wheel can defer even an already elapsed deadline to
+        // its next tick. That must not let the driver's first poll submit work.
+        Some(deadline) if std::time::Instant::now() >= deadline => {}
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
         None => std::future::pending().await,
     }
 }
@@ -640,6 +696,84 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn deadlines_cover_unstarted_turns_and_final_diagnostic_flushes() {
+        use std::io::Write;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct StalledFlush {
+            ready: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Write for StalledFlush {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                let _ = self.ready.send(());
+                let _ = self.release.recv_timeout(Duration::from_secs(5));
+                Ok(())
+            }
+        }
+        for before_turn in [true, false] {
+            let workspace = tempfile::tempdir().unwrap();
+            let launched = launch_runtime(
+                &AgentConfig::default(),
+                workspace.path().to_path_buf(),
+                None,
+            );
+            assert!(launched.offline);
+            let handle = launched.handle.clone();
+            let token = CancellationToken::new();
+            let output = Output::new(std::io::sink(), &token.child_token()).unwrap();
+            let (ready_tx, ready) = mpsc::channel();
+            let (release, blocked) = mpsc::channel();
+            let diagnostics = Diagnostics::new(StalledFlush {
+                ready: ready_tx,
+                release: blocked,
+            })
+            .unwrap();
+            let args = PrintArgs {
+                prompt: None,
+                intent: StartupIntent::New,
+                output: OutputFormat::Json,
+                permission_mode: None,
+                timeout_secs: Some(if before_turn { 0 } else { 1 }),
+                verbose: false,
+                add_dirs: Vec::new(),
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                run_turn(
+                    args,
+                    "hello".into(),
+                    launched,
+                    &diagnostics,
+                    &output,
+                    &token,
+                ),
+            )
+            .await;
+            let _ = release.send(());
+            assert_eq!(result.unwrap(), EXIT_TIMEOUT);
+            let submitted = handle
+                .session_messages()
+                .await
+                .iter()
+                .any(|message| message.role == deep_code_agent::Role::User);
+            assert_eq!(
+                submitted, !before_turn,
+                "an expired deadline must not submit a prompt"
+            );
+            if !before_turn {
+                ready
+                    .try_recv()
+                    .expect("the final diagnostic flush was reached");
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[test]

@@ -216,15 +216,17 @@ impl<W: Write> Write for PhaseWriter<W> {
 fn signals_and_timeout_interrupt_all_stdout_phases() {
     const CHILD: &str = "DEEP_CODE_STDOUT_PHASE_TEST";
     if let Ok(phase) = std::env::var(CHILD) {
+        let timed = phase.starts_with("timeout_");
+        let phase = phase.strip_prefix("timeout_").unwrap_or(&phase);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
         let code = runtime.block_on(async {
             let interrupt = crate::interrupt::Interrupt::watch().unwrap();
-            let target = match phase.as_str() {
+            let target = match phase {
                 "initial" => "user.message",
-                "events" | "timeout" => "assistant.delta",
+                "events" => "assistant.delta",
                 "stream_result" => "print.result",
                 _ => "all",
             };
@@ -255,13 +257,13 @@ fn signals_and_timeout_interrupt_all_stdout_phases() {
             let args = PrintArgs {
                 prompt: None,
                 intent: StartupIntent::New,
-                output: match phase.as_str() {
+                output: match phase {
                     "text_result" => OutputFormat::Text,
                     "json_result" => OutputFormat::Json,
                     _ => OutputFormat::StreamJson,
                 },
                 permission_mode: None,
-                timeout_secs: (phase == "timeout").then_some(1),
+                timeout_secs: timed.then_some(1),
                 verbose: false,
                 add_dirs: Vec::new(),
             };
@@ -281,9 +283,13 @@ fn signals_and_timeout_interrupt_all_stdout_phases() {
         "stream_result",
         "json_result",
         "text_result",
-        "timeout",
+        "timeout_initial",
+        "timeout_events",
+        "timeout_stream_result",
+        "timeout_json_result",
+        "timeout_text_result",
     ] {
-        let signals = if phase == "timeout" {
+        let signals = if phase.starts_with("timeout_") {
             vec![0]
         } else {
             vec![libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
@@ -333,7 +339,7 @@ fn signals_and_timeout_interrupt_all_stdout_phases() {
             );
             assert_eq!(
                 workspace.path().join("turn-requested").exists(),
-                phase != "initial"
+                !phase.ends_with("initial")
             );
         }
     }

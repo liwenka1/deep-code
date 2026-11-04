@@ -589,8 +589,6 @@ impl AgentRuntime {
             }
 
             if calls.is_empty() {
-                self.persist().await;
-                self.emit_session_updated(tx).await;
                 // No end-of-turn snapshot: it would be near-identical to the
                 // next turn's before_turn (only edits the user makes between
                 // turns differ), and rewind/restore key off before_turn — so
@@ -607,6 +605,12 @@ impl AgentRuntime {
                     )
                     .await;
                 self.finish_turn(&turn_id).await;
+                // Publish the completed save result, not the previous batch's
+                // error (which may still be empty while this write fails).
+                if let Some(persistence) = &self.persistence {
+                    persistence.actor.flush().await;
+                }
+                self.emit_session_updated(tx).await;
                 // Surface any LSP warnings buffered since the last edit tool
                 // before the turn closes, so none are stranded to the next one.
                 self.drain_lsp_warnings(tx).await;

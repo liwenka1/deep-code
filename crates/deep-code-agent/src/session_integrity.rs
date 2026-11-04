@@ -65,6 +65,7 @@ const KEY_BYTES: usize = 32;
 pub(crate) enum KeyUnavailable {
     NoHomeDirectory,
     NotCreatable,
+    Unreadable,
 }
 
 impl std::fmt::Display for KeyUnavailable {
@@ -75,6 +76,9 @@ impl std::fmt::Display for KeyUnavailable {
             ),
             Self::NotCreatable => f.write_str(
                 "~/.deep-code/session-key could not be created (is the home directory writable?)",
+            ),
+            Self::Unreadable => f.write_str(
+                "~/.deep-code/session-key is unreadable or invalid; restore the original key to recover signed sessions",
             ),
         }
     }
@@ -111,24 +115,24 @@ fn load_or_create_key() -> Result<[u8; KEY_BYTES], KeyUnavailable> {
     let dir = crate::paths::home_dir()
         .map(|home| home.join(crate::paths::DEEP_CODE_DIR))
         .ok_or(KeyUnavailable::NoHomeDirectory)?;
+    load_or_create_key_in(&dir)
+}
+
+/// The filesystem implementation is also exercised directly in tests, without
+/// changing HOME or going through the fixed signing key used by unit tests.
+fn load_or_create_key_in(dir: &Path) -> Result<[u8; KEY_BYTES], KeyUnavailable> {
     let path = dir.join(KEY_FILE);
-    if let Ok(existing) = std::fs::read(&path)
-        && let Ok(bytes) = <[u8; KEY_BYTES]>::try_from(existing)
-    {
-        return Ok(bytes);
+    match read_key(&path) {
+        Ok(key) => return Ok(key),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        // Never rotate an existing key on an I/O error or corrupt contents:
+        // that would invalidate every session signed with the original key.
+        Err(_) => return Err(KeyUnavailable::Unreadable),
     }
-    std::fs::create_dir_all(&dir).map_err(|_| KeyUnavailable::NotCreatable)?;
+    std::fs::create_dir_all(dir).map_err(|_| KeyUnavailable::NotCreatable)?;
     let fresh = random_key().ok_or(KeyUnavailable::NotCreatable)?;
-    write_private(&path, &fresh).map_err(|_| KeyUnavailable::NotCreatable)?;
-    // Re-read rather than trusting the write: two processes launching at once
-    // both generate a key and the loser's bytes are the ones on disk. Whoever
-    // reads last wins consistently, so both agree on one key.
-    match std::fs::read(&path) {
-        Ok(stored) if stored.len() == KEY_BYTES => {
-            Ok(<[u8; KEY_BYTES]>::try_from(stored).unwrap_or(fresh))
-        }
-        _ => Ok(fresh),
-    }
+    publish_key(&path, &fresh).map_err(|_| KeyUnavailable::NotCreatable)?;
+    read_key(&path).map_err(|_| KeyUnavailable::Unreadable)
 }
 
 fn random_key() -> Option<[u8; KEY_BYTES]> {
@@ -138,33 +142,49 @@ fn random_key() -> Option<[u8; KEY_BYTES]> {
     Some(bytes)
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
+fn read_key(path: &Path) -> std::io::Result<[u8; KEY_BYTES]> {
+    use std::io::Read;
 
-    // Unlink-then-`create_new`, matching `config::write`'s function of the
-    // same name: `create(true).truncate(true)` follows a symlink at the final
-    // component, so a planted link would have this write the HMAC key — the
-    // trust anchor for recorded write grants — through to wherever it points.
-    // `~/.deep-code` is sandbox-denied, so this is depth rather than a live
-    // hole; two functions with one name and one purpose should not differ in
-    // strength.
-    let _ = std::fs::remove_file(path);
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let mut file = options.open(path)?;
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("session key is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take((KEY_BYTES + 1) as u64).read_to_end(&mut bytes)?;
+    bytes.try_into().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid session key length",
+        )
+    })
+}
+
+/// Publish a complete, private key without replacing an existing name. A
+/// competing process either publishes first or reads the winner's complete
+/// key; no reader can observe an empty/partial file and no loser can unlink it.
+fn publish_key(path: &Path, bytes: &[u8; KEY_BYTES]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("key has no parent"))?;
+    // NamedTempFile is created with mode 0600 on Unix, before any key bytes
+    // are written. persist_noclobber uses a no-replace rename or hard link.
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.write_all(bytes)?;
-    // Tighten permissions on every successful write as well.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    file.as_file().sync_all()?;
+    match file.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.error),
     }
-    Ok(())
 }
 
 /// Length-prefixed so no two different grant lists can render to the same
@@ -293,6 +313,119 @@ fn from_hex(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publishing_a_competing_key_keeps_the_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KEY_FILE);
+        publish_key(&path, &[1; KEY_BYTES]).unwrap();
+        publish_key(&path, &[2; KEY_BYTES]).unwrap();
+        assert_eq!(read_key(&path).unwrap(), [1; KEY_BYTES]);
+        assert_eq!(load_or_create_key_in(dir.path()).unwrap(), [1; KEY_BYTES]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_existing_keys_are_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KEY_FILE);
+        for contents in [Vec::new(), vec![7; KEY_BYTES - 1], vec![7; KEY_BYTES + 1]] {
+            std::fs::write(&path, &contents).unwrap();
+            assert_eq!(
+                load_or_create_key_in(dir.path()),
+                Err(KeyUnavailable::Unreadable)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), contents);
+        }
+    }
+
+    #[test]
+    fn concurrent_processes_share_the_first_key() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "DEEP_CODE_KEY_INIT_TEST";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(dir);
+            let pid = std::process::id();
+            std::fs::write(dir.join(format!("ready-{pid}")), []).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !dir.join("go").exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "parent did not release key initialization"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let key = load_or_create_key_in(&dir.join("keys")).unwrap();
+            std::fs::write(dir.join(format!("result-{pid}")), key).unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut children: Vec<_> = (0..8)
+            .map(|_| {
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "session_integrity::tests::concurrent_processes_share_the_first_key",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, dir.path())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !children
+            .iter()
+            .all(|child| dir.path().join(format!("ready-{}", child.id())).exists())
+        {
+            if Instant::now() >= deadline {
+                for child in &mut children {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                panic!("key initialization children did not start");
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::fs::write(dir.path().join("go"), []).unwrap();
+        while children
+            .iter_mut()
+            .any(|child| child.try_wait().unwrap().is_none())
+        {
+            if Instant::now() >= deadline {
+                for child in &mut children {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                panic!("concurrent key initialization did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let key = read_key(&dir.path().join("keys").join(KEY_FILE)).unwrap();
+        for child in children {
+            let pid = child.id();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join(format!("result-{pid}"))).unwrap(),
+                key
+            );
+        }
+    }
 
     fn roots() -> Vec<PathBuf> {
         vec![PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")]
