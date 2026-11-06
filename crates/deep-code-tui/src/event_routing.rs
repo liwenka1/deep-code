@@ -13,11 +13,23 @@ impl App {
             self.turn_compaction_since = None;
         }
         match event {
-            RuntimeEvent::TurnStarted { .. } => {
+            RuntimeEvent::TurnStarted { turn_id, .. } => {
                 // Never drop a predecessor that streamed content but missed
                 // its terminal event — flush it into history first.
                 self.flush_active_turn();
                 self.active_turn = Some(ActiveTurn::default());
+                // Esc can arrive before the async bootstrap registers its
+                // turn. Repeat that intent against the exact id now observed.
+                if self.cancel_requested {
+                    let runtime = self.runtime.clone();
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            drop(runtime.cancel_turn_if(turn_id).await);
+                        });
+                    }
+                    self.status = self.tr(TextId::StatusCancelling).to_string();
+                    return;
+                }
                 self.status = self.tr_with(
                     TextId::StatusStreamingFrom,
                     &[("backend", &self.backend_label)],
@@ -86,13 +98,8 @@ impl App {
                 self.status = self.tr_with(TextId::StatusToolRunning, &[("tool", &tool_name)]);
             }
             RuntimeEvent::ApprovalRequired { .. } if self.cancel_requested => {
-                // Esc landed while this request was in flight: the runtime took
-                // the parked batch out from under it and finalized the
-                // cancellation on the receiver `cancel_turn` returns, which the
-                // UI does not pump (see `cancel_streaming_turn`). The request is
-                // for a turn that no longer exists; parking it drew a panel
-                // whose every answer the runtime could only drop in silence.
-                self.finish_turn_cancelled();
+                // Esc may race an already queued approval. Keep observing the
+                // same stream until the runtime emits its real terminal event.
             }
             RuntimeEvent::ApprovalRequired { request, .. } => {
                 self.set_active_approval(request.clone());
@@ -114,7 +121,6 @@ impl App {
                     ],
                 );
                 self.park_approval(request);
-                self.clear_stream_receiver();
             }
             RuntimeEvent::ApprovalResolved { decision, .. } => {
                 if let Some(active) = self.active_turn.as_mut() {

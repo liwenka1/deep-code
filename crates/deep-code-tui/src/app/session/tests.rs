@@ -15,6 +15,109 @@ fn test_app() -> (tempfile::TempDir, App) {
     (workspace, app)
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconfiguration_keeps_live_history_after_a_failed_save() {
+    let (workspace, mut app) = test_app();
+    app.shutdown_current_runtime();
+    app.adopt_runtime(deep_code_agent::launch_runtime(
+        &deep_code_agent::AgentConfig::builtin(),
+        workspace.path().to_path_buf(),
+        None,
+    ));
+    app.global_config_path = Some(workspace.path().join("unused-global-config.toml"));
+    let id = app.session_id.clone();
+    // Escaping these bytes takes the encoded record past the storage limit.
+    // The last durable record therefore has no user conversation.
+    let mut events = app.runtime.submit_user("\u{1}".repeat(1_500_000)).await;
+    while let Some(event) = events.recv().await {
+        if matches!(event, RuntimeEvent::TurnFinished { .. }) {
+            break;
+        }
+    }
+    assert!(app.runtime.last_save_error().is_some());
+    let messages = app.runtime.session_messages().await;
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.role == deep_code_agent::Role::User)
+    );
+    let old_runtime = Arc::clone(&app.runtime);
+    app.relaunch_runtime().unwrap();
+    assert!(!Arc::ptr_eq(&old_runtime, &app.runtime));
+    assert_eq!(app.session_id, id);
+    assert_eq!(&app.runtime.session_messages().await[1..], &messages[1..]);
+    assert!(app.runtime.last_save_error().is_some());
+    app.shutdown_current_runtime();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconfiguration_keeps_unpersisted_conversation_and_can_add_a_root() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join(".deep-code"), "blocked").unwrap();
+    let mut app = App::launch(LaunchConfig {
+        workspace: Some(workspace.path().to_path_buf()),
+        ..Default::default()
+    });
+    app.shutdown_current_runtime();
+    app.adopt_runtime(deep_code_agent::launch_runtime(
+        &deep_code_agent::AgentConfig::builtin(),
+        workspace.path().to_path_buf(),
+        None,
+    ));
+    app.global_config_path = Some(workspace.path().join("unused-global-config.toml"));
+    let mut events = app
+        .runtime
+        .submit_user("keep this unsaved conversation")
+        .await;
+    while let Some(event) = events.recv().await {
+        if matches!(event, RuntimeEvent::TurnFinished { .. }) {
+            break;
+        }
+    }
+    let before = app.runtime.session_messages().await;
+    assert!(app.session_id.is_none());
+    let extra = tempfile::tempdir().unwrap();
+    app.add_dir_command(extra.path().to_str().unwrap());
+    assert_eq!(
+        app.extra_roots,
+        vec![deep_code_agent::canonicalize(extra.path()).unwrap()]
+    );
+    assert!(app.session_id.is_none());
+    let after = app.runtime.session_messages().await;
+    assert_eq!(&before[1..], &after[1..]);
+    app.shutdown_current_runtime();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_reconfiguration_retains_the_live_runtime() {
+    let (_workspace, mut app) = test_app();
+    let old_runtime = Arc::clone(&app.runtime);
+    let id = app.session_id.clone();
+    // Protect against a turn starting before the UI has consumed TurnStarted.
+    app.runtime.begin_turn("not yet visible in UI").await;
+    assert!(app.relaunch_runtime().is_err());
+    assert!(Arc::ptr_eq(&old_runtime, &app.runtime));
+    assert_eq!(app.session_id, id);
+    assert!(app.runtime.live_turn_id().await.is_some());
+    app.shutdown_current_runtime();
+}
+
+#[test]
+fn unavailable_store_keeps_the_existing_persisted_runtime() {
+    let (_workspace, mut app) = test_app();
+    let old_runtime = Arc::clone(&app.runtime);
+    let id = app.session_id.clone();
+    std::fs::rename(
+        app.workspace.join(".deep-code"),
+        app.workspace.join("previous-state"),
+    )
+    .unwrap();
+    std::fs::write(app.workspace.join(".deep-code"), "unavailable").unwrap();
+    assert!(app.relaunch_runtime().is_err());
+    assert!(Arc::ptr_eq(&old_runtime, &app.runtime));
+    assert_eq!(app.session_id, id);
+}
+
 fn finish_scan(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !app.poll_session_scan() {

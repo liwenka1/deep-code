@@ -1,10 +1,9 @@
-//! Agent configuration: the [`AgentConfig`] type and its built-in/env
-//! defaults live here; the layered file loading lives in [`layers`].
+//! Agent configuration and pure built-in defaults. Explicit environment and
+//! file loading live in [`layers`].
 
 mod layers;
 mod write;
 
-use std::env;
 use std::time::Duration;
 
 pub use layers::{ConfigLayer, ConfigLoadReport, ConfigSources, LoadedAgentConfig};
@@ -173,19 +172,10 @@ pub struct AgentConfig {
 }
 
 impl Default for AgentConfig {
-    /// Built-in defaults plus the environment overlay. Files are NOT read
-    /// here; use [`AgentConfig::load`] for the full layered configuration.
+    /// Pure built-in defaults. Use [`AgentConfig::load`] to read configuration
+    /// from files and the environment.
     fn default() -> Self {
-        let mut config = Self::builtin();
-        let mut sources = ConfigSources::default();
-        // `default()` has no report to carry warnings on — it is the
-        // no-files constructor used by tests and by callers that only want the
-        // env overlay. `load()` is the path that surfaces them.
-        let mut discarded = Vec::new();
-        layers::apply_env_overlay(&mut config, &mut sources, &mut discarded, &|name| {
-            env::var(name).ok()
-        });
-        config
+        Self::builtin()
     }
 }
 
@@ -265,8 +255,7 @@ mod tests {
 
     #[test]
     fn builtin_config_uses_deepseek_defaults() {
-        // builtin() (not default()) so developer env vars cannot flake this.
-        let config = AgentConfig::builtin();
+        let config = AgentConfig::default();
 
         assert_eq!(config.base_url, DEFAULT_DEEPSEEK_BASE_URL);
         assert_eq!(config.model, DEEPSEEK_V4_PRO);
@@ -275,6 +264,34 @@ mod tests {
             config.chat_completions_url(),
             "https://api.deepseek.com/beta/chat/completions"
         );
+    }
+
+    #[test]
+    fn default_config_ignores_process_environment() {
+        const CHILD: &str = "DEEP_CODE_DEFAULT_CONFIG_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let config = AgentConfig::default();
+            assert!(config.api_key.is_none());
+            assert_eq!(config.model, DEEPSEEK_V4_PRO);
+            assert_eq!(config.base_url, DEFAULT_DEEPSEEK_BASE_URL);
+            let loaded = AgentConfig::load_with(None, None, &|name| std::env::var(name).ok());
+            assert_eq!(loaded.config.api_key.as_deref(), Some("test-key-never-use"));
+            assert_eq!(loaded.config.model, "test-model-never-use");
+            return;
+        }
+        // A child process gives this test real environment variables without
+        // mutating the environment shared by parallel tests.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::default_config_ignores_process_environment",
+            ])
+            .env(CHILD, "1")
+            .env("DEEPSEEK_API_KEY", "test-key-never-use")
+            .env(MODEL_ENV, "test-model-never-use")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]

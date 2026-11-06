@@ -1,4 +1,4 @@
-//! Optional bearer token guard for `/v1/*` routes.
+//! Optional bearer token guard for `/prompt and /approvals` routes.
 
 use axum::http::HeaderMap;
 

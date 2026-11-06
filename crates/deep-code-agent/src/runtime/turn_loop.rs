@@ -149,6 +149,7 @@ impl AgentRuntime {
         emit(
             tx,
             RuntimeEvent::Error {
+                kind: crate::RuntimeFailureKind::Execution,
                 turn_id: Some(turn_id.clone()),
                 message,
             },
@@ -229,6 +230,7 @@ impl AgentRuntime {
                 emit(
                     tx,
                     RuntimeEvent::Error {
+                        kind: crate::RuntimeFailureKind::StepLimit,
                         turn_id: Some(turn_id.clone()),
                         message: crate::tr_with(
                             self.ui_lang(),
@@ -392,6 +394,7 @@ impl AgentRuntime {
                             emit(
                                 tx,
                                 RuntimeEvent::Error {
+                                    kind: crate::RuntimeFailureKind::Execution,
                                     turn_id: Some(turn_id.clone()),
                                     message: crate::tr_with(
                                         self.ui_lang(),
@@ -420,6 +423,7 @@ impl AgentRuntime {
                     emit(
                         tx,
                         RuntimeEvent::Error {
+                            kind: crate::RuntimeFailureKind::Execution,
                             turn_id: Some(turn_id.clone()),
                             message: error.user_message(self.ui_lang()),
                         },
@@ -510,6 +514,7 @@ impl AgentRuntime {
                         emit(
                             tx,
                             RuntimeEvent::Error {
+                                kind: crate::RuntimeFailureKind::Execution,
                                 turn_id: Some(turn_id.clone()),
                                 message,
                             },
@@ -527,6 +532,7 @@ impl AgentRuntime {
                         emit(
                             tx,
                             RuntimeEvent::Error {
+                                kind: crate::RuntimeFailureKind::Execution,
                                 turn_id: Some(turn_id.clone()),
                                 message: error.user_message(self.ui_lang()),
                             },
@@ -542,8 +548,13 @@ impl AgentRuntime {
                 // Partial assistant output stays in the transcript; partial
                 // tool-call deltas are discarded before they become real
                 // calls, so no tool_call/tool pairing is broken.
-                self.record_partial_reply(reply_anchor.as_ref(), text_buffer, reasoning_buffer)
-                    .await;
+                self.record_partial_reply(
+                    &turn_id,
+                    reply_anchor.as_ref(),
+                    text_buffer,
+                    reasoning_buffer,
+                )
+                .await;
                 self.finish_turn_cancelled(&turn_id, tx).await;
                 return;
             }
@@ -551,8 +562,13 @@ impl AgentRuntime {
             if had_error {
                 // Same semantics as cancellation: streamed partial output is
                 // kept (no tool_calls were pushed, so pairing is intact).
-                self.record_partial_reply(reply_anchor.as_ref(), text_buffer, reasoning_buffer)
-                    .await;
+                self.record_partial_reply(
+                    &turn_id,
+                    reply_anchor.as_ref(),
+                    text_buffer,
+                    reasoning_buffer,
+                )
+                .await;
                 self.abort_turn(&turn_id).await;
                 return;
             }
@@ -576,12 +592,18 @@ impl AgentRuntime {
                 // batch to the successor's history or execute its calls.
                 if state.current_turn_id.as_ref() != Some(&turn_id) || cancel.is_cancelled() {
                     drop(state);
-                    self.record_partial_reply(reply_anchor.as_ref(), text_buffer, reasoning_buffer)
-                        .await;
+                    self.record_partial_reply(
+                        &turn_id,
+                        reply_anchor.as_ref(),
+                        text_buffer,
+                        reasoning_buffer,
+                    )
+                    .await;
                     self.finish_turn_cancelled(&turn_id, tx).await;
                     return;
                 }
                 state.session.push_assistant(
+                    turn_id.clone(),
                     text_buffer,
                     reasoning_buffer,
                     calls.iter().map(tool_call_payload).collect(),
@@ -662,6 +684,7 @@ impl AgentRuntime {
 
     async fn record_partial_reply(
         &self,
+        turn_id: &TurnId,
         anchor: Option<&std::sync::Arc<crate::session_entry::SessionEntry>>,
         text: String,
         reasoning: String,
@@ -675,7 +698,7 @@ impl AgentRuntime {
             .lock()
             .await
             .session
-            .insert_partial_assistant_after(anchor, text, reasoning);
+            .insert_partial_assistant_after(anchor, turn_id.clone(), text, reasoning);
         // A superseded turn's finish_turn is a no-op, so save this insertion
         // here as well as on the ordinary cancellation/error path.
         if inserted {
@@ -694,12 +717,17 @@ impl AgentRuntime {
         use super::Steered;
         let drained: Vec<Steered> = {
             let mut state = self.state.lock().await;
+            if state.current_turn_id.as_ref() != Some(turn_id) {
+                return;
+            }
             let drained: Vec<Steered> = std::mem::take(&mut state.steering).into();
             for steered in &drained {
                 match steered {
-                    Steered::User(prompt) => state
-                        .session
-                        .push_user_with_images(&prompt.text, prompt.images.clone()),
+                    Steered::User(prompt) => state.session.push_user_with_images(
+                        turn_id.clone(),
+                        &prompt.text,
+                        prompt.images.clone(),
+                    ),
                     // A runtime nudge (the budget wrap-up): recorded as a System
                     // entry, never a user one. As a user entry it would become
                     // the newest user message and pull compaction's anchor off

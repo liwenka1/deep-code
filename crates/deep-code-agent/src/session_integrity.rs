@@ -220,16 +220,41 @@ pub(crate) fn ensure_key() -> Result<(), KeyUnavailable> {
 /// deterministic struct-field order gives every writer the same representation
 /// without trusting map iteration order.
 ///
-/// Note what this signs: a *re-serialization of the parsed struct*, not the
-/// bytes on disk. Adding a persisted field therefore changes the message for
-/// every existing record. That is why adding one requires bumping
-/// `SESSION_SCHEMA_VERSION`: the version check rejects old files explicitly,
-/// instead of letting them fail verification and be discarded as if forged.
+/// The signed payload is the complete current struct. A file must parse into
+/// that structure and verify against these bytes before it can be resumed.
 fn record_message(record: &mut crate::session_store::SessionRecord) -> Option<Vec<u8>> {
     let tag = record.record_mac.take();
     let message = serde_json::to_vec(&*record).ok();
     record.record_mac = tag;
     message
+}
+
+#[cfg(test)]
+/// Sign a compatibility record in tests so migration fixtures use the same
+/// host key and serialization path as persisted records.
+#[must_use]
+pub(crate) fn sign_serialized<T: serde::Serialize>(value: &T) -> Option<String> {
+    let key_bytes = key().ok()?;
+    let message = serde_json::to_vec(value).ok()?;
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes);
+    Some(to_hex(ring::hmac::sign(&key, &message).as_ref()))
+}
+
+/// Verify a tag over a serialized compatibility record. This is used only
+/// while migrating an older on-disk schema: the old record must be
+/// authenticated before its fields are translated into the current shape.
+/// Keeping this helper generic avoids making the legacy wire structs part of
+/// the public session model.
+#[must_use]
+pub(crate) fn verify_serialized<T: serde::Serialize>(value: &T, tag: Option<&str>) -> bool {
+    let (Ok(key_bytes), Some(tag), Ok(message)) = (key(), tag, serde_json::to_vec(value)) else {
+        return false;
+    };
+    let Some(tag) = from_hex(tag) else {
+        return false;
+    };
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes);
+    ring::hmac::verify(&key, &message, &tag).is_ok()
 }
 
 /// Tag for the complete persisted record, or `None` when the host key is not
@@ -511,5 +536,41 @@ mod tests {
         assert_eq!(sign_record(&mut record), None);
         assert!(!verify_record(&mut record));
         KEY_OVERRIDE.with(|slot| slot.set(previous));
+    }
+
+    #[test]
+    fn a_missing_key_cannot_turn_a_saved_session_into_an_empty_record() {
+        use crate::session_store::{
+            JsonSessionStore, SessionRecord, SessionStore, SessionStoreError,
+        };
+
+        let workspace = tempfile::tempdir().unwrap();
+        let store = JsonSessionStore::for_workspace(workspace.path()).unwrap();
+        let mut record = SessionRecord::new(workspace.path().to_path_buf(), "keep this session");
+        store.save(&mut record).unwrap();
+        let path = crate::session_store::sessions_dir_for_workspace(workspace.path())
+            .join(format!("{}.json", record.id.as_str()));
+        let original = std::fs::read(&path).unwrap();
+
+        struct RestoreKey(Option<Result<[u8; KEY_BYTES], KeyUnavailable>>);
+        impl Drop for RestoreKey {
+            fn drop(&mut self) {
+                KEY_OVERRIDE.with(|slot| slot.set(self.0));
+            }
+        }
+        let _restore = RestoreKey(KEY_OVERRIDE.with(std::cell::Cell::get));
+        KEY_OVERRIDE.with(|slot| slot.set(Some(Err(KeyUnavailable::Unreadable))));
+        assert!(matches!(
+            store.load(&record.id),
+            Err(SessionStoreError::KeyUnavailable { .. })
+        ));
+        assert!(store.list().unwrap().is_empty());
+        assert!(
+            store
+                .take_diagnostics()
+                .iter()
+                .any(|line| line.contains("signing key"))
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original);
     }
 }

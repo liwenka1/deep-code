@@ -1,7 +1,6 @@
 //! Event-loop driver for one unattended turn.
 //!
-//! Mirrors the HTTP server's SSE loop (`deep-code-runtime/src/server.rs`,
-//! `prompt_sse`) with the `--approval-mode autonomous` posture baked in: an
+//! Uses the runtime TurnHandle with an unattended approval policy: an
 //! approval that would prompt is denied deterministically and the turn
 //! continues. A headless run must never park waiting for a decision nobody
 //! will send. Capability is granted the same way as everywhere else —
@@ -18,9 +17,7 @@ pub(crate) enum DriveStatus {
     Cancelled,
     Failed(String),
     /// The event channel closed without a terminal event. Happens when a
-    /// cancel races the approval hand-off and finalizes on a channel this
-    /// loop never held; the caller decides what that means (interrupt,
-    /// timeout, or a genuine defect).
+    /// runtime task exits unexpectedly.
     Incomplete,
 }
 
@@ -52,61 +49,44 @@ pub(crate) async fn drive_to_completion(
         denied_approvals: 0,
     };
 
-    let mut events = runtime.submit_user(prompt).await;
-    'turn: loop {
-        let mut resumed = false;
-        while let Some(event) = events.recv().await {
-            if let Err(error) = on_event(&event).await {
-                runtime.cancel_turn().await;
-                outcome.status = DriveStatus::Failed(format!("output failed: {error}"));
-                break 'turn;
-            }
-            match event {
-                RuntimeEvent::ReasoningDelta { text, .. } => outcome.reasoning.push_str(&text),
-                RuntimeEvent::ApprovalRequired { ref request, .. } => {
-                    // Deny, never park (see module docs). `submit_approval…`
-                    // resumes the batch on a fresh channel.
-                    //
-                    // WITH the note: the stock result text is "Tool call
-                    // denied by user.", and there is no user here. The model
-                    // then plans around a refusal that never happened —
-                    // stops asking, or argues with the absent human — where
-                    // the truth ("nobody can answer; the operator grants
-                    // capability with auto_allow / --permission-mode") is
-                    // something it can act on. Same reason
-                    // `subagent_approval_decision` carries notes.
-                    outcome.denied_approvals += 1;
-                    events = runtime
-                        .submit_approval_with_denial_note(
-                            ApprovalDecision::Denied,
-                            Some(unattended_denial_note(request)),
-                        )
-                        .await;
-                    resumed = true;
-                    break;
-                }
-                RuntimeEvent::TurnFinished {
-                    usage, telemetry, ..
-                } => {
-                    outcome.usage = usage;
-                    outcome.telemetry = telemetry;
-                    outcome.status = DriveStatus::Finished;
-                    break 'turn;
-                }
-                RuntimeEvent::TurnCancelled { .. } => {
-                    outcome.status = DriveStatus::Cancelled;
-                    break 'turn;
-                }
-                RuntimeEvent::Error { message, .. } => {
-                    outcome.status = DriveStatus::Failed(message);
-                    break 'turn;
-                }
-                _ => {}
-            }
+    let mut events = runtime.start_turn(prompt).await;
+    while let Some(event) = events.recv().await {
+        if let Err(error) = on_event(&event).await {
+            events.cancel().await;
+            outcome.status = DriveStatus::Failed(format!("output failed: {error}"));
+            return outcome;
         }
-        if !resumed {
-            break;
+        match event {
+            RuntimeEvent::ReasoningDelta { text, .. } => outcome.reasoning.push_str(&text),
+            RuntimeEvent::ApprovalRequired { ref request, .. } => {
+                outcome.denied_approvals += 1;
+                if let Err(error) = events
+                    .approve(
+                        &request.approval_id,
+                        ApprovalDecision::Denied,
+                        Some(unattended_denial_note(request)),
+                    )
+                    .await
+                {
+                    outcome.status = DriveStatus::Failed(error.to_string());
+                    return outcome;
+                }
+            }
+            _ => {}
         }
+    }
+    if let Some(result) = events.outcome() {
+        use deep_code_agent::FinishReason;
+        outcome.usage = result.usage.clone();
+        outcome.telemetry = result.telemetry.clone();
+        outcome.status = match result.reason {
+            FinishReason::Completed => DriveStatus::Finished,
+            FinishReason::Cancelled => DriveStatus::Cancelled,
+            FinishReason::Incomplete => DriveStatus::Incomplete,
+            FinishReason::StepLimit | FinishReason::Failed => {
+                DriveStatus::Failed(result.error.clone().unwrap_or_default())
+            }
+        };
     }
     outcome
 }

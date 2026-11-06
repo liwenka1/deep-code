@@ -20,7 +20,10 @@ async fn the_final_session_update_reports_the_completed_save_failure() {
 
     struct FailingStore;
     impl SessionStore for FailingStore {
-        fn save_serialized(&self, _: &SessionId, _: &str) -> Result<(), SessionStoreError> {
+        fn save_prepared(
+            &self,
+            _: &crate::session_store::PreparedSession,
+        ) -> Result<(), SessionStoreError> {
             Err(SessionStoreError::Serialization {
                 message: "test save failed".into(),
             })
@@ -633,7 +636,7 @@ async fn approve_path_feeds_tool_result_into_next_turn() {
         Some(RuntimeEvent::ApprovalRequired { .. })
     ));
 
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
     let second = drain(&mut rx).await;
 
     let mut saw_tool_result = false;
@@ -700,7 +703,7 @@ async fn an_approval_park_does_not_refill_the_turns_step_budget() {
         if !matches!(events.last(), Some(RuntimeEvent::ApprovalRequired { .. })) {
             break;
         }
-        let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+        let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
         events = drain(&mut rx).await;
     }
 
@@ -1308,13 +1311,13 @@ async fn gated_agent_dispatches_leave_the_parallel_group_and_face_the_gate() {
     assert!(finished_ids(&events).is_empty());
     assert_eq!(parked_ids(&events), vec!["call_1".to_string()]);
 
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
     let events = drain(&mut rx).await;
     assert_eq!(ran.load(SeqCst), 1);
     assert_eq!(finished_ids(&events), vec!["call_1".to_string()]);
     assert_eq!(parked_ids(&events), vec!["call_2".to_string()]);
 
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
     let events = drain(&mut rx).await;
     assert_eq!(ran.load(SeqCst), 2);
     assert_eq!(finished_ids(&events), vec!["call_2".to_string()]);
@@ -1383,9 +1386,7 @@ async fn session_consent_on_an_agent_dispatch_does_not_cover_later_dispatches() 
         parked_ids(&drain(&mut rx).await),
         vec!["call_1".to_string()]
     );
-    let mut rx = runtime
-        .submit_approval(ApprovalDecision::ApprovedForSession)
-        .await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::ApprovedForSession).await;
     let events = drain(&mut rx).await;
     assert_eq!(
         ran.load(SeqCst),
@@ -1407,7 +1408,7 @@ async fn session_consent_on_an_agent_dispatch_does_not_cover_later_dispatches() 
         1,
         "nothing may run before the human answers"
     );
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
     assert_eq!(
         finished_ids(&drain(&mut rx).await),
         vec!["call_2".to_string()]
@@ -1515,7 +1516,7 @@ async fn deny_path_records_denied_tool_message_and_continues() {
     let mut rx = runtime.submit_user("please echo").await;
     drain(&mut rx).await;
 
-    let mut rx = runtime.submit_approval(ApprovalDecision::Denied).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Denied).await;
     let events = drain(&mut rx).await;
 
     let denied = events.iter().find_map(|event| match event {
@@ -1559,9 +1560,12 @@ async fn unattended_denial_note_replaces_the_denied_by_user_text() {
     drain(&mut rx).await;
 
     let note = "Denied by sub-agent policy (no user saw this request): test note.";
-    let mut rx = runtime
-        .submit_approval_with_denial_note(ApprovalDecision::Denied, Some(note.to_string()))
-        .await;
+    let mut rx = submit_pending_approval_with_denial_note(
+        &runtime,
+        ApprovalDecision::Denied,
+        Some(note.to_string()),
+    )
+    .await;
     let events = drain(&mut rx).await;
 
     let denied = events
@@ -1603,6 +1607,8 @@ async fn unattended_denial_note_replaces_the_denied_by_user_text() {
 #[test]
 fn the_unattended_note_tells_the_model_no_human_was_asked() {
     let request = |tool_name: &str| ApprovalRequest {
+        approval_id: crate::ApprovalId::new(),
+        authority: crate::ApprovalAuthority::AutomaticAllowed,
         call_id: "call_1".to_string(),
         tool_name: tool_name.to_string(),
         description: "d".to_string(),
@@ -1770,7 +1776,7 @@ async fn tool_turn_emits_structured_tool_and_approval_events() {
         } if id == &turn_id && tool_id.as_str() == "call_1"
     )));
 
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
     let second = drain(&mut rx).await;
     assert!(matches!(
         second.first(),
@@ -1932,6 +1938,20 @@ async fn persistent_runtime_records_checkpoint_metadata() {
 
     let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
     let record = store.load(&session_id).unwrap();
+    let turn_id = &record.turns[0].id;
+    assert!(
+        record
+            .entries
+            .iter()
+            .filter(|entry| !matches!(entry.kind, crate::session_entry::EntryKind::System { .. }))
+            .all(|entry| entry.turn_id.as_ref() == Some(turn_id))
+    );
+    assert!(
+        record
+            .checkpoints
+            .iter()
+            .all(|checkpoint| &checkpoint.turn_id == turn_id)
+    );
     assert!(
         record
             .checkpoints
@@ -2160,13 +2180,112 @@ async fn a_compacted_prefix_reports_changed() {
 }
 
 #[tokio::test]
-async fn submit_approval_without_pending_emits_error() {
+async fn submit_approval_without_pending_returns_error() {
     let client = ScriptedClient::new(vec![]);
     let runtime = AgentRuntime::new(client, ToolRegistry::default());
 
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let result = runtime
+        .submit_approval(&crate::ApprovalId::new(), ApprovalDecision::Approved)
+        .await;
+    assert!(matches!(
+        result,
+        Err(crate::ApprovalError::NoPendingApproval)
+    ));
+}
+
+#[tokio::test]
+async fn stale_approval_id_cannot_authorize_reused_model_call_id() {
+    let call = |message: &str| {
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta(
+                    "call_1",
+                    MockEchoTool::NAME,
+                    &serde_json::json!({"message": message}).to_string(),
+                ),
+            },
+            AgentEvent::Done { usage: None },
+        ]
+    };
+    let runtime = AgentRuntime::new(
+        ScriptedClient::new(vec![call("original"), call("successor"), ok_turn()]),
+        ToolRegistry::with_mock_tools(),
+    );
+    let mut first = runtime.submit_user("first").await;
+    let first_events = drain(&mut first).await;
+    let request = |events: Vec<RuntimeEvent>| {
+        events
+            .into_iter()
+            .find_map(|event| {
+                if let RuntimeEvent::ApprovalRequired { request, .. } = event {
+                    Some(request)
+                } else {
+                    None
+                }
+            })
+            .expect("approval request")
+    };
+    let first_request = request(first_events);
+    let mut second = runtime.submit_user("second").await;
+    let second_request = request(drain(&mut second).await);
+    assert_eq!(first_request.call_id, second_request.call_id);
+    assert_ne!(first_request.approval_id, second_request.approval_id);
+    assert!(matches!(
+        runtime
+            .submit_approval(&first_request.approval_id, ApprovalDecision::Approved)
+            .await,
+        Err(crate::ApprovalError::StaleApproval)
+    ));
+    assert_eq!(
+        runtime
+            .state
+            .lock()
+            .await
+            .pending
+            .as_ref()
+            .unwrap()
+            .approval_id,
+        second_request.approval_id
+    );
+    let mut resumed = runtime
+        .submit_approval(&second_request.approval_id, ApprovalDecision::Approved)
+        .await
+        .unwrap();
+    let events = drain(&mut resumed).await;
+    assert!(events.iter().any(|event| matches!(event, RuntimeEvent::ToolCallFinished { result, .. } if result.content == "mock_echo: successor")));
+    assert!(matches!(
+        runtime
+            .submit_approval(&second_request.approval_id, ApprovalDecision::Approved)
+            .await,
+        Err(crate::ApprovalError::NoPendingApproval)
+    ));
+}
+
+#[tokio::test]
+async fn invalid_typed_arguments_return_to_model_before_any_approval() {
+    let runtime = AgentRuntime::new(
+        ScriptedClient::new(vec![
+            vec![
+                AgentEvent::ToolCallDelta {
+                    delta: tool_call_delta("invalid", MockEchoTool::NAME, r#"{"message": 42}"#),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+            ok_turn(),
+        ]),
+        ToolRegistry::with_mock_tools(),
+    );
+    let mut rx = runtime.submit_user("invalid echo").await;
     let events = drain(&mut rx).await;
-    assert!(matches!(events.first(), Some(RuntimeEvent::Error { .. })));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ApprovalRequired { .. } | RuntimeEvent::ApprovalResolved { .. }
+    )));
+    assert!(events.iter().any(|event| matches!(event, RuntimeEvent::ToolCallFinished { result, .. } if result.status == ToolResultStatus::Error && result.content.contains("invalid type"))));
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
 }
 
 #[test]
@@ -2251,9 +2370,7 @@ async fn session_approval_skips_future_prompts_for_same_tool() {
         Some(RuntimeEvent::ApprovalRequired { .. })
     ));
 
-    let mut rx = runtime
-        .submit_approval(ApprovalDecision::ApprovedForSession)
-        .await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::ApprovedForSession).await;
     let second = drain(&mut rx).await;
 
     // The second gated call of the same tool runs without prompting again,
@@ -2316,7 +2433,7 @@ async fn superseded_approval_cannot_execute_record_consent_or_drive_the_successo
                 .any(|event| matches!(event, RuntimeEvent::ApprovalRequired { .. }))
         );
         let old_id = runtime.live_turn_id().await.unwrap();
-        let mut approved = runtime.submit_approval(decision).await;
+        let mut approved = submit_pending_approval(&runtime, decision).await;
         // No yield between submission and supersession: the approval task has
         // not yet been polled and must retain the old turn's cancelled token.
         runtime.begin_turn("new prompt").await;
@@ -2370,7 +2487,7 @@ async fn superseded_root_approval_cannot_widen_the_successors_boundary() {
             .iter()
             .any(|event| matches!(event, RuntimeEvent::ApprovalRequired { .. }))
     );
-    let mut approved = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let mut approved = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
     runtime.begin_turn("new prompt").await;
     let new_id = runtime.live_turn_id().await;
     let events = drain(&mut approved).await;
@@ -2438,9 +2555,7 @@ async fn the_record_says_when_a_human_was_asked() {
         "precondition: the first call parks"
     );
     // "Yes, and stop asking" — so the second call never reaches a human.
-    let mut rx = runtime
-        .submit_approval(ApprovalDecision::ApprovedForSession)
-        .await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::ApprovedForSession).await;
     let resumed = drain(&mut rx).await;
     assert!(
         resumed
@@ -2601,9 +2716,7 @@ async fn session_approval_remembers_network_command_identity() {
     };
     assert!(request.network);
 
-    let mut rx = runtime
-        .submit_approval(ApprovalDecision::ApprovedForSession)
-        .await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::ApprovedForSession).await;
     let second = drain(&mut rx).await;
     assert!(
         second
@@ -2682,9 +2795,7 @@ async fn session_approval_of_an_offline_command_does_not_cover_its_network_varia
     };
     assert!(!request.network);
 
-    let mut rx = runtime
-        .submit_approval(ApprovalDecision::ApprovedForSession)
-        .await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::ApprovedForSession).await;
     let second = drain(&mut rx).await;
     let Some(RuntimeEvent::ApprovalRequired { request, .. }) = second.last() else {
         panic!(
@@ -2702,7 +2813,7 @@ async fn session_approval_of_an_offline_command_does_not_cover_its_network_varia
 
     // Approving the networked call once does not widen the offline consent —
     // but the offline consent still covers the offline repeat.
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
     let third = drain(&mut rx).await;
     assert!(
         third
@@ -2854,7 +2965,7 @@ async fn config_auto_allow_prefix_of_a_name_does_not_pre_approve() {
 }
 
 #[tokio::test]
-async fn late_approval_after_cancel_is_silent() {
+async fn late_approval_after_cancel_is_rejected_without_restarting_the_turn() {
     let client = ScriptedClient::new(vec![vec![
         AgentEvent::ToolCallDelta {
             delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"a"}"#),
@@ -2865,14 +2976,27 @@ async fn late_approval_after_cancel_is_silent() {
 
     let mut rx = runtime.submit_user("run").await;
     drain(&mut rx).await;
+    let approval_id = runtime
+        .state
+        .lock()
+        .await
+        .pending
+        .as_ref()
+        .unwrap()
+        .approval_id
+        .clone();
 
     // Cancel wins the race for the parked batch; the user's keypress lands
-    // afterwards and must not surface a red error.
+    // afterwards must not restart the turn or emit a new error stream.
     let mut rx = runtime.cancel_turn().await;
     drain(&mut rx).await;
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
-    let events = drain(&mut rx).await;
-    assert!(events.is_empty(), "late approval after cancel is benign");
+    assert!(matches!(
+        runtime
+            .submit_approval(&approval_id, ApprovalDecision::Approved)
+            .await,
+        Err(crate::ApprovalError::NoPendingApproval)
+    ));
+    assert!(runtime.live_turn_id().await.is_none());
 }
 
 #[tokio::test]
@@ -2946,7 +3070,7 @@ async fn write_file_appends_lsp_diagnostics_to_session() {
     let mut rx = runtime.submit_user("write broken rust").await;
     drain(&mut rx).await;
 
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
     let events = drain(&mut rx).await;
 
     let tool_result = events.iter().find_map(|event| match event {
@@ -3129,7 +3253,7 @@ async fn persistence_saves_tool_exchange_results() {
     let session_id = runtime.session_id().await.expect("session id");
     let mut rx = runtime.submit_user("please echo").await;
     drain(&mut rx).await;
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
     drain(&mut rx).await;
     runtime.shutdown().await;
 
@@ -3557,7 +3681,7 @@ async fn multi_tool_turn_mixes_auto_and_approval_calls() {
             if id.as_str() == "call_2"
     ));
 
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
     let second = drain(&mut rx).await;
     assert_eq!(finished_ids(&second), vec!["call_2"]);
     assert!(matches!(
@@ -3614,7 +3738,7 @@ async fn multi_tool_turn_serializes_two_approvals() {
             if id.as_str() == "call_1"
     ));
 
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
     let second = drain(&mut rx).await;
     assert_eq!(finished_ids(&second), vec!["call_1"]);
     assert!(matches!(
@@ -3623,7 +3747,7 @@ async fn multi_tool_turn_serializes_two_approvals() {
             if id.as_str() == "call_2"
     ));
 
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
     let third = drain(&mut rx).await;
     assert_eq!(finished_ids(&third), vec!["call_2"]);
     assert!(matches!(
@@ -3671,7 +3795,7 @@ async fn multi_tool_turn_denying_one_call_keeps_batch_running() {
     let mut rx = runtime.submit_user("run both").await;
     drain(&mut rx).await;
 
-    let mut rx = runtime.submit_approval(ApprovalDecision::Denied).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Denied).await;
     let second = drain(&mut rx).await;
     let denied = second
         .iter()
@@ -3691,7 +3815,7 @@ async fn multi_tool_turn_denying_one_call_keeps_batch_running() {
             if id.as_str() == "call_2"
     ));
 
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
     let third = drain(&mut rx).await;
     assert!(matches!(
         third.last(),
@@ -4640,7 +4764,7 @@ async fn root_grant_with_unknown_arguments_bounces_without_prompting() {
             RuntimeEvent::ToolCallFinished { result, .. }
                 if result.tool_name == "request_write_root"
                     && result.status == ToolResultStatus::Error
-                    && result.content.contains("invalid request_write_root arguments")
+                    && result.content.contains("unknown field `command`")
         )),
         "the model gets the precise reason: {events:?}"
     );
@@ -4753,7 +4877,7 @@ async fn approved_root_grant_widens_the_boundary_live() {
         "the model's reason must reach the prompt"
     );
 
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
     let events = drain(&mut rx).await;
 
     let granted_path = events
@@ -4806,7 +4930,7 @@ async fn denied_root_grant_grants_nothing_and_says_so() {
 
     let mut rx = runtime.submit_user("build it").await;
     drain(&mut rx).await;
-    let mut rx = runtime.submit_approval(ApprovalDecision::Denied).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Denied).await;
     let events = drain(&mut rx).await;
 
     let result = events
@@ -4870,7 +4994,7 @@ async fn approved_root_grant_persists_into_the_session_record() {
 
     let mut rx = runtime.submit_user("build it").await;
     drain(&mut rx).await;
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
     drain(&mut rx).await;
     runtime.shutdown().await; // flush the persistence actor
 
@@ -4941,7 +5065,7 @@ async fn root_grant_refuses_when_the_target_changes_under_the_approval() {
         "re-linking must work once the first symlink succeeded"
     );
 
-    let mut rx = runtime.submit_approval(ApprovalDecision::Approved).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
     let events = drain(&mut rx).await;
     assert!(
         events.iter().any(|event| matches!(
@@ -5201,9 +5325,7 @@ async fn execution_authority_follows_who_resolved_the_prompt() {
         first.last(),
         Some(RuntimeEvent::ApprovalRequired { .. })
     ));
-    let mut rx = runtime
-        .submit_approval(ApprovalDecision::ApprovedForSession)
-        .await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::ApprovedForSession).await;
     let rest = drain(&mut rx).await;
     assert_eq!(
         finished_contents(&rest),
@@ -5327,7 +5449,17 @@ async fn a_steered_prompt_is_injected_at_the_next_tool_boundary() {
         started: Arc::clone(&started),
         release: Arc::clone(&release),
     });
-    let runtime = AgentRuntime::new(client, registry);
+    let workspace = tempfile::tempdir().unwrap();
+    let runtime = AgentRuntime::with_new_session(
+        client,
+        registry,
+        "system",
+        workspace.path(),
+        &AgentConfig::default(),
+    )
+    .unwrap()
+    .with_checkpoints(workspace.path(), &mut Vec::new());
+    let session_id = runtime.session_id().await.unwrap();
 
     let mut rx = runtime.submit_user("please echo").await;
     started.notified().await;
@@ -5374,6 +5506,37 @@ async fn a_steered_prompt_is_injected_at_the_next_tool_boundary() {
         }),
         "the steered prompt must be in the wire: {messages:?}"
     );
+    runtime.shutdown().await;
+    let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let record = store.load(&session_id).unwrap();
+    assert_eq!(record.turns.len(), 1, "steering belongs to the active turn");
+    let turn_id = &record.turns[0].id;
+    let entries: Vec<_> = record
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.kind,
+                crate::session_entry::EntryKind::User { .. }
+                    | crate::session_entry::EntryKind::Assistant { .. }
+            )
+        })
+        .collect();
+    assert_eq!(entries.len(), 4);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.turn_id.as_ref() == Some(turn_id))
+    );
+    assert_eq!(&record.checkpoints[0].turn_id, turn_id);
+    let resumed = AgentRuntime::from_session_record(
+        ScriptedClient::new(Vec::new()),
+        ToolRegistry::default(),
+        record,
+        store,
+        AgentConfig::default(),
+    );
+    assert_eq!(resumed.session_messages().await, messages);
 }
 
 /// Serves ordinary text turns, except that the `refuse_at_call`-th request is
@@ -5971,7 +6134,9 @@ async fn standing_consents_never_cover_an_irreversible_command() {
 /// something the operator has to authorize instead.
 #[test]
 fn the_unattended_denial_note_names_the_floor_it_hit() {
-    let request = |tool: &str, matched: Option<&str>| crate::tool::ApprovalRequest {
+    let request = |tool: &str, authority| crate::tool::ApprovalRequest {
+        approval_id: crate::ApprovalId::new(),
+        authority,
         network: false,
         call_id: "c1".to_string(),
         tool_name: tool.to_string(),
@@ -5980,17 +6145,15 @@ fn the_unattended_denial_note_names_the_floor_it_hit() {
         risk_level: crate::execution_policy::RiskLevel::High,
         requires_sandbox: true,
         read_only: false,
-        matched_rule: matched.map(str::to_string),
+        matched_rule: None,
         justification: None,
         resolved_target: None,
         preview: None,
         safety_notes: Vec::new(),
     };
 
-    let floor = crate::unattended_denial_note(&request(
-        "shell",
-        Some("needs-human:irreversible:git push --force"),
-    ));
+    let floor =
+        crate::unattended_denial_note(&request("shell", crate::ApprovalAuthority::HumanOnly));
     assert!(
         floor.contains("allow_irreversible"),
         "the floor's remedy is a config entry, and the note must say so: {floor}"
@@ -6003,9 +6166,16 @@ fn the_unattended_denial_note_names_the_floor_it_hit() {
     // A root grant keeps its own note, and an ordinary gated call keeps the
     // generic one — so the new arm is not swallowing either.
     assert!(
-        crate::unattended_denial_note(&request("request_write_root", None)).contains("--add-dir")
+        crate::unattended_denial_note(&request(
+            "request_write_root",
+            crate::ApprovalAuthority::HumanOnly
+        ))
+        .contains("--add-dir")
     );
-    let generic = crate::unattended_denial_note(&request("shell", Some("builtin:untrusted_shell")));
+    let generic = crate::unattended_denial_note(&request(
+        "shell",
+        crate::ApprovalAuthority::AutomaticAllowed,
+    ));
     assert!(generic.contains("auto_allow"), "{generic}");
 }
 
@@ -7107,4 +7277,201 @@ async fn a_cancel_as_the_summary_finishes_folds_nothing() {
     let outcome = runtime.compact_now(None, &cancel).await;
     assert_eq!(outcome, CompactNowOutcome::Cancelled);
     assert_eq!(runtime.session_messages().await, before);
+}
+
+// The fixture has already observed an approval event; fetch its identity without
+// duplicating extraction boilerplate in behavioral tests unrelated to replay.
+async fn submit_pending_approval(
+    runtime: &AgentRuntime,
+    decision: ApprovalDecision,
+) -> RuntimeEventReceiver {
+    submit_pending_approval_with_denial_note(runtime, decision, None).await
+}
+
+async fn submit_pending_approval_with_denial_note(
+    runtime: &AgentRuntime,
+    decision: ApprovalDecision,
+    note: Option<String>,
+) -> RuntimeEventReceiver {
+    let approval_id = runtime
+        .state
+        .lock()
+        .await
+        .pending
+        .as_ref()
+        .expect("pending approval")
+        .approval_id
+        .clone();
+    runtime
+        .submit_approval_with_denial_note(&approval_id, decision, note)
+        .await
+        .expect("current approval")
+}
+
+#[tokio::test]
+async fn turn_handle_keeps_one_stream_across_approvals_and_uses_the_real_limit_reason() {
+    for (cap, expected) in [(1, FinishReason::StepLimit), (2, FinishReason::Completed)] {
+        let client = ScriptedClient::new(vec![
+            vec![
+                AgentEvent::ToolCallDelta {
+                    delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+            ok_turn(),
+        ]);
+        let mut config = AgentConfig::builtin();
+        config.turn_steps = cap;
+        let runtime = AgentRuntime::with_config(client, ToolRegistry::with_mock_tools(), config);
+        let mut turn = runtime.start_turn("echo once").await;
+        let id = turn.id().clone();
+        let mut approvals = 0;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(event) = turn.recv().await {
+                if let Some(event_id) = event.turn_id() {
+                    assert_eq!(event_id, &id);
+                }
+                if let RuntimeEvent::ApprovalRequired { request, .. } = event {
+                    approvals += 1;
+                    turn.approve(&request.approval_id, ApprovalDecision::Approved, None)
+                        .await
+                        .unwrap();
+                }
+            }
+        })
+        .await
+        .expect("approval must resume on the original stream");
+        assert_eq!(approvals, 1);
+        assert_eq!(
+            turn.outcome().unwrap().reason,
+            expected,
+            "finishing exactly at the cap is success"
+        );
+    }
+}
+
+#[tokio::test]
+async fn turn_handle_receives_parked_cancellation_and_supersession() {
+    for supersede in [false, true] {
+        let client = ScriptedClient::new(vec![
+            vec![
+                AgentEvent::ToolCallDelta {
+                    delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+            ok_turn(),
+        ]);
+        let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools());
+        let mut turn = runtime.start_turn("park here").await;
+        while let Some(event) = turn.recv().await {
+            if matches!(event, RuntimeEvent::ApprovalRequired { .. }) {
+                break;
+            }
+        }
+        if supersede {
+            let mut next = runtime.start_turn("new turn").await;
+            while next.recv().await.is_some() {}
+            assert_eq!(next.outcome().unwrap().reason, FinishReason::Completed);
+        } else {
+            turn.cancel().await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while turn.recv().await.is_some() {}
+        })
+        .await
+        .unwrap();
+        assert_eq!(turn.outcome().unwrap().reason, FinishReason::Cancelled);
+    }
+}
+
+#[tokio::test]
+async fn turn_handle_provider_panic_has_a_terminal_outcome() {
+    struct PanickingClient;
+    #[async_trait::async_trait]
+    impl LlmClient for PanickingClient {
+        fn provider_name(&self) -> &'static str {
+            "panic-test"
+        }
+        fn model(&self) -> &str {
+            "panic-test"
+        }
+        async fn stream_chat(&self, _: ChatRequest) -> AgentResult<AgentEventStream> {
+            panic!("provider test panic")
+        }
+    }
+    let runtime = AgentRuntime::new(PanickingClient, ToolRegistry::default());
+    let mut turn = runtime.start_turn("hello").await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while turn.recv().await.is_some() {}
+    })
+    .await
+    .expect("panic must not strand the stable event stream");
+    assert_eq!(turn.outcome().unwrap().reason, FinishReason::Failed);
+    assert!(runtime.live_turn_id().await.is_none());
+}
+
+#[tokio::test]
+async fn stale_bootstrap_never_drives_or_cancels_its_successor() {
+    let runtime = AgentRuntime::new(
+        ScriptedClient::new(vec![ok_turn()]),
+        ToolRegistry::default(),
+    );
+    let previous = runtime.begin_turn("disconnected request").await;
+    let successor = runtime.begin_turn("new request").await;
+    let mut abandoned = runtime.drive_turn_handle(previous).await;
+    assert!(matches!(
+        abandoned.recv().await,
+        Some(RuntimeEvent::TurnCancelled { .. })
+    ));
+    drop(abandoned);
+    assert_eq!(runtime.live_turn_id().await, Some(successor.clone()));
+    let mut current = runtime.drive_turn_handle(successor).await;
+    while current.recv().await.is_some() {}
+    assert_eq!(current.outcome().unwrap().reason, FinishReason::Completed);
+}
+
+#[tokio::test]
+async fn aborting_start_during_persistence_cancels_the_bootstrap_before_model_work() {
+    let workspace = tempfile::tempdir().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let client = CapturingClient {
+        scripts: Mutex::new(vec![ok_turn()]),
+        requests: requests.clone(),
+    };
+    let runtime = AgentRuntime::with_new_session(
+        client,
+        ToolRegistry::default(),
+        "system",
+        workspace.path(),
+        &AgentConfig::builtin(),
+    )
+    .unwrap();
+    let record = runtime.persistence.as_ref().unwrap().record.clone();
+    let blocked = record.lock().await;
+    let startup = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.start_turn("disconnected during save").await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while runtime.live_turn_id().await.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    startup.abort();
+    assert!(matches!(startup.await, Err(error) if error.is_cancelled()));
+    drop(blocked);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while runtime.live_turn_id().await.is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached bootstrap must settle its cancelled turn");
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "disconnected bootstrap must not reach the model"
+    );
 }

@@ -345,6 +345,28 @@ async fn shell_timeout_kills_grandchildren_too() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_natural_exit_also_stops_descendant_writers() {
+    let workspace = tempdir().unwrap();
+    let result = approved(workspace.path(), "shell", json!({
+        "command": "sh -c '(touch ready; while [ ! -f release ]; do sleep 0.01; done; echo late > late) & while [ ! -f ready ]; do sleep 0.01; done'"
+    })).await;
+    assert_eq!(
+        result.status,
+        ToolResultStatus::Success,
+        "{}",
+        result.content
+    );
+    assert!(workspace.path().join("ready").exists());
+    std::fs::write(workspace.path().join("release"), "finished").unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !workspace.path().join("late").exists(),
+        "a finished shell step left a writer running"
+    );
+}
+
 #[tokio::test]
 async fn shell_streams_chunks_via_on_update() {
     let tmp = tempdir().unwrap();
@@ -874,7 +896,7 @@ async fn unattended_commands_run_without_a_shell() {
     // as `exit 3` and gets the same verdict — still no shell, still no such
     // program.
     let call = ToolCall::new("call_3", "shell", json!({"command": "\"exit\" 3"}));
-    assert!(!registry.evaluate_tool(&call).requires_approval);
+    assert!(!registry.evaluate_tool(&call).requires_approval());
     let error = registry
         .run_tool_call(call, None)
         .await
@@ -888,7 +910,7 @@ async fn unattended_commands_run_without_a_shell() {
     // is something only a shell does, and it is also why this line cannot be
     // trusted (the gate refuses what it cannot parse), so the approval is real.
     let call = ToolCall::new("call_4", "shell", json!({"command": "exit $((1+2))"}));
-    assert!(registry.evaluate_tool(&call).requires_approval);
+    assert!(registry.evaluate_tool(&call).requires_approval());
     let plan = registry.evaluate_tool(&call);
     let ToolRunOutcome::Result { result } = registry
         .run_tool_call_with_plan(
@@ -965,7 +987,7 @@ async fn parse_authority_never_falls_back_to_the_shell() {
     let registry = registry(tmp.path());
     let piped = ToolCall::new("call_1", "shell", json!({"command": "printf a | cat"}));
     let plan = registry.evaluate_tool(&piped);
-    assert!(plan.requires_approval, "a pipe is never trusted");
+    assert!(plan.requires_approval(), "a pipe is never trusted");
 
     let refused = registry
         .run_tool_call_with_plan(
@@ -1065,7 +1087,7 @@ async fn default_trusted_commands_deliver_the_parsed_argv_verbatim() {
         let command = format!("printf '%s\\n' {spelling}");
         let plan =
             registry.evaluate_tool(&ToolCall::new("c", "shell", json!({"command": command})));
-        assert!(!plan.requires_approval, "{command:?} must be trusted");
+        assert!(!plan.requires_approval(), "{command:?} must be trusted");
         let expected: Vec<String> = crate::execution_policy::parse_unattended(&command)
             .expect("trusted commands parse")
             .into_iter()
@@ -1192,7 +1214,7 @@ async fn echo_is_not_auto_trusted_on_windows_and_still_runs_once_approved() {
 
     let plan = registry.evaluate_tool(&call);
     assert!(
-        plan.requires_approval,
+        plan.requires_approval(),
         "`echo` names no program on Windows, so it must not be auto-trusted"
     );
 

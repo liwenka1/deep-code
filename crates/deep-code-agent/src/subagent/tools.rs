@@ -298,9 +298,10 @@ impl Tool for AgentTool {
         let run = std::panic::AssertUnwindSafe({
             let steps_seen = Arc::clone(&steps_seen);
             async move {
-                runtime.begin_turn(task).await;
+                let turn_id = runtime.begin_turn(task).await;
                 run_subagent(
                     runtime,
+                    turn_id,
                     DEFAULT_MAX_STEPS,
                     role,
                     network,

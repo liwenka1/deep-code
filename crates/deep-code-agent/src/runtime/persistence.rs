@@ -23,6 +23,21 @@ fn build_persistence(store: JsonSessionStore, record: SessionRecord) -> Arc<Pers
     Arc::new(Persistence { record, actor })
 }
 
+/// In-process session state for a configuration change. Only a live runtime
+/// can create this value; disk records must use the authenticated resume path.
+pub struct LiveSessionSnapshot {
+    pub(crate) record: SessionRecord,
+    pub(crate) persisted: bool,
+    pub(crate) state: LiveSessionState,
+}
+
+pub(crate) struct LiveSessionState {
+    session_approved: std::collections::HashSet<String>,
+    session_trusted_shell_prefixes: std::collections::HashSet<(String, bool)>,
+    cascade_escalated: bool,
+    last_prefix: Option<(usize, u64)>,
+}
+
 impl AgentRuntime {
     /// Create a runtime backed by a new on-disk session in the workspace.
     ///
@@ -75,6 +90,16 @@ impl AgentRuntime {
         store: JsonSessionStore,
         config: AgentConfig,
     ) -> Self {
+        Self::from_record(client, tools, record, Some(store), config)
+    }
+
+    pub(crate) fn from_record<C: LlmClient + 'static>(
+        client: C,
+        tools: ToolRegistry,
+        record: SessionRecord,
+        store: Option<JsonSessionStore>,
+        config: AgentConfig,
+    ) -> Self {
         let workspace = record.workspace.clone();
         let session = Session::from_entries(record.entries.clone());
         let ui_lang = crate::i18n::SharedLang::new(crate::i18n::Lang::from_env(&config.language));
@@ -99,7 +124,8 @@ impl AgentRuntime {
             boundary: None,
             compact_instructions: None,
             lsp: None,
-            persistence: Some(build_persistence(store, record)),
+            jobs: None,
+            persistence: store.map(|store| build_persistence(store, record)),
             permission_mode: crate::execution_policy::SharedPermissionMode::default(),
             ui_lang,
         }
@@ -110,6 +136,53 @@ impl AgentRuntime {
         Some(persistence.record.lock().await.id.clone())
     }
 
+    /// Capture the actual idle conversation without depending on a successful
+    /// save, a readable session file, or an available signing key.
+    pub async fn live_snapshot(&self) -> std::io::Result<LiveSessionSnapshot> {
+        let state = self.state.lock().await;
+        if state.current_turn_id.is_some() || state.pending.is_some() {
+            return Err(std::io::Error::other("cannot reconfigure an active turn"));
+        }
+        let workspace = self.workspace.clone().ok_or_else(|| {
+            std::io::Error::other("cannot reconfigure a runtime without a workspace")
+        })?;
+        let mut record = if let Some(persistence) = &self.persistence {
+            persistence.record.lock().await.clone()
+        } else {
+            SessionRecord::new(workspace, "")
+        };
+        record.entries = state.session.entries().to_vec();
+        record.session_cost = state.session_cost;
+        record.session_cache_hit_tokens = state.session_cache_hit_tokens;
+        record.session_cache_miss_tokens = state.session_cache_miss_tokens;
+        record.session_cache_savings = state.session_cache_savings;
+        record.record_mac = None;
+        Ok(LiveSessionSnapshot {
+            record,
+            persisted: self.persistence.is_some(),
+            state: LiveSessionState {
+                session_approved: state.session_approved.clone(),
+                session_trusted_shell_prefixes: state.session_trusted_shell_prefixes.clone(),
+                cascade_escalated: state.cascade_escalated,
+                last_prefix: state.last_prefix,
+            },
+        })
+    }
+
+    pub(crate) fn with_live_state(self, live: Option<LiveSessionState>) -> Self {
+        if let Some(live) = live {
+            let mut state = self
+                .state
+                .try_lock()
+                .expect("new runtime has no active tasks");
+            state.session_approved = live.session_approved;
+            state.session_trusted_shell_prefixes = live.session_trusted_shell_prefixes;
+            state.cascade_escalated = live.cascade_escalated;
+            state.last_prefix = live.last_prefix;
+        }
+        self
+    }
+
     /// Failure of the latest completed save, cleared by a successful retry.
     /// Call after [`Self::shutdown`] to check the final durable snapshot.
     #[must_use]
@@ -117,6 +190,15 @@ impl AgentRuntime {
         self.persistence
             .as_ref()
             .and_then(|persistence| persistence.actor.last_save_error())
+    }
+
+    /// Persist the current session and wait for the writer's final outcome.
+    pub async fn flush_session(&self) -> Option<String> {
+        self.persist().await;
+        if let Some(persistence) = &self.persistence {
+            persistence.actor.flush().await;
+        }
+        self.last_save_error()
     }
 
     pub(super) async fn persist(&self) {
@@ -170,6 +252,7 @@ impl AgentRuntime {
         if let Some(turn) = state.current_turn.take() {
             state.current_prompt = None;
             state.current_turn_id = None;
+            state.turn_events = None;
             drop(state);
             if let Some(persistence) = self.persistence.as_ref() {
                 let mut record = persistence.record.lock().await;
@@ -191,5 +274,52 @@ impl AgentRuntime {
         if let Some(turn_id) = open {
             self.finish_turn(&turn_id).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn live_reconfiguration_preserves_memory_only_session_state() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonicalize(workspace.path()).unwrap();
+        let config = AgentConfig::builtin();
+        let runtime = AgentRuntime::from_record(
+            crate::echo_client::EchoClient::new(crate::i18n::SharedLang::default()),
+            ToolRegistry::default(),
+            SessionRecord::new(workspace.clone(), "system"),
+            None,
+            config.clone(),
+        );
+        {
+            let mut state = runtime.state.lock().await;
+            state.session_approved.insert("write_file".to_string());
+            state
+                .session_trusted_shell_prefixes
+                .insert(("cargo test".to_string(), false));
+            state.cascade_escalated = true;
+            state.last_prefix = Some((4, 123));
+            state.session_cost.usd = 0.25;
+            state.session_cache_hit_tokens = 100;
+        }
+        let replacement = crate::runtime_launch::prepare_runtime_reconfiguration(
+            &config,
+            workspace.into(),
+            runtime.live_snapshot().await.unwrap(),
+        )
+        .unwrap();
+        let state = replacement.handle.state.lock().await;
+        assert!(state.session_approved.contains("write_file"));
+        assert!(
+            state
+                .session_trusted_shell_prefixes
+                .contains(&("cargo test".to_string(), false))
+        );
+        assert!(state.cascade_escalated);
+        assert_eq!(state.last_prefix, Some((4, 123)));
+        assert_eq!(state.session_cost.usd, 0.25);
+        assert_eq!(state.session_cache_hit_tokens, 100);
     }
 }

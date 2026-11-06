@@ -15,6 +15,7 @@
 //! ```
 
 pub mod bench;
+mod checkout;
 pub mod report;
 pub mod runner;
 

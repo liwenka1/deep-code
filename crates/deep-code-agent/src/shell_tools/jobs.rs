@@ -79,9 +79,43 @@ pub struct JobStore {
     /// same map lock: a child that finishes spawning after the kill sweep is
     /// killed on the way in instead of outliving the store.
     closed: Arc<AtomicBool>,
+    /// Serializes process creation with destructive workspace restoration.
+    workspace_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl JobStore {
+    pub(super) async fn begin_spawn(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, ToolError> {
+        let guard = self.workspace_gate.clone().lock_owned().await;
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(ToolError::exec_failed("job", "runtime has shut down"));
+        }
+        Ok(guard)
+    }
+
+    /// Hold this guard through the entire restore. A spawn that has not yet
+    /// registered its child must finish registration before the idle check.
+    pub(crate) async fn idle_workspace(
+        &self,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ToolError> {
+        let guard = self.workspace_gate.clone().lock_owned().await;
+        let jobs = self.jobs.lock().expect("job store lock poisoned");
+        for job in jobs.values() {
+            let mut job = job.lock().expect("job lock poisoned");
+            refresh_job(&mut job);
+            let child_alive = job
+                .child
+                .as_mut()
+                .is_some_and(|child| !matches!(child.try_wait(), Ok(Some(_))));
+            if job.status == JobStatus::Running || child_alive {
+                return Err(ToolError::exec_failed(
+                    "checkpoint",
+                    "a job is still running — cancel it before restoring the workspace",
+                ));
+            }
+        }
+        Ok(guard)
+    }
+
     /// Kill every still-running background child. Called on runtime shutdown so
     /// a cancelled or quit session doesn't orphan long-running processes (dev
     /// servers, watchers) that keep holding ports. `kill_on_drop` is the
@@ -590,13 +624,19 @@ impl Spill {
 /// tree there relies on dropping the job's Windows Job Object guard (see the
 /// `job_guard = None` at each kill site), which does contain a detached child.
 pub(super) fn kill_process_tree(child: &mut Child) {
+    kill_process_group(child.id());
+    let _ = child.start_kill();
+}
+
+/// Retain the leader PID before `try_wait`/`wait` reaps it: Tokio clears the
+/// child's id on exit, while its process group can still contain descendants.
+pub(super) fn kill_process_group(pid: Option<u32>) {
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        // Negative pid targets the process group; the child may already have
-        // exited, in which case the signal harmlessly fails.
+    if let Some(pid) = pid {
         unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
     }
-    let _ = child.start_kill();
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 pub(super) type ChunkFn = Arc<dyn Fn(&[u8]) + Send + Sync>;
@@ -678,7 +718,13 @@ pub(super) fn refresh_job(job: &mut JobState) {
     let Some(child) = job.child.as_mut() else {
         return;
     };
+    let pid = child.id();
     if let Ok(Some(status)) = child.try_wait() {
+        // A background command owns its group only while its leader runs.
+        // Otherwise `sh -c 'writer & exit'` would leave a writer behind after
+        // this job reports completion and the workspace restore gate opens.
+        kill_process_group(pid);
+        job.job_guard = None;
         job.exit_code = status.code();
         job.status = if status.success() {
             JobStatus::Completed

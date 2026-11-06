@@ -72,7 +72,7 @@ fn read_tools_are_allowed_without_approval() {
     let policy = ExecPolicy::default();
     let plan = policy.evaluate_tool("read_file", &json!({"path": "a.rs"}));
     assert_eq!(plan.verdict, PolicyVerdict::Allow);
-    assert!(!plan.requires_approval);
+    assert!(!plan.requires_approval());
     assert!(plan.read_only);
 }
 
@@ -81,7 +81,7 @@ fn write_tools_need_approval() {
     let policy = ExecPolicy::default();
     let plan = policy.evaluate_tool("write_file", &json!({"path": "a.rs", "content": "x"}));
     assert!(matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }));
-    assert!(plan.requires_approval);
+    assert!(plan.requires_approval());
 }
 
 /// A root grant is a boundary change: pinned to the top risk tier and a
@@ -99,7 +99,7 @@ fn root_grant_is_high_risk_and_always_prompts() {
         &json!({"path": "/tmp/x", "justification": "build output lives there"}),
     );
     assert!(matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }));
-    assert!(plan.requires_approval);
+    assert!(plan.requires_approval());
     assert_eq!(plan.risk_level, RiskLevel::High);
     // And AcceptEdits' bounded fs-edit allowance never covers it.
     assert!(!accept_edits_approvable(
@@ -135,7 +135,7 @@ fn spawning_a_writing_subagent_needs_approval_like_a_write() {
         "agent",
         &json!({"task": "fix the bug", "role": "implementer"}),
     );
-    assert!(writing.requires_approval, "implementer spawn must prompt");
+    assert!(writing.requires_approval(), "implementer spawn must prompt");
     assert!(!writing.read_only);
     assert!(matches!(
         writing.verdict,
@@ -145,7 +145,7 @@ fn spawning_a_writing_subagent_needs_approval_like_a_write() {
     for readonly_role in ["explore", "review", "verifier", "plan", "general"] {
         let plan = policy.evaluate_tool("agent", &json!({"task": "scan", "role": readonly_role}));
         assert!(
-            !plan.requires_approval,
+            !plan.requires_approval(),
             "read-only role {readonly_role} must not prompt"
         );
         assert_eq!(plan.verdict, PolicyVerdict::Allow);
@@ -153,9 +153,9 @@ fn spawning_a_writing_subagent_needs_approval_like_a_write() {
     // Absent role defaults to `general` (read-only); an unknown role fails
     // closed to a prompt (the tool itself will reject it anyway).
     let bare = policy.evaluate_tool("agent", &json!({"task": "scan"}));
-    assert!(!bare.requires_approval);
+    assert!(!bare.requires_approval());
     let unknown = policy.evaluate_tool("agent", &json!({"task": "x", "role": "root"}));
-    assert!(unknown.requires_approval);
+    assert!(unknown.requires_approval());
 
     // AcceptEdits (and Auto above it) waves the writing spawn through, the
     // same standing consent it grants a plain workspace write.
@@ -232,7 +232,7 @@ fn spawning_a_networked_subagent_needs_approval_even_readonly() {
         &json!({"task": "research the crate docs", "role": "explore", "network": true}),
     );
     assert!(
-        networked.requires_approval,
+        networked.requires_approval(),
         "networked spawn must prompt even for a read-only role"
     );
     assert!(networked.read_only, "explore + network stays read-only");
@@ -241,7 +241,7 @@ fn spawning_a_networked_subagent_needs_approval_even_readonly() {
         Some("builtin:subagent_network_dispatch")
     );
     // The prompt says what is actually being consented to.
-    let PolicyVerdict::NeedsApproval { reason } = &networked.verdict else {
+    let PolicyVerdict::NeedsApproval { reason, .. } = &networked.verdict else {
         panic!("networked spawn must need approval: {networked:?}");
     };
     assert!(
@@ -263,7 +263,7 @@ fn spawning_a_networked_subagent_needs_approval_even_readonly() {
         "agent",
         &json!({"task": "add dep", "role": "implementer", "network": true}),
     );
-    let PolicyVerdict::NeedsApproval { reason } = &both.verdict else {
+    let PolicyVerdict::NeedsApproval { reason, .. } = &both.verdict else {
         panic!("writing networked spawn must need approval: {both:?}");
     };
     assert!(
@@ -306,7 +306,7 @@ fn networked_subagent_dispatch_follows_the_network_mode() {
         &json!({"task": "add dep", "role": "implementer", "network": true}),
     );
     assert!(
-        writing.requires_approval,
+        writing.requires_approval(),
         "the write consent is untouched by network=always"
     );
 }
@@ -331,7 +331,7 @@ fn trusted_shell_command_can_run_without_approval() {
     let policy = ExecPolicy::default();
     let plan = evaluate_shell_command(&policy, "cargo test -p deep-code-agent", false);
     assert_eq!(plan.verdict, PolicyVerdict::Allow);
-    assert!(!plan.requires_approval);
+    assert!(!plan.requires_approval());
 }
 
 #[test]
@@ -715,7 +715,7 @@ fn network_declaration_forces_approval_even_when_trusted() {
         networked.verdict,
         PolicyVerdict::NeedsApproval { .. }
     ));
-    assert!(networked.requires_approval);
+    assert!(networked.requires_approval());
     assert_eq!(networked.risk_level, RiskLevel::Medium);
     assert_eq!(networked.matched_rule.as_deref(), Some("gate:network"));
     assert!(networked.network, "an approved run then gets the grant");
@@ -768,7 +768,7 @@ fn network_never_mode_denies_the_web_tools_too() {
             "{tool} must be refused under never, got {:?}",
             plan.verdict
         );
-        assert!(!plan.requires_approval);
+        assert!(!plan.requires_approval());
         assert_eq!(plan.matched_rule.as_deref(), Some("deny:network_disabled"));
         // Under prompt and always the web tools ask, as they always did.
         for mode in [NetworkMode::Prompt, NetworkMode::Always] {
@@ -938,9 +938,9 @@ fn accept_edits_covers_job_start_only() {
 #[test]
 fn job_cancel_needs_approval_for_its_stated_reason() {
     let plan = ExecPolicy::default().evaluate_tool("job", &json!({"action": "cancel", "id": 1}));
-    assert!(plan.requires_approval);
+    assert!(plan.requires_approval());
     match &plan.verdict {
-        PolicyVerdict::NeedsApproval { reason } => {
+        PolicyVerdict::NeedsApproval { reason, .. } => {
             assert!(
                 reason.contains("kills its process"),
                 "cancel must state the kill consequence, got: {reason}"
@@ -1065,7 +1065,7 @@ fn never_refuses_every_egress_path() {
         );
         assert_eq!(plan.matched_rule.as_deref(), Some("deny:network_disabled"));
         assert!(
-            !plan.requires_approval,
+            !plan.requires_approval(),
             "{tool} must not ask, it must refuse"
         );
         covered.push(ExecPolicy::classify_tool(tool));
@@ -1102,7 +1102,7 @@ fn never_refuses_every_egress_path() {
 }
 
 /// Whether the irreversible-outward floor gated this call — `NeedsApproval` AND
-/// the `needs-human` rule that no automatic path may approve.
+/// the `HumanOnly` authority that no automatic path may approve.
 ///
 /// Both halves matter now that the floor asks instead of refusing: the ordinary
 /// gate also yields `NeedsApproval`, so that alone cannot tell "only a human may
@@ -1112,8 +1112,7 @@ fn never_refuses_every_egress_path() {
 /// pass vacuously.
 fn floor_gated(policy: &ExecPolicy, command: &str) -> bool {
     let plan = evaluate_shell_command(policy, command, false);
-    matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. })
-        && crate::execution_policy::is_needs_human_rule(plan.matched_rule.as_deref())
+    matches!(plan.verdict, PolicyVerdict::NeedsApproval { .. }) && plan.requires_human()
 }
 
 /// The irreversible-outward floor. Each of these is one command that reaches the
@@ -1186,8 +1185,7 @@ fn a_declared_exemption_lifts_exactly_what_it_names() {
     let policy = ExecPolicy::default().with_allow_irreversible(vec!["npm publish".to_string()]);
     let lifted = evaluate_shell_command(&policy, "npm publish --tag next", false);
     assert!(
-        matches!(lifted.verdict, PolicyVerdict::NeedsApproval { .. })
-            && !crate::execution_policy::is_needs_human_rule(lifted.matched_rule.as_deref()),
+        matches!(lifted.verdict, PolicyVerdict::NeedsApproval { .. }) && !lifted.requires_human(),
         "a declared command rejoins the ordinary gate, not the floor: {lifted:?}"
     );
     assert!(
@@ -1870,10 +1868,7 @@ fn package_manager_workspace_flags_keep_their_own_arities() {
     ] {
         for network in [false, true] {
             let plan = evaluate_shell_command(&policy, command, network);
-            assert!(
-                is_needs_human_rule(plan.matched_rule.as_deref()),
-                "{command}: {plan:?}"
-            );
+            assert!(plan.requires_human(), "{command}: {plan:?}");
         }
         assert!(!floor_gated(&policy, &format!("{command} --dry-run")));
     }
@@ -1977,7 +1972,7 @@ fn a_push_or_a_suite_is_gated_by_approval_and_keeps_its_egress() {
 fn an_approved_floor_command_is_still_sandboxed_and_keeps_its_egress() {
     let declared = evaluate_shell_command(&ExecPolicy::default(), "git push --force", true);
     assert!(
-        crate::execution_policy::is_needs_human_rule(declared.matched_rule.as_deref()),
+        declared.requires_human(),
         "precondition: the floor is what gated it"
     );
     assert!(
@@ -2028,7 +2023,7 @@ fn a_dispatch_that_declares_allow_commands_asks_a_human() {
         declared.matched_rule.as_deref(),
         Some("builtin:subagent_allow_commands")
     );
-    let PolicyVerdict::NeedsApproval { reason } = &declared.verdict else {
+    let PolicyVerdict::NeedsApproval { reason, .. } = &declared.verdict else {
         unreachable!("asserted above")
     };
     // Pinned in FULL for this shape, not by `contains`: a dispatch with only
@@ -2056,7 +2051,7 @@ fn a_dispatch_that_declares_allow_commands_asks_a_human() {
             "network": true,
         }),
     );
-    let PolicyVerdict::NeedsApproval { reason } = &combined.verdict else {
+    let PolicyVerdict::NeedsApproval { reason, .. } = &combined.verdict else {
         panic!("expected a prompt: {combined:?}")
     };
     assert!(
@@ -2076,7 +2071,7 @@ fn a_dispatch_that_declares_allow_commands_asks_a_human() {
         "agent",
         &json!({"role": "explore", "task": "x", "allow_commands": many.clone()}),
     );
-    let PolicyVerdict::NeedsApproval { reason } = &long.verdict else {
+    let PolicyVerdict::NeedsApproval { reason, .. } = &long.verdict else {
         panic!("expected a prompt: {long:?}")
     };
     for command in &many {

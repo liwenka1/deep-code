@@ -4,7 +4,7 @@
 //! the field table for it does not live in this crate — it lives in two
 //! READMEs (`README.md`, and the npm page's copy in `packages/deepcode`). That
 //! is deliberate: a generator subcommand would be a new surface to maintain,
-//! test and keep stable, while the table a wrapper author actually reads is
+//! test and document, while the table a wrapper author actually reads is
 //! Markdown on the package page and the repository front door.
 //!
 //! The cost of prose is that nothing forces it to stay true, which is exactly

@@ -580,6 +580,52 @@ async fn insert_after_shutdown_kills_the_late_child() {
     open.shutdown();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn completed_background_leader_cannot_leave_a_writer_after_restore_opens() {
+    let workspace = tempfile::tempdir().unwrap();
+    let child = tokio::process::Command::new("sh")
+        .args(["-c", "(touch ready; while [ ! -f release ]; do sleep 0.01; done; echo late > late) & while [ ! -f ready ]; do sleep 0.01; done"])
+        .current_dir(workspace.path())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn().unwrap();
+    let jobs = JobStore::default();
+    let id = jobs.reserve_id();
+    jobs.insert_with_id(
+        &id,
+        JobState {
+            kind: JobKind::Background,
+            status: JobStatus::Running,
+            exit_code: None,
+            child: Some(child),
+            ..plain_job(SharedBuffer::default())
+        },
+    );
+    let restore = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(guard) = jobs.idle_workspace().await {
+                break guard;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(workspace.path().join("ready").exists());
+    assert_eq!(
+        jobs.get(&id, "job").unwrap().lock().unwrap().status,
+        JobStatus::Completed
+    );
+    std::fs::write(workspace.path().join("release"), "restore started").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !workspace.path().join("late").exists(),
+        "a completed job's descendant wrote during restore"
+    );
+    drop(restore);
+}
+
 #[test]
 fn truncation_note_names_the_spill_file() {
     let tmp = tempfile::tempdir().unwrap();
@@ -837,4 +883,82 @@ fn credential_denial_is_noted_with_or_without_a_sandbox() {
             && !text.contains(crate::sandbox::WRITE_DENIAL_NOTE),
         "an unsandboxed permission error is neither note: {text}"
     );
+}
+
+#[tokio::test]
+async fn restore_guard_excludes_new_spawns_and_running_jobs() {
+    let jobs = JobStore::default();
+    let restore = jobs.idle_workspace().await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), jobs.begin_spawn())
+            .await
+            .is_err()
+    );
+    drop(restore);
+    let spawning = jobs.begin_spawn().await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), jobs.idle_workspace())
+            .await
+            .is_err()
+    );
+    let id = jobs.reserve_id();
+    jobs.insert_with_id(
+        &id,
+        JobState {
+            status: JobStatus::Running,
+            ..plain_job(SharedBuffer::default())
+        },
+    );
+    drop(spawning);
+    assert!(jobs.idle_workspace().await.is_err());
+    jobs.get(&id, "job").unwrap().lock().unwrap().status = JobStatus::Completed;
+    assert!(jobs.idle_workspace().await.is_ok());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn checkpoint_restore_refuses_an_idle_turn_with_a_background_writer() {
+    let workspace = tempfile::tempdir().unwrap();
+    let file = workspace.path().join("file.txt");
+    std::fs::write(&file, "before").unwrap();
+    let store = crate::checkpoint::CheckpointStore::new(workspace.path()).unwrap();
+    let (id, _) = store.snapshot_created("before").unwrap();
+    std::fs::write(&file, "current").unwrap();
+    let jobs = JobStore::default();
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let job_id = jobs.reserve_id();
+    jobs.insert_with_id(
+        &job_id,
+        JobState {
+            kind: JobKind::Background,
+            status: JobStatus::Running,
+            child: Some(child),
+            ..plain_job(SharedBuffer::default())
+        },
+    );
+    let runtime = crate::AgentRuntime::new(
+        crate::echo_client::EchoClient::new(crate::i18n::SharedLang::default()),
+        crate::ToolRegistry::default(),
+    )
+    .with_job_store(jobs.clone())
+    .with_checkpoints(workspace.path(), &mut Vec::new());
+    assert!(
+        runtime
+            .restore_checkpoint(id.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("job is still running")
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "current");
+    cancel_job(&jobs.get(&job_id, "job").unwrap(), "job")
+        .await
+        .unwrap();
+    runtime.restore_checkpoint(id).await.unwrap();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "before");
 }

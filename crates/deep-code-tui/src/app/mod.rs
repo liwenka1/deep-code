@@ -55,6 +55,7 @@ pub struct LaunchConfig {
 pub(crate) enum UiUpdate {
     Event(Box<RuntimeEvent>),
     StreamFinished,
+    ApprovalRejected(String),
     /// `/compact` finished, one way or another. Boxed for the same reason
     /// the event is.
     Compacted(Box<deep_code_agent::CompactNowOutcome>),
@@ -62,7 +63,7 @@ pub(crate) enum UiUpdate {
 
 enum StreamRequest {
     User(UserTurn),
-    Approval(ApprovalDecision),
+    Approval(deep_code_agent::ApprovalId, ApprovalDecision),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +190,7 @@ pub struct App {
     /// holding ports). `None` only before the first runtime is adopted.
     job_store: Option<JobStore>,
     ui_rx: Option<UiUpdateReceiver>,
+    ui_tx: Option<mpsc::WeakUnboundedSender<UiUpdate>>,
     pub(crate) cost_currency: CostCurrency,
     pub(crate) configured_model: String,
     pub(crate) configured_reasoning: String,
@@ -808,6 +810,7 @@ impl App {
             subagent_shutdown,
             job_store,
             ui_rx: None,
+            ui_tx: None,
             cost_currency,
             configured_model,
             configured_reasoning,

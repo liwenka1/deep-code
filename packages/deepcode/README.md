@@ -36,8 +36,6 @@ stdout into exactly one object to branch on:
 | `cost` | object (optional) | `{ usd, cny }` |
 | `usage` | object (optional) | token counts |
 
-- **Fields are added, never renamed or repurposed**; nothing documented here changes meaning
-  without a bump of this contract's version, which is `1`.
 - **Decide by `status`, not the exit code**: a cancelled turn exits `1`, not `124`.
 - **Never use `-c` in a wrapper** — it means "the latest session in this workspace" and races.
   Start with `--new` (the default), keep `session_id`, continue with `--resume <id>`.

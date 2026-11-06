@@ -522,6 +522,7 @@ version = "0.4.20"
 dependencies = [
  "anyhow",
  "deep-code-agent",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

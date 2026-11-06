@@ -3,6 +3,17 @@ use super::*;
 #[cfg(test)]
 mod tests;
 
+fn run_runtime_future<F: std::future::Future>(future: F) -> Result<F::Output, String> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())
+            .map(|runtime| runtime.block_on(future)),
+    }
+}
+
 pub(super) enum SessionScanPurpose {
     Picker,
     List,
@@ -126,19 +137,18 @@ impl App {
     /// Every runtime swap calls this first so the old session's persistence
     /// lands on disk before anything re-reads it.
     fn shutdown_current_runtime(&mut self) {
+        let _ = run_runtime_future(self.stop_current_runtime());
+    }
+
+    async fn stop_current_runtime(&mut self) {
         self.session_scan = None;
         if let Some(stop) = self.subagent_shutdown.take() {
             stop();
         }
         // Kill the outgoing session's background jobs and their process tree
         // before the swap, so a dev server from the old session doesn't linger.
-        if let Some(job_store) = self.job_store.take() {
-            job_store.shutdown();
-        }
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let runtime = Arc::clone(&self.runtime);
-            tokio::task::block_in_place(|| handle.block_on(runtime.shutdown()));
-        }
+        self.job_store = None;
+        self.runtime.shutdown().await;
     }
 
     /// Launch a fresh runtime from the current layered config (optionally
@@ -160,10 +170,18 @@ impl App {
             resume,
         )
         .map_err(|error| error.to_string())?;
+        Ok(self.adopt_configured_runtime(launched, &agent_config))
+    }
+
+    fn adopt_configured_runtime(
+        &mut self,
+        launched: LaunchedRuntime,
+        agent_config: &AgentConfig,
+    ) -> Option<SessionRecord> {
         self.cost_currency = agent_config.cost_currency;
         self.configured_model = agent_config.model.clone();
         self.configured_reasoning = agent_config.reasoning_effort.as_setting().to_string();
-        self.web_backend = deep_code_agent::WebBackend::from_config(&agent_config).id();
+        self.web_backend = deep_code_agent::WebBackend::from_config(agent_config).id();
         // `[ui] notifications` is read here for the same reason as the three
         // above: it is a config value, and a swap that forgot it left the old
         // answer in place until the process restarted. (`lang` is the
@@ -178,7 +196,7 @@ impl App {
         // that could not be saved, an environment override.
         let effective_resume = self.adopt_runtime(launched);
         self.runtime.set_ui_lang(self.lang);
-        Ok(effective_resume)
+        effective_resume
     }
 
     /// Append the effective-grants line to the transcript. Called wherever the
@@ -225,14 +243,6 @@ impl App {
             self.status = self.tr(TextId::AddDirUsage).to_string();
             return;
         }
-        // Applying a grant means relaunching into the current record; a
-        // session that never persisted has no record to resume, and the
-        // relaunch would silently drop the whole conversation. Refuse and
-        // name the working alternative instead.
-        if self.session_id.is_none() {
-            self.status = self.tr(TextId::AddDirNeedsPersistence).to_string();
-            return;
-        }
         let candidate = std::path::Path::new(trimmed);
         let absolute = if candidate.is_absolute() {
             candidate.to_path_buf()
@@ -270,17 +280,14 @@ impl App {
                     &[("dir", &canonical.display().to_string())],
                 );
             }
-            // The fallback runtime (fresh session) was still adopted with the
-            // grant, so the boundary is what the user asked for; surface why
-            // the conversation view may have reset instead of claiming success.
-            Err(message) => self.status = message,
+            Err(message) => {
+                self.extra_roots.retain(|root| *root != canonical);
+                self.status = message;
+            }
         }
     }
 
-    /// Rebuild the runtime with the (re-loaded) layered config, resuming the
-    /// current persisted session so the conversation continues seamlessly.
-    /// The old runtime is shut down first so its persistence flush lands
-    /// before the session record is re-read.
+    /// Prepare the replacement from live memory before retiring the old runtime.
     pub(crate) fn relaunch_runtime(&mut self) -> Result<(), String> {
         if self.runtime_busy() {
             return Err(self.busy_status(TextId::BusyRelaunchConfig));
@@ -288,24 +295,30 @@ impl App {
 
         deep_code_agent::validate_pinned_workspace(&self.workspace)
             .map_err(|error| error.to_string())?;
-        // Flush the old runtime first so re-reading the current session below
-        // sees its latest writes.
-        self.shutdown_current_runtime();
-
-        let resume = self.session_id.as_ref().and_then(|id| {
-            let store = JsonSessionStore::for_pinned_workspace(&self.workspace).ok()?;
-            let session_id = deep_code_agent::SessionId::parse(id).ok()?;
-            store.load(&session_id).ok()
-        });
-        if resume.is_none() && self.session_id.is_some() {
-            // The old runtime is already down; relaunch a fresh session so the
-            // app stays usable instead of pointing at a dead runtime.
-            self.launch_and_adopt(None)?;
-            self.flush_launch_warnings();
-            return Err(self.tr(TextId::SessionReloadFailedRestart).to_string());
-        }
-
-        self.launch_and_adopt(resume)?;
+        let agent_config = self.load_layered_config();
+        run_runtime_future(async {
+            let snapshot = self
+                .runtime
+                .live_snapshot()
+                .await
+                .map_err(|error| error.to_string())?;
+            let launched = deep_code_agent::prepare_runtime_reconfiguration(
+                &agent_config,
+                deep_code_agent::WorkspaceRoots::new(
+                    self.workspace.clone(),
+                    self.extra_roots.clone(),
+                ),
+                snapshot,
+            )
+            .map_err(|error| error.to_string())?;
+            self.stop_current_runtime().await;
+            self.adopt_configured_runtime(launched, &agent_config);
+            if let Some(error) = self.runtime.flush_session().await {
+                self.pending_launch_warnings
+                    .push(format!("failed to persist reconfigured session: {error}"));
+            }
+            Ok::<(), String>(())
+        })??;
         // No rebuild on this path (`/model`, `/apikey`, `/add-dir` keep the
         // transcript), so the warnings belong at the end of it, immediately.
         self.flush_launch_warnings();

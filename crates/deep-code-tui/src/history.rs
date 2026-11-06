@@ -1,4 +1,4 @@
-use deep_code_agent::{EntryKind, SessionRecord, ToolResultStatus};
+use deep_code_agent::{EntryKind, SessionRecord, ToolResultStatus, TurnId};
 
 use deep_code_agent::i18n::{Lang, TextId, tr, tr_with};
 
@@ -668,46 +668,25 @@ impl HistoryCell {
 
 /// Rebuild the transcript of a resumed session.
 ///
-/// Turns are identified by their user entry, and each one closes with the
-/// checkpoints taken inside it. The subtlety is which `record.turns` entry a
-/// user entry belongs to: `turns` is append-only for the life of the session
-/// while `entries` is TRIMMED by compaction, so the two line up at their END,
-/// never at their start. Counting user entries from the front — as this used to
-/// — made a compacted session render the session's OLDEST checkpoints against
-/// its NEWEST turns. The ids printed were the ones the snapshot cap had long
-/// since pruned from disk, each carrying a `/restore <id>` hint that either
-/// failed outright or, while the snapshot still existed, rewound the workspace
-/// to the start of the session instead of to the turn it was printed beside.
-/// Anchoring at the end is right whether or not a compaction ever happened.
+/// Persisted turn identities keep steering within its original turn and keep
+/// checkpoint associations intact when compaction removes older entries.
 pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
-    let user_entries = record
-        .entries
-        .iter()
-        .filter(|entry| matches!(entry.kind, EntryKind::User { .. }))
-        .count();
-    // Saturating: a session interrupted mid-turn has one more user entry than
-    // it has finished turn records, and that trailing turn simply has no record
-    // to key off (`append_turn_checkpoints` returns early for it).
-    let turn_offset = record.turns.len().saturating_sub(user_entries);
-
     let mut cells = Vec::new();
     let mut current_turn: Vec<HistoryCell> = Vec::new();
-    // Which turn (0-based among the user entries present) is open, if any.
-    let mut open_turn: Option<usize> = None;
-    let mut next_turn = 0usize;
+    let mut open_turn: Option<&TurnId> = None;
 
     for entry in &record.entries {
+        if let Some(turn_id) = &entry.turn_id
+            && open_turn != Some(turn_id)
+        {
+            cells.append(&mut current_turn);
+            if let Some(previous) = open_turn {
+                append_turn_checkpoints(&mut cells, record, previous);
+            }
+            open_turn = Some(turn_id);
+        }
         match &entry.kind {
             EntryKind::User { content, .. } => {
-                // Close the turn this entry ends. Cells accumulated before the
-                // FIRST user entry — a compaction banner heading the retained
-                // tail — belong to no turn and are emitted without checkpoints.
-                cells.append(&mut current_turn);
-                if let Some(index) = open_turn {
-                    append_turn_checkpoints(&mut cells, record, turn_offset + index);
-                }
-                open_turn = Some(next_turn);
-                next_turn += 1;
                 current_turn.push(HistoryCell::user(content.clone()));
             }
             EntryKind::System { .. } => {}
@@ -811,27 +790,16 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
         }
     }
     cells.append(&mut current_turn);
-    if let Some(index) = open_turn {
-        append_turn_checkpoints(&mut cells, record, turn_offset + index);
+    if let Some(turn_id) = open_turn {
+        append_turn_checkpoints(&mut cells, record, turn_id);
     }
 
     cells
 }
 
-fn append_turn_checkpoints(
-    cells: &mut Vec<HistoryCell>,
-    record: &SessionRecord,
-    turn_index: usize,
-) {
-    let Some(turn) = record.turns.get(turn_index) else {
-        return;
-    };
-    let window_end = record
-        .turns
-        .get(turn_index + 1)
-        .map_or(u64::MAX, |next| next.started_at_ms);
+fn append_turn_checkpoints(cells: &mut Vec<HistoryCell>, record: &SessionRecord, turn_id: &TurnId) {
     for checkpoint in &record.checkpoints {
-        if checkpoint.created_at_ms >= turn.started_at_ms && checkpoint.created_at_ms < window_end {
+        if &checkpoint.turn_id == turn_id {
             cells.push(HistoryCell::Checkpoint {
                 id: checkpoint.id.0.clone(),
                 label: checkpoint.label.clone(),

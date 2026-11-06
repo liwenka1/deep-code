@@ -731,13 +731,26 @@ impl RiskLevel {
     }
 }
 
+/// Who may resolve a policy approval. This is authority, not a display rule id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalAuthority {
+    AutomaticAllowed,
+    HumanOnly,
+}
+
 /// Policy outcome before user approval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyVerdict {
     Allow,
-    Deny { reason: String },
-    NeedsApproval { reason: String },
+    Deny {
+        reason: String,
+    },
+    NeedsApproval {
+        reason: String,
+        authority: ApprovalAuthority,
+    },
 }
 
 /// How sandboxed shell/job commands get network access (`[sandbox] network`).
@@ -879,7 +892,6 @@ fn network_disabled_plan(subject: &str, read_only: bool) -> ToolExecutionPlan {
                 "network access is disabled by configuration ([sandbox] network = \"never\"){subject}"
             ),
         },
-        requires_approval: false,
         requires_sandbox: false,
         read_only,
         risk_level: RiskLevel::Medium,
@@ -937,7 +949,6 @@ pub fn justification_claimed(arguments: &Value) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolExecutionPlan {
     pub verdict: PolicyVerdict,
-    pub requires_approval: bool,
     pub requires_sandbox: bool,
     pub read_only: bool,
     pub risk_level: RiskLevel,
@@ -950,6 +961,24 @@ pub struct ToolExecutionPlan {
 }
 
 impl ToolExecutionPlan {
+    #[must_use]
+    pub fn requires_approval(&self) -> bool {
+        matches!(self.verdict, PolicyVerdict::NeedsApproval { .. })
+    }
+
+    #[must_use]
+    pub fn approval_authority(&self) -> Option<ApprovalAuthority> {
+        match self.verdict {
+            PolicyVerdict::NeedsApproval { authority, .. } => Some(authority),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn requires_human(&self) -> bool {
+        self.approval_authority() == Some(ApprovalAuthority::HumanOnly)
+    }
+
     pub fn denied_reason(&self) -> Option<&str> {
         match &self.verdict {
             PolicyVerdict::Deny { reason } => Some(reason),
@@ -1193,7 +1222,6 @@ impl ExecPolicy {
         match kind {
             ToolKind::ReadOnlyFile | ToolKind::Search => ToolExecutionPlan {
                 verdict: PolicyVerdict::Allow,
-                requires_approval: false,
                 requires_sandbox: false,
                 read_only: true,
                 risk_level: RiskLevel::Low,
@@ -1202,9 +1230,9 @@ impl ExecPolicy {
             },
             ToolKind::WriteFile => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {
+                    authority: ApprovalAuthority::AutomaticAllowed,
                     reason: "write tools can modify workspace files".to_string(),
                 },
-                requires_approval: true,
                 requires_sandbox: false,
                 read_only: false,
                 risk_level: RiskLevel::Medium,
@@ -1224,9 +1252,9 @@ impl ExecPolicy {
                 }
                 ToolExecutionPlan {
                     verdict: PolicyVerdict::NeedsApproval {
+                        authority: ApprovalAuthority::AutomaticAllowed,
                         reason: "network tools can send data to external hosts".to_string(),
                     },
-                    requires_approval: true,
                     requires_sandbox: false,
                     read_only: true,
                     risk_level: RiskLevel::Medium,
@@ -1240,7 +1268,6 @@ impl ExecPolicy {
                 Some("start") => self.evaluate_command_bearing(tool_name, arguments),
                 Some("status" | "tail") => ToolExecutionPlan {
                     verdict: PolicyVerdict::Allow,
-                    requires_approval: false,
                     requires_sandbox: false,
                     read_only: true,
                     risk_level: RiskLevel::Low,
@@ -1249,9 +1276,9 @@ impl ExecPolicy {
                 },
                 Some("cancel") => ToolExecutionPlan {
                     verdict: PolicyVerdict::NeedsApproval {
+                        authority: ApprovalAuthority::AutomaticAllowed,
                         reason: "cancelling a job kills its process".to_string(),
                     },
-                    requires_approval: true,
                     requires_sandbox: false,
                     read_only: false,
                     risk_level: RiskLevel::Low,
@@ -1262,9 +1289,9 @@ impl ExecPolicy {
                 // rejects it as InvalidArguments.
                 _ => ToolExecutionPlan {
                     verdict: PolicyVerdict::NeedsApproval {
+                        authority: ApprovalAuthority::AutomaticAllowed,
                         reason: "unknown job action".to_string(),
                     },
-                    requires_approval: true,
                     requires_sandbox: false,
                     read_only: false,
                     risk_level: RiskLevel::High,
@@ -1275,9 +1302,9 @@ impl ExecPolicy {
             ToolKind::Shell => self.evaluate_command_bearing(tool_name, arguments),
             ToolKind::Mock => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {
+                    authority: ApprovalAuthority::AutomaticAllowed,
                     reason: "mock tool requires approval for tool-loop tests".to_string(),
                 },
-                requires_approval: true,
                 requires_sandbox: false,
                 read_only: true,
                 risk_level: RiskLevel::Low,
@@ -1373,9 +1400,9 @@ impl ExecPolicy {
                     }
                     ToolExecutionPlan {
                         verdict: PolicyVerdict::NeedsApproval {
+                            authority: ApprovalAuthority::AutomaticAllowed,
                             reason: reason.to_string(),
                         },
-                        requires_approval: true,
                         requires_sandbox: false,
                         read_only: !writes,
                         risk_level: RiskLevel::Medium,
@@ -1394,7 +1421,6 @@ impl ExecPolicy {
                 } else {
                     ToolExecutionPlan {
                         verdict: PolicyVerdict::Allow,
-                        requires_approval: false,
                         requires_sandbox: false,
                         read_only: true,
                         risk_level: RiskLevel::Low,
@@ -1410,11 +1436,11 @@ impl ExecPolicy {
             // auto-approval channel on top of this plan.
             ToolKind::RootGrant => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {
+                    authority: ApprovalAuthority::HumanOnly,
                     reason: "grants write access to a directory outside the current roots, \
                              for the rest of the session"
                         .to_string(),
                 },
-                requires_approval: true,
                 requires_sandbox: false,
                 read_only: false,
                 risk_level: RiskLevel::High,
@@ -1423,9 +1449,9 @@ impl ExecPolicy {
             },
             ToolKind::Unknown => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {
+                    authority: ApprovalAuthority::AutomaticAllowed,
                     reason: format!("unknown tool '{tool_name}' requires approval"),
                 },
-                requires_approval: true,
                 requires_sandbox: false,
                 read_only: false,
                 risk_level: RiskLevel::High,
@@ -1466,7 +1492,6 @@ pub fn evaluate_shell_command(
                     None => format!("shell command denied: {}", reason.rule),
                 },
             },
-            requires_approval: false,
             requires_sandbox: false,
             read_only: false,
             risk_level: RiskLevel::High,
@@ -1498,9 +1523,9 @@ pub fn evaluate_shell_command(
     // publishing a package, force-pushing over someone's commits, merging a PR,
     // applying infrastructure, deleting a bucket.
     //
-    // A `NeedsApproval` marked `needs-human`, which is the root grant's shape and
+    // A `NeedsApproval` with `HumanOnly` authority, which is the root grant's shape and
     // not a denial: the property that makes this a floor is that NO automatic
-    // path may approve it (see `is_needs_human_rule` and its readers) — not that
+    // path may approve it — not that
     // a person is forbidden to. Asked rather than refused, because refusing also
     // refused the interactive case, where a human is right there: under `default`
     // a one-off force push had no way to be authorized short of editing global
@@ -1516,6 +1541,7 @@ pub fn evaluate_shell_command(
     if let Some(matched) = policy.irreversible_outward(command) {
         return ToolExecutionPlan {
             verdict: PolicyVerdict::NeedsApproval {
+                authority: ApprovalAuthority::HumanOnly,
                 reason: format!(
                     "'{matched}' is irreversible and outward-facing: it reaches the world and \
                      the next command cannot undo it. Approve it for this run, or add it to \
@@ -1523,7 +1549,6 @@ pub fn evaluate_shell_command(
                      of command for good."
                 ),
             },
-            requires_approval: true,
             // It RUNS once approved, so it is sandboxed like any other shell
             // command: the Deny version could leave this false because a denied
             // plan never executes, and a plan that runs unconfined because of it
@@ -1531,7 +1556,7 @@ pub fn evaluate_shell_command(
             requires_sandbox: true,
             read_only: false,
             risk_level: RiskLevel::High,
-            matched_rule: Some(format!("{NEEDS_HUMAN_RULE_PREFIX}irreversible:{matched}")),
+            matched_rule: Some(format!("irreversible:{matched}")),
             // The egress it was granted, exactly as the ordinary path computes
             // it: an approved force push that then failed on a connection error
             // would make the approval look broken.
@@ -1563,10 +1588,10 @@ pub fn evaluate_shell_command(
     if network_requested && policy.network_mode == NetworkMode::Prompt {
         return ToolExecutionPlan {
             verdict: PolicyVerdict::NeedsApproval {
+                authority: ApprovalAuthority::AutomaticAllowed,
                 reason: "the command declares it needs network access (egress or listening)"
                     .to_string(),
             },
-            requires_approval: true,
             requires_sandbox: true,
             read_only: false,
             risk_level: if trusted {
@@ -1583,7 +1608,6 @@ pub fn evaluate_shell_command(
     if trusted {
         return ToolExecutionPlan {
             verdict: PolicyVerdict::Allow,
-            requires_approval: false,
             requires_sandbox: true,
             read_only: false,
             risk_level: RiskLevel::Low,
@@ -1595,9 +1619,9 @@ pub fn evaluate_shell_command(
     // 5. Anything else needs explicit user approval.
     ToolExecutionPlan {
         verdict: PolicyVerdict::NeedsApproval {
+            authority: ApprovalAuthority::AutomaticAllowed,
             reason: "shell commands can modify workspace files or run arbitrary code".to_string(),
         },
-        requires_approval: true,
         requires_sandbox: true,
         read_only: false,
         risk_level: RiskLevel::High,
@@ -1664,26 +1688,6 @@ pub fn accept_edits_approvable(tool_name: &str, arguments: &Value) -> bool {
         }
         _ => false,
     }
-}
-
-/// The `matched_rule` prefix on a plan no automatic path may approve.
-///
-/// It rides `matched_rule` rather than a new plan field on purpose: that field is
-/// documented as the machine-readable half ("logged and matched on, not read as
-/// prose"), the same role `deny:` and `builtin:` already play, and the plan
-/// struct has thirty-odd construction sites that a new field would have to touch.
-/// `is_needs_human_rule` is the only reader; keep the prefix here.
-pub const NEEDS_HUMAN_RULE_PREFIX: &str = "needs-human:";
-
-/// Whether a rule id marks a call that only a person may authorize.
-///
-/// Read by `runtime::approval_flow` (above `auto_allow`, session memory, every
-/// permission mode and the judge, so nothing automatic can approve it),
-/// by `subagent_approval_decision` (which denies it with a note naming the floor
-/// rather than the shell wall) and by `unattended_denial_note` (headless runs).
-#[must_use]
-pub fn is_needs_human_rule(rule: Option<&str>) -> bool {
-    rule.is_some_and(|rule| rule.starts_with(NEEDS_HUMAN_RULE_PREFIX))
 }
 
 /// The command identities a dispatch declares for its child, trimmed, empty

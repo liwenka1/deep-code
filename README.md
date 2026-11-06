@@ -87,7 +87,7 @@ deepcode --add-dir DIR   # grant an extra writable directory (repeatable; works 
 deepcode -p "..."        # headless one-shot: run a full turn, print the answer (see below)
 deepcode --help          # command overview (--version prints the version)
 deepcode doctor [--json] # environment self-check
-deepcode serve --http    # run as an HTTP server
+deepcode serve    # run as an HTTP server
 deepcode eval            # SWE-bench rollout (see below)
 deepcode session list|resume|delete|export
 ```
@@ -144,7 +144,6 @@ deepcode -p "..." --output-format stream-json    # NDJSON, same envelopes as the
 | `cost` | object (optional) | `{ usd, cny }` |
 | `usage` | object (optional) | token counts |
 
-- **Fields are added, never renamed or repurposed.** A new key may appear in a later release; nothing documented here changes meaning without a bump of this contract's version, which is `1`.
 - **Decide by `status`, not by the exit code.** A cancelled turn exits `1`, not `124`: the exit code says how the process ended, `status` says what happened to the turn. The codes are listed in the headless section above.
 - **Never use `-c` in a wrapper.** It means "the latest session in *this workspace*", so two calls racing on it adopt each other's thread. Start with `--new` (the default), keep `session_id`, continue with `--resume <id>`.
 - **`denied_approvals > 0` is not a bad answer.** A tool was refused because no human was there to approve it, and retrying fails the same way — widen `--permission-mode` or `approval.auto_allow`, or report the refusal.

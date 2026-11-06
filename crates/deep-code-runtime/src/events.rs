@@ -1,11 +1,11 @@
-//! SSE envelope construction for `/v1/prompt`.
+//! SSE envelope construction for `/prompt`.
 //!
 //! The wire shape (`RuntimeEnvelope` → `RuntimeItem` → kind/payload) is a
-//! stable contract: consumers match on `.item.kind` and read
+//! shared format: consumers match on `.item.kind` and read
 //! `.item.payload.*` with jq-style paths. Both per-variant tables — the kind
 //! string and the turn id — live on `RuntimeEvent` itself (`wire_kind`,
 //! `turn_id`), next to the variants, and every kind is pinned by a test there;
-//! change one only together with its consumers. (The repository's own CI bot
+//! update consumers when changing the format. (The repository's own CI bot
 //! is not one of them: it runs `--output-format json` and reads the final
 //! report, not this stream.)
 //!

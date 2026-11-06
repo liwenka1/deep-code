@@ -87,7 +87,7 @@ deepcode --add-dir DIR   # 额外授权一个可写目录(可重复;-p/serve 同
 deepcode -p "..."        # 无头单发:整轮跑完,答案打到 stdout(见下)
 deepcode --help          # 命令一览(--version 查版本)
 deepcode doctor [--json] # 环境自检
-deepcode serve --http    # 作为 HTTP 服务运行
+deepcode serve    # 作为 HTTP 服务运行
 deepcode eval            # SWE-bench 评测 rollout(见下文)
 deepcode session list|resume|delete|export
 ```
@@ -144,7 +144,6 @@ deepcode -p "..." --output-format stream-json    # NDJSON 逐事件,与 serve �
 | `cost` | object (optional) | `{ usd, cny }` |
 | `usage` | object (optional) | token 计数 |
 
-- **字段只增不改、不改义**:后续版本可能多出新键;这里写过的内容不会改变含义,除非抬这份契约的版本号(目前是 `1`)。
 - **按 `status` 判定,不要看退出码**:被取消的一轮退出码是 `1` 而不是 `124`——退出码说的是进程怎么结束,`status` 说的才是这一轮发生了什么。退出码见上面的无头小节。
 - **包装器里绝不要用 `-c`**:它的含义是"*本工作区*最新的会话",两个调用并发抢它会互相认领对方的线程。用默认的 `--new` 起步,存下 `session_id`,再用 `--resume <id>` 续。
 - **`denied_approvals > 0` 不是"答案不好"**:有工具因为没人在场批准而被拒绝,重试会以同样方式失败——要么放宽 `--permission-mode` / `approval.auto_allow`,要么把这个拒绝报出去。

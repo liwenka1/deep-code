@@ -28,7 +28,7 @@
 //!    The third floor is not a `Deny` but a park: an **irreversible-outward
 //!    command** — publishing, force-pushing, merging a PR, applying
 //!    infrastructure — that no `[sandbox] allow_irreversible` entry authorizes
-//!    comes back as `NeedsApproval` carrying the `needs-human` rule id. That id
+//!    comes back as `NeedsApproval` carrying `ApprovalAuthority::HumanOnly`. This authority
 //!    is what makes it a floor: every automatic path refuses it (stages 4, 5 and
 //!    6 all consult it, so `auto_allow`, session memory, every mode including
 //!    `Yolo`, and the judge are out), while a person can still authorize one run
@@ -45,11 +45,11 @@
 //!    error for a plan whose [`ToolExecutionPlan::denied_reason`] is `Some`
 //!    before consulting approval at all (the sub-agent decision path in
 //!    `runtime.rs` checks the same). A hard denial therefore never reaches
-//!    consent, the mode, or the judge. The registry then asks whenever the plan
-//!    says so *or* the tool's own spec declares `requires_approval`; every tool
-//!    that declares it (the write tools, the root grant, the mock) already gets
-//!    a `NeedsApproval` plan, so that flag is belt-and-braces, not a second
-//!    policy.
+//!    consent, the mode, or the judge. Tool registration's approval requirement
+//!    is folded into the plan during evaluation. The verdict is then the single
+//!    approval decision; no independent boolean can contradict it. Typed tool
+//!    parameters are parsed before this gate, so malformed calls return an error
+//!    without asking a human or the automatic judge.
 //! 4. **Standing consent** — `runtime::approval_flow`: config `auto_allow` (the
 //!    user's explicit list, matched on the exact tool name) and session
 //!    "approve for the session". Session memory is by tool name too, except for
@@ -59,7 +59,7 @@
 //!    compound command records no session consent at all
 //!    (`session_consent_recordable`, which also refuses an irreversible command:
 //!    a recorded identity for one could never be read). Two exclusions sit
-//!    *above* both consents: `request_write_root` and a `needs-human` plan are
+//!    *above* both consents: `request_write_root` and a `HumanOnly` plan are
 //!    never covered by `auto_allow` or session memory (`auto_approval_granted`
 //!    refuses them before consulting either), so no standing consent can
 //!    pre-approve a boundary widening or an irreversible command.
@@ -70,10 +70,10 @@
 //!    spelled relative and in-tree; the sandbox bounds their writes), `Auto`
 //!    inherits that
 //!    AcceptEdits allowance and consults the judge below for the rest, `Yolo`
-//!    waves through all but a root grant and a `needs-human` call.
+//!    waves through all but a root grant and a `HumanOnly` call.
 //! 6. **Auto judge** — the cheap classifier. It only ever sees a call that has
 //!    already cleared three gates it cannot override: a root grant
-//!    (`request_write_root`) — and a `needs-human` call, an unauthorized
+//!    (`request_write_root`) — and a `HumanOnly` call, an unauthorized
 //!    irreversible command — is never auto-approved in any mode; it asks a human,
 //!    or is refused before the prompt (below), egress (a network-native
 //!    tool or a declared `network`) is decided before the judge is consulted, and
@@ -149,8 +149,8 @@ mod shell_deny;
 mod shell_lex;
 
 pub use engine::{
-    ExecPolicy, NetworkMode, PolicyVerdict, RiskLevel, SandboxMode, ToolExecutionPlan, ToolKind,
-    accept_edits_approvable, dispatch_declares_allow_commands, is_needs_human_rule,
+    ApprovalAuthority, ExecPolicy, NetworkMode, PolicyVerdict, RiskLevel, SandboxMode,
+    ToolExecutionPlan, ToolKind, accept_edits_approvable, dispatch_declares_allow_commands,
     justification_claimed, network_requested, normalize_allow_commands, shell_command_of,
 };
 pub use permission_mode::{PermissionMode, SharedPermissionMode};

@@ -307,7 +307,7 @@ None.
         // A writing role's spawn is the write authorization, so it prompts
         // (asserted in the policy tests); approve it here to reach the child.
         let implementer = agent_call("call_2", "land the fix", "implementer");
-        assert!(registry.evaluate_tool(&implementer).requires_approval);
+        assert!(registry.evaluate_tool(&implementer).requires_approval());
         registry
             .run_tool_call(implementer, Some(ApprovalDecision::Approved))
             .await
@@ -637,6 +637,8 @@ None.
         let default_runtime = AgentRuntime::new(SummaryClient, ToolRegistry::new())
             .with_permission_mode(SharedPermissionMode::new(PermissionMode::Default));
         let request = |command: &str, network: bool| ApprovalRequest {
+            approval_id: crate::ApprovalId::new(),
+            authority: crate::ApprovalAuthority::AutomaticAllowed,
             network,
             call_id: "call_1".to_string(),
             tool_name: "shell".to_string(),
@@ -730,6 +732,8 @@ None.
     async fn approval_posture_allows_writes_only_for_writing_roles() {
         let runtime = AgentRuntime::new(SummaryClient, ToolRegistry::new());
         let write_request = ApprovalRequest {
+            approval_id: crate::ApprovalId::new(),
+            authority: crate::ApprovalAuthority::AutomaticAllowed,
             network: false,
             call_id: "call_1".to_string(),
             tool_name: "write_file".to_string(),
@@ -767,6 +771,8 @@ None.
         // The posture never extends past file writes: untrusted shell is
         // denied even for implementer.
         let shell_request = ApprovalRequest {
+            approval_id: crate::ApprovalId::new(),
+            authority: crate::ApprovalAuthority::AutomaticAllowed,
             network: false,
             call_id: "call_2".to_string(),
             tool_name: "shell".to_string(),
@@ -793,6 +799,8 @@ None.
         // is a parent-loop conversation with the human, and a child's
         // approvals never reach one.
         let grant_request = ApprovalRequest {
+            approval_id: crate::ApprovalId::new(),
+            authority: crate::ApprovalAuthority::AutomaticAllowed,
             network: false,
             call_id: "call_3".to_string(),
             tool_name: "request_write_root".to_string(),
@@ -827,6 +835,8 @@ None.
     async fn network_denial_note_matches_the_dispatch_grant() {
         let runtime = AgentRuntime::new(SummaryClient, ToolRegistry::new());
         let networked_shell = ApprovalRequest {
+            approval_id: crate::ApprovalId::new(),
+            authority: crate::ApprovalAuthority::AutomaticAllowed,
             network: true,
             call_id: "call_1".to_string(),
             tool_name: "shell".to_string(),
@@ -881,6 +891,8 @@ None.
     async fn a_granted_child_may_call_the_web_tools_it_was_given() {
         let runtime = AgentRuntime::new(SummaryClient, ToolRegistry::new());
         let fetch = |call_id: &str, tool_name: &str, arguments| ApprovalRequest {
+            approval_id: crate::ApprovalId::new(),
+            authority: crate::ApprovalAuthority::AutomaticAllowed,
             network: false, // network-native tools carry no declaration
             call_id: call_id.to_string(),
             tool_name: tool_name.to_string(),
@@ -990,11 +1002,11 @@ None.
         );
         let plan = online.evaluate_tool(&trusted);
         assert!(
-            plan.network && !plan.requires_approval,
+            plan.network && !plan.requires_approval(),
             "granted child's allow-listed commands run with ambient egress: {plan:?}"
         );
         assert!(
-            online.evaluate_tool(&untrusted).requires_approval,
+            online.evaluate_tool(&untrusted).requires_approval(),
             "the network grant must not widen which commands may run"
         );
     }
@@ -1153,6 +1165,8 @@ None.
         );
         let runtime = AgentRuntime::new(SummaryClient, registry);
         let request = |command: &str, network: bool| ApprovalRequest {
+            approval_id: crate::ApprovalId::new(),
+            authority: crate::ApprovalAuthority::AutomaticAllowed,
             network,
             call_id: "call_1".to_string(),
             tool_name: "shell".to_string(),

@@ -156,6 +156,8 @@ fn find_in_transcript_jumps_and_continues_upward() {
 fn root_grant_approval_drops_the_session_option() {
     let mut app = App::new();
     app.pending_approval = Some(deep_code_agent::ApprovalRequest {
+        approval_id: deep_code_agent::ApprovalId::new(),
+        authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
         network: false,
         call_id: "call_1".to_string(),
         tool_name: deep_code_agent::REQUEST_WRITE_ROOT_TOOL.to_string(),
@@ -199,6 +201,8 @@ fn root_grant_approval_drops_the_session_option() {
 #[test]
 fn a_parked_root_grant_starts_focused_on_deny() {
     let grant = deep_code_agent::ApprovalRequest {
+        approval_id: deep_code_agent::ApprovalId::new(),
+        authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
         network: false,
         call_id: "call_grant".to_string(),
         tool_name: deep_code_agent::REQUEST_WRITE_ROOT_TOOL.to_string(),
@@ -216,6 +220,8 @@ fn a_parked_root_grant_starts_focused_on_deny() {
     // One simple command, so the prompt offers y/a/n (a compound command
     // would drop "a" and change the deny index).
     let ordinary = deep_code_agent::ApprovalRequest {
+        approval_id: deep_code_agent::ApprovalId::new(),
+        authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
         tool_name: "shell".to_string(),
         arguments: serde_json::json!({ "command": "cargo test" }),
         risk_level: deep_code_agent::RiskLevel::Medium,
@@ -245,6 +251,8 @@ fn a_parked_root_grant_starts_focused_on_deny() {
     // Anything reaching the network joins the root grant: `curl … | sh` is one
     // reflex keystroke either way, and y/a/n puts deny at index 2.
     let networked = deep_code_agent::ApprovalRequest {
+        approval_id: deep_code_agent::ApprovalId::new(),
+        authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
         network: true,
         ..ordinary
     };
@@ -263,11 +271,13 @@ fn a_parked_root_grant_starts_focused_on_deny() {
 /// behavior keyed on "what kind of prompt is this" had to be taught about them.
 /// A default of approve would put the reflex `Enter` on publishing a package or
 /// applying infrastructure, and an "a" would print an option whose real effect is
-/// one-time — the gate refuses `needs-human` above session memory, so a recorded
+/// one-time — the gate refuses `HumanOnly` above session memory, so a recorded
 /// identity could never be read.
 #[test]
 fn a_parked_irreversible_command_starts_focused_on_deny_without_a_session_option() {
     let irreversible = deep_code_agent::ApprovalRequest {
+        approval_id: deep_code_agent::ApprovalId::new(),
+        authority: deep_code_agent::ApprovalAuthority::HumanOnly,
         network: false,
         call_id: "call_publish".to_string(),
         tool_name: "shell".to_string(),
@@ -276,7 +286,7 @@ fn a_parked_irreversible_command_starts_focused_on_deny_without_a_session_option
         risk_level: deep_code_agent::RiskLevel::High,
         requires_sandbox: true,
         read_only: false,
-        matched_rule: Some("needs-human:irreversible:npm publish".to_string()),
+        matched_rule: Some("irreversible:npm publish".to_string()),
         justification: None,
         resolved_target: None,
         preview: None,
@@ -298,6 +308,8 @@ fn a_parked_irreversible_command_starts_focused_on_deny_without_a_session_option
     // offering "a", so both assertions above are about the rule id rather than
     // about shell commands in general.
     let ordinary = deep_code_agent::ApprovalRequest {
+        approval_id: deep_code_agent::ApprovalId::new(),
+        authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
         matched_rule: None,
         arguments: serde_json::json!({ "command": "npm run test:e2e" }),
         risk_level: deep_code_agent::RiskLevel::Medium,
@@ -327,6 +339,8 @@ fn a_network_native_prompt_opens_focused_on_deny() {
     ] {
         let mut app = App::new();
         app.park_approval(deep_code_agent::ApprovalRequest {
+            approval_id: deep_code_agent::ApprovalId::new(),
+            authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
             call_id: "call_1".to_string(),
             tool_name: tool_name.to_string(),
             description: String::new(),
@@ -365,6 +379,8 @@ fn a_network_native_prompt_opens_focused_on_deny() {
 fn prompts_without_a_recordable_consent_render_without_the_session_option() {
     let request =
         |tool_name: &str, arguments: serde_json::Value| deep_code_agent::ApprovalRequest {
+            approval_id: deep_code_agent::ApprovalId::new(),
+            authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
             network: false,
             call_id: "call_1".to_string(),
             tool_name: tool_name.to_string(),
@@ -456,6 +472,8 @@ fn prompts_without_a_recordable_consent_render_without_the_session_option() {
 fn approval_scroll_helpers_adjust_panel_offset() {
     let mut app = App::new();
     app.pending_approval = Some(deep_code_agent::ApprovalRequest {
+        approval_id: deep_code_agent::ApprovalId::new(),
+        authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
         network: false,
         call_id: "call_1".to_string(),
         tool_name: "write_file".to_string(),
@@ -1363,6 +1381,8 @@ fn a_menu_the_draft_would_not_offer_is_not_applied() {
 async fn approval_a_key_resolves_for_session() {
     let mut app = App::new();
     app.pending_approval = Some(deep_code_agent::ApprovalRequest {
+        approval_id: deep_code_agent::ApprovalId::new(),
+        authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
         network: false,
         call_id: "call_1".to_string(),
         tool_name: "mock_echo".to_string(),
@@ -2348,6 +2368,8 @@ fn cancel_clears_the_steering_queue_synchronously() {
 #[test]
 fn approval_arriving_after_cancel_renders_the_cancellation_not_a_panel() {
     let request = deep_code_agent::ApprovalRequest {
+        approval_id: deep_code_agent::ApprovalId::new(),
+        authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
         network: false,
         call_id: "call_1".to_string(),
         tool_name: "shell".to_string(),
@@ -2373,7 +2395,7 @@ fn approval_arriving_after_cancel_renders_the_cancellation_not_a_panel() {
     assert!(app.cancel_requested);
 
     app.apply_runtime_event(RuntimeEvent::ApprovalRequired {
-        turn_id: Some(turn_id),
+        turn_id: Some(turn_id.clone()),
         tool_call_id: None,
         request: request.clone(),
     });
@@ -2381,6 +2403,9 @@ fn approval_arriving_after_cancel_renders_the_cancellation_not_a_panel() {
         app.pending_approval.is_none(),
         "a cancelled turn's prompt must not be parked"
     );
+    assert!(app.is_streaming, "keep observing cancellation tail");
+    assert!(app.cancel_requested);
+    app.apply_runtime_event(RuntimeEvent::TurnCancelled { turn_id });
     assert!(!app.is_streaming);
     assert!(!app.cancel_requested);
     assert_eq!(app.status, app.tr(TextId::StatusCancelled));
@@ -2558,6 +2583,7 @@ fn error_event_flushes_partial_assistant_before_error_cell() {
     });
 
     app.apply_runtime_event(RuntimeEvent::Error {
+        kind: deep_code_agent::RuntimeFailureKind::Execution,
         turn_id: Some(turn_id),
         message: "boom".to_string(),
     });
@@ -2626,6 +2652,8 @@ fn approval_status_line_spells_the_risk_tier_once() {
             turn_id: Some(turn_id),
             tool_call_id: Some(deep_code_agent::ToolCallId("call_1".to_string())),
             request: deep_code_agent::ApprovalRequest {
+                approval_id: deep_code_agent::ApprovalId::new(),
+                authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
                 network: false,
                 call_id: "call_1".to_string(),
                 tool_name: "shell".to_string(),
@@ -2709,6 +2737,8 @@ fn approval_events_render_pending_and_resolved_tool_metadata() {
         turn_id: Some(turn_id.clone()),
         tool_call_id: Some(tool_call_id.clone()),
         request: deep_code_agent::ApprovalRequest {
+            approval_id: deep_code_agent::ApprovalId::new(),
+            authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
             network: false,
             call_id: "call_1".to_string(),
             tool_name: "write_file".to_string(),
@@ -3085,7 +3115,7 @@ fn switch_session_adopts_and_banners_the_records_grants() {
 }
 
 #[test]
-fn launch_hydrates_only_the_sanitized_resume_record() {
+fn launch_refuses_to_hydrate_an_unverified_resume_record() {
     let workspace = tempfile::tempdir().unwrap();
     let ws = workspace.path().canonicalize().unwrap();
     let mut record = SessionRecord::new(ws.clone(), "system");
@@ -3095,25 +3125,27 @@ fn launch_hydrates_only_the_sanitized_resume_record() {
             "forged transcript",
         )));
 
+    let rejected_id = record.id.as_str().to_string();
     let app = App::launch(LaunchConfig {
         workspace: Some(ws),
         resume: Some(record),
         ..LaunchConfig::default()
     });
 
+    assert_ne!(app.session_id.as_deref(), Some(rejected_id.as_str()));
     assert!(
         !app.history.iter().any(|cell| matches!(
             cell,
             HistoryCell::User { text } if text == "forged transcript"
         )),
-        "the UI must hydrate the same sanitized record the runtime uses"
+        "unverified history must not reach the UI"
     );
     assert!(
         app.history.iter().any(|cell| matches!(
             cell,
-            HistoryCell::System { text } if text.contains("unverified session transcript")
+            HistoryCell::System { text } if text.contains("cannot resume session")
         )),
-        "the sanitization warning must remain visible"
+        "the resume refusal must remain visible"
     );
 }
 
@@ -3248,22 +3280,15 @@ fn every_swap_path_delivers_its_warnings() {
         "a still-true degradation was re-announced on every relaunch"
     );
 
-    // The fourth point: relaunch_runtime's reload-failure recovery, which
-    // returns Err and so never reaches the flush at the end of the happy path.
+    // A stale display id no longer triggers disk reload or resets live state.
     let mut app = App::launch(LaunchConfig {
         workspace: Some(workspace),
         ..LaunchConfig::default()
     });
     app.history.clear();
     app.session_id = Some("00000000-0000-0000-0000-000000000000".to_string());
-    assert!(
-        app.relaunch_runtime().is_err(),
-        "expected the reload-failure branch"
-    );
-    assert!(
-        degraded(&app),
-        "the reload-failure recovery path dropped its warnings"
-    );
+    app.relaunch_runtime().unwrap();
+    assert!(degraded(&app), "the runtime relaunch dropped its warnings");
 }
 
 #[test]
@@ -3693,6 +3718,7 @@ fn long_failed_turns_and_long_compactions_notify() {
     app.streaming_since =
         std::time::Instant::now().checked_sub(NOTIFY_MIN_TURN + std::time::Duration::from_secs(1));
     app.apply_runtime_event(RuntimeEvent::Error {
+        kind: deep_code_agent::RuntimeFailureKind::Execution,
         turn_id: None,
         message: "boom".to_string(),
     });
@@ -4980,6 +5006,8 @@ fn long_turns_and_approvals_notify_but_quick_turns_do_not() {
     assert_eq!(app.take_notification(), None, "taken once");
 
     let request = deep_code_agent::ApprovalRequest {
+        approval_id: deep_code_agent::ApprovalId::new(),
+        authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
         network: false,
         call_id: "call_1".to_string(),
         tool_name: "mock_echo".to_string(),

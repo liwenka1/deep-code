@@ -4,12 +4,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::execution_policy::{ExecPolicy, PolicyVerdict, ToolExecutionPlan};
+use crate::execution_policy::{ApprovalAuthority, ExecPolicy, PolicyVerdict, ToolExecutionPlan};
 use crate::model::ChatTool;
 
 use super::{
-    ApprovalDecision, ApprovalRequest, ErasedTool, MockEchoTool, RunAuthority, Tool, ToolCall,
-    ToolCx, ToolError, ToolResult, ToolRunOutcome, ToolSpec, shell_safety_notes,
+    ApprovalDecision, ApprovalId, ApprovalRequest, ErasedTool, MockEchoTool, RunAuthority, Tool,
+    ToolCall, ToolCx, ToolError, ToolResult, ToolRunOutcome, ToolSpec, shell_safety_notes,
 };
 
 #[derive(Clone)]
@@ -123,13 +123,23 @@ impl ToolRegistry {
         call: ToolCall,
         decision: Option<ApprovalDecision>,
     ) -> Result<ToolRunOutcome, ToolError> {
-        let plan = self.policy.evaluate_tool(&call.name, &call.arguments);
+        let plan = self.evaluate_tool(&call);
         self.run_tool_call_with_plan(&call, decision, plan, ToolCx::new())
             .await
     }
 
     pub fn evaluate_tool(&self, call: &ToolCall) -> ToolExecutionPlan {
-        self.policy.evaluate_tool(&call.name, &call.arguments)
+        let mut plan = self.policy.evaluate_tool(&call.name, &call.arguments);
+        if matches!(plan.verdict, PolicyVerdict::Allow)
+            && let Some(entry) = self.tools.get(&call.name)
+            && entry.spec.requires_approval
+        {
+            plan.verdict = PolicyVerdict::NeedsApproval {
+                reason: entry.spec.description.clone(),
+                authority: ApprovalAuthority::AutomaticAllowed,
+            };
+        }
+        plan
     }
 
     pub async fn run_tool_call_with_plan(
@@ -146,6 +156,7 @@ impl ToolRegistry {
                 name: call.name.clone(),
             })?;
         let spec = &entry.spec;
+        let prepared = entry.tool.prepare(call)?;
 
         if let Some(reason) = plan.denied_reason() {
             return Ok(ToolRunOutcome::Result {
@@ -170,10 +181,21 @@ impl ToolRegistry {
             plan
         };
 
-        let needs_approval = plan.requires_approval || spec.requires_approval;
+        // `run_tool_call_with_plan` is public and callers may supply a plan
+        // directly, so preserve the tool's own approval contract even when
+        // that plan says Allow. Policy evaluation applies the same rule, but
+        // this boundary must enforce it independently.
+        let mut plan = plan;
+        if spec.requires_approval && matches!(plan.verdict, PolicyVerdict::Allow) {
+            plan.verdict = PolicyVerdict::NeedsApproval {
+                reason: spec.description.clone(),
+                authority: ApprovalAuthority::AutomaticAllowed,
+            };
+        }
+        let needs_approval = plan.requires_approval();
         if needs_approval {
             let description = match &plan.verdict {
-                PolicyVerdict::NeedsApproval { reason } => reason.clone(),
+                PolicyVerdict::NeedsApproval { reason, .. } => reason.clone(),
                 _ => spec.description.clone(),
             };
             match decision {
@@ -181,6 +203,8 @@ impl ToolRegistry {
                     let notes = shell_safety_notes(call);
                     return Ok(ToolRunOutcome::ApprovalRequired {
                         request: ApprovalRequest {
+                            approval_id: ApprovalId::new(),
+                            authority: plan.approval_authority().expect("approval verdict"),
                             call_id: call.id.clone(),
                             tool_name: spec.name.clone(),
                             description,
@@ -221,9 +245,8 @@ impl ToolRegistry {
             cx.with_authority(RunAuthority::Parse)
         };
         let cx = cx.with_plan(plan);
-        entry
-            .tool
-            .execute(call, &cx)
+        prepared
+            .execute(&cx)
             .await
             .map(|result| ToolRunOutcome::Result { result })
     }
@@ -232,6 +255,8 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution_policy::{RiskLevel, ToolExecutionPlan};
+    use serde_json::json;
 
     #[test]
     fn duplicate_registration_is_rejected_instead_of_overwritten() {
@@ -255,5 +280,31 @@ mod tests {
         }));
         assert!(panic.is_err(), "duplicate tool names must fail fast");
         assert_eq!(registry.specs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_supplied_allow_plan_cannot_bypass_spec_level_approval() {
+        let registry = ToolRegistry::with_mock_tools();
+        let call = ToolCall::new(
+            "call_approval",
+            MockEchoTool::NAME,
+            json!({"message": "must ask"}),
+        );
+        let plan = ToolExecutionPlan {
+            verdict: PolicyVerdict::Allow,
+            requires_sandbox: false,
+            read_only: false,
+            risk_level: RiskLevel::Low,
+            matched_rule: None,
+            network: false,
+        };
+
+        assert!(matches!(
+            registry
+                .run_tool_call_with_plan(&call, None, plan, ToolCx::new())
+                .await
+                .unwrap(),
+            ToolRunOutcome::ApprovalRequired { .. }
+        ));
     }
 }

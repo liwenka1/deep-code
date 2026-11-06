@@ -24,12 +24,8 @@ pub(crate) const SELF_IGNORE_BODY: &str = "# Written by deep-code: this director
 
 use crate::checkpoint::CheckpointId;
 use crate::pricing::CostEstimate;
+use crate::runtime::TurnId;
 use crate::session_entry::{EntryKind, SessionEntry};
-
-/// Current on-disk schema version. Bump when making breaking layout changes.
-/// Schema v3 is the authenticated record format. Older layouts are outside the
-/// current storage contract.
-pub const SESSION_SCHEMA_VERSION: u32 = 3;
 
 /// Hard limits for the JSON backend. Session files live in the workspace and
 /// can therefore be written by the model; loading them must not turn into an
@@ -59,12 +55,10 @@ impl SessionId {
     }
 }
 
-/// One user turn's boundary timestamp. Only `started_at_ms` and `turns.len()`
-/// are ever read (the turn count and the checkpoint-to-turn time window).
-/// `SessionRecord` has no `deny_unknown_fields`, so harmless extra keys remain
-/// ignorable within the current schema.
+/// One runtime turn, including any user steering injected while it runs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnRecord {
+    pub id: TurnId,
     pub started_at_ms: u64,
 }
 
@@ -72,15 +66,17 @@ pub struct TurnRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointRecord {
     pub id: CheckpointId,
+    pub turn_id: TurnId,
     pub label: String,
     pub created_at_ms: u64,
 }
 
 impl CheckpointRecord {
     #[must_use]
-    pub fn new(id: CheckpointId, label: impl Into<String>) -> Self {
+    pub fn new(id: CheckpointId, turn_id: TurnId, label: impl Into<String>) -> Self {
         Self {
             id,
+            turn_id,
             label: label.into(),
             created_at_ms: now_ms(),
         }
@@ -89,8 +85,9 @@ impl CheckpointRecord {
 
 impl TurnRecord {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(id: TurnId) -> Self {
         Self {
+            id,
             started_at_ms: now_ms(),
         }
     }
@@ -98,27 +95,22 @@ impl TurnRecord {
 
 impl Default for TurnRecord {
     fn default() -> Self {
-        Self::new()
+        Self::new(TurnId::new())
     }
 }
 
 /// Full persisted session state.
 ///
-/// MUST NOT gain `#[serde(deny_unknown_fields)]` — an unknown key is ignored so
-/// a record written by a newer build stays readable, and whether it can be
-/// trusted is the host tag's decision, not the parser's.
+/// The current structure is the accepted payload. Unknown or missing required
+/// fields are errors; trust is established by the host tag over the parsed record.
 ///
-/// **Adding or removing a persisted field REQUIRES bumping
-/// `SESSION_SCHEMA_VERSION`.** `record_mac` signs a re-serialization of the
-/// parsed struct (see `session_integrity`), so the shape of the struct is part
-/// of the signed bytes: a new field changes the message for every existing
-/// record, verification then fails, and the transcript is discarded on the next
-/// resume. The version check turns that into an explicit "unsupported schema"
-/// rejection instead. The same holds for [`TurnRecord`], [`SessionEntry`],
-/// [`EntryKind`], and every other nested type reachable from here.
+/// `record_mac` signs a re-serialization of this struct (see
+/// `session_integrity`), so the persisted field set defines the signed bytes.
+/// The loader parses this structure directly and authenticates it before any
+/// persisted state is exposed to callers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionRecord {
-    pub schema_version: u32,
     pub id: SessionId,
     pub workspace: PathBuf,
     /// Extra writable roots granted at launch (`--add-dir`), canonical. Kept in
@@ -144,7 +136,7 @@ pub struct SessionRecord {
     pub record_mac: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
-    /// Domain-level conversation entries (schema v3). Wire messages are
+    /// Domain-level conversation entries. Wire messages are
     /// derived via [`crate::session::Session::wire_messages`]. Shared by
     /// `Arc` with the live [`crate::session::Session`], so flushing the
     /// transcript into the record copies pointers, not entry bytes; serde
@@ -201,7 +193,6 @@ impl SessionRecord {
         let now = now_ms();
         let entries = vec![std::sync::Arc::new(SessionEntry::system(system_prompt))];
         Self {
-            schema_version: SESSION_SCHEMA_VERSION,
             id: new_session_id(),
             workspace,
             extra_roots: Vec::new(),
@@ -234,8 +225,7 @@ impl SessionRecord {
     /// granted roots — the saved prompt only ever names the grants that
     /// existed when the session was created, and a root added on `-c
     /// --add-dir` (or dropped as stale) would otherwise stay invisible for
-    /// the rest of the session's life. Defensive about position anyway:
-    /// Older on-disk formats are rejected before this constructor is used.
+    /// the rest of the session's life. A missing system entry is inserted.
     pub fn set_system_prompt(&mut self, system_prompt: impl Into<String>) {
         let entry = std::sync::Arc::new(SessionEntry::system(system_prompt.into()));
         let slot = self
@@ -291,8 +281,6 @@ pub enum SessionStoreError {
     Io { message: String },
     #[error("session storage serialization failed: {message}")]
     Serialization { message: String },
-    #[error("session '{id}' could not be authenticated for persistence")]
-    AuthenticationUnavailable { id: String },
     #[error("no session signing key is available: {detail}")]
     KeyUnavailable { detail: String },
     #[error("session file {path} is too large ({bytes} bytes; limit {limit})")]
@@ -307,27 +295,36 @@ pub enum SessionStoreError {
         count: usize,
         limit: usize,
     },
-    #[error("unsupported session schema version {found} (expected {expected})")]
-    UnsupportedSchema { found: u32, expected: u32 },
+    #[error("session file {path} failed integrity verification")]
+    AuthenticationFailed { path: String },
     #[error("invalid session id '{id}'")]
     InvalidId { id: String },
 }
 
-/// Serialize a record to the on-disk JSON form. Shared by the default
-/// [`SessionStore::save`] and the persistence actor, which serializes under the
-/// record lock and writes with it released — never deep-cloning the record just
-/// to snapshot it.
-///
-/// Sealing belongs to saving, which is why this (and [`SessionStore::save`])
-/// take `&mut`: both tags have to describe the record as it is being written,
-/// and every persistence path funnels through here, so there is no way to write
-/// a record whose transcript or grants are unsigned or stale.
-///
-/// The entry-count and size limits are NOT re-checked here: they belong to
-/// [`save_serialized`](SessionStore::save_serialized), which knows the
-/// destination path and can name it in the error. Repeating them here filled
-/// the error's `path` field with a session id.
-pub(crate) fn serialize_record(record: &mut SessionRecord) -> Result<String, SessionStoreError> {
+/// A host-sealed snapshot for a persistence backend. Its private fields bind
+/// the destination and validation metadata to the encoded body: callers cannot
+/// hand a backend arbitrary JSON or a mismatching session id.
+pub struct PreparedSession {
+    id: SessionId,
+    json: String,
+    entry_count: usize,
+}
+
+impl PreparedSession {
+    pub fn id(&self) -> &SessionId {
+        &self.id
+    }
+
+    pub fn json(&self) -> &str {
+        &self.json
+    }
+}
+
+/// Seal and encode under the record lock; the resulting owned body can be
+/// written after releasing the lock without decoding or authenticating it again.
+pub(crate) fn prepare_record(
+    record: &mut SessionRecord,
+) -> Result<PreparedSession, SessionStoreError> {
     crate::session_integrity::ensure_key().map_err(|reason| SessionStoreError::KeyUnavailable {
         detail: reason.to_string(),
     })?;
@@ -343,22 +340,26 @@ pub(crate) fn serialize_record(record: &mut SessionRecord) -> Result<String, Ses
             }
         })?,
     );
-    serde_json::to_string_pretty(record).map_err(|error| SessionStoreError::Serialization {
-        message: error.to_string(),
+    let json = serde_json::to_string_pretty(&record).map_err(|error| {
+        SessionStoreError::Serialization {
+            message: error.to_string(),
+        }
+    })?;
+    Ok(PreparedSession {
+        id: record.id.clone(),
+        json,
+        entry_count: record.entries.len(),
     })
 }
 
 /// Backend-agnostic session persistence.
 pub trait SessionStore: Send + Sync {
-    /// Serialize then persist a record. Provided in terms of
-    /// [`save_serialized`](SessionStore::save_serialized); the persistence actor
-    /// calls that directly so it can serialize under the record mutex and write
-    /// with the lock released, never deep-cloning the record just to snapshot it.
+    /// Seal, encode, and persist a record.
     fn save(&self, record: &mut SessionRecord) -> Result<(), SessionStoreError> {
-        self.save_serialized(&record.id.clone(), &serialize_record(record)?)
+        self.save_prepared(&prepare_record(record)?)
     }
-    /// Write an already-serialized record body under `id`.
-    fn save_serialized(&self, id: &SessionId, json: &str) -> Result<(), SessionStoreError>;
+    /// Write an encoded snapshot produced by the host's signing path.
+    fn save_prepared(&self, session: &PreparedSession) -> Result<(), SessionStoreError>;
     fn load(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError>;
     fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError>;
     fn delete(&self, id: &SessionId) -> Result<(), SessionStoreError>;

@@ -64,9 +64,10 @@ fn grep_summary_surfaces_skipped_files() {
 #[test]
 fn hydrate_history_keeps_assistant_tool_calls_and_results() {
     let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "");
-    record
-        .entries
-        .push(std::sync::Arc::new(SessionEntry::user("hi")));
+    let turn_id = TurnId::new();
+    record.entries.push(std::sync::Arc::new(
+        SessionEntry::user("hi").with_turn_id(turn_id.clone()),
+    ));
     record
         .entries
         .push(std::sync::Arc::new(SessionEntry::assistant(
@@ -87,11 +88,12 @@ fn hydrate_history_keeps_assistant_tool_calls_and_results() {
             "older conversation summary",
             2,
         )));
-    let mut turn = deep_code_agent::TurnRecord::new();
+    let mut turn = deep_code_agent::TurnRecord::new(turn_id.clone());
     turn.started_at_ms = 10;
     record.turns.push(turn);
     let mut checkpoint = deep_code_agent::CheckpointRecord::new(
         deep_code_agent::CheckpointId("checkpoint_1".to_string()),
+        turn_id,
         "before_turn",
     );
     checkpoint.created_at_ms = 15;
@@ -170,11 +172,7 @@ fn a_compaction_cell_says_what_was_folded_and_what_the_model_now_sees() {
     );
 }
 
-/// Compaction trims `record.entries` and leaves `record.turns` alone, so the
-/// two are aligned only at their end. Counting user entries from the front
-/// rendered the session's oldest checkpoints — the ones the 20-snapshot disk
-/// cap has already deleted — against its newest turns, each with a
-/// `/restore <id>` hint pointing at the wrong snapshot.
+/// Compaction removes entries without changing the surviving turn identities.
 #[test]
 fn hydrate_history_maps_checkpoints_to_turns_after_compaction() {
     let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "sys");
@@ -184,23 +182,22 @@ fn hydrate_history_maps_checkpoints_to_turns_after_compaction() {
         .entries
         .push(std::sync::Arc::new(SessionEntry::compaction("older", 6)));
     for index in 3..5 {
-        record
-            .entries
-            .push(std::sync::Arc::new(SessionEntry::user(format!("u{index}"))));
-        record
-            .entries
-            .push(std::sync::Arc::new(SessionEntry::assistant(
-                format!("a{index}"),
-                None,
-                Vec::new(),
-            )));
+        record.entries.push(std::sync::Arc::new(
+            SessionEntry::user(format!("u{index}")).with_turn_id(TurnId(format!("turn_{index}"))),
+        ));
+        record.entries.push(std::sync::Arc::new(
+            SessionEntry::assistant(format!("a{index}"), None, Vec::new())
+                .with_turn_id(TurnId(format!("turn_{index}"))),
+        ));
     }
     for index in 0..5u64 {
-        let mut turn = deep_code_agent::TurnRecord::new();
+        let turn_id = TurnId(format!("turn_{index}"));
+        let mut turn = deep_code_agent::TurnRecord::new(turn_id.clone());
         turn.started_at_ms = 10 * (index + 1);
         record.turns.push(turn);
         let mut checkpoint = deep_code_agent::CheckpointRecord::new(
             deep_code_agent::CheckpointId(format!("cp_{index}")),
+            turn_id,
             "before_turn",
         );
         checkpoint.created_at_ms = 10 * (index + 1) + 1;
@@ -236,30 +233,28 @@ fn hydrate_history_maps_checkpoints_to_turns_after_compaction() {
     assert!(position("u4") < position("cp_4"));
 }
 
-/// The uncompacted case must be unchanged by the end-anchoring: each turn
-/// still closes with the checkpoint taken inside it.
+/// Each turn closes with its own checkpoint, regardless of clock precision.
 #[test]
 fn hydrate_history_maps_checkpoints_to_turns_without_compaction() {
     let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "sys");
     for index in 0..3u64 {
-        record
-            .entries
-            .push(std::sync::Arc::new(SessionEntry::user(format!("u{index}"))));
-        record
-            .entries
-            .push(std::sync::Arc::new(SessionEntry::assistant(
-                format!("a{index}"),
-                None,
-                Vec::new(),
-            )));
-        let mut turn = deep_code_agent::TurnRecord::new();
-        turn.started_at_ms = 10 * (index + 1);
+        let turn_id = TurnId::new();
+        record.entries.push(std::sync::Arc::new(
+            SessionEntry::user(format!("u{index}")).with_turn_id(turn_id.clone()),
+        ));
+        record.entries.push(std::sync::Arc::new(
+            SessionEntry::assistant(format!("a{index}"), None, Vec::new())
+                .with_turn_id(turn_id.clone()),
+        ));
+        let mut turn = deep_code_agent::TurnRecord::new(turn_id.clone());
+        turn.started_at_ms = 10;
         record.turns.push(turn);
         let mut checkpoint = deep_code_agent::CheckpointRecord::new(
             deep_code_agent::CheckpointId(format!("cp_{index}")),
+            turn_id,
             "before_turn",
         );
-        checkpoint.created_at_ms = 10 * (index + 1) + 1;
+        checkpoint.created_at_ms = 10;
         record.checkpoints.push(checkpoint);
     }
 
@@ -271,6 +266,62 @@ fn hydrate_history_maps_checkpoints_to_turns_without_compaction() {
         })
         .collect();
     assert_eq!(ids, vec!["cp_0", "cp_1", "cp_2"]);
+}
+
+#[test]
+fn hydrate_history_keeps_steering_with_its_turn_after_resume() {
+    use deep_code_agent::{CheckpointId, CheckpointRecord, TurnRecord};
+    use std::sync::Arc;
+
+    let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "sys");
+    let first = TurnId::new();
+    let second = TurnId::new();
+    record.entries.extend([
+        Arc::new(SessionEntry::user("first task").with_turn_id(first.clone())),
+        Arc::new(SessionEntry::assistant("working", None, Vec::new()).with_turn_id(first.clone())),
+        Arc::new(SessionEntry::user("steer first task").with_turn_id(first.clone())),
+        Arc::new(
+            SessionEntry::assistant("first done", None, Vec::new()).with_turn_id(first.clone()),
+        ),
+        Arc::new(SessionEntry::user("second task").with_turn_id(second.clone())),
+        Arc::new(
+            SessionEntry::assistant("second done", None, Vec::new()).with_turn_id(second.clone()),
+        ),
+    ]);
+    // Equal timestamps cannot distinguish turns. The second turn is still
+    // open at shutdown, so it has no completed TurnRecord yet.
+    let mut first_record = TurnRecord::new(first.clone());
+    first_record.started_at_ms = 100;
+    record.turns.push(first_record);
+    for (name, turn_id) in [("cp_first", first), ("cp_second", second)] {
+        let mut checkpoint =
+            CheckpointRecord::new(CheckpointId(name.into()), turn_id, "before_turn");
+        checkpoint.created_at_ms = 100;
+        record.checkpoints.push(checkpoint);
+    }
+    let resumed: SessionRecord =
+        serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+    let rendered: Vec<String> = hydrate_history(&resumed)
+        .into_iter()
+        .filter_map(|cell| match cell {
+            HistoryCell::User { text } | HistoryCell::Assistant { text } => Some(text),
+            HistoryCell::Checkpoint { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rendered,
+        [
+            "first task",
+            "working",
+            "steer first task",
+            "first done",
+            "cp_first",
+            "second task",
+            "second done",
+            "cp_second",
+        ]
+    );
 }
 
 #[test]

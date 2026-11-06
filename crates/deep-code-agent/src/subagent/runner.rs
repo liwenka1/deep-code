@@ -27,6 +27,7 @@ use crate::subagent::roles::SubAgentRole;
 /// frozen tool cell.
 pub async fn run_subagent(
     runtime: AgentRuntime,
+    turn_id: crate::TurnId,
     max_steps: u32,
     role: SubAgentRole,
     network: bool,
@@ -36,7 +37,7 @@ pub async fn run_subagent(
     let started = std::time::Instant::now();
     let mut steps = 0u32;
     let mut budget_notice_sent = false;
-    let mut rx = runtime.drive_turn().await;
+    let mut rx = runtime.drive_turn_handle(turn_id).await;
 
     /// The child's last substantive words, for a run that ends before the
     /// report contract was reached (step cap, a dead stream, an error).
@@ -114,9 +115,12 @@ pub async fn run_subagent(
             RuntimeEvent::ApprovalRequired { request, .. } => {
                 let (decision, denial_note) =
                     runtime.subagent_approval_decision(&request, role, network);
-                rx = runtime
-                    .submit_approval_with_denial_note(decision, denial_note)
-                    .await;
+                if let Err(error) = rx
+                    .approve(&request.approval_id, decision, denial_note)
+                    .await
+                {
+                    return Err((steps, error.to_string(), partial_report(&runtime).await));
+                }
             }
             RuntimeEvent::TurnCancelled { .. } => {
                 return Err((steps, "cancelled".to_string(), None));
@@ -236,10 +240,11 @@ mod tests {
             FindingsThenSilence::default(),
             ToolRegistry::with_mock_tools(),
         );
-        runtime.begin_turn("find the race").await;
+        let turn_id = runtime.begin_turn("find the race").await;
         let steps_seen = Arc::new(AtomicU32::new(0));
         let outcome = run_subagent(
             runtime,
+            turn_id,
             10,
             SubAgentRole::Explore,
             false,

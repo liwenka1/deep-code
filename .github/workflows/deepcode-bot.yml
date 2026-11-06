@@ -245,6 +245,7 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           TRIGGER: ${{ inputs.trigger }}
+          BOT_NAME: ${{ steps.bot.outputs.name }}
         with:
           github-token: ${{ steps.app-token.outputs.token || github.token }}
           result-encoding: string
@@ -306,16 +307,10 @@ jobs:
               issue_number: context.issue.number, per_page: 100,
             });
 
-            // Machine-readable markers beat regex archaeology; older comments
-            // predating the marker fall back to stripping known chrome.
+            // Reuse only the answer delimited by this workflow's body markers.
             const extractBotBody = (body) => {
               const marked = body.match(/<!--dc:body-->([\s\S]*?)<!--\/dc:body-->/);
-              if (marked) return marked[1].trim();
-              return body
-                .replace(/<details>[\s\S]*?<\/details>/g, '')
-                .replace(/^##\s*🤖\s*Deep Code\s*$/m, '')
-                .replace(/^(✅|⏳|⚠️|❌).*$/gm, '')
-                .trim();
+              return marked ? marked[1].trim() : null;
             };
 
             // Strip the fence tags out of every thread piece so a comment
@@ -326,12 +321,13 @@ jobs:
             let history = T.head + T.title + fence(issue.data.title) + '\n\n';
             if (issue.data.body) history += T.first + fence(issue.data.body) + '\n\n';
             for (const comment of comments.data) {
-              const isBot = comment.user.type === 'Bot';
-              const content = isBot ? extractBotBody(comment.body) : comment.body;
+              const isOwnBot = comment.user.type === 'Bot' && comment.user.login === process.env.BOT_NAME;
+              const ownAnswer = isOwnBot ? extractBotBody(comment.body) : null;
+              const content = ownAnswer ?? comment.body;
               if (!content) continue;
-              // The bot's own previous turns are trusted (this workflow wrote
-              // them); everyone else's login and text are untrusted data.
-              const author = isBot ? T.prev : fence(comment.user.login);
+              // Only this workflow's marked answers represent its previous
+              // turns. Other comments retain their author and untrusted body.
+              const author = ownAnswer !== null ? T.prev : fence(comment.user.login);
               history += '### ' + author + '\n' + fence(content) + '\n\n';
             }
             // The whole thread is wrapped as untrusted data (see T.rules); only

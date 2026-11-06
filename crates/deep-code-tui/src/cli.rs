@@ -478,7 +478,6 @@ fn parse_doctor_command(mut args: Vec<String>) -> CliArgs {
 
 fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
     let prog = program_name();
-    let mut http = false;
     let mut host = "127.0.0.1".to_string();
     let mut port = 7878u16;
     let mut auth_token = None;
@@ -500,10 +499,6 @@ fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
             value if value.starts_with("--add-dir=") => {
                 args.remove(0);
                 push_add_dir(&mut add_dirs, value.trim_start_matches("--add-dir="));
-            }
-            "--http" => {
-                http = true;
-                args.remove(0);
             }
             "--approval-mode" => {
                 args.remove(0);
@@ -542,16 +537,11 @@ fn parse_serve_command(mut args: Vec<String>) -> CliArgs {
             }
             other => {
                 eprintln!(
-                    "Unknown serve argument '{other}'. Usage: {prog} serve --http [--host HOST] [--port PORT] [--auth-token TOKEN] [--resume ID] [--approval-mode interactive|autonomous] [--add-dir DIR]..."
+                    "Unknown serve argument '{other}'. Usage: {prog} serve [--host HOST] [--port PORT] [--auth-token TOKEN] [--resume ID] [--approval-mode interactive|autonomous] [--add-dir DIR]..."
                 );
                 std::process::exit(2);
             }
         }
-    }
-
-    if !http {
-        eprintln!("Usage: {prog} serve --http [--host 127.0.0.1] [--port 7878]");
-        std::process::exit(2);
     }
 
     // CLI flag wins; otherwise DEEP_CODE_APPROVAL_MODE=autonomous; else interactive.
@@ -623,7 +613,7 @@ fn parse_eval_command(mut args: Vec<String>) -> CliArgs {
                 json = true;
                 args.remove(0);
             }
-            "--markdown" | "--to-markdown" => {
+            "--markdown" => {
                 markdown = true;
                 args.remove(0);
             }
@@ -972,7 +962,7 @@ fn usage_text() -> String {
         format!("  {prog} github install [--with-app]   # install the CI bot into this repo (--print to preview)"),
         format!("  {prog} github status                 # show the CI bot's status"),
         format!("  {prog} doctor [--json]"),
-        format!("  {prog} serve --http [--host HOST] [--port PORT]"),
+        format!("  {prog} serve [--host HOST] [--port PORT]"),
         format!("  {prog} session list|resume|delete|export"),
         format!("  {prog} eval [--subset lite] [--sample N] [--parallel N] [--json] [--markdown]"),
         String::new(),

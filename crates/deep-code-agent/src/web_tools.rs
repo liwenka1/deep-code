@@ -1724,7 +1724,7 @@ mod tests {
         for name in [WebSearchTool::NAME, FetchUrlTool::NAME] {
             assert_eq!(ExecPolicy::classify_tool(name), ToolKind::Network);
             let plan = ExecPolicy::new().evaluate_tool(name, &json!({}));
-            assert!(plan.requires_approval, "{name} must be approval-gated");
+            assert!(plan.requires_approval(), "{name} must be approval-gated");
             assert!(plan.read_only);
             assert_eq!(plan.risk_level, RiskLevel::Medium);
         }

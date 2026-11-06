@@ -62,13 +62,13 @@ pub(super) fn session_allowable(tool_name: &str) -> bool {
 /// Whether answering "approve for the session" at this prompt would record
 /// anything at all: either the tool is `session_allowable` by name, or the
 /// call is one simple shell command whose identity can be remembered
-/// (`shell_consent_identity`) — and in neither case is it a `needs-human` call.
+/// (`shell_consent_identity`) — and in neither case is it a `HumanOnly` call.
 /// `false` means "a" would silently downgrade to a one-time approve: a UI reads
 /// this to offer only the options that mean what they say, and it is the same
 /// rules the recording path applies, so the panel and the runtime cannot
 /// disagree about what "a" does.
 ///
-/// `needs-human` is the third rule and the reason this takes the rule id: an
+/// `HumanOnly` is the third rule and the reason this takes authority: an
 /// irreversible command is refused to every automatic path ABOVE this question
 /// (`auto_approval_granted` returns before consulting session memory), so a
 /// recorded identity for it would never be read. Offering "a" would print an
@@ -85,9 +85,9 @@ pub(super) fn session_allowable(tool_name: &str) -> bool {
 pub fn session_consent_recordable(
     tool_name: &str,
     arguments: &serde_json::Value,
-    matched_rule: Option<&str>,
+    authority: Option<crate::execution_policy::ApprovalAuthority>,
 ) -> bool {
-    if crate::execution_policy::is_needs_human_rule(matched_rule) {
+    if authority == Some(crate::execution_policy::ApprovalAuthority::HumanOnly) {
         return false;
     }
     session_allowable(tool_name) || shell_consent_identity(tool_name, arguments).is_some()
@@ -267,7 +267,7 @@ impl AgentRuntime {
         if is_root_grant(&call.name) {
             return None;
         }
-        // A plan marked `needs-human` (today: an irreversible-outward command)
+        // A plan marked `HumanOnly` (today: an irreversible-outward command)
         // joins the root grant at this height — ABOVE config `auto_allow`, above
         // session memory, above every permission mode and above the judge — for
         // the same reason: it is a decision only a person makes, and no standing
@@ -284,7 +284,7 @@ impl AgentRuntime {
         //
         // Yolo included: it auto-approves everything that reaches it, and the
         // point of this check is that this call does not reach it.
-        if crate::execution_policy::is_needs_human_rule(request.matched_rule.as_deref()) {
+        if request.authority == crate::execution_policy::ApprovalAuthority::HumanOnly {
             return None;
         }
         // Inside a sub-agent NONE of the channels below apply: a child's gated
@@ -483,6 +483,7 @@ impl AgentRuntime {
             turn_id,
             cancel,
             root_grant_target,
+            ..
         } = pending;
         // Validate ownership and record standing consent under the same lock.
         // `begin_turn` may have superseded this batch after it was submitted
@@ -497,9 +498,7 @@ impl AgentRuntime {
                 return;
             }
             if decision == ApprovalDecision::ApprovedForSession {
-                let needs_human = crate::execution_policy::is_needs_human_rule(
-                    self.tools.evaluate_tool(&current).matched_rule.as_deref(),
-                );
+                let needs_human = self.tools.evaluate_tool(&current).requires_human();
                 if !needs_human {
                     if session_allowable(&current.name) {
                         state.session_approved.insert(current.name.clone());
@@ -602,6 +601,7 @@ impl AgentRuntime {
                 // interleave into a parked batch with a cancelled token.
                 request.preview = self.approval_preview(&current);
                 let batch = PendingToolBatch {
+                    approval_id: request.approval_id.clone(),
                     current,
                     remaining,
                     turn_id: turn_id.clone(),
@@ -1154,7 +1154,7 @@ mod tests {
     }
 
     /// An irreversible command offers no session consent, and the reason is not
-    /// theoretical: the gate refuses `needs-human` ABOVE session memory
+    /// theoretical: the gate refuses `HumanOnly` ABOVE session memory
     /// (`auto_approval_granted` returns before consulting it), so a recorded
     /// identity could never be read — "a" would print an option meaning "this
     /// once". The identity a shell consent records also drops flags, so a
@@ -1165,7 +1165,8 @@ mod tests {
     /// was recorded" have to stay the same answer.
     #[tokio::test]
     async fn an_irreversible_command_records_no_session_consent() {
-        const RULE: Option<&str> = Some("needs-human:irreversible:git push --force");
+        const RULE: Option<crate::execution_policy::ApprovalAuthority> =
+            Some(crate::execution_policy::ApprovalAuthority::HumanOnly);
         assert!(!session_consent_recordable(
             "shell",
             &json!({ "command": "git push --force origin main" }),
@@ -1187,6 +1188,7 @@ mod tests {
         );
         runtime.begin_turn("approve a shell call").await;
         let pending = PendingToolBatch {
+            approval_id: crate::ApprovalId::new(),
             current: crate::tool::ToolCall::new(
                 "c1",
                 "shell",

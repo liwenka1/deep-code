@@ -39,7 +39,7 @@ impl App {
     /// tools, a command-identity consent for one simple shell command. A root
     /// grant (per-directory by design), a sub-agent dispatch (what it authorizes
     /// lives in the arguments), a job status/tail/cancel, a compound shell
-    /// command and an irreversible command (`needs-human`: no automatic path may
+    /// command and an irreversible command (`HumanOnly`: no automatic path may
     /// ever read a recorded consent for it) record nothing, so the OPTION
     /// disappears from the rendered list rather than advertising a consent that
     /// would silently downgrade to a one-time approve.
@@ -57,7 +57,7 @@ impl App {
             deep_code_agent::session_consent_recordable(
                 &request.tool_name,
                 &request.arguments,
-                request.matched_rule.as_deref(),
+                Some(request.authority),
             )
         })
     }
@@ -70,7 +70,7 @@ impl App {
     /// write boundary for good rather than authorizing one action; anything
     /// reaching the network, where a mis-keyed yes costs whatever the far end
     /// sends back or receives — `curl … | sh` is one keystroke either way; and
-    /// an irreversible command (`needs-human`), which is the one class where a
+    /// an irreversible command (`HumanOnly`), which is the one class where a
     /// mis-keyed yes cannot be walked back at all — the whole reason that floor
     /// parks a prompt instead of refusing outright is that a person may
     /// authorize one run, and a default that approves it is not a decision. The
@@ -93,10 +93,8 @@ impl App {
         // predicate the runtime's egress floor reads, so the two cannot drift.
         let reaches_network =
             request.network || deep_code_agent::is_network_tool(&request.tool_name);
-        // Read off `matched_rule`, the same field the runtime's own refusal reads
-        // (`approval_flow::auto_approval_granted`), so the panel's default and
-        // the gate's answer cannot disagree about which prompts these are.
-        let irreversible = deep_code_agent::is_needs_human_rule(request.matched_rule.as_deref());
+        // The panel consumes the same typed authority as the runtime gate.
+        let irreversible = request.authority == deep_code_agent::ApprovalAuthority::HumanOnly;
         let deny_by_default = is_root_grant || reaches_network || irreversible;
         self.pending_approval = Some(request);
         self.approval_scroll_offset = 0;
@@ -179,14 +177,14 @@ impl App {
     }
 
     fn resolve_pending_tool(&mut self, decision: ApprovalDecision) {
-        if self.pending_approval.take().is_none() {
+        let Some(request) = self.pending_approval.take() else {
             return;
-        }
+        };
 
         let label = self.tr(decision.text_id());
         self.approval_scroll_offset = 0;
         self.status = self.tr_with(TextId::StatusToolResolved, &[("decision", label)]);
         self.is_streaming = true;
-        self.start_stream(StreamRequest::Approval(decision));
+        self.start_stream(StreamRequest::Approval(request.approval_id, decision));
     }
 }

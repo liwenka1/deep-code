@@ -1,5 +1,3 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -7,7 +5,7 @@ use tokio::sync::mpsc;
 use super::telemetry::TurnTelemetry;
 use crate::checkpoint::CheckpointId;
 use crate::model::Usage;
-use crate::session_store::{SessionId, now_ms};
+use crate::session_store::SessionId;
 use crate::tool::{ApprovalRequest, ToolResult, ToolUpdate};
 
 /// Stable identifier for one user-visible agent turn.
@@ -17,9 +15,7 @@ pub struct TurnId(pub String);
 impl TurnId {
     #[must_use]
     pub fn new() -> Self {
-        static TURN_COUNTER: AtomicU64 = AtomicU64::new(0);
-        let seq = TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
-        Self(format!("turn_{}_{seq}", now_ms()))
+        Self(format!("turn_{}", uuid::Uuid::new_v4()))
     }
 
     #[must_use]
@@ -55,6 +51,13 @@ impl From<&str> for ToolCallId {
     fn from(value: &str) -> Self {
         Self(value.to_string())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeFailureKind {
+    Execution,
+    StepLimit,
 }
 
 /// Events the agent runtime produces for UIs.
@@ -187,16 +190,10 @@ pub enum RuntimeEvent {
     /// exists so library code never writes to stderr while a raw-mode
     /// terminal owns the screen.
     Warning { message: String },
-    /// Runtime-level error. Terminal for the current turn: every emitter inside
-    /// a turn ends the turn right after sending it, and consumers rely on that
-    /// (the TUI stops observing the stream, headless stops the run). The one
-    /// emitter outside a turn — `submit_approval` with nothing pending —
-    /// reports a rejected request with `turn_id: None` on that request's own
-    /// channel; whatever turn may be live is neither named nor ended by it. A
-    /// degradation the loop survives — a failed checkpoint snapshot,
-    /// say — is a [`Self::Warning`], never this: an `Error` from a loop that
-    /// keeps going is a turn nobody is watching.
+    /// Terminal runtime failure with a machine-readable cause. Approvals that
+    /// are stale or absent return ApprovalError without ending the live turn.
     Error {
+        kind: RuntimeFailureKind,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<TurnId>,
         message: String,
@@ -211,7 +208,7 @@ impl RuntimeEvent {
     /// exists so a payload can round-trip back into this enum; the two spellings
     /// are deliberate and both owned here.
     ///
-    /// Stable wire contract: the SSE (`/v1/prompt`) and headless `stream-json`
+    /// Shared wire format: the SSE (`/prompt`) and headless `stream-json`
     /// consumers match on `item.kind`, and the test below pins every string —
     /// change one only together with those consumers, as a deliberate red test.
     #[must_use]
@@ -295,6 +292,8 @@ mod tests {
     /// length check below is the nudge to pin it here too.
     fn sample_request() -> ApprovalRequest {
         ApprovalRequest {
+            approval_id: crate::ApprovalId::new(),
+            authority: crate::ApprovalAuthority::AutomaticAllowed,
             network: false,
             call_id: "call_1".to_string(),
             tool_name: "shell".to_string(),
@@ -490,6 +489,7 @@ mod tests {
             ),
             (
                 RuntimeEvent::Error {
+                    kind: crate::RuntimeFailureKind::Execution,
                     turn_id: Some(turn.clone()),
                     message: "e".to_string(),
                 },
@@ -541,6 +541,7 @@ mod tests {
                 path: "/tmp/x".to_string(),
             },
             RuntimeEvent::Error {
+                kind: crate::RuntimeFailureKind::Execution,
                 turn_id: None,
                 message: "e".to_string(),
             },

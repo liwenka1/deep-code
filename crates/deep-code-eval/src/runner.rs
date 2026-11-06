@@ -3,19 +3,21 @@
 //! a non-empty patch is not "resolved"; submit the predictions to the official
 //! SWE-bench harness (sb-cli) for the real resolved rate.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deep_code_agent::{
-    AgentConfig, ApprovalDecision, LaunchedRuntime, Role, RuntimeEvent, RuntimeEventReceiver,
-    TurnTelemetry, launch_runtime,
+    AgentConfig, ApprovalDecision, FinishReason, Role, RuntimeEvent, TurnHandle, TurnTelemetry,
+    launch_runtime,
 };
-use tokio::sync::{Mutex as TokioMutex, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use crate::bench::{BenchmarkInstance, BenchmarkSet};
+use crate::checkout::checkout_repo;
+#[cfg(test)]
+use crate::checkout::{cache_dir_under, git};
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -314,7 +316,7 @@ fn unattended_decision(
     request: &deep_code_agent::ApprovalRequest,
 ) -> (ApprovalDecision, Option<String>) {
     let needs_a_person = request.tool_name == deep_code_agent::REQUEST_WRITE_ROOT_TOOL
-        || deep_code_agent::is_needs_human_rule(request.matched_rule.as_deref());
+        || request.authority == deep_code_agent::ApprovalAuthority::HumanOnly;
     if needs_a_person {
         (
             ApprovalDecision::Denied,
@@ -354,15 +356,15 @@ async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> I
     // Bound the checkout too, not just the turn: a stalled clone/fetch (git has
     // no timeout of its own) would otherwise hold this parallelism slot forever
     // and write nothing until every other instance finished.
-    match timeout(
+    if let Err(error) = checkout_repo(
+        instance.repo(),
+        instance.base_commit(),
+        workspace.path(),
         config.instance_timeout,
-        checkout_repo(instance.repo(), instance.base_commit(), workspace.path()),
     )
     .await
     {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return error_result(format!("checkout failed: {e}"), &start),
-        Err(_) => return error_result("checkout timed out".to_string(), &start),
+        return error_result(format!("checkout failed: {error}"), &start);
     }
 
     // Snapshot trusted metadata before any model tools can change HEAD or the
@@ -381,16 +383,15 @@ async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> I
     for warning in &launched.warnings {
         eprintln!("warning: {warning}");
     }
-    let receiver = launched.handle.submit_user(instance_prompt(instance)).await;
+    let receiver = launched.handle.start_turn(instance_prompt(instance)).await;
 
-    let outcome = timeout(config.instance_timeout, consume_events(&launched, receiver)).await;
+    let outcome = timeout(config.instance_timeout, consume_events(receiver)).await;
     let (timed_out, turn) = match outcome {
         Ok(turn) => (false, turn),
         Err(_) => {
             // Stop the still-running turn before reading the working tree,
             // otherwise the diff races against in-flight edits.
-            let cancel_rx = launched.handle.cancel_turn().await;
-            let _ = timeout(Duration::from_secs(10), drain(cancel_rx)).await;
+            launched.handle.shutdown().await;
             (true, TurnOutcome::default())
         }
     };
@@ -418,7 +419,7 @@ async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> I
         (rounds, calls)
     };
     let max_turn_steps = config.agent_config.turn_steps;
-    let step_limit_hit = max_turn_steps > 0 && api_rounds >= max_turn_steps;
+    let step_limit_hit = turn.step_limit_hit;
     // Fully stop the runtime before extracting the diff.
     launched.shutdown().await;
 
@@ -487,67 +488,31 @@ async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> I
 struct TurnOutcome {
     telemetry: Option<TurnTelemetry>,
     error: Option<String>,
+    step_limit_hit: bool,
 }
 
-/// Consume runtime events until the turn terminates. Approvals are granted
-/// automatically; `submit_approval` returns a NEW event receiver which MUST
-/// replace the old one (the previous channel closes at the approval point).
-async fn consume_events(
-    launched: &LaunchedRuntime,
-    mut receiver: RuntimeEventReceiver,
-) -> TurnOutcome {
-    let mut outcome = TurnOutcome::default();
-    loop {
-        let Some(event) = receiver.recv().await else {
-            // Channel closed without a terminal event (should not happen).
-            outcome
-                .error
-                .get_or_insert_with(|| "event stream ended without TurnFinished".into());
-            return outcome;
-        };
-        match event {
-            RuntimeEvent::ApprovalRequired { ref request, .. } => {
-                // The benchmark approves everything so a run is unattended —
-                // but not a request to WIDEN the write boundary. This harness
-                // exists to run a model over untrusted checkouts, and a
-                // granted root is a real sandbox write grant, so a prompt
-                // injected into a benchmark repo could ask for the
-                // evaluator's own `~/.cargo` and get a yes with nobody
-                // present. Every other unattended channel (headless `-p`,
-                // serve, sub-agents) already refuses this one; this was the
-                // only place that said yes.
-                //
-                // The denial carries the real reason for the same reason the
-                // sub-agent gate does: nobody saw this prompt, so the stock
-                // "User declined the write-root request" would teach the model
-                // a refusal that never happened — here, in a rollout whose
-                // whole output is what the model did next.
-                let (decision, denial_note) = unattended_decision(request);
-                receiver = launched
-                    .handle
-                    .submit_approval_with_denial_note(decision, denial_note)
-                    .await;
+/// The core handle owns termination and preserves the event stream across approvals.
+async fn consume_events(mut turn: TurnHandle) -> TurnOutcome {
+    while let Some(event) = turn.recv().await {
+        if let RuntimeEvent::ApprovalRequired { request, .. } = event {
+            let (decision, denial_note) = unattended_decision(&request);
+            if let Err(error) = turn
+                .approve(&request.approval_id, decision, denial_note)
+                .await
+            {
+                return TurnOutcome {
+                    error: Some(error.to_string()),
+                    ..Default::default()
+                };
             }
-            RuntimeEvent::TurnFinished { telemetry, .. } => {
-                outcome.telemetry = telemetry;
-                return outcome;
-            }
-            RuntimeEvent::TurnCancelled { .. } => {
-                outcome.error = Some("turn cancelled".into());
-                return outcome;
-            }
-            RuntimeEvent::Error { message, .. } => {
-                outcome.error = Some(message);
-                return outcome;
-            }
-            _ => {}
         }
     }
-}
-
-/// Drain a receiver until it closes (used after cancel_turn).
-async fn drain(mut receiver: RuntimeEventReceiver) {
-    while receiver.recv().await.is_some() {}
+    let result = turn.outcome().expect("closed handle has an outcome");
+    TurnOutcome {
+        telemetry: result.telemetry.clone(),
+        error: result.error.clone(),
+        step_limit_hit: result.reason == FinishReason::StepLimit,
+    }
 }
 
 /// Copy one instance's session transcripts out of its throwaway workspace,
@@ -580,122 +545,6 @@ async fn save_transcript(
         {
             tokio::fs::copy(&path, dest.join(name)).await?;
         }
-    }
-    Ok(())
-}
-
-// ── Repo checkout with a per-repo cache ─────────────────────────────────────
-
-/// Bare-clone cache: SWE-bench reuses the same repos for many instances
-/// (django alone is ~1/3 of Lite); re-fetching per instance wastes GBs.
-fn cache_dir() -> PathBuf {
-    cache_dir_under(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
-}
-
-/// [`cache_dir`] with the two variables handed in. The same rule the agent's
-/// own home lookup follows: `HOME` then `USERPROFILE`, and an empty or
-/// relative value is no home — here the temp directory stands in, rather than
-/// a cache under whatever directory the run started from.
-fn cache_dir_under(
-    home: Option<std::ffi::OsString>,
-    profile: Option<std::ffi::OsString>,
-) -> PathBuf {
-    [home, profile]
-        .into_iter()
-        .flatten()
-        .map(PathBuf::from)
-        .find(|path| path.is_absolute())
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".cache")
-        .join("deep-code")
-        .join("swebench-repos")
-}
-
-/// How much of a failed git command's stderr to carry into the error.
-const GIT_ERROR_TAIL: usize = 400;
-
-async fn git(args: &[&str]) -> anyhow::Result<()> {
-    let output = tokio::process::Command::new("git")
-        .args(args)
-        .output()
-        .await?;
-    if !output.status.success() {
-        // Keep the reason. A bare "git clone failed" reads identically whether
-        // the network dropped, the disk filled, or the commit is gone — and
-        // cloning is the most failure-prone step of a multi-hour rollout, on
-        // the machine least likely to be watched while it runs.
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let trimmed = stderr.trim();
-        let reason = if trimmed.is_empty() {
-            "(no stderr)".to_string()
-        } else {
-            // Tail-bounded and char-safe (paths and messages may be non-ASCII).
-            let chars: Vec<char> = trimmed.chars().collect();
-            chars[chars.len().saturating_sub(GIT_ERROR_TAIL)..]
-                .iter()
-                .collect()
-        };
-        anyhow::bail!("git {} failed: {reason}", args.join(" "));
-    }
-    Ok(())
-}
-
-/// One lock per repo id, so parallel instances of the same repo serialize their
-/// use of the shared bare cache instead of racing `if !cache.exists() { clone }`
-/// (three concurrent `clone --bare` into one path fail with exit 128, and an
-/// instance that sees the dir mid-clone gets an empty repo and a failed
-/// checkout). Cross-repo checkouts still run in parallel.
-fn repo_lock_for(repo: &str) -> Arc<TokioMutex<()>> {
-    static LOCKS: LazyLock<StdMutex<HashMap<String, Arc<TokioMutex<()>>>>> =
-        LazyLock::new(|| StdMutex::new(HashMap::new()));
-    LOCKS
-        .lock()
-        .expect("repo-lock map poisoned")
-        .entry(repo.to_string())
-        .or_default()
-        .clone()
-}
-
-/// Check out `repo` at `commit` into `dest`, going through the bare cache.
-async fn checkout_repo(repo: &str, commit: &str, dest: &Path) -> anyhow::Result<()> {
-    let cache = cache_dir().join(repo.replace('/', "__"));
-    let cache_str = cache.to_string_lossy().into_owned();
-    let dest_str = dest.to_string_lossy().into_owned();
-    let url = format!("https://github.com/{repo}.git");
-
-    // The whole checkout is serialized per repo: the `clone --shared` workdir
-    // borrows objects from the cache, so a concurrent `fetch` into that cache
-    // (the retry path below) could pull the alternates out from under it. The
-    // agent turn dominates an instance's runtime, so serializing checkouts of
-    // the same repo costs little; different repos still overlap.
-    let lock = repo_lock_for(repo);
-    let _guard = lock.lock().await;
-
-    if !cache.exists() {
-        if let Some(parent) = cache.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        git(&["clone", "--bare", &url, &cache_str]).await?;
-    }
-    // `--shared` borrows objects from the cache instead of copying; workdirs
-    // are throwaway temp dirs, so the alternates coupling is fine.
-    git(&["clone", "--shared", "--no-checkout", &cache_str, &dest_str]).await?;
-    if git(&["-C", &dest_str, "checkout", "-q", commit])
-        .await
-        .is_err()
-    {
-        // Cache may predate the commit: refresh it once and retry.
-        git(&[
-            "-C",
-            &cache_str,
-            "fetch",
-            "origin",
-            "+refs/heads/*:refs/heads/*",
-        ])
-        .await?;
-        git(&["-C", &dest_str, "checkout", "-q", commit])
-            .await
-            .map_err(|_| anyhow::anyhow!("commit {commit} not found for {repo}"))?;
     }
     Ok(())
 }
@@ -981,9 +830,11 @@ mod tests {
 
     fn approval_request(
         tool: &str,
-        matched_rule: Option<&str>,
+        authority: deep_code_agent::ApprovalAuthority,
     ) -> deep_code_agent::ApprovalRequest {
         deep_code_agent::ApprovalRequest {
+            approval_id: deep_code_agent::ApprovalId::new(),
+            authority,
             network: false,
             call_id: "c1".to_string(),
             tool_name: tool.to_string(),
@@ -992,7 +843,7 @@ mod tests {
             risk_level: deep_code_agent::RiskLevel::High,
             requires_sandbox: true,
             read_only: false,
-            matched_rule: matched_rule.map(str::to_string),
+            matched_rule: None,
             justification: None,
             resolved_target: None,
             preview: None,
@@ -1025,7 +876,7 @@ mod tests {
     fn the_harness_denies_only_what_needs_a_person() {
         let (decision, note) = unattended_decision(&approval_request(
             "shell",
-            Some("needs-human:irreversible:git push --force"),
+            deep_code_agent::ApprovalAuthority::HumanOnly,
         ));
         assert_eq!(decision, ApprovalDecision::Denied);
         assert!(
@@ -1036,7 +887,7 @@ mod tests {
 
         let (decision, note) = unattended_decision(&approval_request(
             deep_code_agent::REQUEST_WRITE_ROOT_TOOL,
-            None,
+            deep_code_agent::ApprovalAuthority::HumanOnly,
         ));
         assert_eq!(decision, ApprovalDecision::Denied);
         assert!(
@@ -1046,11 +897,17 @@ mod tests {
 
         // Everything else is approved, or a rollout could not run at all.
         assert_eq!(
-            unattended_decision(&approval_request("shell", Some("builtin:untrusted_shell"))),
+            unattended_decision(&approval_request(
+                "shell",
+                deep_code_agent::ApprovalAuthority::AutomaticAllowed
+            )),
             (ApprovalDecision::Approved, None)
         );
         assert_eq!(
-            unattended_decision(&approval_request("write_file", None)),
+            unattended_decision(&approval_request(
+                "write_file",
+                deep_code_agent::ApprovalAuthority::AutomaticAllowed
+            )),
             (ApprovalDecision::Approved, None)
         );
     }

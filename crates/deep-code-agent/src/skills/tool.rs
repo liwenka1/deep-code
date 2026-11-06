@@ -451,6 +451,6 @@ mod tests {
         );
         let plan = ExecPolicy::new().evaluate_tool(SkillTool::NAME, &json!({ "name": "x" }));
         assert!(matches!(plan.verdict, PolicyVerdict::Allow));
-        assert!(!plan.requires_approval && plan.read_only);
+        assert!(!plan.requires_approval() && plan.read_only);
     }
 }

@@ -1,6 +1,6 @@
 //! Local HTTP/SSE runtime API. Surface kept deliberately small: the only
 //! production consumer is headless automation (CI bot) driving
-//! `/v1/prompt` + `/v1/approvals` with a bearer token.
+//! `/prompt` + `/approvals` with a bearer token.
 
 mod auth;
 mod events;

@@ -70,8 +70,8 @@ pub use doctor::{DoctorReport, default_config_path};
 pub use error::AgentResult;
 pub use event::AgentEvent;
 pub use execution_policy::{
-    NetworkMode, PermissionMode, RiskLevel, SafetyNote, SandboxMode, SharedPermissionMode,
-    is_needs_human_rule, shell_command_of,
+    ApprovalAuthority, NetworkMode, PermissionMode, RiskLevel, SafetyNote, SandboxMode,
+    SharedPermissionMode, shell_command_of,
 };
 pub use git_workspace::{GitOutput, IsolatedGit, IsolatedGitError};
 pub use i18n::{Lang, TextId, tr, tr_with};
@@ -107,20 +107,23 @@ pub use paths::{canonicalize, ensure_owned_dirs};
 pub use pinned_dir::validate_pinned_workspace;
 pub use pricing::{CostCurrency, CostEstimate};
 pub use root_grant::REQUEST_WRITE_ROOT_TOOL;
+pub use runtime::LiveSessionSnapshot;
 pub use runtime::{
-    AgentRuntime, CompactNowOutcome, CompactionReport, MAX_TURN_STEPS, PrefixStatus, RuntimeEvent,
-    RuntimeEventReceiver, ToolCallId, TurnId, TurnTelemetry, UserTurn, is_network_tool,
-    session_consent_recordable, unattended_denial_note,
+    AgentRuntime, CompactNowOutcome, CompactionReport, FinishReason, MAX_TURN_STEPS, PrefixStatus,
+    RuntimeEvent, RuntimeEventReceiver, RuntimeFailureKind, ToolCallId, TurnHandle, TurnId,
+    TurnOutcome, TurnTelemetry, UserTurn, is_network_tool, session_consent_recordable,
+    unattended_denial_note,
 };
 pub use runtime_launch::{
-    LaunchedRuntime, launch_runtime, relaunch_runtime, tools_enabled, web_enabled,
+    LaunchedRuntime, launch_runtime, prepare_runtime_reconfiguration, relaunch_runtime,
+    tools_enabled, web_enabled,
 };
 pub use sandbox::{Enforcement, EnforcementGap, sandbox_available, sandbox_enforcement};
 pub use session::Session;
 pub use session_entry::{Ask, EntryKind, ExchangeResult, SessionEntry, ToolExchange};
 pub use session_store::{
-    CheckpointRecord, JsonSessionStore, SessionId, SessionRecord, SessionStore, SessionStoreError,
-    TurnRecord, format_sessions_storage_note, now_ms,
+    CheckpointRecord, JsonSessionStore, PreparedSession, SessionId, SessionRecord, SessionStore,
+    SessionStoreError, TurnRecord, format_sessions_storage_note, now_ms,
 };
 pub use shell_tools::JobStore;
 /// The token [`AgentRuntime::compact_now`] takes, re-exported so a front-end
@@ -138,8 +141,8 @@ pub use text_sanitize::{
     collapse_whitespace, is_bidi_or_zero_width, neutralize_char_into, neutralize_display_text,
 };
 pub use tool::{
-    ApprovalDecision, ApprovalRequest, MockEchoTool, ToolError, ToolRegistry, ToolResult,
-    ToolResultStatus,
+    ApprovalDecision, ApprovalError, ApprovalId, ApprovalRequest, MockEchoTool, ToolError,
+    ToolRegistry, ToolResult, ToolResultStatus,
 };
 // `/status` names which backend the web tools run on; the decision is made
 // here from the provider config, so the TUI asks rather than re-deriving it.

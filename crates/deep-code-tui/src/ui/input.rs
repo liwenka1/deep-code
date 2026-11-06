@@ -481,6 +481,8 @@ mod tests {
 
         let mut app = App::new();
         app.park_approval(deep_code_agent::ApprovalRequest {
+            approval_id: deep_code_agent::ApprovalId::new(),
+            authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
             network: false,
             call_id: "call_1".to_string(),
             tool_name: "mock_echo".to_string(),
@@ -547,6 +549,8 @@ mod tests {
 
         let park = |app: &mut App| {
             app.park_approval(deep_code_agent::ApprovalRequest {
+                approval_id: deep_code_agent::ApprovalId::new(),
+                authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
                 network: false,
                 call_id: "call_1".to_string(),
                 tool_name: "mock_echo".to_string(),
@@ -602,6 +606,8 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = App::new();
         app.park_approval(deep_code_agent::ApprovalRequest {
+            approval_id: deep_code_agent::ApprovalId::new(),
+            authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
             network: false,
             call_id: "call_1".to_string(),
             tool_name: "mock_echo".to_string(),
@@ -1023,6 +1029,8 @@ mod tests {
     fn the_composer_takes_no_click_under_an_approval_panel() {
         let mut app = en_app("draft text");
         app.park_approval(deep_code_agent::ApprovalRequest {
+            approval_id: deep_code_agent::ApprovalId::new(),
+            authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
             network: false,
             call_id: "call_1".to_string(),
             tool_name: "mock_echo".to_string(),

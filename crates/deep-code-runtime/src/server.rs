@@ -42,7 +42,7 @@ pub struct RuntimeServerOptions {
     pub resume_session_id: Option<String>,
     /// Headless/unattended: auto-deny (never park) any approval that reaches the
     /// server, so a gated tool that slipped past auto-allow can't hang the turn
-    /// on a `/v1/approvals` callback that never arrives.
+    /// on a `/approvals` callback that never arrives.
     pub autonomous_approvals: bool,
 }
 
@@ -124,7 +124,7 @@ impl Drop for ActiveTurnLease {
 }
 
 /// Cleanup for an approval parked on a client that may disconnect: if the SSE
-/// stream is dropped while waiting on `/v1/approvals`, remove the stale slot
+/// stream is dropped while waiting on `/approvals`, remove the stale slot
 /// entry (so later callers get an honest 409 instead of "accepted"). The
 /// accompanying ActiveTurnLease cancels that turn; cleanup must not resume an
 /// unobserved model loop. Disarmed on the normal resume path.
@@ -251,11 +251,11 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
         options.host, options.port, launched.backend_label
     );
     if options.auth_token.is_some() {
-        eprintln!("auth: bearer token required for /v1/* routes");
+        eprintln!("auth: bearer token required for /prompt and /approvals routes");
     } else {
         eprintln!(
             "warning: no auth token is set — any process on this machine can call \
-             /v1/* and drive the agent into running tools. Pass --auth-token <TOKEN> \
+             /prompt and /approvals and drive the agent into running tools. Pass --auth-token <TOKEN> \
              or set {RUNTIME_TOKEN_ENV}."
         );
     }
@@ -276,8 +276,8 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
     let shutdown_runtime = Arc::clone(&state.runtime);
 
     let protected = Router::new()
-        .route("/v1/prompt", post(prompt_sse))
-        .route("/v1/approvals", post(submit_approval))
+        .route("/prompt", post(prompt_sse))
+        .route("/approvals", post(submit_approval))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state.clone());
 
@@ -437,7 +437,7 @@ async fn require_auth(State(state): State<AppState>, request: Request, next: Nex
         // No token: the bind is loopback-only (enforced at startup), but a web
         // page that DNS-rebinds its own hostname to 127.0.0.1 is same-origin, so
         // neither the absence of CORS nor the JSON content-type check stops it —
-        // and it could read the SSE stream and POST to /v1/prompt|/v1/approvals.
+        // and it could read the SSE stream and POST to /prompt|/approvals.
         // Require a loopback `Host`, which such a page cannot forge (the browser
         // sends the attacker's hostname). A token, when set, IS the boundary and
         // also permits non-loopback binds, so this only guards the no-token mode.
@@ -534,29 +534,28 @@ async fn prompt_sse(
 
         let mut event_stream = {
             let runtime = runtime.lock().await;
-            let stream = runtime.handle.submit_user(prompt).await;
+            let stream = runtime.handle.start_turn(prompt).await;
             // Record the turn this lease owns, so a disconnect cancels exactly
             // this turn and never a successor started by the next request.
             // Read the id before taking the (non-Send) std lock — the guard
             // must not straddle an await.
-            let live = runtime.handle.live_turn_id().await;
+            let live = Some(stream.id().clone());
             if let Ok(mut id) = lease_turn_id.lock() {
                 *id = live;
             }
             stream
         };
 
-        loop {
-            let mut resume_after_approval = false;
-            while let Some(event) = event_stream.recv().await {
+        while let Some(event) = event_stream.recv().await {
                 let outgoing = thread_sse_event(envelopes.event(&event));
 
                 match event {
                     RuntimeEvent::ApprovalRequired { request, .. } => {
+                        let approval_id = request.approval_id.clone();
                         let (decision, denial_note) = if autonomous_approvals {
                             yield Ok(outgoing);
                             // Headless/unattended: no HTTP client will POST to
-                            // /v1/approvals, so parking here would hang the turn
+                            // /approvals, so parking here would hang the turn
                             // until the connection dies. Deny deterministically
                             // instead — the agent records a denied result and
                             // continues (it never blocks on the callback).
@@ -598,13 +597,10 @@ async fn prompt_sse(
                             // "denied by user" text is true for it.
                             (decision, None)
                         };
-                        let runtime = runtime.lock().await;
-                        event_stream = runtime
-                            .handle
-                            .submit_approval_with_denial_note(decision, denial_note)
-                            .await;
-                        resume_after_approval = true;
-                        break;
+                        if let Err(error) = event_stream.approve(&approval_id, decision, denial_note).await {
+                            yield Ok(thread_sse_event(envelopes.manual("error", serde_json::json!({ "message": error.to_string() }))));
+                            return;
+                        }
                     }
                     RuntimeEvent::TurnFinished { .. }
                     | RuntimeEvent::TurnCancelled { .. }
@@ -614,10 +610,6 @@ async fn prompt_sse(
                     }
                     _ => yield Ok(outgoing),
                 }
-            }
-            if !resume_after_approval {
-                break;
-            }
         }
     };
 
@@ -630,7 +622,7 @@ async fn prompt_sse(
 
 #[derive(Deserialize)]
 struct ApprovalRequestBody {
-    call_id: String,
+    approval_id: deep_code_agent::ApprovalId,
     // The agent enum is `#[serde(rename_all = "snake_case")]`, so it already
     // deserializes `approved`/`approved_for_session`/`denied` straight off the
     // wire — no separate DTO. It's the SSE output contract too, so reusing it
@@ -641,7 +633,7 @@ struct ApprovalRequestBody {
 #[derive(Serialize)]
 struct ApprovalResponse {
     accepted: bool,
-    call_id: String,
+    approval_id: deep_code_agent::ApprovalId,
 }
 
 async fn submit_approval(
@@ -660,11 +652,10 @@ async fn resolve_pending_approval(
         let Some(pending) = slot.as_ref() else {
             return Err(ApiError::conflict("no pending approval"));
         };
-        if pending.request.call_id != body.call_id {
-            return Err(ApiError::bad_request(format!(
-                "call_id mismatch: expected '{}', got '{}'",
-                pending.request.call_id, body.call_id
-            )));
+        if pending.request.approval_id != body.approval_id {
+            return Err(ApiError::conflict(
+                "approval_id does not identify the pending approval",
+            ));
         }
         slot.take()
             .expect("pending approval checked under this lock")
@@ -678,7 +669,7 @@ async fn resolve_pending_approval(
     }
     Ok(Json(ApprovalResponse {
         accepted: true,
-        call_id: body.call_id,
+        approval_id: body.approval_id,
     }))
 }
 

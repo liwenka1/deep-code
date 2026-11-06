@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::image::ImageRef;
 use crate::message::Message;
 use crate::model::ToolCallPayload;
+use crate::runtime::TurnId;
 use crate::session_entry::{Ask, EntryKind, ExchangeResult, SessionEntry, ToolExchange};
 use crate::tool::ToolResultStatus;
 
@@ -70,8 +71,8 @@ impl Session {
         self.push_entry(SessionEntry::system(content));
     }
 
-    pub fn push_user(&mut self, content: impl Into<String>) {
-        self.push_user_with_images(content, Vec::new());
+    pub fn push_user(&mut self, turn_id: TurnId, content: impl Into<String>) {
+        self.push_user_with_images(turn_id, content, Vec::new());
     }
 
     /// Append a user turn that carries images.
@@ -79,25 +80,34 @@ impl Session {
     /// Separate from `push_user` rather than folded into it: the images are
     /// local paths (see [`SessionEntry::user_with_images`]), and a call site
     /// that has none should not have to spell an empty `Vec` to say so.
-    pub fn push_user_with_images(&mut self, content: impl Into<String>, images: Vec<PathBuf>) {
-        self.push_entry(SessionEntry::user_with_images(content, images));
+    pub fn push_user_with_images(
+        &mut self,
+        turn_id: TurnId,
+        content: impl Into<String>,
+        images: Vec<PathBuf>,
+    ) {
+        self.push_entry(SessionEntry::user_with_images(content, images).with_turn_id(turn_id));
     }
 
     /// Append an assistant turn; `calls` become pending exchanges whose
     /// results are filled in by [`Session::record_tool_result`].
     pub fn push_assistant(
         &mut self,
+        turn_id: TurnId,
         content: impl Into<String>,
         reasoning: impl Into<String>,
         calls: Vec<ToolCallPayload>,
     ) {
         let reasoning = reasoning.into();
         let exchanges = calls.into_iter().map(ToolExchange::pending).collect();
-        self.push_entry(SessionEntry::assistant(
-            content,
-            (!reasoning.is_empty()).then_some(reasoning),
-            exchanges,
-        ));
+        self.push_entry(
+            SessionEntry::assistant(
+                content,
+                (!reasoning.is_empty()).then_some(reasoning),
+                exchanges,
+            )
+            .with_turn_id(turn_id),
+        );
     }
 
     /// Keep a late partial reply beside the request it answered. A newer turn
@@ -106,6 +116,7 @@ impl Session {
     pub(crate) fn insert_partial_assistant_after(
         &mut self,
         anchor: &Arc<SessionEntry>,
+        turn_id: TurnId,
         content: String,
         reasoning: String,
     ) -> bool {
@@ -116,14 +127,9 @@ impl Session {
         else {
             return false;
         };
-        self.entries.insert(
-            index + 1,
-            Arc::new(SessionEntry::assistant(
-                content,
-                Some(reasoning),
-                Vec::new(),
-            )),
-        );
+        let reply =
+            SessionEntry::assistant(content, Some(reasoning), Vec::new()).with_turn_id(turn_id);
+        self.entries.insert(index + 1, Arc::new(reply));
         true
     }
 
@@ -239,13 +245,36 @@ mod tests {
     #[test]
     fn late_partial_reply_cannot_reappear_after_its_anchor_was_compacted() {
         let mut session = Session::new();
-        session.push_user("old task");
+        session.push_user(TurnId::new(), "old task");
         let anchor = session.entries().last().unwrap().clone();
         session.replace_entries(vec![Arc::new(SessionEntry::compaction("summary", 1))]);
-        session.push_user("new task");
+        session.push_user(TurnId::new(), "new task");
         let before = session.wire_messages();
-        assert!(!session.insert_partial_assistant_after(&anchor, "late".into(), "reason".into()));
+        assert!(!session.insert_partial_assistant_after(
+            &anchor,
+            TurnId::new(),
+            "late".into(),
+            "reason".into()
+        ));
         assert_eq!(session.wire_messages(), before);
+    }
+
+    #[test]
+    fn late_partial_reply_keeps_its_original_turn_identity() {
+        let mut session = Session::new();
+        let first = TurnId::new();
+        let second = TurnId::new();
+        session.push_user(first.clone(), "old task");
+        let anchor = session.entries().last().unwrap().clone();
+        session.push_user(second.clone(), "new task");
+        assert!(session.insert_partial_assistant_after(
+            &anchor,
+            first.clone(),
+            "late".into(),
+            "reason".into()
+        ));
+        assert_eq!(session.entries()[1].turn_id.as_ref(), Some(&first));
+        assert_eq!(session.entries()[2].turn_id.as_ref(), Some(&second));
     }
 
     fn tool_call(id: &str) -> ToolCallPayload {
@@ -282,9 +311,11 @@ mod tests {
         // what keeps the DeepSeek prefix-cache fingerprint stable across the
         // refactor.
         let mut session = Session::new();
+        let turn_id = TurnId::new();
         session.push_system("you are deep-code");
-        session.push_user("修个 bug");
+        session.push_user(turn_id.clone(), "修个 bug");
         session.push_assistant(
+            turn_id.clone(),
             "看看文件",
             "先读再改",
             vec![tool_call("c1"), tool_call("c2")],
@@ -301,8 +332,8 @@ mod tests {
             ToolResultStatus::Error,
             Ask::Unasked
         ));
-        session.push_assistant("改好了", "", Vec::new());
-        session.push_user("thanks");
+        session.push_assistant(turn_id, "改好了", "", Vec::new());
+        session.push_user(TurnId::new(), "thanks");
 
         let expected = vec![
             Message::system("you are deep-code"),
@@ -323,8 +354,9 @@ mod tests {
     #[test]
     fn record_tool_result_targets_latest_assistant_entry() {
         let mut session = Session::new();
-        session.push_assistant("first", "", vec![tool_call("c1")]);
-        session.push_assistant("second", "", vec![tool_call("c9")]);
+        let turn_id = TurnId::new();
+        session.push_assistant(turn_id.clone(), "first", "", vec![tool_call("c1")]);
+        session.push_assistant(turn_id, "second", "", vec![tool_call("c9")]);
 
         // Unknown id → false; id from an OLDER entry → also false (results
         // always belong to the newest batch).

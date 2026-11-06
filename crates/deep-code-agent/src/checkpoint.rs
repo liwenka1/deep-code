@@ -1009,8 +1009,8 @@ fn checkpoint_error(action: &str, error: std::io::Error) -> ToolError {
 
 #[cfg(test)]
 impl CheckpointStore {
-    /// Test convenience: a snapshot that must have been created, in the old
-    /// `(id, warnings)` shape. Tests never run with a cancelled token or an
+    /// Test convenience: return the created snapshot's id and warnings.
+    /// Tests never run with a cancelled token or an
     /// over-budget workspace, so a skip is a test bug rather than an outcome to
     /// handle.
     pub(crate) fn snapshot_created(

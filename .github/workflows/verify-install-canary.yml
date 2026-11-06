@@ -6,7 +6,7 @@
 #
 #   1. 演练。release.yml 的 `verify-install` 是决定一个版本能否进 npm 的闸门；
 #      这个 workflow 让你在拿一次真实发版去赌之前，先证明那道闸门本身是好的。
-#      对当前已发布的版本（如 0.4.8）dispatch 一次，看 5 条 leg 全绿即可。
+#      对当前已发布的版本 dispatch 一次，检查各平台安装结果。
 #      不作定时任务：一个因为 runner 或网络抖动而变红的定时 job 会训练你去忽略
 #      它，那个代价比它提前几天报信的价值更高。
 #
@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Already-published version to verify, no leading v (e.g. 0.4.8)'
+        description: 'Already-published version to verify, no leading v (current release)'
         required: true
 
 # 只读。这个 job 只安装和运行，不发布任何东西。
@@ -82,14 +82,8 @@ jobs:
             os: windows-latest
             expect: win32-x64
     steps:
-      # Two checkouts, and both the split and their ORDER matter.
-      #
-      # This first one is the CHECKER: it must come from the ref this workflow was
-      # dispatched from, not from the released tag — a tag older than this change
-      # (v0.4.8, for instance) contains no scripts/verify-install.sh, so running
-      # the script out of the released tree would fail with "No such file" on all
-      # five legs. That is a red run that says nothing about the release, which is
-      # exactly the kind of false signal this whole design exists to avoid.
+      # Check out the current checker before its release-package subject.
+      # Checkout cleans its destination, so the workspace root must come first.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # This one is the SUBJECT: the tagged tree, because install.mjs reads its

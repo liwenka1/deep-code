@@ -22,6 +22,8 @@ fail=0
 info() { printf '%s\n' "$*"; }
 bad() { printf '::error::%s\n' "$*"; fail=1; }
 
+node --test packages/deepcode/install.test.mjs
+
 # ── 1. release.yml build matrix ↔ install.mjs ASSET_MAP ──
 #
 # Compared as key→value PAIRS, not as two sets of names. A set comparison passes
@@ -132,17 +134,11 @@ if grep -qE "$FORBIDDEN" <<<"$PACKED"; then
 fi
 
 # ── 3. the launcher must hand the linked name over ──
-# `bin/deepcode` sets DEEP_CODE_PROGRAM_NAME so that `--version` and `--help`
-# name the command the user actually ran. Without it the binary reports
-# `deepcode-bin` on unix — a name on nobody's PATH — which is f514302.
-#
-# scripts/verify-install.sh stays lenient about this at release time, because it
-# also has to diagnose releases cut before that handoff existed. THIS is the
-# check that keeps that leniency from hiding a regression in our own tree.
+# The launcher supplies the public command name to the downloaded binary.
 if grep -q 'DEEP_CODE_PROGRAM_NAME' packages/deepcode/bin/deepcode; then
   info "OK  bin/deepcode hands DEEP_CODE_PROGRAM_NAME over to the binary"
 else
-  bad "bin/deepcode no longer sets DEEP_CODE_PROGRAM_NAME — 'deepcode --version' would report 'deepcode-bin' on unix, a command on nobody's PATH (f514302)"
+  bad "bin/deepcode no longer sets DEEP_CODE_PROGRAM_NAME — the binary must report the public command name"
 fi
 
 if [ "$fail" -eq 0 ]; then

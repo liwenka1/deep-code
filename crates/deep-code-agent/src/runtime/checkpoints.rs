@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::checkpoint::{CheckpointId, CheckpointStore, SnapshotOutcome, SnapshotSkip};
 use crate::runtime::AgentRuntime;
-use crate::runtime::event::{RuntimeEvent, emit};
+use crate::runtime::event::{RuntimeEvent, TurnId, emit};
 use crate::session_store::CheckpointRecord;
 use crate::tool::ToolError;
 
@@ -48,21 +48,33 @@ impl AgentRuntime {
         // mix of the rewound tree and the live turn's later writes, with the
         // model unaware and a "restored" report either way. Cancel the turn
         // first (Esc), then restore.
-        {
-            let state = self.state.lock().await;
-            if state.current_turn_id.is_some() || state.pending.is_some() {
-                return Err(ToolError::exec_failed(
-                    "checkpoint",
-                    "a turn is in progress — cancel it (Esc) before restoring, so the rollback \
+        let state = self.state.clone().lock_owned().await;
+        if state.current_turn_id.is_some() || state.pending.is_some() {
+            return Err(ToolError::exec_failed(
+                "checkpoint",
+                "a turn is in progress — cancel it (Esc) before restoring, so the rollback \
                      is not overwritten by the turn's remaining file writes",
-                ));
-            }
+            ));
         }
-        store.restore(&id)
+        let jobs = match &self.jobs {
+            Some(jobs) => Some(jobs.idle_workspace().await?),
+            None => None,
+        };
+        let store = Arc::clone(store);
+        tokio::task::spawn_blocking(move || {
+            // Keep both guards in the blocking task even if its awaiting
+            // caller is cancelled. No turn or process may start mid-restore.
+            let _state = state;
+            let _jobs = jobs;
+            store.restore(&id)
+        })
+        .await
+        .map_err(|error| ToolError::exec_failed("checkpoint", error.to_string()))?
     }
 
     pub(super) async fn snapshot_turn(
         &self,
+        turn_id: &TurnId,
         label: &str,
         cancel: &CancellationToken,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
@@ -84,7 +96,8 @@ impl AgentRuntime {
                 for message in prune_warnings {
                     emit(tx, RuntimeEvent::Warning { message });
                 }
-                self.record_checkpoint(id.clone(), label).await;
+                self.record_checkpoint(id.clone(), turn_id.clone(), label)
+                    .await;
                 emit(
                     tx,
                     RuntimeEvent::CheckpointCreated {
@@ -139,11 +152,11 @@ impl AgentRuntime {
         );
     }
 
-    async fn record_checkpoint(&self, id: CheckpointId, label: &str) {
+    async fn record_checkpoint(&self, id: CheckpointId, turn_id: TurnId, label: &str) {
         let Some(persistence) = self.persistence.as_ref() else {
             return;
         };
-        let record = CheckpointRecord::new(id, label);
+        let record = CheckpointRecord::new(id, turn_id, label);
         {
             // A plain lock (not try_lock): losing the race here used to drop
             // the checkpoint from session metadata, leaving a snapshot on disk

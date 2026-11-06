@@ -354,6 +354,8 @@ fn default_risk_level() -> RiskLevel {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
+    pub approval_id: ApprovalId,
+    pub authority: crate::execution_policy::ApprovalAuthority,
     pub call_id: String,
     pub tool_name: String,
     pub description: String,
@@ -394,6 +396,33 @@ pub struct ApprovalRequest {
     /// user's language. Not a dry-run — see `execution_policy::safety_notes`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub safety_notes: Vec<SafetyNote>,
+}
+
+/// Runtime-generated identity of one approval prompt. Model call ids may be
+/// reused across turns and must never authorize a pending call.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ApprovalId(String);
+
+impl ApprovalId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+}
+
+impl Default for ApprovalId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ApprovalError {
+    #[error("no pending tool approval")]
+    NoPendingApproval,
+    #[error("approval has expired or belongs to another pending call")]
+    StaleApproval,
 }
 
 /// Static safety notes for a shell-bearing tool call (the `shell` tool, or
@@ -518,7 +547,32 @@ pub trait Tool: Send + Sync + 'static {
 pub trait ErasedTool: Send + Sync {
     fn spec(&self) -> ToolSpec;
 
-    async fn execute(&self, call: &ToolCall, cx: &ToolCx) -> Result<ToolResult, ToolError>;
+    /// Parse before evaluating an approval. The prepared execution owns the
+    /// exact typed parameters that passed validation.
+    fn prepare(&self, call: &ToolCall) -> Result<Box<dyn PreparedToolCall + '_>, ToolError>;
+
+    async fn execute(&self, call: &ToolCall, cx: &ToolCx) -> Result<ToolResult, ToolError> {
+        self.prepare(call)?.execute(cx).await
+    }
+}
+
+#[async_trait]
+pub trait PreparedToolCall: Send {
+    async fn execute(self: Box<Self>, cx: &ToolCx) -> Result<ToolResult, ToolError>;
+}
+
+struct TypedToolCall<'a, T: Tool> {
+    tool: &'a T,
+    call: ToolCall,
+    params: T::Params,
+}
+
+#[async_trait]
+impl<T: Tool> PreparedToolCall for TypedToolCall<'_, T> {
+    async fn execute(self: Box<Self>, cx: &ToolCx) -> Result<ToolResult, ToolError> {
+        let output = self.tool.run(self.params, cx).await?;
+        Ok(output.into_result(&self.call.id, &self.call.name))
+    }
 }
 
 #[async_trait]
@@ -532,7 +586,7 @@ impl<T: Tool> ErasedTool for T {
         }
     }
 
-    async fn execute(&self, call: &ToolCall, cx: &ToolCx) -> Result<ToolResult, ToolError> {
+    fn prepare(&self, call: &ToolCall) -> Result<Box<dyn PreparedToolCall + '_>, ToolError> {
         let params: T::Params =
             serde_json::from_value(call.arguments.clone()).map_err(|error| {
                 ToolError::InvalidArguments {
@@ -540,8 +594,11 @@ impl<T: Tool> ErasedTool for T {
                     message: error.to_string(),
                 }
             })?;
-        let output = self.run(params, cx).await?;
-        Ok(output.into_result(&call.id, &call.name))
+        Ok(Box::new(TypedToolCall {
+            tool: self,
+            call: call.clone(),
+            params,
+        }))
     }
 }
 
@@ -690,7 +747,6 @@ mod tests {
 
         let plan = |requires_sandbox: bool, network: bool| ToolExecutionPlan {
             verdict: PolicyVerdict::Allow,
-            requires_approval: false,
             requires_sandbox,
             read_only: false,
             risk_level: RiskLevel::Low,

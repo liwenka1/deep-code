@@ -307,7 +307,6 @@ text_ids! {
     // 会话管理
     BusyRelaunchConfig,
     GlobalConfigUnavailable,
-    SessionReloadFailedRestart,
     BusySwitchSession,
     BusyRestore,
     BusyCompact,
@@ -331,7 +330,6 @@ text_ids! {
     BoundaryDenialBreaker,
     BoundaryDenialBreakerWithPath,
     AddDirUsage,
-    AddDirNeedsPersistence,
     AddDirResolveFailed,
     AddDirNotDirectory,
     AddDirAlreadyWorkspace,

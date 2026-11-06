@@ -97,6 +97,10 @@ pub(super) struct RuntimeState {
     pub(super) session_cache_savings: CostEstimate,
     pub(super) current_prompt: Option<crate::runtime::UserTurn>,
     pub(super) current_turn_id: Option<TurnId>,
+    pub(super) turn_events: Option<(
+        TurnId,
+        tokio::sync::mpsc::UnboundedSender<super::RuntimeEvent>,
+    )>,
     /// Prompts the user steered into the in-flight turn (mid-turn steering), in
     /// arrival order. Drained at the top of each `run_loop` iteration — i.e. at
     /// a tool-batch boundary, the only point where appending a `user` entry
@@ -181,6 +185,7 @@ pub(super) struct Persistence {
 /// rest of the batch, resumed in order once the decision arrives.
 #[derive(Debug, Clone)]
 pub(super) struct PendingToolBatch {
+    pub(super) approval_id: crate::tool::ApprovalId,
     pub(super) current: ToolCall,
     pub(super) remaining: VecDeque<ToolCall>,
     pub(super) turn_id: TurnId,

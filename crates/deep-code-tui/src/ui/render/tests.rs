@@ -1125,6 +1125,8 @@ fn root_grant_screen(width: u16, height: u16, resolved_target: &str) -> String {
 /// A `request_write_root` approval as the runtime parks it.
 fn root_grant_request(requested: &str, resolved_target: &str) -> deep_code_agent::ApprovalRequest {
     deep_code_agent::ApprovalRequest {
+        approval_id: deep_code_agent::ApprovalId::new(),
+        authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
         call_id: "call_grant".to_string(),
         tool_name: deep_code_agent::REQUEST_WRITE_ROOT_TOOL.to_string(),
         description: "grants write access to a directory outside the current roots".to_string(),
@@ -1864,6 +1866,8 @@ fn a_long_shell_command_can_still_be_answered() {
         let mut app = App::new();
         app.lang = Lang::En;
         app.pending_approval = Some(deep_code_agent::ApprovalRequest {
+            approval_id: deep_code_agent::ApprovalId::new(),
+            authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
             call_id: "call_sh".to_string(),
             tool_name: "shell".to_string(),
             description: "shell commands can modify workspace files or run arbitrary code"
@@ -2003,6 +2007,8 @@ fn an_overflowing_approval_panel_announces_what_is_below_the_fold() {
     let mut app = App::new();
     app.lang = Lang::En;
     app.pending_approval = Some(deep_code_agent::ApprovalRequest {
+        approval_id: deep_code_agent::ApprovalId::new(),
+        authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
         call_id: "call_big".to_string(),
         tool_name: "write_file".to_string(),
         description: "writes a file".to_string(),
@@ -2055,6 +2061,8 @@ fn root_grant_panel_never_shows_a_decoy_command_on_the_action_line() {
     let mut app = App::new();
     app.lang = Lang::En;
     app.pending_approval = Some(deep_code_agent::ApprovalRequest {
+        approval_id: deep_code_agent::ApprovalId::new(),
+        authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
         call_id: "call_grant".to_string(),
         tool_name: deep_code_agent::REQUEST_WRITE_ROOT_TOOL.to_string(),
         description: "grants write access".to_string(),

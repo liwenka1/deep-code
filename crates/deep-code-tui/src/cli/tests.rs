@@ -122,11 +122,19 @@ fn print_args_carry_add_dirs() {
 }
 
 #[test]
+fn serve_uses_http_without_a_transport_flag() {
+    let parsed = parse_serve_command(Vec::new());
+    assert!(matches!(
+        parsed.mode,
+        RunMode::Serve { host, port: 7878, .. } if host == "127.0.0.1"
+    ));
+}
+
+#[test]
 fn serve_accepts_add_dir_in_both_spellings() {
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
     let parsed = parse_serve_command(vec![
-        "--http".to_string(),
         "--add-dir".to_string(),
         first.path().to_string_lossy().into_owned(),
         format!("--add-dir={}", second.path().to_string_lossy()),
@@ -299,7 +307,7 @@ fn help_is_recognized_in_any_position() {
     for args in [
         vec!["doctor"],
         vec!["doctor", "--json"],
-        vec!["serve", "--http", "--port", "8080"],
+        vec!["serve", "--port", "8080"],
         vec!["session", "list"],
         vec!["-c"],
         // A value that merely contains the word must not count.

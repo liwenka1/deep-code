@@ -6,7 +6,7 @@
 //! mode — not even `Yolo` —
 //! runs a command the deny list *recognized*. (An unauthorized `npm publish` is
 //! a different gate: the irreversible-outward floor parks it as a `NeedsApproval`
-//! no automatic path may answer — see `is_needs_human_rule` — rather than a hard
+//! no automatic path may answer — see `ToolExecutionPlan::requires_human` — rather than a hard
 //! `Deny`, so an interactive user can still authorize it once.) Be honest about what that
 //! buys: `shell_deny` is best-effort string parsing, not a security boundary.
 //! An obfuscation it fails to parse falls through as `NeedsApproval`, which
@@ -53,7 +53,7 @@ pub enum PermissionMode {
     Auto,
     /// Auto-approve everything that reaches the gate except two calls, both of
     /// which ask in every mode: a root grant (`request_write_root`) and a
-    /// `needs-human` plan (today: an unauthorized irreversible-outward command).
+    /// `HumanOnly` plan (today: an unauthorized irreversible-outward command).
     /// Hard denies still block, and the deny floor still runs first.
     Yolo,
 }

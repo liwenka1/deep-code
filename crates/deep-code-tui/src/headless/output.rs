@@ -3,8 +3,7 @@
 //! Three formats, three consumers:
 //! - `text`: humans and shell pipes; stdout carries the answer, nothing else.
 //! - `json`: automation that wants one summary object (the bot workflow reads
-//!   `.result` / `.reasoning`). The field set is a wire contract: extend it,
-//!   never rename or repurpose.
+//!   `.result` / `.reasoning`). The README documents the current field set.
 //! - `stream-json`: NDJSON of the same envelopes the SSE server sends, so jq
 //!   paths (`.item.kind`, `.item.payload.text`) work unchanged against both.
 

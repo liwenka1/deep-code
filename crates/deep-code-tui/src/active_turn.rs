@@ -503,6 +503,8 @@ mod tests {
     /// The minimum a `mark_approval_required` / `resolve_approval` pair needs.
     fn gated_shell_request() -> deep_code_agent::ApprovalRequest {
         deep_code_agent::ApprovalRequest {
+            approval_id: deep_code_agent::ApprovalId::new(),
+            authority: deep_code_agent::ApprovalAuthority::AutomaticAllowed,
             call_id: "call_1".to_string(),
             tool_name: "shell".to_string(),
             description: "runs a command".to_string(),

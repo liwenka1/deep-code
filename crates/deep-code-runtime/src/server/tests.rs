@@ -3,6 +3,85 @@ use deep_code_agent::DoctorReport;
 use serde_json::json;
 use std::time::Duration;
 
+async fn pending_approval_id(state: &AppState) -> deep_code_agent::ApprovalId {
+    state
+        .approval
+        .lock()
+        .await
+        .as_ref()
+        .unwrap()
+        .request
+        .approval_id
+        .clone()
+}
+
+#[tokio::test]
+async fn replayed_approval_cannot_resolve_a_successor_with_the_same_model_call_id() {
+    let state = tool_calling_state(false);
+    let body = body_paused_at_approval(&state).await;
+    let stale_id = pending_approval_id(&state).await;
+    let (sender, mut receiver) = oneshot::channel();
+    let successor_id = deep_code_agent::ApprovalId::new();
+    {
+        let mut slot = state.approval.lock().await;
+        let mut request = slot.as_ref().unwrap().request.clone();
+        // Providers can restart call ids on every turn. The argument change is
+        // deliberately invisible to a client replaying the first response.
+        request.approval_id = successor_id.clone();
+        request.arguments = json!({"message": "different successor operation"});
+        *slot = Some(PendingApproval {
+            request,
+            respond: sender,
+            owner: Arc::new(()),
+        });
+    }
+    let stale = resolve_pending_approval(
+        state.clone(),
+        ApprovalRequestBody {
+            approval_id: stale_id,
+            decision: ApprovalDecision::Approved,
+        },
+    )
+    .await;
+    assert_eq!(stale.err().unwrap().status, StatusCode::CONFLICT);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(pending_approval_id(&state).await, successor_id);
+    let accepted = resolve_pending_approval(
+        state.clone(),
+        ApprovalRequestBody {
+            approval_id: successor_id.clone(),
+            decision: ApprovalDecision::Denied,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(accepted.accepted);
+    assert_eq!(receiver.await.unwrap(), ApprovalDecision::Denied);
+    let repeated = resolve_pending_approval(
+        state,
+        ApprovalRequestBody {
+            approval_id: successor_id,
+            decision: ApprovalDecision::Approved,
+        },
+    )
+    .await;
+    assert_eq!(repeated.err().unwrap().status, StatusCode::CONFLICT);
+    drop(body);
+}
+
+#[test]
+fn approval_protocol_requires_prompt_identity() {
+    assert!(
+        serde_json::from_value::<ApprovalRequestBody>(json!({
+            "call_id": "call_1", "decision": "approved"
+        }))
+        .is_err()
+    );
+}
+
 async fn body_paused_at_approval(state: &AppState) -> axum::body::BodyDataStream {
     use futures_util::StreamExt;
     let sse = prompt_sse(
@@ -27,11 +106,12 @@ async fn approval_is_ready_as_soon_as_its_event_is_visible() {
     use futures_util::StreamExt;
     let state = tool_calling_state(false);
     let mut body = body_paused_at_approval(&state).await;
+    let approval_id = pending_approval_id(&state).await;
     // No extra body poll: models a client answering while SSE is backpressured.
     let result = submit_approval(
         State(state.clone()),
         Json(ApprovalRequestBody {
-            call_id: "call_1".into(),
+            approval_id,
             decision: ApprovalDecision::Approved,
         }),
     )
@@ -51,6 +131,7 @@ async fn approval_is_ready_as_soon_as_its_event_is_visible() {
 async fn disconnect_at_approval_event_cleans_up_without_resuming_the_stream() {
     let state = tool_calling_state(false);
     let body = body_paused_at_approval(&state).await;
+    let approval_id = pending_approval_id(&state).await;
     assert!(state.approval.lock().await.is_some());
     drop(body);
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -75,7 +156,7 @@ async fn disconnect_at_approval_event_cleans_up_without_resuming_the_stream() {
     let response = submit_approval(
         State(state.clone()),
         Json(ApprovalRequestBody {
-            call_id: "call_1".into(),
+            approval_id,
             decision: ApprovalDecision::Approved,
         }),
     )
@@ -134,8 +215,8 @@ fn test_state(workspace: PathBuf, auth_token: Option<String>) -> AppState {
 
 fn test_router(state: AppState) -> Router {
     let protected = Router::new()
-        .route("/v1/prompt", post(prompt_sse))
-        .route("/v1/approvals", post(submit_approval))
+        .route("/prompt", post(prompt_sse))
+        .route("/approvals", post(submit_approval))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state.clone());
 
@@ -226,10 +307,13 @@ async fn stale_approval_after_disconnect_returns_conflict() {
     let (tx, rx) = oneshot::channel();
     // The prompt stream that parked this approval is gone.
     drop(rx);
+    let approval_id = deep_code_agent::ApprovalId::new();
     {
         let mut slot = state.approval.lock().await;
         *slot = Some(PendingApproval {
             request: serde_json::from_value(json!({
+                "approval_id": approval_id,
+                "authority": "automatic_allowed",
                 "call_id": "call-1",
                 "tool_name": "shell",
                 "description": "run",
@@ -243,7 +327,7 @@ async fn stale_approval_after_disconnect_returns_conflict() {
     let result = resolve_pending_approval(
         state,
         ApprovalRequestBody {
-            call_id: "call-1".to_string(),
+            approval_id,
             decision: ApprovalDecision::Approved,
         },
     )
@@ -280,15 +364,24 @@ async fn protected_routes_require_auth_token() {
     let client = reqwest::Client::new();
 
     let unauth = client
-        .post(format!("http://{addr}/v1/prompt"))
+        .post(format!("http://{addr}/prompt"))
         .json(&json!({ "prompt": "hi" }))
         .send()
         .await
         .unwrap();
     assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
 
-    let authed = client
+    let versioned = client
         .post(format!("http://{addr}/v1/prompt"))
+        .bearer_auth("secret123")
+        .json(&json!({ "prompt": "hi" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(versioned.status(), StatusCode::NOT_FOUND);
+
+    let authed = client
+        .post(format!("http://{addr}/prompt"))
         .header("Authorization", "Bearer secret123")
         .json(&json!({ "prompt": "hi" }))
         .send()
@@ -305,7 +398,7 @@ async fn prompt_sse_returns_assistant_delta_and_turn_completed() {
     let client = reqwest::Client::new();
 
     let response = client
-        .post(format!("http://{addr}/v1/prompt"))
+        .post(format!("http://{addr}/prompt"))
         .json(&json!({ "prompt": "hello runtime test" }))
         .send()
         .await
@@ -335,7 +428,7 @@ async fn prompt_sse_returns_assistant_delta_and_turn_completed() {
     assert!(
         envelopes.iter().all(|envelope| envelope.item.item_id
             == format!("{}_item_{}", envelope.thread_id, envelope.seq)),
-        "item_id shape must stay stable"
+        "item_id identifies its thread and sequence"
     );
     let delta_text = envelopes
         .iter()
@@ -446,15 +539,15 @@ fn tool_calling_state(autonomous_approvals: bool) -> AppState {
 }
 
 #[tokio::test]
-async fn approval_rejects_mismatched_call_id() {
+async fn approval_rejects_mismatched_approval_id() {
     let state = tool_calling_state(false);
-    let addr = spawn_test_server(state).await;
+    let addr = spawn_test_server(state.clone()).await;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
-    let prompt_url = format!("http://{addr}/v1/prompt");
-    let approvals_url = format!("http://{addr}/v1/approvals");
+    let prompt_url = format!("http://{addr}/prompt");
+    let approvals_url = format!("http://{addr}/approvals");
 
     let prompt_client = client.clone();
     let prompt_handle = tokio::spawn(async move {
@@ -469,19 +562,28 @@ async fn approval_rejects_mismatched_call_id() {
             .unwrap()
     });
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let approval_id = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(pending) = state.approval.lock().await.as_ref() {
+                break pending.request.approval_id.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 
     let bad = client
         .post(&approvals_url)
-        .json(&json!({ "call_id": "wrong-id", "decision": "approved" }))
+        .json(&json!({ "approval_id": deep_code_agent::ApprovalId::new(), "decision": "approved" }))
         .send()
         .await
         .unwrap();
-    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(bad.status(), StatusCode::CONFLICT);
 
     let good = client
         .post(&approvals_url)
-        .json(&json!({ "call_id": "call_1", "decision": "approved" }))
+        .json(&json!({ "approval_id": approval_id, "decision": "approved" }))
         .send()
         .await
         .unwrap();
@@ -497,14 +599,14 @@ async fn autonomous_mode_auto_denies_instead_of_hanging() {
     let state = tool_calling_state(true);
     let addr = spawn_test_server(state).await;
     // A short client timeout is the point: in interactive mode the turn
-    // would park forever (no one POSTs /v1/approvals) and trip this timeout.
+    // would park forever (no one POSTs /approvals) and trip this timeout.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
 
     let body = client
-        .post(format!("http://{addr}/v1/prompt"))
+        .post(format!("http://{addr}/prompt"))
         .json(&json!({ "prompt": "hello" }))
         .send()
         .await
@@ -514,7 +616,7 @@ async fn autonomous_mode_auto_denies_instead_of_hanging() {
         .unwrap();
 
     // Approval was surfaced, then auto-denied, and the turn still finished —
-    // no /v1/approvals call was ever made.
+    // no /approvals call was ever made.
     assert!(
         body.contains("event: approval.required"),
         "expected approval.required, got: {body}"

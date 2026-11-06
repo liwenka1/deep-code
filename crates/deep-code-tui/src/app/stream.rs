@@ -256,14 +256,8 @@ impl App {
         }
         self.cancel_requested = true;
         let runtime = Arc::clone(&self.runtime);
-        // The streaming loop emits TurnCancelled on the live channel that the
-        // bridge task is already pumping; the receiver returned here stays
-        // empty, so it can be dropped. The one case where it would not be
-        // empty — the runtime had already parked the batch and finalizes the
-        // cancellation on it — is the race where its `ApprovalRequired` is
-        // still in flight towards us; `cancel_requested` turns that request
-        // into the cancellation when it lands, so nothing is lost by not
-        // pumping the second channel.
+        // Streaming and approval cancellation both finish on the original
+        // TurnHandle stream, so the bridge remains responsible for the tail.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let _ = runtime.cancel_turn().await;
@@ -312,7 +306,9 @@ impl App {
         // behind it would keep running with nobody observing — tools execute,
         // files change, cost accrues, and an approval request parks forever with
         // no UI to answer it.
-        if (self.is_streaming || self.compacting()) && self.ui_rx.is_none() {
+        if (self.is_streaming || self.pending_approval.is_some() || self.compacting())
+            && self.ui_rx.is_none()
+        {
             self.ui_rx = Some(rx);
         }
 
@@ -326,36 +322,34 @@ impl App {
     }
 
     pub(super) fn start_stream(&mut self, request: StreamRequest) {
-        // A prompt/approval advances the session while a picker is loading.
-        // Retire its receiver so a late scan cannot open over the live turn.
         self.session_scan = None;
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.ui_rx = Some(rx);
         self.cancel_requested = false;
         self.streaming_since = Some(std::time::Instant::now());
-
         let runtime = Arc::clone(&self.runtime);
+        let prompt = match request {
+            StreamRequest::User(prompt) => prompt,
+            StreamRequest::Approval(approval_id, decision) => {
+                let tx = self.ui_tx.as_ref().and_then(|tx| tx.upgrade());
+                tokio::spawn(async move {
+                    if let Err(error) = runtime.submit_approval(&approval_id, decision).await
+                        && let Some(tx) = tx
+                    {
+                        let _ = tx.send(UiUpdate::ApprovalRejected(error.to_string()));
+                    }
+                });
+                return;
+            }
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.ui_rx = Some(rx);
+        self.ui_tx = Some(tx.downgrade());
         tokio::spawn(async move {
-            let mut events = match request {
-                StreamRequest::User(prompt) => runtime.submit_user(prompt).await,
-                StreamRequest::Approval(decision) => runtime.submit_approval(decision).await,
-            };
-
-            while let Some(event) = events.recv().await {
-                if tx.send(UiUpdate::Event(Box::new(event.clone()))).is_err() {
+            let mut turn = runtime.start_turn(prompt).await;
+            while let Some(event) = turn.recv().await {
+                if tx.send(UiUpdate::Event(Box::new(event))).is_err() {
                     return;
                 }
-                if matches!(
-                    event,
-                    RuntimeEvent::TurnFinished { .. }
-                        | RuntimeEvent::TurnCancelled { .. }
-                        | RuntimeEvent::ApprovalRequired { .. }
-                        | RuntimeEvent::Error { .. }
-                ) {
-                    break;
-                }
             }
-
             let _ = tx.send(UiUpdate::StreamFinished);
         });
     }
@@ -394,6 +388,9 @@ impl App {
     pub(super) fn apply_ui_update(&mut self, update: UiUpdate) {
         match update {
             UiUpdate::Event(event) => self.apply_runtime_event(*event),
+            UiUpdate::ApprovalRejected(message) => {
+                self.status = message;
+            }
             UiUpdate::Compacted(outcome) => {
                 // Rung for a long one however it ended, except a cancel: the
                 // user who pressed Esc is the one person already looking.
@@ -445,5 +442,6 @@ impl App {
 
     pub(crate) fn clear_stream_receiver(&mut self) {
         self.ui_rx = None;
+        self.ui_tx = None;
     }
 }

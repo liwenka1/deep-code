@@ -1,6 +1,30 @@
 use super::*;
 use crate::tool::MockEchoTool;
 
+#[tokio::test]
+async fn preparing_a_live_reconfiguration_does_not_write_the_session_file() {
+    let workspace = tempfile::tempdir().unwrap();
+    let ws = crate::paths::canonicalize(workspace.path()).unwrap();
+    let config = AgentConfig::builtin();
+    let original = launch_runtime(&config, ws.clone(), None);
+    let id = original.handle.session_id().await.unwrap();
+    let path =
+        crate::session_store::sessions_dir_for_workspace(&ws).join(format!("{}.json", id.as_str()));
+    let before = std::fs::read(&path).unwrap();
+    let extra = tempfile::tempdir().unwrap();
+    let extra = crate::paths::canonicalize(extra.path()).unwrap();
+    let prepared = prepare_runtime_reconfiguration(
+        &config,
+        WorkspaceRoots::new(&ws, vec![extra.clone()]),
+        original.handle.live_snapshot().await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(prepared.extra_roots, vec![extra]);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    original.shutdown().await;
+    prepared.shutdown().await;
+}
+
 /// Tool names in the parent registry built for `client`.
 fn parent_tool_names<C: LlmClient + Clone + 'static>(
     client: C,
@@ -272,15 +296,8 @@ fn resume_drops_stale_recorded_grants_instead_of_disabling_tools() {
     );
 }
 
-/// A session record does not get to say which workspace it belongs to.
-///
-/// The record is an ordinary `write_file` target for the model — it lives
-/// at `<workspace>/.deep-code/sessions/<id>.json`, inside the primary
-/// writable root — and `-c` ranks candidates by an `updated_at_ms` read out
-/// of the file itself. Trusting `record.workspace` therefore let a written
-/// record move the primary write root (to `/`, say) and take the session
-/// store with it, without any prompt: not a defeated approval, a skipped
-/// one.
+/// Even an authenticated session moved from another workspace resumes under
+/// the directory the caller selected; its recorded path cannot redirect tools.
 #[test]
 fn resume_uses_the_callers_workspace_not_the_records_claim() {
     let caller = tempfile::TempDir::new().unwrap();
@@ -288,7 +305,7 @@ fn resume_uses_the_callers_workspace_not_the_records_claim() {
     let elsewhere = tempfile::TempDir::new().unwrap();
     let claimed = elsewhere.path().canonicalize().unwrap();
 
-    let record = SessionRecord::new(claimed.clone(), "system");
+    let record = signed(SessionRecord::new(claimed.clone(), "system"));
     let id = record.id.clone();
     let launched = launch_runtime(&AgentConfig::builtin(), caller_ws.clone(), Some(record));
 
@@ -373,7 +390,7 @@ fn resume_refuses_a_recorded_grant_a_request_could_never_have_won() {
 /// dropped, not silently redirected.
 ///
 /// The tag authenticates the path's SPELLING, and every root that reaches
-/// the record through `serialize_record` was canonical when it was signed.
+/// the record through `prepare_record` was canonical when it was signed.
 /// So a recorded root that no longer resolves to itself is a root whose
 /// meaning changed after approval: planting a symlink over an approved
 /// directory redirects the grant without forging anything, because the
@@ -611,7 +628,7 @@ fn resume_drops_recorded_grants_that_carry_no_authorship_tag() {
 /// must not inject a user turn or an image path into the resumed provider
 /// request.
 #[tokio::test]
-async fn resume_discards_a_forged_transcript() {
+async fn resume_refuses_a_forged_transcript_without_overwriting_its_file() {
     let workspace = tempfile::TempDir::new().unwrap();
     let ws = workspace.path().canonicalize().unwrap();
     let mut record = signed(SessionRecord::new(ws.clone(), "system"));
@@ -619,7 +636,17 @@ async fn resume_discards_a_forged_transcript() {
         crate::session_entry::SessionEntry::user("forged transcript"),
     ));
 
+    let original_id = record.id.clone();
+    JsonSessionStore::for_workspace(&ws).unwrap();
+    let original_path = ws
+        .join(".deep-code/sessions")
+        .join(format!("{}.json", original_id.as_str()));
+    let original_bytes = serde_json::to_vec_pretty(&record).unwrap();
+    std::fs::write(&original_path, &original_bytes).unwrap();
     let launched = launch_runtime(&AgentConfig::builtin(), ws, Some(record));
+    assert_ne!(launched.session_id.as_deref(), Some(original_id.as_str()));
+    assert!(launched.resume_record.is_none());
+    assert_eq!(std::fs::read(&original_path).unwrap(), original_bytes);
     let messages = launched.handle.session_messages().await;
     assert!(
         messages
@@ -631,8 +658,8 @@ async fn resume_discards_a_forged_transcript() {
         launched
             .warnings
             .iter()
-            .any(|warning| warning.contains("unverified session transcript")),
-        "the reset must be visible to the caller: {:?}",
+            .any(|warning| warning.contains("cannot resume session")),
+        "the refusal must be visible to the caller: {:?}",
         launched.warnings
     );
 }

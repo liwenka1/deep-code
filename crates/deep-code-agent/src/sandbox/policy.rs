@@ -323,7 +323,6 @@ mod tests {
     fn plan(requires_sandbox: bool, network: bool) -> ToolExecutionPlan {
         ToolExecutionPlan {
             verdict: PolicyVerdict::Allow,
-            requires_approval: false,
             requires_sandbox,
             read_only: false,
             risk_level: RiskLevel::Low,

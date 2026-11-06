@@ -29,7 +29,7 @@ pub struct LaunchedRuntime {
     pub handle: Arc<AgentRuntime>,
     pub backend_label: String,
     pub session_id: Option<String>,
-    /// The record after resume validation and sanitization. Consumers that
+    /// The effective record after validating resume and rechecking write roots. Consumers that
     /// render restored history must use this value rather than the untrusted
     /// input record they passed to [`launch_runtime`].
     pub resume_record: Option<SessionRecord>,
@@ -69,10 +69,6 @@ pub struct LaunchedRuntime {
 impl LaunchedRuntime {
     pub async fn shutdown(self) {
         (self.stop_hook)();
-        // Kill still-running background jobs before tearing the runtime down so
-        // dev servers/watchers don't outlive the session. `kill_on_drop` is the
-        // backstop for paths that drop the store without calling this.
-        self.job_store.shutdown();
         self.handle.shutdown().await;
     }
 }
@@ -232,6 +228,13 @@ pub fn relaunch_runtime(
     mut roots: WorkspaceRoots,
     resume: Option<SessionRecord>,
 ) -> std::io::Result<LaunchedRuntime> {
+    let warnings = validate_inherited_roots(&mut roots)?;
+    let mut launched = launch_runtime_pinned(config, roots, resume);
+    launched.warnings.splice(0..0, warnings);
+    Ok(launched)
+}
+
+fn validate_inherited_roots(roots: &mut WorkspaceRoots) -> std::io::Result<Vec<String>> {
     crate::pinned_dir::validate_pinned_workspace(&roots.primary)?;
     let mut warnings = Vec::new();
     roots.extras.retain(|root| {
@@ -246,9 +249,71 @@ pub fn relaunch_runtime(
             }
         }
     });
-    let mut launched = launch_runtime_pinned(config, roots, resume);
-    launched.warnings.splice(0..0, warnings);
-    Ok(launched)
+    roots.extras.retain(|root| *root != roots.primary);
+    Ok(warnings)
+}
+
+/// Prepare a configuration replacement from controlled process memory. This
+/// does not load or save a session file, so failed persistence cannot replace
+/// the conversation with an older disk snapshot. The caller retires the old
+/// runtime only after preparation succeeds.
+pub fn prepare_runtime_reconfiguration(
+    config: &AgentConfig,
+    mut roots: WorkspaceRoots,
+    snapshot: crate::runtime::LiveSessionSnapshot,
+) -> std::io::Result<LaunchedRuntime> {
+    let mut warnings = validate_inherited_roots(&mut roots)?;
+    let mut record = snapshot.record;
+    if record.workspace != roots.primary {
+        return Err(std::io::Error::other(
+            "live session belongs to another workspace",
+        ));
+    }
+    record.extra_roots = roots.extras.clone();
+    let instructions = ProjectInstructions::load(&roots.primary);
+    warnings.extend(instructions.warnings.iter().cloned());
+    let skills = Arc::new(discover_in_workspace(&roots.primary));
+    record.set_system_prompt(runtime_system_prompt(&roots, &instructions, &skills));
+    let store = match JsonSessionStore::for_pinned_workspace(&roots.primary) {
+        Ok(store) => Some(store),
+        Err(error) if snapshot.persisted => return Err(std::io::Error::other(error)),
+        Err(error) => {
+            warnings.push(format!(
+                "session persistence unavailable; this session will not be saved ({error})"
+            ));
+            None
+        }
+    };
+    let session = ResumedSession {
+        record,
+        store,
+        live_state: Some(snapshot.state),
+        roots,
+        warnings,
+        instructions,
+        skills,
+    };
+    let parent_cancel = CancellationToken::new();
+    let ui_lang = SharedLang::new(Lang::from_env(&config.language));
+    if config.api_key.is_some() {
+        let client = DeepSeekClient::new(config.clone()).map_err(std::io::Error::other)?;
+        return Ok(finish_resumed_launch(
+            client,
+            format!("DeepSeek {}", config.model),
+            session,
+            config,
+            &parent_cancel,
+            ui_lang,
+        ));
+    }
+    Ok(finish_resumed_launch(
+        EchoClient::new(ui_lang.clone()),
+        "offline echo".to_string(),
+        session,
+        config,
+        &parent_cancel,
+        ui_lang,
+    ))
 }
 
 pub fn launch_runtime(
@@ -346,6 +411,7 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
     prompt: &str,
     parent_cancel: &CancellationToken,
 ) -> LaunchedRuntime {
+    let workspace = parts.roots.primary.clone();
     // Decide persistence before assembling tools: the fallback path must not
     // rebuild (and silently drop) a full extensions set, and the failure
     // reason must reach the user instead of being swallowed.
@@ -372,7 +438,13 @@ fn launch_fresh<C: LlmClient + Clone + 'static>(
                 )
             }
             None => (
-                AgentRuntime::with_system_prompt(client, tools, prompt, config.clone(), false),
+                AgentRuntime::from_record(
+                    client,
+                    tools,
+                    SessionRecord::new(workspace, prompt),
+                    None,
+                    config.clone(),
+                ),
                 None,
             ),
         },
@@ -461,6 +533,7 @@ fn assemble_launch<C: LlmClient + Clone + 'static>(
     } = parts;
     let (runtime, session_id) = make_runtime((*client).clone(), tools);
     let runtime = attach_workspace_helpers(runtime, &roots.primary, config, &mut warnings)
+        .with_job_store(job_store.clone())
         .with_boundary(boundary)
         .with_compact_instructions(instructions.compact_instructions.clone())
         .with_permission_mode(permission_mode.clone())
@@ -502,7 +575,8 @@ fn prepare_persisted_session(
 /// far. One value for the shared tail below instead of four loose parameters.
 struct ResumedSession {
     record: SessionRecord,
-    store: JsonSessionStore,
+    store: Option<JsonSessionStore>,
+    live_state: Option<crate::runtime::LiveSessionState>,
     roots: WorkspaceRoots,
     warnings: Vec<String>,
     instructions: ProjectInstructions,
@@ -525,6 +599,7 @@ fn finish_resumed_launch<C: LlmClient + Clone + 'static>(
     let ResumedSession {
         record,
         store,
+        live_state,
         roots,
         warnings,
         instructions,
@@ -544,10 +619,11 @@ fn finish_resumed_launch<C: LlmClient + Clone + 'static>(
         config,
         parent_cancel,
         |client, tools| {
-            let session_id = record.id.as_str().to_string();
+            let session_id = store.as_ref().map(|_| record.id.as_str().to_string());
             (
-                AgentRuntime::from_session_record(client, tools, record, store, config.clone()),
-                Some(session_id),
+                AgentRuntime::from_record(client, tools, record, store, config.clone())
+                    .with_live_state(live_state),
+                session_id,
             )
         },
     );
@@ -568,23 +644,18 @@ fn launch_resumed(
     // entry would still be sent to the provider on the next turn. Verify the
     // complete record before any entry reaches `Session::from_entries`.
     if !crate::session_integrity::verify_record(&mut record) {
-        warnings.push(
-            "discarding the unverified session transcript and persisted state: the session file "
-                .to_string()
-                + "was modified without a host authenticity tag. The session will resume with a "
-                + "fresh system prompt.",
+        // Disk loading rejects this earlier. Direct library callers can also
+        // pass a record, so never overwrite its id with a cleared transcript.
+        let mut launched = launch_runtime_pinned(
+            config,
+            WorkspaceRoots::new(caller_workspace, cli_extras),
+            None,
         );
-        record.entries.clear();
-        record.turns.clear();
-        record.checkpoints.clear();
-        record.summary = None;
-        record.compaction = None;
-        record.session_cost = crate::pricing::CostEstimate::default();
-        record.session_cache_hit_tokens = 0;
-        record.session_cache_miss_tokens = 0;
-        record.session_cache_savings = crate::pricing::CostEstimate::default();
-        record.updated_at_ms = crate::session_store::now_ms();
-        record.record_mac = None;
+        launched.warnings.insert(0, format!(
+            "cannot resume session {}: missing or invalid host authorship tag; starting a new session and preserving the original file",
+            record.id.as_str(),
+        ));
+        return launched;
     }
     // Do the grants in this record actually come from this host?
     //
@@ -716,7 +787,7 @@ fn launch_resumed(
             return false;
         }
         // The tag authenticates this path's SPELLING. Every path that reaches
-        // the record through `serialize_record` was already canonical when it
+        // the record through `prepare_record` was already canonical when it
         // was signed, so a recorded root that no longer resolves to itself is a
         // root whose meaning changed after it was approved — a symlink planted
         // over an approved directory redirects the grant without forging
@@ -787,7 +858,8 @@ fn launch_resumed(
 
     let session = ResumedSession {
         record,
-        store,
+        store: Some(store),
+        live_state: None,
         roots,
         warnings,
         instructions,

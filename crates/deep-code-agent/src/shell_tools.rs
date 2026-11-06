@@ -21,7 +21,8 @@ use crate::workspace_policy::{WorkspacePolicy, invalid};
 pub use jobs::JobStore;
 use jobs::{
     ChunkFn, JobKind, JobState, JobStatus, SharedBuffer, SpillOwner, cancel_job, job_details,
-    job_text_snapshot, kill_process_tree, refresh_job, shell_text_output, spawn_buffer_reader,
+    job_text_snapshot, kill_process_group, kill_process_tree, refresh_job, shell_text_output,
+    spawn_buffer_reader,
 };
 
 /// Strip provider/runtime secrets AND linker/shell code-injection vectors from a
@@ -781,6 +782,7 @@ impl Tool for ShellTool {
 
         let started = Instant::now();
         let deadline = started + timeout;
+        let spawn_guard = self.jobs.begin_spawn().await?;
         let job_id = self.jobs.reserve_id();
         let (stdout, stderr) = spill_buffers(&self.spill_dir, &job_id);
         let stream_budget = Arc::new(AtomicUsize::new(0));
@@ -806,6 +808,8 @@ impl Tool for ShellTool {
                 job_guard: None,
             },
         );
+
+        drop(spawn_guard);
 
         // Sequencing with the shell's own rules for `&&` and `;`: a gated
         // step is skipped while the previous status stands, and the run's
@@ -867,6 +871,7 @@ impl Tool for ShellTool {
                 });
 
                 let remaining = deadline.saturating_duration_since(Instant::now());
+                let child_pid = child.id();
                 let (status, exit_code) = tokio::select! {
                     result = child.wait() => match result {
                         Ok(exit) => (
@@ -874,6 +879,10 @@ impl Tool for ShellTool {
                             exit.code(),
                         ),
                         Err(error) => {
+                            kill_process_tree(&mut child);
+                            #[cfg(windows)]
+                            drop(_guard);
+                            let _ = child.wait().await;
                             return Err(ToolError::exec_failed(
                                 Self::NAME,
                                 format!("failed to wait for command: {error}"),
@@ -891,6 +900,11 @@ impl Tool for ShellTool {
                         (JobStatus::TimedOut, None)
                     }
                 };
+                // The command's natural exit ends its helpers' lifetime too.
+                // Clear them before publishing completion or reopening restore.
+                kill_process_group(child_pid);
+                #[cfg(windows)]
+                drop(_guard);
                 drain_readers(stdout_task, stderr_task).await;
                 outcome = (status, exit_code);
                 previous_succeeded = status == JobStatus::Completed;
@@ -981,6 +995,7 @@ impl JobTool {
             ));
         };
 
+        let spawn_guard = self.jobs.begin_spawn().await?;
         // Tie the process lifetime to its stored `Child`: if the JobStore is
         // dropped (app exit) the OS process is killed rather than orphaned.
         // `JobStore::shutdown` makes this deterministic on cancel/quit.
@@ -1034,6 +1049,7 @@ impl JobTool {
             },
         );
 
+        drop(spawn_guard);
         let job = self.jobs.get(&job_id, Self::NAME)?;
         let details = {
             let job = job.lock().expect("job lock poisoned");

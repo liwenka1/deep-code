@@ -573,12 +573,14 @@ mod tests {
     fn compact_keeps_recent_tail() {
         let mut entries = vec![Arc::new(SessionEntry::system("sys"))];
         for index in 0..12 {
-            entries.push(Arc::new(SessionEntry::user(format!("u{index}"))));
-            entries.push(Arc::new(SessionEntry::assistant(
-                format!("a{index}"),
-                None,
-                Vec::new(),
-            )));
+            let turn_id = crate::TurnId::new();
+            entries.push(Arc::new(
+                SessionEntry::user(format!("u{index}")).with_turn_id(turn_id.clone()),
+            ));
+            entries.push(Arc::new(
+                SessionEntry::assistant(format!("a{index}"), None, Vec::new())
+                    .with_turn_id(turn_id),
+            ));
         }
         let result = compact_entries(&entries);
         assert!(result.archived_count > 0);
@@ -593,6 +595,15 @@ mod tests {
             &result.entries.last().unwrap().kind,
             EntryKind::Assistant { content, .. } if content == "a11"
         ));
+        for entry in &result.entries {
+            if matches!(
+                entry.kind,
+                EntryKind::User { .. } | EntryKind::Assistant { .. }
+            ) {
+                assert!(entry.turn_id.is_some());
+                assert!(entries.iter().any(|original| Arc::ptr_eq(original, entry)));
+            }
+        }
         // The tail keeps whole entries: the derived wire still pairs cleanly.
         let wire: Vec<Message> = result
             .entries

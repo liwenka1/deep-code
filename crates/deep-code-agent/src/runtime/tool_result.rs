@@ -367,6 +367,7 @@ impl AgentRuntime {
                     // `pending`: so the cancel either sees this batch parked or
                     // this park sees the cancel — the lock serializes the two.
                     let batch = PendingToolBatch {
+                        approval_id: request.approval_id.clone(),
                         current: call,
                         remaining,
                         turn_id: turn_id.clone(),
@@ -427,8 +428,7 @@ impl AgentRuntime {
             current,
             mut remaining,
             turn_id,
-            cancel: _,
-            root_grant_target: _,
+            ..
         } = pending;
         remaining.push_front(current);
         self.finish_cancelled_calls(remaining, &turn_id, tx).await;
@@ -571,6 +571,7 @@ pub(super) fn runtime_error_from_tool_error(
     turn_id: Option<TurnId>,
 ) -> RuntimeEvent {
     RuntimeEvent::Error {
+        kind: crate::RuntimeFailureKind::Execution,
         turn_id,
         message: error.to_string(),
     }

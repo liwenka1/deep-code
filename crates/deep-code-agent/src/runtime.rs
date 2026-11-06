@@ -29,6 +29,8 @@ mod telemetry;
 /// Crate-visible for `TOOL_OUTPUT_BUDGET`: the shell layer's spill decisions
 /// have to be keyed to the same ceiling this module enforces on tool results.
 pub(crate) mod tool_result;
+mod turn_handle;
+pub use turn_handle::{FinishReason, TurnHandle, TurnOutcome};
 mod turn_loop;
 pub use turn_loop::MAX_TURN_STEPS;
 pub(crate) use turn_loop::budget_wrap_up_due;
@@ -50,7 +52,7 @@ use crate::session::Session;
 use crate::session_store::{TurnRecord, now_ms};
 use crate::tool::{ApprovalDecision, ApprovalRequest, ToolCall, ToolRegistry};
 use event::emit;
-pub use event::{RuntimeEvent, RuntimeEventReceiver, ToolCallId, TurnId};
+pub use event::{RuntimeEvent, RuntimeEventReceiver, RuntimeFailureKind, ToolCallId, TurnId};
 
 /// One user turn: its text plus the local image files attached to it.
 ///
@@ -103,6 +105,8 @@ impl From<&str> for UserTurn {
         Self::new(text)
     }
 }
+pub use persistence::LiveSessionSnapshot;
+pub(crate) use persistence::LiveSessionState;
 use state::{Persistence, RuntimeState};
 pub use telemetry::{PrefixStatus, TurnTelemetry};
 
@@ -141,6 +145,7 @@ pub struct AgentRuntime {
     /// rest of the instructions; `None` when no file has the section.
     compact_instructions: Option<String>,
     lsp: Option<Arc<LspManager>>,
+    jobs: Option<crate::JobStore>,
     persistence: Option<Arc<Persistence>>,
     /// Session permission mode, shared (lock-free) with the TUI so it can show
     /// the current mode and flip it on Shift+Tab. The approval gate reads it
@@ -220,6 +225,7 @@ impl AgentRuntime {
             boundary: None,
             compact_instructions: None,
             lsp: None,
+            jobs: None,
             persistence: None,
             permission_mode: SharedPermissionMode::default(),
             ui_lang: crate::i18n::SharedLang::new(crate::i18n::Lang::from_env(&config.language)),
@@ -266,6 +272,7 @@ impl AgentRuntime {
             boundary: None,
             compact_instructions: None,
             lsp: None,
+            jobs: None,
             persistence: None,
             permission_mode: SharedPermissionMode::default(),
             ui_lang: crate::i18n::SharedLang::new(crate::i18n::Lang::from_env(&config.language)),
@@ -335,6 +342,9 @@ impl AgentRuntime {
     /// persistence and stop spawned LSP servers.
     pub async fn shutdown(&self) {
         self.cancel_live_turn().await;
+        if let Some(jobs) = &self.jobs {
+            jobs.shutdown();
+        }
         self.persist().await;
         if let Some(persistence) = self.persistence.as_ref() {
             persistence.actor.flush().await;
@@ -362,6 +372,12 @@ impl AgentRuntime {
         }
     }
 
+    #[must_use]
+    pub fn with_job_store(mut self, jobs: crate::JobStore) -> Self {
+        self.jobs = Some(jobs);
+        self
+    }
+
     /// Start a new turn from a user prompt. Returns a receiver that yields
     /// [`RuntimeEvent`]s until either the turn finishes or an approval is
     /// required. After approval, call [`Self::submit_approval`] to resume.
@@ -371,7 +387,7 @@ impl AgentRuntime {
     }
 
     /// Record a user prompt and start turn bookkeeping without spawning the loop.
-    pub async fn begin_turn(&self, prompt: impl Into<UserTurn>) {
+    pub async fn begin_turn(&self, prompt: impl Into<UserTurn>) -> TurnId {
         // A previous turn may still be live (e.g. the HTTP client disconnected
         // mid-turn and a new prompt arrived): cancel its loop so it stops
         // streaming. The turn-id guard in `finish_turn` keeps that loop's late
@@ -380,6 +396,14 @@ impl AgentRuntime {
             let state = self.state.lock().await;
             if state.current_turn_id.is_some() {
                 state.cancel.cancel();
+                if let Some((id, tx)) = &state.turn_events {
+                    emit(
+                        tx,
+                        RuntimeEvent::TurnCancelled {
+                            turn_id: id.clone(),
+                        },
+                    );
+                }
             }
         }
         self.finalize_orphan_turn().await;
@@ -389,17 +413,19 @@ impl AgentRuntime {
             let mut state = self.state.lock().await;
             // Interrupted tool calls need no repair here: pending exchanges
             // synthesize their placeholder at wire derivation.
-            state
-                .session
-                .push_user_with_images(&prompt.text, prompt.images.clone());
+            state.session.push_user_with_images(
+                turn_id.clone(),
+                &prompt.text,
+                prompt.images.clone(),
+            );
             state.pending = None;
-            state.current_turn = Some(TurnRecord::new());
+            state.current_turn = Some(TurnRecord::new(turn_id.clone()));
             state.current_prompt = Some(prompt);
             state.current_turn_id = Some(turn_id.clone());
             // A fresh step budget for this turn, and only for it: the step cap
             // and the two one-shot nudges survive the approval parks inside a
             // turn (see `TurnBudget`), so only a new turn starts from zero.
-            state.turn_budget = Some(TurnBudget::new(turn_id));
+            state.turn_budget = Some(TurnBudget::new(turn_id.clone()));
             state.cancel = CancellationToken::new();
             // Per-turn struggle counter and the "triggered this turn" flag
             // reset; the `cascade_escalated` latch intentionally persists for
@@ -418,22 +444,14 @@ impl AgentRuntime {
             state.steering.clear();
         }
         self.persist().await;
+        turn_id
     }
 
-    /// Spawn the model/tool loop for the current turn.
+    /// Low-level step driver used by the runtime's focused tests. Application
+    /// adapters own the complete stream through `start_turn` / `TurnHandle`.
     pub async fn drive_turn(&self) -> RuntimeEventReceiver {
-        let (tx, rx) = mpsc::unbounded_channel();
         let (turn_id, prompt) = self.current_turn_context().await;
-        emit(
-            &tx,
-            RuntimeEvent::TurnStarted {
-                turn_id: turn_id.clone(),
-                prompt,
-            },
-        );
-        self.emit_session_updated(&tx).await;
-        // The turn's cancel token, so an Esc/quit during a large before-turn
-        // snapshot aborts the copy promptly instead of after the whole tree.
+        let (tx, rx) = self.event_channel(Some(&turn_id)).await;
         let cancel = {
             let state = self.state.lock().await;
             if state.current_turn_id.as_ref() != Some(&turn_id) {
@@ -441,12 +459,35 @@ impl AgentRuntime {
             }
             state.cancel.clone()
         };
-        self.snapshot_turn("before_turn", &cancel, &tx).await;
+        self.spawn_turn(turn_id, prompt, cancel, tx);
+        rx
+    }
+
+    fn spawn_turn(
+        &self,
+        turn_id: TurnId,
+        prompt: String,
+        cancel: CancellationToken,
+        tx: mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
         let runtime = self.clone();
         tokio::spawn(async move {
-            runtime.run_loop(turn_id, cancel, &tx).await;
+            let work = async {
+                emit(
+                    &tx,
+                    RuntimeEvent::TurnStarted {
+                        turn_id: turn_id.clone(),
+                        prompt,
+                    },
+                );
+                runtime.emit_session_updated(&tx).await;
+                runtime
+                    .snapshot_turn(&turn_id, "before_turn", &cancel, &tx)
+                    .await;
+                runtime.run_loop(turn_id.clone(), cancel, &tx).await;
+            };
+            runtime.supervise_turn(&turn_id, &tx, work).await;
         });
-        rx
     }
 
     /// Hand the runtime a prompt the user typed while a turn was streaming, to
@@ -489,9 +530,14 @@ impl AgentRuntime {
 
     /// Resolve a pending tool approval and resume the loop.
     ///
-    /// If there is no pending approval, returns an error event on the stream.
-    pub async fn submit_approval(&self, decision: ApprovalDecision) -> RuntimeEventReceiver {
-        self.submit_approval_with_denial_note(decision, None).await
+    /// A stale or already-consumed prompt cannot resolve a different call.
+    pub async fn submit_approval(
+        &self,
+        approval_id: &crate::tool::ApprovalId,
+        decision: ApprovalDecision,
+    ) -> Result<RuntimeEventReceiver, crate::tool::ApprovalError> {
+        self.submit_approval_with_denial_note(approval_id, decision, None)
+            .await
     }
 
     /// Like [`Self::submit_approval`], with an explanation recorded as the
@@ -502,27 +548,25 @@ impl AgentRuntime {
     /// things the parent could in fact re-dispatch with the right grant.
     pub async fn submit_approval_with_denial_note(
         &self,
+        approval_id: &crate::tool::ApprovalId,
         decision: ApprovalDecision,
         denial_note: Option<String>,
-    ) -> RuntimeEventReceiver {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let (pending, cancelled) = {
+    ) -> Result<RuntimeEventReceiver, crate::tool::ApprovalError> {
+        let pending = {
             let mut state = self.state.lock().await;
-            let cancelled = state.cancel.is_cancelled();
-            (state.pending.take(), cancelled)
-        };
-
-        let Some(pending) = pending else {
-            // A cancellation that raced ahead already resolved the batch —
-            // the late approval keypress is benign, not an error.
-            if !cancelled {
-                let _ = tx.send(RuntimeEvent::Error {
-                    turn_id: None,
-                    message: "no pending tool approval".to_string(),
-                });
+            let pending = state
+                .pending
+                .as_ref()
+                .ok_or(crate::tool::ApprovalError::NoPendingApproval)?;
+            if &pending.approval_id != approval_id {
+                return Err(crate::tool::ApprovalError::StaleApproval);
             }
-            return rx;
+            state
+                .pending
+                .take()
+                .expect("pending approval checked under lock")
         };
+        let (tx, rx) = self.event_channel(Some(&pending.turn_id)).await;
 
         let runtime = self.clone();
         tokio::spawn(async move {
@@ -534,11 +578,16 @@ impl AgentRuntime {
                     decision,
                 },
             );
+            let turn_id = pending.turn_id.clone();
             runtime
-                .handle_approval(pending, decision, denial_note, &tx)
+                .supervise_turn(
+                    &turn_id,
+                    &tx,
+                    runtime.handle_approval(pending, decision, denial_note, &tx),
+                )
                 .await;
         });
-        rx
+        Ok(rx)
     }
 
     /// Cancel the in-flight turn, if any. Idle runtimes treat this as a
@@ -565,13 +614,16 @@ impl AgentRuntime {
     }
 
     async fn cancel_turn_inner(&self, only_if: Option<TurnId>) -> RuntimeEventReceiver {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (mut tx, rx) = mpsc::unbounded_channel();
         let pending = {
             let mut state = self.state.lock().await;
             if let Some(want) = only_if.as_ref()
                 && state.current_turn_id.as_ref() != Some(want)
             {
                 return rx;
+            }
+            if let Some((_, stable)) = state.turn_events.as_ref() {
+                tx = stable.clone();
             }
             let pending = state.pending.take();
             // Flip the token under the same lock that guards `pending`. The park
@@ -598,7 +650,14 @@ impl AgentRuntime {
         if let Some(pending) = pending {
             let runtime = self.clone();
             tokio::spawn(async move {
-                runtime.finalize_cancelled_batch(pending, &tx).await;
+                let turn_id = pending.turn_id.clone();
+                runtime
+                    .supervise_turn(
+                        &turn_id,
+                        &tx,
+                        runtime.finalize_cancelled_batch(pending, &tx),
+                    )
+                    .await;
             });
         }
         rx
@@ -722,7 +781,7 @@ impl AgentRuntime {
             // changes.
             return (ApprovalDecision::Denied, None);
         }
-        if !plan.requires_approval {
+        if !plan.requires_approval() {
             return (ApprovalDecision::Approved, None);
         }
         let kind = crate::execution_policy::ExecPolicy::classify_tool(&request.tool_name);
@@ -787,7 +846,7 @@ impl AgentRuntime {
         // `request.matched_rule`: that field is filled in by the registry for the
         // panel's benefit, and a decision this consequential must not depend on
         // whether the caller populated a display field.
-        if crate::execution_policy::is_needs_human_rule(plan.matched_rule.as_deref()) {
+        if plan.requires_human() {
             return (
                 ApprovalDecision::Denied,
                 Some(SUBAGENT_NEEDS_HUMAN_DENIAL.to_string()),
@@ -882,7 +941,7 @@ pub fn unattended_denial_note(request: &ApprovalRequest) -> String {
     // can answer it. Without this arm the model would read the generic "nobody is
     // here" text and retry a command whose remedy is a different sentence
     // entirely.
-    if crate::execution_policy::is_needs_human_rule(request.matched_rule.as_deref()) {
+    if request.authority == crate::execution_policy::ApprovalAuthority::HumanOnly {
         return UNATTENDED_NEEDS_HUMAN_DENIAL.to_string();
     }
     UNATTENDED_DENIAL.to_string()

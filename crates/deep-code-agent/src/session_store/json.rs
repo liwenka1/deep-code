@@ -1,5 +1,6 @@
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
+use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::fs;
 use std::io::{Read, Write};
@@ -7,10 +8,182 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{
-    MAX_SESSION_ENTRIES, MAX_SESSION_FILE_BYTES, MAX_SESSION_LIST, SESSION_SCHEMA_VERSION,
-    SessionId, SessionRecord, SessionStore, SessionStoreError, sessions_dir_for_workspace,
+    MAX_SESSION_ENTRIES, MAX_SESSION_FILE_BYTES, MAX_SESSION_LIST, PreparedSession, SessionId,
+    SessionRecord, SessionStore, SessionStoreError, sessions_dir_for_workspace,
     validate_session_id,
 };
+
+/// Schemas written before turn and entry identities became part of a session.
+/// Schema 2 was the last published format and had no full-record tag; schema 3
+/// was the short-lived authenticated format on the development branch. Keep
+/// these wire structs local to the loader so the current model can remain
+/// strict while both older shapes are migrated explicitly.
+const LEGACY_SESSION_SCHEMA_VERSION: u32 = 3;
+const PUBLISHED_SESSION_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyTurnRecord {
+    started_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyCheckpointRecord {
+    id: crate::checkpoint::CheckpointId,
+    label: String,
+    created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySessionEntry {
+    #[serde(flatten)]
+    kind: crate::session_entry::EntryKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySessionRecord {
+    schema_version: u32,
+    id: SessionId,
+    workspace: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    extra_roots: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extra_roots_mac: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    record_mac: Option<String>,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+    entries: Vec<Arc<LegacySessionEntry>>,
+    turns: Vec<LegacyTurnRecord>,
+    #[serde(default)]
+    checkpoints: Vec<LegacyCheckpointRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction: Option<String>,
+    #[serde(default)]
+    session_cost: crate::pricing::CostEstimate,
+    #[serde(default)]
+    session_cache_hit_tokens: u64,
+    #[serde(default)]
+    session_cache_miss_tokens: u64,
+    #[serde(default)]
+    session_cache_savings: crate::pricing::CostEstimate,
+}
+
+impl LegacySessionRecord {
+    fn migrate(mut self) -> Result<SessionRecord, SessionStoreError> {
+        if !matches!(
+            self.schema_version,
+            PUBLISHED_SESSION_SCHEMA_VERSION | LEGACY_SESSION_SCHEMA_VERSION
+        ) {
+            return Err(SessionStoreError::Serialization {
+                message: format!(
+                    "unsupported legacy session schema version {}",
+                    self.schema_version
+                ),
+            });
+        }
+
+        // Both legacy shapes must carry a host-authenticated tag before any
+        // defaults or identities are added. Schema 2 was published before
+        // full-record authentication, so files from that release without a
+        // tag cannot be safely resumed or upgraded: a model-written file could
+        // otherwise smuggle an altered transcript through this migration.
+        let tag = self.record_mac.take();
+        let authenticated = crate::session_integrity::verify_serialized(&self, tag.as_deref());
+        self.record_mac = tag;
+        if !authenticated {
+            return Err(SessionStoreError::AuthenticationFailed {
+                path: "legacy session".to_string(),
+            });
+        }
+
+        let turn_ids: Vec<_> = self
+            .turns
+            .iter()
+            .map(|_| crate::runtime::TurnId::new())
+            .collect();
+        let mut current_turn = None;
+        let mut next_turn = 0;
+        let entries = self
+            .entries
+            .into_iter()
+            .map(|entry| {
+                let turn_id = match entry.kind {
+                    crate::session_entry::EntryKind::User { .. } => {
+                        let id = turn_ids
+                            .get(next_turn)
+                            .cloned()
+                            .unwrap_or_else(crate::runtime::TurnId::new);
+                        next_turn = next_turn.saturating_add(1);
+                        current_turn = Some(id.clone());
+                        Some(id)
+                    }
+                    crate::session_entry::EntryKind::Assistant { .. } => current_turn.clone(),
+                    _ => None,
+                };
+                Arc::new(crate::session_entry::SessionEntry {
+                    turn_id,
+                    kind: entry.kind.clone(),
+                })
+            })
+            .collect();
+        let turns = self
+            .turns
+            .into_iter()
+            .zip(turn_ids.iter().cloned())
+            .map(|(turn, id)| super::TurnRecord {
+                id,
+                started_at_ms: turn.started_at_ms,
+            })
+            .collect();
+        let checkpoints = self
+            .checkpoints
+            .into_iter()
+            .enumerate()
+            .map(|(index, checkpoint)| {
+                let turn_id = turn_ids
+                    .get(index)
+                    .cloned()
+                    .or_else(|| turn_ids.last().cloned())
+                    .unwrap_or_else(crate::runtime::TurnId::new);
+                super::CheckpointRecord {
+                    id: checkpoint.id,
+                    turn_id,
+                    label: checkpoint.label,
+                    created_at_ms: checkpoint.created_at_ms,
+                }
+            })
+            .collect();
+
+        let mut record = SessionRecord {
+            id: self.id,
+            workspace: self.workspace,
+            extra_roots: self.extra_roots,
+            extra_roots_mac: self.extra_roots_mac,
+            record_mac: None,
+            created_at_ms: self.created_at_ms,
+            updated_at_ms: self.updated_at_ms,
+            entries,
+            turns,
+            checkpoints,
+            summary: self.summary,
+            compaction: self.compaction,
+            session_cost: self.session_cost,
+            session_cache_hit_tokens: self.session_cache_hit_tokens,
+            session_cache_miss_tokens: self.session_cache_miss_tokens,
+            session_cache_savings: self.session_cache_savings,
+        };
+        record.record_mac = Some(
+            crate::session_integrity::sign_record(&mut record).ok_or_else(|| {
+                SessionStoreError::KeyUnavailable {
+                    detail: "could not sign migrated session".to_string(),
+                }
+            })?,
+        );
+        Ok(record)
+    }
+}
 
 /// Bound diagnostics as well as retained records while scanning the directory.
 const MAX_SESSION_DIAGNOSTICS: usize = 32;
@@ -199,29 +372,42 @@ impl JsonSessionStore {
             serde_json::from_str(&raw).map_err(|error| SessionStoreError::Serialization {
                 message: format!("failed to parse {}: {error}", path.display()),
             })?;
-        let parse_error = |error: serde_json::Error| SessionStoreError::Serialization {
-            message: format!("failed to parse {}: {error}", path.display()),
-        };
-        let version = value
-            .get("schema_version")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as u32;
-        let record = match version {
-            SESSION_SCHEMA_VERSION => {
-                serde_json::from_value::<SessionRecord>(value).map_err(parse_error)?
-            }
-            other => {
-                return Err(SessionStoreError::UnsupportedSchema {
-                    found: other,
-                    expected: SESSION_SCHEMA_VERSION,
-                });
-            }
+        let mut record = if value.get("schema_version").is_some() {
+            let legacy: LegacySessionRecord = serde_json::from_value(value).map_err(|error| {
+                SessionStoreError::Serialization {
+                    message: format!("failed to parse {}: {error}", path.display()),
+                }
+            })?;
+            legacy.migrate().map_err(|error| match error {
+                SessionStoreError::AuthenticationFailed { .. } => {
+                    SessionStoreError::AuthenticationFailed {
+                        path: path.display().to_string(),
+                    }
+                }
+                other => other,
+            })?
+        } else {
+            serde_json::from_value::<SessionRecord>(value).map_err(|error| {
+                SessionStoreError::Serialization {
+                    message: format!("failed to parse {}: {error}", path.display()),
+                }
+            })?
         };
         if record.entries.len() > MAX_SESSION_ENTRIES {
             return Err(SessionStoreError::TooManyEntries {
                 path: path.display().to_string(),
                 count: record.entries.len(),
                 limit: MAX_SESSION_ENTRIES,
+            });
+        }
+        crate::session_integrity::ensure_key().map_err(|reason| {
+            SessionStoreError::KeyUnavailable {
+                detail: reason.to_string(),
+            }
+        })?;
+        if !crate::session_integrity::verify_record(&mut record) {
+            return Err(SessionStoreError::AuthenticationFailed {
+                path: path.display().to_string(),
             });
         }
         Ok(record)
@@ -270,23 +456,10 @@ impl JsonSessionStore {
             if validate_session_id(stem).is_err() {
                 continue;
             }
-            let record = self.read_file(&path);
+            let record = self.load(&SessionId(stem.to_string()));
             check_scan_cancelled(cancel)?;
             match record {
-                Ok(mut record) => {
-                    if !crate::session_integrity::verify_record(&mut record) {
-                        self.diagnose(format!(
-                            "skipping unauthenticated session {} (modified file)",
-                            path.display()
-                        ));
-                        continue;
-                    }
-                    // Bind the id to the filename, as `load` does and for the same
-                    // reason: the picker and any resume off this list must target
-                    // the file that actually holds the session, not an id copied
-                    // inside it.
-                    record.id = SessionId(stem.to_string());
-                    record.record_mac = crate::session_integrity::sign_record(&mut record);
+                Ok(record) => {
                     let target = if record.has_user_entry() {
                         &mut resumable
                     } else {
@@ -302,12 +475,6 @@ impl JsonSessionStore {
                     {
                         target[oldest_index] = record;
                     }
-                }
-                Err(SessionStoreError::UnsupportedSchema { .. }) => {
-                    self.diagnose(format!(
-                        "skipping unsupported session file {}",
-                        path.display()
-                    ));
                 }
                 Err(error) => {
                     self.diagnose(format!(
@@ -341,7 +508,9 @@ fn check_scan_cancelled(
 }
 
 impl SessionStore for JsonSessionStore {
-    fn save_serialized(&self, id: &SessionId, json: &str) -> Result<(), SessionStoreError> {
+    fn save_prepared(&self, session: &PreparedSession) -> Result<(), SessionStoreError> {
+        let id = session.id();
+        let json = session.json();
         validate_session_id(id.as_str())?;
         let path = self.path_for(id)?;
         if json.len() as u64 > MAX_SESSION_FILE_BYTES {
@@ -351,35 +520,11 @@ impl SessionStore for JsonSessionStore {
                 limit: MAX_SESSION_FILE_BYTES,
             });
         }
-        let mut record: SessionRecord =
-            serde_json::from_str(json).map_err(|error| SessionStoreError::Serialization {
-                message: format!("failed to parse {}: {error}", path.display()),
-            })?;
-        if record.entries.len() > MAX_SESSION_ENTRIES {
+        if session.entry_count > MAX_SESSION_ENTRIES {
             return Err(SessionStoreError::TooManyEntries {
                 path: path.display().to_string(),
-                count: record.entries.len(),
+                count: session.entry_count,
                 limit: MAX_SESSION_ENTRIES,
-            });
-        }
-        if record.schema_version != SESSION_SCHEMA_VERSION {
-            return Err(SessionStoreError::UnsupportedSchema {
-                found: record.schema_version,
-                expected: SESSION_SCHEMA_VERSION,
-            });
-        }
-        if record.id != *id {
-            return Err(SessionStoreError::Serialization {
-                message: format!(
-                    "session id {} does not match destination {}",
-                    record.id.as_str(),
-                    id.as_str()
-                ),
-            });
-        }
-        if !crate::session_integrity::verify_record(&mut record) {
-            return Err(SessionStoreError::AuthenticationUnavailable {
-                id: id.as_str().to_string(),
             });
         }
         self.write_atomic(&path, json.as_bytes())
@@ -392,16 +537,21 @@ impl SessionStore for JsonSessionStore {
         // inside it; without this, the resumed runtime would save back under that
         // original id and silently clobber the source session. Binding the id to
         // the file it was loaded from makes a fork write to itself.
-        let authenticated = crate::session_integrity::verify_record(&mut record);
-        record.id = id.clone();
         // A deliberately copied session file is a valid fork when its
         // original contents were host-authenticated: rebind the id and re-tag
         // the transcript, so the resumed runtime can still verify it. The
         // narrow grant tag is NOT re-issued — it names the id and workspace it
         // was approved under, so a fork keeps its conversation and loses its
         // authority (`runtime_launch` drops the grants, with a warning).
-        if authenticated {
-            record.record_mac = crate::session_integrity::sign_record(&mut record);
+        if record.id != *id {
+            record.id = id.clone();
+            record.record_mac = Some(
+                crate::session_integrity::sign_record(&mut record).ok_or_else(|| {
+                    SessionStoreError::Serialization {
+                        message: "could not authenticate the forked session".to_string(),
+                    }
+                })?,
+            );
         }
         Ok(record)
     }

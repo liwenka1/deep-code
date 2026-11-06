@@ -148,6 +148,132 @@ fn json_store_round_trips_session() {
 }
 
 #[test]
+fn json_store_migrates_an_authenticated_legacy_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    let id = SessionId("legacy_session".to_string());
+    let legacy = LegacySessionRecord {
+        schema_version: LEGACY_SESSION_SCHEMA_VERSION,
+        id: id.clone(),
+        workspace: dir.path().to_path_buf(),
+        extra_roots: Vec::new(),
+        extra_roots_mac: None,
+        record_mac: None,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        entries: vec![
+            std::sync::Arc::new(LegacySessionEntry {
+                kind: crate::session_entry::EntryKind::System {
+                    content: "system".to_string(),
+                },
+            }),
+            std::sync::Arc::new(LegacySessionEntry {
+                kind: crate::session_entry::EntryKind::User {
+                    content: "resume me".to_string(),
+                    images: Vec::new(),
+                },
+            }),
+            std::sync::Arc::new(LegacySessionEntry {
+                kind: crate::session_entry::EntryKind::Assistant {
+                    content: "saved".to_string(),
+                    reasoning: None,
+                    exchanges: Vec::new(),
+                },
+            }),
+        ],
+        turns: vec![LegacyTurnRecord { started_at_ms: 1 }],
+        checkpoints: vec![LegacyCheckpointRecord {
+            id: crate::checkpoint::CheckpointId("checkpoint_1".to_string()),
+            label: "before_turn".to_string(),
+            created_at_ms: 1,
+        }],
+        summary: None,
+        compaction: None,
+        session_cost: crate::pricing::CostEstimate::default(),
+        session_cache_hit_tokens: 0,
+        session_cache_miss_tokens: 0,
+        session_cache_savings: crate::pricing::CostEstimate::default(),
+    };
+    let mut legacy = legacy;
+    legacy.record_mac = Some(crate::session_integrity::sign_serialized(&legacy).unwrap());
+    fs::write(
+        store.path_for(&id).unwrap(),
+        serde_json::to_vec_pretty(&legacy).unwrap(),
+    )
+    .unwrap();
+
+    let loaded = store.load(&id).unwrap();
+    assert_eq!(loaded.id, id);
+    assert_eq!(loaded.entries.len(), 3);
+    assert_eq!(loaded.turns.len(), 1);
+    assert_eq!(loaded.checkpoints.len(), 1);
+    assert_eq!(
+        loaded.entries[1].turn_id.as_ref(),
+        Some(&loaded.turns[0].id)
+    );
+    assert_eq!(
+        loaded.entries[2].turn_id.as_ref(),
+        Some(&loaded.turns[0].id)
+    );
+    assert_eq!(loaded.checkpoints[0].turn_id, loaded.turns[0].id);
+    assert!(store.list().unwrap().iter().any(|record| record.id == id));
+}
+
+#[test]
+fn json_store_rejects_an_unsigned_published_schema_without_rewriting_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    let id = SessionId("published_legacy_session".to_string());
+    let legacy = LegacySessionRecord {
+        schema_version: PUBLISHED_SESSION_SCHEMA_VERSION,
+        id: id.clone(),
+        workspace: dir.path().to_path_buf(),
+        extra_roots: Vec::new(),
+        extra_roots_mac: None,
+        record_mac: None,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        entries: vec![
+            std::sync::Arc::new(LegacySessionEntry {
+                kind: crate::session_entry::EntryKind::System {
+                    content: "system".to_string(),
+                },
+            }),
+            std::sync::Arc::new(LegacySessionEntry {
+                kind: crate::session_entry::EntryKind::User {
+                    content: "continue this".to_string(),
+                    images: Vec::new(),
+                },
+            }),
+        ],
+        turns: vec![LegacyTurnRecord { started_at_ms: 1 }],
+        checkpoints: Vec::new(),
+        summary: None,
+        compaction: None,
+        session_cost: crate::pricing::CostEstimate::default(),
+        session_cache_hit_tokens: 0,
+        session_cache_miss_tokens: 0,
+        session_cache_savings: crate::pricing::CostEstimate::default(),
+    };
+    let path = store.path_for(&id).unwrap();
+    let original = serde_json::to_vec_pretty(&legacy).unwrap();
+    fs::write(&path, &original).unwrap();
+
+    assert!(matches!(
+        store.load(&id),
+        Err(SessionStoreError::AuthenticationFailed { .. })
+    ));
+    assert!(store.list().unwrap().is_empty());
+    assert!(
+        store
+            .take_diagnostics()
+            .iter()
+            .any(|line| line.contains("failed integrity verification"))
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
 fn session_signatures_survive_real_cost_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
@@ -163,7 +289,7 @@ fn session_signatures_survive_real_cost_round_trips() {
         for input in [22, 1_001, 12_345] {
             // Flash's first case produces USD 0.00012660000000000001.
             // Without float_roundtrip, parsing rounds it to 0.0001266 and
-            // save_serialized rejects the signature we just generated.
+            // verification rejects the signature the writer just generated.
             let cost = crate::pricing::calculate_turn_cost(
                 model,
                 &crate::model::Usage {
@@ -220,7 +346,7 @@ fn a_copied_session_file_does_not_write_back_to_the_original() {
 }
 
 #[test]
-fn json_store_rejects_old_schema_files() {
+fn json_store_restores_recorded_grants() {
     let dir = tempfile::tempdir().unwrap();
     let extra = tempfile::tempdir().unwrap();
     let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
@@ -232,40 +358,6 @@ fn json_store_rejects_old_schema_files() {
     store.save(&mut record).unwrap();
     let loaded = store.load(&record.id).unwrap();
     assert_eq!(loaded.extra_roots, vec![extra.path().to_path_buf()]);
-
-    // Records from the previous layout are rejected by the hard schema
-    // boundary.
-    let mut old_schema = serde_json::to_value(&record).unwrap();
-    old_schema.as_object_mut().unwrap().remove("extra_roots");
-    old_schema.as_object_mut().unwrap().remove("record_mac");
-    old_schema["schema_version"] = serde_json::json!(2);
-    old_schema["id"] = serde_json::json!("session_7_0");
-    let path = dir
-        .path()
-        .join(".deep-code/sessions")
-        .join("session_7_0.json");
-    std::fs::write(&path, serde_json::to_string_pretty(&old_schema).unwrap()).unwrap();
-    assert!(matches!(
-        store.load(&SessionId("session_7_0".to_string())),
-        Err(SessionStoreError::UnsupportedSchema { found: 2, .. })
-    ));
-}
-
-#[test]
-fn json_store_rejects_future_schema() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
-    let future = serde_json::json!({"schema_version": 4, "id": "session_9_0"});
-    let path = dir
-        .path()
-        .join(".deep-code/sessions")
-        .join("session_9_0.json");
-    std::fs::write(&path, future.to_string()).unwrap();
-
-    assert!(matches!(
-        store.load(&SessionId("session_9_0".to_string())),
-        Err(SessionStoreError::UnsupportedSchema { found: 4, .. })
-    ));
 }
 
 #[test]
@@ -358,9 +450,9 @@ fn list_finds_the_latest_session_beyond_the_former_entry_scan_limit() {
     let path = store.root.join(last.file_name());
     let mut newest = store.read_file(&path).unwrap();
     newest.updated_at_ms = 1_000;
-    let json = super::super::serialize_record(&mut newest).unwrap();
+    let snapshot = super::super::prepare_record(&mut newest).unwrap();
     // Overwrite in place to keep the directory entries unchanged.
-    fs::write(&path, json).unwrap();
+    fs::write(&path, snapshot.json()).unwrap();
 
     let listed = store.list().unwrap();
     assert_eq!(listed.len(), MAX_SESSION_LIST);
@@ -375,7 +467,10 @@ fn list_finds_the_latest_session_beyond_the_former_byte_scan_limit() {
     // Legal trailing JSON whitespace keeps this fixture's parsed records
     // small while exercising over 64 MiB of real filesystem input.
     let write_padded = |record: &mut SessionRecord| {
-        let mut json = super::super::serialize_record(record).unwrap();
+        let mut json = super::super::prepare_record(record)
+            .unwrap()
+            .json()
+            .to_string();
         json.push_str(&" ".repeat(7 * 1024 * 1024));
         assert!((json.len() as u64) < MAX_SESSION_FILE_BYTES);
         fs::write(store.path_for(&record.id).unwrap(), json).unwrap();
@@ -569,89 +664,38 @@ fn json_store_export_is_pretty_json() {
     let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
     store.save(&mut record).unwrap();
     let exported = store.export(&record.id).unwrap();
-    assert!(exported.contains("\"schema_version\""));
+    assert!(exported.contains("\"entries\""));
     assert!(exported.contains('\n'));
 }
 
-/// The fields of [`SessionRecord`] are part of the signed bytes:
-/// `session_integrity::record_message` signs a re-serialization of the parsed
-/// struct, so adding or removing a field changes the tag for every existing
-/// record. `list()` would then treat those files as forged and `/resume` would
-/// discard their transcripts.
-///
-/// Adding a field is therefore allowed only together with a
-/// `SESSION_SCHEMA_VERSION` bump. This list is the tripwire that makes the bump
-/// deliberate: if you are reading this because the assertion failed, bump the
-/// version (and update the list) rather than deleting the test.
+/// Unknown fields must not be discarded and then overwritten by a resumed save.
 #[test]
-fn the_signed_field_set_is_pinned() {
-    let mut record = SessionRecord::new(PathBuf::from("/ws"), "system");
-    // Populate every optional field too, so no key hides behind its
-    // `skip_serializing_if`.
-    record.extra_roots = vec![PathBuf::from("/extra")];
-    record.extra_roots_mac = Some("tag".to_string());
-    record.record_mac = Some("tag".to_string());
-    record.summary = Some("summary".to_string());
-    record.compaction = Some("archived=1".to_string());
-
-    let value = serde_json::to_value(&record).unwrap();
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .expect("a record is a JSON object")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    assert_eq!(
-        keys,
-        vec![
-            "checkpoints",
-            "compaction",
-            "created_at_ms",
-            "entries",
-            "extra_roots",
-            "extra_roots_mac",
-            "id",
-            "record_mac",
-            "schema_version",
-            "session_cache_hit_tokens",
-            "session_cache_miss_tokens",
-            "session_cache_savings",
-            "session_cost",
-            "summary",
-            "turns",
-            "updated_at_ms",
-            "workspace",
-        ],
-        "the record's shape is part of the host tag: bump SESSION_SCHEMA_VERSION \
-         when it changes, and update this list"
-    );
-}
-
-/// A key this build does not know is dropped at parse time, so it never reaches
-/// the signed message. That is what makes a forward-compatible writer safe: the
-/// record stays verifiable and `list()` still offers it.
-#[test]
-fn an_unknown_field_does_not_make_a_record_look_forged() {
+fn an_unknown_field_is_rejected_without_modifying_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
     let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
     store.save(&mut record).unwrap();
     let path = store.path_for(&record.id).unwrap();
     let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    value["a_field_from_a_newer_build"] = serde_json::json!({"nested": true});
-    fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    value["unexpected_field"] = serde_json::json!({"nested": true});
+    let original = serde_json::to_string_pretty(&value).unwrap();
+    fs::write(&path, &original).unwrap();
 
-    let listed = store.list().unwrap();
-    assert_eq!(listed.len(), 1, "an unknown key must not hide the session");
-    assert_eq!(listed[0].id, record.id);
+    assert!(matches!(
+        store.load(&record.id),
+        Err(SessionStoreError::Serialization { .. })
+    ));
+    assert!(store.list().unwrap().is_empty());
+    assert!(
+        store
+            .take_diagnostics()
+            .iter()
+            .any(|line| line.contains("unexpected_field"))
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
 }
 
-/// The other direction: a *required* field that disappears is a parse error, not
-/// an empty session. The distinction matters because the version check is what
-/// lets a schema bump reject old files explicitly; a parser that filled the gap
-/// with a default would hand an unverifiable record to `/resume`, which then
-/// clears the transcript and writes the empty result back.
+/// A missing required field is a parse error, never an empty session to save.
 #[test]
 fn a_record_missing_a_required_field_is_refused_rather_than_emptied() {
     let dir = tempfile::tempdir().unwrap();
@@ -665,7 +709,8 @@ fn a_record_missing_a_required_field_is_refused_rather_than_emptied() {
         .unwrap()
         .remove("session_cost")
         .expect("session_cost is persisted");
-    fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    let original = serde_json::to_string_pretty(&value).unwrap();
+    fs::write(&path, &original).unwrap();
 
     assert!(matches!(
         store.load(&record.id),
@@ -679,6 +724,48 @@ fn a_record_missing_a_required_field_is_refused_rather_than_emptied() {
             .any(|line| line.contains("unreadable session")),
         "{diagnostics:?}"
     );
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+}
+
+#[test]
+fn unauthenticated_records_are_refused_without_rewriting_or_exporting_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonSessionStore::for_workspace(dir.path()).unwrap();
+    for mutation in ["transcript", "missing_tag", "invalid_tag"] {
+        let mut record = SessionRecord::new(dir.path().to_path_buf(), "system");
+        record.entries.push(std::sync::Arc::new(
+            crate::session_entry::SessionEntry::user("preserve this conversation"),
+        ));
+        store.save(&mut record).unwrap();
+        let path = store.path_for(&record.id).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        match mutation {
+            "transcript" => value["entries"] = serde_json::json!([]),
+            "missing_tag" => {
+                value.as_object_mut().unwrap().remove("record_mac");
+            }
+            _ => value["record_mac"] = serde_json::json!("invalid"),
+        }
+        let original = serde_json::to_string_pretty(&value).unwrap();
+        fs::write(&path, &original).unwrap();
+        assert!(
+            matches!(
+                store.load(&record.id),
+                Err(SessionStoreError::AuthenticationFailed { .. })
+            ),
+            "{mutation}"
+        );
+        assert!(
+            matches!(
+                store.export(&record.id),
+                Err(SessionStoreError::AuthenticationFailed { .. })
+            ),
+            "{mutation}"
+        );
+        assert!(store.list().unwrap().is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
 }
 
 /// A record that fails its tag is skipped by `list()` — and the reason is
@@ -702,7 +789,7 @@ fn list_hands_its_skip_reasons_to_the_caller() {
     assert!(
         diagnostics
             .iter()
-            .any(|line| line.contains("unauthenticated session")),
+            .any(|line| line.contains("failed integrity verification")),
         "{diagnostics:?}"
     );
     assert!(

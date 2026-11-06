@@ -14,10 +14,15 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::model::ToolCallPayload;
+use crate::runtime::TurnId;
 use crate::tool::ToolResultStatus;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEntry {
+    /// Runtime turn that produced this entry. Session-wide instructions and
+    /// compaction summaries do not belong to an individual turn.
+    #[serde(default)]
+    pub turn_id: Option<TurnId>,
     #[serde(flatten)]
     pub kind: EntryKind,
 }
@@ -25,7 +30,16 @@ pub struct SessionEntry {
 impl SessionEntry {
     #[must_use]
     pub fn new(kind: EntryKind) -> Self {
-        Self { kind }
+        Self {
+            turn_id: None,
+            kind,
+        }
+    }
+
+    #[must_use]
+    pub fn with_turn_id(mut self, turn_id: TurnId) -> Self {
+        self.turn_id = Some(turn_id);
+        self
     }
 
     /// Number of wire messages this entry derives to (an assistant entry

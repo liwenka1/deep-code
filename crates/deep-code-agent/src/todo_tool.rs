@@ -227,6 +227,6 @@ mod tests {
         );
         let plan = ExecPolicy::new().evaluate_tool(TodoWriteTool::NAME, &json!({}));
         assert!(matches!(plan.verdict, PolicyVerdict::Allow));
-        assert!(!plan.requires_approval);
+        assert!(!plan.requires_approval());
     }
 }

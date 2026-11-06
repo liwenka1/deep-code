@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use crate::session_store::{SessionRecord, SessionStore, serialize_record};
+use crate::session_store::{SessionRecord, SessionStore, prepare_record};
 
 /// Backoff delays between save retries. A save is attempted once, then retried
 /// after each of these delays before the failure is finally recorded. This
@@ -118,7 +118,7 @@ async fn actor_loop(
         }
 
         if pending_save {
-            let outcome = save_with_retry(store.as_ref(), &record).await;
+            let outcome = save_with_retry(&store, &record).await;
             let mut slot = last_error.lock().expect("save error lock poisoned");
             match outcome {
                 Ok(()) => *slot = None,
@@ -143,16 +143,26 @@ async fn actor_loop(
 /// mid-backoff (latest-wins holds). Returns the last error only once every
 /// attempt is exhausted.
 async fn save_with_retry(
-    store: &(dyn SessionStore + Send + Sync),
-    record: &Mutex<SessionRecord>,
+    store: &Arc<dyn SessionStore + Send + Sync>,
+    record: &Arc<Mutex<SessionRecord>>,
 ) -> Result<(), crate::session_store::SessionStoreError> {
     let mut attempt = 0usize;
     loop {
-        let (id, json) = {
-            let mut guard = record.lock().await;
-            (guard.id.clone(), serialize_record(&mut guard)?)
-        };
-        match store.save_serialized(&id, &json) {
+        let store = Arc::clone(store);
+        let record = Arc::clone(record);
+        // Encoding, signing, and fsync can all be expensive. None may occupy
+        // the async executor (including a single-threaded runtime).
+        let outcome = tokio::task::spawn_blocking(move || {
+            let snapshot = prepare_record(&mut record.blocking_lock())?;
+            store.save_prepared(&snapshot)
+        })
+        .await
+        .map_err(
+            |error| crate::session_store::SessionStoreError::Serialization {
+                message: format!("session writer failed: {error}"),
+            },
+        )?;
+        match outcome {
             Ok(()) => return Ok(()),
             // Only transient I/O faults (ENOSPC, file lock, network-FS blip)
             // are worth retrying; serialization / invalid-id / schema errors are
@@ -204,7 +214,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::session_store::{SessionId, SessionRecord, SessionStoreError};
+    use crate::session_store::{PreparedSession, SessionId, SessionRecord, SessionStoreError};
 
     #[derive(Default)]
     struct CountingStore {
@@ -222,9 +232,9 @@ mod tests {
     }
 
     impl SessionStore for CountingStore {
-        fn save_serialized(&self, _id: &SessionId, json: &str) -> Result<(), SessionStoreError> {
+        fn save_prepared(&self, session: &PreparedSession) -> Result<(), SessionStoreError> {
             self.saves.fetch_add(1, Ordering::SeqCst);
-            *self.latest.lock().unwrap() = Some(serde_json::from_str(json).unwrap());
+            *self.latest.lock().unwrap() = Some(serde_json::from_str(session.json()).unwrap());
             Ok(())
         }
         fn load(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError> {
@@ -242,7 +252,7 @@ mod tests {
 
     struct FailingStore;
     impl SessionStore for FailingStore {
-        fn save_serialized(&self, _id: &SessionId, _json: &str) -> Result<(), SessionStoreError> {
+        fn save_prepared(&self, _: &PreparedSession) -> Result<(), SessionStoreError> {
             Err(SessionStoreError::Io {
                 message: "synthetic failure".to_string(),
             })
@@ -258,6 +268,105 @@ mod tests {
         fn delete(&self, _id: &SessionId) -> Result<(), SessionStoreError> {
             Ok(())
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_blocked_writer_does_not_block_the_async_executor() {
+        struct BlockingStore {
+            started: Arc<tokio::sync::Notify>,
+            release: StdMutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl SessionStore for BlockingStore {
+            fn save_prepared(&self, _: &PreparedSession) -> Result<(), SessionStoreError> {
+                self.started.notify_one();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|_| SessionStoreError::Serialization {
+                        message: "writer blocked the only async worker".to_string(),
+                    })
+            }
+            fn load(&self, _: &SessionId) -> Result<SessionRecord, SessionStoreError> {
+                unreachable!()
+            }
+            fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError> {
+                unreachable!()
+            }
+            fn delete(&self, _: &SessionId) -> Result<(), SessionStoreError> {
+                unreachable!()
+            }
+        }
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (release, wait) = std::sync::mpsc::channel();
+        let store = Arc::new(BlockingStore {
+            started: Arc::clone(&started),
+            release: StdMutex::new(wait),
+        });
+        let handle = PersistenceActorHandle::spawn(store, Arc::new(Mutex::new(make_record())));
+        // Queue the flush before yielding so it shares the one save attempt.
+        let flush = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.flush().await }
+        });
+        started.notified().await;
+        release.send(()).unwrap();
+        flush.await.unwrap();
+        assert_eq!(handle.last_save_error(), None);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_retry_writes_the_latest_record_without_holding_its_lock_during_io() {
+        struct UpdatingStore {
+            record: Arc<Mutex<SessionRecord>>,
+            attempts: AtomicUsize,
+            latest: StdMutex<Option<SessionRecord>>,
+        }
+        impl SessionStore for UpdatingStore {
+            fn save_prepared(&self, snapshot: &PreparedSession) -> Result<(), SessionStoreError> {
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.record
+                        .try_lock()
+                        .expect("I/O must release the record lock")
+                        .summary = Some("updated while the first write failed".to_string());
+                    return Err(SessionStoreError::Io {
+                        message: "retry this write".to_string(),
+                    });
+                }
+                *self.latest.lock().unwrap() = Some(serde_json::from_str(snapshot.json()).unwrap());
+                Ok(())
+            }
+            fn load(&self, _: &SessionId) -> Result<SessionRecord, SessionStoreError> {
+                unreachable!()
+            }
+            fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError> {
+                unreachable!()
+            }
+            fn delete(&self, _: &SessionId) -> Result<(), SessionStoreError> {
+                unreachable!()
+            }
+        }
+        let record = Arc::new(Mutex::new(make_record()));
+        let store = Arc::new(UpdatingStore {
+            record: Arc::clone(&record),
+            attempts: AtomicUsize::new(0),
+            latest: StdMutex::new(None),
+        });
+        let handle = PersistenceActorHandle::spawn(store.clone(), record);
+        handle.flush().await;
+        assert_eq!(handle.last_save_error(), None);
+        assert_eq!(store.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            store
+                .latest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .summary
+                .as_deref(),
+            Some("updated while the first write failed")
+        );
     }
 
     fn make_record() -> SessionRecord {
@@ -327,7 +436,7 @@ mod tests {
         fail_first: usize,
     }
     impl SessionStore for FlakyStore {
-        fn save_serialized(&self, _id: &SessionId, _json: &str) -> Result<(), SessionStoreError> {
+        fn save_prepared(&self, _: &PreparedSession) -> Result<(), SessionStoreError> {
             if self.attempts.fetch_add(1, Ordering::SeqCst) < self.fail_first {
                 Err(SessionStoreError::Io {
                     message: "disk full".to_string(),
@@ -413,7 +522,7 @@ mod tests {
         attempts: Arc<AtomicUsize>,
     }
     impl SessionStore for PermanentFailStore {
-        fn save_serialized(&self, _id: &SessionId, _json: &str) -> Result<(), SessionStoreError> {
+        fn save_prepared(&self, _: &PreparedSession) -> Result<(), SessionStoreError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             Err(SessionStoreError::Serialization {
                 message: "permanent".to_string(),
