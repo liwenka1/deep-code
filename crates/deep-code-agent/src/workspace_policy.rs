@@ -142,7 +142,7 @@ impl WorkspacePolicy {
     /// Build a policy that canonicalizes its roots. Test-only: every production
     /// launch goes through [`Self::new_pinned`], which refuses a root that no
     /// longer resolves to its approved directory.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn new(roots: impl Into<WorkspaceRoots>) -> Result<Self, ToolError> {
         Self::new_inner(roots.into(), false)
     }

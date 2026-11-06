@@ -1,6 +1,5 @@
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
-use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::fs;
 use std::io::{Read, Write};
@@ -12,178 +11,6 @@ use super::{
     SessionRecord, SessionStore, SessionStoreError, sessions_dir_for_workspace,
     validate_session_id,
 };
-
-/// Schemas written before turn and entry identities became part of a session.
-/// Schema 2 was the last published format and had no full-record tag; schema 3
-/// was the short-lived authenticated format on the development branch. Keep
-/// these wire structs local to the loader so the current model can remain
-/// strict while both older shapes are migrated explicitly.
-const LEGACY_SESSION_SCHEMA_VERSION: u32 = 3;
-const PUBLISHED_SESSION_SCHEMA_VERSION: u32 = 2;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacyTurnRecord {
-    started_at_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacyCheckpointRecord {
-    id: crate::checkpoint::CheckpointId,
-    label: String,
-    created_at_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacySessionEntry {
-    #[serde(flatten)]
-    kind: crate::session_entry::EntryKind,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacySessionRecord {
-    schema_version: u32,
-    id: SessionId,
-    workspace: PathBuf,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    extra_roots: Vec<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    extra_roots_mac: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    record_mac: Option<String>,
-    created_at_ms: u64,
-    updated_at_ms: u64,
-    entries: Vec<Arc<LegacySessionEntry>>,
-    turns: Vec<LegacyTurnRecord>,
-    #[serde(default)]
-    checkpoints: Vec<LegacyCheckpointRecord>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    summary: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    compaction: Option<String>,
-    #[serde(default)]
-    session_cost: crate::pricing::CostEstimate,
-    #[serde(default)]
-    session_cache_hit_tokens: u64,
-    #[serde(default)]
-    session_cache_miss_tokens: u64,
-    #[serde(default)]
-    session_cache_savings: crate::pricing::CostEstimate,
-}
-
-impl LegacySessionRecord {
-    fn migrate(mut self) -> Result<SessionRecord, SessionStoreError> {
-        if !matches!(
-            self.schema_version,
-            PUBLISHED_SESSION_SCHEMA_VERSION | LEGACY_SESSION_SCHEMA_VERSION
-        ) {
-            return Err(SessionStoreError::Serialization {
-                message: format!(
-                    "unsupported legacy session schema version {}",
-                    self.schema_version
-                ),
-            });
-        }
-
-        // Both legacy shapes must carry a host-authenticated tag before any
-        // defaults or identities are added. Schema 2 was published before
-        // full-record authentication, so files from that release without a
-        // tag cannot be safely resumed or upgraded: a model-written file could
-        // otherwise smuggle an altered transcript through this migration.
-        let tag = self.record_mac.take();
-        let authenticated = crate::session_integrity::verify_serialized(&self, tag.as_deref());
-        self.record_mac = tag;
-        if !authenticated {
-            return Err(SessionStoreError::AuthenticationFailed {
-                path: "legacy session".to_string(),
-            });
-        }
-
-        let turn_ids: Vec<_> = self
-            .turns
-            .iter()
-            .map(|_| crate::runtime::TurnId::new())
-            .collect();
-        let mut current_turn = None;
-        let mut next_turn = 0;
-        let entries = self
-            .entries
-            .into_iter()
-            .map(|entry| {
-                let turn_id = match entry.kind {
-                    crate::session_entry::EntryKind::User { .. } => {
-                        let id = turn_ids
-                            .get(next_turn)
-                            .cloned()
-                            .unwrap_or_else(crate::runtime::TurnId::new);
-                        next_turn = next_turn.saturating_add(1);
-                        current_turn = Some(id.clone());
-                        Some(id)
-                    }
-                    crate::session_entry::EntryKind::Assistant { .. } => current_turn.clone(),
-                    _ => None,
-                };
-                Arc::new(crate::session_entry::SessionEntry {
-                    turn_id,
-                    kind: entry.kind.clone(),
-                })
-            })
-            .collect();
-        let turns = self
-            .turns
-            .into_iter()
-            .zip(turn_ids.iter().cloned())
-            .map(|(turn, id)| super::TurnRecord {
-                id,
-                started_at_ms: turn.started_at_ms,
-            })
-            .collect();
-        let checkpoints = self
-            .checkpoints
-            .into_iter()
-            .enumerate()
-            .map(|(index, checkpoint)| {
-                let turn_id = turn_ids
-                    .get(index)
-                    .cloned()
-                    .or_else(|| turn_ids.last().cloned())
-                    .unwrap_or_else(crate::runtime::TurnId::new);
-                super::CheckpointRecord {
-                    id: checkpoint.id,
-                    turn_id,
-                    label: checkpoint.label,
-                    created_at_ms: checkpoint.created_at_ms,
-                }
-            })
-            .collect();
-
-        let mut record = SessionRecord {
-            id: self.id,
-            workspace: self.workspace,
-            extra_roots: self.extra_roots,
-            extra_roots_mac: self.extra_roots_mac,
-            record_mac: None,
-            created_at_ms: self.created_at_ms,
-            updated_at_ms: self.updated_at_ms,
-            entries,
-            turns,
-            checkpoints,
-            summary: self.summary,
-            compaction: self.compaction,
-            session_cost: self.session_cost,
-            session_cache_hit_tokens: self.session_cache_hit_tokens,
-            session_cache_miss_tokens: self.session_cache_miss_tokens,
-            session_cache_savings: self.session_cache_savings,
-        };
-        record.record_mac = Some(
-            crate::session_integrity::sign_record(&mut record).ok_or_else(|| {
-                SessionStoreError::KeyUnavailable {
-                    detail: "could not sign migrated session".to_string(),
-                }
-            })?,
-        );
-        Ok(record)
-    }
-}
 
 /// Bound diagnostics as well as retained records while scanning the directory.
 const MAX_SESSION_DIAGNOSTICS: usize = 32;
@@ -372,27 +199,11 @@ impl JsonSessionStore {
             serde_json::from_str(&raw).map_err(|error| SessionStoreError::Serialization {
                 message: format!("failed to parse {}: {error}", path.display()),
             })?;
-        let mut record = if value.get("schema_version").is_some() {
-            let legacy: LegacySessionRecord = serde_json::from_value(value).map_err(|error| {
-                SessionStoreError::Serialization {
-                    message: format!("failed to parse {}: {error}", path.display()),
-                }
-            })?;
-            legacy.migrate().map_err(|error| match error {
-                SessionStoreError::AuthenticationFailed { .. } => {
-                    SessionStoreError::AuthenticationFailed {
-                        path: path.display().to_string(),
-                    }
-                }
-                other => other,
-            })?
-        } else {
-            serde_json::from_value::<SessionRecord>(value).map_err(|error| {
-                SessionStoreError::Serialization {
-                    message: format!("failed to parse {}: {error}", path.display()),
-                }
-            })?
-        };
+        let mut record = serde_json::from_value::<SessionRecord>(value).map_err(|error| {
+            SessionStoreError::Serialization {
+                message: format!("failed to parse {}: {error}", path.display()),
+            }
+        })?;
         if record.entries.len() > MAX_SESSION_ENTRIES {
             return Err(SessionStoreError::TooManyEntries {
                 path: path.display().to_string(),

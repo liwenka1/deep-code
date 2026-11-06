@@ -312,13 +312,11 @@ function downloadFile(url, dest, redirectsLeft = MAX_DOWNLOAD_REDIRECTS) {
       // not on the file — without this the promise resolved on the truncated
       // file's 'finish' and the partial download was treated as a success.
       response.on('error', (err) => {
-        file.close();
-        fs.rmSync(dest, { force: true });
+        discardPartial(file, dest);
         reject(err);
       });
       response.on('aborted', () => {
-        file.close();
-        fs.rmSync(dest, { force: true });
+        discardPartial(file, dest);
         reject(new Error(`Connection closed before the download finished: ${url}`));
       });
 

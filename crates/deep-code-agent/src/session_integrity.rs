@@ -229,34 +229,6 @@ fn record_message(record: &mut crate::session_store::SessionRecord) -> Option<Ve
     message
 }
 
-#[cfg(test)]
-/// Sign a compatibility record in tests so migration fixtures use the same
-/// host key and serialization path as persisted records.
-#[must_use]
-pub(crate) fn sign_serialized<T: serde::Serialize>(value: &T) -> Option<String> {
-    let key_bytes = key().ok()?;
-    let message = serde_json::to_vec(value).ok()?;
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes);
-    Some(to_hex(ring::hmac::sign(&key, &message).as_ref()))
-}
-
-/// Verify a tag over a serialized compatibility record. This is used only
-/// while migrating an older on-disk schema: the old record must be
-/// authenticated before its fields are translated into the current shape.
-/// Keeping this helper generic avoids making the legacy wire structs part of
-/// the public session model.
-#[must_use]
-pub(crate) fn verify_serialized<T: serde::Serialize>(value: &T, tag: Option<&str>) -> bool {
-    let (Ok(key_bytes), Some(tag), Ok(message)) = (key(), tag, serde_json::to_vec(value)) else {
-        return false;
-    };
-    let Some(tag) = from_hex(tag) else {
-        return false;
-    };
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes);
-    ring::hmac::verify(&key, &message, &tag).is_ok()
-}
-
 /// Tag for the complete persisted record, or `None` when the host key is not
 /// available or the record cannot be serialized.
 #[must_use]
