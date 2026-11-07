@@ -818,9 +818,6 @@ mod tests {
             fn base_commit(&self) -> &str {
                 "abc"
             }
-            fn hints(&self) -> Option<&str> {
-                None
-            }
         }
         let prompt = instance_prompt(&Fake);
         assert!(prompt.contains("git checkout of x/x"));

@@ -9,9 +9,9 @@
 //! use deep_code_eval::{EvalConfig, load_bench, run_bench};
 //!
 //! let config = EvalConfig::default();
-//! let bench = load_bench("swe-bench", "lite", Some(5)).await?;
+//! let bench = load_bench("swe-bench", "lite", "test", Some(5)).await?;
 //! let report = run_bench(config, &bench).await?;
-//! println!("resolved: {}/{}", report.resolved, report.total);
+//! println!("patches: {}/{}", report.patches_produced, report.total);
 //! ```
 
 pub mod bench;

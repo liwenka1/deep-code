@@ -14,15 +14,11 @@ pub trait BenchmarkInstance: std::fmt::Debug {
     fn repo(&self) -> &str;
     /// Base commit SHA to check out before running the agent.
     fn base_commit(&self) -> &str;
-    /// Hints (optional) — not sent to the agent; used for metadata.
-    fn hints(&self) -> Option<&str>;
 }
 
 /// A benchmark data set.
 #[derive(Debug, Clone)]
 pub struct BenchmarkSet<T: BenchmarkInstance + Clone> {
-    pub name: String,
-    pub description: String,
     pub instances: Vec<T>,
 }
 
@@ -41,37 +37,13 @@ pub async fn load_bench(
 
 // ── SWE-bench ────────────────────────────────────────────────────────────────
 
-/// A single SWE-bench instance — matches the datasets-server API response.
+/// The fields consumed from a SWE-bench datasets-server response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SweBenchInstance {
     pub instance_id: String,
     pub repo: String,
     pub base_commit: String,
     pub problem_statement: String,
-    /// Populated from `hints_text` in the raw API response.
-    #[serde(default, alias = "hints_text")]
-    pub hints: Option<String>,
-    /// Patch (reference solution, not used in Phase 1).
-    #[serde(default)]
-    pub patch: Option<String>,
-    /// Test patch (reference test changes).
-    #[serde(default)]
-    pub test_patch: Option<String>,
-    /// FAIL_TO_PASS test list (JSON string array).
-    #[serde(default)]
-    pub fail_to_pass: Option<String>,
-    /// PASS_TO_PASS test list (JSON string array).
-    #[serde(default)]
-    pub pass_to_pass: Option<String>,
-    /// When the issue was created.
-    #[serde(default)]
-    pub created_at: Option<String>,
-    /// SWE-bench dataset version.
-    #[serde(default)]
-    pub version: Option<String>,
-    /// Environment setup commit for Docker evaluation.
-    #[serde(default)]
-    pub environment_setup_commit: Option<String>,
 }
 
 impl BenchmarkInstance for SweBenchInstance {
@@ -86,8 +58,5 @@ impl BenchmarkInstance for SweBenchInstance {
     }
     fn base_commit(&self) -> &str {
         &self.base_commit
-    }
-    fn hints(&self) -> Option<&str> {
-        self.hints.as_deref()
     }
 }

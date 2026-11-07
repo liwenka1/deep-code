@@ -97,10 +97,7 @@ pub async fn load(
         all_instances.truncate(n);
     }
 
-    let total = all_instances.len();
     Ok(BenchmarkSet {
-        name: format!("swe-bench/{subset}/{split}"),
-        description: format!("SWE-bench {subset} {split} ({total} instances)"),
         instances: all_instances,
     })
 }
