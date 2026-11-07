@@ -31,6 +31,9 @@ pub enum AgentError {
     #[error("request timed out: no response headers within {seconds}s")]
     RequestTimeout { seconds: u64 },
 
+    #[error("request body exceeded {limit_bytes} bytes (actual: {actual_bytes})")]
+    RequestTooLarge { limit_bytes: u64, actual_bytes: u64 },
+
     #[error("stream stalled: no data for {seconds}s")]
     StreamStalled { seconds: u64 },
 
@@ -113,6 +116,17 @@ impl AgentError {
                 lang,
                 TextId::ErrRequestTimeout,
                 &[("seconds", &seconds.to_string())],
+            ),
+            Self::RequestTooLarge {
+                limit_bytes,
+                actual_bytes,
+            } => tr_with(
+                lang,
+                TextId::ErrRequestTooLarge,
+                &[
+                    ("limit", &limit_bytes.to_string()),
+                    ("actual", &actual_bytes.to_string()),
+                ],
             ),
             Self::StreamStalled { seconds } => tr_with(
                 lang,

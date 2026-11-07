@@ -248,6 +248,7 @@
   "ErrParse": "Failed to parse the provider response: {detail}",
   "ErrSerde": "Serialization error: {detail}",
   "ErrRequestTimeout": "Request timed out: no DeepSeek response headers within {seconds}s\nNetwork or DeepSeek is slow — retry, or raise provider.timeout_secs.",
+  "ErrRequestTooLarge": "Request body is too large ({actual} bytes; limit {limit})\nThe provider accepts at most 48 MiB per request. Remove some images or shorten the task.",
   "ErrStreamStalled": "Stream stalled: no new data for {seconds}s\nNetwork may be stalling or the proxy dropped — retry; for genuinely long tasks raise DEEP_CODE_STREAM_CHUNK_TIMEOUT_SECS.",
   "ErrStreamDeadline": "Stream exceeded the {seconds}s total deadline\nThis turn ran too long and was terminated — split the task and retry, or raise DEEP_CODE_STREAM_TOTAL_TIMEOUT_SECS.",
   "ErrStreamOverflow": "Stream too large: content exceeded the {limit}-byte cap\nThe response was unusually huge and was truncated for safety — narrow the task, or raise DEEP_CODE_STREAM_MAX_BYTES.",

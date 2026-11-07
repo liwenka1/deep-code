@@ -10,6 +10,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use crate::config::AgentConfig;
 use crate::error::{AgentError, AgentResult};
 use crate::event::{AgentEvent, chunk_to_events};
+use crate::image::MAX_REQUEST_BYTES;
 use crate::model::{ChatRequest, StreamChunk};
 
 pub type AgentEventStream = Pin<Box<dyn Stream<Item = AgentResult<AgentEvent>> + Send>>;
@@ -64,6 +65,15 @@ impl LlmClient for DeepSeekClient {
         }
         request.stream = true;
 
+        let body = serde_json::to_vec(&request)?;
+        let body_bytes = body.len() as u64;
+        if body_bytes > MAX_REQUEST_BYTES {
+            return Err(AgentError::RequestTooLarge {
+                limit_bytes: MAX_REQUEST_BYTES,
+                actual_bytes: body_bytes,
+            });
+        }
+
         let send = self
             .http
             .post(self.config.chat_completions_url())
@@ -72,7 +82,7 @@ impl LlmClient for DeepSeekClient {
                 format!("Bearer {}", self.config.require_api_key()?),
             )
             .header(CONTENT_TYPE, "application/json")
-            .json(&request)
+            .body(body)
             .send();
 
         // `send()` resolves once response headers arrive, before the body, so

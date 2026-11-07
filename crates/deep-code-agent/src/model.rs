@@ -51,15 +51,12 @@ fn default_stream() -> bool {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatChoice {
-    pub index: u32,
-    pub message: Option<Message>,
     pub delta: Option<ChoiceDelta>,
     pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChoiceDelta {
-    pub role: Option<String>,
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,

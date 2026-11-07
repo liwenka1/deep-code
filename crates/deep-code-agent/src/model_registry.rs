@@ -16,10 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const DEEPSEEK_V4_PRO: &str = "deepseek-v4-pro";
-/// Canonical id for the Flash model. The API renamed it from
-/// `deepseek-v4-flash`, which survives as an alias in `assets/models.toml`
-/// (still accepted, still billed at the Flash rate), so configs and docs
-/// written against the old name keep resolving — 0.4.11 shipped that promise.
+/// Canonical id for the Flash model; `flash` is its short name.
 pub const DEEPSEEK_FLASH: &str = "deepseek-flash";
 /// Pseudo-model: lets the turn router pick pro/flash per prompt.
 pub const AUTO_MODEL: &str = "auto";
@@ -329,11 +326,7 @@ mod tests {
         }
     }
 
-    /// Every name the API answers to for Flash resolves to the one canonical
-    /// id, ignoring case and surrounding whitespace. `deepseek-v4-flash` is the
-    /// one that matters most: it is what releases up to 0.4.10 persisted into
-    /// `provider.model`, and a missing alias would send it through as a
-    /// `Passthrough` id with no window, price or vision row.
+    /// The canonical id and short name ignore case and surrounding whitespace.
     #[test]
     fn every_flash_name_resolves_to_the_canonical_id() {
         let registry = ModelRegistry::default();
@@ -341,7 +334,6 @@ mod tests {
             "deepseek-flash",
             "DeepSeek-Flash",
             "  deepseek-flash ",
-            "deepseek-v4-flash",
             "flash",
         ] {
             let resolution = registry.resolve(Some(name));
@@ -525,7 +517,7 @@ mod tests {
     #[test]
     fn info_lookup_works_through_aliases() {
         let registry = ModelRegistry::default();
-        let entry = registry.info_for("deepseek-v4-flash").expect("known alias");
+        let entry = registry.info_for("flash").expect("known alias");
         assert_eq!(entry.id, DEEPSEEK_FLASH);
         assert!(registry.info_for("no-such-model").is_none());
     }

@@ -324,21 +324,23 @@ impl AgentRuntime {
                 crate::image::MAX_TOTAL_BYTES,
             );
 
-            let prefix = probe_prefix(&messages, prior_prefix);
+            let mut request = ChatRequest::streaming(route.effective_model.clone(), messages)
+                .with_tools(self.tools.chat_tools());
+            if let Some(effort) = route.effective_effort.as_api_value() {
+                request = request.with_reasoning_effort(effort);
+            }
+            let request =
+                crate::image::fit_request_to_limit(request, crate::image::MAX_REQUEST_BYTES);
 
-            let estimated_context_tokens = estimate_token_count(&messages);
+            let prefix = probe_prefix(&request.messages, prior_prefix);
+
+            let estimated_context_tokens = estimate_token_count(&request.messages);
             // Our own read on how close this request is to the window, used only
             // for the overflow rescue below. The provider's error wording is not
             // ours to rely on across versions; this number is, so the rescue has
             // a signal that does not depend on it.
             let near_window = estimated_context_tokens
                 >= context_window_for_model(&route.effective_model).saturating_mul(95) / 100;
-
-            let mut request = ChatRequest::streaming(route.effective_model.clone(), messages)
-                .with_tools(self.tools.chat_tools());
-            if let Some(effort) = route.effective_effort.as_api_value() {
-                request = request.with_reasoning_effort(effort);
-            }
 
             let opened = tokio::select! {
                 biased;

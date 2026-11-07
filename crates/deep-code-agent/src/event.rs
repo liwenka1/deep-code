@@ -69,10 +69,7 @@ mod tests {
     fn chunk_to_events_emits_text_and_done() {
         let chunk = StreamChunk {
             choices: vec![ChatChoice {
-                index: 0,
-                message: None,
                 delta: Some(ChoiceDelta {
-                    role: None,
                     content: Some("hello".to_string()),
                     reasoning_content: None,
                     tool_calls: None,
@@ -106,14 +103,12 @@ mod tests {
         // A provider streaming n>1 choices that each report a finish_reason must
         // still yield ONE Done — usage is request-level, so a Done per choice
         // would make the turn loop count the request's cost several times.
-        let finished = |index| ChatChoice {
-            index,
-            message: None,
+        let finished = || ChatChoice {
             delta: None,
             finish_reason: Some("stop".to_string()),
         };
         let chunk = StreamChunk {
-            choices: vec![finished(0), finished(1)],
+            choices: vec![finished(), finished()],
             usage: Some(Usage {
                 total_tokens: Some(5),
                 ..Usage::default()

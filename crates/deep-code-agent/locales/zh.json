@@ -248,6 +248,7 @@
   "ErrParse": "无法解析 provider 响应：{detail}",
   "ErrSerde": "序列化错误：{detail}",
   "ErrRequestTimeout": "请求超时：{seconds}s 内未收到 DeepSeek 响应头\n网络或 DeepSeek 服务响应缓慢：请检查网络后重试，或调大 provider.timeout_secs。",
+  "ErrRequestTooLarge": "请求体过大（{actual} 字节，限制 {limit}）\n服务端每次请求最多接受 48 MiB：请减少图片或缩短任务。",
   "ErrStreamStalled": "流式响应卡顿：连续 {seconds}s 未收到新数据\n网络可能卡顿或代理中断：请检查网络后重试；如确属长任务，可调大 DEEP_CODE_STREAM_CHUNK_TIMEOUT_SECS。",
   "ErrStreamDeadline": "流式响应总时长超过 {seconds}s 上限\n本轮响应耗时过长已被终止：可拆分任务后重试，或调大 DEEP_CODE_STREAM_TOTAL_TIMEOUT_SECS。",
   "ErrStreamOverflow": "流式响应过大：累计内容超过 {limit} 字节上限\n响应内容异常巨大已被截断保护：请缩小任务范围，或调大 DEEP_CODE_STREAM_MAX_BYTES。",

@@ -21,6 +21,7 @@
 //! told something was attached and is now missing, or it answers as if the user
 //! had typed text alone.
 
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
@@ -35,6 +36,8 @@ const IMAGES_DIR: &str = ".deep-code/images";
 pub const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 /// Inline cap for every image in one request, from the same table.
 pub const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum serialized JSON request body accepted by the provider.
+pub const MAX_REQUEST_BYTES: u64 = 48 * 1024 * 1024;
 /// What one image adds to the context, at most.
 ///
 /// The guide's rule: an image below roughly 544×544 is scaled *up*, anything
@@ -73,15 +76,13 @@ impl ImageDetail {
         }
     }
 
-    /// Parse a configured value. Accepts the API's own spellings (`low`,
-    /// `high`) as well as this codebase's alias (`original`), so a config
-    /// written against either vocabulary keeps loading; `None` for anything
-    /// else, so a typo is reported rather than silently sent.
+    /// Parse one of the configured wire spellings. `None` means the value is
+    /// invalid and must be reported rather than silently changed.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "low" => Some(Self::Low),
-            "high" | "original" => Some(Self::Original),
+            "original" => Some(Self::Original),
             "auto" => Some(Self::Auto),
             _ => None,
         }
@@ -299,6 +300,16 @@ fn over_total_note(image: &str, limit: u64) -> String {
     )
 }
 
+/// The note for an image dropped because the complete serialized request was
+/// over the provider's body limit.
+#[must_use]
+fn over_request_note(image: &str, limit: u64) -> String {
+    format!(
+        "[图片已省略 / image omitted, request body over {}: {image}]",
+        size_label(limit)
+    )
+}
+
 /// Check a local file and report what it is.
 ///
 /// Reads the file's header only, so attaching a 30 MiB screenshot costs a few
@@ -354,19 +365,10 @@ fn read_header(path: &Path) -> Result<Vec<u8>, ImageError> {
 /// naming it, and the principle that leaves `--add-dir` unpoliced applies to
 /// their own attachments too.
 ///
-/// **A path from a session file is a weaker claim, and worth naming.** The
-/// recorded path was a user's when it was written, but this crate's own threat
-/// model holds the session file to be *model*-writable — that is why the root
-/// grants in it carry an authorship tag at all (`runtime_launch`). So a model
-/// that can write a `.deep-code/sessions/*.json` can name an image file
-/// anywhere the process can read it and have its bytes sent to the provider on
-/// the next turn. The window is narrow (the file must really be a PNG/JPEG/GIF/
-/// WebP under the per-image cap, and the path must be known), and closing it
-/// properly means resolving those paths through the workspace policy — which
-/// costs the case the feature is for, a screenshot on the Desktop surviving a
-/// `--continue`. Recorded here rather than left implied, because a future
-/// `read_image` tool that reuses this function would inherit the gap with a much
-/// shorter path to it.
+/// Paths restored from a session are authenticated session data. They still
+/// pass the same file, format, and size checks as a newly pasted attachment;
+/// this function does not treat a persisted path as permission to read an
+/// arbitrary non-image file.
 pub fn data_url(path: &Path) -> Result<String, ImageError> {
     // The inspection is what rejects a missing file, a non-image, or an
     // oversized one *before* anything is read into memory.
@@ -386,7 +388,18 @@ pub fn data_url(path: &Path) -> Result<String, ImageError> {
 /// and the server reads the payload, which is the 400 the sniff exists to
 /// prevent. A non-image therefore fails here rather than being labelled anyway.
 fn data_url_of(path: &Path) -> Result<String, ImageError> {
-    let data = std::fs::read(path).map_err(|error| ImageError::Unreadable(error.to_string()))?;
+    let mut file =
+        std::fs::File::open(path).map_err(|error| ImageError::Unreadable(error.to_string()))?;
+    let mut data = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_IMAGE_BYTES.saturating_add(1))
+        .read_to_end(&mut data)
+        .map_err(|error| ImageError::Unreadable(error.to_string()))?;
+    if data.len() as u64 > MAX_IMAGE_BYTES {
+        return Err(ImageError::TooLarge {
+            bytes: data.len() as u64,
+        });
+    }
     let format = ImageFormat::sniff(&data).ok_or(ImageError::UnsupportedFormat)?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
     Ok(format!("data:{};base64,{encoded}", format.media_type()))
@@ -420,6 +433,10 @@ fn data_url_of(path: &Path) -> Result<String, ImageError> {
 /// across them, so the budget is spent on what the user reached for last. Every
 /// image that is dropped says so by path.
 ///
+/// The public convenience entry point also applies the complete request-body
+/// limit with an empty model/tool envelope. Production requests run the same
+/// pass after their real model and tools are attached.
+///
 /// That order has a cost, and it is worth knowing before "fixing" it back: with
 /// the oldest images charged first, whether a given message's images are sent
 /// depends only on that message and the ones older than it, so the bytes of the
@@ -433,7 +450,11 @@ fn data_url_of(path: &Path) -> Result<String, ImageError> {
 /// silently left out. A turn nobody can use is the worse of the two.
 #[must_use]
 pub fn hydrate(messages: Vec<Message>, detail: Option<ImageDetail>) -> Vec<Message> {
-    hydrate_for(messages, detail, true, MAX_TOTAL_BYTES)
+    let request = crate::model::ChatRequest::streaming(
+        "",
+        hydrate_for(messages, detail, true, MAX_TOTAL_BYTES),
+    );
+    fit_request_to_limit(request, MAX_REQUEST_BYTES).messages
 }
 
 /// [`hydrate`] with the two things a caller has to know and a test has to vary:
@@ -531,6 +552,67 @@ pub(crate) fn hydrate_for(
             message
         })
         .collect()
+}
+
+/// Remove the oldest hydrated images until the complete request fits the
+/// provider's body limit. This runs after tools and model options are attached,
+/// because those fields consume the same 48 MiB body as inline base64 images.
+///
+/// A request can still exceed the limit after all images are removed (for
+/// example, because a tool result is enormous). The HTTP client reports that
+/// case explicitly; this helper only chooses which optional images to discard.
+#[must_use]
+pub(crate) fn fit_request_to_limit(
+    mut request: crate::model::ChatRequest,
+    limit: u64,
+) -> crate::model::ChatRequest {
+    loop {
+        match serialized_size(&request) {
+            Some(size) if size <= limit => return request,
+            None => return request,
+            Some(_) => {}
+        }
+
+        let mut removed = None;
+        'messages: for (message_index, message) in request.messages.iter_mut().enumerate() {
+            if !message.images.is_empty() {
+                removed = Some((message_index, message.images.remove(0)));
+                break 'messages;
+            }
+        }
+        let Some((message_index, image)) = removed else {
+            return request;
+        };
+        let note = over_request_note(&describe_image(&image), limit);
+        let message = &mut request.messages[message_index];
+        if !message.content.is_empty() {
+            message.content.push(' ');
+        }
+        message.content.push_str(&note);
+    }
+}
+
+fn serialized_size(request: &crate::model::ChatRequest) -> Option<u64> {
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, request)
+        .ok()
+        .map(|()| counter.bytes)
+}
+
+#[derive(Default)]
+struct ByteCounter {
+    bytes: u64,
+}
+
+impl Write for ByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(bytes.len() as u64);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Why a pasted image could not be stored.
@@ -1063,6 +1145,24 @@ mod tests {
         assert_eq!(hydrated, messages, "an existing detail is not overwritten");
     }
 
+    #[test]
+    fn an_inline_url_is_removed_when_the_complete_request_is_too_large() {
+        let request = crate::model::ChatRequest::streaming(
+            "deepseek-flash",
+            vec![Message::user_with_images(
+                "look",
+                vec![ImageRef::Url {
+                    url: "data:image/png;base64,".to_string() + &"A".repeat(256),
+                    detail: None,
+                }],
+            )],
+        );
+
+        let fitted = fit_request_to_limit(request, 100);
+        assert!(fitted.messages[0].images.is_empty());
+        assert!(fitted.messages[0].content.contains("request body over"));
+    }
+
     /// A model that cannot take images gets a sentence instead of the picture —
     /// never a failed request. The note is what keeps a transcript sendable after
     /// a model switch, so the turn survives and only the image is lost.
@@ -1325,11 +1425,8 @@ mod tests {
             assert_eq!(ImageDetail::parse(detail.as_str()), Some(detail));
         }
         assert_eq!(ImageDetail::parse(" LOW "), Some(ImageDetail::Low));
-        // `high` is the API's own spelling for the same thing, and 0.4.20's
-        // example config documented it: a config carrying it must keep
-        // loading rather than degrade to a warning and `auto`.
-        assert_eq!(ImageDetail::parse("high"), Some(ImageDetail::Original));
-        assert_eq!(ImageDetail::parse("HIGH"), Some(ImageDetail::Original));
+        assert_eq!(ImageDetail::parse("high"), None);
+        assert_eq!(ImageDetail::parse("HIGH"), None);
     }
 
     #[test]

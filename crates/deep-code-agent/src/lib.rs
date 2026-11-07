@@ -87,8 +87,8 @@ pub use instructions::{
 // acceptable image is.
 pub use image::{
     Attachment, ImageDetail, ImageError, ImageFormat, ImageRef, MAX_IMAGE_BYTES,
-    MAX_IMAGES_PER_MESSAGE, MAX_TOKENS_PER_IMAGE, MAX_TOTAL_BYTES, StoreError, data_url, hydrate,
-    inspect, store, store_in_pinned_workspace,
+    MAX_IMAGES_PER_MESSAGE, MAX_REQUEST_BYTES, MAX_TOKENS_PER_IMAGE, MAX_TOTAL_BYTES, StoreError,
+    data_url, hydrate, inspect, store, store_in_pinned_workspace,
 };
 // Already reachable through `AgentRuntime::session_messages`'s signature;
 // exported so consumers (the headless driver) can actually name them.

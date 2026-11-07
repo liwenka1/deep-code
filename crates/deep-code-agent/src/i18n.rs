@@ -419,6 +419,7 @@ text_ids! {
     ErrParse,
     ErrSerde,
     ErrRequestTimeout,
+    ErrRequestTooLarge,
     ErrStreamStalled,
     ErrStreamDeadline,
     ErrStreamOverflow,
