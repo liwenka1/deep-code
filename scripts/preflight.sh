@@ -8,15 +8,8 @@
 # `--all-targets` run locally and lands red on CI (b83ab4a). The `--doc`
 # pass closes that gap.
 #
-# Two ci.yml jobs have NO counterpart here, so a green preflight does not imply
-# a green CI:
-#   * `msrv · check`, which compiles against the declared floor. Run it by hand
-#     with `RUSTUP_TOOLCHAIN=1.88.0 cargo check --locked --workspace` — the env
-#     var, not `cargo +1.88`, so the local run goes through the same rustup
-#     priority level CI does. (`+toolchain` outranks rust-toolchain.toml and
-#     `rustup default` does not; that gap is what made the CI job a permanent
-#     green while the hand-verification looked sound.)
-#   * the Windows symlink boundary tests; see the case below.
+# The Windows symlink boundary tests have no counterpart here; see the case
+# below. A green Unix run therefore does not cover Windows-only code.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

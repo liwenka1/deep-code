@@ -8,7 +8,7 @@ import test from 'node:test';
 // point. These tests never download assets or modify the installed executable.
 const source = fs.readFileSync(new URL('./install.mjs', import.meta.url), 'utf8')
   .replace(/^import .*;$/gm, '')
-  .replace('const PKG_DIR = path.dirname(fileURLToPath(import.meta.url));', 'const PKG_DIR = "/package";')
+  .replace('const PKG_DIR = import.meta.dirname;', 'const PKG_DIR = "/package";')
   .split('// ── 启动 ──')[0];
 
 function installer({ version = '1.0.0', manifest = 'abc  asset', downloadError, hash = 'abc' } = {}) {
@@ -21,7 +21,7 @@ function installer({ version = '1.0.0', manifest = 'abc  asset', downloadError, 
     },
     platform: () => 'linux',
     arch: () => 'x64',
-    process: { env: { npm_package_version: '99.0.0' }, exit: () => { throw new Error('installer exited'); } },
+    process: { exit: () => { throw new Error('installer exited'); } },
     console: { log() {}, warn() {}, error() {} },
   });
   vm.runInContext(source, context);
@@ -55,6 +55,6 @@ test('checksum verification accepts a matching download and removes a mismatched
   assert.equal(await invalid.context.checksumMatches('asset', '/installed'), false);
 });
 
-test('package metadata is required even when an environment version is present', () => {
+test('package metadata requires a version', () => {
   assert.throws(() => installer({ version: null }), /installer exited/);
 });

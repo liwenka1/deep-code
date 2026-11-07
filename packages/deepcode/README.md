@@ -59,7 +59,7 @@ Full contract, flags and approval posture: [README](https://github.com/liwenka1/
 
 ## Notes
 
-- Requires Node.js >= 18 (for the installer only; the CLI itself is a native binary).
+- Requires Node.js >= 24 (for the installer only; the CLI itself is a native binary).
 - If your network blocks GitHub, grab a binary from the
   [releases page](https://github.com/liwenka1/deep-code/releases) manually, or
   build from source: clone `liwenka1/deep-code` and run

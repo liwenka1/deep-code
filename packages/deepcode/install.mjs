@@ -7,14 +7,13 @@ import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 import { platform, arch } from 'node:os';
 import { execFileSync } from 'node:child_process';
 
 // ── 配置 ──
 const REPO = 'liwenka1/deep-code';
 // The installed package metadata identifies the release asset to download.
-const PKG_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PKG_DIR = import.meta.dirname;
 const VERSION = readVersion();
 
 function readVersion() {
@@ -29,8 +28,6 @@ function readVersion() {
     process.exit(1);
   }
 }
-// `import.meta.dirname` only exists on Node 20.11+; derive it from the module
-// URL so the `engines: node >=18` floor actually works.
 const BIN_DIR = path.join(PKG_DIR, 'bin');
 // The real binary sits next to the `deepcode` JS launcher (bin/deepcode), which
 // spawns it. Distinct names so the download never clobbers the launcher.

@@ -6,6 +6,12 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [Unreleased]
+
+- **Breaking:** model and image configuration now accepts only the current catalog names (`flash` and `low`/`original`/`auto`); retired aliases are removed.
+- Image requests now fit the complete 48 MiB JSON body limit, including text and tools, and reject an oversized non-image request with a clear error.
+- The supported build floors are Rust 1.96 and Node.js 24.
+
 ## [0.4.20] - 2026-10-30
 
 - The `--help` text for `-p` now shows the complete flag list, generated from the same list the parser accepts instead of a hand-written copy that had drifted: it was missing `--add-dir` and the `[--new | -c | --resume ID]` session choice and abbreviated the permission modes to `MODE`, so the help a user asked for was less complete than the usage line a mistyped flag printed.
