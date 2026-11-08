@@ -107,7 +107,11 @@ impl App {
             }
             _ if prompt == "/model" || prompt.starts_with("/model ") => {
                 let arg = prompt.strip_prefix("/model").unwrap_or_default().trim();
-                self.set_model(arg);
+                if arg.is_empty() {
+                    self.open_model_picker();
+                } else {
+                    self.set_model(arg);
+                }
                 true
             }
             // `starts_with("/apikey")`, not `"/apikey "`: pasting the key right

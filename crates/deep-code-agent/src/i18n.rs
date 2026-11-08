@@ -210,6 +210,9 @@ text_ids! {
     PickerTitle,
     PickerHelpResume,
     PickerHelpStartup,
+    ModelPickerHelp,
+    ModelPickerModel,
+    ModelPickerReasoning,
     EmptySessionTitle,
     // 相对时间
     TimeJustNow,
@@ -364,6 +367,8 @@ text_ids! {
     StatusModelInfoShown,
     ModelUnknown,
     ModelSwitched,
+    ModelAndReasoningSwitched,
+    StatusModelPickerCancelled,
     LogoutDone,
     StatusLoggedOut,
     CopiedResponse,

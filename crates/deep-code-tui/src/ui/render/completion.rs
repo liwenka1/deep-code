@@ -2,6 +2,7 @@
 //! candidates, drawn above the composer.
 
 use super::*;
+use crate::app::CompletionKind;
 
 /// Max completion rows shown at once; the list windows around the selection so
 /// wrapping past the top/bottom keeps the highlighted item on screen.
@@ -54,9 +55,14 @@ pub(super) fn render_completion_menu(
             Line::from(spans)
         })
         .collect();
+    let title = match menu.kind {
+        CompletionKind::ModelPicker => tr(lang, TextId::ModelPickerModel),
+        CompletionKind::ReasoningPicker => tr(lang, TextId::ModelPickerReasoning),
+        CompletionKind::Slash | CompletionKind::File => tr(lang, TextId::CompletionMenuTitle),
+    };
     let panel = Paragraph::new(lines).block(
         Block::default()
-            .title(tr(lang, TextId::CompletionMenuTitle))
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Blue)),
     );

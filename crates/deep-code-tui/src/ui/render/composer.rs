@@ -364,17 +364,23 @@ pub(super) fn render_input_from_layout(
         } else {
             tr(app.lang, TextId::ComposerPlaceholder).to_string()
         };
+        // Keep the first cell empty for the input caret. Drawing the hint on
+        // top of the caret made an empty composer look cursorless in terminals
+        // whose cursor blended with the placeholder's dim style.
         frame.buffer_mut().set_string(
-            text_x,
+            text_x.saturating_add(1),
             inner_area.y,
             &hint,
             Style::default().fg(Color::DarkGray),
         );
     }
 
-    // The cursor follows the composer whenever it is editable — including mid
-    // stream, otherwise steered text would be typed blind. Only the approval
-    // prompt takes focus away (keys there are y/a/n, not text).
+    // Draw the caret into the same buffer as the composer. Letting the terminal
+    // own it introduces a visible race: the new text is flushed first and the
+    // terminal cursor is moved afterwards, so the old position can flash for a
+    // frame when the first character is inserted or the last one is deleted.
+    // Keeping the caret in the buffer makes the text and caret one atomic
+    // update. The approval prompt is the only state that takes focus away.
     if app.pending_approval.is_none() {
         let cursor_y = inner_area.y.saturating_add(
             u16::try_from(
@@ -385,6 +391,14 @@ pub(super) fn render_input_from_layout(
             .unwrap_or(u16::MAX),
         );
         let cursor_x = text_x.saturating_add(u16::try_from(layout.cursor_col).unwrap_or(u16::MAX));
+        if let Some(cell) = frame.buffer_mut().cell_mut((cursor_x, cursor_y)) {
+            cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+
+        // Keep the coordinate observable in the in-memory test backend. The
+        // production terminal cursor is intentionally left hidden by ratatui;
+        // the reversed cell above is the actual caret users see.
+        #[cfg(test)]
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 

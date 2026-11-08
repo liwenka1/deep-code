@@ -153,6 +153,10 @@ fn setup_terminal(interrupted: &CancellationToken) -> Result<(AppTerminal, Termi
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
+    // The composer draws its caret in the frame buffer. Hide the terminal's
+    // own cursor before the first frame so it cannot briefly appear at (0, 0)
+    // while the alternate screen is being populated.
+    terminal.hide_cursor()?;
 
     Ok((terminal, cleanup))
 }

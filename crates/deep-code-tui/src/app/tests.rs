@@ -1089,10 +1089,62 @@ fn model_command_resolves_aliases_persists_and_keeps_session() {
     assert!(app.status.contains("auto"));
 
     assert!(app.handle_slash_command("/model"));
-    assert!(matches!(
-        app.history.last(),
-        Some(HistoryCell::System { text }) if text.contains("用法")
-    ));
+    assert!(app.model_picker_open());
+    app.model_picker_cancel();
+    assert!(app.status.contains("取消"));
+
+    // The real slash-command path clears the composer after dispatch. The
+    // picker is command-owned, so that cleanup must leave its inline menu up.
+    let mut submitted = App::new();
+    submitted.input = "/model".to_string();
+    submitted.input_cursor = submitted.input.chars().count();
+    submitted.submit();
+    assert!(submitted.model_picker_open());
+    assert!(submitted.completion_open());
+    submitted.model_picker_cancel();
+}
+
+#[test]
+fn model_picker_navigates_both_rows_without_applying() {
+    let mut app = App::new();
+    app.open_model_picker();
+    let picker = app.model_picker.as_ref().expect("picker open");
+    assert_eq!(
+        picker.models,
+        vec![
+            deep_code_agent::AUTO_MODEL.to_string(),
+            deep_code_agent::DEEPSEEK_V4_PRO.to_string(),
+            deep_code_agent::DEEPSEEK_FLASH.to_string(),
+        ]
+    );
+    assert_eq!(picker.focus, ModelPickerFocus::Model);
+    let initial_model = picker.selected_model;
+    app.completion_down();
+    assert_ne!(app.completion.as_ref().unwrap().selected, initial_model);
+    assert_eq!(
+        app.completion.as_ref().unwrap().kind,
+        CompletionKind::ModelPicker
+    );
+    app.model_picker_accept_selection();
+    assert_ne!(
+        app.model_picker.as_ref().unwrap().selected_model,
+        initial_model
+    );
+    assert_eq!(
+        app.model_picker.as_ref().unwrap().focus,
+        ModelPickerFocus::Reasoning
+    );
+    assert_eq!(
+        app.completion.as_ref().unwrap().kind,
+        CompletionKind::ReasoningPicker
+    );
+    let initial_effort = app.model_picker.as_ref().unwrap().selected_effort;
+    app.completion_down();
+    assert_ne!(app.completion.as_ref().unwrap().selected, initial_effort);
+    // Cancel at the second step to verify the draft never applies here.
+    app.model_picker_cancel();
+    assert!(app.model_picker.is_none());
+    assert!(!app.model_picker_open());
 }
 
 #[test]
@@ -2890,6 +2942,8 @@ fn status_line_is_minimal_model_and_context() {
     let status = app.status_line();
     // The effective model in use, plus context headroom — nothing else.
     assert!(status.contains("deepseek-flash"), "{status}");
+    assert!(status.contains("deepseek-flash high"), "{status}");
+    assert!(!status.contains("thinking="), "{status}");
     assert!(status.contains("ctx 1%"), "{status}");
     // Cost, session id, checkpoint, and the verbose route label are gone.
     assert!(!status.contains("session"), "{status}");

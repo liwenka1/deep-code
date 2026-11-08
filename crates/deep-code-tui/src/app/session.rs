@@ -24,6 +24,43 @@ pub(super) struct PendingSessionScan {
     task: crate::session_scan::SessionScan,
 }
 
+/// Build the effort choices from the embedded model catalog. `auto` and
+/// `off` are product-level controls; the catalog contributes the provider's
+/// thinking levels. Keeping this derived from the catalog means a future model
+/// can narrow or expand its levels without a second hard-coded UI list.
+fn picker_efforts(
+    registry: &deep_code_agent::ModelRegistry,
+    model: &str,
+    current: &str,
+) -> Vec<String> {
+    let mut efforts = vec!["auto".to_string(), "off".to_string()];
+    let mut levels = Vec::new();
+    if model == deep_code_agent::AUTO_MODEL {
+        for info in registry.list() {
+            levels.extend(info.reasoning_efforts.iter().map(String::as_str));
+        }
+    } else if let Some(info) = registry.info_for(model) {
+        levels.extend(info.reasoning_efforts.iter().map(String::as_str));
+    }
+    // Unknown/passthrough models do not have catalog metadata yet. Keep the
+    // current built-in choices usable for them until the provider is queried.
+    if levels.is_empty() {
+        levels.extend(["low", "high", "max"]);
+    }
+    for level in levels {
+        if !efforts.iter().any(|effort| effort == level) {
+            efforts.push(level.to_string());
+        }
+    }
+    // Preserve an older config spelling such as `medium` so opening and
+    // cancelling the picker never changes a setting implicitly. The provider
+    // maps it to `high` when the turn is routed.
+    if !efforts.iter().any(|effort| effort == current) {
+        efforts.push(current.to_string());
+    }
+    efforts
+}
+
 impl PendingSessionScan {
     pub(super) fn cancel(&self) {
         self.task.cancel();
@@ -327,6 +364,225 @@ impl App {
 
     pub(crate) fn resume_picker_open(&self) -> bool {
         self.resume_picker.is_some()
+    }
+
+    /// Whether the model/reasoning picker owns the terminal input.
+    pub(crate) fn model_picker_open(&self) -> bool {
+        self.model_picker.is_some()
+    }
+
+    /// Open the two-step model + reasoning picker. The values stay in the
+    /// inline menus until the second Enter, so changing both settings causes
+    /// one config write and one runtime relaunch.
+    pub(crate) fn open_model_picker(&mut self) {
+        if self.runtime_busy() {
+            self.status = self.busy_status(TextId::BusyRelaunchConfig);
+            return;
+        }
+
+        let registry = deep_code_agent::ModelRegistry::default();
+        let mut models = vec![deep_code_agent::AUTO_MODEL.to_string()];
+        models.extend(registry.list().iter().map(|model| model.id.clone()));
+        let current_model = registry.resolve(Some(&self.configured_model)).resolved_id;
+        let selected_model = models
+            .iter()
+            .position(|model| model == &current_model)
+            .unwrap_or(0);
+
+        let efforts = picker_efforts(&registry, &current_model, &self.configured_reasoning);
+        let selected_effort = efforts
+            .iter()
+            .position(|effort| effort == &self.configured_reasoning)
+            .unwrap_or(0);
+
+        self.close_completion();
+        self.clear_selection();
+        self.model_picker = Some(ModelPicker {
+            models,
+            selected_model,
+            efforts,
+            selected_effort,
+            focus: ModelPickerFocus::Model,
+        });
+        self.completion = Some(self.model_picker_menu(CompletionKind::ModelPicker));
+        self.status = self.tr(TextId::ModelPickerHelp).to_string();
+    }
+
+    /// Build a picker step using the same inline menu rendered for slash
+    /// commands and file completion. The selected value is kept by index in
+    /// `ModelPicker`; the menu only owns the current highlight.
+    fn model_picker_menu(&self, kind: CompletionKind) -> CompletionMenu {
+        let Some(picker) = self.model_picker.as_ref() else {
+            return CompletionMenu {
+                kind,
+                items: Vec::new(),
+                selected: 0,
+            };
+        };
+        let (items, selected) = match kind {
+            CompletionKind::ModelPicker => (
+                picker
+                    .models
+                    .iter()
+                    .map(|model| {
+                        let label = match model.as_str() {
+                            deep_code_agent::AUTO_MODEL => "Auto".to_string(),
+                            deep_code_agent::DEEPSEEK_V4_PRO => "Pro".to_string(),
+                            deep_code_agent::DEEPSEEK_FLASH => "Flash".to_string(),
+                            other => other.to_string(),
+                        };
+                        (label, model.clone())
+                    })
+                    .collect(),
+                picker.selected_model,
+            ),
+            CompletionKind::ReasoningPicker => (
+                picker
+                    .efforts
+                    .iter()
+                    .map(|effort| {
+                        let label = match effort.as_str() {
+                            "auto" => "Auto",
+                            "off" => "Off",
+                            "low" => "Low",
+                            "medium" => "Medium",
+                            "high" => "High",
+                            "max" => "Max",
+                            other => other,
+                        };
+                        (label.to_string(), String::new())
+                    })
+                    .collect(),
+                picker.selected_effort,
+            ),
+            CompletionKind::Slash | CompletionKind::File => (Vec::new(), 0),
+        };
+        CompletionMenu {
+            kind,
+            items,
+            selected,
+        }
+    }
+
+    /// Finish one of the two inline picker steps. Selecting a model replaces
+    /// the same menu with the effort choices; selecting an effort commits both
+    /// values through the existing atomic config path.
+    pub(crate) fn model_picker_accept_selection(&mut self) {
+        let Some(menu) = self.completion.as_ref().cloned() else {
+            return;
+        };
+        match menu.kind {
+            CompletionKind::ModelPicker => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.selected_model = menu.selected;
+                }
+                self.model_picker_refresh_efforts();
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.focus = ModelPickerFocus::Reasoning;
+                }
+                self.completion = Some(self.model_picker_menu(CompletionKind::ReasoningPicker));
+            }
+            CompletionKind::ReasoningPicker => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.selected_effort = menu.selected;
+                    picker.focus = ModelPickerFocus::Reasoning;
+                }
+                self.close_completion();
+                self.model_picker_accept();
+            }
+            CompletionKind::Slash | CompletionKind::File => {}
+        }
+    }
+
+    /// Recompute the effort choices after selecting a model, preserving the
+    /// current effort when the new model supports it and otherwise falling
+    /// back to the catalog default.
+    fn model_picker_refresh_efforts(&mut self) {
+        let Some((model, previous_effort)) = self.model_picker.as_ref().map(|picker| {
+            (
+                picker.models.get(picker.selected_model).cloned(),
+                picker.efforts.get(picker.selected_effort).cloned(),
+            )
+        }) else {
+            return;
+        };
+        let Some(model) = model else {
+            return;
+        };
+        let previous_effort = previous_effort.unwrap_or_else(|| "high".to_string());
+        let registry = deep_code_agent::ModelRegistry::default();
+        let efforts = picker_efforts(&registry, &model, &previous_effort);
+        let selected_effort = efforts
+            .iter()
+            .position(|effort| effort == &previous_effort)
+            .or_else(|| {
+                registry.info_for(&model).and_then(|info| {
+                    efforts
+                        .iter()
+                        .position(|effort| effort == &info.default_reasoning_effort)
+                })
+            })
+            .unwrap_or(0);
+        if let Some(picker) = self.model_picker.as_mut() {
+            picker.efforts = efforts;
+            picker.selected_effort = selected_effort;
+        }
+    }
+
+    pub(crate) fn model_picker_cancel(&mut self) {
+        self.close_completion();
+        if self.model_picker.take().is_some() {
+            self.status = self.tr(TextId::StatusModelPickerCancelled).to_string();
+        }
+    }
+
+    /// Apply both picker rows atomically, preserving the current session.
+    pub(crate) fn model_picker_accept(&mut self) {
+        let Some(picker) = self.model_picker.take() else {
+            return;
+        };
+        let Some(model) = picker.models.get(picker.selected_model).cloned() else {
+            return;
+        };
+        let Some(reasoning_effort) = picker.efforts.get(picker.selected_effort).cloned() else {
+            return;
+        };
+        if self.runtime_busy() {
+            self.status = self.busy_status(TextId::BusyRelaunchConfig);
+            return;
+        }
+        let Some(config_path) = self.global_config_path.clone() else {
+            self.status = self.tr(TextId::GlobalConfigUnavailable).to_string();
+            return;
+        };
+        let update = deep_code_agent::GlobalConfigUpdate::ModelAndReasoning {
+            model: model.clone(),
+            reasoning_effort: reasoning_effort.clone(),
+        };
+        match deep_code_agent::write_global_config_update(&config_path, &update, self.lang) {
+            Ok(_) => match self.relaunch_runtime() {
+                Ok(()) => {
+                    self.history.push(HistoryCell::system(self.tr_with(
+                        TextId::ModelAndReasoningSwitched,
+                        &[
+                            ("model", &model),
+                            ("reasoning", &reasoning_effort),
+                            ("backend", &self.backend_label),
+                        ],
+                    )));
+                    self.status = self.tr_with(
+                        TextId::ModelAndReasoningSwitched,
+                        &[
+                            ("model", &model),
+                            ("reasoning", &reasoning_effort),
+                            ("backend", &self.backend_label),
+                        ],
+                    );
+                }
+                Err(message) => self.status = message,
+            },
+            Err(message) => self.status = message,
+        }
     }
 
     /// Open the in-app `/resume` modal, listing the workspace's non-empty

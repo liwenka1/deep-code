@@ -45,7 +45,6 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         app.composer = None;
         return;
     }
-
     let inner_width = frame.area().width.saturating_sub(2).max(1);
     // Compute layout once — height and rendering share the same result.
     let composer_text = neutralize_composer_text(&app.input);

@@ -19,6 +19,8 @@
 #
 #   https://api-docs.deepseek.com/quick_start/pricing/          (USD)
 #   https://api-docs.deepseek.com/zh-cn/quick_start/pricing/    (CNY)
+#   https://api-docs.deepseek.com/api/list-models/              (effort levels)
+#   https://api-docs.deepseek.com/guides/thinking_mode/         (mapping/defaults)
 #
 # Both pages carry the same "Model Details" table, and this file mirrors it row
 # for row: the model version, the capability flags, the context window, the
@@ -57,7 +59,7 @@
 # This file has exactly one failure mode: going stale. Record when it was last
 # checked against the pages above.
 #
-#   last reviewed: 2026-10-03
+#   last reviewed: 2026-11-08
 # ---------------------------------------------------------------------------
 
 [[model]]
@@ -73,6 +75,10 @@ version = "DeepSeek-V4-Pro-0813"
 # Capabilities, in the order of the official table's "Model Details" block.
 # `supports_reasoning` is the "thinking mode" row above that block.
 supports_reasoning = true
+# Official thinking effort levels when thinking is enabled. `none` is the
+# separate non-thinking switch and is therefore not listed here.
+reasoning_efforts = ["low", "high", "max"]
+default_reasoning_effort = "high"
 context_window = 1000000
 max_output = 384000
 supports_json_output = true
@@ -99,9 +105,11 @@ output_cny = 27.0
 id = "deepseek-flash"
 # `flash` is the advertised short name (see the `pro` note above).
 aliases = ["flash"]
-version = "DeepSeek-V4.1-Flash"
+version = "DeepSeek-V4.1-Flash-1017"
 
 supports_reasoning = true
+reasoning_efforts = ["low", "high", "max"]
+default_reasoning_effort = "high"
 context_window = 1000000
 max_output = 384000
 supports_json_output = true

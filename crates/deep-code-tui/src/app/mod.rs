@@ -70,6 +70,8 @@ enum StreamRequest {
 pub(crate) enum CompletionKind {
     Slash,
     File,
+    ModelPicker,
+    ReasoningPicker,
 }
 
 /// Inline completion menu state: `/` commands or `@` workspace files.
@@ -279,6 +281,9 @@ pub struct App {
     /// Open `/resume` modal: rendered as an in-app overlay (no alt-screen
     /// churn, so switching sessions doesn't flicker) over the live TUI.
     pub(crate) resume_picker: Option<ResumePicker>,
+    /// Open `/model` picker. The model and effort menus are edited in memory
+    /// and applied together when the second Enter is pressed.
+    pub(crate) model_picker: Option<ModelPicker>,
     session_scan: Option<session::PendingSessionScan>,
     /// UI language, resolved from config at launch; `/lang` switches it live.
     pub(crate) lang: Lang,
@@ -300,6 +305,24 @@ pub struct App {
 pub(crate) struct ResumePicker {
     pub(crate) sessions: Vec<SessionRecord>,
     pub(crate) selected: usize,
+}
+
+/// Draft state for the model + reasoning picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelPickerFocus {
+    Model,
+    Reasoning,
+}
+
+pub(crate) struct ModelPicker {
+    /// Canonical model ids (with `auto` as the first pseudo-model).
+    pub(crate) models: Vec<String>,
+    pub(crate) selected_model: usize,
+    /// Serialized reasoning-effort values. Keeping this as strings lets the
+    /// picker display the same spelling that config persistence uses.
+    pub(crate) efforts: Vec<String>,
+    pub(crate) selected_effort: usize,
+    pub(crate) focus: ModelPickerFocus,
 }
 
 /// A position in the transcript line buffer: absolute line index + display
@@ -842,6 +865,7 @@ impl App {
             composer: None,
             composer_scroll: 0,
             resume_picker: None,
+            model_picker: None,
             session_scan: None,
             lang,
             permission_mode,
@@ -1006,10 +1030,14 @@ impl App {
         // composer that still holds images would count against the per-message
         // cap for no visible reason.
         self.attached_images.clear();
-        // And the menu goes with the text it was completing: Ctrl+C clears the
-        // composer without closing it, and Enter then applied it to nothing —
-        // `/c`, Ctrl+C, Enter ran `/clear`.
-        self.close_completion();
+        // Ordinary completion goes with the text it was completing: Ctrl+C
+        // clears the composer without closing it, and Enter then applied it to
+        // nothing — `/c`, Ctrl+C, Enter ran `/clear`. The model picker is a
+        // command-owned menu, so it must survive the slash command's input
+        // cleanup; its own cancel/apply paths close it.
+        if !self.model_picker_open() {
+            self.close_completion();
+        }
         // A walk through the history ends here too, and the draft parked behind
         // a recalled prompt with it: what the composer held was sent or thrown
         // away, so `↑` starts again from the newest prompt. Here rather than
@@ -1150,14 +1178,16 @@ impl App {
     pub fn status_line(&self) -> String {
         // CC-style minimal idle frame. The permission-mode chip is rendered
         // separately by `render_status` (always visible), and streaming/error
-        // states have their own branches there — so this shows just the model
-        // in use, context headroom, and any transient note. Session id and
-        // cost detail live in `/status`, not on the always-on bar.
+        // states have their own branches there — so this shows the model in
+        // use, thinking effort, context headroom, and any transient note.
+        // Session id and cost detail live in `/status`, not on the always-on
+        // bar.
         //
         // The model is the *effective* one (auto-routing or a cascade can make
         // it differ from configured), so a switch to a pricier model is visible
-        // here rather than only under `/status`. Falls back to the configured
-        // model before the first turn produces telemetry.
+        // here rather than only under `/status`. The thinking chip follows the
+        // same rule: it shows the effective effort after a turn, and the
+        // configured setting before the first turn produces telemetry.
         let model = self
             .last_telemetry
             .as_ref()
@@ -1169,6 +1199,12 @@ impl App {
             .as_ref()
             .map(|value| format!("  ctx {}%", value.context_usage_percent))
             .unwrap_or_default();
+        let reasoning = self
+            .last_telemetry
+            .as_ref()
+            .map_or(self.configured_reasoning.as_str(), |value| {
+                value.reasoning_effort.as_str()
+            });
         // `self.status` carries only the transient note (tool progress, command
         // feedback, the post-turn `/restore {id}` rollback hint).
         let note = if self.status.is_empty() {
@@ -1176,7 +1212,7 @@ impl App {
         } else {
             format!("  {}", self.status)
         };
-        format!("{model}{ctx}{note}")
+        format!("{model} {reasoning}{ctx}{note}")
     }
 
     pub async fn shutdown_runtime(&self) {

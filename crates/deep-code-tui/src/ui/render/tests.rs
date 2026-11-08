@@ -2527,6 +2527,71 @@ fn layout_input_materializes_the_row_the_caret_needs() {
     assert_eq!(scrolled.visible_lines.len(), max_vis);
 }
 
+#[test]
+fn empty_composer_keeps_the_caret_before_the_placeholder() {
+    let (rows, caret) = draw_composer(40, 12, "");
+    assert_eq!(caret, (2, 9));
+    assert_eq!(rows[9].chars().nth(2), Some(' '));
+    assert_eq!(rows[9].chars().nth(3), Some('T'));
+}
+
+#[test]
+fn composer_draws_the_caret_in_the_same_buffer_as_the_placeholder() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+    assert!(
+        terminal.backend().buffer()[(2, 9)]
+            .style()
+            .add_modifier
+            .contains(Modifier::REVERSED),
+        "the empty input caret must be painted on its blank cell"
+    );
+}
+
+#[test]
+fn composer_caret_moves_with_text_without_reusing_the_placeholder_cell() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert_eq!(terminal.backend().buffer()[(2, 9)].symbol(), " ");
+    assert_eq!(terminal.backend().buffer()[(3, 9)].symbol(), "T");
+
+    app.input = "x".to_string();
+    app.input_cursor = 1;
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert_eq!(terminal.backend().buffer()[(2, 9)].symbol(), "x");
+    assert!(
+        terminal.backend().buffer()[(3, 9)]
+            .style()
+            .add_modifier
+            .contains(Modifier::REVERSED)
+    );
+    assert_eq!(terminal.backend().buffer()[(3, 9)].symbol(), " ");
+
+    app.input.clear();
+    app.input_cursor = 0;
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert_eq!(terminal.backend().buffer()[(2, 9)].symbol(), " ");
+    assert!(
+        terminal.backend().buffer()[(2, 9)]
+            .style()
+            .add_modifier
+            .contains(Modifier::REVERSED)
+    );
+    assert_eq!(terminal.backend().buffer()[(3, 9)].symbol(), "T");
+}
+
 /// The reported symptom, asserted where a human sees it: the caret the terminal
 /// is handed.
 ///

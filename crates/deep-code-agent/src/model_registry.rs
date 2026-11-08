@@ -102,6 +102,12 @@ pub struct ModelInfo {
     pub version: String,
     /// Emits a thinking (reasoning) trace.
     pub supports_reasoning: bool,
+    /// Thinking effort levels accepted by the provider when reasoning is
+    /// enabled. The provider's `none`/disabled value is deliberately not in
+    /// this list: it is a mode switch, not an effort level.
+    pub reasoning_efforts: Vec<String>,
+    /// Provider default when reasoning is enabled and no effort is supplied.
+    pub default_reasoning_effort: String,
     pub context_window: u32,
     /// Largest response the model will produce — well below `context_window`,
     /// and the ceiling a caller setting `max_tokens` has to respect.
@@ -365,10 +371,38 @@ mod tests {
             );
         }
 
+        for model in [DEEPSEEK_V4_PRO, DEEPSEEK_FLASH] {
+            let info = registry.info_for(model).expect("catalog entry");
+            assert_eq!(
+                info.reasoning_efforts
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                vec!["low", "high", "max"]
+            );
+            assert_eq!(info.default_reasoning_effort, "high");
+        }
+
         let mut claimed: Vec<String> = Vec::new();
         for entry in registry.list() {
             assert!(!entry.id.trim().is_empty(), "a catalog entry has no id");
             assert!(entry.context_window > 0, "{} has no window", entry.id);
+            if entry.supports_reasoning {
+                assert!(
+                    !entry.reasoning_efforts.is_empty(),
+                    "{} supports reasoning but declares no effort levels",
+                    entry.id
+                );
+                assert!(
+                    entry
+                        .reasoning_efforts
+                        .iter()
+                        .any(|effort| effort == &entry.default_reasoning_effort),
+                    "{} default reasoning effort {} is not supported",
+                    entry.id,
+                    entry.default_reasoning_effort
+                );
+            }
             assert!(
                 entry.max_output > 0 && entry.max_output < entry.context_window,
                 "{}: max_output={} must be positive and below the {}-token window; a caller \

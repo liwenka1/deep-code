@@ -167,10 +167,9 @@ impl AgentRuntime {
 
         let inner = loop {
             // Refresh the model AND the effort on every attempt: a fallback in a
-            // prior attempt mutated the route (Pro→Flash), and Flash rejects
-            // `max`. Re-deriving the effort from the route's current model keeps
-            // the two coherent, so a retry after a fallback never re-sends the
-            // original unclamped effort to the fallen-back model.
+            // prior attempt mutates the route (Pro→Flash). Re-deriving the
+            // effort from the route's current model keeps the request and route
+            // metadata coherent if a future model has narrower levels.
             let mut attempt = request.clone();
             attempt.model = route.effective_model.clone();
             attempt.reasoning_effort =
@@ -191,8 +190,7 @@ impl AgentRuntime {
 
         // Mid-stream re-opens stay on the route's final model: the fallback
         // decision was already taken (and surfaced) at open time. The effort
-        // rides the same model, so a reopen after a Pro→Flash fallback does not
-        // re-send `max` to Flash.
+        // rides the same model so the request and route metadata stay aligned.
         let mut request = request;
         request.model = route.effective_model.clone();
         request.reasoning_effort =
@@ -273,7 +271,9 @@ impl AgentRuntime {
                 if let Some(fallback) = api_fallback_model(route) {
                     route.effective_model = fallback.to_string();
                     route.used_model_fallback = true;
-                    // Flash rejects `max`; cap the retry's effort to what it accepts.
+                    // Keep the retry's effort aligned with the fallback model's
+                    // catalog entry. The current DeepSeek models both accept max;
+                    // this remains the compatibility seam for future entries.
                     route.effective_effort =
                         clamp_effort_to_model(fallback, route.effective_effort);
                     route.fallback_reason = Some(

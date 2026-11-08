@@ -106,17 +106,16 @@ impl TurnRoute {
     }
 }
 
-/// Cap reasoning effort to what the chosen model accepts: Flash tops out at
-/// High (only Pro supports `max`). Applied to whichever model a turn actually
-/// runs on, including after an API fallback from Pro to Flash, so we never send
-/// `max` to Flash.
+/// Cap reasoning effort to what the chosen model accepts.
+///
+/// The current DeepSeek catalog gives both built-in models the same
+/// `low/high/max` thinking levels. Keep this seam so a future catalog entry
+/// with a narrower set can be handled in one place; for the current models it
+/// deliberately preserves the requested effort.
 #[must_use]
 pub fn clamp_effort_to_model(model: &str, effort: ReasoningEffort) -> ReasoningEffort {
-    if model == DEEPSEEK_FLASH && effort == ReasoningEffort::Max {
-        ReasoningEffort::High
-    } else {
-        effort
-    }
+    let _ = model;
+    effort
 }
 
 /// When auto mode picked Pro and the API call fails, retry once with Flash.

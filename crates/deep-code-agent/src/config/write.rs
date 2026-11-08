@@ -19,6 +19,15 @@ pub enum GlobalConfigUpdate {
     /// `Some(key)` sets the API key, `None` removes it (logout).
     ApiKey(Option<String>),
     Model(String),
+    /// Provider reasoning effort (`off`, `low`, `high`, `max`, or `auto`).
+    ReasoningEffort(String),
+    /// Atomically update the model and reasoning effort selected together by
+    /// the interactive picker. Keeping both fields in one document write
+    /// avoids a half-applied selection if the second write fails.
+    ModelAndReasoning {
+        model: String,
+        reasoning_effort: String,
+    },
     /// UI language (`ui.language`): "auto" | "zh" | "en".
     Language(String),
 }
@@ -91,6 +100,16 @@ pub fn write_global_config_update(
         }
         GlobalConfigUpdate::Model(model) => {
             document["provider"]["model"] = value(model.as_str());
+        }
+        GlobalConfigUpdate::ReasoningEffort(effort) => {
+            document["provider"]["reasoning_effort"] = value(effort.as_str());
+        }
+        GlobalConfigUpdate::ModelAndReasoning {
+            model,
+            reasoning_effort,
+        } => {
+            document["provider"]["model"] = value(model.as_str());
+            document["provider"]["reasoning_effort"] = value(reasoning_effort.as_str());
         }
         GlobalConfigUpdate::Language(language) => {
             document["ui"]["language"] = value(language.as_str());
@@ -253,6 +272,37 @@ mod tests {
         assert!(contents.contains("api_key = \"sk-oldoldoldoldold\""));
         assert!(contents.contains("model = \"deepseek-flash\""));
         assert!(contents.contains("currency = \"usd\""));
+    }
+
+    #[test]
+    fn model_and_reasoning_update_is_written_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[provider]\nmodel = \"auto\"\nreasoning_effort = \"auto\"\n",
+        )
+        .unwrap();
+
+        write_global_config_update(
+            &path,
+            &GlobalConfigUpdate::ModelAndReasoning {
+                model: "deepseek-flash".to_string(),
+                reasoning_effort: "max".to_string(),
+            },
+            Lang::En,
+        )
+        .unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("model = \"deepseek-flash\""));
+        assert!(contents.contains("reasoning_effort = \"max\""));
+        let loaded = crate::config::AgentConfig::load_with(Some(path), None, &|_| None);
+        assert_eq!(loaded.config.model, "deepseek-flash");
+        assert_eq!(
+            loaded.config.reasoning_effort,
+            crate::reasoning::ReasoningEffortSetting::Max
+        );
     }
 
     #[test]

@@ -174,6 +174,10 @@ impl App {
                 self.cursor_to_end();
                 false
             }
+            // Picker menus are consumed by `model_picker_accept_selection` so
+            // the first Enter advances to the effort step instead of sending
+            // the current composer input.
+            CompletionKind::ModelPicker | CompletionKind::ReasoningPicker => false,
         }
     }
 }

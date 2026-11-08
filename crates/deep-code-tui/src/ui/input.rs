@@ -86,10 +86,9 @@ pub(super) fn dispatch_terminal_event(
 /// Route one mouse event; returns the text a finished drag selected, for the
 /// caller to put on the clipboard.
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Option<String> {
-    // The `/resume` overlay covers the transcript and the composer, but the
-    // last frame's transcript snapshot outlives it: a drag across the overlay
-    // copied text from the hidden transcript, a click folded a block nobody
-    // could see, and the wheel scrolled it.
+    // The `/resume` overlay covers the transcript and composer, but the last
+    // frame's snapshots outlive it: a drag across the overlay must not copy
+    // hidden text, fold an unseen block, or scroll the transcript.
     if app.resume_picker_open() {
         return None;
     }
@@ -262,6 +261,26 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             // Pairs with Home, and with the overflow indicator that now tells
             // the user there is more below.
             KeyCode::End => app.scroll_approval_to_bottom(),
+            _ => {}
+        }
+        return;
+    }
+
+    // The model picker reuses the completion menu's rendering, but it is a
+    // two-step command rather than text completion. Let it own navigation and
+    // acceptance while open; the composer cursor remains visible underneath.
+    if app.model_picker_open() {
+        match key.code {
+            KeyCode::Up => app.completion_up(),
+            KeyCode::Down => app.completion_down(),
+            KeyCode::Enter => app.model_picker_accept_selection(),
+            KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                app.model_picker_accept_selection();
+            }
+            KeyCode::Esc => app.model_picker_cancel(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.model_picker_cancel();
+            }
             _ => {}
         }
         return;

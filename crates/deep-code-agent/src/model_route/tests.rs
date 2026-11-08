@@ -106,12 +106,12 @@ fn resolve_subagent_uses_low_effort_in_auto_mode() {
 }
 
 #[test]
-fn flash_never_requests_max_effort() {
+fn both_built_in_models_accept_max_effort() {
     assert_eq!(
         clamp_effort_to_model(DEEPSEEK_FLASH, ReasoningEffort::Max),
-        ReasoningEffort::High
+        ReasoningEffort::Max
     );
-    // High and below pass through; Pro keeps Max.
+    // All supported levels pass through for both built-in models.
     assert_eq!(
         clamp_effort_to_model(DEEPSEEK_FLASH, ReasoningEffort::High),
         ReasoningEffort::High
@@ -123,9 +123,8 @@ fn flash_never_requests_max_effort() {
 }
 
 #[test]
-fn fixed_flash_clamps_explicit_max_effort_to_high() {
-    // A fixed Flash model with an explicit Max effort must be clamped: Flash
-    // never accepts Max.
+fn fixed_flash_preserves_explicit_max_effort() {
+    // Both current DeepSeek models support Max.
     let config = AgentConfig {
         model: DEEPSEEK_FLASH.to_string(),
         reasoning_effort: ReasoningEffortSetting::Max,
@@ -140,7 +139,7 @@ fn fixed_flash_clamps_explicit_max_effort_to_high() {
         Lang::Zh,
     );
     assert_eq!(route.effective_model, DEEPSEEK_FLASH);
-    assert_eq!(route.effective_effort, ReasoningEffort::High);
+    assert_eq!(route.effective_effort, ReasoningEffort::Max);
 }
 
 #[test]

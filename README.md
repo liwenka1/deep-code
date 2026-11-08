@@ -92,7 +92,7 @@ deepcode eval            # SWE-bench rollout (see below)
 deepcode session list|resume|delete|export
 ```
 
-Common slash commands: `/help` `/model` `/apikey` `/lang` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy` `/add-dir` `/image` `/init` (`/help` lists everything plus keybindings).
+Common slash commands: `/help` `/model` `/apikey` `/lang` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy` `/add-dir` `/image` `/init` (`/model` opens the model/thinking picker; `/model <name>` switches directly, and `/help` lists everything plus keybindings).
 
 ### Working across sibling repos (`--add-dir`)
 
@@ -197,7 +197,7 @@ Trigger prefix, who may trigger it, language, model and permission tier are all 
 Config file: `~/.deep-code/config.toml` (see `config.example.toml` in the repo root).
 Load order: built-in defaults → global → project `.deep-code/config.toml` → environment variables → CLI flags.
 
-Common keys: `provider.model` (`pro`/`flash`/`auto`), `provider.reasoning_effort` (`off`/`low`/`medium`/`high`/`max`), `cost.currency`, `approval.auto_allow` (pre-approved tool names, matched exactly — never prefixes), `ui.notifications` (ring the terminal — BEL plus an OSC 9 desktop notification where supported — when a turn or a `/compact` that ran for a while ends — an error included — or an approval is waiting; on by default).
+Common keys: `provider.model` (`pro`/`flash`/`auto`), `provider.reasoning_effort` (`off`/`low`/`high`/`max`/`auto`), `cost.currency`, `approval.auto_allow` (pre-approved tool names, matched exactly — never prefixes), `ui.notifications` (ring the terminal — BEL plus an OSC 9 desktop notification where supported — when a turn or a `/compact` that ran for a while ends — an error included — or an approval is waiting; on by default). `off` disables thinking, `auto` chooses an effort per task, and `medium` remains accepted as a compatibility spelling for `high`.
 
 > Keep the API key in an environment variable or the global config; `api_key` in project-level config is ignored, so it can't leak with the repo.
 

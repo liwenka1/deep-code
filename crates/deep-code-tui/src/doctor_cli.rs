@@ -150,14 +150,20 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
         // `version` and `concurrency_limit` are printed because they are the two
         // fields nothing consumes yet, and an unread field is one that rots.
         println!(
-            "    - {} v={} ctx={} max_out={} conc={} caps={} fim={}",
+            "    - {} v={} ctx={} max_out={} conc={} caps={} fim={} reasoning={} (default={})",
             model.id,
             model.version,
             model.context_window,
             model.max_output,
             model.concurrency_limit,
             capabilities,
-            model.fim_completion
+            model.fim_completion,
+            if model.reasoning_efforts.is_empty() {
+                "-".to_string()
+            } else {
+                model.reasoning_efforts.join("/")
+            },
+            model.default_reasoning_effort
         );
     }
     // The report decides whether guidance applies (`api_key_hint` is `Some`

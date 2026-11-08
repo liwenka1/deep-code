@@ -64,7 +64,10 @@ impl ReasoningEffortSetting {
         match self {
             Self::Off => ReasoningEffort::Off,
             Self::Low => ReasoningEffort::Low,
-            Self::Medium => ReasoningEffort::Medium,
+            // DeepSeek accepts `medium` as a compatibility spelling for
+            // `high`; keep parsing the old config value, but make the
+            // concrete route and telemetry describe what the API receives.
+            Self::Medium => ReasoningEffort::High,
             Self::High => ReasoningEffort::High,
             Self::Max => ReasoningEffort::Max,
             Self::Auto => unreachable!("handled above"),
@@ -76,9 +79,12 @@ impl ReasoningEffort {
     #[must_use]
     pub fn as_api_value(self) -> Option<&'static str> {
         match self {
-            Self::Off => Some("off"),
+            // `none` is DeepSeek's current Chat Completions spelling for
+            // disabling thinking. `off` remains the product/config label.
+            Self::Off => Some("none"),
             Self::Low => Some("low"),
-            Self::Medium => Some("medium"),
+            // `medium` is accepted for compatibility and maps to high.
+            Self::Medium => Some("high"),
             Self::High => Some("high"),
             Self::Max => Some("max"),
         }
@@ -89,7 +95,7 @@ impl ReasoningEffort {
         match self {
             Self::Off => "off",
             Self::Low => "low",
-            Self::Medium => "med",
+            Self::Medium => "high",
             Self::High => "high",
             Self::Max => "max",
         }
@@ -157,6 +163,16 @@ mod tests {
         assert_eq!(select_auto_effort(true, "debug"), ReasoningEffort::Low);
         assert_eq!(
             select_auto_effort(false, "refactor module"),
+            ReasoningEffort::High
+        );
+    }
+
+    #[test]
+    fn compatibility_efforts_use_current_deepseek_wire_values() {
+        assert_eq!(ReasoningEffort::Off.as_api_value(), Some("none"));
+        assert_eq!(ReasoningEffort::Medium.as_api_value(), Some("high"));
+        assert_eq!(
+            ReasoningEffortSetting::Medium.resolve(false, "anything"),
             ReasoningEffort::High
         );
     }
