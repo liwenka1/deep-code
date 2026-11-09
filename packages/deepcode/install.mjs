@@ -7,13 +7,14 @@ import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { platform, arch } from 'node:os';
 import { execFileSync } from 'node:child_process';
 
 // ── 配置 ──
 const REPO = 'liwenka1/deep-code';
 // The installed package metadata identifies the release asset to download.
-const PKG_DIR = import.meta.dirname;
+const PKG_DIR = path.dirname(fileURLToPath(import.meta.url));
 const VERSION = readVersion();
 
 function readVersion() {

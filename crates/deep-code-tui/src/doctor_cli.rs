@@ -256,7 +256,7 @@ mod tests {
             workspace.path(),
             &AgentConfig {
                 sandbox_mode: SandboxMode::Off,
-                ..AgentConfig::default()
+                ..AgentConfig::builtin()
             },
         );
         let overall =
@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(sandbox_state(&off, &overall), "disabled");
         assert!(!off.sandbox.available);
 
-        let on = DoctorReport::collect(workspace.path(), &AgentConfig::default());
+        let on = DoctorReport::collect(workspace.path(), &AgentConfig::builtin());
         let overall =
             Enforcement::weakest(on.sandbox.filesystem.clone(), on.sandbox.network.clone());
         assert_ne!(sandbox_state(&on, &overall), "disabled");

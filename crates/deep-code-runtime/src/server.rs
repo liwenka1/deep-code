@@ -623,10 +623,7 @@ async fn prompt_sse(
 #[derive(Deserialize)]
 struct ApprovalRequestBody {
     approval_id: deep_code_agent::ApprovalId,
-    // The agent enum is `#[serde(rename_all = "snake_case")]`, so it already
-    // deserializes `approved`/`approved_for_session`/`denied` straight off the
-    // wire — no separate DTO. It's the SSE output contract too, so reusing it
-    // as the HTTP input adds no coupling that wasn't already there.
+    // The agent enum is also used by the SSE output contract.
     decision: ApprovalDecision,
 }
 
@@ -647,7 +644,7 @@ async fn resolve_pending_approval(
     state: AppState,
     body: ApprovalRequestBody,
 ) -> Result<Json<ApprovalResponse>, ApiError> {
-    let pending = {
+    let (pending, approval_id) = {
         let mut slot = state.approval.lock().await;
         let Some(pending) = slot.as_ref() else {
             return Err(ApiError::conflict("no pending approval"));
@@ -657,8 +654,11 @@ async fn resolve_pending_approval(
                 "approval_id does not identify the pending approval",
             ));
         }
-        slot.take()
-            .expect("pending approval checked under this lock")
+        let approval_id = pending.request.approval_id.clone();
+        let pending = slot
+            .take()
+            .expect("pending approval checked under this lock");
+        (pending, approval_id)
     };
     if pending.respond.send(body.decision).is_err() {
         // The prompt stream that parked this approval is gone (client
@@ -669,7 +669,7 @@ async fn resolve_pending_approval(
     }
     Ok(Json(ApprovalResponse {
         accepted: true,
-        approval_id: body.approval_id,
+        approval_id,
     }))
 }
 

@@ -142,7 +142,7 @@ pub fn write_global_config_update(
             ],
         )
     })?;
-    fs::rename(&tmp, path).map_err(|error| {
+    replace_existing(&tmp, path).map_err(|error| {
         tr_with(
             lang,
             TextId::CfgReplaceFailed,
@@ -154,6 +154,55 @@ pub fn write_global_config_update(
     })?;
     restrict_permissions(path);
     Ok(path.to_path_buf())
+}
+
+/// Replace `destination` with `temporary` using the platform's file
+/// replacement semantics. Unix `rename` replaces an existing file, while
+/// Windows rejects that operation. The Windows fallback first moves the old
+/// file aside and restores it if installing the new file fails, so an I/O
+/// error cannot turn a config update into data loss.
+fn replace_existing(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        fs::rename(temporary, destination)
+    }
+    #[cfg(windows)]
+    {
+        match fs::rename(temporary, destination) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                replace_file_windows(temporary, destination)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn replace_file_windows(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let temporary: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+    let replaced = unsafe {
+        ReplaceFileW(
+            destination.as_ptr(),
+            temporary.as_ptr(),
+            std::ptr::null(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn new_config_template(lang: Lang) -> String {

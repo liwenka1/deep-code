@@ -384,6 +384,12 @@ impl App {
         let mut models = vec![deep_code_agent::AUTO_MODEL.to_string()];
         models.extend(registry.list().iter().map(|model| model.id.clone()));
         let current_model = registry.resolve(Some(&self.configured_model)).resolved_id;
+        // Keep a configured passthrough/provider model visible in the picker.
+        // Opening `/model` to change only reasoning must never silently replace
+        // an unlisted model with Auto when the user confirms the second step.
+        if !models.iter().any(|model| model == &current_model) {
+            models.push(current_model.clone());
+        }
         let selected_model = models
             .iter()
             .position(|model| model == &current_model)

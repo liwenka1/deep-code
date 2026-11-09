@@ -5455,7 +5455,7 @@ async fn a_steered_prompt_is_injected_at_the_next_tool_boundary() {
         registry,
         "system",
         workspace.path(),
-        &AgentConfig::default(),
+        &AgentConfig::builtin(),
     )
     .unwrap()
     .with_checkpoints(workspace.path(), &mut Vec::new());
@@ -5534,7 +5534,7 @@ async fn a_steered_prompt_is_injected_at_the_next_tool_boundary() {
         ToolRegistry::default(),
         record,
         store,
-        AgentConfig::default(),
+        AgentConfig::builtin(),
     );
     assert_eq!(resumed.session_messages().await, messages);
 }

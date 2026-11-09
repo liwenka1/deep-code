@@ -8,7 +8,7 @@ import test from 'node:test';
 // point. These tests never download assets or modify the installed executable.
 const source = fs.readFileSync(new URL('./install.mjs', import.meta.url), 'utf8')
   .replace(/^import .*;$/gm, '')
-  .replace('const PKG_DIR = import.meta.dirname;', 'const PKG_DIR = "/package";')
+  .replace('const PKG_DIR = path.dirname(fileURLToPath(import.meta.url));', 'const PKG_DIR = "/package";')
   .split('// ── 启动 ──')[0];
 
 function installer({ version = '1.0.0', manifest = 'abc  asset', downloadError, hash = 'abc' } = {}) {

@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn doctor_report_serializes_to_json() {
         let workspace = TempDir::new().unwrap();
-        let config = AgentConfig::default();
+        let config = AgentConfig::builtin();
         let report = DoctorReport::collect(workspace.path(), &config);
         let json = report.to_json_pretty().unwrap();
         assert!(json.contains("\"version\""));
@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn sandbox_json_keeps_its_documented_keys() {
         let workspace = TempDir::new().unwrap();
-        let config = AgentConfig::default();
+        let config = AgentConfig::builtin();
         let report = DoctorReport::collect(workspace.path(), &config);
         let value: serde_json::Value =
             serde_json::from_str(&report.to_json_pretty().unwrap()).unwrap();
@@ -478,7 +478,7 @@ mod tests {
             workspace.path(),
             &AgentConfig {
                 sandbox_mode: crate::execution_policy::SandboxMode::Off,
-                ..AgentConfig::default()
+                ..AgentConfig::builtin()
             },
         );
         assert_eq!(report.sandbox.filesystem, Enforcement::None);
@@ -515,7 +515,7 @@ mod tests {
             workspace.path(),
             &AgentConfig {
                 api_key: None,
-                ..AgentConfig::default()
+                ..AgentConfig::builtin()
             },
         );
         assert!(without.deepseek.api_key_hint.is_some());
@@ -528,7 +528,7 @@ mod tests {
                 workspace.path(),
                 &AgentConfig {
                     api_key: key.clone(),
-                    ..AgentConfig::default()
+                    ..AgentConfig::builtin()
                 },
             );
             let blank = key.as_deref().is_none_or(|value| value.trim().is_empty());
@@ -551,7 +551,7 @@ mod tests {
     fn api_key_missing_when_unset() {
         let config = AgentConfig {
             api_key: None,
-            ..AgentConfig::default()
+            ..AgentConfig::builtin()
         };
         assert_eq!(api_key_report(&config).source, "missing");
     }

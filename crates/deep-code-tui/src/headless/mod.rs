@@ -720,7 +720,7 @@ mod tests {
         for before_turn in [true, false] {
             let workspace = tempfile::tempdir().unwrap();
             let launched = launch_runtime(
-                &AgentConfig::default(),
+                &AgentConfig::builtin(),
                 workspace.path().to_path_buf(),
                 None,
             );

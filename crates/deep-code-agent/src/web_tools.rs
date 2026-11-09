@@ -49,8 +49,9 @@ use crate::tool::{Tool, ToolCx, ToolError, ToolOutput, ToolRegistry, run_blockin
 
 mod ssrf;
 
-/// Raw download cap on the local fetch path (the API path has no body to cap:
-/// the service returns Markdown, and [`render_fetched`] pages it).
+/// Raw download cap for fetched page content and provider API responses. The
+/// provider response is retained in memory before JSON parsing and may be
+/// triggered by a remote page, so it needs the same hard bound as local fetch.
 const DEFAULT_MAX_FETCH_BYTES: usize = 512 * 1024;
 /// One retry on the statuses the service documents as transient — 408, 429,
 /// 5xx — because a failed Search/Fetch request is not billed and the model has
@@ -258,7 +259,7 @@ fn api_post(
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.trim().parse::<u64>().ok())
             .map(Duration::from_secs);
-        let text = match response.text() {
+        let text = match read_api_response(response) {
             Ok(text) => text,
             Err(error) => {
                 return Err(first_failure.unwrap_or_else(|| {
@@ -292,6 +293,34 @@ fn api_post(
         }
         return Err(failure(status, &text));
     }
+}
+
+/// Read at most one byte beyond the API response budget. `Response::text()`
+/// allocates the complete body before returning, so using it directly would
+/// let a remote fetch response exhaust the process even though the rendered
+/// tool output is capped later.
+fn read_api_response(response: reqwest::blocking::Response) -> std::io::Result<String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > DEFAULT_MAX_FETCH_BYTES as u64)
+    {
+        return Err(std::io::Error::other(format!(
+            "response body exceeds {} KiB limit",
+            DEFAULT_MAX_FETCH_BYTES / 1024
+        )));
+    }
+    let mut bytes = Vec::new();
+    response
+        .take((DEFAULT_MAX_FETCH_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > DEFAULT_MAX_FETCH_BYTES {
+        return Err(std::io::Error::other(format!(
+            "response body exceeds {} KiB limit",
+            DEFAULT_MAX_FETCH_BYTES / 1024
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// The `error.message` of an OpenAI-shaped error body, else the body itself;
@@ -1203,6 +1232,19 @@ mod tests {
         assert!(url_line.ends_with('…'));
     }
 
+    #[tokio::test]
+    async fn tools_api_rejects_an_oversized_response_body() {
+        let oversized = format!(
+            "{{\"results\": [{{\"summary\": \"{}\"}}]}}",
+            "x".repeat(DEFAULT_MAX_FETCH_BYTES)
+        );
+        let (base, _seen) = serve_api_once(200, oversized);
+        let tool = WebSearchTool::new(zh(), &WebBackend::test_api(&base));
+        let result = run(&tool, WebSearchTool::NAME, json!({ "query": "q" })).await;
+        assert_eq!(result.status, ToolResultStatus::Error);
+        assert!(result.content.contains("512 KiB"), "{}", result.content);
+    }
+
     /// A continuation pages the text this session already fetched: the mock
     /// answers exactly one request, so a second fetch could only fail. That is
     /// also the money: Search and Fetch bill per successful request, and a
@@ -1756,7 +1798,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires network and a DeepSeek API key"]
     async fn tools_api_real_network() {
-        let backend = WebBackend::from_config(&AgentConfig::default());
+        let backend = WebBackend::from_config(&AgentConfig::builtin());
         assert_eq!(backend.id(), "deepseek-tools-api", "set DEEPSEEK_API_KEY");
         let result = run(
             &WebSearchTool::new(zh(), &backend),

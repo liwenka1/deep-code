@@ -241,7 +241,7 @@ fn signals_and_timeout_interrupt_all_stdout_phases() {
             .unwrap();
             let diagnostics = Diagnostics::new(std::io::sink()).unwrap();
             let mut launched = launch_runtime(
-                &AgentConfig::default(),
+                &AgentConfig::builtin(),
                 deep_code_agent::WorkspaceRoots::new(workspace_root(), Vec::new()),
                 None,
             );

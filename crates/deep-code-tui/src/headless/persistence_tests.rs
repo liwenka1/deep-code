@@ -52,7 +52,7 @@ async fn storage_pressure_compacts_before_headless_loses_new_messages() {
         let id = record.id.clone();
         let config = AgentConfig {
             compaction_threshold: Some(u32::MAX),
-            ..AgentConfig::default()
+            ..AgentConfig::builtin()
         };
         let launched = launch_runtime(&config, workspace.path().to_path_buf(), Some(record));
         assert!(
@@ -104,7 +104,7 @@ async fn unsavable_current_turn_returns_an_error_instead_of_success() {
     store.save(&mut record).unwrap();
     let id = record.id.clone();
     let launched = launch_runtime(
-        &AgentConfig::default(),
+        &AgentConfig::builtin(),
         workspace.path().to_path_buf(),
         Some(record),
     );

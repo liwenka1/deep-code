@@ -29,7 +29,7 @@ fn resolve_turn_route_auto_model_and_effort() {
     let config = AgentConfig {
         model: AUTO_MODEL.to_string(),
         reasoning_effort: ReasoningEffortSetting::Auto,
-        ..AgentConfig::default()
+        ..AgentConfig::builtin()
     };
     let route = resolve_turn_route(
         &config,
@@ -50,7 +50,7 @@ fn resolve_turn_route_auto_model_and_effort() {
 fn fixed_model_routes_as_hard_rule_without_fallback_label() {
     let config = AgentConfig {
         model: DEEPSEEK_V4_PRO.to_string(),
-        ..AgentConfig::default()
+        ..AgentConfig::builtin()
     };
     let route = resolve_turn_route(
         &config,
@@ -69,7 +69,7 @@ fn fixed_model_routes_as_hard_rule_without_fallback_label() {
 fn passthrough_model_is_not_labelled_as_api_fallback() {
     let config = AgentConfig {
         model: "deepseek-v9-experimental".to_string(),
-        ..AgentConfig::default()
+        ..AgentConfig::builtin()
     };
     let route = resolve_turn_route(
         &config,
@@ -92,7 +92,7 @@ fn passthrough_model_is_not_labelled_as_api_fallback() {
 fn resolve_subagent_uses_low_effort_in_auto_mode() {
     let config = AgentConfig {
         reasoning_effort: ReasoningEffortSetting::Auto,
-        ..AgentConfig::default()
+        ..AgentConfig::builtin()
     };
     let route = resolve_turn_route(
         &config,
@@ -128,7 +128,7 @@ fn fixed_flash_preserves_explicit_max_effort() {
     let config = AgentConfig {
         model: DEEPSEEK_FLASH.to_string(),
         reasoning_effort: ReasoningEffortSetting::Max,
-        ..AgentConfig::default()
+        ..AgentConfig::builtin()
     };
     let route = resolve_turn_route(
         &config,
@@ -149,7 +149,7 @@ fn debugging_unifies_to_pro_and_max() {
     let config = AgentConfig {
         model: AUTO_MODEL.to_string(),
         reasoning_effort: ReasoningEffortSetting::Auto,
-        ..AgentConfig::default()
+        ..AgentConfig::builtin()
     };
     let route = resolve_turn_route(
         &config,
@@ -168,7 +168,7 @@ fn context_pressure_forces_pro_without_keywords() {
     let config = AgentConfig {
         model: AUTO_MODEL.to_string(),
         reasoning_effort: ReasoningEffortSetting::Auto,
-        ..AgentConfig::default()
+        ..AgentConfig::builtin()
     };
     let ctx = RouteContext {
         context_tokens: 800_000,
@@ -198,7 +198,7 @@ fn images_outrank_every_rule_that_would_force_pro() {
     let config = AgentConfig {
         model: AUTO_MODEL.to_string(),
         reasoning_effort: ReasoningEffortSetting::Auto,
-        ..AgentConfig::default()
+        ..AgentConfig::builtin()
     };
     // Cascade latched, context at pressure, difficulty keyword, and a
     // borderline task with cost-first off: four independent reasons to pick Pro.
@@ -258,7 +258,7 @@ fn the_model_images_are_forced_onto_is_the_one_that_takes_them() {
 fn images_leave_a_pinned_model_alone() {
     let config = AgentConfig {
         model: DEEPSEEK_V4_PRO.to_string(),
-        ..AgentConfig::default()
+        ..AgentConfig::builtin()
     };
     let ctx = RouteContext {
         has_images: true,
@@ -284,7 +284,7 @@ fn cascade_escalation_forces_pro_on_trivial_prompt() {
     let config = AgentConfig {
         model: AUTO_MODEL.to_string(),
         reasoning_effort: ReasoningEffortSetting::Auto,
-        ..AgentConfig::default()
+        ..AgentConfig::builtin()
     };
     let ctx = RouteContext {
         escalated: true,
@@ -342,7 +342,7 @@ fn fixed_pro_model_keeps_requested_id() {
         model: DEEPSEEK_V4_PRO.to_string(),
         reasoning_effort: ReasoningEffortSetting::High,
         cost_currency: CostCurrency::Cny,
-        ..AgentConfig::default()
+        ..AgentConfig::builtin()
     };
     let route = resolve_turn_route(
         &config,

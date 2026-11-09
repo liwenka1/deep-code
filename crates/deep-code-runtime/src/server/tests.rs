@@ -203,7 +203,7 @@ fn test_state(workspace: PathBuf, auth_token: Option<String>) -> AppState {
         version: "0.1.0".to_string(),
         auth_token,
         runtime: Arc::new(Mutex::new(launch_runtime(
-            &AgentConfig::default(),
+            &AgentConfig::builtin(),
             workspace,
             None,
         ))),
@@ -353,7 +353,7 @@ async fn health_route_via_router_smoke() {
     assert!(response.status().is_success());
     let body: HealthResponse = response.json().await.unwrap();
     assert_eq!(body.status, "ok");
-    let _ = DoctorReport::collect(dir.path(), &AgentConfig::default());
+    let _ = DoctorReport::collect(dir.path(), &AgentConfig::builtin());
 }
 
 #[tokio::test]

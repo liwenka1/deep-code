@@ -249,7 +249,7 @@ None.
         let services = attach_subagent_tools(
             &mut registry,
             client,
-            AgentConfig::default(),
+            AgentConfig::builtin(),
             dir.path().to_path_buf(),
             cancel,
         );
@@ -295,7 +295,7 @@ None.
         let services = attach_subagent_tools(
             &mut registry,
             client.clone(),
-            AgentConfig::default(),
+            AgentConfig::builtin(),
             dir.path().to_path_buf(),
             cancel,
         );
@@ -339,7 +339,7 @@ None.
         let _services = attach_subagent_tools(
             &mut registry,
             client,
-            AgentConfig::default(),
+            AgentConfig::builtin(),
             dir.path().to_path_buf(),
             cancel,
         );
@@ -379,7 +379,7 @@ None.
         let services = attach_subagent_tools(
             &mut registry,
             client,
-            AgentConfig::default(),
+            AgentConfig::builtin(),
             dir.path().to_path_buf(),
             cancel,
         );
@@ -413,7 +413,7 @@ None.
         let services = attach_subagent_tools(
             &mut registry,
             client,
-            AgentConfig::default(),
+            AgentConfig::builtin(),
             dir.path().to_path_buf(),
             cancel,
         );
@@ -445,7 +445,7 @@ None.
         let services = attach_subagent_tools(
             &mut registry,
             client,
-            AgentConfig::default(),
+            AgentConfig::builtin(),
             dir.path().to_path_buf(),
             cancel,
         );
@@ -479,7 +479,7 @@ None.
         let services = attach_subagent_tools(
             &mut registry,
             client,
-            AgentConfig::default(),
+            AgentConfig::builtin(),
             dir.path().to_path_buf(),
             cancel,
         );
@@ -522,7 +522,7 @@ None.
         attach_subagent_tools(
             &mut registry,
             client,
-            AgentConfig::default(),
+            AgentConfig::builtin(),
             dir.path().to_path_buf(),
             CancellationToken::new(),
         );
@@ -582,7 +582,7 @@ None.
         let config = AgentConfig {
             stream_chunk_timeout: Duration::from_secs(7200),
             stream_total_timeout: Duration::from_secs(7200),
-            ..AgentConfig::default()
+            ..AgentConfig::builtin()
         };
         let services = attach_subagent_tools(
             &mut registry,
