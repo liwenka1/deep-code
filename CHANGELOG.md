@@ -6,6 +6,21 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [0.5.0] - 2026-11-10
+
+- **Breaking:** model and image configuration now accepts only the current catalog names (`flash` and `low`/`original`/`auto`); retired aliases are removed.
+- **Breaking:** reasoning configuration now accepts only `none`, `low`, `high`, `max`, and `auto`. `auto` remains deep-code's task-based effort policy; `provider.model = "auto"` independently routes each task between Pro and Flash. Provider effort aliases are no longer normalized by deep-code.
+- `/model` now opens a model and thinking-strength picker, so the model and reasoning effort can be chosen from a menu instead of typed; `/model <name>` still switches directly.
+- The `deepseek-v4-flash` spelling is recognized again as an alias for `deepseek-flash`.
+- Image requests now fit the complete 48 MiB JSON body limit, including text and tools, and reject an oversized non-image request with a clear error.
+- The supported build floors are Rust 1.96 and Node.js 24.
+- Session persistence and recovery are tightened: session costs keep full floating-point precision so resuming a session no longer breaks its signature, signature errors are attributed to the right cause, and the session list now reports diagnostics.
+- **Security:** the approval and runtime boundaries, and the command policy, are tightened, and the option table for irreversible commands is completed.
+- **Security:** the workspace-tool boundary and the runtime identifier are fixed.
+- The headless timeout boundary is fixed, so a headless run no longer hangs past its timeout.
+- Session scanning and startup output are now cancellable throughout.
+- Configuration defaults, cross-platform file writes, and the tool-response boundary are fixed.
+
 ## [Unreleased]
 
 - **Breaking:** model and image configuration now accepts only the current catalog names (`flash` and `low`/`original`/`auto`); retired aliases are removed.
@@ -416,3 +431,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.4.18]: https://github.com/liwenka1/deep-code/compare/v0.4.17...v0.4.18
 [0.4.19]: https://github.com/liwenka1/deep-code/compare/v0.4.18...v0.4.19
 [0.4.20]: https://github.com/liwenka1/deep-code/compare/v0.4.19...v0.4.20
+[0.5.0]: https://github.com/liwenka1/deep-code/compare/v0.4.20...v0.5.0
