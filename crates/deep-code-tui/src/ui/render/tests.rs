@@ -501,7 +501,7 @@ fn welcome_text(offline: bool, lang: Lang) -> String {
     let cell = HistoryCell::Welcome {
         version: "0.1.0".to_string(),
         model: "deepseek-flash".to_string(),
-        reasoning: "medium".to_string(),
+        reasoning: "high".to_string(),
         offline,
         workspace: "~/code/deep-code".to_string(),
         resumed_turns: None,
@@ -3005,7 +3005,7 @@ fn welcome_cell_names_the_loaded_instructions() {
     let cell = |instructions: Option<&str>| HistoryCell::Welcome {
         version: "0.1.0".to_string(),
         model: "deepseek-flash".to_string(),
-        reasoning: "medium".to_string(),
+        reasoning: "high".to_string(),
         offline: false,
         workspace: "~/code/deep-code".to_string(),
         resumed_turns: None,

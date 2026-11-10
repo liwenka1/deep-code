@@ -59,9 +59,9 @@
 # Model: deepseek-v4-pro, deepseek-flash, or auto (routed per task).
 # model = "auto"
 
-# Reasoning effort: off, low, high, max, or auto. `off` disables thinking;
-# `auto` lets deep-code choose per task. `medium` remains accepted as a
-# compatibility spelling for `high`.
+# Reasoning effort: none, low, high, max, or auto. `none` disables thinking;
+# `auto` lets deep-code choose the effort per task. The model auto setting
+# separately lets deep-code choose Pro or Flash per task.
 # reasoning_effort = "high"
 
 # Request timeout in seconds: connect plus waiting for response headers. It does

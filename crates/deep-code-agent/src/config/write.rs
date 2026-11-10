@@ -19,7 +19,7 @@ pub enum GlobalConfigUpdate {
     /// `Some(key)` sets the API key, `None` removes it (logout).
     ApiKey(Option<String>),
     Model(String),
-    /// Provider reasoning effort (`off`, `low`, `high`, `max`, or `auto`).
+    /// Provider reasoning effort (`none`, `low`, `high`, `max`, or `auto`).
     ReasoningEffort(String),
     /// Atomically update the model and reasoning effort selected together by
     /// the interactive picker. Keeping both fields in one document write

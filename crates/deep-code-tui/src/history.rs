@@ -316,7 +316,7 @@ pub enum HistoryCell {
         version: String,
         /// Raw model id, e.g. "deepseek-flash".
         model: String,
-        /// Raw reasoning setting, e.g. "medium".
+        /// Raw reasoning setting, e.g. "high".
         reasoning: String,
         offline: bool,
         /// Home-relative workspace path, left-truncated at render time.

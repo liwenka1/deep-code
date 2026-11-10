@@ -24,16 +24,12 @@ pub(super) struct PendingSessionScan {
     task: crate::session_scan::SessionScan,
 }
 
-/// Build the effort choices from the embedded model catalog. `auto` and
-/// `off` are product-level controls; the catalog contributes the provider's
+/// Build the effort choices from the embedded model catalog. `auto` is the
+/// product-level control; the catalog contributes the provider's
 /// thinking levels. Keeping this derived from the catalog means a future model
 /// can narrow or expand its levels without a second hard-coded UI list.
-fn picker_efforts(
-    registry: &deep_code_agent::ModelRegistry,
-    model: &str,
-    current: &str,
-) -> Vec<String> {
-    let mut efforts = vec!["auto".to_string(), "off".to_string()];
+fn picker_efforts(registry: &deep_code_agent::ModelRegistry, model: &str) -> Vec<String> {
+    let mut efforts = vec!["auto".to_string(), "none".to_string()];
     let mut levels = Vec::new();
     if model == deep_code_agent::AUTO_MODEL {
         for info in registry.list() {
@@ -51,12 +47,6 @@ fn picker_efforts(
         if !efforts.iter().any(|effort| effort == level) {
             efforts.push(level.to_string());
         }
-    }
-    // Preserve an older config spelling such as `medium` so opening and
-    // cancelling the picker never changes a setting implicitly. The provider
-    // maps it to `high` when the turn is routed.
-    if !efforts.iter().any(|effort| effort == current) {
-        efforts.push(current.to_string());
     }
     efforts
 }
@@ -395,7 +385,7 @@ impl App {
             .position(|model| model == &current_model)
             .unwrap_or(0);
 
-        let efforts = picker_efforts(&registry, &current_model, &self.configured_reasoning);
+        let efforts = picker_efforts(&registry, &current_model);
         let selected_effort = efforts
             .iter()
             .position(|effort| effort == &self.configured_reasoning)
@@ -449,9 +439,8 @@ impl App {
                     .map(|effort| {
                         let label = match effort.as_str() {
                             "auto" => "Auto",
-                            "off" => "Off",
+                            "none" => "None",
                             "low" => "Low",
-                            "medium" => "Medium",
                             "high" => "High",
                             "max" => "Max",
                             other => other,
@@ -517,7 +506,7 @@ impl App {
         };
         let previous_effort = previous_effort.unwrap_or_else(|| "high".to_string());
         let registry = deep_code_agent::ModelRegistry::default();
-        let efforts = picker_efforts(&registry, &model, &previous_effort);
+        let efforts = picker_efforts(&registry, &model);
         let selected_effort = efforts
             .iter()
             .position(|effort| effort == &previous_effort)

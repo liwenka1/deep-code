@@ -6,9 +6,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffortSetting {
-    Off,
+    None,
     Low,
-    Medium,
     #[default]
     High,
     Max,
@@ -19,9 +18,8 @@ pub enum ReasoningEffortSetting {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
-    Off,
+    None,
     Low,
-    Medium,
     High,
     Max,
 }
@@ -35,9 +33,8 @@ impl ReasoningEffortSetting {
     #[must_use]
     pub fn as_setting(self) -> &'static str {
         match self {
-            Self::Off => "off",
+            Self::None => "none",
             Self::Low => "low",
-            Self::Medium => "medium",
             Self::High => "high",
             Self::Max => "max",
             Self::Auto => "auto",
@@ -46,9 +43,8 @@ impl ReasoningEffortSetting {
 
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "off" | "none" | "false" | "0" => Some(Self::Off),
+            "none" => Some(Self::None),
             "low" => Some(Self::Low),
-            "medium" | "med" => Some(Self::Medium),
             "high" => Some(Self::High),
             "max" => Some(Self::Max),
             "auto" => Some(Self::Auto),
@@ -62,12 +58,8 @@ impl ReasoningEffortSetting {
             return select_auto_effort(is_subagent, last_user_message);
         }
         match self {
-            Self::Off => ReasoningEffort::Off,
+            Self::None => ReasoningEffort::None,
             Self::Low => ReasoningEffort::Low,
-            // DeepSeek accepts `medium` as a compatibility spelling for
-            // `high`; keep parsing the old config value, but make the
-            // concrete route and telemetry describe what the API receives.
-            Self::Medium => ReasoningEffort::High,
             Self::High => ReasoningEffort::High,
             Self::Max => ReasoningEffort::Max,
             Self::Auto => unreachable!("handled above"),
@@ -79,12 +71,8 @@ impl ReasoningEffort {
     #[must_use]
     pub fn as_api_value(self) -> Option<&'static str> {
         match self {
-            // `none` is DeepSeek's current Chat Completions spelling for
-            // disabling thinking. `off` remains the product/config label.
-            Self::Off => Some("none"),
+            Self::None => Some("none"),
             Self::Low => Some("low"),
-            // `medium` is accepted for compatibility and maps to high.
-            Self::Medium => Some("high"),
             Self::High => Some("high"),
             Self::Max => Some("max"),
         }
@@ -93,9 +81,8 @@ impl ReasoningEffort {
     #[must_use]
     pub fn short_label(self) -> &'static str {
         match self {
-            Self::Off => "off",
+            Self::None => "none",
             Self::Low => "low",
-            Self::Medium => "high",
             Self::High => "high",
             Self::Max => "max",
         }
@@ -131,9 +118,8 @@ mod tests {
     #[test]
     fn effort_setting_spelling_is_the_serde_spelling_and_parses_back() {
         for setting in [
-            ReasoningEffortSetting::Off,
+            ReasoningEffortSetting::None,
             ReasoningEffortSetting::Low,
-            ReasoningEffortSetting::Medium,
             ReasoningEffortSetting::High,
             ReasoningEffortSetting::Max,
             ReasoningEffortSetting::Auto,
@@ -168,12 +154,14 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_efforts_use_current_deepseek_wire_values() {
-        assert_eq!(ReasoningEffort::Off.as_api_value(), Some("none"));
-        assert_eq!(ReasoningEffort::Medium.as_api_value(), Some("high"));
+    fn canonical_efforts_use_current_deepseek_wire_values() {
+        assert_eq!(ReasoningEffort::None.as_api_value(), Some("none"));
+        assert_eq!(ReasoningEffort::High.as_api_value(), Some("high"));
         assert_eq!(
-            ReasoningEffortSetting::Medium.resolve(false, "anything"),
-            ReasoningEffort::High
+            ReasoningEffortSetting::None.resolve(false, "anything"),
+            ReasoningEffort::None
         );
+        assert_eq!(ReasoningEffortSetting::parse("medium"), None);
+        assert_eq!(ReasoningEffortSetting::parse("off"), None);
     }
 }
