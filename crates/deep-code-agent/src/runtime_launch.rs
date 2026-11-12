@@ -127,29 +127,41 @@ pub fn build_tool_registry(
         }
     };
     if let Some(policy) = &boundary {
-        registry.extend(workspace_tool_registry_from(policy.clone()));
+        registry
+            .extend(workspace_tool_registry_from(policy.clone()))
+            .expect("built-in workspace tool names must be unique");
         let (shell_tools, shell_jobs) =
             shell_tool_registry_from(policy.clone(), !config.sandbox_mode.is_os());
-        registry.extend(shell_tools);
+        registry
+            .extend(shell_tools)
+            .expect("built-in shell tool names must be unique");
         job_store = shell_jobs;
-        registry.register(crate::root_grant::RequestWriteRootTool);
+        registry
+            .register(crate::root_grant::RequestWriteRootTool)
+            .expect("built-in root grant tool name must be unique");
     }
     if web_enabled() {
-        registry.extend(crate::web_tools::web_tool_registry(
-            ui_lang,
-            &crate::web_tools::WebBackend::from_config(config),
-        ));
+        registry
+            .extend(crate::web_tools::web_tool_registry(
+                ui_lang,
+                &crate::web_tools::WebBackend::from_config(config),
+            ))
+            .expect("built-in web tool names must be unique");
     }
     // The model's own task list: parent only (a child's work is one task) and
     // always, since it needs no boundary.
-    registry.register(crate::todo_tool::TodoWriteTool);
+    registry
+        .register(crate::todo_tool::TodoWriteTool)
+        .expect("built-in todo tool name must be unique");
     // Mounted only when the index lists something: a tool whose every call
     // can only answer "no such skill" is tokens spent on a dead end.
     if !skills.is_empty() {
-        registry.register(crate::skills::SkillTool::new(
-            Arc::clone(skills),
-            ui_lang.clone(),
-        ));
+        registry
+            .register(crate::skills::SkillTool::new(
+                Arc::clone(skills),
+                ui_lang.clone(),
+            ))
+            .expect("built-in skill tool name must be unique");
     }
     (registry, job_store, boundary)
 }

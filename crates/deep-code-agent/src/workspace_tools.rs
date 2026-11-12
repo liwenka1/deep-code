@@ -70,11 +70,21 @@ impl WorkspaceTools {
 
     pub fn into_registry(self) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
-        registry.register(ReadFileTool::new(self.root.clone()));
-        registry.register(ListDirTool::new(self.root.clone()));
-        registry.register(GrepFilesTool::new(self.root.clone()));
-        registry.register(WriteFileTool::new(self.root.clone()));
-        registry.register(ApplyPatchTool::new(self.root));
+        registry
+            .register(ReadFileTool::new(self.root.clone()))
+            .expect("built-in workspace tool names must be unique");
+        registry
+            .register(ListDirTool::new(self.root.clone()))
+            .expect("built-in workspace tool names must be unique");
+        registry
+            .register(GrepFilesTool::new(self.root.clone()))
+            .expect("built-in workspace tool names must be unique");
+        registry
+            .register(WriteFileTool::new(self.root.clone()))
+            .expect("built-in workspace tool names must be unique");
+        registry
+            .register(ApplyPatchTool::new(self.root))
+            .expect("built-in workspace tool names must be unique");
         registry
     }
 }

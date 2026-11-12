@@ -4,10 +4,10 @@
 #       或出现在 PR 里）+ 每周一次定时（新披露的通告不伴随任何 push,
 #       定时是它们唯一的入场通道）+ 手动。
 #
-# 只对 vulnerability 转红；unmaintained/yanked 这类 warning 照常打印但不
-# 挡门——它们大多指向锁在上游的传递依赖（本仓库无从替换）,让 CI 永久红
-# 只会训练出「audit 红是正常的」,那是比漏报更糟的失败方向。真有可修的
-# vulnerability 时,修法是升级/替换依赖,不是绕门。
+# 可维护性与 yanked 告警照常打印，但 unsound 必须挡门。unsound 会把运行时
+# 安全性置于未验证状态，不能当成普通噪音；yanked 依赖目前仍由 arboard 的
+# Windows 传递依赖带入，先保留为可见告警。ratatui 0.29 间接固定的 lru
+# 两条 advisory 经过调用路径审查后暂时显式豁免，待 ratatui 升级兼容后移除。
 name: Audit
 
 on:
@@ -43,3 +43,13 @@ jobs:
 
       - name: Audit Cargo.lock against RUSTSEC
         run: cargo audit
+
+      # The default command only reports unsound advisories as warnings and
+      # exits 0. Make that release-relevant class an explicit gate. The two
+      # lru advisories are the known ratatui 0.29 transitive exception; keep
+      # their IDs visible here so the exemption is auditable and removable.
+      - name: Block unsound dependencies
+        run: >-
+          cargo audit --deny unsound
+          --ignore RUSTSEC-2026-0002
+          --ignore RUSTSEC-2026-0253

@@ -394,7 +394,7 @@ impl Tool for AutoEchoTool {
 
 fn registry_with_auto_and_mock() -> ToolRegistry {
     let mut registry = ToolRegistry::with_mock_tools();
-    registry.register(AutoEchoTool);
+    registry.register(AutoEchoTool).unwrap();
     registry
 }
 
@@ -998,7 +998,7 @@ async fn auto_mode_floors_network_tools_above_the_judge() {
         ],
     ]);
     let mut registry = ToolRegistry::with_mock_tools();
-    registry.register(NetworkMockTool);
+    registry.register(NetworkMockTool).unwrap();
     let runtime = AgentRuntime::new(client, registry)
         .with_permission_mode(SharedPermissionMode::new(PermissionMode::Auto));
 
@@ -1191,10 +1191,12 @@ async fn batch_runs_parallel_safe_agent_calls_concurrently() {
     ]);
     let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut registry = ToolRegistry::new();
-    registry.register(BarrierAgentTool {
-        barrier: Arc::new(tokio::sync::Barrier::new(2)),
-        ran: Arc::clone(&ran),
-    });
+    registry
+        .register(BarrierAgentTool {
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            ran: Arc::clone(&ran),
+        })
+        .unwrap();
     let runtime = AgentRuntime::new(client, registry);
 
     let mut rx = runtime.submit_user("fan out").await;
@@ -1253,10 +1255,12 @@ async fn gated_agent_dispatches_leave_the_parallel_group_and_face_the_gate() {
         let mut registry = ToolRegistry::new();
         // A size-1 barrier never blocks: on the serial path these calls run
         // one at a time, so a size-2 barrier would be a deadlock, not a test.
-        registry.register(BarrierAgentTool {
-            barrier: Arc::new(tokio::sync::Barrier::new(1)),
-            ran: Arc::clone(&ran),
-        });
+        registry
+            .register(BarrierAgentTool {
+                barrier: Arc::new(tokio::sync::Barrier::new(1)),
+                ran: Arc::clone(&ran),
+            })
+            .unwrap();
         let runtime = AgentRuntime::new(scripted(), registry)
             .with_permission_mode(SharedPermissionMode::new(mode));
         (runtime, ran)
@@ -1364,10 +1368,12 @@ async fn session_consent_on_an_agent_dispatch_does_not_cover_later_dispatches() 
     ]);
     let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut registry = ToolRegistry::new();
-    registry.register(BarrierAgentTool {
-        barrier: Arc::new(tokio::sync::Barrier::new(1)),
-        ran: Arc::clone(&ran),
-    });
+    registry
+        .register(BarrierAgentTool {
+            barrier: Arc::new(tokio::sync::Barrier::new(1)),
+            ran: Arc::clone(&ran),
+        })
+        .unwrap();
     let runtime = AgentRuntime::new(client, registry)
         .with_permission_mode(SharedPermissionMode::new(PermissionMode::Default));
     let parked_ids = |events: &[RuntimeEvent]| -> Vec<String> {
@@ -2614,7 +2620,7 @@ async fn auto_mode_parks_network_declaration_without_judging() {
         ],
     ]);
     let mut registry = ToolRegistry::default();
-    registry.register(FakeShellTool);
+    registry.register(FakeShellTool).unwrap();
     let runtime = AgentRuntime::new(client, registry)
         .with_permission_mode(SharedPermissionMode::new(PermissionMode::Auto));
 
@@ -2650,7 +2656,7 @@ async fn yolo_mode_auto_approves_network_declaration_with_grant() {
         ],
     ]);
     let mut registry = ToolRegistry::default();
-    registry.register(FakeShellTool);
+    registry.register(FakeShellTool).unwrap();
     let runtime = AgentRuntime::new(client, registry)
         .with_permission_mode(SharedPermissionMode::new(PermissionMode::Yolo));
 
@@ -2706,7 +2712,7 @@ async fn session_approval_remembers_network_command_identity() {
         ],
     ]);
     let mut registry = ToolRegistry::default();
-    registry.register(FakeShellTool);
+    registry.register(FakeShellTool).unwrap();
     let runtime = AgentRuntime::new(client, registry);
 
     let mut rx = runtime.submit_user("push twice").await;
@@ -2785,7 +2791,7 @@ async fn session_approval_of_an_offline_command_does_not_cover_its_network_varia
         ],
     ]);
     let mut registry = ToolRegistry::default();
-    registry.register(FakeShellTool);
+    registry.register(FakeShellTool).unwrap();
     let runtime = AgentRuntime::new(client, registry);
 
     let mut rx = runtime.submit_user("test three times").await;
@@ -4295,7 +4301,7 @@ async fn repeated_tool_errors_trigger_cascade_and_surface_in_telemetry() {
         ..AgentConfig::builtin()
     };
     let mut registry = ToolRegistry::with_mock_tools();
-    registry.register(FailingTool);
+    registry.register(FailingTool).unwrap();
     let runtime = AgentRuntime::with_config(client, registry, config);
 
     let mut rx = runtime.submit_user("do the thing").await;
@@ -4537,9 +4543,11 @@ async fn shutdown_cancels_live_turn_and_waits_for_finalize() {
         AgentEvent::Done { usage: None },
     ]]);
     let mut registry = ToolRegistry::default();
-    registry.register(ParkUntilCancelledTool {
-        started: Arc::clone(&started),
-    });
+    registry
+        .register(ParkUntilCancelledTool {
+            started: Arc::clone(&started),
+        })
+        .unwrap();
     let runtime = AgentRuntime::new(client, registry);
 
     let _rx = runtime.submit_user("go").await;
@@ -4576,7 +4584,7 @@ async fn tool_reported_spend_folds_into_session_totals() {
         ],
     ]);
     let mut registry = ToolRegistry::default();
-    registry.register(SpendReportingTool);
+    registry.register(SpendReportingTool).unwrap();
     let runtime = AgentRuntime::new(client, registry);
 
     let mut rx = runtime.submit_user("go").await;
@@ -4690,7 +4698,9 @@ fn root_grant_fixture(
 ) -> (ToolRegistry, crate::workspace_policy::WorkspacePolicy) {
     let policy = crate::workspace_policy::WorkspacePolicy::new(workspace.to_path_buf()).unwrap();
     let mut registry = crate::workspace_tools::workspace_tool_registry_from(policy.clone());
-    registry.register(crate::root_grant::RequestWriteRootTool);
+    registry
+        .register(crate::root_grant::RequestWriteRootTool)
+        .unwrap();
     (registry, policy)
 }
 
@@ -5316,7 +5326,7 @@ async fn execution_authority_follows_who_resolved_the_prompt() {
         done_script(),
     ]);
     let mut registry = ToolRegistry::default();
-    registry.register(AuthorityProbeTool);
+    registry.register(AuthorityProbeTool).unwrap();
     let runtime = AgentRuntime::new(client, registry);
     let mut rx = runtime.submit_user("go").await;
     let first = drain(&mut rx).await;
@@ -5344,7 +5354,7 @@ async fn execution_authority_follows_who_resolved_the_prompt() {
     // instead of taking a `Parse` that would then fail to spawn.
     let client = ScriptedClient::new(vec![shell_script("call_1", "mkdir sub"), done_script()]);
     let mut registry = ToolRegistry::default();
-    registry.register(AuthorityProbeTool);
+    registry.register(AuthorityProbeTool).unwrap();
     let runtime = AgentRuntime::new(client, registry)
         .with_permission_mode(SharedPermissionMode::new(PermissionMode::AcceptEdits));
     let mut rx = runtime.submit_user("go").await;
@@ -5371,7 +5381,7 @@ async fn execution_authority_follows_who_resolved_the_prompt() {
         done_script(),
     ]);
     let mut registry = ToolRegistry::default();
-    registry.register(AuthorityProbeTool);
+    registry.register(AuthorityProbeTool).unwrap();
     let runtime = AgentRuntime::new(client, registry)
         .with_permission_mode(SharedPermissionMode::new(PermissionMode::Yolo));
     let mut rx = runtime.submit_user("go").await;
@@ -5445,10 +5455,12 @@ async fn a_steered_prompt_is_injected_at_the_next_tool_boundary() {
         ],
     ]);
     let mut registry = ToolRegistry::with_mock_tools();
-    registry.register(BlockingEchoTool {
-        started: Arc::clone(&started),
-        release: Arc::clone(&release),
-    });
+    registry
+        .register(BlockingEchoTool {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        })
+        .unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let runtime = AgentRuntime::with_new_session(
         client,

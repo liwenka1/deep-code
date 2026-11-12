@@ -141,8 +141,9 @@ pub use text_sanitize::{
     collapse_whitespace, is_bidi_or_zero_width, neutralize_char_into, neutralize_display_text,
 };
 pub use tool::{
-    ApprovalDecision, ApprovalError, ApprovalId, ApprovalRequest, MockEchoTool, ToolError,
-    ToolRegistry, ToolResult, ToolResultStatus,
+    ApprovalDecision, ApprovalError, ApprovalId, ApprovalRequest, MAX_TOOL_CALL_ARGUMENT_BYTES,
+    MAX_TOOL_CALL_TOTAL_ARGUMENT_BYTES, MockEchoTool, ToolError, ToolRegistry, ToolRegistryError,
+    ToolResult, ToolResultStatus,
 };
 // `/status` names which backend the web tools run on; the decision is made
 // here from the provider config, so the TUI asks rather than re-deriving it.

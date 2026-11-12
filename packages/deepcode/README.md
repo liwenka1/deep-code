@@ -43,6 +43,8 @@ stdout into exactly one object to branch on:
   to approve it, and a retry fails the same way.
 - **Close stdin when spawning**: an inherited idle pipe costs 2 s on macOS/Linux and hangs on
   Windows, and `--timeout` does not cover that read.
+- **Headless runs have a finite default**: omitting `--timeout` uses a 900-second wall-clock
+  ceiling, so an unattended wrapper cannot run forever by accident.
 
 Exit codes: `0` finished / `1` error / `2` usage / `124` timeout / `130` Ctrl-C.
 

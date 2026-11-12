@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use thiserror::Error;
+
 use crate::execution_policy::{ApprovalAuthority, ExecPolicy, PolicyVerdict, ToolExecutionPlan};
 use crate::model::ChatTool;
 
@@ -22,6 +24,18 @@ struct RegisteredTool {
 pub struct ToolRegistry {
     tools: HashMap<String, RegisteredTool>,
     policy: ExecPolicy,
+}
+
+/// Errors raised while assembling a tool registry.
+///
+/// Registration happens during launch, before a turn can run. Returning a
+/// typed error keeps a bad extension or duplicated built-in from taking down
+/// the whole process with a panic, and lets callers decide whether to disable
+/// the conflicting capability or abort launch with context.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ToolRegistryError {
+    #[error("duplicate tool name '{name}' registered; refusing to overwrite the existing tool")]
+    DuplicateToolName { name: String },
 }
 
 impl std::fmt::Debug for ToolRegistry {
@@ -48,20 +62,20 @@ impl ToolRegistry {
         self.policy = policy;
     }
 
-    pub fn register<T: Tool>(&mut self, tool: T) {
-        self.register_erased(Arc::new(tool));
+    pub fn register<T: Tool>(&mut self, tool: T) -> Result<(), ToolRegistryError> {
+        self.register_erased(Arc::new(tool))
     }
 
     /// Register a dynamically-shaped tool. The spec (including the schemars
     /// run for typed tools) is computed once here, not per request.
-    pub fn register_erased(&mut self, tool: Arc<dyn ErasedTool>) {
+    pub fn register_erased(&mut self, tool: Arc<dyn ErasedTool>) -> Result<(), ToolRegistryError> {
         let spec = tool.spec();
         let name = spec.name.clone();
-        assert!(
-            !self.tools.contains_key(&name),
-            "duplicate tool name '{name}' registered; refusing to overwrite the existing tool"
-        );
+        if self.tools.contains_key(&name) {
+            return Err(ToolRegistryError::DuplicateToolName { name });
+        }
         self.tools.insert(name, RegisteredTool { spec, tool });
+        Ok(())
     }
 
     /// Fixture registry for tests (including `deep-code-runtime`'s, which is why
@@ -69,21 +83,22 @@ impl ToolRegistry {
     #[must_use]
     pub fn with_mock_tools() -> Self {
         let mut registry = Self::new();
-        registry.register(MockEchoTool);
+        registry
+            .register(MockEchoTool)
+            .expect("mock tool name must be unique");
         registry
     }
 
-    pub fn extend(&mut self, other: ToolRegistry) {
+    pub fn extend(&mut self, other: ToolRegistry) -> Result<(), ToolRegistryError> {
         if let Some(name) = other
             .tools
             .keys()
             .find(|name| self.tools.contains_key(*name))
         {
-            panic!(
-                "duplicate tool name '{name}' while extending a registry; refusing to overwrite the existing tool"
-            );
+            return Err(ToolRegistryError::DuplicateToolName { name: name.clone() });
         }
         self.tools.extend(other.tools);
+        Ok(())
     }
 
     /// Clone a subset of tools from another registry.
@@ -200,11 +215,17 @@ impl ToolRegistry {
             };
             match decision {
                 None => {
+                    let Some(authority) = plan.approval_authority() else {
+                        return Err(ToolError::exec_failed(
+                            call.name.clone(),
+                            "internal policy error: approval requested without an authority",
+                        ));
+                    };
                     let notes = shell_safety_notes(call);
                     return Ok(ToolRunOutcome::ApprovalRequired {
                         request: ApprovalRequest {
                             approval_id: ApprovalId::new(),
-                            authority: plan.approval_authority().expect("approval verdict"),
+                            authority,
                             call_id: call.id.clone(),
                             tool_name: spec.name.clone(),
                             description,
@@ -259,26 +280,28 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn duplicate_registration_is_rejected_instead_of_overwritten() {
+    fn duplicate_registration_returns_an_error_instead_of_panicking() {
         let mut registry = ToolRegistry::new();
-        registry.register(MockEchoTool);
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            registry.register(MockEchoTool);
-        }));
-        assert!(panic.is_err(), "duplicate tool names must fail fast");
+        registry.register(MockEchoTool).unwrap();
+        let error = registry.register(MockEchoTool).unwrap_err();
+        assert!(matches!(
+            error,
+            ToolRegistryError::DuplicateToolName { name } if name == MockEchoTool::NAME
+        ));
         assert_eq!(registry.specs().len(), 1);
     }
 
     #[test]
-    fn duplicate_extension_is_rejected_instead_of_overwritten() {
+    fn duplicate_extension_returns_an_error_instead_of_panicking() {
         let mut registry = ToolRegistry::new();
-        registry.register(MockEchoTool);
+        registry.register(MockEchoTool).unwrap();
         let mut other = ToolRegistry::new();
-        other.register(MockEchoTool);
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            registry.extend(other);
-        }));
-        assert!(panic.is_err(), "duplicate tool names must fail fast");
+        other.register(MockEchoTool).unwrap();
+        let error = registry.extend(other).unwrap_err();
+        assert!(matches!(
+            error,
+            ToolRegistryError::DuplicateToolName { name } if name == MockEchoTool::NAME
+        ));
         assert_eq!(registry.specs().len(), 1);
     }
 

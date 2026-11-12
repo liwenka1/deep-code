@@ -139,8 +139,8 @@ fn normalize(value: &str) -> String {
 /// A child's system prompt: role intro, its real network grant, the parent's
 /// project instructions (AGENTS.md) when any, the host facts, and the report
 /// contract. Instructions sit before the host facts for the same reason they
-/// follow the identity in the parent's prompt: they are the user's words about
-/// this repository, read before the generic material.
+/// follow the identity in the parent's prompt: they supply repository context,
+/// framed by the same trust boundary as the parent's instructions.
 pub fn build_system_prompt(
     role: SubAgentRole,
     network: bool,
@@ -158,7 +158,12 @@ pub fn build_system_prompt(
         NETWORK_DENIED_BLOCK
     };
     let instructions = instructions
-        .map(|block| format!("{block}\n\n"))
+        .map(|block| {
+            format!(
+                "{}\n\n",
+                crate::instructions::render_untrusted_project_instructions(block)
+            )
+        })
         .unwrap_or_default();
     format!(
         "{}\n{}\n\n{instructions}{}\n\n{}",

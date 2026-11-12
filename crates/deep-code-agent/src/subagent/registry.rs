@@ -50,8 +50,9 @@ pub struct SubAgentServices {
     /// on it.
     pub permission_mode: SharedPermissionMode,
     pub exec_policy: ExecPolicy,
-    /// The parent's project-instructions block (AGENTS.md), handed to every
-    /// child's system prompt. A child starts from a blank context, and the
+    /// The parent's raw project-instructions block (AGENTS.md). Every child's
+    /// prompt applies the shared trust framing at insertion time. A child
+    /// starts from a blank context, and the
     /// repository's conventions are the part of the parent's context it most
     /// needs — an implementer that does not know where tests live writes them
     /// in the wrong place. The same text the parent read, not a re-read: a
@@ -109,7 +110,9 @@ impl SubAgentServices {
 }
 
 pub fn register_subagent_tools(registry: &mut ToolRegistry, services: Arc<SubAgentServices>) {
-    registry.register(AgentTool::new(services));
+    registry
+        .register(AgentTool::new(services))
+        .expect("built-in agent tool name must be unique");
 }
 
 /// Attach sub-agent tools to an existing parent registry. Test-only: the
@@ -212,13 +215,17 @@ pub(crate) fn child_tool_registry(
     // is naming commands, and silently dropping one because the role happens to
     // be `explore` would make the panel a lie.
     let (shell_tools, job_store) = shell_tool_registry_from(boundary.clone(), unconfined);
-    registry.extend(shell_tools);
+    registry
+        .extend(shell_tools)
+        .expect("built-in shell tool names must be unique");
     if network {
         // The web tools ride the same grant: in-process fetch/search behind
         // the SSRF pin, the research half of "this child may reach the
         // network". Absent a grant they are absent, not merely gated — an
         // unattended prompt could only be auto-denied anyway.
-        registry.extend(crate::web_tools::web_tool_registry(ui_lang, web_backend));
+        registry
+            .extend(crate::web_tools::web_tool_registry(ui_lang, web_backend))
+            .expect("built-in web tool names must be unique");
     }
     (registry, job_store)
 }

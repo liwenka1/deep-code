@@ -634,18 +634,22 @@ impl ShellTools {
 
     pub fn into_registry(self) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
-        registry.register(ShellTool::new(
-            self.root.clone(),
-            self.jobs.clone(),
-            self.sandbox.clone(),
-            self.spill_dir.clone(),
-        ));
-        registry.register(JobTool::new(
-            self.root,
-            self.jobs,
-            self.sandbox,
-            self.spill_dir,
-        ));
+        registry
+            .register(ShellTool::new(
+                self.root.clone(),
+                self.jobs.clone(),
+                self.sandbox.clone(),
+                self.spill_dir.clone(),
+            ))
+            .expect("built-in shell tool names must be unique");
+        registry
+            .register(JobTool::new(
+                self.root,
+                self.jobs,
+                self.sandbox,
+                self.spill_dir,
+            ))
+            .expect("built-in shell tool names must be unique");
         registry
     }
 }

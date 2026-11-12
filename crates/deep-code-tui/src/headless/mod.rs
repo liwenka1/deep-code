@@ -48,6 +48,25 @@ pub(crate) const EXIT_USAGE: i32 = 2;
 pub(crate) const EXIT_TIMEOUT: i32 = 124;
 pub(crate) const EXIT_INTERRUPT: i32 = 130;
 
+/// Headless runs are unattended, so an omitted timeout must still have a
+/// finite wall-clock ceiling. Interactive TUI sessions may choose an
+/// unlimited turn budget; a one-shot process must not inherit that setting and
+/// run forever in CI or a wrapper that forgot `--timeout`.
+pub(crate) const DEFAULT_HEADLESS_TIMEOUT_SECS: u64 = 900;
+pub(crate) const DEFAULT_HEADLESS_TURN_STEPS: u32 = deep_code_agent::MAX_TURN_STEPS;
+
+fn effective_headless_timeout_secs(requested: Option<u64>) -> u64 {
+    requested.unwrap_or(DEFAULT_HEADLESS_TIMEOUT_SECS)
+}
+
+fn effective_headless_turn_steps(configured: u32) -> u32 {
+    if configured == 0 {
+        DEFAULT_HEADLESS_TURN_STEPS
+    } else {
+        configured
+    }
+}
+
 pub async fn run_print(args: PrintArgs) -> i32 {
     let interrupted = match crate::interrupt::Interrupt::watch() {
         Ok(interrupted) => interrupted,
@@ -164,8 +183,20 @@ async fn run_with_diagnostics(
     // Skill/configuration reads can block. Keep polling the signal receivers
     // while initialization runs, and never start a turn from a late result.
     let roots = deep_code_agent::WorkspaceRoots::new(workspace, args.add_dirs.clone());
+    let mut config = loaded.config;
+    if config.turn_steps == 0 {
+        emit(
+            diagnostics,
+            "budget",
+            &format!(
+                "headless mode does not allow an unlimited turn budget; using {} steps",
+                DEFAULT_HEADLESS_TURN_STEPS
+            ),
+        );
+        config.turn_steps = effective_headless_turn_steps(config.turn_steps);
+    }
     let mut initializing =
-        tokio::task::spawn_blocking(move || launch_runtime(&loaded.config, roots, resume));
+        tokio::task::spawn_blocking(move || launch_runtime(&config, roots, resume));
     let launched = tokio::select! {
         biased;
         () = &mut *interruption => {
@@ -258,9 +289,8 @@ async fn run_turn(
     let started = std::time::Instant::now();
     // An unrepresentably large timeout degrades to no deadline, never a panic.
     // Start before the first frame and retain the same budget for the result.
-    let deadline = args
-        .timeout_secs
-        .and_then(|secs| started.checked_add(std::time::Duration::from_secs(secs)));
+    let timeout_secs = effective_headless_timeout_secs(args.timeout_secs);
+    let deadline = started.checked_add(std::time::Duration::from_secs(timeout_secs));
     let stdout = stdout.with_deadline(deadline);
     let interruption = interrupted_token.cancelled();
     tokio::pin!(interruption);
@@ -349,7 +379,7 @@ async fn run_turn(
                     }
                     diagnostics.line(format!(
                         "timeout after {}s: cancelling the turn…",
-                        args.timeout_secs.unwrap_or(0)
+                        timeout_secs
                     ));
                     canceller.cancel_turn().await;
                 }
@@ -503,7 +533,7 @@ fn classify(
             EXIT_TIMEOUT,
             Some(format!(
                 "turn cancelled after the {}s timeout",
-                args.timeout_secs.unwrap_or(0)
+                effective_headless_timeout_secs(args.timeout_secs)
             )),
         ),
         DriveStatus::Cancelled | DriveStatus::Incomplete if interrupted => {
@@ -696,6 +726,24 @@ async fn sleep_until(deadline: Option<std::time::Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headless_timeout_defaults_to_a_finite_wall_clock() {
+        assert_eq!(
+            effective_headless_timeout_secs(None),
+            DEFAULT_HEADLESS_TIMEOUT_SECS
+        );
+        assert_eq!(effective_headless_timeout_secs(Some(42)), 42);
+    }
+
+    #[test]
+    fn headless_budget_replaces_unlimited_configuration() {
+        assert_eq!(
+            effective_headless_turn_steps(0),
+            DEFAULT_HEADLESS_TURN_STEPS
+        );
+        assert_eq!(effective_headless_turn_steps(7), 7);
+    }
 
     #[tokio::test]
     async fn deadlines_cover_unstarted_turns_and_final_diagnostic_flushes() {

@@ -172,8 +172,12 @@ impl WebBackend {
 #[must_use]
 pub fn web_tool_registry(ui_lang: &SharedLang, backend: &WebBackend) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    registry.register(WebSearchTool::new(ui_lang.clone(), backend));
-    registry.register(FetchUrlTool::new(ui_lang.clone(), backend));
+    registry
+        .register(WebSearchTool::new(ui_lang.clone(), backend))
+        .expect("built-in web tool names must be unique");
+    registry
+        .register(FetchUrlTool::new(ui_lang.clone(), backend))
+        .expect("built-in web tool names must be unique");
     registry
 }
 

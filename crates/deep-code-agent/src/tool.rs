@@ -8,9 +8,11 @@ mod mock;
 mod registry;
 mod schema;
 
-pub use accumulator::ToolCallAccumulator;
+pub use accumulator::{
+    MAX_TOOL_CALL_ARGUMENT_BYTES, MAX_TOOL_CALL_TOTAL_ARGUMENT_BYTES, ToolCallAccumulator,
+};
 pub use mock::MockEchoTool;
-pub use registry::ToolRegistry;
+pub use registry::{ToolRegistry, ToolRegistryError};
 
 use std::sync::Arc;
 
@@ -816,7 +818,7 @@ mod tests {
         let mut registry =
             crate::workspace_tools::workspace_tool_registry(workspace.path()).unwrap();
         let (shell, _) = crate::shell_tools::shell_tool_registry(workspace.path()).unwrap();
-        registry.extend(shell);
+        registry.extend(shell).unwrap();
 
         for spec in registry.specs() {
             let schema = &spec.parameters;
