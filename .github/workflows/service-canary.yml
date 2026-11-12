@@ -1,0 +1,167 @@
+# Real provider/LSP contracts, kept out of per-PR CI. No pull_request trigger:
+# paid calls use a dedicated low-quota credential only on the scheduled or
+# manually selected trusted revision. Missing credentials are an explicit skip.
+name: Real services (canary)
+
+on:
+  schedule:
+    - cron: '17 4 * * 1' # Weekly, Monday 04:17 UTC.
+  workflow_dispatch:
+    inputs:
+      live_api:
+        description: 'Run the paid API smokes when DEEPCODE_CANARY_API_KEY is configured (false runs only rust-analyzer).'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: service-canary-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  availability:
+    name: Check live API availability
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      available: ${{ steps.key.outputs.available }}
+    steps:
+      # No checkout/build ever receives this key. Do not print its value.
+      - name: Check the dedicated canary credential
+        id: key
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPCODE_CANARY_API_KEY }}
+          RUN_LIVE_API: ${{ github.event_name != 'workflow_dispatch' || inputs.live_api }}
+        run: |
+          if [ "$RUN_LIVE_API" != 'true' ]; then
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo '### Live API: SKIPPED — disabled by the manual dispatch input.' >> "$GITHUB_STEP_SUMMARY"
+          elif [ -z "${DEEPSEEK_API_KEY//[[:space:]]/}" ]; then
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo '::warning::Live API smokes skipped: DEEPCODE_CANARY_API_KEY is not configured.'
+            echo '### Live API: SKIPPED — missing DEEPCODE_CANARY_API_KEY; no provider contract was verified.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+            echo '### Live API: credential available; results follow in the live API job.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  live-api:
+    name: Live API · SSE, web, sub-agent
+    needs: availability
+    if: needs.availability.outputs.available == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        # Pinned to match rust-toolchain.toml; bump both together.
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+        with:
+          toolchain: 1.96.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build the agent test binary without credentials
+        id: build
+        timeout-minutes: 15
+        run: cargo test --locked -p deep-code-agent --lib --no-run
+
+      # Independent steps still run after an earlier smoke fails, but never
+      # after a failed build or cancellation. Each has an outer process-tree
+      # deadline as well as the Rust test's request/token/turn limits.
+      - name: Verify real SSE
+        id: sse
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 2
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPCODE_CANARY_API_KEY }}
+        run: bash scripts/run-service-canary.sh sse
+
+      - name: Verify real Search & Fetch
+        id: web
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 3
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPCODE_CANARY_API_KEY }}
+        run: bash scripts/run-service-canary.sh web
+
+      - name: Verify a real read-only sub-agent
+        id: subagent
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 3
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPCODE_CANARY_API_KEY }}
+          DEEPCODE_REQUIRE_SANDBOX: '1'
+        run: bash scripts/run-service-canary.sh subagent
+
+      - name: Summarize actual live API outcomes
+        if: always()
+        env:
+          BUILD: ${{ steps.build.outcome }}
+          SSE: ${{ steps.sse.outcome }}
+          WEB: ${{ steps.web.outcome }}
+          SUBAGENT: ${{ steps.subagent.outcome }}
+        run: |
+          {
+            echo '## Live API canary'
+            echo
+            echo '| Check | Outcome |'
+            echo '| --- | --- |'
+            echo "| Test binary build | $BUILD |"
+            echo "| SSE | $SSE |"
+            echo "| Search & Fetch | $WEB |"
+            echo "| Read-only sub-agent | $SUBAGENT |"
+            echo
+            echo 'A skipped check did not verify a provider contract. No automatic retry or publication runs here.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  lsp:
+    name: Real rust-analyzer
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain and rust-analyzer
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+        with:
+          toolchain: 1.96.0
+          components: rust-analyzer
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build the agent test binary
+        id: build
+        timeout-minutes: 15
+        run: cargo test --locked -p deep-code-agent --lib --no-run
+
+      - name: Verify real diagnostics
+        id: diagnostics
+        timeout-minutes: 2
+        run: |
+          rust-analyzer --version
+          bash scripts/run-service-canary.sh lsp
+
+      - name: Summarize actual LSP outcome
+        if: always()
+        env:
+          BUILD: ${{ steps.build.outcome }}
+          DIAGNOSTICS: ${{ steps.diagnostics.outcome }}
+        run: |
+          {
+            echo '## Real rust-analyzer canary'
+            echo "- Test binary build: $BUILD"
+            echo "- Diagnostics: $DIAGNOSTICS"
+            echo '- No API credential is used by this job.'
+          } >> "$GITHUB_STEP_SUMMARY"

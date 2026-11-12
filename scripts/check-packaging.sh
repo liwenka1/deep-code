@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Packaging contract checks — the two ways this repo can break every install at
-# once. Both are invisible to the Rust test suite, and both previously surfaced
-# only after a tag was pushed, because nothing else reads these files together.
+# Packaging contract checks — the release/install relationships invisible to
+# the Rust test suite, checked before a tag is pushed.
 #
 #   1. ASSET_MAP in packages/deepcode/install.mjs must name exactly the assets
 #      release.yml's build matrix produces. Add a platform leg and forget the
@@ -12,6 +11,9 @@
 #      installed" fast path trusts any existing file whose hash matches the
 #      release's SHA256SUMS — so a stale `deepcode-bin` committed or packed into
 #      the tarball would be handed to users as if it were their platform's build.
+#
+#   3. Build, install gate, and installation rehearsal must cover the same
+#      native platforms. A leg on the wrong architecture installs another asset.
 #
 # Read-only: parses files, packs into a temp dir, asserts. No network, no writes
 # outside $TMPDIR. Runs in CI on every PR, and by hand from the repo root.
@@ -97,6 +99,56 @@ else
   done <<<"$MAP_PAIRS"
 fi
 
+# ── 1b. every built platform must have a native install gate and rehearsal ──
+# The workflows use literal include rows. Stop reading at `steps:` and at the
+# next job, so names from other matrices or steps cannot fill a missing leg.
+platform_matrix() {
+  awk -v job="$1" -v field="$2" -v tab="$TAB" '
+    /^  [[:alnum:]_-]+:/ {
+      if (active) exit
+      active = ($0 == "  " job ":")
+    }
+    !active { next }
+    /^[[:space:]]*steps:/ { exit }
+    /^[[:space:]]*- name:/ {
+      name = $0; sub(/^[[:space:]]*- name:[[:space:]]*/, "", name)
+      os = ""; next
+    }
+    /^[[:space:]]*os:/ {
+      os = $0; sub(/^[[:space:]]*os:[[:space:]]*/, "", os); next
+    }
+    /^[[:space:]]*(target|expect):/ {
+      key = $0; sub(/^[[:space:]]*/, "", key); sub(/:.*/, "", key)
+      value = $0; sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", value)
+      if (key == field && name != "" && os != "")
+        printf "%s%s%s%s%s\n", name, tab, os, tab, (field == "target" ? name : value)
+      name = ""
+    }
+  ' "$3" | tr -d '\r' | sort
+}
+
+BUILD_PLATFORMS="$(platform_matrix build target .github/workflows/release.yml)"
+INSTALL_PLATFORMS="$(platform_matrix verify-install expect .github/workflows/release.yml)"
+CANARY_PLATFORMS="$(platform_matrix verify expect .github/workflows/verify-install-canary.yml)"
+
+if [ -z "$BUILD_PLATFORMS" ]; then
+  bad "parsed no native platform rows out of release.yml's build matrix"
+elif [ "$BUILD_PLATFORMS" != "$INSTALL_PLATFORMS" ]; then
+  bad "release install matrix must match every build platform, OS pin, and expected host"
+else
+  info "OK  every built platform has a matching native install gate"
+fi
+if [ -z "$INSTALL_PLATFORMS" ] || [ "$INSTALL_PLATFORMS" != "$CANARY_PLATFORMS" ]; then
+  bad "install canary matrix must match the release install gate"
+else
+  info "OK  install canary covers the same native platforms as the release gate"
+fi
+# macos-latest is arm64; keeping the name without this native pin would give
+# false Intel coverage. Review this guard together with any future runner bump.
+if ! grep -qxF "darwin-x64${TAB}macos-15-intel${TAB}darwin-x64" <<<"$BUILD_PLATFORMS"; then
+  bad "darwin-x64 must build and verify on the native macos-15-intel runner"
+fi
+
 # ── 2. the npm tarball's contents ──
 PACK_DIR="$(mktemp -d)"
 trap 'rm -rf "$PACK_DIR"' EXIT
@@ -142,7 +194,7 @@ else
 fi
 
 if [ "$fail" -eq 0 ]; then
-  info "OK  packaging contract holds (asset map, tarball contents, launcher handoff)"
+  info "OK  packaging contract holds (asset map, native verification matrices, tarball contents, launcher handoff)"
 fi
 
 exit "$fail"

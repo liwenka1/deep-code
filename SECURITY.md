@@ -188,15 +188,21 @@ review to rediscover:
   `cargo metadata` step — which honours the repo's `.cargo/config.toml`
   `rustc-wrapper`/`rustc-workspace-wrapper` — is neutralized by overriding those
   wrappers with a pass-through in the server's environment (unix; the env value
-  beats the config file). So opening a repository does not run its code; what
-  remains is that the server reads the workspace to analyze it. **One residual:**
-  `typescript-language-server` prefers the workspace's own
-  `node_modules/typescript/lib/tsserver.js` over any bundled copy, so a hostile
-  TS/JS repo can still get repo-controlled code run by the server on the first
-  edit of a `.ts`/`.js` file. Until a bundled tsserver is pinned, set
-  `[lsp] enabled = false` when opening untrusted TS/JS repositories. Turning the
-  server off removes the read too. Running it inside the sandbox would close all
-  of this at trusted-`cargo build` risk, and is a possible future option.
+  beats the config file). TypeScript/JavaScript diagnostics do **not** start a
+  server by default: `typescript-language-server` can execute the workspace's
+  `node_modules/typescript/lib/tsserver.js` and plugins, and a configured tsserver
+  path may fall back to that workspace version if it is invalid. To opt in for
+  a trusted environment, set `DEEP_CODE_TRUST_TYPESCRIPT_LSP=1` (`true`/`on` also
+  work) **before starting deep-code**. This trusts the server and Node resolved
+  through PATH as well as the repository's TypeScript code; it grants no
+  sandbox confinement. The value is snapshotted when the LSP manager is created;
+  repository config, permission modes (including yolo) and child shell commands
+  cannot opt the parent process in. `NODE_OPTIONS` and `NODE_PATH` are stripped
+  from the server environment, automatic type acquisition is disabled, and no
+  client plugins are supplied. These are additional defenses, not a promise
+  that an opted-in server cannot execute repository plugins. `[lsp] enabled =
+  false` disables every server. Running LSP inside the sandbox remains a future
+  option at trusted-`cargo build` risk.
 - The CI bot's model prompt carries the issue title, body and every comment, and
   those authors can be anyone even when only trusted associations may *trigger*
   the bot. That thread text is wrapped in an `<untrusted-thread>` envelope and
@@ -429,9 +435,18 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
 - 编辑后诊断用的语言服务器(`[lsp] enabled`,默认开)运行在 OS 沙箱**之外**——
   它不是模型的 shell 命令。已在 initialize 握手里关掉执行仓库代码的开关
   (rust-analyzer 的 build script、proc-macro、保存时 `cargo check` 全部禁用),
-  所以打开一个仓库不会跑它的代码,剩下的只是服务器为分析而读取工作区。设
-  `[lsp] enabled = false` 连这一点也去掉。把服务器放进沙箱可恢复完整分析精度,
-  代价是等同"可信 `cargo build`"的风险,是后续可选项。
+  Unix 上还通过环境变量覆盖仓库配置的 rustc wrapper。
+  **TS/JS 诊断默认不启动服务器**: `typescript-language-server` 可能执行仓库里的
+  `tsserver.js` 和插件,固定 tsserver 路径无效时还可能回退仓库版本。
+  只有在**启动 deep-code 前**设置 `DEEP_CODE_TRUST_TYPESCRIPT_LSP=1`
+  (`true`/`on` 也可)才允许启动。这表示信任 PATH 找到的语言服务器、Node,
+  以及仓库 TypeScript 代码,并不提供沙箱隔离。开关在 LSP manager 创建时快照;
+  项目配置、包括 yolo 在内的权限档位和子 shell 都不能替父进程授权。
+  服务器环境中的 `NODE_OPTIONS`、`NODE_PATH` 会被清理,自动类型下载关闭,
+  不传客户端插件;这些属于额外防御,不保证授权后的服务器不会执行仓库插件。
+  `[lsp] enabled = false` 会关闭所有语言服务器。
+  把服务器放进沙箱可恢复完整分析精度,代价是等同"可信 `cargo build`"的风险,
+  是后续可选项。
 - Windows 上,一个词里带两个 `%` 是 **indirection**,不是拒绝:`cmd.exe` 在命令行
   上展开 `%VAR%`、`%VAR:~0,0%`、`%VAR:a=b%`,所以 `de%PATH:~0,0%l` 真正执行时已经
   是 `del`,这里没有任何规则读得懂那个词。这类行因此永不可信、永不是有界编辑、

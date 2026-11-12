@@ -59,6 +59,20 @@ fn filter_and_rank(mut items: Vec<Diagnostic>, keep_warnings: bool) -> Vec<Diagn
 /// self-heals.
 const SPAWN_BUDGET: u32 = 2;
 
+/// TypeScript's language server may execute the workspace's tsserver and
+/// plugins outside the shell sandbox. Only a process-level opt-in can grant
+/// that trust; checked-out configuration and permission modes cannot.
+const TRUST_TYPESCRIPT_LSP_ENV: &str = "DEEP_CODE_TRUST_TYPESCRIPT_LSP";
+
+fn typescript_lsp_trusted(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on"
+        )
+    })
+}
+
 /// Everything tracked per language, guarded together by one lock. The cell
 /// lock is held across probe + spawn + install, so concurrent queries for
 /// one language wait for a single spawn instead of double-spawning and
@@ -75,6 +89,9 @@ struct LangCell {
 
 pub struct LspManager {
     workspace: PathBuf,
+    /// Snapshotted before any server starts. A repository cannot opt itself
+    /// in through tsconfig, .deep-code/config.toml, or an agent permission tier.
+    trust_typescript_lsp: bool,
     /// Per-language server state (transport, spawn budget, warning latch).
     /// The outer lock only guards the map itself and is never held across an
     /// await; each cell has its own lock so languages stay independent.
@@ -97,6 +114,9 @@ impl LspManager {
     pub fn new(workspace: PathBuf) -> Self {
         Self {
             workspace,
+            trust_typescript_lsp: typescript_lsp_trusted(
+                std::env::var(TRUST_TYPESCRIPT_LSP_ENV).ok().as_deref(),
+            ),
             languages: AsyncMutex::new(HashMap::new()),
             stubs: AsyncMutex::new(HashMap::new()),
             warnings: std::sync::Mutex::new(Vec::new()),
@@ -263,6 +283,19 @@ impl LspManager {
 
         let cell = self.cell(lang).await;
         let mut cell = cell.lock().await;
+        if matches!(lang, Language::TypeScript | Language::JavaScript) && !self.trust_typescript_lsp
+        {
+            if !cell.notified_unavailable {
+                cell.notified_unavailable = true;
+                self.warn(format!(
+                    "lsp: {} diagnostics are off: typescript-language-server can execute \
+                     workspace TypeScript code outside the sandbox; only for trusted \
+                     repositories, start deep-code with {TRUST_TYPESCRIPT_LSP_ENV}=1 to enable it",
+                    lang.as_key()
+                ));
+            }
+            return None;
+        }
         if let Some(live) = &cell.transport {
             return Some((live.clone(), false));
         }

@@ -1802,33 +1802,48 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires network and a DeepSeek API key"]
     async fn tools_api_real_network() {
-        let backend = WebBackend::from_config(&AgentConfig::builtin());
+        // `builtin` is deliberately environment-free; load only the canary key
+        // rather than silently selecting the local fallback or a developer's
+        // endpoint/model overrides.
+        let api_key = std::env::var("DEEPSEEK_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+            .expect("set DEEPSEEK_API_KEY to run this smoke test");
+        let config = AgentConfig {
+            api_key: Some(api_key),
+            ..AgentConfig::builtin()
+        };
+        let backend = WebBackend::from_config(&config);
         assert_eq!(backend.id(), "deepseek-tools-api", "set DEEPSEEK_API_KEY");
-        let result = run(
-            &WebSearchTool::new(zh(), &backend),
-            WebSearchTool::NAME,
-            json!({ "query": "rust programming language", "max_results": 3 }),
-        )
-        .await;
-        assert_eq!(
-            result.status,
-            ToolResultStatus::Success,
-            "{}",
-            result.content
-        );
-        assert!(result.content.starts_with("1. "));
-        let result = run(
-            &FetchUrlTool::new(zh(), &backend),
-            FetchUrlTool::NAME,
-            json!({ "url": "https://example.com/" }),
-        )
-        .await;
-        assert_eq!(
-            result.status,
-            ToolResultStatus::Success,
-            "{}",
-            result.content
-        );
-        assert!(result.content.contains("Example Domain"));
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let result = run(
+                &WebSearchTool::new(zh(), &backend),
+                WebSearchTool::NAME,
+                json!({ "query": "rust programming language", "max_results": 1 }),
+            )
+            .await;
+            assert_eq!(
+                result.status,
+                ToolResultStatus::Success,
+                "{}",
+                result.content
+            );
+            assert!(result.content.starts_with("1. "));
+            let result = run(
+                &FetchUrlTool::new(zh(), &backend),
+                FetchUrlTool::NAME,
+                json!({ "url": "https://example.com/" }),
+            )
+            .await;
+            assert_eq!(
+                result.status,
+                ToolResultStatus::Success,
+                "{}",
+                result.content
+            );
+            assert!(result.content.contains("Example Domain"));
+        })
+        .await
+        .expect("real web smoke exceeded 90 seconds");
     }
 }

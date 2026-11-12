@@ -397,29 +397,39 @@ mod tests {
             .expect("set DEEPSEEK_API_KEY to run this smoke test");
         let config = AgentConfig {
             api_key: Some(api_key),
+            model: crate::model_registry::DEEPSEEK_FLASH.to_string(),
             ..AgentConfig::builtin()
         };
         let client = DeepSeekClient::new(config.clone()).expect("client builds");
-        let request = ChatRequest::streaming(
+        let mut request = ChatRequest::streaming(
             config.model.clone(),
             vec![crate::message::Message::user("Reply with exactly: pong")],
-        );
+        )
+        .with_reasoning_effort("none");
+        request.max_tokens = Some(32);
 
-        let mut events = client.stream_chat(request).await.expect("stream opens");
-        let mut text = String::new();
-        let mut saw_done = false;
-        while let Some(event) = events.next().await {
-            match event.expect("stream event decodes") {
-                AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
-                AgentEvent::Done { .. } => saw_done = true,
-                _ => {}
+        // This calls the client directly, outside the runtime's stream guards.
+        // Bound the body as well as the connection so a stalled service cannot
+        // leave a canary open indefinitely.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let mut events = client.stream_chat(request).await.expect("stream opens");
+            let mut text = String::new();
+            let mut saw_done = false;
+            while let Some(event) = events.next().await {
+                match event.expect("stream event decodes") {
+                    AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+                    AgentEvent::Done { .. } => saw_done = true,
+                    _ => {}
+                }
             }
-        }
-        assert!(saw_done, "stream must terminate with a Done event");
-        assert!(
-            !text.trim().is_empty(),
-            "model must stream non-empty text, got none"
-        );
+            assert!(saw_done, "stream must terminate with a Done event");
+            assert!(
+                !text.trim().is_empty(),
+                "model must stream non-empty text, got none"
+            );
+        })
+        .await
+        .expect("real SSE smoke exceeded 60 seconds");
     }
 
     /// `stream.max_bytes` is documented as the stream's size guard, and the

@@ -177,6 +177,11 @@
 # When off, no language server is ever started — useful when the server is not
 # installed, or when you would rather it did not run. The poll interval and the
 # per-round cap are constants, not settings.
+# TypeScript/JavaScript additionally require DEEP_CODE_TRUST_TYPESCRIPT_LSP=1
+# (or true/on) in the environment BEFORE launch. These servers may execute
+# repository TypeScript/plugin code with your full rights, so enable them only
+# for trusted environments. Project config and permission modes cannot grant
+# this trust. Rust diagnostics do not require that opt-in.
 # enabled = true
 
 [context]

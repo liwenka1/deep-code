@@ -131,7 +131,7 @@ bash scripts/verify-install.sh "$(node -p 'require("./packages/deepcode/package.
 - 产物执行 —— 退出码 + 版本字符串精确匹配
 - 四者版本一致 —— 文本比对
 - `SHA256SUMS` —— `sha256sum -c`
-- 打包契约（`check-packaging.sh`）—— 键值对文本比对 + tarball 内容比对
+- 打包契约（`check-packaging.sh`）—— 资产映射与验证矩阵比对 + tarball 内容比对
 - 安装验证 —— 宿主平台断言 + 退出码 + `deepcode <版本>` 精确匹配
 
 唯一一处 AI 在链路里：**`release-prep.yml` 用模型起草 CHANGELOG**，且无人过目
@@ -149,9 +149,12 @@ bash scripts/verify-install.sh "$(node -p 'require("./packages/deepcode/package.
 
 ## 已知的残余（诚实清单）
 
+五个平台均配置了原生 runner 上的产物执行和安装验证；其中 Intel macOS 使用
+`macos-15-intel`，安装演练使用相同矩阵。本地契约检查只能验证配置，实际 runner
+执行结果仍需以发布工作流或对已发布版本运行安装演练的结果为准。
+
 | 残余 | 影响 | 为什么接受 |
 |---|---|---|
-| **`deep-code-x86_64-apple-darwin` 从未在 CI 里被执行过** | 它是唯一一个"没被执行就发出去"的产物。若它启动即死，只有 Intel Mac 用户会先发现 | 没有 x86_64 macOS runner 可用（`macos-13` 稀缺且在退役，见 `release.yml` 的 matrix 注释），arm64 runner 上执行需 Rosetta 而 runner 没有。S1 与 `verify-install` 都**显式出声**声明这一点，不静默；`verify-install` 的每条 leg 还断言宿主平台，杜绝"名字覆盖了、实际没有" |
 | `release` job 里新建的校验和自检，演练覆盖不到 | 首次发版时这一步是第一次运行 | 它是"照搬的已有代码 + 一个自检"，且失败会停在 npm publish 之前 |
 | 闸门失败时 GitHub Release 已公开 | 会留下"有 Release、npm 上没有"的孤儿版本 | 用户不受影响（`latest` 没动）。修好代码后发下一个 patch；若是验证脚本自身的问题，"Re-run failed jobs" 可以走通（建 Release 是幂等更新） |
 | npm 可能改为默认门禁 install scripts | 若被拦住，`npm i -g deepcode` 会"安装成功"但二进制不存在，**所有新装用户全坏** | 闸门天然覆盖：二进制不存在时 `verify-install` 当场变红；持续关注 npm 的安装脚本策略变化 |

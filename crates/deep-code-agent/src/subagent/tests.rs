@@ -1071,6 +1071,28 @@ None.
     #[tokio::test]
     #[ignore = "requires DEEPSEEK_API_KEY and network"]
     async fn real_deepseek_child_returns_structured_report() {
+        struct SmokeClient(crate::client::DeepSeekClient);
+
+        #[async_trait::async_trait]
+        impl LlmClient for SmokeClient {
+            fn provider_name(&self) -> &'static str {
+                self.0.provider_name()
+            }
+
+            fn model(&self) -> &str {
+                self.0.model()
+            }
+
+            async fn stream_chat(&self, mut request: ChatRequest) -> AgentResult<AgentEventStream> {
+                // A live canary exercises the loop, not the provider's maximum
+                // output. Pin cost even if failure routing changes the model.
+                request.model = crate::model_registry::DEEPSEEK_FLASH.to_string();
+                request.max_tokens = Some(512);
+                request.reasoning_effort = Some("none".to_string());
+                self.0.stream_chat(request).await
+            }
+        }
+
         let api_key = std::env::var("DEEPSEEK_API_KEY")
             .ok()
             .filter(|key| !key.trim().is_empty())
@@ -1083,9 +1105,17 @@ None.
         .unwrap();
         let config = AgentConfig {
             api_key: Some(api_key),
+            model: crate::model_registry::DEEPSEEK_FLASH.to_string(),
+            reasoning_effort: crate::reasoning::ReasoningEffortSetting::None,
+            turn_steps: 4,
+            stream_max_retries: 0,
+            stream_chunk_timeout: Duration::from_secs(30),
+            stream_total_timeout: Duration::from_secs(45),
             ..AgentConfig::builtin()
         };
-        let client = Arc::new(crate::client::DeepSeekClient::new(config.clone()).expect("client"));
+        let client = Arc::new(SmokeClient(
+            crate::client::DeepSeekClient::new(config.clone()).expect("client"),
+        ));
         let mut registry = ToolRegistry::new();
         attach_subagent_tools(
             &mut registry,
@@ -1095,16 +1125,19 @@ None.
             CancellationToken::new(),
         );
 
-        let result = registry
-            .run_tool_call(
+        let result = tokio::time::timeout(
+            Duration::from_secs(120),
+            registry.run_tool_call(
                 agent_call(
                     "call_1",
                     "Read lib.rs in the workspace and report what its single function does. Read-only.",
                     "explore",
                 ),
                 None,
-            )
+            ),
+        )
             .await
+            .expect("real sub-agent smoke exceeded 120 seconds")
             .unwrap()
             .into_result()
             .unwrap();

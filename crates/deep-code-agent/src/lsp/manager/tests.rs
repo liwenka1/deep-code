@@ -70,6 +70,137 @@ async fn unsupported_extensions_are_skipped() {
     assert!(manager.diagnostics_for(&notes).await.is_none());
 }
 
+#[test]
+fn typescript_trust_requires_an_explicit_recognized_value() {
+    for value in [
+        None,
+        Some(""),
+        Some("false"),
+        Some("0"),
+        Some("off"),
+        Some("tru"),
+        Some("yes"),
+    ] {
+        assert!(
+            !typescript_lsp_trusted(value),
+            "{value:?} cannot grant trust"
+        );
+    }
+    for value in ["1", "true", "on", " TRUE ", "On"] {
+        assert!(typescript_lsp_trusted(Some(value)), "{value:?}");
+    }
+}
+
+#[tokio::test]
+async fn typescript_trust_gate_runs_before_spawn_and_warns_once_per_language() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = LspManager::new(dir.path().to_path_buf());
+    manager.trust_typescript_lsp = false;
+    let launches = AtomicU32::new(0);
+    for language in [Language::TypeScript, Language::JavaScript] {
+        for _ in 0..2 {
+            assert!(
+                manager
+                    .acquire_with(language, |_, _| async {
+                        launches.fetch_add(1, Ordering::SeqCst);
+                        Ok(Arc::new(CannedTransport(Vec::new())) as Arc<dyn LspTransport>)
+                    })
+                    .await
+                    .is_none()
+            );
+        }
+    }
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    let warnings = manager.take_warnings();
+    assert_eq!(warnings.len(), 2, "one warning per language: {warnings:?}");
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| warning.contains(TRUST_TYPESCRIPT_LSP_ENV))
+    );
+    assert!(manager.take_warnings().is_empty());
+}
+
+#[tokio::test]
+async fn explicit_typescript_trust_preserves_on_demand_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = LspManager::new(dir.path().to_path_buf());
+    manager.trust_typescript_lsp = true;
+    for language in [Language::TypeScript, Language::JavaScript] {
+        let launched = manager
+            .acquire_with(language, |program, args| async move {
+                assert_eq!(program, "typescript-language-server");
+                assert_eq!(args, ["--stdio"]);
+                Ok(Arc::new(CannedTransport(Vec::new())) as Arc<dyn LspTransport>)
+            })
+            .await;
+        assert!(launched.is_some());
+    }
+    assert!(manager.take_warnings().is_empty());
+    manager.shutdown_all().await;
+}
+
+/// A repository can put its language server first in PATH (e.g. npm run).
+/// Default diagnostics must refuse it before executing even its first byte.
+#[cfg(unix)]
+#[tokio::test]
+async fn untrusted_typescript_lsp_never_starts_repository_code() {
+    const CHILD: &str = "DEEPCODE_TEST_UNTRUSTED_TYPESCRIPT_LSP";
+    if std::env::var_os(CHILD).is_some() {
+        let workspace = std::env::current_dir().unwrap();
+        let manager = LspManager::new(workspace.clone());
+        for file in ["broken.ts", "broken.js"] {
+            assert!(
+                manager
+                    .diagnostics_for(&workspace.join(file))
+                    .await
+                    .is_none()
+            );
+        }
+        assert!(!workspace.join("server-executed").exists());
+        assert_eq!(manager.take_warnings().len(), 2);
+        manager.shutdown_all().await;
+        return;
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    let workspace = tempfile::tempdir().unwrap();
+    let bin = workspace.path().join("node_modules/.bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let server = bin.join("typescript-language-server");
+    std::fs::write(&server, "#!/bin/sh\nprintf executed > server-executed\n").unwrap();
+    std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        workspace.path().join("broken.ts"),
+        "const n: number = 'wrong';",
+    )
+    .unwrap();
+    std::fs::write(workspace.path().join("broken.js"), "const = ;").unwrap();
+    let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "lsp::manager::tests::untrusted_typescript_lsp_never_starts_repository_code",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("PATH", &bin)
+        .env_remove(TRUST_TYPESCRIPT_LSP_ENV)
+        .current_dir(workspace.path())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(Duration::from_secs(10), child)
+        .await
+        .expect("the trust refusal must finish without a server timeout")
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!workspace.path().join("server-executed").exists());
+}
+
 #[tokio::test]
 async fn stub_diagnostics_come_back_with_workspace_relative_paths() {
     let (dir, manager) =
@@ -250,20 +381,31 @@ async fn real_rust_analyzer_reports_diagnostics_for_broken_file() {
     assert!(available, "rust-analyzer not found on PATH");
 
     let workspace = tempfile::tempdir().unwrap();
-    let broken = workspace.path().join("broken.rs");
-    std::fs::write(&broken, "fn main() { let count: u32 = \"three\"; }").unwrap();
+    // Give the real server a discoverable crate. A loose file with only a type
+    // mismatch can legitimately produce no diagnostics when cargo check is
+    // disabled by our security settings. A syntax error in a real crate tests
+    // the native diagnostics path without running project build scripts.
+    std::fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"deep-code-lsp-canary\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir(workspace.path().join("src")).unwrap();
+    let broken = workspace.path().join("src/main.rs");
+    std::fs::write(&broken, "fn main() { let count = ; }\n").unwrap();
 
     let cold_budget_ms = COLD_START_POLL_MS;
     let manager = LspManager::new(workspace.path().to_path_buf());
     let block = manager.diagnostics_for(&broken).await.unwrap_or_else(|| {
+        let warnings = manager.take_warnings();
         panic!(
             "no diagnostics within the {cold_budget_ms}ms cold-start budget \
-                 (server too slow, spawn failed, or it found nothing wrong)"
+                 (server too slow, spawn failed, or it found nothing wrong); warnings: {warnings:?}"
         )
     });
     let rendered = crate::lsp::render_blocks(&[block]);
     assert!(
-        rendered.contains("broken.rs"),
+        rendered.contains("main.rs"),
         "diagnostics must reference the broken file, got: {rendered}"
     );
     manager.shutdown_all().await;

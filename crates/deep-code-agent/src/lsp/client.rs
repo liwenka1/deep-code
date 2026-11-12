@@ -111,6 +111,11 @@ impl StdioLspTransport {
         for name in crate::config::SUBPROCESS_INJECTION_ENV {
             launch.env_remove(name);
         }
+        // Node can otherwise preload arbitrary code or resolve plugins through
+        // inherited search paths before the language server reads initialize.
+        // Keep this LSP-specific: user-approved shell commands may rely on
+        // their Node environment, while diagnostics must use the server itself.
+        launch.env_remove("NODE_OPTIONS").env_remove("NODE_PATH");
         // rust-analyzer runs `cargo metadata` to load the project, and cargo
         // honours the repository's own `.cargo/config.toml` `[build]
         // rustc-wrapper` / `rustc-workspace-wrapper` — running `<wrapper> rustc
@@ -531,12 +536,11 @@ fn code_text(raw: &Value) -> Option<String> {
 /// arbitrary repositories; a future option is to run the server inside the OS
 /// sandbox instead, which would restore accuracy at trusted-`cargo build` risk.
 ///
-/// typescript-language-server does not run project build steps, but it DOES
-/// prefer the workspace's own `node_modules/typescript/lib/tsserver.js` over any
-/// bundled copy — repo-controlled code this process would then run. That one is
-/// a known residual (there is no bundled tsserver to point it at), documented in
-/// `SECURITY.md` rather than claimed closed; `null` leaves every other server on
-/// its defaults.
+/// TypeScript/JavaScript servers are gated by the manager's process-level
+/// trust opt-in because they may select repository-controlled tsserver code.
+/// Even when explicitly trusted, disable automatic npm type acquisition and
+/// client-supplied plugins. This does not turn an opted-in server into a
+/// sandbox; it still runs with the user's rights.
 fn initialization_options(language: Language) -> Value {
     match language {
         Language::Rust => json!({
@@ -546,6 +550,10 @@ fn initialization_options(language: Language) -> Value {
             // Older rust-analyzer spelled the save-check switch differently;
             // unknown keys are ignored, so setting both covers either version.
             "check": { "enable": false },
+        }),
+        Language::TypeScript | Language::JavaScript => json!({
+            "disableAutomaticTypingAcquisition": true,
+            "plugins": [],
         }),
         _ => Value::Null,
     }

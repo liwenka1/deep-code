@@ -21,6 +21,80 @@ fn rust_initialization_options_disable_code_execution() {
 }
 
 #[test]
+fn trusted_typescript_servers_disable_typing_downloads_and_client_plugins() {
+    for language in [Language::TypeScript, Language::JavaScript] {
+        let options = initialization_options(language);
+        assert_eq!(options["disableAutomaticTypingAcquisition"], json!(true));
+        assert_eq!(options["plugins"], json!([]));
+    }
+}
+
+/// Inspect the real spawned process, with the test harness itself isolated so
+/// parallel tests never mutate or depend on the developer's Node environment.
+#[cfg(unix)]
+#[tokio::test]
+async fn language_server_does_not_inherit_node_injection_environment() {
+    const CHILD: &str = "DEEPCODE_TEST_LSP_NODE_ENV";
+    if std::env::var_os(CHILD).is_some() {
+        let workspace = std::env::current_dir().unwrap();
+        let script = workspace.join("server.sh");
+        let transport = StdioLspTransport::spawn(
+            "/bin/sh",
+            &[script.to_str().unwrap().to_owned()],
+            Language::Rust,
+            workspace.clone(),
+        )
+        .await
+        .unwrap();
+        let captured = workspace.join("node-env.txt");
+        let content = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(content) = tokio::fs::read_to_string(&captured).await
+                    && !content.is_empty()
+                {
+                    break content;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("server must record its environment");
+        transport.shutdown().await;
+        assert_eq!(content, "unset|unset");
+        return;
+    }
+
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("server.sh"),
+        "printf '%s|%s' \"${NODE_OPTIONS-unset}\" \"${NODE_PATH-unset}\" > node-env.txt\nwhile IFS= read -r line; do :; done\n"
+    ).unwrap();
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "lsp::client::tests::language_server_does_not_inherit_node_injection_environment",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("NODE_OPTIONS", "--require ./untrusted.cjs")
+            .env("NODE_PATH", "./node_modules")
+            .current_dir(workspace.path())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("isolated LSP environment test must finish")
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn decoder_yields_a_complete_frame() {
     let mut decoder = FrameDecoder::default();
     decoder.feed(&frame(r#"{"ok":true}"#));

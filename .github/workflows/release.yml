@@ -61,9 +61,9 @@ jobs:
             os: macos-latest
             target: aarch64-apple-darwin
           - name: darwin-x64
-            # Intel macOS runners (macos-13) are scarce/retiring and can queue
-            # forever; cross-compile x86_64 on the arm64 runner instead.
-            os: macos-latest
+            # Native Intel runner: the release artifact must execute here and
+            # the installer must select this same architecture below.
+            os: macos-15-intel
             target: x86_64-apple-darwin
           # Pinned to the OLDEST available Ubuntu runner on purpose: a
           # `-gnu` binary requires at least the glibc it was linked against, and
@@ -94,9 +94,9 @@ jobs:
 
       # The release pipeline used to go straight from build to npm publish with
       # no test gate at all, so tagging a commit whose CI was red (or tagging
-      # before CI finished) shipped a broken binary as npm `latest`. Host-native
-      # (no `--target`): a cross-compiled artifact cannot be executed here, but
-      # the workspace tests still run on every platform in the matrix.
+      # before CI finished) shipped a broken binary as npm `latest`. All matrix
+      # legs are native, so workspace tests and the release artifact both run
+      # on the platform they cover.
       # Same insurance ci.yml carries, and it matters more here: this is the
       # last gate before npm publish, so a runner that silently lost the
       # symlink privilege (or a sandbox backend) would let the whole
@@ -150,22 +150,6 @@ jobs:
           BIN="deep-code-${{ matrix.target }}"
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             BIN="${BIN}.exe"
-          fi
-
-          # darwin-x64 is cross-compiled on an arm64 runner, and executing an
-          # x86_64 binary there would need Rosetta, which the runner does not
-          # have. Skip LOUDLY: this gate's entire value is that a silent skip is
-          # indistinguishable from a pass — the same argument the
-          # DEEPCODE_REQUIRE_* comments on the Test step above make.
-          #
-          # Stated cost, in full: this is the ONE artifact CI never executes.
-          # `verify-install` does not cover it either, and cannot — there is no
-          # x86_64 macOS runner here to install it on, and a macOS leg cannot
-          # stand in for one (it would fetch the arm64 asset instead). Say so
-          # here rather than let a green board imply otherwise.
-          if [[ "${{ matrix.target }}" == "x86_64-apple-darwin" ]]; then
-            echo "::warning::$BIN is NOT executed anywhere in CI: it is cross-compiled on an arm64 runner with no Rosetta, and no x86_64 macOS runner exists to install it on. This is the one artifact that ships unexecuted."
-            exit 0
           fi
 
           # GitHub's bash shell runs with `-e -o pipefail`, so a binary that dies
@@ -305,23 +289,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      # Same OS pins as `build` where the platform is real, on purpose: the linux
+      # Same native OS pins as `build`, on purpose: the Linux
       # legs re-confirm the glibc floor on the oldest supported runner by
       # actually installing and running the published asset there.
-      #
-      # There is deliberately NO `darwin-x64` leg. `install.mjs` picks its asset
-      # from the HOST (`process.platform`-`process.arch`), so a `darwin-x64` leg
-      # on `macos-latest` (arm64) would download and run the arm64 asset and go
-      # green — a leg that proves nothing about the platform in its name, while
-      # reading as coverage. `darwin-x64` was exactly that until this comment
-      # existed. The honest position: the x86_64-apple-darwin asset is the one
-      # artifact CI never executes (see the `expect` assertion below, and
-      # RELEASING.md's residual list).
+      # `install.mjs` selects from the host architecture, so darwin-x64 needs
+      # an Intel runner; the platform assertion below prevents false coverage.
       matrix:
         include:
           - name: darwin-arm64
             os: macos-latest
             expect: darwin-arm64
+          - name: darwin-x64
+            os: macos-15-intel
+            expect: darwin-x64
           - name: linux-x64
             os: ubuntu-22.04
             expect: linux-x64

@@ -63,15 +63,16 @@ jobs:
     strategy:
       fail-fast: false
       # Same pins and same reasoning as release.yml's `verify-install` matrix —
-      # including the absence of a `darwin-x64` leg, which on an arm64 runner
-      # would verify the arm64 asset while its name claimed otherwise. The
-      # rehearsal has to cover the same platform set as the gate it rehearses,
-      # or it is proving something about a different pipeline.
+      # including a native Intel runner for darwin-x64. The rehearsal covers
+      # every built platform, and check-packaging.sh guards against drift.
       matrix:
         include:
           - name: darwin-arm64
             os: macos-latest
             expect: darwin-arm64
+          - name: darwin-x64
+            os: macos-15-intel
+            expect: darwin-x64
           - name: linux-x64
             os: ubuntu-22.04
             expect: linux-x64

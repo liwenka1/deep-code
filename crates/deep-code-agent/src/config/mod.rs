@@ -135,7 +135,9 @@ pub struct AgentConfig {
     pub default_permission_mode: PermissionMode,
     /// Post-edit LSP diagnostics master switch (`[lsp] enabled`). On by
     /// default; polling budgets and caps are deliberately not configurable
-    /// (constants in `lsp::manager`).
+    /// (constants in `lsp::manager`). TypeScript/JavaScript server execution
+    /// additionally needs the process-level DEEP_CODE_TRUST_TYPESCRIPT_LSP
+    /// opt-in, independent of this switch and permission modes.
     pub lsp_enabled: bool,
     /// How the model should process attached images (`[vision] detail`).
     ///
