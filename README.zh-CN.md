@@ -235,12 +235,13 @@ deep-code **不内置 MCP**。它本来就有 shell,所以扩展能力的方式�
 
 ```sh
 # 需已配置 DeepSeek API key(未配置会直接报错,不会空跑)
-deepcode eval --sample 2                  # 联调:dev split 先跑 2 题
-deepcode eval                             # dev 全量(23 题,约几分钱)
-deepcode eval --split test --parallel 4 --timeout 900   # test 全量(300 题)
+deepcode eval --sample 2 --out eval-smoke  # 联调:dev split 先跑 2 题
+deepcode eval --out eval-dev              # dev 全量(23 题,约几分钱)
+deepcode eval --split test --parallel 4 --timeout 900 --out eval-test  # test 全量(300 题)
+deepcode eval --sample 2 --out eval-smoke --resume    # 中断后恢复同一批 2 题
 ```
 
-产物在 `eval-out/`(可用 `--out` 改):`predictions.json`(官方格式)+ `report.json`(含每题耗时、成本、模型与路由来源)。
+产物在 `eval-out/`(可用 `--out` 改):`checkpoint.json`、`predictions.json`(官方格式)和 `report.json`(含每题耗时、成本、模型与路由来源),每题结束后保存。中断后保留原参数和 `--out`,加 `--resume` 可跳过所有已保存结果,包括空 patch、超时和错误;只重新执行未保存题。恢复会核对题集和有效配置;API key 不落盘且可以更换,并发数和报告格式也可调整。新一轮不会覆盖已有 checkpoint 或报告,恢复细节见[评测指南](./crates/deep-code-eval/README.md)。
 
 官方评分:
 

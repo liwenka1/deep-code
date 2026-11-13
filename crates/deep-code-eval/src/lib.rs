@@ -16,8 +16,10 @@
 
 pub mod bench;
 mod checkout;
+mod progress;
 pub mod report;
 pub mod runner;
+mod signature;
 
 pub use bench::{BenchmarkInstance, BenchmarkSet, load_bench};
 pub use runner::{BenchReport, EvalConfig, InstanceResult, InstanceStatus, run_bench};

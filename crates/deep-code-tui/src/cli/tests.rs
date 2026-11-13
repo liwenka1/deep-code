@@ -18,6 +18,80 @@ fn parse_session_list_subcommand() {
     assert_eq!(parsed.mode, RunMode::SessionList);
 }
 
+#[test]
+fn eval_defaults_start_a_new_checkpoint_in_eval_out() {
+    let parsed = parse_eval_command(Vec::new());
+    assert_eq!(
+        parsed.mode,
+        RunMode::Eval(EvalArgs {
+            subset: "lite".to_string(),
+            split: "dev".to_string(),
+            sample: None,
+            parallel: 1,
+            json: false,
+            markdown: false,
+            timeout_secs: 300,
+            out_dir: PathBuf::from("eval-out"),
+            resume: false,
+        })
+    );
+}
+
+#[test]
+fn eval_resume_is_a_boolean_and_preserves_the_rollout_options() {
+    let parsed = parse_eval_command(
+        [
+            "--resume",
+            "--out",
+            "my-eval",
+            "--subset",
+            "verified",
+            "--split",
+            "test",
+            "--sample",
+            "2",
+            "--parallel",
+            "3",
+            "--timeout",
+            "90",
+            "--json",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    );
+    assert_eq!(
+        parsed.mode,
+        RunMode::Eval(EvalArgs {
+            subset: "verified".to_string(),
+            split: "test".to_string(),
+            sample: Some(2),
+            parallel: 3,
+            json: true,
+            markdown: false,
+            timeout_secs: 90,
+            out_dir: PathBuf::from("my-eval"),
+            resume: true,
+        })
+    );
+    assert_eq!(
+        print_args(&["-p", "continue", "--resume", "session_123"]).intent,
+        StartupIntent::ResumeId("session_123".to_string()),
+        "headless --resume must still consume a session id"
+    );
+}
+
+#[test]
+fn help_advertises_eval_checkpoint_resume_alongside_its_output_directory() {
+    let text = usage_text();
+    let eval_usage = text
+        .split_once(" eval ")
+        .expect("help must advertise eval")
+        .1;
+    assert!(eval_usage.contains("[--out DIR] [--resume]"), "{text}");
+    assert!(eval_usage.contains("[--timeout SECS]"), "{text}");
+}
+
 fn tui_intent(args: &[&str]) -> StartupIntent {
     let parsed = parse_tui_args(args.iter().map(|s| (*s).to_string()).collect());
     match parsed.mode {

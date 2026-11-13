@@ -82,6 +82,21 @@ pub enum GithubCommand {
     Status,
 }
 
+/// Arguments owned by the benchmark rollout command. Its `--resume` is a
+/// boolean checkpoint switch, independent of interactive session ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalArgs {
+    pub subset: String,
+    pub split: String,
+    pub sample: Option<usize>,
+    pub parallel: usize,
+    pub json: bool,
+    pub markdown: bool,
+    pub timeout_secs: u64,
+    pub out_dir: PathBuf,
+    pub resume: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunMode {
     Tui {
@@ -113,16 +128,7 @@ pub enum RunMode {
     SessionExport {
         id: String,
     },
-    Eval {
-        subset: String,
-        split: String,
-        sample: Option<usize>,
-        parallel: usize,
-        json: bool,
-        markdown: bool,
-        timeout_secs: u64,
-        out_dir: PathBuf,
-    },
+    Eval(EvalArgs),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -574,6 +580,7 @@ fn parse_eval_command(mut args: Vec<String>) -> CliArgs {
     let mut markdown = false;
     let mut timeout_secs = 300;
     let mut out_dir = PathBuf::from("eval-out");
+    let mut resume = false;
 
     while let Some(arg) = args.first().cloned() {
         match arg.as_str() {
@@ -588,6 +595,10 @@ fn parse_eval_command(mut args: Vec<String>) -> CliArgs {
             "--out" => {
                 args.remove(0);
                 out_dir = PathBuf::from(require_value(&mut args, "--out"));
+            }
+            "--resume" => {
+                args.remove(0);
+                resume = true;
             }
             "--sample" => {
                 args.remove(0);
@@ -630,7 +641,7 @@ fn parse_eval_command(mut args: Vec<String>) -> CliArgs {
                 eprintln!(
                     "Unknown eval argument '{other}'. Usage: {prog} eval \
 [--subset lite|verified] [--split dev|test] [--sample N] [--parallel N] \
-[--json] [--markdown] [--timeout SECS] [--out DIR]"
+[--json] [--markdown] [--timeout SECS] [--out DIR] [--resume]"
                 );
                 std::process::exit(2);
             }
@@ -638,7 +649,7 @@ fn parse_eval_command(mut args: Vec<String>) -> CliArgs {
     }
 
     CliArgs {
-        mode: RunMode::Eval {
+        mode: RunMode::Eval(EvalArgs {
             subset,
             split,
             sample,
@@ -647,7 +658,8 @@ fn parse_eval_command(mut args: Vec<String>) -> CliArgs {
             markdown,
             timeout_secs,
             out_dir,
-        },
+            resume,
+        }),
     }
 }
 
@@ -964,7 +976,8 @@ fn usage_text() -> String {
         format!("  {prog} doctor [--json]"),
         format!("  {prog} serve [--host HOST] [--port PORT]"),
         format!("  {prog} session list|resume|delete|export"),
-        format!("  {prog} eval [--subset lite] [--sample N] [--parallel N] [--json] [--markdown]"),
+        format!("  {prog} eval [--subset lite] [--split dev|test] [--sample N] [--parallel N]"),
+        "              [--timeout SECS] [--out DIR] [--resume] [--json] [--markdown]".to_string(),
         String::new(),
         format!("  {prog} --help | --version"),
     ]);

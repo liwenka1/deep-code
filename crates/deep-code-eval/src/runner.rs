@@ -3,19 +3,25 @@
 //! a non-empty patch is not "resolved"; submit the predictions to the official
 //! SWE-bench harness (sb-cli) for the real resolved rate.
 
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deep_code_agent::{
-    AgentConfig, ApprovalDecision, FinishReason, Role, RuntimeEvent, TurnHandle, TurnTelemetry,
-    launch_runtime,
+    AgentConfig, ApprovalDecision, CancellationToken, FinishReason, Role, RuntimeEvent, TurnHandle,
+    TurnTelemetry, launch_runtime,
 };
-use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use crate::bench::{BenchmarkInstance, BenchmarkSet};
 use crate::checkout::checkout_repo;
+use crate::progress::ProgressStore;
+#[cfg(test)]
+mod resume_tests;
 #[cfg(test)]
 use crate::checkout::{cache_dir_under, git};
 
@@ -41,6 +47,12 @@ pub struct EvalConfig {
     /// Where to copy each instance's session transcript before its throwaway
     /// workspace is dropped. `None` discards them.
     pub transcripts_dir: Option<PathBuf>,
+    /// Persist each completed instance and current exports here. `None` keeps
+    /// the library's in-memory behavior; the CLI always supplies its `--out`.
+    pub output_dir: Option<PathBuf>,
+    /// Continue a compatible checkpoint, skipping every saved terminal result
+    /// (including errors/timeouts). Requires `output_dir`.
+    pub resume: bool,
 }
 
 impl Default for EvalConfig {
@@ -54,6 +66,8 @@ impl Default for EvalConfig {
             agent_config: AgentConfig::default(),
             instance_timeout: Duration::from_secs(300),
             transcripts_dir: None,
+            output_dir: None,
+            resume: false,
         }
     }
 }
@@ -132,6 +146,8 @@ pub struct BenchReport {
     pub model_name: String,
     pub started_at: String,
     pub duration_ms: u64,
+    /// Selected instance count. In a partial on-disk report, `results.len()`
+    /// is the completed count and can be smaller than this total.
     pub total: usize,
     pub patches_produced: usize,
     pub empty_patches: usize,
@@ -145,7 +161,7 @@ pub struct BenchReport {
 
 /// Run a benchmark rollout: produce patches for every instance.
 pub async fn run_bench(
-    mut config: EvalConfig,
+    config: EvalConfig,
     bench_set: &BenchmarkSet<impl BenchmarkInstance + Clone + Send + Sync + 'static>,
 ) -> anyhow::Result<BenchReport> {
     // Eval blind-approves every tool call over untrusted checkouts; without an
@@ -178,81 +194,244 @@ pub async fn run_bench(
          writes nor network). Run inside a container, or on macOS/Linux with \
          sandbox support."
     );
+    run_bench_with(config, bench_set, |config, instance, cancel| async move {
+        run_single(&config, &instance, &cancel).await
+    })
+    .await
+}
+
+/// Keep the real scheduler and persistence path injectable: local tests can
+/// interrupt a fake rollout without cloning repositories or billing a model.
+async fn run_bench_with<I, F, Fut>(
+    mut config: EvalConfig,
+    bench_set: &BenchmarkSet<I>,
+    execute: F,
+) -> anyhow::Result<BenchReport>
+where
+    I: BenchmarkInstance + Clone + Send + Sync + 'static,
+    F: Fn(EvalConfig, I, CancellationToken) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = InstanceResult> + Send + 'static,
+{
+    anyhow::ensure!(
+        !config.resume || config.output_dir.is_some(),
+        "resuming an eval requires an output directory"
+    );
     harden_config_for_rollout(&mut config);
-    let started_at = utc_now_iso();
+    let signature = crate::signature::run_signature(&config, &bench_set.instances)?;
+    let now = utc_now_iso();
+    // A task holds a lease too: if the caller drops this future, cancellation
+    // cleanup must finish before another process can resume this directory.
+    let progress = config
+        .output_dir
+        .as_deref()
+        .map(|dir| ProgressStore::open(dir, config.resume, &signature, &now))
+        .transpose()?
+        .map(|store| Arc::new(Mutex::new(store)));
+    let prior = progress.as_ref().map(|store| {
+        store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state()
+            .clone()
+    });
+    let started_at = prior.as_ref().map_or(now, |state| state.started_at.clone());
+    let prior_duration = prior.as_ref().map_or(0, |state| state.duration_ms);
+    let mut results = prior.map_or_else(Vec::new, |state| state.results);
+    let selected: HashSet<_> = bench_set
+        .instances
+        .iter()
+        .map(|instance| instance.instance_id())
+        .collect();
+    for result in &results {
+        anyhow::ensure!(
+            selected.contains(result.instance_id.as_str()),
+            "checkpoint contains an unselected instance; refusing to resume"
+        );
+    }
+    let completed: HashSet<_> = results
+        .iter()
+        .map(|result| result.instance_id.clone())
+        .collect();
+    let mut pending = bench_set
+        .instances
+        .iter()
+        .filter(|instance| !completed.contains(instance.instance_id()))
+        .cloned();
+    if config.resume {
+        println!(
+            "Resuming: {}/{} saved instances will be skipped (including errors/timeouts).",
+            results.len(),
+            selected.len()
+        );
+    }
     let start = Instant::now();
-
-    let instances: Vec<_> = bench_set.instances.clone();
-    let semaphore = Arc::new(Semaphore::new(config.parallelism.max(1)));
-
-    let mut handles = Vec::with_capacity(instances.len());
-    for instance in instances {
-        let permit = semaphore.clone().acquire_owned().await?;
-        let config = config.clone();
-        let instance_id = instance.instance_id().to_string();
-
-        handles.push((
-            instance_id,
-            tokio::spawn(async move {
-                let _permit = permit;
-                run_single(&config, &instance).await
-            }),
-        ));
+    let report = build_report(
+        &config,
+        &started_at,
+        prior_duration,
+        selected.len(),
+        &results,
+    );
+    // Exports are derived views. Rebuild them before starting any new paid
+    // work, including when an earlier run saved a checkpoint but not exports.
+    if let Some(store) = &progress {
+        store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write_exports(&report)?;
     }
 
-    // Results come back through the join, not a shared sink, so an instance
-    // whose task panicked or was aborted still lands in the report as an
-    // error. It would otherwise vanish: official scoring counts a missing
-    // instance as unresolved, and `total` derived from the collected results
-    // would agree with itself — a short report costing real score with
-    // nothing flagging the gap.
-    let mut final_results = Vec::with_capacity(handles.len());
-    for (instance_id, handle) in handles {
-        match handle.await {
-            Ok(result) => final_results.push(result),
-            Err(join_error) => {
-                eprintln!("  💥 {instance_id}: instance task did not finish ({join_error})");
-                final_results.push(InstanceResult {
-                    instance_id,
-                    status: InstanceStatus::Error,
-                    patch: String::new(),
-                    duration_ms: 0,
-                    api_rounds: 0,
-                    tool_calls: 0,
-                    max_turn_steps: 0,
-                    step_limit_hit: false,
-                    cost_cny: 0.0,
-                    model: None,
-                    route_source: None,
-                    cascade_triggered: false,
-                    error: Some(format!("instance task did not finish: {join_error}")),
-                });
+    let mut running = InstanceTasks::new();
+    let mut task_ids = HashMap::new();
+    let execute = Arc::new(execute);
+    loop {
+        while running.tasks.len() < config.parallelism.max(1) {
+            let Some(instance) = pending.next() else {
+                break;
+            };
+            let id = instance.instance_id().to_owned();
+            let config = config.clone();
+            let execute = Arc::clone(&execute);
+            let cancel = running.cancel.clone();
+            let lease = progress.clone();
+            let task = running.tasks.spawn(async move {
+                let _directory_lease = lease;
+                execute(config, instance, cancel).await
+            });
+            task_ids.insert(task.id(), id);
+        }
+        let Some(outcome) = running.tasks.join_next_with_id().await else {
+            break;
+        };
+        let (id, result) = match outcome {
+            Ok((task_id, result)) => (
+                task_ids
+                    .remove(&task_id)
+                    .expect("every spawned task has an id"),
+                result,
+            ),
+            Err(error) => {
+                let id = task_ids
+                    .remove(&error.id())
+                    .expect("every spawned task has an id");
+                let result = task_error(&id, format!("instance task did not finish: {error}"));
+                (id, result)
+            }
+        };
+        let result = if result.instance_id == id {
+            result
+        } else {
+            task_error(&id, "instance task returned a mismatched id".into())
+        };
+        results.push(result.clone());
+        let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Some(store) = &progress {
+            let report = build_report(
+                &config,
+                &started_at,
+                prior_duration.saturating_add(elapsed_ms),
+                selected.len(),
+                &results,
+            );
+            let saved = {
+                let mut store = store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                store
+                    .record(result, elapsed_ms)
+                    .and_then(|()| store.write_exports(&report))
+            };
+            if let Err(error) = saved {
+                // Do not replace a failed save with another paid request. Let
+                // every in-flight instance explicitly shut its runtime down.
+                running.cancel.cancel();
+                while running.tasks.join_next().await.is_some() {}
+                return Err(error.context("failed to save eval progress; stopped new work; resume the same output directory after fixing the storage error"));
             }
         }
+        // Only now may the next loop iteration schedule another instance.
     }
-    // Join order follows spawn order, but don't inherit the loader's ordering
-    // as an invariant: sort so reports and predictions stay diffable.
-    final_results.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+    Ok(build_report(
+        &config,
+        &started_at,
+        prior_duration
+            .saturating_add(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)),
+        selected.len(),
+        &results,
+    ))
+}
 
-    let model_name = submission_name(&config.agent_config.model);
+/// A dropped coordinator cancels but does not abort the instance futures: they
+/// need to reach their explicit runtime shutdown, not leave detached tools.
+struct InstanceTasks {
+    tasks: JoinSet<InstanceResult>,
+    cancel: CancellationToken,
+}
 
-    let count =
-        |status: InstanceStatus| final_results.iter().filter(|r| r.status == status).count();
-    Ok(BenchReport {
-        bench: config.bench,
-        subset: config.subset,
-        split: config.split,
-        model_name,
-        started_at,
-        duration_ms: start.elapsed().as_millis() as u64,
-        total: final_results.len(),
+impl InstanceTasks {
+    fn new() -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            cancel: CancellationToken::new(),
+        }
+    }
+}
+
+impl Drop for InstanceTasks {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.tasks.detach_all();
+    }
+}
+
+fn task_error(id: &str, error: String) -> InstanceResult {
+    InstanceResult {
+        instance_id: id.to_owned(),
+        status: InstanceStatus::Error,
+        patch: String::new(),
+        duration_ms: 0,
+        api_rounds: 0,
+        tool_calls: 0,
+        max_turn_steps: 0,
+        step_limit_hit: false,
+        cost_cny: 0.0,
+        model: None,
+        route_source: None,
+        cascade_triggered: false,
+        error: Some(error),
+    }
+}
+
+fn build_report(
+    config: &EvalConfig,
+    started_at: &str,
+    duration_ms: u64,
+    planned_total: usize,
+    results: &[InstanceResult],
+) -> BenchReport {
+    let mut results = results.to_vec();
+    results.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+    let count = |status: InstanceStatus| {
+        results
+            .iter()
+            .filter(|result| result.status == status)
+            .count()
+    };
+    BenchReport {
+        bench: config.bench.clone(),
+        subset: config.subset.clone(),
+        split: config.split.clone(),
+        model_name: submission_name(&config.agent_config.model),
+        started_at: started_at.to_owned(),
+        duration_ms,
+        total: planned_total,
         patches_produced: count(InstanceStatus::PatchProduced),
         empty_patches: count(InstanceStatus::EmptyPatch),
         timeouts: count(InstanceStatus::Timeout),
         errors: count(InstanceStatus::Error),
-        total_cost_cny: final_results.iter().map(|r| r.cost_cny).sum(),
-        results: final_results,
-    })
+        total_cost_cny: results.iter().map(|result| result.cost_cny).sum(),
+        results,
+    }
 }
 
 /// `model_name_or_path` for the official predictions: agent version plus the
@@ -328,7 +507,11 @@ fn unattended_decision(
 }
 
 /// Run the agent on a single benchmark instance.
-async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> InstanceResult {
+async fn run_single(
+    config: &EvalConfig,
+    instance: &impl BenchmarkInstance,
+    cancel: &CancellationToken,
+) -> InstanceResult {
     let instance_id = instance.instance_id().to_string();
     println!("  ▶ {instance_id} ...");
     let start = Instant::now();
@@ -353,17 +536,23 @@ async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> I
         Ok(dir) => dir,
         Err(e) => return error_result(format!("failed to create temp dir: {e}"), &start),
     };
+    if cancel.is_cancelled() {
+        return error_result("rollout cancelled".into(), &start);
+    }
     // Bound the checkout too, not just the turn: a stalled clone/fetch (git has
     // no timeout of its own) would otherwise hold this parallelism slot forever
     // and write nothing until every other instance finished.
-    if let Err(error) = checkout_repo(
+    // Cancellation requests teardown AND waits for the checkout worker to
+    // reap its Git process before the workspace and output lease are dropped.
+    let checkout = checkout_repo(
         instance.repo(),
         instance.base_commit(),
         workspace.path(),
         config.instance_timeout,
+        cancel,
     )
-    .await
-    {
+    .await;
+    if let Err(error) = checkout {
         return error_result(format!("checkout failed: {error}"), &start);
     }
 
@@ -379,13 +568,23 @@ async fn run_single(config: &EvalConfig, instance: &impl BenchmarkInstance) -> I
         }
     };
 
+    if cancel.is_cancelled() {
+        return error_result("rollout cancelled".into(), &start);
+    }
     let launched = launch_runtime(&config.agent_config, workspace.path().to_path_buf(), None);
     for warning in &launched.warnings {
         eprintln!("warning: {warning}");
     }
     let receiver = launched.handle.start_turn(instance_prompt(instance)).await;
 
-    let outcome = timeout(config.instance_timeout, consume_events(receiver)).await;
+    let outcome = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            launched.shutdown().await;
+            return error_result("rollout cancelled".into(), &start);
+        }
+        outcome = timeout(config.instance_timeout, consume_events(receiver)) => outcome,
+    };
     let (timed_out, turn) = match outcome {
         Ok(turn) => (false, turn),
         Err(_) => {

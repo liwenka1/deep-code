@@ -4,24 +4,23 @@
 //! local report. Scoring stays with the official SWE-bench harness — submit
 //! the predictions via sb-cli to get the real resolved rate.
 
-use std::path::PathBuf;
-
 use deep_code_agent::AgentConfig;
 use deep_code_eval::{EvalConfig, load_bench, run_bench};
 
-use crate::cli::workspace_root;
+use crate::cli::{EvalArgs, workspace_root};
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run_eval(
-    subset: String,
-    split: String,
-    sample: Option<usize>,
-    parallel: usize,
-    json: bool,
-    markdown: bool,
-    timeout_secs: u64,
-    out_dir: PathBuf,
-) -> anyhow::Result<()> {
+pub async fn run_eval(args: EvalArgs) -> anyhow::Result<()> {
+    let EvalArgs {
+        subset,
+        split,
+        sample,
+        parallel,
+        json,
+        markdown,
+        timeout_secs,
+        out_dir,
+        resume,
+    } = args;
     let workspace = workspace_root();
 
     // Load agent config from workspace (respects env vars, global config, etc.).
@@ -56,6 +55,8 @@ pub async fn run_eval(
         // keep its transcript so a struggling instance can be diagnosed
         // without re-running the split.
         transcripts_dir: Some(out_dir.join("transcripts")),
+        output_dir: Some(out_dir.clone()),
+        resume,
     };
 
     println!("Loading SWE-bench {subset}/{split} ...");
@@ -70,15 +71,10 @@ pub async fn run_eval(
     println!("Running rollout (parallel={parallel}, timeout={timeout_secs}s/instance) ...");
     let report = run_bench(eval_config, &bench_set).await?;
 
-    // Always persist the two artifacts: official predictions + full report.
-    std::fs::create_dir_all(&out_dir)?;
+    // The runner saves each result and atomically refreshes both exports as
+    // instances finish. Do not overwrite those files non-atomically here.
     let predictions_path = out_dir.join("predictions.json");
-    std::fs::write(
-        &predictions_path,
-        deep_code_eval::report::to_predictions_json(&report)?,
-    )?;
     let report_path = out_dir.join("report.json");
-    std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
 
     println!();
     if json {
@@ -93,6 +89,7 @@ pub async fn run_eval(
     // through a table whose fallthrough would call an unknown subset "lite".
     let sb_subset = format!("swe-bench_{subset}");
     println!("Wrote:");
+    println!("  {}", out_dir.join("checkpoint.json").display());
     println!("  {}", predictions_path.display());
     println!("  {}", report_path.display());
     let transcripts_dir = out_dir.join("transcripts");

@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use deep_code_agent::CancellationToken;
 use tokio::sync::Mutex as AsyncMutex;
 
 fn cache_dir() -> PathBuf {
@@ -69,22 +70,38 @@ impl CheckoutControl {
 async fn run_worker<T: Send + 'static>(
     cache: PathBuf,
     budget: Duration,
+    cancel: CancellationToken,
     work: impl FnOnce(CheckoutControl) -> anyhow::Result<T> + Send + 'static,
 ) -> anyhow::Result<T> {
     let deadline = Instant::now() + budget;
     let cancelled = Arc::new(AtomicBool::new(false));
     let _cancel_on_drop = CancelOnDrop(cancelled.clone());
-    let lock = tokio::time::timeout(budget, repo_lock_for(&cache).lock_owned())
-        .await
-        .map_err(|_| anyhow::anyhow!("checkout timed out waiting for repository lock"))?;
-    tokio::task::spawn_blocking(move || {
+    let lock = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => anyhow::bail!("checkout cancelled waiting for repository lock"),
+        lock = tokio::time::timeout(budget, repo_lock_for(&cache).lock_owned()) => {
+            lock.map_err(|_| anyhow::anyhow!("checkout timed out waiting for repository lock"))?
+        }
+    };
+    let worker_cancelled = cancelled.clone();
+    let mut worker = tokio::task::spawn_blocking(move || {
         let _lock = lock;
         work(CheckoutControl {
-            cancelled,
+            cancelled: worker_cancelled,
             deadline,
         })
-    })
-    .await?
+    });
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            cancelled.store(true, Ordering::Release);
+            // Dropping this join would release the instance's directory lease
+            // before the blocking worker had killed/reaped its Git process.
+            // Cancellation requests teardown; returning waits for it.
+            worker.await?
+        }
+        result = &mut worker => result?,
+    }
 }
 
 /// Check out a benchmark commit through its shared bare cache. The deadline
@@ -95,12 +112,13 @@ pub(crate) async fn checkout_repo(
     commit: &str,
     dest: &Path,
     budget: Duration,
+    cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     let cache = cache_dir().join(repo.replace('/', "__"));
     let source = format!("https://github.com/{repo}.git");
     let commit = commit.to_owned();
     let dest = dest.to_path_buf();
-    run_worker(cache.clone(), budget, move |control| {
+    run_worker(cache.clone(), budget, cancel.clone(), move |control| {
         checkout_at(&source, &commit, &dest, &cache, &control)
     })
     .await
@@ -302,15 +320,20 @@ mod tests {
         let destination = root.path().join("checkout");
         let worker_cache = cache.clone();
         let worker_dest = destination.clone();
-        run_worker(cache.clone(), Duration::from_secs(10), move |control| {
-            checkout_at(
-                &source.to_string_lossy(),
-                commit.trim(),
-                &worker_dest,
-                &worker_cache,
-                &control,
-            )
-        })
+        run_worker(
+            cache.clone(),
+            Duration::from_secs(10),
+            CancellationToken::new(),
+            move |control| {
+                checkout_at(
+                    &source.to_string_lossy(),
+                    commit.trim(),
+                    &worker_dest,
+                    &worker_cache,
+                    &control,
+                )
+            },
+        )
         .await
         .unwrap();
         assert!(cache.join("HEAD").is_file());
@@ -350,13 +373,26 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn cancellation_stops_children_before_unlock(abort_caller: bool) {
+    enum Stop {
+        Timeout,
+        DropCaller,
+        Cancel,
+    }
+
+    #[cfg(unix)]
+    async fn cancellation_stops_children_before_unlock(stop: Stop) {
         let root = tempfile::tempdir().unwrap();
         let cache = root.path().join("cache.git");
         let directory = root.path().to_path_buf();
+        let cancel = CancellationToken::new();
+        let budget = match stop {
+            Stop::Timeout => Duration::from_millis(300),
+            Stop::DropCaller | Stop::Cancel => Duration::from_secs(10),
+        };
         let task = tokio::spawn(run_worker(
             cache.clone(),
-            Duration::from_millis(300),
+            budget,
+            cancel.clone(),
             move |control| {
                 run_command(Command::new("sh").args([
                 "-c",
@@ -373,17 +409,32 @@ mod tests {
         })
         .await
         .unwrap();
-        if abort_caller {
-            task.abort();
-            assert!(task.await.unwrap_err().is_cancelled());
-        } else {
-            assert!(
-                task.await
+        match stop {
+            Stop::DropCaller => {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            }
+            Stop::Timeout => {
+                assert!(
+                    task.await
+                        .unwrap()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("timed out")
+                );
+            }
+            Stop::Cancel => {
+                cancel.cancel();
+                let error = tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .expect("external cancellation must finish promptly")
                     .unwrap()
-                    .unwrap_err()
-                    .to_string()
-                    .contains("timed out")
-            );
+                    .unwrap_err();
+                assert!(error.to_string().contains("cancelled"), "{error:#}");
+                // Unlike a dropped async caller, explicit cancellation must
+                // not return before the blocking worker releases its lock.
+                assert!(repo_lock_for(&cache).try_lock().is_ok());
+            }
         }
         let lock = repo_lock_for(&cache);
         let _next_checkout = tokio::time::timeout(Duration::from_secs(5), lock.lock())
@@ -409,12 +460,54 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn timeout_reaps_git_before_releasing_the_repo_lock() {
-        cancellation_stops_children_before_unlock(false).await;
+        cancellation_stops_children_before_unlock(Stop::Timeout).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn dropping_checkout_still_reaps_git_before_unlocking() {
-        cancellation_stops_children_before_unlock(true).await;
+        cancellation_stops_children_before_unlock(Stop::DropCaller).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_cancellation_reaps_git_before_returning() {
+        cancellation_stops_children_before_unlock(Stop::Cancel).await;
+    }
+
+    #[tokio::test]
+    async fn external_cancellation_interrupts_waiting_for_the_repo_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache.git");
+        let _owner = repo_lock_for(&cache).lock_owned().await;
+        let cancel = CancellationToken::new();
+        let invoked = Arc::new(AtomicBool::new(false));
+        let worker_invoked = invoked.clone();
+        let mut task = tokio::spawn(run_worker(
+            cache,
+            Duration::from_secs(30),
+            cancel.clone(),
+            move |_| {
+                worker_invoked.store(true, Ordering::Release);
+                Ok(())
+            },
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut task)
+                .await
+                .is_err(),
+            "the other checkout still owns the repository lock"
+        );
+        cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("waiting for a repository lock must be cancellable")
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled"), "{error:#}");
+        assert!(
+            !invoked.load(Ordering::Acquire),
+            "cancelled wait must not start checkout work"
+        );
     }
 }

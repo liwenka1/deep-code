@@ -235,12 +235,13 @@ Built-in SWE-bench rollout driver: pulls the official dataset, drives the agent 
 
 ```sh
 # Requires a configured DeepSeek API key (errors out instead of dry-running)
-deepcode eval --sample 2                  # shakedown: 2 tasks from the dev split
-deepcode eval                             # full dev split (23 tasks, a few cents)
-deepcode eval --split test --parallel 4 --timeout 900   # full test split (300 tasks)
+deepcode eval --sample 2 --out eval-smoke  # shakedown: 2 tasks from the dev split
+deepcode eval --out eval-dev              # full dev split (23 tasks, a few cents)
+deepcode eval --split test --parallel 4 --timeout 900 --out eval-test  # full test split (300 tasks)
+deepcode eval --sample 2 --out eval-smoke --resume    # resume the same 2-task run
 ```
 
-Artifacts land in `eval-out/` (change with `--out`): `predictions.json` (official format) + `report.json` (per-task time, cost, model and routing source).
+Artifacts land in `eval-out/` (change with `--out`): `checkpoint.json` plus `predictions.json` (official format) and `report.json` (per-task time, cost, model and routing source), saved after each completed task. Use the same options and `--out` with `--resume` to skip every saved result, including empty patches, timeouts and errors; only unsaved tasks run again. Resume validates the selected tasks and effective configuration; the API key is not stored and may change, as may concurrency and report format. A fresh run refuses to overwrite an existing checkpoint or report. See the [eval guide](./crates/deep-code-eval/README.md) for recovery details.
 
 Official scoring:
 

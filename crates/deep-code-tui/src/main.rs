@@ -62,28 +62,7 @@ async fn run() -> anyhow::Result<()> {
             })
             .await
         }
-        RunMode::Eval {
-            subset,
-            split,
-            sample,
-            parallel,
-            json,
-            markdown,
-            timeout_secs,
-            out_dir,
-        } => {
-            eval_cli::run_eval(
-                subset,
-                split,
-                sample,
-                parallel,
-                json,
-                markdown,
-                timeout_secs,
-                out_dir,
-            )
-            .await
-        }
+        RunMode::Eval(args) => eval_cli::run_eval(args).await,
         RunMode::SessionList => session_cli::list(),
         RunMode::SessionDelete { id } => session_cli::delete(id),
         RunMode::SessionExport { id } => session_cli::export(id),
