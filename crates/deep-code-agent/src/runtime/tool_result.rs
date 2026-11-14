@@ -719,7 +719,10 @@ fn spill_tool_text(
     file.write_all(&text.as_bytes()[..end])?;
     file.sync_data()?;
     Ok((
-        std::path::PathBuf::from(".deep-code/spill/tool-results").join(filename),
+        std::path::PathBuf::from(".deep-code")
+            .join("spill")
+            .join("tool-results")
+            .join(filename),
         end == text.len(),
     ))
 }
@@ -883,13 +886,26 @@ mod tests {
             .unwrap();
         assert_eq!(files.len(), 1);
         let path = files[0].path();
-        let relative = path.strip_prefix(&workspace).unwrap();
-        assert!(bounded.text().contains(&format!(
-            "Full output saved to {}; use read_file with next_start_byte",
-            relative.display()
-        )));
+        let text = bounded.text();
+        let reported = text
+            .rsplit_once("Full output saved to ")
+            .expect("the continuation must identify a complete source")
+            .1
+            .split_once("; use read_file with next_start_byte for bounded continuation.")
+            .expect("the continuation must explain how to read the source")
+            .0;
+        let relative = std::path::Path::new(reported);
+        assert!(
+            relative.is_relative(),
+            "the source must be workspace-relative"
+        );
+        let reported_path = workspace.join(relative);
         assert_eq!(
-            std::fs::read_to_string(path).unwrap(),
+            reported_path.canonicalize().unwrap(),
+            path.canonicalize().unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(reported_path).unwrap(),
             content.summary_text()
         );
     }
