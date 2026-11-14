@@ -877,18 +877,19 @@ mod tests {
         assert!(
             matches!(&bounded.blocks[1], ContentBlock::Image { image: actual } if actual == &image)
         );
-        assert!(
-            bounded
-                .text()
-                .contains("Full output saved to .deep-code/spill/tool-results/")
-        );
         let files = std::fs::read_dir(workspace.join(".deep-code/spill/tool-results"))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(files.len(), 1);
+        let path = files[0].path();
+        let relative = path.strip_prefix(&workspace).unwrap();
+        assert!(bounded.text().contains(&format!(
+            "Full output saved to {}; use read_file with next_start_byte",
+            relative.display()
+        )));
         assert_eq!(
-            std::fs::read_to_string(files[0].path()).unwrap(),
+            std::fs::read_to_string(path).unwrap(),
             content.summary_text()
         );
     }

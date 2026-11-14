@@ -338,6 +338,15 @@ fn open_user_file(path: &Path) -> Result<std::fs::File, ImageError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+        // Allow opening a directory handle so the same-handle metadata check
+        // can report NotAFile instead of Windows returning access denied first.
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
     options.open(path).map_err(image_io_error)
 }
 

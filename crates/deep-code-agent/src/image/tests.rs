@@ -119,6 +119,18 @@ fn draft_inspection_is_bounded_and_reports_actual_format() {
 }
 
 #[test]
+fn directories_are_rejected_consistently_by_inspection_and_admission() {
+    let dir = tempdir().unwrap();
+    assert_eq!(inspect(dir.path()), Err(ImageError::NotAFile));
+    assert_eq!(read_user_image(dir.path()), Err(ImageError::NotAFile));
+    let (assets, notes) = snapshot_paths(&workspace(&dir), &[dir.path().to_path_buf()]);
+    assert!(assets.is_empty());
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].contains("not a file"), "{}", notes[0]);
+    assert!(!dir.path().join(IMAGES_DIR).exists());
+}
+
+#[test]
 fn same_bytes_have_one_stable_asset_and_round_trip_through_json() {
     let dir = tempdir().unwrap();
     let first = asset(&dir);
