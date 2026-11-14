@@ -1,10 +1,10 @@
-//! Change previews for gated file-mutating tool calls.
+//! Bounded change and process-input previews for gated tool calls.
 //!
 //! An approval prompt that only shows raw JSON arguments asks the user to
-//! sign off blind on large rewrites. For `apply_patch` and `write_file` we
-//! can do better: derive a bounded unified diff from the call arguments and
-//! the current workspace state, and attach it to the
-//! [`crate::tool::ApprovalRequest`] before it reaches the UI.
+//! sign off blind on large rewrites or interpreter input. Mutation previews
+//! derive a diff from the workspace; process previews show the exact stdin
+//! byte count, bounded content, target and pipe/EOF semantics. Both attach to
+//! [`crate::tool::ApprovalRequest`] for UI and HTTP consumers.
 
 use std::path::Path;
 
@@ -17,10 +17,12 @@ use crate::workspace_policy::WorkspacePolicy;
 
 const MAX_PREVIEW_LINES: usize = 40;
 const MAX_PREVIEW_BYTES: usize = 4 * 1024;
-/// The read tool's source-size guard — the same constant, not a copy, so a
-/// bumped limit cannot leave the preview refusing files the tools accept.
+/// Maximum existing source read for a mutation diff preview. This does not
+/// limit paged reads by read_file.
 const MAX_SOURCE_BYTES: u64 = crate::workspace_tools::MAX_FILE_BYTES;
 const NEW_FILE_HEAD_LINES: usize = 20;
+const STDIN_FRAGMENT_BYTES: usize = 1536;
+const STDIN_FRAGMENT_LINES: usize = 16;
 
 /// Build a preview against the live policy already used by the runtime. A
 /// runtime must not reconstruct a policy after a root path has been swapped:
@@ -49,8 +51,98 @@ pub(crate) fn build_approval_preview_with_policy(
             let path = policy.resolve_for_write(rel, "write_file").ok()?;
             Some(write_file_preview(policy, &path, content, lang))
         }
+        "shell" => string_arg(&call.arguments, "stdin")
+            .map(|input| process_input_preview(input, None, false, lang)),
+        "job" => match string_arg(&call.arguments, "action")? {
+            "start" => {
+                let interactive = call
+                    .arguments
+                    .get("interactive")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let input = string_arg(&call.arguments, "stdin").unwrap_or_default();
+                Some(process_input_preview(input, None, interactive, lang))
+            }
+            "input" => Some(process_input_preview(
+                string_arg(&call.arguments, "stdin")?,
+                Some(string_arg(&call.arguments, "job_id")?),
+                true,
+                lang,
+            )),
+            "close_stdin" => Some(process_input_preview(
+                "",
+                Some(string_arg(&call.arguments, "job_id")?),
+                false,
+                lang,
+            )),
+            _ => None,
+        },
         _ => None,
     }
+}
+
+fn process_input_preview(input: &str, job_id: Option<&str>, keep_open: bool, lang: Lang) -> String {
+    let mut out = match lang {
+        Lang::En => format!(
+            "stdin: {} UTF-8 bytes; no newline is appended\n",
+            input.len()
+        ),
+        Lang::Zh => format!("stdin：{} 个 UTF-8 字节；不会自动添加换行\n", input.len()),
+    };
+    if let Some(job_id) = job_id {
+        let target = crate::text_util::truncate_chars(job_id, 160);
+        out.push_str(&match lang {
+            Lang::En => format!("target job_id: {target}\n"),
+            Lang::Zh => format!("目标 job_id：{target}\n"),
+        });
+    }
+    out.push_str(match (lang, keep_open) {
+        (Lang::En, true) => "pipe remains open; EOF is not sent (pipe, not a PTY)\n",
+        (Lang::Zh, true) => "保留输入管道；不发送 EOF（管道，不是 PTY）\n",
+        (Lang::En, false) => {
+            "stdin closes with EOF; process completion must be checked separately\n"
+        }
+        (Lang::Zh, false) => "关闭 stdin 并发送 EOF；进程是否完成需另行检查\n",
+    });
+    if input.is_empty() {
+        out.push_str(match lang {
+            Lang::En => "[stdin is empty]",
+            Lang::Zh => "[stdin 为空]",
+        });
+        return out;
+    }
+    let mut head_end = input.len().min(STDIN_FRAGMENT_BYTES);
+    while !input.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    if let Some((index, _)) = input.match_indices('\n').nth(STDIN_FRAGMENT_LINES - 1) {
+        head_end = head_end.min(index + 1);
+    }
+    let mut tail_start = input.len().saturating_sub(STDIN_FRAGMENT_BYTES);
+    while !input.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    if let Some((index, _)) = input.rmatch_indices('\n').nth(STDIN_FRAGMENT_LINES - 1) {
+        tail_start = tail_start.max(index + 1);
+    }
+    if head_end >= tail_start {
+        out.push_str("[stdin]\n");
+        out.push_str(input);
+    } else {
+        out.push_str("[stdin head]\n");
+        out.push_str(&input[..head_end]);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        let omitted = tail_start - head_end;
+        out.push_str(&match lang {
+            Lang::En => format!("[stdin middle omitted: {omitted} bytes]\n"),
+            Lang::Zh => format!("[stdin 中间已省略：{omitted} 字节]\n"),
+        });
+        out.push_str("[stdin tail]\n");
+        out.push_str(&input[tail_start..]);
+    }
+    out
 }
 
 fn write_file_preview(policy: &WorkspacePolicy, path: &Path, content: &str, lang: Lang) -> String {
@@ -84,12 +176,7 @@ fn write_file_preview(policy: &WorkspacePolicy, path: &Path, content: &str, lang
     };
     match handle.no_follow_metadata() {
         Ok(metadata) if metadata.len() > MAX_SOURCE_BYTES => {
-            // The number comes from the same constant that decided the refusal
-            // one line up. It used to be baked into the locale string, so this
-            // was the one of the three user-facing mentions of the limit that
-            // `MAX_FILE_BYTES`'s own doc comment claimed to have unified and
-            // hadn't: bumping the cap would refuse at the new size while the
-            // panel still said "2 MiB".
+            // The displayed limit comes from this mutation-preview guard.
             return tr_with(
                 lang,
                 TextId::PreviewFileTooBig,
@@ -213,17 +300,7 @@ mod tests {
         assert!(preview.contains("+three"), "{preview}");
     }
 
-    /// The limit named in the message must come from the constant that decided
-    /// the refusal. `MAX_FILE_BYTES`'s doc comment claims all three
-    /// user-facing mentions derive from it and names "the approval preview's
-    /// source guard" as one of them — but this one lived in the locale string
-    /// as a literal "2 MiB", so a bumped cap would refuse at the new size while
-    /// telling the user the old one.
-    ///
-    /// "The other two are pinned in `workspace_tools::tests`" was half true
-    /// when written: grep's note is, `read_file`'s was asserted nowhere at all
-    /// — its whole size guard could be deleted with the entire workspace green.
-    /// It has its own test now (`read_file_refuses_a_file_over_the_limit`).
+    /// Mutation-preview refusals name the source guard actually enforced.
     #[test]
     fn write_file_preview_reports_the_limit_from_the_constant() {
         let workspace = tempfile::tempdir().unwrap();
@@ -334,11 +411,143 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         assert!(
             preview(
-                &call("shell", json!({"command": "ls"})),
+                &call("unknown_tool", json!({"command": "ls"})),
                 &WorkspaceRoots::from(workspace.path()),
                 Lang::Zh
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn shell_preview_exposes_interpreter_stdin_and_exact_byte_count() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = "from pathlib import Path\nPath('result.txt').write_text('你好')\n";
+        let shown = preview(
+            &call("shell", json!({ "command": "python3 -", "stdin": source })),
+            &WorkspaceRoots::from(workspace.path()),
+            Lang::En,
+        )
+        .unwrap();
+        assert!(
+            shown.contains(&format!("{} UTF-8 bytes", source.len())),
+            "{shown}"
+        );
+        assert!(shown.contains(source), "{shown}");
+        assert!(shown.contains("no newline is appended"));
+        assert!(shown.contains("closes with EOF"));
+        assert!(!shown.contains("pipe remains open"));
+        assert!(!workspace.path().join("result.txt").exists());
+    }
+
+    #[test]
+    fn long_utf8_single_line_input_keeps_both_ends_with_explicit_middle_omission() {
+        let workspace = tempfile::tempdir().unwrap();
+        let input = format!("HEAD{}xxTAIL", "界".repeat((64 * 1024 - 10) / 3));
+        assert_eq!(input.len(), 64 * 1024);
+        let shown = preview(
+            &call("shell", json!({ "command": "python3 -", "stdin": input })),
+            &WorkspaceRoots::from(workspace.path()),
+            Lang::En,
+        )
+        .unwrap();
+        assert!(shown.contains(&format!("{} UTF-8 bytes", input.len())));
+        assert!(shown.contains("HEAD") && shown.ends_with("TAIL"));
+        assert!(shown.contains("[stdin head]") && shown.contains("[stdin tail]"));
+        assert!(shown.contains("stdin middle omitted:") && shown.contains("bytes]"));
+        assert!(
+            shown.len() <= MAX_PREVIEW_BYTES,
+            "{} preview bytes",
+            shown.len()
+        );
+        assert!(!shown.contains('�'));
+    }
+
+    #[test]
+    fn many_line_stdin_keeps_a_bounded_head_and_tail() {
+        let input = (0..1_000)
+            .map(|line| format!("line-{line}\n"))
+            .collect::<String>();
+        let shown = process_input_preview(&input, None, false, Lang::En);
+        assert!(shown.contains("line-0\n") && shown.ends_with("line-999\n"));
+        assert!(shown.contains("stdin middle omitted:"));
+        assert!(shown.lines().count() <= MAX_PREVIEW_LINES);
+        assert!(shown.len() <= MAX_PREVIEW_BYTES);
+    }
+
+    #[test]
+    fn job_previews_name_input_targets_and_pipe_or_eof_semantics() {
+        let workspace = tempfile::tempdir().unwrap();
+        let roots = WorkspaceRoots::from(workspace.path());
+        let interactive = preview(
+            &call(
+                "job",
+                json!({
+                    "action": "start", "command": "python3 -i", "interactive": true,
+                    "stdin": "print('ready')\n"
+                }),
+            ),
+            &roots,
+            Lang::En,
+        )
+        .unwrap();
+        assert!(interactive.contains("pipe remains open; EOF is not sent"));
+        assert!(interactive.contains("pipe, not a PTY"));
+        assert!(interactive.contains("print('ready')"));
+        let finite = preview(
+            &call(
+                "job",
+                json!({
+                    "action": "start", "command": "cat", "stdin": "done"
+                }),
+            ),
+            &roots,
+            Lang::En,
+        )
+        .unwrap();
+        assert!(finite.contains("4 UTF-8 bytes") && finite.contains("closes with EOF"));
+        let empty_interactive = preview(
+            &call(
+                "job",
+                json!({
+                    "action": "start", "command": "cat", "interactive": true
+                }),
+            ),
+            &roots,
+            Lang::En,
+        )
+        .unwrap();
+        assert!(
+            empty_interactive.contains("0 UTF-8 bytes")
+                && empty_interactive.contains("pipe remains open")
+        );
+        let input = preview(
+            &call(
+                "job",
+                json!({
+                    "action": "input", "job_id": "job_target", "stdin": "你好\n"
+                }),
+            ),
+            &roots,
+            Lang::En,
+        )
+        .unwrap();
+        assert!(input.contains("target job_id: job_target"));
+        assert!(input.contains("7 UTF-8 bytes") && input.contains("你好\n"));
+        assert!(input.contains("EOF is not sent"));
+        let eof = preview(
+            &call(
+                "job",
+                json!({
+                    "action": "close_stdin", "job_id": "job_target"
+                }),
+            ),
+            &roots,
+            Lang::En,
+        )
+        .unwrap();
+        assert!(eof.contains("target job_id: job_target"));
+        assert!(eof.contains("0 UTF-8 bytes") && eof.contains("closes with EOF"));
+        assert!(eof.contains("process completion must be checked separately"));
     }
 }

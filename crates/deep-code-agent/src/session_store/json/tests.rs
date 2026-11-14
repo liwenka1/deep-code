@@ -143,7 +143,7 @@ fn json_store_round_trips_session() {
     assert_eq!(loaded.entries.len(), 2);
     assert!(matches!(
         &loaded.entries[1].kind,
-        crate::session_entry::EntryKind::User { content, .. } if content == "hello"
+        crate::session_entry::EntryKind::User { content, .. } if content.text() == "hello"
     ));
 }
 
@@ -722,4 +722,35 @@ fn a_forked_session_keeps_its_transcript_and_loses_its_grants() {
         ),
         "a fork must not inherit the original session's write grants"
     );
+}
+
+#[test]
+fn current_session_format_is_explicit_and_rejects_other_schemas() {
+    let workspace = tempfile::tempdir().unwrap();
+    let record = SessionRecord::new(workspace.path().to_path_buf(), "system");
+    let current = serde_json::to_value(&record).unwrap();
+    assert_eq!(current["format_version"], 1);
+    assert_eq!(
+        serde_json::from_value::<SessionRecord>(current.clone()).unwrap(),
+        record
+    );
+
+    for version in [
+        serde_json::Value::Null,
+        serde_json::json!(0),
+        serde_json::json!(2),
+    ] {
+        let mut unsupported = current.clone();
+        unsupported["format_version"] = version;
+        assert!(serde_json::from_value::<SessionRecord>(unsupported).is_err());
+    }
+    let mut unversioned = current.clone();
+    unversioned
+        .as_object_mut()
+        .unwrap()
+        .remove("format_version");
+    assert!(serde_json::from_value::<SessionRecord>(unversioned).is_err());
+    let mut unknown = current;
+    unknown["unexpected_field"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<SessionRecord>(unknown).is_err());
 }

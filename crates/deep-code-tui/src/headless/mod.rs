@@ -299,7 +299,9 @@ async fn run_turn(
     let mut emitter = matches!(args.output, OutputFormat::StreamJson)
         .then(|| output::NdjsonEmitter::new(format!("print_{}", now_ms()), Vec::new()));
     if let Some(emitter) = emitter.as_mut() {
-        emitter.manual("user.message", serde_json::json!({ "content": prompt }));
+        emitter.manual("user.message", serde_json::json!({
+            "content": deep_code_agent::Content::<deep_code_agent::ImageAsset>::from_text(&prompt)
+        }));
         if let Err(error) = stdout.send(&emitter.take_pending()).await {
             launched.shutdown().await;
             return if interrupted_token.is_cancelled() {

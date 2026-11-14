@@ -74,8 +74,8 @@ async fn shell_trusted_command_runs_without_approval() {
         panic!("expected trusted command to run without approval");
     };
     assert_eq!(result.status, ToolResultStatus::Success);
-    assert!(result.content.contains("hello"));
-    assert!(result.content.contains("[exit 0"));
+    assert!(result.content.text().contains("hello"));
+    assert!(result.content.text().contains("[exit 0"));
     let info = details(&result);
     assert_eq!(info["status"], "completed");
     assert_eq!(info["exit_code"], 0);
@@ -111,7 +111,12 @@ async fn shell_untrusted_command_requires_approval() {
 async fn shell_reports_failure() {
     let tmp = tempdir().unwrap();
     let result = approved(tmp.path(), "shell", json!({"command": "exit 7"})).await;
-    assert!(result.content.contains("[exit 7"));
+    assert_eq!(
+        result.status,
+        ToolResultStatus::Success,
+        "a nonzero program exit is an observed execution result"
+    );
+    assert!(result.content.text().contains("[exit 7"));
     let info = details(&result);
     assert_eq!(info["status"], "failed");
     assert_eq!(info["exit_code"], 7);
@@ -127,7 +132,7 @@ async fn shell_times_out_and_kills_the_child() {
         json!({"command": sleep_5(), "timeout_secs": 1}),
     )
     .await;
-    assert!(result.content.contains("timed out"));
+    assert!(result.content.text().contains("timed out"));
     assert_eq!(details(&result)["status"], "timed_out");
     assert!(
         started.elapsed() < Duration::from_secs(4),
@@ -157,12 +162,12 @@ async fn shell_overflow_spills_full_stream_and_result_names_the_file() {
     };
     assert_eq!(result.status, ToolResultStatus::Success);
     assert!(
-        result.content.contains("complete stream saved"),
+        result.content.text().contains("complete stream saved"),
         "result must point at the spill file: {}",
         result.content
     );
 
-    let spill_path = details(&result)["stdout_spill_path"]
+    let spill_path = details(&result)["stdout"]["spill"]["path"]
         .as_str()
         .expect("details carry the spill path")
         .to_string();
@@ -179,6 +184,90 @@ async fn shell_overflow_spills_full_stream_and_result_names_the_file() {
     assert!(std::path::Path::new(&spill_path).exists());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_spills_leave_both_streams_recoverable_through_bounded_pages() {
+    let tmp = tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join(".deep-code")).unwrap();
+    std::fs::write(tmp.path().join(".deep-code/spill"), "not a directory").unwrap();
+    let registry = registry(tmp.path());
+    let result = run_shell(
+        &registry,
+        json!({"command": "seq 1 1500; seq 1 1500 >&2"}),
+        Some(ApprovalDecision::Approved),
+    )
+    .await;
+    let id = details(&result)["job_id"].as_str().unwrap();
+    let expected: String = (1..=1500).map(|line| format!("{line}\n")).collect();
+    assert!(expected.chars().count() > MAX_OUTPUT_CHARS);
+    for stream in ["stdout", "stderr"] {
+        assert!(details(&result)[stream]["spill"].is_null());
+        assert_eq!(details(&result)[stream]["capture_complete"], true);
+        assert!(
+            result
+                .content
+                .text()
+                .contains(&format!("stream={stream} start_byte=0"))
+        );
+        let mut cursor = 0;
+        let mut restored = String::new();
+        loop {
+            let call = ToolCall::new(
+                "page",
+                "job",
+                json!({
+                    "action": "tail", "job_id": id, "stream": stream,
+                    "start_byte": cursor, "max_chars": MAX_TAIL_CHARS,
+                }),
+            );
+            let ToolRunOutcome::Result { result } =
+                registry.run_tool_call(call, None).await.unwrap()
+            else {
+                panic!("retained output reads do not need approval");
+            };
+            assert!(
+                result.content.text().chars().count()
+                    <= crate::runtime::tool_result::TOOL_OUTPUT_BUDGET
+            );
+            let metadata = details(&result);
+            let json = serde_json::to_vec_pretty(metadata).unwrap();
+            assert!(
+                json.len() + 32 * json.iter().filter(|byte| **byte == b'\n').count() <= 16 * 1024
+            );
+            let page = &metadata["output_page"];
+            assert_eq!(page["start_byte"], cursor);
+            restored.push_str(page["text"].as_str().unwrap());
+            let Some(next) = page["next_start_byte"].as_u64() else {
+                assert_eq!(page["has_more"], false);
+                assert_eq!(page["finished"], true);
+                break;
+            };
+            assert_eq!(page["has_more"], true);
+            assert!(next > cursor);
+            cursor = next;
+        }
+        assert_eq!(
+            restored, expected,
+            "the prefix outside the original tail must be recoverable"
+        );
+    }
+    let missing_stream = ToolCall::new(
+        "bad_page",
+        "job",
+        json!({
+            "action": "tail", "job_id": id, "start_byte": 0,
+        }),
+    );
+    assert!(
+        registry
+            .run_tool_call(missing_stream, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("requires a stream")
+    );
+}
+
 /// `drain_readers` returns once the readers are done, and gives up on one that
 /// never reaches end-of-stream instead of waiting for it — the
 /// lingering-grandchild case the 500 ms cap exists for. Virtual time, so the
@@ -190,7 +279,9 @@ async fn shell_overflow_spills_full_stream_and_result_names_the_file() {
 async fn drain_readers_gives_up_on_a_reader_that_never_ends() {
     let stuck = tokio::spawn(std::future::pending::<()>());
     let handle = stuck.abort_handle();
-    drain_readers(Some(stuck), None).await;
+    let stdout = SharedBuffer::default();
+    let stderr = SharedBuffer::default();
+    assert!(!drain_readers(Some(stuck), None, &stdout, &stderr).await);
     // `abort` is a request; the task is dropped the next time the runtime gets
     // to it, so give it that turn before asking.
     tokio::task::yield_now().await;
@@ -201,7 +292,7 @@ async fn drain_readers_gives_up_on_a_reader_that_never_ends() {
 
     // Both readers already at end-of-stream: returns without waiting the cap.
     let done = tokio::spawn(async {});
-    drain_readers(Some(done), None).await;
+    assert!(drain_readers(Some(done), None, &stdout, &stderr).await);
 }
 
 /// A shell call is a SEQUENCE, and its spill handles belong to the run rather
@@ -230,7 +321,7 @@ async fn a_later_step_of_a_chain_still_spills() {
     // Quiet first step: nothing crossed the threshold before the overflow.
     let quiet_first = run_shell(&registry, json!({"command": "true && seq 1 6000"}), None).await;
     assert_eq!(quiet_first.status, ToolResultStatus::Success);
-    let path = details(&quiet_first)["stdout_spill_path"]
+    let path = details(&quiet_first)["stdout"]["spill"]["path"]
         .as_str()
         .unwrap_or_else(|| {
             panic!(
@@ -245,7 +336,7 @@ async fn a_later_step_of_a_chain_still_spills() {
         "the spill must hold the overflowing step whole, got {} bytes",
         saved.len()
     );
-    assert!(quiet_first.content.contains("complete stream saved"));
+    assert!(quiet_first.content.text().contains("complete stream saved"));
 
     // Both steps loud: the file is the whole RUN, not the first step, and its
     // size agrees with the bytes the run reports having produced.
@@ -255,7 +346,7 @@ async fn a_later_step_of_a_chain_still_spills() {
         None,
     )
     .await;
-    let path = details(&both_loud)["stdout_spill_path"]
+    let path = details(&both_loud)["stdout"]["spill"]["path"]
         .as_str()
         .expect("a chain whose steps both overflow must spill")
         .to_string();
@@ -270,7 +361,9 @@ async fn a_later_step_of_a_chain_still_spills() {
     );
     assert_eq!(
         saved.len() as u64,
-        details(&both_loud)["stdout_len"].as_u64().unwrap(),
+        details(&both_loud)["stdout"]["total_bytes"]
+            .as_u64()
+            .unwrap(),
         "a note that says 'complete stream' must name a file holding all of it"
     );
 }
@@ -281,7 +374,7 @@ async fn small_output_leaves_no_spill_dir_behind() {
     let tmp = tempdir().unwrap();
     let result = approved(tmp.path(), "shell", json!({"command": "echo hi"})).await;
     assert_eq!(result.status, ToolResultStatus::Success);
-    assert!(details(&result)["stdout_spill_path"].is_null());
+    assert!(details(&result)["stdout"]["spill"]["path"].is_null());
     assert!(!tmp.path().join(".deep-code/spill").exists());
 }
 
@@ -303,7 +396,7 @@ async fn shell_accepts_a_justification_argument() {
         "{}",
         result.content
     );
-    assert!(result.content.contains("ok"));
+    assert!(result.content.text().contains("ok"));
 }
 
 /// Timeout must kill the whole process tree (the child is spawned as its own
@@ -323,6 +416,7 @@ async fn shell_timeout_kills_grandchildren_too() {
 
     let pid: i32 = result
         .content
+        .text()
         .lines()
         .find_map(|line| line.trim().strip_prefix("started:"))
         .expect("grandchild pid echoed")
@@ -422,7 +516,7 @@ async fn shell_kill_on_cancellation() {
     else {
         panic!("expected result");
     };
-    assert!(result.content.contains("cancelled"));
+    assert!(result.content.text().contains("cancelled"));
     assert_eq!(details(&result)["status"], "cancelled");
     assert!(
         started.elapsed() < Duration::from_secs(4),
@@ -465,7 +559,7 @@ async fn job_start_status_tail_and_cancel_work() {
     else {
         panic!("expected result");
     };
-    assert!(result.content.contains("started job_"));
+    assert_eq!(details(&result)["status"], "running");
     let job_id = details(&result)["job_id"].as_str().unwrap().to_string();
 
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -474,7 +568,7 @@ async fn job_start_status_tail_and_cancel_work() {
     else {
         panic!("expected result");
     };
-    assert!(result.content.contains("hello"));
+    assert!(result.content.text().contains("hello"));
     assert_eq!(details(&result)["status"], "running");
 
     let cancel = ToolCall::new(
@@ -837,14 +931,13 @@ async fn run_shell(
     }
 }
 
-/// The stdout lines of a shell result: everything before the first bracketed
-/// status/stderr marker.
+/// Structured stdout avoids parsing renderer framing in process tests.
 #[cfg(unix)]
 fn stdout_lines(result: &ToolResult) -> Vec<String> {
-    result
-        .content
+    details(result)["stdout"]["text"]
+        .as_str()
+        .unwrap()
         .lines()
-        .take_while(|line| !line.starts_with('['))
         .map(str::to_string)
         .collect()
 }
@@ -973,7 +1066,7 @@ async fn unattended_sequences_follow_the_shell_chain_rules() {
     )
     .await;
     // (approved as text: the shell path — the control for the next call)
-    assert!(missing.content.contains("yes") && !missing.content.contains("no\n"));
+    assert!(missing.content.text().contains("yes") && !missing.content.text().contains("no\n"));
 }
 
 /// Parse authority never falls back to the shell. A command the unattended
@@ -1151,13 +1244,9 @@ async fn a_command_that_never_starts_leaves_no_running_record_behind() {
     unattended(&registry, "no-such-binary-xyz")
         .await
         .expect_err("a missing program is still the caller's error");
-    let state = jobs
-        .get("job_1", "shell")
-        .expect("the record is still reachable");
-    assert_ne!(
-        state.lock().unwrap().status,
-        JobStatus::Running,
-        "a spawn failure must not pin the record as Running"
+    assert!(
+        jobs.idle_workspace().await.is_ok(),
+        "a spawn failure must not pin a record as Running"
     );
 
     // The consequence that is actually visible: real finished jobs keep their
@@ -1225,7 +1314,11 @@ async fn echo_is_not_auto_trusted_on_windows_and_still_runs_once_approved() {
         "{}",
         result.content
     );
-    assert!(result.content.contains("hello"), "{}", result.content);
+    assert!(
+        result.content.text().contains("hello"),
+        "{}",
+        result.content
+    );
     let info = details(&result);
     assert_eq!(info["status"], "completed");
     assert_eq!(info["exit_code"], 0);
@@ -1331,4 +1424,163 @@ fn cache_roots_ride_the_calls_egress() {
         offline.contains(&canonical),
         "the workspace is a root either way: {offline:?}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_stdin_is_exact_and_closed_after_one_input() {
+    let tmp = tempdir().unwrap();
+    let result = approved(
+        tmp.path(),
+        "shell",
+        json!({
+            "command": "cat", "stdin": "first\nsecond\n"
+        }),
+    )
+    .await;
+    assert_eq!(result.status, ToolResultStatus::Success);
+    let info = details(&result);
+    assert_eq!(info["status"], "completed");
+    assert_eq!(info["exit_code"], 0);
+    assert_eq!(info["stdin_open"], false);
+    assert_eq!(info["stdout"]["text"], "first\nsecond\n");
+    assert_eq!(info["stdout"]["finished"], true);
+    assert_eq!(info["stdout"]["capture_complete"], true);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn interactive_job_accepts_two_inputs_then_eof_and_rejects_late_input() {
+    let tmp = tempdir().unwrap();
+    let registry = registry(tmp.path());
+    let ToolRunOutcome::Result { result } = registry
+        .run_tool_call(
+            ToolCall::new(
+                "start",
+                "job",
+                json!({"action": "start", "command": "cat", "interactive": true}),
+            ),
+            Some(ApprovalDecision::Approved),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected job start")
+    };
+    let id = details(&result)["job_id"].as_str().unwrap().to_string();
+    assert_eq!(details(&result)["stdin_open"], true);
+
+    for (index, input) in ["one\n", "two\n"].into_iter().enumerate() {
+        let call = ToolCall::new(
+            format!("input{index}"),
+            "job",
+            json!({"action": "input", "job_id": id, "stdin": input}),
+        );
+        assert!(matches!(
+            registry.run_tool_call(call.clone(), None).await.unwrap(),
+            ToolRunOutcome::ApprovalRequired { .. }
+        ));
+        let ToolRunOutcome::Result { result } = registry
+            .run_tool_call(call, Some(ApprovalDecision::Approved))
+            .await
+            .unwrap()
+        else {
+            panic!("expected input result")
+        };
+        assert_eq!(details(&result)["stdin_open"], true);
+    }
+    let eof = ToolCall::new("eof", "job", json!({"action": "close_stdin", "job_id": id}));
+    assert!(matches!(
+        registry.run_tool_call(eof.clone(), None).await.unwrap(),
+        ToolRunOutcome::ApprovalRequired { .. }
+    ));
+    registry
+        .run_tool_call(eof, Some(ApprovalDecision::Approved))
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let finished = loop {
+        let ToolRunOutcome::Result { result } = registry
+            .run_tool_call(
+                ToolCall::new("status", "job", json!({"action": "status", "job_id": id})),
+                None,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("status is read only")
+        };
+        if details(&result)["status"] == "completed"
+            && details(&result)["stdout"]["finished"] == true
+        {
+            break result;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cat did not finish after EOF: {}",
+            result.content
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let info = details(&finished);
+    assert_eq!(info["stdout"]["text"], "one\ntwo\n");
+    assert_eq!(info["stdout"]["total_bytes"], 8);
+    assert_eq!(info["stdout"]["capture_complete"], true);
+    assert_eq!(info["stdin_open"], false);
+    let late = registry
+        .run_tool_call(
+            ToolCall::new(
+                "late",
+                "job",
+                json!({"action": "input", "job_id": id, "stdin": "late"}),
+            ),
+            Some(ApprovalDecision::Approved),
+        )
+        .await;
+    assert!(matches!(late, Err(ToolError::InvalidArguments { .. })));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdin_limit_and_runtime_job_ownership_are_enforced() {
+    let tmp = tempdir().unwrap();
+    let first = registry(tmp.path());
+    let oversize = first
+        .run_tool_call(
+            ToolCall::new(
+                "oversize",
+                "shell",
+                json!({"command": "cat", "stdin": "x".repeat(MAX_STDIN_BYTES + 1)}),
+            ),
+            Some(ApprovalDecision::Approved),
+        )
+        .await;
+    assert!(matches!(oversize, Err(ToolError::InvalidArguments { .. })));
+    let ToolRunOutcome::Result { result } = first
+        .run_tool_call(
+            ToolCall::new(
+                "start",
+                "job",
+                json!({"action": "start", "command": "cat", "stdin": "done"}),
+            ),
+            Some(ApprovalDecision::Approved),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected job")
+    };
+    let id = details(&result)["job_id"].as_str().unwrap();
+    let second = registry(tmp.path());
+    let foreign = second
+        .run_tool_call(
+            ToolCall::new("foreign", "job", json!({"action": "status", "job_id": id})),
+            None,
+        )
+        .await;
+    let Err(error) = foreign else {
+        panic!("foreign job id was accepted")
+    };
+    assert!(error.to_string().contains("not owned by this runtime"));
 }

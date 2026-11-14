@@ -1720,7 +1720,7 @@ fn finish_tool(
             call_id: id.to_string(),
             tool_name: tool.to_string(),
             status,
-            content: format!("{tool} output"),
+            content: format!("{tool} output").into(),
             details: None,
         },
     });
@@ -3508,7 +3508,7 @@ impl deep_code_agent::LlmClient for StallingSummaryClient {
         let summarizer = request
             .messages
             .first()
-            .is_some_and(|message| message.content.contains("Session handover"));
+            .is_some_and(|message| message.content.text().contains("Session handover"));
         let stream = async_stream::try_stream! {
             if summarizer {
                 std::future::pending::<()>().await;
@@ -3559,7 +3559,8 @@ async fn esc_and_ctrl_c_cancel_a_running_compact() {
         assert_eq!(app.history.len(), cells, "{key}: nothing folded");
         let wire = app.runtime.session_messages().await;
         assert!(
-            wire.iter().any(|message| message.content == "prompt 0"),
+            wire.iter()
+                .any(|message| message.content.text() == "prompt 0"),
             "{key}: {wire:?}"
         );
     }
@@ -4490,7 +4491,7 @@ impl deep_code_agent::LlmClient for BriefCapturingClient {
             .messages
             .iter()
             .rfind(|message| message.role == deep_code_agent::Role::User)
-            .map(|message| message.content.clone());
+            .map(|message| message.content.summary_text());
         *self.last_user_message.lock().unwrap() = last;
         let stream = async_stream::try_stream! {
             yield deep_code_agent::AgentEvent::TextDelta { text: "ok".to_string() };
@@ -5388,4 +5389,57 @@ fn a_click_on_a_compaction_title_folds_and_unfolds_the_summary() {
             ..
         }
     ));
+}
+
+#[test]
+fn image_request_event_surfaces_omission_and_warning_is_recorded_once() {
+    let mut app = App::new();
+    app.lang = deep_code_agent::i18n::Lang::En;
+    let before = app.history.len();
+    app.apply_runtime_event(RuntimeEvent::ImageRequestPrepared {
+        turn_id: deep_code_agent::TurnId("turn".into()),
+        model: "text-only".into(),
+        images: vec![deep_code_agent::ImageDelivery {
+            observation_id: Some("fixture-observation".into()),
+            message_index: 1,
+            block_index: 1,
+            call_id: Some("call".into()),
+            image: ".deep-code/images/asset.png".into(),
+            included: false,
+            reason: Some("image not sent".into()),
+        }],
+    });
+    assert!(app.status.contains("1 image(s) omitted"));
+    assert_eq!(app.history.len(), before);
+    app.apply_runtime_event(RuntimeEvent::Warning {
+        message: "image not sent".into(),
+    });
+    assert_eq!(app.history.len(), before + 1);
+    assert!(
+        matches!(app.history.last(), Some(HistoryCell::System { text }) if text.contains("image not sent") && !text.contains("base64"))
+    );
+}
+
+#[test]
+fn context_listing_projects_inline_images_without_dumping_base64() {
+    use deep_code_agent::{Content, ContentBlock, ImageRef, Message};
+    let app = App::new();
+    let messages = vec![Message::user(Content::new(vec![
+        ContentBlock::Text {
+            text: "inspect".into(),
+        },
+        ContentBlock::Image {
+            image: ImageRef::Url {
+                url: "data:image/png;base64,secret-pixels".into(),
+                detail: None,
+            },
+        },
+        ContentBlock::Text {
+            text: "then explain".into(),
+        },
+    ]))];
+    let text = app.context_list_lines(&messages).join("\n");
+    assert!(text.contains("1 image(s)"));
+    assert!(text.contains("inspect") && text.contains("then explain"));
+    assert!(!text.contains("secret-pixels") && !text.contains("base64"));
 }

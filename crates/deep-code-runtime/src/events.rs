@@ -87,5 +87,91 @@ impl EnvelopeStream {
 
 #[must_use]
 pub fn event_payload(event: &RuntimeEvent) -> Value {
-    serde_json::to_value(event).unwrap_or_else(|_| serde_json::json!({}))
+    serde_json::to_value(event).expect("runtime events contain serializable observation data")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deep_code_agent::{
+        Content, ContentBlock, ImageAsset, ImageDelivery, ImageFormat, ToolCallId, ToolResult,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn tool_envelopes_preserve_ordered_content_and_nested_execution_streams() {
+        let asset = ImageAsset {
+            workspace: "/workspace".into(),
+            digest: "a".repeat(64),
+            format: ImageFormat::Png,
+            bytes: 70,
+        };
+        let mut result = ToolResult::success(
+            "call",
+            "read_file",
+            Content::new(vec![
+                ContentBlock::Text {
+                    text: "before".into(),
+                },
+                ContentBlock::Image {
+                    image: asset.clone(),
+                },
+                ContentBlock::Text {
+                    text: "after".into(),
+                },
+            ]),
+        );
+        result.details = Some(json!({
+            "job_id": "job_1", "status": "failed", "exit_code": 1,
+            "stdout": { "text": "out", "total_bytes": 3, "omitted_bytes": 0,
+                "inline_truncated": false, "capture_complete": true, "finished": true,
+                "read_error": null, "spill": null },
+            "stderr": { "text": "err", "total_bytes": 9, "omitted_bytes": 6,
+                "inline_truncated": true, "capture_complete": false, "finished": true,
+                "read_error": "pipe failed", "spill": null }
+        }));
+        let event = RuntimeEvent::ToolCallFinished {
+            turn_id: Some(TurnId("turn".into())),
+            tool_call_id: ToolCallId("call".into()),
+            result,
+        };
+        let mut stream = EnvelopeStream::new("thread".into());
+        let envelope = stream.event(&event);
+        assert_eq!(envelope.item.kind, "tool.finished");
+        let payload = &envelope.item.payload["result"];
+        assert_eq!(payload["content"][0]["text"], "before");
+        assert_eq!(payload["content"][1]["image"]["digest"], asset.digest);
+        assert_eq!(payload["content"][2]["text"], "after");
+        assert_eq!(payload["details"]["stdout"]["text"], "out");
+        assert_eq!(payload["details"]["stderr"]["read_error"], "pipe failed");
+        assert!(payload["content"].is_array());
+        assert!(!serde_json::to_string(&envelope).unwrap().contains("base64"));
+        assert_eq!(
+            serde_json::from_value::<RuntimeEvent>(envelope.item.payload).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn image_projection_envelope_reports_omissions_without_image_payloads() {
+        let event = RuntimeEvent::ImageRequestPrepared {
+            turn_id: TurnId("turn".into()),
+            model: "deepseek-v4-pro".into(),
+            images: vec![ImageDelivery {
+                observation_id: Some("fixture-observation".into()),
+                message_index: 2,
+                block_index: 1,
+                call_id: Some("call".into()),
+                image: ".deep-code/images/asset.png".into(),
+                included: false,
+                reason: Some("current model does not accept images".into()),
+            }],
+        };
+        let envelope = EnvelopeStream::new("thread".into()).event(&event);
+        assert_eq!(envelope.item.kind, "image.request_prepared");
+        assert_eq!(envelope.item.payload["images"][0]["included"], false);
+        assert_eq!(envelope.item.payload["images"][0]["call_id"], "call");
+        assert!(envelope.item.payload["images"][0].get("url").is_none());
+        assert!(!serde_json::to_string(&envelope).unwrap().contains("base64"));
+    }
 }

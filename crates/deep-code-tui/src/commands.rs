@@ -452,8 +452,10 @@ impl App {
         let line = |index: usize, message: &Message| {
             // Newlines would break the one-line-per-message shape this listing
             // exists to provide.
-            let head =
-                crate::history::truncate_chars(&message.content.replace('\n', " "), LINE_CHARS);
+            let head = crate::history::truncate_chars(
+                &message.content.summary_text().replace('\n', " "),
+                LINE_CHARS,
+            );
             // The wire role (`system`/`user`/`assistant`/`tool`), not a
             // translation: this is a dump of the wire, and the reason to read it
             // is to compare it against the transcript above.
@@ -462,24 +464,13 @@ impl App {
             } else {
                 format!(" (+{} tool call(s))", message.tool_calls.len())
             };
-            // Images are part of the wire too, and they are the one thing a
-            // reader of this listing cannot see in the text: the content shows a
-            // `[图片 #1 PNG]` chip where the picture sits, and the tokens those
-            // pictures cost (up to 1024 each) would otherwise appear from
-            // nowhere. Counted, not shown — a data URL is megabytes of base64
-            // and would defeat the one-line-per-message shape.
-            //
-            // Counted before hydration, so this is what the *transcript* holds
-            // rather than what the request will carry: an image the request had
-            // to leave out (over the budget, or a model that cannot take one) is
-            // still counted here and shows up as a sentence in `content` that
-            // this listing has already truncated past. The listing answers "what
-            // is in the sessions's history", and `/status` plus the per-turn
-            // telemetry are where the request's own size is read.
-            let images = if message.images.is_empty() {
+            // Count persisted observations before request preparation. The
+            // summary retains image identity without expanding inline bytes;
+            // request omission events report what a particular model received.
+            let images = if !message.content.has_images() {
                 String::new()
             } else {
-                format!(" (+{} image(s))", message.images.len())
+                format!(" (+{} image(s))", message.content.image_count())
             };
             let role = message.role.as_str();
             if head.is_empty() {

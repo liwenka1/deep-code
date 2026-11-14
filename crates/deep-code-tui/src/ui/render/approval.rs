@@ -355,6 +355,13 @@ pub(super) fn approval_lines(
         lines.extend(command_head_lines(&command, width, lang));
     }
 
+    // stdin can be executable source for an interpreter. Keep its preview
+    // beside the command/target, ahead of descriptive and advisory text.
+    let process_input = matches!(tool_name, "shell" | "job");
+    if process_input {
+        append_preview_lines(&mut lines, preview, true, width, lang);
+    }
+
     // Neutralised but not capped: tool descriptions run past any line cap, and
     // they are written by this crate, not the model — the filter is uniformity
     // with the rest of the panel, not a boundary of its own.
@@ -453,31 +460,49 @@ pub(super) fn approval_lines(
         }
     }
 
-    if let Some(preview) = preview.filter(|preview| !preview.trim().is_empty()) {
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            format!("  {}", tr(lang, TextId::ApprovalPreviewHeader)),
-            dim,
-        )));
-        let added = Style::default().fg(Color::Green);
-        let removed = Style::default().fg(Color::Red);
-        for raw in preview.lines() {
-            // The widest model-controlled text on the panel: a write_file diff
-            // is that call's own `content` argument (apply_patch's `old`/`new`)
-            // rendered verbatim, so it gets the same neutralisation as the
-            // action and the justification. Not trimmed — a diff line's leading
-            // spaces are its alignment. Colour is decided from the neutralised
-            // text so a leading escape byte cannot borrow the `+` styling.
-            let line = neutralize_display_text(raw);
-            let style = match line.as_bytes().first() {
-                Some(b'+') => added,
-                Some(b'-') => removed,
-                _ => dim,
-            };
-            lines.extend(wrap_prefixed("  ", &line, width, style, style));
-        }
+    if !process_input {
+        append_preview_lines(&mut lines, preview, false, width, lang);
     }
     lines
+}
+
+fn append_preview_lines(
+    lines: &mut Vec<Line<'static>>,
+    preview: Option<&str>,
+    process_input: bool,
+    width: usize,
+    lang: Lang,
+) {
+    let Some(preview) = preview.filter(|preview| !preview.trim().is_empty()) else {
+        return;
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+    let header = if process_input {
+        match lang {
+            Lang::En => "── stdin preview ──",
+            Lang::Zh => "── 标准输入预览 ──",
+        }
+    } else {
+        tr(lang, TextId::ApprovalPreviewHeader)
+    };
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(format!("  {header}"), dim)));
+    for raw in preview.lines() {
+        // Preserve source alignment while neutralizing terminal controls and
+        // invisible reordering. stdin is data, so its +/- prefixes are not diff
+        // colours. Agent-side bounds retain both ends of long input.
+        let line = neutralize_display_text(raw);
+        let style = if process_input {
+            dim
+        } else {
+            match line.as_bytes().first() {
+                Some(b'+') => Style::default().fg(Color::Green),
+                Some(b'-') => Style::default().fg(Color::Red),
+                _ => dim,
+            }
+        };
+        lines.extend(wrap_prefixed("  ", &line, width, style, style));
+    }
 }
 
 /// Rows the y/a/n choice block occupies at the bottom of the panel.

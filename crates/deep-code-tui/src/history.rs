@@ -333,16 +333,15 @@ pub enum HistoryCell {
     /// unified diff of the file before and after, as the tool computed it from
     /// the bytes it wrote — so a fuzzy-matched `apply_patch` shows the
     /// re-indented text it spliced, not the model's `new` argument. `/diff`
-    /// renders the working tree the same way. Live-only: the session record
-    /// keeps the model-facing result, not this, so a resumed transcript shows
-    /// none.
+    /// renders the working tree the same way. Live and resumed transcripts use
+    /// the bounded preview retained in the tool's details.
     Diff {
         /// Workspace-relative file path, or the `/diff` scope label.
         path: String,
         diff: String,
         added: usize,
         removed: usize,
-        /// The producer cut the diff at its cap; what is here is the head.
+        /// Only a bounded portion of the diff is available inline.
         truncated: bool,
         /// Created by this write — the diff is all additions.
         new_file: bool,
@@ -672,6 +671,14 @@ impl HistoryCell {
 /// checkpoint associations intact when compaction removes older entries.
 pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
     let mut cells = Vec::new();
+    let omitted_image_reports = record.turns.iter().fold(0u64, |omitted, turn| {
+        omitted.saturating_add(turn.image_reports_omitted)
+    });
+    if omitted_image_reports > 0 {
+        cells.push(HistoryCell::system(format!(
+            "较早的 {omitted_image_reports} 条图片观察报告已因保留预算省略；仅保留近期报告。 / {omitted_image_reports} earlier image observation reports omitted by the retention budget; only recent reports are retained."
+        )));
+    }
     let mut current_turn: Vec<HistoryCell> = Vec::new();
     let mut open_turn: Option<&TurnId> = None;
 
@@ -687,7 +694,7 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
         }
         match &entry.kind {
             EntryKind::User { content, .. } => {
-                current_turn.push(HistoryCell::user(content.clone()));
+                current_turn.push(HistoryCell::user(content.summary_text()));
             }
             EntryKind::System { .. } => {}
             EntryKind::Assistant {
@@ -712,10 +719,9 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
                     // already ARE one batch, so this needs no segmentation of
                     // its own — a non-qualifying exchange simply breaks the run
                     // by being pushed between the qualifying ones.
-                    let summary = exchange
-                        .result
-                        .as_ref()
-                        .map(|result| summarize_tool_result(&result.content));
+                    let summary = exchange.result.as_ref().map(|result| {
+                        summarize_tool_observation(&result.content, result.details.as_ref())
+                    });
                     // The approval the record kept, mapped back onto what the
                     // live view showed. `asked` is that predicate exactly — the
                     // live badge appears iff the request was put in front of a
@@ -772,12 +778,19 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
                             status: result.status,
                             summary,
                         });
+                        if let Some(diff) = HistoryCell::edit_diff(result.details.as_ref()) {
+                            current_turn.push(diff);
+                        }
+                        if let Some(todo) = HistoryCell::todo_from(result.details.as_ref()) {
+                            current_turn.push(todo);
+                        }
                     }
                 }
             }
             EntryKind::Compaction {
                 summary,
                 archived_count,
+                ..
             } => {
                 // The record carries no token counts, so a replayed cell can
                 // say what was folded but not what it bought.
@@ -798,6 +811,23 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
 }
 
 fn append_turn_checkpoints(cells: &mut Vec<HistoryCell>, record: &SessionRecord, turn_id: &TurnId) {
+    if let Some(turn) = record.turns.iter().find(|turn| &turn.id == turn_id) {
+        for request in &turn.image_requests {
+            let reasons = request
+                .images
+                .iter()
+                .filter(|image| !image.included)
+                .filter_map(|image| image.reason.as_deref())
+                .collect::<Vec<_>>();
+            if !reasons.is_empty() {
+                cells.push(HistoryCell::system(format!(
+                    "{}: {}",
+                    request.model,
+                    reasons.join("\n")
+                )));
+            }
+        }
+    }
     for checkpoint in &record.checkpoints {
         if &checkpoint.turn_id == turn_id {
             cells.push(HistoryCell::Checkpoint {
@@ -806,6 +836,191 @@ fn append_turn_checkpoints(cells: &mut Vec<HistoryCell>, record: &SessionRecord,
             });
         }
     }
+}
+
+/// Project ordered observations for a text transcript. Execution details carry
+/// stream completeness independently of the bounded model-facing text.
+pub(crate) fn summarize_tool_observation(
+    content: &deep_code_agent::Content,
+    details: Option<&serde_json::Value>,
+) -> String {
+    let mut summary = details
+        .and_then(summarize_execution)
+        .unwrap_or_else(|| summarize_tool_result(&content.summary_text()));
+    if let Some(storage) = details.and_then(summarize_details_storage) {
+        if !summary.is_empty() {
+            summary.push_str("; ");
+        }
+        summary.push_str(&storage);
+    }
+    summary
+}
+
+fn summarize_details_storage(details: &serde_json::Value) -> Option<String> {
+    let storage = details.get("details_storage")?.as_object()?;
+    if storage
+        .get("inline_truncated")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return None;
+    }
+    let mut summary = "details preview truncated".to_string();
+    if let Some(bytes) = storage
+        .get("original_bytes")
+        .and_then(serde_json::Value::as_u64)
+    {
+        summary.push_str(&format!(" ({bytes} bytes originally)"));
+    }
+    if let Some(path) = storage
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty())
+    {
+        let extent = if storage.get("complete").and_then(serde_json::Value::as_bool) == Some(true) {
+            "full"
+        } else {
+            "partial"
+        };
+        summary.push_str(&format!(
+            "; {extent} details saved {}",
+            truncate_chars(&collapse_whitespace(path), 160)
+        ));
+    } else {
+        summary.push_str("; omitted details unavailable");
+    }
+    if let Some(error) = storage
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .filter(|error| !error.is_empty())
+    {
+        summary.push_str(&format!(
+            "; details storage: {}",
+            truncate_chars(&collapse_whitespace(error), 160)
+        ));
+    }
+    Some(summary)
+}
+
+fn summarize_execution(details: &serde_json::Value) -> Option<String> {
+    let object = details.as_object()?;
+    let page = object
+        .get("output_page")
+        .and_then(serde_json::Value::as_object);
+    let job = object.get("job_id")?.as_str()?;
+    let stdout = object.get("stdout")?.as_object()?;
+    let stderr = object.get("stderr")?.as_object()?;
+    let status = object.get("status")?.as_str()?;
+    let exit = object
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .map_or_else(|| "none".to_string(), |code| code.to_string());
+    let command = object
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let mut summary = format!(
+        "{job}: {status} exit={exit} ({})",
+        truncate_chars(command, 80)
+    );
+    if let Some(error) = object
+        .get("input_error")
+        .and_then(serde_json::Value::as_str)
+    {
+        summary.push_str(&format!("; stdin: {}", truncate_chars(error, 120)));
+    }
+    for (name, stream) in [("stdout", stdout), ("stderr", stderr)] {
+        if page.is_none()
+            && stream
+                .get("inline_truncated")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        {
+            let omitted = stream
+                .get("omitted_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            summary.push_str(&format!("; {name} truncated ({omitted} bytes omitted)"));
+            if let Some(spill) = stream.get("spill").filter(|spill| spill.is_object()) {
+                if let Some(path) = spill.get("path").and_then(serde_json::Value::as_str) {
+                    summary.push_str(&format!(", saved {}", truncate_chars(path, 100)));
+                }
+                if spill.get("capped").and_then(serde_json::Value::as_bool) == Some(true) {
+                    summary.push_str(" (file contains head only)");
+                }
+            }
+        }
+        if let Some(error) = stream.get("read_error").and_then(serde_json::Value::as_str) {
+            summary.push_str(&format!(
+                "; {name} capture failed: {}",
+                truncate_chars(error, 120)
+            ));
+        } else if stream
+            .get("capture_complete")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        {
+            summary.push_str(&format!("; {name} capture incomplete"));
+        }
+        if let Some(text) = stream
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            summary.push_str(&format!(
+                "; {name}: {}",
+                truncate_chars(&collapse_whitespace(text), 100)
+            ));
+        }
+    }
+    if let Some(page) = page {
+        let number = |key| {
+            page.get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        let stream = page
+            .get("stream")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("output");
+        summary.push_str(&format!(
+            "; {stream} bytes {}..{} of {}",
+            number("start_byte"),
+            number("end_byte"),
+            number("total_bytes")
+        ));
+        if number("unavailable_before_byte") > 0 {
+            summary.push_str(&format!(
+                "; bytes before {} unavailable from memory",
+                number("unavailable_before_byte")
+            ));
+        }
+        if let Some(next) = page
+            .get("next_start_byte")
+            .and_then(serde_json::Value::as_u64)
+        {
+            let action = if page.get("has_more").and_then(serde_json::Value::as_bool) == Some(true)
+            {
+                "next byte"
+            } else {
+                "waiting for output at byte"
+            };
+            summary.push_str(&format!("; {action} {next}"));
+        } else {
+            summary.push_str("; end of retained output");
+        }
+        if let Some(text) = page
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            summary.push_str(&format!(
+                "; {stream}: {}",
+                truncate_chars(&collapse_whitespace(text), 100)
+            ));
+        }
+    }
+    Some(summary)
 }
 
 pub(crate) fn summarize_tool_result(content: &str) -> String {
@@ -854,16 +1069,21 @@ fn summarize_json_tool_result(value: &serde_json::Value) -> Option<String> {
     if let Some(lines) = object.get("lines").and_then(serde_json::Value::as_array) {
         let total_lines = object
             .get("total_lines")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(lines.len() as u64);
+            .and_then(serde_json::Value::as_u64);
         let truncated = object
             .get("truncated")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        return Some(format!(
-            "{path}: {} lines shown of {total_lines} (truncated={truncated})",
-            lines.len()
-        ));
+        return Some(match total_lines {
+            Some(total) => format!(
+                "{path}: {} lines shown of {total} (truncated={truncated})",
+                lines.len()
+            ),
+            None => format!(
+                "{path}: {} lines shown (total unknown, truncated={truncated})",
+                lines.len()
+            ),
+        });
     }
 
     if let Some(matches) = object.get("matches").and_then(serde_json::Value::as_array) {
@@ -938,36 +1158,6 @@ fn summarize_json_tool_result(value: &serde_json::Value) -> Option<String> {
         .and_then(serde_json::Value::as_u64)
     {
         return Some(format!("{path}: {replacements} replacements"));
-    }
-
-    if let Some(command) = object.get("command").and_then(serde_json::Value::as_str) {
-        let status = object
-            .get("status")
-            .or_else(|| object.get("tool_status"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
-        let cwd = object
-            .get("cwd")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(".");
-        if let Some(job_id) = object.get("job_id").and_then(serde_json::Value::as_str) {
-            return Some(format!("{job_id}: {status} in {cwd} ({command})"));
-        }
-        if object.contains_key("stdout") || object.contains_key("stderr") {
-            let exit = object
-                .get("exit_code")
-                .and_then(serde_json::Value::as_i64)
-                .map_or("none".to_string(), |code| code.to_string());
-            return Some(format!("{status} exit={exit} in {cwd} ({command})"));
-        }
-    }
-
-    if let Some(job_id) = object.get("job_id").and_then(serde_json::Value::as_str) {
-        let status = object
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
-        return Some(format!("{job_id}: {status}"));
     }
 
     None

@@ -1,171 +1,193 @@
-//! Model-facing rendering of shell/job output: the plain-text result body, the
-//! truncation and sandbox-denial notes, the `job` tool's status/tail snapshot
-//! and details JSON, and the byte/duration formatters.
-//!
-//! Split from the process/buffer machinery in the parent module — this is
-//! presentation, not job bookkeeping, and it reaches `JobState`/`SharedBuffer`
-//! only through their accessors. The one thing it changes on disk is the
-//! spill file a stream turned out not to need (`discard_unreported_spill`):
-//! the renderer is the first to know both streams' final sizes, so that
-//! decision has to be made here (see `shell_text_output`). `use super::*`
-//! inherits the parent's types and constants.
+//! Model and UI projections of a captured execution state.
 
 use super::*;
-use serde_json::{Value, json};
+use crate::tool::ToolOutput;
+#[cfg(test)]
+use serde_json::Value;
 
-/// Model-facing plain-text output for a finished foreground shell command.
+pub(in crate::shell_tools) fn job_output(
+    job_id: &str,
+    job: &JobState,
+    max_chars: usize,
+) -> ToolOutput {
+    let snapshot = ExecutionSnapshot::capture(job_id, job, max_chars.min(INLINE_STREAM_CHARS));
+    let text = render_snapshot(&snapshot, denial_note(job));
+    let details = serde_json::to_value(&snapshot).expect("execution snapshots are serializable");
+    if snapshot.stdout.finished && !snapshot.stdout.inline_truncated {
+        job.stdout.discard_unreported_spill();
+    }
+    if snapshot.stderr.finished && !snapshot.stderr.inline_truncated {
+        job.stderr.discard_unreported_spill();
+    }
+    ToolOutput::text(text).with_details(details)
+}
+
+pub(in crate::shell_tools) fn job_page_output(
+    job_id: &str,
+    job: &JobState,
+    stream: super::super::JobStream,
+    start_byte: Option<u64>,
+    max_chars: usize,
+) -> Result<ToolOutput, ToolError> {
+    let buffer = match stream {
+        super::super::JobStream::Stdout => &job.stdout,
+        super::super::JobStream::Stderr => &job.stderr,
+    };
+    let page = buffer.page(stream, start_byte, max_chars)?;
+    // The page is the payload; two additional tail windows would duplicate it
+    // and overrun the shared model/details budgets.
+    let snapshot = ExecutionSnapshot::capture(job_id, job, 0);
+    let mut details = serde_json::to_value(&snapshot).expect("execution snapshots serialize");
+    details["output_page"] = serde_json::to_value(&page).expect("output pages serialize");
+    let mut text = format!(
+        "{job_id} ({:?}) — {} · {} · cmd: {}\n[{} retained output bytes {}..{}; retained range {}..{}; finished={}; has_more={}]\n",
+        snapshot.kind,
+        snapshot.status.as_str(),
+        format_elapsed(snapshot.duration_ms),
+        crate::text_util::truncate_chars(&snapshot.command, 512),
+        stream.as_str(),
+        page.start_byte,
+        page.end_byte,
+        page.retained_start_byte,
+        page.total_bytes,
+        page.finished,
+        page.has_more,
+    );
+    if page.unavailable_before_byte > 0 {
+        text.push_str(&format!(
+            "[bytes before {} are unavailable as text from the ring; use a spill file if one was reported]\n",
+            page.unavailable_before_byte,
+        ));
+    }
+    text.push_str(&page.text);
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    if let Some(error) = &page.read_error {
+        text.push_str(&format!(
+            "[{} capture failed: {error}; output is incomplete]\n",
+            stream.as_str()
+        ));
+    }
+    if page.lossy_utf8 {
+        text.push_str("[invalid UTF-8 bytes are shown as replacement characters; byte cursors still refer to the original stream]\n");
+    }
+    match page.next_start_byte {
+        Some(next) => {
+            if !page.has_more {
+                text.push_str(
+                    "[no more buffered text now; wait for more output before resuming]\n",
+                );
+            }
+            text.push_str(&format!(
+                "[resume: job action=tail job_id={job_id} stream={} start_byte={next} max_chars={}]",
+                stream.as_str(), max_chars.min(INLINE_STREAM_CHARS),
+            ));
+        }
+        None => text.push_str("[end of retained output]"),
+    }
+    Ok(ToolOutput::text(text).with_details(details))
+}
+
+#[cfg(test)]
 pub(in crate::shell_tools) fn shell_text_output(
     job_id: &str,
     job: &JobState,
     max_chars: usize,
 ) -> String {
-    let stdout = tail_chars(&job.stdout.text(), max_chars);
-    let stderr = tail_chars(&job.stderr.text(), max_chars);
-    let elapsed = format_elapsed(job.started_at.elapsed().as_millis() as u64);
+    job_output(job_id, job, max_chars).content.text()
+}
 
-    let mut out = String::new();
-    if stdout.is_empty() && stderr.is_empty() {
+#[cfg(test)]
+pub(in crate::shell_tools) fn job_text_snapshot(
+    job_id: &str,
+    job: &JobState,
+    max_chars: usize,
+) -> String {
+    shell_text_output(job_id, job, max_chars)
+}
+
+#[cfg(test)]
+pub(in crate::shell_tools) fn job_details(job_id: &str, job: &JobState) -> Value {
+    job_output(job_id, job, INLINE_STREAM_CHARS)
+        .details
+        .expect("execution output carries details")
+}
+
+fn render_snapshot(snapshot: &ExecutionSnapshot, denial: Option<&str>) -> String {
+    let command = crate::text_util::truncate_chars(&snapshot.command, 512);
+    let mut out = format!(
+        "{} ({:?}) — {} · {} · cmd: {}\n[process status: {}; exit code: {}; stdin: {}]\n",
+        snapshot.job_id,
+        snapshot.kind,
+        snapshot.status.as_str(),
+        format_elapsed(snapshot.duration_ms),
+        command,
+        snapshot.status.as_str(),
+        snapshot
+            .exit_code
+            .map_or_else(|| "none".to_string(), |code| code.to_string()),
+        if snapshot.stdin_open {
+            "open"
+        } else {
+            "closed"
+        },
+    );
+    if snapshot.stdout.text.is_empty() && snapshot.stderr.text.is_empty() {
         out.push_str("(no output)\n");
-    } else {
-        if !stdout.is_empty() {
-            out.push_str(&stdout);
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-        }
-        if !stderr.is_empty() {
-            out.push_str("[stderr]\n");
-            out.push_str(&stderr);
+    }
+    for (name, stream) in [("stdout", &snapshot.stdout), ("stderr", &snapshot.stderr)] {
+        if !stream.text.is_empty() {
+            out.push_str(&format!("[{name}]\n{}", stream.text));
             if !out.ends_with('\n') {
                 out.push('\n');
             }
         }
     }
-
-    match job.status {
-        JobStatus::TimedOut => out.push_str(&format!(
-            "[timed out after {elapsed} — killed; use `job action=start` for long-running processes]"
-        )),
-        JobStatus::Cancelled => out.push_str(&format!("[cancelled after {elapsed}]")),
+    match snapshot.status {
+        JobStatus::Running => out
+            .push_str("[still running; this tool call returning does not mean the process exited]"),
+        JobStatus::TimedOut => {
+            out.push_str("[timed out — process killed; previous effects are not rolled back]")
+        }
+        JobStatus::Cancelled => {
+            out.push_str("[cancelled — process killed; previous effects are not rolled back]")
+        }
         _ => out.push_str(&format!(
-            "[exit {} · {elapsed}]",
-            job.exit_code.map_or_else(|| "?".to_string(), |code| code.to_string())
+            "[exit {} · {}]",
+            snapshot
+                .exit_code
+                .map_or_else(|| "?".to_string(), |code| code.to_string()),
+            format_elapsed(snapshot.duration_ms)
         )),
     }
-
-    let (rendered_chars, denial) = rendered_with_pending_denial(&out, job);
-    if let Some(note) = truncation_note(job_id, job, max_chars, rendered_chars) {
-        out.push('\n');
-        out.push_str(&note);
+    if let Some(error) = &snapshot.input_error {
+        out.push_str(&format!("\n[stdin: {error}]"));
+    }
+    for (name, stream) in [("stdout", &snapshot.stdout), ("stderr", &snapshot.stderr)] {
+        if stream.inline_truncated {
+            out.push_str(&format!("\n[{name} truncated"));
+            match &stream.spill {
+                Some(spill) if spill.capped => out.push_str(&format!(" — first {} saved: '{}' (output exceeded the per-stream cap, so the file holds the head only); read that file for the parts not shown]", format_bytes(spill.bytes), spill.path.display())),
+                Some(spill) => out.push_str(&format!(" — {} stream saved: '{}' ({}); read that file for the parts not shown]", if stream.capture_complete { "complete" } else { "captured" }, spill.path.display(), format_bytes(spill.bytes))),
+                None => out.push_str(&format!(" — page retained output: job action=tail job_id={} stream={name} start_byte={} max_chars={}; bytes before {} are unavailable from the ring]", snapshot.job_id, stream.omitted_bytes, INLINE_STREAM_CHARS, stream.omitted_bytes)),
+            }
+        }
+        if let Some(error) = &stream.read_error {
+            out.push_str(&format!(
+                "\n[{name} capture failed: {error}; output is incomplete]"
+            ));
+        } else if !stream.finished && snapshot.status != JobStatus::Running {
+            out.push_str(&format!(
+                "\n[{name} capture has not reached EOF; output may still be draining]"
+            ));
+        }
     }
     if let Some(note) = denial {
         out.push('\n');
         out.push_str(note);
     }
-
-    // Both streams are complete and the joint result has been measured, so
-    // this is the first point where "that file was redundant" can be decided
-    // truthfully. `truncation_note` has already claimed every file it names,
-    // so whatever is still unclaimed here belongs to a result that shows
-    // everything inline. Runs before `job_details`, which would otherwise
-    // hand the model a path to a file with nothing in it worth reading.
-    if rendered_chars <= crate::runtime::tool_result::TOOL_OUTPUT_BUDGET
-        && job.stdout.omitted_len() == 0
-        && job.stderr.omitted_len() == 0
-    {
-        job.stdout.discard_unreported_spill();
-        job.stderr.discard_unreported_spill();
-    }
     out
-}
-
-/// How large `out` will be once the denial note has been appended, plus the
-/// note itself so the caller does not look it up twice.
-///
-/// Both renderings append that note AFTER asking `truncation_note` whether
-/// anything was dropped, so both have to count it BEFORE asking (the notes
-/// run ~350-400 chars): measuring without it put a failed sandboxed build at
-/// 12,039 rendered chars against a 12,000 budget with `result_elided`
-/// computed as false, so 4,039 characters went out with no truncation note,
-/// no spill file and no tail hint.
-///
-/// Shared rather than open-coded because it was open-coded: the fix landed in
-/// `shell_text_output` and `job_text_snapshot` kept passing a bare
-/// `out.chars().count()`, so `job action=tail` on a failed sandboxed job went
-/// on silently dropping ~4k chars while the commit that fixed it claimed both
-/// renderings now agreed. One function is what makes that claim checkable.
-fn rendered_with_pending_denial(out: &str, job: &JobState) -> (usize, Option<&'static str>) {
-    let denial = denial_note(job);
-    // `+ 1` for the newline each caller writes before the note.
-    let pending = denial.map_or(0, |note| note.chars().count() + 1);
-    (out.chars().count() + pending, denial)
-}
-
-/// The truncation note for both renderings, or `None` when the inline text
-/// carries the complete streams.
-///
-/// Two honesty fixes over the old ring-only check: the note now also fires
-/// when `tail_chars` alone cut content (a stream previously truncated with NO
-/// indication at all), and when a spill file exists it names the absolute path
-/// and size — an actionable pointer instead of the dead-end `job action=tail`
-/// (whose window is capped and whose record is evicted after 32 jobs; the file
-/// outlives both).
-///
-/// "Lost" is judged against the SMALLER of this rendering's own window and
-/// [`crate::runtime::tool_result::TOOL_OUTPUT_BUDGET`], the chars a tool
-/// result keeps after the runtime
-/// bounds it. Judging by the window alone made the note unreachable for the
-/// band between the two: the shell layer handed over 20k chars believing them
-/// all visible, and the runtime then elided the middle without a word.
-fn truncation_note(
-    job_id: &str,
-    job: &JobState,
-    max_chars: usize,
-    rendered_chars: usize,
-) -> Option<String> {
-    let budget = crate::runtime::tool_result::TOOL_OUTPUT_BUDGET;
-    let retained = max_chars.min(budget);
-    // The runtime bounds the WHOLE rendered result — both streams plus the
-    // framing between them — so once that total is over budget the middle is
-    // being elided no matter how modest either stream looks alone. Judging the
-    // streams one at a time missed exactly that: `seq 1 1500; seq 1 1500 >&2`
-    // is two 6,393-char streams, neither over the budget, ~12.8k rendered, and
-    // ~4.8k characters silently dropped with no note and no file. Framing was
-    // uncounted even for a single stream, which put the boundary ~17 chars off.
-    let result_elided = rendered_chars > budget;
-    let mut lines = Vec::new();
-    let mut lost_without_file = false;
-    for (label, buffer) in [("stdout", &job.stdout), ("stderr", &job.stderr)] {
-        let full = buffer.text();
-        let lost = buffer.omitted_len() > 0
-            || full.chars().count() > retained
-            || (result_elided && !full.is_empty());
-        if !lost {
-            continue;
-        }
-        match buffer.spill_info_reported() {
-            // A capped file is NOT the complete stream — it stops at the
-            // per-stream ceiling — so it must not be announced as one, and the
-            // instruction has to stay true for what is actually on disk.
-            Some(info) if info.capped => lines.push(format!(
-                "[{label} truncated — first {} saved: '{}' (output exceeded the per-stream cap, so the file holds the head only); grep or read that file for the parts not shown]",
-                format_bytes(info.bytes),
-                info.path.display(),
-            )),
-            Some(info) => lines.push(format!(
-                "[{label} truncated — complete stream saved: '{}' ({}); grep or read that file for the parts not shown]",
-                info.path.display(),
-                format_bytes(info.bytes),
-            )),
-            None => lost_without_file = true,
-        }
-    }
-    if lost_without_file {
-        lines.push(format!(
-            "[output truncated — fuller tail: job action=tail job_id={job_id}]"
-        ));
-    }
-    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// The sandbox-denial note for a failed sandboxed command, or `None` when the
@@ -210,75 +232,6 @@ fn denial_note(job: &JobState) -> Option<&'static str> {
         .then_some(crate::sandbox::WRITE_DENIAL_NOTE)
 }
 
-/// Model-facing plain-text snapshot for job status/tail.
-pub(in crate::shell_tools) fn job_text_snapshot(
-    job_id: &str,
-    job: &JobState,
-    max_chars: usize,
-) -> String {
-    let kind = match job.kind {
-        JobKind::Foreground => "foreground",
-        JobKind::Background => "background",
-    };
-    let exit = job
-        .exit_code
-        .map_or_else(String::new, |code| format!(" · exit {code}"));
-    let mut out = format!(
-        "{job_id} ({kind}) — {}{exit} · {} · cmd: {}\n",
-        job.status.as_str(),
-        format_elapsed(job.started_at.elapsed().as_millis() as u64),
-        job.command
-    );
-    let stdout = tail_chars(&job.stdout.text(), max_chars);
-    let stderr = tail_chars(&job.stderr.text(), max_chars);
-    if !stdout.is_empty() {
-        out.push_str("[stdout]\n");
-        out.push_str(&stdout);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-    if !stderr.is_empty() {
-        out.push_str("[stderr]\n");
-        out.push_str(&stderr);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-    if stdout.is_empty() && stderr.is_empty() {
-        out.push_str("(no output)\n");
-    }
-    let (rendered_chars, denial) = rendered_with_pending_denial(&out, job);
-    if let Some(note) = truncation_note(job_id, job, max_chars, rendered_chars) {
-        out.push_str(&note);
-        out.push('\n');
-    }
-    if let Some(note) = denial {
-        out.push_str(note);
-        out.push('\n');
-    }
-    out
-}
-
-/// UI-facing structured details for any job-backed result.
-pub(in crate::shell_tools) fn job_details(job_id: &str, job: &JobState) -> Value {
-    json!({
-        "job_id": job_id,
-        "kind": job.kind,
-        "command": job.command,
-        "cwd": job.cwd,
-        "status": job.status,
-        "exit_code": job.exit_code,
-        "duration_ms": job.started_at.elapsed().as_millis() as u64,
-        "stdout_len": job.stdout.total_len(),
-        "stderr_len": job.stderr.total_len(),
-        "stdout_truncated": job.stdout.omitted_len() > 0,
-        "stderr_truncated": job.stderr.omitted_len() > 0,
-        "stdout_spill_path": job.stdout.spill_info_reported().map(|info| info.path.display().to_string()),
-        "stderr_spill_path": job.stderr.spill_info_reported().map(|info| info.path.display().to_string()),
-    })
-}
-
 /// Human-readable byte size for the truncation note (whole units, one
 /// decimal from MB up — precision is noise at these magnitudes).
 fn format_bytes(bytes: u64) -> String {
@@ -297,12 +250,4 @@ fn format_elapsed(ms: u64) -> String {
     } else {
         format!("{:.1}s", ms as f64 / 1_000.0)
     }
-}
-
-fn tail_chars(value: &str, max_chars: usize) -> String {
-    let count = value.chars().count();
-    if count <= max_chars {
-        return value.to_string();
-    }
-    value.chars().skip(count - max_chars).collect()
 }

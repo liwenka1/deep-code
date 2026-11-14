@@ -4,10 +4,11 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tokio::process::ChildStdin;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use std::path::{Path, PathBuf};
@@ -20,8 +21,8 @@ use crate::workspace_policy::WorkspaceRoots;
 use crate::workspace_policy::{WorkspacePolicy, invalid};
 pub use jobs::JobStore;
 use jobs::{
-    ChunkFn, JobKind, JobState, JobStatus, SharedBuffer, SpillOwner, cancel_job, job_details,
-    job_text_snapshot, kill_process_group, kill_process_tree, refresh_job, shell_text_output,
+    ChunkFn, JobInput, JobKind, JobState, JobStatus, SharedBuffer, SpillOwner, cancel_job,
+    job_output, job_page_output, kill_process_group, kill_process_tree, refresh_job,
     spawn_buffer_reader,
 };
 
@@ -53,7 +54,7 @@ fn scrub_secret_env(cmd: &mut tokio::process::Command) {
 /// with grep/head filters just to see a different slice of the output.
 /// Appended to all four shell/job descriptions — spilling is not a sandbox
 /// concern, so confined and unconfined hosts behave identically.
-const SPILL_DESC: &str = " When output overflows the inline window, the complete stream is saved to a file under .deep-code/spill/ and the result names its absolute path — grep or read that file instead of re-running the command with filters.";
+const SPILL_DESC: &str = " Optional stdin sends UTF-8 bytes followed by EOF. Background start with interactive=true retains a pipe; action=input sends exact bytes, close_stdin sends EOF. These are pipes, not a PTY; programs may buffer output. Input dispatch is not proof of processing, and job IDs belong to this runtime only. When output overflows the inline window, captured output is saved to a file under .deep-code/spill/ and the result names its absolute path. If no file is available, use job action=tail with stream=stdout|stderr and start_byte to page through retained output; follow output_page.next_start_byte while has_more is true. A running stream with has_more=false needs more output before resuming. Bytes older than the retained range are unavailable from memory.";
 
 /// Shell tool description for hosts whose sandbox really confines the command.
 const SHELL_DESC_CONFINED: &str = "Run a foreground shell command in the workspace; output streams live and the process is killed at the timeout. Use it for git (status/diff/log), builds, and tests; start long-running processes (dev servers) with the job tool instead. Commands run sandboxed without network; set network=true when one needs it (installs, git remote ops) — a failed download/connection usually means the run lacked the network grant. Writes are confined to the granted roots (the workspace and --add-dir directories): a write outside them fails with e.g. 'Operation not permitted', and no retry, sudo or chmod can succeed — request the directory with the request_write_root tool instead (the user decides).";
@@ -243,15 +244,25 @@ fn sandbox_roots(root: &WorkspacePolicy, cx: &ToolCx) -> Vec<PathBuf> {
     roots
 }
 
+struct SpawnOptions<'a> {
+    cwd: &'a Path,
+    policy: &'a SandboxPolicy,
+    stdin_piped: bool,
+}
+
 fn spawn_confined(
     sandbox: &SandboxManager,
     granted_roots: &[PathBuf],
     form: CommandForm<'_>,
-    cwd: &Path,
-    policy: &SandboxPolicy,
+    options: SpawnOptions<'_>,
     tool_name: &str,
     error_context: &str,
 ) -> Result<(tokio::process::Child, Option<SandboxGuard>), ToolError> {
+    let SpawnOptions {
+        cwd,
+        policy,
+        stdin_piped,
+    } = options;
     // Refuse rather than run bare when the policy wanted a sandbox but this
     // host has no backend: the safety model treats the OS sandbox as the real
     // boundary, so a command that would otherwise escape unconfined must not
@@ -295,13 +306,16 @@ fn spawn_confined(
     }
     let mut cmd = tokio::process::Command::from(std_cmd);
     scrub_secret_env(&mut cmd);
-    // Detach stdin from the console (an inherited child restoring console mode
-    // on exit would drop our mouse capture), pipe both output streams, and kill
-    // the process if the handle is dropped.
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    // Never inherit the terminal. A pipe exists only for explicitly supplied
+    // input or an explicitly interactive background job.
+    cmd.stdin(if stdin_piped {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
     let child = cmd
         .spawn()
         .map_err(|error| ToolError::exec_failed(tool_name, format!("{error_context}: {error}")))?;
@@ -375,43 +389,44 @@ fn steps_for(
 /// gone; the cap guards a lingering grandchild that inherited the pipe and
 /// keeps it open past the parent's exit.
 ///
-/// Says nothing about spill handles, and returns nothing, on purpose. It used
-/// to report whether it had aborted, so the caller could pay the
-/// `finish_spill` an aborted reader never reached — which made the release
-/// conditional on the *exceptional* path while the ordinary one still had each
-/// step's reader finish the run's shared buffers at its own end-of-stream.
-/// That is the same lost output, on the common path: see [`SpillOwner`], which
-/// now settles ownership once, and the single release site after the step loop
-/// in [`ShellTool::run`].
+/// Returns whether both reader tasks joined successfully before the deadline. Spill
+/// lifetime is owned by the caller for the entire foreground sequence.
 async fn drain_readers(
     stdout_task: Option<tokio::task::JoinHandle<()>>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
-) {
-    let stdout_abort = stdout_task.as_ref().map(|task| task.abort_handle());
-    let stderr_abort = stderr_task.as_ref().map(|task| task.abort_handle());
-    let drain = async {
-        if let Some(task) = stdout_task {
-            let _ = task.await;
-        }
-        if let Some(task) = stderr_task {
-            let _ = task.await;
-        }
+    stdout: &SharedBuffer,
+    stderr: &SharedBuffer,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    let (stdout_ok, stderr_ok) = tokio::join!(
+        drain_reader(stdout_task, stdout, "stdout", deadline),
+        drain_reader(stderr_task, stderr, "stderr", deadline),
+    );
+    stdout_ok && stderr_ok
+}
+
+async fn drain_reader(
+    task: Option<tokio::task::JoinHandle<()>>,
+    buffer: &SharedBuffer,
+    stream: &str,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let Some(mut task) = task else {
+        return true;
     };
-    if tokio::time::timeout(Duration::from_millis(500), drain)
-        .await
-        .is_ok()
-    {
-        return;
-    }
-    // A grandchild that inherited the pipe kept it open past the cap: abort the
-    // reader tasks so they (and the pipe fds they hold) don't linger until that
-    // process finally exits (dropping the JoinHandle alone would only detach
-    // them, not stop them).
-    if let Some(abort) = stdout_abort {
-        abort.abort();
-    }
-    if let Some(abort) = stderr_abort {
-        abort.abort();
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            buffer.record_read_error(format!("{stream} output reader task failed: {error}"));
+            false
+        }
+        Err(_) => {
+            // Stop only the reader whose inherited pipe stayed open. A later
+            // foreground step still writes into this run-owned buffer.
+            task.abort();
+            buffer.record_read_error("output drain deadline reached before EOF".to_string());
+            false
+        }
     }
 }
 
@@ -446,6 +461,7 @@ fn abandon_job(jobs: &JobStore, job_id: &str) {
         return;
     };
     job.status = JobStatus::Failed;
+    job.finished_at = Some(Instant::now());
     job.exit_code = None;
 }
 
@@ -466,7 +482,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// deadline at all — so the ceiling is not the tool's limit, it is the point
 /// past which sitting in the foreground stops being the right shape.
 const MAX_TIMEOUT_SECS: u64 = 1800;
-const MAX_OUTPUT_CHARS: usize = 20_000;
+const MAX_OUTPUT_CHARS: usize = jobs::INLINE_STREAM_CHARS;
 const DEFAULT_TAIL_CHARS: u64 = 4_000;
 /// The most a `job tail` may ask for — the same window the foreground result
 /// body gets, derived rather than re-spelled: the tail is the escape hatch for
@@ -476,6 +492,30 @@ const MAX_TAIL_CHARS: u64 = MAX_OUTPUT_CHARS as u64;
 /// the ring capacity so the two cannot drift — the final output still carries
 /// the tail beyond this.
 const MAX_STREAMED_BYTES: usize = jobs::JOB_BUFFER_BYTES;
+const MAX_STDIN_BYTES: usize = 64 * 1024;
+
+fn validate_stdin(input: Option<&str>, tool_name: &str) -> Result<(), ToolError> {
+    if input.is_some_and(|input| input.len() > MAX_STDIN_BYTES) {
+        return Err(invalid(
+            tool_name,
+            format!("stdin exceeds the {MAX_STDIN_BYTES}-byte input limit"),
+        ));
+    }
+    Ok(())
+}
+
+fn write_initial_input(
+    pipe: ChildStdin,
+    input: String,
+    cx: &ToolCx,
+) -> tokio::task::JoinHandle<Result<(), String>> {
+    let cancel = cx.cancel_token().clone();
+    tokio::spawn(async move {
+        JobInput::new(pipe)
+            .send(input.as_bytes(), true, &cancel)
+            .await
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct ShellTools {
@@ -721,6 +761,8 @@ struct ShellParams {
     cwd: Option<String>,
     /// Timeout in seconds, default 120, max 1800; the command is killed at the deadline. For long runs (test suites, installs, dev servers) prefer the job tool, which has no deadline
     timeout_secs: Option<u64>,
+    /// Optional UTF-8 input, sent once followed by EOF. At most 64 KiB; requires a single command.
+    stdin: Option<String>,
     /// Set true when the command needs network access (downloads/installs, git push/pull/fetch/clone, curl). The sandbox blocks all network by default; a declaration routes through user approval.
     #[allow(dead_code)] // consumed by the execution policy from the raw arguments
     network: Option<bool>,
@@ -773,6 +815,7 @@ impl Tool for ShellTool {
         if command.is_empty() {
             return Err(invalid(Self::NAME, "command must not be empty"));
         }
+        validate_stdin(params.stdin.as_deref(), Self::NAME)?;
         let cwd = self.root.resolve_cwd(params.cwd.as_deref(), Self::NAME)?;
         let timeout = Duration::from_secs(
             params
@@ -782,6 +825,9 @@ impl Tool for ShellTool {
         );
         let policy = cx.sandbox_policy();
         let steps = steps_for(&command, cx.authority(), Self::NAME)?;
+        if params.stdin.is_some() && steps.len() != 1 {
+            return Err(invalid(Self::NAME, "stdin requires one foreground command"));
+        }
         let granted_roots = sandbox_roots(&self.root, cx);
 
         let started = Instant::now();
@@ -802,6 +848,7 @@ impl Tool for ShellTool {
                 command: command.clone(),
                 cwd: self.root.relative_display(&cwd),
                 started_at: started,
+                finished_at: None,
                 status: JobStatus::Running,
                 exit_code: None,
                 sandboxed: self.sandbox.should_sandbox(&policy),
@@ -809,6 +856,8 @@ impl Tool for ShellTool {
                 stdout: stdout.clone(),
                 stderr: stderr.clone(),
                 child: None,
+                input: None,
+                input_error: None,
                 job_guard: None,
             },
         );
@@ -827,6 +876,7 @@ impl Tool for ShellTool {
         // the ordinary path and the failure paths become separate spellings of
         // one rule, which is exactly how the release came to be conditional in
         // the first place.
+        let mut input_error = None;
         let sequence: Result<(JobStatus, Option<i32>), ToolError> = async {
             let mut outcome = (JobStatus::Completed, Some(0));
             let mut previous_succeeded = true;
@@ -838,8 +888,11 @@ impl Tool for ShellTool {
                     &self.sandbox,
                     &granted_roots,
                     step.form.as_command_form(),
-                    &cwd,
-                    &policy,
+                    SpawnOptions {
+                        cwd: &cwd,
+                        policy: &policy,
+                        stdin_piped: params.stdin.is_some(),
+                    },
                     Self::NAME,
                     "failed to start command",
                 ) {
@@ -872,6 +925,9 @@ impl Tool for ShellTool {
                         Some(stream_chunk_fn(cx, "stderr", Arc::clone(&stream_budget))),
                         SpillOwner::Caller,
                     )
+                });
+                let input_task = child.stdin.take().map(|pipe| {
+                    write_initial_input(pipe, params.stdin.clone().unwrap_or_default(), cx)
                 });
 
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -909,7 +965,19 @@ impl Tool for ShellTool {
                 kill_process_group(child_pid);
                 #[cfg(windows)]
                 drop(_guard);
-                drain_readers(stdout_task, stderr_task).await;
+                drain_readers(stdout_task, stderr_task, &stdout, &stderr).await;
+                if let Some(mut task) = input_task {
+                    match tokio::time::timeout(Duration::from_millis(500), &mut task).await {
+                        Ok(Ok(Ok(()))) => {}
+                        Ok(Ok(Err(error))) => input_error = Some(error),
+                        Ok(Err(error)) => input_error = Some(format!("stdin task failed: {error}")),
+                        Err(_) => {
+                            task.abort();
+                            let _ = task.await;
+                            input_error = Some("stdin delivery did not settle; input may have been partially delivered".to_string());
+                        }
+                    }
+                }
                 outcome = (status, exit_code);
                 previous_succeeded = status == JobStatus::Completed;
                 if matches!(status, JobStatus::Cancelled | JobStatus::TimedOut) {
@@ -922,8 +990,8 @@ impl Tool for ShellTool {
 
         // The run is over, so the run releases the spill handles it owns — see
         // [`SpillOwner`] for why no reader may. Unconditional, and BEFORE the
-        // result is rendered: `shell_text_output` calls
-        // `discard_unreported_spill`, which removes the file, and removing a
+        // result is rendered: `job_output` calls
+        // `discard_unreported_spill`, which removes redundant files; removing a
         // file with an open handle fails on Windows.
         stdout.finish_spill();
         stderr.finish_spill();
@@ -939,15 +1007,17 @@ impl Tool for ShellTool {
         let job = self.jobs.get(&job_id, Self::NAME)?;
         let mut job = job.lock().expect("job lock poisoned");
         job.status = status;
+        job.finished_at = Some(Instant::now());
         job.exit_code = exit_code;
-        let content = shell_text_output(&job_id, &job, MAX_OUTPUT_CHARS);
-        let details = job_details(&job_id, &job);
-        Ok(ToolOutput::text(content).with_details(details))
+        job.input_error = input_error;
+        stdout.finish_stream(None);
+        stderr.finish_stream(None);
+        Ok(job_output(&job_id, &job, MAX_OUTPUT_CHARS))
     }
 }
 
 /// Background job management: `action=start` launches, `status`/`tail`
-/// inspect, `cancel` kills.
+/// inspect, `cancel` kills, and explicitly interactive jobs accept bounded input.
 #[derive(Debug, Clone)]
 struct JobTool {
     root: WorkspacePolicy,
@@ -983,6 +1053,7 @@ impl JobTool {
         if command.is_empty() {
             return Err(invalid(Self::NAME, "command must not be empty"));
         }
+        validate_stdin(params.stdin.as_deref(), Self::NAME)?;
         let cwd = self.root.resolve_cwd(params.cwd.as_deref(), Self::NAME)?;
         let policy = cx.sandbox_policy();
         // A background job is one process the store can own and kill. An
@@ -1007,13 +1078,17 @@ impl JobTool {
             &self.sandbox,
             &sandbox_roots(&self.root, cx),
             step.form.as_command_form(),
-            &cwd,
-            &policy,
+            SpawnOptions {
+                cwd: &cwd,
+                policy: &policy,
+                stdin_piped: params.interactive || params.stdin.is_some(),
+            },
             Self::NAME,
             "failed to start background command",
         )?;
         let job_id = self.jobs.reserve_id();
         let (stdout, stderr) = spill_buffers(&self.spill_dir, &job_id);
+        let input = child.stdin.take().map(JobInput::new);
         // One process, one reader per stream, and nothing comes back to these
         // buffers afterwards — the reader is the last writer, so it owns the
         // spill handle (`SpillOwner::Reader`). A background job has no step
@@ -1042,6 +1117,7 @@ impl JobTool {
                 command: command.clone(),
                 cwd: self.root.relative_display(&cwd),
                 started_at: Instant::now(),
+                finished_at: None,
                 status: JobStatus::Running,
                 exit_code: None,
                 sandboxed: self.sandbox.should_sandbox(&policy),
@@ -1049,20 +1125,29 @@ impl JobTool {
                 stdout,
                 stderr,
                 child: Some(child),
+                input: input.clone(),
+                input_error: None,
                 job_guard,
             },
         );
 
         drop(spawn_guard);
         let job = self.jobs.get(&job_id, Self::NAME)?;
-        let details = {
-            let job = job.lock().expect("job lock poisoned");
-            job_details(&job_id, &job)
-        };
-        Ok(
-            ToolOutput::text(format!("started {job_id} (background): {command}"))
-                .with_details(details),
-        )
+        if let Some(input) = input
+            && (params.stdin.is_some() || !params.interactive)
+            && let Err(error) = input
+                .send(
+                    params.stdin.as_deref().unwrap_or_default().as_bytes(),
+                    !params.interactive,
+                    cx.cancel_token(),
+                )
+                .await
+        {
+            job.lock().expect("job lock poisoned").input_error = Some(error);
+        }
+        let mut job = job.lock().expect("job lock poisoned");
+        refresh_job(&mut job);
+        Ok(job_output(&job_id, &job, DEFAULT_TAIL_CHARS as usize))
     }
 
     fn snapshot(&self, params: &JobParams, max_chars: usize) -> Result<ToolOutput, ToolError> {
@@ -1070,8 +1155,10 @@ impl JobTool {
         let job = self.jobs.get(job_id, Self::NAME)?;
         let mut job = job.lock().expect("job lock poisoned");
         refresh_job(&mut job);
-        Ok(ToolOutput::text(job_text_snapshot(job_id, &job, max_chars))
-            .with_details(job_details(job_id, &job)))
+        if let Some(stream) = params.stream {
+            return job_page_output(job_id, &job, stream, params.start_byte, max_chars);
+        }
+        Ok(job_output(job_id, &job, max_chars))
     }
 
     async fn cancel(&self, params: &JobParams) -> Result<ToolOutput, ToolError> {
@@ -1083,10 +1170,64 @@ impl JobTool {
         }
         cancel_job(&job, Self::NAME).await?;
         let job = job.lock().expect("job lock poisoned");
-        Ok(
-            ToolOutput::text(job_text_snapshot(job_id, &job, DEFAULT_TAIL_CHARS as usize))
-                .with_details(job_details(job_id, &job)),
-        )
+        Ok(job_output(job_id, &job, DEFAULT_TAIL_CHARS as usize))
+    }
+
+    async fn input(
+        &self,
+        params: &JobParams,
+        cx: &ToolCx,
+        eof: bool,
+    ) -> Result<ToolOutput, ToolError> {
+        let bytes = if eof {
+            if params.stdin.is_some() {
+                return Err(invalid(
+                    Self::NAME,
+                    "close_stdin does not accept stdin; send input first",
+                ));
+            }
+            ""
+        } else {
+            params
+                .stdin
+                .as_deref()
+                .ok_or_else(|| invalid(Self::NAME, "action=input requires stdin"))?
+        };
+        validate_stdin(Some(bytes), Self::NAME)?;
+        let job_id = require_job_id(params)?;
+        let state = self.jobs.get(job_id, Self::NAME)?;
+        let input = {
+            let mut job = state.lock().expect("job lock poisoned");
+            refresh_job(&mut job);
+            if job.status != JobStatus::Running {
+                return Err(invalid(
+                    Self::NAME,
+                    "cannot write stdin after the process has ended",
+                ));
+            }
+            job.input.clone().ok_or_else(|| {
+                invalid(
+                    Self::NAME,
+                    "stdin is closed; start the job with interactive=true to keep a pipe open",
+                )
+            })?
+        };
+        if let Err(error) = input.send(bytes.as_bytes(), eof, cx.cancel_token()).await {
+            state.lock().expect("job lock poisoned").input_error = Some(error.clone());
+            return Err(ToolError::exec_failed(Self::NAME, error));
+        }
+        let mut job = state.lock().expect("job lock poisoned");
+        refresh_job(&mut job);
+        let mut result = job_output(job_id, &job, DEFAULT_TAIL_CHARS as usize);
+        result.content.push_text(if eof {
+            "\n[stdin EOF sent; process completion must be checked separately]".to_string()
+        } else {
+            format!(
+                "\n[{} stdin bytes dispatched; this does not prove the program processed them]",
+                bytes.len()
+            )
+        });
+        Ok(result)
     }
 }
 
@@ -1104,21 +1245,49 @@ enum JobAction {
     Status,
     Tail,
     Cancel,
+    Input,
+    CloseStdin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum JobStream {
+    Stdout,
+    Stderr,
+}
+
+impl JobStream {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct JobParams {
-    /// start launches a background command, status/tail inspect a job, cancel kills it
+    /// start launches; status/tail inspect; cancel kills; input writes bytes; close_stdin sends EOF
     action: JobAction,
     /// Shell command to launch (required for action=start)
     command: Option<String>,
+    /// Initial UTF-8 input on start, or the exact bytes sent by action=input. At most 64 KiB.
+    stdin: Option<String>,
+    /// Start only: retain a stdin pipe for subsequent input and close_stdin actions. No PTY.
+    #[serde(default)]
+    interactive: bool,
     /// Optional workspace-relative working directory, start only (absolute allowed only inside a granted root)
     cwd: Option<String>,
-    /// Job id from a previous start (required for status/tail/cancel)
+    /// Runtime-owned job id from a previous start, required for every action except start
     job_id: Option<String>,
-    /// Tail size per stream for action=tail, default 4000, max 20000
+    /// Tail size per stream for action=tail, default 4000, max 4976
     max_chars: Option<u64>,
+    /// Tail only: select a single stream for bounded retained-output paging.
+    stream: Option<JobStream>,
+    /// Tail only, requires stream: absolute byte cursor from output_page.next_start_byte.
+    /// Omit to begin at the earliest retained text. Evicted bytes are reported explicitly.
+    start_byte: Option<u64>,
     /// start only: set true when the job needs network access — including binding/listening on a port (dev servers). The sandbox blocks all network by default; a declaration routes through user approval.
     #[allow(dead_code)] // consumed by the execution policy from the raw arguments
     network: Option<bool>,
@@ -1140,6 +1309,40 @@ impl Tool for JobTool {
     }
 
     async fn run(&self, params: JobParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+        if params.action == JobAction::Start && params.job_id.is_some() {
+            return Err(invalid(Self::NAME, "job_id is not accepted by start"));
+        }
+        if params.action != JobAction::Start
+            && (params.command.is_some()
+                || params.cwd.is_some()
+                || params.network.is_some()
+                || params.interactive)
+        {
+            return Err(invalid(
+                Self::NAME,
+                "command, cwd, network and interactive are start-only fields",
+            ));
+        }
+        if !matches!(params.action, JobAction::Start | JobAction::Input) && params.stdin.is_some() {
+            return Err(invalid(
+                Self::NAME,
+                "stdin is only accepted by start and input",
+            ));
+        }
+        if params.action != JobAction::Tail && params.max_chars.is_some() {
+            return Err(invalid(Self::NAME, "max_chars is only accepted by tail"));
+        }
+        if params.action != JobAction::Tail
+            && (params.stream.is_some() || params.start_byte.is_some())
+        {
+            return Err(invalid(
+                Self::NAME,
+                "stream and start_byte are only accepted by tail",
+            ));
+        }
+        if params.start_byte.is_some() && params.stream.is_none() {
+            return Err(invalid(Self::NAME, "start_byte requires a stream selector"));
+        }
         match params.action {
             JobAction::Start => self.start(&params, cx).await,
             JobAction::Status => self.snapshot(&params, DEFAULT_TAIL_CHARS as usize),
@@ -1151,6 +1354,8 @@ impl Tool for JobTool {
                 self.snapshot(&params, max_chars)
             }
             JobAction::Cancel => self.cancel(&params).await,
+            JobAction::Input => self.input(&params, cx, false).await,
+            JobAction::CloseStdin => self.input(&params, cx, true).await,
         }
     }
 }

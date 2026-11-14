@@ -15,6 +15,13 @@ PR 的 CI 使用固定 Rust 工具链检查格式、Clippy、workspace 测试和
 node --test scripts/run-service-canary.test.mjs
 ```
 
+## 工具工作流回归
+
+常规 workspace 测试覆盖有序图文内容、图片快照身份与原生 tool 消息、逐请求视觉路由和省图记录、
+压缩后图片来源保留、超长 UTF-8 文本的字节游标续读、输出落盘完整性、标准输入及 EOF/取消、
+输入权限门，以及 TUI/HTTP/headless 的内容与执行状态投影。这些测试使用临时工作区、真实本地
+子进程和模拟模型客户端，不调用付费 API；协议序列化通过不代表已验证真实提供方的图片理解。
+
 ## 真实服务 canary
 
 `.github/workflows/service-canary.yml` 每周一 04:17 UTC 跑一次，也可从 Actions 的

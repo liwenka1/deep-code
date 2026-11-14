@@ -36,6 +36,7 @@ pub(crate) struct LiveSessionState {
     session_trusted_shell_prefixes: std::collections::HashSet<(String, bool)>,
     cascade_escalated: bool,
     last_prefix: Option<(usize, u64)>,
+    image_projections: super::state::ImageProjectionIndex,
 }
 
 impl AgentRuntime {
@@ -111,6 +112,9 @@ impl AgentRuntime {
             tools: Arc::new(tools),
             state: Arc::new(Mutex::new(RuntimeState {
                 session,
+                image_projections: super::state::ImageProjectionIndex::from_state(
+                    &record.image_projection_state,
+                ),
                 // Restore the lifetime cost totals so a resumed session keeps
                 // counting from its saved total instead of resetting to zero.
                 session_cost: record.session_cost,
@@ -139,19 +143,27 @@ impl AgentRuntime {
     /// Capture the actual idle conversation without depending on a successful
     /// save, a readable session file, or an available signing key.
     pub async fn live_snapshot(&self) -> std::io::Result<LiveSessionSnapshot> {
+        let workspace = self.workspace.clone().ok_or_else(|| {
+            std::io::Error::other("cannot reconfigure a runtime without a workspace")
+        })?;
+        let record_guard = if let Some(persistence) = &self.persistence {
+            Some(persistence.record.lock().await)
+        } else {
+            None
+        };
         let state = self.state.lock().await;
         if state.current_turn_id.is_some() || state.pending.is_some() {
             return Err(std::io::Error::other("cannot reconfigure an active turn"));
         }
-        let workspace = self.workspace.clone().ok_or_else(|| {
-            std::io::Error::other("cannot reconfigure a runtime without a workspace")
-        })?;
-        let mut record = if let Some(persistence) = &self.persistence {
-            persistence.record.lock().await.clone()
-        } else {
-            SessionRecord::new(workspace, "")
-        };
+        let mut record = record_guard
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| SessionRecord::new(workspace, ""));
         record.entries = state.session.entries().to_vec();
+        record.image_projection_state = state
+            .image_projections
+            .snapshot(&state.session.image_observation_ids());
+        record.limit_image_reports();
         record.session_cost = state.session_cost;
         record.session_cache_hit_tokens = state.session_cache_hit_tokens;
         record.session_cache_miss_tokens = state.session_cache_miss_tokens;
@@ -165,6 +177,7 @@ impl AgentRuntime {
                 session_trusted_shell_prefixes: state.session_trusted_shell_prefixes.clone(),
                 cascade_escalated: state.cascade_escalated,
                 last_prefix: state.last_prefix,
+                image_projections: state.image_projections.clone(),
             },
         })
     }
@@ -179,6 +192,7 @@ impl AgentRuntime {
             state.session_trusted_shell_prefixes = live.session_trusted_shell_prefixes;
             state.cascade_escalated = live.cascade_escalated;
             state.last_prefix = live.last_prefix;
+            state.image_projections = live.image_projections;
         }
         self
     }
@@ -215,27 +229,44 @@ impl AgentRuntime {
     /// and a `/compact` followed by a quit used to lose that spend.
     pub(super) async fn persist_with(&self, edit: impl FnOnce(&mut SessionRecord)) {
         let Some(persistence) = self.persistence.as_ref() else {
+            let mut state = self.state.lock().await;
+            let active = state.session.image_observation_ids();
+            state.image_projections.retain_observations(&active);
+            if let Some(turn) = &mut state.current_turn {
+                let mut remaining = crate::session_store::IMAGE_REPORT_BUDGET_BYTES;
+                turn.limit_image_reports(&mut remaining);
+            }
             return;
         };
-        let (entries, cost, cache_hit, cache_miss, savings) = {
-            let state = self.state.lock().await;
-            (
-                state.session.entries().to_vec(),
-                state.session_cost,
-                state.session_cache_hit_tokens,
-                state.session_cache_miss_tokens,
-                state.session_cache_savings,
-            )
-        };
         {
+            // Record first: waiting for disk serialization must not block turn
+            // cancellation. The same lock order is used by live_snapshot.
             let mut record = persistence.record.lock().await;
-            record.entries = entries;
-            // Flush the lifetime cost totals so resume restores them.
-            record.session_cost = cost;
-            record.session_cache_hit_tokens = cache_hit;
-            record.session_cache_miss_tokens = cache_miss;
-            record.session_cache_savings = savings;
+            let mut state = self.state.lock().await;
+            let active = state.session.image_observation_ids();
+            state.image_projections.retain_observations(&active);
+            record.entries = state.session.entries().to_vec();
+            record.image_projection_state = state.image_projections.snapshot(&active);
+            if let Some(turn) = state.current_turn.clone() {
+                if let Some(existing) = record.turns.iter_mut().find(|entry| entry.id == turn.id) {
+                    *existing = turn;
+                } else {
+                    record.turns.push(turn);
+                }
+            }
+            record.session_cost = state.session_cost;
+            record.session_cache_hit_tokens = state.session_cache_hit_tokens;
+            record.session_cache_miss_tokens = state.session_cache_miss_tokens;
+            record.session_cache_savings = state.session_cache_savings;
             edit(&mut record);
+            record.limit_image_reports();
+            // Keep the authority in sync, otherwise a later persist/finish
+            // would restore the unbounded current-turn report list.
+            if let Some(turn) = &mut state.current_turn
+                && let Some(saved) = record.turns.iter().find(|saved| saved.id == turn.id)
+            {
+                *turn = saved.clone();
+            }
             record.touch();
         }
         persistence.actor.request_save();
@@ -256,7 +287,11 @@ impl AgentRuntime {
             drop(state);
             if let Some(persistence) = self.persistence.as_ref() {
                 let mut record = persistence.record.lock().await;
-                record.turns.push(turn);
+                if let Some(existing) = record.turns.iter_mut().find(|entry| entry.id == turn.id) {
+                    *existing = turn;
+                } else {
+                    record.turns.push(turn);
+                }
                 record.touch();
             }
         } else {
@@ -280,6 +315,99 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn current_turn_report_pruning_survives_repeated_persistence_and_finish() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().canonicalize().unwrap();
+        let runtime = AgentRuntime::with_new_session(
+            crate::echo_client::EchoClient::new(crate::i18n::SharedLang::default()),
+            ToolRegistry::default(),
+            "system",
+            &workspace,
+            &AgentConfig::builtin(),
+        )
+        .unwrap();
+        let turn_id = runtime.begin_turn("observe").await;
+        let asset = crate::image::snapshot_bytes(&workspace, b"GIF89a-observation").unwrap();
+        let image = {
+            let mut state = runtime.state.lock().await;
+            state
+                .session
+                .push_user_with_images(turn_id.clone(), "steered image", vec![asset]);
+            let ids = state.session.image_observation_ids();
+            let image = crate::image::ImageDelivery {
+                observation_id: Some(ids.iter().next().unwrap().clone()),
+                message_index: 1,
+                block_index: 1,
+                call_id: None,
+                image: "asset".into(),
+                included: false,
+                reason: Some("x".repeat(4096)),
+            };
+            let mut archived = image.clone();
+            archived.observation_id = Some("archived-observation".into());
+            state.image_projections.changes("flash", &[archived]);
+            for index in 0..200 {
+                let model = if index % 2 == 0 { "flash" } else { "pro" };
+                state
+                    .image_projections
+                    .changes(model, std::slice::from_ref(&image));
+                state.current_turn.as_mut().unwrap().image_requests.push(
+                    crate::ImageRequestRecord {
+                        model: model.into(),
+                        images: vec![image.clone()],
+                    },
+                );
+            }
+            image
+        };
+        assert_eq!(runtime.flush_session().await, None);
+        let bounded = runtime.state.lock().await.current_turn.clone().unwrap();
+        assert!(bounded.image_reports_omitted > 0);
+        assert!(bounded.image_requests.len() < 200);
+        assert_eq!(runtime.flush_session().await, None);
+        assert_eq!(
+            runtime.state.lock().await.current_turn.as_ref(),
+            Some(&bounded)
+        );
+        runtime.finish_turn(&turn_id).await;
+        assert_eq!(runtime.flush_session().await, None);
+        let snapshot = runtime.live_snapshot().await.unwrap();
+        assert_eq!(snapshot.record.turns.last(), Some(&bounded));
+        assert_eq!(snapshot.record.image_projection_state.len(), 1);
+        assert_eq!(
+            snapshot.record.image_projection_state[0].observation_id,
+            image.observation_id.clone().unwrap()
+        );
+        assert_eq!(
+            snapshot.record.image_projection_state[0].fingerprint.len(),
+            64
+        );
+        let mut restored = super::super::state::ImageProjectionIndex::from_state(
+            &snapshot.record.image_projection_state,
+        );
+        assert!(
+            restored
+                .changes("pro", std::slice::from_ref(&image))
+                .is_empty()
+        );
+        assert_eq!(
+            restored.changes("flash", std::slice::from_ref(&image)),
+            vec![image]
+        );
+        let id = runtime.session_id().await.unwrap();
+        runtime.shutdown().await;
+        let saved = JsonSessionStore::for_workspace(&workspace)
+            .unwrap()
+            .load(&id)
+            .unwrap();
+        assert_eq!(saved.turns.last(), Some(&bounded));
+        assert_eq!(
+            saved.image_projection_state,
+            snapshot.record.image_projection_state
+        );
+    }
 
     #[tokio::test]
     async fn live_reconfiguration_preserves_memory_only_session_state() {

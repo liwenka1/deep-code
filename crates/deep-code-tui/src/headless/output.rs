@@ -6,6 +6,10 @@
 //!   `.result` / `.reasoning`). The README documents the current field set.
 //! - `stream-json`: NDJSON of the same envelopes the SSE server sends, so jq
 //!   paths (`.item.kind`, `.item.payload.text`) work unchanged against both.
+//!   Observation `content` fields are ordered text/image arrays; execution
+//!   details contain separate `stdout`/`stderr` stream snapshots. The final
+//!   report's `result` remains the assistant's text answer. Print-mode input
+//!   accepts text only; image assets in events come from tool observations.
 
 use std::io::Write;
 
@@ -130,7 +134,9 @@ mod tests {
         let mut buffer = Vec::new();
         {
             let mut emitter = NdjsonEmitter::new("print_test".to_string(), &mut buffer);
-            emitter.manual("user.message", serde_json::json!({ "content": "hi" }));
+            emitter.manual("user.message", serde_json::json!({
+                "content": deep_code_agent::Content::<deep_code_agent::ImageAsset>::from_text("hi")
+            }));
             emitter.event(&RuntimeEvent::AssistantDelta {
                 turn_id: TurnId("turn_test_0".to_string()),
                 text: "hello".to_string(),
@@ -145,6 +151,7 @@ mod tests {
         assert_eq!(envelopes.len(), 2);
         assert_eq!(envelopes[0].item.kind, "user.message");
         assert_eq!(envelopes[0].seq, 1);
+        assert_eq!(envelopes[0].item.payload["content"][0]["text"], "hi");
         // Same contract the bot's jq depends on for SSE: `.item.payload.text`.
         assert_eq!(envelopes[1].item.kind, "assistant.delta");
         assert_eq!(envelopes[1].seq, 2);
@@ -180,5 +187,64 @@ mod tests {
         assert_eq!(value["session_id"], "session_1_0");
         assert!(value.get("error").is_none(), "absent error must be omitted");
         assert!(value.get("cost").is_none());
+    }
+
+    #[test]
+    fn ndjson_keeps_content_arrays_execution_details_and_image_omission_reports() {
+        use deep_code_agent::{
+            Content, ContentBlock, ImageAsset, ImageDelivery, ImageFormat, ToolCallId, ToolResult,
+        };
+        let mut emitter = NdjsonEmitter::new("print_test".into(), Vec::new());
+        let mut result = ToolResult::success(
+            "call",
+            "read_file",
+            Content::new(vec![
+                ContentBlock::Text {
+                    text: "screenshot".into(),
+                },
+                ContentBlock::Image {
+                    image: ImageAsset {
+                        workspace: "/workspace".into(),
+                        digest: "a".repeat(64),
+                        format: ImageFormat::Png,
+                        bytes: 70,
+                    },
+                },
+            ]),
+        );
+        result.details = Some(serde_json::json!({
+            "stdout": { "text": "out", "capture_complete": true },
+            "stderr": { "text": "err", "capture_complete": false, "read_error": "read failed" }
+        }));
+        emitter.event(&RuntimeEvent::ToolCallFinished {
+            turn_id: Some(TurnId("turn".into())),
+            tool_call_id: ToolCallId("call".into()),
+            result,
+        });
+        emitter.event(&RuntimeEvent::ImageRequestPrepared {
+            turn_id: TurnId("turn".into()),
+            model: "text-only".into(),
+            images: vec![ImageDelivery {
+                observation_id: Some("fixture-observation".into()),
+                message_index: 2,
+                block_index: 1,
+                call_id: Some("call".into()),
+                image: "asset.png".into(),
+                included: false,
+                reason: Some("image not sent".into()),
+            }],
+        });
+        let text = String::from_utf8(emitter.take_pending()).unwrap();
+        let envelopes: Vec<RuntimeEnvelope> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let result = &envelopes[0].item.payload["result"];
+        assert!(result["content"].is_array());
+        assert_eq!(result["content"][1]["type"], "image");
+        assert_eq!(result["details"]["stderr"]["read_error"], "read failed");
+        assert_eq!(envelopes[1].item.kind, "image.request_prepared");
+        assert_eq!(envelopes[1].item.payload["images"][0]["included"], false);
+        assert!(!text.contains("base64"));
     }
 }

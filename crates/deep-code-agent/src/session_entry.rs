@@ -11,7 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use std::path::PathBuf;
+use crate::content::{Content, ContentBlock};
+use crate::image::ImageAsset;
 
 use crate::model::ToolCallPayload;
 use crate::runtime::TurnId;
@@ -19,6 +20,8 @@ use crate::tool::ToolResultStatus;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEntry {
+    /// Stable identity retained when compaction moves surviving entries.
+    pub id: String,
     /// Runtime turn that produced this entry. Session-wide instructions and
     /// compaction summaries do not belong to an individual turn.
     #[serde(default)]
@@ -31,6 +34,7 @@ impl SessionEntry {
     #[must_use]
     pub fn new(kind: EntryKind) -> Self {
         Self {
+            id: uuid::Uuid::new_v4().to_string(),
             turn_id: None,
             kind,
         }
@@ -61,23 +65,22 @@ impl SessionEntry {
     }
 
     #[must_use]
-    pub fn user(content: impl Into<String>) -> Self {
-        Self::user_with_images(content, Vec::new())
-    }
-
-    /// A user turn that carries images.
-    ///
-    /// `images` are local paths, not bytes and not URLs. Bytes would put
-    /// megabytes into every session file *and* into every save — the persistence
-    /// actor rewrites the whole record — while a URL would be a second copy of
-    /// data we already have on disk. [`crate::image::hydrate`] reads them when a
-    /// request is assembled.
-    #[must_use]
-    pub fn user_with_images(content: impl Into<String>, images: Vec<PathBuf>) -> Self {
+    pub fn user(content: impl Into<Content>) -> Self {
         Self::new(EntryKind::User {
             content: content.into(),
-            images,
         })
+    }
+
+    /// User-selected images have already been admitted as immutable assets.
+    #[must_use]
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImageAsset>) -> Self {
+        let mut content = Content::from(content.into());
+        content.blocks.extend(
+            images
+                .into_iter()
+                .map(|image| ContentBlock::Image { image }),
+        );
+        Self::user(content)
     }
 
     #[must_use]
@@ -98,6 +101,7 @@ impl SessionEntry {
         Self::new(EntryKind::Compaction {
             summary: summary.into(),
             archived_count,
+            image_sources: Vec::new(),
         })
     }
 }
@@ -109,14 +113,7 @@ pub enum EntryKind {
         content: String,
     },
     User {
-        content: String,
-        /// Local image files attached to this turn, in the order the user
-        /// attached them.
-        ///
-        /// Omitted when empty; deserialization treats an omitted value as no
-        /// images.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        images: Vec<PathBuf>,
+        content: Content,
     },
     Assistant {
         content: String,
@@ -129,7 +126,33 @@ pub enum EntryKind {
     Compaction {
         summary: String,
         archived_count: usize,
+        /// Image identities survive a lossy text summary; pixels are not replayed.
+        image_sources: Vec<CompactionImageSource>,
     },
+}
+
+/// Origin of an archived image observation. Kept independently of the model's
+/// summary so neither truncation nor another compaction loses the asset link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionImageSource {
+    pub image: ImageAsset,
+    pub role: crate::message::Role,
+    pub call_id: Option<String>,
+    pub tool_name: Option<String>,
+}
+
+impl CompactionImageSource {
+    #[must_use]
+    pub fn summary_text(&self) -> String {
+        format!(
+            "[image observation source: {}; role={}; call_id={:?}; tool={:?}; pixels not supplied]",
+            self.image,
+            self.role.as_str(),
+            self.call_id,
+            self.tool_name
+        )
+    }
 }
 
 /// Whether the approval gate put a call in front of a human.
@@ -167,11 +190,11 @@ impl ToolExchange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExchangeResult {
-    /// Model-facing content, size-bounded by `truncate_tool_output` (head+tail,
-    /// middle elided). This is the only persisted copy: the untruncated output
-    /// exists solely on the live event stream, so a large tool result cannot be
-    /// recovered in full from a session file or `session export`.
-    pub content: String,
+    /// Ordered observations. Image bytes remain in the content-addressed store.
+    pub content: Content,
+    /// Bounded display/execution facts; never projected into model content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
     pub status: ToolResultStatus,
     /// Whether the approval gate ever put this call in front of a human.
     ///

@@ -11,6 +11,150 @@ fn job_output_buffer_is_bounded_with_omitted_count() {
 }
 
 #[test]
+fn retained_pages_report_eviction_and_never_split_utf8_scalars() {
+    let buffer = SharedBuffer::default();
+    let source = "界😀".repeat(JOB_BUFFER_BYTES / 7 + 100);
+    buffer.push(source.as_bytes());
+    buffer.finish_stream(None);
+    let mut cursor = Some(0);
+    let mut text = String::new();
+    let first = buffer
+        .page(super::super::JobStream::Stdout, cursor, 37)
+        .unwrap();
+    assert!(first.retained_start_byte > 0);
+    assert!(first.start_byte >= first.retained_start_byte);
+    assert_eq!(first.unavailable_before_byte, first.start_byte);
+    let available_start = first.start_byte;
+    loop {
+        let page = buffer
+            .page(super::super::JobStream::Stdout, cursor, 37)
+            .unwrap();
+        assert!(!page.lossy_utf8);
+        assert!(!page.text.contains('�'));
+        assert_eq!(page.end_byte - page.start_byte, page.text.len());
+        text.push_str(&page.text);
+        let Some(next) = page.next_start_byte else {
+            break;
+        };
+        assert!(page.has_more && next > page.start_byte);
+        cursor = Some(next as u64);
+    }
+    assert_eq!(text, source[available_start..]);
+    assert!(
+        buffer
+            .page(
+                super::super::JobStream::Stdout,
+                Some((available_start + 1) as u64),
+                20
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn running_pages_wait_for_new_complete_text_and_keep_absolute_cursors() {
+    let buffer = SharedBuffer::default();
+    buffer.push(b"first");
+    let first = buffer
+        .page(super::super::JobStream::Stderr, None, 100)
+        .unwrap();
+    assert_eq!(first.text, "first");
+    assert_eq!(first.next_start_byte, Some(5));
+    assert!(!first.has_more && !first.finished);
+    let waiting = buffer
+        .page(super::super::JobStream::Stderr, Some(5), 100)
+        .unwrap();
+    assert!(waiting.text.is_empty() && !waiting.has_more);
+    assert_eq!(waiting.next_start_byte, Some(5));
+    let unicode = "😀".as_bytes();
+    buffer.push(&unicode[..2]);
+    let partial = buffer
+        .page(super::super::JobStream::Stderr, Some(5), 100)
+        .unwrap();
+    assert!(partial.text.is_empty() && !partial.has_more);
+    assert_eq!(partial.next_start_byte, Some(5));
+    buffer.push(&unicode[2..]);
+    buffer.push(b"next");
+    let next = buffer
+        .page(super::super::JobStream::Stderr, Some(5), 100)
+        .unwrap();
+    assert_eq!(next.text, "😀next");
+    assert_eq!(next.next_start_byte, Some(13));
+    buffer.finish_stream(None);
+    let done = buffer
+        .page(super::super::JobStream::Stderr, Some(13), 100)
+        .unwrap();
+    assert!(done.text.is_empty() && done.finished && !done.has_more);
+    assert_eq!(done.next_start_byte, None);
+    assert!(
+        buffer
+            .page(super::super::JobStream::Stderr, Some(14), 100)
+            .is_err()
+    );
+}
+
+#[test]
+fn retained_pages_bound_json_escaping_and_advance_across_invalid_utf8() {
+    let buffer = SharedBuffer::default();
+    let source = "\u{1}界😀".repeat(2000);
+    buffer.push(source.as_bytes());
+    buffer.finish_stream(None);
+    let page = buffer
+        .page(
+            super::super::JobStream::Stdout,
+            Some(0),
+            INLINE_STREAM_CHARS,
+        )
+        .unwrap();
+    assert!(serde_json::to_vec(&page.text).unwrap().len() <= 8 * 1024);
+    assert!(page.text.chars().count() <= INLINE_STREAM_CHARS);
+    assert!(page.has_more && page.end_byte > 0);
+    let invalid = SharedBuffer::default();
+    invalid.push(&vec![0xff; 10_000]);
+    invalid.finish_stream(None);
+    let first = invalid
+        .page(super::super::JobStream::Stdout, Some(0), 2000)
+        .unwrap();
+    let second = invalid
+        .page(
+            super::super::JobStream::Stdout,
+            first.next_start_byte.map(|at| at as u64),
+            2000,
+        )
+        .unwrap();
+    assert!(first.lossy_utf8 && second.lossy_utf8);
+    assert_eq!(first.end_byte, 2000);
+    assert_eq!(second.start_byte, 2000);
+    assert_eq!(second.end_byte, 4000);
+}
+
+#[test]
+fn evicted_invalid_continuation_bytes_stay_available_to_ring_paging() {
+    let buffer = SharedBuffer::default();
+    buffer.push(&vec![0x80; JOB_BUFFER_BYTES + 100]);
+    buffer.finish_stream(None);
+    let mut cursor = None;
+    let mut consumed = 0;
+    loop {
+        let page = buffer
+            .page(super::super::JobStream::Stdout, cursor, INLINE_STREAM_CHARS)
+            .unwrap();
+        assert_eq!(page.retained_start_byte, 100);
+        assert_eq!(page.unavailable_before_byte, 100);
+        assert!(page.lossy_utf8 && !page.text.is_empty());
+        assert_eq!(page.text.chars().count(), page.end_byte - page.start_byte);
+        assert!(page.text.chars().all(|character| character == '�'));
+        consumed += page.end_byte - page.start_byte;
+        let Some(next) = page.next_start_byte else {
+            break;
+        };
+        assert!(page.has_more && next > page.start_byte);
+        cursor = Some(next as u64);
+    }
+    assert_eq!(consumed, JOB_BUFFER_BYTES);
+}
+
+#[test]
 fn spill_below_threshold_touches_no_disk() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("spill/job_1.stdout.log");
@@ -104,7 +248,7 @@ fn a_finished_spill_never_reopens_even_after_its_file_was_discarded() {
     buffer.push(&vec![b'a'; SPILL_THRESHOLD_BYTES + 1]);
     assert!(path.exists(), "precondition: a file was written");
 
-    buffer.finish_spill();
+    buffer.finish_stream(None);
     buffer.discard_unreported_spill();
     assert!(!path.exists(), "precondition: the orphan was discarded");
 
@@ -117,6 +261,174 @@ fn a_finished_spill_never_reopens_even_after_its_file_was_discarded() {
         buffer.spill_info().is_none(),
         "and must not claim one either"
     );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_drain_timeout_marks_only_the_blocked_stream_incomplete() {
+    for blocked_stdout in [true, false] {
+        let stdout = SharedBuffer::default();
+        let stderr = SharedBuffer::default();
+        let (mut out_writer, out_pipe) = tokio::io::duplex(64);
+        let (mut err_writer, err_pipe) = tokio::io::duplex(64);
+        let out_reader = spawn_buffer_reader(out_pipe, stdout.clone(), None, SpillOwner::Caller);
+        let err_reader = spawn_buffer_reader(err_pipe, stderr.clone(), None, SpillOwner::Caller);
+        out_writer.write_all(b"stdout output").await.unwrap();
+        err_writer.write_all(b"stderr output").await.unwrap();
+        let held_writer = if blocked_stdout {
+            drop(err_writer);
+            out_writer
+        } else {
+            drop(out_writer);
+            err_writer
+        };
+
+        let started = tokio::time::Instant::now();
+        assert!(
+            !super::super::drain_readers(Some(out_reader), Some(err_reader), &stdout, &stderr)
+                .await
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(500));
+        stdout.finish_stream(None);
+        stderr.finish_stream(None);
+
+        let (blocked, complete) = if blocked_stdout {
+            (stdout.snapshot(64), stderr.snapshot(64))
+        } else {
+            (stderr.snapshot(64), stdout.snapshot(64))
+        };
+        assert!(complete.finished);
+        assert!(complete.capture_complete);
+        assert!(complete.read_error.is_none(), "EOF is not a drain error");
+        assert_eq!(complete.total_bytes, 13);
+        assert!(blocked.finished);
+        assert!(!blocked.capture_complete);
+        assert!(
+            blocked
+                .read_error
+                .as_deref()
+                .unwrap()
+                .contains("drain deadline")
+        );
+        drop(held_writer);
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_reader_join_failure_marks_only_its_own_stream_incomplete() {
+    for failed_stdout in [true, false] {
+        let stdout = SharedBuffer::default();
+        let stderr = SharedBuffer::default();
+        let (mut writer, pipe) = tokio::io::duplex(64);
+        writer.write_all(b"captured output").await.unwrap();
+        drop(writer);
+        let healthy_buffer = if failed_stdout { &stderr } else { &stdout };
+        let healthy = spawn_buffer_reader(pipe, healthy_buffer.clone(), None, SpillOwner::Caller);
+        let failed = tokio::spawn(std::future::pending::<()>());
+        failed.abort();
+        let (out_reader, err_reader) = if failed_stdout {
+            (failed, healthy)
+        } else {
+            (healthy, failed)
+        };
+
+        assert!(
+            !super::super::drain_readers(Some(out_reader), Some(err_reader), &stdout, &stderr)
+                .await
+        );
+        stdout.finish_stream(None);
+        stderr.finish_stream(None);
+        let (failed, complete, stream) = if failed_stdout {
+            (stdout.snapshot(64), stderr.snapshot(64), "stdout")
+        } else {
+            (stderr.snapshot(64), stdout.snapshot(64), "stderr")
+        };
+        assert!(complete.capture_complete);
+        assert!(complete.read_error.is_none());
+        assert_eq!(complete.text, "captured output");
+        assert!(!failed.capture_complete);
+        let error = failed.read_error.as_deref().unwrap();
+        assert!(
+            error.contains(stream) && error.contains("reader task failed"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("deadline"),
+            "a task failure is not a timeout"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_drain_timeout_keeps_the_foreground_spills_writable_for_later_steps() {
+    for first_step_bytes in [0, SPILL_THRESHOLD_BYTES + 1] {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("stdout.log");
+        let err_path = tmp.path().join("stderr.log");
+        let stdout = SharedBuffer::with_spill(out_path.clone());
+        let stderr = SharedBuffer::with_spill(err_path.clone());
+        let (mut first_out, out_pipe) = tokio::io::duplex(8192);
+        let (mut first_err, err_pipe) = tokio::io::duplex(8192);
+        let out_reader = spawn_buffer_reader(out_pipe, stdout.clone(), None, SpillOwner::Caller);
+        let err_reader = spawn_buffer_reader(err_pipe, stderr.clone(), None, SpillOwner::Caller);
+        let mut expected_out = vec![b'a'; first_step_bytes];
+        let mut expected_err = vec![b'b'; first_step_bytes];
+        first_out.write_all(&expected_out).await.unwrap();
+        first_err.write_all(&expected_err).await.unwrap();
+
+        // An inherited pipe stays open after the first step exits. Use paused
+        // time to reach the actual foreground drain-timeout path deterministically.
+        assert!(
+            !super::super::drain_readers(Some(out_reader), Some(err_reader), &stdout, &stderr)
+                .await
+        );
+        drop((first_out, first_err));
+        tokio::task::yield_now().await;
+
+        // A later step evicts its head from both rings, so only the spill can
+        // preserve all of its output. Cover both lazy creation and an existing file.
+        let later_out = vec![b'o'; JOB_BUFFER_BYTES + 100];
+        let later_err = vec![b'e'; JOB_BUFFER_BYTES + 200];
+        expected_out.extend_from_slice(&later_out);
+        expected_err.extend_from_slice(&later_err);
+        let (mut next_out, out_pipe) = tokio::io::duplex(8192);
+        let (mut next_err, err_pipe) = tokio::io::duplex(8192);
+        let out_reader = spawn_buffer_reader(out_pipe, stdout.clone(), None, SpillOwner::Caller);
+        let err_reader = spawn_buffer_reader(err_pipe, stderr.clone(), None, SpillOwner::Caller);
+        let writer = tokio::spawn(async move {
+            next_out.write_all(&later_out).await.unwrap();
+            next_err.write_all(&later_err).await.unwrap();
+        });
+        assert!(
+            super::super::drain_readers(Some(out_reader), Some(err_reader), &stdout, &stderr).await
+        );
+        writer.await.unwrap();
+
+        for (buffer, path, expected) in [
+            (&stdout, &out_path, &expected_out),
+            (&stderr, &err_path, &expected_err),
+        ] {
+            assert_eq!(std::fs::read(path).unwrap(), *expected);
+            let running = buffer.snapshot(32);
+            assert!(
+                !running.finished,
+                "only the whole run can finish its streams"
+            );
+            assert!(running.omitted_bytes > 0);
+            assert_eq!(running.total_bytes, expected.len());
+            assert!(running.read_error.is_some());
+
+            buffer.finish_stream(None);
+            let finished = buffer.snapshot(32);
+            assert!(finished.finished);
+            assert_eq!(finished.read_error, running.read_error);
+            assert!(
+                !finished.capture_complete,
+                "a prior drain error stays visible"
+            );
+            assert_eq!(finished.spill.unwrap().bytes, expected.len() as u64);
+        }
+    }
 }
 
 /// Spill content is raw command output — `env`, registry logins, tokens a
@@ -205,11 +517,11 @@ fn unnamed_fully_inline_spill_is_removed_once_the_result_is_rendered() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("job_5.stdout.log");
     let buffer = SharedBuffer::with_spill(path.clone());
-    buffer.push("好".repeat(5_000).as_bytes()); // 15,000 bytes, 5,000 chars
+    buffer.push("好".repeat(4_000).as_bytes()); // 15,000 bytes, 5,000 chars
     assert!(path.exists(), "crossed the byte threshold — file written");
 
     let job = plain_job(buffer.clone());
-    buffer.finish_spill();
+    buffer.finish_stream(None);
     assert!(path.exists(), "stream end alone decides nothing");
 
     let rendered = shell_text_output("job_5", &job, 20_000);
@@ -248,13 +560,13 @@ fn a_joint_overflow_always_leaves_a_file_to_read() {
     stderr.push(stream.as_bytes());
 
     let job = two_stream_job(stdout.clone(), stderr.clone());
-    stdout.finish_spill();
-    stderr.finish_spill();
+    stdout.finish_stream(None);
+    stderr.finish_stream(None);
     let rendered = shell_text_output("job_j", &job, 20_000);
 
     assert!(
-        rendered.chars().count() > budget,
-        "precondition: the pair is over budget"
+        rendered.chars().count() <= budget,
+        "rendering must reserve room for framing and spill references"
     );
     assert!(
         rendered.contains(&out_path.display().to_string())
@@ -285,7 +597,7 @@ fn the_denial_note_counts_toward_the_budget_it_pushes_the_result_past() {
     job.status = JobStatus::Failed;
     job.exit_code = Some(1);
     job.sandboxed = true;
-    stderr.finish_spill();
+    stderr.finish_stream(None);
 
     let rendered = shell_text_output("job_d", &job, 20_000);
     assert!(
@@ -293,8 +605,8 @@ fn the_denial_note_counts_toward_the_budget_it_pushes_the_result_past() {
         "precondition: this job carries the denial note"
     );
     assert!(
-        rendered.chars().count() > budget,
-        "precondition: the result is over budget once the note is on it"
+        rendered.chars().count() <= budget,
+        "the denial note must fit inside the shared result budget"
     );
     assert!(
         rendered.contains(&err_path.display().to_string()),
@@ -326,7 +638,7 @@ fn the_denial_note_counts_toward_the_budget_in_the_job_snapshot_too() {
     job.status = JobStatus::Failed;
     job.exit_code = Some(1);
     job.sandboxed = true;
-    stderr.finish_spill();
+    stderr.finish_stream(None);
 
     let rendered = job_text_snapshot("job_t", &job, 20_000);
     assert!(
@@ -334,8 +646,8 @@ fn the_denial_note_counts_toward_the_budget_in_the_job_snapshot_too() {
         "precondition: this job carries the denial note"
     );
     assert!(
-        rendered.chars().count() > budget,
-        "precondition: the snapshot is over budget once the note is on it"
+        rendered.chars().count() <= budget,
+        "the denial note must fit inside the shared result budget"
     );
     assert!(
         rendered.contains(&err_path.display().to_string()),
@@ -364,25 +676,23 @@ fn an_asymmetric_pair_keeps_both_files_when_their_sum_is_over_budget() {
     assert!(out_path.exists() && err_path.exists(), "both files written");
 
     let job = two_stream_job(stdout.clone(), stderr.clone());
-    stdout.finish_spill();
-    stderr.finish_spill();
+    stdout.finish_stream(None);
+    stderr.finish_stream(None);
 
     let rendered = shell_text_output("job_6", &job, 20_000);
     assert!(
-        rendered.chars().count() > budget,
-        "precondition: the pair renders over budget"
+        rendered.chars().count() <= budget,
+        "both streams and framing must fit the result budget"
     );
     assert!(
-        out_path.exists() && err_path.exists(),
-        "neither file may be deleted when the joint result loses content"
+        out_path.exists(),
+        "a truncated stream must retain its spill file"
     );
-    for path in [&out_path, &err_path] {
-        assert!(
-            rendered.contains(&path.display().to_string()),
-            "and the note must name {}: {rendered}",
-            path.display()
-        );
-    }
+    assert!(
+        rendered.contains(&out_path.display().to_string()),
+        "the truncation note must name {}: {rendered}",
+        out_path.display()
+    );
 }
 
 /// The band between what a tool result actually retains
@@ -407,7 +717,7 @@ fn output_past_the_retained_budget_keeps_its_file_and_names_it() {
     cjk.push("好".repeat(budget + 1_000).as_bytes());
     let job = plain_job(cjk.clone());
     assert_eq!(job.stdout.omitted_len(), 0, "precondition: ring intact");
-    cjk.finish_spill();
+    cjk.finish_stream(None);
     assert!(
         cjk_path.exists(),
         "past the retained budget the stream is NOT fully inline — keep the file"
@@ -428,7 +738,7 @@ fn output_past_the_retained_budget_keeps_its_file_and_names_it() {
         "ASCII output past the retained budget must be archived too"
     );
     let ascii_job = plain_job(ascii.clone());
-    ascii.finish_spill();
+    ascii.finish_stream(None);
     assert!(ascii_path.exists(), "and must survive stream end");
     let ascii_text = shell_text_output("job_8", &ascii_job, 20_000);
     assert!(
@@ -497,7 +807,7 @@ fn reported_spill_survives_stream_end_even_when_fully_inline() {
         "precondition: the path escaped to the model: {snapshot}"
     );
 
-    stdout.finish_spill();
+    stdout.finish_stream(None);
     assert!(
         path.exists(),
         "a named path must stay valid after the stream"
@@ -517,6 +827,7 @@ fn plain_job(stdout: SharedBuffer) -> JobState {
         command: "cargo test".to_string(),
         cwd: ".".to_string(),
         started_at: Instant::now(),
+        finished_at: None,
         status: JobStatus::Completed,
         exit_code: Some(0),
         sandboxed: true,
@@ -524,6 +835,8 @@ fn plain_job(stdout: SharedBuffer) -> JobState {
         stdout,
         stderr: SharedBuffer::default(),
         child: None,
+        input: None,
+        input_error: None,
         job_guard: None,
     }
 }
@@ -548,6 +861,8 @@ async fn insert_after_shutdown_kills_the_late_child() {
         status: JobStatus::Running,
         exit_code: None,
         child: Some(child),
+        input: None,
+        input_error: None,
         ..plain_job(SharedBuffer::default())
     };
 
@@ -599,6 +914,8 @@ async fn completed_background_leader_cannot_leave_a_writer_after_restore_opens()
             status: JobStatus::Running,
             exit_code: None,
             child: Some(child),
+            input: None,
+            input_error: None,
             ..plain_job(SharedBuffer::default())
         },
     );
@@ -649,10 +966,10 @@ fn truncation_note_names_the_spill_file() {
     );
     let details = job_details("job_9", &job);
     assert_eq!(
-        details["stdout_spill_path"].as_str(),
+        details["stdout"]["spill"]["path"].as_str(),
         Some(path.display().to_string().as_str())
     );
-    assert!(details["stderr_spill_path"].is_null());
+    assert!(details["stderr"]["spill"]["path"].is_null());
 }
 
 /// Two streams that each fit the budget can still overflow it together, and
@@ -682,8 +999,8 @@ fn two_streams_that_each_fit_the_budget_still_report_their_joint_loss() {
 
     let text = shell_text_output("job_7", &job, 20_000);
     assert!(
-        text.chars().count() > budget,
-        "precondition: together they overflow the result budget"
+        text.chars().count() <= budget,
+        "the shared window must keep the combined result within budget"
     );
     assert!(
         text.contains("job action=tail job_id=job_7"),
@@ -715,6 +1032,7 @@ fn finished_job(status: JobStatus, sandboxed: bool, stderr_text: &str) -> JobSta
         command: "printf x > /outside/f".to_string(),
         cwd: ".".to_string(),
         started_at: Instant::now(),
+        finished_at: None,
         status,
         exit_code: Some(if status == JobStatus::Completed { 0 } else { 1 }),
         sandboxed,
@@ -722,6 +1040,8 @@ fn finished_job(status: JobStatus, sandboxed: bool, stderr_text: &str) -> JobSta
         stdout: SharedBuffer::default(),
         stderr,
         child: None,
+        input: None,
+        input_error: None,
         job_guard: None,
     }
 }
@@ -938,6 +1258,8 @@ async fn checkpoint_restore_refuses_an_idle_turn_with_a_background_writer() {
             kind: JobKind::Background,
             status: JobStatus::Running,
             child: Some(child),
+            input: None,
+            input_error: None,
             ..plain_job(SharedBuffer::default())
         },
     );
@@ -961,4 +1283,96 @@ async fn checkpoint_restore_refuses_an_idle_turn_with_a_background_writer() {
         .unwrap();
     runtime.restore_checkpoint(id).await.unwrap();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "before");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn closing_input_cancels_backpressure_and_a_waiting_writer() {
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .stdin(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let input = JobInput::new(child.stdin.take().unwrap());
+    let first_input = input.clone();
+    let first = tokio::spawn(async move {
+        first_input
+            .send(
+                &vec![b'x'; 1024 * 1024],
+                false,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let second_input = input.clone();
+    let second = tokio::spawn(async move {
+        second_input
+            .send(
+                b"second",
+                false,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    input.close();
+    let both = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        (first.await.unwrap(), second.await.unwrap())
+    })
+    .await
+    .expect("closing stdin must interrupt both blocked writers");
+    assert!(both.0.is_err() && both.1.is_err());
+    assert!(!input.is_open());
+    assert!(input.stream.lock().await.is_none());
+    child.kill().await.unwrap();
+}
+
+#[test]
+fn execution_snapshot_keeps_terminal_time_and_capture_facts() {
+    let stdout = SharedBuffer::default();
+    stdout.push(b"output");
+    stdout.finish_stream(None);
+    let mut job = plain_job(stdout);
+    let now = Instant::now();
+    job.started_at = now - std::time::Duration::from_secs(2);
+    job.finished_at = Some(now - std::time::Duration::from_secs(1));
+    let snapshot = ExecutionSnapshot::capture("job_test", &job, 3);
+    assert_eq!(snapshot.duration_ms, 1000);
+    assert_eq!(snapshot.stdout.text, "put");
+    assert_eq!(snapshot.stdout.total_bytes, 6);
+    assert!(snapshot.stdout.inline_truncated);
+    assert!(snapshot.stdout.capture_complete);
+    let output = job_output("job_test", &job, 3);
+    let details = output.details.unwrap();
+    assert_eq!(details["duration_ms"], 1000);
+    assert_eq!(details["stdout"]["text"], "put");
+    assert!(output.content.text().contains("put"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_input_never_writes_and_closes_the_pipe() {
+    let mut child = tokio::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let input = JobInput::new(child.stdin.take().unwrap());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    assert!(
+        input
+            .send(b"must not arrive", false, &cancel)
+            .await
+            .is_err()
+    );
+    let output = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.stdout.is_empty());
+    assert!(!input.is_open());
 }

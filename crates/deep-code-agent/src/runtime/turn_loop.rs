@@ -180,7 +180,7 @@ impl AgentRuntime {
                     context_tokens,
                     context_window: context_window_for_model(DEEPSEEK_V4_PRO),
                     escalated: state.cascade_escalated,
-                    has_images: prompt.has_images(),
+                    has_images: state.session.turn_has_images(&turn_id),
                 },
             )
         };
@@ -292,47 +292,45 @@ impl AgentRuntime {
             // this is the only place a request's exact messages exist next to
             // what the last turn sent, and the last iteration's probe is the one
             // telemetry reports.
-            let (messages, prior_prefix, reply_anchor) = {
+            let (messages, prior_prefix, reply_anchor, image_occurrences) = {
                 let state = self.state.lock().await;
+                let (messages, image_occurrences) =
+                    state.session.wire_messages_with_image_occurrences();
+                let mut selected = resolve_turn_route(
+                    &self.config,
+                    &self.registry,
+                    &user_prompt,
+                    self.is_subagent,
+                    RouteContext {
+                        context_tokens: estimate_token_count(&messages),
+                        context_window: context_window_for_model(DEEPSEEK_V4_PRO),
+                        escalated: state.cascade_escalated,
+                        has_images: state.session.turn_has_images(&turn_id),
+                    },
+                    self.ui_lang(),
+                );
+                if route.used_model_fallback {
+                    selected.effective_model = route.effective_model.clone();
+                    selected.effective_effort = route.effective_effort;
+                    selected.used_model_fallback = true;
+                    selected.fallback_reason = route.fallback_reason.clone();
+                }
+                route = selected;
                 (
-                    state.session.wire_messages(),
+                    messages,
                     state.last_prefix,
                     state.session.entries().last().cloned(),
+                    image_occurrences,
                 )
             };
-            // Resolving an image reads a file, so it happens outside the lock.
-            //
-            // Capability-aware, and that is what makes the session usable after a
-            // model switch: a transcript that already contains an image must stay
-            // sendable on a model without vision, so `hydrate` replaces those
-            // images with a note instead of the request being refused. Refusing
-            // here would wedge the session for good — the image is in the history,
-            // every later turn re-derives it, so *every* turn including the
-            // text-only ones would be refused, with advice ("remove the images")
-            // the user cannot act on because the images left the draft at submit.
-            // An id the registry does not know is treated as accepting (`map_or`),
-            // so a self-hosted or newer model is the server's call rather than
-            // ours.
-            let accepts_images = self
-                .registry
-                .info_for(&route.effective_model)
-                .is_none_or(|entry| entry.supports_vision);
-            let messages = crate::image::hydrate_for(
-                messages,
-                Some(self.config.vision_detail),
-                accepts_images,
-                crate::image::MAX_TOTAL_BYTES,
-            );
-
+            // Keep an unresolved template. Each attempt prepares images for
+            // its selected model; fallback must never reuse a projection that
+            // already removed observations for a different model.
             let mut request = ChatRequest::streaming(route.effective_model.clone(), messages)
                 .with_tools(self.tools.chat_tools());
             if let Some(effort) = route.effective_effort.as_api_value() {
                 request = request.with_reasoning_effort(effort);
             }
-            let request =
-                crate::image::fit_request_to_limit(request, crate::image::MAX_REQUEST_BYTES);
-
-            let prefix = probe_prefix(&request.messages, prior_prefix);
 
             let estimated_context_tokens = estimate_token_count(&request.messages);
             // Our own read on how close this request is to the window, used only
@@ -434,6 +432,23 @@ impl AgentRuntime {
                     return;
                 }
             };
+
+            let prefix = probe_prefix(&stream.prepared_request().messages, prior_prefix);
+            let estimated_context_tokens =
+                estimate_token_count(&stream.prepared_request().messages);
+            let image_deliveries: Vec<_> = stream
+                .image_deliveries()
+                .iter()
+                .map(|image| {
+                    let mut image = image.clone();
+                    image.observation_id = image_occurrences
+                        .get(&(image.message_index, image.block_index))
+                        .cloned();
+                    image
+                })
+                .collect();
+            self.record_image_projection(&turn_id, &route.effective_model, &image_deliveries, tx)
+                .await;
 
             let mut accumulator = ToolCallAccumulator::default();
             let mut tool_call_ids: HashMap<u32, ToolCallId> = HashMap::new();
@@ -708,6 +723,80 @@ impl AgentRuntime {
         }
     }
 
+    async fn record_image_projection(
+        &self,
+        turn_id: &TurnId,
+        model: &str,
+        images: &[crate::image::ImageDelivery],
+        tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        if images.is_empty() {
+            return;
+        }
+        let changed = {
+            let mut state = self.state.lock().await;
+            if state.current_turn_id.as_ref() != Some(turn_id) {
+                return;
+            }
+            if state.current_turn.is_none() {
+                return;
+            }
+            let changes = state.image_projections.changes(model, images);
+            if !changes.is_empty() {
+                state
+                    .current_turn
+                    .as_mut()
+                    .expect("turn checked above")
+                    .image_requests
+                    .push(crate::session_store::ImageRequestRecord {
+                        model: model.to_owned(),
+                        images: changes.clone(),
+                    });
+                let mut budget = crate::session_store::IMAGE_REPORT_BUDGET_BYTES;
+                state
+                    .current_turn
+                    .as_mut()
+                    .expect("turn checked above")
+                    .limit_image_reports(&mut budget);
+            }
+            changes
+        };
+        emit(
+            tx,
+            RuntimeEvent::ImageRequestPrepared {
+                turn_id: turn_id.clone(),
+                model: model.to_owned(),
+                images: images.to_vec(),
+            },
+        );
+        if !changed.is_empty() {
+            let omitted: Vec<_> = changed.iter().filter(|image| !image.included).collect();
+            if !omitted.is_empty() {
+                let reasons = omitted
+                    .iter()
+                    .take(4)
+                    .map(|image| {
+                        format!(
+                            "{}: {}",
+                            image.image,
+                            image.reason.as_deref().unwrap_or("unavailable")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                emit(
+                    tx,
+                    RuntimeEvent::Warning {
+                        message: format!(
+                            "图片观察未包含在本次模型请求中 / image observations unavailable to this request ({model}): {reasons}"
+                        ),
+                    },
+                );
+            }
+            self.persist().await;
+        }
+    }
+
     /// Record any steered prompts in the session and tell the UI they landed.
     ///
     /// One lock scope for the whole batch: a `steer()` racing this drain lands
@@ -725,11 +814,9 @@ impl AgentRuntime {
             let drained: Vec<Steered> = std::mem::take(&mut state.steering).into();
             for steered in &drained {
                 match steered {
-                    Steered::User(prompt) => state.session.push_user_with_images(
-                        turn_id.clone(),
-                        &prompt.text,
-                        prompt.images.clone(),
-                    ),
+                    Steered::User { content, .. } => {
+                        state.session.push_user(turn_id.clone(), content.clone())
+                    }
                     // A runtime nudge (the budget wrap-up): recorded as a System
                     // entry, never a user one. As a user entry it would become
                     // the newest user message and pull compaction's anchor off
@@ -751,7 +838,7 @@ impl AgentRuntime {
             // `UserMessageInjected` as the user's own message and retires a
             // pending user steer against it, neither of which is true of a
             // runtime nudge. It stays an internal instruction to the model.
-            if let Steered::User(prompt) = steered {
+            if let Steered::User { prompt, .. } = steered {
                 emit(
                     tx,
                     RuntimeEvent::UserMessageInjected {

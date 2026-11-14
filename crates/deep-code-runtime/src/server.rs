@@ -476,7 +476,10 @@ fn host_header_is_loopback(headers: &axum::http::HeaderMap) -> bool {
     host_is_loopback(hostname)
 }
 
+/// Text-only prompt input. Image observations may appear in output events when
+/// tools produce them; this endpoint does not accept image uploads or paths.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PromptRequest {
     prompt: String,
 }
@@ -529,7 +532,7 @@ async fn prompt_sse(
         let mut envelopes = EnvelopeStream::new(thread_id);
         yield Ok(thread_sse_event(envelopes.manual(
             "user.message",
-            serde_json::json!({ "content": prompt }),
+            serde_json::json!({ "content": deep_code_agent::Content::<deep_code_agent::ImageAsset>::from_text(&prompt) }),
         )));
 
         let mut event_stream = {

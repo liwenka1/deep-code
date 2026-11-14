@@ -263,7 +263,7 @@ None.
 
         assert_eq!(result.status, crate::tool::ToolResultStatus::Success);
         assert!(
-            result.content.contains("Mapped the crate root"),
+            result.content.text().contains("Mapped the crate root"),
             "tool result must be the child's report, got: {}",
             result.content
         );
@@ -393,7 +393,7 @@ None.
 
         assert_eq!(result.status, crate::tool::ToolResultStatus::Error);
         assert!(
-            result.content.contains("sub-agent failed"),
+            result.content.text().contains("sub-agent failed"),
             "model must read the failure, got: {}",
             result.content
         );
@@ -462,7 +462,7 @@ None.
 
         let result = call.await.unwrap().into_result().unwrap();
         assert_eq!(result.status, crate::tool::ToolResultStatus::Error);
-        assert!(result.content.contains("cancelled"));
+        assert!(result.content.text().contains("cancelled"));
         let manager = services.manager.read().unwrap();
         assert_eq!(
             manager.list_current_session()[0].status,
@@ -498,7 +498,7 @@ None.
         turn_cancel.cancel();
 
         let result = run.await.unwrap().into_result().unwrap();
-        assert!(result.content.contains("cancelled"));
+        assert!(result.content.text().contains("cancelled"));
         let manager = services.manager.read().unwrap();
         assert_eq!(
             manager.list_current_session()[0].status,
@@ -549,7 +549,7 @@ None.
         canceller.await.unwrap();
 
         assert!(
-            result.content.contains("cancelled"),
+            result.content.text().contains("cancelled"),
             "expected cancellation, got: {}",
             result.content
         );
@@ -601,7 +601,7 @@ None.
 
         assert_eq!(result.status, crate::tool::ToolResultStatus::Error);
         assert!(
-            result.content.contains("timeout"),
+            result.content.text().contains("timeout"),
             "must surface the wall-clock timeout, got: {}",
             result.content
         );
@@ -1149,7 +1149,7 @@ None.
             result.content
         );
         assert!(
-            result.content.contains("SUMMARY"),
+            result.content.text().contains("SUMMARY"),
             "report must carry the structured contract, got: {}",
             result.content
         );

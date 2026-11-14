@@ -123,6 +123,13 @@ pub enum RuntimeEvent {
         tool_name: String,
         update: ToolUpdate,
     },
+    /// Images selected for one prepared model request. This reports request
+    /// contents, not successful delivery or visual understanding.
+    ImageRequestPrepared {
+        turn_id: TurnId,
+        model: String,
+        images: Vec<crate::image::ImageDelivery>,
+    },
     /// A tool finished (executed, denied, or failed) and its result has been
     /// recorded in the session.
     ToolCallFinished {
@@ -224,6 +231,7 @@ impl RuntimeEvent {
             Self::ApprovalRequired { .. } => "approval.required",
             Self::ApprovalResolved { .. } => "approval.resolved",
             Self::ToolCallFinished { .. } => "tool.finished",
+            Self::ImageRequestPrepared { .. } => "image.request_prepared",
             Self::RootGranted { .. } => "root.granted",
             Self::SessionUpdated { .. } => "session.updated",
             Self::TurnFinished { .. } => "turn.completed",
@@ -252,6 +260,7 @@ impl RuntimeEvent {
             | Self::AssistantDelta { turn_id, .. }
             | Self::ReasoningDelta { turn_id, .. }
             | Self::ToolCallStarted { turn_id, .. }
+            | Self::ImageRequestPrepared { turn_id, .. }
             | Self::ToolCallUpdated { turn_id, .. }
             | Self::TurnFinished { turn_id, .. }
             | Self::TurnCancelled { turn_id } => Some(turn_id),
@@ -401,6 +410,15 @@ mod tests {
                 some_turn,
             ),
             (
+                RuntimeEvent::ImageRequestPrepared {
+                    turn_id: turn.clone(),
+                    model: "deepseek-flash".to_string(),
+                    images: Vec::new(),
+                },
+                "image.request_prepared",
+                some_turn,
+            ),
+            (
                 RuntimeEvent::ToolCallFinished {
                     turn_id: Some(turn.clone()),
                     tool_call_id: call.clone(),
@@ -497,7 +515,7 @@ mod tests {
                 some_turn,
             ),
         ];
-        assert_eq!(cases.len(), 21, "a new variant must be pinned here too");
+        assert_eq!(cases.len(), 22, "a new variant must be pinned here too");
         for (event, kind, turn_id) in &cases {
             assert_eq!(event.wire_kind(), *kind, "{event:?}");
             assert_eq!(event.turn_id(), *turn_id, "{event:?}");

@@ -102,9 +102,9 @@ pub async fn run_subagent(
                     .iter()
                     .rev()
                     .find(|message| message.role == Role::Assistant)
-                    .filter(|message| !message.content.trim().is_empty());
+                    .filter(|message| !message.content.text().trim().is_empty());
                 return match report {
-                    Some(report) => Ok((report.content.clone(), steps)),
+                    Some(report) => Ok((report.content.text(), steps)),
                     None => Err((
                         steps,
                         "sub-agent finished without a report".to_string(),
@@ -164,6 +164,7 @@ pub async fn run_subagent(
             | RuntimeEvent::CompactionApplied { .. }
             | RuntimeEvent::RootGranted { .. }
             | RuntimeEvent::UserMessageInjected { .. }
+            | RuntimeEvent::ImageRequestPrepared { .. }
             | RuntimeEvent::Warning { .. } => {}
         }
     }

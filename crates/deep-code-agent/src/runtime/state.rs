@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -8,8 +8,89 @@ use super::event::TurnId;
 use super::persistence_actor::PersistenceActorHandle;
 use crate::pricing::CostEstimate;
 use crate::session::Session;
-use crate::session_store::{SessionRecord, TurnRecord};
+use crate::session_store::{ImageProjectionState, SessionRecord, TurnRecord};
 use crate::tool::ToolCall;
+
+/// Latest prepared projection for each observation occurrence across the
+/// session. Comparing against this index keeps unchanged history out of every
+/// later turn's persisted report while still recording model/visibility changes.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ImageProjectionIndex(HashMap<String, String>);
+
+impl ImageProjectionIndex {
+    pub(super) fn from_state(saved: &[ImageProjectionState]) -> Self {
+        Self(
+            saved
+                .iter()
+                .map(|state| (state.observation_id.clone(), state.fingerprint.clone()))
+                .collect(),
+        )
+    }
+
+    pub(super) fn retain_observations(&mut self, active: &HashSet<String>) {
+        self.0.retain(|id, _| active.contains(id));
+    }
+
+    pub(super) fn snapshot(&self, active: &HashSet<String>) -> Vec<ImageProjectionState> {
+        let mut saved: Vec<_> = self
+            .0
+            .iter()
+            .filter(|(id, _)| active.contains(*id))
+            .map(|(id, fingerprint)| ImageProjectionState {
+                observation_id: id.clone(),
+                fingerprint: fingerprint.clone(),
+            })
+            .collect();
+        saved.sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
+        saved
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_turns(turns: &[TurnRecord]) -> Self {
+        let mut index = Self::default();
+        for turn in turns {
+            for record in &turn.image_requests {
+                let _ = index.changes(&record.model, &record.images);
+            }
+        }
+        index
+    }
+
+    pub(super) fn changes(
+        &mut self,
+        model: &str,
+        images: &[crate::image::ImageDelivery],
+    ) -> Vec<crate::image::ImageDelivery> {
+        let mut changes = Vec::new();
+        for image in images {
+            let facts = serde_json::to_vec(&(
+                model,
+                &image.call_id,
+                &image.image,
+                image.included,
+                &image.reason,
+            ))
+            .expect("image projection facts serialize");
+            let digest = ring::digest::digest(&ring::digest::SHA256, &facts);
+            let projection: String = digest
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            // Unbound protocol inputs cannot establish sameness. Never
+            // substitute mutable wire positions for missing provenance.
+            let Some(key) = image.observation_id.as_ref() else {
+                changes.push(image.clone());
+                continue;
+            };
+            if self.0.get(key) != Some(&projection) {
+                self.0.insert(key.clone(), projection);
+                changes.push(image.clone());
+            }
+        }
+        changes
+    }
+}
 
 /// One entry of the steering queue: what landed in the in-flight turn at a
 /// tool-batch boundary.
@@ -30,7 +111,10 @@ use crate::tool::ToolCall;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Steered {
     /// A prompt the user typed while the turn was streaming.
-    User(crate::runtime::UserTurn),
+    User {
+        prompt: crate::runtime::UserTurn,
+        content: crate::content::Content,
+    },
     /// A runtime-originated instruction to the model: recorded as a System
     /// entry, announced as no user injection.
     Notice(String),
@@ -74,6 +158,7 @@ pub(super) struct RuntimeState {
     pub(super) session: Session,
     pub(super) pending: Option<PendingToolBatch>,
     pub(super) current_turn: Option<TurnRecord>,
+    pub(super) image_projections: ImageProjectionIndex,
     /// The `(message count, fingerprint)` of the last request this session
     /// sent, so the next turn can ask whether its own wire messages still open
     /// with that exact run — see `telemetry::probe_prefix`. The count is the
@@ -197,4 +282,86 @@ pub(super) struct PendingToolBatch {
     /// value, or it refuses (see `apply_root_grant`): a symlink shuffled
     /// between prompt and approval cannot substitute the target.
     pub(super) root_grant_target: Option<std::path::PathBuf>,
+}
+
+#[cfg(test)]
+mod image_projection_tests {
+    use super::*;
+
+    #[test]
+    fn unchanged_history_is_deduplicated_across_turns_and_visibility_changes_survive() {
+        let image = crate::image::ImageDelivery {
+            observation_id: Some("entry:0:1".into()),
+            message_index: 1,
+            block_index: 1,
+            call_id: Some("capture".into()),
+            image: "sha256:asset".into(),
+            included: true,
+            reason: None,
+        };
+        let mut first = TurnRecord::default();
+        first
+            .image_requests
+            .push(crate::session_store::ImageRequestRecord {
+                model: "flash".into(),
+                images: vec![image.clone()],
+            });
+        let mut index = ImageProjectionIndex::from_turns(&[first]);
+        for _ in 0..100 {
+            assert!(
+                index
+                    .changes("flash", std::slice::from_ref(&image))
+                    .is_empty()
+            );
+        }
+        let mut moved = image.clone();
+        moved.message_index = 0;
+        moved.block_index = 9;
+        assert!(
+            index.changes("flash", &[moved]).is_empty(),
+            "wire positions are not identity"
+        );
+        let mut attached_again = image.clone();
+        attached_again.observation_id = Some("another-entry:0:1".into());
+        assert_eq!(
+            index.changes("flash", &[attached_again.clone()]),
+            vec![attached_again]
+        );
+        let mut omitted = image.clone();
+        omitted.included = false;
+        omitted.reason = Some("unsupported".into());
+        assert_eq!(
+            index.changes("pro", std::slice::from_ref(&omitted)),
+            vec![omitted.clone()]
+        );
+        assert!(
+            index
+                .changes("pro", std::slice::from_ref(&omitted))
+                .is_empty()
+        );
+        assert_eq!(
+            index.changes("flash", std::slice::from_ref(&image)),
+            vec![image]
+        );
+    }
+
+    #[test]
+    fn protocol_images_without_observation_identity_are_never_position_deduplicated() {
+        let image = crate::image::ImageDelivery {
+            observation_id: None,
+            message_index: 1,
+            block_index: 1,
+            call_id: None,
+            image: "same-asset".into(),
+            included: false,
+            reason: Some("unsupported".into()),
+        };
+        let mut index = ImageProjectionIndex::default();
+        for _ in 0..2 {
+            assert_eq!(
+                index.changes("pro", std::slice::from_ref(&image)),
+                vec![image.clone()]
+            );
+        }
+    }
 }

@@ -24,6 +24,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::content::Content;
 use crate::execution_policy::{RiskLevel, SafetyNote, ToolExecutionPlan, safety_notes};
 use crate::model::{ChatTool, ChatToolFunction};
 use crate::sandbox::SandboxPolicy;
@@ -91,7 +92,7 @@ pub struct ToolResult {
     pub call_id: String,
     pub tool_name: String,
     pub status: ToolResultStatus,
-    pub content: String,
+    pub content: Content,
     /// Structured data for UI rendering; never sent to the model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
@@ -102,7 +103,7 @@ impl ToolResult {
     pub fn success(
         call_id: impl Into<String>,
         tool_name: impl Into<String>,
-        content: impl Into<String>,
+        content: impl Into<Content>,
     ) -> Self {
         Self {
             call_id: call_id.into(),
@@ -119,13 +120,13 @@ impl ToolResult {
             call_id: call.id.clone(),
             tool_name: call.name.clone(),
             status: ToolResultStatus::Denied,
-            content: "Tool call denied by user.".to_string(),
+            content: "Tool call denied by user.".into(),
             details: None,
         }
     }
 
     #[must_use]
-    pub fn error(call: &ToolCall, message: impl Into<String>) -> Self {
+    pub fn error(call: &ToolCall, message: impl Into<Content>) -> Self {
         Self {
             call_id: call.id.clone(),
             tool_name: call.name.clone(),
@@ -308,13 +309,22 @@ impl ToolCx {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolOutput {
     pub status: ToolResultStatus,
-    pub content: String,
+    pub content: Content,
     pub details: Option<Value>,
 }
 
 impl ToolOutput {
     #[must_use]
-    pub fn text(content: impl Into<String>) -> Self {
+    pub fn observations(content: Content) -> Self {
+        Self {
+            status: ToolResultStatus::Success,
+            content,
+            details: None,
+        }
+    }
+
+    #[must_use]
+    pub fn text(content: impl Into<Content>) -> Self {
         Self {
             status: ToolResultStatus::Success,
             content: content.into(),
@@ -325,7 +335,7 @@ impl ToolOutput {
     /// A failure the model should read and recover from, recorded as a
     /// status=Error result without aborting the tool pipeline.
     #[must_use]
-    pub fn soft_error(content: impl Into<String>) -> Self {
+    pub fn soft_error(content: impl Into<Content>) -> Self {
         Self {
             status: ToolResultStatus::Error,
             content: content.into(),
@@ -644,7 +654,7 @@ mod tests {
             panic!("expected denied result");
         };
         assert_eq!(result.status, ToolResultStatus::Error);
-        assert!(result.content.contains("execution policy denied"));
+        assert!(result.content.text().contains("execution policy denied"));
     }
 
     #[tokio::test]

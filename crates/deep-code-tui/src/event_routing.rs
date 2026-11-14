@@ -2,7 +2,7 @@ use deep_code_agent::{RuntimeEvent, ToolCallId};
 
 use crate::active_turn::{ActiveToolCell, ActiveTurn};
 use crate::app::App;
-use crate::history::{HistoryCell, ToolApprovalState, folded_entry, summarize_tool_result};
+use crate::history::{HistoryCell, ToolApprovalState, folded_entry, summarize_tool_observation};
 use deep_code_agent::i18n::TextId;
 
 impl App {
@@ -97,6 +97,20 @@ impl App {
                 self.append_active_tool_output(&tool_call_id, &update.text);
                 self.status = self.tr_with(TextId::StatusToolRunning, &[("tool", &tool_name)]);
             }
+            RuntimeEvent::ImageRequestPrepared { model, images, .. } => {
+                let omitted = images.iter().filter(|image| !image.included).count();
+                if omitted > 0 {
+                    // The runtime emits the detailed Warning separately; this
+                    // request event updates status without duplicating history.
+                    self.status = self.tr_with(
+                        TextId::SystemWarning,
+                        &[(
+                            "message",
+                            &format!("{model}: {omitted} image(s) omitted from this request"),
+                        )],
+                    );
+                }
+            }
             RuntimeEvent::ApprovalRequired { .. } if self.cancel_requested => {
                 // Esc may race an already queued approval. Keep observing the
                 // same stream until the runtime emits its real terminal event.
@@ -171,7 +185,7 @@ impl App {
                 // Computed once, for the two consumers below: summarising scans
                 // the whole tool content, so doing it per-decision would pay it
                 // twice on every call.
-                let summary = summarize_tool_result(&result.content);
+                let summary = summarize_tool_observation(&result.content, result.details.as_ref());
                 // A call that brought diagnostics along is shown in full: today
                 // their cell is pushed BETWEEN the call and its result, so
                 // folding the call would either reorder them or drop them

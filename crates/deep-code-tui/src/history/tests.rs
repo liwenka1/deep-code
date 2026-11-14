@@ -76,7 +76,8 @@ fn hydrate_history_keeps_assistant_tool_calls_and_results() {
             vec![ToolExchange {
                 call: call("call_1", "mock_echo"),
                 result: Some(ExchangeResult {
-                    content: "mock_echo: hi".to_string(),
+                    content: "mock_echo: hi".into(),
+                    details: None,
                     status: ToolResultStatus::Denied,
                     asked: false,
                 }),
@@ -496,7 +497,8 @@ fn hydrate_folds_a_run_of_quiet_calls_and_keeps_the_rest_visible() {
         .push(std::sync::Arc::new(SessionEntry::user("go")));
     let done = |content: &str| {
         Some(ExchangeResult {
-            content: content.to_string(),
+            content: content.into(),
+            details: None,
             status: deep_code_agent::ToolResultStatus::Success,
             asked: false,
         })
@@ -551,7 +553,7 @@ fn hydrate_folds_a_run_of_quiet_calls_and_keeps_the_rest_visible() {
             _ => None,
         })
         .collect();
-    // `Some(false)` on every record: nothing was granted, so the shell folds
+    // `asked: false` on every record: nothing was granted, so the shell folds
     // exactly as it did live — which is the whole point of recording it.
     assert_eq!(batches, vec![2, 2], "got {cells:?}");
     assert!(
@@ -575,8 +577,7 @@ fn hydrate_folds_a_run_of_quiet_calls_and_keeps_the_rest_visible() {
     );
 }
 
-/// …while a record that DOES carry the answer comes back exactly as it was
-/// lived: the badge is restored, a call a human was asked about stays out of a
+/// Recorded approval decisions come back exactly as they were lived: the badge is restored, a call a human was asked about stays out of a
 /// folded run, and a call nobody was asked about folds as it did live — which is
 /// the standing-consent case (`auto_allow`, Yolo, a remembered command).
 #[test]
@@ -584,7 +585,8 @@ fn hydrate_restores_what_the_record_kept() {
     let mut record = SessionRecord::new(PathBuf::from("/tmp/ws"), "");
     let result = |content: &str, asked: bool| {
         Some(ExchangeResult {
-            content: content.to_string(),
+            content: content.into(),
+            details: None,
             status: deep_code_agent::ToolResultStatus::Success,
             asked,
         })
@@ -658,7 +660,8 @@ fn hydrate_badges_a_refusal_only_when_a_human_made_it() {
     let exchange = |asked: bool| ToolExchange {
         call: call("c1", "shell"),
         result: Some(ExchangeResult {
-            content: "declined".to_string(),
+            content: "declined".into(),
+            details: None,
             status: deep_code_agent::ToolResultStatus::Denied,
             asked,
         }),
@@ -831,4 +834,343 @@ fn instructions_summary_lists_sources_and_truncation() {
             "~/.deep-code/AGENTS.md（10 行） + AGENTS.md（42 行） · 已截断至 24000 字符 · 含压缩说明"
         )
     );
+}
+
+#[test]
+fn ordered_image_observations_replay_as_readable_identity_and_keep_details() {
+    use deep_code_agent::{Content, ContentBlock, ImageAsset, ImageFormat};
+    let image = ImageAsset {
+        workspace: "/workspace".into(),
+        digest: "a".repeat(64),
+        format: ImageFormat::Png,
+        bytes: 70,
+    };
+    let content = Content::new(vec![
+        ContentBlock::Text {
+            text: "before".into(),
+        },
+        ContentBlock::Image {
+            image: image.clone(),
+        },
+        ContentBlock::Text {
+            text: "after".into(),
+        },
+    ]);
+    let mut record = SessionRecord::new(PathBuf::from("/workspace"), "");
+    record
+        .entries
+        .push(std::sync::Arc::new(SessionEntry::user(content.clone())));
+    record
+        .entries
+        .push(std::sync::Arc::new(SessionEntry::assistant(
+            "",
+            None,
+            vec![ToolExchange {
+                call: call("call", "write_file"),
+                result: Some(ExchangeResult {
+                    content,
+                    status: ToolResultStatus::Success,
+                    asked: false,
+                    details: Some(serde_json::json!({ "edit": {
+                        "path": "a.txt", "diff": "+hello\n", "added": 1, "removed": 0,
+                        "truncated": false, "new_file": true
+                    }})),
+                }),
+            }],
+        )));
+    let cells = hydrate_history(&record);
+    let HistoryCell::User { text } = &cells[0] else {
+        panic!("user observation missing");
+    };
+    assert!(text.find("before").unwrap() < text.find(&image.digest).unwrap());
+    assert!(text.find(&image.digest).unwrap() < text.find("after").unwrap());
+    assert!(cells.iter().any(|cell| matches!(cell, HistoryCell::ToolResult { summary, .. } if summary.contains(&image.digest))));
+    assert!(cells.iter().any(|cell| matches!(cell, HistoryCell::Diff { path, diff, .. } if path == "a.txt" && diff == "+hello\n")));
+    assert!(!text.contains("base64"));
+}
+
+#[test]
+fn execution_summary_reads_nested_stream_state_and_reports_incomplete_capture() {
+    let details = serde_json::json!({
+        "job_id": "job_1", "status": "failed", "exit_code": 2,
+        "command": "run-check", "input_error": "pipe closed",
+        "stdout": { "text": "normal output", "inline_truncated": true,
+            "omitted_bytes": 42, "capture_complete": true,
+            "spill": { "path": ".deep-code/output/job.stdout", "capped": true } },
+        "stderr": { "text": "failure output", "inline_truncated": false,
+            "capture_complete": false, "read_error": "read failed" }
+    });
+    let summary = summarize_tool_observation(&"bounded model text".into(), Some(&details));
+    for fact in [
+        "job_1: failed exit=2",
+        "stdin: pipe closed",
+        "stdout truncated",
+        "42 bytes omitted",
+        "file contains head only",
+        "stderr capture failed: read failed",
+        "stdout: normal output",
+        "stderr: failure output",
+    ] {
+        assert!(summary.contains(fact), "missing {fact}: {summary}");
+    }
+}
+
+#[test]
+fn bounded_edit_details_keep_the_storage_notice_visible() {
+    let content = deep_code_agent::Content::from(r#"{"path":"min.js","replacements":1}"#);
+    let mut details = serde_json::json!({
+        "edit": { "path": "min.js", "diff": "-old\n+new\n", "added": 1,
+            "removed": 1, "truncated": true, "new_file": false }
+    });
+    assert_eq!(
+        summarize_tool_observation(&content, Some(&details)),
+        "min.js: 1 replacements"
+    );
+    details["details_storage"] = serde_json::json!({
+        "inline_truncated": true,
+        "path": ".deep-code/spill/tool-results/edit-details.txt",
+        "complete": true, "original_bytes": 65536, "error": null
+    });
+    let summary = summarize_tool_observation(&content, Some(&details));
+    for fact in [
+        "min.js: 1 replacements",
+        "details preview truncated",
+        "65536 bytes originally",
+        "full details saved .deep-code/spill/tool-results/edit-details.txt",
+    ] {
+        assert!(summary.contains(fact), "missing {fact}: {summary}");
+    }
+    assert!(matches!(HistoryCell::edit_diff(Some(&details)),
+        Some(HistoryCell::Diff { truncated: true, diff, .. }) if diff == "-old\n+new\n"));
+}
+
+#[test]
+fn execution_summary_keeps_details_storage_notice_after_stream_facts() {
+    let details = serde_json::json!({
+        "job_id": "job_1", "status": "completed", "exit_code": 0,
+        "command": "check",
+        "stdout": { "text": "captured output", "inline_truncated": false,
+            "capture_complete": true, "read_error": null },
+        "stderr": { "text": "", "inline_truncated": false,
+            "capture_complete": true, "read_error": null },
+        "details_storage": { "inline_truncated": true,
+            "path": ".deep-code/spill/tool-results/job-details.txt",
+            "complete": true, "original_bytes": 100000, "error": null }
+    });
+    let summary = summarize_tool_observation(&"model text".into(), Some(&details));
+    assert!(summary.contains("job_1: completed exit=0"), "{summary}");
+    assert!(summary.contains("stdout: captured output"), "{summary}");
+    assert!(summary.contains("details preview truncated"), "{summary}");
+    assert!(
+        summary.contains("full details saved .deep-code/spill/tool-results/job-details.txt"),
+        "{summary}"
+    );
+    assert!(!summary.contains("capture failed"), "{summary}");
+    assert!(!summary.contains("capture incomplete"), "{summary}");
+}
+
+#[test]
+fn details_storage_notice_distinguishes_partial_and_unavailable_sources() {
+    let content = "custom tool finished".into();
+    let partial = serde_json::json!({ "details_storage": {
+        "inline_truncated": true, "path": ".deep-code/spill/tool-results/partial.txt",
+        "complete": false, "original_bytes": 100000000, "error": null
+    }});
+    let summary = summarize_tool_observation(&content, Some(&partial));
+    assert!(summary.starts_with("custom tool finished; details preview truncated"));
+    assert!(
+        summary.contains("partial details saved .deep-code/spill/tool-results/partial.txt"),
+        "{summary}"
+    );
+    assert!(!summary.contains("full details saved"), "{summary}");
+
+    for reason in ["output workspace unavailable", "permission denied"] {
+        let unavailable = serde_json::json!({ "details_storage": {
+            "inline_truncated": true, "path": null, "complete": false,
+            "original_bytes": 100000, "error": reason
+        }});
+        let summary = summarize_tool_observation(&content, Some(&unavailable));
+        assert!(summary.contains("omitted details unavailable"), "{summary}");
+        assert!(summary.contains(reason), "{summary}");
+        assert!(!summary.contains("details saved"), "{summary}");
+    }
+    let no_source = serde_json::json!({ "details_storage": {
+        "inline_truncated": true, "path": null, "complete": true,
+        "original_bytes": 100000, "error": null
+    }});
+    let summary = summarize_tool_observation(&content, Some(&no_source));
+    assert!(summary.contains("omitted details unavailable"), "{summary}");
+    assert!(!summary.contains("full details saved"), "{summary}");
+}
+
+#[test]
+fn bounded_details_storage_reference_reappears_when_a_session_is_resumed() {
+    let source = ".deep-code/spill/tool-results/missing-details.txt";
+    let details = serde_json::json!({
+        "edit": { "path": "min.js", "diff": "-old\n+new\n", "added": 1,
+            "removed": 1, "truncated": true, "new_file": false },
+        "details_storage": { "inline_truncated": true, "path": source,
+            "complete": true, "original_bytes": 65536, "error": null }
+    });
+    let mut record = SessionRecord::new(PathBuf::from("/workspace"), "");
+    record
+        .entries
+        .push(std::sync::Arc::new(SessionEntry::user("edit")));
+    record
+        .entries
+        .push(std::sync::Arc::new(SessionEntry::assistant(
+            "",
+            None,
+            vec![ToolExchange {
+                call: call("edit", "apply_patch"),
+                result: Some(ExchangeResult {
+                    content: "changed min.js".into(),
+                    details: Some(details.clone()),
+                    status: ToolResultStatus::Success,
+                    asked: false,
+                }),
+            }],
+        )));
+    let resumed: SessionRecord =
+        serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+    let cells = hydrate_history(&resumed);
+    let live_summary = summarize_tool_observation(&"changed min.js".into(), Some(&details));
+    assert!(cells.iter().any(|cell| matches!(cell,
+        HistoryCell::ToolResult { summary, .. } if summary == &live_summary && summary.contains(source)
+    )));
+    assert!(cells.iter().any(|cell| matches!(cell,
+        HistoryCell::Diff { path, diff, truncated: true, .. }
+            if path == "min.js" && diff == "-old\n+new\n"
+    )));
+}
+
+#[test]
+fn image_request_omission_reappears_when_a_turn_is_resumed() {
+    let mut record = SessionRecord::new(PathBuf::from("/workspace"), "");
+    let turn_id = TurnId("turn_images".into());
+    record.entries.push(std::sync::Arc::new(
+        SessionEntry::user("look").with_turn_id(turn_id.clone()),
+    ));
+    let mut turn = deep_code_agent::TurnRecord::new(turn_id);
+    turn.image_requests.push(
+        serde_json::from_value(serde_json::json!({
+            "model": "text-only", "images": [{
+                "message_index": 1, "block_index": 1, "call_id": "call",
+                "image": ".deep-code/images/asset.png", "included": false,
+                "reason": "image not sent: current model does not accept images"
+            }]
+        }))
+        .unwrap(),
+    );
+    record.turns.push(turn);
+    let cells = hydrate_history(&record);
+    assert!(cells.iter().any(|cell| matches!(cell, HistoryCell::System { text } if text.contains("text-only") && text.contains("image not sent"))));
+}
+
+#[test]
+fn image_report_retention_notice_includes_compacted_turns_and_keeps_recent_reasons() {
+    let mut record = SessionRecord::new(PathBuf::from("/workspace"), "");
+    let mut archived = deep_code_agent::TurnRecord::new(TurnId("archived".into()));
+    archived.image_reports_omitted = 2;
+    let current_id = TurnId("current".into());
+    record.entries.push(std::sync::Arc::new(
+        SessionEntry::user("latest task").with_turn_id(current_id.clone()),
+    ));
+    let mut current = deep_code_agent::TurnRecord::new(current_id);
+    current.image_reports_omitted = 3;
+    current.image_requests.push(
+        serde_json::from_value(serde_json::json!({
+            "model": "text-only", "images": [{
+                "observation_id": "current:0:1", "message_index": 1, "block_index": 1,
+                "call_id": null, "image": "sha256:asset", "included": false,
+                "reason": "recent image omitted: current model does not accept images"
+            }]
+        }))
+        .unwrap(),
+    );
+    record.turns.extend([archived, current]);
+    let resumed: SessionRecord =
+        serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+    let cells = hydrate_history(&resumed);
+    let notices: Vec<_> = cells
+        .iter()
+        .filter_map(|cell| match cell {
+            HistoryCell::System { text } if text.contains("retention budget") => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notices.len(), 1, "retention has one session-wide notice");
+    assert!(notices[0].contains("较早的 5 条图片观察报告"));
+    assert!(notices[0].contains("5 earlier image observation reports omitted"));
+    assert!(cells.iter().any(|cell| matches!(cell,
+        HistoryCell::System { text } if text.contains("text-only") && text.contains("recent image omitted")
+    )));
+    assert!(cells.iter().any(|cell| matches!(cell,
+        HistoryCell::User { text } if text == "latest task"
+    )));
+}
+
+#[test]
+fn zero_omitted_image_reports_add_no_retention_notice() {
+    let mut record = SessionRecord::new(PathBuf::from("/workspace"), "");
+    let turn_id = TurnId("current".into());
+    record.entries.push(std::sync::Arc::new(
+        SessionEntry::user("latest task").with_turn_id(turn_id.clone()),
+    ));
+    record.turns.push(deep_code_agent::TurnRecord::new(turn_id));
+    let cells = hydrate_history(&record);
+    assert_eq!(cells.len(), 1);
+    assert!(matches!(&cells[0], HistoryCell::User { text } if text == "latest task"));
+}
+
+#[test]
+fn omitted_image_report_count_saturates_without_panicking() {
+    let mut record = SessionRecord::new(PathBuf::from("/workspace"), "");
+    for (id, omitted) in [("older", u64::MAX), ("recent", 1)] {
+        let mut turn = deep_code_agent::TurnRecord::new(TurnId(id.into()));
+        turn.image_reports_omitted = omitted;
+        record.turns.push(turn);
+    }
+    let cells = hydrate_history(&record);
+    assert_eq!(cells.len(), 1);
+    assert!(matches!(&cells[0], HistoryCell::System { text }
+        if text.contains(&format!("{} earlier image observation reports", u64::MAX))
+    ));
+}
+
+#[test]
+fn execution_page_summary_exposes_continuation_and_memory_eviction() {
+    let details = serde_json::json!({
+        "job_id": "job", "command": "seq 1 1500", "status": "completed", "exit_code": 0,
+        "stdout": {"text": "", "capture_complete": true, "inline_truncated": true, "omitted_bytes": 0},
+        "stderr": {"text": "", "capture_complete": true},
+        "output_page": {"stream": "stdout", "text": "next page", "start_byte": 100,
+            "end_byte": 200, "total_bytes": 300, "unavailable_before_byte": 100,
+            "has_more": true, "next_start_byte": 200},
+    });
+    let summary = summarize_tool_observation(&"page".into(), Some(&details));
+    assert!(summary.contains("stdout bytes 100..200 of 300"));
+    assert!(summary.contains("bytes before 100 unavailable from memory"));
+    assert!(summary.contains("next byte 200") && summary.contains("next page"));
+    assert!(!summary.contains("truncated (0 bytes") && !summary.contains("capture incomplete"));
+    let mut running = details.clone();
+    running["status"] = "running".into();
+    running["output_page"]["has_more"] = false.into();
+    let summary = summarize_tool_observation(&"page".into(), Some(&running));
+    assert!(summary.contains("waiting for output at byte 200"));
+    running["output_page"]["next_start_byte"] = serde_json::Value::Null;
+    let summary = summarize_tool_observation(&"page".into(), Some(&running));
+    assert!(summary.contains("end of retained output"));
+}
+
+#[test]
+fn text_page_summary_does_not_invent_an_unknown_total() {
+    let summary = summarize_tool_result(
+        &serde_json::json!({
+            "path": "virtual.txt", "total_lines": null,
+            "lines": [{"text": "one"}], "truncated": true,
+        })
+        .to_string(),
+    );
+    assert!(summary.contains("1 lines shown (total unknown, truncated=true)"));
 }

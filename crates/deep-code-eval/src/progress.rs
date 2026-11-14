@@ -33,6 +33,16 @@ struct Checkpoint {
     state: ProgressState,
 }
 
+/// Explicitly release ownership even if a concurrent fork inherited the file
+/// description before its close-on-exec descriptor was closed.
+struct OutputLock(File);
+
+impl Drop for OutputLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// A single writer owns the output directory for its whole rollout. The lock
 /// file intentionally stays on disk: deleting it while another process opens
 /// it would let two processes lock different inodes for the same directory.
@@ -41,7 +51,7 @@ pub(crate) struct ProgressStore {
     signature: Value,
     state: ProgressState,
     base_duration_ms: u64,
-    _lock: File,
+    _lock: OutputLock,
 }
 
 impl ProgressStore {
@@ -62,6 +72,7 @@ impl ProgressStore {
         lock.try_lock().map_err(|error| {
             anyhow::anyhow!("eval output directory is already in use or cannot be locked: {error}")
         })?;
+        let lock = OutputLock(lock);
 
         let checkpoint_path = directory.join(CHECKPOINT_FILE);
         let state = if resume {
@@ -307,6 +318,28 @@ mod tests {
             .expect("lock must be exclusive");
         assert!(error.to_string().contains("already in use"), "{error:#}");
         drop(first);
+        assert!(open(directory.path(), true).is_ok());
+    }
+
+    #[test]
+    fn dropping_writer_releases_a_lock_with_an_inherited_file_description() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open(directory.path(), false).unwrap();
+        // A duplicated descriptor has the same lock ownership as the copy a
+        // parallel fork temporarily retains before exec.
+        let inherited = store._lock.0.try_clone().unwrap();
+        drop(store);
+        let resumed = open(directory.path(), true).unwrap();
+        assert!(
+            open(directory.path(), true).is_err(),
+            "the resumed writer owns the lock"
+        );
+        drop(inherited);
+        assert!(
+            open(directory.path(), true).is_err(),
+            "closing an old descriptor must not release the new writer's lock"
+        );
+        drop(resumed);
         assert!(open(directory.path(), true).is_ok());
     }
 

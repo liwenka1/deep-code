@@ -14,18 +14,17 @@ use crate::workspace_policy::{WorkspacePolicy, contains_symlink, invalid, json_s
 
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 500;
+const TEXT_READ_PAGE_BYTES: usize = 64 * 1024;
 /// Chars held back from [`crate::runtime::tool_result::TOOL_OUTPUT_BUDGET`] for
 /// `read_file`'s wrapper fields (path, counts, flags) so the line array plus the
 /// wrapper together stay under the budget the runtime enforces on every result.
-const READ_WRAPPER_RESERVE: usize = 256;
+const READ_WRAPPER_RESERVE: usize = 1_024;
 /// Same idea for `grep_files`, whose wrapper is larger: the pattern, four skipped
 /// counts, up to four capped skipped-path lists and a note ride alongside the
 /// matches, so more is reserved than for a plain read.
 const GREP_WRAPPER_RESERVE: usize = 2_048;
-/// Size cap for reading/searching a single file. `pub(crate)` so every
-/// user-facing mention of the limit (read_file's error, grep's note, the
-/// approval preview's source guard) derives from this one number instead of
-/// hardcoding "2 MiB" — a bumped constant must not leave the prose lying.
+/// Whole-file cap for searches and mutation previews. Text reads instead
+/// use bounded byte pages and can continue through larger source files.
 pub(crate) const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const DEFAULT_GREP_RESULTS: usize = 100;
 const MAX_GREP_RESULTS: usize = 500;
@@ -114,120 +113,215 @@ impl ReadFileTool {
         Self { root }
     }
 
-    fn read_sync(&self, params: ReadFileParams) -> Result<ToolOutput, ToolError> {
+    fn read_sync(
+        &self,
+        params: ReadFileParams,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        use crate::content::Content;
+        use crate::image::{ImageFormat, MAX_IMAGE_BYTES, snapshot_bytes};
+        use std::io::{Read, Seek, SeekFrom};
+
+        if cancel.is_cancelled() {
+            return Err(ToolError::exec_failed(Self::NAME, "read cancelled"));
+        }
         let start_line = params.start_line.unwrap_or(1);
         if start_line == 0 {
             return Err(invalid(Self::NAME, "start_line must be greater than 0"));
         }
+        if params.start_byte.is_some() && params.start_line.is_some() {
+            return Err(invalid(
+                Self::NAME,
+                "use start_byte or start_line, not both",
+            ));
+        }
+        let handle = self.root.open_existing(&params.path, Self::NAME)?;
+        let path = handle.path().to_path_buf();
+        let display = self.root.relative_display(&path);
+        let mut file = handle.open_read().map_err(|error| {
+            ToolError::exec_failed(Self::NAME, format!("{display} could not be read: {error}"))
+        })?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| ToolError::exec_failed(Self::NAME, error.to_string()))?;
+        if !metadata.is_file() {
+            return Err(invalid(Self::NAME, "path is not a file"));
+        }
+        let mut header = [0u8; 16];
+        let header_bytes = file
+            .read(&mut header)
+            .map_err(|error| ToolError::exec_failed(Self::NAME, error.to_string()))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| ToolError::exec_failed(Self::NAME, error.to_string()))?;
+        if ImageFormat::sniff(&header[..header_bytes]).is_some() {
+            if params.start_line.is_some()
+                || params.max_lines.is_some()
+                || params.start_byte.is_some()
+            {
+                return Err(invalid(
+                    Self::NAME,
+                    "image reads do not accept text pagination parameters",
+                ));
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_IMAGE_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| ToolError::exec_failed(Self::NAME, error.to_string()))?;
+            if cancel.is_cancelled() {
+                return Err(ToolError::exec_failed(Self::NAME, "read cancelled"));
+            }
+            let asset = snapshot_bytes(self.root.root(), &bytes)
+                .map_err(|error| ToolError::exec_failed(Self::NAME, error.to_string()))?;
+            let mut content = Content::from_text(format!(
+                "Image read from {display}; immutable observation {asset}\n"
+            ));
+            content.push_image(asset);
+            return Ok(ToolOutput::observations(content));
+        }
+
+        Self::read_text_page(file, &display, metadata.len(), params, cancel)
+    }
+
+    fn read_text_page<R: std::io::Read + std::io::Seek>(
+        file: R,
+        display: &str,
+        metadata_bytes: u64,
+        params: ReadFileParams,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        use std::io::{BufRead, Read, Seek, SeekFrom};
+
+        let start_line = params.start_line.unwrap_or(1);
         let max_lines = params
             .max_lines
             .unwrap_or(DEFAULT_READ_LINES)
             .clamp(1, MAX_READ_LINES);
-        let handle =
-            self.root
-                .open_existing(&params.path, Self::NAME)
-                .map_err(|error| match error {
-                    ToolError::ExecutionFailed { message, .. } => ToolError::exec_failed(
-                        Self::NAME,
-                        format!(
-                            "{} could not be read: {message}",
-                            self.root
-                                .relative_display(std::path::Path::new(&params.path))
-                        ),
-                    ),
-                    other => other,
-                })?;
-        let path = handle.path().to_path_buf();
-        let metadata = handle.no_follow_metadata().map_err(|error| {
-            ToolError::exec_failed(
-                Self::NAME,
-                format!(
-                    "failed to read metadata for {}: {error}",
-                    self.root.relative_display(&path)
-                ),
-            )
-        })?;
-        if !metadata.is_file() {
-            return Err(invalid(Self::NAME, "path is not a file"));
+        let mut reader = std::io::BufReader::new(file);
+        let mut start_byte = params.start_byte.unwrap_or(0);
+        if params.start_byte.is_some() {
+            reader
+                .seek(SeekFrom::Start(start_byte))
+                .map_err(|error| ToolError::exec_failed(Self::NAME, error.to_string()))?;
+        } else {
+            // Skip lines without allocating them, even for very large logs.
+            let mut skipped = 0usize;
+            while skipped < start_line - 1 {
+                if cancel.is_cancelled() {
+                    return Err(ToolError::exec_failed(Self::NAME, "read cancelled"));
+                }
+                let buffer = reader
+                    .fill_buf()
+                    .map_err(|error| ToolError::exec_failed(Self::NAME, error.to_string()))?;
+                if buffer.is_empty() {
+                    break;
+                }
+                let newline = buffer.iter().position(|byte| *byte == b'\n');
+                let count = newline.map_or(buffer.len(), |at| at + 1);
+                reader.consume(count);
+                start_byte += count as u64;
+                if newline.is_some() {
+                    skipped += 1;
+                }
+            }
         }
-        if metadata.len() > MAX_FILE_BYTES {
-            return Err(ToolError::exec_failed(
+        // The bound is on each observation, not on the source file size.
+        let mut bytes = Vec::new();
+        reader
+            .by_ref()
+            .take(TEXT_READ_PAGE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| ToolError::exec_failed(Self::NAME, error.to_string()))?;
+        if cancel.is_cancelled() {
+            return Err(ToolError::exec_failed(Self::NAME, "read cancelled"));
+        }
+        // The extra byte is lookahead. File metadata is only advisory: procfs
+        // may report zero and sysfs may report a page regardless of readable data.
+        let reached_eof = bytes.len() <= TEXT_READ_PAGE_BYTES;
+        let available = bytes.len().min(TEXT_READ_PAGE_BYTES);
+        let contents = match std::str::from_utf8(&bytes[..available]) {
+            Ok(text) => text,
+            Err(error) if error.error_len().is_none() && !reached_eof => {
+                std::str::from_utf8(&bytes[..error.valid_up_to()])
+                    .map_err(|error| ToolError::exec_failed(Self::NAME, error.to_string()))?
+            }
+            Err(error) => {
+                return Err(ToolError::exec_failed(
+                    Self::NAME,
+                    format!("{display} is not valid UTF-8 at this position: {error}"),
+                ));
+            }
+        };
+        let line_budget = crate::runtime::tool_result::TOOL_OUTPUT_BUDGET
+            .saturating_sub(READ_WRAPPER_RESERVE + json!(display).to_string().chars().count());
+        if line_budget < 64 {
+            return Err(invalid(
                 Self::NAME,
-                format!(
-                    "{} is larger than the current {MAX_FILE_MIB} MiB read limit",
-                    self.root.relative_display(&path)
-                ),
+                "path metadata exceeds the text page budget",
             ));
         }
-        let contents = handle.read_to_string().map_err(|error| {
-            // Name the cause, and use the workspace-relative spelling. One
-            // `map_err` covered both "the bytes are not UTF-8" and every IO
-            // failure, so a permission error came back as "failed to read X as
-            // UTF-8: Permission denied" — the same two causes grep splits into
-            // separate ledgers, still conflated here. It also reached for
-            // `path.display()` while the size check nearby uses
-            // `relative_display`, leaking the absolute host path to the model.
-            let cause = if error.kind() == std::io::ErrorKind::InvalidData {
-                "is not valid UTF-8"
-            } else {
-                "could not be read"
-            };
-            ToolError::exec_failed(
-                Self::NAME,
-                format!("{} {cause}: {error}", self.root.relative_display(&path)),
-            )
-        })?;
-        let lines = contents.lines().collect::<Vec<_>>();
-        let total_lines = lines.len();
-        let start_index = start_line.saturating_sub(1);
-        // Size the returned slice to the runtime's per-result budget, not just to
-        // `max_lines`. The result used to be up to 500 pretty-printed
-        // `{"line","text"}` objects (~49 chars of overhead each), so an ordinary
-        // 200-line read ran to 16-20k chars and the runtime's 12k truncation
-        // silently dropped the MIDDLE — while `next_start_line` pointed past the
-        // hole, so the model "continued" over unseen lines. Emit compact JSON and
-        // stop adding lines once the budget is reached, reporting the real
-        // continuation point.
-        let line_budget =
-            crate::runtime::tool_result::TOOL_OUTPUT_BUDGET.saturating_sub(READ_WRAPPER_RESERVE);
-        let mut selected: Vec<serde_json::Value> = Vec::new();
+        let mut selected = Vec::new();
         let mut used = 0usize;
-        for (index, line) in lines.iter().enumerate().skip(start_index).take(max_lines) {
-            let element = json!({"line": index + 1, "text": line});
-            // Compact size of this element plus its separating comma, in chars —
-            // the same unit the budget's truncation counts in.
-            let cost = serde_json::to_string(&element).map_or(0, |text| text.chars().count()) + 1;
-            // Always take at least one line: a single line wider than the whole
-            // budget still gets returned (the runtime trims its ends) rather than
-            // an empty result that strands the read.
-            if !selected.is_empty() && used + cost > line_budget {
+        let mut consumed = 0usize;
+        let mut partial_line = false;
+        for (index, raw) in contents.split_inclusive('\n').take(max_lines).enumerate() {
+            let line = match raw.strip_suffix('\n') {
+                Some(line) => line.strip_suffix('\r').unwrap_or(line),
+                None => raw,
+            };
+            let line_number = params.start_byte.is_none().then_some(start_line + index);
+            let element = json!({"line": line_number, "text": line});
+            let cost = element.to_string().chars().count() + 1;
+            if used + cost > line_budget {
+                if !selected.is_empty() {
+                    break;
+                }
+                let boundaries: Vec<_> = std::iter::once(0)
+                    .chain(line.char_indices().map(|(at, ch)| at + ch.len_utf8()))
+                    .collect();
+                let (mut low, mut high) = (0, boundaries.len() - 1);
+                while low < high {
+                    let middle = low + (high - low).div_ceil(2);
+                    let element = json!({"line": line_number, "text": &line[..boundaries[middle]]});
+                    if element.to_string().chars().count() < line_budget {
+                        low = middle;
+                    } else {
+                        high = middle - 1;
+                    }
+                }
+                let end = boundaries[low];
+                if end == 0 {
+                    return Err(invalid(
+                        Self::NAME,
+                        "text page cannot make progress within its budget",
+                    ));
+                }
+                selected.push(json!({"line": line_number, "text": &line[..end]}));
+                consumed += end;
+                partial_line = true;
                 break;
             }
             used += cost;
+            consumed += raw.len();
+            partial_line = !raw.ends_with('\n') && (consumed < bytes.len() || !reached_eof);
             selected.push(element);
         }
-        let returned = selected.len();
-        let next_start_line = if start_index + returned < total_lines {
-            Some(start_index + returned + 1)
-        } else {
-            None
-        };
-        // Compact, not pretty: the pretty overhead is exactly what this budget
-        // accounting is measuring, so the emitted bytes must match what was
-        // counted (and be as small as what fits).
-        Ok(ToolOutput::text(
-            serde_json::to_string(&json!({
-                "path": self.root.relative_display(&path),
-                "total_lines": total_lines,
-                "start_line": start_line,
-                "max_lines": max_lines,
-                "returned_lines": returned,
-                "truncated": next_start_line.is_some(),
-                "next_start_line": next_start_line,
-                "lines": selected
-            }))
-            .unwrap_or_else(|_| "{}".to_string()),
-        ))
+        let next_byte = start_byte + consumed as u64;
+        let truncated = consumed < bytes.len() || !reached_eof;
+        let next_start_line = (truncated && params.start_byte.is_none() && !partial_line)
+            .then_some(start_line + selected.len());
+        let total_lines = (start_byte == 0 && reached_eof).then(|| contents.lines().count());
+        // A seek beyond EOF cannot establish the source's total length.
+        let total_bytes = (reached_eof
+            && (params.start_byte.is_none() || start_byte == 0 || !bytes.is_empty()))
+        .then_some(start_byte + bytes.len() as u64);
+        Ok(ToolOutput::text(json!({
+            "path": display, "metadata_bytes": metadata_bytes, "total_bytes": total_bytes, "total_lines": total_lines,
+            "start_line": params.start_byte.is_none().then_some(start_line), "start_byte": start_byte,
+            "max_lines": max_lines, "returned_lines": selected.len(), "returned_bytes": consumed,
+            "truncated": truncated, "partial_line": partial_line,
+            "next_start_line": next_start_line, "next_start_byte": truncated.then_some(next_byte),
+            "lines": selected,
+        }).to_string()))
     }
 }
 
@@ -236,8 +330,10 @@ impl ReadFileTool {
 struct ReadFileParams {
     /// Workspace-relative file path (absolute allowed only inside a granted root)
     path: String,
-    /// 1-based line number, default 1
+    /// 1-based line number, default 1; mutually exclusive with start_byte
     start_line: Option<usize>,
+    /// UTF-8 byte cursor returned by a previous read, including partial lines
+    start_byte: Option<u64>,
     /// Maximum lines to return, default 200, max 500
     max_lines: Option<usize>,
 }
@@ -251,12 +347,13 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read a UTF-8 file from the workspace. Supports start_line and max_lines for bounded reads."
+        "Read workspace text or an image. Text uses bounded pages with next_start_byte for exact continuation, even for large files or long lines. Continuation uses actual EOF; metadata_bytes is advisory and total_bytes is null until known. Images return actual visual observations; text pagination parameters do not apply to images."
     }
 
-    async fn run(&self, params: ReadFileParams, _cx: &ToolCx) -> Result<ToolOutput, ToolError> {
+    async fn run(&self, params: ReadFileParams, cx: &ToolCx) -> Result<ToolOutput, ToolError> {
         let this = self.clone();
-        run_blocking(Self::NAME, move || this.read_sync(params)).await
+        let cancel = cx.cancel_token().clone();
+        run_blocking(Self::NAME, move || this.read_sync(params, &cancel)).await
     }
 }
 

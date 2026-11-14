@@ -131,14 +131,14 @@ pub(crate) fn has_user_message(record: &SessionRecord) -> bool {
 /// First user prompt, single-lined and truncated — the list title.
 pub(crate) fn session_title(record: &SessionRecord, lang: Lang) -> String {
     let first = record.entries.iter().find_map(|entry| match &entry.kind {
-        deep_code_agent::EntryKind::User { content, .. } => Some(content.as_str()),
+        deep_code_agent::EntryKind::User { content, .. } => Some(content.summary_text()),
         _ => None,
     });
     let first = match first {
         Some(content) => content,
         None => return tr(lang, TextId::EmptySessionTitle).to_string(),
     };
-    crate::history::truncate_chars(&crate::history::collapse_whitespace(first), 56)
+    crate::history::truncate_chars(&crate::history::collapse_whitespace(&first), 56)
 }
 
 /// Human-readable age, e.g. "刚刚 / 5 分钟前" or "just now / 5 min ago". Pure.

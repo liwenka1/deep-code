@@ -1265,7 +1265,7 @@ impl ExecPolicy {
             ToolKind::Job => match arguments.get("action").and_then(Value::as_str) {
                 // Launching a background command is exactly as risky as the
                 // command itself: same deny/trust/approve gate as `shell`.
-                Some("start") => self.evaluate_command_bearing(tool_name, arguments),
+                Some("start") => self.evaluate_command_input(tool_name, arguments),
                 Some("status" | "tail") => ToolExecutionPlan {
                     verdict: PolicyVerdict::Allow,
                     requires_sandbox: false,
@@ -1285,6 +1285,18 @@ impl ExecPolicy {
                     matched_rule: Some("builtin:job_control".to_string()),
                     network: false,
                 },
+                Some("input" | "close_stdin") => ToolExecutionPlan {
+                    verdict: PolicyVerdict::NeedsApproval {
+                        authority: ApprovalAuthority::AutomaticAllowed,
+                        reason: "writing stdin can execute new instructions in the running process"
+                            .to_string(),
+                    },
+                    requires_sandbox: false,
+                    read_only: false,
+                    risk_level: RiskLevel::High,
+                    matched_rule: Some("builtin:job_input".to_string()),
+                    network: false,
+                },
                 // Missing/unknown action: gate defensively; the tool then
                 // rejects it as InvalidArguments.
                 _ => ToolExecutionPlan {
@@ -1299,7 +1311,7 @@ impl ExecPolicy {
                     network: false,
                 },
             },
-            ToolKind::Shell => self.evaluate_command_bearing(tool_name, arguments),
+            ToolKind::Shell => self.evaluate_command_input(tool_name, arguments),
             ToolKind::Mock => ToolExecutionPlan {
                 verdict: PolicyVerdict::NeedsApproval {
                     authority: ApprovalAuthority::AutomaticAllowed,
@@ -1459,6 +1471,23 @@ impl ExecPolicy {
                 network: false,
             },
         }
+    }
+
+    fn evaluate_command_input(&self, tool_name: &str, arguments: &Value) -> ToolExecutionPlan {
+        let mut plan = self.evaluate_command_bearing(tool_name, arguments);
+        if input_requested(arguments)
+            && !matches!(plan.verdict, PolicyVerdict::Deny { .. })
+            && !plan.requires_human()
+        {
+            plan.verdict = PolicyVerdict::NeedsApproval {
+                authority: ApprovalAuthority::AutomaticAllowed,
+                reason: "explicit stdin or an interactive pipe adds executable input beyond the command identity".to_string(),
+            };
+            plan.read_only = false;
+            plan.risk_level = RiskLevel::High;
+            plan.matched_rule = Some("builtin:execution_input".to_string());
+        }
+        plan
     }
 
     /// The shared tail of the `shell` and `job action=start` arms: the command
@@ -1662,7 +1691,7 @@ pub fn shell_command_of<'a>(tool_name: &str, arguments: &'a Value) -> Option<&'a
 pub fn accept_edits_approvable(tool_name: &str, arguments: &Value) -> bool {
     // A network declaration is never covered by accept-edits: that mode's
     // standing consent is "edit files in the workspace", not "open egress".
-    if network_requested(arguments) {
+    if network_requested(arguments) || input_requested(arguments) {
         return false;
     }
     match ExecPolicy::classify_tool(tool_name) {
@@ -1688,6 +1717,12 @@ pub fn accept_edits_approvable(tool_name: &str, arguments: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// Input changes what an interpreter can execute, independently of its argv.
+fn input_requested(arguments: &Value) -> bool {
+    arguments.get("stdin").is_some_and(|value| !value.is_null())
+        || arguments.get("interactive").and_then(Value::as_bool) == Some(true)
 }
 
 /// The command identities a dispatch declares for its child, trimmed, empty

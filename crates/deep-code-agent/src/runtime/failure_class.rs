@@ -46,7 +46,7 @@ pub(super) fn record_failure_signals(
     // for the session); the latch is read by the next turn's router.
     if result.status == ToolResultStatus::Error
         && !boundary_denial
-        && result.content != CANCELLED_TOOL_RESULT
+        && result.content.text() != CANCELLED_TOOL_RESULT
         && !crate::subagent::is_subagent_tool(&call.name)
     {
         state.turn_tool_errors += 1;
@@ -82,12 +82,16 @@ fn is_boundary_denial(call: &ToolCall, result: &ToolResult) -> bool {
     if result.status == ToolResultStatus::Error
         && result
             .content
+            .text()
             .contains(crate::workspace_policy::OUTSIDE_ROOTS)
     {
         return true;
     }
     matches!(call.name.as_str(), "shell" | "job")
-        && result.content.contains(crate::sandbox::WRITE_DENIAL_NOTE)
+        && result
+            .content
+            .text()
+            .contains(crate::sandbox::WRITE_DENIAL_NOTE)
 }
 
 #[cfg(test)]
@@ -112,7 +116,7 @@ mod tests {
             !is_boundary_denial(&call, &result),
             "a network denial is not the granted-roots fence"
         );
-        result.content = format!("sh: ...\n{}", crate::sandbox::WRITE_DENIAL_NOTE);
+        result.content = format!("sh: ...\n{}", crate::sandbox::WRITE_DENIAL_NOTE).into();
         assert!(
             is_boundary_denial(&call, &result),
             "the write note keeps feeding the breaker"

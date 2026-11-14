@@ -8,14 +8,16 @@ use std::sync::{
 use std::time::Instant;
 
 use serde::Serialize;
-use tokio::io::AsyncReadExt;
-use tokio::process::Child;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStdin};
 
 use crate::tool::ToolError;
 use crate::workspace_policy::invalid;
 
 mod render;
+#[cfg(test)]
 pub(super) use render::{job_details, job_text_snapshot, shell_text_output};
+pub(super) use render::{job_output, job_page_output};
 
 /// Live-output ring capacity per stream — the single source of truth for how
 /// much of a stream is held in memory. The shell tool's live-stream cap
@@ -27,7 +29,7 @@ pub(super) const JOB_BUFFER_BYTES: usize = 128 * 1024;
 /// Room left for the framing the renderer adds around the two streams:
 /// `[stderr]`, the trailing `[exit N · Nms]`, the notes. Small and generous —
 /// it only has to keep the sum below the budget, not predict it exactly.
-const SPILL_FRAMING_RESERVE: usize = 256;
+const SPILL_FRAMING_RESERVE: usize = 2048;
 
 /// The one size that decides everything about a spill: below it a stream needs
 /// no file, at or above it a stream keeps one.
@@ -52,11 +54,11 @@ const SPILL_FRAMING_RESERVE: usize = 256;
 ///
 /// Well under the ring capacity, so at the moment of crossing the ring still
 /// holds every byte and the file can start from byte zero.
-const SPILL_JOINT_INLINE_CHARS: usize =
+pub(super) const INLINE_STREAM_CHARS: usize =
     (crate::runtime::tool_result::TOOL_OUTPUT_BUDGET - SPILL_FRAMING_RESERVE) / 2;
 
 /// Alias for the create side, in the units the create side compares.
-const SPILL_THRESHOLD_BYTES: usize = SPILL_JOINT_INLINE_CHARS;
+const SPILL_THRESHOLD_BYTES: usize = INLINE_STREAM_CHARS;
 
 /// Per-stream cap on a spill file. The file keeps the HEAD (where compilers
 /// put the root-cause error) and stops there; the ring independently keeps
@@ -71,8 +73,9 @@ const SPILL_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// without ever dropping a running background job.
 const MAX_RETAINED_JOBS: usize = 32;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct JobStore {
+    owner: Arc<str>,
     next_id: Arc<AtomicU64>,
     jobs: Arc<Mutex<HashMap<String, Arc<Mutex<JobState>>>>>,
     /// Set by [`Self::shutdown`], read by [`Self::insert_with_id`] under the
@@ -81,6 +84,18 @@ pub struct JobStore {
     closed: Arc<AtomicBool>,
     /// Serializes process creation with destructive workspace restoration.
     workspace_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Default for JobStore {
+    fn default() -> Self {
+        Self {
+            owner: uuid::Uuid::new_v4().simple().to_string().into(),
+            next_id: Arc::default(),
+            jobs: Arc::default(),
+            closed: Arc::default(),
+            workspace_gate: Arc::default(),
+        }
+    }
 }
 
 impl JobStore {
@@ -139,7 +154,9 @@ impl JobStore {
                 // tree there (`kill_process_tree`'s `start_kill` only reaps the
                 // direct child); `None` on Unix, so this is a no-op.
                 state.job_guard = None;
+                state.close_input();
                 state.status = JobStatus::Cancelled;
+                state.finished_at = Some(Instant::now());
             }
         }
     }
@@ -149,7 +166,11 @@ impl JobStore {
     /// the id and must exist before the output buffers (and thus the state)
     /// are constructed.
     pub(super) fn reserve_id(&self) -> String {
-        format!("job_{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1)
+        format!(
+            "job_{}_{}",
+            self.owner,
+            self.next_id.fetch_add(1, Ordering::Relaxed) + 1
+        )
     }
 
     pub(super) fn insert_with_id(&self, id: &str, mut state: JobState) {
@@ -165,7 +186,9 @@ impl JobStore {
         {
             kill_process_tree(child);
             state.job_guard = None;
+            state.close_input();
             state.status = JobStatus::Cancelled;
+            state.finished_at = Some(Instant::now());
         }
         guard.insert(id.to_string(), Arc::new(Mutex::new(state)));
         evict_finished_jobs(&mut guard);
@@ -177,7 +200,7 @@ impl JobStore {
             .expect("job store lock poisoned")
             .get(id)
             .cloned()
-            .ok_or_else(|| invalid(tool_name, format!("unknown job_id '{id}'")))
+            .ok_or_else(|| invalid(tool_name, format!("job_id '{id}' is not owned by this runtime or is no longer retained; jobs cannot be resumed after a runtime restart")))
     }
 }
 
@@ -209,7 +232,7 @@ fn evict_finished_jobs(jobs: &mut HashMap<String, Arc<Mutex<JobState>>>) {
     }
 }
 
-/// Monotonic counter out of a `job_<n>` id, for oldest-first ordering.
+/// Monotonic suffix of a runtime-owned job id, for oldest-first ordering.
 fn job_sequence(id: &str) -> u64 {
     id.rsplit('_')
         .next()
@@ -223,6 +246,7 @@ pub(super) struct JobState {
     pub(super) command: String,
     pub(super) cwd: String,
     pub(super) started_at: Instant,
+    pub(super) finished_at: Option<Instant>,
     pub(super) status: JobStatus,
     pub(super) exit_code: Option<i32>,
     /// Whether the command ran under the OS sandbox. A failure only qualifies
@@ -239,6 +263,9 @@ pub(super) struct JobState {
     /// Present for background jobs; foreground children are owned by the
     /// running tool future and only their terminal state lands here.
     pub(super) child: Option<Child>,
+    /// Only an explicitly interactive background job retains a writable pipe.
+    pub(super) input: Option<Arc<JobInput>>,
+    pub(super) input_error: Option<String>,
     /// OS sandbox guard tied to the child (Windows Job Object); dropping it with
     /// the job kills the process tree. `None` on macOS/Linux (confined pre-spawn),
     /// and `None` for a foreground run, whose tool future holds each step's
@@ -246,6 +273,159 @@ pub(super) struct JobState {
     /// Held purely for its `Drop` — never read.
     #[allow(dead_code)]
     pub(super) job_guard: Option<crate::sandbox::SandboxGuard>,
+}
+
+/// One captured view of process state, shared by model and UI projections.
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct ExecutionSnapshot {
+    pub(super) job_id: String,
+    pub(super) kind: JobKind,
+    pub(super) command: String,
+    pub(super) cwd: String,
+    pub(super) status: JobStatus,
+    pub(super) exit_code: Option<i32>,
+    pub(super) duration_ms: u64,
+    pub(super) sandboxed: bool,
+    pub(super) network: bool,
+    pub(super) stdin_open: bool,
+    pub(super) input_error: Option<String>,
+    pub(super) stdout: StreamSnapshot,
+    pub(super) stderr: StreamSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct StreamSnapshot {
+    pub(super) text: String,
+    pub(super) total_bytes: usize,
+    /// Bytes evicted from the in-memory ring; inline truncation is separate.
+    pub(super) omitted_bytes: usize,
+    pub(super) inline_truncated: bool,
+    pub(super) finished: bool,
+    pub(super) read_error: Option<String>,
+    /// All stream bytes were captured and remain available in the ring or an uncapped spill.
+    pub(super) capture_complete: bool,
+    pub(super) spill: Option<SpillInfo>,
+}
+
+/// One bounded read of the currently retained bytes. Cursors refer to the
+/// original stream, so appending output never changes their meaning.
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct OutputPage {
+    pub(super) stream: super::JobStream,
+    pub(super) requested_start_byte: Option<u64>,
+    pub(super) start_byte: usize,
+    pub(super) end_byte: usize,
+    pub(super) retained_start_byte: usize,
+    pub(super) unavailable_before_byte: usize,
+    pub(super) total_bytes: usize,
+    pub(super) next_start_byte: Option<usize>,
+    pub(super) has_more: bool,
+    pub(super) finished: bool,
+    pub(super) lossy_utf8: bool,
+    pub(super) read_error: Option<String>,
+    pub(super) text: String,
+}
+
+impl ExecutionSnapshot {
+    pub(super) fn capture(job_id: &str, job: &JobState, max_chars: usize) -> Self {
+        Self {
+            job_id: job_id.to_string(),
+            kind: job.kind,
+            command: job.command.clone(),
+            cwd: job.cwd.clone(),
+            status: job.status,
+            exit_code: job.exit_code,
+            duration_ms: job
+                .finished_at
+                .unwrap_or_else(Instant::now)
+                .duration_since(job.started_at)
+                .as_millis() as u64,
+            sandboxed: job.sandboxed,
+            network: job.network,
+            stdin_open: job.input.as_ref().is_some_and(|input| input.is_open()),
+            input_error: job.input_error.clone(),
+            stdout: job.stdout.snapshot(max_chars),
+            stderr: job.stderr.snapshot(max_chars),
+        }
+    }
+}
+
+impl JobState {
+    fn close_input(&mut self) {
+        if let Some(input) = self.input.take() {
+            input.close();
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct JobInput {
+    stream: tokio::sync::Mutex<Option<ChildStdin>>,
+    open: AtomicBool,
+    closed: tokio_util::sync::CancellationToken,
+}
+
+impl JobInput {
+    pub(super) fn new(stream: ChildStdin) -> Arc<Self> {
+        Arc::new(Self {
+            stream: tokio::sync::Mutex::new(Some(stream)),
+            open: AtomicBool::new(true),
+            closed: tokio_util::sync::CancellationToken::new(),
+        })
+    }
+
+    pub(super) fn is_open(&self) -> bool {
+        self.open.load(Ordering::SeqCst)
+    }
+
+    fn close(&self) {
+        self.open.store(false, Ordering::SeqCst);
+        self.closed.cancel();
+        if let Ok(mut stream) = self.stream.try_lock() {
+            stream.take();
+        }
+    }
+
+    /// A failed write may have delivered a prefix. Close the pipe so a caller
+    /// cannot accidentally repeat the rest as though no input reached it.
+    pub(super) async fn send(
+        &self,
+        bytes: &[u8],
+        eof: bool,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), String> {
+        let result = {
+            let operation = async {
+                let mut stream = self.stream.lock().await;
+                if !self.is_open() {
+                    return Err("stdin is closed".to_string());
+                }
+                let pipe = stream
+                    .as_mut()
+                    .ok_or_else(|| "stdin is closed".to_string())?;
+                pipe.write_all(bytes).await.map_err(|error| {
+                    format!("stdin write failed; input may have been partially delivered: {error}")
+                })?;
+                if eof {
+                    self.open.store(false, Ordering::SeqCst);
+                    stream.take();
+                }
+                Ok(())
+            };
+            tokio::pin!(operation);
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err("stdin write cancelled; input may have been partially delivered; inspect the job before retrying".to_string()),
+                () = self.closed.cancelled() => Err("stdin is closed; input may have been partially delivered".to_string()),
+                () = tokio::time::sleep(std::time::Duration::from_secs(5)) => Err("stdin write timed out; input may have been partially delivered; inspect the job before retrying".to_string()),
+                result = &mut operation => result,
+            }
+        };
+        if result.is_err() {
+            self.close();
+        }
+        result
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -308,6 +488,7 @@ impl SharedBuffer {
         self.0.lock().expect("output buffer lock poisoned").text()
     }
 
+    #[cfg(test)]
     fn total_len(&self) -> usize {
         self.0
             .lock()
@@ -315,6 +496,7 @@ impl SharedBuffer {
             .total_len
     }
 
+    #[cfg(test)]
     fn omitted_len(&self) -> usize {
         self.0
             .lock()
@@ -334,21 +516,6 @@ impl SharedBuffer {
             .and_then(Spill::info)
     }
 
-    /// Like `spill_info`, and additionally remembers that the path is about
-    /// to leave this process (a note, a details payload): a reported file
-    /// must stay valid, so stream end never removes it. Every rendering that
-    /// names the path goes through here; the side-effect-free getter stays
-    /// for tests.
-    pub(super) fn spill_info_reported(&self) -> Option<SpillInfo> {
-        let mut ring = self.0.lock().expect("output buffer lock poisoned");
-        let spill = ring.spill.as_mut()?;
-        let info = spill.info();
-        if info.is_some() {
-            spill.reported = true;
-        }
-        info
-    }
-
     /// Stream over: release the spill file handle. The file stays on disk —
     /// transcript references must outlive the job record — and whether it was
     /// worth writing is decided later, by [`Self::discard_unreported_spill`].
@@ -364,6 +531,132 @@ impl SharedBuffer {
         let mut ring = self.0.lock().expect("output buffer lock poisoned");
         if let Some(spill) = ring.spill.as_mut() {
             spill.finish();
+        }
+    }
+
+    pub(super) fn finish_stream(&self, error: Option<String>) {
+        let mut ring = self.0.lock().expect("output buffer lock poisoned");
+        ring.finished = true;
+        if let Some(error) = error {
+            ring.read_error.get_or_insert(error);
+        }
+        if let Some(spill) = ring.spill.as_mut() {
+            spill.finish();
+        }
+    }
+
+    /// Record incomplete capture without ending a run that has later writers.
+    pub(super) fn record_read_error(&self, error: String) {
+        self.0
+            .lock()
+            .expect("output buffer lock poisoned")
+            .read_error
+            .get_or_insert(error);
+    }
+
+    pub(super) fn page(
+        &self,
+        stream: super::JobStream,
+        requested: Option<u64>,
+        max_chars: usize,
+    ) -> Result<OutputPage, ToolError> {
+        let ring = self.0.lock().expect("output buffer lock poisoned");
+        let bytes: Vec<_> = ring.bytes.iter().copied().collect();
+        let retained_start = ring.omitted_len();
+        // Eviction can cut through a UTF-8 scalar. Its remaining continuation
+        // bytes cannot be reconstructed, and belong to the unavailable prefix.
+        let partial_prefix = if retained_start > 0 {
+            let continuation_bytes = bytes
+                .iter()
+                .take(4)
+                .take_while(|byte| **byte & 0xc0 == 0x80)
+                .count();
+            // A cut scalar can leave at most three continuation bytes. A
+            // longer run is invalid data, not one truncated character.
+            if continuation_bytes <= 3 {
+                continuation_bytes
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let available_start = retained_start + partial_prefix;
+        let requested_offset = requested
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| invalid("job", "start_byte exceeds the supported stream offset"))?
+            .unwrap_or(available_start);
+        if requested_offset > ring.total_len {
+            return Err(invalid(
+                "job",
+                "start_byte exceeds the captured stream length",
+            ));
+        }
+        let start = requested_offset.max(available_start);
+        let offset = start - retained_start;
+        if inside_utf8_scalar(&bytes, offset) {
+            return Err(invalid(
+                "job",
+                "start_byte is inside a UTF-8 character; use a returned cursor",
+            ));
+        }
+        let page = read_page_text(
+            &bytes[offset..],
+            ring.finished,
+            max_chars.clamp(1, INLINE_STREAM_CHARS),
+        );
+        let end = start + page.consumed;
+        Ok(OutputPage {
+            stream,
+            requested_start_byte: requested,
+            start_byte: start,
+            end_byte: end,
+            retained_start_byte: retained_start,
+            unavailable_before_byte: available_start,
+            total_bytes: ring.total_len,
+            next_start_byte: (page.has_more || !ring.finished).then_some(end),
+            has_more: page.has_more,
+            finished: ring.finished,
+            lossy_utf8: page.lossy,
+            read_error: ring.read_error.clone(),
+            text: page.text,
+        })
+    }
+
+    fn snapshot(&self, max_chars: usize) -> StreamSnapshot {
+        let mut ring = self.0.lock().expect("output buffer lock poisoned");
+        let full = ring.text();
+        let count = full.chars().count();
+        let text = if count > max_chars {
+            full.chars().skip(count - max_chars).collect()
+        } else {
+            full
+        };
+        let omitted_bytes = ring.omitted_len();
+        let inline_truncated = omitted_bytes > 0 || count > max_chars;
+        let spill = if inline_truncated {
+            ring.spill.as_mut().and_then(|spill| {
+                let info = spill.info();
+                if info.is_some() {
+                    spill.reported = true;
+                }
+                info
+            })
+        } else {
+            None
+        };
+        StreamSnapshot {
+            text,
+            total_bytes: ring.total_len,
+            omitted_bytes,
+            inline_truncated,
+            finished: ring.finished,
+            read_error: ring.read_error.clone(),
+            capture_complete: ring.finished
+                && ring.read_error.is_none()
+                && (omitted_bytes == 0 || spill.as_ref().is_some_and(|info| !info.capped)),
+            spill,
         }
     }
 
@@ -386,7 +679,90 @@ impl SharedBuffer {
     }
 }
 
+fn inside_utf8_scalar(bytes: &[u8], offset: usize) -> bool {
+    (1..=3.min(offset)).any(|back| {
+        let start = offset - back;
+        let width = match bytes[start] {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => return false,
+        };
+        width > back
+            && start + width <= bytes.len()
+            && std::str::from_utf8(&bytes[start..start + width]).is_ok()
+    })
+}
+
+struct PageText {
+    text: String,
+    consumed: usize,
+    chars: usize,
+    json_bytes: usize,
+    has_more: bool,
+    lossy: bool,
+}
+
+impl PageText {
+    fn push(&mut self, character: char, source_bytes: usize, max_chars: usize) -> bool {
+        let encoded = match character {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            '\0'..='\u{1f}' => 6,
+            _ => character.len_utf8(),
+        };
+        // Bound both model text and the JSON details. This leaves room for
+        // execution metadata without duplicating the two tail windows.
+        if self.chars >= max_chars || self.json_bytes + encoded > 8 * 1024 {
+            self.has_more = true;
+            return false;
+        }
+        self.text.push(character);
+        self.consumed += source_bytes;
+        self.chars += 1;
+        self.json_bytes += encoded;
+        true
+    }
+}
+
+fn read_page_text(bytes: &[u8], finished: bool, max_chars: usize) -> PageText {
+    let mut page = PageText {
+        text: String::new(),
+        consumed: 0,
+        chars: 0,
+        json_bytes: 2,
+        has_more: false,
+        lossy: false,
+    };
+    'page: while page.consumed < bytes.len() {
+        let remaining = &bytes[page.consumed..];
+        let (valid, invalid) = match std::str::from_utf8(remaining) {
+            Ok(text) => (text, None),
+            Err(error) => (
+                std::str::from_utf8(&remaining[..error.valid_up_to()]).expect("valid UTF-8 prefix"),
+                Some(error.error_len()),
+            ),
+        };
+        for character in valid.chars() {
+            if !page.push(character, character.len_utf8(), max_chars) {
+                break 'page;
+            }
+        }
+        let invalid_bytes = match invalid {
+            None => break,
+            Some(Some(count)) => count,
+            Some(None) if finished => bytes.len() - page.consumed,
+            Some(None) => break, // A running stream may append the remaining UTF-8 bytes.
+        };
+        if !page.push('\u{fffd}', invalid_bytes, max_chars) {
+            break;
+        }
+        page.lossy = true;
+    }
+    page
+}
+
 /// Facts about a written spill file, for the model-facing note and details.
+#[derive(Debug, Clone, Serialize)]
 pub(super) struct SpillInfo {
     pub(super) path: PathBuf,
     pub(super) bytes: u64,
@@ -399,6 +775,8 @@ struct RingBuffer {
     capacity: usize,
     total_len: usize,
     spill: Option<Spill>,
+    finished: bool,
+    read_error: Option<String>,
 }
 
 impl RingBuffer {
@@ -411,6 +789,8 @@ impl RingBuffer {
             capacity,
             total_len: 0,
             spill: None,
+            finished: false,
+            read_error: None,
         }
     }
 
@@ -688,6 +1068,7 @@ where
 {
     tokio::spawn(async move {
         let mut chunk = [0_u8; 8192];
+        let mut error = None;
         loop {
             match pipe.read(&mut chunk).await {
                 Ok(0) => break,
@@ -697,14 +1078,19 @@ where
                         on_chunk(&chunk[..bytes]);
                     }
                 }
-                Err(_) => break,
+                Err(cause) => {
+                    error = Some(cause.to_string());
+                    break;
+                }
             }
         }
         // Stream over: release the spill file handle (data is already
         // written unbuffered). The file stays on disk for later reads —
         // unless it turned out to be an orphan nothing will ever name.
         if spill_owner == SpillOwner::Reader {
-            buffer.finish_spill();
+            buffer.finish_stream(error);
+        } else if let Some(error) = error {
+            buffer.record_read_error(error);
         }
     })
 }
@@ -725,12 +1111,14 @@ pub(super) fn refresh_job(job: &mut JobState) {
         // this job reports completion and the workspace restore gate opens.
         kill_process_group(pid);
         job.job_guard = None;
+        job.close_input();
         job.exit_code = status.code();
         job.status = if status.success() {
             JobStatus::Completed
         } else {
             JobStatus::Failed
         };
+        job.finished_at = Some(Instant::now());
         job.child = None;
     }
 }
@@ -753,6 +1141,7 @@ pub(super) async fn cancel_job(
         // Windows: dropping the Job Object guard kills the whole tree (`None`
         // on Unix, where the child was confined into its own group pre-spawn).
         job.job_guard = None;
+        job.close_input();
         child
     };
     let exit_code = match child {
@@ -768,6 +1157,7 @@ pub(super) async fn cancel_job(
     let mut job = state.lock().expect("job lock poisoned");
     job.exit_code = exit_code;
     job.status = JobStatus::Cancelled;
+    job.finished_at = Some(Instant::now());
     Ok(())
 }
 

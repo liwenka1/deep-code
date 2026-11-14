@@ -82,6 +82,19 @@ fn approval_protocol_requires_prompt_identity() {
     );
 }
 
+#[test]
+fn prompt_input_accepts_text_and_rejects_unimplemented_attachment_fields() {
+    let text =
+        serde_json::from_value::<PromptRequest>(json!({ "prompt": "inspect the page" })).unwrap();
+    assert_eq!(text.prompt, "inspect the page");
+    for extra in [
+        json!({ "prompt": "look", "images": ["/tmp/shot.png"] }),
+        json!({ "prompt": "look", "content": [{ "type": "text", "text": "look" }] }),
+    ] {
+        assert!(serde_json::from_value::<PromptRequest>(extra).is_err());
+    }
+}
+
 async fn body_paused_at_approval(state: &AppState) -> axum::body::BodyDataStream {
     use futures_util::StreamExt;
     let sse = prompt_sse(
@@ -421,6 +434,12 @@ async fn prompt_sse_returns_assistant_delta_and_turn_completed() {
     let first = envelopes.first().expect("at least one envelope");
     assert_eq!(first.item.kind, "user.message");
     assert_eq!(first.seq, 1);
+    assert_eq!(
+        first.item.payload["content"],
+        json!([
+            { "type": "text", "text": "hello runtime test" }
+        ])
+    );
     assert!(
         envelopes.windows(2).all(|pair| pair[1].seq > pair[0].seq),
         "seq must increase monotonically"

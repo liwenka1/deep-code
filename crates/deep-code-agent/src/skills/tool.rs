@@ -260,7 +260,7 @@ mod tests {
             result.content
         );
         assert_eq!(
-            result.content,
+            result.content.text(),
             format!(
                 "# Skill: review\n{}\n\n1. read the diff\n2. run the tests",
                 manifest.display()
@@ -270,7 +270,7 @@ mod tests {
         let miss = call(&tool, json!({ "name": "nope" })).await;
         assert_eq!(miss.status, ToolResultStatus::Error);
         assert!(
-            miss.content.contains("nope") && miss.content.contains("release, review"),
+            miss.content.text().contains("nope") && miss.content.text().contains("release, review"),
             "{}",
             miss.content
         );
@@ -306,8 +306,9 @@ mod tests {
                 "{}",
                 result.content
             );
-            assert!(result.content.chars().count() <= TOOL_OUTPUT_BUDGET);
-            let (_, rest) = result.content.split_once("\n\n").unwrap();
+            assert!(result.content.text().chars().count() <= TOOL_OUTPUT_BUDGET);
+            let content = result.content.text();
+            let (_, rest) = content.split_once("\n\n").unwrap();
             chunks += 1;
             match rest.rsplit_once("\n\n[") {
                 Some((chunk, note)) if note.contains("offset=") => {
@@ -332,7 +333,11 @@ mod tests {
 
         let beyond = call(&tool, json!({ "name": "long", "offset": 40_000 })).await;
         assert_eq!(beyond.status, ToolResultStatus::Error);
-        assert!(beyond.content.contains("40000"), "{}", beyond.content);
+        assert!(
+            beyond.content.text().contains("40000"),
+            "{}",
+            beyond.content
+        );
     }
 
     /// Swapping the file for a symlink after launch — the one thing a
@@ -353,7 +358,8 @@ mod tests {
         let result = call(&tool, json!({ "name": "swap" })).await;
         assert_eq!(result.status, ToolResultStatus::Error);
         assert!(
-            !result.content.contains("PRIVATE KEY") && result.content.contains("swap"),
+            !result.content.text().contains("PRIVATE KEY")
+                && result.content.text().contains("swap"),
             "{}",
             result.content
         );
@@ -361,7 +367,11 @@ mod tests {
         fs::remove_file(&manifest).unwrap();
         let gone = call(&tool, json!({ "name": "swap" })).await;
         assert_eq!(gone.status, ToolResultStatus::Error);
-        assert!(!gone.content.contains("original"), "{}", gone.content);
+        assert!(
+            !gone.content.text().contains("original"),
+            "{}",
+            gone.content
+        );
     }
 
     /// A skill whose directory is itself a symlink (a supported layout) keeps
@@ -389,7 +399,7 @@ mod tests {
             "{}",
             result.content
         );
-        assert!(result.content.ends_with("body via link"));
+        assert!(result.content.text().ends_with("body via link"));
     }
 
     /// The `offset=` a continuation note names, or `None` on the last page.
@@ -426,7 +436,7 @@ mod tests {
                 "{}",
                 result.content
             );
-            last = result.content;
+            last = result.content.text();
             match next_offset(&last) {
                 Some(next) => offset = next,
                 None => break,

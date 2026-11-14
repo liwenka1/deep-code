@@ -256,14 +256,14 @@ mod tests {
             .find(|message| message.role == Role::Tool)
             .expect("the denied call keeps its paired tool message");
         assert!(
-            denied.content.contains("no user saw this request"),
+            denied.content.text().contains("no user saw this request"),
             "the model must be told the run is unattended: {}",
-            denied.content
+            denied.content.summary_text()
         );
         assert!(
-            !denied.content.contains("denied by user"),
+            !denied.content.text().contains("denied by user"),
             "the stock human-refusal text must not reach the model: {}",
-            denied.content
+            denied.content.summary_text()
         );
     }
 

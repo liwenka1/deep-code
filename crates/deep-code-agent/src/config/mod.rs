@@ -139,12 +139,9 @@ pub struct AgentConfig {
     /// additionally needs the process-level DEEP_CODE_TRUST_TYPESCRIPT_LSP
     /// opt-in, independent of this switch and permission modes.
     pub lsp_enabled: bool,
-    /// How the model should process attached images (`[vision] detail`).
-    ///
-    /// `Auto` (the API's own default, currently `Original`) unless the user
-    /// says otherwise. `Low` downsamples to 512×512 first — cheaper and
-    /// faster, and the wrong choice for exactly the case images get attached
-    /// for here, which is reading text off a screenshot.
+    /// Provider processing detail for user and tool images (`[vision] detail`).
+    /// Defaults to `Auto`. The provider handles `Low`/`Original` resolution;
+    /// admitted asset bytes stay unchanged.
     pub vision_detail: ImageDetail,
     /// How sandboxed shell/job commands get network access (`[sandbox]
     /// network`): `prompt` (declare → approval, the default), `always`, or

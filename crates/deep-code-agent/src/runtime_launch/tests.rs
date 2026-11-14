@@ -651,7 +651,7 @@ async fn resume_refuses_a_forged_transcript_without_overwriting_its_file() {
     assert!(
         messages
             .iter()
-            .all(|message| message.content != "forged transcript"),
+            .all(|message| message.content.text() != "forged transcript"),
         "unverified history must never reach the provider: {messages:?}"
     );
     assert!(
@@ -868,7 +868,7 @@ async fn agents_md_is_read_at_each_launch_and_on_resume() {
     let config = AgentConfig::builtin();
 
     let first = launch_runtime(&config, ws.clone(), None);
-    let system = first.handle.session_messages().await[0].content.clone();
+    let system = first.handle.session_messages().await[0].content.text();
     assert!(system.starts_with(DEFAULT_SYSTEM_PROMPT), "{system}");
     assert!(
         system.contains("# Project instructions (AGENTS.md)") && system.contains("rule one"),
@@ -898,7 +898,7 @@ async fn agents_md_is_read_at_each_launch_and_on_resume() {
 
     std::fs::write(&file, "rule two: never force-push\n").unwrap();
     let second = launch_runtime(&config, ws.clone(), None);
-    let system = second.handle.session_messages().await[0].content.clone();
+    let system = second.handle.session_messages().await[0].content.text();
     assert!(
         system.contains("rule two") && !system.contains("rule one"),
         "{system}"
@@ -907,7 +907,7 @@ async fn agents_md_is_read_at_each_launch_and_on_resume() {
 
     // The record still carries the first prompt; resuming rebuilds it.
     let resumed = launch_runtime(&config, ws.clone(), Some(record));
-    let system = resumed.handle.session_messages().await[0].content.clone();
+    let system = resumed.handle.session_messages().await[0].content.text();
     assert!(
         system.contains("rule two") && !system.contains("rule one"),
         "{system}"
@@ -917,7 +917,7 @@ async fn agents_md_is_read_at_each_launch_and_on_resume() {
     // No file: no block, no source, no warning about it.
     std::fs::remove_file(&file).unwrap();
     let bare = launch_runtime(&config, ws, None);
-    let system = bare.handle.session_messages().await[0].content.clone();
+    let system = bare.handle.session_messages().await[0].content.text();
     assert!(!system.contains("# Project instructions"), "{system}");
     assert!(
         !bare

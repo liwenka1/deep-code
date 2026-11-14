@@ -35,6 +35,7 @@ mod turn_loop;
 pub use turn_loop::MAX_TURN_STEPS;
 pub(crate) use turn_loop::budget_wrap_up_due;
 
+use crate::content::{Content, ContentBlock};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -54,20 +55,15 @@ use crate::tool::{ApprovalDecision, ApprovalRequest, ToolCall, ToolRegistry};
 use event::emit;
 pub use event::{RuntimeEvent, RuntimeEventReceiver, RuntimeFailureKind, ToolCallId, TurnId};
 
-/// One user turn: its text plus the local image files attached to it.
+/// User input to admit: text followed by local image attachments.
 ///
-/// The runtime's whole public prompt surface takes `impl Into<UserTurn>`, and
-/// the two `From` impls below are why: every call site written before images
-/// existed keeps compiling unchanged, and a text-only turn keeps one obvious
-/// spelling rather than growing a second constructor.
+/// Admission snapshots every valid image before it enters the session or a
+/// steering queue. Text-only input can be supplied directly via `Into`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UserTurn {
     pub text: String,
-    /// Local image files, in the order the user attached them.
-    ///
-    /// Paths rather than bytes: [`crate::image::hydrate`] reads them when a
-    /// request is assembled and the session stores these same paths, so an image
-    /// is never copied into the transcript or into the session file.
+    /// Source files in attachment order. These paths are input only; the
+    /// persisted observation holds immutable content-addressed assets.
     pub images: Vec<PathBuf>,
 }
 
@@ -279,6 +275,44 @@ impl AgentRuntime {
         }
     }
 
+    /// Configure where explicitly supplied user images are snapshotted.
+    /// This does not grant filesystem access to tools.
+    #[must_use]
+    pub fn with_image_workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
+        self.workspace = Some(workspace.into());
+        self
+    }
+
+    async fn admit_user_content(&self, prompt: &UserTurn) -> Content {
+        let mut content = Content::from(prompt.text.clone());
+        if prompt.images.is_empty() {
+            return content;
+        }
+        let Some(workspace) = self.workspace.clone() else {
+            content.push_text("\n[图片未接纳：运行时未配置图片存储目录 / images unavailable: no image workspace configured]");
+            return content;
+        };
+        let paths = prompt.images.clone();
+        match tokio::task::spawn_blocking(move || crate::image::snapshot_paths(&workspace, &paths))
+            .await
+        {
+            Ok((images, notes)) => {
+                content.blocks.extend(
+                    images
+                        .into_iter()
+                        .map(|image| ContentBlock::Image { image }),
+                );
+                for note in notes {
+                    content.push_text(format!("\n{note}"));
+                }
+            }
+            Err(error) => {
+                content.push_text(format!("\n[图片未接纳 / image admission failed: {error}]"))
+            }
+        }
+        content
+    }
+
     /// Attach a shared permission-mode handle (created at launch and shared
     /// with the TUI). Builder-style so the constructors stay unchanged.
     #[must_use]
@@ -408,16 +442,13 @@ impl AgentRuntime {
         }
         self.finalize_orphan_turn().await;
         let prompt = prompt.into();
+        let content = self.admit_user_content(&prompt).await;
         let turn_id = TurnId::new();
         {
             let mut state = self.state.lock().await;
             // Interrupted tool calls need no repair here: pending exchanges
             // synthesize their placeholder at wire derivation.
-            state.session.push_user_with_images(
-                turn_id.clone(),
-                &prompt.text,
-                prompt.images.clone(),
-            );
+            state.session.push_user(turn_id.clone(), content);
             state.pending = None;
             state.current_turn = Some(TurnRecord::new(turn_id.clone()));
             state.current_prompt = Some(prompt);
@@ -504,11 +535,15 @@ impl AgentRuntime {
     /// is expected to fall back to sending it as the next prompt — which is
     /// exactly what the TUI's own queue does.
     pub async fn steer(&self, text: impl Into<UserTurn>) -> bool {
+        let target = self.state.lock().await.current_turn_id.clone();
+        let Some(target) = target else { return false };
+        let prompt = text.into();
+        let content = self.admit_user_content(&prompt).await;
         let mut state = self.state.lock().await;
-        if state.current_turn_id.is_none() {
+        if state.current_turn_id.as_ref() != Some(&target) {
             return false;
         }
-        state.steering.push_back(Steered::User(text.into()));
+        state.steering.push_back(Steered::User { prompt, content });
         true
     }
 

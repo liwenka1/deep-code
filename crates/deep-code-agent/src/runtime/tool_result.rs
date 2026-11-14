@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::content::{Content, ContentBlock};
 use crate::model::{ToolCallFunctionPayload, ToolCallPayload};
 use crate::runtime::AgentRuntime;
 use crate::runtime::approval_flow::RootGrantPrompt;
@@ -120,7 +121,7 @@ impl AgentRuntime {
     ) -> Result<ToolRunOutcome, ToolError> {
         if !self.owns_turn(turn_id, cancel).await {
             let mut result = ToolResult::denied(call);
-            result.content = CANCELLED_TOOL_RESULT.to_string();
+            result.content = CANCELLED_TOOL_RESULT.into();
             return Ok(ToolRunOutcome::Result { result });
         }
         // A sink for spend a tool incurs out-of-band (a sub-agent's own request
@@ -486,18 +487,39 @@ impl AgentRuntime {
         turn_id: TurnId,
     ) {
         self.attach_edit_diagnostics(call, &mut result, tx).await;
+        let content = result.content.clone();
+        let details = result.details.clone();
+        let workspace = self.workspace.clone();
+        match crate::tool::run_blocking("tool_output", move || {
+            Ok((
+                bound_tool_content(&content, workspace.as_deref()),
+                bound_tool_details(details, workspace.as_deref()),
+            ))
+        })
+        .await
+        {
+            Ok((content, details)) => {
+                result.content = content;
+                result.details = details;
+            }
+            Err(error) => {
+                result
+                    .content
+                    .push_text(format!("\n[output preparation failed: {error}]"));
+                result.content = bound_tool_content(&result.content, None);
+                result.details = bound_tool_details(result.details.take(), None);
+            }
+        }
 
         {
             let mut state = self.state.lock().await;
-            // Size-bounded copy, and the only one that gets persisted — the
-            // untruncated output goes out on the event stream and is not stored
-            // anywhere (the second, lossless copy in `TurnRecord.tool_results`
-            // was removed to stop O(session²) write amplification).
-            let trimmed = truncate_tool_output(&result.content);
-            if !state
-                .session
-                .record_tool_result(&result.call_id, trimmed, result.status, ask)
-            {
+            if !state.session.record_tool_result(
+                &result.call_id,
+                result.content.clone(),
+                result.status,
+                ask,
+                result.details.clone(),
+            ) {
                 // Should be unreachable: the assistant entry carrying this
                 // call was pushed before the batch ran.
                 emit(
@@ -527,28 +549,179 @@ impl AgentRuntime {
     }
 }
 
-/// Chars a single tool result keeps before its middle is elided. This — not
-/// the shell layer's own `MAX_OUTPUT_CHARS` window — is the real ceiling on
-/// what the model ever reads back from a tool, because every result passes
-/// through [`truncate_tool_output`] on its way into the transcript. The spill
-/// machinery keys its "did anything get lost?" decisions on this value for
-/// exactly that reason; see `shell_tools::jobs::SPILL_THRESHOLD_BYTES`.
+/// Maximum text characters projected into one tool observation. Image blocks
+/// remain ordered; omitted text gets a bounded, readable spill source.
 pub(crate) const TOOL_OUTPUT_BUDGET: usize = 12_000;
-const TOOL_OUTPUT_HEAD: usize = 4_000;
-const TOOL_OUTPUT_TAIL: usize = 4_000;
+
+/// Serialized UI details per result, including room for their indentation in
+/// the session record. Model text and UI metadata have independent budgets.
+const TOOL_DETAILS_BUDGET_BYTES: usize = 16 * 1024;
+
+fn details_storage_size(details: &serde_json::Value) -> usize {
+    let json = serde_json::to_vec_pretty(details).expect("JSON values serialize");
+    // A details value sits inside entries/exchanges/result. Allow 32 extra
+    // spaces per structural newline, beyond the actual session indentation.
+    json.len().saturating_add(
+        json.iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+            .saturating_mul(32),
+    )
+}
+
+fn bound_tool_details(
+    details: Option<serde_json::Value>,
+    workspace: Option<&std::path::Path>,
+) -> Option<serde_json::Value> {
+    let mut preview = details?;
+    if details_storage_size(&preview) <= TOOL_DETAILS_BUDGET_BYTES {
+        return Some(preview);
+    }
+    let original = serde_json::to_string(&preview).expect("JSON values serialize");
+    let (path, complete, error) = match workspace.map(|root| spill_tool_text(root, &original)) {
+        Some(Ok((path, complete))) => (Some(path), complete, None),
+        Some(Err(error)) => (None, false, Some(error.to_string())),
+        None => (
+            None,
+            false,
+            Some("no output workspace is available".to_string()),
+        ),
+    };
+    let storage = serde_json::json!({
+        "inline_truncated": true,
+        "path": path,
+        "complete": complete,
+        "original_bytes": original.len(),
+        "error": error.map(|error| error.chars().take(256).collect::<String>()),
+    });
+    let Some(object) = preview.as_object_mut() else {
+        return Some(serde_json::json!({"details_storage": storage}));
+    };
+    object.insert("details_storage".into(), storage.clone());
+
+    // Shorten display payloads without modifying identities or execution
+    // facts such as capture_complete, byte counters and process exit status.
+    let mut paths = vec![
+        "/edit/diff".to_string(),
+        "/stdout/text".into(),
+        "/stderr/text".into(),
+    ];
+    if let Some(todos) = preview.get("todos").and_then(serde_json::Value::as_array) {
+        paths.extend((0..todos.len()).map(|index| format!("/todos/{index}/content")));
+    }
+    let sources: Vec<_> = paths
+        .into_iter()
+        .filter_map(|path| {
+            let serde_json::Value::String(text) = preview.pointer_mut(&path)? else {
+                return None;
+            };
+            Some((path, std::mem::take(text)))
+        })
+        .collect();
+    if sources.is_empty() {
+        return Some(serde_json::json!({"details_storage": storage}));
+    }
+    for limit in [2048, 1024, 512, 256, 128, 64] {
+        for (path, source) in &sources {
+            let text = if source.chars().count() <= limit {
+                source.clone()
+            } else {
+                crate::text_util::clip_middle(source, limit, limit / 3, limit / 3, |_| {
+                    "\n...[details preview omitted]...\n".into()
+                })
+            };
+            *preview
+                .pointer_mut(path)
+                .expect("preview path remains present") = text.into();
+            if path == "/edit/diff" && source.chars().count() > limit {
+                preview["edit"]["truncated"] = true.into();
+            }
+        }
+        if details_storage_size(&preview) <= TOOL_DETAILS_BUDGET_BYTES {
+            return Some(preview);
+        }
+    }
+    // Unknown/large schemas still have a recoverable source, but cannot be
+    // allowed to exhaust the transcript's storage budget.
+    Some(serde_json::json!({"details_storage": storage}))
+}
 
 /// Bound a tool result before it re-enters the model context: oversized
 /// outputs keep their head and tail with a marker for the elided middle, so
 /// the next request stays small without losing the most relevant ends.
 /// Counts by `char` to stay UTF-8 safe.
-pub(super) fn truncate_tool_output(content: &str) -> String {
-    crate::text_util::clip_middle(
-        content,
-        TOOL_OUTPUT_BUDGET,
-        TOOL_OUTPUT_HEAD,
-        TOOL_OUTPUT_TAIL,
-        |elided| format!("\n\n...[省略 {elided} 字符 / {elided} chars truncated]...\n\n"),
-    )
+fn bound_tool_content(content: &Content, workspace: Option<&std::path::Path>) -> Content {
+    let text_chars = content
+        .text_blocks()
+        .map(|text| text.chars().count())
+        .sum::<usize>();
+    if text_chars <= TOOL_OUTPUT_BUDGET {
+        return content.clone();
+    }
+    let full_text = content.summary_text();
+    let continuation = match workspace.map(|root| spill_tool_text(root, &full_text)) {
+        Some(Ok((path, complete))) => format!("\n[Inline output shortened. {} saved to {}; use read_file with next_start_byte for bounded continuation.]\n", if complete { "Full output" } else { "Only the first 64 MiB" }, path.display()),
+        Some(Err(error)) => format!("\n[Inline output shortened; full output could not be saved: {error}]\n"),
+        None => "\n[Inline output shortened; this runtime has no output workspace, so the omitted text is unavailable.]\n".into(),
+    };
+    let mut remaining = TOOL_OUTPUT_BUDGET.saturating_sub(continuation.chars().count());
+    let mut text_left = content.text_blocks().count();
+    let mut bounded = Content::default();
+    for block in &content.blocks {
+        match block {
+            ContentBlock::Text { text } => {
+                let share = remaining / text_left.max(1);
+                let clipped = if text.chars().count() <= share {
+                    text.clone()
+                } else if share < 64 {
+                    text.chars().take(share).collect()
+                } else {
+                    crate::text_util::clip_middle(text, share, share / 3, share / 3, |count| {
+                        format!("\n...[{count} characters omitted]...\n")
+                    })
+                };
+                remaining = remaining.saturating_sub(clipped.chars().count());
+                text_left = text_left.saturating_sub(1);
+                if !clipped.is_empty() {
+                    bounded.push_text(clipped);
+                }
+            }
+            ContentBlock::Image { image } => bounded.push_image(image.clone()),
+        }
+    }
+    bounded.push_text(continuation);
+    bounded
+}
+
+fn spill_tool_text(
+    root: &std::path::Path,
+    text: &str,
+) -> std::io::Result<(std::path::PathBuf, bool)> {
+    use std::io::Write;
+    const MAX_BYTES: usize = 64 * 1024 * 1024;
+    let directory = crate::pinned_dir::open_canonical(root)?;
+    let state = crate::pinned_dir::owned_child(&directory, ".deep-code")?;
+    let spill = crate::pinned_dir::owned_child(&state, "spill")?;
+    let results = crate::pinned_dir::owned_child(&spill, "tool-results")?;
+    let filename = format!("{}.txt", uuid::Uuid::new_v4());
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = results.open_with(&filename, &options)?;
+    let mut end = text.len().min(MAX_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    file.write_all(&text.as_bytes()[..end])?;
+    file.sync_data()?;
+    Ok((
+        std::path::PathBuf::from(".deep-code/spill/tool-results").join(filename),
+        end == text.len(),
+    ))
 }
 
 pub(super) fn tool_call_payload(call: &ToolCall) -> ToolCallPayload {
@@ -582,6 +755,174 @@ mod tests {
     use super::*;
     use crate::execution_policy::{ExecPolicy, NetworkMode, PermissionMode};
     use serde_json::json;
+
+    #[test]
+    fn small_details_are_preserved_without_a_storage_reference() {
+        let details = json!({"job_id": "job", "status": "completed", "exit_code": 0});
+        assert_eq!(
+            bound_tool_details(Some(details.clone()), None),
+            Some(details)
+        );
+        assert_eq!(bound_tool_details(None, None), None);
+    }
+
+    #[test]
+    fn details_budget_counts_utf8_and_json_escaping_and_preserves_edit_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let original = json!({"edit": {
+            "path": "unicode.txt", "diff": "界\t\"\u{1}".repeat(20_000),
+            "added": 1, "removed": 1, "truncated": false, "new_file": false,
+        }});
+        let preview = bound_tool_details(Some(original.clone()), Some(&root)).unwrap();
+        assert!(details_storage_size(&preview) <= TOOL_DETAILS_BUDGET_BYTES);
+        assert_eq!(preview["edit"]["path"], "unicode.txt");
+        assert_eq!(preview["edit"]["added"], 1);
+        assert_eq!(preview["edit"]["removed"], 1);
+        assert_eq!(preview["edit"]["new_file"], false);
+        assert_eq!(preview["edit"]["truncated"], true);
+        let source = &preview["details_storage"];
+        assert_eq!(source["complete"], true);
+        let saved = std::fs::read(root.join(source["path"].as_str().unwrap())).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&saved).unwrap(),
+            original
+        );
+        assert_eq!(source["original_bytes"], saved.len());
+    }
+
+    #[test]
+    fn details_preview_does_not_change_execution_capture_facts() {
+        let text = "😀".repeat(20_000);
+        let original = json!({
+            "job_id": "job", "status": "completed", "exit_code": 0,
+            "stdout": {"text": text, "capture_complete": true, "finished": true,
+                "inline_truncated": false, "total_bytes": text.len(), "read_error": null},
+            "stderr": {"text": "", "capture_complete": true, "finished": true},
+        });
+        let preview = bound_tool_details(Some(original.clone()), None).unwrap();
+        assert!(details_storage_size(&preview) <= TOOL_DETAILS_BUDGET_BYTES);
+        assert!(preview["stdout"]["text"].as_str().unwrap().len() < text.len());
+        for key in [
+            "capture_complete",
+            "finished",
+            "inline_truncated",
+            "total_bytes",
+            "read_error",
+        ] {
+            assert_eq!(preview["stdout"][key], original["stdout"][key]);
+        }
+        assert_eq!(preview["details_storage"]["complete"], false);
+        assert!(preview["details_storage"]["path"].is_null());
+        assert!(
+            preview["details_storage"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("workspace")
+        );
+    }
+
+    #[test]
+    fn details_budget_accounts_for_nested_pretty_whitespace_and_unknown_schemas() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let original = json!({"rows": vec![json!({}); 1000]});
+        assert!(serde_json::to_vec(&original).unwrap().len() < TOOL_DETAILS_BUDGET_BYTES);
+        assert!(details_storage_size(&original) > TOOL_DETAILS_BUDGET_BYTES);
+        let preview = bound_tool_details(Some(original.clone()), Some(&root)).unwrap();
+        assert!(details_storage_size(&preview) <= TOOL_DETAILS_BUDGET_BYTES);
+        let source = root.join(preview["details_storage"]["path"].as_str().unwrap());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(source).unwrap()).unwrap(),
+            original
+        );
+        assert!(preview.get("rows").is_none());
+    }
+
+    #[test]
+    fn details_remain_bounded_and_report_a_failed_sidecar_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join(".deep-code"), "not a directory").unwrap();
+        let preview =
+            bound_tool_details(Some(json!({"payload": "x".repeat(100_000)})), Some(&root)).unwrap();
+        assert!(details_storage_size(&preview) <= TOOL_DETAILS_BUDGET_BYTES);
+        assert_eq!(preview["details_storage"]["complete"], false);
+        assert!(preview["details_storage"]["path"].is_null());
+        assert!(preview["details_storage"]["error"].is_string());
+    }
+
+    #[test]
+    fn bounded_content_preserves_images_and_exposes_the_complete_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        let image = crate::image::snapshot_bytes(
+            &workspace,
+            include_bytes!("../image/tests/fixtures/red.png"),
+        )
+        .unwrap();
+        let content = Content::new(vec![
+            ContentBlock::Text {
+                text: "前".repeat(20_000),
+            },
+            ContentBlock::Image {
+                image: image.clone(),
+            },
+            ContentBlock::Text {
+                text: "後".repeat(20_000),
+            },
+        ]);
+        let bounded = bound_tool_content(&content, Some(&workspace));
+        assert!(bounded.text().chars().count() <= TOOL_OUTPUT_BUDGET);
+        assert!(
+            matches!(&bounded.blocks[1], ContentBlock::Image { image: actual } if actual == &image)
+        );
+        assert!(
+            bounded
+                .text()
+                .contains("Full output saved to .deep-code/spill/tool-results/")
+        );
+        let files = std::fs::read_dir(workspace.join(".deep-code/spill/tool-results"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(files[0].path()).unwrap(),
+            content.summary_text()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_spills_are_private_inside_an_existing_directory() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let directory = root.join(".deep-code/spill/tool-results");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (path, complete) = spill_tool_text(&root, "private tool data").unwrap();
+        assert!(complete);
+        assert_eq!(
+            std::fs::metadata(root.join(path)).unwrap().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn many_small_blocks_stay_inside_one_output_budget() {
+        let content: Content = Content::new(
+            (0..20_000)
+                .map(|_| ContentBlock::Text {
+                    text: "文字".into(),
+                })
+                .collect(),
+        );
+        let bounded = bound_tool_content(&content, None);
+        assert!(bounded.text().chars().count() <= TOOL_OUTPUT_BUDGET);
+        assert!(bounded.text().contains("omitted text is unavailable"));
+    }
 
     /// The plan an UNDECLARED command gets: this is the exact shape that used
     /// to run offline under yolo — `git push` (untrusted, prompts) and

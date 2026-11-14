@@ -292,15 +292,17 @@
 # notifications = true
 
 [vision]
-# How attached images are handed to the model. Only `deepseek-flash` accepts
-# image input (see `supports_vision` in the model catalog); a turn carrying an
-# image is routed to it, and pinning `provider.model` to a model that cannot
-# take one makes the turn stop instead of sending a request that would 400.
+# Provider processing detail for user and tool image observations. Auto mode
+# routes fresh images to a vision-capable model for each request; fixed models
+# retain their selection and unsupported images get explicit omission notes.
+# The TUI preserves an attached-image draft when the selected model cannot see it.
 #
-#   low       downscales to 512x512 first - faster and cheaper, and the wrong
-#             choice when you are attaching a screenshot to read text off
-#   original  the original image
-#   auto      let the API decide; currently the same as `original`
+#   low       provider uses a low-resolution representation
+#   original  provider uses the original image
+#   auto      let the provider decide
+#
+# Uploaded bytes are not resized locally. The session references immutable
+# content-addressed assets; changing the source path cannot change history.
 #
 # Unlike the permission fields, this one has no project-layer guard: it changes
 # the quality and cost of images you chose to attach, and can widen nothing.

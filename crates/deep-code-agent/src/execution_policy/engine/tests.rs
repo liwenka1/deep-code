@@ -2103,3 +2103,43 @@ fn a_dispatch_that_declares_allow_commands_asks_a_human() {
         );
     }
 }
+
+#[test]
+fn executable_input_is_an_approval_point_independent_of_command_trust() {
+    let policy = ExecPolicy::default();
+    for (tool, arguments) in [
+        (
+            "shell",
+            json!({"command": "echo hello", "stdin": "instructions"}),
+        ),
+        (
+            "job",
+            json!({"action": "start", "command": "echo hello", "interactive": true}),
+        ),
+        (
+            "job",
+            json!({"action": "input", "job_id": "job_x", "stdin": "instructions"}),
+        ),
+        ("job", json!({"action": "close_stdin", "job_id": "job_x"})),
+    ] {
+        let plan = policy.evaluate_tool(tool, &arguments);
+        assert!(plan.requires_approval(), "{tool} {arguments}: {plan:?}");
+        assert!(
+            !plan.requires_human(),
+            "input retains ordinary approval-mode semantics"
+        );
+        assert!(!plan.read_only);
+        assert_eq!(plan.risk_level, RiskLevel::High);
+        assert!(!accept_edits_approvable(tool, &arguments));
+    }
+    assert!(!accept_edits_approvable(
+        "shell",
+        &json!({"command": "touch x", "stdin": "data"})
+    ));
+    assert!(matches!(
+        policy
+            .evaluate_tool("shell", &json!({"command": "rm -rf /", "stdin": "data"}))
+            .verdict,
+        PolicyVerdict::Deny { .. }
+    ));
+}

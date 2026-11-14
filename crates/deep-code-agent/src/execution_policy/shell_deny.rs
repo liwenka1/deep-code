@@ -300,10 +300,9 @@ fn is_volume_or_device_path(token: &str) -> bool {
 /// A blanket deny on the recurse+force shape — the exact mirror of `rm -rf` —
 /// looks symmetric but is not: on Unix `rm -r <dir>` stays available as the
 /// everyday escape, whereas `rd /s` without `/q` stops to ask for confirmation
-/// and stdin is `Stdio::null()`, so it can never complete. Denying the whole
-/// shape therefore leaves Windows with *no* working way to delete a directory
-/// tree. So this floor refuses only the shapes that are unambiguously
-/// destructive and keeps `rd /s /q node_modules` runnable.
+/// unless input is explicitly supplied. Ordinary unattended deletion therefore
+/// needs `/q`. This floor refuses targets that are unambiguously destructive
+/// and keeps `rd /s /q node_modules` runnable.
 ///
 /// Not covered here: an absolute path to somewhere else in the user's home. That
 /// is the out-of-workspace question the approval gate answers.

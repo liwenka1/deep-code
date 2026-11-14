@@ -32,6 +32,8 @@ use crate::session_entry::{EntryKind, SessionEntry};
 /// unbounded allocation or a picker-wide memory blow-up.
 pub(crate) const MAX_SESSION_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const MAX_SESSION_ENTRIES: usize = 4096;
+/// Image-report history has its own ceiling, independent of model context.
+pub(crate) const IMAGE_REPORT_BUDGET_BYTES: usize = 512 * 1024;
 /// Maximum number of records retained by the picker/list API.
 pub(crate) const MAX_SESSION_LIST: usize = 32;
 
@@ -60,6 +62,24 @@ impl SessionId {
 pub struct TurnRecord {
     pub id: TurnId,
     pub started_at_ms: u64,
+    /// Changes in image projection, not image bytes or HTTP-success claims.
+    pub image_requests: Vec<ImageRequestRecord>,
+    /// Cumulative observation reports removed by the retention budget.
+    pub image_reports_omitted: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageRequestRecord {
+    pub model: String,
+    pub images: Vec<crate::image::ImageDelivery>,
+}
+
+/// Latest projection fingerprint for an observation still in the transcript.
+/// Independent of report history so pruning reports does not reset deduplication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageProjectionState {
+    pub observation_id: String,
+    pub fingerprint: String,
 }
 
 /// Checkpoint metadata retained in the session for UI/API resume projections.
@@ -89,14 +109,80 @@ impl TurnRecord {
         Self {
             id,
             started_at_ms: now_ms(),
+            image_requests: Vec::new(),
+            image_reports_omitted: 0,
         }
     }
+
+    pub(crate) fn limit_image_reports(&mut self, remaining: &mut usize) {
+        for request in self.image_requests.iter_mut().rev() {
+            // Include the model's JSON escaping and ample request/array framing.
+            let overhead = report_storage_cost(&request.model).saturating_add(512);
+            let mut first_kept = request.images.len();
+            if let Some(mut room) = remaining.checked_sub(overhead) {
+                for image in request.images.iter().rev() {
+                    let cost = report_storage_cost(image).saturating_add(32);
+                    let Some(next) = room.checked_sub(cost) else {
+                        break;
+                    };
+                    room = next;
+                    first_kept -= 1;
+                }
+                if first_kept < request.images.len() {
+                    *remaining = room;
+                }
+            }
+            self.image_reports_omitted =
+                self.image_reports_omitted.saturating_add(first_kept as u64);
+            request.images.drain(..first_kept);
+        }
+        self.image_requests
+            .retain(|request| !request.images.is_empty());
+    }
+}
+
+fn report_storage_cost(value: &impl Serialize) -> usize {
+    #[derive(Default)]
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len()).saturating_add(
+                bytes
+                    .iter()
+                    .filter(|byte| **byte == b'\n')
+                    .count()
+                    .saturating_mul(32),
+            );
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter::default();
+    serde_json::to_writer_pretty(&mut counter, value).expect("image report data serializes");
+    counter.0
 }
 
 impl Default for TurnRecord {
     fn default() -> Self {
         Self::new(TurnId::new())
     }
+}
+
+/// Current on-disk contract. Unsupported versions are rejected, never migrated.
+const SESSION_FORMAT_VERSION: u32 = 1;
+
+fn deserialize_format_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    let version = u32::deserialize(deserializer)?;
+    if version != SESSION_FORMAT_VERSION {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported session format {version}; expected {SESSION_FORMAT_VERSION}"
+        )));
+    }
+    Ok(version)
 }
 
 /// Full persisted session state.
@@ -111,6 +197,8 @@ impl Default for TurnRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionRecord {
+    #[serde(deserialize_with = "deserialize_format_version")]
+    pub format_version: u32,
     pub id: SessionId,
     pub workspace: PathBuf,
     /// Extra writable roots granted at launch (`--add-dir`), canonical. Kept in
@@ -143,6 +231,7 @@ pub struct SessionRecord {
     /// serializes through the `Arc` transparently (same on-disk JSON).
     pub entries: Vec<std::sync::Arc<SessionEntry>>,
     pub turns: Vec<TurnRecord>,
+    pub image_projection_state: Vec<ImageProjectionState>,
     /// Workspace snapshots created during this session.
     pub checkpoints: Vec<CheckpointRecord>,
     /// Transcript summary produced by compaction. Derived field mirroring the
@@ -163,6 +252,12 @@ pub struct SessionRecord {
 }
 
 impl SessionRecord {
+    pub(crate) fn limit_image_reports(&mut self) {
+        let mut remaining = IMAGE_REPORT_BUDGET_BYTES;
+        for turn in self.turns.iter_mut().rev() {
+            turn.limit_image_reports(&mut remaining);
+        }
+    }
     /// Leave room for the next model/tool batch before the JSON backend's hard
     /// limits. Short messages and JSON escaping can exhaust disk limits long
     /// before the token-based context threshold is reached.
@@ -193,6 +288,7 @@ impl SessionRecord {
         let now = now_ms();
         let entries = vec![std::sync::Arc::new(SessionEntry::system(system_prompt))];
         Self {
+            format_version: SESSION_FORMAT_VERSION,
             id: new_session_id(),
             workspace,
             extra_roots: Vec::new(),
@@ -202,6 +298,7 @@ impl SessionRecord {
             updated_at_ms: now,
             entries,
             turns: Vec::new(),
+            image_projection_state: Vec::new(),
             checkpoints: Vec::new(),
             summary: None,
             compaction: None,
@@ -247,7 +344,7 @@ impl SessionRecord {
             .iter()
             .rev()
             .find_map(|entry| match &entry.kind {
-                EntryKind::User { content, .. } => Some(content.clone()),
+                EntryKind::User { content, .. } => Some(content.summary_text()),
                 _ => None,
             })
             .unwrap_or_else(|| "(empty session)".to_string())
@@ -325,6 +422,7 @@ impl PreparedSession {
 pub(crate) fn prepare_record(
     record: &mut SessionRecord,
 ) -> Result<PreparedSession, SessionStoreError> {
+    record.limit_image_reports();
     crate::session_integrity::ensure_key().map_err(|reason| SessionStoreError::KeyUnavailable {
         detail: reason.to_string(),
     })?;
@@ -428,6 +526,63 @@ pub fn format_sessions_storage_note(workspace: &Path, program: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_report_retention_budgets_serialized_bytes_and_is_idempotent() {
+        let mut record = SessionRecord::new(PathBuf::from("/workspace"), "system");
+        let mut turn = TurnRecord::default();
+        turn.image_requests.push(ImageRequestRecord {
+            model: "flash".into(),
+            images: (0..100)
+                .map(|index| crate::image::ImageDelivery {
+                    observation_id: Some(format!("observation-{index}")),
+                    message_index: index,
+                    block_index: 0,
+                    call_id: None,
+                    image: "sha256:asset".into(),
+                    included: false,
+                    reason: Some("界\t\"\u{1}".repeat(2000)),
+                })
+                .collect(),
+        });
+        record.turns.push(turn);
+        record.limit_image_reports();
+        let images = &record.turns[0].image_requests[0].images;
+        assert!(!images.is_empty() && images.len() < 100);
+        assert_eq!(
+            images.last().unwrap().observation_id.as_deref(),
+            Some("observation-99")
+        );
+        assert_eq!(
+            record.turns[0].image_reports_omitted as usize,
+            100 - images.len()
+        );
+        assert!(serde_json::to_vec_pretty(&record).unwrap().len() < IMAGE_REPORT_BUDGET_BYTES);
+        let once = record.clone();
+        record.limit_image_reports();
+        assert_eq!(
+            record, once,
+            "saving twice must not remove/count the same reports twice"
+        );
+        record.turns[0].image_requests.push(ImageRequestRecord {
+            model: "pro".into(),
+            images: vec![crate::image::ImageDelivery {
+                observation_id: Some("oversized".into()),
+                message_index: 0,
+                block_index: 0,
+                call_id: None,
+                image: "asset".into(),
+                included: false,
+                reason: Some("x".repeat(IMAGE_REPORT_BUDGET_BYTES * 2)),
+            }],
+        });
+        record.limit_image_reports();
+        assert_eq!(
+            record.turns[0].image_reports_omitted,
+            once.turns[0].image_reports_omitted + 1
+        );
+        assert!(serde_json::to_vec_pretty(&record).unwrap().len() < IMAGE_REPORT_BUDGET_BYTES);
+    }
 
     #[test]
     fn validate_session_id_rejects_traversal() {

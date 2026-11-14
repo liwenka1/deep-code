@@ -561,7 +561,7 @@ mod tests {
                     crate::tool::ToolRegistry::new(),
                     crate::config::AgentConfig::builtin(),
                 );
-                let system = runtime.session_messages().await[0].content.clone();
+                let system = runtime.session_messages().await[0].content.text();
                 assert!(
                     system.contains(&framed),
                     "{role:?}, network={network}: {system}"

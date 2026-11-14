@@ -6,6 +6,7 @@ mod checkpoint;
 mod client;
 mod compaction;
 mod config;
+mod content;
 mod doctor;
 mod echo_client;
 mod error;
@@ -66,6 +67,7 @@ pub use config::{
     AgentConfig, ConfigLoadReport, ConfigSources, GlobalConfigUpdate, LoadedAgentConfig,
     validate_api_key, write_global_config_update,
 };
+pub use content::{Content, ContentBlock};
 pub use doctor::{DoctorReport, default_config_path};
 pub use error::AgentResult;
 pub use event::AgentEvent;
@@ -86,9 +88,9 @@ pub use instructions::{
 // sides come through here so there is exactly one definition of what an
 // acceptable image is.
 pub use image::{
-    Attachment, ImageDetail, ImageError, ImageFormat, ImageRef, MAX_IMAGE_BYTES,
-    MAX_IMAGES_PER_MESSAGE, MAX_REQUEST_BYTES, MAX_TOKENS_PER_IMAGE, MAX_TOTAL_BYTES, StoreError,
-    data_url, hydrate, inspect, store, store_in_pinned_workspace,
+    Attachment, ImageAsset, ImageDelivery, ImageDetail, ImageError, ImageFormat, ImageRef,
+    MAX_IMAGE_BYTES, MAX_IMAGES_PER_MESSAGE, MAX_REQUEST_BYTES, MAX_TOKENS_PER_IMAGE,
+    MAX_TOTAL_BYTES, StoreError, data_url, inspect, store, store_in_pinned_workspace,
 };
 // Already reachable through `AgentRuntime::session_messages`'s signature;
 // exported so consumers (the headless driver) can actually name them.
@@ -120,10 +122,13 @@ pub use runtime_launch::{
 };
 pub use sandbox::{Enforcement, EnforcementGap, sandbox_available, sandbox_enforcement};
 pub use session::Session;
-pub use session_entry::{Ask, EntryKind, ExchangeResult, SessionEntry, ToolExchange};
+pub use session_entry::{
+    Ask, CompactionImageSource, EntryKind, ExchangeResult, SessionEntry, ToolExchange,
+};
 pub use session_store::{
-    CheckpointRecord, JsonSessionStore, PreparedSession, SessionId, SessionRecord, SessionStore,
-    SessionStoreError, TurnRecord, format_sessions_storage_note, now_ms,
+    CheckpointRecord, ImageProjectionState, ImageRequestRecord, JsonSessionStore, PreparedSession,
+    SessionId, SessionRecord, SessionStore, SessionStoreError, TurnRecord,
+    format_sessions_storage_note, now_ms,
 };
 pub use shell_tools::JobStore;
 /// The token [`AgentRuntime::compact_now`] takes, re-exported so a front-end

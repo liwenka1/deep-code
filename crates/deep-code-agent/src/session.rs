@@ -1,25 +1,17 @@
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::image::ImageRef;
+use crate::content::Content;
+use crate::image::{ImageAsset, ImageRef};
 use crate::message::Message;
 use crate::model::ToolCallPayload;
 use crate::runtime::TurnId;
 use crate::session_entry::{Ask, EntryKind, ExchangeResult, SessionEntry, ToolExchange};
 use crate::tool::ToolResultStatus;
 
-/// Synthetic wire content for a tool call whose result never arrived — the
-/// session was interrupted between the assistant's `tool_calls` and the tool
-/// executing. Synthesized at wire derivation, never stored.
-///
-/// Bilingual like every other model-facing string this crate writes
-/// (`[会话摘要 / session summary]`, `工具 / tool`, `运行环境 / Environment`).
-/// It was missed by the pass that fixed the compaction role labels, which is
-/// easy to do — it is the one such string with no `tr` call and no language
-/// pack entry anywhere near it, and it only ever appears in a session that was
-/// interrupted.
-pub(crate) const INTERRUPTED_TOOL_RESULT: &str = "工具调用未完成：会话在执行前被中断。/ Tool call did not complete: \
-     the session was interrupted before it ran.";
+/// A missing settlement cannot establish whether external actions happened.
+/// Recovery describes the uncertainty and never repeats the operation itself.
+pub(crate) const INTERRUPTED_TOOL_RESULT: &str = "工具执行结果未知：会话在结果记录前中断。先验证外部状态，不要直接重跑可能已执行的操作。/ Tool outcome unknown: the session ended before its result was recorded. Verify external state before repeating an operation that may already have run.";
 
 /// Marker prefixing the derived compaction-summary system message. Shared
 /// with the wire→entry grouping so summaries round-trip into
@@ -71,20 +63,18 @@ impl Session {
         self.push_entry(SessionEntry::system(content));
     }
 
-    pub fn push_user(&mut self, turn_id: TurnId, content: impl Into<String>) {
-        self.push_user_with_images(turn_id, content, Vec::new());
+    pub fn push_user(&mut self, turn_id: TurnId, content: impl Into<Content>) {
+        self.push_entry(SessionEntry::user(content).with_turn_id(turn_id));
     }
 
     /// Append a user turn that carries images.
     ///
-    /// Separate from `push_user` rather than folded into it: the images are
-    /// local paths (see [`SessionEntry::user_with_images`]), and a call site
-    /// that has none should not have to spell an empty `Vec` to say so.
+    /// Assets are admitted before they enter the conversation.
     pub fn push_user_with_images(
         &mut self,
         turn_id: TurnId,
         content: impl Into<String>,
-        images: Vec<PathBuf>,
+        images: Vec<ImageAsset>,
     ) {
         self.push_entry(SessionEntry::user_with_images(content, images).with_turn_id(turn_id));
     }
@@ -144,9 +134,10 @@ impl Session {
     pub fn record_tool_result(
         &mut self,
         call_id: &str,
-        content: String,
+        content: Content,
         status: ToolResultStatus,
         ask: Ask,
+        details: Option<serde_json::Value>,
     ) -> bool {
         // Find the newest assistant entry first, and only `make_mut` (which
         // clones the entry while the persistence record also holds it) once a
@@ -179,10 +170,28 @@ impl Session {
         };
         exchange.result = Some(ExchangeResult {
             content,
+            details,
             status,
             asked: ask == Ask::Asked,
         });
         true
+    }
+
+    /// Whether this turn contains visual observations still relevant to its work.
+    pub(crate) fn turn_has_images(&self, turn_id: &TurnId) -> bool {
+        self.entries
+            .iter()
+            .filter(|entry| entry.turn_id.as_ref() == Some(turn_id))
+            .any(|entry| match &entry.kind {
+                EntryKind::User { content } => content.has_images(),
+                EntryKind::Assistant { exchanges, .. } => exchanges.iter().any(|exchange| {
+                    exchange
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result.content.has_images())
+                }),
+                _ => false,
+            })
     }
 
     /// Derive the DeepSeek/OpenAI wire messages. Pending exchanges emit the
@@ -196,6 +205,84 @@ impl Session {
             .flat_map(|entry| entry_wire_messages(entry))
             .collect()
     }
+
+    /// Snapshot request positions beside their persisted source identities.
+    /// Only the positions change when compaction moves retained entries.
+    pub(crate) fn wire_messages_with_image_occurrences(
+        &self,
+    ) -> (Vec<Message>, HashMap<(usize, usize), String>) {
+        let mut messages = Vec::new();
+        let mut occurrences = HashMap::new();
+        for entry in &self.entries {
+            for (entry_message, message) in entry_wire_messages(entry).into_iter().enumerate() {
+                let message_index = messages.len();
+                for (block_index, block) in message.content.blocks.iter().enumerate() {
+                    if matches!(block, crate::content::ContentBlock::Image { .. }) {
+                        occurrences.insert(
+                            (message_index, block_index),
+                            format!("{}:{entry_message}:{block_index}", entry.id),
+                        );
+                    }
+                }
+                messages.push(message);
+            }
+        }
+        (messages, occurrences)
+    }
+
+    /// Enumerate active provenance without cloning model-facing message text.
+    pub(crate) fn image_observation_ids(&self) -> HashSet<String> {
+        let mut ids = HashSet::new();
+        for entry in &self.entries {
+            let mut add = |message: usize, content: &Content| {
+                for (block, value) in content.blocks.iter().enumerate() {
+                    if matches!(value, crate::content::ContentBlock::Image { .. }) {
+                        ids.insert(format!("{}:{message}:{block}", entry.id));
+                    }
+                }
+            };
+            match &entry.kind {
+                EntryKind::User { content } => add(0, content),
+                EntryKind::Assistant { exchanges, .. } => {
+                    for (index, exchange) in exchanges.iter().enumerate() {
+                        if let Some(result) = &exchange.result {
+                            add(index + 1, &result.content);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        ids
+    }
+}
+
+const COMPACTION_IMAGE_SOURCE_CHARS: usize = 2_000;
+const COMPACTION_IMAGE_SOURCE_COUNT: usize = 16;
+
+fn compaction_image_source_text(sources: &[crate::session_entry::CompactionImageSource]) -> String {
+    let mut text =
+        "\n\n[归档图片来源数据；像素未提供 / Archived image source data; pixels not supplied]\n"
+            .to_string();
+    let mut shown = 0usize;
+    // Leave room for the explicit metadata/omission notice below.
+    const NOTICE_RESERVE: usize = 256;
+    for source in sources.iter().rev().take(COMPACTION_IMAGE_SOURCE_COUNT) {
+        let remaining =
+            COMPACTION_IMAGE_SOURCE_CHARS.saturating_sub(text.chars().count() + NOTICE_RESERVE);
+        if remaining < 128 {
+            break;
+        }
+        let line = source.summary_text();
+        text.push_str(&crate::text_util::truncate_chars(
+            &line,
+            remaining.min(512).saturating_sub(1),
+        ));
+        text.push('\n');
+        shown += 1;
+    }
+    text.push_str(&format!("[Showing {shown} of {} archived image sources; full source metadata is retained in the session record. Source lines may be shortened.]", sources.len()));
+    text
 }
 
 /// Wire messages for one entry. Shared with compaction's archived-entry
@@ -203,13 +290,20 @@ impl Session {
 pub(crate) fn entry_wire_messages(entry: &SessionEntry) -> Vec<Message> {
     match &entry.kind {
         EntryKind::System { content } => vec![Message::system(content.clone())],
-        EntryKind::User { content, images } => vec![Message::user_with_images(
-            content.clone(),
-            images.iter().cloned().map(ImageRef::Path).collect(),
+        EntryKind::User { content } => vec![Message::user_content(
+            content.map_images(|image| ImageRef::Asset(image.clone())),
         )],
-        EntryKind::Compaction { summary, .. } => vec![Message::system(format!(
-            "{COMPACTION_SUMMARY_PREFIX}{summary}"
-        ))],
+        EntryKind::Compaction {
+            summary,
+            image_sources,
+            ..
+        } => {
+            let mut content = format!("{COMPACTION_SUMMARY_PREFIX}{summary}");
+            if !image_sources.is_empty() {
+                content.push_str(&compaction_image_source_text(image_sources));
+            }
+            vec![Message::system(content)]
+        }
         EntryKind::Assistant {
             content,
             reasoning,
@@ -226,11 +320,14 @@ pub(crate) fn entry_wire_messages(entry: &SessionEntry) -> Vec<Message> {
                 calls,
             ));
             for exchange in exchanges {
-                let content = exchange
-                    .result
-                    .as_ref()
-                    .map_or(INTERRUPTED_TOOL_RESULT, |result| result.content.as_str());
-                out.push(Message::tool(exchange.call.id.clone(), content));
+                let content = exchange.result.as_ref().map_or_else(
+                    || Content::from(INTERRUPTED_TOOL_RESULT),
+                    |result| result.content.clone(),
+                );
+                out.push(Message::tool_content(
+                    exchange.call.id.clone(),
+                    content.map_images(|image| ImageRef::Asset(image.clone())),
+                ));
             }
             out
         }
@@ -241,6 +338,62 @@ pub(crate) fn entry_wire_messages(entry: &SessionEntry) -> Vec<Message> {
 mod tests {
     use super::*;
     use crate::model::{ToolCallFunctionPayload, ToolCallPayload};
+
+    #[test]
+    fn image_occurrences_keep_source_identity_through_compaction_and_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().canonicalize().unwrap();
+        let image = crate::image::snapshot_bytes(&workspace, b"GIF89a-observation").unwrap();
+        let mut session = Session::new();
+        session.push_system("system");
+        for _ in 0..6 {
+            let turn = TurnId::new();
+            session.push_user_with_images(turn.clone(), "observe", vec![image.clone()]);
+            session.push_assistant(turn, "observed", "", Vec::new());
+        }
+        let (messages, before) = session.wire_messages_with_image_occurrences();
+        assert_eq!(
+            session.image_observation_ids(),
+            before.values().cloned().collect()
+        );
+        let last_position = messages
+            .iter()
+            .rposition(|message| message.content.has_images())
+            .unwrap();
+        let identity = before[&(last_position, 1)].clone();
+        let compacted = crate::compaction::compact_entries(session.entries());
+        assert!(compacted.archived_count > 0);
+        session.replace_entries(compacted.entries);
+        let (messages, after) = session.wire_messages_with_image_occurrences();
+        let new_position = messages
+            .iter()
+            .rposition(|message| message.content.has_images())
+            .unwrap();
+        assert!(new_position < last_position);
+        assert_eq!(after[&(new_position, 1)], identity);
+        let encoded = serde_json::to_vec(session.entries()).unwrap();
+        let decoded = serde_json::from_slice(&encoded).unwrap();
+        let restored = Session::from_entries(decoded);
+        assert_eq!(
+            restored.wire_messages_with_image_occurrences(),
+            (messages, after)
+        );
+        let mut restored = restored;
+        let same_turn = restored.entries().last().unwrap().turn_id.clone().unwrap();
+        restored.push_user_with_images(same_turn, "observe again", vec![image]);
+        let (_, occurrences) = restored.wire_messages_with_image_occurrences();
+        assert_eq!(
+            occurrences.values().filter(|id| **id == identity).count(),
+            1
+        );
+        assert_eq!(
+            occurrences
+                .values()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            occurrences.len()
+        );
+    }
 
     #[test]
     fn late_partial_reply_cannot_reappear_after_its_anchor_was_compacted() {
@@ -291,13 +444,12 @@ mod tests {
     /// Every string this crate puts on the wire for the MODEL carries both
     /// languages — the summary marker, the compaction role labels, the
     /// cancellation note. This one is the placeholder a resumed-after-interrupt
-    /// session hands back for a tool call that never ran, and it was the last
-    /// Chinese-only one left.
+    /// session hands back when the external outcome is unknown.
     #[test]
     fn the_interrupted_placeholder_is_bilingual() {
-        assert!(INTERRUPTED_TOOL_RESULT.contains("工具调用未完成"));
+        assert!(INTERRUPTED_TOOL_RESULT.contains("工具执行结果未知"));
         assert!(
-            INTERRUPTED_TOOL_RESULT.contains("interrupted before it ran"),
+            INTERRUPTED_TOOL_RESULT.contains("Tool outcome unknown"),
             "{INTERRUPTED_TOOL_RESULT}"
         );
         // The line continuation must not leave the join inside the sentence.
@@ -322,15 +474,17 @@ mod tests {
         );
         assert!(session.record_tool_result(
             "c1",
-            "content-1".to_string(),
+            "content-1".into(),
             ToolResultStatus::Success,
-            Ask::Unasked
+            Ask::Unasked,
+            None,
         ));
         assert!(session.record_tool_result(
             "c2",
-            "content-2".to_string(),
+            "content-2".into(),
             ToolResultStatus::Error,
-            Ask::Unasked
+            Ask::Unasked,
+            None,
         ));
         session.push_assistant(turn_id, "改好了", "", Vec::new());
         session.push_user(TurnId::new(), "thanks");
@@ -362,28 +516,115 @@ mod tests {
         // always belong to the newest batch).
         assert!(!session.record_tool_result(
             "nope",
-            String::new(),
+            Content::default(),
             ToolResultStatus::Success,
-            Ask::Unasked
+            Ask::Unasked,
+            None,
         ));
         assert!(!session.record_tool_result(
             "c1",
-            String::new(),
+            Content::default(),
             ToolResultStatus::Success,
-            Ask::Unasked
+            Ask::Unasked,
+            None,
         ));
         assert!(session.record_tool_result(
             "c9",
-            "ok".to_string(),
+            "ok".into(),
             ToolResultStatus::Success,
-            Ask::Unasked
+            Ask::Unasked,
+            None,
         ));
         // Double-record of the same call is rejected.
         assert!(!session.record_tool_result(
             "c9",
-            "again".to_string(),
+            "again".into(),
             ToolResultStatus::Success,
-            Ask::Unasked
+            Ask::Unasked,
+            None,
         ));
+    }
+
+    #[test]
+    fn tool_observations_keep_role_order_and_metadata_out_of_model_content() {
+        use crate::content::ContentBlock;
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let asset = crate::image::snapshot_bytes(&workspace, b"GIF89a-observed").unwrap();
+        let turn = TurnId::new();
+        let mut session = Session::new();
+        session.push_user(turn.clone(), "inspect the page");
+        session.push_assistant(turn.clone(), "", "", vec![tool_call("shot")]);
+        let content = Content::new(vec![
+            ContentBlock::Text {
+                text: "before".into(),
+            },
+            ContentBlock::Image {
+                image: asset.clone(),
+            },
+            ContentBlock::Text {
+                text: "after".into(),
+            },
+        ]);
+        assert!(session.record_tool_result(
+            "shot",
+            content,
+            ToolResultStatus::Success,
+            Ask::Unasked,
+            Some(serde_json::json!({"exit_code":0, "ui_only":"secret"}))
+        ));
+        let messages = session.wire_messages();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2].role, crate::message::Role::Tool);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("shot"));
+        assert!(
+            matches!(&messages[2].content.blocks[0], ContentBlock::Text {text} if text == "before")
+        );
+        assert!(
+            matches!(&messages[2].content.blocks[1], ContentBlock::Image {image:ImageRef::Asset(image)} if image == &asset)
+        );
+        assert!(
+            matches!(&messages[2].content.blocks[2], ContentBlock::Text {text} if text == "after")
+        );
+        assert!(!messages[2].content.summary_text().contains("secret"));
+        assert!(session.turn_has_images(&turn));
+        let next = TurnId::new();
+        session.push_user(next.clone(), "plain follow-up");
+        assert!(!session.turn_has_images(&next));
+    }
+
+    #[test]
+    fn compaction_keeps_full_source_metadata_but_bounds_its_wire_projection() {
+        use crate::session_entry::CompactionImageSource;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().canonicalize().unwrap();
+        let image = crate::image::snapshot_bytes(&workspace, b"GIF89a-bounded-sources").unwrap();
+        let sources: Vec<_> = (0..100)
+            .map(|index| CompactionImageSource {
+                image: image.clone(),
+                role: crate::message::Role::Tool,
+                call_id: Some(format!("call-{index}")),
+                tool_name: Some("long-tool-name".repeat(1_000)),
+            })
+            .collect();
+        let entry = SessionEntry::new(EntryKind::Compaction {
+            summary: "known visual conclusion".into(),
+            archived_count: 200,
+            image_sources: sources.clone(),
+        });
+        let wire = entry_wire_messages(&entry);
+        let text = wire[0].content.text();
+        assert!(
+            text.chars().count()
+                <= COMPACTION_SUMMARY_PREFIX.chars().count()
+                    + "known visual conclusion".len()
+                    + COMPACTION_IMAGE_SOURCE_CHARS
+        );
+        assert!(text.contains("call-99"));
+        assert!(text.contains("of 100 archived image sources"));
+        assert!(!wire[0].content.has_images());
+        assert!(
+            matches!(&entry.kind, EntryKind::Compaction {image_sources,..} if image_sources == &sources)
+        );
     }
 }

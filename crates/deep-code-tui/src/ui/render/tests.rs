@@ -247,7 +247,7 @@ fn clicking_the_row_a_batch_registered_unfolds_that_run() {
                 call_id: id.to_string(),
                 tool_name: tool.to_string(),
                 status: ToolResultStatus::Success,
-                content: format!("{tool} body"),
+                content: format!("{tool} body").into(),
                 details: None,
             },
         });
@@ -334,7 +334,7 @@ fn quiet_call(app: &mut App, turn: &deep_code_agent::TurnId, id: &str, path: &st
             call_id: id.to_string(),
             tool_name: "read_file".to_string(),
             status: ToolResultStatus::Success,
-            content: "12 lines".to_string(),
+            content: "12 lines".into(),
             details: None,
         },
     });
@@ -2159,8 +2159,7 @@ fn resume_picker_neutralizes_every_model_reachable_field() {
         .entries
         .push(std::sync::Arc::new(deep_code_agent::SessionEntry::new(
             deep_code_agent::EntryKind::User {
-                content: "sess\u{1b}[8m\u{202e}ion".to_string(),
-                images: Vec::new(),
+                content: "sess\u{1b}[8m\u{202e}ion".into(),
             },
         )));
     let picker = crate::app::ResumePicker {
@@ -3339,4 +3338,38 @@ fn a_find_that_wrapping_hides_opens_one_block_at_most() {
         .count();
     assert_eq!(opened, 1, "{}", app.status);
     assert!(app.pending_find.is_none());
+}
+
+#[test]
+fn process_input_preview_is_visible_beside_command_and_uses_panel_sanitizer() {
+    let input = "print('hi')\n\u{1b}[8m\u{202e}TAIL";
+    let preview = format!(
+        "stdin: {} UTF-8 bytes; no newline is appended\nstdin closes with EOF\n[stdin]\n{input}",
+        input.len()
+    );
+    let lines = approval_lines(
+        "shell",
+        deep_code_agent::RiskLevel::High,
+        true,
+        false,
+        None,
+        None,
+        None,
+        "MODEL-DESCRIPTION",
+        &serde_json::json!({ "command": "python3 -", "stdin": input }).to_string(),
+        Some(&preview),
+        &[],
+        100,
+        Lang::En,
+    );
+    let text = lines
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+        .collect::<String>();
+    assert!(text.contains("python3 -") && text.contains("print('hi')"));
+    assert!(text.contains(&format!("{} UTF-8 bytes", input.len())));
+    assert!(text.contains("stdin closes with EOF") && text.contains("TAIL"));
+    assert!(text.find("stdin preview").unwrap() < text.find("MODEL-DESCRIPTION").unwrap());
+    assert!(!text.chars().any(char::is_control));
+    assert!(!text.chars().any(is_bidi_or_zero_width));
 }

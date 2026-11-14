@@ -179,7 +179,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.status, ToolResultStatus::Success);
-        assert_eq!(result.content, "todo: 1/4 done, 1 in progress, 2 pending");
+        assert_eq!(
+            result.content.text(),
+            "todo: 1/4 done, 1 in progress, 2 pending"
+        );
         let todos = result.details.unwrap()["todos"].clone();
         assert_eq!(todos[0]["content"], "read the parser", "trimmed");
         assert_eq!(todos[0]["status"], "done");
@@ -215,7 +218,10 @@ mod tests {
             assert!(error.to_string().contains(expect), "{error}");
         }
         let empty = run(json!({ "items": [] })).await.unwrap();
-        assert_eq!(empty.content, "todo: 0/0 done, 0 in progress, 0 pending");
+        assert_eq!(
+            empty.content.text(),
+            "todo: 0/0 done, 0 in progress, 0 pending"
+        );
     }
 
     #[test]

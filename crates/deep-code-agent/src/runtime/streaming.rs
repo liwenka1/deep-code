@@ -40,6 +40,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(4);
 pub(super) struct GuardedStream {
     client: Arc<dyn LlmClient>,
     request: ChatRequest,
+    images: Vec<crate::image::ImageDelivery>,
     inner: AgentEventStream,
     chunk_timeout: Duration,
     total_timeout: Duration,
@@ -55,6 +56,14 @@ pub(super) struct GuardedStream {
 }
 
 impl GuardedStream {
+    pub(super) fn prepared_request(&self) -> &ChatRequest {
+        &self.request
+    }
+
+    pub(super) fn image_deliveries(&self) -> &[crate::image::ImageDelivery] {
+        &self.images
+    }
+
     pub(super) async fn next(&mut self) -> Option<AgentResult<AgentEvent>> {
         if self.finished {
             return None;
@@ -165,11 +174,7 @@ impl AgentRuntime {
         let mut retries_used = 0u32;
         let mut backoff = INITIAL_BACKOFF;
 
-        let inner = loop {
-            // Refresh the model AND the effort on every attempt: a fallback in a
-            // prior attempt mutates the route (Pro→Flash). Re-deriving the
-            // effort from the route's current model keeps the request and route
-            // metadata coherent if a future model has narrower levels.
+        let (inner, prepared) = loop {
             let mut attempt = request.clone();
             attempt.model = route.effective_model.clone();
             attempt.reasoning_effort =
@@ -177,7 +182,7 @@ impl AgentRuntime {
                     .as_api_value()
                     .map(str::to_string);
             match self.stream_with_fallback(route, attempt).await {
-                Ok(stream) => break stream,
+                Ok(opened) => break opened,
                 Err(error) if retries_left > 0 && open_error_retriable(&error) => {
                     retries_left -= 1;
                     retries_used += 1;
@@ -187,18 +192,21 @@ impl AgentRuntime {
                 Err(error) => return Err(error),
             }
         };
+        let mut guarded =
+            self.guarded(prepared.request, inner, retries_left, retries_used, backoff);
+        guarded.images = prepared.images;
+        Ok(guarded)
+    }
 
-        // Mid-stream re-opens stay on the route's final model: the fallback
-        // decision was already taken (and surfaced) at open time. The effort
-        // rides the same model so the request and route metadata stay aligned.
-        let mut request = request;
-        request.model = route.effective_model.clone();
-        request.reasoning_effort =
-            clamp_effort_to_model(&route.effective_model, route.effective_effort)
-                .as_api_value()
-                .map(str::to_string);
-
-        Ok(self.guarded(request, inner, retries_left, retries_used, backoff))
+    pub(super) fn prepare_model_request(
+        &self,
+        request: ChatRequest,
+    ) -> crate::image::PreparedImageRequest {
+        let accepted = self
+            .registry
+            .info_for(&request.model)
+            .is_none_or(|entry| entry.supports_vision);
+        crate::image::prepare_request_images(request, Some(self.config.vision_detail), accepted)
     }
 
     /// Open a stream for a request no turn route governs — the compaction
@@ -245,6 +253,7 @@ impl AgentRuntime {
         GuardedStream {
             client: Arc::clone(&self.client),
             request,
+            images: Vec::new(),
             inner,
             chunk_timeout: self.config.stream_chunk_timeout,
             total_timeout: self.config.stream_total_timeout,
@@ -264,16 +273,17 @@ impl AgentRuntime {
         &self,
         route: &mut TurnRoute,
         request: ChatRequest,
-    ) -> Result<AgentEventStream, AgentError> {
-        match self.client.stream_chat(request.clone()).await {
-            Ok(stream) => Ok(stream),
+    ) -> Result<(AgentEventStream, crate::image::PreparedImageRequest), AgentError> {
+        let prepared = self.prepare_model_request(request.clone());
+        match self.client.stream_chat(prepared.request.clone()).await {
+            Ok(stream) => Ok((stream, prepared)),
             Err(error) if api_error_retriable(&error) => {
                 if let Some(fallback) = api_fallback_model(route) {
                     route.effective_model = fallback.to_string();
                     route.used_model_fallback = true;
                     // Keep the retry's effort aligned with the fallback model's
                     // catalog entry. The current DeepSeek models both accept max;
-                    // this remains the compatibility seam for future entries.
+                    // future model entries can impose a different cap.
                     route.effective_effort =
                         clamp_effort_to_model(fallback, route.effective_effort);
                     route.fallback_reason = Some(
@@ -284,7 +294,11 @@ impl AgentRuntime {
                     retry.model = fallback.to_string();
                     retry.reasoning_effort =
                         route.effective_effort.as_api_value().map(str::to_string);
-                    self.client.stream_chat(retry).await
+                    let prepared = self.prepare_model_request(retry);
+                    self.client
+                        .stream_chat(prepared.request.clone())
+                        .await
+                        .map(|stream| (stream, prepared))
                 } else {
                     Err(error)
                 }

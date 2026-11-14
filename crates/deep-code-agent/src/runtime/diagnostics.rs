@@ -49,7 +49,10 @@ impl AgentRuntime {
             if !blocks.is_empty() {
                 let rendered = render_blocks(&blocks);
                 let summary = summarize_blocks(&blocks);
-                result.content = append_diagnostics(&result.content, &rendered);
+                if !result.content.is_empty() {
+                    result.content.push_text("\n\n");
+                }
+                result.content.push_text(&rendered);
                 emit(
                     tx,
                     RuntimeEvent::DiagnosticsUpdated {
@@ -71,15 +74,5 @@ impl AgentRuntime {
                 emit(tx, RuntimeEvent::Warning { message });
             }
         }
-    }
-}
-
-pub(super) fn append_diagnostics(content: &str, rendered: &str) -> String {
-    if rendered.is_empty() {
-        content.to_string()
-    } else if content.is_empty() {
-        rendered.to_string()
-    } else {
-        format!("{content}\n\n{rendered}")
     }
 }

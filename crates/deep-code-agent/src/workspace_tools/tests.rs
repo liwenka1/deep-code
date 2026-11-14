@@ -35,12 +35,192 @@ async fn read_file_returns_structured_lines() {
         json!({"path": "notes.txt", "start_line": 2, "max_lines": 1}),
     )
     .await;
-    let output: Value = serde_json::from_str(&result.content).unwrap();
+    let output: Value = serde_json::from_str(&result.content.text()).unwrap();
 
     assert_eq!(output["path"], "notes.txt");
     assert_eq!(output["lines"][0]["line"], 2);
     assert_eq!(output["lines"][0]["text"], "two");
     assert_eq!(output["truncated"], true);
+}
+
+fn virtual_text_page(
+    bytes: &[u8],
+    metadata_bytes: u64,
+    arguments: Value,
+) -> Result<Value, ToolError> {
+    let params = serde_json::from_value(arguments).unwrap();
+    let output = ReadFileTool::read_text_page(
+        std::io::Cursor::new(bytes),
+        "virtual.txt",
+        metadata_bytes,
+        params,
+        &CancellationToken::new(),
+    )?;
+    Ok(serde_json::from_str(&output.content.text()).unwrap())
+}
+
+#[test]
+fn text_pages_use_actual_eof_with_zero_or_inflated_metadata_size() {
+    for metadata_bytes in [0, 4096] {
+        let empty = virtual_text_page(b"", metadata_bytes, json!({"path": "virtual.txt"})).unwrap();
+        assert_eq!(empty["total_bytes"], 0);
+        assert_eq!(empty["returned_bytes"], 0);
+        assert_eq!(empty["truncated"], false);
+        assert!(empty["next_start_byte"].is_null());
+        let bytes = b"one\ntwo\n";
+        let first = virtual_text_page(
+            bytes,
+            metadata_bytes,
+            json!({"path": "virtual.txt", "max_lines": 1}),
+        )
+        .unwrap();
+        assert_eq!(first["lines"][0]["text"], "one");
+        assert_eq!(first["metadata_bytes"], metadata_bytes);
+        assert_eq!(first["total_bytes"], bytes.len());
+        assert_eq!(first["next_start_byte"], 4);
+        assert_eq!(first["next_start_line"], 2);
+        assert_eq!(first["truncated"], true);
+        let second = virtual_text_page(
+            bytes,
+            metadata_bytes,
+            json!({"path": "virtual.txt", "start_byte": 4}),
+        )
+        .unwrap();
+        assert_eq!(second["lines"][0]["text"], "two");
+        assert_eq!(second["total_bytes"], bytes.len());
+        assert_eq!(second["truncated"], false);
+        assert!(second["next_start_byte"].is_null());
+        for cursor in [bytes.len(), bytes.len() + 100] {
+            let empty = virtual_text_page(
+                bytes,
+                metadata_bytes,
+                json!({"path": "virtual.txt", "start_byte": cursor}),
+            )
+            .unwrap();
+            assert_eq!(empty["returned_bytes"], 0);
+            assert_eq!(empty["truncated"], false);
+            assert!(empty["next_start_byte"].is_null());
+            assert!(
+                empty["total_bytes"].is_null(),
+                "seeking past EOF cannot establish file length"
+            );
+        }
+        let skipped = virtual_text_page(
+            bytes,
+            metadata_bytes,
+            json!({"path": "virtual.txt", "start_line": 100}),
+        )
+        .unwrap();
+        assert_eq!(skipped["returned_bytes"], 0);
+        assert_eq!(skipped["total_bytes"], bytes.len());
+        assert_eq!(skipped["truncated"], false);
+        assert!(skipped["next_start_byte"].is_null());
+    }
+}
+
+#[test]
+fn text_page_lookahead_handles_exact_byte_limit_and_utf8_boundaries() {
+    let exact = "x\n".repeat(TEXT_READ_PAGE_BYTES / 2);
+    let page = virtual_text_page(
+        exact.as_bytes(),
+        0,
+        json!({"path": "virtual.txt", "max_lines": 1}),
+    )
+    .unwrap();
+    assert_eq!(page["total_bytes"], TEXT_READ_PAGE_BYTES);
+    assert_eq!(page["truncated"], true);
+    let near_end = virtual_text_page(
+        exact.as_bytes(),
+        0,
+        json!({"path": "virtual.txt", "start_byte": TEXT_READ_PAGE_BYTES - 2}),
+    )
+    .unwrap();
+    assert_eq!(near_end["returned_bytes"], 2);
+    assert_eq!(near_end["truncated"], false);
+    let body = format!("{}界tail", "x".repeat(TEXT_READ_PAGE_BYTES - 1));
+    let mut cursor = 0u64;
+    let mut collected = String::new();
+    for _ in 0..32 {
+        let page = virtual_text_page(
+            body.as_bytes(),
+            0,
+            json!({"path": "virtual.txt", "start_byte": cursor}),
+        )
+        .unwrap();
+        let count = page["returned_bytes"].as_u64().unwrap();
+        assert!(count > 0);
+        let projected = page["lines"][0]["text"].as_str().unwrap();
+        assert_eq!(projected, &body[cursor as usize..(cursor + count) as usize]);
+        collected.push_str(projected);
+        cursor += count;
+        if page["truncated"] == false {
+            assert!(page["next_start_byte"].is_null());
+            break;
+        }
+        assert_eq!(page["partial_line"], true);
+        assert_eq!(page["next_start_byte"], cursor);
+    }
+    assert_eq!(collected, body);
+    for metadata_bytes in [0, 4096] {
+        let error = virtual_text_page(b"abc\xe7", metadata_bytes, json!({"path": "virtual.txt"}))
+            .unwrap_err();
+        assert!(error.to_string().contains("not valid UTF-8"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn read_file_continues_procfs_and_stops_at_sysfs_eof() {
+    let tmp = tempdir().unwrap();
+    let roots = WorkspaceRoots::new(tmp.path(), vec!["/proc".into(), "/sys".into()]);
+    let registry = workspace_tool_registry(roots).unwrap();
+    let read = |arguments| {
+        registry.run_tool_call(
+            ToolCall::new("read", "read_file", arguments),
+            Some(ApprovalDecision::Approved),
+        )
+    };
+    let ToolRunOutcome::Result { result } = read(json!({"path": "/proc/meminfo", "max_lines": 1}))
+        .await
+        .unwrap()
+    else {
+        panic!("expected a read result");
+    };
+    let first: Value = serde_json::from_str(&result.content.text()).unwrap();
+    assert_eq!(first["metadata_bytes"], 0);
+    assert_eq!(first["truncated"], true);
+    let cursor = first["next_start_byte"].as_u64().unwrap();
+    assert!(cursor > 0);
+    let ToolRunOutcome::Result { result } =
+        read(json!({"path": "/proc/meminfo", "start_byte": cursor, "max_lines": 1}))
+            .await
+            .unwrap()
+    else {
+        panic!("expected a read result");
+    };
+    let second: Value = serde_json::from_str(&result.content.text()).unwrap();
+    assert!(second["returned_bytes"].as_u64().unwrap() > 0);
+    let path = "/sys/kernel/cpu_byteorder";
+    if !std::path::Path::new(path).exists() {
+        return;
+    }
+    let ToolRunOutcome::Result { result } = read(json!({"path": path})).await.unwrap() else {
+        panic!("expected a read result");
+    };
+    let first: Value = serde_json::from_str(&result.content.text()).unwrap();
+    assert_eq!(first["truncated"], false);
+    assert!(first["next_start_byte"].is_null());
+    let cursor = first["returned_bytes"].as_u64().unwrap();
+    let ToolRunOutcome::Result { result } = read(json!({"path": path, "start_byte": cursor}))
+        .await
+        .unwrap()
+    else {
+        panic!("expected a read result");
+    };
+    let last: Value = serde_json::from_str(&result.content.text()).unwrap();
+    assert_eq!(last["returned_bytes"], 0);
+    assert_eq!(last["truncated"], false);
+    assert!(last["next_start_byte"].is_null());
 }
 
 /// A read of a large file must fit the runtime's per-result budget, and its
@@ -59,13 +239,13 @@ async fn read_file_fits_the_result_budget_and_paginates_without_a_gap() {
     fs::write(tmp.path().join("big.txt"), &body).unwrap();
 
     let result = run(tmp.path(), "read_file", json!({"path": "big.txt"})).await;
-    let out: Value = serde_json::from_str(&result.content).unwrap();
+    let out: Value = serde_json::from_str(&result.content.text()).unwrap();
 
     let budget = crate::runtime::tool_result::TOOL_OUTPUT_BUDGET;
     assert!(
-        result.content.chars().count() <= budget,
+        result.content.text().chars().count() <= budget,
         "read result must fit the {budget}-char budget, got {}",
-        result.content.chars().count()
+        result.content.text().chars().count()
     );
     let returned = out["returned_lines"].as_u64().unwrap() as usize;
     assert!(
@@ -98,13 +278,13 @@ async fn grep_results_are_capped_to_the_output_budget() {
     fs::write(tmp.path().join("big.txt"), &body).unwrap();
 
     let result = run(tmp.path(), "grep_files", json!({"pattern": "NEEDLE"})).await;
-    let out: Value = serde_json::from_str(&result.content).unwrap();
+    let out: Value = serde_json::from_str(&result.content.text()).unwrap();
 
     let budget = crate::runtime::tool_result::TOOL_OUTPUT_BUDGET;
     assert!(
-        result.content.chars().count() <= budget,
+        result.content.text().chars().count() <= budget,
         "grep result must fit the {budget}-char budget, got {}",
-        result.content.chars().count()
+        result.content.text().chars().count()
     );
     assert_eq!(out["truncated"], true);
     let returned = out["matches"].as_array().unwrap().len();
@@ -176,7 +356,7 @@ async fn spill_files_are_hidden_from_default_grep_but_reachable_explicitly() {
 
     // Default walk: only the source hit; the hidden `.deep-code` never shows.
     let result = run(tmp.path(), "grep_files", json!({"pattern": "NEEDLE"})).await;
-    let output: Value = serde_json::from_str(&result.content).unwrap();
+    let output: Value = serde_json::from_str(&result.content.text()).unwrap();
     let matched: Vec<&str> = output["matches"]
         .as_array()
         .unwrap()
@@ -192,7 +372,7 @@ async fn spill_files_are_hidden_from_default_grep_but_reachable_explicitly() {
         json!({"pattern": "NEEDLE", "path": ".deep-code/spill"}),
     )
     .await;
-    let output: Value = serde_json::from_str(&result.content).unwrap();
+    let output: Value = serde_json::from_str(&result.content.text()).unwrap();
     assert_eq!(output["matches"][0]["line"], "NEEDLE in log");
 
     // read_file reaches the same file — the granted-root resolution covers
@@ -204,7 +384,7 @@ async fn spill_files_are_hidden_from_default_grep_but_reachable_explicitly() {
     )
     .await;
     assert_eq!(result.status, ToolResultStatus::Success);
-    let output: Value = serde_json::from_str(&result.content).unwrap();
+    let output: Value = serde_json::from_str(&result.content.text()).unwrap();
     assert_eq!(output["lines"][0]["text"], "NEEDLE in log");
 }
 
@@ -215,7 +395,7 @@ async fn list_dir_returns_structured_entries() {
     fs::write(tmp.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
     let result = run(tmp.path(), "list_dir", json!({"path": "src"})).await;
-    let output: Value = serde_json::from_str(&result.content).unwrap();
+    let output: Value = serde_json::from_str(&result.content.text()).unwrap();
 
     assert_eq!(output["path"], "src");
     assert_eq!(output["entries"][0]["name"], "lib.rs");
@@ -240,7 +420,7 @@ async fn list_dir_reports_size_without_read_permission() {
     }
 
     let result = run(tmp.path(), "list_dir", json!({"path": "."})).await;
-    let output: Value = serde_json::from_str(&result.content).unwrap();
+    let output: Value = serde_json::from_str(&result.content.text()).unwrap();
     let entry = output["entries"]
         .as_array()
         .unwrap()
@@ -267,7 +447,7 @@ async fn list_dir_caps_a_huge_directory_and_reports_the_total() {
     }
 
     let result = run(tmp.path(), "list_dir", json!({"path": "many"})).await;
-    let output: Value = serde_json::from_str(&result.content).unwrap();
+    let output: Value = serde_json::from_str(&result.content.text()).unwrap();
 
     assert_eq!(
         output["entries"].as_array().unwrap().len(),
@@ -292,7 +472,7 @@ async fn grep_files_returns_matches_with_context() {
         json!({"pattern": "needle", "context_lines": 1}),
     )
     .await;
-    let output: Value = serde_json::from_str(&result.content).unwrap();
+    let output: Value = serde_json::from_str(&result.content.text()).unwrap();
 
     assert_eq!(output["matches"][0]["path"], "main.rs");
     assert_eq!(output["matches"][0]["line_number"], 2);
@@ -316,7 +496,7 @@ async fn grep_stops_when_the_turn_is_cancelled() {
     let params: GrepFilesParams = serde_json::from_value(json!({"pattern": "needle"})).unwrap();
 
     let output: Value =
-        serde_json::from_str(&tool.grep_sync(params, &cancel).unwrap().content).unwrap();
+        serde_json::from_str(&tool.grep_sync(params, &cancel).unwrap().content.text()).unwrap();
     assert_eq!(
         output["files_searched"], 0,
         "a pre-cancelled grep searches nothing"
@@ -354,7 +534,7 @@ async fn grep_files_reports_oversized_files_instead_of_skipping_silently() {
     fs::write(tmp.path().join("big.log"), big).unwrap();
 
     let result = run(tmp.path(), "grep_files", json!({"pattern": "needle"})).await;
-    let output: Value = serde_json::from_str(&result.content).unwrap();
+    let output: Value = serde_json::from_str(&result.content.text()).unwrap();
 
     assert_eq!(output["skipped_oversized"], 1);
     assert_eq!(
@@ -390,7 +570,7 @@ async fn grep_files_files_a_non_utf8_file_as_binary_not_unreadable() {
     fs::write(tmp.path().join("binary.bin"), [0xFF, 0xFE, b'n', 0x80]).unwrap();
 
     let result = run(tmp.path(), "grep_files", json!({"pattern": "needle"})).await;
-    let output: Value = serde_json::from_str(&result.content).unwrap();
+    let output: Value = serde_json::from_str(&result.content.text()).unwrap();
 
     assert_eq!(output["skipped_binary"], 1, "{output}");
     assert_eq!(
@@ -444,7 +624,7 @@ async fn grep_files_does_not_invent_a_refusal_from_a_bad_ignore_glob() {
     fs::write(tmp.join("b.txt"), "needle two\n").unwrap();
 
     let result = run(tmp, "grep_files", json!({"pattern": "needle"})).await;
-    let output: Value = serde_json::from_str(&result.content).unwrap();
+    let output: Value = serde_json::from_str(&result.content.text()).unwrap();
 
     assert_eq!(output["files_searched"], 2, "{output}");
     assert_eq!(output["matches"].as_array().unwrap().len(), 2, "{output}");
@@ -458,37 +638,139 @@ async fn grep_files_does_not_invent_a_refusal_from_a_bad_ignore_glob() {
     );
 }
 
-/// The read cap had no test anywhere: deleting the whole guard left all 573
-/// agent tests, 200 TUI tests and both doc suites green, while
-/// `approval_preview` asserted in a comment that this mention was pinned.
-///
-/// The size guard returns BEFORE `read_to_string`, so this test says nothing
-/// about the two read causes staying apart — that is
-/// `read_file_names_the_cause_and_keeps_the_path_relative` and its
-/// unreadable-file sibling. (It used to claim otherwise here.)
 #[tokio::test]
-async fn read_file_refuses_a_file_over_the_limit() {
+async fn read_file_pages_sources_larger_than_the_search_limit() {
     let tmp = tempdir().unwrap();
-    let big = vec![b'a'; (MAX_FILE_BYTES + 1) as usize];
-    fs::write(tmp.path().join("big.txt"), &big).unwrap();
+    let body = "line\n".repeat((MAX_FILE_BYTES as usize / 5) + 10);
+    fs::write(tmp.path().join("big.txt"), &body).unwrap();
+    let result = run(tmp.path(), "read_file", json!({"path": "big.txt"})).await;
+    let page: Value = serde_json::from_str(&result.content.text()).unwrap();
+    assert_eq!(page["metadata_bytes"], body.len());
+    assert!(page["total_bytes"].is_null());
+    assert_eq!(page["returned_lines"], DEFAULT_READ_LINES);
+    assert_eq!(page["next_start_byte"], DEFAULT_READ_LINES * 5);
+    assert_eq!(page["truncated"], true);
+}
 
-    let call = ToolCall::new("call_1", "read_file", json!({"path": "big.txt"}));
-    let outcome = registry(tmp.path())
-        .run_tool_call(call, Some(ApprovalDecision::Approved))
+#[tokio::test]
+async fn read_file_byte_cursor_reassembles_long_utf8_lines_without_gaps() {
+    let tmp = tempdir().unwrap();
+    let body = format!("{}\nend", "字\t\"".repeat(20_000));
+    fs::write(tmp.path().join("long.txt"), &body).unwrap();
+    let mut cursor = 0u64;
+    let mut reassembled = String::new();
+    loop {
+        let result = run(
+            tmp.path(),
+            "read_file",
+            json!({"path": "long.txt", "start_byte": cursor}),
+        )
         .await;
-    let message = match outcome {
-        Err(ToolError::ExecutionFailed { message, .. }) => message,
-        other => panic!("expected the size guard to refuse, got {other:?}"),
-    };
+        let text = result.content.text();
+        assert!(text.chars().count() <= crate::runtime::tool_result::TOOL_OUTPUT_BUDGET);
+        let page: Value = serde_json::from_str(&text).unwrap();
+        let count = page["returned_bytes"].as_u64().unwrap();
+        assert!(count > 0);
+        let observed = &body[cursor as usize..(cursor + count) as usize];
+        let lines = page["lines"].as_array().unwrap();
+        let projected = lines
+            .iter()
+            .map(|line| line["text"].as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(projected, observed.strip_suffix('\n').unwrap_or(observed));
+        reassembled.push_str(observed);
+        cursor += count;
+        if page["truncated"] == false {
+            break;
+        }
+        assert_eq!(page["next_start_byte"], cursor);
+    }
+    assert_eq!(reassembled, body);
+}
 
-    assert!(
-        message.contains(&format!("{MAX_FILE_MIB} MiB")),
-        "the refusal must name the limit it enforced: {message}"
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn read_file_rejects_path_metadata_that_exhausts_the_page_budget() {
+    let tmp = tempdir().unwrap();
+    let mut relative = std::path::PathBuf::new();
+    for _ in 0..22 {
+        relative.push("\u{1}".repeat(100));
+    }
+    fs::create_dir_all(tmp.path().join(&relative)).unwrap();
+    relative.push("text.txt");
+    fs::write(tmp.path().join(&relative), "字").unwrap();
+    let error = registry(tmp.path())
+        .run_tool_call(
+            ToolCall::new("read", "read_file", json!({"path": relative})),
+            Some(ApprovalDecision::Approved),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("page budget"));
+}
+
+#[tokio::test]
+async fn read_file_preserves_a_standalone_carriage_return() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("cr.txt"), "abc\r").unwrap();
+    let result = run(tmp.path(), "read_file", json!({"path": "cr.txt"})).await;
+    let page: Value = serde_json::from_str(&result.content.text()).unwrap();
+    assert_eq!(page["lines"][0]["text"], "abc\r");
+    assert_eq!(page["returned_bytes"], 4);
+    assert_eq!(page["truncated"], false);
+    fs::write(tmp.path().join("cr.txt"), "abc\r\ndef\r").unwrap();
+    let result = run(
+        tmp.path(),
+        "read_file",
+        json!({"path": "cr.txt", "max_lines": 1}),
+    )
+    .await;
+    let page: Value = serde_json::from_str(&result.content.text()).unwrap();
+    assert_eq!(page["lines"][0]["text"], "abc");
+    assert_eq!(page["next_start_byte"], 5);
+    let next = run(
+        tmp.path(),
+        "read_file",
+        json!({"path": "cr.txt", "start_byte": 5}),
+    )
+    .await;
+    let page: Value = serde_json::from_str(&next.content.text()).unwrap();
+    assert_eq!(page["lines"][0]["text"], "def\r");
+}
+
+#[tokio::test]
+async fn read_file_returns_native_image_observation_with_fixed_identity() {
+    let tmp = tempdir().unwrap();
+    let bytes = include_bytes!("../image/tests/fixtures/red.png");
+    fs::write(tmp.path().join("shot.bin"), bytes).unwrap();
+    let result = run(tmp.path(), "read_file", json!({"path": "shot.bin"})).await;
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(result.content.image_count(), 1);
+    let asset = result.content.images().next().unwrap();
+    fs::write(tmp.path().join("shot.bin"), "changed").unwrap();
+    let message = crate::Message::tool_content(
+        "image_call",
+        result
+            .content
+            .map_images(|image| crate::ImageRef::Asset(image.clone())),
     );
-    assert!(
-        !message.contains(tmp.path().to_str().unwrap()),
-        "the absolute host path leaked to the model: {message}"
+    let request = crate::ChatRequest::streaming("deepseek-flash", vec![message]);
+    let prepared =
+        crate::image::prepare_request_images(request, Some(crate::ImageDetail::Auto), true);
+    assert_eq!(
+        prepared
+            .images
+            .iter()
+            .filter(|image| image.included)
+            .count(),
+        1
     );
+    assert!(asset.bytes > 0);
+    let wire = serde_json::to_value(&prepared.request.messages[0]).unwrap();
+    assert_eq!(wire["role"], "tool");
+    assert_eq!(wire["tool_call_id"], "image_call");
+    assert_eq!(wire["content"][1]["type"], "image_url");
 }
 
 /// The OTHER arm of the same `if`. Only the `InvalidData` branch was
@@ -687,7 +969,7 @@ async fn grep_hedges_the_census_when_a_symlinked_directory_is_refused() {
     }
 
     let result = run(tmp.path(), "grep_files", json!({"pattern": "needle"})).await;
-    let output: Value = serde_json::from_str(&result.content).unwrap();
+    let output: Value = serde_json::from_str(&result.content.text()).unwrap();
 
     assert_eq!(output["skipped_symlinks"], 1, "{output}");
     let note = output["note"].as_str().unwrap_or_default();
@@ -722,7 +1004,7 @@ async fn grep_files_reports_a_symlinked_file_rather_than_dropping_it() {
     ));
 
     let result = run(tmp.path(), "grep_files", json!({"pattern": "needle"})).await;
-    let output: Value = serde_json::from_str(&result.content).unwrap();
+    let output: Value = serde_json::from_str(&result.content.text()).unwrap();
 
     assert_eq!(output["skipped_symlinks"], 1, "{output}");
     assert_eq!(
@@ -763,7 +1045,7 @@ async fn grep_files_reports_an_unreadable_directory() {
     // Restore before asserting: a panic here must not leave a tempdir that
     // cannot be cleaned up.
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-    let output: Value = serde_json::from_str(&result.content).unwrap();
+    let output: Value = serde_json::from_str(&result.content.text()).unwrap();
 
     assert_eq!(output["skipped_unreadable"], 1, "{output}");
     assert_eq!(
@@ -987,7 +1269,7 @@ async fn apply_patch_replaces_exactly_once_after_approval() {
         "fn new() {}\n"
     );
     assert_eq!(
-        serde_json::from_str::<Value>(&result.content).unwrap()["match"],
+        serde_json::from_str::<Value>(&result.content.text()).unwrap()["match"],
         "exact"
     );
 }
@@ -1034,7 +1316,7 @@ async fn apply_patch_fuzzy_matches_indentation_and_adopts_the_files_indent() {
         "fn f() {\n\tlet y = 42;\n}\n"
     );
     assert_eq!(
-        serde_json::from_str::<Value>(&result.content).unwrap()["match"],
+        serde_json::from_str::<Value>(&result.content.text()).unwrap()["match"],
         "fuzzy-indent"
     );
 }
@@ -1111,7 +1393,7 @@ async fn apply_patch_fuzzy_indent_keeps_the_following_line_intact() {
         "the untouched `return 0` must keep its indentation"
     );
     assert_eq!(
-        serde_json::from_str::<Value>(&result.content).unwrap()["match"],
+        serde_json::from_str::<Value>(&result.content.text()).unwrap()["match"],
         "fuzzy-indent"
     );
 }
@@ -1241,7 +1523,7 @@ async fn apply_patch_fuzzy_matches_smart_quotes() {
         "let s = \"bye\";\n"
     );
     assert_eq!(
-        serde_json::from_str::<Value>(&result.content).unwrap()["match"],
+        serde_json::from_str::<Value>(&result.content.text()).unwrap()["match"],
         "fuzzy-punct"
     );
 }
@@ -1578,7 +1860,7 @@ async fn write_tools_carry_the_real_diff_in_details() {
         "the diff shows the tab-indented text that was written, not `new` as given: {diff}"
     );
     assert!(
-        !result.content.contains("diff"),
+        !result.content.text().contains("diff"),
         "the model-facing result stays as it was: {}",
         result.content
     );

@@ -10,7 +10,6 @@ use crate::error::{AgentError, AgentResult};
 use crate::event::AgentEvent;
 use crate::model::{ChatRequest, FunctionCallDelta, ToolCallDelta, Usage};
 use crate::model_registry::{DEEPSEEK_FLASH, DEEPSEEK_V4_PRO};
-use crate::runtime::diagnostics::append_diagnostics;
 use crate::session_store::SessionStore;
 use crate::tool::{MockEchoTool, Tool, ToolError, ToolRegistry, ToolResultStatus};
 
@@ -168,7 +167,7 @@ async fn superseded_partial_reply_stays_with_its_request_and_is_saved() {
     runtime.begin_turn("second").await;
     drain(&mut rx).await;
     let messages = runtime.session_messages().await;
-    let text: Vec<_> = messages.iter().map(|m| m.content.as_str()).collect();
+    let text: Vec<_> = messages.iter().map(|m| m.content.text()).collect();
     assert_eq!(text, ["system", "first", "partial", "second"]);
     assert!(
         runtime.live_turn_id().await.is_some(),
@@ -269,7 +268,7 @@ async fn superseded_error_or_completed_reply_stays_with_its_request() {
         assert_eq!(
             messages
                 .iter()
-                .map(|m| m.content.as_str())
+                .map(|m| m.content.text())
                 .collect::<Vec<_>>(),
             ["first", "partial", "second"]
         );
@@ -279,17 +278,6 @@ async fn superseded_error_or_completed_reply_stays_with_its_request() {
         );
         assert!(runtime.live_turn_id().await.is_some());
     }
-}
-
-#[test]
-fn append_diagnostics_joins_blocks() {
-    assert_eq!(
-        append_diagnostics(
-            "{\"path\":\"a.rs\"}",
-            "<diagnostics file=\"a.rs\">\n</diagnostics>"
-        ),
-        "{\"path\":\"a.rs\"}\n\n<diagnostics file=\"a.rs\">\n</diagnostics>"
-    );
 }
 
 /// Scripted client: replays a pre-recorded sequence of provider events for
@@ -645,7 +633,7 @@ async fn approve_path_feeds_tool_result_into_next_turn() {
         match event {
             RuntimeEvent::ToolCallFinished { result, .. } => {
                 assert_eq!(result.status, ToolResultStatus::Success);
-                assert_eq!(result.content, "mock_echo: hi");
+                assert_eq!(result.content.text(), "mock_echo: hi");
                 saw_tool_result = true;
             }
             RuntimeEvent::TurnFinished { .. } => saw_finish = true,
@@ -662,7 +650,7 @@ async fn approve_path_feeds_tool_result_into_next_turn() {
     assert_eq!(messages[1].tool_calls[0].id, "call_1");
     assert_eq!(messages[2].role, crate::message::Role::Tool);
     assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
-    assert_eq!(messages[3].content, "thanks");
+    assert_eq!(messages[3].content.text(), "thanks");
 }
 
 /// A turn's step budget counts the whole turn, and an approval park is inside
@@ -753,7 +741,7 @@ async fn yolo_mode_auto_approves_gated_tool_without_parking() {
     );
     assert!(events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::ToolCallFinished { result, .. } if result.content == "mock_echo: hi"
+        RuntimeEvent::ToolCallFinished { result, .. } if result.content.text() == "mock_echo: hi"
     )));
     assert!(
         events
@@ -820,7 +808,7 @@ async fn auto_mode_runs_when_classifier_approves() {
     );
     assert!(events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::ToolCallFinished { result, .. } if result.content == "mock_echo: hi"
+        RuntimeEvent::ToolCallFinished { result, .. } if result.content.text() == "mock_echo: hi"
     )));
 }
 
@@ -1011,7 +999,7 @@ async fn auto_mode_floors_network_tools_above_the_judge() {
     assert!(
         events.iter().all(|event| !matches!(
             event,
-            RuntimeEvent::ToolCallFinished { result, .. } if result.content == "fetched"
+            RuntimeEvent::ToolCallFinished { result, .. } if result.content.text() == "fetched"
         )),
         "the network tool must not have run"
     );
@@ -1296,7 +1284,7 @@ async fn gated_agent_dispatches_leave_the_parallel_group_and_face_the_gate() {
                 result.status,
                 ToolResultStatus::Success,
                 "a gated dispatch must not degrade into an error: {}",
-                result.content
+                result.content.text()
             );
         }
     }
@@ -1533,11 +1521,9 @@ async fn deny_path_records_denied_tool_message_and_continues() {
     assert_eq!(denied.status, ToolResultStatus::Denied);
 
     let messages = runtime.session_messages().await;
-    assert!(
-        messages
-            .iter()
-            .any(|m| matches!(m.role, crate::message::Role::Tool) && m.content.contains("denied"))
-    );
+    assert!(messages.iter().any(
+        |m| matches!(m.role, crate::message::Role::Tool) && m.content.text().contains("denied")
+    ));
 }
 
 /// An unattended denial (the sub-agent auto-decider) carries its real reason,
@@ -1583,7 +1569,8 @@ async fn unattended_denial_note_replaces_the_denied_by_user_text() {
         .expect("expected ToolResult on deny path");
     assert_eq!(denied.status, ToolResultStatus::Denied);
     assert_eq!(
-        denied.content, note,
+        denied.content.text(),
+        note,
         "the note must replace the stock text verbatim"
     );
 
@@ -1591,7 +1578,7 @@ async fn unattended_denial_note_replaces_the_denied_by_user_text() {
     assert!(
         messages
             .iter()
-            .any(|m| matches!(m.role, crate::message::Role::Tool) && m.content == note),
+            .any(|m| matches!(m.role, crate::message::Role::Tool) && m.content.text() == note),
         "the recorded tool message must carry the note, not 'denied by user'"
     );
 }
@@ -1674,7 +1661,7 @@ async fn plain_response_yields_assistant_message_and_finish() {
     ));
     let messages = runtime.session_messages().await;
     assert_eq!(messages.len(), 2);
-    assert_eq!(messages[1].content, "hello");
+    assert_eq!(messages[1].content.text(), "hello");
     assert!(messages[1].tool_calls.is_empty());
 }
 
@@ -2258,7 +2245,7 @@ async fn stale_approval_id_cannot_authorize_reused_model_call_id() {
         .await
         .unwrap();
     let events = drain(&mut resumed).await;
-    assert!(events.iter().any(|event| matches!(event, RuntimeEvent::ToolCallFinished { result, .. } if result.content == "mock_echo: successor")));
+    assert!(events.iter().any(|event| matches!(event, RuntimeEvent::ToolCallFinished { result, .. } if result.content.text() == "mock_echo: successor")));
     assert!(matches!(
         runtime
             .submit_approval(&second_request.approval_id, ApprovalDecision::Approved)
@@ -2287,28 +2274,11 @@ async fn invalid_typed_arguments_return_to_model_before_any_approval() {
         event,
         RuntimeEvent::ApprovalRequired { .. } | RuntimeEvent::ApprovalResolved { .. }
     )));
-    assert!(events.iter().any(|event| matches!(event, RuntimeEvent::ToolCallFinished { result, .. } if result.status == ToolResultStatus::Error && result.content.contains("invalid type"))));
+    assert!(events.iter().any(|event| matches!(event, RuntimeEvent::ToolCallFinished { result, .. } if result.status == ToolResultStatus::Error && result.content.text().contains("invalid type"))));
     assert!(matches!(
         events.last(),
         Some(RuntimeEvent::TurnFinished { .. })
     ));
-}
-
-#[test]
-fn truncate_tool_output_keeps_head_and_tail() {
-    use crate::runtime::tool_result::truncate_tool_output;
-
-    let small = "short output";
-    assert_eq!(truncate_tool_output(small), small, "small output unchanged");
-
-    let big = "A".repeat(5_000) + &"B".repeat(20_000) + &"C".repeat(5_000);
-    let out = truncate_tool_output(&big);
-    assert!(out.chars().count() < big.chars().count());
-    assert!(out.starts_with("AAAA"));
-    assert!(out.ends_with("CCCC"));
-    assert!(out.contains("truncated"));
-    // Head + tail + marker, far below the original 30k.
-    assert!(out.chars().count() < 9_000);
 }
 
 /// A by-name session consent is offered exactly where the NAME is the risk.
@@ -2401,7 +2371,13 @@ async fn session_approval_skips_future_prompts_for_same_tool() {
         Some(RuntimeEvent::TurnFinished { .. })
     ));
     assert_eq!(
-        runtime.session_messages().await.last().unwrap().content,
+        runtime
+            .session_messages()
+            .await
+            .last()
+            .unwrap()
+            .content
+            .text(),
         "done"
     );
 }
@@ -2469,7 +2445,13 @@ async fn superseded_approval_cannot_execute_record_consent_or_drive_the_successo
                 .any(|event| matches!(event, RuntimeEvent::TurnFinished { .. }))
         );
         assert_eq!(
-            runtime.session_messages().await.last().unwrap().content,
+            runtime
+                .session_messages()
+                .await
+                .last()
+                .unwrap()
+                .content
+                .text(),
             "new reply"
         );
     }
@@ -2672,7 +2654,7 @@ async fn yolo_mode_auto_approves_network_declaration_with_grant() {
         events.iter().any(|event| matches!(
             event,
             RuntimeEvent::ToolCallFinished { result, .. }
-                if result.content.contains("net=true")
+                if result.content.text().contains("net=true")
         )),
         "the sandbox policy of the executed call must carry the grant"
     );
@@ -2736,7 +2718,7 @@ async fn session_approval_remembers_network_command_identity() {
         .filter(|event| {
             matches!(
                 event,
-                RuntimeEvent::ToolCallFinished { result, .. } if result.content.contains("net=true")
+                RuntimeEvent::ToolCallFinished { result, .. } if result.content.text().contains("net=true")
             )
         })
         .count();
@@ -3084,8 +3066,8 @@ async fn write_file_appends_lsp_diagnostics_to_session() {
         _ => None,
     });
     let tool_result = tool_result.expect("tool result after approval");
-    assert!(tool_result.content.contains("<diagnostics file="));
-    assert!(tool_result.content.contains("syntax error"));
+    assert!(tool_result.content.text().contains("<diagnostics file="));
+    assert!(tool_result.content.text().contains("syntax error"));
     assert!(
         events
             .iter()
@@ -3097,7 +3079,7 @@ async fn write_file_appends_lsp_diagnostics_to_session() {
         .iter()
         .find(|message| matches!(message.role, crate::message::Role::Tool))
         .expect("tool message");
-    assert!(tool_message.content.contains("<diagnostics file="));
+    assert!(tool_message.content.text().contains("<diagnostics file="));
 }
 
 #[tokio::test]
@@ -3201,7 +3183,7 @@ async fn session_updated_reports_authoritative_metadata() {
             message_count,
             turn_count,
             ..
-        } if id == &session_id && *message_count >= 2 && *turn_count == 0
+        } if id == &session_id && *message_count >= 2 && *turn_count == 1
     )));
 }
 
@@ -3277,7 +3259,12 @@ async fn persistence_saves_tool_exchange_results() {
         .expect("assistant entry with an exchange");
     assert_eq!(exchange.call.function.name, MockEchoTool::NAME);
     assert_eq!(
-        exchange.result.as_ref().expect("recorded result").content,
+        exchange
+            .result
+            .as_ref()
+            .expect("recorded result")
+            .content
+            .text(),
         "mock_echo: hi"
     );
 }
@@ -3333,8 +3320,8 @@ async fn resumed_runtime_continues_conversation() {
     drain(&mut rx).await;
     let messages = resumed.session_messages().await;
     assert_eq!(messages.len(), 5);
-    assert_eq!(messages[3].content, "second");
-    assert_eq!(messages[4].content, "world");
+    assert_eq!(messages[3].content.text(), "second");
+    assert_eq!(messages[4].content.text(), "world");
 }
 
 /// Lifetime session cost must survive resume: it's persisted into the record
@@ -3499,7 +3486,13 @@ async fn auto_pro_retries_with_flash_after_retriable_api_error() {
             .is_some_and(|reason| reason.contains("降级"))
     );
     assert_eq!(
-        runtime.session_messages().await.last().unwrap().content,
+        runtime
+            .session_messages()
+            .await
+            .last()
+            .unwrap()
+            .content
+            .text(),
         "recovered"
     );
 }
@@ -3633,10 +3626,10 @@ async fn multi_tool_turn_executes_all_auto_calls_in_order_and_persists() {
     assert_eq!(messages[2].tool_calls[0].id, "call_1");
     assert_eq!(messages[2].tool_calls[1].id, "call_2");
     assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_1"));
-    assert_eq!(messages[3].content, "read_file: one");
+    assert_eq!(messages[3].content.text(), "read_file: one");
     assert_eq!(messages[4].tool_call_id.as_deref(), Some("call_2"));
-    assert_eq!(messages[4].content, "read_file: two");
-    assert_eq!(messages[5].content, "done");
+    assert_eq!(messages[4].content.text(), "read_file: two");
+    assert_eq!(messages[5].content.text(), "done");
 
     runtime.shutdown().await;
     let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
@@ -3701,7 +3694,7 @@ async fn multi_tool_turn_mixes_auto_and_approval_calls() {
     assert_eq!(messages[1].tool_calls.len(), 2);
     assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
     assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_2"));
-    assert_eq!(messages[3].content, "mock_echo: gated");
+    assert_eq!(messages[3].content.text(), "mock_echo: gated");
 }
 
 #[tokio::test]
@@ -3763,8 +3756,8 @@ async fn multi_tool_turn_serializes_two_approvals() {
 
     let messages = runtime.session_messages().await;
     assert_eq!(messages.len(), 5);
-    assert_eq!(messages[2].content, "mock_echo: first");
-    assert_eq!(messages[3].content, "mock_echo: second");
+    assert_eq!(messages[2].content.text(), "mock_echo: first");
+    assert_eq!(messages[3].content.text(), "mock_echo: second");
 }
 
 #[tokio::test]
@@ -3831,8 +3824,8 @@ async fn multi_tool_turn_denying_one_call_keeps_batch_running() {
     let messages = runtime.session_messages().await;
     // user, assistant(2 tool_calls), tool(denied), tool(success), assistant("done")
     assert_eq!(messages.len(), 5);
-    assert!(messages[2].content.contains("denied"));
-    assert_eq!(messages[3].content, "mock_echo: second");
+    assert!(messages[2].content.text().contains("denied"));
+    assert_eq!(messages[3].content.text(), "mock_echo: second");
 }
 
 /// First call: yields one text delta then hangs forever; later calls stream
@@ -3902,7 +3895,7 @@ async fn cancel_during_stream_keeps_partial_text_and_allows_next_turn() {
 
     let messages = runtime.session_messages().await;
     assert_eq!(messages.len(), 2);
-    assert_eq!(messages[1].content, "partial");
+    assert_eq!(messages[1].content.text(), "partial");
     assert!(messages[1].tool_calls.is_empty());
 
     // Token was rotated: a fresh turn streams to completion.
@@ -3913,7 +3906,13 @@ async fn cancel_during_stream_keeps_partial_text_and_allows_next_turn() {
         Some(RuntimeEvent::TurnFinished { .. })
     ));
     assert_eq!(
-        runtime.session_messages().await.last().unwrap().content,
+        runtime
+            .session_messages()
+            .await
+            .last()
+            .unwrap()
+            .content
+            .text(),
         "recovered"
     );
 }
@@ -3944,7 +3943,7 @@ async fn cancel_while_waiting_approval_synthesizes_results_for_batch() {
     assert_eq!(finished_ids(&events), vec!["call_1", "call_2"]);
     assert!(events.iter().all(|event| match event {
         RuntimeEvent::ToolCallFinished { result, .. } => {
-            result.status == ToolResultStatus::Error && result.content.contains("取消")
+            result.status == ToolResultStatus::Error && result.content.text().contains("取消")
         }
         _ => true,
     }));
@@ -4092,7 +4091,13 @@ async fn stream_error_before_content_retries_transparently() {
     let telemetry = turn_finished_telemetry(&events).expect("telemetry");
     assert_eq!(telemetry.stream_retries, 1);
     assert_eq!(
-        runtime.session_messages().await.last().unwrap().content,
+        runtime
+            .session_messages()
+            .await
+            .last()
+            .unwrap()
+            .content
+            .text(),
         "recovered"
     );
 }
@@ -4219,7 +4224,13 @@ async fn open_retry_runs_after_fallback_exhausted_and_is_counted() {
     assert_eq!(telemetry.stream_retries, 1);
     assert!(telemetry.used_model_fallback);
     assert_eq!(
-        runtime.session_messages().await.last().unwrap().content,
+        runtime
+            .session_messages()
+            .await
+            .last()
+            .unwrap()
+            .content
+            .text(),
         "recovered"
     );
 }
@@ -4247,7 +4258,7 @@ async fn stream_error_keeps_partial_assistant_text() {
     let messages = runtime.session_messages().await;
     // Same semantics as cancellation: the streamed partial text survives.
     assert_eq!(messages.len(), 2);
-    assert_eq!(messages[1].content, "partial answer");
+    assert_eq!(messages[1].content.text(), "partial answer");
     assert!(messages[1].tool_calls.is_empty());
 }
 
@@ -4774,7 +4785,7 @@ async fn root_grant_with_unknown_arguments_bounces_without_prompting() {
             RuntimeEvent::ToolCallFinished { result, .. }
                 if result.tool_name == "request_write_root"
                     && result.status == ToolResultStatus::Error
-                    && result.content.contains("unknown field `command`")
+                    && result.content.text().contains("unknown field `command`")
         )),
         "the model gets the precise reason: {events:?}"
     );
@@ -4903,7 +4914,7 @@ async fn approved_root_grant_widens_the_boundary_live() {
         RuntimeEvent::ToolCallFinished { result, .. }
             if result.tool_name == "request_write_root"
                 && result.status == ToolResultStatus::Success
-                && result.content.contains("granted")
+                && result.content.text().contains("granted")
     )));
     // The load-bearing assertion: the SAME session's next tool call writes
     // into the just-granted root — no relaunch, no new registry.
@@ -4956,9 +4967,12 @@ async fn denied_root_grant_grants_nothing_and_says_so() {
         .expect("denied call still records a result");
     assert_eq!(result.status, ToolResultStatus::Denied);
     assert!(
-        result.content.contains("Do not request this path again"),
+        result
+            .content
+            .text()
+            .contains("Do not request this path again"),
         "denial must be final and say so: {}",
-        result.content
+        result.content.text()
     );
     assert!(
         events
@@ -5083,7 +5097,7 @@ async fn root_grant_refuses_when_the_target_changes_under_the_approval() {
             RuntimeEvent::ToolCallFinished { result, .. }
                 if result.tool_name == "request_write_root"
                     && result.status == ToolResultStatus::Error
-                    && result.content.contains("changed underneath the approval")
+                    && result.content.text().contains("changed underneath the approval")
         )),
         "the grant must refuse the swapped target: {events:?}"
     );
@@ -5134,7 +5148,7 @@ async fn unresolvable_root_grant_bounces_without_prompting() {
             RuntimeEvent::ToolCallFinished { result, .. }
                 if result.tool_name == "request_write_root"
                     && result.status == ToolResultStatus::Error
-                    && result.content.contains("cannot resolve")
+                    && result.content.text().contains("cannot resolve")
         )),
         "the model gets the precise reason: {events:?}"
     );
@@ -5230,7 +5244,7 @@ async fn a_second_in_band_error_frame_does_not_emit_a_second_terminal_error() {
     );
     // The partial text before the error survives, as for a single error.
     let messages = runtime.session_messages().await;
-    assert_eq!(messages[1].content, "partial");
+    assert_eq!(messages[1].content.text(), "partial");
 }
 
 /// A tool named `shell` that records who let it run, in place of the real one.
@@ -5289,7 +5303,7 @@ fn finished_contents(events: &[RuntimeEvent]) -> Vec<String> {
     events
         .iter()
         .filter_map(|event| match event {
-            RuntimeEvent::ToolCallFinished { result, .. } => Some(result.content.clone()),
+            RuntimeEvent::ToolCallFinished { result, .. } => Some(result.content.text()),
             _ => None,
         })
         .collect()
@@ -5514,7 +5528,8 @@ async fn a_steered_prompt_is_injected_at_the_next_tool_boundary() {
     let messages = runtime.session_messages().await;
     assert!(
         messages.iter().any(|message| {
-            matches!(message.role, crate::message::Role::User) && message.content == "skip the echo"
+            matches!(message.role, crate::message::Role::User)
+                && message.content.text() == "skip the echo"
         }),
         "the steered prompt must be in the wire: {messages:?}"
     );
@@ -5893,7 +5908,8 @@ async fn a_model_that_cannot_take_images_keeps_the_session_usable() {
         ..AgentConfig::builtin()
     };
     let runtime =
-        AgentRuntime::with_system_prompt(client, ToolRegistry::default(), "system", config, false);
+        AgentRuntime::with_system_prompt(client, ToolRegistry::default(), "system", config, false)
+            .with_image_workspace(dir.path().canonicalize().unwrap());
 
     let mut rx = runtime
         .submit_user(UserTurn::with_images("look at this", vec![image]))
@@ -5905,6 +5921,17 @@ async fn a_model_that_cannot_take_images_keeps_the_session_usable() {
             .any(|event| matches!(event, RuntimeEvent::Error { .. })),
         "the turn must run, with the image degraded: {events:?}"
     );
+
+    assert!(
+        events.iter().any(|event| matches!(event,
+            RuntimeEvent::ImageRequestPrepared { model, images, .. }
+                if model == DEEPSEEK_V4_PRO && images.len() == 1 && !images[0].included
+        )),
+        "fixed model must report the omitted admitted image: {events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(event,
+        RuntimeEvent::Warning { message } if message.contains("image observations unavailable")
+    )));
 
     // The turn after it must not be refused for the picture still in the
     // history — that is the wedge.
@@ -5933,7 +5960,8 @@ async fn the_same_image_turn_is_accepted_on_flash() {
         ..AgentConfig::builtin()
     };
     let runtime =
-        AgentRuntime::with_system_prompt(client, ToolRegistry::default(), "system", config, false);
+        AgentRuntime::with_system_prompt(client, ToolRegistry::default(), "system", config, false)
+            .with_image_workspace(dir.path().canonicalize().unwrap());
 
     let mut rx = runtime
         .submit_user(UserTurn::with_images("look at this", vec![image]))
@@ -5945,6 +5973,13 @@ async fn the_same_image_turn_is_accepted_on_flash() {
             .iter()
             .any(|event| matches!(event, RuntimeEvent::Error { .. })),
         "Flash accepts images, so the turn must run: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(event,
+            RuntimeEvent::ImageRequestPrepared { model, images, .. }
+                if model == DEEPSEEK_FLASH && images.len() == 1 && images[0].included
+        )),
+        "admitted image must be present in the prepared Flash request: {events:?}"
     );
 }
 
@@ -6003,7 +6038,7 @@ async fn a_turn_past_four_fifths_of_its_budget_is_asked_to_hand_over() {
     let messages = runtime.session_messages().await;
     assert!(
         messages.iter().any(|message| {
-            message.role == crate::message::Role::System && message.content.contains("3/4")
+            message.role == crate::message::Role::System && message.content.text().contains("3/4")
         }),
         "the budget notice must reach the model as a System message: {messages:?}"
     );
@@ -6318,8 +6353,11 @@ async fn compaction_asks_the_model_for_a_handover_summary() {
     // The session now opens with the handover (this runtime has no system
     // prompt), and the retained tail follows it verbatim.
     let wire = runtime.session_messages().await;
-    assert!(wire[0].content.contains(handover), "{:?}", wire[0]);
-    assert!(wire.iter().any(|message| message.content == "prompt 5"));
+    assert!(wire[0].content.text().contains(handover), "{:?}", wire[0]);
+    assert!(
+        wire.iter()
+            .any(|message| message.content.text() == "prompt 5")
+    );
 }
 
 /// When the summarizer fails — here the provider answers with an error — a
@@ -6363,7 +6401,7 @@ fn is_handover_request(request: &ChatRequest) -> bool {
     request
         .messages
         .first()
-        .is_some_and(|message| message.content.contains("Session handover"))
+        .is_some_and(|message| message.content.text().contains("Session handover"))
 }
 
 /// Ordinary turns get `ok_turn`; the handover summarizer gets whatever
@@ -6459,13 +6497,13 @@ async fn the_offline_backend_is_never_asked_for_a_handover() {
     let wire = runtime.session_messages().await;
     assert!(
         wire.iter()
-            .any(|message| message.content == "decision 0: keep the parser API"),
+            .any(|message| message.content.text() == "decision 0: keep the parser API"),
         "the archived turns are still there: {wire:?}"
     );
     assert!(
         !wire
             .iter()
-            .any(|message| message.content.contains("会话摘要")),
+            .any(|message| message.content.text().contains("会话摘要")),
         "{wire:?}"
     );
 }
@@ -6672,13 +6710,14 @@ async fn an_esc_during_a_threshold_compaction_folds_nothing() {
     );
     let wire = runtime.session_messages().await;
     assert!(
-        wire.iter().any(|message| message.content == "prompt 0"),
+        wire.iter()
+            .any(|message| message.content.text() == "prompt 0"),
         "{wire:?}"
     );
     assert!(
         !wire
             .iter()
-            .any(|message| message.content.contains("会话摘要")),
+            .any(|message| message.content.text().contains("会话摘要")),
         "{wire:?}"
     );
 }
@@ -6890,7 +6929,8 @@ async fn a_failed_threshold_compaction_is_skipped_for_the_turn() {
     );
     let wire = runtime.session_messages().await;
     assert!(
-        wire.iter().any(|message| message.content == "prompt 0"),
+        wire.iter()
+            .any(|message| message.content.text() == "prompt 0"),
         "{wire:?}"
     );
 }
@@ -7001,11 +7041,13 @@ async fn a_turn_that_lands_while_compact_writes_is_kept() {
     let wire = runtime.session_messages().await;
     assert!(
         wire.iter()
-            .any(|message| message.content == "a late prompt"),
+            .any(|message| message.content.text() == "a late prompt"),
         "{wire:?}"
     );
     assert!(
-        !wire.iter().any(|message| message.content == "prompt 0"),
+        !wire
+            .iter()
+            .any(|message| message.content.text() == "prompt 0"),
         "{wire:?}"
     );
 }
@@ -7485,5 +7527,650 @@ async fn aborting_start_during_persistence_cancels_the_bootstrap_before_model_wo
     assert!(
         requests.lock().unwrap().is_empty(),
         "disconnected bootstrap must not reach the model"
+    );
+}
+
+#[tokio::test]
+async fn user_images_are_snapshotted_before_the_first_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().canonicalize().unwrap();
+    let source = workspace.join("attachment.gif");
+    let original = b"GIF89a-original-observation";
+    std::fs::write(&source, original).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let runtime = AgentRuntime::with_system_prompt(
+        CapturingClient {
+            scripts: Mutex::new(vec![ok_turn()]),
+            requests: requests.clone(),
+        },
+        ToolRegistry::default(),
+        "system",
+        AgentConfig {
+            model: DEEPSEEK_FLASH.into(),
+            ..AgentConfig::builtin()
+        },
+        false,
+    )
+    .with_image_workspace(&workspace);
+
+    runtime
+        .begin_turn(UserTurn::with_images("observe", vec![source.clone()]))
+        .await;
+    std::fs::write(&source, b"GIF89a-new-file-contents").unwrap();
+    let mut receiver = runtime.drive_turn().await;
+    let events = drain(&mut receiver).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Error { .. })),
+        "{events:?}"
+    );
+    let messages = runtime.session_messages().await;
+    let asset = messages
+        .iter()
+        .flat_map(|message| message.content.images())
+        .find_map(|image| match image {
+            crate::image::ImageRef::Asset(asset) => Some(asset),
+            _ => None,
+        })
+        .expect("session retains an immutable asset");
+    assert_eq!(asset.read().unwrap(), original);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]["messages"][1]["content"][1]["image_url"]["url"],
+        asset.data_url().unwrap()
+    );
+}
+
+#[derive(Debug)]
+struct ImageObservationTool(crate::image::ImageAsset);
+
+#[async_trait::async_trait]
+impl Tool for ImageObservationTool {
+    type Params = AutoEchoParams;
+    fn name(&self) -> &str {
+        "read_file"
+    }
+    fn description(&self) -> &str {
+        "Returns a captured observation."
+    }
+    async fn run(
+        &self,
+        _: Self::Params,
+        _: &crate::tool::ToolCx,
+    ) -> Result<crate::tool::ToolOutput, ToolError> {
+        Ok(crate::tool::ToolOutput::observations(Content::new(vec![
+            ContentBlock::Text {
+                text: "capture begins".into(),
+            },
+            ContentBlock::Image {
+                image: self.0.clone(),
+            },
+            ContentBlock::Text {
+                text: "capture ends".into(),
+            },
+        ]))
+        .with_details(serde_json::json!({"exit_code":0})))
+    }
+}
+
+#[tokio::test]
+async fn a_new_tool_image_reroutes_auto_for_the_next_request_and_records_delivery() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().canonicalize().unwrap();
+    let asset = crate::image::snapshot_bytes(&workspace, b"GIF89a-captured").unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut tools = ToolRegistry::default();
+    tools.register(ImageObservationTool(asset.clone())).unwrap();
+    let config = AgentConfig {
+        model: crate::model_registry::AUTO_MODEL.into(),
+        ..AgentConfig::builtin()
+    };
+    let runtime = AgentRuntime::with_new_session(
+        CapturingClient {
+            scripts: Mutex::new(vec![
+                vec![
+                    AgentEvent::ToolCallDelta {
+                        delta: tool_call_delta("capture", "read_file", "{}"),
+                    },
+                    AgentEvent::Done { usage: None },
+                ],
+                ok_turn(),
+                ok_turn(),
+            ]),
+            requests: requests.clone(),
+        },
+        tools,
+        "system",
+        &workspace,
+        &config,
+    )
+    .unwrap();
+    let mut receiver = runtime.submit_user("debug this architecture").await;
+    let events = drain(&mut receiver).await;
+    assert!(events.iter().any(|event| matches!(event,
+        RuntimeEvent::ImageRequestPrepared { model, images, .. }
+            if model == DEEPSEEK_FLASH && images.iter().any(|image| image.call_id.as_deref() == Some("capture") && image.included && image.observation_id.is_some())
+    )), "next request must include the tool's image: {events:?}");
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0]["model"], DEEPSEEK_V4_PRO);
+        assert_eq!(requests[1]["model"], DEEPSEEK_FLASH);
+        let observation = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap();
+        assert_eq!(observation["tool_call_id"], "capture");
+        assert_eq!(observation["content"][0]["text"], "capture begins");
+        assert_eq!(observation["content"][1]["type"], "image_url");
+        assert_eq!(observation["content"][2]["text"], "capture ends");
+    }
+    let mut receiver = runtime.submit_user("debug a separate architecture").await;
+    drain(&mut receiver).await;
+    assert_eq!(
+        requests.lock().unwrap()[2]["model"],
+        DEEPSEEK_V4_PRO,
+        "historical images do not pin later turns to Flash"
+    );
+    let store = crate::session_store::JsonSessionStore::for_workspace(&workspace).unwrap();
+    let saved = store.load(&runtime.session_id().await.unwrap()).unwrap();
+    assert_eq!(saved.turns[0].image_requests.len(), 1);
+    assert!(saved.turns[0].image_requests[0].images[0].included);
+    let entry = saved
+        .entries
+        .iter()
+        .find_map(|entry| match &entry.kind {
+            crate::session_entry::EntryKind::Assistant { exchanges, .. } => exchanges
+                .iter()
+                .find_map(|exchange| exchange.result.as_ref()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(entry.details.as_ref().unwrap()["exit_code"], 0);
+    assert_eq!(entry.content.images().next(), Some(&asset));
+}
+
+#[tokio::test]
+async fn many_small_patches_in_one_turn_persist_bounded_details_and_recoverable_sources() {
+    const EDITS: usize = 128;
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().canonicalize().unwrap();
+    let mut original = "x".repeat(70 * 1024);
+    original.push_str("TAIL0");
+    std::fs::write(workspace.join("minified.txt"), &original).unwrap();
+    let mut batch = Vec::new();
+    for index in 0..EDITS {
+        let arguments = serde_json::json!({
+            "path": "minified.txt",
+            "old": format!("TAIL{}", index % 2),
+            "new": format!("TAIL{}", (index + 1) % 2),
+        })
+        .to_string();
+        batch.push(AgentEvent::ToolCallDelta {
+            delta: indexed_tool_call_delta(
+                index as u32,
+                &format!("edit_{index}"),
+                "apply_patch",
+                &arguments,
+            ),
+        });
+    }
+    batch.push(AgentEvent::Done { usage: None });
+    let runtime = AgentRuntime::with_new_session(
+        ScriptedClient::new(vec![batch, ok_turn()]),
+        crate::workspace_tools::workspace_tool_registry(workspace.clone()).unwrap(),
+        "system",
+        &workspace,
+        &AgentConfig::builtin(),
+    )
+    .unwrap()
+    .with_permission_mode(SharedPermissionMode::new(
+        crate::execution_policy::PermissionMode::AcceptEdits,
+    ));
+    let mut receiver = runtime
+        .submit_user("Make these small edits in one turn")
+        .await;
+    let events = drain(&mut receiver).await;
+    let live_details: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::ToolCallFinished { result, .. } => {
+                assert_eq!(result.status, ToolResultStatus::Success);
+                Some(result.details.clone().unwrap())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(live_details.len(), EDITS);
+    let id = runtime.session_id().await.unwrap();
+    runtime.shutdown().await;
+    let store = crate::JsonSessionStore::for_workspace(&workspace).unwrap();
+    let saved = store.load(&id).unwrap();
+    let stored_details: Vec<_> = saved
+        .entries
+        .iter()
+        .flat_map(|entry| match &entry.kind {
+            crate::EntryKind::Assistant { exchanges, .. } => exchanges
+                .iter()
+                .filter_map(|exchange| {
+                    exchange
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.details.clone())
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect();
+    assert_eq!(
+        stored_details.len(),
+        EDITS,
+        "the latest results must survive restart"
+    );
+    assert_eq!(
+        stored_details, live_details,
+        "live and replay must use the same bounded details"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("minified.txt")).unwrap(),
+        original
+    );
+    let session_path = workspace
+        .join(".deep-code/sessions")
+        .join(format!("{}.json", id.as_str()));
+    assert!(
+        std::fs::metadata(session_path).unwrap().len()
+            < crate::session_store::MAX_SESSION_FILE_BYTES
+    );
+    for details in &stored_details {
+        assert!(serde_json::to_vec_pretty(details).unwrap().len() < 16 * 1024);
+        let source = &details["details_storage"];
+        assert_eq!(source["inline_truncated"], true);
+        assert_eq!(source["complete"], true);
+        assert!(source["error"].is_null());
+        let path = source["path"]
+            .as_str()
+            .expect("full details must remain readable");
+        let bytes = std::fs::read(workspace.join(path)).unwrap();
+        assert_eq!(
+            bytes.len() as u64,
+            source["original_bytes"].as_u64().unwrap()
+        );
+        let full: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(full["edit"]["diff"].as_str().unwrap().len() >= 64 * 1024);
+        assert_eq!(details["edit"]["truncated"], true);
+    }
+}
+
+#[tokio::test]
+async fn repeated_image_attachments_after_compaction_keep_distinct_reports_and_warnings() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().canonicalize().unwrap();
+    let source = workspace.join("same.gif");
+    std::fs::write(&source, b"GIF89a-same-asset").unwrap();
+    let config = AgentConfig {
+        model: DEEPSEEK_V4_PRO.into(),
+        ..AgentConfig::builtin()
+    };
+    let runtime = AgentRuntime::with_new_session(
+        ScriptedClient::new(std::iter::repeat_with(ok_turn).take(32).collect()),
+        ToolRegistry::default(),
+        "system",
+        &workspace,
+        &config,
+    )
+    .unwrap();
+    for _ in 0..3 {
+        let mut receiver = runtime.submit_user("plain context").await;
+        drain(&mut receiver).await;
+    }
+    folded(compact(&runtime, None).await);
+    let mut observed = Vec::new();
+    for _ in 0..2 {
+        let mut receiver = runtime
+            .submit_user(UserTurn::with_images("observe", vec![source.clone()]))
+            .await;
+        let events = drain(&mut receiver).await;
+        assert!(events.iter().any(|event| matches!(event,
+            RuntimeEvent::Warning { message } if message.contains("image observations unavailable")
+        )), "each fresh omitted observation needs its own warning");
+        let image = events
+            .iter()
+            .find_map(|event| match event {
+                RuntimeEvent::ImageRequestPrepared { images, .. } => {
+                    assert_eq!(images.len(), 1, "archived sources must not resend pixels");
+                    Some(images[0].clone())
+                }
+                _ => None,
+            })
+            .expect("fresh image request is reported");
+        assert!(!image.included);
+        assert!(
+            image.observation_id.is_some(),
+            "session observations must have stable identity"
+        );
+        observed.push(image);
+        for _ in 0..3 {
+            let mut receiver = runtime.submit_user("plain follow-up").await;
+            let events = drain(&mut receiver).await;
+            assert!(!events.iter().any(|event| matches!(event,
+                RuntimeEvent::Warning { message } if message.contains("image observations unavailable")
+            )), "an unchanged historical omission must not warn again");
+        }
+        folded(compact(&runtime, None).await);
+    }
+    assert_eq!(
+        observed[0].image, observed[1].image,
+        "the source asset is intentionally identical"
+    );
+    assert_eq!(
+        (observed[0].message_index, observed[0].block_index),
+        (observed[1].message_index, observed[1].block_index),
+        "compaction reuses wire positions"
+    );
+    assert_ne!(observed[0].observation_id, observed[1].observation_id);
+    let id = runtime.session_id().await.unwrap();
+    runtime.shutdown().await;
+    let store = crate::JsonSessionStore::for_workspace(&workspace).unwrap();
+    let saved = store.load(&id).unwrap();
+    let reports: Vec<_> = saved
+        .turns
+        .iter()
+        .flat_map(|turn| &turn.image_requests)
+        .flat_map(|request| &request.images)
+        .collect();
+    assert_eq!(
+        reports.len(),
+        2,
+        "unchanged history must not expand every later turn's audit"
+    );
+    assert_eq!(reports[0].observation_id, observed[0].observation_id);
+    assert_eq!(reports[1].observation_id, observed[1].observation_id);
+
+    // Restore the persisted identities and attach the same asset again at the
+    // same compacted wire position. It must still be a fresh observation.
+    let resumed = AgentRuntime::from_session_record(
+        ScriptedClient::new(vec![ok_turn()]),
+        ToolRegistry::default(),
+        saved,
+        store,
+        config,
+    );
+    let mut receiver = resumed
+        .submit_user(UserTurn::with_images("observe again", vec![source]))
+        .await;
+    let events = drain(&mut receiver).await;
+    assert!(events.iter().any(|event| matches!(event,
+        RuntimeEvent::Warning { message } if message.contains("image observations unavailable")
+    )));
+    let image = events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::ImageRequestPrepared { images, .. } => images.first(),
+            _ => None,
+        })
+        .unwrap();
+    assert!(image.observation_id.is_some());
+    assert!(
+        observed
+            .iter()
+            .all(|prior| prior.observation_id != image.observation_id)
+    );
+    resumed.shutdown().await;
+}
+
+#[tokio::test]
+async fn image_report_retention_stays_bounded_across_model_switches_and_compaction() {
+    const TURNS: usize = 160;
+
+    #[derive(Debug)]
+    struct ImageBatchTool(crate::ImageAsset);
+    #[async_trait::async_trait]
+    impl Tool for ImageBatchTool {
+        type Params = AutoEchoParams;
+        fn name(&self) -> &str {
+            "read_file"
+        }
+        fn description(&self) -> &str {
+            "Returns a batch of image observations."
+        }
+        async fn run(
+            &self,
+            _: Self::Params,
+            _: &crate::tool::ToolCx,
+        ) -> Result<crate::tool::ToolOutput, ToolError> {
+            let mut content = Content::from_text("observed image batch");
+            // Each occurrence needs its own audit identity, even when all
+            // pixels are identical. Request limits omit the excess images.
+            for _ in 0..128 {
+                content.push_image(self.0.clone());
+            }
+            Ok(crate::tool::ToolOutput::observations(content))
+        }
+    }
+
+    struct SwitchingClient {
+        calls: Mutex<usize>,
+        models: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl LlmClient for SwitchingClient {
+        fn provider_name(&self) -> &'static str {
+            "retention-regression"
+        }
+        fn model(&self) -> &str {
+            "retention-regression"
+        }
+        async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
+            let ordinary = !request.tools.is_empty();
+            if ordinary {
+                self.models.lock().unwrap().push(request.model.clone());
+            }
+            let image_turn = ordinary
+                && request.messages.last().is_some_and(|message| {
+                    message.role == crate::Role::User
+                        && message.content.text() == "debug image observations"
+                });
+            let events = if image_turn {
+                let call_id = {
+                    let mut calls = self.calls.lock().unwrap();
+                    *calls += 1;
+                    format!("capture-{calls}")
+                };
+                vec![
+                    AgentEvent::ToolCallDelta {
+                        delta: tool_call_delta(&call_id, "read_file", "{}"),
+                    },
+                    AgentEvent::Done { usage: None },
+                ]
+            } else {
+                // Compaction's tool-less handover receives a short summary.
+                ok_turn()
+            };
+            let stream = try_stream! {
+                for event in events {
+                    yield event;
+                }
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().canonicalize().unwrap();
+    let asset = crate::image::snapshot_bytes(
+        &workspace,
+        include_bytes!("../image/tests/fixtures/red.png"),
+    )
+    .unwrap();
+    let source = asset.path();
+    let models = Arc::new(Mutex::new(Vec::new()));
+    let mut tools = ToolRegistry::default();
+    tools.register(ImageBatchTool(asset)).unwrap();
+    let config = AgentConfig {
+        model: crate::model_registry::AUTO_MODEL.into(),
+        ..AgentConfig::builtin()
+    };
+    let runtime = AgentRuntime::with_new_session(
+        SwitchingClient {
+            calls: Mutex::new(0),
+            models: models.clone(),
+        },
+        tools,
+        "system",
+        &workspace,
+        &config,
+    )
+    .unwrap();
+    for index in 0..TURNS {
+        let input = if index % 2 == 0 {
+            UserTurn::with_images("debug image observations", vec![source.clone()])
+        } else {
+            UserTurn::new("debug this separate architecture")
+        };
+        let expected_model = if index % 2 == 0 {
+            DEEPSEEK_FLASH
+        } else {
+            DEEPSEEK_V4_PRO
+        };
+        let mut receiver = runtime.submit_user(input).await;
+        let events = drain(&mut receiver).await;
+        assert!(
+            events.iter().any(|event| matches!(event,
+                RuntimeEvent::ImageRequestPrepared { model, images, .. }
+                    if model == expected_model && !images.is_empty()
+            )),
+            "turn {index} must exercise the image projection on {expected_model}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                RuntimeEvent::Error { .. }
+                    | RuntimeEvent::SessionUpdated {
+                        save_error: Some(_),
+                        ..
+                    }
+            )),
+            "turn {index} must keep saving successfully"
+        );
+        if index % 4 == 3 {
+            folded(compact(&runtime, None).await);
+            assert!(runtime.state.lock().await.session.entries().len() <= 8);
+            assert_eq!(
+                runtime.flush_session().await,
+                None,
+                "save after compacting turn {index}"
+            );
+        }
+    }
+    assert!(
+        models
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|model| model == DEEPSEEK_FLASH)
+    );
+    assert!(
+        models
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|model| model == DEEPSEEK_V4_PRO)
+    );
+    let id = runtime.session_id().await.unwrap();
+    assert_eq!(runtime.flush_session().await, None);
+    runtime.shutdown().await;
+    let store = crate::JsonSessionStore::for_workspace(&workspace).unwrap();
+    let saved = store.load(&id).unwrap();
+    assert_eq!(
+        saved.turns.len(),
+        TURNS,
+        "report retention must not remove turn identity"
+    );
+    assert!(
+        saved.entries.len() <= 8,
+        "transcript compaction must already have run"
+    );
+    let body = store.export(&id).unwrap();
+    assert!(
+        body.len() < 2 * 1024 * 1024,
+        "image audits must not become an irreducible storage log: {} bytes",
+        body.len()
+    );
+    assert!(
+        !saved.turns.last().unwrap().image_requests.is_empty(),
+        "retain the newest model-switch report"
+    );
+    assert!(
+        saved
+            .turns
+            .iter()
+            .map(|turn| turn.image_reports_omitted)
+            .sum::<u64>()
+            > 0,
+        "the stress case must actually exercise the independent audit budget"
+    );
+    assert!(
+        !saved.image_projection_state.is_empty(),
+        "latest projection state is retained independently of archived audit reports"
+    );
+    let retained_images = |record: &crate::SessionRecord| {
+        record
+            .turns
+            .iter()
+            .flat_map(|turn| &turn.image_requests)
+            .map(|request| request.images.len())
+            .sum::<usize>()
+    };
+    let audit_before_resume = retained_images(&saved);
+    let omitted_before_resume = saved
+        .turns
+        .iter()
+        .map(|turn| turn.image_reports_omitted)
+        .sum::<u64>();
+    let resumed = AgentRuntime::from_session_record(
+        SwitchingClient {
+            calls: Mutex::new(0),
+            models: Arc::new(Mutex::new(Vec::new())),
+        },
+        ToolRegistry::default(),
+        saved,
+        store.clone(),
+        config,
+    );
+    let mut receiver = resumed
+        .submit_user("debug this separate architecture")
+        .await;
+    let events = drain(&mut receiver).await;
+    assert!(events.iter().any(|event| matches!(event,
+        RuntimeEvent::ImageRequestPrepared { model, images, .. }
+            if model == DEEPSEEK_V4_PRO && !images.is_empty()
+    )));
+    assert!(
+        !events.iter().any(|event| matches!(event,
+            RuntimeEvent::Warning { message } if message.contains("image observations unavailable")
+        )),
+        "restoring a trimmed audit must not replay unchanged historical omissions"
+    );
+    assert_eq!(resumed.flush_session().await, None);
+    resumed.shutdown().await;
+    let restored = store.load(&id).unwrap();
+    assert_eq!(restored.turns.len(), TURNS + 1);
+    assert!(restored.turns.last().unwrap().image_requests.is_empty());
+    assert_eq!(
+        retained_images(&restored),
+        audit_before_resume,
+        "deduplication must use the independent latest projection state after resume"
+    );
+    assert_eq!(
+        restored
+            .turns
+            .iter()
+            .map(|turn| turn.image_reports_omitted)
+            .sum::<u64>(),
+        omitted_before_resume
     );
 }

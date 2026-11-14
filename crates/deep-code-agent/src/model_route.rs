@@ -45,12 +45,10 @@ pub struct RouteContext {
     /// Cascade escalation latch: Flash already struggled (repeated tool-call
     /// failures) earlier this session, so force Pro for the rest of it.
     pub escalated: bool,
-    /// This turn carries images.
-    ///
-    /// The one input only Flash accepts, so it outranks every other signal here
-    /// — all of which exist to move work *onto* Pro. Sending an image to Pro is
-    /// a 400, so a turn carrying one runs on the model that can take it or not
-    /// at all.
+    /// New user or tool image observations in the active turn. Re-evaluated
+    /// before each request; archived images do not select the next turn's model.
+    /// Auto mode selects Flash for these observations. A fixed model keeps the
+    /// user's choice and request preparation reports unsupported images.
     pub has_images: bool,
 }
 
@@ -131,7 +129,7 @@ pub fn api_fallback_model(route: &TurnRoute) -> Option<&'static str> {
     }
 }
 
-/// Resolve the concrete model + reasoning effort for one user turn.
+/// Resolve model and effort for the next request of a user turn.
 #[must_use]
 pub fn resolve_turn_route(
     config: &AgentConfig,

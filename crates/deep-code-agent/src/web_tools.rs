@@ -1161,7 +1161,7 @@ mod tests {
             result.content
         );
         assert_eq!(
-            result.content,
+            result.content.text(),
             "1. Example Docs\n   https://example.com/docs\n   2026-10-01 · Example\n   The long summary for models.\n\
              2. https://example.org/\n   https://example.org/\n   only a snippet\n"
         );
@@ -1182,7 +1182,8 @@ mod tests {
         );
         let tool = WebSearchTool::new(zh(), &WebBackend::test_api(&base));
         let result = run(&tool, WebSearchTool::NAME, json!({ "query": "q" })).await;
-        let blurb = result.content.lines().nth(2).unwrap().trim();
+        let text = result.content.text();
+        let blurb = text.lines().nth(2).unwrap().trim();
         assert_eq!(blurb.chars().count(), SUMMARY_CHARS + 1, "{blurb}");
         assert!(blurb.ends_with('…'));
     }
@@ -1211,10 +1212,18 @@ mod tests {
         )
         .await;
         assert_eq!(result.status, ToolResultStatus::Success);
-        assert!(result.content.contains("1. hit 0"), "{}", result.content);
-        assert!(result.content.contains("2. hit 1"), "{}", result.content);
         assert!(
-            !result.content.contains("hit 2"),
+            result.content.text().contains("1. hit 0"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.text().contains("2. hit 1"),
+            "{}",
+            result.content
+        );
+        assert!(
+            !result.content.text().contains("hit 2"),
             "a third hit was neither asked for nor wanted: {}",
             result.content
         );
@@ -1231,7 +1240,8 @@ mod tests {
         );
         let tool = WebSearchTool::new(zh(), &WebBackend::test_api(&base));
         let result = run(&tool, WebSearchTool::NAME, json!({ "query": "q" })).await;
-        let url_line = result.content.lines().nth(1).unwrap().trim();
+        let text = result.content.text();
+        let url_line = text.lines().nth(1).unwrap().trim();
         assert_eq!(url_line.chars().count(), URL_CHARS + 1, "{url_line}");
         assert!(url_line.ends_with('…'));
     }
@@ -1246,7 +1256,11 @@ mod tests {
         let tool = WebSearchTool::new(zh(), &WebBackend::test_api(&base));
         let result = run(&tool, WebSearchTool::NAME, json!({ "query": "q" })).await;
         assert_eq!(result.status, ToolResultStatus::Error);
-        assert!(result.content.contains("512 KiB"), "{}", result.content);
+        assert!(
+            result.content.text().contains("512 KiB"),
+            "{}",
+            result.content
+        );
     }
 
     /// A continuation pages the text this session already fetched: the mock
@@ -1281,7 +1295,7 @@ mod tests {
             second.content
         );
         assert!(
-            second.content.contains(&content[6..12]),
+            second.content.text().contains(&content[6..12]),
             "the continuation starts where the note said: {}",
             second.content
         );
@@ -1349,7 +1363,7 @@ mod tests {
         let result = run(&tool, WebSearchTool::NAME, json!({ "query": "q" })).await;
         assert_eq!(result.status, ToolResultStatus::Error);
         assert!(
-            result.content.contains("per-domain fetch limit"),
+            result.content.text().contains("per-domain fetch limit"),
             "the service's message has to survive: {}",
             result.content
         );
@@ -1364,7 +1378,7 @@ mod tests {
         let result = run(&tool, WebSearchTool::NAME, json!({ "query": "anything" })).await;
         assert_eq!(result.status, ToolResultStatus::Error);
         assert!(
-            result.content.contains("api.deepseek.com"),
+            result.content.text().contains("api.deepseek.com"),
             "{}",
             result.content
         );
@@ -1384,7 +1398,7 @@ mod tests {
         .await;
         assert_eq!(result.status, ToolResultStatus::Error);
         assert!(
-            result.content.contains("没有搜索结果"),
+            result.content.text().contains("没有搜索结果"),
             "{}",
             result.content
         );
@@ -1401,7 +1415,7 @@ mod tests {
         )
         .await;
         assert_eq!(result.status, ToolResultStatus::Error);
-        assert!(result.content.contains("429"), "{}", result.content);
+        assert!(result.content.text().contains("429"), "{}", result.content);
 
         let (base, _) = serve_api_once(
             400,
@@ -1416,7 +1430,8 @@ mod tests {
         .await;
         assert_eq!(result.status, ToolResultStatus::Error);
         assert!(
-            result.content.contains("400") && result.content.contains("query too long"),
+            result.content.text().contains("400")
+                && result.content.text().contains("query too long"),
             "{}",
             result.content
         );
@@ -1429,7 +1444,11 @@ mod tests {
         )
         .await;
         assert_eq!(result.status, ToolResultStatus::Error);
-        assert!(result.content.contains("results"), "{}", result.content);
+        assert!(
+            result.content.text().contains("results"),
+            "{}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -1481,12 +1500,13 @@ mod tests {
                 "{}",
                 result.content
             );
-            assert!(result.content.chars().count() <= TOOL_OUTPUT_BUDGET);
+            assert!(result.content.text().chars().count() <= TOOL_OUTPUT_BUDGET);
             let request = seen.recv().unwrap();
             assert_eq!(request.path, "/fetch");
             assert_eq!(request.body, json!({ "url": "https://1.1.1.1/article" }));
 
-            let (header, body) = result.content.split_once("\n\n").unwrap();
+            let text = result.content.text();
+            let (header, body) = text.split_once("\n\n").unwrap();
             assert_eq!(header, "Example article\nhttps://1.1.1.1/article");
             chunks += 1;
             if let Some((chunk, note)) = body.rsplit_once("\n\n[") {
@@ -1523,7 +1543,11 @@ mod tests {
         )
         .await;
         assert_eq!(result.status, ToolResultStatus::Error);
-        assert!(result.content.contains("offset 4"), "{}", result.content);
+        assert!(
+            result.content.text().contains("offset 4"),
+            "{}",
+            result.content
+        );
     }
 
     /// A short page is returned whole with no note at all, and an untitled
@@ -1541,7 +1565,7 @@ mod tests {
             json!({ "url": "https://1.1.1.1/x" }),
         )
         .await;
-        assert_eq!(result.content, "https://1.1.1.1/x\n\n# Hi\n\nbody");
+        assert_eq!(result.content.text(), "https://1.1.1.1/x\n\n# Hi\n\nbody");
         assert!(tool.description().contains("Markdown"));
     }
 
@@ -1561,12 +1585,16 @@ mod tests {
         ] {
             let result = run(&tool, FetchUrlTool::NAME, json!({ "url": url })).await;
             assert_eq!(result.status, ToolResultStatus::Error, "{url}");
-            assert!(result.content.contains(expect), "{url}: {}", result.content);
+            assert!(
+                result.content.text().contains(expect),
+                "{url}: {}",
+                result.content
+            );
         }
         let long = format!("https://1.1.1.1/{}", "a".repeat(MAX_URL_CHARS));
         let result = run(&tool, FetchUrlTool::NAME, json!({ "url": long })).await;
         assert_eq!(result.status, ToolResultStatus::Error);
-        assert!(result.content.contains("8192"), "{}", result.content);
+        assert!(result.content.text().contains("8192"), "{}", result.content);
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
             "no refused URL may reach the API"
@@ -1589,7 +1617,7 @@ mod tests {
         .await;
         assert_eq!(result.status, ToolResultStatus::Error);
         assert!(
-            result.content.contains("upstream unreachable"),
+            result.content.text().contains("upstream unreachable"),
             "{}",
             result.content
         );
@@ -1603,7 +1631,11 @@ mod tests {
         )
         .await;
         assert_eq!(result.status, ToolResultStatus::Error);
-        assert!(result.content.contains("content"), "{}", result.content);
+        assert!(
+            result.content.text().contains("content"),
+            "{}",
+            result.content
+        );
     }
 
     #[test]
@@ -1627,7 +1659,7 @@ mod tests {
         let long = format!("http://127.0.0.1:9/{}", "a".repeat(MAX_URL_CHARS));
         let result = run(&tool, FetchUrlTool::NAME, json!({ "url": long })).await;
         assert_eq!(result.status, ToolResultStatus::Error);
-        assert!(result.content.contains("8192"), "{}", result.content);
+        assert!(result.content.text().contains("8192"), "{}", result.content);
     }
 
     /// A name this machine cannot resolve, or `None` when the environment
@@ -1682,7 +1714,11 @@ mod tests {
         )
         .await;
         assert_eq!(result.status, ToolResultStatus::Error);
-        assert!(result.content.contains("localhost"), "{}", result.content);
+        assert!(
+            result.content.text().contains("localhost"),
+            "{}",
+            result.content
+        );
     }
 
     /// The local path keeps the resolving guard, because there the request
@@ -1702,7 +1738,7 @@ mod tests {
         let result = run(&tool, FetchUrlTool::NAME, json!({ "url": url })).await;
         assert_eq!(result.status, ToolResultStatus::Error);
         assert!(
-            result.content.contains("无法解析主机"),
+            result.content.text().contains("无法解析主机"),
             "the guard's own refusal, not a failed connection: {}",
             result.content
         );
@@ -1720,7 +1756,7 @@ mod tests {
         };
         let result = run(&tool, FetchUrlTool::NAME, json!({ "url": url.clone() })).await;
         assert_eq!(
-            result.content,
+            result.content.text(),
             format!(
                 "{url}\n[下载已按 16 bytes 上限截断，下文为截断前的内容]\n\n{}",
                 "x".repeat(16)
@@ -1734,7 +1770,7 @@ mod tests {
             json!({ "url": url.clone() }),
         )
         .await;
-        assert_eq!(result.content, format!("{url}\n\n纯文本 & tags"));
+        assert_eq!(result.content.text(), format!("{url}\n\n纯文本 & tags"));
 
         let url = serve_once("abcdef".to_string(), "text/plain");
         let result = run(
@@ -1743,7 +1779,7 @@ mod tests {
             json!({ "url": url.clone(), "offset": 4 }),
         )
         .await;
-        assert_eq!(result.content, format!("{url}\n\nef\n\n[内容结束]"));
+        assert_eq!(result.content.text(), format!("{url}\n\nef\n\n[内容结束]"));
         assert!(
             local_fetch_tool()
                 .description()
@@ -1761,7 +1797,7 @@ mod tests {
         )
         .await;
         assert_eq!(result.status, ToolResultStatus::Error);
-        assert!(result.content.contains("非公网"));
+        assert!(result.content.text().contains("非公网"));
     }
 
     #[test]
@@ -1828,7 +1864,7 @@ mod tests {
                 "{}",
                 result.content
             );
-            assert!(result.content.starts_with("1. "));
+            assert!(result.content.text().starts_with("1. "));
             let result = run(
                 &FetchUrlTool::new(zh(), &backend),
                 FetchUrlTool::NAME,
@@ -1841,7 +1877,7 @@ mod tests {
                 "{}",
                 result.content
             );
-            assert!(result.content.contains("Example Domain"));
+            assert!(result.content.text().contains("Example Domain"));
         })
         .await
         .expect("real web smoke exceeded 90 seconds");

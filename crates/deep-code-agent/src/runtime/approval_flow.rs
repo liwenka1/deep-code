@@ -98,6 +98,14 @@ pub fn session_consent_recordable(
 /// [`session_consent_recordable`], so the panel's "would `a` record anything"
 /// and the runtime's "what does `a` record" cannot answer from different rules.
 fn shell_consent_identity(tool_name: &str, arguments: &serde_json::Value) -> Option<String> {
+    if arguments.get("stdin").is_some_and(|value| !value.is_null())
+        || arguments
+            .get("interactive")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        return None;
+    }
     // Two rules, each with one home: `shell_command_of` says which calls carry
     // a command at all (`shell`, or `job action=start` — status/tail/cancel
     // must never record a prefix), and `command_shape::session_identity` says
@@ -542,14 +550,17 @@ impl AgentRuntime {
                     let mut result = ToolResult::denied(&current);
                     // The unattended note wins: "user declined" is only true
                     // when a user actually saw the prompt.
-                    result.content = denial_note.clone().unwrap_or_else(|| {
-                        format!(
-                            "User declined the write-root request for '{}'. Do not request \
+                    result.content = denial_note
+                        .clone()
+                        .unwrap_or_else(|| {
+                            format!(
+                                "User declined the write-root request for '{}'. Do not request \
                              this path again; continue within the granted roots, or the user \
                              can grant it later with /add-dir.",
-                            root_grant_requested_path(&current)
-                        )
-                    });
+                                root_grant_requested_path(&current)
+                            )
+                        })
+                        .into();
                     result
                 }
                 _ => {
@@ -586,7 +597,7 @@ impl AgentRuntime {
                 if result.status == crate::tool::ToolResultStatus::Denied
                     && let Some(note) = denial_note
                 {
-                    result.content = note;
+                    result.content = note.into();
                 }
                 self.record_tool_result(&current, result, ask, tx, turn_id.clone())
                     .await;
@@ -779,7 +790,7 @@ impl AgentRuntime {
         let state = self.state.lock().await;
         if state.current_turn_id.as_ref() != Some(turn_id) || cancel.is_cancelled() {
             let mut result = ToolResult::denied(call);
-            result.content = super::tool_result::CANCELLED_TOOL_RESULT.to_string();
+            result.content = super::tool_result::CANCELLED_TOOL_RESULT.into();
             return result;
         }
         let outcome = boundary.grant_resolved(fresh);
@@ -1139,6 +1150,19 @@ mod tests {
         for (tool, arguments) in [
             ("shell", json!({ "command": "cargo test && rm -rf /" })),
             ("job", json!({ "action": "cancel", "job_id": "job_1" })),
+            (
+                "shell",
+                json!({ "command": "python3", "stdin": "print(1)" }),
+            ),
+            (
+                "job",
+                json!({ "action": "start", "command": "python3", "interactive": true }),
+            ),
+            (
+                "job",
+                json!({ "action": "input", "job_id": "job_1", "stdin": "print(1)" }),
+            ),
+            ("job", json!({ "action": "close_stdin", "job_id": "job_1" })),
             ("agent", json!({ "role": "implementer", "task": "land it" })),
             (
                 "agent",
