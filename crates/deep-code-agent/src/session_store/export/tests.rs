@@ -18,6 +18,13 @@ fn details_path() -> PathBuf {
         .join(format!("{}.txt", uuid::Uuid::new_v4()))
 }
 
+fn stream_path() -> PathBuf {
+    PathBuf::from(".deep-code")
+        .join("spill")
+        .join("run-123-4-5")
+        .join("job_owner_1.stdout.log")
+}
+
 fn add_result(record: &mut SessionRecord, text: String, details: Value) {
     record.entries.push(Arc::new(SessionEntry::assistant(
         "",
@@ -60,7 +67,7 @@ fn a_bundle_survives_workspace_cleanup_with_images_full_output_and_nested_growin
     let canonical = crate::paths::canonicalize(workspace.path()).unwrap();
     let store = JsonSessionStore::for_workspace(&canonical).unwrap();
     let asset = crate::image::snapshot_bytes(&canonical, b"GIF89a-observation").unwrap();
-    let stream = PathBuf::from(".deep-code/spill/run-123-4-5/job_owner_1.stdout.log");
+    let stream = stream_path();
     let stream_bytes = b"earlier output followed by later output";
     source(&canonical, &stream, stream_bytes);
     let full_output = details_path();
@@ -156,17 +163,20 @@ fn a_bundle_survives_workspace_cleanup_with_images_full_output_and_nested_growin
         }
     }
     let observed = result(&restored);
-    assert!(
-        !observed
-            .content
-            .text()
-            .contains(&format!("saved: '{}'", canonical.join(&stream).display()))
-    );
-    assert!(
-        observed
-            .content
-            .text()
-            .contains(&format!("saved: '{}'", stream.display()))
+    let text = observed.content.text();
+    assert!(!text.contains(&format!("saved: '{}'", canonical.join(&stream).display())));
+    let reported_stream = text
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("[stdout truncated — complete stream saved: '"))
+        .and_then(|notice| notice.split_once("' ("))
+        .map(|(path, _)| Path::new(path))
+        .expect("the stream notice must identify its exported source");
+    assert!(reported_stream.is_relative());
+    assert_eq!(reported_stream, stream);
+    assert_eq!(
+        std::fs::read(destination.join(reported_stream)).unwrap(),
+        stream_bytes
     );
     assert_eq!(
         std::fs::read(destination.join(&full_output)).unwrap(),
@@ -304,7 +314,7 @@ fn source_marker_examples_in_user_input_and_tool_source_code_are_not_export_refe
     let mut record = SessionRecord::new(canonical, "system");
     let user_text = "Explain this example:\n[Inline output shortened. Full output saved to not-a-captured-source; use read_file with next_start_byte for bounded continuation.]\n";
     record.entries.push(Arc::new(SessionEntry::user(user_text)));
-    let stream = PathBuf::from(".deep-code/spill/run-123-4-5/job_owner_1.stdout.log");
+    let stream = stream_path();
     source(store.workspace_path(), &stream, b"x");
     let tool_text = serde_json::to_string(&json!({"lines": [
         {"text": include_str!("../../runtime/tool_result.rs")},
