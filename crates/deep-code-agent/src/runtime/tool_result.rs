@@ -12,6 +12,7 @@ use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
 use crate::runtime::failure_class::record_failure_signals;
 use crate::runtime::state::PendingToolBatch;
 use crate::session_entry::Ask;
+use crate::tool::details::{PreparedPreview, storage_size as details_storage_size};
 use crate::tool::{
     ApprovalDecision, RunAuthority, ToolCall, ToolCx, ToolError, ToolResult, ToolRunOutcome,
 };
@@ -490,17 +491,21 @@ impl AgentRuntime {
         let content = result.content.clone();
         let details = result.details.clone();
         let workspace = self.workspace.clone();
-        match crate::tool::run_blocking("tool_output", move || {
+        let prepared = match crate::tool::run_blocking("tool_output", move || {
+            let details = bound_tool_details(details, workspace.as_deref());
+            let prepared = details.as_ref().and_then(PreparedPreview::new);
             Ok((
                 bound_tool_content(&content, workspace.as_deref()),
-                bound_tool_details(details, workspace.as_deref()),
+                details,
+                prepared,
             ))
         })
         .await
         {
-            Ok((content, details)) => {
+            Ok((content, details, prepared)) => {
                 result.content = content;
                 result.details = details;
+                prepared
             }
             Err(error) => {
                 result
@@ -508,17 +513,19 @@ impl AgentRuntime {
                     .push_text(format!("\n[output preparation failed: {error}]"));
                 result.content = bound_tool_content(&result.content, None);
                 result.details = bound_tool_details(result.details.take(), None);
+                result.details.as_ref().and_then(PreparedPreview::new)
             }
-        }
+        };
 
         {
             let mut state = self.state.lock().await;
-            if !state.session.record_tool_result(
+            if !state.session.record_prepared_tool_result(
                 &result.call_id,
                 result.content.clone(),
                 result.status,
                 ask,
                 result.details.clone(),
+                prepared,
             ) {
                 // Should be unreachable: the assistant entry carrying this
                 // call was pushed before the batch ran.
@@ -557,47 +564,49 @@ pub(crate) const TOOL_OUTPUT_BUDGET: usize = 12_000;
 /// the session record. Model text and UI metadata have independent budgets.
 const TOOL_DETAILS_BUDGET_BYTES: usize = 16 * 1024;
 
-fn details_storage_size(details: &serde_json::Value) -> usize {
-    let json = serde_json::to_vec_pretty(details).expect("JSON values serialize");
-    // A details value sits inside entries/exchanges/result. Allow 32 extra
-    // spaces per structural newline, beyond the actual session indentation.
-    json.len().saturating_add(
-        json.iter()
-            .filter(|byte| **byte == b'\n')
-            .count()
-            .saturating_mul(32),
-    )
-}
-
 fn bound_tool_details(
     details: Option<serde_json::Value>,
     workspace: Option<&std::path::Path>,
 ) -> Option<serde_json::Value> {
     let mut preview = details?;
+    let oversized = details_storage_size(&preview) > TOOL_DETAILS_BUDGET_BYTES;
+    let has_source = preview
+        .get("details_storage")
+        .is_some_and(serde_json::Value::is_object);
+    if !oversized && (has_source || crate::tool::details::preview_size(&preview) == 0) {
+        return Some(preview);
+    }
+    if !has_source {
+        // Capture the complete source while already off the async executor.
+        // Retention can later remove an old preview without filesystem I/O.
+        let original = serde_json::to_string(&preview).expect("JSON values serialize");
+        let (path, complete, error) = match workspace.map(|root| spill_tool_text(root, &original)) {
+            Some(Ok((path, complete))) => (Some(path), complete, None),
+            Some(Err(error)) => (None, false, Some(error.to_string())),
+            None => (
+                None,
+                false,
+                Some("no output workspace is available".to_string()),
+            ),
+        };
+        let storage = serde_json::json!({
+            "inline_truncated": oversized,
+            "path": path,
+            "complete": complete,
+            "original_bytes": original.len(),
+            "error": error.map(|error| error.chars().take(256).collect::<String>()),
+        });
+        if let Some(object) = preview.as_object_mut() {
+            object.insert("details_storage".into(), storage);
+        } else {
+            preview = serde_json::json!({"preview": preview, "details_storage": storage});
+        }
+    }
     if details_storage_size(&preview) <= TOOL_DETAILS_BUDGET_BYTES {
         return Some(preview);
     }
-    let original = serde_json::to_string(&preview).expect("JSON values serialize");
-    let (path, complete, error) = match workspace.map(|root| spill_tool_text(root, &original)) {
-        Some(Ok((path, complete))) => (Some(path), complete, None),
-        Some(Err(error)) => (None, false, Some(error.to_string())),
-        None => (
-            None,
-            false,
-            Some("no output workspace is available".to_string()),
-        ),
-    };
-    let storage = serde_json::json!({
-        "inline_truncated": true,
-        "path": path,
-        "complete": complete,
-        "original_bytes": original.len(),
-        "error": error.map(|error| error.chars().take(256).collect::<String>()),
-    });
-    let Some(object) = preview.as_object_mut() else {
-        return Some(serde_json::json!({"details_storage": storage}));
-    };
-    object.insert("details_storage".into(), storage.clone());
+    preview["details_storage"]["inline_truncated"] = true.into();
+    let storage = preview["details_storage"].clone();
 
     // Shorten display payloads without modifying identities or execution
     // facts such as capture_complete, byte counters and process exit status.
@@ -605,6 +614,7 @@ fn bound_tool_details(
         "/edit/diff".to_string(),
         "/stdout/text".into(),
         "/stderr/text".into(),
+        "/output_page/text".into(),
     ];
     if let Some(todos) = preview.get("todos").and_then(serde_json::Value::as_array) {
         paths.extend((0..todos.len()).map(|index| format!("/todos/{index}/content")));
@@ -767,6 +777,32 @@ mod tests {
             Some(details)
         );
         assert_eq!(bound_tool_details(None, None), None);
+    }
+
+    #[test]
+    fn a_complete_preview_prepares_its_source_once_before_retention_can_expire_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let original = json!({"edit": {
+            "path": "file", "diff": "x".repeat(7500), "added": 1, "removed": 1,
+            "truncated": false, "new_file": false,
+        }});
+        assert!(details_storage_size(&original) < TOOL_DETAILS_BUDGET_BYTES);
+        let preview = bound_tool_details(Some(original.clone()), Some(&root)).unwrap();
+        assert_eq!(preview["edit"], original["edit"]);
+        assert_eq!(preview["details_storage"]["inline_truncated"], false);
+        assert_eq!(preview["details_storage"]["complete"], true);
+        let source = root.join(preview["details_storage"]["path"].as_str().unwrap());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(source).unwrap()).unwrap(),
+            original
+        );
+        // Preparing again with no writable source must reuse the first full
+        // capture, rather than replacing it with a capture of this preview.
+        assert_eq!(
+            bound_tool_details(Some(preview.clone()), None),
+            Some(preview)
+        );
     }
 
     #[test]

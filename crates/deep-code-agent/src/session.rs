@@ -8,6 +8,7 @@ use crate::model::ToolCallPayload;
 use crate::runtime::TurnId;
 use crate::session_entry::{Ask, EntryKind, ExchangeResult, SessionEntry, ToolExchange};
 use crate::tool::ToolResultStatus;
+use crate::tool::details::{PreparedPreview, PreviewRetention};
 
 /// A missing settlement cannot establish whether external actions happened.
 /// Recovery describes the uncertainty and never repeats the operation itself.
@@ -27,13 +28,22 @@ pub(crate) const COMPACTION_SUMMARY_PREFIX: &str = "[会话摘要 / session summ
 ///
 /// Entries are held behind `Arc` so the live session and the persistence
 /// record share one transcript: `persist()` copies a vector of pointers, not
-/// every entry's bytes. Entries are append-mostly; the one in-place mutation
-/// (a tool result landing in its exchange) goes through [`Arc::make_mut`],
-/// which clones only that single entry when the record still references it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// every entry's bytes. Tool results and expired detail previews are updated
+/// through [`Arc::make_mut`], cloning only an affected entry when a saved
+/// snapshot still references it.
+#[derive(Debug, Clone, Default)]
 pub struct Session {
     entries: Vec<Arc<SessionEntry>>,
+    previews: PreviewRetention,
 }
+
+impl PartialEq for Session {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Eq for Session {}
 
 impl Session {
     #[must_use]
@@ -42,8 +52,9 @@ impl Session {
     }
 
     #[must_use]
-    pub fn from_entries(entries: Vec<Arc<SessionEntry>>) -> Self {
-        Self { entries }
+    pub fn from_entries(mut entries: Vec<Arc<SessionEntry>>) -> Self {
+        let previews = PreviewRetention::from_entries(&mut entries);
+        Self { entries, previews }
     }
 
     #[must_use]
@@ -53,6 +64,7 @@ impl Session {
 
     pub fn replace_entries(&mut self, entries: Vec<Arc<SessionEntry>>) {
         self.entries = entries;
+        self.previews = PreviewRetention::from_entries(&mut self.entries);
     }
 
     fn push_entry(&mut self, entry: SessionEntry) {
@@ -120,6 +132,7 @@ impl Session {
         let reply =
             SessionEntry::assistant(content, Some(reasoning), Vec::new()).with_turn_id(turn_id);
         self.entries.insert(index + 1, Arc::new(reply));
+        self.previews.inserted_entry(index + 1);
         true
     }
 
@@ -139,41 +152,52 @@ impl Session {
         ask: Ask,
         details: Option<serde_json::Value>,
     ) -> bool {
+        let prepared = details.as_ref().and_then(PreparedPreview::new);
+        self.record_prepared_tool_result(call_id, content, status, ask, details, prepared)
+    }
+
+    /// The runtime prepares display costs and compact values on its blocking
+    /// worker. Recording under the state lock only updates the retention queue.
+    pub(crate) fn record_prepared_tool_result(
+        &mut self,
+        call_id: &str,
+        content: Content,
+        status: ToolResultStatus,
+        ask: Ask,
+        details: Option<serde_json::Value>,
+        prepared: Option<PreparedPreview>,
+    ) -> bool {
         // Find the newest assistant entry first, and only `make_mut` (which
         // clones the entry while the persistence record also holds it) once a
         // matching pending exchange is confirmed — a miss must stay copy-free.
         let latest_assistant = self
             .entries
-            .iter_mut()
-            .rev()
-            .find(|entry| matches!(entry.kind, EntryKind::Assistant { .. }));
-        let Some(entry) = latest_assistant else {
+            .iter()
+            .rposition(|entry| matches!(entry.kind, EntryKind::Assistant { .. }));
+        let Some(entry_index) = latest_assistant else {
             return false;
         };
+        let entry = &mut self.entries[entry_index];
         let EntryKind::Assistant { exchanges, .. } = &entry.kind else {
             unreachable!("filtered to assistant entries above");
         };
-        if !exchanges
+        let Some(exchange_index) = exchanges
             .iter()
-            .any(|exchange| exchange.call.id == call_id && exchange.result.is_none())
-        {
+            .position(|exchange| exchange.call.id == call_id && exchange.result.is_none())
+        else {
             return false;
-        }
+        };
         let EntryKind::Assistant { exchanges, .. } = &mut Arc::make_mut(entry).kind else {
             unreachable!("make_mut preserves the entry kind");
         };
-        let Some(exchange) = exchanges
-            .iter_mut()
-            .find(|exchange| exchange.call.id == call_id && exchange.result.is_none())
-        else {
-            unreachable!("presence checked above");
-        };
-        exchange.result = Some(ExchangeResult {
+        exchanges[exchange_index].result = Some(ExchangeResult {
             content,
             details,
             status,
             asked: ask == Ask::Asked,
         });
+        self.previews
+            .record(&mut self.entries, entry_index, exchange_index, prepared);
         true
     }
 
@@ -256,6 +280,10 @@ impl Session {
         ids
     }
 }
+
+#[cfg(test)]
+#[path = "session/retention_tests.rs"]
+mod retention_tests;
 
 const COMPACTION_IMAGE_SOURCE_CHARS: usize = 2_000;
 const COMPACTION_IMAGE_SOURCE_COUNT: usize = 16;

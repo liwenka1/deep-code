@@ -1045,6 +1045,104 @@ fn bounded_details_storage_reference_reappears_when_a_session_is_resumed() {
 }
 
 #[test]
+fn retained_edit_history_restores_archived_sources_and_recent_diffs() {
+    const EDITS: usize = 128;
+    let diff = format!("-{}\n+{}\n", "a".repeat(7_000), "b".repeat(7_000));
+    let exchanges = (0..EDITS)
+        .map(|index| {
+            let mut details = serde_json::json!({
+                "edit": {
+                    "path": format!("file_{index}.txt"), "diff": diff,
+                    "added": 1, "removed": 1, "truncated": false, "new_file": false
+                }
+            });
+            let original_bytes = serde_json::to_vec(&details).unwrap().len();
+            details["details_storage"] = serde_json::json!({
+                "inline_truncated": false,
+                "path": format!(".deep-code/spill/tool-results/edit_{index}.txt"),
+                "complete": true, "original_bytes": original_bytes, "error": null
+            });
+            ToolExchange {
+                call: call(&format!("edit_{index}"), "apply_patch"),
+                result: Some(ExchangeResult {
+                    content: format!("changed file_{index}.txt").into(),
+                    details: Some(details),
+                    status: ToolResultStatus::Success,
+                    asked: false,
+                }),
+            }
+        })
+        .collect();
+    let mut record = SessionRecord::new(PathBuf::from("/workspace"), "");
+    record.entries.extend([
+        std::sync::Arc::new(SessionEntry::user("edit these files")),
+        std::sync::Arc::new(SessionEntry::assistant("", None, exchanges)),
+    ]);
+    // Use the real retention entry point, then the same serialized data the
+    // transcript receives on resume rather than a hand-built archived shape.
+    let session = deep_code_agent::Session::from_entries(record.entries);
+    record.entries = session.entries().to_vec();
+    let resumed: SessionRecord =
+        serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+    let deep_code_agent::EntryKind::Assistant { exchanges, .. } =
+        &resumed.entries.last().unwrap().kind
+    else {
+        panic!("edit exchanges missing");
+    };
+    let archived = exchanges[0]
+        .result
+        .as_ref()
+        .unwrap()
+        .details
+        .as_ref()
+        .unwrap();
+    assert!(archived["edit"].get("diff").is_none());
+    assert_eq!(archived["edit"]["added"], 1);
+    assert_eq!(archived["edit"]["removed"], 1);
+    assert_eq!(archived["edit"]["truncated"], true);
+    assert_eq!(archived["details_storage"]["inline_truncated"], true);
+    assert_eq!(archived["details_storage"]["complete"], true);
+    let recent = exchanges
+        .last()
+        .unwrap()
+        .result
+        .as_ref()
+        .unwrap()
+        .details
+        .as_ref()
+        .unwrap();
+    assert_eq!(recent["edit"]["diff"], diff);
+    assert_eq!(recent["details_storage"]["inline_truncated"], false);
+
+    let cells = hydrate_history(&resumed);
+    let summaries: Vec<_> = cells
+        .iter()
+        .filter_map(|cell| match cell {
+            HistoryCell::ToolResult { summary, .. } => Some(summary),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(summaries.len(), EDITS);
+    assert!(summaries[0].contains("changed file_0.txt"));
+    assert!(summaries[0].contains("details preview truncated"));
+    assert!(summaries[0].contains("full details saved .deep-code/spill/tool-results/edit_0.txt"));
+    assert!(!summaries[0].contains("unavailable"));
+    assert!(summaries[EDITS - 1].contains("changed file_127.txt"));
+    assert!(!summaries[EDITS - 1].contains("details preview truncated"));
+    assert!(!summaries[EDITS - 1].contains("details saved"));
+    assert!(!cells.iter().any(|cell| matches!(cell,
+        HistoryCell::Diff { path, .. } if path == "file_0.txt"
+    )));
+    assert!(cells.iter().any(|cell| matches!(cell,
+        HistoryCell::Diff { path, diff: retained, truncated: false, .. }
+            if path == "file_127.txt" && retained == &diff
+    )));
+    assert!(!cells.iter().any(|cell| matches!(cell,
+        HistoryCell::Diff { diff, .. } if diff.trim().is_empty()
+    )));
+}
+
+#[test]
 fn image_request_omission_reappears_when_a_turn_is_resumed() {
     let mut record = SessionRecord::new(PathBuf::from("/workspace"), "");
     let turn_id = TurnId("turn_images".into());

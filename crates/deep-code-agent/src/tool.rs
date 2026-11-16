@@ -1,4 +1,5 @@
 mod accumulator;
+pub(crate) mod details;
 // NOTE: this is a test fixture, but it cannot be `cfg(test)`-gated: the
 // `deep-code-runtime` tests are a separate crate and consume it, so gating would
 // need a `test-fixtures` Cargo feature plus conditional `ToolKind::Mock` match

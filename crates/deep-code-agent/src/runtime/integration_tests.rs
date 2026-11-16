@@ -7806,6 +7806,337 @@ async fn many_small_patches_in_one_turn_persist_bounded_details_and_recoverable_
 }
 
 #[tokio::test]
+async fn unsourced_details_survive_resume_and_subsequent_saves_without_losing_their_only_copy() {
+    const EDITS: usize = 128;
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().canonicalize().unwrap();
+    let store = crate::JsonSessionStore::for_workspace(&workspace).unwrap();
+    let expected: Vec<_> = (0..EDITS)
+        .map(|index| {
+            serde_json::json!({"edit": {
+                "path": format!("file_{index}.txt"),
+                "diff": format!("-{}\n+{}\n", "a".repeat(7000), "b".repeat(7000)),
+                "added": 1, "removed": 1, "truncated": false, "new_file": false,
+            }})
+        })
+        .collect();
+    assert!(expected.iter().all(|details| {
+        serde_json::to_vec_pretty(details).unwrap().len() < 16 * 1024
+            && details.get("details_storage").is_none()
+    }));
+    assert!(
+        expected
+            .iter()
+            .map(|details| serde_json::to_vec(details).unwrap().len())
+            .sum::<usize>()
+            > crate::tool::details::PREVIEW_RETENTION_BYTES
+    );
+    let mut record = crate::SessionRecord::new(workspace.clone(), "system");
+    let turn_id = TurnId::new();
+    record.entries.extend([
+        Arc::new(crate::SessionEntry::user("edit the files").with_turn_id(turn_id.clone())),
+        Arc::new(
+            crate::SessionEntry::assistant(
+                "",
+                None,
+                expected
+                    .iter()
+                    .enumerate()
+                    .map(|(index, details)| crate::ToolExchange {
+                        call: tool_result::tool_call_payload(&ToolCall::new(
+                            format!("existing_edit_{index}"),
+                            "apply_patch",
+                            serde_json::json!({
+                                "path": format!("file_{index}.txt"), "old": "a", "new": "b",
+                            }),
+                        )),
+                        result: Some(crate::ExchangeResult {
+                            content: "edited".into(),
+                            details: Some(details.clone()),
+                            status: ToolResultStatus::Success,
+                            asked: false,
+                        }),
+                    })
+                    .collect(),
+            )
+            .with_turn_id(turn_id),
+        ),
+    ]);
+    // This valid current-format fixture must reach resume with its unsourced
+    // previews intact, before the current save path can apply retention.
+    crate::session_integrity::ensure_key().unwrap();
+    record.extra_roots_mac = crate::session_integrity::sign_roots(
+        record.id.as_str(),
+        &record.workspace,
+        &record.extra_roots,
+    );
+    record.record_mac = crate::session_integrity::sign_record(&mut record);
+    assert!(record.record_mac.is_some());
+    let id = record.id.clone();
+    let encoded = serde_json::to_vec_pretty(&record).unwrap();
+    assert!(encoded.len() < crate::session_store::MAX_SESSION_FILE_BYTES as usize);
+    std::fs::write(
+        workspace
+            .join(".deep-code/sessions")
+            .join(format!("{}.json", id.as_str())),
+        encoded,
+    )
+    .unwrap();
+    let assert_intact = |entries: &[Arc<crate::SessionEntry>]| {
+        let details: Vec<_> = entries
+            .iter()
+            .flat_map(|entry| match &entry.kind {
+                crate::EntryKind::Assistant { exchanges, .. } => exchanges.as_slice(),
+                _ => &[],
+            })
+            .filter(|exchange| exchange.call.id.starts_with("existing_edit_"))
+            .map(|exchange| exchange.result.as_ref().unwrap().details.as_ref().unwrap())
+            .collect();
+        assert_eq!(details.len(), EDITS);
+        for (index, (actual, expected)) in details.iter().zip(&expected).enumerate() {
+            assert!(
+                *actual == expected,
+                "unsourced detail {index} lost its only complete copy"
+            );
+        }
+    };
+
+    let loaded = store.load(&id).unwrap();
+    assert_intact(&loaded.entries);
+    let session = crate::Session::from_entries(loaded.entries.clone());
+    assert_intact(session.entries());
+    let runtime = AgentRuntime::from_session_record(
+        ScriptedClient::new(vec![ok_turn()]),
+        ToolRegistry::default(),
+        loaded,
+        store.clone(),
+        AgentConfig::builtin(),
+    );
+    assert_intact(&runtime.live_snapshot().await.unwrap().record.entries);
+    let mut receiver = runtime.submit_user("continue with a short reply").await;
+    for event in drain(&mut receiver).await {
+        match event {
+            RuntimeEvent::SessionUpdated { save_error, .. } => assert!(save_error.is_none()),
+            RuntimeEvent::Error { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    assert_eq!(runtime.flush_session().await, None);
+    runtime.shutdown().await;
+    assert_eq!(runtime.last_save_error(), None);
+    let saved = store.load(&id).unwrap();
+    assert_intact(&saved.entries);
+    let resumed = AgentRuntime::from_session_record(
+        ScriptedClient::new(Vec::new()),
+        ToolRegistry::default(),
+        saved,
+        store.clone(),
+        AgentConfig::builtin(),
+    );
+    resumed.shutdown().await;
+    assert_eq!(resumed.last_save_error(), None);
+    assert_intact(&store.load(&id).unwrap().entries);
+}
+
+#[tokio::test]
+async fn a_long_patch_turn_keeps_all_results_and_recoverable_archived_details() {
+    const STEPS: usize = 150;
+    const CALLS_PER_STEP: usize = 4;
+    const EDITS: usize = STEPS * CALLS_PER_STEP;
+    assert!(STEPS < MAX_TURN_STEPS as usize);
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().canonicalize().unwrap();
+    let original = format!("{}TAIL0", "x".repeat(7_500));
+    std::fs::write(workspace.join("minified.txt"), &original).unwrap();
+    let mut scripts: Vec<_> = (0..STEPS)
+        .map(|step| {
+            let mut events: Vec<_> = (0..CALLS_PER_STEP)
+                .map(|slot| {
+                    let index = step * CALLS_PER_STEP + slot;
+                    AgentEvent::ToolCallDelta {
+                        delta: indexed_tool_call_delta(
+                            slot as u32,
+                            &format!("edit_{index}"),
+                            "apply_patch",
+                            &serde_json::json!({
+                                "path": "minified.txt",
+                                "old": format!("TAIL{}", index % 2),
+                                "new": format!("TAIL{}", (index + 1) % 2),
+                            })
+                            .to_string(),
+                        ),
+                    }
+                })
+                .collect();
+            events.push(AgentEvent::Done { usage: None });
+            events
+        })
+        .collect();
+    scripts.push(ok_turn());
+    let config = AgentConfig {
+        model: DEEPSEEK_V4_PRO.into(),
+        ..AgentConfig::builtin()
+    };
+    let runtime = AgentRuntime::with_new_session(
+        ScriptedClient::new(scripts),
+        crate::workspace_tools::workspace_tool_registry(workspace.clone()).unwrap(),
+        "system",
+        &workspace,
+        &config,
+    )
+    .unwrap()
+    .with_permission_mode(SharedPermissionMode::new(
+        crate::execution_policy::PermissionMode::AcceptEdits,
+    ));
+    let mut receiver = runtime
+        .submit_user("Make these small edits in one turn")
+        .await;
+    let (mut completed, mut finished, mut compacted) = (0, false, false);
+    let (mut first_live_details, mut last_live_details) = (None, None);
+    while let Some(event) = receiver.recv().await {
+        match event {
+            RuntimeEvent::ToolCallFinished { result, .. } => {
+                assert_eq!(result.status, ToolResultStatus::Success);
+                assert!(result.content.text().len() < 100);
+                let details = result.details.unwrap();
+                if completed == 0 {
+                    // This diff fits the per-result limit. Only the sum of
+                    // many small edits can force it into archived storage.
+                    assert_eq!(details["details_storage"]["inline_truncated"], false);
+                    assert_eq!(details["details_storage"]["complete"], true);
+                    assert!(details["edit"]["diff"].as_str().unwrap().len() > 15_000);
+                    let mut original_details = details.clone();
+                    original_details
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("details_storage");
+                    first_live_details = Some(original_details);
+                }
+                last_live_details = Some(details);
+                completed += 1;
+            }
+            RuntimeEvent::SessionUpdated { save_error, .. } => {
+                assert!(save_error.is_none(), "{save_error:?}");
+            }
+            RuntimeEvent::Error { message, .. } => panic!("{message}"),
+            RuntimeEvent::CompactionApplied { .. } => compacted = true,
+            RuntimeEvent::TurnFinished { .. } => finished = true,
+            _ => {}
+        }
+    }
+    assert_eq!(completed, EDITS);
+    assert!(finished);
+    assert!(!compacted, "the current user's whole turn must stay intact");
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("minified.txt")).unwrap(),
+        original
+    );
+    let id = runtime.session_id().await.unwrap();
+    assert_eq!(runtime.flush_session().await, None);
+    runtime.shutdown().await;
+    assert_eq!(runtime.last_save_error(), None);
+    let store = crate::JsonSessionStore::for_workspace(&workspace).unwrap();
+    let saved = store.load(&id).unwrap();
+    let exchanges: Vec<_> = saved
+        .entries
+        .iter()
+        .flat_map(|entry| match &entry.kind {
+            crate::EntryKind::Assistant { exchanges, .. } => exchanges.as_slice(),
+            _ => &[],
+        })
+        .collect();
+    assert_eq!(exchanges.len(), EDITS);
+    for (index, exchange) in exchanges.iter().enumerate() {
+        assert_eq!(exchange.call.id, format!("edit_{index}"));
+        assert_eq!(
+            exchange.result.as_ref().unwrap().status,
+            ToolResultStatus::Success,
+            "every completed edit must survive restart"
+        );
+    }
+    assert!(
+        serde_json::to_vec_pretty(&saved).unwrap().len()
+            < crate::session_store::MAX_SESSION_FILE_BYTES as usize
+    );
+    let first = exchanges[0]
+        .result
+        .as_ref()
+        .unwrap()
+        .details
+        .as_ref()
+        .unwrap();
+    let source = &first["details_storage"];
+    assert_eq!(source["inline_truncated"], true);
+    assert_eq!(source["complete"], true);
+    assert!(source["error"].is_null());
+    assert_eq!(first["edit"]["path"], "minified.txt");
+    assert_eq!(first["edit"]["added"], 1);
+    assert_eq!(first["edit"]["removed"], 1);
+    assert_eq!(first["edit"]["truncated"], true);
+    assert_eq!(
+        exchanges[EDITS - 1].result.as_ref().unwrap().details,
+        last_live_details,
+        "recent diffs should retain their complete previews"
+    );
+
+    // Follow the advertised source through the actual tool, including its
+    // byte cursor, so a saved path that merely looks correct cannot pass.
+    let tools = crate::workspace_tools::workspace_tool_registry(workspace.clone()).unwrap();
+    let mut cursor = 0u64;
+    let mut recovered = String::new();
+    loop {
+        let crate::tool::ToolRunOutcome::Result { result } = tools
+            .run_tool_call(
+                crate::tool::ToolCall::new(
+                    "read_archived_details",
+                    "read_file",
+                    serde_json::json!({"path": source["path"], "start_byte": cursor}),
+                ),
+                None,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("an archived details source must be readable without approval");
+        };
+        assert_eq!(result.status, ToolResultStatus::Success);
+        let page: serde_json::Value = serde_json::from_str(&result.content.text()).unwrap();
+        for line in page["lines"].as_array().unwrap() {
+            recovered.push_str(line["text"].as_str().unwrap());
+        }
+        let Some(next) = page["next_start_byte"].as_u64() else {
+            break;
+        };
+        assert!(next > cursor, "continuation must make progress");
+        cursor = next;
+    }
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&recovered).unwrap(),
+        first_live_details.unwrap(),
+        "archiving must preserve the complete original diff"
+    );
+    assert_eq!(source["original_bytes"], recovered.len());
+    assert_eq!(
+        runtime.live_snapshot().await.unwrap().record.entries,
+        saved.entries,
+        "an idle snapshot must not resurrect discarded previews"
+    );
+    let resumed = AgentRuntime::from_session_record(
+        ScriptedClient::new(Vec::new()),
+        ToolRegistry::default(),
+        saved,
+        store,
+        config,
+    );
+    assert_eq!(
+        resumed.session_messages().await,
+        runtime.session_messages().await
+    );
+    resumed.shutdown().await;
+    assert_eq!(resumed.last_save_error(), None);
+}
+
+#[tokio::test]
 async fn repeated_image_attachments_after_compaction_keep_distinct_reports_and_warnings() {
     let directory = tempfile::tempdir().unwrap();
     let workspace = directory.path().canonicalize().unwrap();

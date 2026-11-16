@@ -14,10 +14,10 @@ Actions → Release Prep → 输入新版本号（不带 v）→ Run
 
 ---
 
-## 四个阶段
+## 五个阶段
 
 ```
-guard ──► build(×5) ──► release ──► verify-install(×4) ──► publish
+guard ──► build(×5) ──► release ──► verify-install(×5) ──► publish
   │          │             │              │                   │
 拒绝非 tag  test+构建   资产+校验和    安装并运行           npm publish
            +执行产物     +自检          真产物
@@ -28,14 +28,14 @@ guard ──► build(×5) ──► release ──► verify-install(×4) ─�
 | `guard` | 拒绝非 tag 触发 | 误触发的 workflow_dispatch（否则会白跑半小时矩阵再报绿） |
 | `build` ×5 | `cargo test` → `cargo build --release` → **执行产物** → 上传 | 编译失败；安全测试静默 skip；**产物起不来**；**glibc floor 被抬高** |
 | `release` | tag↔版本↔CHANGELOG 四者一致 → 资产 → `SHA256SUMS` → **校验和自检** → 建 Release | 版本不一致；缺 changelog 节；校验和生成错或漏（它是所有安装的信任根） |
-| `verify-install` ×4 | 断言宿主平台 == leg 声称的平台 → `npm pack` → 本地安装 → `deepcode --version` / `--help` | 资产名不匹配；`SHA256SUMS` 与资产不一致；postinstall 失败；启动器回归；`os`/`cpu` 标签不匹配 —— **"全平台装不上"这一整类** |
-
-> `verify-install` 只有 **4** 条 leg，这是刻意的。`install.mjs` 按**宿主机**的
-> `platform`-`arch` 选资产，所以在 `macos-latest`（arm64）上放一条叫 `darwin-x64`
-> 的 leg，它会下载并运行 **arm64** 资产然后全绿 —— 一条对它名字里的平台什么都没
-> 证明的 leg，读起来却像覆盖。所以每条 leg 现在都会先断言宿主平台等于自己声称的
-> 平台，不一致就直接红，让这种幽灵 leg 无法悄悄出现。
+| `verify-install` ×5 | 断言宿主平台 == leg 声称的平台 → `npm pack` → 本地安装 → `deepcode --version` / `--help` | 资产名不匹配；`SHA256SUMS` 与资产不一致；postinstall 失败；启动器回归；`os`/`cpu` 标签不匹配 —— **"全平台装不上"这一整类** |
 | `publish` | `npm publish`（幂等） | 只有前四步全绿才跑得到 |
+
+> `verify-install` 使用 **5** 条原生 leg，覆盖 macOS arm64/x64、Linux arm64/x64
+> 和 Windows x64；其中 Intel Mac 使用 `macos-15-intel`。`install.mjs` 按**宿主机**的
+> `platform`-`arch` 选资产，所以在 `macos-latest`（arm64）上仅放一条叫 `darwin-x64`
+> 的 leg，仍会下载并运行 **arm64** 资产，无法证明 Intel Mac 资产可用。每条 leg
+> 都会先断言宿主平台等于自己声称的平台，不一致就失败，确保验证实际覆盖对应产物。
 
 ### 三道闸门各自覆盖的真实回归
 
