@@ -1,97 +1,67 @@
-# 测试与真实服务验证
+# 测试指南
 
-## 评测恢复的离线回归
+从仓库根目录执行以下命令，使用 [rust-toolchain.toml](./rust-toolchain.toml) 固定的 Rust 工具链。
+脚本需要 Bash；打包及 Node 脚本测试另需 Node.js 和 npm。
 
-`cargo test --locked -p deep-code-eval --lib` 使用本地模拟任务和临时文件验证
-逐题保存、并发完成顺序、中断恢复、输出目录锁、配置校验和写入失败。
-这些测试不会调用付费模型,也不会运行 SWE-bench 真实评测。
-
-## 常规验证
-
-PR 的 CI 使用固定 Rust 工具链检查格式、Clippy、workspace 测试和打包契约。本地可运行
-`bash scripts/preflight.sh`；canary runner 自身的契约测试不访问网络或模型：
+## 日常检查
 
 ```sh
+bash scripts/preflight.sh
+bash scripts/check-packaging.sh
 node --test scripts/run-service-canary.test.mjs
 ```
 
-## 工具工作流回归
+- `preflight.sh`：格式、Clippy、公开及私有 rustdoc、workspace 全部 targets 测试和 doctest。
+- `check-packaging.sh`：安装器测试、发布资产与平台矩阵、实际 npm 包内容。
+- `run-service-canary.test.mjs`：真实服务检查脚本自身的离线契约测试。
 
-常规 workspace 测试覆盖有序图文内容、图片快照身份与原生 tool 消息、逐请求视觉路由和省图记录、
-压缩后图片来源保留、超长 UTF-8 文本的字节游标续读、输出落盘完整性、标准输入及 EOF/取消、
-输入权限门，以及 TUI/HTTP/headless 的内容与执行状态投影。这些测试使用临时工作区、真实本地
-子进程和模拟模型客户端，不调用付费 API；协议序列化通过不代表已验证真实提供方的图片理解。
+这三项共同覆盖常规本地检查，不调用付费模型或执行 SWE-bench 真实评测。
+CI 配置见 [.github/workflows/ci.yml](./.github/workflows/ci.yml)。
 
-可归档的工具详情预览另有 1 MiB 的全会话累计保留预算，优先保留近期预览；执行事实与完整详情来源引用
-独立保留。没有来源准备记录的详情保留原文，避免恢复和再次保存丢失唯一副本。新结果的预览
-成本与归档摘要在后台一次准备，会话通过增量队列执行保留，不在每次结果完成时重新序列化历史。
-长轮次回归在同一个用户回合执行 600 次小编辑，验证保存与恢复全部结果、旧 diff 通过
-`read_file` 分页读取完整来源，以及重复保存和重启不会恢复已归档的预览；另有无来源详情恢复、
-增量处理的序列化次数和历史插入后索引更新的回归。
+## 按模块验证
 
-会话超过 8 MiB 时采用小索引和不可变的 1 MiB 数据块保存，恢复时完整重建正文与工具参数；
-索引先验证宿主签名，数据块逐个校验摘要，重建后再验证会话签名。单个索引仍限 8 MiB，
-逻辑正文读取上限为 128 MiB，列表中的候选窗口也限制累计保留体积。600 次、每次 15,000
-字符的 `write_file` 回归检查全部调用参数和完成结果均可恢复；缺块、损坏、链接和写入失败
-另有拒绝或保留旧快照的检查。保留或搬运会话时需要一并保留 `sessions/chunks/`。
+| 模块 | 命令 | 主要范围 |
+| --- | --- | --- |
+| Agent | `cargo test --locked -p deep-code-agent --lib` | 模型协议、工具与权限、会话存储、图片、子代理、沙箱和 LSP |
+| HTTP runtime | `cargo test --locked -p deep-code-runtime --lib` | 认证、SSE、审批和事件协议 |
+| TUI / CLI | `cargo test --locked -p deep-code-tui` | 输入与渲染、命令、会话切换和 headless 行为 |
+| Eval | `cargo test --locked -p deep-code-eval --lib` | 逐题保存、断点续跑、归档及报告 |
 
-数据块引用列表也包含在签名中。保存与删除按所有有效索引回收无引用块，fork 共享块共同保留；
-读写和回收通过目录级文件锁协调，读取期间不会回收其快照。无法确认索引时保守跳过回收并记录
-诊断，清理失败不冒充保存失败。连续 20 次约 10 MiB 前部更新的回归检查块占用收敛，另验证
-fork、并发读写、发布失败及等待锁时的取消行为。
+调试单个场景时可在 `cargo test` 命令后添加测试名过滤条件；确认输出实际运行了目标测试，
+避免将匹配零项当作验证通过。具体回归场景以对应模块的测试源码为准。
+SWE-bench 的运行、归档和官方评分见 [Eval 使用说明](./crates/deep-code-eval/README.md)。
 
-评测归档会复制会话实际引用的图片、详情与完整输出，重定位来源并重新签名；删除原临时工作区后
-仍可读取。缺失来源、越界路径和导出失败会显式报告。长命令详情降级仍保留执行事实；输出截断
-计数区分内联省略字节与环形缓冲淘汰字节，并覆盖非 ASCII 及非法 UTF-8 输出。
-完整工具输出来源由运行时写入 `content_storage`，导出只依据结构化来源元数据；普通正文中的
-续读示例不构成文件引用。
+## 真实服务验证
 
-## 真实服务 canary
+独立的 [Real services (canary)](./.github/workflows/service-canary.yml) 工作流每周运行，
+也可在 Actions 手动触发。它验证真实 DeepSeek SSE、搜索与抓取、子代理，以及本机 rust-analyzer。
 
-`.github/workflows/service-canary.yml` 每周一 04:17 UTC 跑一次，也可从 Actions 的
-**Real services (canary)** 手动触发。它独立于每次 PR 的离线测试，不发布版本、评论或上传会话。
+配置仓库 secret `DEEPCODE_CANARY_API_KEY` 后才运行真实 API 检查；缺少密钥或手动设置
+`live_api=false` 时跳过这些检查，仅运行 LSP。工作流绿色不能代替确认每项是否实际执行。
+带密钥的工作流只在定时或手动选定的可信代码上运行，不接收 PR 触发；手动运行前应审查目标版本。
 
-## 覆盖与结果
-
-- SSE：真实 DeepSeek 请求、认证、流式解析和结束事件。
-- Search & Fetch：一次搜索（最多一个结果）和一次 `https://example.com/` 抓取。
-- 子代理：临时工作区中的单函数只读调查和结构化报告。
-- LSP：固定 Rust 工具链附带的 rust-analyzer，对临时错误文件返回诊断。
-
-配置仓库 secret **`DEEPCODE_CANARY_API_KEY`** 后才执行前三项。建议使用独立、低额度的
-DeepSeek key；它仅在检查密钥是否存在和实际调用服务的步骤中进入环境，构建和 LSP 步骤没有密钥。
-没有 key 时 live API job 会显示 **skipped**，summary 会明确写出未验证 provider；
-workflow 整体为绿色不能替代查看各项是否实际执行。手动输入 `live_api=false` 可只跑 LSP。
-
-工作流只在定时或手动触发的可信代码上运行，不接收 PR 触发；有写权限的维护者应只对已审查的
-revision 手动运行带密钥的检查。不要在公共 PR 中运行该工作流或扩大 token 权限。
-
-## 预算与截止时间
-
-| 检查 | 请求/输出约束 | Rust 检查时限 | 外层进程时限 |
-| --- | --- | --- | --- |
-| SSE | Flash、关闭思考、一次请求、最多 32 输出 tokens | 60 秒 | 90 秒 |
-| Search & Fetch | 一个结果、一次 fetch；服务瞬时错误沿用单次内置重试 | 90 秒 | 120 秒 |
-| 子代理 | Flash、关闭思考、最多 4 个模型请求、每次最多 512 输出 tokens、流式重试关闭 | 120 秒 | 150 秒 |
-| rust-analyzer | 本机临时文件，不调用模型 | 现有 LSP 冷启动轮询预算 | 90 秒 |
-
-编译单独限时 15 分钟，每个 job 总计最多 20 分钟。canary 本身不做失败重跑；频率和输出上限
-控制调用规模，不代表账户的货币硬额度，账户侧仍应设置预算。网络故障、服务契约变化或额度耗尽
-都会让实际执行的检查失败，应查看具体 step，而不是忽略红灯。
-
-## 本地验证
-
-先安装仓库固定的 Rust 工具链。LSP 额外需要 `rustup component add rust-analyzer`；
-脚本的外层截止时间使用 GNU `timeout`，工作流运行在 Ubuntu。
+本地检查需要 GNU `timeout`；LSP 另需 `rustup component add rust-analyzer`：
 
 ```sh
 cargo test --locked -p deep-code-agent --lib --no-run
 bash scripts/run-service-canary.sh lsp
-# 自行设置 DEEPSEEK_API_KEY 后再按需运行；这些命令会产生真实服务调用费用。
+
+# 配置 DEEPSEEK_API_KEY 后按需运行；以下命令会产生真实 API 调用费用。
 bash scripts/run-service-canary.sh sse
 bash scripts/run-service-canary.sh web
 bash scripts/run-service-canary.sh subagent
 ```
 
-脚本在执行前按完整名称确认 ignored 测试确实存在，避免测试改名后 `--exact` 匹配零项却返回成功。
-测试仍保留 `#[ignore]`，常规 `cargo test` 不会自动消耗 API 额度。
+真实服务测试标记为 `#[ignore]`，普通 `cargo test` 不会自动运行。请求、输出和时间预算由
+测试及 [canary 脚本](./scripts/run-service-canary.sh) 定义；使用独立低额度密钥并设置账户预算。
+
+## 验收范围
+
+- 模拟客户端和本地子进程测试验证协议与程序行为；真实提供方的图文理解仍需单独验收。
+- TUI 自动化测试之外，交互改动还需在真实终端验证输入、粘贴、审批、取消和会话恢复。
+- 本机检查通过只代表当前平台；Linux、macOS、Windows 的原生行为需分别验证。
+  Linux/macOS preflight 要求沙箱可用；Windows 本地可能跳过缺少权限的符号链接测试，
+  CI 通过 `DEEPCODE_REQUIRE_SYMLINKS=1` 要求这些测试实际执行。
+- 原生安装与发布验收见 [RELEASING.md](./RELEASING.md)。
+  [Verify Install (canary)](./.github/workflows/verify-install-canary.yml) 可检查已发布版本的五平台安装，
+  不会发布新版本。
