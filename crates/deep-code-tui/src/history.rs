@@ -907,6 +907,11 @@ fn summarize_execution(details: &serde_json::Value) -> Option<String> {
     let page = object
         .get("output_page")
         .and_then(serde_json::Value::as_object);
+    let details_truncated = object
+        .get("details_storage")
+        .and_then(|storage| storage.get("inline_truncated"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
     let job = object.get("job_id")?.as_str()?;
     let stdout = object.get("stdout")?.as_object()?;
     let stderr = object.get("stderr")?.as_object()?;
@@ -937,10 +942,23 @@ fn summarize_execution(details: &serde_json::Value) -> Option<String> {
                 == Some(true)
         {
             let omitted = stream
-                .get("omitted_bytes")
+                .get("inline_omitted_bytes")
                 .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            summary.push_str(&format!("; {name} truncated ({omitted} bytes omitted)"));
+                .or_else(|| {
+                    // A display preview may have shortened or removed text.
+                    // Lossy UTF-8 also changes byte lengths. Neither can be
+                    // used to reconstruct the original inline window.
+                    if details_truncated {
+                        return None;
+                    }
+                    let total = stream.get("total_bytes")?.as_u64()?;
+                    let text = stream.get("text")?.as_str()?;
+                    (!text.contains('\u{fffd}')).then(|| total.saturating_sub(text.len() as u64))
+                });
+            summary.push_str(&format!("; {name} truncated"));
+            if let Some(omitted) = omitted.filter(|bytes| *bytes > 0) {
+                summary.push_str(&format!(" ({omitted} bytes omitted inline)"));
+            }
             if let Some(spill) = stream.get("spill").filter(|spill| spill.is_object()) {
                 if let Some(path) = spill.get("path").and_then(serde_json::Value::as_str) {
                     summary.push_str(&format!(", saved {}", truncate_chars(path, 100)));

@@ -1,7 +1,9 @@
 use super::*;
 
 #[cfg(test)]
-mod tests;
+mod switch_tests;
+#[cfg(test)]
+pub(super) mod tests;
 
 fn run_runtime_future<F: std::future::Future>(future: F) -> Result<F::Output, String> {
     match tokio::runtime::Handle::try_current() {
@@ -17,11 +19,23 @@ fn run_runtime_future<F: std::future::Future>(future: F) -> Result<F::Output, St
 pub(super) enum SessionScanPurpose {
     Picker,
     List,
+    Resume(deep_code_agent::SessionId),
 }
 
 pub(super) struct PendingSessionScan {
     purpose: SessionScanPurpose,
     task: crate::session_scan::SessionScan,
+}
+
+pub(super) struct PendingSessionSwitch {
+    current: Arc<AgentRuntime>,
+    task: crate::session_switch::SessionSwitch,
+}
+
+impl PendingSessionSwitch {
+    pub(super) fn cancel(&self) {
+        self.task.cancel();
+    }
 }
 
 /// Build the effort choices from the embedded model catalog. `auto` is the
@@ -161,14 +175,15 @@ impl App {
     }
 
     /// Stop the subagent supervisor and flush + tear down the live runtime.
-    /// Every runtime swap calls this first so the old session's persistence
-    /// lands on disk before anything re-reads it.
+    /// Configuration changes and new conversations use this path; resumed
+    /// sessions prepare their flush and launch in a background switch.
     fn shutdown_current_runtime(&mut self) {
         let _ = run_runtime_future(self.stop_current_runtime());
     }
 
     async fn stop_current_runtime(&mut self) {
         self.session_scan = None;
+        self.session_switch = None;
         if let Some(stop) = self.subagent_shutdown.take() {
             stop();
         }
@@ -596,8 +611,9 @@ impl App {
 
     fn begin_session_scan(&mut self, purpose: SessionScanPurpose) {
         // A newer request owns a new receiver; a cancelled worker can never
-        // deliver a stale picker/list into it.
+        // deliver a stale result into it.
         self.session_scan = None;
+        self.session_switch = None;
         match JsonSessionStore::for_pinned_workspace(&self.workspace)
             .and_then(crate::session_scan::SessionScan::start)
         {
@@ -613,7 +629,9 @@ impl App {
     }
 
     pub(crate) fn cancel_session_scan(&mut self) -> bool {
-        if self.session_scan.take().is_some() {
+        let scan = self.session_scan.take();
+        let switch = self.session_switch.take();
+        if scan.is_some() || switch.is_some() {
             self.status = self.tr(TextId::StatusResumeCancelled).to_string();
             true
         } else {
@@ -624,12 +642,16 @@ impl App {
     /// Nonblocking: the terminal loop still drains keys and runtime events
     /// while the worker reads the directory.
     pub(crate) fn poll_session_scan(&mut self) -> bool {
+        let cleanup_changed = self.poll_session_cleanup();
+        if self.poll_session_switch() {
+            return true;
+        }
         let Some(result) = self
             .session_scan
             .as_mut()
             .and_then(|scan| scan.task.try_result())
         else {
-            return false;
+            return cleanup_changed;
         };
         let purpose = self
             .session_scan
@@ -650,13 +672,112 @@ impl App {
                         self.status = self.busy_status(TextId::BusySwitchSession);
                     }
                     SessionScanPurpose::List => self.show_session_list(listing.records),
+                    SessionScanPurpose::Resume(_) => {
+                        let record = listing
+                            .records
+                            .into_iter()
+                            .next()
+                            .expect("single-session load returned its record");
+                        if let Err(message) = self.switch_session(record) {
+                            self.status = message;
+                        }
+                    }
                 }
             }
             Err(error) => {
-                self.status =
-                    self.tr_with(TextId::SessionsReadFailed, &[("error", &error.to_string())]);
+                self.status = match purpose {
+                    SessionScanPurpose::Resume(id) => self.tr_with(
+                        TextId::SessionNotFound,
+                        &[("id", id.as_str()), ("error", &error.to_string())],
+                    ),
+                    SessionScanPurpose::Picker | SessionScanPurpose::List => {
+                        self.tr_with(TextId::SessionsReadFailed, &[("error", &error.to_string())])
+                    }
+                };
             }
         }
+        true
+    }
+
+    fn poll_session_switch(&mut self) -> bool {
+        let Some(result) = self
+            .session_switch
+            .as_mut()
+            .and_then(|switch| switch.task.try_result())
+        else {
+            return false;
+        };
+        let pending = self
+            .session_switch
+            .take()
+            .expect("switch result has an owner");
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.status = error;
+                return true;
+            }
+        };
+        if !Arc::ptr_eq(&pending.current, &self.runtime)
+            || self.runtime_busy()
+            || !self.runtime.is_idle()
+        {
+            self.status = self.busy_status(TextId::BusySwitchSession);
+            return true;
+        }
+
+        let (launched, config) = prepared.take();
+        // Starting the cleanup worker can fail. Do this before retiring the
+        // current runtime, and hold its commit permit until adoption succeeds.
+        let mut cleanup =
+            match crate::session_switch::SessionCleanup::prepare(Arc::clone(&self.runtime)) {
+                Ok(cleanup) => cleanup,
+                Err(error) => {
+                    (launched.stop_hook)();
+                    launched.job_store.shutdown();
+                    self.status = error;
+                    return true;
+                }
+            };
+        if let Some(stop) = self.subagent_shutdown.take() {
+            stop();
+        }
+        if let Some(jobs) = self.job_store.take() {
+            jobs.shutdown();
+        }
+        // Everything below is an in-memory commit. No shutdown, save or
+        // session-store lock may be awaited on the terminal thread.
+        let record = self.adopt_configured_runtime(launched, &config);
+        self.finish_session_switch(record.as_ref());
+        // Enqueue now, before the UI can request another switch. The worker
+        // only waits for this receipt; it cannot issue a stale save later.
+        cleanup.commit(self.runtime.commit_prepared_session());
+        self.session_cleanup.push(cleanup);
+        true
+    }
+
+    fn poll_session_cleanup(&mut self) -> bool {
+        let mut errors = Vec::new();
+        self.session_cleanup
+            .retain(|cleanup| match cleanup.try_result() {
+                None => true,
+                Some(Ok(())) => false,
+                Some(Err(error)) => {
+                    errors.push(error);
+                    false
+                }
+            });
+        if errors.is_empty() {
+            return false;
+        }
+        let error = errors.join("\n");
+        if !self.save_error_notified {
+            self.history.push(HistoryCell::system(
+                self.tr_with(TextId::SystemSaveFailed, &[("error", &error)]),
+            ));
+        }
+        self.save_error_notified = true;
+        self.status = self.tr_with(TextId::StatusSaveFailed, &[("error", &error)]);
         true
     }
 
@@ -743,10 +864,13 @@ impl App {
         }
     }
 
-    /// Load session `id` and switch to it in place. Surfaces a readable status
-    /// on a bad id / missing record rather than failing the command.
+    /// Start a cancellable background load; polling applies the switch later.
+    /// A bad id fails immediately, while a missing record is reported on completion.
     pub(crate) fn switch_session_by_id(&mut self, id: &str) -> Result<(), String> {
         self.cancel_session_scan();
+        if self.runtime_busy() {
+            return Err(self.busy_status(TextId::BusySwitchSession));
+        }
         let store = JsonSessionStore::for_pinned_workspace(&self.workspace).map_err(|error| {
             self.tr_with(
                 TextId::SessionStoreOpenFailed,
@@ -759,19 +883,25 @@ impl App {
                 &[("id", id), ("error", &error.to_string())],
             )
         })?;
-        let record = store.load(&session_id).map_err(|error| {
-            self.tr_with(
-                TextId::SessionNotFound,
-                &[("id", id), ("error", &error.to_string())],
-            )
-        })?;
-        self.switch_session(record)
+        let task =
+            crate::session_scan::SessionScan::load(store, session_id.clone()).map_err(|error| {
+                self.tr_with(
+                    TextId::SessionNotFound,
+                    &[("id", id), ("error", &error.to_string())],
+                )
+            })?;
+        self.session_scan = Some(PendingSessionScan {
+            purpose: SessionScanPurpose::Resume(session_id),
+            task,
+        });
+        self.status = self.tr(TextId::StatusScanningSessions).to_string();
+        Ok(())
     }
 
-    /// Switch the live session to `record` in place: shut the current runtime
-    /// down (flushing its persistence), relaunch resuming `record`, and rebuild
-    /// the visible transcript. This is what `/resume` executes.
+    /// Prepare the entire switch in the background. The old runtime remains
+    /// usable until polling commits a completed, still-current request.
     pub(crate) fn switch_session(&mut self, record: SessionRecord) -> Result<(), String> {
+        self.cancel_session_scan();
         if self.runtime_busy() {
             return Err(self.busy_status(TextId::BusySwitchSession));
         }
@@ -780,12 +910,21 @@ impl App {
             return Ok(());
         }
 
-        deep_code_agent::validate_pinned_workspace(&self.workspace)
-            .map_err(|error| error.to_string())?;
-        self.shutdown_current_runtime();
-        let effective_record = self.launch_and_adopt(Some(record.clone()))?;
+        let current = Arc::clone(&self.runtime);
+        let task = crate::session_switch::SessionSwitch::start(
+            Arc::clone(&current),
+            deep_code_agent::WorkspaceRoots::new(self.workspace.clone(), self.extra_roots.clone()),
+            self.global_config_path.clone(),
+            record,
+        )?;
+        self.session_switch = Some(PendingSessionSwitch { current, task });
+        self.status = self.tr(TextId::StatusSwitchingSession).to_string();
+        Ok(())
+    }
 
+    fn finish_session_switch(&mut self, effective_record: Option<&SessionRecord>) {
         self.history.clear();
+        self.save_error_notified = false;
         self.active_turn = None;
         self.clear_selection();
         self.scroll_offset = 0;
@@ -795,7 +934,7 @@ impl App {
         // different session and auto-send there.
         self.steering_queue.clear();
         self.pending_steering_flush = false;
-        if let Some(effective_record) = effective_record.as_ref() {
+        if let Some(effective_record) = effective_record {
             self.history.extend(hydrate_history(effective_record));
         }
         // After the rebuild, so the clear above cannot erase them: resuming is
@@ -809,9 +948,11 @@ impl App {
         self.push_extra_roots_banner();
         self.status = self.tr_with(
             TextId::StatusSwitchedSession,
-            &[("id", record.id.as_str()), ("backend", &self.backend_label)],
+            &[
+                ("id", self.session_id.as_deref().unwrap_or("")),
+                ("backend", &self.backend_label),
+            ],
         );
-        Ok(())
     }
 
     /// Start a fresh conversation in place — what `/clear` executes. The current

@@ -11,6 +11,39 @@ fn job_output_buffer_is_bounded_with_omitted_count() {
 }
 
 #[test]
+fn snapshot_distinguishes_inline_omission_from_ring_eviction_in_source_bytes() {
+    for (source, max_chars, omitted, expected) in [
+        (vec![b'x'; 6000], 4976, 1024, "x".repeat(4976)),
+        (
+            "界".repeat(2000).into_bytes(),
+            1000,
+            3000,
+            "界".repeat(1000),
+        ),
+        (vec![b'a', 0xff, b'b', 0xe2, 0x82], 2, 2, "b�".into()),
+    ] {
+        let buffer = SharedBuffer::default();
+        buffer.push(&source);
+        let snapshot = buffer.snapshot(max_chars);
+        assert_eq!(snapshot.omitted_bytes, 0, "the ring still holds all bytes");
+        assert_eq!(snapshot.inline_omitted_bytes, omitted);
+        assert_eq!(snapshot.text, expected);
+        assert!(snapshot.inline_truncated);
+    }
+    let buffer = SharedBuffer(Arc::new(Mutex::new(RingBuffer::new(4))));
+    buffer.push("界xy".as_bytes());
+    let snapshot = buffer.snapshot(2);
+    assert_eq!(snapshot.text, "xy");
+    assert_eq!(snapshot.omitted_bytes, 1);
+    assert_eq!(snapshot.inline_omitted_bytes, 3);
+    let page = buffer
+        .page(super::super::JobStream::Stdout, Some(0), 10)
+        .unwrap();
+    assert_eq!(page.retained_start_byte, 1);
+    assert_eq!(page.end_byte, 5);
+}
+
+#[test]
 fn retained_pages_report_eviction_and_never_split_utf8_scalars() {
     let buffer = SharedBuffer::default();
     let source = "界😀".repeat(JOB_BUFFER_BYTES / 7 + 100);

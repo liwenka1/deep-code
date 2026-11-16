@@ -3158,6 +3158,7 @@ fn switch_session_adopts_and_banners_the_records_grants() {
     store.save(&mut record).unwrap();
 
     app.switch_session(record).unwrap();
+    super::session::tests::finish_scan(&mut app);
 
     // The display state must describe the adopted runtime's boundary, not the
     // (grantless) one this App launched with — and say so in the transcript.
@@ -3305,14 +3306,29 @@ fn every_swap_path_delivers_its_warnings() {
         })
     };
 
-    // `/resume` — switch_session rebuilds the transcript, then flushes.
+    // `/resume` rebuilds from an authenticated record and must retain the
+    // warning explaining why a formerly granted directory was dropped.
+    let resume_workspace = tempfile::tempdir().unwrap();
+    let extra = tempfile::tempdir().unwrap();
     let mut app = App::launch(LaunchConfig {
-        workspace: Some(workspace.clone()),
+        workspace: Some(resume_workspace.path().to_path_buf()),
         ..LaunchConfig::default()
     });
-    let record = deep_code_agent::SessionRecord::new(workspace.clone(), "system");
+    let mut record = SessionRecord::new(app.workspace.clone(), "system")
+        .with_extra_roots(vec![extra.path().canonicalize().unwrap()]);
+    JsonSessionStore::for_pinned_workspace(&app.workspace)
+        .unwrap()
+        .save(&mut record)
+        .unwrap();
+    drop(extra);
+    app.history.clear();
     app.switch_session(record).unwrap();
-    assert!(degraded(&app), "/resume dropped the swap's warnings");
+    super::session::tests::finish_scan(&mut app);
+    assert!(
+        app.history.iter().any(|cell| matches!(cell,
+        HistoryCell::System { text } if text.contains("dropping recorded --add-dir grant"))),
+        "/resume dropped the swap's warnings"
+    );
 
     // `/model` & friends — relaunch_runtime does NOT clear the transcript.
     let mut app = App::launch(LaunchConfig {

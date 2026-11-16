@@ -13,6 +13,9 @@ use crate::model_registry::{DEEPSEEK_FLASH, DEEPSEEK_V4_PRO};
 use crate::session_store::SessionStore;
 use crate::tool::{MockEchoTool, Tool, ToolError, ToolRegistry, ToolResultStatus};
 
+#[path = "storage_tests.rs"]
+mod storage_tests;
+
 #[tokio::test]
 async fn the_final_session_update_reports_the_completed_save_failure() {
     use crate::session_store::{SessionId, SessionRecord, SessionStoreError};

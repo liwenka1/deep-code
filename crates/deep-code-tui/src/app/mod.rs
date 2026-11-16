@@ -11,11 +11,12 @@ use std::sync::Arc;
 
 use std::path::PathBuf;
 
+#[cfg(test)]
+use deep_code_agent::SessionStore;
 use deep_code_agent::{
     AgentConfig, AgentRuntime, ApprovalDecision, ApprovalRequest, CostCurrency, JobStore,
-    JsonSessionStore, LaunchedRuntime, RuntimeEvent, SessionRecord, SessionStore,
-    SharedSubAgentManager, TurnTelemetry, UserTurn, default_config_path, launch_runtime,
-    supports_vision_for_model,
+    JsonSessionStore, LaunchedRuntime, RuntimeEvent, SessionRecord, SharedSubAgentManager,
+    TurnTelemetry, UserTurn, default_config_path, launch_runtime, supports_vision_for_model,
 };
 use tokio::sync::mpsc;
 
@@ -285,6 +286,8 @@ pub struct App {
     /// and applied together when the second Enter is pressed.
     pub(crate) model_picker: Option<ModelPicker>,
     session_scan: Option<session::PendingSessionScan>,
+    session_switch: Option<session::PendingSessionSwitch>,
+    session_cleanup: Vec<crate::session_switch::SessionCleanup>,
     /// UI language, resolved from config at launch; `/lang` switches it live.
     pub(crate) lang: Lang,
     /// Session permission mode, shared (lock-free) with the runtime's approval
@@ -867,6 +870,8 @@ impl App {
             resume_picker: None,
             model_picker: None,
             session_scan: None,
+            session_switch: None,
+            session_cleanup: Vec::new(),
             lang,
             permission_mode,
             sandbox_off,
@@ -1219,6 +1224,9 @@ impl App {
         if let Some(scan) = &self.session_scan {
             scan.cancel();
         }
+        if let Some(switch) = &self.session_switch {
+            switch.cancel();
+        }
         if let Some(shutdown) = &self.subagent_shutdown {
             shutdown();
         }
@@ -1229,5 +1237,10 @@ impl App {
             job_store.shutdown();
         }
         self.runtime.shutdown().await;
+        for cleanup in &self.session_cleanup {
+            // Save errors remain available on the runtime and are shown by
+            // polling while the UI is active. Exit still drains every task.
+            let _ = cleanup.finish().await;
+        }
     }
 }

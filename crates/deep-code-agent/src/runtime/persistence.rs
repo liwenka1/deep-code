@@ -206,6 +206,27 @@ impl AgentRuntime {
             .and_then(|persistence| persistence.actor.last_save_error())
     }
 
+    /// Queue persistence of the record created by
+    /// [`crate::prepare_runtime_resume`] at the moment its runtime is adopted.
+    /// This neither locks runtime state nor performs I/O. The returned future
+    /// only waits for that queued write; delaying it never queues a later
+    /// snapshot, and dropping it does not cancel the write. Subsequent live
+    /// changes use [`Self::flush_session`].
+    pub fn commit_prepared_session(
+        &self,
+    ) -> impl std::future::Future<Output = Option<String>> + Send + 'static {
+        let receipt = self.persistence.as_ref().map(|persistence| {
+            let actor = persistence.actor.clone();
+            let receipt = actor.request_flush();
+            (actor, receipt)
+        });
+        async move {
+            let (actor, receipt) = receipt?;
+            let _ = receipt.await;
+            actor.last_save_error()
+        }
+    }
+
     /// Persist the current session and wait for the writer's final outcome.
     pub async fn flush_session(&self) -> Option<String> {
         self.persist().await;
@@ -315,6 +336,62 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_commit_is_queued_before_its_receipt_is_polled() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonicalize(workspace.path()).unwrap();
+        let store = JsonSessionStore::for_workspace(&workspace).unwrap();
+        let record = SessionRecord::new(workspace, "prepared system prompt");
+        let id = record.id.clone();
+        let runtime = AgentRuntime::from_record(
+            crate::echo_client::EchoClient::new(crate::i18n::SharedLang::default()),
+            ToolRegistry::default(),
+            record,
+            Some(store.clone()),
+            AgentConfig::builtin(),
+        );
+        let state = runtime.state.lock().await;
+        let receipt = runtime.commit_prepared_session();
+
+        // The commit must already be in the actor queue, even though neither
+        // its receipt nor the runtime state lock is available to a lazy save.
+        let initial = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let reader = store.clone();
+                let id = id.clone();
+                match tokio::task::spawn_blocking(move || reader.load(&id))
+                    .await
+                    .unwrap()
+                {
+                    Ok(record) => break record,
+                    Err(SessionStoreError::NotFound { .. }) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected session read failure: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("an unpolled receipt must not delay the committed write");
+        assert!(initial.summary.is_none());
+
+        runtime
+            .persistence
+            .as_ref()
+            .unwrap()
+            .record
+            .lock()
+            .await
+            .summary = Some("a later record must not be saved by the old receipt".into());
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), receipt)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(store.load(&id).unwrap().summary.is_none());
+        drop(state);
+        runtime.shutdown_after_flush().await;
+    }
 
     #[tokio::test]
     async fn current_turn_report_pruning_survives_repeated_persistence_and_finish() {

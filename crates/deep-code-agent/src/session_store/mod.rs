@@ -4,6 +4,7 @@
 //! [`SessionStore`] trait is intentionally narrow so a SQLite backend can
 //! replace JSON later without touching the runtime.
 
+mod export;
 mod json;
 
 use std::path::{Path, PathBuf};
@@ -31,6 +32,8 @@ use crate::session_entry::{EntryKind, SessionEntry};
 /// can therefore be written by the model; loading them must not turn into an
 /// unbounded allocation or a picker-wide memory blow-up.
 pub(crate) const MAX_SESSION_FILE_BYTES: u64 = 8 * 1024 * 1024;
+/// Reconstruction limit for an authenticated session stored in bounded chunks.
+pub(crate) const MAX_SESSION_BODY_BYTES: u64 = 128 * 1024 * 1024;
 pub(crate) const MAX_SESSION_ENTRIES: usize = 4096;
 /// Image-report history has its own ceiling, independent of model context.
 pub(crate) const IMAGE_REPORT_BUDGET_BYTES: usize = 512 * 1024;

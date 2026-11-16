@@ -320,7 +320,18 @@ fn list_finds_the_latest_session_beyond_the_former_entry_scan_limit() {
 
     // Pick the actual last directory entry, rather than assuming filesystem
     // enumeration follows creation order or sorts the filenames.
-    let last = store.directory.entries().unwrap().last().unwrap().unwrap();
+    let last = store
+        .directory
+        .entries()
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            Path::new(&entry.file_name())
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .last()
+        .unwrap();
     let path = store.root.join(last.file_name());
     let mut newest = store.read_file(&path).unwrap();
     newest.updated_at_ms = 1_000;
@@ -357,7 +368,18 @@ fn list_finds_the_latest_session_beyond_the_former_byte_scan_limit() {
         ));
         write_padded(&mut record);
     }
-    let last = store.directory.entries().unwrap().last().unwrap().unwrap();
+    let last = store
+        .directory
+        .entries()
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            Path::new(&entry.file_name())
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .last()
+        .unwrap();
     let mut newest = store.read_file(&store.root.join(last.file_name())).unwrap();
     newest.updated_at_ms = 1_000;
     write_padded(&mut newest);

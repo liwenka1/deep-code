@@ -17,6 +17,7 @@ mod markdown;
 mod prompt_history;
 mod session_cli;
 mod session_scan;
+mod session_switch;
 mod startup;
 mod ui;
 

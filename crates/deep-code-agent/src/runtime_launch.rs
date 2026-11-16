@@ -246,6 +246,26 @@ pub fn relaunch_runtime(
     Ok(launched)
 }
 
+/// Prepare an authenticated session replacement without saving it. The caller
+/// may discard the runtime while a switch is still cancellable; only after
+/// adopting it should the caller request persistence with
+/// [`AgentRuntime::flush_session`].
+pub fn prepare_runtime_resume(
+    config: &AgentConfig,
+    mut roots: WorkspaceRoots,
+    record: SessionRecord,
+) -> std::io::Result<LaunchedRuntime> {
+    let mut warnings = validate_inherited_roots(&mut roots)?;
+    let session = prepare_resumed_session(record, roots.primary, roots.extras)?;
+    if session.store.is_none() {
+        return Err(std::io::Error::other(session.warnings.join("; ")));
+    }
+    let mut launched = finish_resume(config, session, &CancellationToken::new());
+    warnings.append(&mut launched.warnings);
+    launched.warnings = warnings;
+    Ok(launched)
+}
+
 fn validate_inherited_roots(roots: &mut WorkspaceRoots) -> std::io::Result<Vec<String>> {
     crate::pinned_dir::validate_pinned_workspace(&roots.primary)?;
     let mut warnings = Vec::new();
@@ -645,29 +665,56 @@ fn finish_resumed_launch<C: LlmClient + Clone + 'static>(
 
 fn launch_resumed(
     config: &AgentConfig,
-    mut record: SessionRecord,
+    record: SessionRecord,
     caller_workspace: PathBuf,
     cli_extras: Vec<PathBuf>,
     parent_cancel: &CancellationToken,
 ) -> LaunchedRuntime {
+    let fallback_roots = WorkspaceRoots::new(caller_workspace.clone(), cli_extras.clone());
+    let mut session = match prepare_resumed_session(record, caller_workspace, cli_extras) {
+        Ok(session) => session,
+        Err(error) => {
+            let mut launched = launch_runtime_pinned(config, fallback_roots, None);
+            launched.warnings.insert(
+                0,
+                format!("{error}; starting a new session and preserving the original file"),
+            );
+            return launched;
+        }
+    };
+    let Some(store) = session.store.as_ref() else {
+        let mut launched = launch_runtime_pinned(config, session.roots, None);
+        launched.warnings.splice(0..0, session.warnings);
+        return launched;
+    };
+    // Save refreshed grants and prompt even when the caller exits before its
+    // first turn. Cancellable UI preparation instead defers this until commit.
+    if let Err(error) = store.save(&mut session.record) {
+        session
+            .warnings
+            .push(format!("failed to persist resumed session grants: {error}"));
+    }
+    finish_resume(config, session, parent_cancel)
+}
+
+fn prepare_resumed_session(
+    mut record: SessionRecord,
+    caller_workspace: PathBuf,
+    cli_extras: Vec<PathBuf>,
+) -> std::io::Result<ResumedSession> {
     let mut warnings = Vec::new();
     // The session file is writable from inside the workspace. A root-only tag
     // therefore cannot make the transcript trustworthy: a forged user/image
     // entry would still be sent to the provider on the next turn. Verify the
     // complete record before any entry reaches `Session::from_entries`.
     if !crate::session_integrity::verify_record(&mut record) {
-        // Disk loading rejects this earlier. Direct library callers can also
-        // pass a record, so never overwrite its id with a cleared transcript.
-        let mut launched = launch_runtime_pinned(
-            config,
-            WorkspaceRoots::new(caller_workspace, cli_extras),
-            None,
-        );
-        launched.warnings.insert(0, format!(
-            "cannot resume session {}: missing or invalid host authorship tag; starting a new session and preserving the original file",
-            record.id.as_str(),
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "cannot resume session {}: missing or invalid host authorship tag",
+                record.id.as_str(),
+            ),
         ));
-        return launched;
     }
     // Do the grants in this record actually come from this host?
     //
@@ -849,34 +896,28 @@ fn launch_resumed(
     record.set_system_prompt(runtime_system_prompt(&roots, &instructions, &skills));
     let workspace = record.workspace.clone();
     let store = match JsonSessionStore::for_pinned_workspace(&workspace) {
-        Ok(store) => store,
+        Ok(store) => Some(store),
         Err(error) => {
-            let mut launched = launch_runtime_pinned(config, roots, None);
-            launched
-                .warnings
-                .insert(0, format!("session store unavailable: {error}"));
-            launched.warnings.splice(1..1, warnings);
-            return launched;
+            warnings.insert(0, format!("session store unavailable: {error}"));
+            None
         }
     };
-    // Save the merged grants and refreshed prompt NOW, not at the first
-    // turn's persist(): "grants persist with the session" must hold even for
-    // a resume that adds a grant and exits before any turn — the next plain
-    // `-c` should still see it. A failure degrades to a warning; the
-    // persistence actor retries the write on the first turn anyway.
-    if let Err(error) = store.save(&mut record) {
-        warnings.push(format!("failed to persist resumed session grants: {error}"));
-    }
-
-    let session = ResumedSession {
+    Ok(ResumedSession {
         record,
-        store: Some(store),
+        store,
         live_state: None,
         roots,
         warnings,
         instructions,
         skills,
-    };
+    })
+}
+
+fn finish_resume(
+    config: &AgentConfig,
+    session: ResumedSession,
+    parent_cancel: &CancellationToken,
+) -> LaunchedRuntime {
     let ui_lang = SharedLang::new(Lang::from_env(&config.language));
     if config.api_key.is_some()
         && let Ok(client) = DeepSeekClient::new(config.clone())

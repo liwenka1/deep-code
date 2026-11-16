@@ -117,8 +117,8 @@ pub use runtime::{
     unattended_denial_note,
 };
 pub use runtime_launch::{
-    LaunchedRuntime, launch_runtime, prepare_runtime_reconfiguration, relaunch_runtime,
-    tools_enabled, web_enabled,
+    LaunchedRuntime, launch_runtime, prepare_runtime_reconfiguration, prepare_runtime_resume,
+    relaunch_runtime, tools_enabled, web_enabled,
 };
 pub use sandbox::{Enforcement, EnforcementGap, sandbox_available, sandbox_enforcement};
 pub use session::Session;

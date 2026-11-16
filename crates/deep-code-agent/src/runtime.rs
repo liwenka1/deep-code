@@ -388,6 +388,19 @@ impl AgentRuntime {
         }
     }
 
+    /// Retire background resources without another persistence request. Use
+    /// for an idle runtime that was flushed and no longer accepts input, or a
+    /// prepared replacement that never accepted input.
+    pub async fn shutdown_after_flush(&self) {
+        self.cancel_live_turn().await;
+        if let Some(jobs) = &self.jobs {
+            jobs.shutdown();
+        }
+        if let Some(lsp) = self.lsp.as_ref() {
+            lsp.shutdown_all().await;
+        }
+    }
+
     /// Cancel the in-flight turn, if any, and wait — bounded — for its loop to
     /// observe the token and finalize. The loop runs as its own task, so it is
     /// still polled while this waits; on cancel the foreground-shell arm kills
@@ -702,6 +715,16 @@ impl AgentRuntime {
     /// tests/debugging.
     pub async fn session_messages(&self) -> Vec<Message> {
         self.state.lock().await.session.wire_messages()
+    }
+
+    /// Nonblocking idle check for a controller committing a prepared switch.
+    /// A locked state is treated as busy. The controller must also stop or
+    /// cancel the switch when it accepts new input.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        self.state
+            .try_lock()
+            .is_ok_and(|state| state.current_turn_id.is_none() && state.pending.is_none())
     }
 
     /// The id of the turn currently in flight, if any. The SSE server captures

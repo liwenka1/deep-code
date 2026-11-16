@@ -25,6 +25,82 @@ async fn preparing_a_live_reconfiguration_does_not_write_the_session_file() {
     prepared.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preparing_and_discarding_a_resume_does_not_wait_for_or_write_the_store() {
+    let workspace = tempfile::tempdir().unwrap();
+    let ws = crate::paths::canonicalize(workspace.path()).unwrap();
+    let store = JsonSessionStore::for_workspace(&ws).unwrap();
+    let mut record = SessionRecord::new(ws.clone(), "stale system prompt");
+    record.entries.push(Arc::new(crate::SessionEntry::user(
+        "keep this conversation",
+    )));
+    store.save(&mut record).unwrap();
+    let directory = crate::session_store::sessions_dir_for_workspace(&ws);
+    let path = directory.join(format!("{}.json", record.id.as_str()));
+    let before = std::fs::read(&path).unwrap();
+    let extra = tempfile::tempdir().unwrap();
+    let extra = crate::paths::canonicalize(extra.path()).unwrap();
+    std::fs::write(ws.join("AGENTS.md"), "Current resume instructions").unwrap();
+
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(directory.join(".store.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let (release, released) = std::sync::mpsc::channel();
+    // A regression can finish and fail its duration assertion, rather than
+    // leaving the suite waiting forever on its own held store lock.
+    let writer = std::thread::spawn(move || {
+        let _ = released.recv_timeout(std::time::Duration::from_secs(5));
+        lock.unlock().unwrap();
+    });
+
+    let started = std::time::Instant::now();
+    let prepared = prepare_runtime_resume(
+        &AgentConfig::builtin(),
+        WorkspaceRoots::new(&ws, vec![extra.clone()]),
+        record,
+    )
+    .unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(prepared.extra_roots, vec![extra]);
+    let effective = prepared.resume_record.as_ref().unwrap();
+    assert!(matches!(&effective.entries[0].kind,
+        crate::EntryKind::System { content } if content.contains("Current resume instructions")));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    (prepared.stop_hook)();
+    let started = std::time::Instant::now();
+    prepared.handle.shutdown_after_flush().await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    drop(prepared);
+    release.send(()).unwrap();
+    writer.join().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn preparing_a_resume_rejects_forgery_without_creating_a_fallback_session() {
+    let workspace = tempfile::tempdir().unwrap();
+    let ws = crate::paths::canonicalize(workspace.path()).unwrap();
+    let store = JsonSessionStore::for_workspace(&ws).unwrap();
+    let mut record = SessionRecord::new(ws.clone(), "system");
+    store.save(&mut record).unwrap();
+    let directory = crate::session_store::sessions_dir_for_workspace(&ws);
+    let path = directory.join(format!("{}.json", record.id.as_str()));
+    let before = std::fs::read(&path).unwrap();
+    let count_before = std::fs::read_dir(&directory).unwrap().count();
+    record
+        .entries
+        .push(Arc::new(crate::SessionEntry::user("forged")));
+
+    let result = prepare_runtime_resume(&AgentConfig::builtin(), WorkspaceRoots::from(ws), record);
+    assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::InvalidData));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), count_before);
+}
+
 /// Tool names in the parent registry built for `client`.
 fn parent_tool_names<C: LlmClient + Clone + 'static>(
     client: C,

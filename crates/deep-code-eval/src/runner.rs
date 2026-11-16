@@ -44,8 +44,8 @@ pub struct EvalConfig {
     pub agent_config: AgentConfig,
     /// Timeout per instance (wall-clock).
     pub instance_timeout: Duration,
-    /// Where to copy each instance's session transcript before its throwaway
-    /// workspace is dropped. `None` discards them.
+    /// Where to export each instance's transcript and referenced observations
+    /// before its throwaway workspace is dropped. `None` discards them.
     pub transcripts_dir: Option<PathBuf>,
     /// Persist each completed instance and current exports here. `None` keeps
     /// the library's in-memory behavior; the CLI always supplies its `--out`.
@@ -628,15 +628,24 @@ async fn run_single(
     // session with it. Without this, diagnosing a low score means re-running
     // the whole split. Copied before patch extraction so even an extraction
     // failure keeps its evidence.
-    if let Some(dir) = config.transcripts_dir.as_deref()
-        && let Err(error) = save_transcript(workspace.path(), dir, &instance_id).await
-    {
-        eprintln!("warning: transcript not saved for {instance_id}: {error}");
-    }
+    let transcript_error = if let Some(dir) = config.transcripts_dir.as_deref() {
+        save_transcript(workspace.path(), dir, &instance_id)
+            .await
+            .err()
+            .map(|error| format!("transcript export failed: {error}"))
+    } else {
+        None
+    };
 
     let patch = match extract_git_diff(patch_repository).await {
         Ok(patch) => patch,
-        Err(e) => return error_result(format!("patch extraction failed: {e}"), &start),
+        Err(e) => {
+            let mut result = error_result(format!("patch extraction failed: {e}"), &start);
+            if let Some(error) = transcript_error {
+                record_transcript_error(&mut result, error);
+            }
+            return result;
+        }
     };
 
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -661,12 +670,7 @@ async fn run_single(
         // session spend so a timed-out instance still reports its real cost.
         None => (session_spend.cost.cny, None, None, false),
     };
-    println!(
-        "  ✓ {instance_id}: {status:?} ({}s, patch={}b, ¥{cost_cny:.4})",
-        duration_ms / 1000,
-        patch.len()
-    );
-    InstanceResult {
+    let mut result = InstanceResult {
         instance_id,
         status,
         patch,
@@ -680,7 +684,31 @@ async fn run_single(
         route_source,
         cascade_triggered,
         error,
+    };
+    if let Some(error) = transcript_error {
+        record_transcript_error(&mut result, error);
     }
+    println!(
+        "  ✓ {}: {:?} ({}s, patch={}b, ¥{cost_cny:.4})",
+        result.instance_id,
+        result.status,
+        duration_ms / 1000,
+        result.patch.len()
+    );
+    result
+}
+
+fn record_transcript_error(result: &mut InstanceResult, error: String) {
+    if matches!(
+        result.status,
+        InstanceStatus::PatchProduced | InstanceStatus::EmptyPatch
+    ) {
+        result.status = InstanceStatus::Error;
+    }
+    result.error = Some(match result.error.take() {
+        Some(original) => format!("{original}; {error}"),
+        None => error,
+    });
 }
 
 #[derive(Default)]
@@ -714,37 +742,40 @@ async fn consume_events(mut turn: TurnHandle) -> TurnOutcome {
     }
 }
 
-/// Copy one instance's session transcripts out of its throwaway workspace,
-/// into `<dest_root>/<instance_id>/`. Only `sessions/` — `checkpoints/` next
-/// to it are full workspace snapshots, gigabytes across a split.
+/// Export a standalone observation workspace to `<dest_root>/<instance_id>/`.
+/// Only referenced sources travel; checkpoints and unrelated state stay behind.
 async fn save_transcript(
     workspace: &Path,
     dest_root: &Path,
     instance_id: &str,
 ) -> anyhow::Result<()> {
-    let sessions = workspace.join(".deep-code").join("sessions");
-    if !sessions.is_dir() {
-        return Ok(()); // persistence was unavailable for this instance
+    if !matches!(
+        Path::new(instance_id)
+            .components()
+            .collect::<Vec<_>>()
+            .as_slice(),
+        [std::path::Component::Normal(_)]
+    ) {
+        anyhow::bail!("invalid transcript instance id");
     }
-    let dest = dest_root.join(instance_id);
-    tokio::fs::create_dir_all(&dest).await?;
-    let mut entries = tokio::fs::read_dir(&sessions).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        // Only real files. `DirEntry::file_type` does NOT follow symlinks, so a
-        // `sessions/x.json` symlink the agent planted (an ordinary workspace
-        // write) is skipped rather than having `tokio::fs::copy` — which DOES
-        // follow symlinks — copy its target (e.g. ~/.deep-code/config.toml, the
-        // API key) out into eval-out, from this unsandboxed harness.
-        if !entry.file_type().await.is_ok_and(|kind| kind.is_file()) {
-            continue;
-        }
-        if path.extension().is_some_and(|ext| ext == "json")
-            && let Some(name) = path.file_name()
-        {
-            tokio::fs::copy(&path, dest.join(name)).await?;
+    for directory in [
+        workspace.join(".deep-code"),
+        workspace.join(".deep-code/sessions"),
+    ] {
+        match tokio::fs::symlink_metadata(directory).await {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => anyhow::bail!("transcript storage is not a regular directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
         }
     }
+    let workspace = workspace.to_path_buf();
+    let destination = dest_root.join(instance_id);
+    tokio::task::spawn_blocking(move || {
+        deep_code_agent::JsonSessionStore::for_workspace(&workspace)?
+            .export_all_bundles(&destination)
+    })
+    .await??;
     Ok(())
 }
 
@@ -879,13 +910,14 @@ mod tests {
     async fn transcript_copy_takes_sessions_and_leaves_checkpoints() {
         let workspace = tempfile::tempdir().unwrap();
         let agent_dir = workspace.path().join(".deep-code");
-        tokio::fs::create_dir_all(agent_dir.join("sessions"))
-            .await
-            .unwrap();
+        use deep_code_agent::{JsonSessionStore, SessionRecord, SessionStore};
+        let store = JsonSessionStore::for_workspace(workspace.path()).unwrap();
+        let mut record = SessionRecord::new(
+            deep_code_agent::canonicalize(workspace.path()).unwrap(),
+            "system",
+        );
+        store.save(&mut record).unwrap();
         tokio::fs::create_dir_all(agent_dir.join("checkpoints").join("ckpt_1"))
-            .await
-            .unwrap();
-        tokio::fs::write(agent_dir.join("sessions/session_1.json"), b"{}")
             .await
             .unwrap();
         tokio::fs::write(agent_dir.join("sessions/notes.txt"), b"x")
@@ -901,7 +933,16 @@ mod tests {
             .unwrap();
 
         let dest = out.path().join("repo__repo-1");
-        assert!(dest.join("session_1.json").is_file());
+        let restored = JsonSessionStore::for_workspace(&dest)
+            .unwrap()
+            .load(&record.id)
+            .unwrap();
+        assert_eq!(restored.entries, record.entries);
+        assert!(
+            dest.join(".deep-code/sessions")
+                .join(format!("{}.json", record.id.as_str()))
+                .is_file()
+        );
         assert!(
             !dest.join("notes.txt").exists(),
             "only session json travels"
@@ -924,9 +965,13 @@ mod tests {
         tokio::fs::create_dir_all(&sessions).await.unwrap();
 
         // A real session file, and a secret sitting outside the workspace.
-        tokio::fs::write(sessions.join("real.json"), b"{}")
-            .await
-            .unwrap();
+        use deep_code_agent::{JsonSessionStore, SessionRecord, SessionStore};
+        let store = JsonSessionStore::for_workspace(workspace.path()).unwrap();
+        let mut record = SessionRecord::new(
+            deep_code_agent::canonicalize(workspace.path()).unwrap(),
+            "system",
+        );
+        store.save(&mut record).unwrap();
         let secret = tempfile::tempdir().unwrap();
         tokio::fs::write(secret.path().join("id_rsa"), b"PRIVATE KEY")
             .await
@@ -942,11 +987,14 @@ mod tests {
 
         let dest = out.path().join("repo__repo-1");
         assert!(
-            dest.join("real.json").is_file(),
+            JsonSessionStore::for_workspace(&dest)
+                .unwrap()
+                .load(&record.id)
+                .is_ok(),
             "real sessions still travel"
         );
         assert!(
-            !dest.join("stolen.json").exists(),
+            !dest.join(".deep-code/sessions/stolen.json").exists(),
             "a symlinked session file must not be followed and copied out"
         );
     }
@@ -961,6 +1009,53 @@ mod tests {
             save_transcript(workspace.path(), out.path(), "x__x-1")
                 .await
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn transcript_export_failure_is_persisted_without_losing_the_patch_or_primary_error() {
+        let mut result = task_error("repo__repo-1", "unused".into());
+        result.status = InstanceStatus::PatchProduced;
+        result.patch = "a useful patch".into();
+        result.error = None;
+        record_transcript_error(
+            &mut result,
+            "transcript export failed: source is missing".into(),
+        );
+        assert_eq!(result.status, InstanceStatus::Error);
+        assert_eq!(result.patch, "a useful patch");
+        assert_eq!(
+            result.error.as_deref(),
+            Some("transcript export failed: source is missing")
+        );
+
+        result.status = InstanceStatus::Timeout;
+        result.error = Some("instance timeout".into());
+        record_transcript_error(
+            &mut result,
+            "transcript export failed: permission denied".into(),
+        );
+        assert_eq!(result.status, InstanceStatus::Timeout);
+        assert!(
+            result
+                .error
+                .as_ref()
+                .unwrap()
+                .starts_with("instance timeout; ")
+        );
+        let restored: InstanceResult =
+            serde_json::from_slice(&serde_json::to_vec(&result).unwrap()).unwrap();
+        assert_eq!(restored.error, result.error);
+    }
+
+    #[tokio::test]
+    async fn transcript_destination_rejects_instance_path_traversal() {
+        let workspace = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        assert!(
+            save_transcript(workspace.path(), out.path(), "../escape")
+                .await
+                .is_err()
         );
     }
 

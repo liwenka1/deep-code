@@ -492,13 +492,9 @@ impl AgentRuntime {
         let details = result.details.clone();
         let workspace = self.workspace.clone();
         let prepared = match crate::tool::run_blocking("tool_output", move || {
-            let details = bound_tool_details(details, workspace.as_deref());
+            let (content, details) = prepare_tool_output(&content, details, workspace.as_deref());
             let prepared = details.as_ref().and_then(PreparedPreview::new);
-            Ok((
-                bound_tool_content(&content, workspace.as_deref()),
-                details,
-                prepared,
-            ))
+            Ok((content, details, prepared))
         })
         .await
         {
@@ -511,8 +507,8 @@ impl AgentRuntime {
                 result
                     .content
                     .push_text(format!("\n[output preparation failed: {error}]"));
-                result.content = bound_tool_content(&result.content, None);
-                result.details = bound_tool_details(result.details.take(), None);
+                (result.content, result.details) =
+                    prepare_tool_output(&result.content, result.details.take(), None);
                 result.details.as_ref().and_then(PreparedPreview::new)
             }
         };
@@ -564,6 +560,28 @@ pub(crate) const TOOL_OUTPUT_BUDGET: usize = 12_000;
 /// the session record. Model text and UI metadata have independent budgets.
 const TOOL_DETAILS_BUDGET_BYTES: usize = 16 * 1024;
 
+fn prepare_tool_output(
+    content: &Content,
+    mut details: Option<serde_json::Value>,
+    workspace: Option<&std::path::Path>,
+) -> (Content, Option<serde_json::Value>) {
+    // Only this preparation step establishes a captured content source. A
+    // tool's display data cannot assert that its body was shortened here.
+    if let Some(object) = details.as_mut().and_then(serde_json::Value::as_object_mut) {
+        object.remove("content_storage");
+    }
+    let (content, storage) = bound_tool_content(content, workspace);
+    if let Some(storage) = storage {
+        let mut value = details.unwrap_or_else(|| serde_json::json!({}));
+        if !value.is_object() {
+            value = serde_json::json!({"preview": value});
+        }
+        value["content_storage"] = storage;
+        details = Some(value);
+    }
+    (content, bound_tool_details(details, workspace))
+}
+
 fn bound_tool_details(
     details: Option<serde_json::Value>,
     workspace: Option<&std::path::Path>,
@@ -606,11 +624,14 @@ fn bound_tool_details(
         return Some(preview);
     }
     preview["details_storage"]["inline_truncated"] = true.into();
-    let storage = preview["details_storage"].clone();
 
     // Shorten display payloads without modifying identities or execution
     // facts such as capture_complete, byte counters and process exit status.
     let mut paths = vec![
+        "/command".to_string(),
+        "/cwd".into(),
+        "/name".into(),
+        "/edit/path".into(),
         "/edit/diff".to_string(),
         "/stdout/text".into(),
         "/stderr/text".into(),
@@ -629,7 +650,7 @@ fn bound_tool_details(
         })
         .collect();
     if sources.is_empty() {
-        return Some(serde_json::json!({"details_storage": storage}));
+        return Some(crate::tool::details::compact_details(&preview));
     }
     for limit in [2048, 1024, 512, 256, 128, 64] {
         for (path, source) in &sources {
@@ -646,34 +667,63 @@ fn bound_tool_details(
             if path == "/edit/diff" && source.chars().count() > limit {
                 preview["edit"]["truncated"] = true.into();
             }
+            if matches!(path.as_str(), "/command" | "/cwd" | "/name")
+                && source.chars().count() > limit
+            {
+                preview[format!("{}_truncated", &path[1..])] = true.into();
+            }
+            if path == "/edit/path" && source.chars().count() > limit {
+                preview["edit"]["path_truncated"] = true.into();
+            }
         }
         if details_storage_size(&preview) <= TOOL_DETAILS_BUDGET_BYTES {
             return Some(preview);
         }
     }
-    // Unknown/large schemas still have a recoverable source, but cannot be
-    // allowed to exhaust the transcript's storage budget.
-    Some(serde_json::json!({"details_storage": storage}))
+    // Remove unknown display schemas while retaining execution identity,
+    // status, counters and capture errors beside the complete source.
+    let mut compact = crate::tool::details::compact_details(&preview);
+    for name in ["stdout", "stderr"] {
+        if let Some(text) = preview.pointer(&format!("/{name}/text")) {
+            compact[name]["text"] = text.clone();
+        }
+    }
+    Some(compact)
 }
 
 /// Bound a tool result before it re-enters the model context: oversized
 /// outputs keep their head and tail with a marker for the elided middle, so
 /// the next request stays small without losing the most relevant ends.
 /// Counts by `char` to stay UTF-8 safe.
-fn bound_tool_content(content: &Content, workspace: Option<&std::path::Path>) -> Content {
+fn bound_tool_content(
+    content: &Content,
+    workspace: Option<&std::path::Path>,
+) -> (Content, Option<serde_json::Value>) {
     let text_chars = content
         .text_blocks()
         .map(|text| text.chars().count())
         .sum::<usize>();
     if text_chars <= TOOL_OUTPUT_BUDGET {
-        return content.clone();
+        return (content.clone(), None);
     }
     let full_text = content.summary_text();
-    let continuation = match workspace.map(|root| spill_tool_text(root, &full_text)) {
-        Some(Ok((path, complete))) => format!("\n[Inline output shortened. {} saved to {}; use read_file with next_start_byte for bounded continuation.]\n", if complete { "Full output" } else { "Only the first 64 MiB" }, path.display()),
-        Some(Err(error)) => format!("\n[Inline output shortened; full output could not be saved: {error}]\n"),
-        None => "\n[Inline output shortened; this runtime has no output workspace, so the omitted text is unavailable.]\n".into(),
+    let (path, complete, error) = match workspace.map(|root| spill_tool_text(root, &full_text)) {
+        Some(Ok((path, complete))) => (Some(path), complete, None),
+        Some(Err(error)) => (None, false, Some(error.to_string())),
+        None => (None, false, Some("no output workspace is available".into())),
     };
+    let continuation = match (&path, workspace) {
+        (Some(path), _) => format!("\n[Inline output shortened. {} saved to {}; use read_file with next_start_byte for bounded continuation.]\n", if complete { "Full output" } else { "Only the first 64 MiB" }, path.display()),
+        (None, Some(_)) => format!("\n[Inline output shortened; full output could not be saved: {}]\n", error.as_deref().unwrap_or("unknown capture failure")),
+        (None, None) => "\n[Inline output shortened; this runtime has no output workspace, so the omitted text is unavailable.]\n".into(),
+    };
+    let storage = serde_json::json!({
+        "inline_truncated": true,
+        "path": path,
+        "complete": complete,
+        "original_bytes": full_text.len(),
+        "error": error.map(|error| error.chars().take(256).collect::<String>()),
+    });
     let mut remaining = TOOL_OUTPUT_BUDGET.saturating_sub(continuation.chars().count());
     let mut text_left = content.text_blocks().count();
     let mut bounded = Content::default();
@@ -700,7 +750,7 @@ fn bound_tool_content(content: &Content, workspace: Option<&std::path::Path>) ->
         }
     }
     bounded.push_text(continuation);
-    bounded
+    (bounded, Some(storage))
 }
 
 fn spill_tool_text(
@@ -862,6 +912,106 @@ mod tests {
     }
 
     #[test]
+    fn details_fallback_preserves_execution_facts_when_other_payload_cannot_fit() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let original = json!({
+            "job_id": "job_1", "kind": "foreground", "command": "x".repeat(24_000),
+            "cwd": ".", "status": "failed", "exit_code": 7, "duration_ms": 42,
+            "sandboxed": true, "network": false, "stdin_open": false,
+            "input_error": "input closed",
+            "stdout": {"text": "out", "total_bytes": 300, "omitted_bytes": 100,
+                "inline_omitted_bytes": 297, "inline_truncated": true, "finished": true,
+                "capture_complete": true, "read_error": null, "spill": null},
+            "stderr": {"text": "err", "total_bytes": 3, "omitted_bytes": 0,
+                "inline_omitted_bytes": 0, "inline_truncated": false, "finished": true,
+                "capture_complete": false, "read_error": "reader failed", "spill": null},
+            "vendor_payload": "x".repeat(100_000),
+        });
+        let preview = bound_tool_details(Some(original.clone()), Some(&root)).unwrap();
+        assert!(details_storage_size(&preview) <= TOOL_DETAILS_BUDGET_BYTES);
+        for key in [
+            "job_id",
+            "kind",
+            "cwd",
+            "status",
+            "exit_code",
+            "duration_ms",
+            "sandboxed",
+            "network",
+            "stdin_open",
+            "input_error",
+            "stdout",
+            "stderr",
+        ] {
+            assert_eq!(preview[key], original[key], "execution fact {key}");
+        }
+        assert!(preview.get("vendor_payload").is_none());
+        assert_eq!(preview["command_truncated"], true);
+        let source = &preview["details_storage"];
+        assert_eq!(source["inline_truncated"], true);
+        assert_eq!(source["complete"], true);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(root.join(source["path"].as_str().unwrap())).unwrap()
+            )
+            .unwrap(),
+            original
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_long_executed_command_retains_its_actual_status_and_capture_facts() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let command = format!("printf ok; #{}", "x".repeat(24_000));
+        let registry = crate::shell_tools::ShellTools::new(root.as_path())
+            .unwrap()
+            .with_sandbox(crate::sandbox::SandboxManager::new().force_sandbox(Some(false)))
+            .into_registry();
+        let ToolRunOutcome::Result { result } = registry
+            .run_tool_call(
+                ToolCall::new("long", "shell", json!({"command": command})),
+                Some(ApprovalDecision::Approved),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("the approved command must execute");
+        };
+        assert_eq!(result.status, crate::tool::ToolResultStatus::Success);
+        let original = result.details.unwrap();
+        assert_eq!(original["status"], "completed");
+        assert_eq!(original["exit_code"], 0);
+        assert_eq!(original["stdout"]["text"], "ok");
+        let preview = bound_tool_details(Some(original.clone()), Some(&root)).unwrap();
+        assert!(details_storage_size(&preview) <= TOOL_DETAILS_BUDGET_BYTES);
+        for key in [
+            "job_id",
+            "kind",
+            "status",
+            "exit_code",
+            "duration_ms",
+            "stdout",
+            "stderr",
+        ] {
+            assert_eq!(preview[key], original[key], "execution fact {key}");
+        }
+        assert_eq!(preview["command_truncated"], true);
+        assert!(preview["command"].as_str().unwrap().len() < command.len());
+        let source = &preview["details_storage"];
+        assert_eq!(source["complete"], true);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(root.join(source["path"].as_str().unwrap())).unwrap()
+            )
+            .unwrap(),
+            original
+        );
+    }
+
+    #[test]
     fn details_budget_accounts_for_nested_pretty_whitespace_and_unknown_schemas() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -911,7 +1061,7 @@ mod tests {
                 text: "後".repeat(20_000),
             },
         ]);
-        let bounded = bound_tool_content(&content, Some(&workspace));
+        let (bounded, source) = bound_tool_content(&content, Some(&workspace));
         assert!(bounded.text().chars().count() <= TOOL_OUTPUT_BUDGET);
         assert!(
             matches!(&bounded.blocks[1], ContentBlock::Image { image: actual } if actual == &image)
@@ -944,6 +1094,139 @@ mod tests {
             std::fs::read_to_string(reported_path).unwrap(),
             content.summary_text()
         );
+        assert_eq!(source.as_ref().unwrap()["path"], reported);
+        assert_eq!(source.as_ref().unwrap()["complete"], true);
+    }
+
+    #[test]
+    fn only_output_preparation_can_establish_the_content_source() {
+        let example = "Report:\n[Inline output shortened. Full output saved to not-a-captured-source; use read_file with next_start_byte for bounded continuation.]\n";
+        let (content, details) = prepare_tool_output(
+            &Content::from(example),
+            Some(json!({"agent_id": "agent", "content_storage": {
+                "path": "not-a-captured-source", "complete": true,
+            }})),
+            None,
+        );
+        assert_eq!(content.text(), example);
+        assert!(details.unwrap().get("content_storage").is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_captured_output_is_exported_from_metadata_after_workspace_cleanup() {
+        use crate::session_store::SessionStore;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().canonicalize().unwrap();
+        let mut tools = crate::tool::ToolRegistry::default();
+        tools.register(crate::tool::MockEchoTool).unwrap();
+        let runtime = AgentRuntime::with_new_session(
+            crate::echo_client::EchoClient::new(crate::i18n::SharedLang::default()),
+            crate::tool::ToolRegistry::default(),
+            "system",
+            &workspace,
+            &crate::AgentConfig::builtin(),
+        )
+        .unwrap();
+        let turn = runtime.begin_turn("capture output").await;
+        let call = ToolCall::new(
+            "capture",
+            "mock_echo",
+            json!({"message": "captured ".repeat(3000)}),
+        );
+        runtime.state.lock().await.session.push_assistant(
+            turn.clone(),
+            "",
+            "",
+            vec![tool_call_payload(&call)],
+        );
+        let ToolRunOutcome::Result { result } = tools
+            .run_tool_call(call.clone(), Some(ApprovalDecision::Approved))
+            .await
+            .unwrap()
+        else {
+            panic!("approved fixture must execute");
+        };
+        let original = result.content.text();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        runtime
+            .record_tool_result(&call, result, Ask::Asked, &tx, turn.clone())
+            .await;
+        let mut recorded = None;
+        while let Ok(event) = rx.try_recv() {
+            if let RuntimeEvent::ToolCallFinished { result, .. } = event {
+                recorded = Some(result);
+            }
+        }
+        let recorded = recorded.unwrap();
+        assert!(recorded.content.text().chars().count() <= TOOL_OUTPUT_BUDGET);
+        let storage = &recorded.details.as_ref().unwrap()["content_storage"];
+        assert_eq!(storage["complete"], true);
+        assert_eq!(storage["original_bytes"], original.len());
+        runtime.finish_turn(&turn).await;
+        runtime.shutdown().await;
+        assert_eq!(runtime.last_save_error(), None);
+        let id = runtime.session_id().await.unwrap();
+        let source_store = crate::JsonSessionStore::for_workspace(&workspace).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let destination = out.path().join("archive");
+        source_store.export_bundle(&id, &destination).unwrap();
+        drop(runtime);
+        drop(source_store);
+        tokio::task::yield_now().await;
+        directory.close().unwrap();
+        let exported = crate::JsonSessionStore::for_workspace(&destination)
+            .unwrap()
+            .load(&id)
+            .unwrap();
+        let result = exported
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.kind {
+                crate::EntryKind::Assistant { exchanges, .. } => exchanges
+                    .first()
+                    .and_then(|exchange| exchange.result.as_ref()),
+                _ => None,
+            })
+            .unwrap();
+        let storage = &result.details.as_ref().unwrap()["content_storage"];
+        let path = storage["path"].as_str().unwrap();
+        let tools = crate::workspace_tools::workspace_tool_registry(destination).unwrap();
+        let mut recovered = String::new();
+        let mut cursor = 0u64;
+        loop {
+            let ToolRunOutcome::Result { result: page } = tools
+                .run_tool_call(
+                    ToolCall::new(
+                        "read",
+                        "read_file",
+                        json!({"path": path, "start_byte": cursor}),
+                    ),
+                    None,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("captured source must remain readable");
+            };
+            let page: serde_json::Value = serde_json::from_str(&page.content.text()).unwrap();
+            recovered.extend(
+                page["lines"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|line| line["text"].as_str().unwrap()),
+            );
+            let Some(next) = page["next_start_byte"].as_u64() else {
+                break;
+            };
+            assert!(next > cursor);
+            cursor = next;
+        }
+        assert_eq!(recovered.len(), original.len());
+        assert!(
+            recovered == original,
+            "every original output byte must survive export"
+        );
     }
 
     #[cfg(unix)]
@@ -972,7 +1255,9 @@ mod tests {
                 })
                 .collect(),
         );
-        let bounded = bound_tool_content(&content, None);
+        let (bounded, source) = bound_tool_content(&content, None);
+        assert!(source.as_ref().unwrap()["path"].is_null());
+        assert_eq!(source.as_ref().unwrap()["complete"], false);
         assert!(bounded.text().chars().count() <= TOOL_OUTPUT_BUDGET);
         assert!(bounded.text().contains("omitted text is unavailable"));
     }

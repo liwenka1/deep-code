@@ -299,6 +299,8 @@ pub(super) struct StreamSnapshot {
     pub(super) total_bytes: usize,
     /// Bytes evicted from the in-memory ring; inline truncation is separate.
     pub(super) omitted_bytes: usize,
+    /// Original stream bytes outside this snapshot's inline text window.
+    pub(super) inline_omitted_bytes: usize,
     pub(super) inline_truncated: bool,
     pub(super) finished: bool,
     pub(super) read_error: Option<String>,
@@ -626,14 +628,13 @@ impl SharedBuffer {
 
     fn snapshot(&self, max_chars: usize) -> StreamSnapshot {
         let mut ring = self.0.lock().expect("output buffer lock poisoned");
-        let full = ring.text();
+        let bytes: Vec<_> = ring.bytes.iter().copied().collect();
+        let full = String::from_utf8_lossy(&bytes);
         let count = full.chars().count();
-        let text = if count > max_chars {
-            full.chars().skip(count - max_chars).collect()
-        } else {
-            full
-        };
+        let skipped_chars = count.saturating_sub(max_chars);
+        let text = full.chars().skip(skipped_chars).collect();
         let omitted_bytes = ring.omitted_len();
+        let inline_omitted_bytes = omitted_bytes + lossy_prefix_bytes(&bytes, skipped_chars);
         let inline_truncated = omitted_bytes > 0 || count > max_chars;
         let spill = if inline_truncated {
             ring.spill.as_mut().and_then(|spill| {
@@ -650,6 +651,7 @@ impl SharedBuffer {
             text,
             total_bytes: ring.total_len,
             omitted_bytes,
+            inline_omitted_bytes,
             inline_truncated,
             finished: ring.finished,
             read_error: ring.read_error.clone(),
@@ -677,6 +679,39 @@ impl SharedBuffer {
             spill.discard_if_unreported();
         }
     }
+}
+
+/// Map a prefix of the lossy text back to its original bytes. A replacement
+/// character can stand for one or several bytes, so rendered UTF-8 length is
+/// not a valid source offset for snapshots of non-UTF-8 output.
+fn lossy_prefix_bytes(bytes: &[u8], mut chars: usize) -> usize {
+    let mut offset = 0;
+    while chars > 0 && offset < bytes.len() {
+        let remaining = &bytes[offset..];
+        let error = match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                return offset
+                    + valid
+                        .char_indices()
+                        .nth(chars)
+                        .map_or(valid.len(), |(index, _)| index);
+            }
+            Err(error) => error,
+        };
+        let valid =
+            std::str::from_utf8(&remaining[..error.valid_up_to()]).expect("valid UTF-8 prefix");
+        if let Some((index, _)) = valid.char_indices().nth(chars) {
+            return offset + index;
+        }
+        chars -= valid.chars().count();
+        offset += valid.len();
+        if chars == 0 {
+            break;
+        }
+        offset += error.error_len().unwrap_or(bytes.len() - offset);
+        chars -= 1;
+    }
+    offset
 }
 
 fn inside_utf8_scalar(bytes: &[u8], offset: usize) -> bool {

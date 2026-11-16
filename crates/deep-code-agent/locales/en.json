@@ -136,6 +136,7 @@
   "NoResumableSessions": "No resumable sessions",
   "StatusPickSession": "Pick a session to resume (↑/↓ · Enter · Esc cancel)",
   "StatusScanningSessions": "Scanning saved sessions… (Esc / Ctrl+C to cancel)",
+  "StatusSwitchingSession": "Switching sessions… (Esc / Ctrl+C to cancel)",
   "StartupScanningSessions": "Scanning saved sessions… (Ctrl+C to cancel)",
   "StatusResumeCancelled": "Cancelled; staying in the current session",
   "SessionStoreOpenFailed": "Could not open the session store: {error}",

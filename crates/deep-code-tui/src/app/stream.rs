@@ -323,6 +323,7 @@ impl App {
 
     pub(super) fn start_stream(&mut self, request: StreamRequest) {
         self.session_scan = None;
+        self.session_switch = None;
         self.cancel_requested = false;
         self.streaming_since = Some(std::time::Instant::now());
         let runtime = Arc::clone(&self.runtime);
@@ -361,6 +362,8 @@ impl App {
     /// and Esc or Ctrl+C fires its cancel token meanwhile.
     /// The caller has already checked that nothing else is in flight.
     pub(crate) fn start_compaction(&mut self, focus: Option<&str>) {
+        self.session_scan = None;
+        self.session_switch = None;
         let (tx, rx) = mpsc::unbounded_channel();
         self.ui_rx = Some(rx);
         let running = RunningCompaction::new();

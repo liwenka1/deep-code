@@ -81,13 +81,17 @@ impl PersistenceActorHandle {
         let _ = self.tx.send(Command::Save);
     }
 
+    /// Queue a save and its completion receipt immediately. Waiting for the
+    /// receipt must not enqueue another write at a later point in time.
+    pub(super) fn request_flush(&self) -> oneshot::Receiver<()> {
+        let (ack, rx) = oneshot::channel();
+        let _ = self.tx.send(Command::Flush(ack));
+        rx
+    }
+
     /// Wait until pending saves complete. The actor stays alive afterwards.
     pub(super) async fn flush(&self) {
-        let (ack, rx) = oneshot::channel();
-        if self.tx.send(Command::Flush(ack)).is_err() {
-            return;
-        }
-        let _ = rx.await;
+        let _ = self.request_flush().await;
     }
 
     /// Wait until pending saves complete and stop the actor.

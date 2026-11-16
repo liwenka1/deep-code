@@ -254,6 +254,35 @@ pub(crate) fn verify_record(record: &mut crate::session_store::SessionRecord) ->
     ring::hmac::verify(&key, &message, &tag).is_ok()
 }
 
+fn storage_message(digest: &str, bytes: u64, chunks: &[String]) -> Vec<u8> {
+    let mut message = b"deep-code/session/chunks/v1\0".to_vec();
+    message.extend_from_slice(&bytes.to_le_bytes());
+    message.extend_from_slice(digest.as_bytes());
+    message.extend_from_slice(&(chunks.len() as u64).to_le_bytes());
+    for chunk in chunks {
+        message.extend_from_slice(&(chunk.len() as u64).to_le_bytes());
+        message.extend_from_slice(chunk.as_bytes());
+    }
+    message
+}
+
+/// Authenticate a large record's digest before loading or parsing its body.
+pub(crate) fn sign_storage(digest: &str, bytes: u64, chunks: &[String]) -> Option<String> {
+    let key_bytes = key().ok()?;
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes);
+    Some(to_hex(
+        ring::hmac::sign(&key, &storage_message(digest, bytes, chunks)).as_ref(),
+    ))
+}
+
+pub(crate) fn verify_storage(digest: &str, bytes: u64, chunks: &[String], tag: &str) -> bool {
+    let (Ok(key_bytes), Some(tag)) = (key(), from_hex(tag)) else {
+        return false;
+    };
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes);
+    ring::hmac::verify(&key, &storage_message(digest, bytes, chunks), &tag).is_ok()
+}
+
 /// Tag for this record's grant list, or `None` when there is no key (and
 /// therefore nothing to claim).
 #[must_use]

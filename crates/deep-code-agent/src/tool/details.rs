@@ -37,14 +37,16 @@ fn fields(value: &Value, names: &[&str]) -> Map<String, Value> {
 
 /// Preserve the facts consumed by execution summaries; display payload and
 /// unknown schemas remain available through the complete details source.
-fn compact_details(details: &Value) -> Value {
+pub(crate) fn compact_details(details: &Value) -> Value {
     let mut compact = fields(
         details,
         &[
             "job_id",
             "kind",
             "command",
+            "command_truncated",
             "cwd",
+            "cwd_truncated",
             "status",
             "exit_code",
             "duration_ms",
@@ -54,11 +56,23 @@ fn compact_details(details: &Value) -> Value {
             "input_error",
             "agent_id",
             "name",
+            "name_truncated",
             "role",
             "steps",
             "details_storage",
+            "content_storage",
         ],
     );
+    for (name, limit) in [("command", 512), ("cwd", 256), ("name", 512)] {
+        if let Some(Value::String(text)) = compact.get_mut(name)
+            && text.chars().count() > limit
+        {
+            *text = crate::text_util::clip_middle(text, limit, limit / 3, limit / 3, |_| {
+                "\n...[details preview omitted]...\n".into()
+            });
+            compact.insert(format!("{name}_truncated"), true.into());
+        }
+    }
     for name in ["stdout", "stderr"] {
         if let Some(stream) = details.get(name) {
             compact.insert(
@@ -68,6 +82,7 @@ fn compact_details(details: &Value) -> Value {
                     &[
                         "total_bytes",
                         "omitted_bytes",
+                        "inline_omitted_bytes",
                         "inline_truncated",
                         "finished",
                         "read_error",
@@ -103,7 +118,25 @@ fn compact_details(details: &Value) -> Value {
         );
     }
     if let Some(edit) = details.get("edit") {
-        let mut facts = fields(edit, &["path", "added", "removed", "truncated", "new_file"]);
+        let mut facts = fields(
+            edit,
+            &[
+                "path",
+                "path_truncated",
+                "added",
+                "removed",
+                "truncated",
+                "new_file",
+            ],
+        );
+        if let Some(Value::String(path)) = facts.get_mut("path")
+            && path.chars().count() > 512
+        {
+            *path = crate::text_util::clip_middle(path, 512, 170, 170, |_| {
+                "\n...[details preview omitted]...\n".into()
+            });
+            facts.insert("path_truncated".into(), true.into());
+        }
         if edit
             .get("diff")
             .and_then(Value::as_str)
@@ -328,6 +361,8 @@ mod tests {
                 "finished": true, "lossy_utf8": false, "read_error": null},
             "details_storage": {"path": "full.json", "complete": true,
                 "original_bytes": 9000, "error": null, "inline_truncated": false},
+            "content_storage": {"path": "output.txt", "complete": true,
+                "original_bytes": 10000, "error": null, "inline_truncated": true},
         });
         let archived = PreparedPreview::new(&original).unwrap().compact;
         let mut expected = original;

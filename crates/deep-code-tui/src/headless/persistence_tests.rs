@@ -115,8 +115,13 @@ async fn unsavable_current_turn_returns_an_error_instead_of_success() {
     let err = Capture::default();
     let output = Output::new(out.clone(), &token).unwrap();
     let diagnostics = Diagnostics::new(err.clone()).unwrap();
-    // The current user message cannot be archived. Escaping makes this exceed
-    // the disk limit while remaining below the model's context threshold.
+    // This current user message requires chunks and cannot be archived.
+    // Fail the actual chunk write, retaining the last complete inline record.
+    std::fs::write(
+        workspace.path().join(".deep-code/sessions/chunks"),
+        "blocked",
+    )
+    .unwrap();
     let code = run_turn(
         args(),
         "\u{1}".repeat(1_500_000),

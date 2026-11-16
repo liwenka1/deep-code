@@ -47,6 +47,12 @@ deep-code eval --sample 2 --out my-run --resume
 不会默默另开一轮。没有 `--resume` 时,已有 checkpoint 或报告的目录不会被覆盖;
 同一输出目录也不能由两个评测进程同时写入。
 
+每题的会话与引用的图片、完整输出保存在 `--out DIR` 下的
+`transcripts/<instance_id>/`，该目录是可独立读取的归档工作区：`.deep-code/sessions/`
+包含会话及其分块，`.deep-code/images/`、`.deep-code/spill/` 保存实际引用的来源。通过 `SessionStore` 或工作区
+读取工具查看时，请保留整个实例目录，单独移动一个 JSON 不能带走完整会话。临时仓库清理后
+归档仍可读取；导出失败会记录到该题的错误中，保留已生成的 patch 与已有的超时等主要错误。
+
 ## 官方评分(得出真实 resolved 率)
 
 ```bash

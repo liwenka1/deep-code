@@ -895,7 +895,7 @@ fn execution_summary_reads_nested_stream_state_and_reports_incomplete_capture() 
         "job_id": "job_1", "status": "failed", "exit_code": 2,
         "command": "run-check", "input_error": "pipe closed",
         "stdout": { "text": "normal output", "inline_truncated": true,
-            "omitted_bytes": 42, "capture_complete": true,
+            "omitted_bytes": 10, "inline_omitted_bytes": 42, "capture_complete": true,
             "spill": { "path": ".deep-code/output/job.stdout", "capped": true } },
         "stderr": { "text": "failure output", "inline_truncated": false,
             "capture_complete": false, "read_error": "read failed" }
@@ -913,6 +913,87 @@ fn execution_summary_reads_nested_stream_state_and_reports_incomplete_capture() 
     ] {
         assert!(summary.contains(fact), "missing {fact}: {summary}");
     }
+}
+
+#[test]
+fn inline_omission_counts_match_live_and_restored_summaries_in_source_bytes() {
+    for (text, total, inline_omitted, ring_omitted) in [
+        ("x".repeat(4976), 6000, 1024, 0),
+        ("界".repeat(1000), 6000, 3000, 0),
+        ("b�".into(), 5, 2, 0),
+        ("xy".into(), 5, 3, 1),
+    ] {
+        let details = serde_json::json!({
+            "job_id": "job", "command": "produce output", "status": "completed", "exit_code": 0,
+            "stdout": {"text": text, "total_bytes": total, "omitted_bytes": ring_omitted,
+                "inline_omitted_bytes": inline_omitted, "inline_truncated": true,
+                "capture_complete": true, "read_error": null},
+            "stderr": {"text": "", "total_bytes": 0, "omitted_bytes": 0,
+                "inline_omitted_bytes": 0, "inline_truncated": false, "capture_complete": true},
+        });
+        let content = deep_code_agent::Content::from("captured output");
+        let live = summarize_tool_observation(&content, Some(&details));
+        assert!(live.contains(&format!(
+            "stdout truncated ({inline_omitted} bytes omitted inline)"
+        )));
+        assert!(!live.contains("(0 bytes omitted"));
+        let mut record = SessionRecord::new(PathBuf::from("/workspace"), "");
+        record
+            .entries
+            .push(std::sync::Arc::new(SessionEntry::assistant(
+                "",
+                None,
+                vec![ToolExchange {
+                    call: call("capture", "shell"),
+                    result: Some(ExchangeResult {
+                        content,
+                        details: Some(details),
+                        status: ToolResultStatus::Success,
+                        asked: false,
+                    }),
+                }],
+            )));
+        let resumed: SessionRecord =
+            serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(hydrate_history(&resumed).iter().any(|cell| match cell {
+            HistoryCell::ToolResult { summary, .. } => summary == &live,
+            HistoryCell::ToolBatch { entries, .. } => {
+                entries.iter().any(|entry| entry.summary == live)
+            }
+            _ => false,
+        }));
+    }
+}
+
+#[test]
+fn omission_summaries_do_not_reconstruct_a_shortened_or_lossy_snapshot_window() {
+    let mut details = serde_json::json!({
+        "job_id": "job", "status": "completed", "exit_code": 0,
+        "stdout": {"text": "short preview", "total_bytes": 6000, "omitted_bytes": 0,
+            "inline_truncated": true, "capture_complete": true},
+        "stderr": {"text": "", "capture_complete": true},
+        "details_storage": {"inline_truncated": true, "path": "full.json", "complete": true},
+    });
+    let summary = summarize_tool_observation(&"output".into(), Some(&details));
+    assert!(summary.contains("stdout truncated"));
+    assert!(!summary.contains("bytes omitted inline"));
+    details["stdout"]["inline_omitted_bytes"] = 1024.into();
+    details["stdout"].as_object_mut().unwrap().remove("text");
+    let summary = summarize_tool_observation(&"output".into(), Some(&details));
+    assert!(summary.contains("stdout truncated (1024 bytes omitted inline)"));
+
+    details.as_object_mut().unwrap().remove("details_storage");
+    details["stdout"]
+        .as_object_mut()
+        .unwrap()
+        .remove("inline_omitted_bytes");
+    details["stdout"]["text"] = "b�".into();
+    let summary = summarize_tool_observation(&"output".into(), Some(&details));
+    assert!(summary.contains("stdout truncated"));
+    assert!(!summary.contains("bytes omitted inline"));
+    details["stdout"]["text"] = "界".repeat(1000).into();
+    let summary = summarize_tool_observation(&"output".into(), Some(&details));
+    assert!(summary.contains("stdout truncated (3000 bytes omitted inline)"));
 }
 
 #[test]

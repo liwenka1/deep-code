@@ -26,8 +26,13 @@ async fn reconfiguration_keeps_live_history_after_a_failed_save() {
     ));
     app.global_config_path = Some(workspace.path().join("unused-global-config.toml"));
     let id = app.session_id.clone();
-    // Escaping these bytes takes the encoded record past the storage limit.
-    // The last durable record therefore has no user conversation.
+    // The large escaped record needs chunk storage. Make that storage
+    // unavailable while leaving its last complete inline snapshot intact.
+    std::fs::write(
+        workspace.path().join(".deep-code/sessions/chunks"),
+        "blocked",
+    )
+    .unwrap();
     let mut events = app.runtime.submit_user("\u{1}".repeat(1_500_000)).await;
     while let Some(event) = events.recv().await {
         if matches!(event, RuntimeEvent::TurnFinished { .. }) {
@@ -118,9 +123,10 @@ fn unavailable_store_keeps_the_existing_persisted_runtime() {
     assert_eq!(app.session_id, id);
 }
 
-fn finish_scan(app: &mut App) {
+pub(in crate::app) fn finish_scan(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !app.poll_session_scan() {
+    while app.session_scan.is_some() || app.session_switch.is_some() {
+        app.poll_session_scan();
         assert!(Instant::now() < deadline, "session scan did not complete");
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -158,6 +164,114 @@ fn session_commands_return_before_results_are_applied() {
             .iter()
             .any(|session| session.id == record.id)
     );
+}
+
+fn saved_resume_target(app: &App) -> SessionRecord {
+    let store = JsonSessionStore::for_pinned_workspace(&app.workspace).unwrap();
+    let mut record = SessionRecord::new(app.workspace.clone(), "system");
+    record
+        .entries
+        .push(Arc::new(deep_code_agent::SessionEntry::user(
+            "resume this saved conversation",
+        )));
+    store.save(&mut record).unwrap();
+    record
+}
+
+/// A separate open file description holds the actual store lock. The timeout
+/// releases it even if a regression blocks the command, so the test can fail.
+fn hold_store_writer(app: &App) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(app.workspace.join(".deep-code/sessions/.store.lock"))
+        .unwrap();
+    let (started, ready) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        file.lock().unwrap();
+        started.send(()).unwrap();
+        let _ = wait.recv_timeout(Duration::from_secs(5));
+        file.unlock().unwrap();
+    });
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    (release, worker)
+}
+
+#[test]
+fn resume_by_id_returns_and_can_be_cancelled_while_the_store_is_locked() {
+    for cancel_input in [App::handle_escape, App::handle_ctrl_c] {
+        let (_workspace, mut app) = test_app();
+        let target = saved_resume_target(&app);
+        let runtime = Arc::clone(&app.runtime);
+        let session_id = app.session_id.clone();
+        let (release, writer) = hold_store_writer(&app);
+
+        let started = Instant::now();
+        assert!(app.handle_slash_command(&format!("/resume {}", target.id.as_str())));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(app.session_scan.is_some());
+        assert!(!app.poll_session_scan());
+        app.push_char('x');
+        cancel_input(&mut app);
+        assert!(app.session_scan.is_none());
+        assert!(!app.should_quit);
+        assert_eq!(app.input, "x");
+        assert_eq!(app.session_id, session_id);
+        assert!(Arc::ptr_eq(&app.runtime, &runtime));
+
+        release.send(()).unwrap();
+        writer.join().unwrap();
+        assert!(!app.poll_session_scan());
+        assert_eq!(app.session_id, session_id);
+        assert!(Arc::ptr_eq(&app.runtime, &runtime));
+    }
+}
+
+#[test]
+fn resume_by_id_switches_only_after_polling_and_reports_missing_records() {
+    let (_workspace, mut app) = test_app();
+    let target = saved_resume_target(&app);
+    let previous_id = app.session_id.clone();
+    assert!(app.handle_slash_command(&format!("/resume {}", target.id.as_str())));
+    assert!(app.session_scan.is_some());
+    assert_eq!(app.session_id, previous_id);
+    finish_scan(&mut app);
+    assert_eq!(app.session_id.as_deref(), Some(target.id.as_str()));
+    assert!(
+        app.history
+            .iter()
+            .any(|cell| matches!(cell, HistoryCell::User { .. }))
+    );
+
+    let missing = SessionRecord::new(app.workspace.clone(), "system").id;
+    assert!(app.handle_slash_command(&format!("/resume {}", missing.as_str())));
+    assert!(app.session_scan.is_some());
+    finish_scan(&mut app);
+    assert!(app.status.contains(missing.as_str()));
+    assert_eq!(app.session_id.as_deref(), Some(target.id.as_str()));
+
+    assert!(app.handle_slash_command("/resume invalid/id"));
+    assert!(app.session_scan.is_none());
+    assert!(app.status.contains("invalid/id"));
+    assert_eq!(app.session_id.as_deref(), Some(target.id.as_str()));
+}
+
+#[test]
+fn resume_by_id_rechecks_busy_state_before_applying_its_result() {
+    let (_workspace, mut app) = test_app();
+    let target = saved_resume_target(&app);
+    let previous_id = app.session_id.clone();
+    app.is_streaming = true;
+    assert!(app.switch_session_by_id(target.id.as_str()).is_err());
+    assert!(app.session_scan.is_none());
+
+    app.is_streaming = false;
+    app.switch_session_by_id(target.id.as_str()).unwrap();
+    app.is_streaming = true;
+    finish_scan(&mut app);
+    assert_eq!(app.session_id, previous_id);
+    assert_eq!(app.status, app.busy_status(TextId::BusySwitchSession));
 }
 
 /// Hold a real worker at a channel barrier: responsiveness and cancellation

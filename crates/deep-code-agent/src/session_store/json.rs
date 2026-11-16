@@ -7,18 +7,64 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{
-    MAX_SESSION_ENTRIES, MAX_SESSION_FILE_BYTES, MAX_SESSION_LIST, PreparedSession, SessionId,
-    SessionRecord, SessionStore, SessionStoreError, sessions_dir_for_workspace,
-    validate_session_id,
+    MAX_SESSION_BODY_BYTES, MAX_SESSION_ENTRIES, MAX_SESSION_FILE_BYTES, MAX_SESSION_LIST,
+    PreparedSession, SessionId, SessionRecord, SessionStore, SessionStoreError,
+    sessions_dir_for_workspace, validate_session_id,
 };
+
+mod chunks;
+mod lock;
+use lock::StoreLock;
 
 /// Bound diagnostics as well as retained records while scanning the directory.
 const MAX_SESSION_DIAGNOSTICS: usize = 32;
 
-/// JSON file backend: one pretty-printed file per session.
+#[derive(Default)]
+struct SessionWindow {
+    records: Vec<(SessionRecord, usize)>,
+    newest_excluded: Option<(u64, SessionId)>,
+}
+
+impl SessionWindow {
+    fn push(&mut self, record: SessionRecord, bytes: usize) {
+        let key = (record.updated_at_ms, record.id.clone());
+        if self
+            .newest_excluded
+            .as_ref()
+            .is_some_and(|cutoff| key <= *cutoff)
+        {
+            return;
+        }
+        self.records.push((record, bytes));
+        self.records.sort_by(|(left, _), (right, _)| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        let mut remaining = MAX_SESSION_BODY_BYTES as usize;
+        let mut keep = 0;
+        for (_, bytes) in self.records.iter().take(MAX_SESSION_LIST) {
+            if *bytes > remaining {
+                break;
+            }
+            remaining -= bytes;
+            keep += 1;
+        }
+        if let Some((excluded, _)) = self.records.get(keep) {
+            // Keep a continuous recent prefix. Remember its frontier so later
+            // directory entries cannot fill holes with previously excluded history.
+            self.newest_excluded = Some((excluded.updated_at_ms, excluded.id.clone()));
+        }
+        self.records.truncate(keep);
+    }
+}
+
+/// JSON backend with bounded manifests and immutable chunks for large records.
 #[derive(Debug, Clone)]
 pub struct JsonSessionStore {
     root: PathBuf,
+    workspace: PathBuf,
     directory: Arc<Dir>,
     /// A bounded sample of records `list()` refused to return, one per line.
     /// Collected instead of printed: library stderr cannot be shown by the
@@ -44,9 +90,14 @@ impl JsonSessionStore {
         Self::write_self_ignore(&state);
         Ok(Self {
             root: sessions_dir_for_workspace(workspace),
+            workspace: workspace.to_path_buf(),
             directory: Arc::new(directory),
             diagnostics: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
+    }
+
+    pub(super) fn workspace_path(&self) -> &Path {
+        &self.workspace
     }
 
     /// Take the lines accumulated by earlier [`SessionStore::list`] calls:
@@ -71,6 +122,12 @@ impl JsonSessionStore {
             diagnostics.push(message);
         } else if diagnostics.len() == MAX_SESSION_DIAGNOSTICS {
             diagnostics.push("additional session diagnostics omitted".to_string());
+        }
+    }
+
+    fn reclaim_chunks(&self) {
+        if let Err(error) = chunks::collect(&self.directory) {
+            self.diagnose(format!("session chunk cleanup skipped: {error}"));
         }
     }
 
@@ -116,30 +173,41 @@ impl JsonSessionStore {
         let filename = path.file_name().ok_or_else(|| SessionStoreError::Io {
             message: "session path has no filename".into(),
         })?;
-        let temporary = format!(".{}.tmp", uuid::Uuid::new_v4());
-        let saved = (|| -> std::io::Result<()> {
-            let mut file = self
-                .directory
-                .open_with(&temporary, OpenOptions::new().write(true).create_new(true))?;
-            file.write_all(contents)?;
-            file.sync_all()?;
-            drop(file);
-            self.directory
-                .rename(&temporary, &self.directory, filename)?;
-            // Linux capability directories use O_PATH, which fsync rejects.
-            // Reopen this same pinned directory for reading before syncing it.
-            #[cfg(unix)]
-            self.directory.open(".")?.sync_all()?;
-            Ok(())
-        })();
-        if let Err(error) = saved {
-            let _ = self.directory.remove_file(&temporary);
-            return Err(SessionStoreError::Io {
+        write_atomic_in(&self.directory, filename, contents).map_err(|error| {
+            SessionStoreError::Io {
                 message: format!("failed to save {}: {error}", path.display()),
-            });
-        }
-        Ok(())
+            }
+        })
     }
+}
+
+fn write_atomic_in(
+    directory: &Dir,
+    filename: &std::ffi::OsStr,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    let temporary = format!(".{}.tmp", uuid::Uuid::new_v4());
+    let saved = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = directory.open_with(&temporary, &options)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        directory.rename(&temporary, directory, filename)?;
+        #[cfg(unix)]
+        directory.open(".")?.sync_all()?;
+        Ok(())
+    })();
+    if saved.is_err() {
+        let _ = directory.remove_file(&temporary);
+    }
+    saved
 }
 
 fn store_io(error: std::io::Error) -> SessionStoreError {
@@ -148,32 +216,41 @@ fn store_io(error: std::io::Error) -> SessionStoreError {
     }
 }
 
+fn read_index(directory: &Dir, filename: &std::ffi::OsStr) -> std::io::Result<(String, bool)> {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = directory.open_with(filename, &options)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("session entry is not a regular file"));
+    }
+    let mut contents = String::new();
+    file.take(MAX_SESSION_FILE_BYTES.saturating_add(1))
+        .read_to_string(&mut contents)?;
+    let too_large = contents.len() as u64 > MAX_SESSION_FILE_BYTES;
+    Ok((contents, too_large))
+}
+
 impl JsonSessionStore {
+    #[cfg(test)]
     fn read_file(&self, path: &Path) -> Result<SessionRecord, SessionStoreError> {
+        self.read_sized(path, None).map(|(record, _)| record)
+    }
+
+    fn read_sized(
+        &self,
+        path: &Path,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<(SessionRecord, usize), SessionStoreError> {
+        let _guard = StoreLock::acquire(&self.directory, false, cancel)?;
         let filename = path.file_name().ok_or_else(|| SessionStoreError::Io {
             message: "invalid session filename".into(),
         })?;
-        let read = || -> std::io::Result<(String, bool)> {
-            let mut options = OpenOptions::new();
-            options.read(true).follow(FollowSymlinks::No);
-            #[cfg(unix)]
-            {
-                use cap_std::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_NONBLOCK);
-            }
-            let file = self.directory.open_with(filename, &options)?;
-            if !file.metadata()?.is_file() {
-                return Err(std::io::Error::other("session entry is not a regular file"));
-            }
-            let mut contents = String::new();
-            // Read at most one byte beyond the limit so a file that grows
-            // between metadata and read cannot allocate without bound.
-            file.take(MAX_SESSION_FILE_BYTES.saturating_add(1))
-                .read_to_string(&mut contents)?;
-            let too_large = contents.len() as u64 > MAX_SESSION_FILE_BYTES;
-            Ok((contents, too_large))
-        };
-        let (raw, too_large) = read().map_err(|error| {
+        let (raw, too_large) = read_index(&self.directory, filename).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 SessionStoreError::NotFound {
                     id: path
@@ -195,10 +272,22 @@ impl JsonSessionStore {
                 limit: MAX_SESSION_FILE_BYTES,
             });
         }
-        let value: serde_json::Value =
+        let mut value: serde_json::Value =
             serde_json::from_str(&raw).map_err(|error| SessionStoreError::Serialization {
                 message: format!("failed to parse {}: {error}", path.display()),
             })?;
+        let body_bytes = if value.get("storage").is_some() {
+            let body = chunks::read(&self.directory, value, path, cancel)?;
+            let bytes = body.len();
+            value = serde_json::from_slice(&body).map_err(|error| {
+                SessionStoreError::Serialization {
+                    message: format!("failed to parse reconstructed {}: {error}", path.display()),
+                }
+            })?;
+            bytes
+        } else {
+            raw.len()
+        };
         let mut record = serde_json::from_value::<SessionRecord>(value).map_err(|error| {
             SessionStoreError::Serialization {
                 message: format!("failed to parse {}: {error}", path.display()),
@@ -221,11 +310,24 @@ impl JsonSessionStore {
                 path: path.display().to_string(),
             });
         }
-        Ok(record)
+        Ok((record, body_bytes))
     }
 }
 
 impl JsonSessionStore {
+    /// Synchronous, cancellable load of a single session, including waiting
+    /// for concurrent writers. UI callers must run this on a worker.
+    pub fn load_cancellable(
+        &self,
+        id: &SessionId,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<SessionRecord, SessionStoreError> {
+        check_scan_cancelled(cancel)?;
+        let (record, _) = self.load_sized(id, Some(cancel))?;
+        check_scan_cancelled(cancel)?;
+        Ok(record)
+    }
+
     /// Synchronous, cancellable scan of every candidate. UI callers must run
     /// this on a worker and cancel when its result is no longer needed.
     /// Cancellation is checked between size-limited files; a partial list is
@@ -243,8 +345,8 @@ impl JsonSessionStore {
         // number of entries or bytes can silently resume an older session.
         // Stream one size-limited record at a time and bound both the retained
         // windows and diagnostics, so memory does not grow with directory size.
-        let mut resumable = Vec::new();
-        let mut empty = Vec::new();
+        let mut resumable = SessionWindow::default();
+        let mut empty = SessionWindow::default();
         let entries = self
             .directory
             .entries()
@@ -267,25 +369,16 @@ impl JsonSessionStore {
             if validate_session_id(stem).is_err() {
                 continue;
             }
-            let record = self.load(&SessionId(stem.to_string()));
+            let record = self.load_sized(&SessionId(stem.to_string()), Some(cancel));
             check_scan_cancelled(cancel)?;
             match record {
-                Ok(record) => {
+                Ok((record, bytes)) => {
                     let target = if record.has_user_entry() {
                         &mut resumable
                     } else {
                         &mut empty
                     };
-                    if target.len() < MAX_SESSION_LIST {
-                        target.push(record);
-                    } else if let Some((oldest_index, oldest)) = target
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, candidate)| candidate.updated_at_ms)
-                        && record.updated_at_ms > oldest.updated_at_ms
-                    {
-                        target[oldest_index] = record;
-                    }
+                    target.push(record, bytes);
                 }
                 Err(error) => {
                     self.diagnose(format!(
@@ -297,12 +390,15 @@ impl JsonSessionStore {
         }
 
         check_scan_cancelled(cancel)?;
-        resumable.sort_by_key(|record| std::cmp::Reverse(record.updated_at_ms));
-        empty.sort_by_key(|record| std::cmp::Reverse(record.updated_at_ms));
-        resumable.truncate(MAX_SESSION_LIST);
-        empty.truncate(MAX_SESSION_LIST.saturating_sub(resumable.len()));
-        resumable.extend(empty);
-        let mut records = resumable;
+        empty
+            .records
+            .truncate(MAX_SESSION_LIST.saturating_sub(resumable.records.len()));
+        resumable.records.extend(empty.records);
+        let mut records: Vec<_> = resumable
+            .records
+            .into_iter()
+            .map(|(record, _)| record)
+            .collect();
         records.sort_by_key(|record| std::cmp::Reverse(record.updated_at_ms));
         Ok(records)
     }
@@ -324,11 +420,11 @@ impl SessionStore for JsonSessionStore {
         let json = session.json();
         validate_session_id(id.as_str())?;
         let path = self.path_for(id)?;
-        if json.len() as u64 > MAX_SESSION_FILE_BYTES {
+        if json.len() as u64 > MAX_SESSION_BODY_BYTES {
             return Err(SessionStoreError::TooLarge {
                 path: path.display().to_string(),
                 bytes: json.len() as u64,
-                limit: MAX_SESSION_FILE_BYTES,
+                limit: MAX_SESSION_BODY_BYTES,
             });
         }
         if session.entry_count > MAX_SESSION_ENTRIES {
@@ -338,11 +434,61 @@ impl SessionStore for JsonSessionStore {
                 limit: MAX_SESSION_ENTRIES,
             });
         }
-        self.write_atomic(&path, json.as_bytes())
+        let _guard = StoreLock::acquire(&self.directory, true, None)?;
+        self.reclaim_chunks();
+        if json.len() as u64 > MAX_SESSION_FILE_BYTES {
+            let manifest = chunks::write(&self.directory, json.as_bytes())?;
+            self.write_atomic(&path, &manifest)?;
+        } else {
+            self.write_atomic(&path, json.as_bytes())?;
+        }
+        // Cleanup failure does not undo an already durable snapshot.
+        self.reclaim_chunks();
+        Ok(())
     }
 
     fn load(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError> {
-        let mut record = self.read_file(&self.path_for(id)?)?;
+        self.load_sized(id, None).map(|(record, _)| record)
+    }
+
+    fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError> {
+        self.list_cancellable(&tokio_util::sync::CancellationToken::new())
+    }
+
+    fn delete(&self, id: &SessionId) -> Result<(), SessionStoreError> {
+        let path = self.path_for(id)?;
+        let _guard = StoreLock::acquire(&self.directory, true, None)?;
+        if !self
+            .directory
+            .symlink_metadata(path.file_name().expect("validated filename"))
+            .is_ok_and(|metadata| metadata.is_file())
+        {
+            return Err(SessionStoreError::NotFound {
+                id: id.as_str().to_string(),
+            });
+        }
+        self.directory
+            .remove_file(path.file_name().expect("validated filename"))
+            .map_err(|error| SessionStoreError::Io {
+                message: format!("failed to delete {}: {error}", path.display()),
+            })?;
+        #[cfg(unix)]
+        self.directory
+            .open(".")
+            .and_then(|file| file.sync_all())
+            .map_err(store_io)?;
+        self.reclaim_chunks();
+        Ok(())
+    }
+}
+
+impl JsonSessionStore {
+    fn load_sized(
+        &self,
+        id: &SessionId,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<(SessionRecord, usize), SessionStoreError> {
+        let (mut record, bytes) = self.read_sized(&self.path_for(id)?, cancel)?;
         // The FILENAME is authoritative for the id, not the record's stored one.
         // A session file copied to a new name (a "fork") keeps the original's id
         // inside it; without this, the resumed runtime would save back under that
@@ -364,29 +510,7 @@ impl SessionStore for JsonSessionStore {
                 })?,
             );
         }
-        Ok(record)
-    }
-
-    fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError> {
-        self.list_cancellable(&tokio_util::sync::CancellationToken::new())
-    }
-
-    fn delete(&self, id: &SessionId) -> Result<(), SessionStoreError> {
-        let path = self.path_for(id)?;
-        if !self
-            .directory
-            .symlink_metadata(path.file_name().expect("validated filename"))
-            .is_ok_and(|metadata| metadata.is_file())
-        {
-            return Err(SessionStoreError::NotFound {
-                id: id.as_str().to_string(),
-            });
-        }
-        self.directory
-            .remove_file(path.file_name().expect("validated filename"))
-            .map_err(|error| SessionStoreError::Io {
-                message: format!("failed to delete {}: {error}", path.display()),
-            })
+        Ok((record, bytes))
     }
 }
 

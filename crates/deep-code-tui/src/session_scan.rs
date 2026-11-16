@@ -1,6 +1,8 @@
-//! A cancellable directory scan shared by interactive and startup callers.
+//! Cancellable session reads shared by interactive and startup callers.
 
-use deep_code_agent::{CancellationToken, JsonSessionStore, SessionRecord, SessionStoreError};
+use deep_code_agent::{
+    CancellationToken, JsonSessionStore, SessionId, SessionRecord, SessionStoreError,
+};
 use tokio::sync::oneshot;
 
 pub(crate) struct SessionListing {
@@ -17,6 +19,16 @@ pub(crate) struct SessionScan {
 }
 
 impl SessionScan {
+    pub fn load(store: JsonSessionStore, id: SessionId) -> Result<Self, SessionStoreError> {
+        Self::spawn(move |cancel| {
+            let record = store.load_cancellable(&id, &cancel)?;
+            Ok(SessionListing {
+                records: vec![record],
+                diagnostics: store.take_diagnostics(),
+            })
+        })
+    }
+
     pub fn start(store: JsonSessionStore) -> Result<Self, SessionStoreError> {
         Self::spawn(move |cancel| {
             let records = store.list_cancellable(&cancel)?;
@@ -48,6 +60,11 @@ impl SessionScan {
 
     pub fn cancel(&self) {
         self.cancel.cancel();
+    }
+
+    #[cfg(test)]
+    pub fn is_ready(&self) -> bool {
+        !self.rx.is_empty()
     }
 
     pub fn try_result(&mut self) -> Option<Result<SessionListing, SessionStoreError>> {
