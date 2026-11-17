@@ -327,16 +327,37 @@ mod tests {
                     match listener.accept() {
                         Ok((mut socket, _)) => {
                             hits.fetch_add(1, Ordering::SeqCst);
+                            // Windows accepts inherit the listener's nonblocking
+                            // mode; this synchronous request reader must wait.
+                            socket.set_nonblocking(false).unwrap();
                             socket
                                 .set_read_timeout(Some(Duration::from_secs(2)))
                                 .unwrap();
+                            socket
+                                .set_write_timeout(Some(Duration::from_secs(2)))
+                                .unwrap();
                             let mut request = [0; 8192];
-                            let _ = socket.read(&mut request);
-                            let _ = write!(
-                                socket,
+                            let mut received = 0;
+                            loop {
+                                let count = socket.read(&mut request[received..]).unwrap();
+                                assert!(count > 0, "client closed before sending request headers");
+                                received += count;
+                                if request[..received]
+                                    .windows(4)
+                                    .any(|part| part == b"\r\n\r\n")
+                                {
+                                    break;
+                                }
+                                assert!(
+                                    received < request.len(),
+                                    "request headers exceed test limit"
+                                );
+                            }
+                            let response = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                                 body.len()
                             );
+                            socket.write_all(response.as_bytes()).unwrap();
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(5));
@@ -375,15 +396,20 @@ mod tests {
         ] {
             child.env(key, &proxy);
         }
-        let result = child.output().unwrap();
+        let result = child.output();
         stop.store(true, Ordering::SeqCst);
-        origin_worker.join().unwrap();
-        proxy_worker.join().unwrap();
+        let origin_result = origin_worker.join();
+        let proxy_result = proxy_worker.join();
+        let result = result.expect("run the proxy isolation child");
         assert!(
             result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stdout)
+            "proxy isolation child exited with {}\nstdout:\n{}\nstderr:\n{}",
+            result.status,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
         );
+        origin_result.expect("origin test server");
+        proxy_result.expect("proxy test server");
         assert_eq!(origin_hits.load(Ordering::SeqCst), 1);
         assert_eq!(proxy_hits.load(Ordering::SeqCst), 0);
     }
