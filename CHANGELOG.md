@@ -6,6 +6,14 @@ Entries marked **Security:** change security-relevant behavior.
 
 <!-- next-section -->
 
+## [0.5.1] - 2026-11-17
+
+- The multimodal tool flow and execution input/output are improved, and Windows image directory recognition is fixed.
+- Eval now saves each question as it is answered and can resume from where it stopped.
+- Session persistence and recovery are tightened: session output is written to a consistent on-disk location, a resumed session verifies the source it actually reads, detail accumulation is capped, and source archiving and asynchronous recovery are completed.
+- **Security:** the LSP execution boundary is tightened.
+- **Security:** the project-instruction trust boundary and unattended execution limits are tightened.
+
 ## [0.5.0] - 2026-11-10
 
 - **Breaking:** model and image configuration now accepts only the current catalog names (`flash` and `low`/`original`/`auto`); retired aliases are removed.
@@ -431,3 +439,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.4.19]: https://github.com/liwenka1/deep-code/compare/v0.4.18...v0.4.19
 [0.4.20]: https://github.com/liwenka1/deep-code/compare/v0.4.19...v0.4.20
 [0.5.0]: https://github.com/liwenka1/deep-code/compare/v0.4.20...v0.5.0
+[0.5.1]: https://github.com/liwenka1/deep-code/compare/v0.5.0...v0.5.1
