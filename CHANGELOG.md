@@ -11,7 +11,6 @@ Entries marked **Security:** change security-relevant behavior.
 - **Breaking:** model and image configuration now accepts only the current catalog names (`flash` and `low`/`original`/`auto`); retired aliases are removed.
 - **Breaking:** reasoning configuration now accepts only `none`, `low`, `high`, `max`, and `auto`. `auto` remains deep-code's task-based effort policy; `provider.model = "auto"` independently routes each task between Pro and Flash. Provider effort aliases are no longer normalized by deep-code.
 - `/model` now opens a model and thinking-strength picker, so the model and reasoning effort can be chosen from a menu instead of typed; `/model <name>` still switches directly.
-- The `deepseek-v4-flash` spelling is recognized again as an alias for `deepseek-flash`.
 - Image requests now fit the complete 48 MiB JSON body limit, including text and tools, and reject an oversized non-image request with a clear error.
 - The supported build floors are Rust 1.96 and Node.js 24.
 - Session persistence and recovery are tightened: session costs keep full floating-point precision so resuming a session no longer breaks its signature, signature errors are attributed to the right cause, and the session list now reports diagnostics.
