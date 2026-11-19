@@ -1,3 +1,4 @@
+mod backend;
 mod input;
 // `pub(crate)` for the sanitizer alone: `startup.rs` draws its own resume
 // picker on a real backend before `App` exists, and it has to neutralize the
@@ -13,15 +14,18 @@ use anyhow::Result;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
-use crossterm::execute;
 use crossterm::style::Print;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
+    EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode,
+    enable_raw_mode,
 };
+use crossterm::{execute, queue};
 use deep_code_agent::CancellationToken;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::Terminal;
 
 use crate::app::{App, LaunchConfig};
+
+use self::backend::{FrameBackend, draw_frame};
 
 /// Redraws are coalesced to at most ~30fps; streaming deltas mark the UI
 /// dirty instead of forcing a frame each.
@@ -29,7 +33,7 @@ const MIN_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 /// While streaming, repaint at least this often so the activity indicator
 /// animates through a long time-to-first-token wait.
 const STREAM_TICK_INTERVAL: Duration = Duration::from_millis(120);
-type AppTerminal = Terminal<CrosstermBackend<BufWriter<Output>>>;
+type AppTerminal = Terminal<FrameBackend<Output>>;
 
 /// Install once before startup and keep SIGINT routed through the scan,
 /// picker and TUI. Tokio does not restore the default handler when a signal
@@ -103,6 +107,7 @@ fn install_panic_hook() {
             return;
         };
         let mut stdout = BufWriter::new(stdout.cleanup());
+        let _ = queue_sync_end(&mut stdout);
         let _ = execute!(
             stdout,
             DisableMouseCapture,
@@ -150,13 +155,12 @@ fn setup_terminal(interrupted: &CancellationToken) -> Result<(AppTerminal, Termi
         SetTitle("deep-code")
     )?;
 
-    let backend = CrosstermBackend::new(stdout);
+    let backend = FrameBackend::new(stdout, terminal_uses_ansi());
     let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
-    // The composer draws its caret in the frame buffer. Hide the terminal's
-    // own cursor before the first frame so it cannot briefly appear at (0, 0)
-    // while the alternate screen is being populated.
+    // The first editable frame positions and shows the cursor. Keep it hidden
+    // while clearing the alternate screen so it cannot flash at (0, 0).
     terminal.hide_cursor()?;
+    terminal.clear()?;
 
     Ok((terminal, cleanup))
 }
@@ -191,6 +195,7 @@ impl TerminalCleanup {
         self.active = false;
         let raw = disable_raw_mode();
         let mut output = BufWriter::new(self.output.cleanup());
+        let sync_end = queue_sync_end(&mut output);
         let display = execute!(
             output,
             DisableMouseCapture,
@@ -202,7 +207,7 @@ impl TerminalCleanup {
             let _ = execute!(output, TitleStack::Pop);
         }
         self.output.discard_terminal_writes();
-        raw.and(display)
+        raw.and(sync_end).and(display)
     }
 }
 
@@ -210,6 +215,26 @@ impl Drop for TerminalCleanup {
     fn drop(&mut self) {
         let _ = self.restore();
     }
+}
+
+fn terminal_uses_ansi() -> bool {
+    // A legacy Windows console takes the WinAPI path for cursor commands and
+    // can display raw escape bytes. VT hosts ignore DEC 2026 if unsupported.
+    #[cfg(windows)]
+    {
+        crossterm::ansi_support::supports_ansi()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+fn queue_sync_end(output: &mut impl Write) -> io::Result<()> {
+    if terminal_uses_ansi() {
+        queue!(output, EndSynchronizedUpdate)?;
+    }
+    Ok(())
 }
 
 /// The terminal's title stack (XTWINOPS 22/23): push the title the shell had
@@ -375,7 +400,7 @@ fn run_loop(
             app.is_streaming && last_draw.is_none_or(|at| at.elapsed() >= STREAM_TICK_INTERVAL);
         if (needs_redraw && draw_due) || tick_due {
             app.enforce_history_cap();
-            terminal.draw(|frame| render::render(frame, app))?;
+            draw_frame(terminal, |frame| render::render(frame, app))?;
             last_draw = Some(Instant::now());
             needs_redraw = false;
         }

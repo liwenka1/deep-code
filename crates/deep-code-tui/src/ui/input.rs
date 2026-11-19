@@ -42,7 +42,7 @@ pub(super) fn dispatch_terminal_event(
                 let (keys, leftover) = drain_key_burst(key)?;
                 let text: String = keys.iter().filter_map(key_text_payload).collect();
                 if burst_looks_like_paste(&text) {
-                    app.paste_str(text);
+                    handle_paste(app, text);
                 } else {
                     // Human-plausible burst (fast typing): keep exact key
                     // semantics, including a trailing Enter meaning submit.
@@ -60,7 +60,7 @@ pub(super) fn dispatch_terminal_event(
         }
         Event::Key(_) => Ok(false),
         Event::Paste(text) => {
-            app.paste_str(text);
+            handle_paste(app, text);
             Ok(true)
         }
         Event::Mouse(mouse) => {
@@ -80,6 +80,15 @@ pub(super) fn dispatch_terminal_event(
         }
         Event::Resize(..) => Ok(true),
         _ => Ok(false),
+    }
+}
+
+/// A terminal may deliver an IME commit as a burst of text keys.
+fn handle_paste(app: &mut App, text: String) {
+    if app.history_search_focused() {
+        app.history_search_append(&App::normalize_paste_line_endings(text));
+    } else {
+        app.paste_str(text);
     }
 }
 
@@ -1153,6 +1162,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn submitting_a_wrapped_find_keeps_the_match_when_the_transcript_reappears() {
+        let mut app = en_app("");
+        app.history.clear();
+        app.history.push(crate::history::HistoryCell::Assistant {
+            text: "Earlier reply\nlocate this reply\nLatest reply\n\n\n\n".to_string(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(24, 3)).unwrap();
+        let (rows, _) = draw(&mut terminal, &mut app);
+        assert_eq!(rows[0].trim(), "Latest reply");
+
+        for ch in "/find locate this reply".chars() {
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char(ch)));
+        }
+        draw(&mut terminal, &mut app);
+        let hidden = app.transcript.as_ref().unwrap();
+        assert_eq!(hidden.height, 0);
+        assert!(hidden.lines.last().is_some_and(|line| line.is_empty()));
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        let (rows, _) = draw(&mut terminal, &mut app);
+        let visible = app.transcript.as_ref().unwrap();
+        assert_eq!(visible.height, 1);
+        assert_eq!(rows[usize::from(visible.y)].trim(), "locate this reply");
+    }
+
     /// Ctrl+R opens the search over the draft; Esc closes it with the draft
     /// back; a key the search does not own keeps the match and still does its
     /// own job.
@@ -1184,6 +1219,72 @@ mod tests {
         assert!(!app.history_search_open(), "Ctrl+A leaves the search");
         assert_eq!(app.input, "earlier prompt");
         assert_eq!(app.input_cursor, 0, "and still moves to the line start");
+    }
+
+    #[test]
+    fn a_batched_ime_commit_goes_to_the_history_query() {
+        let mut app = en_app("draft");
+        let commit = "汉字".repeat(PASTE_BURST_MIN_CHARS);
+        let recalled = format!("earlier prompt {commit}");
+        app.prompt_history.push(crate::app::HistoryPrompt {
+            text: recalled.clone(),
+            images: Vec::new(),
+        });
+        app.history_search_start();
+
+        assert!(burst_looks_like_paste(&commit));
+        handle_paste(&mut app, commit.clone());
+        assert_eq!(app.history_search_status().unwrap().1, commit);
+        assert_eq!(app.input, recalled);
+    }
+
+    #[test]
+    fn multiline_paste_matches_saved_history_across_line_endings() {
+        for pasted in ["你好\n世界", "你好\r\n世界", "你好\r世界"] {
+            let mut app = en_app("earlier prompt ");
+            app.paste_str(pasted.to_string());
+            let saved = app.expand_pasted(&app.input);
+            assert_eq!(saved, "earlier prompt 你好\n世界", "{pasted:?}");
+            app.remember_prompt(&saved);
+            let spaced = "newer prompt 你好 世界";
+            app.remember_prompt(spaced);
+
+            app.history_search_start();
+            assert_eq!(app.input, spaced);
+            handle_paste(&mut app, pasted.to_string());
+            assert_eq!(app.history_search_status().unwrap().1, "你好\n世界");
+            assert_eq!(app.input, saved, "{pasted:?}");
+            assert_eq!(app.history_search_display(80).unwrap().1, "你好↵世界");
+            assert_eq!(app.history_search_display(8).unwrap().1, "…↵世界");
+
+            app.history_search_cancel();
+            app.history_search_start();
+            handle_paste(&mut app, "你好 世界".to_string());
+            assert_eq!(app.history_search_display(80).unwrap().1, "你好 世界");
+            assert_eq!(app.input, spaced);
+        }
+    }
+
+    #[test]
+    fn history_search_paste_displays_tabs_and_matches_original_whitespace() {
+        let mut app = en_app("draft");
+        let tabbed = "earlier prompt foo\tbar";
+        let spaced = "newer prompt foo bar";
+        app.remember_prompt(tabbed);
+        app.remember_prompt(spaced);
+
+        for (query, visible, clipped, recalled) in [
+            ("foo\tbar", "foo⇥bar", "…⇥bar", tabbed),
+            ("foo bar", "foo bar", "… bar", spaced),
+        ] {
+            app.history_search_start();
+            handle_paste(&mut app, query.to_string());
+            assert_eq!(app.history_search_status().unwrap().1, query);
+            assert_eq!(app.history_search_display(80).unwrap().1, visible);
+            assert_eq!(app.history_search_display(7).unwrap().1, clipped);
+            assert_eq!(app.input, recalled);
+            app.history_search_cancel();
+        }
     }
 
     /// With a turn's error on the status row, the quit warning still shows

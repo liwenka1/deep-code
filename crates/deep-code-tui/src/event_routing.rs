@@ -320,15 +320,7 @@ impl App {
                 // The durable frame (mode/backend/session/telemetry) comes
                 // from `status_line()`; keep only the rollback hint here so
                 // nothing shows twice.
-                self.status = self
-                    .last_checkpoint
-                    .as_ref()
-                    .map(|id| {
-                        self.tr_with(TextId::StatusRollbackHint, &[("id", id)])
-                            .trim_start_matches(" | ")
-                            .to_string()
-                    })
-                    .unwrap_or_default();
+                self.status = self.rollback_status_hint().unwrap_or_default();
                 self.is_streaming = false;
                 self.cancel_requested = false;
                 self.clear_stream_receiver();

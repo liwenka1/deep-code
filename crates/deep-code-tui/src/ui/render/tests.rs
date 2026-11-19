@@ -317,6 +317,42 @@ fn frame(app: &mut App, width: u16, height: u16) -> String {
         .collect()
 }
 
+#[test]
+fn transcript_selection_stays_within_visible_transcript_rows_when_resized() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = App::new();
+    app.history.clear();
+    app.history.push(HistoryCell::user(
+        "transcript text on first row\nand on second row",
+    ));
+    app.insert_str_at_cursor("unrelated draft");
+    app.scroll_up();
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    app.selection_begin(3, 0);
+    app.selection_update(5, 1);
+    let selected = app.selected_text().unwrap();
+    assert_eq!(selected, "transcript text on first row\n  an");
+
+    for (height, visible_selection_rows) in [(12, 2), (5, 1), (3, 1), (2, 0), (1, 0), (12, 2)] {
+        terminal.backend_mut().resize(80, height);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let transcript = app.transcript.as_ref().unwrap();
+        assert_eq!(transcript.height.min(2), visible_selection_rows);
+        for y in 0..height {
+            let reversed = (0..80).any(|x| buffer[(x, y)].modifier.contains(Modifier::REVERSED));
+            assert_eq!(
+                reversed,
+                y < visible_selection_rows,
+                "height {height}, row {y}"
+            );
+        }
+        assert_eq!(app.selected_text().as_deref(), Some(selected.as_str()));
+    }
+}
+
 /// Drive one quiet call through the event stream.
 fn quiet_call(app: &mut App, turn: &deep_code_agent::TurnId, id: &str, path: &str) {
     use deep_code_agent::{RuntimeEvent, ToolCallId, ToolResult, ToolResultStatus};
@@ -1662,6 +1698,86 @@ fn a_recorded_error_cannot_carry_an_escape_into_the_status_row() {
     }
 }
 
+#[test]
+fn an_empty_composer_shows_the_inline_hint_while_an_error_is_displayed() {
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.sandbox_off = false;
+    app.record_error("Unavailable".to_string());
+
+    let hint = tr(Lang::En, TextId::ComposerPlaceholder);
+    let screen = frame(&mut app, 40, 12);
+    assert!(screen.contains(&format!("› {hint}")), "{screen}");
+    assert!(
+        screen.trim_end().ends_with("[default] Error: Unavailable"),
+        "{screen}"
+    );
+
+    app.insert_str_at_cursor("next draft");
+    let screen = frame(&mut app, 40, 12);
+    assert!(!screen.contains(hint), "{screen}");
+    assert!(
+        screen.trim_end().ends_with("[default] Error: Unavailable"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn a_long_error_gets_the_same_footer_space_with_an_empty_or_nonempty_draft() {
+    let mut app = App::new();
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.record_error(format!("Provider unavailable {}", "诊断".repeat(80)));
+
+    for (lang, sandbox_off) in [(Lang::En, false), (Lang::En, true), (Lang::Zh, true)] {
+        app.lang = lang;
+        app.sandbox_off = sandbox_off;
+        for width in [40, 80, 120] {
+            app.input.clear();
+            let footer = draw_footer(&mut app, width);
+            assert!(footer.contains("Pro"), "{footer}");
+            assert!(!footer.contains('/'), "{footer}");
+            assert_eq!(footer.contains("[unsandboxed]"), sandbox_off, "{footer}");
+
+            app.input = "next draft".to_string();
+            assert_eq!(draw_footer(&mut app, width), footer);
+        }
+    }
+
+    app.lang = Lang::En;
+    app.sandbox_off = false;
+    app.input.clear();
+    assert_eq!(draw_footer(&mut app, 19), "[default] Error: Pr");
+    assert_eq!(draw_footer(&mut app, 20), "[default] Error: Pro");
+}
+
+#[test]
+fn an_error_that_already_fits_keeps_its_entire_message() {
+    let mut app = App::new();
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    for (lang, sandbox_off, error) in [
+        (Lang::En, false, "Could not read ./config.toml"),
+        (Lang::Zh, true, "无法读取 ./config.toml"),
+    ] {
+        app.lang = lang;
+        app.sandbox_off = sandbox_off;
+        app.record_error(error.to_string());
+        let badges_width: usize = status_badges(&app).iter().map(Span::width).sum();
+        let exact_width = (badges_width
+            + status_text_width(tr(lang, TextId::ErrorPrefix))
+            + status_text_width(error)) as u16;
+        let clipped = draw_footer(&mut app, exact_width - 1);
+        assert!(clipped.ends_with("./config.tom"), "{clipped}");
+        for spare in [0, 1, 2] {
+            let footer = draw_footer(&mut app, exact_width + spare);
+            assert!(footer.ends_with("./config.toml"), "{footer}");
+        }
+    }
+}
+
 /// The status row's OTHER two branches — the ones the test above cannot
 /// reach, because populating `app.error` makes the `if` shadow both
 /// `else`s. That shadow is why these two shipped unsanitized while their
@@ -1851,6 +1967,129 @@ fn transcript_past_u16_rows_still_shows_the_bottom() {
         painted.contains("row69999"),
         "the newest line must be reachable past 65k rendered rows"
     );
+}
+
+#[test]
+fn one_row_transcript_scrolls_and_finds_from_the_latest_visible_output() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for (width, height) in [(40, 3), (80, 4)] {
+        let mut app = App::new();
+        app.history.clear();
+        app.history.push(HistoryCell::Assistant {
+            text: "First reply\nEarlier reply\nMiddle reply\nRecent reply\nLatest reply\n\n\n\n\n"
+                .to_string(),
+        });
+        app.insert_str_at_cursor("draft");
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut draw_transcript = |app: &mut App| {
+            terminal.draw(|frame| render(frame, app)).unwrap();
+            let transcript = app.transcript.as_ref().unwrap();
+            assert_eq!(transcript.height, 1);
+            assert!(
+                transcript
+                    .lines
+                    .iter()
+                    .rev()
+                    .take_while(|line| line.trim().is_empty())
+                    .count()
+                    >= 4,
+                "the fixture must leave at least four trailing blank rows"
+            );
+            let buffer = terminal.backend().buffer();
+            let row: String = (0..width)
+                .map(|x| buffer[(x, transcript.y)].symbol())
+                .collect();
+            assert_eq!(row.trim(), transcript.lines[transcript.scroll_top].trim());
+            row.trim().to_owned()
+        };
+
+        assert_eq!(draw_transcript(&mut app), "Latest reply");
+        for reply in [
+            "Recent reply",
+            "Middle reply",
+            "Earlier reply",
+            "First reply",
+        ] {
+            app.scroll_up();
+            assert_eq!(draw_transcript(&mut app), reply);
+        }
+        for reply in [
+            "Earlier reply",
+            "Middle reply",
+            "Recent reply",
+            "Latest reply",
+        ] {
+            app.scroll_down();
+            assert_eq!(draw_transcript(&mut app), reply);
+        }
+
+        app.find_in_transcript("Middle reply");
+        assert_eq!(draw_transcript(&mut app), "Middle reply");
+        app.scroll_down();
+        assert_eq!(draw_transcript(&mut app), "Recent reply");
+        app.scroll_down();
+        assert_eq!(draw_transcript(&mut app), "Latest reply");
+    }
+}
+
+#[test]
+fn a_short_transcript_keeps_the_latest_reply_visible_above_trailing_blanks() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let replies = [
+        "First reply",
+        "Earlier reply",
+        "Middle reply",
+        "Recent reply",
+        "Latest reply",
+    ];
+    for (height, viewport_rows, blank_rows) in [(6, 2, 2), (7, 3, 4)] {
+        let mut app = App::new();
+        app.history.clear();
+        app.history.push(HistoryCell::Assistant {
+            text: replies.join("\n") + &"\n".repeat(blank_rows),
+        });
+        app.insert_str_at_cursor("draft");
+
+        let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+        let draw_transcript = |terminal: &mut Terminal<TestBackend>, app: &mut App| {
+            terminal.draw(|frame| render(frame, app)).unwrap();
+            let transcript = app.transcript.as_ref().unwrap();
+            let buffer = terminal.backend().buffer();
+            (transcript.y..transcript.y + transcript.height)
+                .map(|y| {
+                    let row: String = (0..80).map(|x| buffer[(x, y)].symbol()).collect();
+                    row.trim().to_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let bottom = draw_transcript(&mut terminal, &mut app);
+        let transcript = app.transcript.as_ref().unwrap();
+        assert_eq!(bottom.len(), viewport_rows);
+        assert_eq!(transcript.lines.len(), replies.len() + blank_rows);
+        assert_eq!(bottom[0], "Latest reply");
+
+        app.scroll_up();
+        let earlier = draw_transcript(&mut terminal, &mut app);
+        assert_eq!(
+            earlier,
+            replies[replies.len() - 1 - viewport_rows..replies.len() - 1]
+        );
+        app.scroll_down();
+        assert_eq!(draw_transcript(&mut terminal, &mut app), bottom);
+
+        app.find_in_transcript("Middle reply");
+        assert_eq!(draw_transcript(&mut terminal, &mut app)[0], "Middle reply");
+        app.scroll_down();
+        assert_eq!(draw_transcript(&mut terminal, &mut app), bottom);
+
+        terminal.backend_mut().resize(80, blank_rows as u16 + 6);
+        let taller = draw_transcript(&mut terminal, &mut app);
+        assert_eq!(taller.len(), blank_rows + 2);
+        assert_eq!(taller[..2], ["Recent reply", "Latest reply"]);
+    }
 }
 
 #[test]
@@ -2329,6 +2568,84 @@ fn completion_menu_windows_to_keep_selection_visible() {
 }
 
 #[test]
+fn completion_preserves_scrollback_and_the_selected_candidate() {
+    use crate::app::CompletionKind;
+
+    for (trigger, kind) in [('/', CompletionKind::Slash), ('@', CompletionKind::File)] {
+        let mut app = App::new();
+        app.lang = Lang::En;
+        app.history.push(HistoryCell::Assistant {
+            text: "Earlier reply".to_string(),
+        });
+        app.workspace_files = (0..8).map(|index| format!("src/file{index}.rs")).collect();
+        app.push_char(trigger);
+        assert_eq!(app.completion.as_ref().unwrap().kind, kind);
+        app.completion_up();
+        let menu = app.completion.as_ref().unwrap();
+        let selected = format!("▶ {}", menu.items[menu.selected].0.trim_end());
+
+        for (height, scrollback) in [(3, 0), (6, 1), (11, 5), (12, 5), (24, 10)] {
+            let screen = frame(&mut app, 80, height);
+            assert_eq!(app.transcript.as_ref().unwrap().height, scrollback);
+            assert!(screen.contains(&selected), "{height} rows: {screen}");
+            assert!(screen.contains(&format!("› {trigger}")), "{screen}");
+            if scrollback >= 5 {
+                assert!(screen.contains("Earlier reply"), "{height} rows: {screen}");
+            }
+        }
+    }
+}
+
+#[test]
+fn file_completion_and_a_three_line_draft_fit_in_sixteen_rows() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.history.push(HistoryCell::Assistant {
+        text: "Earlier reply".to_string(),
+    });
+    let files: Vec<_> = (0..8).map(|index| format!("src/file{index}.rs")).collect();
+    app.workspace_files.clone_from(&files);
+    app.insert_str_at_cursor("First draft line\nSecond draft line\n@");
+    assert_eq!(
+        app.completion.as_ref().unwrap().kind,
+        crate::app::CompletionKind::File
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let composer = app.composer.as_ref().unwrap();
+    assert_eq!((composer.rows, composer.first_row), (3, 0));
+    terminal
+        .backend_mut()
+        .assert_cursor_position((composer.text_x + 1, composer.y + 2));
+    let buffer = terminal.backend().buffer();
+    let row = |y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+    for (offset, text) in ["First draft line", "Second draft line", "@"]
+        .into_iter()
+        .enumerate()
+    {
+        let y = composer.y + offset as u16;
+        let draft_line: String = (composer.text_x..80)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        assert_eq!(draft_line.trim_end(), text);
+    }
+    assert_eq!(app.transcript.as_ref().unwrap().height, 5);
+    assert!((0..5).any(|y| row(y).contains("Earlier reply")));
+    let menu: String = (5..composer.y).map(row).collect();
+    assert!(menu.contains("▶ src/file0.rs"), "{menu}");
+    assert_eq!(
+        files
+            .iter()
+            .filter(|path| menu.contains(path.as_str()))
+            .count(),
+        5
+    );
+}
+
+#[test]
 fn streaming_cjk_text_wraps_by_display_width() {
     let cell = HistoryCell::Assistant {
         text: "中".repeat(30), // 60 display columns
@@ -2425,6 +2742,11 @@ fn draw_composer(width: u16, height: u16, input: &str) -> (Vec<String>, (u16, u1
 
     let mut app = App::new();
     app.lang = Lang::En;
+    app.configured_model = "deepseek-flash".to_string();
+    app.configured_reasoning = "high".to_string();
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.sandbox_off = false;
     app.input = input.to_string();
     app.input_cursor = app.input.chars().count();
 
@@ -2527,68 +2849,716 @@ fn layout_input_materializes_the_row_the_caret_needs() {
 }
 
 #[test]
-fn empty_composer_keeps_the_caret_before_the_placeholder() {
-    let (rows, caret) = draw_composer(40, 12, "");
+fn empty_composer_draws_its_hint_at_the_native_caret() {
+    let (rows, caret) = draw_composer(100, 12, "");
     assert_eq!(caret, (2, 9));
-    assert_eq!(rows[9].chars().nth(2), Some(' '));
-    assert_eq!(rows[9].chars().nth(3), Some('T'));
+    let hint = tr(Lang::En, TextId::ComposerPlaceholder);
+    assert_eq!(rows[9].trim_end(), format!("› {hint}"));
+    assert!(!rows[11].contains(hint));
 }
 
 #[test]
-fn composer_draws_the_caret_in_the_same_buffer_as_the_placeholder() {
+fn the_inline_placeholder_fits_the_editable_width_in_a_one_row_pane() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
 
     let mut app = App::new();
-    app.lang = Lang::En;
-    let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
-    terminal.draw(|frame| render(frame, &mut app)).unwrap();
-
-    assert!(
-        terminal.backend().buffer()[(2, 9)]
-            .style()
-            .add_modifier
-            .contains(Modifier::REVERSED),
-        "the empty input caret must be painted on its blank cell"
-    );
+    for (width, lang, hint) in [
+        (40, Lang::Zh, "输入消息，输入 / 唤起命令"),
+        (20, Lang::En, "/ commands"),
+        (12, Lang::Zh, "/ 命令"),
+        (7, Lang::Zh, "/help"),
+        (3, Lang::En, "/"),
+        (2, Lang::En, ""),
+    ] {
+        app.lang = lang;
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        if !hint.is_empty() {
+            terminal.backend_mut().assert_cursor_position((2, 0));
+        }
+        let buffer = terminal.backend().buffer();
+        let mut expected = Buffer::empty(buffer.area);
+        expected.set_string(0, 0, format!("› {hint}"), Style::default());
+        for (actual, expected) in buffer.content.iter().zip(&expected.content) {
+            assert_eq!(actual.symbol(), expected.symbol(), "{width} columns");
+        }
+        assert!(app.composer.as_ref().unwrap().text.is_empty());
+    }
 }
 
 #[test]
-fn composer_caret_moves_with_text_without_reusing_the_placeholder_cell() {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
+fn the_inline_placeholder_is_hidden_while_search_or_approval_owns_the_keys() {
     let mut app = App::new();
     app.lang = Lang::En;
-    let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+    let hint = tr(Lang::En, TextId::ComposerPlaceholder);
+    app.history_search_start();
+    let screen = frame(&mut app, 100, 16);
+    assert!(screen.contains("reverse-i-search"), "{screen}");
+    assert!(!screen.contains(hint), "{screen}");
+    app.history_search_cancel();
 
-    terminal.draw(|frame| render(frame, &mut app)).unwrap();
-    assert_eq!(terminal.backend().buffer()[(2, 9)].symbol(), " ");
-    assert_eq!(terminal.backend().buffer()[(3, 9)].symbol(), "T");
+    app.pending_approval = Some(root_grant_request("/tmp/workspace/cache", "/tmp/cache"));
+    let screen = frame(&mut app, 100, 16);
+    assert!(!screen.contains(hint), "{screen}");
+}
 
-    app.input = "x".to_string();
-    app.input_cursor = 1;
-    terminal.draw(|frame| render(frame, &mut app)).unwrap();
-    assert_eq!(terminal.backend().buffer()[(2, 9)].symbol(), "x");
+#[test]
+fn the_inline_hint_leaves_footer_space_for_the_model_and_badges() {
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.sandbox_off = false;
+    app.configured_model = "deepseek-v4-pro".to_string();
+    app.configured_reasoning = "high".to_string();
+    app.status.clear();
+
+    let hint = tr(Lang::En, TextId::ComposerPlaceholder);
+    let screen = frame(&mut app, 40, 12);
+    assert!(screen.contains(&format!("› {hint}")), "{screen}");
     assert!(
-        terminal.backend().buffer()[(3, 9)]
-            .style()
-            .add_modifier
-            .contains(Modifier::REVERSED)
+        screen
+            .trim_end()
+            .ends_with("[default] deepseek-v4-pro high"),
+        "{screen}"
     );
-    assert_eq!(terminal.backend().buffer()[(3, 9)].symbol(), " ");
 
+    app.sandbox_off = true;
+    let screen = frame(&mut app, 40, 12);
+    assert!(screen.contains(&format!("› {hint}")), "{screen}");
+    assert!(
+        screen
+            .trim_end()
+            .ends_with("[default] [unsandboxed] deepseek-v4-pro"),
+        "{screen}"
+    );
+}
+
+fn idle_footer_telemetry() -> deep_code_agent::TurnTelemetry {
+    deep_code_agent::TurnTelemetry {
+        route_label: String::new(),
+        effective_model: "deepseek-v4-pro".to_string(),
+        reasoning_effort: "high".to_string(),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        cache_hit_tokens: None,
+        cache_miss_tokens: None,
+        session_cache_hit_tokens: 0,
+        session_cache_miss_tokens: 0,
+        session_cache_savings: Default::default(),
+        prefix_status: deep_code_agent::PrefixStatus::Stable,
+        route_reason: String::new(),
+        route_source: String::new(),
+        cascade_triggered: false,
+        fallback_reason: None,
+        context_window: 100,
+        estimated_context_tokens: 85,
+        context_usage_percent: 85,
+        near_compaction_threshold: false,
+        used_model_fallback: false,
+        stream_retries: 0,
+        turn_cost: Default::default(),
+        session_cost: Default::default(),
+    }
+}
+
+fn draw_footer(app: &mut App, width: u16) -> String {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            render_status(frame, app, area);
+        })
+        .unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+#[test]
+fn idle_footer_preserves_complete_context_fields() {
+    use deep_code_agent::PermissionMode;
+
+    let mut app = App::new();
+    app.last_telemetry = Some(idle_footer_telemetry());
+    app.lang = Lang::En;
+    app.permission_mode.set(PermissionMode::Default);
+    app.sandbox_off = false;
+    assert_eq!(
+        draw_footer(&mut app, 39),
+        "[default] deepseek-v4-pro high  ctx 85%"
+    );
+    for lang in [Lang::En, Lang::Zh] {
+        app.lang = lang;
+        for mode in [PermissionMode::Default, PermissionMode::AcceptEdits] {
+            app.permission_mode.set(mode);
+            for sandbox_off in [false, true] {
+                app.sandbox_off = sandbox_off;
+                let badges_width = status_badges(&app).iter().map(Span::width).sum::<usize>();
+                for percent in [0, 85, 100] {
+                    app.last_telemetry.as_mut().unwrap().context_usage_percent = percent;
+                    let context = format!("ctx {percent}%");
+                    for width in [24, 30, 36, 38, 39, 40, 41, 44, 50, 60, 90] {
+                        let footer = draw_footer(&mut app, width);
+                        assert!(
+                            !footer.contains("ctx") || footer.contains(&context),
+                            "{width} columns: {footer}"
+                        );
+                        if usize::from(width) >= badges_width {
+                            assert_eq!(footer.contains("[unsandboxed]"), sandbox_off);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    app.lang = Lang::En;
+    app.permission_mode.set(PermissionMode::Default);
+    app.sandbox_off = false;
+    app.status = "Completed".to_string();
     app.input.clear();
-    app.input_cursor = 0;
+    assert_eq!(draw_footer(&mut app, 20), "[default] Completed");
+    assert_eq!(draw_footer(&mut app, 21), "[default] Completed");
+    app.handle_escape();
+    assert_eq!(draw_footer(&mut app, 22), "[default] Esc quits");
+    app.clear_quit_guard();
+    app.handle_ctrl_c();
+    assert_eq!(draw_footer(&mut app, 22), "[default] Ctrl+C quits");
+}
+
+#[test]
+fn idle_footer_shows_rollback_only_with_room_for_the_complete_command() {
+    use deep_code_agent::{CheckpointId, PermissionMode, RuntimeEvent, TurnId};
+
+    let mut app = App::new();
+    app.permission_mode.set(PermissionMode::Default);
+    let id = "before_turn_1763510400000";
+    app.apply_runtime_event(RuntimeEvent::CheckpointCreated {
+        id: CheckpointId(id.into()),
+        label: "before turn".into(),
+    });
+    let model_status = "deepseek-v4-pro high  ctx 85%";
+    let command = format!("/restore {id}");
+
+    for lang in [Lang::En, Lang::Zh] {
+        app.lang = lang;
+        app.apply_runtime_event(RuntimeEvent::TurnFinished {
+            turn_id: TurnId("turn_1".into()),
+            usage: None,
+            telemetry: Some(idle_footer_telemetry()),
+        });
+        for sandbox_off in [false, true] {
+            app.sandbox_off = sandbox_off;
+            let badges_width: usize = status_badges(&app).iter().map(Span::width).sum();
+            let full_status_width = badges_width + model_status.width() + 2 + app.status.width();
+            let full_width = full_status_width as u16;
+            for (width, show_rollback) in [(full_width - 1, false), (full_width, true)] {
+                let footer = draw_footer(&mut app, width);
+                assert!(footer.contains(model_status), "{footer}");
+                if show_rollback {
+                    assert!(footer.contains(&command), "{footer}");
+                } else {
+                    assert!(!footer.contains("/restore"), "{footer}");
+                }
+            }
+        }
+    }
+    app.lang = Lang::En;
+    app.sandbox_off = false;
+    app.input.clear();
+    app.apply_runtime_event(RuntimeEvent::TurnFinished {
+        turn_id: TurnId("turn_1".into()),
+        usage: None,
+        telemetry: Some(idle_footer_telemetry()),
+    });
+    let footer = draw_footer(&mut app, 52);
+    assert_eq!(footer, format!("[default] {model_status}"));
+}
+
+#[test]
+fn composer_caret_follows_the_draft_click_and_committed_cjk_text() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+
+    for ch in "saasd".chars() {
+        app.push_char(ch);
+    }
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
-    assert_eq!(terminal.backend().buffer()[(2, 9)].symbol(), " ");
-    assert!(
-        terminal.backend().buffer()[(2, 9)]
-            .style()
-            .add_modifier
-            .contains(Modifier::REVERSED)
+    terminal.backend_mut().assert_cursor_position((7, 9));
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(7, 9)].symbol(), " ");
+    assert!(!buffer[(7, 9)].modifier.contains(Modifier::REVERSED));
+    let composer: String = (0..100).map(|col| buffer[(col, 9)].symbol()).collect();
+    assert_eq!(composer.trim_end(), "› saasd");
+
+    app.mouse_press(4, 9);
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    terminal.backend_mut().assert_cursor_position((4, 9));
+    assert_eq!(app.input, "saasd");
+
+    app.push_char('中');
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert_eq!(app.input, "sa中asd");
+    terminal.backend_mut().assert_cursor_position((6, 9));
+    assert_eq!(terminal.backend().buffer()[(4, 9)].symbol(), "中");
+
+    app.cursor_to_end();
+    app.kill_to_line_start();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    terminal.backend_mut().assert_cursor_position((2, 9));
+    let hint = &terminal.backend().buffer()[(2, 9)];
+    assert_eq!(hint.symbol(), "T");
+    assert_eq!(hint.fg, Color::DarkGray);
+    assert!(app.input.is_empty());
+}
+
+#[test]
+fn streaming_composer_hint_adapts_to_space_after_the_cancel_shortcut() {
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.sandbox_off = false;
+    app.is_streaming = true;
+    app.streaming_since = Some(std::time::Instant::now());
+    app.steering_queue.push("follow up".to_string());
+    let hint = tr_with(
+        Lang::En,
+        TextId::ComposerPlaceholderSteering,
+        &[("count", "1")],
     );
-    assert_eq!(terminal.backend().buffer()[(3, 9)].symbol(), "T");
+    let cancel = tr(Lang::En, TextId::StatusEscCancel);
+    let wide = frame(&mut app, 120, 12);
+    assert!(!wide.contains(tr(Lang::En, TextId::ComposerPlaceholder)));
+    let after_cancel = wide.split_once(cancel).unwrap().1;
+    assert!(after_cancel.contains(&hint), "{wide}");
+
+    // A 50-column terminal still shows whether a follow-up is waiting, or
+    // advertises steering when the queue is empty.
+    let narrow = frame(&mut app, 50, 12);
+    assert_eq!(narrow.split_once(cancel).unwrap().1.trim(), "1 queued");
+
+    app.steering_queue.clear();
+    let narrow = frame(&mut app, 50, 12);
+    assert_eq!(narrow.split_once(cancel).unwrap().1.trim(), "Steer");
+
+    let cramped = frame(&mut app, 44, 12);
+    assert!(cramped.trim_end().ends_with("Esc Steer"), "{cramped}");
+}
+
+#[test]
+fn streaming_footer_keeps_activity_and_queue_count_in_narrow_windows() {
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.sandbox_off = true;
+    app.is_streaming = true;
+    app.streaming_since = Some(std::time::Instant::now());
+
+    let check_footer = |app: &mut App, width, badges: &str, suffixes: &[&str]| {
+        let screen = frame(app, width, 12);
+        let (_, status) = screen
+            .split_once(badges)
+            .unwrap_or_else(|| panic!("{width} columns: {screen}"));
+        let status = status.trim_end();
+        let spinner = status.chars().next().unwrap();
+        assert!(
+            matches!(spinner, '\u{2800}'..='\u{28ff}'),
+            "{width} columns: {status}"
+        );
+        assert!(
+            suffixes.iter().any(|&suffix| status.ends_with(suffix)),
+            "{width} columns: {status}"
+        );
+    };
+
+    let badges = "[default] [unsandboxed] ";
+    check_footer(&mut app, 40, badges, &[" Esc"]);
+    app.steering_queue.push("follow up".to_string());
+    check_footer(&mut app, 40, badges, &[" Esc ◷ 1"]);
+
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::AcceptEdits);
+    let badges = "[accept-edits] [unsandboxed] ";
+    for queued in [1, 16] {
+        app.steering_queue
+            .resize_with(queued, || "follow up".to_string());
+        let full = format!(" {queued} queued");
+        let compact = format!(" ◷ {queued}");
+        let tight = format!(" ◷{queued}");
+        for width in 40..=44 {
+            check_footer(&mut app, width, badges, &[&full, &compact, &tight]);
+        }
+    }
+
+    app.steering_queue.clear();
+    let follow_up = "Follow up after the current work";
+    app.insert_str_at_cursor(follow_up);
+    app.submit();
+    assert_eq!(app.steering_queue, [follow_up]);
+    check_footer(&mut app, 36, badges, &[" ◷ 1", " ◷1"]);
+
+    app.insert_str_at_cursor("Another draft");
+    check_footer(&mut app, 36, badges, &[" ◷ 1", " ◷1"]);
+}
+
+#[test]
+fn streaming_footer_preserves_complete_fields_across_narrow_layouts() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let cases = [
+        (Lang::En, "[default] [unsandboxed] ", "generating", " 0s"),
+        (
+            Lang::En,
+            "[accept-edits] [unsandboxed] ",
+            "compacting the context",
+            " · 27s",
+        ),
+        (
+            Lang::En,
+            "[auto] ",
+            "running mcp__github__list_pull_requests",
+            " · 325s",
+        ),
+        (Lang::Zh, "[默认] [unsandboxed] ", "生成中", " 0s"),
+        (
+            Lang::Zh,
+            "[接受编辑] [unsandboxed] ",
+            "压缩上下文中",
+            " · 27s",
+        ),
+        (
+            Lang::Zh,
+            "[YOLO] ",
+            "mcp__github__list_pull_requests 运行中",
+            " · 325s",
+        ),
+    ];
+    let mut app = App::new();
+    for (lang, badges, label, clock) in cases {
+        app.lang = lang;
+        let activity = format!("⠋ {label}");
+        let time = clock.split_whitespace().last().unwrap();
+        for queued in [0, 1, 16] {
+            app.steering_queue.resize_with(queued, String::new);
+            let count = queued.to_string();
+            let tight = format!("◷{count}");
+            let marker = format!("◷ {count}");
+            let localized = tr_with(
+                lang,
+                TextId::ComposerPlaceholderSteeringQueuedShort,
+                &[("count", count.as_str())],
+            );
+            let count_gap = if queued == 0 { 0 } else { 1 + tight.width() };
+            for width in [29, 30, 31, 32, 36, 40, 44, 50] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        let area = frame.area();
+                        render_streaming_status(
+                            frame,
+                            area,
+                            vec![Span::raw(badges)],
+                            &app,
+                            (&activity, clock),
+                            true,
+                        );
+                    })
+                    .unwrap();
+
+                let buffer = terminal.backend().buffer();
+                let mut footer = String::new();
+                let mut col = 0;
+                while col < usize::from(width) {
+                    let grapheme = buffer.content[col].symbol();
+                    footer.push_str(grapheme);
+                    col += grapheme.width().max(1);
+                }
+                let context =
+                    format!("{width} columns, {queued} queued, {activity}{clock}: {footer}");
+                let status = footer
+                    .strip_prefix(badges)
+                    .unwrap_or_else(|| panic!("{context}"));
+                let available = usize::from(width) - badges.width();
+                let numbers: Vec<_> = status
+                    .split(|ch: char| !ch.is_ascii_digit() && ch != 's')
+                    .filter(|part| part.starts_with(|ch: char| ch.is_ascii_digit()))
+                    .collect();
+                assert!(
+                    numbers
+                        .iter()
+                        .all(|&part| part == time || (queued > 0 && part == count.as_str())),
+                    "{context}"
+                );
+                if queued > 0 && available >= tight.width() {
+                    assert!(
+                        status.contains(&marker)
+                            || status.contains(&tight)
+                            || status.contains(&localized),
+                        "{context}"
+                    );
+                }
+                let spinner_and_count = 1 + count_gap;
+                if available >= spinner_and_count {
+                    assert!(status.starts_with('⠋'), "{context}");
+                }
+                let clock_fits = available >= spinner_and_count + clock.width();
+                if clock_fits {
+                    assert!(numbers.contains(&time), "{context}");
+                }
+                let with_clock = if clock_fits { clock.width() } else { 0 };
+                if available >= spinner_and_count + with_clock + 1 + "Esc".width() {
+                    assert!(
+                        status.split_whitespace().any(|word| word == "Esc"),
+                        "{context}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn streaming_footer_keeps_generation_and_compaction_clocks_at_40_columns() {
+    use std::time::{Duration, Instant};
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.sandbox_off = true;
+    app.is_streaming = true;
+    let now = Instant::now();
+    let generating_since = now.checked_sub(Duration::from_secs(12)).unwrap_or(now);
+    let compacting_since = now.checked_sub(Duration::from_secs(34)).unwrap_or(now);
+    app.streaming_since = Some(generating_since);
+
+    for compaction in [None, Some(compacting_since)] {
+        app.turn_compaction_since = compaction;
+        let screen = frame(&mut app, 40, 12);
+        let (_, status) = screen
+            .rsplit_once("[default] [unsandboxed] ")
+            .unwrap_or_else(|| panic!("{screen}"));
+        let spinner = status.chars().next().unwrap();
+        assert!(matches!(spinner, '\u{2800}'..='\u{28ff}'), "{status}");
+        assert!(status.trim_end().ends_with(" Esc"), "{status}");
+        let started_at = compaction.unwrap_or(generating_since);
+        let elapsed = now.duration_since(started_at).as_secs()..=started_at.elapsed().as_secs();
+        assert!(
+            status
+                .split_whitespace()
+                .filter_map(|word| word.strip_suffix('s')?.parse::<u64>().ok())
+                .any(|seconds| elapsed.contains(&seconds)),
+            "{status}"
+        );
+    }
+}
+
+#[test]
+fn streaming_footer_keeps_tool_elapsed_time_and_cancel_at_60_columns() {
+    use std::time::{Duration, Instant};
+
+    use crate::active_turn::{ActiveToolCell, ActiveTurn, LiveOutput};
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.sandbox_off = false;
+    app.is_streaming = true;
+    let now = Instant::now();
+    app.streaming_since = Some(now);
+    let tool_name = "mcp__github__list_pull_requests";
+    let mut turn = ActiveTurn::default();
+    turn.upsert_tool(ActiveToolCell {
+        tool_call_id: deep_code_agent::ToolCallId("call_1".to_string()),
+        tool_name: tool_name.to_string(),
+        arguments: "{}".to_string(),
+        approval: ToolApprovalState::NotRequired,
+        live_output: LiveOutput::default(),
+        started_at: now,
+    });
+    app.active_turn = Some(turn);
+
+    for elapsed in [0, 12] {
+        let started_at = now.checked_sub(Duration::from_secs(elapsed)).unwrap_or(now);
+        app.active_turn.as_mut().unwrap().tools[0].started_at = started_at;
+        let screen = frame(&mut app, 60, 12);
+        let (_, status) = screen
+            .rsplit_once("[default] ")
+            .unwrap_or_else(|| panic!("{screen}"));
+        assert!(status.contains("running "), "{status}");
+        assert!(
+            status.split_whitespace().any(|word| word == "Esc"),
+            "{status}"
+        );
+        let tool_seconds =
+            now.duration_since(started_at).as_secs()..=started_at.elapsed().as_secs();
+        let seconds = status
+            .split_whitespace()
+            .filter_map(|word| word.strip_suffix('s')?.parse::<u64>().ok())
+            .find(|seconds| tool_seconds.contains(seconds))
+            .unwrap_or_else(|| panic!("missing tool clock: {status}"));
+        if seconds < 10 {
+            assert!(status.contains(tool_name), "{status}");
+        } else {
+            assert!(status.contains('…'), "{status}");
+        }
+    }
+}
+
+#[test]
+fn streaming_footer_fits_the_steering_hint_with_either_cancel_label() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    let badges = "[default] [unsandboxed] ";
+    let activity = "⠋ running mcp__github__list_pull_requests";
+    let clock = " · 0s";
+    for (width, show_hint, suffix) in [
+        (79, true, "   Esc"),
+        (80, true, " Esc Steer"),
+        (82, true, "   Esc Steer"),
+        (82, false, "   Esc"),
+        (84, true, "   Esc Steer"),
+        (90, true, " Esc to cancel Steer"),
+    ] {
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_streaming_status(
+                    frame,
+                    area,
+                    vec![Span::raw(badges)],
+                    &app,
+                    (activity, clock),
+                    show_hint,
+                );
+            })
+            .unwrap();
+        let footer: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert_eq!(
+            footer.trim_end(),
+            format!("{badges}{activity}{clock}{suffix}"),
+            "{width} columns, show hint {show_hint}"
+        );
+    }
+}
+
+#[test]
+fn chinese_streaming_footer_keeps_tool_elapsed_time_and_cancel_at_40_columns() {
+    use std::time::{Duration, Instant};
+
+    use crate::active_turn::{ActiveToolCell, ActiveTurn, LiveOutput};
+
+    let mut app = App::new();
+    app.lang = Lang::Zh;
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::AcceptEdits);
+    app.sandbox_off = true;
+    app.is_streaming = true;
+    let now = Instant::now();
+    app.streaming_since = Some(now);
+    let started_at = now.checked_sub(Duration::from_secs(12)).unwrap_or(now);
+    let mut turn = ActiveTurn::default();
+    turn.upsert_tool(ActiveToolCell {
+        tool_call_id: deep_code_agent::ToolCallId("call_1".to_string()),
+        tool_name: "mcp__github__list_pull_requests".to_string(),
+        arguments: "{}".to_string(),
+        approval: ToolApprovalState::NotRequired,
+        live_output: LiveOutput::default(),
+        started_at,
+    });
+    app.active_turn = Some(turn);
+
+    let screen = frame(&mut app, 40, 12);
+    let (_, status) = screen
+        .rsplit_once("[unsandboxed] ")
+        .unwrap_or_else(|| panic!("{screen}"));
+    let spinner = status.chars().next().unwrap();
+    assert!(matches!(spinner, '\u{2800}'..='\u{28ff}'), "{status}");
+    let elapsed = now.duration_since(started_at).as_secs()..=started_at.elapsed().as_secs();
+    assert!(
+        status
+            .trim_end()
+            .strip_suffix(" Esc")
+            .and_then(|status| status.rsplit_once(" · "))
+            .and_then(|(_, clock)| clock.strip_suffix('s'))
+            .and_then(|seconds| seconds.parse::<u64>().ok())
+            .is_some_and(|seconds| elapsed.contains(&seconds)),
+        "{status}"
+    );
+}
+
+#[test]
+fn streaming_footer_confirms_a_queued_follow_up_with_the_transcript_scrolled_up() {
+    use crate::active_turn::{ActiveToolCell, ActiveTurn, LiveOutput};
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.sandbox_off = false;
+    app.is_streaming = true;
+    let now = std::time::Instant::now();
+    app.streaming_since = Some(now);
+    let mut turn = ActiveTurn::default();
+    turn.upsert_tool(ActiveToolCell {
+        tool_call_id: deep_code_agent::ToolCallId("call_1".to_string()),
+        tool_name: "mcp__github__list_pull_requests".to_string(),
+        arguments: "{}".to_string(),
+        approval: crate::history::ToolApprovalState::NotRequired,
+        live_output: LiveOutput::default(),
+        started_at: now,
+    });
+    app.active_turn = Some(turn);
+    for _ in 0..60 {
+        app.history.push(HistoryCell::user("Earlier message"));
+    }
+    app.scroll_offset = 40;
+    let follow_up = "Wait for the checks please";
+    app.insert_str_at_cursor(follow_up);
+    app.submit();
+    assert!(app.input.is_empty());
+    assert_eq!(app.steering_queue, [follow_up]);
+
+    let screen = frame(&mut app, 80, 12);
+    assert!(!screen.contains(follow_up), "{screen}");
+    assert!(screen.contains("Esc to cancel 1 queued"), "{screen}");
+
+    app.insert_str_at_cursor("Another draft");
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::AcceptEdits);
+    app.sandbox_off = true;
+    let narrow = frame(&mut app, 50, 12);
+    assert!(narrow.contains("[accept-edits] [unsandboxed]"), "{narrow}");
+    assert!(narrow.contains("Esc 1 queued"), "{narrow}");
 }
 
 /// The reported symptom, asserted where a human sees it: the caret the terminal
@@ -2672,24 +3642,192 @@ fn composer_caret_lands_on_a_visible_row_when_the_input_scrolls() {
     );
 }
 
-/// The one case the fix does NOT change, pinned so it is a known limitation
-/// rather than a surprise: a terminal too short to show the caret's row.
-///
-/// At 40x12 an 8-row composer cannot fit (`Constraint::Min(5)` on the transcript
-/// leaves 6), so it is drawn 4 rows tall and the caret is clamped onto the last
-/// VISIBLE text row. Before the fix the same clamp applied here and landed on the
-/// same row — this is a "nowhere to draw" case, not the boundary bug, and the
-/// distinction only holds if someone keeps the two apart on purpose.
 #[test]
-fn composer_caret_is_clamped_when_the_terminal_cannot_show_its_row() {
-    let (rows, caret) = draw_composer(40, 12, &"a".repeat(266));
+fn composer_scrolls_to_the_caret_when_the_terminal_is_short() {
+    let (rows, (x, y)) = draw_composer(40, 12, &"a".repeat(266));
     let screen = rows.join("\n");
-    let (_, cy) = caret;
+    assert_eq!(x, 2, "{screen}");
+    assert!(rows[y as usize].trim().is_empty(), "{screen}");
+    assert!(rows[y as usize - 1].contains("aaaa"), "{screen}");
+}
 
-    assert!(
-        rows[cy as usize].contains("aaaa"),
-        "with no free row the caret stays on a text row:\n{screen}"
-    );
+#[test]
+fn composer_borders_use_only_spare_rows() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let app = App::new();
+    for draft_rows in 1..=COMPOSER_MAX_VISIBLE_ROWS {
+        let lines: Vec<_> = (1..=draft_rows)
+            .map(|line| format!("Draft line {line}"))
+            .collect();
+        let input = lines.join("\n");
+        let layout = layout_input(
+            &input,
+            input.chars().count(),
+            38,
+            COMPOSER_MAX_VISIBLE_ROWS,
+            0,
+        );
+        for height in 1..=draft_rows + 2 {
+            let mut terminal = Terminal::new(TestBackend::new(40, height as u16)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render_input_from_layout(frame, &app, &layout, area);
+                })
+                .unwrap();
+            let visible = draft_rows.min(height);
+            let text_y = u16::from(height > draft_rows);
+            let caret = terminal.get_cursor_position().unwrap();
+            assert_eq!(caret.x, 2 + lines.last().unwrap().len() as u16);
+            assert_eq!(caret.y, text_y + visible as u16 - 1);
+            let buffer = terminal.backend().buffer();
+            for (offset, text) in lines[draft_rows - visible..].iter().enumerate() {
+                let row: String = (2..40)
+                    .map(|x| buffer[(x, text_y + offset as u16)].symbol())
+                    .collect();
+                assert_eq!(
+                    row.trim_end(),
+                    text,
+                    "{draft_rows} draft rows in {height} rows"
+                );
+            }
+            if height > draft_rows {
+                assert_eq!(buffer[(0, 0)].symbol(), "─");
+            }
+            if height == draft_rows + 2 {
+                assert_eq!(buffer[(0, height as u16 - 1)].symbol(), "─");
+            }
+        }
+    }
+}
+
+#[test]
+fn composer_preserves_the_filled_row_when_the_caret_wraps_in_a_short_pane() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for (glyph, prefix_len) in [("a", 77), ("中", 38)] {
+        let mut app = App::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 9)).unwrap();
+        app.insert_str_at_cursor(&glyph.repeat(prefix_len));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let before_wrap = terminal.get_cursor_position().unwrap();
+        assert_eq!(usize::from(before_wrap.x), 2 + prefix_len * glyph.width());
+
+        app.insert_str_at_cursor(glyph);
+        for height in [9, 3, 10, 9] {
+            terminal.backend_mut().resize(80, height);
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let composer = app.composer.as_ref().unwrap();
+            assert_eq!(composer.first_row, 0, "height {height}");
+            assert_eq!(composer.rows, 2, "height {height}");
+            let (x, y) = (composer.text_x, composer.y);
+            terminal.backend_mut().assert_cursor_position((x, y + 1));
+            let buffer = terminal.backend().buffer();
+            let draft: String = (x..80)
+                .step_by(glyph.width())
+                .map(|col| buffer[(col, y)].symbol())
+                .collect();
+            assert_eq!(draft, app.input, "height {height}");
+            assert!((0..80).all(|col| buffer[(col, y + 1)].symbol() == " "));
+            if height == 10 {
+                assert_eq!(buffer[(0, y - 1)].symbol(), "─");
+                assert_eq!(buffer[(0, y + 2)].symbol(), "─");
+            }
+        }
+
+        let composer = app.composer.as_ref().unwrap();
+        let (x, y) = (composer.text_x + glyph.width() as u16, composer.y);
+        app.mouse_press(x, y);
+        assert_eq!(app.input_cursor, 1);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        terminal.backend_mut().assert_cursor_position((x, y));
+    }
+}
+
+#[test]
+fn composer_keeps_draft_and_caret_visible_in_short_panes() {
+    for height in 1..=6 {
+        for input in ["", "sa中asd"] {
+            let (rows, (x, y)) = draw_composer(40, height, input);
+            assert_eq!(usize::from(x), 2 + status_text_width(input));
+            assert!(rows[y as usize].starts_with('›'), "{rows:?}");
+            if !input.is_empty() {
+                assert!(rows[y as usize].contains('中'), "{rows:?}");
+            }
+            if height > 1 {
+                assert!(rows.last().unwrap().contains("[default]"), "{rows:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn short_panes_show_the_latest_reply_alongside_the_draft_and_footer() {
+    use deep_code_agent::{PermissionMode, RuntimeEvent, TurnId};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.permission_mode.set(PermissionMode::Default);
+    app.sandbox_off = false;
+    app.history.push(HistoryCell::user("Earlier prompt"));
+    app.insert_str_at_cursor("follow-up");
+    app.is_streaming = true;
+    app.streaming_since = Some(std::time::Instant::now());
+    let turn_id = TurnId("turn_1".into());
+    app.apply_runtime_event(RuntimeEvent::AssistantDelta {
+        turn_id: turn_id.clone(),
+        text: "Latest reply".into(),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 3)).unwrap();
+    for streaming in [true, false] {
+        if !streaming {
+            app.apply_runtime_event(RuntimeEvent::TurnFinished {
+                turn_id: turn_id.clone(),
+                usage: None,
+                telemetry: None,
+            });
+        }
+        for height in [3, 4, 5] {
+            terminal.backend_mut().resize(80, height);
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let caret = terminal.get_cursor_position().unwrap();
+            assert_eq!(caret.x, 2 + "follow-up".len() as u16);
+            let buffer = terminal.backend().buffer();
+            let row = |y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+            let transcript = app.transcript.as_ref().unwrap();
+            assert_eq!(transcript.height, 1, "{height} rows");
+            assert!(row(transcript.y).contains("Latest reply"), "{height} rows");
+            assert_eq!(row(caret.y).trim_end(), "› follow-up");
+            let footer = row(height - 1);
+            assert!(footer.starts_with("[default] "), "{footer}");
+            if streaming {
+                assert!(footer.contains("Esc"), "{footer}");
+            }
+        }
+    }
+}
+
+#[test]
+fn clicking_a_short_composer_uses_the_visible_draft_rows() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = App::new();
+    app.input = (0..10).map(|line| format!("Line {line}\n")).collect();
+    app.input_cursor = app.input.chars().count();
+    let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let composer = app.composer.as_ref().unwrap();
+    let first_row = composer.first_row;
+    assert!(first_row > 0);
+    let (x, y) = (composer.text_x + 2, composer.y);
+    app.mouse_press(x, y);
+    assert_eq!(app.input_cursor, 7 * first_row + 2);
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    terminal.backend_mut().assert_cursor_position((x, y));
+    assert_eq!(app.composer.as_ref().unwrap().first_row, first_row);
 }
 
 // ---------------------------------------------------------------------------
@@ -3244,6 +4382,528 @@ fn an_open_history_search_is_always_on_the_status_row() {
         app.history_search_start();
         let text = frame(&mut app, 120, 24);
         assert!(text.contains("reverse-i-search"), "{state}: {text}");
+    }
+}
+
+#[test]
+fn history_search_places_the_native_caret_after_the_query() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.insert_str_at_cursor("draft");
+    let recalled = "earlier 你好 prompt";
+    app.prompt_history.push(crate::app::HistoryPrompt {
+        text: recalled.to_string(),
+        images: Vec::new(),
+    });
+    let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+
+    app.history_search_start();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let empty = terminal.get_cursor_position().unwrap();
+    assert_eq!(empty.y, 11);
+    assert_eq!(terminal.backend().buffer()[empty].symbol(), "'");
+
+    app.history_search_append("你好");
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert_eq!(app.input, recalled);
+    terminal
+        .backend_mut()
+        .assert_cursor_position((empty.x + 4, 11));
+    assert_eq!(terminal.backend().buffer()[(empty.x + 4, 11)].symbol(), "'");
+
+    app.history_search_cancel();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert_eq!(app.input, "draft");
+    terminal.backend_mut().assert_cursor_position((7, 9));
+}
+
+#[test]
+fn history_search_shows_complete_key_hints_that_fit_after_the_result() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let assert_footer = |app: &mut App, width, before_caret: &str, after_caret: &str| {
+        let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        terminal
+            .backend_mut()
+            .assert_cursor_position((before_caret.width() as u16, 11));
+        let expected = format!("{before_caret}{after_caret}");
+        assert!(expected.width() <= usize::from(width));
+        let buffer = terminal.backend().buffer();
+        let mut col = 0;
+        for grapheme in expected.graphemes(true) {
+            assert_eq!(
+                buffer[(col, 11)].symbol(),
+                grapheme,
+                "width {width}, column {col}"
+            );
+            col += grapheme.width() as u16;
+        }
+        for col in col..width {
+            assert_eq!(
+                buffer[(col, 11)].symbol(),
+                " ",
+                "width {width}, column {col}"
+            );
+        }
+    };
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.sandbox_off = false;
+    app.remember_prompt("older foo");
+    app.remember_prompt("newer foo");
+    app.history_search_start();
+    app.history_search_append("foo");
+
+    for (width, hints) in [
+        (53, ""),
+        (54, " — Esc"),
+        (79, " — Ctrl+R older, Esc"),
+        (80, " — Ctrl+R older, Enter keep, Esc"),
+        (94, " — Ctrl+R older, Enter keep, Esc back to draft"),
+    ] {
+        assert_footer(
+            &mut app,
+            width,
+            "[default] (reverse-i-search) 'foo",
+            &format!("': match 1 of 2{hints}"),
+        );
+    }
+
+    app.history_search_push('x');
+    assert_footer(
+        &mut app,
+        100,
+        "[default] (reverse-i-search) 'foox",
+        "': no match — Backspace to widen, Esc back to draft",
+    );
+
+    app.history_search_cancel();
+    app.lang = Lang::Zh;
+    app.history_search_start();
+    app.history_search_append("foo");
+    assert_footer(
+        &mut app,
+        80,
+        "[默认] （反向搜索）'foo",
+        "'：第 1 / 2 条 — Ctrl+R 更早，Enter 保留，Esc 回到草稿",
+    );
+}
+
+#[test]
+fn narrow_history_search_keeps_a_two_digit_match_count_intact() {
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.sandbox_off = false;
+    for number in 1..=10 {
+        app.remember_prompt(&format!("prompt {number}"));
+    }
+    app.history_search_start();
+
+    let compact = frame(&mut app, 33, 12);
+    assert!(compact.contains("[default] Search '': 1/10"), "{compact}");
+    let full = frame(&mut app, 34, 12);
+    assert!(
+        full.ends_with("[default] Search '': match 1 of 10"),
+        "{full}"
+    );
+
+    for _ in 1..10 {
+        app.history_search_older();
+    }
+    let compact = frame(&mut app, 34, 12);
+    assert!(compact.contains("[default] Search '': 10/10"), "{compact}");
+    let full = frame(&mut app, 35, 12);
+    assert!(
+        full.ends_with("[default] Search '': match 10 of 10"),
+        "{full}"
+    );
+}
+
+#[test]
+fn history_search_keeps_a_query_row_when_badges_fill_the_footer() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.sandbox_off = true;
+    app.insert_str_at_cursor("draft");
+    app.remember_prompt("saved abc");
+    app.history_search_start();
+
+    for width in [24, 25] {
+        let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        terminal.backend_mut().assert_cursor_position((8, 10));
+
+        app.history_search_push('a');
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        terminal.backend_mut().assert_cursor_position((9, 10));
+        let buffer = terminal.backend().buffer();
+        let row = |y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(row(8).contains("saved abc"));
+        assert_eq!(row(10).trim_end(), "Search 'a': match 1 of 1");
+        assert_eq!(row(11).trim_end(), "[default] [unsandboxed]");
+        app.history_search_backspace();
+    }
+
+    app.history_search_append("abc");
+    let mut short = Terminal::new(TestBackend::new(24, 1)).unwrap();
+    short.draw(|frame| render(frame, &mut app)).unwrap();
+    short.backend_mut().assert_cursor_position((4, 0));
+
+    let mut wide = Terminal::new(TestBackend::new(80, 12)).unwrap();
+    wide.draw(|frame| render(frame, &mut app)).unwrap();
+    assert_eq!(wide.get_cursor_position().unwrap().y, 11);
+
+    app.history_search_cancel();
+    let mut terminal = Terminal::new(TestBackend::new(24, 12)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert_eq!(app.input, "draft");
+    terminal.backend_mut().assert_cursor_position((7, 9));
+}
+
+#[test]
+fn history_search_keeps_the_query_when_the_terminal_is_short() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.sandbox_off = false;
+    app.remember_prompt("saved needle");
+    app.history_search_start();
+    app.history_search_append("needle");
+
+    for height in 1..=6 {
+        let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let expected = "[default] (reverse-i-search) 'needle";
+        terminal
+            .backend_mut()
+            .assert_cursor_position((expected.width() as u16, height - 1));
+        let buffer = terminal.backend().buffer();
+        let row = |y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        assert!(row(height - 1).contains("'needle': match 1 of 1"));
+        if height >= 2 {
+            let preview = app.composer.as_ref().unwrap();
+            assert_eq!(preview.rows, 1);
+            assert!(row(preview.y).contains("saved needle"));
+        }
+    }
+}
+
+#[test]
+fn history_search_reserves_transcript_space_with_a_long_recalled_prompt() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.history.clear();
+    for reply in 0..12 {
+        app.history.push(HistoryCell::Assistant {
+            text: format!("Earlier reply {reply:02}"),
+        });
+    }
+    app.remember_prompt(&format!("needle {} recalled tail", "a".repeat(78 * 5)));
+    app.history_search_start();
+    app.history_search_append("needle");
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 9)).unwrap();
+    for (width, height, sandbox_off, transcript_height) in [
+        (80, 1, false, 0),
+        (80, 2, false, 0),
+        (80, 3, false, 1),
+        (80, 9, false, 5),
+        (80, 12, false, 5),
+        (24, 2, true, 0),
+        (24, 4, true, 1),
+        (24, 9, true, 4),
+    ] {
+        app.sandbox_off = sandbox_off;
+        terminal.backend_mut().resize(width, height);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let caret = terminal.get_cursor_position().unwrap();
+        assert_eq!(caret.y, height - 1 - u16::from(sandbox_off));
+        let buffer = terminal.backend().buffer();
+        let row = |y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let query_row = row(caret.y);
+        assert!(
+            query_row.contains("needle") && query_row.contains("match 1 of 1"),
+            "{query_row}"
+        );
+
+        let transcript = app.transcript.as_ref().unwrap();
+        assert_eq!(transcript.height, transcript_height, "{width}×{height}");
+        if transcript_height > 0 {
+            let preview = app.composer.as_ref().unwrap();
+            assert!(preview.y >= transcript_height && preview.y + preview.rows <= caret.y);
+            assert!(row(preview.y + preview.rows - 1).contains("recalled tail"));
+            assert!((0..transcript_height).any(|y| row(y).contains("Earlier reply 11")));
+        }
+    }
+
+    let initial_top = app.transcript.as_ref().unwrap().scroll_top;
+    app.scroll_up();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert!(app.transcript.as_ref().unwrap().scroll_top < initial_top);
+    assert!(app.history_search_focused());
+    assert_eq!(terminal.get_cursor_position().unwrap().y, 7);
+}
+
+#[test]
+fn history_search_shows_the_recalled_text_when_it_fills_a_preview_row() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.sandbox_off = false;
+    app.history.push(HistoryCell::Assistant {
+        text: "Earlier reply".into(),
+    });
+    let prompt = "a".repeat(78);
+    app.remember_prompt(&prompt);
+    app.history_search_start();
+    app.history_search_append("a");
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 3)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert_eq!(app.transcript.as_ref().unwrap().height, 1);
+    let preview = app.composer.as_ref().unwrap();
+    assert_eq!((preview.rows, preview.first_row), (1, 0));
+    let buffer = terminal.backend().buffer();
+    let preview_text: String = (preview.text_x..80)
+        .map(|x| buffer[(x, preview.y)].symbol())
+        .collect();
+    assert_eq!(preview_text, prompt);
+    assert_eq!(app.input_cursor, 78);
+    terminal.backend_mut().assert_cursor_position((31, 2));
+
+    app.history_search_accept();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    terminal.backend_mut().assert_cursor_position((2, 1));
+    assert_eq!(app.input, prompt);
+}
+
+#[test]
+fn history_search_shows_a_separate_no_match_result_above_the_badges() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    for (width, sandbox_off, badges) in [
+        (22, false, "[default]"),
+        (36, true, "[default] [unsandboxed]"),
+    ] {
+        let mut app = App::new();
+        app.lang = Lang::En;
+        app.permission_mode
+            .set(deep_code_agent::PermissionMode::Default);
+        app.sandbox_off = sandbox_off;
+        app.remember_prompt("compile parser");
+        app.history_search_start();
+        app.history_search_append("compile parserx");
+
+        let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let caret = terminal.get_cursor_position().unwrap();
+        assert_eq!(caret.y, 10);
+        let buffer = terminal.backend().buffer();
+        let row = |y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert_eq!(row(11).trim_end(), badges);
+        assert!(row(8).contains("compile parser"));
+        assert!(row(10).contains("x': no match"));
+        let ending: String = (caret.x..width).map(|x| buffer[(x, 10)].symbol()).collect();
+        assert_eq!(ending.trim_end(), "': no match");
+    }
+}
+
+#[test]
+fn history_search_keeps_a_compact_label_next_to_the_badges() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    for (width, lang, prefix) in [
+        (40, Lang::En, "[default] [unsandboxed] Search '"),
+        (32, Lang::Zh, "[默认] [unsandboxed] 搜索 '"),
+    ] {
+        let mut app = App::new();
+        app.lang = lang;
+        app.permission_mode
+            .set(deep_code_agent::PermissionMode::Default);
+        app.sandbox_off = true;
+        app.history_search_start();
+
+        let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+        for query in ["", "中"] {
+            app.history_search_append(query);
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let expected = format!("{prefix}{query}'");
+            let cursor_x = (expected.width() - 1) as u16;
+            terminal
+                .backend_mut()
+                .assert_cursor_position((cursor_x, 11));
+
+            let status = terminal.backend().buffer();
+            let mut col = 0;
+            for grapheme in expected.graphemes(true) {
+                assert_eq!(status[(col, 11)].symbol(), grapheme, "column {col}");
+                col += grapheme.width() as u16;
+            }
+        }
+    }
+}
+
+#[test]
+fn history_search_shows_no_match_beside_the_query_at_40_columns() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    for (sandbox_off, preview, query, before_caret, result) in [
+        (
+            false,
+            "earlier preview",
+            "bogus text",
+            "[default] Search 'bogus text",
+            "': no match",
+        ),
+        (
+            false,
+            "compile parser",
+            "compile parserx",
+            "[default] Search '…le parserx",
+            "': no match",
+        ),
+        (
+            true,
+            "compile parser",
+            "compile parserx",
+            "[default] [unsandboxed] ?…serx",
+            ": no match",
+        ),
+    ] {
+        let mut app = App::new();
+        app.lang = Lang::En;
+        app.permission_mode
+            .set(deep_code_agent::PermissionMode::Default);
+        app.sandbox_off = sandbox_off;
+        app.remember_prompt(preview);
+        app.history_search_start();
+        app.history_search_append(query);
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        terminal
+            .backend_mut()
+            .assert_cursor_position((before_caret.width() as u16, 11));
+        let buffer = terminal.backend().buffer();
+        let row_text = |row| {
+            (0..40)
+                .map(|col| buffer[(col, row)].symbol())
+                .collect::<String>()
+        };
+        assert_eq!(row_text(11).trim_end(), format!("{before_caret}{result}"));
+        assert!(row_text(9).contains(preview));
+    }
+}
+
+#[test]
+fn history_search_keeps_the_query_tail_and_caret_visible_in_a_narrow_terminal() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.sandbox_off = false;
+    app.history_search_start();
+    app.history_search_append(&"一".repeat(30));
+    app.history_search_append("尾\u{202e}");
+
+    let mut terminal = Terminal::new(TestBackend::new(38, 12)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let caret = terminal.get_cursor_position().unwrap();
+    assert_eq!(caret.y, 11);
+    assert!(caret.x < 38);
+    assert_eq!(terminal.backend().buffer()[(18, 11)].symbol(), "…");
+    assert_eq!(
+        terminal.backend().buffer()[(caret.x - 2, 11)].symbol(),
+        "尾"
+    );
+    let result: String = (caret.x..38)
+        .map(|col| terminal.backend().buffer()[(col, 11)].symbol())
+        .collect();
+    assert_eq!(result, "': no history");
+}
+
+#[test]
+fn history_search_shows_clipping_even_when_only_the_marker_fits() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new();
+    app.lang = Lang::En;
+    app.permission_mode
+        .set(deep_code_agent::PermissionMode::Default);
+    app.sandbox_off = false;
+
+    let badge_width = "[default] ".width() as u16;
+    let cases = [
+        (15, "query尾", "?…尾"),
+        (14, "query尾", "…尾"),
+        (13, "query尾", "?…"),
+        (12, "query尾", "…"),
+        (11, "query尾", ""),
+        (13, "尾", "尾"),
+    ];
+    for (width, query, visible_query) in cases {
+        app.history_search_start();
+        app.history_search_append(query);
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_status(frame, &mut app, area);
+            })
+            .unwrap();
+        let mut col = badge_width;
+        for grapheme in visible_query.graphemes(true) {
+            assert_eq!(terminal.backend().buffer()[(col, 0)].symbol(), grapheme);
+            col += grapheme.width() as u16;
+        }
+        terminal.backend_mut().assert_cursor_position((col, 0));
+        assert_eq!(terminal.backend().buffer()[(col, 0)].symbol(), " ");
+        app.history_search_cancel();
     }
 }
 

@@ -1,6 +1,22 @@
 use super::*;
 use crate::app::ClickPress;
 
+impl TranscriptSnapshot {
+    /// First row of the bottom viewport, before applying a scroll offset.
+    pub(crate) fn bottom_scroll_top(lines: &[String], height: u16) -> usize {
+        // A hidden viewport uses the same anchor as a one-row viewport, so
+        // submitting a wrapped /find keeps the match when that row reappears.
+        let bottom = lines.len().saturating_sub(usize::from(height).max(1));
+        // Keep the normal bottom alignment whenever it shows content. With
+        // enough trailing blanks to fill the viewport, leave the latest line
+        // of content visible at the top.
+        lines
+            .iter()
+            .rposition(|line| !line.trim().is_empty())
+            .map_or(bottom, |last_content| bottom.min(last_content))
+    }
+}
+
 impl App {
     /// Record what the transcript render produced, for mouse → text mapping.
     pub(crate) fn set_transcript_snapshot(&mut self, snap: TranscriptSnapshot) {
@@ -37,12 +53,12 @@ impl App {
             .rposition(|line| line.to_lowercase().contains(&needle));
         match matched {
             Some(line_index) => {
-                let viewport = usize::from(snapshot.height).max(1);
-                let max_scroll = total.saturating_sub(viewport);
+                let bottom =
+                    TranscriptSnapshot::bottom_scroll_top(&snapshot.lines, snapshot.height);
                 // scroll_offset counts lines up from the bottom; putting the
                 // match at the top of the viewport means scroll_top ==
                 // line_index (clamped to the scrollable range).
-                self.scroll_offset = max_scroll.saturating_sub(line_index);
+                self.scroll_offset = bottom.saturating_sub(line_index);
                 self.find_state = Some((query.to_string(), line_index));
                 self.status = self.tr_with(
                     TextId::FindFound,

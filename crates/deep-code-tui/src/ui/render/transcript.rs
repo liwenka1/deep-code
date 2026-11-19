@@ -14,7 +14,6 @@ pub(super) fn render_messages(
 ) -> TranscriptSnapshot {
     // No transcript border/title — a 1-col left gutter and the input box
     // below provide all the structure, keeping every column for content.
-    let viewport = usize::from(area.height).max(1);
     let content_width = area.width.saturating_sub(2).max(8);
 
     // Render the WHOLE transcript into a stable line buffer: a fixed
@@ -100,8 +99,6 @@ pub(super) fn render_messages(
         }
     }
 
-    let max_scroll = lines.len().saturating_sub(viewport);
-    let scroll = app.scroll_offset.min(max_scroll);
     // Absolute top row, NOT clamped to u16. ratatui's `Paragraph::scroll` offset
     // is a u16, so `scroll_top as u16` WRAPPED (mod 65536) once history crossed
     // 65_535 rendered rows, and clamping to u16::MAX instead pinned the view to
@@ -110,9 +107,9 @@ pub(super) fn render_messages(
     // the lines: render from `scroll_top` down with the Paragraph's own offset at
     // 0, so any height is addressable. `plain` and `scroll_top` stay absolute for
     // the selection overlay and the snapshot, so mouse→line mapping is unchanged.
-    let scroll_top = max_scroll - scroll;
-
     let plain: Vec<String> = lines.iter().map(line_plain_text).collect();
+    let bottom = TranscriptSnapshot::bottom_scroll_top(&plain, area.height);
+    let scroll_top = bottom.saturating_sub(app.scroll_offset);
 
     let visible: Vec<Line<'static>> = if scroll_top < lines.len() {
         lines.split_off(scroll_top)
@@ -124,7 +121,7 @@ pub(super) fn render_messages(
     frame.render_widget(paragraph, area);
 
     if let Some(sel) = app.selection {
-        highlight_selection(frame, area, scroll_top, viewport, &plain, sel);
+        highlight_selection(frame, area, scroll_top, &plain, sel);
     }
 
     TranscriptSnapshot {
@@ -151,34 +148,33 @@ pub(super) fn highlight_selection(
     frame: &mut Frame<'_>,
     area: ratatui::layout::Rect,
     scroll_top: usize,
-    viewport: usize,
     lines: &[String],
     selection: (crate::app::TextPos, crate::app::TextPos),
 ) {
+    if area.is_empty() {
+        return;
+    }
+
     let (a, b) = selection;
     let (start, end) = if a <= b { (a, b) } else { (b, a) };
     let text_x = area.x.saturating_add(1);
+    let text_width = usize::from(area.right().saturating_sub(text_x));
+    let first = start.0.max(scroll_top);
+    let last = end.0.min(scroll_top + usize::from(area.height) - 1);
     let style = Style::default().add_modifier(Modifier::REVERSED);
-    for line in start.0..=end.0 {
-        if line < scroll_top || line >= scroll_top + viewport {
-            continue;
-        }
+    for line in first..=last {
         let Some(text) = lines.get(line) else {
             continue;
         };
-        let width = UnicodeWidthStr::width(text.as_str());
+        let width = UnicodeWidthStr::width(text.as_str()).min(text_width);
         let from = if line == start.0 { start.1 } else { 0 }.min(width);
         let to = if line == end.0 { end.1 } else { width }.min(width);
         if to <= from {
             continue;
         }
         let y = area.y + (line - scroll_top) as u16;
-        let x = text_x.saturating_add(from as u16);
-        let avail = area.x.saturating_add(area.width).saturating_sub(x);
-        let w = ((to - from) as u16).min(avail);
-        if w == 0 {
-            continue;
-        }
+        let x = text_x + from as u16;
+        let w = (to - from) as u16;
         frame
             .buffer_mut()
             .set_style(ratatui::layout::Rect::new(x, y, w, 1), style);

@@ -2,13 +2,13 @@
 //! approval panel, composer input, and status bar, plus the text-wrapping
 //! helpers they share.
 
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style, Stylize};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Widget};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, ComposerSnapshot, FoldTarget, TranscriptSnapshot};
+use crate::app::{App, ComposerSnapshot, FoldTarget, QuitKey, TranscriptSnapshot};
 use crate::history::HistoryCell;
 use crate::markdown::render_markdown;
 use deep_code_agent::SafetyNote;
@@ -48,20 +48,62 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let inner_width = frame.area().width.saturating_sub(2).max(1);
     // Compute layout once — height and rendering share the same result.
     let composer_text = neutralize_composer_text(&app.input);
-    let layout = layout_input(
-        &composer_text,
-        app.input_cursor,
-        inner_width as usize,
-        COMPOSER_MAX_VISIBLE_ROWS,
-        app.composer_scroll,
-    );
-    app.composer_scroll = layout.first_row;
-    let visual_rows = layout.total_rows.clamp(1, COMPOSER_MAX_VISIBLE_ROWS);
-    let input_height = Constraint::Length(visual_rows as u16 + 2);
+    let searching = app.history_search_focused();
+    let layout = if searching {
+        layout_recalled_input(
+            &composer_text,
+            inner_width as usize,
+            COMPOSER_MAX_VISIBLE_ROWS,
+            app.composer_scroll,
+        )
+    } else {
+        layout_input(
+            &composer_text,
+            app.input_cursor,
+            inner_width as usize,
+            COMPOSER_MAX_VISIBLE_ROWS,
+            app.composer_scroll,
+        )
+    };
+    let visual_rows = layout.total_rows.clamp(1, COMPOSER_MAX_VISIBLE_ROWS) as u16;
+    let area = frame.area();
 
     // The composer's text rows, when it takes clicks. Under an approval panel it
     // is drawn but not editable — its keys are y/a/n — so it takes none.
-    let (snapshot, composer_rows) = if app.pending_approval.is_some() {
+    let (snapshot, composer_rows) = if searching {
+        let badges = status_badges(app);
+        let badges_width: usize = badges.iter().map(Span::width).sum();
+        let width = usize::from(area.width);
+        let separate_row =
+            app.prepare_history_search_field(width.saturating_sub(badges_width), width);
+        // Reserve the field before assigning the recalled prompt and
+        // transcript. With just one visible line, the active field takes it.
+        let [body, search, status] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(area.height.min(1)),
+            Constraint::Length(u16::from(separate_row && area.height > 1)),
+        ])
+        .areas(area);
+        // The caret is in the search row. One recalled row is enough before
+        // reserving transcript space for output and scrolling.
+        let [transcript_height, _, composer_height] =
+            body_row_heights(body.height, visual_rows, 1, 0);
+        let [transcript, composer] = Layout::vertical([
+            Constraint::Length(transcript_height),
+            Constraint::Length(composer_height),
+        ])
+        .areas(body);
+        let snap = render_messages(frame, app, transcript);
+        let rows = render_input_from_layout(frame, app, &layout, composer);
+        let query_badges = if separate_row {
+            frame.render_widget(Line::from(badges), status);
+            Vec::new()
+        } else {
+            badges
+        };
+        render_history_search_field(frame, search, query_badges, app);
+        (snap, Some(rows))
+    } else if app.pending_approval.is_some() {
         // Carved by hand, not by the constraint solver. `Constraint::Min(5)`
         // on the transcript carries MIN_SIZE_GE strength (STRONG*100) while
         // the panel's `Constraint::Length` carries LENGTH_SIZE_EQ (STRONG*10),
@@ -90,7 +132,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         rest -= status_h;
         let panel_h = panel_rows.min(rest);
         rest -= panel_h;
-        let input_h = (visual_rows as u16 + 2).min(rest);
+        let input_h = (visual_rows + 2).min(rest);
         rest -= input_h;
         let transcript_h = rest;
 
@@ -105,38 +147,66 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_input_from_layout(frame, app, &layout, row(transcript_h + panel_h, input_h));
         render_status(frame, app, row(transcript_h + panel_h + input_h, status_h));
         (snap, None)
-    } else if let Some(menu) = app.completion.clone() {
+    } else {
         // Cloned for the frame: `render_messages` now takes `&mut App` (it
         // memoizes each cell's rendered lines), so nothing may hold a borrow
         // into `app` across it. The menu is a handful of short rows.
-        let menu_height = (menu.items.len() as u16).min(COMPLETION_VISIBLE_ROWS as u16) + 2;
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(5),
-                Constraint::Length(menu_height),
-                input_height,
-                Constraint::Length(1),
-            ])
-            .split(frame.area());
-        let snap = render_messages(frame, app, chunks[0]);
-        render_completion_menu(frame, &menu, chunks[1], app.lang);
-        let rows = render_input_from_layout(frame, app, &layout, chunks[2]);
-        render_status(frame, app, chunks[3]);
-        (snap, Some(rows))
-    } else {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(5), input_height, Constraint::Length(1)])
-            .split(frame.area());
-        let snap = render_messages(frame, app, chunks[0]);
-        let rows = render_input_from_layout(frame, app, &layout, chunks[1]);
-        render_status(frame, app, chunks[2]);
+        let menu = app.completion.clone();
+        let menu_height = menu.as_ref().map_or(0, |menu| {
+            menu.items.len().min(COMPLETION_VISIBLE_ROWS) as u16 + 2
+        });
+        // The draft takes the only row in a one-line pane. With more room,
+        // keep the footer, the editable text, and the selected completion.
+        // Reserve scrollback before expanding the menu.
+        let status_height = u16::from(area.height > 1);
+        let [transcript_height, menu_height, composer_height] = body_row_heights(
+            area.height - status_height,
+            visual_rows,
+            visual_rows.min(2),
+            menu_height,
+        );
+        let [transcript, completion, composer, status] = Layout::vertical([
+            Constraint::Length(transcript_height),
+            Constraint::Length(menu_height),
+            Constraint::Length(composer_height),
+            Constraint::Length(status_height),
+        ])
+        .areas(area);
+        let snap = render_messages(frame, app, transcript);
+        if let Some(menu) = menu {
+            render_completion_menu(frame, &menu, completion, app.lang);
+        }
+        let rows = render_input_from_layout(frame, app, &layout, composer);
+        render_status(frame, app, status);
         (snap, Some(rows))
     };
     app.set_transcript_snapshot(snapshot);
-    app.composer = composer_rows
-        .map(|rows| composer_snapshot(rows, &layout, inner_width as usize, composer_text));
+    app.composer_scroll = composer_rows.map_or(layout.first_row, |(_, first_row)| first_row);
+    app.composer =
+        composer_rows.map(|rows| composer_snapshot(rows, inner_width as usize, composer_text));
+}
+
+/// Assign rows to the transcript, completion menu, and composer after
+/// reserving the active footer. Keep an editor or preview row, the selected
+/// completion, and one transcript row before adding composer borders.
+fn body_row_heights(
+    body_height: u16,
+    draft_rows: u16,
+    minimum_draft_rows: u16,
+    menu_height: u16,
+) -> [u16; 3] {
+    let menu_min = u16::from(menu_height > 0);
+    let composer_min = body_height
+        .saturating_sub(menu_min + 1)
+        .clamp(body_height.min(minimum_draft_rows), 3);
+    let transcript_min = (body_height - composer_min).saturating_sub(menu_min).min(5);
+    let menu_height = menu_height.min(body_height - transcript_min - composer_min);
+    let composer_height = (draft_rows + 2).min(body_height - transcript_min - menu_height);
+    [
+        body_height - menu_height - composer_height,
+        menu_height,
+        composer_height,
+    ]
 }
 
 /// In-app `/resume` overlay. Mirrors the standalone startup picker's minimal
@@ -348,7 +418,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 /// description is longer than any line cap.
 pub(crate) use deep_code_agent::neutralize_display_text;
 
-fn render_status(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
+fn status_badges(app: &App) -> Vec<Span<'static>> {
     use deep_code_agent::PermissionMode;
 
     // A permanent chip so the current permission mode is always visible.
@@ -374,58 +444,320 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) 
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
+    spans
+}
+
+fn render_status(frame: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Rect) {
+    let badges = status_badges(app);
 
     // An open Ctrl+R search owns the row while it lasts, ahead of an error or
     // a streaming turn: it takes the keys — Esc included — so a search that
     // is not on screen turned the user's Esc on a running turn into closing
     // something they could not see.
-    if let Some(search) = app.history_search_status() {
-        spans.push(Span::styled(
-            neutralize_display_text(search),
-            Style::default().fg(Color::Yellow),
-        ));
-    } else if let Some(error) = &app.error {
-        spans.push(Span::styled(
-            tr(app.lang, TextId::ErrorPrefix),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ));
-        // `RuntimeEvent::Error` carries tool failures, which quote the paths
-        // and commands the model chose — and this row is drawn in the SAME
-        // frame as the approval panel, outliving the turn that produced it.
-        // An escape here reaches the terminal exactly like one in the
-        // transcript did, so it gets the same treatment.
-        //
-        // ALL THREE branches, not just this one. The other two carry the tool
-        // NAME straight off the model's tool call — `streaming_activity`
-        // formats `ActiveToolCell::tool_name`, and `status_line` splices
-        // `App::status`, which `event_routing` fills from `tool_name` on every
-        // `ToolCallStarted` and on `ApprovalRequired`. That last one prints
-        // the model's chosen name on this row in the same frame as the
-        // approval panel — and this row is drawn AFTER the panel, so an
-        // escape here repaints the thing the human is reading to decide.
-        // Sanitizing only the error branch is why that survived three rounds:
-        // the one test scanning this row populates `app.error`, so the `if`
-        // shadowed both `else`s.
-        spans.push(Span::raw(neutralize_display_text(error)));
-    } else if let Some(activity) = app.streaming_activity() {
-        // While streaming (incl. a long time-to-first-token wait) show an
-        // animated indicator so the screen never looks frozen.
-        spans.push(Span::styled(
-            neutralize_display_text(&activity),
-            Style::default().fg(Color::Cyan),
-        ));
-        spans.push(Span::styled(
-            format!("   {}", tr(app.lang, TextId::StatusEscCancel)),
-            Style::default().fg(Color::DarkGray),
-        ));
+    if app.history_search_open() {
+        render_history_search_field(frame, area, badges, app);
+        return;
+    }
+    if let Some(error) = &app.error {
+        render_error_status(frame, area, badges, app.lang, error);
+    } else if app.is_streaming {
+        let (activity, clock) = app
+            .streaming_activity()
+            .unwrap_or_else(|| (app.status_line(), String::new()));
+        render_streaming_status(
+            frame,
+            area,
+            badges,
+            app,
+            (&activity, &clock),
+            empty_composer_accepts_hint(app),
+        );
     } else {
-        spans.push(Span::raw(neutralize_display_text(&app.status_line())));
+        render_idle_status(frame, area, badges, app);
+    }
+}
+
+fn render_error_status(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    mut badges: Vec<Span<'_>>,
+    lang: Lang,
+    error: &str,
+) {
+    if area.is_empty() {
+        return;
+    }
+    badges.push(Span::styled(
+        tr(lang, TextId::ErrorPrefix),
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    ));
+    let buffer = frame.buffer_mut();
+    let (x, y) = buffer.set_line(area.x, area.y, &Line::from(badges), area.width);
+    let available = usize::from(area.right() - x);
+    // Runtime errors can quote paths and commands supplied by the model.
+    let error = neutralize_display_text(error);
+    buffer.set_stringn(x, y, error, available, Color::DarkGray);
+}
+
+fn status_text_width(text: &str) -> usize {
+    text.graphemes(true).map(UnicodeWidthStr::width).sum()
+}
+
+fn render_idle_status(frame: &mut Frame<'_>, area: Rect, badges: Vec<Span<'_>>, app: &App) {
+    if area.is_empty() {
+        return;
+    }
+    let buffer = frame.buffer_mut();
+    let (x, y) = buffer.set_line(area.x, area.y, &Line::from(badges), area.width);
+    let available = usize::from(area.right() - x);
+    if available == 0 {
+        return;
+    }
+    let [model, reasoning, context, note] = app
+        .status_line_parts()
+        .map(|part| neutralize_display_text(&part));
+    let model_width = status_text_width(&model);
+    let reasoning_width = status_text_width(&reasoning);
+    let context_width = status_text_width(&context);
+    let full_details_width = model_width + reasoning_width + context_width;
+    let note_width = status_text_width(&note);
+    // The rollback hint is only useful as a complete command and checkpoint
+    // ID. Keep the model and context fields visible while it has no room.
+    let (note, note_width) = if note_width > 0
+        && full_details_width + note_width > available
+        && app.rollback_status_hint().as_deref() == Some(app.status.as_str())
+    {
+        ("", 0)
+    } else {
+        (note.as_str(), note_width)
+    };
+    if note_width >= available {
+        let note = note.trim_start();
+        if status_text_width(note) > available
+            && let Some((key, warning)) = &app.quit_armed
+            && app.status == *warning
+        {
+            let key = match key {
+                QuitKey::Esc => "Esc",
+                QuitKey::CtrlC => "Ctrl+C",
+            };
+            let short = tr_with(app.lang, TextId::StatusQuitConfirmShort, &[("key", key)]);
+            buffer.set_stringn(x, y, short, available, Color::DarkGray);
+        } else {
+            buffer.set_stringn(x, y, note, available, Color::DarkGray);
+        }
+        return;
     }
 
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().fg(Color::DarkGray)),
-        area,
+    // Keep the complete model and percentage when they fit together, then
+    // add the whole reasoning field if there is space.
+    let mut details_width = available - note_width;
+    let context = if model_width + context_width <= details_width {
+        details_width -= context_width;
+        context.as_str()
+    } else {
+        ""
+    };
+    let reasoning = if model_width + reasoning_width <= details_width {
+        reasoning.as_str()
+    } else {
+        ""
+    };
+    let (mut x, _) = buffer.set_stringn(x, y, model, details_width, Color::DarkGray);
+    for field in [reasoning, context, note] {
+        (x, _) = buffer.set_stringn(x, y, field, usize::from(area.right() - x), Color::DarkGray);
+    }
+}
+
+fn render_streaming_status(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    badges: Vec<Span<'_>>,
+    app: &App,
+    (activity, clock): (&str, &str),
+    show_composer_hint: bool,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let buffer = frame.buffer_mut();
+    let (x, y) = buffer.set_line(area.x, area.y, &Line::from(badges), area.width);
+    let available = usize::from(area.right() - x);
+    let activity = neutralize_display_text(activity);
+    let clock = neutralize_display_text(clock);
+    let clock_width = clock.width();
+    let mut activity_widths = activity.graphemes(true).map(UnicodeWidthStr::width);
+    let first_activity_width = activity_widths.find(|&width| width > 0).unwrap_or_default();
+    let activity_label_width = first_activity_width + activity_widths.sum::<usize>();
+    let full_activity_width = activity_label_width + clock_width;
+    let full_cancel = tr(app.lang, TextId::StatusEscCancel);
+    let short_cancel = "Esc";
+    let count = app.steering_queue.len().to_string();
+    let args = [("count", count.as_str())];
+    let preferred_gap = 3;
+    let fits = |activity_width, cancel_width, hint_width| {
+        let suffix_width =
+            cancel_width + hint_width + usize::from(cancel_width > 0 && hint_width > 0);
+        activity_width + suffix_width + usize::from(activity_width > 0 && suffix_width > 0)
+            <= available
+    };
+
+    // Reserve the count, spinner, clock, and cancel key together before
+    // spending any of their columns on longer labels. The transcript marks
+    // its pending entries with the same compact count symbol.
+    let compact_count = (!app.steering_queue.is_empty())
+        .then(|| format!("◷{count}"))
+        .filter(|value| value.width() <= available);
+    let count_width = compact_count.as_deref().map_or(0, UnicodeWidthStr::width);
+    let activity_minimum = if fits(first_activity_width, 0, count_width) {
+        first_activity_width
+    } else {
+        0
+    };
+    let show_clock = activity_minimum > 0
+        && clock_width > 0
+        && fits(activity_minimum + clock_width, 0, count_width);
+    let reserved_clock_width = if show_clock { clock_width } else { 0 };
+    let activity_minimum = activity_minimum + reserved_clock_width;
+    let short_cancel = if fits(activity_minimum, short_cancel.width(), count_width) {
+        short_cancel
+    } else {
+        ""
+    };
+    let full_hint = show_composer_hint
+        .then(|| tr_with(app.lang, TextId::ComposerPlaceholderSteering, &args))
+        .filter(|hint| {
+            full_activity_width + full_cancel.width() + hint.width() + 2 * preferred_gap
+                <= available
+        });
+    let (hint, hint_gap) = if let Some(hint) = full_hint {
+        (hint, preferred_gap)
+    } else if let Some(compact_count) = compact_count {
+        let queued = tr_with(
+            app.lang,
+            TextId::ComposerPlaceholderSteeringQueuedShort,
+            &args,
+        );
+        let hint = [queued, format!("◷ {count}")]
+            .into_iter()
+            .find(|label| fits(activity_minimum, short_cancel.width(), label.width()))
+            .unwrap_or(compact_count);
+        (hint, 1)
+    } else {
+        let short = tr(app.lang, TextId::ComposerPlaceholderSteeringShort);
+        if show_composer_hint
+            && app.steering_queue.is_empty()
+            && !short_cancel.is_empty()
+            && fits(full_activity_width, short_cancel.width(), short.width())
+        {
+            (short.into(), 1)
+        } else {
+            (String::new(), 0)
+        }
+    };
+    let cancel = if fits(
+        full_activity_width,
+        full_cancel.width(),
+        hint.width() + hint_gap.saturating_sub(1),
+    ) {
+        full_cancel
+    } else {
+        short_cancel
+    };
+    let suffix = if cancel.is_empty() {
+        hint
+    } else {
+        format!("{cancel}{:hint_gap$}{hint}", "")
+    };
+    let activity_space = available.saturating_sub(suffix.width());
+    let full_activity_fits = full_activity_width < activity_space;
+    let gap = if suffix.is_empty() || activity_minimum == 0 {
+        0
+    } else if reserved_clock_width > 0 && !full_activity_fits {
+        1
+    } else {
+        let reserve = if full_activity_fits {
+            full_activity_width
+        } else {
+            activity_minimum
+        };
+        preferred_gap.min(activity_space.saturating_sub(reserve))
+    };
+    let label_budget = if activity_minimum > 0 {
+        activity_space.saturating_sub(gap + reserved_clock_width)
+    } else {
+        0
+    };
+    let ellipsis =
+        show_clock && activity_label_width > label_budget && label_budget > first_activity_width;
+    let (mut activity_end, _) = buffer.set_stringn(
+        x,
+        y,
+        activity,
+        label_budget - usize::from(ellipsis),
+        Color::Cyan,
     );
+    if ellipsis {
+        (activity_end, _) = buffer.set_stringn(activity_end, y, "…", 1, Color::Cyan);
+    }
+    if show_clock {
+        (activity_end, _) = buffer.set_stringn(activity_end, y, clock, clock_width, Color::Cyan);
+    }
+    let suffix_x = if activity_end == x {
+        x
+    } else {
+        activity_end + gap as u16
+    };
+    buffer.set_stringn(
+        suffix_x,
+        y,
+        &suffix,
+        usize::from(area.right() - suffix_x),
+        Color::DarkGray,
+    );
+}
+
+fn render_history_search_field(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    badges: Vec<Span<'_>>,
+    app: &mut App,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let buffer = frame.buffer_mut();
+    let (status_x, y) = buffer.set_line(area.x, area.y, &Line::from(badges), area.width);
+    let available = usize::from(area.right() - status_x);
+    if available == 0 {
+        return;
+    }
+
+    let focused = app.history_search_focused();
+    let Some((label, query, suffix)) = app.history_search_display(available) else {
+        return;
+    };
+    let (query_x, _) = buffer.set_stringn(status_x, y, label, available - 1, Color::Yellow);
+    let query_budget = usize::from(area.right() - query_x) - 1;
+    let (cursor_x, _) = buffer.set_stringn(query_x, y, query, query_budget, Color::Yellow);
+    let result_width = status_text_width(suffix);
+    let result_budget = usize::from(area.right() - cursor_x);
+    let result_end = if result_width <= result_budget {
+        buffer
+            .set_stringn(cursor_x, y, suffix, result_budget, Color::Yellow)
+            .0
+    } else {
+        cursor_x
+    };
+    if focused {
+        if result_width > 0
+            && usize::from(result_end - cursor_x) == result_width
+            && let Some(hints) = app.history_search_hints(usize::from(area.right() - result_end))
+        {
+            buffer.set_string(result_end, y, hints, Color::Yellow);
+        }
+        frame.set_cursor_position((cursor_x, y));
+    }
 }
 
 #[cfg(test)]

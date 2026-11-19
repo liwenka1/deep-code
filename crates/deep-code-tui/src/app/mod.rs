@@ -932,25 +932,42 @@ impl App {
     /// Live activity label shown while a turn runs: an animated spinner plus
     /// elapsed seconds, so a long wait reads as activity rather than a frozen
     /// screen. While a tool is executing, the label names the tool and shows
-    /// that call's own clock instead of the generic "generating".
+    /// that call's own clock instead of the generic "generating". The clock
+    /// is a separate suffix so the renderer can preserve it when clipping.
     #[must_use]
-    pub(crate) fn streaming_activity(&self) -> Option<String> {
+    pub(crate) fn streaming_activity(&self) -> Option<(String, String)> {
         if !self.is_streaming {
             return None;
         }
         let elapsed = self.streaming_since?.elapsed();
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let frame = FRAMES[(elapsed.as_millis() / 120 % FRAMES.len() as u128) as usize];
+        let timed_activity = |id, elapsed: std::time::Duration, tool: Option<&str>| {
+            let template = self.tr(id);
+            let (label, clock) = if let Some((before, after)) = template.split_once("{secs}") {
+                let label = before.trim_end_matches([' ', '·']);
+                let separator = &before[label.len()..];
+                let clock = format!("{separator}{}{after}", elapsed.as_secs());
+                (label, clock)
+            } else {
+                (template, String::new())
+            };
+            // Split the translated clock before inserting the tool name.
+            // Only the localized separator and elapsed time belong to it.
+            let activity = match tool.zip(label.split_once("{tool}")) {
+                Some((tool, (before, after))) => format!("{frame} {before}{tool}{after}"),
+                None => format!("{frame} {label}"),
+            };
+            (activity, clock)
+        };
         // A compaction inside the turn owns the wait the same way: a minute of
         // "generating" with nothing appearing reads as a hang, and Esc is the
         // reflex that follows.
         if let Some(since) = self.turn_compaction_since {
-            return Some(format!(
-                "{frame} {}",
-                self.tr_with(
-                    TextId::StreamingCompacting,
-                    &[("secs", &since.elapsed().as_secs().to_string())],
-                )
+            return Some(timed_activity(
+                TextId::StreamingCompacting,
+                since.elapsed(),
+                None,
             ));
         }
         // A running tool owns the wait: "generating 180s" while a sub-agent or
@@ -958,24 +975,13 @@ impl App {
         // a batch the newest is the one whose start the user just watched;
         // finished calls leave `tools`, so this falls back by itself.
         if let Some(tool) = self.active_turn.as_ref().and_then(|turn| turn.tools.last()) {
-            return Some(format!(
-                "{frame} {}",
-                self.tr_with(
-                    TextId::StreamingToolRunning,
-                    &[
-                        ("tool", &tool.tool_name),
-                        ("secs", &tool.started_at.elapsed().as_secs().to_string()),
-                    ],
-                )
+            return Some(timed_activity(
+                TextId::StreamingToolRunning,
+                tool.started_at.elapsed(),
+                Some(&tool.tool_name),
             ));
         }
-        Some(format!(
-            "{frame} {}",
-            self.tr_with(
-                TextId::StreamingGenerating,
-                &[("secs", &elapsed.as_secs().to_string())],
-            )
-        ))
+        Some(timed_activity(TextId::StreamingGenerating, elapsed, None))
     }
 
     /// Test constructor: launch into a process-shared temp workspace so the
@@ -1172,15 +1178,39 @@ impl App {
     }
 
     pub fn scroll_up(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_add(3);
+        self.scroll_offset = self
+            .scroll_offset
+            .saturating_add(self.transcript_scroll_step());
     }
 
     pub fn scroll_down(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(3);
+        self.scroll_offset = self
+            .scroll_offset
+            .saturating_sub(self.transcript_scroll_step());
+    }
+
+    fn transcript_scroll_step(&self) -> usize {
+        self.transcript
+            .as_ref()
+            .map_or(3, |transcript| usize::from(transcript.height).min(3))
     }
 
     #[must_use]
     pub fn status_line(&self) -> String {
+        self.status_line_parts().concat()
+    }
+
+    pub(crate) fn rollback_status_hint(&self) -> Option<String> {
+        self.last_checkpoint.as_deref().map(|id| {
+            self.tr_with(TextId::StatusRollbackHint, &[("id", id)])
+                .trim_start_matches(" | ")
+                .to_string()
+        })
+    }
+
+    /// Model, reasoning effort, context usage, and the transient note, in
+    /// display order. The renderer can give each field its own width budget.
+    pub(crate) fn status_line_parts(&self) -> [String; 4] {
         // CC-style minimal idle frame. The permission-mode chip is rendered
         // separately by `render_status` (always visible), and streaming/error
         // states have their own branches there — so this shows the model in
@@ -1217,7 +1247,7 @@ impl App {
         } else {
             format!("  {}", self.status)
         };
-        format!("{model} {reasoning}{ctx}{note}")
+        [model.to_string(), format!(" {reasoning}"), ctx, note]
     }
 
     pub async fn shutdown_runtime(&self) {

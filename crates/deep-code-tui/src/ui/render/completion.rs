@@ -14,17 +14,30 @@ pub(super) fn render_completion_menu(
     area: ratatui::layout::Rect,
     lang: Lang,
 ) {
+    if area.is_empty() {
+        return;
+    }
+    let title = match menu.kind {
+        CompletionKind::ModelPicker => tr(lang, TextId::ModelPickerModel),
+        CompletionKind::ReasoningPicker => tr(lang, TextId::ModelPickerReasoning),
+        CompletionKind::Slash | CompletionKind::File => tr(lang, TextId::CompletionMenuTitle),
+    };
+    let block = Block::default().border_style(Style::default().fg(Color::Blue));
+    let block = match area.height {
+        1 => block,
+        2 => block.title(title).borders(Borders::TOP),
+        _ => block.title(title).borders(Borders::ALL),
+    };
+    let visible_rows = usize::from(block.inner(area).height).min(COMPLETION_VISIBLE_ROWS);
     // Window around the selection so wrapping to the last/first item keeps the
     // highlight visible instead of scrolling it off the top of the list.
-    let start = menu
-        .selected
-        .saturating_sub(COMPLETION_VISIBLE_ROWS.saturating_sub(1));
+    let start = menu.selected.saturating_sub(visible_rows.saturating_sub(1));
     let lines: Vec<Line<'static>> = menu
         .items
         .iter()
         .enumerate()
         .skip(start)
-        .take(COMPLETION_VISIBLE_ROWS)
+        .take(visible_rows)
         .map(|(index, (value, hint))| {
             let marker = if index == menu.selected { "▶ " } else { "  " };
             let mut spans = vec![Span::raw(marker.to_string())];
@@ -55,16 +68,5 @@ pub(super) fn render_completion_menu(
             Line::from(spans)
         })
         .collect();
-    let title = match menu.kind {
-        CompletionKind::ModelPicker => tr(lang, TextId::ModelPickerModel),
-        CompletionKind::ReasoningPicker => tr(lang, TextId::ModelPickerReasoning),
-        CompletionKind::Slash | CompletionKind::File => tr(lang, TextId::CompletionMenuTitle),
-    };
-    let panel = Paragraph::new(lines).block(
-        Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Blue)),
-    );
-    frame.render_widget(panel, area);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }

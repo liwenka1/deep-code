@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 use deep_code_agent::CancellationToken;
 use tokio::sync::{mpsc, oneshot};
 
+pub(crate) const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
 struct Request {
     bytes: Vec<u8>,
     done: oneshot::Sender<io::Result<()>>,
@@ -124,7 +126,7 @@ impl Output {
     }
 
     pub async fn send(&self, bytes: &[u8]) -> io::Result<()> {
-        for bytes in bytes.chunks(64 * 1024) {
+        for bytes in bytes.chunks(MAX_REQUEST_BYTES) {
             self.check()?;
             let (done, received) = oneshot::channel();
             tokio::select! {
@@ -173,7 +175,7 @@ impl Output {
 
 impl Write for Output {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let count = bytes.len().min(64 * 1024);
+        let count = bytes.len().min(MAX_REQUEST_BYTES);
         self.send_sync(&bytes[..count])?;
         Ok(count)
     }

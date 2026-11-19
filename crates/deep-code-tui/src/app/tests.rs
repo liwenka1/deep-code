@@ -87,6 +87,17 @@ fn scroll_helpers_adjust_offset() {
     assert_eq!(app.scroll_offset, 3);
     app.scroll_down();
     assert_eq!(app.scroll_offset, 0);
+
+    for (height, step) in [(0, 0), (1, 1), (2, 2), (3, 3), (8, 3)] {
+        app.transcript = Some(TranscriptSnapshot {
+            height,
+            ..TranscriptSnapshot::default()
+        });
+        app.scroll_up();
+        assert_eq!(app.scroll_offset, step);
+        app.scroll_down();
+        assert_eq!(app.scroll_offset, 0);
+    }
 }
 
 #[test]
@@ -2214,8 +2225,9 @@ fn streaming_activity_shows_only_while_streaming() {
 
     app.is_streaming = true;
     app.streaming_since = Some(std::time::Instant::now());
-    let activity = app.streaming_activity().expect("indicator while streaming");
-    assert!(activity.contains("生成中"));
+    let (activity, clock) = app.streaming_activity().expect("indicator while streaming");
+    assert!(activity.ends_with("生成中"));
+    assert!(clock.starts_with(' ') && clock.ends_with('s'), "{clock:?}");
 
     app.is_streaming = false;
     assert!(app.streaming_activity().is_none());
@@ -2244,15 +2256,19 @@ fn streaming_activity_names_the_running_tool() {
     });
     app.active_turn = Some(turn);
 
-    let activity = app.streaming_activity().expect("indicator while running");
+    let (activity, clock) = app.streaming_activity().expect("indicator while running");
+    assert!(activity.ends_with("agent 运行中"), "{activity:?}");
     assert!(
-        activity.contains("agent") && activity.contains("运行中"),
-        "tool wait must name the tool: {activity:?}"
+        clock
+            .strip_prefix(" · ")
+            .and_then(|clock| clock.strip_suffix('s'))
+            .is_some_and(|seconds| seconds.parse::<u64>().is_ok()),
+        "{clock:?}"
     );
 
     // Tool finished and removed → falls back to the generating label.
     app.active_turn.as_mut().unwrap().tools.clear();
-    let activity = app.streaming_activity().expect("indicator while streaming");
+    let (activity, _) = app.streaming_activity().expect("indicator while streaming");
     assert!(activity.contains("生成中"), "{activity:?}");
 }
 
@@ -3643,12 +3659,16 @@ fn a_compaction_inside_the_turn_names_the_wait() {
     app.is_streaming = true;
     app.streaming_since = Some(std::time::Instant::now());
     app.apply_runtime_event(RuntimeEvent::CompactionStarted);
-    let label = app.streaming_activity().unwrap();
-    assert!(label.contains("压缩上下文中"), "{label}");
+    let (label, clock) = app.streaming_activity().unwrap();
+    assert!(label.ends_with("压缩上下文中"), "{label}");
+    assert!(
+        clock.starts_with(" · ") && clock.ends_with('s'),
+        "{clock:?}"
+    );
     app.apply_runtime_event(RuntimeEvent::Warning {
         message: "skipped".to_string(),
     });
-    let label = app.streaming_activity().unwrap();
+    let (label, _) = app.streaming_activity().unwrap();
     assert!(label.contains("生成中"), "{label}");
 }
 
@@ -5319,7 +5339,10 @@ fn a_search_keeps_the_draft_one_down_arrow_away() {
 }
 
 fn search_status(app: &App) -> String {
-    app.history_search_status().unwrap_or_default().to_string()
+    app.history_search_status()
+        .map_or_else(String::new, |(before, query, after)| {
+            format!("{before}{query}{after}")
+        })
 }
 
 /// A `todo_write` result is followed by the task list as a cell; unknown

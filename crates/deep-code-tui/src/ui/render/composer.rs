@@ -77,10 +77,9 @@ pub(crate) struct LayoutResult {
 ///
 /// Guarantee: the row the cursor is on always EXISTS in `visible_lines` (and is
 /// counted by `total_rows`). A caret at the right edge of an exactly-filled line
-/// belongs to the row that starts there, so this materializes that row — without
-/// it the renderer's `min(inner_height - 1)` clamp silently rewrote the caret to
-/// row 0, which is the "cursor snaps back to the first line when the text is
-/// exactly one line long" bug.
+/// belongs to the row that starts there, so this materializes that row. The
+/// renderer can then scroll to that row if the terminal gives it a smaller
+/// viewport than the one laid out here.
 ///
 /// `scroll_top` is the previous frame's [`LayoutResult::first_row`]. The window
 /// stays there while the caret is inside it and moves only as far as it takes to
@@ -95,17 +94,44 @@ pub(crate) fn layout_input(
     max_visible_rows: usize,
     scroll_top: usize,
 ) -> LayoutResult {
+    layout_composer(
+        input,
+        Some(cursor_chars),
+        width,
+        max_visible_rows,
+        scroll_top,
+    )
+}
+
+pub(super) fn layout_recalled_input(
+    input: &str,
+    width: usize,
+    max_visible_rows: usize,
+    scroll_top: usize,
+) -> LayoutResult {
+    layout_composer(input, None, width, max_visible_rows, scroll_top)
+}
+
+fn layout_composer(
+    input: &str,
+    cursor_chars: Option<usize>,
+    width: usize,
+    max_visible_rows: usize,
+    scroll_top: usize,
+) -> LayoutResult {
     let mut lines = wrap_input_lines(input, width);
     let max_visible = max_visible_rows.max(1);
-    let (cursor_row, cursor_col) = cursor_row_col(input, cursor_chars, width.max(1));
+    let (cursor_row, cursor_col) = if let Some(cursor_chars) = cursor_chars {
+        cursor_row_col(input, cursor_chars, width.max(1))
+    } else {
+        // The active caret is in the search field. Anchor even a one-row
+        // preview to recalled text, including after an exact-width wrap.
+        let last_text = lines.iter().rposition(|line| !line.trim().is_empty());
+        (last_text.unwrap_or(0), 0)
+    };
 
-    // Two callers depend on this row existing. `total_rows` sizes the composer,
-    // so the box grows by the row the caret needs; and
-    // `render_input_from_layout` clamps the caret row with `min(inner_height - 1)`,
-    // which without this resolves to 0 and puts the caret back at the start of the
-    // first line — the reported symptom, and a silent one, because a caret on a
-    // row that was never rendered is indistinguishable from a caret that belongs
-    // at column 0.
+    // `total_rows` sizes the composer and the renderer needs the caret's row
+    // in its viewport, even when that row has no text yet.
     while lines.len() <= cursor_row {
         lines.push(String::new());
     }
@@ -305,117 +331,125 @@ pub(super) fn wrap_input_lines(input: &str, width: usize) -> Vec<String> {
 const PROMPT: &str = "› ";
 const GUTTER: u16 = 2;
 
-/// Draw the composer; returns the rows its text went on (gutter included), for
-/// [`composer_snapshot`].
+pub(super) fn empty_composer_accepts_hint(app: &App) -> bool {
+    app.input.is_empty()
+        && app.pending_approval.is_none()
+        && !app.history_search_open()
+        && !app.model_picker_open()
+}
+
+fn default_placeholder(lang: Lang, width: u16) -> Option<&'static str> {
+    [
+        tr(lang, TextId::ComposerPlaceholder),
+        tr(lang, TextId::ComposerPlaceholderShort),
+        "/help",
+        "/",
+    ]
+    .into_iter()
+    .find(|hint| hint.width() <= usize::from(width))
+}
+
+/// Draw the composer and return the text area (including its gutter) and its
+/// first absolute visual row for [`composer_snapshot`].
 pub(super) fn render_input_from_layout(
     frame: &mut Frame<'_>,
     app: &App,
     layout: &LayoutResult,
-    area: ratatui::layout::Rect,
-) -> ratatui::layout::Rect {
-    // Borderless composer: just a dim rule above and below, with a "› "
-    // prompt marker. The streaming state shows in the status line, so the
-    // composer needs no title.
+    area: Rect,
+) -> (Rect, usize) {
+    // Draw borders only in rows left over after the draft and its caret row.
+    let borders = match usize::from(area.height).saturating_sub(layout.visible_lines.len()) {
+        0 => Borders::NONE,
+        1 => Borders::TOP,
+        _ => Borders::TOP | Borders::BOTTOM,
+    };
     let style = Style::default();
     let prompt_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
 
     let block = Block::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
+        .borders(borders)
         .border_style(Style::default().fg(Color::DarkGray));
     let inner_area = block.inner(area);
     block.render(area, frame.buffer_mut());
 
-    let inner_height = usize::from(inner_area.height).max(1);
+    let row_count = layout
+        .visible_lines
+        .len()
+        .min(usize::from(inner_area.height));
+    if row_count == 0 {
+        return (inner_area, layout.first_row);
+    }
     let text_x = inner_area.x.saturating_add(GUTTER);
 
-    let visible = if layout.visible_lines.len() > inner_height {
-        &layout.visible_lines[..inner_height]
+    // Scroll within the generated rows. Keep the previous top on a click
+    // inside the editor so the text stays under the pointer on the next draw.
+    let previous_offset = app
+        .composer
+        .as_ref()
+        .filter(|previous| previous.rows > 0 && previous.width == inner_area.width)
+        .map_or(0, |previous| {
+            previous.first_row.saturating_sub(layout.first_row)
+        });
+    let cursor_row = layout.cursor_visible_row;
+    let first = previous_offset.clamp(
+        (cursor_row + 1).saturating_sub(row_count),
+        cursor_row.min(layout.visible_lines.len() - row_count),
+    );
+    let visible = &layout.visible_lines[first..first + row_count];
+    let placeholder = if !app.is_streaming && empty_composer_accepts_hint(app) {
+        default_placeholder(app.lang, inner_area.width.saturating_sub(GUTTER))
     } else {
-        &layout.visible_lines
+        None
     };
     for (row, line_text) in visible.iter().enumerate() {
         let y = inner_area.y.saturating_add(row as u16);
-        if y >= inner_area.y.saturating_add(inner_area.height) {
-            break;
-        }
         // "› " on the first row, a matching indent on wrapped continuations.
         if row == 0 {
             frame
                 .buffer_mut()
                 .set_string(inner_area.x, y, PROMPT, prompt_style);
+            if line_text.is_empty()
+                && let Some(placeholder) = placeholder
+            {
+                // Paint the hint where the terminal overlays IME preedit.
+                // Layout and click mapping still use the empty draft.
+                frame
+                    .buffer_mut()
+                    .set_string(text_x, y, placeholder, Color::DarkGray);
+                continue;
+            }
         }
         frame.buffer_mut().set_string(text_x, y, line_text, style);
     }
 
-    // Faint placeholder when the composer is empty and accepting input. While a
-    // turn streams the composer is still live (mid-turn steering), so it gets a
-    // different placeholder too — the text will be steered into the live turn
-    // rather than sent as its own, and once something is already queued the
-    // hint says how many are waiting. Without this the feature is invisible.
-    if app.input.is_empty() && app.pending_approval.is_none() {
-        let hint = if app.is_streaming {
-            tr_with(
-                app.lang,
-                TextId::ComposerPlaceholderSteering,
-                &[("count", &app.steering_queue.len().to_string())],
-            )
-        } else {
-            tr(app.lang, TextId::ComposerPlaceholder).to_string()
-        };
-        // Keep the first cell empty for the input caret. Drawing the hint on
-        // top of the caret made an empty composer look cursorless in terminals
-        // whose cursor blended with the placeholder's dim style.
-        frame.buffer_mut().set_string(
-            text_x.saturating_add(1),
-            inner_area.y,
-            &hint,
-            Style::default().fg(Color::DarkGray),
+    // The terminal anchors IME composition to its native cursor. Set that
+    // cursor to the same insertion point that keyboard and mouse editing use.
+    if app.pending_approval.is_none() && !app.history_search_open() {
+        let cursor = ratatui::layout::Position::new(
+            text_x.saturating_add(u16::try_from(layout.cursor_col).unwrap_or(u16::MAX)),
+            inner_area.y.saturating_add((cursor_row - first) as u16),
         );
-    }
-
-    // Draw the caret into the same buffer as the composer. Letting the terminal
-    // own it introduces a visible race: the new text is flushed first and the
-    // terminal cursor is moved afterwards, so the old position can flash for a
-    // frame when the first character is inserted or the last one is deleted.
-    // Keeping the caret in the buffer makes the text and caret one atomic
-    // update. The approval prompt is the only state that takes focus away.
-    if app.pending_approval.is_none() {
-        let cursor_y = inner_area.y.saturating_add(
-            u16::try_from(
-                layout
-                    .cursor_visible_row
-                    .min(inner_height.saturating_sub(1)),
-            )
-            .unwrap_or(u16::MAX),
-        );
-        let cursor_x = text_x.saturating_add(u16::try_from(layout.cursor_col).unwrap_or(u16::MAX));
-        if let Some(cell) = frame.buffer_mut().cell_mut((cursor_x, cursor_y)) {
-            cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+        if inner_area.contains(cursor) {
+            frame.set_cursor_position(cursor);
         }
-
-        // Keep the coordinate observable in the in-memory test backend. The
-        // production terminal cursor is intentionally left hidden by ratatui;
-        // the reversed cell above is the actual caret users see.
-        #[cfg(test)]
-        frame.set_cursor_position((cursor_x, cursor_y));
     }
 
-    ratatui::layout::Rect {
-        height: u16::try_from(visible.len())
-            .unwrap_or(u16::MAX)
-            .min(inner_area.height),
-        ..inner_area
-    }
+    (
+        Rect {
+            height: row_count as u16,
+            ..inner_area
+        },
+        layout.first_row + first,
+    )
 }
 
 /// What a click on the composer has to know about the frame just drawn: where
 /// its text rows are (`rows`, from [`render_input_from_layout`]), which row of
 /// the input is at the top, and the text they were wrapped from.
 pub(super) fn composer_snapshot(
-    rows: ratatui::layout::Rect,
-    layout: &LayoutResult,
+    (rows, first_row): (Rect, usize),
     wrap_width: usize,
     text: String,
 ) -> ComposerSnapshot {
@@ -426,7 +460,7 @@ pub(super) fn composer_snapshot(
         width: rows.width,
         rows: rows.height,
         wrap_width,
-        first_row: layout.first_row,
+        first_row,
         text,
     }
 }

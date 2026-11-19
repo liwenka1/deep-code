@@ -238,12 +238,20 @@ impl App {
         self.refresh_completion();
     }
 
+    pub(crate) fn normalize_paste_line_endings(text: String) -> String {
+        if text.contains('\r') {
+            text.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            text
+        }
+    }
+
     /// Handle a bracketed-paste payload. Large pastes (multi-line or long)
     /// collapse to a compact `[粘贴 #N …]` chip whose real content is kept in
     /// `pasted_blocks` and expanded back in on submit; short single-line
     /// pastes insert inline.
     pub fn paste_str(&mut self, text: String) {
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let normalized = Self::normalize_paste_line_endings(text);
         if normalized.is_empty() {
             // An empty paste is a signal, not a no-op. A pasteboard carrying
             // pixels and no text — a screenshot — leaves some terminals with
